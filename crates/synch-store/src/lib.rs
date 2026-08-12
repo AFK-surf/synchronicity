@@ -14,7 +14,7 @@ pub use bindings::{Binding, BindingSource};
 pub use cas::{BlobRow, BLOCK_SIZE};
 pub use db::{DeviceKey, KeyState, Store, CAS_DIR, DB_FILE};
 pub use error::{Result, StoreError};
-pub use gc::GcStats;
+pub use gc::{GcStats, TrieStats};
 pub use heads::{Equivocation, Slot, StoredHead};
 pub use schema::SCHEMA_VERSION;
 pub use views::{EntryRow, LocalFile, MirrorRow, PeerSeen, SpaceRow, Want};

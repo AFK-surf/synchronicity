@@ -1,0 +1,577 @@
+//! DNSSEC-based membership discovery (§3.2).
+//!
+//! The resolver queries `_synchronicity.<domain> TXT` and accepts records of
+//! the form `v=sync1 id=<label> nk=<z-base-32 device key>`. The lookup MUST be
+//! DNSSEC-validated end to end, in process — we do not trust an upstream
+//! resolver's AD bit. If the chain of trust does not validate, the response is
+//! discarded entirely and the previously cached member set is retained until
+//! its own expiry. Fail closed.
+//!
+//! Everything above the resolver — record parsing and the malformed-set rules —
+//! is pure and unit-tested here without touching the network.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
+
+use iroh_base::PublicKey;
+use synch_core::{
+    origin::{normalize_domain, normalize_label},
+    NodeId, OriginId,
+};
+
+use crate::error::NetError;
+
+/// The label the membership TXT records live under.
+pub const TXT_PREFIX: &str = "_synchronicity";
+
+/// The version tag every accepted record must carry.
+pub const RECORD_VERSION_TAG: &str = "sync1";
+
+/// Lower clamp on the re-resolution interval (§3.2).
+pub const MIN_TTL: Duration = Duration::from_secs(60);
+/// Upper clamp on the re-resolution interval (§3.2).
+pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Extra grace before a binding that vanished from DNS expires (§3.2).
+pub const DEFAULT_TRUST_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// The query name for a membership domain.
+pub fn query_name(domain: &str) -> String {
+    format!("{TXT_PREFIX}.{domain}")
+}
+
+/// Clamps a TTL into the §3.2 window.
+pub fn clamp_ttl(ttl: Duration) -> Duration {
+    ttl.clamp(MIN_TTL, MAX_TTL)
+}
+
+/// One parsed `v=sync1` TXT record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberRecord {
+    /// The member label, lowercased. `None` for the id-less backward-simple
+    /// form, which binds `OriginId::Key(nk)`.
+    pub id: Option<String>,
+    /// The device key the record binds.
+    pub node_key: NodeId,
+    /// An optional relay dialing hint (§3.3).
+    pub relay: Option<String>,
+    /// An optional direct-address dialing hint (§3.3).
+    pub addr: Option<String>,
+}
+
+impl MemberRecord {
+    /// The origin this record binds its key to, within `domain`.
+    pub fn origin(&self, domain: &str) -> Result<OriginId, NetError> {
+        match &self.id {
+            Some(id) => OriginId::named(id, domain).map_err(|e| NetError::Dns(e.to_string())),
+            None => Ok(OriginId::Key(self.node_key)),
+        }
+    }
+}
+
+/// Why a TXT record was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecordError {
+    /// The record did not start with `v=sync1`.
+    #[error("not a v=sync1 record")]
+    NotSync1,
+    /// The record had no `nk=` field.
+    #[error("record has no nk= field")]
+    MissingKey,
+    /// The `nk=` field was not a valid z-base-32 device key.
+    #[error("invalid nk= device key: {0}")]
+    BadKey(String),
+    /// The `id=` field was not a valid member label.
+    #[error("invalid id= label: {0}")]
+    BadLabel(String),
+    /// A field appeared more than once.
+    #[error("duplicate field {0}=")]
+    Duplicate(&'static str),
+}
+
+/// Parses one TXT record string.
+///
+/// Fields are whitespace-separated `key=value` pairs. `v=sync1` must come
+/// first; unknown fields are ignored so the format can grow.
+pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
+    let mut fields = text.split_whitespace();
+    match fields.next() {
+        Some(first) if first == format!("v={RECORD_VERSION_TAG}") => {}
+        _ => return Err(RecordError::NotSync1),
+    }
+
+    let mut id = None;
+    let mut node_key = None;
+    let mut relay = None;
+    let mut addr = None;
+    for field in fields {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key {
+            "id" => {
+                if id.is_some() {
+                    return Err(RecordError::Duplicate("id"));
+                }
+                id = Some(
+                    normalize_label(value).map_err(|_| RecordError::BadLabel(value.to_string()))?,
+                );
+            }
+            "nk" => {
+                if node_key.is_some() {
+                    return Err(RecordError::Duplicate("nk"));
+                }
+                node_key = Some(
+                    PublicKey::from_z32(value)
+                        .map_err(|e| RecordError::BadKey(format!("{value}: {e}")))?,
+                );
+            }
+            "relay" => relay = Some(value.to_string()),
+            "addr" => addr = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    Ok(MemberRecord {
+        id,
+        node_key: node_key.ok_or(RecordError::MissingKey)?,
+        relay,
+        addr,
+    })
+}
+
+/// The validated membership set for one domain.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberSet {
+    /// The membership domain, normalized.
+    pub domain: String,
+    /// The accepted `(origin, device key)` bindings.
+    pub bindings: Vec<(OriginId, NodeId)>,
+    /// Device keys that appear under more than one identity. Self-detection
+    /// refuses to guess for these, and `synch doctor` reports the ambiguity
+    /// (§3.2).
+    pub ambiguous_keys: Vec<NodeId>,
+    /// Records that could not be parsed, with the reason, for `synch doctor`.
+    pub rejected: Vec<(String, RecordError)>,
+    /// Dialing hints, by device key (§3.3).
+    pub hints: BTreeMap<[u8; 32], Vec<String>>,
+}
+
+impl MemberSet {
+    /// Applies the §3.2 record and malformed-set rules to a batch of TXT
+    /// strings that have *already* been DNSSEC-validated.
+    pub fn from_records(domain: &str, records: &[String]) -> Result<MemberSet, NetError> {
+        let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
+        let mut parsed = Vec::new();
+        let mut rejected = Vec::new();
+        for text in records {
+            match parse_record(text) {
+                Ok(record) => parsed.push(record),
+                Err(e) => rejected.push((text.clone(), e)),
+            }
+        }
+
+        // Malformed-set rule: if the same nk appears under two different ids —
+        // or once with and once without an id — the key is ambiguous and every
+        // binding it would create is dropped.
+        let mut identities: BTreeMap<[u8; 32], BTreeSet<Option<String>>> = BTreeMap::new();
+        for record in &parsed {
+            identities
+                .entry(*record.node_key.as_bytes())
+                .or_default()
+                .insert(record.id.clone());
+        }
+        let ambiguous: BTreeSet<[u8; 32]> = identities
+            .iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .map(|(key, _)| *key)
+            .collect();
+
+        let mut bindings = Vec::new();
+        let mut hints: BTreeMap<[u8; 32], Vec<String>> = BTreeMap::new();
+        for record in &parsed {
+            let key_bytes = *record.node_key.as_bytes();
+            for hint in [record.relay.as_ref(), record.addr.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                hints.entry(key_bytes).or_default().push(hint.clone());
+            }
+            if ambiguous.contains(&key_bytes) {
+                continue;
+            }
+            let origin = record.origin(&domain)?;
+            let binding = (origin, record.node_key);
+            if !bindings.contains(&binding) {
+                bindings.push(binding);
+            }
+        }
+        bindings.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_bytes().cmp(b.1.as_bytes())));
+
+        let mut ambiguous_keys: Vec<NodeId> = Vec::new();
+        for key in &ambiguous {
+            if let Ok(k) = PublicKey::from_bytes(key) {
+                ambiguous_keys.push(k);
+            }
+        }
+
+        Ok(MemberSet {
+            domain,
+            bindings,
+            ambiguous_keys,
+            rejected,
+            hints,
+        })
+    }
+
+    /// Every device key bound to `origin` in this set. Several keys for one
+    /// origin is the rotation window (§3.4), not an error.
+    pub fn keys_for(&self, origin: &OriginId) -> Vec<NodeId> {
+        self.bindings
+            .iter()
+            .filter(|(o, _)| o == origin)
+            .map(|(_, k)| *k)
+            .collect()
+    }
+
+    /// The origin a device key resolves to, for self-detection.
+    ///
+    /// Returns `None` when the key is absent *or* ambiguous: §3.2 requires an
+    /// explicit `--id` rather than a guess.
+    pub fn self_origin(&self, key: &NodeId) -> Option<OriginId> {
+        if self.ambiguous_keys.contains(key) {
+            return None;
+        }
+        let matches: Vec<&OriginId> = self
+            .bindings
+            .iter()
+            .filter(|(_, k)| k == key)
+            .map(|(o, _)| o)
+            .collect();
+        match matches.as_slice() {
+            [only] => Some((*only).clone()),
+            _ => None,
+        }
+    }
+
+    /// Dialing hints published for a device key (§3.3).
+    pub fn hints_for(&self, key: &NodeId) -> &[String] {
+        self.hints
+            .get(key.as_bytes())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+/// A DNSSEC-validating resolver for membership domains.
+///
+/// Validation happens in process: the resolver is built with `validate = true`
+/// and every answer record is additionally required to carry a *secure* DNSSEC
+/// proof, so an insecure or bogus answer is discarded rather than trusted.
+#[derive(Debug, Clone)]
+pub struct DnssecResolver {
+    resolver: hickory_resolver::TokioResolver,
+}
+
+/// A validated lookup result.
+#[derive(Debug, Clone)]
+pub struct ValidatedTxt {
+    /// The TXT strings, one per record.
+    pub records: Vec<String>,
+    /// How long the answer may be cached, clamped to the §3.2 window.
+    pub ttl: Duration,
+}
+
+impl DnssecResolver {
+    /// Builds a resolver from the system configuration, with in-process DNSSEC
+    /// validation enabled.
+    pub fn from_system() -> Result<Self, NetError> {
+        let mut builder = hickory_resolver::Resolver::builder_tokio()
+            .map_err(|e| NetError::Dns(e.to_string()))?;
+        builder.options_mut().validate = true;
+        Ok(DnssecResolver {
+            resolver: builder.build().map_err(|e| NetError::Dns(e.to_string()))?,
+        })
+    }
+
+    /// Resolves `_synchronicity.<domain> TXT`, discarding anything that does
+    /// not validate.
+    pub async fn lookup_txt(&self, domain: &str) -> Result<ValidatedTxt, NetError> {
+        use hickory_resolver::proto::rr::RecordType;
+
+        let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
+        let name = query_name(&domain);
+        let lookup = self
+            .resolver
+            .lookup(name.as_str(), RecordType::TXT)
+            .await
+            .map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
+
+        let mut records = Vec::new();
+        let mut ttl = MAX_TTL;
+        for record in lookup.answers() {
+            if !record.proof.is_secure() {
+                // Fail closed: one unvalidated record poisons the answer.
+                return Err(NetError::Dns(format!(
+                    "{name}: answer is not DNSSEC-secure (proof: {:?})",
+                    record.proof
+                )));
+            }
+            ttl = ttl.min(Duration::from_secs(u64::from(record.ttl)));
+            if let hickory_resolver::proto::rr::RData::TXT(txt) = &record.data {
+                // A TXT record is a sequence of character-strings; the record
+                // text is their concatenation.
+                let joined: String = txt
+                    .txt_data
+                    .iter()
+                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                    .collect();
+                records.push(joined);
+            }
+        }
+        if records.is_empty() {
+            return Err(NetError::Dns(format!("{name}: no TXT records")));
+        }
+        Ok(ValidatedTxt {
+            records,
+            ttl: clamp_ttl(ttl),
+        })
+    }
+
+    /// Resolves and applies the §3.2 rules in one step.
+    pub async fn member_set(&self, domain: &str) -> Result<(MemberSet, Duration), NetError> {
+        let validated = self.lookup_txt(domain).await?;
+        let set = MemberSet::from_records(domain, &validated.records)?;
+        Ok((set, validated.ttl))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh_base::SecretKey;
+
+    use super::*;
+
+    fn key() -> NodeId {
+        SecretKey::generate().public()
+    }
+
+    fn record(id: Option<&str>, key: &NodeId) -> String {
+        match id {
+            Some(id) => format!("v=sync1 id={id} nk={}", key.to_z32()),
+            None => format!("v=sync1 nk={}", key.to_z32()),
+        }
+    }
+
+    #[test]
+    fn parses_a_named_record() {
+        let k = key();
+        let parsed = parse_record(&record(Some("nas"), &k)).unwrap();
+        assert_eq!(parsed.id.as_deref(), Some("nas"));
+        assert_eq!(parsed.node_key, k);
+        assert_eq!(
+            parsed.origin("cluster.example.com").unwrap(),
+            OriginId::named("nas", "cluster.example.com").unwrap()
+        );
+    }
+
+    #[test]
+    fn an_idless_record_binds_the_key_itself() {
+        // §3.2: accepted for backward simplicity; binds OriginId::Key(nk),
+        // non-rotatable, as if statically trusted.
+        let k = key();
+        let parsed = parse_record(&record(None, &k)).unwrap();
+        assert_eq!(parsed.id, None);
+        assert_eq!(parsed.origin("x.example").unwrap(), OriginId::Key(k));
+    }
+
+    #[test]
+    fn parses_dialing_hints() {
+        let k = key();
+        let text = format!(
+            "v=sync1 id=nas nk={} relay=https://relay.example addr=10.0.0.1:4433",
+            k.to_z32()
+        );
+        let parsed = parse_record(&text).unwrap();
+        assert_eq!(parsed.relay.as_deref(), Some("https://relay.example"));
+        assert_eq!(parsed.addr.as_deref(), Some("10.0.0.1:4433"));
+    }
+
+    #[test]
+    fn ignores_unknown_fields() {
+        let k = key();
+        let text = format!("v=sync1 id=nas nk={} future=whatever", k.to_z32());
+        assert!(parse_record(&text).is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_records() {
+        let k = key();
+        assert_eq!(
+            parse_record("v=sync2 id=nas nk=x").unwrap_err(),
+            RecordError::NotSync1
+        );
+        assert_eq!(
+            parse_record("id=nas nk=x").unwrap_err(),
+            RecordError::NotSync1
+        );
+        assert_eq!(
+            parse_record("v=sync1 id=nas").unwrap_err(),
+            RecordError::MissingKey
+        );
+        assert!(matches!(
+            parse_record("v=sync1 id=nas nk=notakey").unwrap_err(),
+            RecordError::BadKey(_)
+        ));
+        assert!(matches!(
+            parse_record(&format!("v=sync1 id=BAD_LABEL nk={}", k.to_z32())).unwrap_err(),
+            RecordError::BadLabel(_)
+        ));
+        assert_eq!(
+            parse_record(&format!("v=sync1 id=a id=b nk={}", k.to_z32())).unwrap_err(),
+            RecordError::Duplicate("id")
+        );
+    }
+
+    #[test]
+    fn labels_are_case_insensitive() {
+        let k = key();
+        let parsed = parse_record(&format!("v=sync1 id=NAS nk={}", k.to_z32())).unwrap();
+        assert_eq!(parsed.id.as_deref(), Some("nas"));
+    }
+
+    #[test]
+    fn builds_a_member_set() {
+        let nas = key();
+        let laptop = key();
+        let records = vec![record(Some("nas"), &nas), record(Some("laptop"), &laptop)];
+        let set = MemberSet::from_records("Cluster.Example.COM.", &records).unwrap();
+        assert_eq!(set.domain, "cluster.example.com");
+        assert_eq!(set.bindings.len(), 2);
+        assert_eq!(
+            set.keys_for(&OriginId::named("nas", "cluster.example.com").unwrap()),
+            vec![nas]
+        );
+        assert!(set.ambiguous_keys.is_empty());
+        assert!(set.rejected.is_empty());
+    }
+
+    #[test]
+    fn two_keys_under_one_id_are_a_rotation_window() {
+        // §3.2: multiple records with the same id and different nk are valid
+        // and mean all listed keys are simultaneously bound.
+        let old = key();
+        let new = key();
+        let records = vec![record(Some("nas"), &old), record(Some("nas"), &new)];
+        let set = MemberSet::from_records("x.example", &records).unwrap();
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        let mut keys = set.keys_for(&origin);
+        keys.sort_by_key(|k| *k.as_bytes());
+        let mut expected = vec![old, new];
+        expected.sort_by_key(|k| *k.as_bytes());
+        assert_eq!(keys, expected);
+        assert!(set.ambiguous_keys.is_empty());
+        // Self-detection still works for each key: one identity each.
+        assert_eq!(set.self_origin(&old), Some(origin.clone()));
+        assert_eq!(set.self_origin(&new), Some(origin));
+    }
+
+    #[test]
+    fn one_key_under_two_ids_is_ambiguous() {
+        // §3.2 malformed-set rule: self-detection refuses to guess and the
+        // bindings the key would create are dropped.
+        let k = key();
+        let other = key();
+        let records = vec![
+            record(Some("nas"), &k),
+            record(Some("laptop"), &k),
+            record(Some("vps"), &other),
+        ];
+        let set = MemberSet::from_records("x.example", &records).unwrap();
+        assert_eq!(set.ambiguous_keys, vec![k]);
+        assert_eq!(set.self_origin(&k), None);
+        assert_eq!(set.bindings.len(), 1);
+        assert_eq!(
+            set.bindings[0].0,
+            OriginId::named("vps", "x.example").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_key_with_and_without_an_id_is_ambiguous() {
+        let k = key();
+        let records = vec![record(Some("nas"), &k), record(None, &k)];
+        let set = MemberSet::from_records("x.example", &records).unwrap();
+        assert_eq!(set.ambiguous_keys, vec![k]);
+        assert!(set.bindings.is_empty());
+        assert_eq!(set.self_origin(&k), None);
+    }
+
+    #[test]
+    fn duplicate_identical_records_collapse() {
+        let k = key();
+        let records = vec![record(Some("nas"), &k), record(Some("nas"), &k)];
+        let set = MemberSet::from_records("x.example", &records).unwrap();
+        assert_eq!(set.bindings.len(), 1);
+        assert!(set.ambiguous_keys.is_empty());
+    }
+
+    #[test]
+    fn unparseable_records_are_reported_not_fatal() {
+        let k = key();
+        let records = vec![
+            record(Some("nas"), &k),
+            "v=spf1 include:example.com ~all".to_string(),
+            "v=sync1 id=broken".to_string(),
+        ];
+        let set = MemberSet::from_records("x.example", &records).unwrap();
+        assert_eq!(set.bindings.len(), 1);
+        assert_eq!(set.rejected.len(), 2);
+    }
+
+    #[test]
+    fn hints_are_collected_per_key() {
+        let k = key();
+        let records = vec![format!(
+            "v=sync1 id=nas nk={} addr=10.0.0.1:4433",
+            k.to_z32()
+        )];
+        let set = MemberSet::from_records("x.example", &records).unwrap();
+        assert_eq!(set.hints_for(&k), &["10.0.0.1:4433".to_string()]);
+        assert!(set.hints_for(&key()).is_empty());
+    }
+
+    #[test]
+    fn self_origin_of_an_absent_key_is_none() {
+        let set = MemberSet::from_records("x.example", &[record(Some("nas"), &key())]).unwrap();
+        assert_eq!(set.self_origin(&key()), None);
+    }
+
+    #[test]
+    fn ttls_are_clamped() {
+        assert_eq!(clamp_ttl(Duration::from_secs(1)), MIN_TTL);
+        assert_eq!(clamp_ttl(Duration::from_secs(999_999)), MAX_TTL);
+        assert_eq!(
+            clamp_ttl(Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn query_names_are_prefixed() {
+        assert_eq!(
+            query_name("cluster.example.com"),
+            "_synchronicity.cluster.example.com"
+        );
+    }
+
+    #[test]
+    fn an_empty_domain_yields_an_empty_set() {
+        let set = MemberSet::from_records("x.example", &[]).unwrap();
+        assert!(set.bindings.is_empty());
+        // Fail-closed: an empty validated set is not an error here, but the
+        // caller keeps existing bindings until they expire on their own.
+        assert!(set.rejected.is_empty());
+    }
+}

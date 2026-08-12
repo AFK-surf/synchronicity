@@ -21,6 +21,15 @@ pub struct GcStats {
     pub roots_marked: usize,
 }
 
+/// How much the content-addressed trie storage holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrieStats {
+    /// Stored trie nodes.
+    pub nodes: usize,
+    /// Stored out-of-line trie values.
+    pub values: usize,
+}
+
 impl Store {
     /// Marks every trie node and value reachable from the retained roots.
     ///
@@ -115,6 +124,19 @@ impl Store {
             out.insert(hash_column(row?, "entries.content")?);
         }
         Ok(out)
+    }
+
+    /// Counts of the content-addressed tables, for `synch doctor` GC stats.
+    pub fn trie_stats(&self) -> Result<TrieStats> {
+        let conn = self.conn();
+        Ok(TrieStats {
+            nodes: conn.query_row("SELECT COUNT(*) FROM trie_nodes", [], |r| {
+                r.get::<_, i64>(0)
+            })? as usize,
+            values: conn.query_row("SELECT COUNT(*) FROM trie_values", [], |r| {
+                r.get::<_, i64>(0)
+            })? as usize,
+        })
     }
 
     fn all_hashes(&self, table: &str) -> Result<Vec<Hash>> {
