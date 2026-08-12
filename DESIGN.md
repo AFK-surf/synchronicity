@@ -223,19 +223,29 @@ No trie rewrite, no re-hashing, no history loss.
 2. The operator publishes the second record: `v=sync1 id=nas nk=<K_new>`, alongside
    the existing one. Both keys are now bound; peers pick this up on their next
    validated refresh.
-3. The node polls its own domain until it observes the validated `K_new` binding, then
-   switches over: it re-signs its current root as a new head (`seq+1`,
-   `signed_by = K_new`) and brings up a second iroh endpoint as `K_new`. **Both
-   endpoints stay live** until the old binding has expired everywhere (worst case one
-   DNS TTL, clamp max 24 h), so peers whose DNS refresh lags are never locked out
-   mid-window; an inbound connection attempt from an unknown key additionally
-   triggers an immediate DNS re-resolution.
-4. The operator removes the `K_old` record; its binding expires after TTL + grace,
-   and the node deletes the `K_old` secret after that. Peers log every rebinding, and
-   `synch doctor` lists recent binding changes per origin. Validated DNS is the *sole*
-   authority on which keys hold an origin — the protocol makes no attempt to
+3. Once the new record has had time to propagate — one TTL is the safe bound, and
+   `synch key ls` reports which of the node's keys peers have actually bound — the
+   operator runs `synch key activate <K_new>`. That re-signs the current root as a
+   new head (`seq+1`, `signed_by = K_new`) and brings up a second iroh endpoint as
+   `K_new`. **Both endpoints stay live** until the old binding has expired everywhere
+   (worst case one DNS TTL, clamp max 24 h), so peers whose DNS refresh lags are never
+   locked out mid-window; an inbound connection attempt from an unknown key
+   additionally triggers an immediate DNS re-resolution.
+4. The operator removes the `K_old` record and runs `synch key retire <K_old>`, which
+   drops the second endpoint and deletes the old secret. Peers log every rebinding,
+   and `synch doctor` lists recent binding changes per origin. Validated DNS is the
+   *sole* authority on which keys hold an origin — the protocol makes no attempt to
    distinguish a legitimate rotation from a domain-level rebinding; see §12 for what
    that implies and §13 for the deferred hardening.
+
+**Rotation is operator-driven throughout: a node never polls its own domain and never
+switches signing keys on its own.** The judgement the switch-over needs — "have my
+peers picked up the new binding yet?" — depends on resolvers the node cannot observe,
+so a node auto-switching on its own view of DNS would strand exactly the peers whose
+refresh lags furthest. Making each step an explicit command also keeps a change of
+signing identity a deliberate act with an audit trail, rather than background
+behavior that fires while nobody is watching. The cost is that a rotation spans two
+operator commands separated by a propagation wait; that is the intended trade.
 
 **Key-loss recovery**: the operator replaces the TXT record with a fresh `K_new` —
 from the cluster's point of view this is just a rotation without the overlap window.
@@ -341,7 +351,7 @@ Notes:
   replicated whole (head flip + root diff), so a deleted key simply vanishes from
   the new root and the diff surfaces it, even to peers partitioned for years. Their
   purpose is interpretation: distinguishing "deleted at seq N" from "never existed"
-  in `synch status`/`synch log` and in one-shot proofs (§9.3). They are retained for
+  in `synch status`/`synch log`. They are retained for
   `tombstone_ttl` (default 90 days), then dropped in a later root. The real residual
   risk is different: the *origin itself* restoring from an old database backup
   republishes its old trie at a higher seq, resurrecting its own deletions — visible
@@ -383,8 +393,10 @@ We implement our own small MPT (crate `synch-mpt`, no consensus-chain baggage):
   (≤ ~key-length/2 nodes). This same property makes diffing cheap and makes *any* node
   able to serve *any* trie node to *any* peer.
 - **Proofs**: a key's value is provable against a root with the node path (Merkle
-  proof); used by the light one-shot CLI mode (§9.3) and available for future partial
-  replication.
+  proof), including proofs of absence. No v1 flow needs them — every node replicates
+  whole tries — so this is capability kept deliberately ahead of its use: partial
+  trie replication (§13) is the design that requires it, and building the proof
+  machinery alongside the trie is far cheaper than retrofitting it.
 
 ### 4.4 Signed heads
 
@@ -442,7 +454,8 @@ Nodes      { nodes: Vec<(Hash, Bytes)>, missing: Vec<Hash> }
 GetValues  { hashes: Vec<Hash> }                        // out-of-line ValueRef payloads
 Values     { values: Vec<(Hash, Bytes)>, missing: Vec<Hash> }
 
-// provider hints (one-shot mode, §9.3, and cold caches). Hints are unverified —
+// provider hints for cold caches: a node holding an object root whose ads it has
+// not replicated yet (bootstrap, or an origin just admitted). Hints are unverified —
 // content is hash-verified regardless, so a wrong hint only wastes a dial:
 FindProviders { object_root: Hash }
 Providers  { ads: Vec<(OriginId, BlobAd)> }
@@ -640,7 +653,7 @@ defaults (`.DS_Store`, `Thumbs.db`, temp/lock patterns).
 
 Since there is no unified tree, materialization is **per (origin, space)**:
 
-- `synch get <origin>:<space>/<path> [-o dest]` — one-shot fetch into a local file.
+- `synch get <origin>:<space>/<path> [-o dest]` — single fetch into a local file.
 - `synch mirror add <origin>:<space> <local-dir>` — continuous read-only mirror: the
   engine tracks that origin's `f:` records for the space and keeps the directory in
   sync (fetching content via §6.4). Mirrored trees are never indexed back into the
@@ -696,8 +709,9 @@ Principles: **every origin publishes only its own copy; the system never merges.
 The workspace ships **two binary targets**, both thin argument-parsing shells over
 the same reusable library crates (§11):
 
-- **`synch`** — the CLI and daemon (§9.2). Named `synch`, not `sync`: the bare word
-  collides with coreutils' `sync(1)` and half the package ecosystem.
+- **`synch`** — the daemon, and the CLI client that drives it (§9.2). Named `synch`,
+  not `sync`: the bare word collides with coreutils' `sync(1)` and half the package
+  ecosystem.
 - **`synch-s3`** — an S3-compatible gateway server (§9.4).
 
 Both are dependency-free static binaries:
@@ -706,18 +720,28 @@ Both are dependency-free static binaries:
 - `rustls` everywhere (no OpenSSL),
 - musl static builds for Linux releases; standard static-ish builds for macOS/Windows.
 
-`synch` is both the CLI and the daemon (`synch daemon run`). The CLI talks to a running
-daemon over a local control socket (Unix domain socket; named pipe on Windows) with a
-random per-datadir token; if no daemon is running, commands that can run one-shot do so
-in-process against the same SQLite DB.
+**The daemon owns the node; the CLI is only a client of it.** Every command except the
+two that bootstrap or *are* the daemon — `synch init`, which creates the datadir before
+any daemon can exist, and `synch daemon run` itself — is a request over the control
+socket (§9.3). There is no in-process fallback: with no daemon running, a command
+fails with a message naming the socket path and the command to start one.
+
+This is a deliberate narrowing. A CLI that could also open the database directly meant
+two code paths to the same state, two processes contending on one SQLite file, and —
+worse — a short-lived second iroh endpoint sharing the daemon's device key, fighting
+it over relay registration and discovery records. One writer, one endpoint, one
+lifecycle is worth more than the convenience of running commands without a daemon.
 
 ### 9.2 Command surface (v1)
 
+`synch init` and `synch daemon run` act on the datadir directly; every other command
+is a control-socket request to a running daemon (§9.3).
+
 ```
-synch init [--id <name>@<domain>]            create identity + database
-synch id                                     print OriginId + current device key(s)
-synch key rotate|ls|retire                   device-key rotation (§3.4)
+synch init [--id <name>@<domain>]            create identity + database (no daemon)
 synch daemon run|status|stop
+synch id                                     print OriginId + current device key(s)
+synch key rotate|activate|retire|ls          operator-driven device-key rotation (§3.4)
 
 synch trust add [--as <name>]|rebind|rm|ls   static membership (named or key-identified)
 synch domain add|rm|ls <domain>              DNSSEC membership
@@ -738,15 +762,39 @@ synch pin add|rm|ls <root|path>              keep content in CAS regardless of p
 synch doctor                                 connectivity, DNSSEC, equivocation, GC stats
 ```
 
-### 9.3 One-shot mode
+### 9.3 The control socket
 
-`synch cat/get/ls` work without a daemon: open endpoint, `Hello` with any reachable
-trusted peer, pull the relevant origin's head + the trie path for the requested key
-(Merkle-proof-verified — no full trie replication needed for a single read), resolve
-holders with `FindProviders` (§5.1 — unverified hints from the helper peer, safe
-because content is hash-verified regardless; a bad hint costs a wasted dial, never
-integrity), fetch the blob slice, exit. This keeps the "dependency-free CLI" promise
-meaningful even on machines that never run the daemon.
+The CLI reaches the daemon over a local, single-user transport:
+
+- **Unix**: a domain socket at `<data_dir>/control.sock`, created `0600` in a `0700`
+  data directory. Stale sockets from a crashed daemon are detected by connect-then-
+  fail and removed on startup.
+- **Windows**: a named pipe, `\\.\pipe\synchronicity-<16 hex of the data dir path
+  hash>`, so several nodes on one machine do not collide.
+
+Authentication is a 32-byte random token in `<data_dir>/control.token` (`0600`),
+regenerated on every daemon start and sent with every request. Filesystem permissions
+are the primary control on Unix; the token is what actually carries the check on
+Windows, where pipe ACLs are easy to get subtly wrong, and it also prevents a
+different user's client from talking to a pipe it managed to open. The socket is never
+exposed beyond the local machine — remote access is what the iroh endpoint and
+`synch-s3` are for.
+
+Framing is length-prefixed `postcard`, the same as the network protocols (§5.1), with
+a `Request`/`Response` enum pair carrying one variant per command. Two properties the
+protocol needs beyond plain request/response:
+
+- **Streaming**: `synch cat`, `synch get`, and a long `synch ls` stream their payload
+  as a sequence of `Chunk` frames terminated by `End`, so a multi-gigabyte read is
+  never buffered in either process. Progress-reporting commands (`scan`, `mirror
+  sync`) stream `Progress` frames the CLI renders and discards.
+- **Version match**: the client sends a protocol version in the first frame; a
+  mismatch fails immediately with both versions named. Client and daemon are normally
+  the same binary, so this exists to catch the upgrade-while-running case rather than
+  to support mixed versions.
+
+Errors cross the socket as structured values (a code plus a message), so the CLI
+renders a daemon-side failure as its own exit status rather than a transport error.
 
 ### 9.4 S3-compatible gateway (`synch-s3`)
 
@@ -906,7 +954,8 @@ synchronicity/
 │   ├── synch-net      # iroh endpoint, ALPN handlers: mptsync + blob protocols, DNSSEC resolver
 │   ├── synch-engine   # the embeddable node API: scanner/watcher/publisher, anti-entropy
 │   │                  # scheduler, fetcher, mirrors — everything a host app needs
-│   ├── synch-cli      # binary target `synch`: clap CLI, daemon, control socket
+│   ├── synch-cli      # binary target `synch`: the daemon, the control-socket
+│   │                  # server and client, and the clap CLI that drives it
 │   └── synch-s3       # binary target `synch-s3`: S3-compatible gateway (§9.4)
 └── .github/workflows/ # ci.yml, release.yml (below)
 ```
@@ -922,6 +971,10 @@ Testing strategy:
 - `mptsync`: in-memory duplex-transport simulation of N nodes with random partitions,
   message loss, and interleaved publishes; assert convergence of all heads and tries.
 - `synch-engine`: temp-dir integration tests across 2–3 real endpoints on localhost.
+- `synch-cli`: control-socket round-trips against a daemon in a temp datadir on both
+  transports — every command variant, a streamed multi-megabyte `cat`, a rejected bad
+  token, a version mismatch, a stale socket left by a killed daemon, and the
+  no-daemon error path.
 - `synch-s3`: integration tests driving the gateway over plain HTTP (GET/HEAD/LIST/
   PUT round-trips, Range reads, ETag checks).
 

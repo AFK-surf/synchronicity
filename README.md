@@ -22,10 +22,13 @@ so neither needs a system library.
 
 ## Usage
 
-Set up a node and index a directory:
+Set up a node. `synch init` is the one command that runs without a daemon — it
+creates the datadir; everything after it is a request to the running daemon over a
+local control socket:
 
 ```sh
 synch init --id nas@cluster.example.com   # or plain `synch init` for a key identity
+synch daemon run &                         # required: the daemon owns the node
 synch space add media /srv/media
 synch scan                                 # hash, publish a signed root
 synch id                                   # print the origin, device key, and address
@@ -36,12 +39,6 @@ Admit a peer. Trust is unilateral, so each side runs this for the other:
 ```sh
 synch trust add <their-device-key> --as laptop --domain cluster.example.com
 synch domain add cluster.example.com       # or DNSSEC membership instead
-```
-
-Run the node:
-
-```sh
-synch daemon run                           # anti-entropy, scanner, watcher, GC
 ```
 
 Read across the cluster. Content is fetched on demand and verified per 16 KiB
