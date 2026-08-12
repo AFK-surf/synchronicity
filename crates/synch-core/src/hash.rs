@@ -74,7 +74,7 @@ impl fmt::Debug for Hash {
     }
 }
 
-/// Error parsing a [`Hash`].
+/// Error parsing a [`struct@Hash`].
 #[derive(Debug, thiserror::Error)]
 pub enum HashParseError {
     /// The input was not 32 bytes / 64 hex characters.

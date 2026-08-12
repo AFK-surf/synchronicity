@@ -1,5 +1,6 @@
 [package]
 name = "synch-s3"
+description = "An S3-compatible gateway onto a synchronicity cluster"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +8,34 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "synch_s3"
+path = "src/lib.rs"
+
+[[bin]]
+name = "synch-s3"
+path = "src/main.rs"
+
 [dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+hex.workspace = true
+hmac.workspace = true
+serde.workspace = true
+sha2.workspace = true
+synch-core.workspace = true
+synch-engine.workspace = true
+synch-store.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

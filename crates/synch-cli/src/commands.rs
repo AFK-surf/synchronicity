@@ -65,6 +65,17 @@ pub(crate) async fn run(cli: Cli) -> Result<()> {
     result
 }
 
+// TODO(design §9.1): the design has the CLI reach a running daemon over a local
+// control socket (Unix domain socket, named pipe on Windows) with a per-datadir
+// token, falling back to in-process when no daemon is running. Only the
+// in-process path exists today; the seam is here, where a socket client would
+// be tried first and this would stay as the fallback.
+//
+// TODO(design §9.3): one-shot mode over the network — open an endpoint, `Hello`
+// any reachable trusted peer, pull just the Merkle path for the requested key,
+// resolve holders with `FindProviders`, fetch, exit. The proof machinery
+// (`synch_mpt::Proof`) and both `FindProviders`/`Providers` wire handlers are
+// implemented and tested; what is missing is the orchestration here.
 async fn open(cli: &Cli) -> Result<Node> {
     Node::open(node_config(cli)?)
         .await
