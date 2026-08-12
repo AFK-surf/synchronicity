@@ -319,6 +319,29 @@ impl Syncer {
                 HeadOutcome::NotNewer => {}
             }
         }
+
+        // A head can arrive by reactive push (§5.3) long before its trie does.
+        // Such a head sits in the pending slot and is *not* newer than what we
+        // hold, so the exchange above will not have asked for it — but §5.2
+        // says its nodes may be fetched from any peer advertising a complete
+        // head for that origin at or above its seq. Do exactly that here, which
+        // is what turns "I heard about it" into "I can serve it".
+        for stored in self.store.all_heads(Slot::Pending)? {
+            let pending = stored.head;
+            let servable = theirs.summaries.iter().any(|summary| {
+                summary.origin == pending.origin
+                    && summary.complete
+                    && summary.order_key() >= (pending.seq, pending.root.0)
+            });
+            if !servable {
+                continue;
+            }
+            match self.fetch_pending(client, &pending.origin).await? {
+                FetchOutcome::Completed => report.tries_completed += 1,
+                FetchOutcome::Abandoned => report.heads_abandoned += 1,
+                _ => {}
+            }
+        }
         Ok(report)
     }
 }
