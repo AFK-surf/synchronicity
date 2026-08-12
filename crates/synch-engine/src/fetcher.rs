@@ -21,6 +21,34 @@ pub struct Provider {
     pub latency_us: i64,
 }
 
+/// A byte window of an object that is present and verified locally.
+///
+/// What [`Node::prepare_entry_range`] hands back so a caller can stream the
+/// window out of the CAS in pieces of its own choosing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedRange {
+    /// The object's blake3 root.
+    pub root: Hash,
+    /// The object's full size in bytes.
+    pub size: u64,
+    /// The first byte of the window.
+    pub start: u64,
+    /// One past the last byte of the window.
+    pub end: u64,
+}
+
+impl PreparedRange {
+    /// How many bytes the window covers.
+    pub fn len(&self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// True if the window is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// What one fetch achieved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FetchReport {
@@ -216,6 +244,10 @@ impl Node {
 
     /// Reads a byte range of a published entry, fetching whatever is missing
     /// first — the engine half of `synch cat --range` (§7.2).
+    ///
+    /// Buffers the whole range: callers streaming a large object want
+    /// [`Node::prepare_entry_range`] and then chunked
+    /// [`Store::read_range`](synch_store::Store::read_range) reads instead.
     pub async fn read_entry_range(
         &self,
         origin: &OriginId,
@@ -224,6 +256,29 @@ impl Node {
         start: u64,
         len: Option<u64>,
     ) -> Result<Vec<u8>> {
+        let range = self
+            .prepare_entry_range(origin, space, path, start, len)
+            .await?;
+        Ok(self
+            .store()
+            .read_range(&range.root, range.start, range.end - range.start)?)
+    }
+
+    /// Resolves an entry, fetches whatever of the requested range is missing,
+    /// and reports where the bytes now live locally.
+    ///
+    /// Every byte is verified against the object's bao tree before it is
+    /// committed to the CAS, so a subsequent
+    /// [`Store::read_range`](synch_store::Store::read_range) over the returned
+    /// window reads only verified content.
+    pub async fn prepare_entry_range(
+        &self,
+        origin: &OriginId,
+        space: &str,
+        path: &str,
+        start: u64,
+        len: Option<u64>,
+    ) -> Result<PreparedRange> {
         let entry = self
             .store()
             .entry(origin, space, path)?
@@ -253,7 +308,12 @@ impl Node {
                 "no provider could serve bytes {start}..{end} of {root}"
             )));
         }
-        Ok(self.store().read_range(&root, start, end - start)?)
+        Ok(PreparedRange {
+            root,
+            size: entry.size,
+            start,
+            end,
+        })
     }
 
     /// Reads a published entry in full.

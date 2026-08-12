@@ -35,10 +35,17 @@ pub struct Node {
 #[derive(Debug)]
 struct NodeInner {
     store: Arc<Store>,
-    net: Net,
+    /// The endpoint under the currently active device key: what this node
+    /// dials from and what peers reach first.
+    net: std::sync::RwLock<Net>,
+    /// Endpoints kept live for keys that are on their way out, so both keys
+    /// serve concurrently through a rotation's overlap window (§3.4).
+    retiring: std::sync::Mutex<Vec<Net>>,
     syncer: Syncer,
     origin: OriginId,
-    secret: SecretKey,
+    /// The signing key. Swapped only by `synch key activate` (§3.4); a node
+    /// never switches keys on its own.
+    secret: std::sync::RwLock<SecretKey>,
     config: NodeConfig,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
 }
@@ -105,10 +112,11 @@ impl Node {
         Ok(Node {
             inner: Arc::new(NodeInner {
                 store,
-                net,
+                net: std::sync::RwLock::new(net),
+                retiring: std::sync::Mutex::new(Vec::new()),
                 syncer,
                 origin,
-                secret,
+                secret: std::sync::RwLock::new(secret),
                 config,
                 ad_clock: std::sync::Mutex::new(Default::default()),
             }),
@@ -120,9 +128,75 @@ impl Node {
         &self.inner.store
     }
 
-    /// The endpoint.
-    pub fn net(&self) -> &Net {
-        &self.inner.net
+    /// The endpoint under the active device key.
+    ///
+    /// Returned by value because a rotation can replace it (§3.4): holding a
+    /// borrow across an `activate` would pin the old endpoint.
+    pub fn net(&self) -> Net {
+        self.inner
+            .net
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The addresses of the endpoints still serving for keys that are being
+    /// retired (§3.4).
+    pub fn retiring_endpoints(&self) -> Vec<EndpointAddr> {
+        self.retiring_nets().iter().map(Net::addr).collect()
+    }
+
+    /// The endpoints still serving for keys that are being retired (§3.4).
+    pub(crate) fn retiring_nets(&self) -> Vec<Net> {
+        self.inner
+            .retiring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The active signing key.
+    pub(crate) fn secret(&self) -> SecretKey {
+        self.inner
+            .secret
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replaces the active key and its endpoint, demoting the previous
+    /// endpoint to a serving-only one for the overlap window (§3.4).
+    pub(crate) fn swap_active_endpoint(&self, secret: SecretKey, net: Net) {
+        let previous = {
+            let mut slot = self
+                .inner
+                .net
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *slot, net)
+        };
+        *self
+            .inner
+            .secret
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = secret;
+        self.inner
+            .retiring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(previous);
+    }
+
+    /// Removes a retiring endpoint, returning it so the caller can shut it
+    /// down outside the lock.
+    pub(crate) fn take_retiring_endpoint(&self, node_id: &NodeId) -> Option<Net> {
+        let mut retiring = self
+            .inner
+            .retiring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = retiring.iter().position(|net| &net.id() == node_id)?;
+        Some(retiring.remove(index))
     }
 
     /// The reconciler.
@@ -137,7 +211,7 @@ impl Node {
 
     /// This node's active device key.
     pub fn node_id(&self) -> NodeId {
-        self.inner.secret.public()
+        self.secret().public()
     }
 
     /// The configuration this node was opened with.
@@ -145,9 +219,14 @@ impl Node {
         &self.inner.config
     }
 
-    /// Shuts the endpoint down cleanly.
+    /// Shuts every endpoint this node holds down cleanly.
     pub async fn shutdown(&self) -> Result<()> {
-        self.inner.net.shutdown().await?;
+        for net in self.retiring_nets() {
+            if let Err(e) = net.shutdown().await {
+                tracing::warn!(error = %e, "a retiring endpoint did not shut down cleanly");
+            }
+        }
+        self.net().shutdown().await?;
         Ok(())
     }
 
@@ -315,13 +394,7 @@ impl Node {
             return Ok(None);
         }
         let seq = self.next_seq()?;
-        let head = SignedHead::sign(
-            &self.inner.secret,
-            self.origin().clone(),
-            seq,
-            root,
-            now_ns(),
-        );
+        let head = SignedHead::sign(&self.secret(), self.origin().clone(), seq, root, now_ns());
         if let Some(previous) = self.store().complete_head(self.origin())? {
             self.store().record_history(&previous)?;
         }
