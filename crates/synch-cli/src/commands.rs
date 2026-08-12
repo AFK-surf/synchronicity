@@ -202,12 +202,18 @@ async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
                 PathBuf::from(reference.path.rsplit('/').next().unwrap_or(&reference.path))
             }
         };
-        let mut file = std::fs::File::create(&target)
-            .with_context(|| format!("could not create {}", target.display()))?;
+        // The destination is created when the first byte arrives, so a read
+        // that fails — an unknown path, no provider — leaves whatever was
+        // there alone instead of truncating it.
+        let mut file: Option<std::fs::File> = None;
         let mut written = 0u64;
         while let Some(response) = client.next().await? {
             match response {
                 Response::Chunk(bytes) => {
+                    let file = match &mut file {
+                        Some(file) => file,
+                        None => file.insert(create(&target)?),
+                    };
                     file.write_all(&bytes)?;
                     written += bytes.len() as u64;
                 }
@@ -216,6 +222,11 @@ async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
                 Response::Ready | Response::End | Response::Error(_) => {}
             }
         }
+        // An empty entry is still an entry: it arrives as no chunks at all.
+        let mut file = match file {
+            Some(file) => file,
+            None => create(&target)?,
+        };
         file.flush()?;
         println!("wrote {written} bytes to {}", target.display());
         return Ok(());
@@ -237,6 +248,11 @@ async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+/// Creates the destination file `synch get` writes to.
+fn create(target: &Path) -> Result<std::fs::File> {
+    std::fs::File::create(target).with_context(|| format!("could not create {}", target.display()))
 }
 
 /// Resolves a path against the caller's working directory.
