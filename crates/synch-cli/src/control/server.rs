@@ -117,7 +117,8 @@ where
                 hello.version, CONTROL_VERSION
             ),
         );
-        return write_frame(&mut stream, &Response::Error(error)).await;
+        write_frame(&mut stream, &Response::Error(error)).await?;
+        return linger(&mut stream).await;
     }
     if !tokens_match(&hello.token, &token) {
         let error = ControlError::new(
@@ -127,16 +128,39 @@ where
                 transport::TOKEN_FILE
             ),
         );
-        return write_frame(&mut stream, &Response::Error(error)).await;
+        write_frame(&mut stream, &Response::Error(error)).await?;
+        return linger(&mut stream).await;
     }
     write_frame(&mut stream, &Response::Ready).await?;
 
     let request: Request = read_frame(&mut stream).await?;
     let mut out = Frames { stream };
-    match dispatch(&node, &stop, request, &mut out).await {
+    let result = match dispatch(&node, &stop, request, &mut out).await {
         Ok(()) => out.end().await,
         Err(error) => out.error(error).await,
-    }
+    };
+    let mut stream = out.stream;
+    linger(&mut stream).await?;
+    result
+}
+
+/// Waits for the client to hang up before the connection is dropped.
+///
+/// Closing a Windows named-pipe server handle can discard bytes the client
+/// has not read yet, so the last frames of a response are only safely
+/// delivered once the *client* has closed. The wait is bounded: a client that
+/// never hangs up costs one idle task for the timeout and no more.
+async fn linger<S>(stream: &mut S) -> std::io::Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut scratch = [0u8; 1];
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::io::AsyncReadExt::read(stream, &mut scratch),
+    )
+    .await;
+    Ok(())
 }
 
 /// The response side of one connection.
