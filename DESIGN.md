@@ -165,6 +165,16 @@ A remote node is **trusted** iff at least one of the following holds:
    (§3.4). A record without an `id=` field is accepted for backward simplicity and
    binds `OriginId::Key(nk)` (non-rotatable, as if statically trusted).
 
+   Malformed-set rules: if the same `nk` appears under two different `id=`s (or once
+   with and once without `id=`), self-detection refuses to guess — the node requires
+   an explicit `--id`, and `sync doctor` reports the ambiguity. Two different
+   machines accidentally sharing one `id=` is indistinguishable from a rotation
+   window at the resolver; it manifests as *sustained* same-seq equivocation, which
+   `sync doctor` diagnoses with the likely cause ("duplicate id assignment?").
+   Finally, a key statically trusted as `OriginId::Key` while publishing heads under
+   a Named origin would sync nothing, silently — doctor detects the mismatch and
+   suggests the missing `--as` name or `sync domain add`.
+
    The lookup MUST be DNSSEC-validated end to end. We use
    `hickory-resolver` with in-process DNSSEC validation (we do not trust an upstream
    resolver's AD bit). If the chain of trust does not validate — missing signatures,
@@ -214,23 +224,46 @@ No trie rewrite, no re-hashing, no history loss.
    the existing one. Both keys are now bound; peers pick this up on their next
    validated refresh.
 3. The node polls its own domain until it observes the validated `K_new` binding, then
-   switches over: it publishes a **rotation statement** into its trie at `m:rotation` —
-   `RotationStmt { old: K_old, new: K_new, at_seq, sig_old }`, where `sig_old` is
-   `K_old`'s signature over `("sync-rotate/1" || origin || old || new || at_seq)` —
-   re-signs its current root as a new head (`seq+1`, `signed_by = K_new`), and restarts
-   its iroh endpoint as `K_new`.
-4. Peers verify the cross-signature and mark the rebinding as **verified continuity**.
-   The operator removes the `K_old` record; its binding expires after TTL + grace, and
-   the node deletes the `K_old` secret after that.
+   switches over: it appends a **rotation statement** to the append-only rotation
+   chain in its trie at `m:rot/<n>` (n strictly increasing) —
+   `RotationStmt { n, old: K_old, new: K_new, at_seq, prev: Hash, sig_old }`, where
+   `prev` is the hash of statement `n-1` (a genesis sentinel for `n = 0`) and
+   `sig_old` is `K_old`'s signature over
+   `("sync-rotate/1" || origin || n || old || new || at_seq || prev)` — then re-signs
+   its current root as a new head (`seq+1`, `signed_by = K_new`) and brings up a
+   second iroh endpoint as `K_new`. **Both endpoints stay live** until the old
+   binding has expired everywhere (worst case one DNS TTL, clamp max 24 h), so peers
+   whose DNS refresh lags are never locked out mid-window; an inbound connection
+   attempt from an unknown key additionally triggers an immediate DNS re-resolution.
+4. Peers verify the **chain, not just the latest link**: a rebinding has *verified
+   continuity* iff a hash- and signature-linked path of rotation statements connects
+   some key the peer previously held a binding for to the newly bound key. Because
+   statements are append-only (a single overwritten slot would break this), a peer
+   partitioned across several rotations A→B→C still verifies A⇝C. The operator then
+   removes the `K_old` record; its binding expires after TTL + grace, and the node
+   deletes the `K_old` secret after that.
 
-**Key-loss recovery** (no cross-signature possible): the operator simply replaces the
-TXT record with a fresh `K_new`. DNS is authoritative, so peers accept the rebinding —
-but an *uncross-signed* rotation is logged loudly and flagged by `sync doctor` on
-every node until acknowledged, since it is indistinguishable from a domain-level
-takeover (§12). The recovering node (fresh DB, same `id=` name) first pulls its own
-origin's current head from peers, then resumes publishing at `seq+1` — peers enforce
-per-origin seq monotonicity regardless of which bound key signs, so a lost key never
-resets an origin's history or enables rollback.
+**Key-loss recovery** (no cross-signature possible): the operator replaces the TXT
+record with a fresh `K_new`. DNS is authoritative, so peers accept the rebinding by
+default — but an *uncross-signed* rebinding is logged loudly and flagged by
+`sync doctor` on every node until acknowledged, since it is indistinguishable from a
+domain-level takeover (§12); under `rotation_policy = cross-signed-only` it is
+refused outright. The recovering node (fresh DB, same `id=` name) must assume the
+peers it can currently reach may not hold its true latest head, so it: (1) collects
+heads for its own origin from every reachable peer for at least `recovery_quiesce`
+(default 1 h) without publishing, then (2) resumes at `max_observed_seq + seq_gap`
+(default gap 1 000), making same-seq collision with unreachable lost history
+improbable.
+
+Be precise about what recovery does **not** guarantee. Seq monotonicity protects each
+peer against heads older than what *that peer* has already verified — it is not a
+global no-fork property. If a peer holding newer pre-loss heads was partitioned
+throughout recovery, a fork exists: when that peer returns, its retired-key head is
+kept as **fork evidence** (heads verified while their signer was bound remain
+provable history, §4.4), `sync doctor` surfaces it on every node ("origin nas has
+unreconciled pre-recovery history at seq 100"), and the affected entries' content
+remains fetchable for manual salvage via `sync take`. The fork is resolved by the
+origin's operator, never silently by the protocol.
 
 **During the window**, both keys could in principle sign competing heads; the
 deterministic `(seq, root)` ordering (§4.4) still converges everyone, and competing
@@ -238,8 +271,17 @@ same-seq heads are flagged as equivocation exactly as in the single-key case. A
 well-behaved node signs with exactly one key at any moment.
 
 Static-trust named origins rotate the same way, minus DNS: `sync trust rebind nas
-<new-node-id>` on each peer (with the same cross-signed `m:rotation` statement
-providing verified continuity).
+<new-node-id>` on each peer (with the same cross-signed rotation chain providing
+verified continuity).
+
+One availability edge is accepted deliberately: a peer that first learns of an origin
+*after* a rotation, while the origin is offline and has not yet re-signed its head
+under the new key, cannot validate that head — its signer has no live binding, and
+heads from unbound signers must stay untrusted, since any member could fabricate
+them for an absent origin. That origin's data is simply unavailable to the new peer
+until the origin returns and republishes. The alternative — trusting unbound
+signatures — would trade a temporary availability gap for a forgery hole, and is
+rejected.
 
 ---
 
@@ -253,9 +295,9 @@ single prefix byte:
 | Prefix | Key                                  | Value          | Meaning                          |
 |--------|--------------------------------------|----------------|----------------------------------|
 | `f:`   | `f:<space-id>/<utf8 relative path>`  | `FileEntry`    | this origin's copy of a file     |
-| `b:`   | `b:<32-byte tree-node hash>`         | `BlobAd`       | "I hold this hash-tree node"     |
+| `b:`   | `b:<32-byte object root hash>`       | `BlobAd`       | "I hold (part of) this object"   |
 | `m:`   | `m:self`                             | `NodeManifest` | node info: name, spaces, version |
-| `m:`   | `m:rotation`                         | `RotationStmt` | cross-signed key rotation (§3.4) |
+| `m:`   | `m:rot/<n>`                          | `RotationStmt` | append-only rotation chain (§3.4)|
 
 Paths are UTF-8, NFC-normalized, `/`-separated, no leading slash, no `.`/`..`
 components. Because the MPT compresses shared prefixes, the `f:` namespace naturally
@@ -287,10 +329,12 @@ struct FileEntry {
 
 struct BlobAd {
     v: u8,
-    object_root: Hash,        // root of the object this tree node belongs to
-    byte_range: (u64, u64),   // span of the object covered by this subtree
-    level: u8,                // 0 = leaf group, root = tree height
-    complete: bool,           // whole subtree present locally (vs. announced-partial)
+    size: u64,                // object length in bytes
+    state: AdState,
+}
+enum AdState {
+    Complete,
+    Partial { spans: Vec<(u64, u64)> },  // held byte spans, coalesced at 16 MiB granularity
 }
 
 struct NodeManifest {
@@ -303,16 +347,26 @@ struct NodeManifest {
 
 Notes:
 
-- **Tombstones**: deletion publishes `kind: Tombstone` (with `content: None`). Tombstones
-  are retained in the trie for `tombstone_ttl` (default 90 days), then dropped in a
-  later root. Peers that were partitioned longer than the TTL may resurrect metadata —
-  documented limitation, standard for AAE systems.
-- **`BlobAd` granularity**: an ad is published for the object **root and every interior
-  node and leaf group** of the hash tree (per the availability requirement, §6.3), so a
-  read on any tree node can be served by any holder. The leaf unit is a **chunk group**
-  (default 16 KiB, `group_log2 = 4` in blake3 chunks), which bounds ad count at
-  ~2 × size/16 KiB per object. A per-space `publish_level` knob can raise the minimum
-  advertised level for very large cold archives; the default publishes everything.
+- **Tombstones**: deletion publishes `kind: Tombstone` (with `content: None`).
+  Tombstones are *not* what makes deletion propagate — tries are single-writer and
+  replicated whole (head flip + root diff), so a deleted key simply vanishes from
+  the new root and the diff surfaces it, even to peers partitioned for years. Their
+  purpose is interpretation: distinguishing "deleted at seq N" from "never existed"
+  in `sync status`/`sync log` and in one-shot proofs (§9.3). They are retained for
+  `tombstone_ttl` (default 90 days), then dropped in a later root. The real residual
+  risk is different: the *origin itself* restoring from an old database backup
+  republishes its old trie at a higher seq, resurrecting its own deletions — visible
+  in `head_history`, not preventable by the protocol.
+- **`BlobAd` granularity — one record per object per holder.** An earlier draft
+  advertised every hash-tree node individually; that is unsound at scale: a single
+  100 GB file yields ~6.1 M leaf groups and ~12 M trie records — larger than the
+  entire per-origin metadata quota (§12) — and replicating per-chunk ad churn during
+  swarm downloads amplifies metadata O(N²) exactly when the network is busiest. The
+  any-subtree-servable property does **not** depend on per-node ads: it comes from
+  bao itself (§6.1) — any holder of a verified slice necessarily also holds the
+  root-path hashes needed to re-serve it. Ads therefore carry only a coarse span
+  summary (16 MiB granularity); exact chunk-level availability is discovered at fetch
+  time from `SliceEnd` (§6.4).
 
 ### 4.3 The Merkle-Patricia Trie
 
@@ -361,15 +415,19 @@ struct SignedHead {
 - A head is **valid** iff `sig` verifies under `signed_by` *and* `signed_by` is
   currently bound to `origin` (§3.1). Accepted heads record the binding check in
   `heads.verified_at`, so history signed by since-retired keys stays valid — a
-  rotation never invalidates already-replicated state.
+  rotation never invalidates already-replicated state. Verified-then-displaced heads
+  are retained *with their signatures* in `head_history` (§10) as provable history
+  and fork evidence (§3.4).
 - Heads are **relayable**: any peer can hand you a newer signed head for any origin;
   the signature makes provenance independent of the carrier.
 - Ordering is `(seq, root)` lexicographic. `created_at` is never used for ordering
   (clocks lie); it is display metadata.
 - **Equivocation** (an origin signing two different roots at the same seq) is detected
-  and logged loudly (`sync doctor` reports it); the deterministic `(seq, root)` max
-  still converges everyone to the same head. Equivocation only harms the equivocator's
-  own published view.
+  and logged loudly (`sync doctor` reports it); the deterministic `(seq, root)` max —
+  which the §5.2 acceptance rule implements exactly (equal-seq, greater-root heads
+  are accepted, not ignored) — still converges everyone to the same head. Both
+  conflicting signed heads are retained in `head_history` as proof. Equivocation only
+  harms the equivocator's own published view.
 
 ---
 
@@ -381,7 +439,10 @@ ALPN: `sync/mpt/1`. All messages are length-framed `postcard` on QUIC streams.
 
 ```rust
 // bidirectional stream 0 on connect: head gossip (push-pull)
-Hello      { proto: u16, heads: Vec<HeadSummary> }      // HeadSummary = (origin: OriginId, seq, root)
+Hello      { proto: u16, heads: Vec<HeadSummary> }      // HeadSummary = (origin: OriginId, seq, root,
+                                                        //   complete: bool)  — "complete" = I hold the
+                                                        //   full trie under this root and can serve it;
+                                                        //   a signed head alone proves nothing about that
 HeadsWant  { origins: Vec<OriginId> }                   // "yours is newer, send full signed head"
 Heads      { heads: Vec<SignedHead> }
 HeadPush   { head: SignedHead }                         // reactive: sent on any head change
@@ -391,6 +452,11 @@ GetNodes   { hashes: Vec<Hash> }                        // ≤ 256 per batch
 Nodes      { nodes: Vec<(Hash, Bytes)>, missing: Vec<Hash> }
 GetValues  { hashes: Vec<Hash> }                        // out-of-line ValueRef payloads
 Values     { values: Vec<(Hash, Bytes)>, missing: Vec<Hash> }
+
+// provider hints (one-shot mode, §9.3, and cold caches). Hints are unverified —
+// content is hash-verified regardless, so a wrong hint only wastes a dial:
+FindProviders { object_root: Hash }
+Providers  { ads: Vec<(OriginId, BlobAd)> }
 ```
 
 ### 5.2 Reconciliation algorithm
@@ -401,15 +467,20 @@ exchange or `HeadPush`):
 
 ```
 verify sig(H) under H.signed_by; check H.signed_by is bound to O (else ignore)
-check H.seq > local_head(O).seq (else ignore)
+check (H.seq, H.root) > (local.seq, local.root) lexicographically (else ignore)
+  // NB: strictly-greater on seq ALONE would not converge — two peers receiving
+  // different same-seq heads in different orders would diverge permanently. The
+  // (seq, root) rule accepts an equal-seq, greater-root head; the displaced head
+  // is retained in head_history as equivocation evidence (§4.4).
+record H as pending_head(O)                            // durable; complete head untouched
 frontier ← { H.root }
 while frontier ≠ ∅:
     want ← { h ∈ frontier : h ∉ trie_nodes }          // structural sharing: skip known subtrees
     if want = ∅: break
-    nodes ← GetNodes(want) from this peer (or any peer advertising ≥ H.seq)
+    nodes ← GetNodes(want) from this peer (or any peer advertising complete ≥ H.seq)
     verify each node hashes to its requested hash      // reject & disconnect on mismatch
     store nodes; frontier ← their children ∪ out-of-line value hashes
-atomically: set local_head(O) ← H                      // single SQLite transaction
+atomically: set complete_head(O) ← H; clear pending    // single SQLite transaction
 re-materialize changed leaves into `entries` / `blob_providers` (computed from the
 node-level diff between old and new root — only touched subtrees are visited)
 ```
@@ -417,17 +488,27 @@ node-level diff between old and new root — only touched subtrees are visited)
 Properties:
 
 - **Idempotent and resumable**: everything fetched is content-addressed; a crash
-  mid-sync loses nothing. The head pointer flips only when the trie is complete under
-  the new root.
+  mid-sync loses nothing. Per origin there are **two durable head slots** (§10): the
+  in-progress target is recorded as the `pending` head, and the `complete` head —
+  the one `entries` is materialized from, the one advertised as servable — flips only
+  when the trie is fully present under the new root.
 - **Bandwidth ∝ change**: unchanged subtrees are pruned at the first shared hash.
   Fully-in-sync check is a single root-hash comparison in `Hello`.
 - **Verified piecewise**: every trie node is checked against the hash it was requested
   by; a malicious or corrupt peer cannot inject data, only fail to help.
 - **Peer-agnostic**: because trie nodes are content-addressed, missing nodes may be
-  fetched from *any* peer whose advertised head for `O` is ≥ `H.seq` — including nodes
-  that are neither `O` nor the peer that told us about `H`. Hierarchy-agnostic in
-  practice: a laptop that heard about a NAS's update from a VPS can pull the trie
-  nodes from either.
+  fetched from *any* peer advertising a `complete` head for `O` at ≥ `H.seq` (§5.1) —
+  including nodes that are neither `O` nor the peer that told us about `H`.
+  Hierarchy-agnostic in practice: a laptop that heard about a NAS's update from a VPS
+  can pull the trie nodes from either.
+- **No wedging on unservable heads**: if every candidate provider persistently
+  returns `missing` for wanted nodes (default: 3 full rounds across all advertisers —
+  possible when a head was relayed but its trie never fully propagated, or when a
+  serving peer GC'd a root out of retention mid-fetch), the pending head is
+  **abandoned** and head selection re-runs, typically re-targeting the origin's
+  newest complete-advertised head. Structural sharing makes the restart cost
+  proportional to what actually changed, not to what was already fetched — this is
+  also the recovery path for the laggard-vs-GC race (§5.4).
 
 ### 5.3 Anti-entropy scheduling
 
@@ -438,8 +519,11 @@ Properties:
   trusted peer, connect if needed, run a full `Hello` push-pull exchange. This repairs
   anything the reactive path missed (dropped connections, simultaneous partitions) and
   is the mechanism that guarantees convergence.
-- **On-connect**: any new connection (inbound or outbound, whatever its purpose) begins
-  with a `Hello` exchange. Blob fetches double as sync opportunities.
+- **On-connect**: every peer pairing maintains an mpt session (`sync/mpt/1`), and it
+  begins with a `Hello` exchange. Dialing a peer for a blob fetch opens (or reuses)
+  that mpt session alongside `sync/blob/1` — blob fetches double as sync
+  opportunities. `Hello` exists only on the mpt ALPN; the blob ALPN carries nothing
+  but `GetSlice`/`SliceEnd`.
 
 Expected staleness with push + pull-gossip is `O(log N)` rounds after any partition
 heals; at N ≤ 100 and 30 s rounds this is well under 5 minutes worst-case, typically
@@ -449,7 +533,9 @@ sub-second via push.
 
 Old roots are kept for `root_retention` (default 7 days) to serve laggard peers cheap
 diffs and to power `sync log` history (§8). GC is mark-and-sweep in SQLite: mark from
-all retained heads (each origin's latest + retained history roots), sweep unmarked
+all retained heads (each origin's **complete and pending** heads + retained history
+roots — pending heads must be in the mark set or GC would eat an in-progress
+bootstrap), sweep unmarked
 `trie_nodes`/`trie_values`. Runs incrementally in the maintenance loop.
 
 ---
@@ -465,9 +551,9 @@ structure we expose rather than hide:
   `iroh-blobs`/`bao-tree`. Interior nodes are standard blake3 parent nodes.
 - The **object address is the blake3 root hash** — identical to the plain `blake3(file)`
   digest, so addresses are checkable with any blake3 tool.
-- Each stored object keeps an **outboard** encoding (the interior tree, ~1/512 of the
-  content size at 16 KiB groups) alongside the raw bytes, enabling verified slice
-  serving without recomputation.
+- Each stored object keeps an **outboard** encoding (the interior tree — 64 bytes of
+  child hashes per ~16 KiB leaf group, so ~1/256 of the content size) alongside the
+  raw bytes, enabling verified slice serving without recomputation.
 
 **Verified random reads**: a read of any byte range is served as a *bao slice* — the
 chunk groups covering the range plus the sibling hashes on the paths to the root. The
@@ -484,23 +570,34 @@ reimplementing.
   `store/<hex>.obao` for the outboard. Small blobs (≤ 16 KiB) are inlined in SQLite.
 - All *index* metadata — sizes, completeness bitmaps (which chunk groups of a partially
   fetched object are present and verified), refcounts, pin state — is in SQLite (§10).
-- Partial objects are first-class: the completeness bitmap tracks verified groups;
-  `BlobAd`s are published for exactly the complete subtrees (with `complete: true` at
-  covered interior nodes), so even a node holding the first half of a video usefully
-  serves it.
+- Partial objects are first-class: the completeness bitmap tracks verified groups, and
+  the object's single `BlobAd` summarizes them as coarse spans — so even a node
+  holding the first half of a video usefully advertises and serves it.
 
 ### 6.3 Availability publishing
 
-Whenever the local store gains or loses a verified subtree of some object, the engine
-updates the `b:` records in the origin trie (batched, then republished as one new
-head). Published per object: the **root** and **all interior nodes and leaf groups**
-of the hash tree that are locally complete. Consequences:
+Each locally held object is advertised by exactly **one `b:` record**, keyed by the
+object root, whose value summarizes held bytes as coarse spans (16 MiB granularity).
+Ad updates are milestone-driven to bound churn: a record is (re)published when an
+object is first ingested, when it completes, and otherwise at most once per
+`ad_update_interval` (default 60 s) per object while a download is in flight — never
+per chunk. A swarm of N nodes downloading the same object costs O(N) small ad updates
+per interval cluster-wide, not O(N²) per-chunk trie deltas.
+
+Consequences:
 
 - "Who can serve byte range R of object X?" is answered *locally*, by scanning the
-  synced `blob_providers` view for ads whose `(object_root = X)` and `byte_range ∩ R ≠ ∅`,
-  across all origins. No query round-trip, no DHT.
-- Any holder of any subtree is discoverable and can serve it — swarm behavior (fetch
-  different ranges from different peers in parallel) falls out naturally.
+  synced `blob_providers` view for ads on `X` whose spans intersect R, across all
+  origins. No query round-trip, no DHT.
+- Any holder of any verified subtree can serve it (a bao slice carries its own
+  root-path hashes, §6.1) and is discoverable at span granularity — swarm behavior
+  (fetching different ranges from different peers in parallel) falls out naturally.
+  Span summaries are **hints, not promises**: the fetcher learns exact availability
+  from `SliceEnd` and re-plans, so a stale ad costs one wasted round-trip, never
+  correctness.
+- Cost model: availability metadata is ~1 trie record per (object, holder). For the
+  §14 media example, 40 k objects ≈ 40 k ads per holding node — the same order as
+  the `f:` namespace itself, and consistent with the §12 quota.
 
 ### 6.4 Blob transfer protocol
 
@@ -561,6 +658,16 @@ Since there is no unified tree, materialization is **per (origin, space)**:
   local origin trie (no echo).
 - `sync cat <origin>:<space>/<path> [--range a..b]` — stream to stdout with verified
   random access; this is where hash-tree reads shine (e.g. seeking in a large video).
+
+Materialization safety: trie paths are case-sensitive NFC UTF-8, but local
+filesystems may not be. When two published paths collide under the target
+filesystem's folding (case-insensitivity, Unicode normalization), materialization
+writes the lexicographically first and **skips and reports** the rest — never
+silently clobbers. Names invalid on the target platform (Windows reserved device
+names, trailing dot/space, forbidden characters) are likewise skipped and reported.
+And mirror targets may not overlap any configured space root (or vice versa):
+`sync mirror add` and `sync space add` refuse overlapping paths, which makes the
+"no echo" guarantee structural rather than conventional.
 
 Two-way "shared folder" workflows are composed from primitives: both nodes index their
 own copy of a space (same space id), and divergence between them is surfaced by
@@ -639,9 +746,11 @@ sync doctor                                 connectivity, DNSSEC, equivocation, 
 
 `sync cat/get/ls` work without a daemon: open endpoint, `Hello` with any reachable
 trusted peer, pull the relevant origin's head + the trie path for the requested key
-(Merkle-proof-verified — no full trie replication needed for a single read), fetch the
-blob slice, exit. This keeps the "dependency-free CLI" promise meaningful even on
-machines that never run the daemon.
+(Merkle-proof-verified — no full trie replication needed for a single read), resolve
+holders with `FindProviders` (§5.1 — unverified hints from the helper peer, safe
+because content is hash-verified regardless; a bad hint costs a wasted dial, never
+integrity), fetch the blob slice, exit. This keeps the "dependency-free CLI" promise
+meaningful even on machines that never run the daemon.
 
 ---
 
@@ -672,7 +781,7 @@ CREATE TABLE bindings (
   source       TEXT NOT NULL,            -- 'static' | 'dns'
   domain       TEXT,                     -- for dns source
   note         TEXT,
-  cross_signed INTEGER NOT NULL DEFAULT 0, -- verified continuity via m:rotation (§3.4)
+  cross_signed INTEGER NOT NULL DEFAULT 0, -- verified continuity via m:rot chain (§3.4)
   added_at     INTEGER NOT NULL,
   expires_at   INTEGER,                  -- NULL for static
   PRIMARY KEY (origin_id, node_id, source)
@@ -681,7 +790,9 @@ CREATE INDEX bindings_by_key ON bindings (node_id);   -- connection-accept looku
 
 -- mptsync
 CREATE TABLE heads (
-  origin_id   TEXT PRIMARY KEY,
+  origin_id   TEXT NOT NULL,
+  slot        TEXT NOT NULL,             -- 'complete': fully materialized, servable, backs `entries`
+                                         -- 'pending' : fetch in progress (§5.2 resumability)
   seq         INTEGER NOT NULL,
   root        BLOB NOT NULL,
   created_at  INTEGER NOT NULL,
@@ -689,11 +800,13 @@ CREATE TABLE heads (
   sig         BLOB NOT NULL,
   received_at INTEGER NOT NULL,
   verified_at INTEGER NOT NULL,          -- when the signed_by↔origin binding was checked
-  synced      INTEGER NOT NULL DEFAULT 0 -- trie fully materialized under this root
+  PRIMARY KEY (origin_id, slot)
 );
 CREATE TABLE head_history  (origin_id TEXT, seq INTEGER, root BLOB, created_at INTEGER,
-                            signed_by BLOB,
-                            PRIMARY KEY (origin_id, seq));    -- for §8 history, pruned by retention
+                            signed_by BLOB, sig BLOB,    -- sig kept: provable fork/equivocation evidence
+                            PRIMARY KEY (origin_id, seq, root)); -- same-seq forks both stored;
+                                                                 -- for §8 history + §3.4 evidence,
+                                                                 -- pruned by retention
 CREATE TABLE trie_nodes    (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE trie_values   (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 
@@ -714,15 +827,13 @@ CREATE INDEX entries_by_path    ON entries (space, path);
 CREATE INDEX entries_by_content ON entries (content);
 
 CREATE TABLE blob_providers (
-  hash        BLOB NOT NULL,             -- tree-node hash
-  origin_id   TEXT NOT NULL,
   object_root BLOB NOT NULL,
-  range_start INTEGER NOT NULL,
-  range_end   INTEGER NOT NULL,
-  level       INTEGER NOT NULL,
-  PRIMARY KEY (hash, origin_id)
+  origin_id   TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  complete    INTEGER NOT NULL,
+  spans       BLOB,                      -- coalesced 16 MiB-granularity byte spans when partial
+  PRIMARY KEY (object_root, origin_id)
 );
-CREATE INDEX providers_by_object ON blob_providers (object_root, range_start);
 
 -- local content store index
 CREATE TABLE blobs (
@@ -736,7 +847,7 @@ CREATE TABLE blobs (
 );
 
 -- indexing / engine state
-CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT NOT NULL, publish_level INTEGER DEFAULT 0);
+CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT NOT NULL);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));
@@ -797,25 +908,43 @@ Testing strategy:
 - **DNSSEC blast radius**: whoever controls the membership domain (or its DNSSEC keys)
   controls membership — adding a hostile node grants full read access and publish
   rights. With named origins the exposure is strictly larger: the domain controller
-  can *rebind an existing origin's `id=` to an attacker key*, hijacking that namespace
-  for future publishes (it cannot rewrite history or roll back — per-origin seq
-  monotonicity and retained signed heads prevent that, and already-replicated content
-  is hash-verified). Mitigations: legitimate rotations carry a cross-signed
-  `m:rotation` statement (§3.4) and are silent, while any *uncross-signed* rebinding
-  is loudly logged and flagged by `sync doctor` on every node until acknowledged; a
-  `rotation_policy = cross-signed-only` config refuses uncross-signed rebindings
-  outright (trading away DNS-only key-loss recovery). Plus the base mitigations:
-  validated in-process resolution (no resolver trust), TTL-bounded caching, and
-  `sync doctor` surfacing the full live member set, bindings, and their provenance.
-  Deployments that can't accept domain-controller power use static trust only.
-- **Equivocation & rollback**: signed monotonic seq prevents third-party replay of old
-  heads; same-seq forks are detected and reported (§4.4). A malicious *origin* can
-  publish garbage about its own files — that only pollutes its own namespace, which the
-  version model already treats as "their claim, not truth".
+  can *rebind an existing origin's `id=` to an attacker key*, hijacking that
+  namespace for future publishes. Established peers won't accept lower seqs and
+  retain signed history as evidence — but that is per-peer protection only (see the
+  rollback bullet below); new peers get none, and forward overwrites at higher seq
+  remain possible for any binding holder. Mitigations: legitimate rotations carry
+  the append-only cross-signed rotation chain (`m:rot/<n>`, §3.4) and verify
+  silently even across chained rotations a peer missed entirely, while any
+  *uncross-signed* rebinding is loudly logged and flagged by `sync doctor` on every
+  node until acknowledged; a `rotation_policy = cross-signed-only` config refuses
+  uncross-signed rebindings outright (trading away DNS-only key-loss recovery — an
+  explicit choice for hijack-sensitive deployments, made workable by the chain
+  surviving arbitrarily many missed rotations). Plus the base mitigations: validated
+  in-process resolution (no resolver trust), TTL-bounded caching, and `sync doctor`
+  surfacing the full live member set, bindings, and their provenance. Deployments
+  that can't accept domain-controller power use static trust only. The flip side of
+  failing closed is worth stating: a prolonged DNSSEC outage expires dns bindings
+  and shrinks the member set toward static-only — the cluster degrades to a halt
+  rather than falling open. Deliberate.
+- **Equivocation & rollback — stated precisely**: seq monotonicity is a *per-peer*
+  property: each peer refuses heads older than what it has already verified, from
+  first contact onward (trust-on-first-use). It is **not** a global guarantee. A new
+  peer with no prior state has no floor — a binding holder (including a domain
+  hijacker) can feed it fabricated or truncated history wholesale; its protection is
+  epidemic, not cryptographic: one `Hello` with any honest, fresher peer raises it to
+  the cluster's floor via the ordinary max-head rule. And any *current* binding
+  holder can always publish `seq_max+1` with arbitrary content — an effective
+  forward wipe no seq rule prevents; `head_history` retention plus fork-evidence
+  surfacing (§3.4) makes it visible, and `rotation_policy = cross-signed-only` makes
+  it require the old key rather than just the domain. Same-seq forks are detected
+  and reported with retained signed proofs (§4.4). A malicious *origin* publishing
+  garbage about its own files only pollutes its own namespace, which the version
+  model already treats as "their claim, not truth".
 - **Denial of service**: per-peer rate limits on `GetNodes`/`GetSlice`; batch-size caps;
   trie-depth caps on ingest (key length is bounded to 4 KiB, so depth ≤ ~8 K nibbles);
-  publish-size quota per origin (configurable, default 10 M trie leaves) so one member
-  can't OOM the cluster's metadata.
+  publish-size quota per origin (configurable, default 10 M trie leaves — with
+  per-object blob ads (§6.3) that corresponds to millions of files and objects, not
+  a handful of large files) so one member can't OOM the cluster's metadata.
 - **Privacy**: metadata (paths, sizes, mtimes) is visible to *all* members — inherent
   to omnipresence. Content is fetched on demand, so bytes only land where requested or
   mirrored. At-rest encryption of the CAS and DB is delegated to OS disk encryption in
@@ -842,16 +971,17 @@ Testing strategy:
 Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`.
 
 1. `nas` runs `sync space add media /srv/media`. The scanner hashes 40 k files,
-   the publisher signs head `(seq=1, root=r1)` containing 40 k `f:` records and the
-   `b:` ads for every object's tree nodes.
+   the publisher signs head `(seq=1, root=r1)` containing 40 k `f:` records and 40 k
+   per-object `b:` ads.
 2. `laptop` connects (dns-discovered membership, iroh-dialed), `Hello` exchanges heads,
    sees `nas@1 > nas@0`, pulls the trie breadth-first with `GetNodes` — a few MB of
    trie nodes for 40 k entries. It now knows every path, size, mtime, and object root
    on the NAS, holding zero content bytes.
 3. `laptop` runs `sync cat nas:media/talks/keynote.mp4 --range 0..`. Providers for the
    root resolve to `{nas}`; the fetcher streams bao-verified slices; the player seeks —
-   each seek is a new verified range read. Fetched groups land in laptop's CAS, and its
-   next published head advertises the subtrees it now holds.
+   each seek is a new verified range read. Fetched groups land in laptop's CAS, and
+   its next milestone ad update (§6.3) advertises its partial — later complete —
+   copy of the object.
 4. `vps` (which mirrors `nas:media`) later fetches the same file — provider resolution
    now returns `{nas, laptop}` and it pulls from both in parallel.
 5. `nas` edits a file. Watcher → rescan → head `(seq=2, r2)` → `HeadPush` to both peers;
@@ -861,12 +991,13 @@ Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`
    chose) the old object — divergence visible, nothing auto-resolved, adoption one
    `sync take` away.
 6. `nas`'s operator rotates its key: `sync key rotate`, publish the second
-   `id=nas nk=<K_new>` TXT record, wait for validated visibility. `nas` publishes the
-   cross-signed `m:rotation` statement, re-signs its head as `K_new` at `seq=3`, and
-   restarts its endpoint. Peers verify continuity silently; `laptop` and `vps` now
-   dial `K_new`. Every trie node, entry, and blob ad is untouched — `nas@cluster…`
-   is the same origin it always was. The old TXT record is removed and `K_old`
-   expires out of everyone's bindings a TTL later.
+   `id=nas nk=<K_new>` TXT record, wait for validated visibility. `nas` appends the
+   cross-signed statement to its `m:rot` chain, re-signs its head as `K_new` at
+   `seq=3`, and brings up the `K_new` endpoint alongside the old one for the TTL
+   window. Peers verify the chain silently; `laptop` and `vps` now dial `K_new`.
+   Every trie node, entry, and blob ad is untouched — `nas@cluster…` is the same
+   origin it always was. The old TXT record is removed and `K_old` expires out of
+   everyone's bindings a TTL later.
 
 ---
 
