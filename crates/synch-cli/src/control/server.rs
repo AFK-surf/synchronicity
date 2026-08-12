@@ -425,7 +425,28 @@ async fn dispatch<S: AsyncWrite + Unpin>(
         }
 
         Request::Scan => {
-            let (report, head) = node.scan_and_publish()?;
+            // Hashing a tree is long and blocking, so it runs off the runtime
+            // — the daemon keeps serving other requests — and each space is
+            // reported as a Progress frame while the scan is still going.
+            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+            let scanning = {
+                let node = node.clone();
+                tokio::task::spawn_blocking(move || {
+                    node.scan_all_with(|space, report| {
+                        let _ = progress_tx.send(format!(
+                            "scanned {space}: hashed {} · unchanged {} · deleted {}",
+                            report.hashed, report.unchanged, report.deleted
+                        ));
+                    })
+                })
+            };
+            while let Some(line) = progress_rx.recv().await {
+                out.progress(line).await?;
+            }
+            let report = scanning
+                .await
+                .map_err(|e| ControlError::internal(format!("the scan task failed: {e}")))??;
+            let head = node.publish(report.staged.clone())?;
             out.line(format!(
                 "hashed {} · unchanged {} · deleted {} · ignored {}",
                 report.hashed, report.unchanged, report.deleted, report.ignored
@@ -633,8 +654,12 @@ async fn dispatch<S: AsyncWrite + Unpin>(
         }
 
         Request::MirrorSync => {
-            for (origin, space, report) in node.sync_all_mirrors().await? {
-                out.progress(format!("{origin}:{space} synced")).await?;
+            // One mirror at a time, so the report of each arrives while the
+            // next is still being materialized.
+            for mirror in node.store().mirrors()? {
+                let (origin, space) = (mirror.origin, mirror.space);
+                out.progress(format!("{origin}:{space} …")).await?;
+                let report = node.sync_mirror(&origin, &space).await?;
                 out.line(format!(
                     "{origin}:{space}  written {} · current {} · removed {}",
                     report.written, report.current, report.removed

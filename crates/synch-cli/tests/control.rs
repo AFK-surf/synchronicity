@@ -441,6 +441,70 @@ async fn errors_cross_the_socket_with_their_code() {
     daemon.shutdown().await;
 }
 
+/// `scan` and `mirror sync` report what they are doing as they do it, in
+/// frames the CLI renders and discards (§9.3).
+#[tokio::test]
+async fn scan_and_mirror_sync_stream_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+
+    let media = space_with(&[("a.txt", b"a")]);
+    let notes = space_with(&[("b.txt", b"b")]);
+    for (id, space) in [("media", &media), ("notes", &notes)] {
+        lines(
+            data_dir,
+            Request::SpaceAdd {
+                id: id.into(),
+                path: space.path().to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+    }
+
+    let progress = progress_of(data_dir, Request::Scan).await;
+    assert!(
+        progress.iter().any(|line| line.contains("scanned media")),
+        "{progress:?}"
+    );
+    assert!(
+        progress.iter().any(|line| line.contains("scanned notes")),
+        "{progress:?}"
+    );
+
+    let target = tempfile::tempdir().unwrap();
+    lines(
+        data_dir,
+        Request::MirrorAdd {
+            reference: "laptop@cluster.example:media".into(),
+            path: target.path().to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+    let progress = progress_of(data_dir, Request::MirrorSync).await;
+    assert!(
+        progress
+            .iter()
+            .any(|line| line.contains("laptop@cluster.example:media")),
+        "{progress:?}"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// The `Progress` frames of a response.
+async fn progress_of(data_dir: &Path, request: Request) -> Vec<String> {
+    frames(data_dir, request)
+        .await
+        .expect("the request should have succeeded")
+        .into_iter()
+        .filter_map(|frame| match frame {
+            Response::Progress(text) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A multi-megabyte read must arrive as a sequence of bounded chunks, not as
 /// one buffered payload (§9.3).
 #[tokio::test]

@@ -175,9 +175,19 @@ impl Node {
 
     /// Scans every configured space.
     pub fn scan_all(&self) -> Result<ScanReport> {
+        self.scan_all_with(|_, _| {})
+    }
+
+    /// Scans every configured space, reporting each one as it completes.
+    ///
+    /// Hashing a large tree takes as long as it takes; `on_space` is how a
+    /// caller says so while it happens, rather than after everything is done.
+    pub fn scan_all_with(&self, mut on_space: impl FnMut(&str, &ScanReport)) -> Result<ScanReport> {
         let mut report = ScanReport::default();
         for space in self.store().spaces()? {
-            report.merge(self.scan_space(&space.id)?);
+            let one = self.scan_space(&space.id)?;
+            on_space(&space.id, &one);
+            report.merge(one);
         }
         if !report.staged.is_empty() {
             report.staged.push(self.manifest_change()?);
