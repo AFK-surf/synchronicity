@@ -1,0 +1,94 @@
+//! `synch daemon run`: the process that owns the node (§9.1).
+//!
+//! The daemon holds the one endpoint, the one database writer, and the one
+//! lifecycle. It serves the control socket concurrently with the engine's
+//! standing work — the anti-entropy scheduler, the scanner, the filesystem
+//! watcher, and the maintenance/GC pass.
+
+use anyhow::{Context, Result};
+use synch_engine::{Node, NodeConfig};
+use tokio::sync::broadcast;
+
+use crate::{control::Server, render};
+
+/// Opens the node, binds the control socket, and runs until stopped.
+///
+/// Stopping happens on `Ctrl-C` or on a `synch daemon stop` request; both fire
+/// the same broadcast, which every task shuts down on.
+pub async fn run(config: NodeConfig) -> Result<()> {
+    let node = Node::open(config)
+        .await
+        .context("could not open the node (run `synch init` first?)")?;
+    let (stop_tx, _) = broadcast::channel::<()>(1);
+
+    // Bind before announcing: a client that sees the banner can connect.
+    let server = Server::bind(node.clone(), stop_tx.clone())
+        .await
+        .with_context(|| format!("could not bind the control socket for {}", node.origin()))?;
+    println!(
+        "origin {} on {}",
+        node.origin(),
+        render::addr(&node.net().direct_addr())
+    );
+    println!("control socket: {}", server.endpoint_name());
+
+    let control = tokio::spawn(server.run());
+    let aae = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+        node.run_anti_entropy(shutdown).await
+    });
+    let scanner = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+        node.run_scanner(shutdown).await
+    });
+    let watcher = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+        node.run_watcher(shutdown).await
+    });
+    let maintenance = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+        node.run_maintenance(shutdown).await
+    });
+
+    // An initial scan and push, so a fresh daemon converges immediately rather
+    // than waiting a full interval.
+    if let Err(e) = node.scan_publish_push().await {
+        tracing::warn!(error = %e, "initial scan failed");
+    }
+
+    let mut stopped = stop_tx.subscribe();
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            println!("shutting down");
+            let _ = stop_tx.send(());
+        }
+        _ = stopped.recv() => {}
+    }
+
+    let _ = tokio::join!(control, aae, scanner, watcher, maintenance);
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// Spawns one of the engine's standing loops, wired to the stop broadcast.
+fn spawn_loop<F, Fut>(
+    node: &Node,
+    stop: &broadcast::Sender<()>,
+    body: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnOnce(Node, ShutdownSignal) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let node = node.clone();
+    let mut rx = stop.subscribe();
+    tokio::spawn(async move {
+        body(
+            node,
+            Box::pin(async move {
+                let _ = rx.recv().await;
+            }),
+        )
+        .await
+    })
+}
+
+/// The future the engine loops await to know they should stop.
+type ShutdownSignal = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;

@@ -7,30 +7,31 @@ use clap::{Parser, Subcommand};
 /// synchronicity — an omnipresent peer-to-peer file store.
 #[derive(Debug, Parser)]
 #[command(name = "synch", version, about, long_about = None)]
-pub(crate) struct Cli {
+pub struct Cli {
     /// The data directory. Defaults to the platform data directory.
     #[arg(long, global = true, env = "SYNCH_DATA_DIR")]
-    pub(crate) data_dir: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
 
     /// Bind the endpoint to this address instead of an ephemeral port.
     #[arg(long, global = true)]
-    pub(crate) bind: Option<String>,
+    pub bind: Option<String>,
 
     /// Disable relays and address discovery; reach peers by direct address only.
     #[arg(long, global = true)]
-    pub(crate) offline: bool,
+    pub offline: bool,
 
     /// Increase log verbosity.
     #[arg(short, long, global = true)]
-    pub(crate) verbose: bool,
+    pub verbose: bool,
 
+    /// The command to run.
     #[command(subcommand)]
-    pub(crate) command: Command,
+    pub command: Command,
 }
 
 /// The top-level commands.
 #[derive(Debug, Subcommand)]
-pub(crate) enum Command {
+pub enum Command {
     /// Create an identity and database.
     Init {
         /// The stable origin id, as `<name>@<domain>`. Without it the device
@@ -42,21 +43,25 @@ pub(crate) enum Command {
     Id,
     /// Device-key rotation.
     Key {
+        /// The key subcommand.
         #[command(subcommand)]
         command: KeyCommand,
     },
     /// Run or inspect the daemon.
     Daemon {
+        /// The daemon subcommand.
         #[command(subcommand)]
         command: DaemonCommand,
     },
     /// Static membership.
     Trust {
+        /// The trust subcommand.
         #[command(subcommand)]
         command: TrustCommand,
     },
     /// DNSSEC membership domains.
     Domain {
+        /// The domain subcommand.
         #[command(subcommand)]
         command: DomainCommand,
     },
@@ -64,6 +69,7 @@ pub(crate) enum Command {
     Peers,
     /// Index a local directory as a space.
     Space {
+        /// The space subcommand.
         #[command(subcommand)]
         command: SpaceCommand,
     },
@@ -108,11 +114,13 @@ pub(crate) enum Command {
     },
     /// Continuous read-only materialization.
     Mirror {
+        /// The mirror subcommand.
         #[command(subcommand)]
         command: MirrorCommand,
     },
     /// Keep content in the local store regardless of policy.
     Pin {
+        /// The pin subcommand.
         #[command(subcommand)]
         command: PinCommand,
     },
@@ -127,31 +135,42 @@ pub(crate) enum Command {
 }
 
 /// `synch key ...`
+///
+/// Rotation is operator-driven end to end (§3.4): the node never polls its own
+/// domain and never switches signing keys on its own.
 #[derive(Debug, Subcommand)]
-pub(crate) enum KeyCommand {
-    /// Generate a new device key and print the TXT record to publish.
+pub enum KeyCommand {
+    /// Generate the next device key and print the TXT record to publish.
     Rotate,
-    /// List local device keys.
-    Ls,
-    /// Delete a retired device key's secret.
+    /// Switch signing to a generated key, keeping the old one serving.
+    Activate {
+        /// The z-base-32 device key to activate.
+        key: String,
+    },
+    /// Drop a retiring key's endpoint and delete its secret.
     Retire {
         /// The z-base-32 device key to delete.
         key: String,
     },
+    /// List local device keys.
+    Ls,
 }
 
 /// `synch daemon ...`
 #[derive(Debug, Subcommand)]
-pub(crate) enum DaemonCommand {
-    /// Run the anti-entropy, scanner, watcher, and maintenance loops.
+pub enum DaemonCommand {
+    /// Own the node: serve the control socket and run the anti-entropy,
+    /// scanner, watcher, and maintenance loops.
     Run,
-    /// Print the node's current state.
+    /// Print the running node's current state.
     Status,
+    /// Ask the running daemon to shut down.
+    Stop,
 }
 
 /// `synch trust ...`
 #[derive(Debug, Subcommand)]
-pub(crate) enum TrustCommand {
+pub enum TrustCommand {
     /// Trust a device key.
     Add {
         /// The peer's z-base-32 device key.
@@ -187,7 +206,7 @@ pub(crate) enum TrustCommand {
 
 /// `synch domain ...`
 #[derive(Debug, Subcommand)]
-pub(crate) enum DomainCommand {
+pub enum DomainCommand {
     /// Add a DNSSEC membership domain.
     Add {
         /// The domain, e.g. `cluster.example.com`.
@@ -206,7 +225,7 @@ pub(crate) enum DomainCommand {
 
 /// `synch space ...`
 #[derive(Debug, Subcommand)]
-pub(crate) enum SpaceCommand {
+pub enum SpaceCommand {
     /// Index a local directory.
     Add {
         /// The space id.
@@ -225,7 +244,7 @@ pub(crate) enum SpaceCommand {
 
 /// `synch mirror ...`
 #[derive(Debug, Subcommand)]
-pub(crate) enum MirrorCommand {
+pub enum MirrorCommand {
     /// Mirror a peer's space into a local directory.
     Add {
         /// `<origin>:<space>`.
@@ -246,7 +265,7 @@ pub(crate) enum MirrorCommand {
 
 /// `synch pin ...`
 #[derive(Debug, Subcommand)]
-pub(crate) enum PinCommand {
+pub enum PinCommand {
     /// Pin an object root.
     Add {
         /// The object root, hex.
@@ -263,16 +282,16 @@ pub(crate) enum PinCommand {
 
 /// A parsed `--range` argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ByteRange {
+pub struct ByteRange {
     /// The first byte, inclusive.
-    pub(crate) start: u64,
+    pub start: u64,
     /// The last byte, exclusive. `None` means "to the end".
-    pub(crate) end: Option<u64>,
+    pub end: Option<u64>,
 }
 
 impl ByteRange {
     /// Parses `START..END`, `START..`, `..END`, or `..`.
-    pub(crate) fn parse(text: &str) -> anyhow::Result<ByteRange> {
+    pub fn parse(text: &str) -> anyhow::Result<ByteRange> {
         let (start, end) = text
             .split_once("..")
             .ok_or_else(|| anyhow::anyhow!("a range looks like START..END"))?;
@@ -290,8 +309,8 @@ impl ByteRange {
         Ok(ByteRange { start, end })
     }
 
-    /// The length of the range, when bounded.
-    pub(crate) fn len(&self) -> Option<u64> {
+    /// How many bytes the range covers, when it is bounded.
+    pub fn length(&self) -> Option<u64> {
         self.end.map(|end| end.saturating_sub(self.start))
     }
 }
@@ -373,8 +392,8 @@ mod tests {
                 end: Some(20)
             }
         );
-        assert_eq!(ByteRange::parse("10..20").unwrap().len(), Some(10));
-        assert_eq!(ByteRange::parse("10..").unwrap().len(), None);
+        assert_eq!(ByteRange::parse("10..20").unwrap().length(), Some(10));
+        assert_eq!(ByteRange::parse("10..").unwrap().length(), None);
         assert!(ByteRange::parse("20..10").is_err());
         assert!(ByteRange::parse("nonsense").is_err());
         assert!(ByteRange::parse("a..b").is_err());

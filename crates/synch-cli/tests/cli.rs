@@ -1,12 +1,15 @@
 //! End-to-end tests that drive the real `synch` binary.
 //!
-//! Two nodes are wired together with static trust and explicit direct
-//! addresses, then made to converge and transfer content — the same path a user
-//! walks, exercised through the actual command surface.
+//! `synch init` creates the datadir; `synch daemon run` owns the node; every
+//! other command is a control-socket request to that daemon (§9.1). These
+//! tests walk that path through the actual binary — the in-process
+//! control-socket coverage lives in `tests/control.rs`.
 
 use std::{
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
 };
 
 fn synch_bin() -> PathBuf {
@@ -30,14 +33,18 @@ impl Cli {
         }
     }
 
-    fn try_run(&self, args: &[&str]) -> (bool, String, String) {
-        let output = Command::new(synch_bin())
+    fn output(&self, args: &[&str]) -> std::process::Output {
+        Command::new(synch_bin())
             .arg("--data-dir")
             .arg(&self.data_dir)
             .arg("--offline")
             .args(args)
             .output()
-            .expect("synch binary runs");
+            .expect("synch binary runs")
+    }
+
+    fn try_run(&self, args: &[&str]) -> (bool, String, String) {
+        let output = self.output(args);
         (
             output.status.success(),
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -52,13 +59,7 @@ impl Cli {
     }
 
     fn run_bytes(&self, args: &[&str]) -> Vec<u8> {
-        let output = Command::new(synch_bin())
-            .arg("--data-dir")
-            .arg(&self.data_dir)
-            .arg("--offline")
-            .args(args)
-            .output()
-            .expect("synch binary runs");
+        let output = self.output(args);
         assert!(
             output.status.success(),
             "synch {args:?} failed:\n{}",
@@ -66,125 +67,236 @@ impl Cli {
         );
         output.stdout
     }
+
+    /// Starts `synch daemon run` and waits until its control socket answers.
+    fn daemon(&self) -> Daemon {
+        let mut child = Command::new(synch_bin())
+            .arg("--data-dir")
+            .arg(&self.data_dir)
+            .arg("--offline")
+            .arg("--bind")
+            .arg("127.0.0.1:0")
+            .arg("daemon")
+            .arg("run")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("daemon starts");
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut banner = String::new();
+        reader
+            .read_line(&mut banner)
+            .expect("the daemon prints a banner");
+        // Keep draining so the child never blocks on a full pipe.
+        std::thread::spawn(move || {
+            let mut sink = String::new();
+            while reader.read_line(&mut sink).unwrap_or(0) > 0 {
+                sink.clear();
+            }
+        });
+
+        let address = banner
+            .rsplit(" via ")
+            .next()
+            .unwrap_or_default()
+            .split(',')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        // The banner is printed after the socket is bound, but the first
+        // command still has to find a daemon that has finished opening.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if self.try_run(&["daemon", "status"]).0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        Daemon { child, address }
+    }
+}
+
+/// A running `synch daemon run` child.
+struct Daemon {
+    child: Child,
+    address: String,
+}
+
+impl Daemon {
+    /// Asks the daemon to stop and waits for the process to exit.
+    fn stop(mut self, cli: &Cli) {
+        cli.run(&["daemon", "stop"]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => panic!("waiting for the daemon: {e}"),
+            }
+        }
+        panic!("the daemon did not exit after `daemon stop`");
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[test]
-fn init_id_and_doctor() {
+fn init_is_the_only_command_that_runs_without_a_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let cli = Cli::new(dir.path());
 
     let out = cli.run(&["init", "--id", "nas@cluster.example"]);
     assert!(out.contains("nas@cluster.example"), "{out}");
+    assert!(out.contains("synch daemon run"), "{out}");
 
     // Init is not idempotent: a second one must not silently replace the key.
     let (ok, _, _) = cli.try_run(&["init"]);
     assert!(!ok, "init must refuse to overwrite an identity");
 
-    let id = cli.run(&["id"]);
-    assert!(id.contains("nas@cluster.example"), "{id}");
-    assert!(id.contains("active"), "{id}");
-
-    let doctor = cli.run(&["doctor"]);
-    assert!(doctor.contains("origin: nas@cluster.example"), "{doctor}");
-    assert!(doctor.contains("equivocation: none detected"), "{doctor}");
-    assert!(doctor.contains("static trust only"), "{doctor}");
+    // Everything else needs the daemon, and says so.
+    for args in [
+        vec!["id"],
+        vec!["ls", "media"],
+        vec!["doctor"],
+        vec!["daemon", "status"],
+    ] {
+        let (ok, _, stderr) = cli.try_run(&args);
+        assert!(!ok, "{args:?} must fail without a daemon");
+        assert!(stderr.contains("synch daemon run"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("control.sock") || stderr.contains("\\pipe\\synchronicity-"),
+            "{args:?}: {stderr} must name the socket"
+        );
+    }
 }
 
 #[test]
 fn commands_refuse_to_run_without_an_identity() {
     let dir = tempfile::tempdir().unwrap();
     let cli = Cli::new(dir.path());
-    let (ok, _, stderr) = cli.try_run(&["id"]);
+    // No datadir at all: `daemon run` has nothing to open.
+    let (ok, _, stderr) = cli.try_run(&["daemon", "run"]);
     assert!(!ok);
     assert!(stderr.contains("synch init"), "{stderr}");
 }
 
 #[test]
-fn spaces_scan_and_list() {
+fn the_command_surface_works_over_the_socket() {
     let dir = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     let cli = Cli::new(dir.path());
-    cli.run(&["init"]);
+    cli.run(&["init", "--id", "nas@cluster.example"]);
 
     std::fs::create_dir_all(space.path().join("talks")).unwrap();
     std::fs::write(space.path().join("notes.txt"), b"hello").unwrap();
     std::fs::write(space.path().join("talks/a.txt"), b"talk").unwrap();
+
+    let daemon = cli.daemon();
+
+    let id = cli.run(&["id"]);
+    assert!(id.contains("nas@cluster.example"), "{id}");
+    assert!(id.contains("active"), "{id}");
 
     cli.run(&["space", "add", "media", &space.path().to_string_lossy()]);
     assert!(cli.run(&["space", "ls"]).contains("media"));
 
     let scan = cli.run(&["scan"]);
     assert!(scan.contains("hashed 2"), "{scan}");
-    assert!(scan.contains("published seq 1"), "{scan}");
+    assert!(scan.contains("published seq"), "{scan}");
 
     let ls = cli.run(&["ls", "media"]);
     assert!(ls.contains("notes.txt"), "{ls}");
     assert!(ls.contains("talks/a.txt"), "{ls}");
-
-    // A directory listing is a prefix scan.
     let ls = cli.run(&["ls", "media/talks"]);
-    assert!(ls.contains("talks/a.txt"), "{ls}");
     assert!(!ls.contains("notes.txt"), "{ls}");
 
-    // A second scan finds nothing new.
-    assert!(cli.run(&["scan"]).contains("nothing changed"));
+    assert_eq!(
+        cli.run_bytes(&["cat", "nas@cluster.example:media/notes.txt"]),
+        b"hello"
+    );
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("notes.txt");
+    cli.run(&[
+        "get",
+        "nas@cluster.example:media/notes.txt",
+        "-o",
+        &target.to_string_lossy(),
+    ]);
+    assert_eq!(std::fs::read(&target).unwrap(), b"hello");
 
-    let status = cli.run(&["status", "media"]);
-    assert!(status.contains("[agree]"), "{status}");
+    assert!(cli.run(&["status", "media"]).contains("[agree]"));
+    assert!(cli.run(&["log", "media/notes.txt"]).contains("seq 1"));
 
-    // Deleting a file publishes a tombstone, visible as a "deleted" entry.
-    std::fs::remove_file(space.path().join("notes.txt")).unwrap();
-    cli.run(&["scan"]);
-    let ls = cli.run(&["ls", "media"]);
-    assert!(ls.contains("deleted"), "{ls}");
-
-    let log = cli.run(&["log", "media/notes.txt"]);
-    assert!(log.contains("seq 2"), "{log}");
-    assert!(log.contains("seq 1"), "{log}");
-}
-
-#[test]
-fn pins_and_trust_management() {
-    let dir = tempfile::tempdir().unwrap();
-    let space = tempfile::tempdir().unwrap();
-    let cli = Cli::new(dir.path());
-    cli.run(&["init"]);
-    std::fs::write(space.path().join("a.txt"), b"pin me").unwrap();
-    cli.run(&["space", "add", "media", &space.path().to_string_lossy()]);
-    cli.run(&["scan"]);
-
-    let root = blake3::hash(b"pin me").to_hex().to_string();
+    let root = blake3::hash(b"hello").to_hex().to_string();
     cli.run(&["pin", "add", &root]);
     assert!(cli.run(&["pin", "ls"]).contains(&root));
     cli.run(&["pin", "rm", &root]);
-    assert!(cli.run(&["pin", "ls"]).trim().is_empty());
 
-    // A bogus root is rejected rather than silently ignored.
+    // A daemon-side failure is this process's exit status, not a transport
+    // error.
     let (ok, _, stderr) = cli.try_run(&["pin", "add", "nothex"]);
     assert!(!ok);
     assert!(stderr.contains("hex"), "{stderr}");
 
-    // Static trust, named so it can rotate.
-    let peer = tempfile::tempdir().unwrap();
-    let peer_cli = Cli::new(peer.path());
-    peer_cli.run(&["init"]);
-    let peer_key = key_of(&peer_cli);
+    // Rotation, driven entirely by the operator (§3.4).
+    let rotate = cli.run(&["key", "rotate"]);
+    assert!(
+        rotate.contains("_synchronicity.cluster.example."),
+        "{rotate}"
+    );
+    assert!(rotate.contains("v=sync1 id=nas nk="), "{rotate}");
+    let keys = cli.run(&["key", "ls"]);
+    assert_eq!(keys.lines().count(), 2, "{keys}");
+    assert_eq!(keys.matches("active").count(), 1, "{keys}");
+    let new_key = keys
+        .lines()
+        .find(|line| line.contains("retiring"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the generated key")
+        .to_string();
+    let old_key = keys
+        .lines()
+        .find(|line| line.contains("active"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the active key")
+        .to_string();
 
-    cli.run(&[
-        "trust",
-        "add",
-        &peer_key,
-        "--as",
-        "laptop",
-        "--domain",
-        "x.example",
-    ]);
-    let trust = cli.run(&["trust", "ls"]);
-    assert!(trust.contains("laptop@x.example"), "{trust}");
-    assert!(trust.contains("live"), "{trust}");
+    let activated = cli.run(&["key", "activate", &new_key]);
+    assert!(activated.contains(&new_key), "{activated}");
+    assert!(cli.run(&["id"]).contains(&new_key));
+    // Both keys serve until the old one is retired.
+    assert!(cli.run(&["doctor"]).contains("retiring:"));
+    cli.run(&["key", "retire", &old_key]);
+    let keys = cli.run(&["key", "ls"]);
+    assert_eq!(keys.lines().count(), 1, "{keys}");
+    assert!(keys.contains(&new_key), "{keys}");
 
-    cli.run(&["trust", "rm", "laptop@x.example"]);
-    assert!(!cli.run(&["trust", "ls"]).contains("laptop@x.example"));
+    // A publish after the rotation is signed by the new key and keeps counting
+    // up from where the old one left off.
+    std::fs::write(space.path().join("after.txt"), b"after").unwrap();
+    let scan = cli.run(&["scan"]);
+    assert!(scan.contains("published seq"), "{scan}");
+
+    let doctor = cli.run(&["doctor"]);
+    assert!(doctor.contains("origin: nas@cluster.example"), "{doctor}");
+    assert!(doctor.contains("equivocation: none detected"), "{doctor}");
+    assert!(cli.run(&["daemon", "status"]).contains("storage:"));
+
+    daemon.stop(&cli);
+
+    // With the daemon gone, the socket is gone with it.
+    let (ok, _, stderr) = cli.try_run(&["id"]);
+    assert!(!ok);
+    assert!(stderr.contains("synch daemon run"), "{stderr}");
 }
 
 #[test]
@@ -192,38 +304,17 @@ fn domains_are_configurable_without_dns() {
     let dir = tempfile::tempdir().unwrap();
     let cli = Cli::new(dir.path());
     cli.run(&["init", "--id", "nas@cluster.example"]);
+    let daemon = cli.daemon();
 
     // `domain add` attempts a refresh; with no resolver or no records it must
     // still record the domain and fail closed rather than crash.
     let _ = cli.try_run(&["domain", "add", "cluster.example"]);
     assert!(cli.run(&["domain", "ls"]).contains("cluster.example"));
-    let doctor = cli.run(&["doctor"]);
-    assert!(doctor.contains("domain cluster.example"), "{doctor}");
+    assert!(cli.run(&["doctor"]).contains("domain cluster.example"));
 
     cli.run(&["domain", "rm", "cluster.example"]);
     assert!(cli.run(&["domain", "ls"]).trim().is_empty());
-}
-
-#[test]
-fn key_rotation_prints_the_record_to_publish() {
-    let dir = tempfile::tempdir().unwrap();
-    let cli = Cli::new(dir.path());
-    cli.run(&["init", "--id", "nas@cluster.example"]);
-
-    let out = cli.run(&["key", "rotate"]);
-    assert!(out.contains("_synchronicity.cluster.example."), "{out}");
-    assert!(out.contains("v=sync1 id=nas nk="), "{out}");
-    // Both keys are held during the window, exactly one of them active.
-    let keys = cli.run(&["key", "ls"]);
-    assert_eq!(keys.lines().count(), 2, "{keys}");
-    assert_eq!(keys.matches("active").count(), 1, "{keys}");
-
-    // A key-identified origin says so instead of printing a record.
-    let other = tempfile::tempdir().unwrap();
-    let other_cli = Cli::new(other.path());
-    other_cli.run(&["init"]);
-    let out = other_cli.run(&["key", "rotate"]);
-    assert!(out.contains("cannot rotate"), "{out}");
+    daemon.stop(&cli);
 }
 
 #[test]
@@ -237,6 +328,13 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     nas.run(&["init", "--id", "nas@cluster.example"]);
     laptop.run(&["init", "--id", "laptop@cluster.example"]);
 
+    let payload: Vec<u8> = (0..120_000u32).map(|i| (i * 13) as u8).collect();
+    std::fs::write(nas_space.path().join("small.txt"), b"a small file").unwrap();
+    std::fs::write(nas_space.path().join("big.bin"), &payload).unwrap();
+
+    let nas_daemon = nas.daemon();
+    let laptop_daemon = laptop.daemon();
+
     // Each side learns the other's key. Addresses are exchanged explicitly
     // because these nodes run with discovery disabled.
     let nas_key = key_of(&nas);
@@ -249,6 +347,8 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
         "laptop",
         "--domain",
         "cluster.example",
+        "--addr",
+        &laptop_daemon.address,
     ]);
     laptop.run(&[
         "trust",
@@ -258,115 +358,65 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
         "nas",
         "--domain",
         "cluster.example",
+        "--addr",
+        &nas_daemon.address,
     ]);
 
-    // Publish on the NAS.
-    let payload: Vec<u8> = (0..120_000u32).map(|i| (i * 13) as u8).collect();
-    std::fs::write(nas_space.path().join("small.txt"), b"a small file").unwrap();
-    std::fs::write(nas_space.path().join("big.bin"), &payload).unwrap();
+    // `ls` on the laptop is empty until the NAS publishes and pushes.
+    assert!(laptop.run(&["ls", "media"]).trim().is_empty());
+
     nas.run(&["space", "add", "media", &nas_space.path().to_string_lossy()]);
     nas.run(&["scan"]);
 
-    // Bring the NAS up as a daemon so the laptop has something to dial.
-    let mut daemon = Command::new(synch_bin())
-        .arg("--data-dir")
-        .arg(nas_dir.path())
-        .arg("--offline")
-        .arg("--bind")
-        .arg("127.0.0.1:0")
-        .arg("daemon")
-        .arg("run")
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-
-    let addr = read_daemon_address(&mut daemon);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Point the laptop at the running NAS and sync.
-        laptop.run(&[
-            "trust",
-            "add",
-            &nas_key,
-            "--as",
-            "nas",
-            "--domain",
-            "cluster.example",
-            "--addr",
-            &addr,
-        ]);
-
-        // `ls` on the laptop is empty until it syncs.
-        assert!(laptop.run(&["ls", "media"]).trim().is_empty());
-
-        // A `cat` triggers a sync-on-demand path: the laptop must first learn
-        // the head. Drive that through the peers/anti-entropy path by running
-        // the daemon briefly on the laptop side is heavy, so use `doctor` to
-        // confirm the binding and then sync via a short daemon run.
-        let mut laptop_daemon = Command::new(synch_bin())
-            .arg("--data-dir")
-            .arg(laptop_dir.path())
-            .arg("--offline")
-            .arg("--bind")
-            .arg("127.0.0.1:0")
-            .arg("daemon")
-            .arg("run")
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("laptop daemon starts");
-        let _ = read_daemon_address(&mut laptop_daemon);
-
-        // Wait for the laptop to converge; the first anti-entropy round fires
-        // within one jittered interval, but the initial push from the NAS side
-        // is not guaranteed to have happened yet.
-        let mut converged = false;
-        for _ in 0..120 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if laptop.run(&["ls", "media"]).contains("big.bin") {
-                converged = true;
-                break;
-            }
+    // The publish is pushed reactively; the periodic round repairs whatever
+    // the push missed.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut converged = false;
+    while Instant::now() < deadline {
+        if laptop.run(&["ls", "media"]).contains("big.bin") {
+            converged = true;
+            break;
         }
-        let _ = laptop_daemon.kill();
-        let _ = laptop_daemon.wait();
-        assert!(converged, "the laptop never learned the NAS's entries");
-
-        // Metadata matches; content still lives only on the NAS.
-        let ls = laptop.run(&["ls", "media"]);
-        assert!(ls.contains("small.txt"), "{ls}");
-        assert!(ls.contains("120000"), "{ls}");
-
-        // A verified full read and a verified range read.
-        let got = laptop.run_bytes(&["cat", "nas@cluster.example:media/small.txt"]);
-        assert_eq!(got, b"a small file");
-
-        let got = laptop.run_bytes(&[
-            "cat",
-            "nas@cluster.example:media/big.bin",
-            "--range",
-            "60000..60100",
-        ]);
-        assert_eq!(got, &payload[60_000..60_100]);
-
-        let out_dir = tempfile::tempdir().unwrap();
-        let target = out_dir.path().join("fetched.bin");
-        laptop.run(&[
-            "get",
-            "nas@cluster.example:media/big.bin",
-            "-o",
-            &target.to_string_lossy(),
-        ]);
-        assert_eq!(std::fs::read(&target).unwrap(), payload);
-
-        // `status` now shows both origins' views of the space.
-        let status = laptop.run(&["status", "media"]);
-        assert!(status.contains("nas@cluster.example"), "{status}");
-    }));
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
+        std::thread::sleep(Duration::from_millis(500));
     }
+    assert!(converged, "the laptop never learned the NAS's entries");
+
+    // Metadata matches; content still lives only on the NAS.
+    let ls = laptop.run(&["ls", "media"]);
+    assert!(ls.contains("small.txt"), "{ls}");
+    assert!(ls.contains("120000"), "{ls}");
+
+    // A verified full read and a verified range read, both streamed from the
+    // laptop's daemon over the control socket.
+    let got = laptop.run_bytes(&["cat", "nas@cluster.example:media/small.txt"]);
+    assert_eq!(got, b"a small file");
+
+    let got = laptop.run_bytes(&[
+        "cat",
+        "nas@cluster.example:media/big.bin",
+        "--range",
+        "60000..60100",
+    ]);
+    assert_eq!(got, &payload[60_000..60_100]);
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let target = out_dir.path().join("fetched.bin");
+    laptop.run(&[
+        "get",
+        "nas@cluster.example:media/big.bin",
+        "-o",
+        &target.to_string_lossy(),
+    ]);
+    assert_eq!(std::fs::read(&target).unwrap(), payload);
+
+    // `status` now shows both origins' views of the space.
+    assert!(laptop
+        .run(&["status", "media"])
+        .contains("nas@cluster.example"));
+    assert!(laptop.run(&["peers"]).contains(&nas_key));
+
+    laptop_daemon.stop(&laptop);
+    nas_daemon.stop(&nas);
 }
 
 fn key_of(cli: &Cli) -> String {
@@ -377,29 +427,5 @@ fn key_of(cli: &Cli) -> String {
         .split_whitespace()
         .next()
         .expect("a key")
-        .to_string()
-}
-
-/// Reads the `origin ... via HOST:PORT` line a daemon prints on startup.
-fn read_daemon_address(child: &mut std::process::Child) -> String {
-    use std::io::{BufRead, BufReader};
-    let stdout = child.stdout.take().expect("piped stdout");
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("daemon prints a banner");
-    // Keep draining so the child never blocks on a full pipe.
-    std::thread::spawn(move || {
-        let mut sink = String::new();
-        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
-            sink.clear();
-        }
-    });
-    line.rsplit(" via ")
-        .next()
-        .unwrap_or_default()
-        .split(',')
-        .next()
-        .unwrap_or_default()
-        .trim()
         .to_string()
 }

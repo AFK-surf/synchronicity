@@ -1,17 +1,14 @@
-//! `synch` — the synchronicity CLI and daemon (§9.1).
+//! `synch` — the synchronicity daemon and the CLI that drives it (§9.1).
 //!
-//! A thin argument-parsing shell over `synch-engine`: every command here is a
-//! few lines of dispatch and formatting over the embeddable node API.
-#![deny(missing_docs)]
-
-mod cli;
-mod commands;
+//! A thin argument-parsing shell over [`synch_cli`]: parse, dispatch, render
+//! the failure as an exit status.
 
 use clap::Parser;
+use synch_cli::{cli::Cli, commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = cli::Cli::parse();
+    let args = Cli::parse();
     let default = if args.verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
