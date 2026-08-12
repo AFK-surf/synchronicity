@@ -9,44 +9,6 @@ Sections refer to `DESIGN.md`.
 
 ## Deferred, with the module boundary in place
 
-### §9.1 — the control socket
-
-The design describes a local control socket (Unix domain socket, named pipe on
-Windows) with a per-datadir token, and the CLI talking to a running daemon over
-it. This implementation runs every command **in process against the same SQLite
-database**, which is the same fallback the design already specifies for when no
-daemon is running.
-
-Consequences: `synch daemon run` and a concurrent `synch ls` are two processes
-against one WAL database, which SQLite handles; but a CLI command that needs to
-*dial a peer* brings up its own short-lived endpoint rather than reusing the
-daemon's connections. The command surface and behavior are unchanged.
-
-`// TODO(design §9.1)` marks the seam in `crates/synch-cli/src/commands.rs`.
-
-### §9.3 — one-shot mode over the network
-
-`synch cat/get/ls` work without a daemon against the local database, and the
-Merkle-proof machinery they would need for a network one-shot read is
-implemented and tested (`synch_mpt::Proof`, including proofs of absence and
-rejection of truncated proofs). What is not wired up is the "open an endpoint,
-`Hello` a reachable peer, pull just the trie path for one key, `FindProviders`,
-fetch, exit" flow. `FindProviders`/`Providers` are implemented on both sides of
-the wire, so the remaining work is the CLI-side orchestration.
-
-`// TODO(design §9.3)` marks the seam in `crates/synch-cli/src/commands.rs`.
-
-### §3.4 — automatic rotation switch-over
-
-`synch key rotate` implements step 1: it generates the new key, keeps the old
-one active, and prints the TXT record to publish. Steps 3 and 4 — polling the
-domain until the new binding is observed, re-signing the head under the new key,
-and running two endpoints side by side for the overlap window — are not
-automated; an operator drives them with `synch key retire` once propagation is
-confirmed. The data model already supports the whole thing: `device_keys` holds
-several keys with an `active`/`retiring` state, and `bindings` binds several
-keys to one origin simultaneously, which is what the tests exercise.
-
 ### §3.4 — key-loss recovery quiesce
 
 The `recovery_quiesce` / `seq_gap` protocol for a node rebuilding from an empty
@@ -70,7 +32,54 @@ anti-entropy scheduler picks a random peer each round, a persistently unservable
 head is still abandoned and re-selected; the difference is that the count is
 per-session rather than global.
 
+## Differences in detail
+
+### §3.4 — which endpoint dials during the overlap window
+
+The design says `synch key activate` "brings up a second iroh endpoint as
+`K_new`" and that both endpoints stay live until the old binding has expired.
+Both do. What the design does not say is which of them the node dials *out*
+from, and this implementation makes the new key the primary: `K_new` signs, and
+new outbound connections carry it, while `K_old`'s endpoint keeps accepting
+until `synch key retire` drops it. That way the identity peers are being moved
+to is the one they see on every fresh connection, and retiring the old key
+becomes a pure teardown of a serving-only endpoint rather than a second
+switch-over.
+
+One consequence is visible with an explicit `--bind HOST:PORT`: two endpoints
+cannot share a port, so the incoming key binds an ephemeral port on the same
+interface, and the fixed port stays with the outgoing key until it is retired.
+
+### §9.3 — `Line` frames for textual output
+
+The design describes `cat`, `get`, and a long `ls` streaming their payload "as a
+sequence of `Chunk` frames terminated by `End`". Byte payloads (`cat`, `get`) do
+exactly that. Textual output (`ls`, `status`, `log`, `doctor`, …) streams
+`Line` frames instead — the same incremental delivery terminated by the same
+`End`, but framed per line, so the CLI does not have to re-split a byte stream
+it is only going to print line by line. `Progress` and the structured `Error`
+are as specified.
+
+### §3.4 — the state of a key between `rotate` and `activate`
+
+`device_keys.state` is `active` or `retiring` (§10), so the key that
+`synch key rotate` generates is stored as `retiring` until `synch key activate`
+promotes it: "held, and not the signing key". Exactly one key is `active` at any
+moment, which is the invariant that matters.
+
 ## Adapted to the dependencies
+
+### §9.3 — the control token's randomness
+
+The 32 random bytes in `control.token` come from `SecretKey::generate()`, which
+is the same OS CSPRNG that mints device keys, rather than from a separate `rand`
+dependency at a version this workspace does not otherwise pin.
+
+Filesystem permissions are enforced where the platform has them: the data
+directory is `0700` and the token and socket are `0600` on Unix, created that
+way rather than chmod-ed afterwards. Windows has no equivalent, which is the
+case §9.3 already anticipates — there the token carries the whole check, and it
+is checked on every request on both platforms.
 
 ### §10 — the writer task
 

@@ -32,13 +32,32 @@ synch daemon run &                         # required: the daemon owns the node
 synch space add media /srv/media
 synch scan                                 # hash, publish a signed root
 synch id                                   # print the origin, device key, and address
+synch daemon status                        # what the running node is doing
+synch daemon stop                          # ask it to shut down
 ```
+
+The socket is `<data-dir>/control.sock` (a `\\.\pipe\synchronicity-…` named pipe
+on Windows), `0600` inside a `0700` data directory, authenticated by a token
+regenerated on every daemon start. With no daemon running, every command except
+`synch init` fails with a message naming that socket.
 
 Admit a peer. Trust is unilateral, so each side runs this for the other:
 
 ```sh
 synch trust add <their-device-key> --as laptop --domain cluster.example.com
 synch domain add cluster.example.com       # or DNSSEC membership instead
+```
+
+Rotate a device key. Every step is an explicit command: a node never polls its
+own domain and never switches signing keys on its own.
+
+```sh
+synch key rotate                           # generate K_new, print the TXT record
+# publish the record, wait for it to propagate
+synch key activate <K_new>                 # re-sign the head, serve on both keys
+# remove the old record
+synch key retire <K_old>                   # drop that endpoint, delete the secret
+synch key ls                               # this node's keys and their state
 ```
 
 Read across the cluster. Content is fetched on demand and verified per 16 KiB
@@ -76,7 +95,7 @@ node's own origin are writable; foreign-origin buckets are read-only.
 | `synch-store` | the SQLite schema and the content-addressed blob store |
 | `synch-net` | the iroh endpoint, both ALPNs, reconciliation, the DNSSEC resolver |
 | `synch-engine` | the embeddable node: scanner, publisher, anti-entropy, fetcher, mirrors |
-| `synch-cli` | the `synch` binary |
+| `synch-cli` | the `synch` binary: the daemon, the control socket, and the CLI client |
 | `synch-s3` | the `synch-s3` binary and the gateway library |
 
 All logic lives in the library crates, so any Rust application can embed a full
