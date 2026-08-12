@@ -1,0 +1,140 @@
+//! Nibble sequences: the radix-16 alphabet the trie is keyed on (§4.3).
+
+use serde::{Deserialize, Serialize};
+
+/// A sequence of nibbles (4-bit values), high nibble of each byte first.
+///
+/// Stored one nibble per byte so that the postcard encoding is canonical: two
+/// equal nibble sequences always produce identical bytes, which is what makes
+/// node hashing deterministic.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Nibbles(Vec<u8>);
+
+impl Nibbles {
+    /// An empty sequence.
+    pub fn new() -> Self {
+        Nibbles(Vec::new())
+    }
+
+    /// Expands a byte string into nibbles, high nibble first.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut v = Vec::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            v.push(b >> 4);
+            v.push(b & 0x0f);
+        }
+        Nibbles(v)
+    }
+
+    /// Builds from raw nibble values, masking each to 4 bits.
+    pub fn from_nibbles(nibbles: &[u8]) -> Self {
+        Nibbles(nibbles.iter().map(|n| n & 0x0f).collect())
+    }
+
+    /// Packs an even-length nibble sequence back into bytes.
+    ///
+    /// Returns `None` for odd-length sequences, which cannot correspond to a
+    /// byte-string key.
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        if !self.0.len().is_multiple_of(2) {
+            return None;
+        }
+        Some(
+            self.0
+                .chunks_exact(2)
+                .map(|pair| (pair[0] << 4) | pair[1])
+                .collect(),
+        )
+    }
+
+    /// The nibbles as a slice.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The number of nibbles.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True if there are no nibbles.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// A new sequence with `nibble` prepended.
+    pub fn prepend(&self, nibble: u8) -> Nibbles {
+        let mut v = Vec::with_capacity(self.0.len() + 1);
+        v.push(nibble & 0x0f);
+        v.extend_from_slice(&self.0);
+        Nibbles(v)
+    }
+
+    /// A new sequence with `prefix` prepended.
+    pub fn prepend_all(&self, prefix: &[u8]) -> Nibbles {
+        let mut v = Vec::with_capacity(self.0.len() + prefix.len());
+        v.extend(prefix.iter().map(|n| n & 0x0f));
+        v.extend_from_slice(&self.0);
+        Nibbles(v)
+    }
+}
+
+impl From<&[u8]> for Nibbles {
+    fn from(nibbles: &[u8]) -> Self {
+        Nibbles::from_nibbles(nibbles)
+    }
+}
+
+/// The length of the longest common prefix of two nibble slices.
+pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_round_trip() {
+        let bytes = b"f:photos/a.jpg";
+        let n = Nibbles::from_bytes(bytes);
+        assert_eq!(n.len(), bytes.len() * 2);
+        assert_eq!(n.to_bytes().unwrap(), bytes.to_vec());
+    }
+
+    #[test]
+    fn nibble_order_is_high_first() {
+        let n = Nibbles::from_bytes(&[0xab]);
+        assert_eq!(n.as_slice(), &[0x0a, 0x0b]);
+    }
+
+    #[test]
+    fn odd_length_has_no_byte_form() {
+        assert!(Nibbles::from_nibbles(&[1, 2, 3]).to_bytes().is_none());
+    }
+
+    #[test]
+    fn prepending() {
+        let n = Nibbles::from_nibbles(&[3, 4]);
+        assert_eq!(n.prepend(2).as_slice(), &[2, 3, 4]);
+        assert_eq!(n.prepend_all(&[0, 1]).as_slice(), &[0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn common_prefixes() {
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 9]), 2);
+        assert_eq!(common_prefix_len(&[1], &[2]), 0);
+        assert_eq!(common_prefix_len(&[], &[1]), 0);
+    }
+
+    #[test]
+    fn nibble_order_matches_byte_order() {
+        // Lexicographic nibble order must agree with lexicographic byte order,
+        // which is what makes prefix range scans correct.
+        let a = Nibbles::from_bytes(b"abc");
+        let b = Nibbles::from_bytes(b"abd");
+        assert!(a < b);
+        let short = Nibbles::from_bytes(b"ab");
+        assert!(short < a);
+    }
+}

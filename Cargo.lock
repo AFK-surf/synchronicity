@@ -893,6 +893,14 @@ version = "0.1.0"
 [[package]]
 name = "synch-mpt"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "postcard",
+ "proptest",
+ "serde",
+ "synch-core",
+ "thiserror",
+]
 
 [[package]]
 name = "synch-net"
