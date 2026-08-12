@@ -20,6 +20,9 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         .await
         .context("could not open the node (run `synch init` first?)")?;
     let (stop_tx, _) = broadcast::channel::<()>(1);
+    // Subscribed before anything can ask us to stop, so a `daemon stop` that
+    // arrives during the initial scan is not sent to nobody.
+    let mut stopped = stop_tx.subscribe();
 
     // Bind before announcing: a client that sees the banner can connect.
     let server = Server::bind(node.clone(), stop_tx.clone())
@@ -52,7 +55,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         tracing::warn!(error = %e, "initial scan failed");
     }
 
-    let mut stopped = stop_tx.subscribe();
     tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal?;

@@ -135,12 +135,18 @@ where
 
     let request: Request = read_frame(&mut stream).await?;
     let mut out = Frames { stream };
-    let result = match dispatch(&node, &stop, request, &mut out).await {
-        Ok(()) => out.end().await,
-        Err(error) => out.error(error).await,
+    let (outcome, result) = match dispatch(&node, request, &mut out).await {
+        Ok(outcome) => (outcome, out.end().await),
+        Err(error) => (Outcome::default(), out.error(error).await),
     };
     let mut stream = out.stream;
     linger(&mut stream).await?;
+    drop(stream);
+    // The daemon comes down only once its answer has landed, so `synch daemon
+    // stop` reports what happened instead of losing the connection under itself.
+    if outcome.stop_daemon {
+        let _ = stop.send(());
+    }
     result
 }
 
@@ -190,15 +196,25 @@ impl<S: AsyncWrite + Unpin> Frames<S> {
     }
 }
 
-type Handled = std::result::Result<(), ControlError>;
+/// What handling a request leaves for the connection to do afterwards.
+#[derive(Debug, Default, Clone, Copy)]
+struct Outcome {
+    /// `synch daemon stop`: bring the daemon down once this response is out.
+    stop_daemon: bool,
+}
+
+type Handled = std::result::Result<Outcome, ControlError>;
+
+/// What a helper that only writes frames returns.
+type Done = std::result::Result<(), ControlError>;
 
 /// Serves one request.
 async fn dispatch<S: AsyncWrite + Unpin>(
     node: &Node,
-    stop: &broadcast::Sender<()>,
     request: Request,
     out: &mut Frames<S>,
 ) -> Handled {
+    let mut outcome = Outcome::default();
     match request {
         Request::Id => {
             out.line(format!("origin: {}", node.origin())).await?;
@@ -302,7 +318,7 @@ async fn dispatch<S: AsyncWrite + Unpin>(
 
         Request::DaemonStop => {
             out.line("stopping").await?;
-            let _ = stop.send(());
+            outcome.stop_daemon = true;
         }
 
         Request::TrustAdd {
@@ -689,7 +705,7 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             }
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Streams a verified byte range out of the CAS as `Chunk` frames.
@@ -705,7 +721,7 @@ async fn stream_entry<S: AsyncWrite + Unpin>(
     path: &str,
     start: u64,
     len: Option<u64>,
-) -> Handled {
+) -> Done {
     let range = node
         .prepare_entry_range(origin, space, path, start, len)
         .await?;
@@ -722,7 +738,7 @@ async fn stream_entry<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn refresh_domains<S: AsyncWrite + Unpin>(node: &Node, out: &mut Frames<S>) -> Handled {
+async fn refresh_domains<S: AsyncWrite + Unpin>(node: &Node, out: &mut Frames<S>) -> Done {
     let resolver = match synch_net::DnssecResolver::from_system() {
         Ok(resolver) => resolver,
         Err(e) => {
