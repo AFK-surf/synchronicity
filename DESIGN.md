@@ -114,7 +114,7 @@ For DNS-discovered members, the `OriginId` comes from the `id=` field of the TXT
 record (§3.2), scoped by the membership domain: `nas@cluster.example.com`. For
 statically trusted peers without a name, the OriginId degenerates to the device key
 itself — self-certifying, but not rotatable. Static trust may also bind a name
-(`sync trust add --as nas <node-id>`), which makes rotation available without DNS.
+(`synch trust add --as nas <node-id>`), which makes rotation available without DNS.
 
 A **binding** is the association `OriginId → device key`, with a source (static or
 dns) and a validity window. An origin may have several simultaneously bound device
@@ -122,7 +122,7 @@ keys (the rotation window, §3.4). Every trust check and every head verification
 through the bindings table — nothing in the durable data model references a bare
 device key as an identity.
 
-Device secret keys are generated on `sync init` (and on `sync key rotate`) and stored
+Device secret keys are generated on `synch init` (and on `synch key rotate`) and stored
 in the SQLite database (created `0600` inside the data directory). Display/interchange
 encoding for keys is z-base-32 (iroh's native encoding).
 
@@ -133,19 +133,19 @@ A remote node is **trusted** iff at least one of the following holds:
 1. **Static trust** — its public key was explicitly added:
 
    ```
-   sync trust add <node-id> [--note "zeynep's laptop"]
+   synch trust add <node-id> [--note "zeynep's laptop"]
    ```
 
    Static trust is unilateral per node and never expires (until removed). For two nodes
    to sync, *each* must trust the other; there is no transitive trust. With `--as
-   <name>` the binding is to a named OriginId (rotatable via `sync trust rebind`);
+   <name>` the binding is to a named OriginId (rotatable via `synch trust rebind`);
    without it, the key is the identity.
 
 2. **DNSSEC-based discovery** — the node's key appears in a TXT record of a configured
    membership domain:
 
    ```
-   sync domain add cluster.example.com
+   synch domain add cluster.example.com
    ```
 
    The resolver queries `_synchronicity.<domain> TXT` and accepts records of the form:
@@ -167,13 +167,13 @@ A remote node is **trusted** iff at least one of the following holds:
 
    Malformed-set rules: if the same `nk` appears under two different `id=`s (or once
    with and once without `id=`), self-detection refuses to guess — the node requires
-   an explicit `--id`, and `sync doctor` reports the ambiguity. Two different
+   an explicit `--id`, and `synch doctor` reports the ambiguity. Two different
    machines accidentally sharing one `id=` is indistinguishable from a rotation
    window at the resolver; it manifests as *sustained* same-seq equivocation, which
-   `sync doctor` diagnoses with the likely cause ("duplicate id assignment?").
+   `synch doctor` diagnoses with the likely cause ("duplicate id assignment?").
    Finally, a key statically trusted as `OriginId::Key` while publishing heads under
    a Named origin would sync nothing, silently — doctor detects the mismatch and
-   suggests the missing `--as` name or `sync domain add`.
+   suggests the missing `--as` name or `synch domain add`.
 
    The lookup MUST be DNSSEC-validated end to end. We use
    `hickory-resolver` with in-process DNSSEC validation (we do not trust an upstream
@@ -185,7 +185,7 @@ A remote node is **trusted** iff at least one of the following holds:
    disappears from DNS expires after `dns_trust_grace` (default: 1 TTL + 10 minutes)
    to absorb propagation glitches. Adding a machine to the cluster becomes: generate
    identity, publish one TXT record. A node learns its *own* OriginId either
-   explicitly (`sync init --id nas@cluster.example.com`) or by auto-detection —
+   explicitly (`synch init --id nas@cluster.example.com`) or by auto-detection —
    finding its device key in the validated record set; explicit config wins on
    conflict.
 
@@ -217,7 +217,7 @@ No trie rewrite, no re-hashing, no history loss.
 
 **Planned rotation** (origin `nas@cluster.example.com`, `K_old → K_new`):
 
-1. `sync key rotate` generates `K_new` locally, keeps `K_old` active, and prints the
+1. `synch key rotate` generates `K_new` locally, keeps `K_old` active, and prints the
    TXT record to publish. The node continues operating (transport + signing) on
    `K_old`.
 2. The operator publishes the second record: `v=sync1 id=nas nk=<K_new>`, alongside
@@ -232,7 +232,7 @@ No trie rewrite, no re-hashing, no history loss.
    triggers an immediate DNS re-resolution.
 4. The operator removes the `K_old` record; its binding expires after TTL + grace,
    and the node deletes the `K_old` secret after that. Peers log every rebinding, and
-   `sync doctor` lists recent binding changes per origin. Validated DNS is the *sole*
+   `synch doctor` lists recent binding changes per origin. Validated DNS is the *sole*
    authority on which keys hold an origin — the protocol makes no attempt to
    distinguish a legitimate rotation from a domain-level rebinding; see §12 for what
    that implies and §13 for the deferred hardening.
@@ -251,9 +251,9 @@ peer against heads older than what *that peer* has already verified — it is no
 global no-fork property. If a peer holding newer pre-loss heads was partitioned
 throughout recovery, a fork exists: when that peer returns, its retired-key head is
 kept as **fork evidence** (heads verified while their signer was bound remain
-provable history, §4.4), `sync doctor` surfaces it on every node ("origin nas has
+provable history, §4.4), `synch doctor` surfaces it on every node ("origin nas has
 unreconciled pre-recovery history at seq 100"), and the affected entries' content
-remains fetchable for manual salvage via `sync take`. The fork is resolved by the
+remains fetchable for manual salvage via `synch take`. The fork is resolved by the
 origin's operator, never silently by the protocol.
 
 **During the window**, both keys could in principle sign competing heads; the
@@ -261,7 +261,7 @@ deterministic `(seq, root)` ordering (§4.4) still converges everyone, and compe
 same-seq heads are flagged as equivocation exactly as in the single-key case. A
 well-behaved node signs with exactly one key at any moment.
 
-Static-trust named origins rotate the same way, minus DNS: `sync trust rebind nas
+Static-trust named origins rotate the same way, minus DNS: `synch trust rebind nas
 <new-node-id>` on each peer.
 
 One availability edge is accepted deliberately: a peer that first learns of an origin
@@ -294,7 +294,7 @@ mirrors directory structure, and a directory listing is a range scan over
 `f:<space>/<dir>/`.
 
 A **space** is a named sync root (like a Syncthing folder): a user configures
-`sync space add photos ~/Pictures`, and that subtree is indexed under `f:photos/...`.
+`synch space add photos ~/Pictures`, and that subtree is indexed under `f:photos/...`.
 Spaces are the unit of sharing policy and of local materialization.
 
 ### 4.2 Records
@@ -341,7 +341,7 @@ Notes:
   replicated whole (head flip + root diff), so a deleted key simply vanishes from
   the new root and the diff surfaces it, even to peers partitioned for years. Their
   purpose is interpretation: distinguishing "deleted at seq N" from "never existed"
-  in `sync status`/`sync log` and in one-shot proofs (§9.3). They are retained for
+  in `synch status`/`synch log` and in one-shot proofs (§9.3). They are retained for
   `tombstone_ttl` (default 90 days), then dropped in a later root. The real residual
   risk is different: the *origin itself* restoring from an old database backup
   republishes its old trie at a higher seq, resurrecting its own deletions — visible
@@ -359,7 +359,7 @@ Notes:
 
 ### 4.3 The Merkle-Patricia Trie
 
-We implement our own small MPT (crate `sync-mpt`, no consensus-chain baggage):
+We implement our own small MPT (crate `synch-mpt`, no consensus-chain baggage):
 
 - **Radix-16** (nibble) trie with three node kinds, à la Ethereum, but simplified:
 
@@ -412,7 +412,7 @@ struct SignedHead {
 - Ordering is `(seq, root)` lexicographic. `created_at` is never used for ordering
   (clocks lie); it is display metadata.
 - **Equivocation** (an origin signing two different roots at the same seq) is detected
-  and logged loudly (`sync doctor` reports it); the deterministic `(seq, root)` max —
+  and logged loudly (`synch doctor` reports it); the deterministic `(seq, root)` max —
   which the §5.2 acceptance rule implements exactly (equal-seq, greater-root heads
   are accepted, not ignored) — still converges everyone to the same head. Both
   conflicting signed heads are retained in `head_history` as proof. Equivocation only
@@ -521,7 +521,7 @@ sub-second via push.
 ### 5.4 Trie garbage collection
 
 Old roots are kept for `root_retention` (default 7 days) to serve laggard peers cheap
-diffs and to power `sync log` history (§8). GC is mark-and-sweep in SQLite: mark from
+diffs and to power `synch log` history (§8). GC is mark-and-sweep in SQLite: mark from
 all retained heads (each origin's **complete and pending** heads + retained history
 roots — pending heads must be in the mark set or GC would eat an in-progress
 bootstrap), sweep unmarked
@@ -606,7 +606,7 @@ The fetcher:
 2. Streams and verifies groups as they arrive; verified groups are committed to the
    CAS and the completeness bitmap immediately (progress survives restarts).
 3. Re-plans on provider failure or on ads changing. Wants are a persistent queue
-   (`want` table) with priorities: explicit `sync get` > policy mirror > prefetch.
+   (`want` table) with priorities: explicit `synch get` > policy mirror > prefetch.
 
 This is intentionally the same shape as iroh-blobs' protocol; we keep our own ALPN and
 message frame so the availability semantics (partial serving, `SliceEnd`) stay under
@@ -640,12 +640,12 @@ defaults (`.DS_Store`, `Thumbs.db`, temp/lock patterns).
 
 Since there is no unified tree, materialization is **per (origin, space)**:
 
-- `sync get <origin>:<space>/<path> [-o dest]` — one-shot fetch into a local file.
-- `sync mirror add <origin>:<space> <local-dir>` — continuous read-only mirror: the
+- `synch get <origin>:<space>/<path> [-o dest]` — one-shot fetch into a local file.
+- `synch mirror add <origin>:<space> <local-dir>` — continuous read-only mirror: the
   engine tracks that origin's `f:` records for the space and keeps the directory in
   sync (fetching content via §6.4). Mirrored trees are never indexed back into the
   local origin trie (no echo).
-- `sync cat <origin>:<space>/<path> [--range a..b]` — stream to stdout with verified
+- `synch cat <origin>:<space>/<path> [--range a..b]` — stream to stdout with verified
   random access; this is where hash-tree reads shine (e.g. seeking in a large video).
 
 Materialization safety: trie paths are case-sensitive NFC UTF-8, but local
@@ -655,12 +655,12 @@ writes the lexicographically first and **skips and reports** the rest — never
 silently clobbers. Names invalid on the target platform (Windows reserved device
 names, trailing dot/space, forbidden characters) are likewise skipped and reported.
 And mirror targets may not overlap any configured space root (or vice versa):
-`sync mirror add` and `sync space add` refuse overlapping paths, which makes the
+`synch mirror add` and `synch space add` refuse overlapping paths, which makes the
 "no echo" guarantee structural rather than conventional.
 
 Two-way "shared folder" workflows are composed from primitives: both nodes index their
 own copy of a space (same space id), and divergence between them is surfaced by
-`sync status` (§8) for explicit adoption with `sync take`.
+`synch status` (§8) for explicit adoption with `synch take`.
 
 ---
 
@@ -670,17 +670,17 @@ Principles: **every origin publishes only its own copy; the system never merges.
 
 - Each `(origin, space, path)` triple is an independent assertion: "this is my current
   copy". The cluster-wide state of a path is the *set* of such assertions.
-- **Divergence is data, not an error.** `sync status <space>/<path>` shows all origins'
+- **Divergence is data, not an error.** `synch status <space>/<path>` shows all origins'
   entries side by side (size, mtime, content root, seq). Two origins whose content
   roots match are "in agreement" — a purely observational notion.
-- **Adoption is explicit**: `sync take <origin>:<space>/<path>` fetches that origin's
+- **Adoption is explicit**: `synch take <origin>:<space>/<path>` fetches that origin's
   content, writes it into the local space, and thereby (via the indexing pipeline)
   publishes it as the local node's own new entry. `prev` is set to the replaced local
   content root, recording 1-step lineage so UIs can distinguish "adopted theirs on top
   of X" from "changed independently".
 - **History**: retained old roots (§5.4) give each origin a time machine over its own
-  publishes: `sync log <space>/<path>` walks historical roots' leaves for the key;
-  `sync cat --at <seq>` reads an old version if its content is still in someone's CAS
+  publishes: `synch log <space>/<path>` walks historical roots' leaves for the key;
+  `synch cat --at <seq>` reads an old version if its content is still in someone's CAS
   (content GC is pin/retention-driven, so history depth is a storage policy, not a
   protocol constant).
 - No branches, no merge commits, no vector clocks in v1. `prev` plus per-origin `seq`
@@ -691,15 +691,22 @@ Principles: **every origin publishes only its own copy; the system never merges.
 
 ## 9. CLI and process model
 
-### 9.1 One binary, no dependencies
+### 9.1 Two binaries, no dependencies
 
-A single `sync` binary (name negotiable; `sy` alias) built with:
+The workspace ships **two binary targets**, both thin argument-parsing shells over
+the same reusable library crates (§11):
+
+- **`synch`** — the CLI and daemon (§9.2). Named `synch`, not `sync`: the bare word
+  collides with coreutils' `sync(1)` and half the package ecosystem.
+- **`synch-s3`** — an S3-compatible gateway server (§9.4).
+
+Both are dependency-free static binaries:
 
 - `rusqlite` with the `bundled` feature (SQLite compiled in — no system SQLite),
 - `rustls` everywhere (no OpenSSL),
 - musl static builds for Linux releases; standard static-ish builds for macOS/Windows.
 
-`sync` is both the CLI and the daemon (`sync daemon run`). The CLI talks to a running
+`synch` is both the CLI and the daemon (`synch daemon run`). The CLI talks to a running
 daemon over a local control socket (Unix domain socket; named pipe on Windows) with a
 random per-datadir token; if no daemon is running, commands that can run one-shot do so
 in-process against the same SQLite DB.
@@ -707,39 +714,70 @@ in-process against the same SQLite DB.
 ### 9.2 Command surface (v1)
 
 ```
-sync init [--id <name>@<domain>]            create identity + database
-sync id                                     print OriginId + current device key(s)
-sync key rotate|ls|retire                   device-key rotation (§3.4)
-sync daemon run|status|stop
+synch init [--id <name>@<domain>]            create identity + database
+synch id                                     print OriginId + current device key(s)
+synch key rotate|ls|retire                   device-key rotation (§3.4)
+synch daemon run|status|stop
 
-sync trust add [--as <name>]|rebind|rm|ls   static membership (named or key-identified)
-sync domain add|rm|ls <domain>              DNSSEC membership
-sync peers                                  live peers, addresses, last sync, lag
+synch trust add [--as <name>]|rebind|rm|ls   static membership (named or key-identified)
+synch domain add|rm|ls <domain>              DNSSEC membership
+synch peers                                  live peers, addresses, last sync, lag
 
-sync space add <id> <path>                  index a local directory as a space
-sync space ls|rm
+synch space add <id> <path>                  index a local directory as a space
+synch space ls|rm
 
-sync ls   [<origin>:]<space>/[<dir>]        list entries (default: all origins, merged view)
-sync status [<space>[/<path>]]              agreement/divergence across origins
-sync cat  <origin>:<space>/<path> [--range] verified streaming read
-sync get  <origin>:<space>/<path> [-o …]    fetch to file
-sync take <origin>:<space>/<path>           adopt a peer's version as my own
-sync log  [<origin>:]<space>/<path>         per-origin publish history
-sync mirror add|rm|ls                       continuous read-only materialization
+synch ls   [<origin>:]<space>/[<dir>]        list entries (default: all origins, merged view)
+synch status [<space>[/<path>]]              agreement/divergence across origins
+synch cat  <origin>:<space>/<path> [--range] verified streaming read
+synch get  <origin>:<space>/<path> [-o …]    fetch to file
+synch take <origin>:<space>/<path>           adopt a peer's version as my own
+synch log  [<origin>:]<space>/<path>         per-origin publish history
+synch mirror add|rm|ls                       continuous read-only materialization
 
-sync pin add|rm|ls <root|path>              keep content in CAS regardless of policy
-sync doctor                                 connectivity, DNSSEC, equivocation, GC stats
+synch pin add|rm|ls <root|path>              keep content in CAS regardless of policy
+synch doctor                                 connectivity, DNSSEC, equivocation, GC stats
 ```
 
 ### 9.3 One-shot mode
 
-`sync cat/get/ls` work without a daemon: open endpoint, `Hello` with any reachable
+`synch cat/get/ls` work without a daemon: open endpoint, `Hello` with any reachable
 trusted peer, pull the relevant origin's head + the trie path for the requested key
 (Merkle-proof-verified — no full trie replication needed for a single read), resolve
 holders with `FindProviders` (§5.1 — unverified hints from the helper peer, safe
 because content is hash-verified regardless; a bad hint costs a wasted dial, never
 integrity), fetch the blob slice, exit. This keeps the "dependency-free CLI" promise
 meaningful even on machines that never run the daemon.
+
+### 9.4 S3-compatible gateway (`synch-s3`)
+
+The second binary target embeds the same engine crate and exposes a subset of the S3
+HTTP API, so existing S3 tooling (aws cli, rclone, restic, mc, the SDKs) can read
+and write a synchronicity cluster without knowing anything about it.
+
+- **Bucket mapping**: a bucket names a *view* — `synch-s3 bucket add <bucket>
+  <origin>:<space>`. Reads serve that origin's published entries; content flows
+  through the normal verified path (local CAS first, then peer fetch). Buckets
+  whose origin is the local node are writable; foreign-origin buckets are
+  read-only — the version model (§8) forbids publishing someone else's view.
+- **Operations (v1)**:
+  - `GetObject` — including `Range` requests, served as verified range reads (§6.1).
+  - `HeadObject` — size, mtime, ETag straight from the entry metadata; no content
+    fetch.
+  - `ListObjectsV2` — prefix + delimiter listing as a range scan over the `f:`
+    namespace (§4.3); continuation tokens are trie cursor positions.
+  - `PutObject` — writes into the local space directory, then runs the normal
+    ingest pipeline (hash → CAS → stage entry, §7.1); responds once durably staged,
+    with the head publish following the usual batching.
+- **ETag** is the object's blake3 root hash, hex, quoted. S3 permits opaque ETags
+  (MD5 equivalence is only conventional for non-multipart uploads); tooling that
+  insists on MD5 validation must have it disabled.
+- **Auth**: SigV4 with static access-key pairs configured on the gateway
+  (`synch-s3 key add`), or `--anonymous` for localhost-only development. The
+  gateway authenticates S3 clients only; cluster access is the node's own
+  membership (§3).
+- **Not in v1**: DeleteObject (maps naturally to a tombstone publish — first in
+  line for v1.1), multipart upload, CopyObject, bucket versioning APIs, presigned
+  URLs.
 
 ---
 
@@ -848,38 +886,53 @@ CREATE TABLE peers_seen    (node_id BLOB PRIMARY KEY, last_addr BLOB, last_seen 
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can
-always be rebuilt from `trie_nodes` (`sync doctor --rebuild`).
+always be rebuilt from `trie_nodes` (`synch doctor --rebuild`).
 
 ---
 
 ## 11. Crate layout
 
-Cargo workspace:
+Cargo workspace. All logic lives in reusable library crates — the two binaries are
+thin shells, so any Rust application can embed a full node by depending on
+`synch-engine`. Crate names carry the `synch-` prefix throughout (`sync` is far too
+common a name to squat on — coreutils, countless crates):
 
 ```
 synchronicity/
 ├── crates/
-│   ├── sync-core      # types: NodeId, Hash, records, keys, signed heads; postcard schemas
-│   ├── sync-mpt       # the Merkle-Patricia Trie: nodes, hashing, diff, proofs, cursors
-│   ├── sync-store     # SQLite layer + CAS (bao-tree outboards, bitmaps, GC)
-│   ├── sync-net       # iroh endpoint, ALPN handlers: mptsync + blob protocols, DNSSEC resolver
-│   ├── sync-engine    # scanner/watcher/publisher, anti-entropy scheduler, fetcher, mirrors
-│   └── sync-cli       # the `sync` binary: clap CLI, daemon, control socket
-└── docs/
+│   ├── synch-core     # types: OriginId, Hash, records, keys, signed heads; postcard schemas
+│   ├── synch-mpt      # the Merkle-Patricia Trie: nodes, hashing, diff, proofs, cursors
+│   ├── synch-store    # SQLite layer + CAS (bao-tree outboards, bitmaps, GC)
+│   ├── synch-net      # iroh endpoint, ALPN handlers: mptsync + blob protocols, DNSSEC resolver
+│   ├── synch-engine   # the embeddable node API: scanner/watcher/publisher, anti-entropy
+│   │                  # scheduler, fetcher, mirrors — everything a host app needs
+│   ├── synch-cli      # binary target `synch`: clap CLI, daemon, control socket
+│   └── synch-s3       # binary target `synch-s3`: S3-compatible gateway (§9.4)
+└── .github/workflows/ # ci.yml, release.yml (below)
 ```
 
 Key dependencies: `iroh`, `bao-tree`, `blake3`, `ed25519-dalek` (via iroh),
 `rusqlite` (bundled), `notify`, `hickory-resolver` (dnssec), `tokio`, `postcard`,
-`serde`, `clap`, `tracing`, `directories`.
+`serde`, `clap`, `tracing`, `directories`; `axum`/`hyper` (rustls) for `synch-s3`.
 
 Testing strategy:
 
-- `sync-mpt`: property tests (proptest) — insert/delete/iterate vs. a BTreeMap model;
+- `synch-mpt`: property tests (proptest) — insert/delete/iterate vs. a BTreeMap model;
   root-hash determinism; diff completeness (diff(a,b) applied to a yields b).
 - `mptsync`: in-memory duplex-transport simulation of N nodes with random partitions,
   message loss, and interleaved publishes; assert convergence of all heads and tries.
-- `sync-engine`: temp-dir integration tests across 2–3 real endpoints on localhost.
-- Cross-platform CI matrix (linux-musl, macos, windows) from day one.
+- `synch-engine`: temp-dir integration tests across 2–3 real endpoints on localhost.
+- `synch-s3`: integration tests driving the gateway over plain HTTP (GET/HEAD/LIST/
+  PUT round-trips, Range reads, ETag checks).
+
+CI (GitHub Actions):
+
+- `ci.yml` — on push and pull request: rustfmt check, `clippy -D warnings`, and the
+  full test suite across a linux / macos / windows matrix.
+- `release.yml` — on `v*` tags: release builds of both binaries for
+  x86_64-unknown-linux-musl (fully static), aarch64-unknown-linux-musl,
+  macOS (arm64 + x86_64), and Windows x86_64, attached to a GitHub Release with
+  checksums.
 
 ---
 
@@ -904,9 +957,9 @@ Testing strategy:
   protocol makes no attempt to distinguish a legitimate rotation from a domain-level
   takeover — a cryptographic continuity scheme (old-key cross-signing of rebindings)
   was considered and deliberately deferred as complexity not yet earned (§13). What
-  v1 does provide: every rebinding is logged and listed by `sync doctor`, plus the
+  v1 does provide: every rebinding is logged and listed by `synch doctor`, plus the
   base mitigations — validated in-process resolution (no resolver trust),
-  TTL-bounded caching, and `sync doctor` surfacing the full live member set,
+  TTL-bounded caching, and `synch doctor` surfacing the full live member set,
   bindings, and their provenance. Deployments that can't accept domain-controller
   power use static trust only. The flip side of
   failing closed is worth stating: a prolonged DNSSEC outage expires dns bindings
@@ -948,7 +1001,7 @@ Testing strategy:
   already permits it).
 - Smarter placement policies ("keep ≥ 2 replicas of every object cluster-wide"),
   built on the same `BlobAd` availability data.
-- A local read-only HTTP gateway (`sync serve`) for browser access; optional
+- A local read-only HTTP gateway (`synch serve`) for browser access; optional
   platform-specific mounts (FUSE/WinFsp/NFSv3-loopback) as *plugins*, never as core.
 - Bandwidth scheduling / QoS between anti-entropy and bulk fetches.
 
@@ -958,14 +1011,14 @@ Testing strategy:
 
 Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`.
 
-1. `nas` runs `sync space add media /srv/media`. The scanner hashes 40 k files,
+1. `nas` runs `synch space add media /srv/media`. The scanner hashes 40 k files,
    the publisher signs head `(seq=1, root=r1)` containing 40 k `f:` records and 40 k
    per-object `b:` ads.
 2. `laptop` connects (dns-discovered membership, iroh-dialed), `Hello` exchanges heads,
    sees `nas@1 > nas@0`, pulls the trie breadth-first with `GetNodes` — a few MB of
    trie nodes for 40 k entries. It now knows every path, size, mtime, and object root
    on the NAS, holding zero content bytes.
-3. `laptop` runs `sync cat nas:media/talks/keynote.mp4 --range 0..`. Providers for the
+3. `laptop` runs `synch cat nas:media/talks/keynote.mp4 --range 0..`. Providers for the
    root resolve to `{nas}`; the fetcher streams bao-verified slices; the player seeks —
    each seek is a new verified range read. Fetched groups land in laptop's CAS, and
    its next milestone ad update (§6.3) advertises its partial — later complete —
@@ -974,11 +1027,11 @@ Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`
    now returns `{nas, laptop}` and it pulls from both in parallel.
 5. `nas` edits a file. Watcher → rescan → head `(seq=2, r2)` → `HeadPush` to both peers;
    each pulls exactly the changed path's trie nodes. `laptop`'s stale copy of the old
-   content remains valid (content-addressed), and `sync status media/…` on any node
+   content remains valid (content-addressed), and `synch status media/…` on any node
    shows `nas` at the new root and `laptop` still advertising (and pinning, if it
    chose) the old object — divergence visible, nothing auto-resolved, adoption one
-   `sync take` away.
-6. `nas`'s operator rotates its key: `sync key rotate`, publish the second
+   `synch take` away.
+6. `nas`'s operator rotates its key: `synch key rotate`, publish the second
    `id=nas nk=<K_new>` TXT record, wait for validated visibility. `nas` re-signs its
    head as `K_new` at `seq=3` and brings up the `K_new` endpoint alongside the old
    one for the TTL window. `laptop` and `vps` pick up the rebinding on their next
