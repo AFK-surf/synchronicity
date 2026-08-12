@@ -48,8 +48,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The test suite binds only loopback sockets and disables relays and
       # discovery, so it needs no network access.
-      - run: cargo test --workspace --all-targets
-      - run: cargo test --workspace --doc
+      # --no-fail-fast so one run reports every platform failure, rather than
+      # surfacing them one CI round-trip at a time.
+      - run: cargo test --workspace --all-targets --no-fail-fast
+      - run: cargo test --workspace --doc --no-fail-fast
 
   docs:
     name: rustdoc

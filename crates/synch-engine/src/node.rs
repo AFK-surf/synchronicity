@@ -232,7 +232,7 @@ impl Node {
         validate_space(id)?;
         let path = canonical_dir(path.as_ref())?;
         for mirror in self.store().mirrors()? {
-            if paths_overlap(&path, Path::new(&mirror.local_path)) {
+            if paths_overlap(&path, &stored_root(&mirror.local_path)) {
                 return Err(EngineError::invalid(format!(
                     "space root {} overlaps mirror {}",
                     path.display(),
@@ -241,7 +241,7 @@ impl Node {
             }
         }
         for space in self.store().spaces()? {
-            if space.id != id && paths_overlap(&path, Path::new(&space.local_path)) {
+            if space.id != id && paths_overlap(&path, &stored_root(&space.local_path)) {
                 return Err(EngineError::invalid(format!(
                     "space root {} overlaps space {}",
                     path.display(),
@@ -448,6 +448,20 @@ pub fn paths_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
+/// Resolves a stored space or mirror root for comparison against a freshly
+/// canonicalized path.
+///
+/// Both registration paths canonicalize before storing, but a stored root can
+/// still be non-canonical: it may predate that, or a symlink may have appeared
+/// along it since. Comparing a canonical path against a raw one silently
+/// misses overlaps — on macOS every temp path under `/var` resolves to
+/// `/private/var`, so the guard passed a directory it should have refused.
+/// Falls back to the raw value when the directory no longer exists.
+pub fn stored_root(path: &str) -> PathBuf {
+    let raw = PathBuf::from(path);
+    std::fs::canonicalize(&raw).unwrap_or(raw)
+}
+
 /// Encodes an endpoint address for the `peers_seen.last_addr` column.
 pub fn encode_addr(addr: &EndpointAddr) -> Vec<u8> {
     let parts: Vec<String> = addr
@@ -620,6 +634,33 @@ mod tests {
         // And a nested subdirectory is caught too, so "no echo" is structural.
         let nested = shared.path().join("sub");
         assert!(node.add_space("nested", &nested).is_err());
+        node.shutdown().await.unwrap();
+    }
+
+    /// A mirror root stored through a symlink still has to be caught: the
+    /// incoming path is canonicalized, so the stored one must be too. This is
+    /// what fails on macOS, where every temp path under `/var` resolves to
+    /// `/private/var`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlap_is_detected_through_symlinked_roots() {
+        let dir = node_dir();
+        let node = spawn(dir.path(), None).await;
+        let real = tempfile::tempdir().unwrap();
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("via-symlink");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        node.store()
+            .put_mirror(
+                &OriginId::named("nas", "x.example").unwrap(),
+                "media",
+                &link.to_string_lossy(),
+            )
+            .unwrap();
+
+        let err = node.add_space("media", real.path()).unwrap_err();
+        assert!(err.to_string().contains("overlaps mirror"));
         node.shutdown().await.unwrap();
     }
 

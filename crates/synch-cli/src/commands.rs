@@ -301,7 +301,7 @@ async fn dispatch(cli: &Cli, node: &Node) -> Result<()> {
                 for head in node.store().head_history(&origin)? {
                     roots.push((head.seq, head.root));
                 }
-                roots.sort_by(|a, b| b.0.cmp(&a.0));
+                roots.sort_by_key(|r| std::cmp::Reverse(r.0));
                 roots.dedup();
                 let mut last: Option<Option<Vec<u8>>> = None;
                 for (seq, root) in roots {

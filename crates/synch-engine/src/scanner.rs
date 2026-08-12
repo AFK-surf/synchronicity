@@ -288,17 +288,12 @@ fn file_identity(metadata: &std::fs::Metadata) -> Option<Vec<u8>> {
         id.extend_from_slice(&metadata.ino().to_le_bytes());
         Some(id)
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        use std::os::windows::fs::MetadataExt;
-        // `file_index` is only populated for handles opened with the right
-        // flags, so it is genuinely optional here.
-        metadata
-            .file_index()
-            .map(|index| index.to_le_bytes().to_vec())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
+        // Windows exposes a file index only via `MetadataExt::file_index`,
+        // which is still unstable (rust-lang/rust#63010), and reading it
+        // otherwise costs an open handle per file. Identity is optional by
+        // design, so change detection falls back to (size, mtime) there.
         let _ = metadata;
         None
     }

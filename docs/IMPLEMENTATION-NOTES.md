@@ -146,10 +146,16 @@ handled correctly.
 ### §7.1 — `file_id`
 
 The `(size, mtime_ns, file_id)` change-detection triple uses `(dev, ino)` on
-Unix and `file_index` on Windows. Windows only populates `file_index` for
-handles opened with particular flags, so it is genuinely optional there; the
-size and mtime comparison still applies, and a full re-hash on ambiguity is the
-safe direction.
+Unix and **no file identity at all on Windows**. `std::os::windows::fs::
+MetadataExt::file_index` is still unstable (rust-lang/rust#63010) and does not
+compile on stable, and obtaining the index otherwise costs an open handle per
+file during every scan. Identity is `Option` by design, so Windows falls back
+to comparing size and mtime, and re-hashes on ambiguity — the safe direction.
+
+The visible consequence is narrow: a Windows file replaced by a different file
+with byte-identical size and mtime is not re-hashed until the next full scan.
+Restoring identity would mean calling `GetFileInformationByHandle` through a
+`windows-sys` dependency; deferred as not yet worth the dependency.
 
 ### §9.4 — `PutObject` publish timing
 

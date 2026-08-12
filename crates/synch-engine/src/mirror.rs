@@ -18,7 +18,7 @@ use synch_core::{EntryKind, OriginId};
 
 use crate::{
     error::{EngineError, Result},
-    node::{paths_overlap, Node},
+    node::{paths_overlap, stored_root, Node},
 };
 
 /// What one mirror pass did.
@@ -46,7 +46,7 @@ impl Node {
         std::fs::create_dir_all(path)?;
         let path = std::fs::canonicalize(path)?;
         for existing in self.store().spaces()? {
-            if paths_overlap(&path, Path::new(&existing.local_path)) {
+            if paths_overlap(&path, &stored_root(&existing.local_path)) {
                 return Err(EngineError::invalid(format!(
                     "mirror target {} overlaps space {}",
                     path.display(),
@@ -56,7 +56,7 @@ impl Node {
         }
         for existing in self.store().mirrors()? {
             if (&existing.origin != origin || existing.space != space)
-                && paths_overlap(&path, Path::new(&existing.local_path))
+                && paths_overlap(&path, &stored_root(&existing.local_path))
             {
                 return Err(EngineError::invalid(format!(
                     "mirror target {} overlaps mirror {}:{}",
