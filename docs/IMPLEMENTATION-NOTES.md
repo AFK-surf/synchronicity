@@ -75,11 +75,13 @@ The 32 random bytes in `control.token` come from `SecretKey::generate()`, which
 is the same OS CSPRNG that mints device keys, rather than from a separate `rand`
 dependency at a version this workspace does not otherwise pin.
 
-Filesystem permissions are enforced where the platform has them: the data
-directory is `0700` and the token and socket are `0600` on Unix, created that
-way rather than chmod-ed afterwards. Windows has no equivalent, which is the
-case §9.3 already anticipates — there the token carries the whole check, and it
-is checked on every request on both platforms.
+Filesystem permissions are enforced where the platform has them: on Unix the
+data directory is `0700` and the token and socket are `0600`. The token file is
+*created* `0600` rather than chmod-ed afterwards; the socket can only be
+restricted once `bind` has made it, and the `0700` directory around it is what
+covers that instant. Windows has no equivalent, which is the case §9.3 already
+anticipates — there the token carries the whole check, and it is checked on
+every request on both platforms.
 
 ### §10 — the writer task
 
