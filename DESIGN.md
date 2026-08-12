@@ -224,31 +224,22 @@ No trie rewrite, no re-hashing, no history loss.
    the existing one. Both keys are now bound; peers pick this up on their next
    validated refresh.
 3. The node polls its own domain until it observes the validated `K_new` binding, then
-   switches over: it appends a **rotation statement** to the append-only rotation
-   chain in its trie at `m:rot/<n>` (n strictly increasing) —
-   `RotationStmt { n, old: K_old, new: K_new, at_seq, prev: Hash, sig_old }`, where
-   `prev` is the hash of statement `n-1` (a genesis sentinel for `n = 0`) and
-   `sig_old` is `K_old`'s signature over
-   `("sync-rotate/1" || origin || n || old || new || at_seq || prev)` — then re-signs
-   its current root as a new head (`seq+1`, `signed_by = K_new`) and brings up a
-   second iroh endpoint as `K_new`. **Both endpoints stay live** until the old
-   binding has expired everywhere (worst case one DNS TTL, clamp max 24 h), so peers
-   whose DNS refresh lags are never locked out mid-window; an inbound connection
-   attempt from an unknown key additionally triggers an immediate DNS re-resolution.
-4. Peers verify the **chain, not just the latest link**: a rebinding has *verified
-   continuity* iff a hash- and signature-linked path of rotation statements connects
-   some key the peer previously held a binding for to the newly bound key. Because
-   statements are append-only (a single overwritten slot would break this), a peer
-   partitioned across several rotations A→B→C still verifies A⇝C. The operator then
-   removes the `K_old` record; its binding expires after TTL + grace, and the node
-   deletes the `K_old` secret after that.
+   switches over: it re-signs its current root as a new head (`seq+1`,
+   `signed_by = K_new`) and brings up a second iroh endpoint as `K_new`. **Both
+   endpoints stay live** until the old binding has expired everywhere (worst case one
+   DNS TTL, clamp max 24 h), so peers whose DNS refresh lags are never locked out
+   mid-window; an inbound connection attempt from an unknown key additionally
+   triggers an immediate DNS re-resolution.
+4. The operator removes the `K_old` record; its binding expires after TTL + grace,
+   and the node deletes the `K_old` secret after that. Peers log every rebinding, and
+   `sync doctor` lists recent binding changes per origin. Validated DNS is the *sole*
+   authority on which keys hold an origin — the protocol makes no attempt to
+   distinguish a legitimate rotation from a domain-level rebinding; see §12 for what
+   that implies and §13 for the deferred hardening.
 
-**Key-loss recovery** (no cross-signature possible): the operator replaces the TXT
-record with a fresh `K_new`. DNS is authoritative, so peers accept the rebinding by
-default — but an *uncross-signed* rebinding is logged loudly and flagged by
-`sync doctor` on every node until acknowledged, since it is indistinguishable from a
-domain-level takeover (§12); under `rotation_policy = cross-signed-only` it is
-refused outright. The recovering node (fresh DB, same `id=` name) must assume the
+**Key-loss recovery**: the operator replaces the TXT record with a fresh `K_new` —
+from the cluster's point of view this is just a rotation without the overlap window.
+The recovering node (fresh DB, same `id=` name) must assume the
 peers it can currently reach may not hold its true latest head, so it: (1) collects
 heads for its own origin from every reachable peer for at least `recovery_quiesce`
 (default 1 h) without publishing, then (2) resumes at `max_observed_seq + seq_gap`
@@ -271,8 +262,7 @@ same-seq heads are flagged as equivocation exactly as in the single-key case. A
 well-behaved node signs with exactly one key at any moment.
 
 Static-trust named origins rotate the same way, minus DNS: `sync trust rebind nas
-<new-node-id>` on each peer (with the same cross-signed rotation chain providing
-verified continuity).
+<new-node-id>` on each peer.
 
 One availability edge is accepted deliberately: a peer that first learns of an origin
 *after* a rotation, while the origin is offline and has not yet re-signed its head
@@ -297,7 +287,6 @@ single prefix byte:
 | `f:`   | `f:<space-id>/<utf8 relative path>`  | `FileEntry`    | this origin's copy of a file     |
 | `b:`   | `b:<32-byte object root hash>`       | `BlobAd`       | "I hold (part of) this object"   |
 | `m:`   | `m:self`                             | `NodeManifest` | node info: name, spaces, version |
-| `m:`   | `m:rot/<n>`                          | `RotationStmt` | append-only rotation chain (§3.4)|
 
 Paths are UTF-8, NFC-normalized, `/`-separated, no leading slash, no `.`/`..`
 components. Because the MPT compresses shared prefixes, the `f:` namespace naturally
@@ -781,7 +770,6 @@ CREATE TABLE bindings (
   source       TEXT NOT NULL,            -- 'static' | 'dns'
   domain       TEXT,                     -- for dns source
   note         TEXT,
-  cross_signed INTEGER NOT NULL DEFAULT 0, -- verified continuity via m:rot chain (§3.4)
   added_at     INTEGER NOT NULL,
   expires_at   INTEGER,                  -- NULL for static
   PRIMARY KEY (origin_id, node_id, source)
@@ -912,17 +900,15 @@ Testing strategy:
   namespace for future publishes. Established peers won't accept lower seqs and
   retain signed history as evidence — but that is per-peer protection only (see the
   rollback bullet below); new peers get none, and forward overwrites at higher seq
-  remain possible for any binding holder. Mitigations: legitimate rotations carry
-  the append-only cross-signed rotation chain (`m:rot/<n>`, §3.4) and verify
-  silently even across chained rotations a peer missed entirely, while any
-  *uncross-signed* rebinding is loudly logged and flagged by `sync doctor` on every
-  node until acknowledged; a `rotation_policy = cross-signed-only` config refuses
-  uncross-signed rebindings outright (trading away DNS-only key-loss recovery — an
-  explicit choice for hijack-sensitive deployments, made workable by the chain
-  surviving arbitrarily many missed rotations). Plus the base mitigations: validated
-  in-process resolution (no resolver trust), TTL-bounded caching, and `sync doctor`
-  surfacing the full live member set, bindings, and their provenance. Deployments
-  that can't accept domain-controller power use static trust only. The flip side of
+  remain possible for any binding holder. **v1 accepts this exposure knowingly**: the
+  protocol makes no attempt to distinguish a legitimate rotation from a domain-level
+  takeover — a cryptographic continuity scheme (old-key cross-signing of rebindings)
+  was considered and deliberately deferred as complexity not yet earned (§13). What
+  v1 does provide: every rebinding is logged and listed by `sync doctor`, plus the
+  base mitigations — validated in-process resolution (no resolver trust),
+  TTL-bounded caching, and `sync doctor` surfacing the full live member set,
+  bindings, and their provenance. Deployments that can't accept domain-controller
+  power use static trust only. The flip side of
   failing closed is worth stating: a prolonged DNSSEC outage expires dns bindings
   and shrinks the member set toward static-only — the cluster degrades to a halt
   rather than falling open. Deliberate.
@@ -935,8 +921,7 @@ Testing strategy:
   the cluster's floor via the ordinary max-head rule. And any *current* binding
   holder can always publish `seq_max+1` with arbitrary content — an effective
   forward wipe no seq rule prevents; `head_history` retention plus fork-evidence
-  surfacing (§3.4) makes it visible, and `rotation_policy = cross-signed-only` makes
-  it require the old key rather than just the domain. Same-seq forks are detected
+  surfacing (§3.4) makes it visible. Same-seq forks are detected
   and reported with retained signed proofs (§4.4). A malicious *origin* publishing
   garbage about its own files only pollutes its own namespace, which the version
   model already treats as "their claim, not truth".
@@ -955,6 +940,9 @@ Testing strategy:
 ## 13. Future work (explicit non-v1)
 
 - Read-only membership tier and per-space ACLs.
+- Rotation continuity attestation: cryptographically distinguishing a legitimate key
+  rotation from a domain-level rebinding (e.g. an old-key cross-signed rotation log),
+  closing the DNSSEC over-trust exposure accepted in §12.
 - Encrypted spaces (per-space content keys; metadata padding).
 - Partial trie replication for very large clusters (the proof machinery in §4.3
   already permits it).
@@ -991,10 +979,10 @@ Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`
    chose) the old object — divergence visible, nothing auto-resolved, adoption one
    `sync take` away.
 6. `nas`'s operator rotates its key: `sync key rotate`, publish the second
-   `id=nas nk=<K_new>` TXT record, wait for validated visibility. `nas` appends the
-   cross-signed statement to its `m:rot` chain, re-signs its head as `K_new` at
-   `seq=3`, and brings up the `K_new` endpoint alongside the old one for the TTL
-   window. Peers verify the chain silently; `laptop` and `vps` now dial `K_new`.
+   `id=nas nk=<K_new>` TXT record, wait for validated visibility. `nas` re-signs its
+   head as `K_new` at `seq=3` and brings up the `K_new` endpoint alongside the old
+   one for the TTL window. `laptop` and `vps` pick up the rebinding on their next
+   validated DNS refresh and now dial `K_new`.
    Every trie node, entry, and blob ad is untouched — `nas@cluster…` is the same
    origin it always was. The old TXT record is removed and `K_old` expires out of
    everyone's bindings a TTL later.
