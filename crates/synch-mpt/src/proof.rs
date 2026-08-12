@@ -2,8 +2,9 @@
 //!
 //! A proof is the node path from the root down to where the key resolves — or
 //! to where it provably dead-ends. Verification is self-contained: it needs the
-//! root hash and the proof, nothing else. This is what the one-shot CLI mode
-//! (§9.3) reads a single entry with, without replicating a whole trie.
+//! root hash and the proof, nothing else, which is what lets a holder of one
+//! signed head answer for one key without shipping a whole trie — the
+//! capability partial replication (§13) is built on.
 
 use serde::{Deserialize, Serialize};
 use synch_core::Hash;

@@ -349,7 +349,8 @@ impl MptClient {
         }
     }
 
-    /// Asks a peer who advertises an object (§9.3 one-shot mode, cold caches).
+    /// Asks a peer who advertises an object, for bootstrapping a cold cache
+    /// that holds no `b:` records for it yet (§6.3).
     pub async fn find_providers(
         &self,
         object_root: Hash,

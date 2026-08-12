@@ -64,7 +64,8 @@ impl<S: NodeStore + ?Sized> NodeStore for &S {
     }
 }
 
-/// An in-memory node store, for tests, proof verification, and one-shot reads.
+/// An in-memory node store, for tests and for verifying a proof against a
+/// root without touching any durable store.
 #[derive(Debug, Default)]
 pub struct MemStore {
     nodes: Mutex<HashMap<Hash, Vec<u8>>>,
