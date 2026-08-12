@@ -1,7 +1,11 @@
 //! The SQLite schema (§10), applied verbatim on open.
 
 /// The schema version stored in `config`.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Every statement below is `IF NOT EXISTS` and every version bump so far has
+/// been purely additive, so applying this schema to an older database *is* the
+/// migration; [`crate::db::Store::open`] stamps the new version afterwards.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The §10 schema. Every statement is `IF NOT EXISTS`, so opening an existing
 /// database is a no-op.
@@ -48,6 +52,18 @@ CREATE TABLE IF NOT EXISTS head_history (
   signed_by BLOB, sig BLOB,
   PRIMARY KEY (origin_id, seq, root)
 );
+-- key-loss recovery (§3.4): the highest head a peer has advertised for an
+-- origin in its `Hello` summary. These are observations of existing traffic,
+-- never heads: the heads behind them are signed by a key that is no longer
+-- bound, so they cannot be accepted (§4.4) and only their existence is kept.
+CREATE TABLE IF NOT EXISTS observed_heads (
+  origin_id   TEXT PRIMARY KEY,
+  seq         INTEGER NOT NULL,
+  root        BLOB NOT NULL,
+  complete    INTEGER NOT NULL,      -- whether the advertiser can serve that trie
+  observed_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS trie_nodes    (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS trie_values   (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 

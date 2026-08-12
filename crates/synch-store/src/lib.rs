@@ -7,6 +7,7 @@ pub mod db;
 pub mod error;
 pub mod gc;
 pub mod heads;
+pub mod recovery;
 pub mod schema;
 pub mod views;
 
@@ -16,5 +17,6 @@ pub use db::{DeviceKey, KeyState, Store, CAS_DIR, DB_FILE};
 pub use error::{Result, StoreError};
 pub use gc::{GcStats, TrieStats};
 pub use heads::{Equivocation, Slot, StoredHead};
+pub use recovery::ObservedHead;
 pub use schema::SCHEMA_VERSION;
 pub use views::{EntryRow, LocalFile, MirrorRow, PeerSeen, SpaceRow, Want};

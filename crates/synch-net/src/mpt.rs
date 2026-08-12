@@ -86,12 +86,16 @@ impl MptProtocol {
     ) -> Result<(), NetError> {
         let request: MptMessage = read_frame(recv).await?;
         match request {
-            MptMessage::Hello { proto, heads: _ } => {
+            MptMessage::Hello { proto, heads } => {
                 if proto != PROTO_VERSION {
                     return Err(NetError::Unexpected(format!(
                         "unsupported protocol version {proto}"
                     )));
                 }
+                // A dialing peer's summaries are as good an observation as the
+                // ones we collect by dialing out, and a node in recovery is
+                // more likely to be called than to be calling (§3.4).
+                self.syncer.observe_summaries(&heads, now_ns())?;
                 let ours = self.syncer.local_summaries()?;
                 write_frame(
                     send,

@@ -126,6 +126,18 @@ impl Store {
                 )?;
             }
             Some(v) if v == SCHEMA_VERSION.to_string() => {}
+            // Every schema change so far has been additive and every statement
+            // is `IF NOT EXISTS`, so executing the schema above has already
+            // brought an older database up to date; all that is left is to
+            // stamp the version. A *newer* database is refused: this build
+            // cannot know what it would be reading.
+            Some(v) if v.parse::<u32>().is_ok_and(|found| found < SCHEMA_VERSION) => {
+                conn.execute(
+                    "UPDATE config SET value = ?1 WHERE key = 'schema_version'",
+                    params![SCHEMA_VERSION.to_string()],
+                )?;
+                tracing::info!(from = %v, to = SCHEMA_VERSION, "database schema upgraded");
+            }
             Some(v) => {
                 return Err(StoreError::invalid(format!(
                     "database schema version {v} is not supported by this build (expected {SCHEMA_VERSION})"
@@ -493,5 +505,37 @@ mod tests {
             store.set_config("schema_version", "999").unwrap();
         }
         assert!(Store::open(dir.path()).is_err());
+
+        // Nor is a version this build cannot even parse.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path()).unwrap();
+            store.set_config("schema_version", "tomorrow").unwrap();
+        }
+        assert!(Store::open(dir.path()).is_err());
+    }
+
+    /// An older database is migrated in place: the schema is additive and
+    /// every statement is `IF NOT EXISTS`, so opening it is the upgrade.
+    #[test]
+    fn an_older_schema_is_upgraded_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path()).unwrap();
+            store.set_config("keep", "me").unwrap();
+            store
+                .conn()
+                .execute_batch("DROP TABLE observed_heads")
+                .unwrap();
+            store.set_config("schema_version", "1").unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.config("schema_version").unwrap().as_deref(),
+            Some(SCHEMA_VERSION.to_string().as_str())
+        );
+        assert_eq!(store.config("keep").unwrap().as_deref(), Some("me"));
+        // The table the newer version added exists again.
+        assert_eq!(store.observed_heads().unwrap().len(), 0);
     }
 }

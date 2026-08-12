@@ -125,6 +125,43 @@ impl Syncer {
         Ok(out)
     }
 
+    /// Records what a peer advertised for *this node's own* origin (§3.4).
+    ///
+    /// A node that lost its key and its database holds no head of its own, and
+    /// the heads its peers still hold for it are signed by the lost key: no
+    /// longer bound, so they can never be accepted as heads (§4.4). Their
+    /// existence is what recovery reads, and it is already in every `Hello`
+    /// summary — no new wire message, and no unbound signature is trusted here.
+    /// Summaries for other origins are ignored: for those, the ordinary
+    /// acceptance rule is both sufficient and stricter.
+    ///
+    /// Returns the highest seq now observed for our origin.
+    pub fn observe_summaries(
+        &self,
+        summaries: &[HeadSummary],
+        now: i64,
+    ) -> Result<Option<u64>, NetError> {
+        let Some(own) = self.store.self_origin()? else {
+            return Ok(None);
+        };
+        for summary in summaries.iter().filter(|s| s.origin == own) {
+            if self.store.record_observed_head(
+                &own,
+                summary.seq,
+                &summary.root,
+                summary.complete,
+                now,
+            )? {
+                tracing::info!(
+                    origin = %own,
+                    seq = summary.seq,
+                    "a peer advertises a head for our own origin"
+                );
+            }
+        }
+        Ok(self.store.observed_head(&own)?.map(|o| o.seq))
+    }
+
     /// Offers a head for adoption, applying the full §5.2 acceptance rule.
     pub fn offer_head(&self, head: &SignedHead, now: i64) -> Result<HeadOutcome, NetError> {
         // 1. The signature must verify under the key that claims to have made it.
@@ -258,6 +295,21 @@ impl Syncer {
         }
     }
 
+    /// Runs a `Hello` exchange that pushes and pulls nothing, purely to read
+    /// the peer's summaries (§3.4 step 2).
+    ///
+    /// This is what the recovery quiesce collects with. It is the ordinary
+    /// exchange with an empty decision, so a recovering node learns how far
+    /// peers say its origin had got without adopting anything.
+    pub async fn observe_with(&self, client: &MptClient) -> Result<Vec<HeadSummary>, NetError> {
+        let ours = self.local_summaries()?;
+        let exchange = client
+            .head_exchange(ours, |_theirs| (Vec::new(), Vec::new()))
+            .await?;
+        self.observe_summaries(&exchange.summaries, now_ns())?;
+        Ok(exchange.summaries)
+    }
+
     /// Runs one full `Hello` push-pull exchange with a peer, then fetches
     /// whatever it advertised that we do not have (§5.2, §5.3).
     pub async fn sync_with(&self, client: &MptClient) -> Result<SyncReport, NetError> {
@@ -298,6 +350,10 @@ impl Syncer {
                 (push, want)
             })
             .await?;
+
+        // Every exchange is also an observation of what peers hold for our own
+        // origin, which is what `synch recover` reads (§3.4).
+        self.observe_summaries(&theirs.summaries, now_ns())?;
 
         report.heads_pushed = theirs.pushed;
         for head in theirs.received {
@@ -539,6 +595,76 @@ mod tests {
         let old = SignedHead::sign(&key, origin.clone(), 4, Hash([9u8; 32]), 0);
         assert_eq!(syncer.offer_head(&old, 0).unwrap(), HeadOutcome::NotNewer);
         assert_eq!(store.head_floor(&origin).unwrap().unwrap().0, 5);
+    }
+
+    /// §3.4 step 2: a peer advertising a head for *our* origin is recorded as
+    /// an observation, never adopted — the head behind it is signed by a key
+    /// that is no longer bound.
+    #[test]
+    fn summaries_for_our_own_origin_are_observed_not_adopted() {
+        let (_d, store, lost_key, origin) = setup();
+        store.set_self_origin(&origin).unwrap();
+        // The lost key is no longer bound to the origin: recovery starts from a
+        // database that knows only the new key.
+        store
+            .remove_binding(&origin, &lost_key.public(), BindingSource::Static)
+            .unwrap();
+        let syncer = Syncer::new(store.clone());
+
+        let observed = syncer
+            .observe_summaries(
+                &[
+                    HeadSummary {
+                        origin: origin.clone(),
+                        seq: 100,
+                        root: Hash([7u8; 32]),
+                        complete: true,
+                    },
+                    HeadSummary {
+                        origin: OriginId::named("laptop", "x.example").unwrap(),
+                        seq: 4,
+                        root: Hash([1u8; 32]),
+                        complete: true,
+                    },
+                ],
+                42,
+            )
+            .unwrap();
+        assert_eq!(observed, Some(100));
+        assert_eq!(store.observed_head(&origin).unwrap().unwrap().seq, 100);
+        // Only our own origin is tracked this way.
+        assert_eq!(
+            store
+                .observed_head(&OriginId::named("laptop", "x.example").unwrap())
+                .unwrap(),
+            None
+        );
+        // And nothing became a head: the signer is unbound.
+        assert_eq!(store.complete_head(&origin).unwrap(), None);
+        let head = SignedHead::sign(&lost_key, origin.clone(), 100, Hash([7u8; 32]), 0);
+        assert_eq!(syncer.offer_head(&head, 0).unwrap(), HeadOutcome::Unbound);
+        assert_eq!(store.head_floor(&origin).unwrap(), None);
+    }
+
+    #[test]
+    fn a_store_with_no_identity_observes_nothing() {
+        let (_d, store, _key, origin) = setup();
+        let syncer = Syncer::new(store.clone());
+        assert_eq!(
+            syncer
+                .observe_summaries(
+                    &[HeadSummary {
+                        origin: origin.clone(),
+                        seq: 9,
+                        root: Hash::EMPTY,
+                        complete: true,
+                    }],
+                    0,
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.observed_head(&origin).unwrap(), None);
     }
 
     #[test]
