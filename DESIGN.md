@@ -249,12 +249,31 @@ operator commands separated by a propagation wait; that is the intended trade.
 
 **Key-loss recovery**: the operator replaces the TXT record with a fresh `K_new` —
 from the cluster's point of view this is just a rotation without the overlap window.
-The recovering node (fresh DB, same `id=` name) must assume the
-peers it can currently reach may not hold its true latest head, so it: (1) collects
-heads for its own origin from every reachable peer for at least `recovery_quiesce`
-(default 1 h) without publishing, then (2) resumes at `max_observed_seq + seq_gap`
-(default gap 1 000), making same-seq collision with unreachable lost history
-improbable.
+The recovering node (fresh DB, same `id=` name) must assume the peers it can
+currently reach may not hold its true latest head, so recovery is a distinct,
+explicitly driven state rather than something a node does on startup:
+
+1. **Detection.** A node that holds no head of its own but finds peers advertising
+   heads for its own origin is *in recovery*. It refuses to publish — a node that
+   silently started over at `seq = 1` would have every peer correctly reject it, and
+   the reason would be invisible. `synch doctor` reports the state and the highest
+   seq seen so far, and publishing commands fail pointing at `synch recover`.
+2. **Observation.** The heads peers hold for this origin are signed by the lost key,
+   which is no longer bound, so they cannot be accepted as heads (§4.4) — but their
+   *existence* is what matters. Peers report `(origin, seq, root, complete)` for every
+   origin they track in the `Hello` summary (§5.1), and that summary is what recovery
+   reads. No new wire message, and no need to trust an unbound signature to learn that
+   a higher seq once existed.
+3. **Resumption.** `synch recover` collects those summaries from every reachable peer
+   for at least `recovery_quiesce` (default 1 h, `--wait` to override), then sets the
+   node's publishing floor to `max_observed_seq + seq_gap` (default 1 000). The gap
+   makes a same-seq collision with history held only by an unreachable peer
+   improbable rather than merely unlikely. Publishing resumes from the floor.
+
+Recovery is operator-driven for the same reason rotation is: the node cannot see the
+peers it cannot reach, so "how far had I got?" is a judgement made on partial
+information. An operator knows whether the NAS that holds the newest history is
+merely asleep or genuinely gone; the node does not.
 
 Be precise about what recovery does **not** guarantee. Seq monotonicity protects each
 peer against heads older than what *that peer* has already verified — it is not a
@@ -759,6 +778,7 @@ synch log  [<origin>:]<space>/<path>         per-origin publish history
 synch mirror add|rm|ls                       continuous read-only materialization
 
 synch pin add|rm|ls <root|path>              keep content in CAS regardless of policy
+synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
 synch doctor                                 connectivity, DNSSEC, equivocation, GC stats
 ```
 
