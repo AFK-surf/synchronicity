@@ -57,7 +57,7 @@ Status: draft v0.1 · 2026-08-12
 │                         ▼           ▼              ▼               │
 │                 ┌──────────────────────────┐ ┌──────────────┐      │
 │                 │   SQLite (all metadata)  │ │  CAS blob    │      │
-│                 │  tries · heads · trust   │ │  store (fs)  │      │
+│                 │ tries · heads · bindings │ │  store (fs)  │      │
 │                 │  entries · scanner state │ │              │      │
 │                 └──────────────────────────┘ └──────────────┘      │
 │                              │                                     │
@@ -91,16 +91,40 @@ the *interpretation* layer (§8), where they belong.
 
 ## 3. Identity, trust, and membership
 
-### 3.1 Node identity
+### 3.1 Node identity: origins vs. device keys
 
-Each node has an Ed25519 keypair — the same keypair used as its iroh `NodeId`. The
-`NodeId` is the node's identity everywhere: in trust records, in trie ownership, in DNS
-records, and on the wire. iroh connections are mutually authenticated QUIC: when a
-connection is established, both sides have cryptographic proof of the remote `NodeId`.
+Two deliberately separate notions, so that keys can rotate without identity changing:
 
-The secret key is generated on `sync init` and stored in the SQLite database (which is
-created `0600` inside the data directory). Display/interchange encoding is z-base-32
-(iroh's native encoding).
+- **Device key** — an Ed25519 keypair, the same keypair used as the iroh `NodeId`. It
+  authenticates *connections* (mutually authenticated QUIC: after the handshake both
+  sides have cryptographic proof of the remote `NodeId`) and *signs heads*. Device
+  keys are rotatable (§3.4).
+- **`OriginId`** — the stable identity that owns a trie and keys all replicated state:
+  heads, `f:`/`b:` records, provider views. It never changes for the lifetime of a
+  node, across any number of key rotations.
+
+```rust
+enum OriginId {
+    Key(NodeId),                          // no name: the device key is the identity
+    Named { domain: String, id: String }, // dns membership: rendered "<id>@<domain>"
+}
+```
+
+For DNS-discovered members, the `OriginId` comes from the `id=` field of the TXT
+record (§3.2), scoped by the membership domain: `nas@cluster.example.com`. For
+statically trusted peers without a name, the OriginId degenerates to the device key
+itself — self-certifying, but not rotatable. Static trust may also bind a name
+(`sync trust add --as nas <node-id>`), which makes rotation available without DNS.
+
+A **binding** is the association `OriginId → device key`, with a source (static or
+dns) and a validity window. An origin may have several simultaneously bound device
+keys (the rotation window, §3.4). Every trust check and every head verification goes
+through the bindings table — nothing in the durable data model references a bare
+device key as an identity.
+
+Device secret keys are generated on `sync init` (and on `sync key rotate`) and stored
+in the SQLite database (created `0600` inside the data directory). Display/interchange
+encoding for keys is z-base-32 (iroh's native encoding).
 
 ### 3.2 Trust sources
 
@@ -113,37 +137,52 @@ A remote node is **trusted** iff at least one of the following holds:
    ```
 
    Static trust is unilateral per node and never expires (until removed). For two nodes
-   to sync, *each* must trust the other; there is no transitive trust.
+   to sync, *each* must trust the other; there is no transitive trust. With `--as
+   <name>` the binding is to a named OriginId (rotatable via `sync trust rebind`);
+   without it, the key is the identity.
 
 2. **DNSSEC-based discovery** — the node's key appears in a TXT record of a configured
    membership domain:
 
    ```
-   sync domain add cluster.univalence.me
+   sync domain add cluster.example.com
    ```
 
    The resolver queries `_synchronicity.<domain> TXT` and accepts records of the form:
 
    ```
-   _synchronicity.cluster.univalence.me.  300  IN  TXT  "v=sync1 nk=<z-base32 node-id>"
-   _synchronicity.cluster.univalence.me.  300  IN  TXT  "v=sync1 nk=<z-base32 node-id>"
+   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=nas    nk=<z-base32 device key>"
+   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key>"
+   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key>"  ; rotation window
    ```
 
-   One record per member. The lookup MUST be DNSSEC-validated end to end. We use
+   Each record binds one device key to the origin named by `id=`. The `id` field is
+   the member's stable identifier — an opaque label matching `[a-z0-9-]{1,63}`,
+   case-insensitive, unique per member within the domain — and is what the data model
+   keys the node by (`OriginId::Named`). The `nk` field is the *current* device key.
+   **Multiple records with the same `id` and different `nk` are valid** and mean all
+   listed device keys are simultaneously bound — this is the key-rotation window
+   (§3.4). A record without an `id=` field is accepted for backward simplicity and
+   binds `OriginId::Key(nk)` (non-rotatable, as if statically trusted).
+
+   The lookup MUST be DNSSEC-validated end to end. We use
    `hickory-resolver` with in-process DNSSEC validation (we do not trust an upstream
    resolver's AD bit). If the chain of trust does not validate — missing signatures,
    expired RRSIGs, broken chain — the response is **discarded entirely** and the
    previously cached member set is retained until its own expiry. Fail closed.
 
-   Records are re-resolved on the TTL (clamped to `[60s, 24h]`). A key that disappears
-   from DNS loses trust after `dns_trust_grace` (default: 1 TTL + 10 minutes) to absorb
-   propagation glitches. Adding a machine to the cluster becomes: generate identity,
-   publish one TXT record.
+   Records are re-resolved on the TTL (clamped to `[60s, 24h]`). A binding that
+   disappears from DNS expires after `dns_trust_grace` (default: 1 TTL + 10 minutes)
+   to absorb propagation glitches. Adding a machine to the cluster becomes: generate
+   identity, publish one TXT record. A node learns its *own* OriginId either
+   explicitly (`sync init --id nas@cluster.example.com`) or by auto-detection —
+   finding its device key in the validated record set; explicit config wins on
+   conflict.
 
-Both sources feed a single `trust` table (§10). Enforcement is at connection accept
-time and on every incoming message: connections from non-trusted `NodeId`s are closed
-immediately after the QUIC handshake; trie heads and records from non-trusted origins
-are ignored even if relayed by a trusted peer.
+Both sources feed a single `bindings` table (§10). Enforcement is at connection accept
+time and on every incoming message: connections from device keys with no live binding
+are closed immediately after the QUIC handshake; trie heads whose signing key is not
+bound to the claimed origin are ignored even if relayed by a trusted peer.
 
 Trust admits a node to the cluster in full: it may read all metadata and all content,
 and its published trie is replicated by everyone. (Finer-grained ACLs are future work,
@@ -156,7 +195,51 @@ For dialing, we use iroh's standard discovery stack — pkarr/DNS node discovery
 relay servers — so nodes behind NATs work out of the box. Optionally, the TXT record
 may carry a hint: `relay=https://...` or `addr=host:port`, which is fed into iroh as
 dialing hints. Self-hosted deployments can run their own iroh relay; nothing in
-synchronicity assumes n0's infrastructure.
+synchronicity assumes n0's infrastructure. To reach a named origin, a node dials
+whichever device key(s) are currently bound to it.
+
+### 3.4 Key rotation
+
+Because every piece of durable state — tries, heads, entries, provider views, content
+— is keyed by `OriginId`, rotating a device key changes *nothing* about replicated
+data. It only changes which key may sign for the origin and which `NodeId` peers dial.
+No trie rewrite, no re-hashing, no history loss.
+
+**Planned rotation** (origin `nas@cluster.example.com`, `K_old → K_new`):
+
+1. `sync key rotate` generates `K_new` locally, keeps `K_old` active, and prints the
+   TXT record to publish. The node continues operating (transport + signing) on
+   `K_old`.
+2. The operator publishes the second record: `v=sync1 id=nas nk=<K_new>`, alongside
+   the existing one. Both keys are now bound; peers pick this up on their next
+   validated refresh.
+3. The node polls its own domain until it observes the validated `K_new` binding, then
+   switches over: it publishes a **rotation statement** into its trie at `m:rotation` —
+   `RotationStmt { old: K_old, new: K_new, at_seq, sig_old }`, where `sig_old` is
+   `K_old`'s signature over `("sync-rotate/1" || origin || old || new || at_seq)` —
+   re-signs its current root as a new head (`seq+1`, `signed_by = K_new`), and restarts
+   its iroh endpoint as `K_new`.
+4. Peers verify the cross-signature and mark the rebinding as **verified continuity**.
+   The operator removes the `K_old` record; its binding expires after TTL + grace, and
+   the node deletes the `K_old` secret after that.
+
+**Key-loss recovery** (no cross-signature possible): the operator simply replaces the
+TXT record with a fresh `K_new`. DNS is authoritative, so peers accept the rebinding —
+but an *uncross-signed* rotation is logged loudly and flagged by `sync doctor` on
+every node until acknowledged, since it is indistinguishable from a domain-level
+takeover (§12). The recovering node (fresh DB, same `id=` name) first pulls its own
+origin's current head from peers, then resumes publishing at `seq+1` — peers enforce
+per-origin seq monotonicity regardless of which bound key signs, so a lost key never
+resets an origin's history or enables rollback.
+
+**During the window**, both keys could in principle sign competing heads; the
+deterministic `(seq, root)` ordering (§4.4) still converges everyone, and competing
+same-seq heads are flagged as equivocation exactly as in the single-key case. A
+well-behaved node signs with exactly one key at any moment.
+
+Static-trust named origins rotate the same way, minus DNS: `sync trust rebind nas
+<new-node-id>` on each peer (with the same cross-signed `m:rotation` statement
+providing verified continuity).
 
 ---
 
@@ -172,6 +255,7 @@ single prefix byte:
 | `f:`   | `f:<space-id>/<utf8 relative path>`  | `FileEntry`    | this origin's copy of a file     |
 | `b:`   | `b:<32-byte tree-node hash>`         | `BlobAd`       | "I hold this hash-tree node"     |
 | `m:`   | `m:self`                             | `NodeManifest` | node info: name, spaces, version |
+| `m:`   | `m:rotation`                         | `RotationStmt` | cross-signed key rotation (§3.4) |
 
 Paths are UTF-8, NFC-normalized, `/`-separated, no leading slash, no `.`/`..`
 components. Because the MPT compresses shared prefixes, the `f:` namespace naturally
@@ -265,14 +349,19 @@ The mutable pointer per origin is a **head**:
 
 ```rust
 struct SignedHead {
-    origin: NodeId,
-    seq: u64,          // strictly monotonic per origin
+    origin: OriginId,
+    seq: u64,          // strictly monotonic per origin, across key rotations
     root: Hash,        // MPT root hash ("empty" sentinel for the empty trie)
     created_at: i64,   // unix nanos, informational only
-    sig: Signature,    // ed25519 over ("sync-head/1" || origin || seq || root || created_at)
+    signed_by: NodeId, // the device key that produced sig
+    sig: Signature,    // ed25519 over ("sync-head/1" || origin || seq || root || created_at || signed_by)
 }
 ```
 
+- A head is **valid** iff `sig` verifies under `signed_by` *and* `signed_by` is
+  currently bound to `origin` (§3.1). Accepted heads record the binding check in
+  `heads.verified_at`, so history signed by since-retired keys stays valid — a
+  rotation never invalidates already-replicated state.
 - Heads are **relayable**: any peer can hand you a newer signed head for any origin;
   the signature makes provenance independent of the carrier.
 - Ordering is `(seq, root)` lexicographic. `created_at` is never used for ordering
@@ -292,8 +381,8 @@ ALPN: `sync/mpt/1`. All messages are length-framed `postcard` on QUIC streams.
 
 ```rust
 // bidirectional stream 0 on connect: head gossip (push-pull)
-Hello      { proto: u16, heads: Vec<HeadSummary> }      // HeadSummary = (origin, seq, root)
-HeadsWant  { origins: Vec<NodeId> }                     // "yours is newer, send full signed head"
+Hello      { proto: u16, heads: Vec<HeadSummary> }      // HeadSummary = (origin: OriginId, seq, root)
+HeadsWant  { origins: Vec<OriginId> }                   // "yours is newer, send full signed head"
 Heads      { heads: Vec<SignedHead> }
 HeadPush   { head: SignedHead }                         // reactive: sent on any head change
 
@@ -311,7 +400,8 @@ copy of that trie in `trie_nodes`. On learning a newer head `H` for `O` (via `He
 exchange or `HeadPush`):
 
 ```
-verify sig(H); check H.seq > local_head(O).seq (else ignore)
+verify sig(H) under H.signed_by; check H.signed_by is bound to O (else ignore)
+check H.seq > local_head(O).seq (else ignore)
 frontier ← { H.root }
 while frontier ≠ ∅:
     want ← { h ∈ frontier : h ∉ trie_nodes }          // structural sharing: skip known subtrees
@@ -521,11 +611,12 @@ in-process against the same SQLite DB.
 ### 9.2 Command surface (v1)
 
 ```
-sync init                                   create identity + database
-sync id                                     print NodeId (z-base-32)
+sync init [--id <name>@<domain>]            create identity + database
+sync id                                     print OriginId + current device key(s)
+sync key rotate|ls|retire                   device-key rotation (§3.4)
 sync daemon run|status|stop
 
-sync trust add|rm|ls <node-id>              static membership
+sync trust add [--as <name>]|rebind|rm|ls   static membership (named or key-identified)
 sync domain add|rm|ls <domain>              DNSSEC membership
 sync peers                                  live peers, addresses, last sync, lag
 
@@ -565,37 +656,50 @@ batches) are single transactions.
 ```sql
 -- node & config
 CREATE TABLE config        (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE identity      (id INTEGER PRIMARY KEY CHECK (id = 1), secret_key BLOB NOT NULL);
-
--- membership
-CREATE TABLE trust (
-  node_id     BLOB NOT NULL,             -- 32-byte NodeId
-  source      TEXT NOT NULL,             -- 'static' | 'dns'
-  domain      TEXT,                      -- for dns source
-  note        TEXT,
-  added_at    INTEGER NOT NULL,
-  expires_at  INTEGER,                   -- NULL for static
-  PRIMARY KEY (node_id, source, domain)
+                                         -- includes 'self_origin_id'
+CREATE TABLE device_keys (                -- own keys; >1 row only during rotation
+  node_id     BLOB PRIMARY KEY,
+  secret_key  BLOB NOT NULL,
+  state       TEXT NOT NULL,             -- 'active' | 'retiring'
+  created_at  INTEGER NOT NULL
 );
+
+-- membership: OriginId → device-key bindings.
+-- origin_id is the canonical rendering: '<id>@<domain>' or 'key:<z-base32>'.
+CREATE TABLE bindings (
+  origin_id    TEXT NOT NULL,
+  node_id      BLOB NOT NULL,            -- bound device key (32 bytes)
+  source       TEXT NOT NULL,            -- 'static' | 'dns'
+  domain       TEXT,                     -- for dns source
+  note         TEXT,
+  cross_signed INTEGER NOT NULL DEFAULT 0, -- verified continuity via m:rotation (§3.4)
+  added_at     INTEGER NOT NULL,
+  expires_at   INTEGER,                  -- NULL for static
+  PRIMARY KEY (origin_id, node_id, source)
+);
+CREATE INDEX bindings_by_key ON bindings (node_id);   -- connection-accept lookup
 
 -- mptsync
 CREATE TABLE heads (
-  origin      BLOB PRIMARY KEY,
+  origin_id   TEXT PRIMARY KEY,
   seq         INTEGER NOT NULL,
   root        BLOB NOT NULL,
   created_at  INTEGER NOT NULL,
+  signed_by   BLOB NOT NULL,             -- device key that signed this head
   sig         BLOB NOT NULL,
   received_at INTEGER NOT NULL,
+  verified_at INTEGER NOT NULL,          -- when the signed_by↔origin binding was checked
   synced      INTEGER NOT NULL DEFAULT 0 -- trie fully materialized under this root
 );
-CREATE TABLE head_history  (origin BLOB, seq INTEGER, root BLOB, created_at INTEGER,
-                            PRIMARY KEY (origin, seq));       -- for §8 history, pruned by retention
+CREATE TABLE head_history  (origin_id TEXT, seq INTEGER, root BLOB, created_at INTEGER,
+                            signed_by BLOB,
+                            PRIMARY KEY (origin_id, seq));    -- for §8 history, pruned by retention
 CREATE TABLE trie_nodes    (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE trie_values   (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 
 -- materialized views of trie leaves (rebuilt incrementally from diffs)
 CREATE TABLE entries (
-  origin      BLOB NOT NULL,
+  origin_id   TEXT NOT NULL,
   space       TEXT NOT NULL,
   path        TEXT NOT NULL,
   kind        INTEGER NOT NULL,
@@ -604,19 +708,19 @@ CREATE TABLE entries (
   content     BLOB,                      -- object root hash
   seq         INTEGER NOT NULL,
   prev        BLOB,
-  PRIMARY KEY (origin, space, path)
+  PRIMARY KEY (origin_id, space, path)
 );
 CREATE INDEX entries_by_path    ON entries (space, path);
 CREATE INDEX entries_by_content ON entries (content);
 
 CREATE TABLE blob_providers (
   hash        BLOB NOT NULL,             -- tree-node hash
-  origin      BLOB NOT NULL,
+  origin_id   TEXT NOT NULL,
   object_root BLOB NOT NULL,
   range_start INTEGER NOT NULL,
   range_end   INTEGER NOT NULL,
   level       INTEGER NOT NULL,
-  PRIMARY KEY (hash, origin)
+  PRIMARY KEY (hash, origin_id)
 );
 CREATE INDEX providers_by_object ON blob_providers (object_root, range_start);
 
@@ -636,8 +740,8 @@ CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT NOT NULL, publi
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));
-CREATE TABLE mirrors       (origin BLOB, space TEXT, local_path TEXT NOT NULL,
-                            PRIMARY KEY (origin, space));
+CREATE TABLE mirrors       (origin_id TEXT, space TEXT, local_path TEXT NOT NULL,
+                            PRIMARY KEY (origin_id, space));
 CREATE TABLE want          (root BLOB, ranges BLOB, priority INTEGER, reason TEXT,
                             created_at INTEGER, PRIMARY KEY (root, ranges));
 CREATE TABLE peers_seen    (node_id BLOB PRIMARY KEY, last_addr BLOB, last_seen INTEGER,
@@ -692,10 +796,18 @@ Testing strategy:
   corrupt.
 - **DNSSEC blast radius**: whoever controls the membership domain (or its DNSSEC keys)
   controls membership — adding a hostile node grants full read access and publish
-  rights. This is the explicit trust tradeoff of dns discovery; deployments that can't
-  accept it use static trust only. Mitigations: validated in-process resolution (no
-  resolver trust), TTL-bounded caching, `sync doctor` surfacing the full live member
-  set and its provenance, and loud logging when the DNS set changes.
+  rights. With named origins the exposure is strictly larger: the domain controller
+  can *rebind an existing origin's `id=` to an attacker key*, hijacking that namespace
+  for future publishes (it cannot rewrite history or roll back — per-origin seq
+  monotonicity and retained signed heads prevent that, and already-replicated content
+  is hash-verified). Mitigations: legitimate rotations carry a cross-signed
+  `m:rotation` statement (§3.4) and are silent, while any *uncross-signed* rebinding
+  is loudly logged and flagged by `sync doctor` on every node until acknowledged; a
+  `rotation_policy = cross-signed-only` config refuses uncross-signed rebindings
+  outright (trading away DNS-only key-loss recovery). Plus the base mitigations:
+  validated in-process resolution (no resolver trust), TTL-bounded caching, and
+  `sync doctor` surfacing the full live member set, bindings, and their provenance.
+  Deployments that can't accept domain-controller power use static trust only.
 - **Equivocation & rollback**: signed monotonic seq prevents third-party replay of old
   heads; same-seq forks are detected and reported (§4.4). A malicious *origin* can
   publish garbage about its own files — that only pollutes its own namespace, which the
@@ -727,7 +839,7 @@ Testing strategy:
 
 ## 14. End-to-end walkthrough
 
-Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.univalence.me`.
+Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`.
 
 1. `nas` runs `sync space add media /srv/media`. The scanner hashes 40 k files,
    the publisher signs head `(seq=1, root=r1)` containing 40 k `f:` records and the
@@ -748,6 +860,13 @@ Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.univalence.m
    shows `nas` at the new root and `laptop` still advertising (and pinning, if it
    chose) the old object — divergence visible, nothing auto-resolved, adoption one
    `sync take` away.
+6. `nas`'s operator rotates its key: `sync key rotate`, publish the second
+   `id=nas nk=<K_new>` TXT record, wait for validated visibility. `nas` publishes the
+   cross-signed `m:rotation` statement, re-signs its head as `K_new` at `seq=3`, and
+   restarts its endpoint. Peers verify continuity silently; `laptop` and `vps` now
+   dial `K_new`. Every trie node, entry, and blob ad is untouched — `nas@cluster…`
+   is the same origin it always was. The old TXT record is removed and `K_old`
+   expires out of everyone's bindings a TTL later.
 
 ---
 
