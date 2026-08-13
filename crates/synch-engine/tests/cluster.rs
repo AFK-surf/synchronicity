@@ -815,3 +815,112 @@ async fn a_fetch_falls_back_to_provider_hints_when_no_local_ad_covers_a_root() {
     nas.node.shutdown().await.unwrap();
     laptop.node.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
+    // §8: deletions are adoptable exactly as content is. A tombstone on one
+    // side and a live file on the other is deletion divergence, and it ends
+    // the way every other divergence ends — by someone taking the other's
+    // assertion as their own.
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    introduce(&[&nas, &laptop]);
+
+    nas.node.add_space("shared", nas.space.path()).unwrap();
+    laptop
+        .node
+        .add_space("shared", laptop.space.path())
+        .unwrap();
+
+    // Both publish the same file, so the path starts out unanimous.
+    for peer in [&nas, &laptop] {
+        std::fs::write(peer.space.path().join("notes.txt"), b"hello").unwrap();
+        peer.node.scan_and_publish().unwrap();
+    }
+    nas.node
+        .sync_with_peer(&laptop.node.node_id())
+        .await
+        .unwrap();
+    laptop
+        .node
+        .sync_with_peer(&nas.node.node_id())
+        .await
+        .unwrap();
+    let set = laptop.node.versions("shared", "notes.txt").unwrap();
+    assert_eq!(set.version_count(), 1, "{:?}", set.versions);
+
+    // The NAS deletes it. Now the tree carries a live version and a tombstone.
+    std::fs::remove_file(nas.space.path().join("notes.txt")).unwrap();
+    nas.node.scan_and_publish().unwrap();
+    laptop
+        .node
+        .sync_with_peer(&nas.node.node_id())
+        .await
+        .unwrap();
+
+    let set = laptop.node.versions("shared", "notes.txt").unwrap();
+    assert_eq!(set.version_count(), 2, "deletion divergence");
+    assert!(set.is_divergent());
+    assert!(set.exists(), "a live version keeps the path visible");
+
+    // The laptop takes the NAS's deletion.
+    let removed = laptop
+        .node
+        .adopt_deletion("shared", "notes.txt")
+        .unwrap()
+        .expect("our copy was here");
+    assert_eq!(removed, laptop.space.path().join("notes.txt"));
+    assert!(!laptop.space.path().join("notes.txt").exists());
+
+    let head = laptop.node.scan_publish_push().await.unwrap().unwrap();
+    assert!(head.seq > 1);
+
+    // The laptop now publishes its own tombstone, both sides agree, and the
+    // path has left the unified tree.
+    let set = laptop.node.versions("shared", "notes.txt").unwrap();
+    assert_eq!(set.version_count(), 1, "{:?}", set.versions);
+    assert!(set.versions[0].is_tombstone());
+    assert!(!set.exists(), "every publisher tombstoned it");
+    assert!(laptop
+        .node
+        .unified_listing("shared", "", None, None)
+        .unwrap()
+        .iter()
+        .all(|s| !s.exists()));
+
+    // And the NAS sees the same once it syncs.
+    nas.node
+        .sync_with_peer(&laptop.node.node_id())
+        .await
+        .unwrap();
+    let set = nas.node.versions("shared", "notes.txt").unwrap();
+    assert_eq!(set.version_count(), 1);
+    assert!(!set.exists());
+
+    nas.node.shutdown().await.unwrap();
+    laptop.node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn adopting_a_deletion_refuses_a_path_outside_a_space() {
+    // The same guard content adoption takes: outside a configured space
+    // nothing would publish the adoption, so the write would be a silent no-op
+    // with a filesystem side effect.
+    let node = spawn("solo").await;
+    let err = node
+        .node
+        .adopt_deletion("nowhere", "notes.txt")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("space nowhere"), "{err}");
+
+    // And a path that is simply not here is not an error: the assertion being
+    // adopted is "this is gone", and it already is.
+    node.node.add_space("shared", node.space.path()).unwrap();
+    assert!(node
+        .node
+        .adopt_deletion("shared", "never-existed.txt")
+        .unwrap()
+        .is_none());
+    node.node.shutdown().await.unwrap();
+}

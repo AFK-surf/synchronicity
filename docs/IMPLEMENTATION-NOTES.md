@@ -372,6 +372,28 @@ The question is asked about *our* origin, and answered by peers who are already
 authorized members (§3.2), so it carries nothing they could not already read
 out of their own bindings table.
 
+### §8 — adopting a deletion
+
+`synch take` of a tombstone version removes the local copy and lets the *next
+scan* publish our own tombstone — the same path a deletion made with `rm`
+takes, rather than a second way of minting one. `take` already flushes before
+it answers (§7.1), so the tombstone is published by the time the command
+returns and the seq it prints is real.
+
+Three details:
+
+- **Nothing here is an error.** Taking a deletion of a path we never had
+  reports that it is already absent: the assertion being adopted is "this is
+  gone", and it already is. The command still runs a scan, and says plainly
+  when there was nothing for it to publish.
+- **The space guard is the same one content adoption takes.** A path outside a
+  configured space is refused, because outside one nothing would publish the
+  adoption and the removal would be a filesystem side effect with no assertion
+  behind it. A directory is refused too — `take` adopts a path's version, and a
+  directory is not one.
+- **A symlink is removed as the link it is**, not followed to what it points
+  at.
+
 ### §6.4 — what the fetch fanout splits, and when it stops looking
 
 `fetch_fanout` is "how many providers a single range fetch is split across",

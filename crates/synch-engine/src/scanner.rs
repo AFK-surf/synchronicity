@@ -377,18 +377,57 @@ impl Node {
     /// indexing pipeline republishes them as this node's entry, with `prev`
     /// pointing at the content we replaced.
     pub fn adopt(&self, space_id: &str, path: &str, content: &[u8]) -> Result<PathBuf> {
+        let target = self.adoption_target(space_id, path)?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, content)?;
+        Ok(target)
+    }
+
+    /// Adopts a peer's *deletion* of a path as our own (§8, `synch take`).
+    ///
+    /// Deletions are adoptable exactly as content is: our local copy goes, and
+    /// the next scan publishes our own tombstone through the ordinary indexing
+    /// pipeline — the same path a deletion made with `rm` takes. Adoption is
+    /// how all divergence ends, deletion divergence included: once every
+    /// publisher tombstones the path, it leaves the unified tree.
+    ///
+    /// Returns the file that was removed, or `None` when there was nothing
+    /// here to remove — which is not an error: the assertion being adopted is
+    /// "this path is gone", and it already is.
+    pub fn adopt_deletion(&self, space_id: &str, path: &str) -> Result<Option<PathBuf>> {
+        let target = self.adoption_target(space_id, path)?;
+        // `symlink_metadata`, so a symlink is removed as the link it is rather
+        // than followed to whatever it points at.
+        if std::fs::symlink_metadata(&target).is_err() {
+            return Ok(None);
+        }
+        if target.is_dir() {
+            return Err(EngineError::invalid(format!(
+                "{} is a directory here; refusing to remove it",
+                target.display()
+            )));
+        }
+        std::fs::remove_file(&target)?;
+        Ok(Some(target))
+    }
+
+    /// Where a path lives locally, refusing anything outside a configured
+    /// space.
+    ///
+    /// The guard is the same for content and for deletions: `synch take` may
+    /// only ever write inside a space this node indexes, because outside one
+    /// nothing would publish the adoption and the write would be a silent
+    /// no-op with a filesystem side effect.
+    fn adoption_target(&self, space_id: &str, path: &str) -> Result<PathBuf> {
         let space = self
             .store()
             .space(space_id)?
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))?;
         let normalized =
             synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
-        let target = PathBuf::from(&space.local_path).join(&normalized);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&target, content)?;
-        Ok(target)
+        Ok(PathBuf::from(&space.local_path).join(&normalized))
     }
 }
 

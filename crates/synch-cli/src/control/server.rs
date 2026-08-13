@@ -644,15 +644,42 @@ async fn dispatch<S: AsyncWrite + Unpin>(
                     "that is already this node's own entry",
                 ));
             }
-            let bytes = node
-                .read_entry(&origin, &reference.space, &reference.path)
-                .await?;
-            let path = node.adopt(&reference.space, &reference.path, &bytes)?;
-            out.line(format!("adopted into {}", path.display())).await?;
+            // A tombstone is an assertion like any other, and §8 makes it
+            // adoptable the same way: take the deletion, and let the next scan
+            // publish our own.
+            let theirs = node.resolve(
+                &reference.space,
+                &reference.path,
+                &VersionPolicy::Origin(origin.clone()),
+            )?;
+            if theirs.kind == synch_core::EntryKind::Tombstone {
+                match node.adopt_deletion(&reference.space, &reference.path)? {
+                    Some(path) => {
+                        out.line(format!("removed {}", path.display())).await?;
+                    }
+                    None => {
+                        out.line(format!(
+                            "{}/{} is already absent here",
+                            reference.space, reference.path
+                        ))
+                        .await?;
+                    }
+                }
+            } else {
+                let bytes = node
+                    .read_entry(&origin, &reference.space, &reference.path)
+                    .await?;
+                let path = node.adopt(&reference.space, &reference.path, &bytes)?;
+                out.line(format!("adopted into {}", path.display())).await?;
+            }
             // `take` publishes before it answers, for the same reason
             // `scan` does: the seq it prints has to be a real one (§7.1).
-            if let Some(head) = node.scan_publish_push().await? {
-                out.line(format!("published seq {}", head.seq)).await?;
+            match node.scan_publish_push().await? {
+                Some(head) => out.line(format!("published seq {}", head.seq)).await?,
+                None => {
+                    out.line("nothing to publish: this node had no version of that path")
+                        .await?
+                }
             }
         }
 

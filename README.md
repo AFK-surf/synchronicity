@@ -106,6 +106,7 @@ synch cat media/notes.txt --from nas@cluster.example.com   # pin one origin
 synch cat media/notes.txt --strict         # refuse a divergent path, list its versions
 synch get media/notes.txt -o notes.txt
 synch take nas@cluster.example.com:media/notes.txt   # adopt their version as ours
+synch take nas@cluster.example.com:media/gone.txt    # …including their deletion
 synch doctor                               # membership, heads, equivocation, storage
 ```
 
@@ -114,7 +115,9 @@ an explicit policy: `newest` (the default — the greatest `(mtime, content root
 origin)`, so every node picks the same one), `origin=<id>`, or `strict`.
 Selection is presentation, not resolution: nothing is written, no assertion
 changes, and the other versions stay visible until a `synch take` ends the
-divergence.
+divergence. Deletions are adoptable the same way: taking a tombstone version
+removes the local copy and publishes our own tombstone, and once every
+publisher has done so the path leaves the tree.
 
 Mirror a space into a directory, continuously, under a policy of its own:
 

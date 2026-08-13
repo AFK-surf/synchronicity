@@ -938,3 +938,106 @@ async fn the_token_is_regenerated_on_every_start() {
     assert_eq!(error.code, ErrorCode::Unauthorized);
     daemon.shutdown().await;
 }
+
+#[tokio::test]
+async fn take_adopts_a_peers_deletion_over_the_socket() {
+    // §8: `synch take` of a tombstone version deletes our local copy and
+    // publishes our own tombstone. The live form is unchanged, which the same
+    // test checks first.
+    let dir = tempfile::tempdir().unwrap();
+    let space = space_with(&[("shared.txt", b"ours"), ("kept.txt", b"ours")]);
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+
+    lines(
+        data_dir,
+        Request::SpaceAdd {
+            id: "media".into(),
+            path: space.path().to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+    lines(data_dir, Request::Scan).await;
+
+    let peer = OriginId::named("laptop", "cluster.example").unwrap();
+    // The peer publishes a live version of `kept.txt` with the same bytes we
+    // could fetch locally, and a tombstone for `shared.txt`.
+    let root = daemon
+        .node
+        .store()
+        .ingest_bytes(b"theirs", synch_core::now_ns())
+        .unwrap();
+    daemon
+        .node
+        .store()
+        .put_entry(
+            &peer,
+            "media",
+            "kept.txt",
+            &synch_core::FileEntry::file(6, 9_000, root, 4),
+        )
+        .unwrap();
+    daemon
+        .node
+        .store()
+        .put_entry(
+            &peer,
+            "media",
+            "shared.txt",
+            &synch_core::FileEntry::tombstone(9_000, 4, None),
+        )
+        .unwrap();
+
+    // Taking a live version still works exactly as it did.
+    let taken = lines(
+        data_dir,
+        Request::Take {
+            reference: "laptop@cluster.example:media/kept.txt".into(),
+        },
+    )
+    .await;
+    assert!(taken.contains("adopted into"), "{taken}");
+    assert_eq!(
+        std::fs::read(space.path().join("kept.txt")).unwrap(),
+        b"theirs"
+    );
+
+    // Taking a deletion removes our copy and publishes our own tombstone.
+    let taken = lines(
+        data_dir,
+        Request::Take {
+            reference: "laptop@cluster.example:media/shared.txt".into(),
+        },
+    )
+    .await;
+    assert!(taken.contains("removed"), "{taken}");
+    assert!(taken.contains("published seq"), "{taken}");
+    assert!(!space.path().join("shared.txt").exists());
+
+    let set = daemon.node.versions("media", "shared.txt").unwrap();
+    assert_eq!(set.version_count(), 1, "{:?}", set.versions);
+    assert!(set.versions[0].is_tombstone());
+    assert!(!set.exists(), "the path has left the unified tree");
+
+    // Taking a deletion of something we never had says so rather than failing.
+    daemon
+        .node
+        .store()
+        .put_entry(
+            &peer,
+            "media",
+            "never-ours.txt",
+            &synch_core::FileEntry::tombstone(9_000, 4, None),
+        )
+        .unwrap();
+    let taken = lines(
+        data_dir,
+        Request::Take {
+            reference: "laptop@cluster.example:media/never-ours.txt".into(),
+        },
+    )
+    .await;
+    assert!(taken.contains("already absent"), "{taken}");
+
+    daemon.shutdown().await;
+}
