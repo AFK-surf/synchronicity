@@ -128,7 +128,9 @@ fn to_request(cli: &Cli) -> Result<Request> {
                 domain: domain.clone(),
             },
             DomainCommand::Ls => Request::DomainLs,
-            DomainCommand::Refresh => Request::DomainRefresh,
+            DomainCommand::Refresh { domain } => Request::DomainRefresh {
+                domain: domain.clone(),
+            },
         },
 
         Command::Peers => Request::Peers,
@@ -162,8 +164,12 @@ fn to_request(cli: &Cli) -> Result<Request> {
         },
 
         Command::Pin { command } => match command {
-            PinCommand::Add { root } => Request::PinAdd { root: root.clone() },
-            PinCommand::Rm { root } => Request::PinRm { root: root.clone() },
+            PinCommand::Add { target } => Request::PinAdd {
+                target: target.clone(),
+            },
+            PinCommand::Rm { target } => Request::PinRm {
+                target: target.clone(),
+            },
             PinCommand::Ls => Request::PinLs,
         },
 

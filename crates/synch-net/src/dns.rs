@@ -12,6 +12,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
     time::Duration,
 };
 
@@ -344,6 +346,31 @@ impl DnssecResolver {
         let validated = self.lookup_txt(domain).await?;
         let set = MemberSet::from_records(domain, &validated.records)?;
         Ok((set, validated.ttl))
+    }
+}
+
+/// A future returning one domain's validated member set.
+pub type MemberSetFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(MemberSet, Duration), NetError>> + Send + 'a>>;
+
+/// What a membership refresh resolves through (§3.2).
+///
+/// [`DnssecResolver`] is the production implementation and the only one a
+/// running node uses. The trait exists so that the daemon's TTL-driven refresh
+/// loop — the thing that keeps a DNSSEC cluster from dissolving one TTL after
+/// the last `synch domain refresh` — can be driven and asserted on without a
+/// live, signed zone.
+///
+/// Boxed rather than `async fn` in trait so the refresh loop can hold a
+/// `&dyn MemberResolver` and stay object-safe.
+pub trait MemberResolver: std::fmt::Debug + Send + Sync {
+    /// Resolves one domain's member set and how long the answer is good for.
+    fn resolve_members<'a>(&'a self, domain: &'a str) -> MemberSetFuture<'a>;
+}
+
+impl MemberResolver for DnssecResolver {
+    fn resolve_members<'a>(&'a self, domain: &'a str) -> MemberSetFuture<'a> {
+        Box::pin(self.member_set(domain))
     }
 }
 

@@ -271,6 +271,21 @@ fn the_command_surface_works_over_the_socket() {
     assert!(cli.run(&["pin", "ls"]).contains(&root));
     cli.run(&["pin", "rm", &root]);
 
+    // A pin may also name a path, in which case the version the reading policy
+    // selects supplies the root (§8).
+    assert!(cli.run(&["pin", "add", "media/notes.txt"]).contains(&root));
+    assert!(cli.run(&["pin", "ls"]).contains(&root));
+    assert!(cli.run(&["pin", "rm", "media/notes.txt"]).contains(&root));
+    assert!(!cli.run(&["pin", "ls"]).contains(&root));
+
+    // `domain refresh` takes one domain as well as none.
+    let (ok, _, stderr) = cli.try_run(&["domain", "refresh", "not.configured.example"]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("not a configured membership domain"),
+        "{stderr}"
+    );
+
     // A daemon-side failure is this process's exit status, not a transport
     // error.
     let (ok, _, stderr) = cli.try_run(&["pin", "add", "nothex"]);

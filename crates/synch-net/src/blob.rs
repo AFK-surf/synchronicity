@@ -23,12 +23,22 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct BlobProtocol {
     store: Arc<Store>,
+    on_unknown_key: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl BlobProtocol {
     /// Builds a handler over a store.
     pub fn new(store: Arc<Store>) -> Self {
-        BlobProtocol { store }
+        BlobProtocol {
+            store,
+            on_unknown_key: None,
+        }
+    }
+
+    /// Rings `wake` whenever a connection is refused for an unknown key (§3.4).
+    pub fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.on_unknown_key = wake;
+        self
     }
 }
 
@@ -38,6 +48,9 @@ impl ProtocolHandler for BlobProtocol {
         match self.store.is_trusted_key(&remote, now_ns()) {
             Ok(true) => {}
             _ => {
+                if let Some(wake) = &self.on_unknown_key {
+                    wake.notify_waiters();
+                }
                 connection.close(0u32.into(), b"untrusted");
                 return Err(AcceptError::from_err(std::io::Error::other(
                     "peer has no live binding",

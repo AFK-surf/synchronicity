@@ -46,7 +46,15 @@ Admit a peer. Trust is unilateral, so each side runs this for the other:
 ```sh
 synch trust add <their-device-key> --as laptop --domain cluster.example.com
 synch domain add cluster.example.com       # or DNSSEC membership instead
+synch domain refresh cluster.example.com   # one domain now, or all of them with no argument
 ```
+
+Membership from DNS refreshes itself: the daemon re-resolves each configured
+domain when its TTL runs out, and again — rate-limited — when a peer this node
+holds no binding for tries to connect, which is what the far side of a lagging
+key rotation looks like. A resolver outage fails closed: the cached bindings
+keep their own expiry, and the member set shrinks toward static-only rather
+than falling open.
 
 Rotate a device key. Every step is an explicit command: a node never polls its
 own domain and never switches signing keys on its own.
@@ -109,6 +117,17 @@ synch mirror add media /mnt/safe --policy strict           # skip divergent path
 synch mirror ls
 synch mirror sync
 synch mirror rm /mnt/safe
+```
+
+Keep bytes around regardless of retention. A pin names an object root, or a
+path — in which case the version the reading policy selects supplies the root:
+
+```sh
+synch pin add media/talks/keynote.mp4
+synch pin add nas@cluster.example.com:media/notes.txt      # that origin's version
+synch pin add 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+synch pin ls
+synch pin rm media/talks/keynote.mp4
 ```
 
 Serve the same data over S3:

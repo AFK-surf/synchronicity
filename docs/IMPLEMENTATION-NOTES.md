@@ -130,10 +130,19 @@ visible in a listing:
   selected, so the file goes. Under `newest` a deletion newer than the content
   removes it; under `origin=<id>` only that origin's deletion does.
 - **The path has left the unified tree.** When every entry for a path is gone —
-  tombstones expired (§4.2), an origin untrusted — there is nothing left to
-  select, and nothing in the listing to notice. So each pass ends by walking
+  every publisher's tombstone expired (§4.2), or an operator ran `synch doctor
+  --rebuild` against a trie that no longer carries it — there is nothing left
+  to select, and nothing in the listing to notice. So each pass ends by walking
   the mirror directory and removing files whose path the tree no longer carries
   at all. Directories are left in place.
+
+  Untrusting an origin is *not* one of those cases. Removal cuts a node off
+  from future participation — connections refused, new heads ignored — and
+  nothing cascades a deletion through everyone's tries, because that would hand
+  any removal a blast radius (§12). The untrusted origin's entries stay in the
+  tree and age out with ordinary retention; what changes is that `synch doctor`
+  lists the origin under "origins held without a live binding", with how many
+  entries it still carries.
 
 Two related choices: an `origin=` pin that selects nothing (that origin
 publishes no version of the path) removes the file too, since the path is not
@@ -237,6 +246,60 @@ like any other.
 promotes it: "held, and not the signing key". Exactly one key is `active` at any
 moment, which is the invariant that matters.
 
+### §3.2, §3.4 — when membership is re-resolved, and what triggers it
+
+§3.2 says records are re-resolved on the TTL, clamped to `[60 s, 24 h]`, and
+§3.4 adds that an inbound connection from an unknown key triggers an immediate
+re-resolution. Both run in the daemon's DNS loop (`Node::run_dns`), beside the
+maintenance loop that expires bindings — the two exist as a pair, because
+expiry without renewal dissolves a DNSSEC cluster one TTL plus grace after the
+last manual `synch domain refresh`.
+
+Three things the design leaves open:
+
+- **The schedule lives in memory, not in the database.** It is a property of a
+  running daemon, and a restart re-resolving every configured domain once is
+  the right behavior anyway. A domain that has never been resolved — one
+  `synch domain add` just wrote — is due immediately.
+- **The trigger is rate-limited per domain**, at 30 s. The bell is rung by an
+  inbound refusal, which a peer that keeps retrying produces as fast as it can
+  dial, so an unlimited trigger would be a query amplifier pointed at the
+  cluster's own zone. Within a cooldown window the refusals are counted and
+  ignored; the TTL schedule is unaffected.
+- **A failed lookup moves the retry time, and nothing else.** Failing closed
+  (§3.2) means the cached bindings keep their own expiry, so a resolver outage
+  degrades the cluster on the schedule §3.2 describes rather than on the
+  schedule the outage would otherwise dictate. The retry waits one clamped
+  minimum TTL, so a resolver that is down is not polled in a tight loop.
+
+The refresh resolves through a `MemberResolver` trait rather than a concrete
+`DnssecResolver`, so the loop's scheduling can be asserted on without a live
+signed zone. `DnssecResolver` is the only implementation a running node ever
+uses, and it is unchanged: in-process validation, per-record `Proof::is_secure()`.
+
+### §7.1 — spaces added while the daemon runs
+
+The watcher registers every configured space root with `notify` and
+re-registers on every debounced pass, plus immediately when `space add` or
+`space rm` rings its bell. A watcher whose set was fixed at startup would leave
+a newly added space covered only by the hourly rescan, and would keep waking
+for a directory nobody indexes any more. Failing to watch a root stays
+non-fatal, exactly as at startup: the periodic scan is the guarantee, and the
+watcher is a latency optimization.
+
+### §9.2 — `synch pin` and `synch domain refresh` argument forms
+
+`synch pin add|rm` accepts a hex object root or a `[<origin>:]<space>/<path>`.
+A path is resolved through the same selection every other read goes through
+(§8), so pinning `media/notes.txt` and `synch cat media/notes.txt` always mean
+the same bytes; an `<origin>:` prefix pins that origin's version. Text with no
+`/` in it was meant to be a root and is reported as a bad root rather than as a
+bad space.
+
+`synch domain refresh` takes an optional domain and refreshes just that one. A
+domain the node was never told about is a typo, so it is refused before a
+resolver is even built.
+
 ## Adapted to the dependencies
 
 ### §9.3 — the control token's randomness
@@ -301,16 +364,15 @@ survives restarts through the CAS rather than through a queue — so the table
 never had a producer or a consumer, and dropping it removes a shape the design
 does not have.
 
-### §10 — the writer task
+### §10 — one connection rather than a writer task and a reader pool
 
-The design specifies "single writer task (all writes funneled through one tokio
-task; reads from a pool)". This implementation funnels **all** access through one
-mutex-guarded `rusqlite::Connection`. The invariant the design cares about —
-that every multi-step state change is one transaction and no partial state is
-observable — holds identically. What is given up is read concurrency: readers
-serialize behind the same mutex rather than running from a pool. WAL mode is
-still enabled, so the change is a code-structure difference, not a durability
-one.
+§10 asks for "all access through one mutex-guarded connection", and that is
+literally what this is: one `rusqlite::Connection` behind a `Mutex`, WAL mode,
+`synchronous=NORMAL`. The invariant the section names — every multi-step state
+change is a single transaction and no partial state is ever observable — is
+what the [`Store::transaction`](../crates/synch-store/src/db.rs) scope
+enforces, and §10 accepts the cost the arrangement carries: readers serialize
+behind the same mutex instead of running concurrently.
 
 ### §6.2 — outboard file naming
 

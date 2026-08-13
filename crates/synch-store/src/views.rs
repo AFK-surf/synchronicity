@@ -212,6 +212,22 @@ impl Store {
         )
     }
 
+    /// Every origin that has materialized entries.
+    ///
+    /// Used by `synch doctor` to name origins whose data this node still holds
+    /// after their binding went away — removal cuts off future participation
+    /// and never cascades a deletion through everyone's tries (§12).
+    pub fn entry_origins(&self) -> Result<Vec<OriginId>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT DISTINCT origin_id FROM entries ORDER BY origin_id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(origin_column(row?, "entries.origin_id")?);
+        }
+        Ok(out)
+    }
+
     /// Every space id that any origin has published entries for.
     pub fn known_spaces(&self) -> Result<Vec<String>> {
         let conn = self.conn();

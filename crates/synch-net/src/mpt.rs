@@ -28,6 +28,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct MptProtocol {
     syncer: Syncer,
+    on_unknown_key: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl MptProtocol {
@@ -35,7 +36,18 @@ impl MptProtocol {
     pub fn new(store: Arc<Store>) -> Self {
         MptProtocol {
             syncer: Syncer::new(store),
+            on_unknown_key: None,
         }
+    }
+
+    /// Rings `wake` whenever a connection is refused for an unknown key.
+    ///
+    /// A peer whose key this node has not resolved yet — the far side of a key
+    /// rotation, typically — arrives exactly this way, and §3.4 makes that
+    /// refusal a trigger for an immediate DNS re-resolution.
+    pub fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.on_unknown_key = wake;
+        self
     }
 
     fn store(&self) -> &Arc<Store> {
@@ -53,6 +65,9 @@ impl ProtocolHandler for MptProtocol {
             Ok(true) => {}
             _ => {
                 tracing::debug!(peer = %remote.fmt_short(), "refusing connection: no live binding");
+                if let Some(wake) = &self.on_unknown_key {
+                    wake.notify_waiters();
+                }
                 connection.close(0u32.into(), b"untrusted");
                 return Err(AcceptError::from_err(std::io::Error::other(
                     "peer has no live binding",

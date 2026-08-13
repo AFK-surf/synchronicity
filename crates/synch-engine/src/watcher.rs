@@ -4,7 +4,7 @@
 //! correctness never depends on watcher completeness, so a missed event costs
 //! at most one scan interval of latency, never a lost file.
 
-use std::{path::PathBuf, time::Duration};
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use tokio::sync::mpsc;
@@ -14,36 +14,77 @@ use crate::{error::Result, node::Node};
 /// A debounced rescan trigger over every configured space.
 #[derive(Debug)]
 pub struct SpaceWatcher {
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
     hints: mpsc::Receiver<()>,
     debounce: Duration,
+    /// The space roots currently registered with `notify`, so a re-register
+    /// pass can tell what is new and what has gone.
+    watching: HashSet<PathBuf>,
 }
 
 impl SpaceWatcher {
     /// Starts watching every configured space root.
     pub fn start(node: &Node) -> Result<SpaceWatcher> {
         let (tx, rx) = mpsc::channel(64);
-        let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if event.is_ok() {
-                    // A full channel already means a rescan is pending, so dropping
-                    // the hint loses nothing.
-                    let _ = tx.try_send(());
-                }
-            })
-            .map_err(watch_error)?;
-
-        for space in node.store().spaces()? {
-            let path = PathBuf::from(&space.local_path);
-            if let Err(e) = watcher.watch(&path, RecursiveMode::Recursive) {
-                tracing::warn!(space = %space.id, error = %e, "cannot watch space; relying on periodic scans");
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if event.is_ok() {
+                // A full channel already means a rescan is pending, so dropping
+                // the hint loses nothing.
+                let _ = tx.try_send(());
             }
-        }
-        Ok(SpaceWatcher {
-            _watcher: watcher,
+        })
+        .map_err(watch_error)?;
+
+        let mut out = SpaceWatcher {
+            watcher,
             hints: rx,
             debounce: node.config().watch_debounce,
-        })
+            watching: HashSet::new(),
+        };
+        out.resync(node)?;
+        Ok(out)
+    }
+
+    /// Registers spaces added since the last pass and drops ones removed.
+    ///
+    /// A daemon runs for weeks and `synch space add` lands whenever an
+    /// operator says so, so the watched set cannot be fixed at startup: an
+    /// unregistered space would be covered only by the hourly rescan, and a
+    /// removed one would keep waking the watcher for a directory nobody
+    /// indexes. Failing to watch a root is not fatal — the periodic scan is
+    /// the guarantee (§7.1).
+    pub fn resync(&mut self, node: &Node) -> Result<usize> {
+        let configured: HashSet<PathBuf> = node
+            .store()
+            .spaces()?
+            .into_iter()
+            .map(|space| PathBuf::from(&space.local_path))
+            .collect();
+        let mut changed = 0;
+        for path in configured.difference(&self.watching.clone()) {
+            match self.watcher.watch(path, RecursiveMode::Recursive) {
+                Ok(()) => {
+                    self.watching.insert(path.clone());
+                    changed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "cannot watch space; relying on periodic scans");
+                }
+            }
+        }
+        for path in self.watching.clone().difference(&configured) {
+            let _ = self.watcher.unwatch(path);
+            self.watching.remove(path);
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    /// The space roots currently registered.
+    pub fn watched(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self.watching.iter().cloned().collect();
+        out.sort();
+        out
     }
 
     /// Waits for at least one hint, then swallows further hints for the
@@ -85,12 +126,26 @@ impl Node {
         };
         let shutdown = std::pin::pin!(shutdown);
         let mut shutdown = shutdown;
+        let spaces_changed = self.spaces_changed_signal();
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
+                // `space add` / `space rm` ring this so a new root is watched
+                // at once rather than at the next filesystem hint.
+                _ = spaces_changed.notified() => {
+                    if let Err(e) = watcher.resync(self) {
+                        tracing::warn!(error = %e, "re-registering spaces failed");
+                    }
+                }
                 triggered = watcher.next_rescan() => {
                     if !triggered {
                         return;
+                    }
+                    // Every pass re-registers, so a space that appeared while
+                    // the daemon ran is watched from here on even if the nudge
+                    // was missed.
+                    if let Err(e) = watcher.resync(self) {
+                        tracing::warn!(error = %e, "re-registering spaces failed");
                     }
                     // Staged, not published: a burst of editor saves is one
                     // batch and therefore one head (§7.1).
@@ -160,6 +215,33 @@ mod tests {
         Node::init(dir.path(), None).unwrap();
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
         let _watcher = SpaceWatcher::start(&node).unwrap();
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spaces_added_and_removed_while_running_are_re_registered() {
+        // A daemon runs for weeks; `space add` lands whenever an operator says
+        // so. A watcher fixed at startup would leave the new root covered only
+        // by the hourly rescan (§7.1).
+        let dir = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        Node::init(dir.path(), None).unwrap();
+        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
+        node.add_space("one", first.path()).unwrap();
+
+        let mut watcher = SpaceWatcher::start(&node).unwrap();
+        assert_eq!(watcher.watched().len(), 1);
+
+        node.add_space("two", second.path()).unwrap();
+        assert_eq!(watcher.resync(&node).unwrap(), 1);
+        assert_eq!(watcher.watched().len(), 2);
+        // Re-registering an unchanged set is a no-op.
+        assert_eq!(watcher.resync(&node).unwrap(), 0);
+
+        node.remove_space("two").unwrap();
+        assert_eq!(watcher.resync(&node).unwrap(), 1);
+        assert_eq!(watcher.watched().len(), 1);
         node.shutdown().await.unwrap();
     }
 }

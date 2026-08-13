@@ -30,6 +30,14 @@ pub struct NetOptions {
     /// never touch the network; self-hosted deployments can use it on closed
     /// networks.
     pub offline: bool,
+    /// Notified when a connection is refused because the dialing device key
+    /// has no live binding (§3.4).
+    ///
+    /// A peer that rotated its key and whose new record this node has not
+    /// resolved yet arrives exactly this way, so the refusal is the cue for an
+    /// immediate DNS re-resolution. The endpoint only rings the bell; the rate
+    /// limiting and the resolving belong to whoever is listening.
+    pub on_unknown_key: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl NetOptions {
@@ -38,6 +46,7 @@ impl NetOptions {
         NetOptions {
             bind_addr: Some("127.0.0.1:0".parse().expect("valid loopback address")),
             offline: true,
+            on_unknown_key: None,
         }
     }
 }
@@ -75,8 +84,14 @@ impl Net {
             .map_err(|e| NetError::Endpoint(e.to_string()))?;
 
         let router = Router::builder(endpoint)
-            .accept(ALPN_MPT, MptProtocol::new(store.clone()))
-            .accept(ALPN_BLOB, BlobProtocol::new(store.clone()))
+            .accept(
+                ALPN_MPT,
+                MptProtocol::new(store.clone()).on_unknown_key(options.on_unknown_key.clone()),
+            )
+            .accept(
+                ALPN_BLOB,
+                BlobProtocol::new(store.clone()).on_unknown_key(options.on_unknown_key.clone()),
+            )
             .spawn();
 
         Ok(Net { router, store })

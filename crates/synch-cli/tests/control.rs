@@ -254,7 +254,7 @@ async fn every_command_variant_round_trips() {
     assert!(lines(data_dir, Request::DomainLs)
         .await
         .contains("cluster.example"));
-    let _ = frames(data_dir, Request::DomainRefresh).await;
+    let _ = frames(data_dir, Request::DomainRefresh { domain: None }).await;
     assert!(lines(
         data_dir,
         Request::DomainRm {
@@ -299,13 +299,23 @@ async fn every_command_variant_round_trips() {
 
     // Pins.
     let root = blake3::hash(b"hello").to_hex().to_string();
-    assert!(lines(data_dir, Request::PinAdd { root: root.clone() })
-        .await
-        .contains(&root));
+    assert!(lines(
+        data_dir,
+        Request::PinAdd {
+            target: root.clone()
+        }
+    )
+    .await
+    .contains(&root));
     assert!(lines(data_dir, Request::PinLs).await.contains(&root));
-    assert!(lines(data_dir, Request::PinRm { root: root.clone() })
-        .await
-        .contains(&root));
+    assert!(lines(
+        data_dir,
+        Request::PinRm {
+            target: root.clone()
+        }
+    )
+    .await
+    .contains(&root));
     assert!(lines(data_dir, Request::PinLs).await.is_empty());
 
     // Reports.
@@ -417,7 +427,7 @@ async fn errors_cross_the_socket_with_their_code() {
         failure(
             data_dir,
             Request::PinAdd {
-                root: "not-hex".into()
+                target: "not-hex".into()
             }
         )
         .await,

@@ -242,10 +242,15 @@ pub fn doctor(node: &Node) -> Lines {
 
     if !report.unbound_origins.is_empty() {
         out.push(String::new());
-        out.push("unbound origins (see §3.4):".into());
-        for origin in &report.unbound_origins {
-            out.push(format!("  {origin}"));
+        out.push("origins held without a live binding (§3.4, §12):".into());
+        for (origin, entries) in &report.unbound_origins {
+            out.push(format!("  {origin}: {entries} entr(ies) still held"));
         }
+        out.push(
+            "  removal cuts off future participation only; what they published stays \
+             replicated and ages out with ordinary retention"
+                .into(),
+        );
     }
 
     out.push(String::new());

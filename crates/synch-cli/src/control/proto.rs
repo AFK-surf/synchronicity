@@ -28,8 +28,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// by the unified tree (§8), which gave `cat`/`get` a version policy and
 /// re-shaped the `mirror` requests: postcard identifies variants by position
 /// and fields by order, so a client and a daemon from either side of such a
-/// change must say so plainly rather than mis-decode each other.
-pub const CONTROL_VERSION: u32 = 3;
+/// change must say so plainly rather than mis-decode each other. Bumped to 4
+/// when `domain refresh` grew an optional domain and `pin add`/`pin rm` grew a
+/// `<space>/<path>` form — both reshape an existing variant's fields.
+pub const CONTROL_VERSION: u32 = 4;
 
 /// How many payload bytes one `Chunk` frame carries.
 ///
@@ -218,8 +220,11 @@ pub enum Request {
     },
     /// `synch domain ls`
     DomainLs,
-    /// `synch domain refresh`
-    DomainRefresh,
+    /// `synch domain refresh [<domain>]`
+    DomainRefresh {
+        /// The one domain to refresh, or `None` for every configured domain.
+        domain: Option<String>,
+    },
     /// `synch peers`
     Peers,
     /// `synch space add <id> <path>`
@@ -296,15 +301,17 @@ pub enum Request {
     MirrorLs,
     /// `synch mirror sync`
     MirrorSync,
-    /// `synch pin add <root>`
+    /// `synch pin add <root>|<space>/<path>`
     PinAdd {
-        /// The object root, hex.
-        root: String,
+        /// A hex object root, or a `<space>/<path>` whose selected version's
+        /// root is pinned (§8).
+        target: String,
     },
-    /// `synch pin rm <root>`
+    /// `synch pin rm <root>|<space>/<path>`
     PinRm {
-        /// The object root, hex.
-        root: String,
+        /// A hex object root, or a `<space>/<path>` whose selected version's
+        /// root is unpinned (§8).
+        target: String,
     },
     /// `synch pin ls`
     PinLs,

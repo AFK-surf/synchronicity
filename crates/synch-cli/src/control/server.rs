@@ -390,7 +390,7 @@ async fn dispatch<S: AsyncWrite + Unpin>(
         Request::DomainAdd { domain } => {
             node.add_domain(&domain)?;
             out.line(format!("added {domain}")).await?;
-            refresh_domains(node, out).await?;
+            refresh_domains(node, out, Some(&domain)).await?;
         }
 
         Request::DomainRm { domain } => {
@@ -405,7 +405,7 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             }
         }
 
-        Request::DomainRefresh => refresh_domains(node, out).await?,
+        Request::DomainRefresh { domain } => refresh_domains(node, out, domain.as_deref()).await?,
 
         Request::Peers => {
             let now = now_ns();
@@ -696,14 +696,14 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             }
         }
 
-        Request::PinAdd { root } => {
-            let root = parse_root(&root)?;
+        Request::PinAdd { target } => {
+            let root = pin_target(node, &target)?;
             node.store().set_pinned(&root, true)?;
             out.line(format!("pinned {root}")).await?;
         }
 
-        Request::PinRm { root } => {
-            let root = parse_root(&root)?;
+        Request::PinRm { target } => {
+            let root = pin_target(node, &target)?;
             node.store().set_pinned(&root, false)?;
             out.line(format!("unpinned {root}")).await?;
         }
@@ -836,7 +836,14 @@ async fn recover<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn refresh_domains<S: AsyncWrite + Unpin>(node: &Node, out: &mut Frames<S>) -> Done {
+async fn refresh_domains<S: AsyncWrite + Unpin>(
+    node: &Node,
+    out: &mut Frames<S>,
+    domain: Option<&str>,
+) -> Done {
+    // A domain the node was never told about is a typo, and it is refused
+    // before a resolver is even built.
+    let domain = domain.map(|d| node.configured_domain(d)).transpose()?;
     let resolver = match synch_net::DnssecResolver::from_system() {
         Ok(resolver) => resolver,
         Err(e) => {
@@ -845,7 +852,10 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(node: &Node, out: &mut Frames<S>
             return Ok(());
         }
     };
-    match node.refresh_domains(&resolver).await {
+    match node
+        .refresh_domains_named(&resolver, domain.as_deref())
+        .await
+    {
         Ok(refreshes) => {
             for refresh in refreshes {
                 out.line(format!(
@@ -929,7 +939,34 @@ fn parse_policy(text: Option<&str>) -> std::result::Result<VersionPolicy, Contro
     }
 }
 
-fn parse_root(text: &str) -> std::result::Result<Hash, ControlError> {
-    Hash::from_str(text)
-        .map_err(|_| ControlError::invalid(format!("{text} is not a 64-character hex object root")))
+/// What `synch pin add|rm` names: a hex object root, or a path whose selected
+/// version supplies one (§8).
+///
+/// A pin is about bytes, and the bytes a path stands for are whichever version
+/// the reading policy picks — the same selection every other read goes
+/// through, so a pin and a `synch cat` of the same reference always mean the
+/// same object. An `<origin>:` prefix pins that origin's version.
+fn pin_target(node: &Node, text: &str) -> std::result::Result<Hash, ControlError> {
+    if let Ok(root) = Hash::from_str(text) {
+        return Ok(root);
+    }
+    // A reference always carries a path, so anything without a separator was
+    // meant to be a root and is reported as one rather than as a bad space.
+    let malformed = || {
+        ControlError::invalid(format!(
+            "{text} is neither a 64-character hex object root nor a <space>/<path>"
+        ))
+    };
+    if !text.contains('/') {
+        return Err(malformed());
+    }
+    let reference = parse_reference(text).map_err(|_| malformed())?;
+    if reference.is_space_root() {
+        return Err(malformed());
+    }
+    let policy = policy_for(&reference, None, false)?;
+    let entry = node.resolve(&reference.space, &reference.path, &policy)?;
+    entry.content.ok_or_else(|| {
+        ControlError::invalid(format!("{text} selects a version with no content to pin"))
+    })
 }

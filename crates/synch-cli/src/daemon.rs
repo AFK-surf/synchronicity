@@ -48,6 +48,19 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let maintenance = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
         node.run_maintenance(shutdown).await
     });
+    // Membership is only as live as its last validated lookup: without this
+    // loop a DNSSEC cluster dissolves one TTL plus grace after the last manual
+    // refresh, because `run_maintenance` expires bindings and nothing renews
+    // them (§3.2). It also carries the §3.4 unknown-key trigger.
+    let dns = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+        match synch_net::DnssecResolver::from_system() {
+            Ok(resolver) => node.run_dns(&resolver, shutdown).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "no DNSSEC resolver available; membership will not refresh");
+                shutdown.await
+            }
+        }
+    });
     // What turns the scanner's and the watcher's staged changes into heads: one
     // batch per quiet period or per 1000 entries, whichever comes first (§7.1).
     let publisher = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
@@ -69,7 +82,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         _ = stopped.recv() => {}
     }
 
-    let _ = tokio::join!(control, aae, scanner, watcher, maintenance, publisher);
+    let _ = tokio::join!(control, aae, scanner, watcher, maintenance, publisher, dns);
     node.shutdown().await?;
     Ok(())
 }

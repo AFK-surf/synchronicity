@@ -246,8 +246,11 @@ pub enum DomainCommand {
     },
     /// List configured membership domains.
     Ls,
-    /// Re-resolve every configured domain now.
-    Refresh,
+    /// Re-resolve one configured domain now, or every one.
+    Refresh {
+        /// The domain to refresh. Omitted, every configured domain is.
+        domain: Option<String>,
+    },
 }
 
 /// `synch space ...`
@@ -300,15 +303,16 @@ pub enum MirrorCommand {
 /// `synch pin ...`
 #[derive(Debug, Subcommand)]
 pub enum PinCommand {
-    /// Pin an object root.
+    /// Pin an object root, or the version a path selects.
     Add {
-        /// The object root, hex.
-        root: String,
+        /// A hex object root, or `<space>/<path>` — whose selected version's
+        /// content root is the one pinned (§8).
+        target: String,
     },
-    /// Unpin an object root.
+    /// Unpin an object root, or the version a path selects.
     Rm {
-        /// The object root, hex.
-        root: String,
+        /// A hex object root, or `<space>/<path>`.
+        target: String,
     },
     /// List pinned objects.
     Ls,

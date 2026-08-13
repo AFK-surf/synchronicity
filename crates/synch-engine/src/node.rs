@@ -51,6 +51,15 @@ struct NodeInner {
     /// The batch between staging and one signed root (§7.1).
     publisher: Publisher,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
+    /// When each configured membership domain is next due for re-resolution,
+    /// and when it was last attempted (§3.2, §3.4).
+    dns: std::sync::Mutex<std::collections::HashMap<String, crate::membership::DomainSchedule>>,
+    /// Rung when an inbound connection is refused for an unknown device key,
+    /// which §3.4 makes a trigger for an immediate DNS re-resolution.
+    dns_wake: Arc<tokio::sync::Notify>,
+    /// Rung when a space is added or removed, so the watcher re-registers
+    /// without waiting for the next filesystem hint (§7.1).
+    spaces_changed: Arc<tokio::sync::Notify>,
 }
 
 /// What `init` created.
@@ -103,13 +112,18 @@ impl Node {
     }
 
     /// Opens an initialized data directory and binds the endpoint.
-    pub async fn open(config: NodeConfig) -> Result<Node> {
+    pub async fn open(mut config: NodeConfig) -> Result<Node> {
         let store = Arc::new(Store::open(&config.data_dir)?);
         let origin = store.self_origin()?.ok_or(EngineError::NotInitialized)?;
         let secret = store
             .active_device_key()?
             .ok_or(EngineError::NoActiveKey)?
             .secret;
+        // Every endpoint this node ever binds — this one, and the second one a
+        // key activation brings up — rings the same bell, because the refusal
+        // that matters can arrive at either (§3.4).
+        let dns_wake = Arc::new(tokio::sync::Notify::new());
+        config.net.on_unknown_key = Some(dns_wake.clone());
         let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let syncer = Syncer::new(store.clone());
         let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
@@ -124,6 +138,9 @@ impl Node {
                 config,
                 publisher,
                 ad_clock: std::sync::Mutex::new(Default::default()),
+                dns: std::sync::Mutex::new(Default::default()),
+                dns_wake,
+                spaces_changed: Arc::new(tokio::sync::Notify::new()),
             }),
         };
         // A batch that was still buffered when the process died was never
@@ -350,6 +367,7 @@ impl Node {
             }
         }
         self.store().put_space(id, &path.to_string_lossy())?;
+        self.spaces_changed();
         Ok(())
     }
 
@@ -371,7 +389,45 @@ impl Node {
         for path in self.store().local_files(id)? {
             self.store().remove_local_file(id, &path)?;
         }
+        self.spaces_changed();
         Ok(staged)
+    }
+
+    /// Tells the watcher that the set of spaces changed (§7.1).
+    pub(crate) fn spaces_changed(&self) {
+        self.inner.spaces_changed.notify_waiters();
+    }
+
+    /// The bell the watcher waits on for space additions and removals.
+    pub(crate) fn spaces_changed_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.spaces_changed.clone()
+    }
+
+    /// The bell an unknown-key refusal rings, which the DNS refresh loop waits
+    /// on (§3.4).
+    pub(crate) fn dns_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.dns_wake.clone()
+    }
+
+    /// Rings the unknown-key bell as an inbound refusal would.
+    ///
+    /// The endpoint rings it on its own; this is how a caller that already
+    /// knows a binding is stale asks for the same re-resolution.
+    pub fn trigger_dns_refresh(&self) {
+        self.inner.dns_wake.notify_waiters();
+    }
+
+    /// The per-domain re-resolution schedule (§3.2).
+    pub(crate) fn dns_schedule(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<String, crate::membership::DomainSchedule>,
+    > {
+        self.inner
+            .dns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     // ---- publishing -------------------------------------------------------
