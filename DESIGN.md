@@ -26,9 +26,12 @@ Status: draft v0.1 · 2026-08-12
 - **Verifiable content**: content-addressed storage with a hash tree per object, so
   random reads are verifiable without downloading whole files, and any holder of any
   subtree can serve it.
-- **Honest version control**: no invented "global" tree state, no automatic conflict
-  resolution. Each node publishes *its own* view; divergence is a first-class,
-  observable condition that users resolve explicitly.
+- **One tree, honest versions**: users see a single hierarchy aggregated from every
+  node, but the system never invents a merged state. Each path carries the full set
+  of per-origin versions; a file written by several nodes has several versions.
+  Divergence is first-class and visible, choosing between versions is an explicit,
+  deterministic policy, and resolution only ever happens by a node adopting a
+  version as its own (§8).
 
 ### Non-goals
 
@@ -76,8 +79,10 @@ The core mental model:
 1. Every node owns exactly one **origin trie**: a signed Merkle-Patricia Trie containing
    that node's published records — its file metadata and its blob inventory.
 2. Every node **replicates the origin tries of all trusted peers** via anti-entropy
-   (`mptsync`). The cluster-wide view is the *union* of per-origin tries; it is never
-   merged into a single tree.
+   (`mptsync`). The stored state is the *union* of per-origin tries — origins' tries
+   are never merged. What the user is shown is a **unified tree** derived from that
+   union: one hierarchy in which each path carries one version per distinct content
+   root published for it (§8).
 3. File content lives in a local **content-addressed store**, addressed by BLAKE3 hash
    tree roots. Who-has-what is discoverable from the synced tries, so any node can fetch
    any range of any object from any holder, with per-read cryptographic verification.
@@ -672,17 +677,23 @@ behavior with zero kernel dependencies:
 Ignore rules: `.syncignore` per space root (gitignore syntax), plus sensible built-in
 defaults (`.DS_Store`, `Thumbs.db`, temp/lock patterns).
 
-### 7.2 Materialization (peers' spaces)
+### 7.2 Materialization (the unified tree, under a policy)
 
-Since there is no unified tree, materialization is **per (origin, space)**:
+Materialization reads the unified tree (§8), so every materializing surface names a
+**version policy** — `newest` (default), `origin=<id>`, or `strict`:
 
-- `synch get <origin>:<space>/<path> [-o dest]` — single fetch into a local file.
-- `synch mirror add <origin>:<space> <local-dir>` — continuous read-only mirror: the
-  engine tracks that origin's `f:` records for the space and keeps the directory in
-  sync (fetching content via §6.4). Mirrored trees are never indexed back into the
-  local origin trie (no echo).
-- `synch cat <origin>:<space>/<path> [--range a..b]` — stream to stdout with verified
-  random access; this is where hash-tree reads shine (e.g. seeking in a large video).
+- `synch get <space>/<path> [-o dest] [--from <origin>|--strict]` — single fetch of
+  the selected version into a local file. `synch get <origin>:<space>/<path>` remains
+  the origin-pinned form.
+- `synch mirror add <space> <local-dir> [--policy newest|origin=<id>|strict]` —
+  continuous read-only mirror of the unified tree for that space: the engine keeps
+  the directory in sync with the policy-selected version of every path (fetching
+  content via §6.4). Under `strict`, divergent paths are skipped and reported —
+  the mirror never guesses. Mirrored trees are never indexed back into the local
+  origin trie (no echo).
+- `synch cat <space>/<path> [--range a..b] [--from <origin>|--strict]` — stream to
+  stdout with verified random access; this is where hash-tree reads shine (e.g.
+  seeking in a large video).
 
 Materialization safety: trie paths are case-sensitive NFC UTF-8, but local
 filesystems may not be. When two published paths collide under the target
@@ -694,26 +705,59 @@ And mirror targets may not overlap any configured space root (or vice versa):
 `synch mirror add` and `synch space add` refuse overlapping paths, which makes the
 "no echo" guarantee structural rather than conventional.
 
-Two-way "shared folder" workflows are composed from primitives: both nodes index their
-own copy of a space (same space id), and divergence between them is surfaced by
-`synch status` (§8) for explicit adoption with `synch take`.
+Two-way "shared folder" workflows are the unified tree working as intended: both
+nodes index their own copy of a space (same space id), the tree shows one hierarchy,
+agreement renders as plain files, and divergence between the copies is marked and
+surfaced by `synch status` (§8) for explicit adoption with `synch take`.
 
 ---
 
-## 8. Version control model
+## 8. The unified tree and its versions
 
-Principles: **every origin publishes only its own copy; the system never merges.**
+What a user sees is **one tree**: per space, the union of every origin's published
+paths. What the system stores and syncs is unchanged — per-origin single-writer tries
+(§4), replicated whole. The unified tree is a *derived view* (`entries` grouped by
+`(space, path)`), never a stored structure and never itself synced; there is nothing
+to reconcile about the view because it is recomputed from the assertions.
 
-- Each `(origin, space, path)` triple is an independent assertion: "this is my current
-  copy". The cluster-wide state of a path is the *set* of such assertions.
-- **Divergence is data, not an error.** `synch status <space>/<path>` shows all origins'
-  entries side by side (size, mtime, content root, seq). Two origins whose content
-  roots match are "in agreement" — a purely observational notion.
+Principles: **every origin publishes only its own copy; the system never merges
+content.** What it does do is aggregate:
+
+- Each `(origin, space, path)` triple remains an independent assertion: "this is my
+  current copy". A path's state in the unified tree is the *set* of those assertions.
+- A **version** of a path is a distinct content root among the origins' current
+  entries for it. Origins asserting the same root collapse into one version with
+  several attestors — agreement is the common case, and it renders as a plain file.
+- A path **exists** in the tree iff at least one origin currently publishes a live
+  (non-tombstone) entry for it. Origins that never published a path simply don't
+  contribute — absence is not an assertion. A tombstone *is* an assertion ("deleted
+  at seq N") and counts as a content-less version: live + tombstone on the same path
+  is deletion divergence, and the path stays visible (marked) until it is resolved
+  or every publisher tombstones it.
+- **Divergent** = two or more versions. Divergence is data, not an error: `synch ls`
+  marks it, `synch status <space>/<path>` shows every version side by side (content
+  root, attestors, size, mtime, seq), `synch doctor` counts them cluster-wide. No
+  version is ever combined with another, and every origin's assertion stays
+  individually addressable as `<origin>:<space>/<path>`.
+- **Selection, not resolution**: any read of a bare `<space>/<path>` must pick one
+  version, and does so by an explicit, deterministic policy:
+  - `newest` (default) — the version with the greatest `(mtime_ns, content_root,
+    origin)`, a total order, so every node selects the same version from the same
+    assertions. This is presentation, not resolution: nothing is written, no
+    assertion changes, and the losing versions remain first-class and marked.
+  - `origin=<id>` — pin to one origin's view (the old per-origin behavior, still the
+    right tool for "serve exactly what the NAS publishes").
+  - `strict` — refuse to read a divergent path, returning the version list instead;
+    for workflows where silently reading either side is worse than failing.
+  Policy is a property of the reading surface: a flag on `cat`/`get` (`--from
+  <origin>`, `--strict`), a stored policy per mirror and per s3 bucket (§7.2, §9.4).
 - **Adoption is explicit**: `synch take <origin>:<space>/<path>` fetches that origin's
   content, writes it into the local space, and thereby (via the indexing pipeline)
-  publishes it as the local node's own new entry. `prev` is set to the replaced local
-  content root, recording 1-step lineage so UIs can distinguish "adopted theirs on top
-  of X" from "changed independently".
+  publishes it as the local node's own new entry. Adoption is how divergence ends:
+  as publishers converge on one root, their assertions collapse back into a single
+  unanimous version. `prev` is set to the replaced local content root, recording
+  1-step lineage so UIs can distinguish "adopted theirs on top of X" from "changed
+  independently".
 - **History**: retained old roots (§5.4) give each origin a record of its own
   publishes: `synch log <space>/<path>` walks historical roots' leaves for the key
   and shows each version's seq and content root. An old version's *bytes* remain
@@ -775,14 +819,19 @@ synch space add <id> <path>                  index a local directory as a space
 synch space ls|rm
 synch scan                                   walk every space now: hash changes, publish
 
-synch ls   [<origin>:]<space>/[<dir>]        list entries (default: all origins, merged view)
-synch status [<space>[/<path>]]              agreement/divergence across origins
-synch cat  <origin>:<space>/<path> [--range] verified streaming read
-synch get  <origin>:<space>/<path> [-o …]    fetch to file
-synch take <origin>:<space>/<path>           adopt a peer's version as my own
+synch ls   [<origin>:]<space>[/<dir>]        list the unified tree (divergent paths
+                                             marked with version counts); origin-
+                                             prefixed form lists one origin's view
+synch status [<space>[/<path>]]              the version inspector: every version of
+                                             a path, its attestors, side by side
+synch cat  [<origin>:]<space>/<path>         verified streaming read of the selected
+           [--range] [--from <o>|--strict]   version (§8 policy; default newest)
+synch get  [<origin>:]<space>/<path> [-o …]  fetch the selected version to a file
+           [--from <o>|--strict]
+synch take <origin>:<space>/<path>           adopt a version as my own (ends divergence)
 synch log  [<origin>:]<space>/<path>         per-origin publish history
-synch mirror add|rm|ls|sync                  continuous read-only materialization
-                                             (sync: bring every mirror up to date now)
+synch mirror add <space> <dir> [--policy …]  continuous materialization of the unified
+synch mirror rm|ls|sync                      tree under a version policy (§7.2)
 
 synch pin add|rm|ls <root|path>              keep content in CAS regardless of policy
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
@@ -829,11 +878,17 @@ The second binary target embeds the same engine crate and exposes a subset of th
 HTTP API, so existing S3 tooling (aws cli, rclone, restic, mc, the SDKs) can read
 and write a synchronicity cluster without knowing anything about it.
 
-- **Bucket mapping**: a bucket names a *view* — `synch-s3 bucket add <bucket>
-  <origin>:<space>`. Reads serve that origin's published entries; content flows
-  through the normal verified path (local CAS first, then peer fetch). Buckets
-  whose origin is the local node are writable; foreign-origin buckets are
-  read-only — the version model (§8) forbids publishing someone else's view.
+- **Bucket mapping**: a bucket names a space of the unified tree plus a version
+  policy — `synch-s3 bucket add <bucket> <space> [--policy newest|origin=<id>|strict]`
+  (default `newest`; `synch-s3 bucket add <bucket> <origin>:<space>` is shorthand
+  for the origin pin). Reads serve the policy-selected version of each path (§8);
+  content flows through the normal verified path (local CAS first, then peer
+  fetch). A `strict` bucket answers a divergent key with `409 Conflict` naming the
+  versions. Writes are always publishes of the *local* node's own view — the
+  version model (§8) forbids publishing someone else's — so every bucket is
+  writable, and a write simply adds/updates our assertion for that path (under an
+  `origin=` pin on a *foreign* origin, the bucket is effectively read-only since
+  reads would not see our writes; the gateway warns on such a configuration).
 - **Operations (v1)**:
   - `GetObject` — including `Range` requests, served as verified range reads (§6.1).
   - `HeadObject` — size, mtime, ETag straight from the entry metadata; no content
@@ -865,10 +920,24 @@ the invariant that matters is that every multi-step state change (head flips,
 publish batches) is a single transaction and no partial state is ever observable;
 read concurrency is deliberately traded away for that simplicity.
 
-The schema carries a version number in `config` (`schema_version`); every statement
-is `IF NOT EXISTS` and changes are additive, so applying the schema *is* the
-upgrade, and a database written by a newer version is refused rather than guessed
-at. `config` also holds `self_origin_id` and, after a recovery (§3.4), the
+**Migrations.** The schema's single source of truth is an ordered chain of
+migrations: `MIGRATIONS[v]` takes a database from version `v` to `v+1`, and version
+1 is the original schema. A fresh database is built by replaying the whole chain
+from empty — there is no separate "current schema" bootstrap path that could drift
+from what upgrades produce; the DDL below documents the final shape, and a test
+asserts that replaying the chain yields exactly it (compared via `sqlite_master`).
+Rules:
+
+- Each migration runs in **one transaction**, with the `schema_version` stamp
+  updated inside that same transaction — a crash mid-upgrade leaves a database that
+  is exactly at some version, never between two.
+- Migrations only ever move forward; a database stamped newer than the binary knows
+  is **refused**, not probed. No `IF NOT EXISTS` anywhere — whether an object exists
+  is determined by the version number, never discovered by trying.
+- Anything a plain SQL statement can't express (a backfill, a table rewrite) is a
+  Rust migration step in the same numbered chain, under the same transaction rule.
+
+`config` also holds `self_origin_id` and, after a recovery (§3.4), the
 `publish_floor`.
 
 ```sql
@@ -959,8 +1028,9 @@ CREATE TABLE spaces        (id TEXT PRIMARY KEY, local_path TEXT NOT NULL);
 CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INTEGER,
                             file_id BLOB, content BLOB, scanned_at INTEGER,
                             PRIMARY KEY (space, relpath));
-CREATE TABLE mirrors       (origin_id TEXT, space TEXT, local_path TEXT NOT NULL,
-                            PRIMARY KEY (origin_id, space));
+CREATE TABLE mirrors       (local_path TEXT PRIMARY KEY,   -- one mirror per directory
+                            space TEXT NOT NULL,
+                            policy TEXT NOT NULL);          -- 'newest' | 'origin=<id>' | 'strict' (§7.2)
 CREATE TABLE peers_seen    (node_id BLOB PRIMARY KEY, last_addr BLOB, last_seen INTEGER,
                             last_sync INTEGER, latency_ewma_us INTEGER);
 
@@ -1117,14 +1187,17 @@ Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`
    each seek is a new verified range read. Fetched groups land in laptop's CAS, and
    its next milestone ad update (§6.3) advertises its partial — later complete —
    copy of the object.
-4. `vps` (which mirrors `nas:media`) later fetches the same file — provider resolution
-   now returns `{nas, laptop}` and it pulls from both in parallel.
-5. `nas` edits a file. Watcher → rescan → head `(seq=2, r2)` → `HeadPush` to both peers;
-   each pulls exactly the changed path's trie nodes. `laptop`'s stale copy of the old
-   content remains valid (content-addressed), and `synch status media/…` on any node
-   shows `nas` at the new root and `laptop` still advertising (and pinning, if it
-   chose) the old object — divergence visible, nothing auto-resolved, adoption one
-   `synch take` away.
+4. `vps` (which runs `synch mirror add media /srv/mirror` — unified tree, default
+   `newest` policy) later fetches the same file — provider resolution now returns
+   `{nas, laptop}` and it pulls from both in parallel.
+5. `nas` edits a file; `laptop` had edited its own copy of the same path an hour
+   earlier. Watcher → rescan → head `(seq=2, r2)` → `HeadPush` to both peers; each
+   pulls exactly the changed path's trie nodes. `synch ls media` on any node still
+   shows one tree, with that path marked `⑂2`: two versions, one asserted by `nas`,
+   one by `laptop`. `synch cat media/that/file` reads the newest deterministically;
+   `--from laptop` reads the other; `synch status media/that/file` lays both out —
+   divergence visible, nothing auto-resolved, adoption one `synch take` away, after
+   which the path collapses back to a single unanimous version.
 6. `nas`'s operator rotates its key: `synch key rotate`, publish the second
    `id=nas nk=<K_new>` TXT record, wait for propagation, then `synch key activate
    <K_new>` — which re-signs the head as `K_new` at `seq=3` and brings up the
