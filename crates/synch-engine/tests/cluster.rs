@@ -869,7 +869,12 @@ async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
         .adopt_deletion("shared", "notes.txt")
         .unwrap()
         .expect("our copy was here");
-    assert_eq!(removed, laptop.space.path().join("notes.txt"));
+    // The engine reports the path under the *stored* space root, which was
+    // canonicalized at `space add` time — on macOS the tempdir's `/var/…` is a
+    // symlink to `/private/var/…`, so the raw tempdir path would not compare
+    // equal even though it names the same file.
+    let canonical_space = laptop.space.path().canonicalize().unwrap();
+    assert_eq!(removed, canonical_space.join("notes.txt"));
     assert!(!laptop.space.path().join("notes.txt").exists());
 
     let head = laptop.node.scan_publish_push().await.unwrap().unwrap();
