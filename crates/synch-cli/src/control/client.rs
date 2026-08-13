@@ -8,7 +8,8 @@ use std::path::Path;
 
 use crate::control::{
     proto::{
-        read_frame, write_frame, ControlError, ErrorCode, Hello, Request, Response, CONTROL_VERSION,
+        read_frame, write_frame, ControlError, ErrorCode, Hello, Request, Response, Upload,
+        CONTROL_VERSION,
     },
     transport::{self, ClientConn},
 };
@@ -77,6 +78,16 @@ impl Client {
     /// Sends the request. One connection carries one command.
     pub async fn send(&mut self, request: &Request) -> Result<(), ControlError> {
         write_frame(&mut self.stream, request).await?;
+        Ok(())
+    }
+
+    /// Sends one frame of a client-streamed payload.
+    ///
+    /// Only [`Request::TreePut`] takes these, and it takes them until an
+    /// [`Upload::End`] or [`Upload::Abort`]: the daemon is reading, not
+    /// answering, until one of the two arrives.
+    pub async fn upload(&mut self, frame: &Upload) -> Result<(), ControlError> {
+        write_frame(&mut self.stream, frame).await?;
         Ok(())
     }
 

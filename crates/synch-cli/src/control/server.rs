@@ -9,6 +9,7 @@ use std::{str::FromStr, sync::Arc};
 
 use synch_core::{now_ns, Hash, NodeId, OriginId};
 use synch_engine::{EntryRef, Node, VersionPolicy};
+use synch_store::{EntryRow, VersionSet};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::broadcast,
@@ -17,8 +18,8 @@ use tokio::{
 use crate::{
     control::{
         proto::{
-            read_frame, tokens_match, write_frame, ControlError, ErrorCode, Hello, Request,
-            Response, CHUNK_SIZE, CONTROL_VERSION,
+            read_frame, tokens_match, write_frame, ControlError, EntryInfo, ErrorCode, Hello,
+            Request, Response, Upload, CHUNK_SIZE, CONTROL_VERSION,
         },
         transport::{self, Listener},
     },
@@ -193,12 +194,33 @@ impl<S: AsyncWrite + Unpin> Frames<S> {
         write_frame(&mut self.stream, &Response::Progress(text.into())).await
     }
 
+    async fn entry(&mut self, info: EntryInfo) -> std::io::Result<()> {
+        write_frame(&mut self.stream, &Response::Entry(Box::new(info))).await
+    }
+
     async fn end(&mut self) -> std::io::Result<()> {
         write_frame(&mut self.stream, &Response::End).await
     }
 
     async fn error(&mut self, error: ControlError) -> std::io::Result<()> {
         write_frame(&mut self.stream, &Response::Error(error)).await
+    }
+}
+
+impl<S: AsyncRead + Unpin> Frames<S> {
+    /// Reads the next frame of a client-streamed payload
+    /// ([`Request::TreePut`]).
+    ///
+    /// A connection that ends mid-payload reads as an abort rather than as an
+    /// end: a truncated body must never be mistaken for a complete object.
+    async fn upload(&mut self) -> std::result::Result<Upload, ControlError> {
+        match read_frame::<Upload, _>(&mut self.stream).await {
+            Ok(frame) => Ok(frame),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(Upload::Abort(
+                "the client closed the connection mid-payload".into(),
+            )),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -215,7 +237,7 @@ type Handled = std::result::Result<Outcome, ControlError>;
 type Done = std::result::Result<(), ControlError>;
 
 /// Serves one request.
-async fn dispatch<S: AsyncWrite + Unpin>(
+async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
     node: &Node,
     request: Request,
     out: &mut Frames<S>,
@@ -762,8 +784,159 @@ async fn dispatch<S: AsyncWrite + Unpin>(
                 out.line(root.to_string()).await?;
             }
         }
+
+        Request::TreeList {
+            space,
+            prefix,
+            start_after,
+            limit,
+            policy,
+        } => {
+            let policy = parse_policy(policy.as_deref())?;
+            let listing = node.unified_listing(
+                &space,
+                &prefix,
+                start_after.as_deref(),
+                limit.map(|n| n as usize),
+            )?;
+            for set in &listing {
+                if !set.exists() {
+                    // Every publisher has tombstoned it: the path has left the
+                    // tree, so the tree does not list it.
+                    continue;
+                }
+                // A listing has no way to answer one path with an error, so a
+                // path the policy refuses is left out rather than reported with
+                // one side's metadata. `TreeResolve` of that path still says
+                // exactly what is wrong.
+                let Ok(row) = node.resolve_set(set, &policy) else {
+                    continue;
+                };
+                out.entry(entry_info(&row, set)).await?;
+            }
+        }
+
+        Request::TreeResolve {
+            space,
+            path,
+            policy,
+        } => {
+            let policy = parse_policy(policy.as_deref())?;
+            let set = node.versions(&space, &path)?;
+            let row = node.resolve_set(&set, &policy)?;
+            out.entry(entry_info(&row, &set)).await?;
+        }
+
+        Request::TreeRead {
+            space,
+            path,
+            policy,
+            start,
+            len,
+        } => {
+            let policy = parse_policy(policy.as_deref())?;
+            stream_entry(node, out, &space, &path, &policy, start, len).await?;
+        }
+
+        Request::TreePut { space, path } => {
+            put_stream(node, out, &space, &path).await?;
+        }
+
+        Request::ConfigGet { key } => {
+            let key = gateway_config_key(&key)?;
+            if let Some(value) = node.store().config(key)? {
+                for record in value.lines() {
+                    out.line(record).await?;
+                }
+            }
+        }
+
+        Request::ConfigAppend { key, record } => {
+            let key = gateway_config_key(&key)?;
+            if record.contains('\n') {
+                return Err(ControlError::invalid(
+                    "a config record is one line: newlines separate records",
+                ));
+            }
+            node.store().append_config(key, &record)?;
+            out.line(format!("appended to {key}")).await?;
+        }
     }
     Ok(outcome)
+}
+
+/// Receives a streamed write and publishes it (§7.1, §9.4).
+///
+/// The recovery gate is taken before a byte is written, for the reason `scan`
+/// takes it before hashing: a node that cannot publish would otherwise accept
+/// the upload, write it into the space, and lose it (§3.4).
+async fn put_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    node: &Node,
+    out: &mut Frames<S>,
+    space: &str,
+    path: &str,
+) -> Done {
+    node.ensure_publishable()?;
+    let mut adoption = node.open_adoption(space, path)?;
+    loop {
+        match out.upload().await? {
+            Upload::Chunk(bytes) => adoption.write(&bytes)?,
+            Upload::End => break,
+            // The staging file goes with the dropped `Adoption`; the space is
+            // left exactly as it was.
+            Upload::Abort(why) => {
+                return Err(ControlError::invalid(format!(
+                    "the write was abandoned after {} byte(s): {why}",
+                    adoption.written()
+                )))
+            }
+        }
+    }
+    let target = adoption.commit()?;
+
+    // The ordinary indexing pipeline takes it from here: hash, CAS, stage,
+    // publish. A write answers with a published seq for the same reason `scan`
+    // does — the entry it reports has to be one peers can already see.
+    node.scan_publish_push().await?;
+    let ours = VersionPolicy::Origin(node.origin().clone());
+    let set = node.versions(space, path)?;
+    let row = node.resolve_set(&set, &ours)?;
+    out.line(format!("wrote {}", target.display())).await?;
+    out.entry(entry_info(&row, &set)).await?;
+    Ok(())
+}
+
+/// Renders one selected entry as the metadata frame a structured client reads.
+fn entry_info(row: &EntryRow, set: &VersionSet) -> EntryInfo {
+    EntryInfo {
+        origin: row.origin.canonical(),
+        space: row.space.clone(),
+        path: row.path.clone(),
+        kind: row.kind,
+        size: row.size,
+        mtime_ns: row.mtime_ns,
+        content: row.content,
+        seq: row.seq,
+        symlink_target: row.symlink_target.clone(),
+        versions: set.version_count() as u32,
+    }
+}
+
+/// The config namespace a control client may read and append to (§9.4).
+///
+/// The `config` table also holds this node's identity and its schema version,
+/// so the gateway's buckets and access keys cannot live there unfenced: a
+/// client that could name any key could read one row to reach another. `s3.` is
+/// the whole of the fence, and it is checked here rather than at each call site
+/// so there is one place to be wrong.
+fn gateway_config_key(key: &str) -> std::result::Result<&str, ControlError> {
+    if key.starts_with("s3.") && key.len() > 3 {
+        Ok(key)
+    } else {
+        Err(ControlError::invalid(format!(
+            "{key} is not in the s3.* config namespace"
+        )))
+    }
 }
 
 /// Streams a verified byte range out of the CAS as `Chunk` frames.

@@ -197,6 +197,24 @@ impl Store {
         Ok(())
     }
 
+    /// Appends one newline-separated record to a config value, creating the
+    /// value if it does not exist yet.
+    ///
+    /// A config row that holds a *list* — the S3 gateway's bucket map and its
+    /// access keys (§9.4) — is read and written by more than one process, and
+    /// a read-modify-write of the whole list silently drops whichever concurrent
+    /// edit commits first. One SQL statement cannot: the append happens inside
+    /// the database, under the same single connection every other write goes
+    /// through, so two appends interleave instead of overwriting each other.
+    pub fn append_config(&self, key: &str, record: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO config (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = value || char(10) || excluded.value",
+            params![key, record],
+        )?;
+        Ok(())
+    }
+
     /// Deletes a config value.
     pub fn clear_config(&self, key: &str) -> Result<()> {
         self.conn()
@@ -585,6 +603,33 @@ mod tests {
         assert_eq!(store.config("k").unwrap(), None);
     }
 
+    /// A list-valued config row grows by appending, and an append never
+    /// rewrites what is already there (§9.4).
+    #[test]
+    fn config_records_append() {
+        let (_dir, store) = temp_store();
+        store
+            .append_config("s3.buckets", "photos\tmedia\tnewest")
+            .unwrap();
+        assert_eq!(
+            store.config("s3.buckets").unwrap().as_deref(),
+            Some("photos\tmedia\tnewest"),
+            "the first append creates the row without a leading separator"
+        );
+        store
+            .append_config("s3.buckets", "docs\tpapers\tstrict")
+            .unwrap();
+        assert_eq!(
+            store
+                .config("s3.buckets")
+                .unwrap()
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["photos\tmedia\tnewest", "docs\tpapers\tstrict"]
+        );
+    }
+
     #[test]
     fn self_origin_round_trip() {
         let (_dir, store) = temp_store();
@@ -918,9 +963,11 @@ mod tests {
         assert_eq!(mirrors[0].local_path, "/mnt/nas");
         assert_eq!(mirrors[0].space, "media");
         assert_eq!(mirrors[0].policy.render(), "origin=nas@x.example");
-        // v5 did the same for the s3 bucket map.
+        // v5 did the same for the s3 bucket map, and v8 moved it into the
+        // `s3.*` namespace the gateway now reads over the control socket.
+        assert_eq!(store.config("s3_buckets").unwrap(), None);
         assert_eq!(
-            store.config("s3_buckets").unwrap().as_deref(),
+            store.config("s3.buckets").unwrap().as_deref(),
             Some("photos\tmedia\torigin=nas@x.example")
         );
     }

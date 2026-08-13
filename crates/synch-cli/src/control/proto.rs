@@ -11,12 +11,13 @@
 //! C→D  Hello    { version, token }
 //! D→C  Ready                        — or Error, and the connection ends
 //! C→D  Request
-//! D→C  Line | Chunk | Progress …    — zero or more
+//! C→D  Upload …                     — only for a request that streams a payload
+//! D→C  Line | Chunk | Entry | …     — zero or more
 //! D→C  End                          — or Error at any point
 //! ```
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use synch_core::MAX_FRAME_LEN;
+use synch_core::{EntryKind, Hash, MAX_FRAME_LEN};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The control protocol version.
@@ -30,8 +31,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// and fields by order, so a client and a daemon from either side of such a
 /// change must say so plainly rather than mis-decode each other. Bumped to 4
 /// when `domain refresh` grew an optional domain and `pin add`/`pin rm` grew a
-/// `<space>/<path>` form — both reshape an existing variant's fields.
-pub const CONTROL_VERSION: u32 = 4;
+/// `<space>/<path>` form — both reshape an existing variant's fields. Bumped to
+/// 5 by the gateway becoming a control-socket client (§9.4): six structured
+/// requests, a client-to-daemon [`Upload`] frame, and a [`Response::Entry`]
+/// frame that carries entry metadata rather than a rendered line.
+pub const CONTROL_VERSION: u32 = 5;
 
 /// How many payload bytes one `Chunk` frame carries.
 ///
@@ -329,6 +333,139 @@ pub enum Request {
     },
     /// `synch scan`
     Scan,
+
+    // ---- structured requests (§9.4) ---------------------------------------
+    //
+    // The variants above answer a CLI subcommand and travel as the text the
+    // user typed. These answer a *program* — the S3 gateway, which is a control
+    // client and nothing more (§9.1, §9.4) — so they name space, path, and
+    // policy as separate fields. An S3 key may contain a colon, which the
+    // `[<origin>:]<space>/<path>` text form would read as an origin, so the
+    // gateway cannot go through the text parser at all.
+    /// The unified listing under a prefix, resolved by a policy (§8): one
+    /// [`Response::Entry`] frame per path the policy selects.
+    ///
+    /// Paths the policy refuses — divergent under `strict`, unpublished by the
+    /// pinned origin under `origin=` — are left out rather than answered with
+    /// one side's metadata; a direct [`Request::TreeResolve`] of such a path
+    /// still says what is wrong.
+    TreeList {
+        /// The space of the unified tree.
+        space: String,
+        /// The path prefix to list under, empty for the whole space.
+        prefix: String,
+        /// Resume after this path, exclusive — a listing cursor.
+        start_after: Option<String>,
+        /// At most this many paths, before the policy filters them.
+        limit: Option<u64>,
+        /// The version policy, as `newest`, `origin=<id>`, or `strict`.
+        policy: Option<String>,
+    },
+    /// The version a policy selects for one path, as one [`Response::Entry`]
+    /// frame and no content — what `HeadObject` answers from (§9.4).
+    TreeResolve {
+        /// The space of the unified tree.
+        space: String,
+        /// The path within the space.
+        path: String,
+        /// The version policy, as `newest`, `origin=<id>`, or `strict`.
+        policy: Option<String>,
+    },
+    /// A verified byte range of the version a policy selects, streamed as
+    /// [`Response::Chunk`] frames.
+    TreeRead {
+        /// The space of the unified tree.
+        space: String,
+        /// The path within the space.
+        path: String,
+        /// The version policy, as `newest`, `origin=<id>`, or `strict`.
+        policy: Option<String>,
+        /// The first byte to read.
+        start: u64,
+        /// How many bytes, or `None` to the end of the object.
+        len: Option<u64>,
+    },
+    /// A streamed write into one of this node's own spaces (§7.1, §9.4).
+    ///
+    /// The client follows the request with [`Upload`] frames; the daemon writes
+    /// them into the space directory as they arrive, runs the ordinary ingest
+    /// pipeline, and answers with the published entry. Nothing is buffered
+    /// whole at either end.
+    TreePut {
+        /// The space to write into.
+        space: String,
+        /// The path within the space.
+        path: String,
+    },
+    /// Reads a config value from the `s3.*` namespace, one
+    /// [`Response::Line`] per stored record.
+    ConfigGet {
+        /// The config key, which must be in the `s3.` namespace.
+        key: String,
+    },
+    /// Appends one record to a config value in the `s3.*` namespace.
+    ///
+    /// Append, never replace: the gateway's bucket map and access keys are
+    /// lists that more than one process reads and writes, and a read-modify-
+    /// write of the whole list loses whichever concurrent edit commits first.
+    /// One atomic append cannot.
+    ConfigAppend {
+        /// The config key, which must be in the `s3.` namespace.
+        key: String,
+        /// The record to append. One line: newlines separate records.
+        record: String,
+    },
+}
+
+/// One entry of the unified tree, as it crosses the socket (§8).
+///
+/// The metadata half of a read: what a listing renders and what `HeadObject`
+/// answers from, with no content fetched. The content root travels as the hash
+/// it is, so a caller that renders it — an S3 ETag, say — does its own
+/// formatting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryInfo {
+    /// The origin whose assertion the policy selected, canonically rendered.
+    pub origin: String,
+    /// The space the entry lives in.
+    pub space: String,
+    /// The path within the space.
+    pub path: String,
+    /// What the entry describes.
+    pub kind: EntryKind,
+    /// The content length in bytes.
+    pub size: u64,
+    /// The selected origin's observed mtime, in unix nanoseconds.
+    pub mtime_ns: i64,
+    /// The object root, for files.
+    pub content: Option<Hash>,
+    /// The origin trie seq this version was published at.
+    pub seq: u64,
+    /// The link target, for a symlink.
+    pub symlink_target: Option<String>,
+    /// How many versions the path carries in the unified tree (§8). One means
+    /// every publisher agrees; more means the selection above chose a side.
+    pub versions: u32,
+}
+
+/// One frame of a payload the *client* streams to the daemon
+/// ([`Request::TreePut`]).
+///
+/// The mirror image of [`Response::Chunk`], and it exists for the same reason:
+/// an object of any size has to cross the socket without either process holding
+/// more than a chunk of it (§9.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Upload {
+    /// A piece of the payload, at most [`CHUNK_SIZE`] bytes.
+    Chunk(Vec<u8>),
+    /// The payload is complete; the daemon may commit it.
+    End,
+    /// The client is abandoning the write and the daemon must keep nothing.
+    ///
+    /// A truncated HTTP body is the case that matters: without a way to say so,
+    /// a half-received object would be indistinguishable from a complete one
+    /// and would get published as the client's own assertion.
+    Abort(String),
 }
 
 /// One frame from the daemon.
@@ -346,6 +483,11 @@ pub enum Response {
     End,
     /// The request failed.
     Error(ControlError),
+    /// One entry of the unified tree, as structured metadata (§9.4).
+    ///
+    /// Boxed because it dwarfs every other variant, and appended last because
+    /// postcard numbers variants by position.
+    Entry(Box<EntryInfo>),
 }
 
 /// Writes one length-framed postcard message.
@@ -461,6 +603,57 @@ mod tests {
         assert!(!tokens_match(&[1, 2, 3], &[1, 2, 4]));
         assert!(!tokens_match(&[1, 2, 3], &[1, 2]));
         assert!(tokens_match(&[], &[]));
+    }
+
+    /// The write direction has frames of its own now, and a structured entry
+    /// has to survive the same round trip a rendered line does (§9.4).
+    #[tokio::test]
+    async fn uploads_and_entries_round_trip() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let request = Request::TreePut {
+            space: "media".into(),
+            // A colon in a key is exactly what the text reference form cannot
+            // carry, which is why these requests are structured.
+            path: "uploads/2024:07:01.bin".into(),
+        };
+        let entry = EntryInfo {
+            origin: "nas@cluster.example".into(),
+            space: "media".into(),
+            path: "uploads/2024:07:01.bin".into(),
+            kind: EntryKind::File,
+            size: 7,
+            mtime_ns: 42,
+            content: Some(Hash::new(b"payload")),
+            seq: 3,
+            symlink_target: None,
+            versions: 1,
+        };
+        write_frame(&mut buffer, &request).await.unwrap();
+        write_frame(&mut buffer, &Upload::Chunk(vec![9, 8, 7]))
+            .await
+            .unwrap();
+        write_frame(&mut buffer, &Upload::End).await.unwrap();
+        write_frame(&mut buffer, &Response::Entry(Box::new(entry.clone())))
+            .await
+            .unwrap();
+
+        let mut reader = buffer.as_slice();
+        assert_eq!(
+            read_frame::<Request, _>(&mut reader).await.unwrap(),
+            request
+        );
+        assert_eq!(
+            read_frame::<Upload, _>(&mut reader).await.unwrap(),
+            Upload::Chunk(vec![9, 8, 7])
+        );
+        assert_eq!(
+            read_frame::<Upload, _>(&mut reader).await.unwrap(),
+            Upload::End
+        );
+        assert_eq!(
+            read_frame::<Response, _>(&mut reader).await.unwrap(),
+            Response::Entry(Box::new(entry))
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::path::Path;
 use iroh_base::SecretKey;
 use synch_cli::control::{
     proto::{Response, CHUNK_SIZE, CONTROL_VERSION},
-    Client, ErrorCode, Request, Server,
+    Client, EntryInfo, ErrorCode, Request, Server, Upload,
 };
 use synch_core::OriginId;
 use synch_engine::{Node, NodeConfig};
@@ -786,6 +786,429 @@ async fn a_multi_megabyte_cat_streams_in_chunks() {
     )
     .await;
     assert_eq!(ranged, payload[1_000_000..1_500_000]);
+
+    daemon.shutdown().await;
+}
+
+/// The `Entry` frames of a response.
+async fn entries(data_dir: &Path, request: Request) -> Vec<EntryInfo> {
+    frames(data_dir, request)
+        .await
+        .unwrap_or_else(|code| panic!("request failed: {}", code.as_str()))
+        .into_iter()
+        .filter_map(|frame| match frame {
+            Response::Entry(info) => Some(*info),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The structured requests §9.4 gives the gateway: a listing and a resolve that
+/// answer in entry metadata rather than in rendered lines, and that name space,
+/// path, and policy as fields — an S3 key may contain a colon, which the text
+/// reference form would read as an origin.
+#[tokio::test]
+async fn the_tree_can_be_listed_and_resolved_structurally() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = space_with(&[
+        ("notes.txt", b"hello"),
+        ("talks/a.txt", b"talk"),
+        ("odd:key.txt", b"colon"),
+    ]);
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    lines(
+        data_dir,
+        Request::SpaceAdd {
+            id: "media".into(),
+            path: space.path().to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+    lines(data_dir, Request::Scan).await;
+
+    let listed = entries(
+        data_dir,
+        Request::TreeList {
+            space: "media".into(),
+            prefix: String::new(),
+            start_after: None,
+            limit: None,
+            policy: None,
+        },
+    )
+    .await;
+    let paths: Vec<&str> = listed.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, vec!["notes.txt", "odd:key.txt", "talks/a.txt"]);
+    let notes = listed.iter().find(|e| e.path == "notes.txt").unwrap();
+    assert_eq!(notes.size, 5);
+    assert_eq!(notes.versions, 1);
+    assert_eq!(notes.content, Some(synch_core::Hash::new(b"hello")));
+    assert_eq!(notes.origin, "nas@cluster.example");
+
+    // A prefix narrows it and a cursor resumes past a path.
+    let listed = entries(
+        data_dir,
+        Request::TreeList {
+            space: "media".into(),
+            prefix: "talks/".into(),
+            start_after: None,
+            limit: None,
+            policy: None,
+        },
+    )
+    .await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let listed = entries(
+        data_dir,
+        Request::TreeList {
+            space: "media".into(),
+            prefix: String::new(),
+            start_after: Some("notes.txt".into()),
+            limit: None,
+            policy: None,
+        },
+    )
+    .await;
+    assert!(
+        listed.iter().all(|e| e.path != "notes.txt"),
+        "the cursor is exclusive: {listed:?}"
+    );
+
+    // A key with a colon in it resolves and reads, which is the whole point of
+    // the structured form.
+    let resolved = entries(
+        data_dir,
+        Request::TreeResolve {
+            space: "media".into(),
+            path: "odd:key.txt".into(),
+            policy: None,
+        },
+    )
+    .await;
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].size, 5);
+    let payload = read(
+        data_dir,
+        Request::TreeRead {
+            space: "media".into(),
+            path: "odd:key.txt".into(),
+            policy: None,
+            start: 1,
+            len: Some(3),
+        },
+    )
+    .await;
+    assert_eq!(payload, b"olo");
+
+    assert_eq!(
+        failure(
+            data_dir,
+            Request::TreeResolve {
+                space: "media".into(),
+                path: "absent.txt".into(),
+                policy: None,
+            }
+        )
+        .await,
+        ErrorCode::NotFound
+    );
+
+    daemon.shutdown().await;
+}
+
+/// A divergent path is left out of a `strict` listing rather than answered with
+/// one side's metadata, and resolving it directly says what is wrong (§8).
+#[tokio::test]
+async fn a_strict_listing_omits_what_a_strict_resolve_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = space_with(&[("shared.txt", b"ours"), ("agreed.txt", b"only one")]);
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    lines(
+        data_dir,
+        Request::SpaceAdd {
+            id: "media".into(),
+            path: space.path().to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+    lines(data_dir, Request::Scan).await;
+
+    let peer = OriginId::named("laptop", "cluster.example").unwrap();
+    let root = daemon
+        .node
+        .store()
+        .ingest_bytes(b"theirs", synch_core::now_ns())
+        .unwrap();
+    daemon
+        .node
+        .store()
+        .put_entry(
+            &peer,
+            "media",
+            "shared.txt",
+            &synch_core::FileEntry::file(6, i64::MAX, root, 4),
+        )
+        .unwrap();
+
+    let strict = Some("strict".to_string());
+    let listed = entries(
+        data_dir,
+        Request::TreeList {
+            space: "media".into(),
+            prefix: String::new(),
+            start_after: None,
+            limit: None,
+            policy: strict.clone(),
+        },
+    )
+    .await;
+    let paths: Vec<&str> = listed.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, vec!["agreed.txt"], "{listed:?}");
+
+    assert_eq!(
+        failure(
+            data_dir,
+            Request::TreeResolve {
+                space: "media".into(),
+                path: "shared.txt".into(),
+                policy: strict,
+            }
+        )
+        .await,
+        ErrorCode::Divergent
+    );
+
+    // `newest` picks the winning version and says the path carries two.
+    let resolved = entries(
+        data_dir,
+        Request::TreeResolve {
+            space: "media".into(),
+            path: "shared.txt".into(),
+            policy: None,
+        },
+    )
+    .await;
+    assert_eq!(resolved[0].versions, 2);
+    assert_eq!(resolved[0].origin, "laptop@cluster.example");
+
+    daemon.shutdown().await;
+}
+
+/// A streamed write crosses the socket a chunk at a time, lands in the space,
+/// and comes back as a published entry (§9.4).
+#[tokio::test]
+async fn a_streamed_put_publishes_without_buffering_the_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = space_with(&[]);
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    lines(
+        data_dir,
+        Request::SpaceAdd {
+            id: "media".into(),
+            path: space.path().to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+
+    let payload: Vec<u8> = (0..1_500_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let mut client = Client::connect(data_dir).await.unwrap();
+    client
+        .send(&Request::TreePut {
+            space: "media".into(),
+            path: "uploads/report.bin".into(),
+        })
+        .await
+        .unwrap();
+    for piece in payload.chunks(CHUNK_SIZE) {
+        client.upload(&Upload::Chunk(piece.to_vec())).await.unwrap();
+    }
+    client.upload(&Upload::End).await.unwrap();
+
+    let mut published = None;
+    while let Some(frame) = client.next().await.unwrap() {
+        if let Response::Entry(info) = frame {
+            published = Some(*info);
+        }
+    }
+    let published = published.expect("the write answers with its published entry");
+    assert_eq!(published.size, payload.len() as u64);
+    assert_eq!(published.content, Some(synch_core::Hash::new(&payload)));
+    assert_eq!(published.origin, "nas@cluster.example");
+    assert_eq!(
+        std::fs::read(space.path().join("uploads/report.bin")).unwrap(),
+        payload
+    );
+
+    // It reads straight back out, and the space holds nothing else: the staging
+    // file went away with the commit.
+    let back = read(
+        data_dir,
+        Request::TreeRead {
+            space: "media".into(),
+            path: "uploads/report.bin".into(),
+            policy: None,
+            start: 0,
+            len: None,
+        },
+    )
+    .await;
+    assert_eq!(back, payload);
+    let left: Vec<String> = std::fs::read_dir(space.path().join("uploads"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec!["report.bin".to_string()]);
+
+    daemon.shutdown().await;
+}
+
+/// A client that hangs up mid-payload leaves the space exactly as it was: half
+/// an object must never become this node's signed assertion (§9.4).
+#[tokio::test]
+async fn an_abandoned_write_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = space_with(&[("kept.txt", b"kept")]);
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    lines(
+        data_dir,
+        Request::SpaceAdd {
+            id: "media".into(),
+            path: space.path().to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+    lines(data_dir, Request::Scan).await;
+
+    let mut client = Client::connect(data_dir).await.unwrap();
+    client
+        .send(&Request::TreePut {
+            space: "media".into(),
+            path: "kept.txt".into(),
+        })
+        .await
+        .unwrap();
+    client
+        .upload(&Upload::Chunk(b"half an object".to_vec()))
+        .await
+        .unwrap();
+    client
+        .upload(&Upload::Abort("the body was truncated".into()))
+        .await
+        .unwrap();
+    let error = loop {
+        match client.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("an abandoned write must fail"),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(error.code, ErrorCode::Invalid);
+    assert!(error.message.contains("abandoned"), "{error}");
+
+    assert_eq!(
+        std::fs::read(space.path().join("kept.txt")).unwrap(),
+        b"kept"
+    );
+    let left: Vec<String> = std::fs::read_dir(space.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        left,
+        vec!["kept.txt".to_string()],
+        "no staging file remains"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// The gateway's configuration is the daemon's to hold: appended a record at a
+/// time, and fenced to the `s3.*` namespace so a client of the socket cannot
+/// read one config row to reach another (§9.4).
+#[tokio::test]
+async fn gateway_config_appends_within_its_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+
+    assert!(lines(
+        data_dir,
+        Request::ConfigGet {
+            key: "s3.buckets".into()
+        }
+    )
+    .await
+    .is_empty());
+
+    for record in ["photos\tmedia\tnewest", "docs\tpapers\tstrict"] {
+        lines(
+            data_dir,
+            Request::ConfigAppend {
+                key: "s3.buckets".into(),
+                record: record.into(),
+            },
+        )
+        .await;
+    }
+    let stored = lines(
+        data_dir,
+        Request::ConfigGet {
+            key: "s3.buckets".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        stored.lines().collect::<Vec<_>>(),
+        vec!["photos\tmedia\tnewest", "docs\tpapers\tstrict"],
+        "records arrive in the order they were appended"
+    );
+
+    // Nothing outside the namespace is reachable, in either direction.
+    for key in ["self_origin_id", "schema_version", "s3", "s3."] {
+        assert_eq!(
+            failure(data_dir, Request::ConfigGet { key: key.into() }).await,
+            ErrorCode::Invalid,
+            "{key} must not be readable"
+        );
+        assert_eq!(
+            failure(
+                data_dir,
+                Request::ConfigAppend {
+                    key: key.into(),
+                    record: "x".into(),
+                }
+            )
+            .await,
+            ErrorCode::Invalid,
+            "{key} must not be writable"
+        );
+    }
+    assert_eq!(
+        daemon
+            .node
+            .store()
+            .config("self_origin_id")
+            .unwrap()
+            .unwrap(),
+        "nas@cluster.example"
+    );
+
+    // A record is one line: a newline would forge a second record.
+    assert_eq!(
+        failure(
+            data_dir,
+            Request::ConfigAppend {
+                key: "s3.keys".into(),
+                record: "id\tsecret\nsmuggled\tin".into(),
+            }
+        )
+        .await,
+        ErrorCode::Invalid
+    );
 
     daemon.shutdown().await;
 }

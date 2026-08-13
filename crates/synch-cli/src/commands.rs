@@ -258,6 +258,10 @@ async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
                 }
                 Response::Line(text) => println!("{text}"),
                 Response::Progress(text) => eprintln!("{text}"),
+                // No CLI command asks for structured entries: the `Entry`
+                // frame answers the gateway's requests (§9.4), and the CLI's
+                // listings arrive already rendered as `Line`s.
+                Response::Entry(_) => {}
                 Response::Ready | Response::End | Response::Error(_) => {}
             }
         }
@@ -282,6 +286,7 @@ async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
             // Progress is rendered and discarded: it is not the command's
             // output, just what it is doing while producing it.
             Response::Progress(text) => eprintln!("{text}"),
+            Response::Entry(_) => {}
             Response::Ready | Response::End | Response::Error(_) => {}
         }
     }

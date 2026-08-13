@@ -413,6 +413,17 @@ impl Node {
         Ok(Some(target))
     }
 
+    /// Opens a streamed write into a local space (§9.4).
+    ///
+    /// The bytes-in-hand form is [`Node::adopt`]; this is the form for a
+    /// payload arriving a piece at a time — an S3 `PutObject` body relayed over
+    /// the control socket — where holding the object in memory to call the
+    /// other one is exactly what must not happen.
+    pub fn open_adoption(&self, space_id: &str, path: &str) -> Result<Adoption> {
+        let target = self.adoption_target(space_id, path)?;
+        Adoption::open(target)
+    }
+
     /// Where a path lives locally, refusing anything outside a configured
     /// space.
     ///
@@ -428,6 +439,94 @@ impl Node {
         let normalized =
             synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
         Ok(PathBuf::from(&space.local_path).join(&normalized))
+    }
+}
+
+/// The suffix a streamed write's staging file carries.
+///
+/// Matched by a built-in ignore rule ([`crate::ignore::BUILTIN_DEFAULTS`]), so
+/// a scan that runs while an upload is still arriving walks straight past it.
+pub const PART_SUFFIX: &str = ".synch-part";
+
+/// A streamed write into a local space that has not landed yet (§9.4).
+///
+/// Bytes go to a staging file beside the target, and the target only appears
+/// once the payload is complete. A client that hangs up mid-body therefore
+/// leaves the space exactly as it was, rather than leaving this node to publish
+/// half an object as its own assertion — and since the assertion is signed and
+/// broadcast, "rather than" is doing real work there. Dropping an `Adoption`
+/// without committing removes the staging file.
+#[derive(Debug)]
+pub struct Adoption {
+    target: PathBuf,
+    staging: PathBuf,
+    file: Option<std::fs::File>,
+    written: u64,
+}
+
+impl Adoption {
+    fn open(target: PathBuf) -> Result<Adoption> {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // The staging name has to be unique per write: two clients putting the
+        // same key at once must not share one file and interleave their bytes.
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "object".into());
+        let staging = target.with_file_name(format!(
+            ".{name}.{}.{}{PART_SUFFIX}",
+            std::process::id(),
+            synch_core::now_ns()
+        ));
+        let file = std::fs::File::create(&staging)?;
+        Ok(Adoption {
+            target,
+            staging,
+            file: Some(file),
+            written: 0,
+        })
+    }
+
+    /// Appends one piece of the payload.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// How many bytes have arrived so far.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Flushes the payload and moves it into place, returning the target.
+    ///
+    /// The rename is what makes the write atomic from the scanner's point of
+    /// view: it sees the old file or the new one, never a partial one.
+    pub fn commit(mut self) -> Result<PathBuf> {
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&self.staging, &self.target)?;
+        Ok(self.target.clone())
+    }
+}
+
+impl Drop for Adoption {
+    fn drop(&mut self) {
+        if self.file.is_some() {
+            let _ = std::fs::remove_file(&self.staging);
+        }
     }
 }
 

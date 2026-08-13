@@ -19,6 +19,10 @@ pub const BUILTIN_DEFAULTS: &[&str] = &[
     ".#*",
     "#*#",
     ".syncignore",
+    // The half-written file a streamed write leaves in the space while it is
+    // still arriving (§9.4). A scan that ran mid-upload would otherwise hash a
+    // fragment and publish it as this node's own assertion.
+    "*.synch-part",
 ];
 
 /// One ignore rule.

@@ -9,5 +9,5 @@ pub mod server;
 pub mod transport;
 
 pub use client::Client;
-pub use proto::{ControlError, ErrorCode, Request, Response, CONTROL_VERSION};
+pub use proto::{ControlError, EntryInfo, ErrorCode, Request, Response, Upload, CONTROL_VERSION};
 pub use server::Server;

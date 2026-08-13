@@ -62,6 +62,7 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration::Sql(V6_ENTRY_SYMLINK_TARGET),
     Migration::Sql(V7_OBSERVED_CLAIMED_BY),
+    Migration::Sql(V8_S3_CONFIG_NAMESPACE),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -283,6 +284,19 @@ CREATE TABLE observed_heads (
 INSERT INTO observed_heads (origin_id, seq, root, complete, claimed_by, observed_at)
   SELECT origin_id, seq, root, complete, NULL, observed_at FROM observed_heads_v6;
 DROP TABLE observed_heads_v6;
+"#;
+
+/// v8 — the gateway's configuration moves into the `s3.*` config namespace
+/// (§9.4).
+///
+/// `synch-s3` no longer opens the database: its buckets and access keys are
+/// stored by the daemon and reached over the control socket, and the daemon
+/// serves exactly one namespace to that client. A prefix is what makes the
+/// fence checkable — `s3.buckets` and `s3.keys` are inside it, `self_origin_id`
+/// is not — so the two rows are renamed to sit under it.
+const V8_S3_CONFIG_NAMESPACE: &str = r#"
+UPDATE config SET key = 's3.buckets' WHERE key = 's3_buckets';
+UPDATE config SET key = 's3.keys'    WHERE key = 's3_access_keys';
 "#;
 
 /// The §10 schema as the design document states it — the shape replaying the
