@@ -395,10 +395,15 @@ pub enum Request {
     },
     /// A streamed write into one of this node's own spaces (§7.1, §9.4).
     ///
-    /// The client follows the request with [`Upload`] frames; the daemon writes
-    /// them into the space directory as they arrive, runs the ordinary ingest
-    /// pipeline, and answers with the published entry. Nothing is buffered
-    /// whole at either end.
+    /// The daemon takes its gates — publishability, a resolvable target —
+    /// and answers [`Response::Ready`] before the first byte; the client
+    /// waits for that ack, then follows with [`Upload`] frames. The daemon
+    /// writes them into the space directory as they arrive, runs the ordinary
+    /// ingest pipeline, and answers with the published entry. Nothing is
+    /// buffered whole at either end. The ack is what lets a refusal arrive
+    /// as the coded error it is: a client already streaming into a refused
+    /// write would instead see the transport fail under it, and on a Windows
+    /// named pipe the unread error frame is discarded with the connection.
     TreePut {
         /// The space to write into.
         space: String,

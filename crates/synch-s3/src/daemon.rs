@@ -203,6 +203,14 @@ impl Daemon {
                 path: path.to_string(),
             })
             .await?;
+        // The daemon acks once its gates are taken. Waiting for the ack is
+        // what turns a refusal — a node in recovery, say — into the coded
+        // error it is (§3.4): a client already streaming would race the error
+        // frame against its own writes and could lose it to the transport.
+        match client.next().await? {
+            Some(Response::Ready) => {}
+            _ => return Err(S3Error::store("the daemon did not acknowledge the write")),
+        }
 
         let mut stream = body.into_data_stream();
         let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);

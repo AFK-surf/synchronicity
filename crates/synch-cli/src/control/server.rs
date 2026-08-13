@@ -202,6 +202,10 @@ impl<S: AsyncWrite + Unpin> Frames<S> {
         write_frame(&mut self.stream, &Response::End).await
     }
 
+    async fn ready(&mut self) -> std::io::Result<()> {
+        write_frame(&mut self.stream, &Response::Ready).await
+    }
+
     async fn error(&mut self, error: ControlError) -> std::io::Result<()> {
         write_frame(&mut self.stream, &Response::Error(error)).await
     }
@@ -880,6 +884,11 @@ async fn put_stream<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Done {
     node.ensure_publishable()?;
     let mut adoption = node.open_adoption(space, path)?;
+    // The gates are taken before the ack, so a refusal reaches the client
+    // while it is still listening. A client that streamed first would race
+    // the refusal against its own writes and could lose it to the transport
+    // (Windows named pipes discard unread frames when the server hangs up).
+    out.ready().await?;
     loop {
         match out.upload().await? {
             Upload::Chunk(bytes) => adoption.write(&bytes)?,

@@ -812,11 +812,18 @@ async fn entries(data_dir: &Path, request: Request) -> Vec<EntryInfo> {
 #[tokio::test]
 async fn the_tree_can_be_listed_and_resolved_structurally() {
     let dir = tempfile::tempdir().unwrap();
+    // A colon is fine in an S3 key and in this protocol, but not in a Windows
+    // file name — writing `odd:key.txt` there creates an alternate data
+    // stream on a file called `odd`. The colon-bearing case can only be
+    // scanned out of a space where the filesystem can hold it.
+    #[cfg(not(windows))]
     let space = space_with(&[
         ("notes.txt", b"hello"),
         ("talks/a.txt", b"talk"),
         ("odd:key.txt", b"colon"),
     ]);
+    #[cfg(windows)]
+    let space = space_with(&[("notes.txt", b"hello"), ("talks/a.txt", b"talk")]);
     let daemon = Daemon::start(dir.path()).await;
     let data_dir = dir.path();
     lines(
@@ -841,7 +848,10 @@ async fn the_tree_can_be_listed_and_resolved_structurally() {
     )
     .await;
     let paths: Vec<&str> = listed.iter().map(|e| e.path.as_str()).collect();
+    #[cfg(not(windows))]
     assert_eq!(paths, vec!["notes.txt", "odd:key.txt", "talks/a.txt"]);
+    #[cfg(windows)]
+    assert_eq!(paths, vec!["notes.txt", "talks/a.txt"]);
     let notes = listed.iter().find(|e| e.path == "notes.txt").unwrap();
     assert_eq!(notes.size, 5);
     assert_eq!(notes.versions, 1);
@@ -879,29 +889,32 @@ async fn the_tree_can_be_listed_and_resolved_structurally() {
 
     // A key with a colon in it resolves and reads, which is the whole point of
     // the structured form.
-    let resolved = entries(
-        data_dir,
-        Request::TreeResolve {
-            space: "media".into(),
-            path: "odd:key.txt".into(),
-            policy: None,
-        },
-    )
-    .await;
-    assert_eq!(resolved.len(), 1);
-    assert_eq!(resolved[0].size, 5);
-    let payload = read(
-        data_dir,
-        Request::TreeRead {
-            space: "media".into(),
-            path: "odd:key.txt".into(),
-            policy: None,
-            start: 1,
-            len: Some(3),
-        },
-    )
-    .await;
-    assert_eq!(payload, b"olo");
+    #[cfg(not(windows))]
+    {
+        let resolved = entries(
+            data_dir,
+            Request::TreeResolve {
+                space: "media".into(),
+                path: "odd:key.txt".into(),
+                policy: None,
+            },
+        )
+        .await;
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].size, 5);
+        let payload = read(
+            data_dir,
+            Request::TreeRead {
+                space: "media".into(),
+                path: "odd:key.txt".into(),
+                policy: None,
+                start: 1,
+                len: Some(3),
+            },
+        )
+        .await;
+        assert_eq!(payload, b"olo");
+    }
 
     assert_eq!(
         failure(
@@ -1024,6 +1037,10 @@ async fn a_streamed_put_publishes_without_buffering_the_object() {
         })
         .await
         .unwrap();
+    assert!(
+        matches!(client.next().await.unwrap(), Some(Response::Ready)),
+        "the daemon acks a write before the first byte"
+    );
     for piece in payload.chunks(CHUNK_SIZE) {
         client.upload(&Upload::Chunk(piece.to_vec())).await.unwrap();
     }
@@ -1093,6 +1110,10 @@ async fn an_abandoned_write_leaves_nothing_behind() {
         })
         .await
         .unwrap();
+    assert!(
+        matches!(client.next().await.unwrap(), Some(Response::Ready)),
+        "the daemon acks a write before the first byte"
+    );
     client
         .upload(&Upload::Chunk(b"half an object".to_vec()))
         .await
