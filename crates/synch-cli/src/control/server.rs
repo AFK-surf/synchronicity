@@ -8,7 +8,7 @@
 use std::{str::FromStr, sync::Arc};
 
 use synch_core::{now_ns, Hash, NodeId, OriginId};
-use synch_engine::{EntryRef, Node};
+use synch_engine::{EntryRef, Node, VersionPolicy};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::broadcast,
@@ -506,29 +506,41 @@ async fn dispatch<S: AsyncWrite + Unpin>(
 
         Request::Ls { reference, all } => {
             let reference = parse_reference(&reference)?;
-            let rows = node.store().list_entries(
-                reference.origin.as_ref(),
-                &reference.space,
-                &reference.dir_prefix(),
-                None,
-                None,
-            )?;
-            let mut seen: Vec<&str> = Vec::new();
-            for row in &rows {
-                if !all {
-                    if seen.contains(&row.path.as_str()) {
-                        continue;
+            match &reference.origin {
+                // The origin-prefixed form lists exactly one origin's view,
+                // which is the old per-origin listing (§9.2).
+                Some(origin) => {
+                    let rows = node.store().list_entries(
+                        Some(origin),
+                        &reference.space,
+                        &reference.dir_prefix(),
+                        None,
+                        None,
+                    )?;
+                    for row in &rows {
+                        out.line(render::entry_line(row, None)).await?;
                     }
-                    seen.push(&row.path);
                 }
-                out.line(format!(
-                    "{:>12}  {:<8}  {}  {}",
-                    row.size,
-                    render::kind_name(row.kind),
-                    row.path,
-                    row.origin.short()
-                ))
-                .await?;
+                // The unified tree: one line per path, divergence marked with
+                // the number of versions the path carries (§8).
+                None => {
+                    let listing = node.unified_listing(
+                        &reference.space,
+                        &reference.dir_prefix(),
+                        None,
+                        None,
+                    )?;
+                    for set in &listing {
+                        if !set.exists() {
+                            // Every publisher has tombstoned it: the path has
+                            // left the tree, so the tree does not list it.
+                            continue;
+                        }
+                        for line in render::unified_line(node, set, all)? {
+                            out.line(line).await?;
+                        }
+                    }
+                }
             }
         }
 
@@ -545,41 +557,22 @@ async fn dispatch<S: AsyncWrite + Unpin>(
                 None => node.store().known_spaces()?,
             };
             for space in spaces {
-                let rows = node.store().list_entries(None, &space, &path, None, None)?;
-                let mut paths: Vec<String> = rows.iter().map(|r| r.path.clone()).collect();
-                paths.sort();
-                paths.dedup();
-                for path in paths {
-                    let views = node.store().entries_for_path(&space, &path)?;
-                    let roots: std::collections::BTreeSet<Option<Hash>> =
-                        views.iter().map(|v| v.content).collect();
-                    let agreement = if roots.len() <= 1 {
-                        "agree"
-                    } else {
-                        "DIVERGED"
-                    };
-                    out.line(format!("{space}/{path}  [{agreement}]")).await?;
-                    for view in views {
-                        out.line(format!(
-                            "    {:<28} seq {:<6} {:>12}  {}",
-                            view.origin.short(),
-                            view.seq,
-                            view.size,
-                            view.content
-                                .map(|h| h.to_hex()[..16].to_string())
-                                .unwrap_or_else(|| render::kind_name(view.kind).to_string()),
-                        ))
-                        .await?;
+                for set in node.unified_listing(&space, &path, None, None)? {
+                    for line in render::version_set(&set) {
+                        out.line(line).await?;
                     }
                 }
             }
         }
 
-        Request::Cat { reference, range } => {
+        Request::Cat {
+            reference,
+            range,
+            from,
+            strict,
+        } => {
             let reference = parse_reference(&reference)?;
-            let origin = reference.origin.clone().ok_or_else(|| {
-                ControlError::invalid("cat needs an explicit <origin>:<space>/<path>")
-            })?;
+            let policy = policy_for(&reference, from.as_deref(), strict)?;
             let range = match &range {
                 Some(text) => crate::cli::ByteRange::parse(text)
                     .map_err(|e| ControlError::invalid(e.to_string()))?,
@@ -591,26 +584,28 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             stream_entry(
                 node,
                 out,
-                &origin,
                 &reference.space,
                 &reference.path,
+                &policy,
                 range.start,
                 range.length(),
             )
             .await?;
         }
 
-        Request::Get { reference } => {
+        Request::Get {
+            reference,
+            from,
+            strict,
+        } => {
             let reference = parse_reference(&reference)?;
-            let origin = reference.origin.clone().ok_or_else(|| {
-                ControlError::invalid("get needs an explicit <origin>:<space>/<path>")
-            })?;
+            let policy = policy_for(&reference, from.as_deref(), strict)?;
             stream_entry(
                 node,
                 out,
-                &origin,
                 &reference.space,
                 &reference.path,
+                &policy,
                 0,
                 None,
             )
@@ -649,27 +644,19 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             }
         }
 
-        Request::MirrorAdd { reference, path } => {
-            let reference = parse_reference(&reference)?;
-            let origin = reference
-                .origin
-                .clone()
-                .ok_or_else(|| ControlError::invalid("mirror add needs <origin>:<space>"))?;
-            node.add_mirror(&origin, &reference.space, &path)?;
-            out.line(format!(
-                "mirroring {origin}:{} into {path}",
-                reference.space
-            ))
-            .await?;
+        Request::MirrorAdd {
+            space,
+            path,
+            policy,
+        } => {
+            let policy = parse_policy(policy.as_deref())?;
+            let stored = node.add_mirror(&space, &path, &policy)?;
+            out.line(format!("mirroring {space} into {stored} ({policy})"))
+                .await?;
         }
 
-        Request::MirrorRm { reference } => {
-            let reference = parse_reference(&reference)?;
-            let origin = reference
-                .origin
-                .clone()
-                .ok_or_else(|| ControlError::invalid("mirror rm needs <origin>:<space>"))?;
-            if node.remove_mirror(&origin, &reference.space)? {
+        Request::MirrorRm { path } => {
+            if node.remove_mirror(&path)? {
                 out.line("removed").await?;
             } else {
                 out.line("no such mirror").await?;
@@ -679,9 +666,9 @@ async fn dispatch<S: AsyncWrite + Unpin>(
         Request::MirrorLs => {
             for mirror in node.store().mirrors()? {
                 out.line(format!(
-                    "{}:{:<20} {}",
-                    mirror.origin.canonical(),
+                    "{:<20} {:<24} {}",
                     mirror.space,
+                    mirror.policy.render(),
                     mirror.local_path
                 ))
                 .await?;
@@ -692,12 +679,15 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             // One mirror at a time, so the report of each arrives while the
             // next is still being materialized.
             for mirror in node.store().mirrors()? {
-                let (origin, space) = (mirror.origin, mirror.space);
-                out.progress(format!("{origin}:{space} …")).await?;
-                let report = node.sync_mirror(&origin, &space).await?;
+                out.progress(format!("{} …", mirror.local_path)).await?;
+                let report = node.sync_mirror(&mirror.local_path).await?;
                 out.line(format!(
-                    "{origin}:{space}  written {} · current {} · removed {}",
-                    report.written, report.current, report.removed
+                    "{}  written {} · current {} · removed {} · skipped {}",
+                    mirror.local_path,
+                    report.written,
+                    report.current,
+                    report.removed,
+                    report.skipped.len()
                 ))
                 .await?;
                 for (path, reason) in &report.skipped {
@@ -735,15 +725,13 @@ async fn dispatch<S: AsyncWrite + Unpin>(
 async fn stream_entry<S: AsyncWrite + Unpin>(
     node: &Node,
     out: &mut Frames<S>,
-    origin: &OriginId,
     space: &str,
     path: &str,
+    policy: &VersionPolicy,
     start: u64,
     len: Option<u64>,
 ) -> Done {
-    let range = node
-        .prepare_entry_range(origin, space, path, start, len)
-        .await?;
+    let range = node.prepare_range(space, path, policy, start, len).await?;
     let mut offset = range.start;
     while offset < range.end {
         let take = (CHUNK_SIZE as u64).min(range.end - offset);
@@ -895,6 +883,50 @@ fn parse_origin(text: &str) -> std::result::Result<OriginId, ControlError> {
 fn parse_reference(text: &str) -> std::result::Result<EntryRef, ControlError> {
     text.parse()
         .map_err(|e: synch_engine::EngineError| ControlError::from(e))
+}
+
+/// Builds the version policy a read runs under, from the reference and the
+/// flags (§8).
+///
+/// An origin-pinned reference *is* an origin policy, and `--from` is the same
+/// thing spelled as a flag, so naming both is a contradiction rather than a
+/// preference and is refused.
+fn policy_for(
+    reference: &EntryRef,
+    from: Option<&str>,
+    strict: bool,
+) -> std::result::Result<VersionPolicy, ControlError> {
+    if let Some(origin) = &reference.origin {
+        if from.is_some() {
+            return Err(ControlError::invalid(
+                "the reference already pins an origin; drop --from or the <origin>: prefix",
+            ));
+        }
+        if strict {
+            return Err(ControlError::invalid(
+                "an origin-pinned reference already names one version; --strict has nothing to refuse",
+            ));
+        }
+        return Ok(VersionPolicy::Origin(origin.clone()));
+    }
+    match (from, strict) {
+        (Some(_), true) => Err(ControlError::invalid(
+            "--from and --strict are two answers to the same question; use one",
+        )),
+        (Some(origin), false) => Ok(VersionPolicy::Origin(parse_origin(origin)?)),
+        (None, true) => Ok(VersionPolicy::Strict),
+        (None, false) => Ok(VersionPolicy::Newest),
+    }
+}
+
+/// Parses a stored or typed version policy, defaulting to `newest`.
+fn parse_policy(text: Option<&str>) -> std::result::Result<VersionPolicy, ControlError> {
+    match text {
+        None => Ok(VersionPolicy::Newest),
+        Some(text) => text
+            .parse()
+            .map_err(|e: synch_store::StoreError| ControlError::invalid(e.to_string())),
+    }
 }
 
 fn parse_root(text: &str) -> std::result::Result<Hash, ControlError> {

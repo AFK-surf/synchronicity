@@ -157,7 +157,8 @@ async fn every_command_variant_round_trips() {
         },
     )
     .await;
-    assert!(status.contains("[agree]"), "{status}");
+    assert!(status.contains("media/notes.txt  1 version(s)"), "{status}");
+    assert!(status.contains("nas@cluster.example"), "{status}");
     assert!(lines(data_dir, Request::Status { reference: None })
         .await
         .contains("media/notes.txt"));
@@ -168,6 +169,8 @@ async fn every_command_variant_round_trips() {
         Request::Cat {
             reference: "nas@cluster.example:media/notes.txt".into(),
             range: None,
+            from: None,
+            strict: false,
         },
     )
     .await;
@@ -175,8 +178,10 @@ async fn every_command_variant_round_trips() {
     let payload = read(
         data_dir,
         Request::Cat {
-            reference: "nas@cluster.example:media/notes.txt".into(),
+            reference: "media/notes.txt".into(),
             range: Some("1..3".into()),
+            from: None,
+            strict: false,
         },
     )
     .await;
@@ -184,7 +189,9 @@ async fn every_command_variant_round_trips() {
     let payload = read(
         data_dir,
         Request::Get {
-            reference: "nas@cluster.example:media/notes.txt".into(),
+            reference: "media/notes.txt".into(),
+            from: Some("nas@cluster.example".into()),
+            strict: false,
         },
     )
     .await;
@@ -259,21 +266,32 @@ async fn every_command_variant_round_trips() {
 
     // Mirrors.
     let mirror_dir = tempfile::tempdir().unwrap();
-    assert!(lines(
+    let mirror_path = mirror_dir.path().to_string_lossy().into_owned();
+    let mirroring = lines(
         data_dir,
         Request::MirrorAdd {
-            reference: "laptop@cluster.example:media".into(),
-            path: mirror_dir.path().to_string_lossy().into_owned(),
-        }
+            space: "media".into(),
+            path: mirror_path.clone(),
+            policy: Some("origin=laptop@cluster.example".into()),
+        },
     )
-    .await
-    .contains("mirroring"));
-    assert!(lines(data_dir, Request::MirrorLs).await.contains("media"));
+    .await;
+    assert!(mirroring.contains("mirroring"), "{mirroring}");
+    assert!(
+        mirroring.contains("origin=laptop@cluster.example"),
+        "{mirroring}"
+    );
+    let mirror_ls = lines(data_dir, Request::MirrorLs).await;
+    assert!(mirror_ls.contains("media"), "{mirror_ls}");
+    assert!(
+        mirror_ls.contains("origin=laptop@cluster.example"),
+        "{mirror_ls}"
+    );
     let _ = frames(data_dir, Request::MirrorSync).await.unwrap();
     assert!(lines(
         data_dir,
         Request::MirrorRm {
-            reference: "laptop@cluster.example:media".into(),
+            path: mirror_path.clone(),
         }
     )
     .await
@@ -375,6 +393,8 @@ async fn errors_cross_the_socket_with_their_code() {
             Request::Cat {
                 reference: "nas@cluster.example:media/absent.txt".into(),
                 range: None,
+                from: None,
+                strict: false,
             }
         )
         .await,
@@ -384,8 +404,10 @@ async fn errors_cross_the_socket_with_their_code() {
         failure(
             data_dir,
             Request::Cat {
-                reference: "media/no-origin.txt".into(),
+                reference: "nas@cluster.example:media/pinned.txt".into(),
                 range: None,
+                from: Some("laptop@cluster.example".into()),
+                strict: false,
             }
         )
         .await,
@@ -476,16 +498,21 @@ async fn scan_and_mirror_sync_stream_progress() {
     lines(
         data_dir,
         Request::MirrorAdd {
-            reference: "laptop@cluster.example:media".into(),
+            space: "media".into(),
             path: target.path().to_string_lossy().into_owned(),
+            policy: None,
         },
     )
     .await;
     let progress = progress_of(data_dir, Request::MirrorSync).await;
+    let target_name = target
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     assert!(
-        progress
-            .iter()
-            .any(|line| line.contains("laptop@cluster.example:media")),
+        progress.iter().any(|line| line.contains(&target_name)),
         "{progress:?}"
     );
 
@@ -686,8 +713,10 @@ async fn a_multi_megabyte_cat_streams_in_chunks() {
     let mut client = Client::connect(data_dir).await.unwrap();
     client
         .send(&Request::Cat {
-            reference: "nas@cluster.example:media/big.bin".into(),
+            reference: "media/big.bin".into(),
             range: None,
+            from: None,
+            strict: false,
         })
         .await
         .unwrap();
@@ -729,8 +758,10 @@ async fn a_multi_megabyte_cat_streams_in_chunks() {
     let ranged = read(
         data_dir,
         Request::Cat {
-            reference: "nas@cluster.example:media/big.bin".into(),
+            reference: "media/big.bin".into(),
             range: Some("1000000..1500000".into()),
+            from: None,
+            strict: false,
         },
     )
     .await;

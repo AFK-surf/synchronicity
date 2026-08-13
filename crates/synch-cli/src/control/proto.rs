@@ -24,10 +24,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Client and daemon are normally the same binary, so this exists to catch the
 /// upgrade-while-running case rather than to support mixed versions (§9.3).
 ///
-/// Bumped to 2 by `synch recover`, which added a [`Request`] variant: postcard
-/// identifies variants by position, so a client and a daemon from either side
-/// of that change must say so plainly rather than mis-decode each other.
-pub const CONTROL_VERSION: u32 = 2;
+/// Bumped to 2 by `synch recover`, which added a [`Request`] variant, and to 3
+/// by the unified tree (§8), which gave `cat`/`get` a version policy and
+/// re-shaped the `mirror` requests: postcard identifies variants by position
+/// and fields by order, so a client and a daemon from either side of such a
+/// change must say so plainly rather than mis-decode each other.
+pub const CONTROL_VERSION: u32 = 3;
 
 /// How many payload bytes one `Chunk` frame carries.
 ///
@@ -62,6 +64,9 @@ pub enum ErrorCode {
     Invalid,
     /// The daemon failed while serving the request.
     Internal,
+    /// A `strict` read met a divergent path (§8); the message lists the
+    /// versions. Appended last: postcard numbers variants by position.
+    Divergent,
 }
 
 impl ErrorCode {
@@ -74,6 +79,7 @@ impl ErrorCode {
             ErrorCode::NotFound => "not-found",
             ErrorCode::Invalid => "invalid",
             ErrorCode::Internal => "internal",
+            ErrorCode::Divergent => "divergent",
         }
     }
 }
@@ -114,6 +120,10 @@ impl From<synch_engine::EngineError> for ControlError {
         let code = match &e {
             E::NotInitialized => ErrorCode::NotInitialized,
             E::NotFound(_) => ErrorCode::NotFound,
+            // Divergence is data, not a malformed request: it gets a code of
+            // its own so a caller can tell "there are several versions" from
+            // "you asked for something impossible" (§8).
+            E::Divergent { .. } => ErrorCode::Divergent,
             // A node in recovery is not broken and the request is not
             // malformed; what is wrong is the state it was made in, and the
             // message says which command resolves it (§3.4).
@@ -228,9 +238,9 @@ pub enum Request {
     },
     /// `synch ls [<origin>:]<space>[/<dir>]`
     Ls {
-        /// The entry reference.
+        /// The entry reference. Without an origin, the unified tree (§8).
         reference: String,
-        /// Show every origin's entry, not just one per path.
+        /// Show every version of every path, with its attestors.
         all: bool,
     },
     /// `synch status [<space>[/<path>]]`
@@ -238,17 +248,25 @@ pub enum Request {
         /// The reference, or `None` for every known space.
         reference: Option<String>,
     },
-    /// `synch cat <origin>:<space>/<path>`
+    /// `synch cat [<origin>:]<space>/<path>`
     Cat {
         /// The entry reference.
         reference: String,
         /// A byte range, as `START..END`, `START..`, or `..END`.
         range: Option<String>,
+        /// `--from <origin>`: read that origin's version.
+        from: Option<String>,
+        /// `--strict`: refuse a divergent path.
+        strict: bool,
     },
-    /// `synch get <origin>:<space>/<path>`
+    /// `synch get [<origin>:]<space>/<path>`
     Get {
         /// The entry reference.
         reference: String,
+        /// `--from <origin>`: fetch that origin's version.
+        from: Option<String>,
+        /// `--strict`: refuse a divergent path.
+        strict: bool,
     },
     /// `synch take <origin>:<space>/<path>`
     Take {
@@ -260,17 +278,19 @@ pub enum Request {
         /// The entry reference.
         reference: String,
     },
-    /// `synch mirror add <origin>:<space> <path>`
+    /// `synch mirror add <space> <dir> [--policy ...]`
     MirrorAdd {
-        /// The `<origin>:<space>` reference.
-        reference: String,
+        /// The space of the unified tree to materialize.
+        space: String,
         /// The local directory, already made absolute by the client.
         path: String,
+        /// The version policy, as the user typed it (§8).
+        policy: Option<String>,
     },
-    /// `synch mirror rm <origin>:<space>`
+    /// `synch mirror rm <dir>`
     MirrorRm {
-        /// The `<origin>:<space>` reference.
-        reference: String,
+        /// The local directory, already made absolute by the client.
+        path: String,
     },
     /// `synch mirror ls`
     MirrorLs,
@@ -387,6 +407,8 @@ mod tests {
         let request = Request::Cat {
             reference: "nas@x:media/a.txt".into(),
             range: Some("0..10".into()),
+            from: None,
+            strict: false,
         };
         write_frame(&mut buffer, &request).await.unwrap();
         write_frame(&mut buffer, &Response::Chunk(vec![1, 2, 3]))

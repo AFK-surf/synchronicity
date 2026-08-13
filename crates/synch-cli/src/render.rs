@@ -4,7 +4,8 @@
 //! verbatim.
 
 use synch_core::now_ns;
-use synch_engine::{EntryRef, Node};
+use synch_engine::{EntryRef, Node, VersionPolicy, VersionSet};
+use synch_store::EntryRow;
 
 use crate::control::ControlError;
 
@@ -32,6 +33,81 @@ pub fn kind_name(kind: synch_core::EntryKind) -> &'static str {
         synch_core::EntryKind::Symlink => "symlink",
         synch_core::EntryKind::Tombstone => "deleted",
     }
+}
+
+/// The mark a divergent path carries in a listing: the number of versions it
+/// holds (§8, §14).
+///
+/// Deliberately a *count* rather than a flag — "two versions" is the fact, and
+/// it is the number `synch status` will lay out.
+pub fn divergence_mark(versions: usize) -> String {
+    format!("\u{2442}{versions}")
+}
+
+/// One line of an origin-pinned listing: a single origin's entry.
+pub fn entry_line(row: &EntryRow, mark: Option<&str>) -> String {
+    format!(
+        "{:>12}  {:<8}  {}{}",
+        row.size,
+        kind_name(row.kind),
+        row.path,
+        mark.map(|m| format!("  {m}")).unwrap_or_default()
+    )
+}
+
+/// One path of the unified tree, as `synch ls` prints it.
+///
+/// The line describes the version the reader would get — the `newest` policy's
+/// selection — and the mark says how many others there are. With `all`, every
+/// version follows, indented, with its attestors.
+pub fn unified_line(node: &Node, set: &VersionSet, all: bool) -> Lines {
+    let selected = node.resolve_set(set, &VersionPolicy::Newest)?;
+    let mark = set
+        .is_divergent()
+        .then(|| divergence_mark(set.version_count()));
+    let mut out = vec![entry_line(&selected, mark.as_deref())];
+    if all {
+        out.extend(version_lines(set));
+    }
+    Ok(out)
+}
+
+/// Every version of a path, newest first — the body of `synch status`.
+pub fn version_set(set: &VersionSet) -> Vec<String> {
+    let mut out = vec![format!(
+        "{}/{}  {} version(s){}",
+        set.space,
+        set.path,
+        set.version_count(),
+        if set.is_divergent() {
+            format!("  {}", divergence_mark(set.version_count()))
+        } else {
+            String::new()
+        }
+    )];
+    out.extend(version_lines(set));
+    out
+}
+
+fn version_lines(set: &VersionSet) -> Vec<String> {
+    set.versions
+        .iter()
+        .rev()
+        .map(|version| {
+            let attestors: Vec<String> = version.attestors.iter().map(|o| o.short()).collect();
+            format!(
+                "    {:<18} {:<8} {:>12}  seq {:<6} {}",
+                version
+                    .content
+                    .map(|h| h.to_hex()[..16].to_string())
+                    .unwrap_or_else(|| "(deleted)".into()),
+                kind_name(version.kind),
+                version.size,
+                version.seq,
+                attestors.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// A coarse "how long ago" rendering of a unix-nanosecond timestamp.
@@ -264,4 +340,76 @@ pub fn log(node: &Node, reference: &EntryRef) -> Lines {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synch_core::{EntryKind, FileEntry, Hash, OriginId};
+    use synch_store::VersionSet;
+
+    fn row(origin: &str, content: &[u8], mtime: i64) -> EntryRow {
+        let entry = FileEntry::file(3, mtime, Hash::new(content), 1);
+        EntryRow {
+            origin: OriginId::named(origin, "x.example").unwrap(),
+            space: "media".into(),
+            path: "f.txt".into(),
+            kind: entry.kind,
+            size: entry.size,
+            mtime_ns: entry.mtime_ns,
+            content: entry.content,
+            seq: entry.seq,
+            prev: None,
+        }
+    }
+
+    #[test]
+    fn divergence_is_marked_with_its_version_count() {
+        assert_eq!(divergence_mark(2), "⑂2");
+        assert_eq!(divergence_mark(7), "⑂7");
+    }
+
+    #[test]
+    fn an_agreed_path_carries_no_mark() {
+        let set = VersionSet::from_entries(
+            "media",
+            "f.txt",
+            vec![row("nas", b"same", 1), row("laptop", b"same", 2)],
+        );
+        assert!(!set.is_divergent());
+        let lines = version_set(&set);
+        assert!(lines[0].contains("1 version(s)"), "{lines:?}");
+        assert!(!lines[0].contains('⑂'), "{lines:?}");
+        // One version, both attestors named on it.
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("nas"), "{lines:?}");
+        assert!(lines[1].contains("laptop"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_divergent_path_lists_every_version_newest_first() {
+        let set = VersionSet::from_entries(
+            "media",
+            "f.txt",
+            vec![row("nas", b"theirs", 100), row("laptop", b"ours", 200)],
+        );
+        let lines = version_set(&set);
+        assert!(lines[0].contains("2 version(s)"), "{lines:?}");
+        assert!(lines[0].contains("⑂2"), "{lines:?}");
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains("laptop"), "the newest first: {lines:?}");
+        assert!(lines[2].contains("nas"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_tombstone_version_says_so() {
+        let mut deleted = row("nas", b"gone", 300);
+        deleted.kind = EntryKind::Tombstone;
+        deleted.content = None;
+        let set =
+            VersionSet::from_entries("media", "f.txt", vec![row("laptop", b"live", 100), deleted]);
+        let lines = version_set(&set);
+        assert!(lines[1].contains("(deleted)"), "{lines:?}");
+        assert!(lines[1].contains("deleted"), "{lines:?}");
+    }
 }

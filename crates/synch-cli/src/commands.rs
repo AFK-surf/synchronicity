@@ -145,12 +145,17 @@ fn to_request(cli: &Cli) -> Result<Request> {
         },
 
         Command::Mirror { command } => match command {
-            MirrorCommand::Add { reference, path } => Request::MirrorAdd {
-                reference: reference.clone(),
+            MirrorCommand::Add {
+                space,
+                path,
+                policy,
+            } => Request::MirrorAdd {
+                space: space.clone(),
                 path: absolute(path)?,
+                policy: policy.clone(),
             },
-            MirrorCommand::Rm { reference } => Request::MirrorRm {
-                reference: reference.clone(),
+            MirrorCommand::Rm { path } => Request::MirrorRm {
+                path: absolute(path)?,
             },
             MirrorCommand::Ls => Request::MirrorLs,
             MirrorCommand::Sync => Request::MirrorSync,
@@ -169,12 +174,26 @@ fn to_request(cli: &Cli) -> Result<Request> {
         Command::Status { reference } => Request::Status {
             reference: reference.clone(),
         },
-        Command::Cat { reference, range } => Request::Cat {
+        Command::Cat {
+            reference,
+            range,
+            from,
+            strict,
+        } => Request::Cat {
             reference: reference.clone(),
             range: range.clone(),
+            from: from.clone(),
+            strict: *strict,
         },
-        Command::Get { reference, .. } => Request::Get {
+        Command::Get {
+            reference,
+            from,
+            strict,
+            ..
+        } => Request::Get {
             reference: reference.clone(),
+            from: from.clone(),
+            strict: *strict,
         },
         Command::Take { reference } => Request::Take {
             reference: reference.clone(),
@@ -205,7 +224,10 @@ async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
 
     // `get` is the one command whose payload lands in a file rather than on
     // stdout, so it needs the destination the caller named.
-    if let Command::Get { reference, output } = &cli.command {
+    if let Command::Get {
+        reference, output, ..
+    } = &cli.command
+    {
         let target = match output {
             Some(path) => path.clone(),
             None => {

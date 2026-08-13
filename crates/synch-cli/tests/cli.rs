@@ -219,21 +219,51 @@ fn the_command_surface_works_over_the_socket() {
     let ls = cli.run(&["ls", "media/talks"]);
     assert!(!ls.contains("notes.txt"), "{ls}");
 
+    // The bare reference reads the unified tree under the default policy; the
+    // origin-prefixed one and `--from` are the same pin spelled two ways (§8).
+    assert_eq!(cli.run_bytes(&["cat", "media/notes.txt"]), b"hello");
     assert_eq!(
         cli.run_bytes(&["cat", "nas@cluster.example:media/notes.txt"]),
         b"hello"
     );
+    assert_eq!(
+        cli.run_bytes(&["cat", "media/notes.txt", "--from", "nas@cluster.example"]),
+        b"hello"
+    );
+    // Nothing is divergent here, so `--strict` reads it happily.
+    assert_eq!(
+        cli.run_bytes(&["cat", "media/notes.txt", "--strict"]),
+        b"hello"
+    );
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("notes.txt");
-    cli.run(&[
-        "get",
-        "nas@cluster.example:media/notes.txt",
-        "-o",
-        &target.to_string_lossy(),
-    ]);
+    cli.run(&["get", "media/notes.txt", "-o", &target.to_string_lossy()]);
     assert_eq!(std::fs::read(&target).unwrap(), b"hello");
 
-    assert!(cli.run(&["status", "media"]).contains("[agree]"));
+    let status = cli.run(&["status", "media"]);
+    assert!(status.contains("media/notes.txt  1 version(s)"), "{status}");
+    assert!(status.contains("nas@cluster.example"), "{status}");
+
+    // A mirror names the directory it writes into, and carries a policy.
+    let mirror_dir = tempfile::tempdir().unwrap();
+    let added = cli.run(&[
+        "mirror",
+        "add",
+        "media",
+        &mirror_dir.path().to_string_lossy(),
+        "--policy",
+        "newest",
+    ]);
+    assert!(added.contains("newest"), "{added}");
+    assert!(cli.run(&["mirror", "ls"]).contains("newest"));
+    cli.run(&["mirror", "sync"]);
+    assert_eq!(
+        std::fs::read(mirror_dir.path().join("notes.txt")).unwrap(),
+        b"hello"
+    );
+    assert!(cli
+        .run(&["mirror", "rm", &mirror_dir.path().to_string_lossy()])
+        .contains("removed"));
     assert!(cli.run(&["log", "media/notes.txt"]).contains("seq 1"));
 
     let root = blake3::hash(b"hello").to_hex().to_string();

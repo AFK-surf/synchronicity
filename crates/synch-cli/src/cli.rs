@@ -73,34 +73,49 @@ pub enum Command {
         #[command(subcommand)]
         command: SpaceCommand,
     },
-    /// List entries.
+    /// List the unified tree, divergent paths marked with their version count.
     Ls {
-        /// `[<origin>:]<space>[/<dir>]`. Defaults to the merged view.
+        /// `[<origin>:]<space>[/<dir>]`. The origin-prefixed form lists one
+        /// origin's view instead of the unified tree.
         reference: String,
-        /// Show every origin's entry, not just one per path.
+        /// Show every version of every path, with its attestors.
         #[arg(long)]
         all: bool,
     },
-    /// Show agreement and divergence across origins.
+    /// The version inspector: every version of a path, side by side.
     Status {
         /// `<space>[/<path>]`.
         reference: Option<String>,
     },
     /// Verified streaming read to stdout.
     Cat {
-        /// `<origin>:<space>/<path>`.
+        /// `[<origin>:]<space>/<path>`. The bare form reads the version the
+        /// policy selects; the origin-prefixed form pins one origin.
         reference: String,
         /// A byte range, as `START..END`, `START..`, or `..END`.
         #[arg(long)]
         range: Option<String>,
+        /// Read this origin's version — the same thing as pinning it in the
+        /// reference.
+        #[arg(long, value_name = "ORIGIN")]
+        from: Option<String>,
+        /// Refuse to read a divergent path, and list its versions instead.
+        #[arg(long, conflicts_with = "from")]
+        strict: bool,
     },
     /// Fetch to a file.
     Get {
-        /// `<origin>:<space>/<path>`.
+        /// `[<origin>:]<space>/<path>`.
         reference: String,
         /// Where to write. Defaults to the entry's file name.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Fetch this origin's version.
+        #[arg(long, value_name = "ORIGIN")]
+        from: Option<String>,
+        /// Refuse to fetch a divergent path, and list its versions instead.
+        #[arg(long, conflicts_with = "from")]
+        strict: bool,
     },
     /// Adopt a peer's version as this node's own.
     Take {
@@ -255,19 +270,26 @@ pub enum SpaceCommand {
 }
 
 /// `synch mirror ...`
+///
+/// A mirror materializes one space of the unified tree into a directory under
+/// a version policy (§7.2), so it is named by the directory it writes into.
 #[derive(Debug, Subcommand)]
 pub enum MirrorCommand {
-    /// Mirror a peer's space into a local directory.
+    /// Mirror a space of the unified tree into a local directory.
     Add {
-        /// `<origin>:<space>`.
-        reference: String,
+        /// The space id.
+        space: String,
         /// The local directory.
         path: PathBuf,
+        /// Which version of each path to write: `newest` (default),
+        /// `origin=<id>`, or `strict`.
+        #[arg(long)]
+        policy: Option<String>,
     },
-    /// Stop mirroring.
+    /// Stop mirroring into a directory.
     Rm {
-        /// `<origin>:<space>`.
-        reference: String,
+        /// The local directory.
+        path: PathBuf,
     },
     /// List mirrors.
     Ls,
@@ -404,12 +426,22 @@ mod tests {
             vec!["synch", "space", "ls"],
             vec!["synch", "space", "rm", "media"],
             vec!["synch", "ls", "media/talks"],
+            vec!["synch", "ls", "nas@x:media/talks", "--all"],
             vec!["synch", "status", "media/a.txt"],
+            vec!["synch", "cat", "media/a.txt", "--range", "0..10"],
+            vec!["synch", "cat", "media/a.txt", "--from", "nas@x"],
+            vec!["synch", "cat", "media/a.txt", "--strict"],
             vec!["synch", "cat", "nas@x:media/a.txt", "--range", "0..10"],
+            vec!["synch", "get", "media/a.txt", "-o", "/tmp/a"],
+            vec!["synch", "get", "media/a.txt", "--strict"],
             vec!["synch", "get", "nas@x:media/a.txt", "-o", "/tmp/a"],
             vec!["synch", "take", "nas@x:media/a.txt"],
             vec!["synch", "log", "media/a.txt"],
-            vec!["synch", "mirror", "add", "nas@x:media", "/mnt/nas"],
+            vec!["synch", "mirror", "add", "media", "/mnt/nas"],
+            vec![
+                "synch", "mirror", "add", "media", "/mnt/nas", "--policy", "strict",
+            ],
+            vec!["synch", "mirror", "rm", "/mnt/nas"],
             vec!["synch", "mirror", "ls"],
             vec!["synch", "pin", "add", "aabb"],
             vec!["synch", "peers"],
@@ -419,6 +451,30 @@ mod tests {
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
+    }
+
+    /// `--from` and `--strict` are two answers to the same question, so the
+    /// command surface refuses both at once rather than picking one.
+    #[test]
+    fn from_and_strict_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from([
+            "synch",
+            "cat",
+            "media/a.txt",
+            "--from",
+            "nas@x",
+            "--strict"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "synch",
+            "get",
+            "media/a.txt",
+            "--from",
+            "nas@x",
+            "--strict"
+        ])
+        .is_err());
     }
 
     #[test]
