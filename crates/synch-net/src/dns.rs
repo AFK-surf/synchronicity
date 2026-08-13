@@ -435,11 +435,13 @@ struct DohHandle {
 
 impl DohHandle {
     fn new(url: reqwest::Url) -> Result<Self, NetError> {
-        // No proxy: resolving names through an HTTP proxy invites a bootstrap
-        // cycle, since the proxy's own name would need resolving first.
+        // Proxies from the environment (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) are
+        // honored, as reqwest does by default: on networks where a proxy is
+        // the only road out, refusing it would strand exactly the deployments
+        // DoH exists for. An operator whose proxy name cannot be resolved
+        // locally names it by address, the same as any other proxied client.
         let client = reqwest::Client::builder()
             .timeout(DOH_TIMEOUT)
-            .no_proxy()
             .build()
             .map_err(|e| NetError::Dns(format!("DoH client: {e}")))?;
         Ok(DohHandle { client, url })
