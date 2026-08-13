@@ -150,15 +150,47 @@ impl Node {
 
     /// One maintenance pass, exposed so tests and `synch doctor` can drive it.
     ///
+    /// The order is the one §5.4 implies and it is not arbitrary. History is
+    /// pruned to `root_retention` *first*, because the trie mark set is
+    /// "complete + pending heads + remaining history roots" — marking from
+    /// every root ever recorded means nothing is ever swept, which is exactly
+    /// the state this pass exists to avoid. Then the trie sweep runs, and then
+    /// content: an object drops out of `referenced_content` only once the
+    /// entries naming it are gone, which is what the trie sweep produces.
+    ///
     /// Tombstones past `tombstone_ttl` are *staged* here rather than published:
     /// the publisher turns them into one head like any other batch (§4.2).
     pub fn maintenance_pass(&self) -> Result<synch_store::GcStats> {
-        let expired = self.store().expire_bindings(now_ns())?;
+        let now = now_ns();
+        let expired = self.store().expire_bindings(now)?;
         if expired > 0 {
             tracing::info!(expired, "dns bindings lapsed");
         }
         self.expire_tombstones()?;
-        Ok(self.store().gc_trie()?)
+
+        let retention = self
+            .config()
+            .root_retention
+            .as_nanos()
+            .min(i64::MAX as u128) as i64;
+        let before = now.saturating_sub(retention);
+        let mut pruned = 0;
+        for origin in self.store().history_origins()? {
+            pruned += self.store().prune_history_before(&origin, before)?;
+        }
+        if pruned > 0 {
+            tracing::info!(pruned, "old roots dropped out of retention");
+        }
+        let stats = self.store().gc(before)?;
+        if stats.nodes > 0 || stats.values > 0 || stats.blobs > 0 {
+            tracing::info!(
+                nodes = stats.nodes,
+                values = stats.values,
+                blobs = stats.blobs,
+                "garbage collected"
+            );
+        }
+        Ok(stats)
     }
 }
 

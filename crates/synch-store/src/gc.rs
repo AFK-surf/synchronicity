@@ -82,17 +82,28 @@ impl Store {
         Ok(stats)
     }
 
-    /// Sweeps content objects that no retained entry references and that are
-    /// not pinned.
+    /// Sweeps content objects that no retained entry references, that are not
+    /// pinned, and that nothing has touched since `before`.
     ///
     /// Content GC is pin- and retention-driven, so history depth is a storage
-    /// policy rather than a protocol constant (§8).
-    pub fn gc_content(&self) -> Result<GcStats> {
+    /// policy rather than a protocol constant (§8). The retention window is
+    /// what keeps an object that was just fetched — for a `synch get` of a
+    /// historical root, say, which no current entry references — from being
+    /// swept out from under the fetch that produced it.
+    ///
+    /// `last_access` is written on ingest and on every download milestone, not
+    /// on reads: a streaming read would otherwise cost one row update per
+    /// chunk, and an object nothing references is by construction not being
+    /// read through the tree.
+    pub fn gc_content(&self, before: i64) -> Result<GcStats> {
         let referenced = self.referenced_content()?;
         let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
         let mut stats = GcStats::default();
         for blob in self.blobs()? {
             if referenced.contains(&blob.root) || pinned.contains(&blob.root) {
+                continue;
+            }
+            if blob.last_access >= before {
                 continue;
             }
             self.delete_blob(&blob.root)?;
@@ -101,10 +112,10 @@ impl Store {
         Ok(stats)
     }
 
-    /// Runs both sweeps.
-    pub fn gc(&self) -> Result<GcStats> {
+    /// Runs both sweeps, with `before` as the content retention horizon.
+    pub fn gc(&self, before: i64) -> Result<GcStats> {
         let trie = self.gc_trie()?;
-        let content = self.gc_content()?;
+        let content = self.gc_content(before)?;
         Ok(GcStats {
             nodes: trie.nodes,
             values: trie.values,
@@ -299,7 +310,8 @@ mod tests {
             .unwrap();
         store.set_pinned(&pinned, true).unwrap();
 
-        let stats = store.gc_content().unwrap();
+        // Ingested at 0, so a horizon of 1 puts all three past retention.
+        let stats = store.gc_content(1).unwrap();
         assert_eq!(stats.blobs, 1);
         assert!(store.blob(&referenced).unwrap().is_some());
         assert!(store.blob(&pinned).unwrap().is_some());
@@ -308,12 +320,86 @@ mod tests {
     }
 
     #[test]
+    fn content_inside_the_retention_window_survives() {
+        // An object nothing references yet — just fetched for a historical
+        // root, say — is not swept out from under the fetch that produced it.
+        let (_d, store) = store();
+        let fresh = store.ingest_bytes(&vec![4u8; 100_000], 1_000).unwrap();
+        assert_eq!(store.gc_content(500).unwrap().blobs, 0);
+        assert!(store.blob(&fresh).unwrap().is_some());
+        assert_eq!(store.gc_content(2_000).unwrap().blobs, 1);
+        assert!(store.blob(&fresh).unwrap().is_none());
+    }
+
+    #[test]
+    fn history_pruning_keeps_the_current_heads_and_fork_evidence() {
+        // §5.4 prunes old roots by retention; §3.4 and §4.4 make same-seq
+        // forks evidence that has to outlive it.
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let old = SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 100);
+        let fork_a = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), 200);
+        let fork_b = SignedHead::sign(&key, origin(), 2, Hash([3u8; 32]), 200);
+        let current = SignedHead::sign(&key, origin(), 3, Hash([4u8; 32]), 300);
+        for head in [&old, &fork_a, &fork_b, &current] {
+            store.record_history(head).unwrap();
+        }
+        store.put_head(Slot::Complete, &current, 0, 0).unwrap();
+
+        // A horizon past every row: the plain old root goes, the current head
+        // stays because it is current, and both fork rows stay because the
+        // head that moved past them is not itself out of retention yet.
+        assert_eq!(store.prune_history_before(&origin(), 250).unwrap(), 1);
+        let kept: Vec<u64> = store
+            .head_history(&origin())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.seq)
+            .collect();
+        assert_eq!(kept, vec![3, 2, 2]);
+        assert_eq!(store.equivocations().unwrap().len(), 1);
+
+        // Once the head that published past the fork is itself older than
+        // retention, the evidence ages out with everything else.
+        assert_eq!(store.prune_history_before(&origin(), 400).unwrap(), 2);
+        assert_eq!(store.head_history(&origin()).unwrap().len(), 1);
+        assert!(store.equivocations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_fork_at_the_current_seq_is_never_pruned() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let a = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), 100);
+        let b = SignedHead::sign(&key, origin(), 2, Hash([3u8; 32]), 100);
+        store.record_history(&a).unwrap();
+        store.record_history(&b).unwrap();
+        store.put_head(Slot::Complete, &a, 0, 0).unwrap();
+
+        // The origin has not published past the forked seq, so no horizon
+        // drops the evidence.
+        assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 0);
+        assert_eq!(store.head_history(&origin()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn history_origins_lists_what_has_history() {
+        let (_d, store) = store();
+        assert!(store.history_origins().unwrap().is_empty());
+        let key = SecretKey::generate();
+        store
+            .record_history(&SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0))
+            .unwrap();
+        assert_eq!(store.history_origins().unwrap(), vec![origin()]);
+    }
+
+    #[test]
     fn full_gc_reports_both_sweeps() {
         let (_d, store) = store();
         let trie = Trie::new(&store);
         trie.insert(Hash::EMPTY, b"k", &vec![7u8; 500]).unwrap();
         store.ingest_bytes(&vec![3u8; 100_000], 0).unwrap();
-        let stats = store.gc().unwrap();
+        let stats = store.gc(1).unwrap();
         assert!(stats.nodes > 0);
         assert_eq!(stats.values, 1);
         assert_eq!(stats.blobs, 1);

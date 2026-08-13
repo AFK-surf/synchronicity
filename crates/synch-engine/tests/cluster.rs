@@ -621,3 +621,98 @@ async fn a_node_recovers_its_state_across_a_restart() {
     let _ = now_ns();
     node.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
+    // §5.4 end to end: publish, overwrite, then run the maintenance pass with
+    // a retention window of nothing. The old root leaves `head_history`, its
+    // private trie nodes are swept, and the old content's *bytes* are gone
+    // from the CAS. A pinned object survives all of it.
+    let data = tempfile::tempdir().unwrap();
+    let space = tempfile::tempdir().unwrap();
+    Node::init(
+        data.path(),
+        Some(OriginId::named("nas", "cluster.example").unwrap()),
+    )
+    .unwrap();
+    let mut config = NodeConfig::loopback(data.path());
+    // Everything published before "now" is out of retention.
+    config.root_retention = Duration::from_nanos(1);
+    let node = Node::open(config).await.unwrap();
+    node.add_space("media", space.path()).unwrap();
+
+    std::fs::write(space.path().join("notes.txt"), b"first revision").unwrap();
+    node.scan_and_publish().unwrap();
+    let old_root = node.current_root();
+    let old_content = node
+        .store()
+        .entry(node.origin(), "media", "notes.txt")
+        .unwrap()
+        .unwrap()
+        .content
+        .unwrap();
+    assert!(node.store().blob(&old_content).unwrap().is_some());
+
+    // A pinned object with no entry pointing at it: retention must not touch it.
+    let pinned = node.store().ingest_bytes(b"pinned bytes", 0).unwrap();
+    node.store().set_pinned(&pinned, true).unwrap();
+
+    std::fs::write(space.path().join("notes.txt"), b"second revision").unwrap();
+    // A distinct mtime, so the scanner cannot mistake the rewrite for no change.
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(space.path().join("notes.txt"), b"second revision").unwrap();
+    node.scan_and_publish().unwrap();
+    let old_root = old_root.unwrap();
+    assert_ne!(node.current_root().unwrap(), old_root);
+
+    // Before maintenance: the old root is retained history and its bytes are
+    // still on disk.
+    assert!(node
+        .store()
+        .head_history(node.origin())
+        .unwrap()
+        .iter()
+        .any(|h| h.root == old_root));
+
+    let stats = node.maintenance_pass().unwrap();
+
+    assert!(
+        !node
+            .store()
+            .head_history(node.origin())
+            .unwrap()
+            .iter()
+            .any(|h| h.root == old_root),
+        "the displaced root must leave retention"
+    );
+    assert!(
+        stats.nodes > 0,
+        "the old root's private nodes must be swept"
+    );
+    assert!(
+        !synch_mpt::NodeStore::has_node(node.store().as_ref(), &old_root).unwrap(),
+        "the old root node itself is gone"
+    );
+    assert!(
+        node.store().blob(&old_content).unwrap().is_none(),
+        "the superseded content must leave the index"
+    );
+    assert!(
+        !node.store().blob_path(&old_content).exists(),
+        "and its bytes must leave the CAS directory"
+    );
+
+    assert!(
+        node.store().blob(&pinned).unwrap().is_some(),
+        "a pin outlives retention"
+    );
+
+    // The current root is still complete and readable.
+    assert_eq!(
+        node.read_entry(node.origin(), "media", "notes.txt")
+            .await
+            .unwrap(),
+        b"second revision"
+    );
+    node.shutdown().await.unwrap();
+}

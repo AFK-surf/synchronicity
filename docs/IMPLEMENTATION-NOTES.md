@@ -246,6 +246,42 @@ like any other.
 promotes it: "held, and not the signing key". Exactly one key is `active` at any
 moment, which is the invariant that matters.
 
+### §5.4, §8 — what retention actually retains, and what it measures against
+
+§5.4 keeps old roots for `root_retention` and sweeps the rest; §8 makes content
+GC pin- and retention-driven. The maintenance pass runs the three steps in the
+order the mark set demands — prune `head_history`, sweep `trie_nodes` /
+`trie_values`, sweep content — because the trie mark set is "complete and
+pending heads plus *remaining* history roots", so marking from every root ever
+recorded would sweep nothing at all, and an object leaves `referenced_content`
+only once the trie sweep has taken the entries naming it.
+
+Four judgements the design leaves open:
+
+- **History ages on `created_at`**, which is the only time `head_history`
+  carries. For this node's own publishes that is this node's clock. For a
+  replicated origin it is the origin's, which is the same member-supplied
+  metadata §8 and §12 already accept for `mtime_ns` — a skewed member can hold
+  its own history in our retention longer or shorter than intended, and no
+  more.
+- **The current heads are never pruned.** `Node::publish` records the head it
+  just minted in `head_history` as well as in the `complete` slot, so a plain
+  age rule would eventually drop the row for the root the node is actually
+  serving. Both slots are exempt by identity, not by age.
+- **Same-seq fork evidence outlives ordinary retention.** Two roots at one seq
+  are provable equivocation (§4.4) and the fork side of a recovery (§3.4),
+  which `synch doctor` surfaces on every node — dropping them on a timer would
+  silently retire the proof. They are kept until the origin has published past
+  the forked seq *and* the head that did so is itself older than retention: at
+  that point the cluster has visibly moved beyond the fork, and the evidence
+  ages out like anything else.
+- **Content ages on `last_access`, which is written on ingest and on download
+  milestones, not on reads.** A streaming read would otherwise cost one row
+  update per chunk, and an object no entry references is by construction not
+  being read through the tree. The window's real job is to stop a just-fetched
+  historical root — one nothing currently references — from being swept out
+  from under the fetch that produced it.
+
 ### §3.2, §3.4 — when membership is re-resolved, and what triggers it
 
 §3.2 says records are re-resolved on the TTL, clamped to `[60 s, 24 h]`, and

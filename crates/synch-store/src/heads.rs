@@ -269,6 +269,88 @@ impl Store {
         )?)
     }
 
+    /// Every origin that has retained history.
+    pub fn history_origins(&self) -> Result<Vec<OriginId>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT origin_id FROM head_history ORDER BY origin_id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(origin_column(row?, "head_history.origin_id")?);
+        }
+        Ok(out)
+    }
+
+    /// Prunes one origin's retained history to the `root_retention` window
+    /// (§5.4), keeping what the design says must survive it.
+    ///
+    /// Three exemptions, and they are the whole point of the rule:
+    ///
+    /// - **The current heads.** The complete and pending heads' rows are what
+    ///   `synch log` reads the present from and what GC marks the live trie
+    ///   from; retention is about *old* roots.
+    /// - **Same-seq fork evidence.** Two roots signed at one seq are provable
+    ///   equivocation (§4.4) and the fork side of someone's recovery (§3.4),
+    ///   surfaced by `synch doctor` on every node. Those rows outlive ordinary
+    ///   retention until the origin has published past the forked seq *and*
+    ///   the head that did so is itself older than retention — at which point
+    ///   the fork is history that the cluster has visibly moved beyond.
+    /// - **Anything newer than `before`**, which is the retention window
+    ///   itself.
+    ///
+    /// Age is the head's own `created_at`, which is the only time this table
+    /// carries. For this node's own history that is this node's clock; for a
+    /// replicated origin it is the origin's, which is the same member-supplied
+    /// metadata §8 and §12 already accept for `mtime_ns`.
+    ///
+    /// Returns how many rows were dropped.
+    pub fn prune_history_before(&self, origin: &OriginId, before: i64) -> Result<usize> {
+        let complete = self.complete_head(origin)?;
+        let pending = self.pending_head(origin)?;
+        let current_seq = complete.as_ref().map(|h| h.seq).unwrap_or(0);
+        let current_created = complete.as_ref().map(|h| h.created_at).unwrap_or(i64::MIN);
+        // A seq with more than one retained root is a fork, and both sides of
+        // it are evidence.
+        let forked: Vec<u64> = self
+            .equivocations()?
+            .into_iter()
+            .filter(|e| &e.origin == origin)
+            .map(|e| e.seq)
+            .collect();
+        let moved_past_forks = current_created < before;
+
+        let mut doomed = Vec::new();
+        for head in self.head_history(origin)? {
+            if head.created_at >= before {
+                continue;
+            }
+            let is_current = [complete.as_ref(), pending.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|h| h.seq == head.seq && h.root == head.root);
+            if is_current {
+                continue;
+            }
+            if forked.contains(&head.seq) && !(current_seq > head.seq && moved_past_forks) {
+                continue;
+            }
+            doomed.push((head.seq, head.root));
+        }
+
+        let pruned = doomed.len();
+        self.transaction(|tx| {
+            for (seq, root) in &doomed {
+                tx.execute(
+                    "DELETE FROM head_history WHERE origin_id = ?1 AND seq = ?2 AND root = ?3",
+                    params![origin.canonical(), *seq as i64, root.as_bytes().to_vec()],
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(pruned)
+    }
+
     /// The roots that GC must mark from: every origin's complete and pending
     /// heads plus retained history roots (§5.4).
     ///
