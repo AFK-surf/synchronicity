@@ -365,22 +365,33 @@ impl Node {
     }
 
     /// The seq this node's next publish will carry.
+    ///
+    /// Normally one past the current head, or 1 for a node that has never
+    /// published. A node that came back from key loss also carries a durable
+    /// publishing floor (§3.4), and the floor only ever raises the seq: it is
+    /// what keeps a recovered node above the history its peers still hold,
+    /// across restarts.
     pub fn next_seq(&self) -> Result<u64> {
-        Ok(self
+        let next = self
             .store()
             .complete_head(self.origin())?
             .map(|h| h.seq + 1)
-            .unwrap_or(1))
+            .unwrap_or(1);
+        Ok(next.max(self.store().publish_floor()?.unwrap_or(0)))
     }
 
     /// Applies staged changes as one new signed root (§7.1).
     ///
     /// One save in an editor costs one head; a 100k-file initial index costs a
     /// handful, because the batch becomes a single root.
+    ///
+    /// Refuses while this node is in key-loss recovery (§3.4): the head it
+    /// would mint carries a seq every peer rejects.
     pub fn publish(&self, staged: Vec<StagedChange>) -> Result<Option<SignedHead>> {
         if staged.is_empty() {
             return Ok(None);
         }
+        self.ensure_can_publish()?;
         let old_root = self.current_root()?;
         let trie = Trie::new(self.store().as_ref());
         let mut root = old_root;

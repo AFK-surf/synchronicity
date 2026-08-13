@@ -34,6 +34,12 @@ pub struct NodeConfig {
     pub fetch_fanout: usize,
     /// How long old roots are retained (§5.4).
     pub root_retention: Duration,
+    /// How long `synch recover` collects peer summaries before it lifts the
+    /// publishing floor (§3.4).
+    pub recovery_quiesce: Duration,
+    /// How far above the highest seq peers advertised publishing resumes after
+    /// recovery (§3.4).
+    pub seq_gap: u64,
     /// The human-friendly node name published in `m:self`.
     pub name: String,
 }
@@ -50,6 +56,8 @@ impl NodeConfig {
             ad_update_interval: Duration::from_secs(60),
             fetch_fanout: 3,
             root_retention: Duration::from_secs(7 * 24 * 3600),
+            recovery_quiesce: crate::recovery::DEFAULT_RECOVERY_QUIESCE,
+            seq_gap: crate::recovery::DEFAULT_SEQ_GAP,
             name: hostname(),
         }
     }
@@ -87,6 +95,8 @@ mod tests {
         assert_eq!(config.ad_update_interval, Duration::from_secs(60));
         assert_eq!(config.fetch_fanout, 3);
         assert_eq!(config.root_retention, Duration::from_secs(7 * 24 * 3600));
+        assert_eq!(config.recovery_quiesce, Duration::from_secs(3600));
+        assert_eq!(config.seq_gap, 1_000);
     }
 
     #[test]

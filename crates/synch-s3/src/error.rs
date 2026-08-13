@@ -160,6 +160,14 @@ impl From<synch_engine::EngineError> for S3Error {
         match e {
             EngineError::NotFound(what) => S3Error::new(StatusCode::NOT_FOUND, "NoSuchKey", what),
             EngineError::Invalid(what) => S3Error::invalid(what),
+            // A node in key-loss recovery cannot publish, so it cannot accept a
+            // write either. That is a state the operator clears with `synch
+            // recover`, not a fault in the request or in the gateway (§3.4).
+            in_recovery @ EngineError::InRecovery { .. } => S3Error::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                in_recovery.to_string(),
+            ),
             other => S3Error::store(other),
         }
     }

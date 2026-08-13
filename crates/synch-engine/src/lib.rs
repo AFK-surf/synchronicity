@@ -15,6 +15,7 @@ pub mod ignore;
 pub mod membership;
 pub mod mirror;
 pub mod node;
+pub mod recovery;
 pub mod reference;
 pub mod rotation;
 pub mod scanner;
@@ -28,6 +29,10 @@ pub use ignore::IgnoreSet;
 pub use membership::{DoctorReport, DomainRefresh, HeadStatus};
 pub use mirror::MirrorReport;
 pub use node::{InitReport, Node, StagedChange};
+pub use recovery::{
+    ObserveRound, RecoveryOptions, RecoveryProgress, RecoveryReport, RecoveryState,
+    UnreconciledHistory, DEFAULT_RECOVERY_QUIESCE, DEFAULT_SEQ_GAP,
+};
 pub use reference::EntryRef;
 pub use rotation::{Activation, RotationPlan};
 pub use scanner::ScanReport;

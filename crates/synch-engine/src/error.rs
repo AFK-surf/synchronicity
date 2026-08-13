@@ -36,6 +36,23 @@ pub enum EngineError {
     /// A caller supplied an invalid argument.
     #[error("{0}")]
     Invalid(String),
+    /// This node is in key-loss recovery and must not publish (§3.4).
+    ///
+    /// Publishing anyway would mint heads at a seq every peer correctly
+    /// rejects, with nothing on either side saying why.
+    #[error(
+        "{origin} is in key-loss recovery: peers hold heads for it up to seq {observed_seq}, \
+         so a publish at seq {would_publish} would be rejected by every one of them. \
+         Run `synch recover` to collect what peers have seen and resume publishing above it"
+    )]
+    InRecovery {
+        /// This node's own origin.
+        origin: synch_core::OriginId,
+        /// The highest seq any peer has advertised for it.
+        observed_seq: u64,
+        /// The seq the refused publish would have carried.
+        would_publish: u64,
+    },
 }
 
 impl EngineError {

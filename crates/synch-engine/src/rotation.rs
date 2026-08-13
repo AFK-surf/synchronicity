@@ -103,6 +103,9 @@ impl Node {
                 "key-identified origins cannot rotate: the device key is the identity",
             ));
         }
+        // Activation re-signs a head of its own, so it is a publish and the
+        // recovery gate applies to it too (§3.4).
+        self.ensure_can_publish()?;
         let previous_key = self.node_id();
         if new_key == &previous_key {
             return Err(EngineError::invalid(format!(

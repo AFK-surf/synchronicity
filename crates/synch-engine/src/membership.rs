@@ -9,6 +9,7 @@ use synch_store::{Binding, BindingSource, Equivocation};
 use crate::{
     error::{EngineError, Result},
     node::Node,
+    recovery::{RecoveryState, UnreconciledHistory},
 };
 
 /// The config key holding the configured membership domains.
@@ -47,6 +48,12 @@ pub struct DoctorReport {
     /// Origins whose heads we hold but which have no live binding — their data
     /// is unavailable until the origin republishes under a bound key (§3.4).
     pub unbound_origins: Vec<OriginId>,
+    /// Whether this node is itself in key-loss recovery, and how far peers say
+    /// its origin had got (§3.4).
+    pub recovery: RecoveryState,
+    /// Pre-recovery history we hold that the origin's current head does not
+    /// supersede: the fork side of someone else's recovery (§3.4, §4.4).
+    pub unreconciled: Vec<UnreconciledHistory>,
     /// Configured membership domains.
     pub domains: Vec<String>,
     /// Trie and content storage counts.
@@ -230,7 +237,9 @@ impl Node {
         origins.sort();
 
         let trie = synch_mpt::Trie::new(self.store().as_ref());
+        let mut unreconciled = Vec::new();
         for origin in origins {
+            unreconciled.extend(self.unreconciled_history(&origin)?);
             let complete = self.store().complete_head(&origin)?;
             let pending = self.store().pending_head(&origin)?;
             let servable = match &complete {
@@ -274,6 +283,8 @@ impl Node {
             heads,
             equivocations: self.store().equivocations()?,
             unbound_origins,
+            recovery: self.recovery_state()?,
+            unreconciled,
             domains: self.domains()?,
             trie: self.store().trie_stats()?,
             blobs: (blobs.len(), complete_blobs),
