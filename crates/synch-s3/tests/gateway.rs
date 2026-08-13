@@ -1,20 +1,34 @@
 //! Drives the gateway over real HTTP on an ephemeral port with a plain client
 //! (§11 testing strategy): GET/HEAD/LIST/PUT round-trips, a Range read, ETag
 //! checks, and byte-exactness.
+//!
+//! The daemon is a real one — same `Server`, same control socket, same token —
+//! and the gateway reaches it only through that socket, which is the property
+//! §9.4 is actually about. Nothing here hands the gateway a `Node`, because
+//! nothing can: it has no way to take one.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::Path};
 
+use synch_cli::control::Server;
 use synch_engine::{Node, NodeConfig};
 use synch_s3::{
     auth::{AccessKey, AuthMode},
-    buckets, Gateway,
+    buckets,
+    daemon::Daemon,
+    Gateway,
 };
+use tokio::sync::broadcast;
 
 struct Harness {
     _data: tempfile::TempDir,
     _space: tempfile::TempDir,
     space_path: std::path::PathBuf,
+    /// The node the *daemon* owns. Held here so a test can assert on the state
+    /// behind the socket; the gateway has no access to it.
     node: Node,
+    daemon: Daemon,
+    stop: broadcast::Sender<()>,
+    served: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     base: String,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: Option<tokio::task::JoinHandle<()>>,
@@ -28,13 +42,24 @@ impl Harness {
         let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
         node.add_space("media", space.path()).unwrap();
 
+        let (stop, _) = broadcast::channel(1);
+        let control = Server::bind(node.clone(), stop.clone()).await.unwrap();
+        let served = tokio::spawn(control.run());
+        let daemon = Daemon::new(data.path());
+
         // The default policy over the unified tree, an origin pin on a
         // foreign origin, and a strict bucket over the same space (§9.4).
-        buckets::add(&node, "my-media", "media", None).unwrap();
-        buckets::add(&node, "nas-media", "nas@cluster.example:media", None).unwrap();
-        buckets::add(&node, "strict-media", "media", Some("strict")).unwrap();
+        buckets::add(&daemon, "my-media", "media", None)
+            .await
+            .unwrap();
+        buckets::add(&daemon, "nas-media", "nas@cluster.example:media", None)
+            .await
+            .unwrap();
+        buckets::add(&daemon, "strict-media", "media", Some("strict"))
+            .await
+            .unwrap();
 
-        let gateway = Gateway::new(node.clone(), auth);
+        let gateway = Gateway::new(daemon.clone(), auth).await.unwrap();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let bound = listener.local_addr().unwrap();
@@ -52,6 +77,9 @@ impl Harness {
             space_path: space.path().to_path_buf(),
             _space: space,
             node,
+            daemon,
+            stop,
+            served: Some(served),
             base: format!("http://{bound}"),
             shutdown: Some(tx),
             server: Some(server),
@@ -64,11 +92,7 @@ impl Harness {
 
     /// Writes a file into the local space and publishes it.
     fn publish(&self, path: &str, content: &[u8]) {
-        let target = self.space_path.join(path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(target, content).unwrap();
+        write_into(&self.space_path, path, content);
         self.node.scan_and_publish().unwrap();
     }
 
@@ -79,8 +103,20 @@ impl Harness {
         if let Some(server) = self.server.take() {
             let _ = server.await;
         }
+        let _ = self.stop.send(());
+        if let Some(served) = self.served.take() {
+            let _ = served.await;
+        }
         self.node.shutdown().await.unwrap();
     }
+}
+
+fn write_into(root: &Path, path: &str, content: &[u8]) {
+    let target = root.join(path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(target, content).unwrap();
 }
 
 fn client() -> reqwest::Client {
@@ -117,13 +153,18 @@ async fn get_head_list_and_range_round_trip() {
     );
     assert_eq!(response.bytes().await.unwrap().as_ref(), b"hello from s3");
 
-    // A large object comes back byte-for-byte.
+    // A large object comes back byte-for-byte, and its declared length is the
+    // object's — a streamed body must still say how long it is.
     let response = http
         .get(harness.url("/my-media/talks/keynote.mp4"))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("content-length").unwrap(),
+        &payload.len().to_string()
+    );
     assert_eq!(response.bytes().await.unwrap().as_ref(), payload.as_slice());
 
     // HeadObject: metadata straight from the entry, no body.
@@ -281,6 +322,52 @@ async fn get_head_list_and_range_round_trip() {
     harness.stop().await;
 }
 
+/// An object far larger than one control-socket chunk crosses the gateway in
+/// both directions without either process holding it (§9.4). Byte-exactness at
+/// this size is the observable half of that; the bounded channel and the
+/// daemon's staging file are the mechanism.
+#[tokio::test]
+async fn a_large_object_streams_through_in_both_directions() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i * 31 % 251) as u8).collect();
+
+    let response = http
+        .put(harness.url("/my-media/uploads/big.bin"))
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("etag").unwrap().to_str().unwrap(),
+        format!("\"{}\"", blake3::hash(&payload).to_hex())
+    );
+
+    let response = http
+        .get(harness.url("/my-media/uploads/big.bin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), payload.as_slice());
+
+    // A range in the middle of it reads without touching the rest.
+    let response = http
+        .get(harness.url("/my-media/uploads/big.bin"))
+        .header("Range", "bytes=2000000-2000999")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 206);
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        &payload[2_000_000..2_001_000]
+    );
+
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn put_object_publishes_into_the_local_space() {
     let harness = Harness::start(AuthMode::Anonymous).await;
@@ -356,13 +443,15 @@ async fn put_object_is_refused_while_the_node_is_in_recovery() {
     assert!(body.contains("ServiceUnavailable"), "{body}");
     assert!(body.contains("synch recover"), "{body}");
 
-    // Nothing was published under a seq the cluster would refuse.
+    // Nothing was published under a seq the cluster would refuse, and nothing
+    // was written into the space either.
     assert!(harness
         .node
         .store()
         .complete_head(harness.node.origin())
         .unwrap()
         .is_none());
+    assert!(!harness.space_path.join("uploads").exists());
 
     harness.stop().await;
 }
@@ -399,9 +488,10 @@ async fn a_foreign_pinned_bucket_writes_our_view_and_reads_theirs() {
         .unwrap();
     assert_eq!(response.status(), 404);
 
-    let bucket = buckets::find(&harness.node, "nas-media").unwrap();
-    assert!(bucket.pins_a_foreign_origin(&harness.node));
-    let warning = bucket.foreign_pin_warning(&harness.node).unwrap();
+    let ours = harness.daemon.origin().await.unwrap();
+    let bucket = buckets::find(&harness.daemon, "nas-media").await.unwrap();
+    assert!(bucket.pins_a_foreign_origin(&ours));
+    let warning = bucket.foreign_pin_warning(&ours).unwrap();
     assert!(warning.contains("read-only"), "{warning}");
     harness.stop().await;
 }
@@ -479,6 +569,7 @@ async fn divergent_keys_are_served_by_policy() {
         body.contains(&blake3::hash(theirs).to_hex().to_string()),
         "{body}"
     );
+    assert!(body.contains("<Resource>shared.txt</Resource>"), "{body}");
 
     // HEAD refuses it the same way.
     let response = http
@@ -523,6 +614,83 @@ async fn deferred_operations_report_not_implemented() {
         .unwrap();
     assert_eq!(response.status(), 501);
     assert!(response.text().await.unwrap().contains("NotImplemented"));
+    harness.stop().await;
+}
+
+/// Buckets and access keys live in the daemon's `s3.*` config namespace, and
+/// the gateway edits them by appending records over the socket (§9.4).
+#[tokio::test]
+async fn bucket_and_key_configuration_lives_in_the_daemon() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+
+    // The buckets the harness added are the daemon's rows, not a file of ours.
+    let stored = harness
+        .node
+        .store()
+        .config(buckets::BUCKETS_CONFIG)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.lines().count(), 3, "{stored}");
+
+    // Replacing a mapping appends rather than rewriting, and the fold makes the
+    // last record win.
+    buckets::add(&harness.daemon, "my-media", "media", Some("strict"))
+        .await
+        .unwrap();
+    let stored = harness
+        .node
+        .store()
+        .config(buckets::BUCKETS_CONFIG)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.lines().count(), 4, "{stored}");
+    let bucket = buckets::find(&harness.daemon, "my-media").await.unwrap();
+    assert_eq!(bucket.policy.render(), "strict");
+
+    // Removing is another record, and it takes the bucket out of the map.
+    assert!(buckets::remove(&harness.daemon, "my-media").await.unwrap());
+    assert!(buckets::find(&harness.daemon, "my-media").await.is_err());
+    assert!(!buckets::remove(&harness.daemon, "my-media").await.unwrap());
+
+    // A mapping the daemon would refuse is refused at `bucket add`, not at the
+    // first GET days later.
+    assert!(
+        buckets::add(&harness.daemon, "bad-policy", "media", Some("whatever"))
+            .await
+            .is_err()
+    );
+    assert!(buckets::add(&harness.daemon, "UPPER", "media", None)
+        .await
+        .is_err());
+    assert!(buckets::add(
+        &harness.daemon,
+        "two-pins",
+        "nas@cluster.example:media",
+        Some("strict")
+    )
+    .await
+    .is_err());
+
+    // Access keys take the same shape.
+    let key = AccessKey {
+        id: "AKID".into(),
+        secret: "shh".into(),
+    };
+    synch_s3::auth::put_key(&harness.daemon, &key)
+        .await
+        .unwrap();
+    assert_eq!(
+        synch_s3::auth::load_keys(&harness.daemon).await.unwrap(),
+        vec![key]
+    );
+    assert!(synch_s3::auth::remove_key(&harness.daemon, "AKID")
+        .await
+        .unwrap());
+    assert!(synch_s3::auth::load_keys(&harness.daemon)
+        .await
+        .unwrap()
+        .is_empty());
+
     harness.stop().await;
 }
 
@@ -613,6 +781,20 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
     );
 
     harness.stop().await;
+}
+
+/// With no daemon there is nothing to serve from, and the gateway says so in
+/// the words the CLI uses rather than as a transport error (§9.1).
+#[tokio::test]
+async fn without_a_daemon_the_gateway_names_the_command_that_starts_one() {
+    let dir = tempfile::tempdir().unwrap();
+    Node::init(dir.path(), None).unwrap();
+    let daemon = Daemon::new(dir.path());
+    let error = buckets::load(&daemon)
+        .await
+        .expect_err("there is no daemon listening");
+    assert_eq!(error.status, 503, "{error}");
+    assert!(error.message.contains("synch daemon run"), "{error}");
 }
 
 fn urlencode(value: &str) -> String {

@@ -1,15 +1,19 @@
 //! `synch-s3` — an S3-compatible gateway onto a synchronicity cluster (§9.4).
 //!
-//! A thin argument-parsing shell over the gateway library and `synch-engine`.
+//! A thin argument-parsing shell over the gateway library. Every subcommand,
+//! `bucket add` and `key add` included, is a control-socket request to a
+//! running daemon: this process opens no database and binds no endpoint, so the
+//! daemon remains the only writer and the only endpoint (§9.1).
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use synch_engine::{Node, NodeConfig};
 use synch_s3::{
     auth::{self, AccessKey, AuthMode},
-    buckets, is_loopback, Gateway,
+    buckets,
+    daemon::Daemon,
+    is_loopback, Gateway,
 };
 
 /// An S3-compatible gateway onto a synchronicity cluster.
@@ -19,10 +23,6 @@ struct Cli {
     /// The node's data directory. Defaults to the platform data directory.
     #[arg(long, global = true, env = "SYNCH_DATA_DIR")]
     data_dir: Option<PathBuf>,
-
-    /// Disable relays and address discovery on the embedded node.
-    #[arg(long, global = true)]
-    offline: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -112,23 +112,16 @@ async fn main() -> Result<()> {
 async fn run(args: Cli) -> Result<()> {
     let data_dir = match args.data_dir {
         Some(dir) => dir,
-        None => synch_engine::default_data_dir()?,
+        None => synch_cli::default_data_dir()?,
     };
-    let mut config = NodeConfig::new(data_dir);
-    config.net.offline = args.offline;
-    if args.offline {
-        config.net.bind_addr = Some("127.0.0.1:0".parse().expect("valid loopback address"));
-    }
-    let node = Node::open(config)
-        .await
-        .context("could not open the node (run `synch init` first?)")?;
-
-    let result = dispatch(&node, args.command).await;
-    node.shutdown().await?;
-    result
+    // Nothing is opened here — only the control token is read, and only when
+    // the first request is sent. With no daemon running, that request fails
+    // with a message naming the socket and `synch daemon run` (§9.1).
+    let daemon = Daemon::new(data_dir);
+    dispatch(&daemon, args.command).await
 }
 
-async fn dispatch(node: &Node, command: Command) -> Result<()> {
+async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
     match command {
         Command::Bucket { command } => match command {
             BucketCommand::Add {
@@ -136,21 +129,21 @@ async fn dispatch(node: &Node, command: Command) -> Result<()> {
                 reference,
                 policy,
             } => {
-                let bucket = buckets::add(node, &bucket, &reference, policy.as_deref())?;
+                let bucket = buckets::add(daemon, &bucket, &reference, policy.as_deref()).await?;
                 println!("{} -> {} ({})", bucket.name, bucket.space, bucket.policy);
-                if let Some(warning) = bucket.foreign_pin_warning(node) {
+                if let Some(warning) = bucket.foreign_pin_warning(&daemon.origin().await?) {
                     println!("warning: {warning}");
                 }
             }
             BucketCommand::Rm { bucket } => {
-                if buckets::remove(node, &bucket)? {
+                if buckets::remove(daemon, &bucket).await? {
                     println!("removed {bucket}");
                 } else {
                     println!("no such bucket");
                 }
             }
             BucketCommand::Ls => {
-                for bucket in buckets::load(node)? {
+                for bucket in buckets::load(daemon).await? {
                     println!("{:<24} {:<20} {}", bucket.name, bucket.space, bucket.policy);
                 }
             }
@@ -158,23 +151,24 @@ async fn dispatch(node: &Node, command: Command) -> Result<()> {
         Command::Key { command } => match command {
             KeyCommand::Add { id, secret } => {
                 auth::put_key(
-                    node,
-                    AccessKey {
+                    daemon,
+                    &AccessKey {
                         id: id.clone(),
                         secret,
                     },
-                )?;
+                )
+                .await?;
                 println!("added access key {id}");
             }
             KeyCommand::Rm { id } => {
-                if auth::remove_key(node, &id)? {
+                if auth::remove_key(daemon, &id).await? {
                     println!("removed {id}");
                 } else {
                     println!("no such access key");
                 }
             }
             KeyCommand::Ls => {
-                for key in auth::load_keys(node)? {
+                for key in auth::load_keys(daemon).await? {
                     println!("{}", key.id);
                 }
             }
@@ -192,7 +186,10 @@ async fn dispatch(node: &Node, command: Command) -> Result<()> {
                 }
                 AuthMode::Anonymous
             } else {
-                let keys = auth::load_keys(node)?;
+                // Read once, at startup: a gateway that re-read the key list per
+                // request would put a socket round trip in front of every
+                // signature check. Adding a key therefore takes a restart.
+                let keys = auth::load_keys(daemon).await?;
                 if keys.is_empty() {
                     bail!(
                         "no access keys configured; add one with `synch-s3 key add <id> <secret>` \
@@ -202,13 +199,18 @@ async fn dispatch(node: &Node, command: Command) -> Result<()> {
                 AuthMode::SigV4(keys)
             };
 
-            let gateway = Gateway::new(node.clone(), auth);
+            let gateway = Gateway::new(daemon.clone(), auth).await?;
             let listener = tokio::net::TcpListener::bind(listen).await?;
             let bound = listener.local_addr()?;
             println!("synch-s3 listening on http://{bound}");
-            for bucket in buckets::load(node)? {
+            println!(
+                "  serving {} through the daemon at {}",
+                gateway.origin(),
+                daemon.data_dir().display()
+            );
+            for bucket in buckets::load(daemon).await? {
                 println!("  {} -> {} ({})", bucket.name, bucket.space, bucket.policy);
-                if let Some(warning) = bucket.foreign_pin_warning(node) {
+                if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
                     tracing::warn!("{warning}");
                     println!("  warning: {warning}");
                 }

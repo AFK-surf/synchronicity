@@ -130,11 +130,19 @@ pub async fn request(data_dir: &Path, request: Request) -> Result<Client, Contro
     Ok(client)
 }
 
+/// Turns a failure to reach the daemon into a structured error.
+///
+/// [`ErrorCode::Unavailable`] rather than `NotFound`: nothing the caller asked
+/// for is missing — the daemon is, and the message names the socket and the
+/// command that starts one (§9.1). A client that renders codes as protocol
+/// statuses, as the S3 gateway does, would otherwise answer "no such key" to
+/// every request made while the daemon was down.
 fn no_daemon(e: std::io::Error) -> ControlError {
-    let code = if e.kind() == std::io::ErrorKind::NotFound {
-        ErrorCode::NotFound
-    } else {
-        ErrorCode::Internal
+    let code = match e.kind() {
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::AddrNotAvailable => ErrorCode::Unavailable,
+        _ => ErrorCode::Internal,
     };
     ControlError::new(code, e.to_string())
 }

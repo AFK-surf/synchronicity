@@ -4,6 +4,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
+use synch_cli::control::{ControlError, ErrorCode};
 
 use crate::xml::escape;
 
@@ -38,6 +39,18 @@ impl S3Error {
     /// Attaches the resource the error refers to.
     pub fn with_resource(mut self, resource: impl Into<String>) -> S3Error {
         self.resource = resource.into();
+        self
+    }
+
+    /// Names the key an error refers to, when it does not already name one.
+    ///
+    /// The daemon reports failures in terms of a space and a path; the S3
+    /// resource is the key, which only the handler that took the request knows.
+    /// An error that already carries a resource keeps it.
+    pub fn with_key(mut self, key: &str) -> S3Error {
+        if self.resource.is_empty() {
+            self.resource = key.to_string();
+        }
         self
     }
 
@@ -148,37 +161,37 @@ impl S3Error {
     }
 }
 
-impl From<synch_engine::EngineError> for S3Error {
-    fn from(e: synch_engine::EngineError) -> Self {
-        use synch_engine::EngineError;
-        match e {
-            EngineError::NotFound(what) => S3Error::new(StatusCode::NOT_FOUND, "NoSuchKey", what),
-            // §9.4: a strict bucket answers a divergent key with 409, naming
-            // the versions it refused to choose between.
-            divergent @ EngineError::Divergent { .. } => {
-                let key = match &divergent {
-                    EngineError::Divergent { path, .. } => path.clone(),
-                    _ => unreachable!("just matched"),
-                };
-                S3Error::divergent(&key, divergent.to_string())
-            }
-            EngineError::Invalid(what) => S3Error::invalid(what),
+/// Every failure the gateway can have is a failure the daemon reported, or a
+/// failure to reach it (§9.4) — so this is the only conversion there is.
+impl From<ControlError> for S3Error {
+    fn from(e: ControlError) -> Self {
+        match e.code {
+            ErrorCode::NotFound => S3Error::new(StatusCode::NOT_FOUND, "NoSuchKey", e.message),
+            // A strict bucket answers a divergent key with 409, naming the
+            // versions it refused to choose between (§8, §9.4). The resource is
+            // filled in by the handler, which is the half that knows the key.
+            ErrorCode::Divergent => S3Error::divergent("", e.message),
+            ErrorCode::Invalid => S3Error::invalid(e.message),
             // A node in key-loss recovery cannot publish, so it cannot accept a
             // write either. That is a state the operator clears with `synch
             // recover`, not a fault in the request or in the gateway (§3.4).
-            in_recovery @ EngineError::InRecovery { .. } => S3Error::new(
+            ErrorCode::Unavailable => S3Error::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ServiceUnavailable",
-                in_recovery.to_string(),
+                e.message,
             ),
-            other => S3Error::store(other),
+            // No daemon, a stale token, a version skew across an upgrade: the
+            // cluster is fine and the request was fine, but this gateway has
+            // nothing to serve from until an operator restarts something.
+            ErrorCode::Unauthorized | ErrorCode::VersionMismatch | ErrorCode::NotInitialized => {
+                S3Error::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    e.message,
+                )
+            }
+            ErrorCode::Internal => S3Error::store(e.message),
         }
-    }
-}
-
-impl From<synch_store::StoreError> for S3Error {
-    fn from(e: synch_store::StoreError) -> Self {
-        S3Error::store(e)
     }
 }
 
@@ -219,6 +232,34 @@ mod tests {
             S3Error::invalid_range("bad").status,
             StatusCode::RANGE_NOT_SATISFIABLE
         );
+    }
+
+    /// Every code the daemon can send lands on a status a client can act on
+    /// (§9.4): "it is not there", "choose a version", "you asked wrong", and
+    /// "come back later" are four different answers.
+    #[test]
+    fn daemon_error_codes_become_s3_statuses() {
+        let status = |code| S3Error::from(ControlError::new(code, "why")).status;
+        assert_eq!(status(ErrorCode::NotFound), StatusCode::NOT_FOUND);
+        assert_eq!(status(ErrorCode::Divergent), StatusCode::CONFLICT);
+        assert_eq!(status(ErrorCode::Invalid), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status(ErrorCode::Internal),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        for code in [
+            ErrorCode::Unavailable,
+            ErrorCode::Unauthorized,
+            ErrorCode::VersionMismatch,
+            ErrorCode::NotInitialized,
+        ] {
+            assert_eq!(
+                status(code),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{}",
+                code.as_str()
+            );
+        }
     }
 
     #[test]

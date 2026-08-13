@@ -73,6 +73,12 @@ pub enum ErrorCode {
     /// A `strict` read met a divergent path (§8); the message lists the
     /// versions. Appended last: postcard numbers variants by position.
     Divergent,
+    /// The daemon is in a state that cannot serve this request yet, and the
+    /// message names what clears it — key-loss recovery (§3.4) is the case
+    /// that exists. Neither a malformed request nor a fault: a caller that
+    /// renders codes as protocol statuses owes this one a "come back later"
+    /// rather than a "you asked wrong".
+    Unavailable,
 }
 
 impl ErrorCode {
@@ -86,6 +92,7 @@ impl ErrorCode {
             ErrorCode::Invalid => "invalid",
             ErrorCode::Internal => "internal",
             ErrorCode::Divergent => "divergent",
+            ErrorCode::Unavailable => "unavailable",
         }
     }
 }
@@ -133,7 +140,8 @@ impl From<synch_engine::EngineError> for ControlError {
             // A node in recovery is not broken and the request is not
             // malformed; what is wrong is the state it was made in, and the
             // message says which command resolves it (§3.4).
-            E::Invalid(_) | E::Key(_) | E::InRecovery { .. } => ErrorCode::Invalid,
+            E::InRecovery { .. } => ErrorCode::Unavailable,
+            E::Invalid(_) | E::Key(_) => ErrorCode::Invalid,
             _ => ErrorCode::Internal,
         };
         ControlError::new(code, format!("{e}"))

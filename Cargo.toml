@@ -27,6 +27,7 @@ synch-mpt = { path = "crates/synch-mpt", version = "0.1.0" }
 synch-store = { path = "crates/synch-store", version = "0.1.0" }
 synch-net = { path = "crates/synch-net", version = "0.1.0" }
 synch-engine = { path = "crates/synch-engine", version = "0.1.0" }
+synch-cli = { path = "crates/synch-cli", version = "0.1.0" }
 
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "query"] }
@@ -51,6 +52,7 @@ sha2 = "0.11.0"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -17,3 +17,11 @@ pub mod commands;
 pub mod control;
 pub mod daemon;
 pub mod render;
+
+/// The platform data directory both binaries default to (§9.3).
+///
+/// Re-exported so a control-socket client can find the datadir holding
+/// `control.token` without linking the engine. `synch-s3` is the one that
+/// needs it: it is a client of the daemon and nothing more, and a dependency
+/// on the node it must not open would be exactly the wrong shape (§9.4).
+pub use synch_engine::default_data_dir;

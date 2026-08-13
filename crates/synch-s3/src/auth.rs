@@ -1,20 +1,36 @@
 //! SigV4 verification for S3 clients (§9.4).
 //!
 //! The gateway authenticates S3 clients only; cluster access is the node's own
-//! membership (§3). Static access-key pairs live in the node's `config` table.
+//! membership (§3). Static access-key pairs are held by the daemon under the
+//! `s3.*` config namespace and read over the control socket, like everything
+//! else the gateway knows (§9.4).
 
 use std::collections::BTreeMap;
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
-use synch_engine::Node;
 
-use crate::error::{S3Error, S3Result};
+use crate::{
+    daemon::Daemon,
+    error::{S3Error, S3Result},
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The config key holding the gateway's static access keys.
-const KEYS_CONFIG: &str = "s3_access_keys";
+/// The config value holding the gateway's static access keys.
+///
+/// An append-only record log, like the bucket map: `<id>\t<secret>` adds or
+/// replaces a key, `<id>` alone removes it, and the last record naming an id
+/// wins (§9.4).
+///
+/// A removal appends rather than rewrites, which means the removed key's secret
+/// stays in the log until an operator clears the value outright. That is a
+/// real trade and worth naming: the alternative is a read-modify-write two
+/// gateways can lose edits through, and the log lives in the same `0700`
+/// datadir as this node's signing key — anyone who can read it can already sign
+/// as the node. A secret that has been handed out and withdrawn should be
+/// treated as spent regardless.
+pub const KEYS_CONFIG: &str = "s3.keys";
 
 /// The SigV4 algorithm string.
 pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -40,62 +56,53 @@ pub enum AuthMode {
     Anonymous,
 }
 
-impl AuthMode {
-    /// Reads the configured keys from the node.
-    pub fn from_node(node: &Node) -> S3Result<AuthMode> {
-        Ok(AuthMode::SigV4(load_keys(node)?))
+/// Folds the append-only record log into the key set it describes.
+///
+/// A record nobody can read is skipped rather than fatal, for the reason the
+/// bucket log skips one: a malformed line must not lock every client out.
+pub fn fold(records: &[String]) -> Vec<AccessKey> {
+    let mut out: Vec<AccessKey> = Vec::new();
+    for record in records {
+        let mut fields = record.split('\t');
+        let Some(id) = fields.next().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let secret = fields.next();
+        out.retain(|k| k.id != id);
+        if let Some(secret) = secret {
+            out.push(AccessKey {
+                id: id.to_string(),
+                secret: secret.to_string(),
+            });
+        }
     }
+    out
 }
 
-/// Loads the configured access keys.
-pub fn load_keys(node: &Node) -> S3Result<Vec<AccessKey>> {
-    let Some(text) = node.store().config(KEYS_CONFIG).map_err(S3Error::store)? else {
-        return Ok(Vec::new());
-    };
-    Ok(parse_keys(&text))
+/// Reads the configured access keys from the daemon.
+pub async fn load_keys(daemon: &Daemon) -> S3Result<Vec<AccessKey>> {
+    Ok(fold(&daemon.config(KEYS_CONFIG).await?))
 }
 
 /// Adds or replaces an access key.
-pub fn put_key(node: &Node, key: AccessKey) -> S3Result<()> {
-    let mut keys = load_keys(node)?;
-    keys.retain(|k| k.id != key.id);
-    keys.push(key);
-    save_keys(node, &keys)
+pub async fn put_key(daemon: &Daemon, key: &AccessKey) -> S3Result<()> {
+    if key.id.contains('\t') || key.secret.contains('\t') {
+        return Err(S3Error::invalid(
+            "an access key id and secret may not contain a tab",
+        ));
+    }
+    daemon
+        .append(KEYS_CONFIG, &format!("{}\t{}", key.id, key.secret))
+        .await
 }
 
 /// Removes an access key, returning whether it existed.
-pub fn remove_key(node: &Node, id: &str) -> S3Result<bool> {
-    let mut keys = load_keys(node)?;
-    let before = keys.len();
-    keys.retain(|k| k.id != id);
-    save_keys(node, &keys)?;
-    Ok(keys.len() != before)
-}
-
-fn save_keys(node: &Node, keys: &[AccessKey]) -> S3Result<()> {
-    let text = keys
-        .iter()
-        .map(|k| format!("{}\t{}", k.id, k.secret))
-        .collect::<Vec<_>>()
-        .join("\n");
-    node.store()
-        .set_config(KEYS_CONFIG, &text)
-        .map_err(S3Error::store)
-}
-
-fn parse_keys(text: &str) -> Vec<AccessKey> {
-    text.lines()
-        .filter_map(|line| {
-            let (id, secret) = line.split_once('\t')?;
-            if id.is_empty() {
-                return None;
-            }
-            Some(AccessKey {
-                id: id.to_string(),
-                secret: secret.to_string(),
-            })
-        })
-        .collect()
+pub async fn remove_key(daemon: &Daemon, id: &str) -> S3Result<bool> {
+    let existed = load_keys(daemon).await?.iter().any(|k| k.id == id);
+    if existed {
+        daemon.append(KEYS_CONFIG, id).await?;
+    }
+    Ok(existed)
 }
 
 /// A parsed `Authorization: AWS4-HMAC-SHA256 ...` header.
@@ -559,15 +566,27 @@ mod tests {
         );
     }
 
+    fn records(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
     #[test]
-    fn key_storage_round_trips() {
-        let text = "AKID\tsecret\nOTHER\tsecret2";
-        let keys = parse_keys(text);
+    fn the_key_log_folds_to_the_keys_it_describes() {
+        let keys = fold(&records(&["AKID\tsecret", "OTHER\tsecret2"]));
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].id, "AKID");
         assert_eq!(keys[1].secret, "secret2");
-        assert!(parse_keys("").is_empty());
-        assert!(parse_keys("garbage").is_empty());
+
+        // A later record replaces an id, and a bare id removes it.
+        let keys = fold(&records(&["AKID\tone", "AKID\ttwo"]));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].secret, "two");
+        let keys = fold(&records(&["AKID\tone", "OTHER\ttwo", "AKID"]));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].id, "OTHER");
+
+        assert!(fold(&[]).is_empty());
+        assert!(fold(&records(&["", "\tno-id"])).is_empty());
     }
 
     #[test]

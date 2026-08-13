@@ -1,15 +1,26 @@
 //! An S3-compatible gateway onto a synchronicity cluster (§9.4).
 //!
-//! The gateway embeds the same engine crate the CLI does, so existing S3
-//! tooling can read and write a cluster without knowing anything about it.
-//! Reads serve the version each bucket's policy selects from the unified tree
-//! (§8) and content flows through the normal verified path — local CAS first,
-//! then peer fetch, with per-16 KiB group verification. ETags are the selected
-//! version's BLAKE3 root, hex, quoted.
+//! The gateway exposes a subset of the S3 HTTP API so existing S3 tooling can
+//! read and write a cluster without knowing anything about it. **It is a
+//! control-socket client of the daemon and nothing more** (§9.1): it never
+//! opens the database, never binds an iroh endpoint, and holds no persistent
+//! state of its own. Every operation is a daemon request — reads stream the
+//! socket's `Chunk` frames straight into the HTTP response, writes stream the
+//! HTTP body over the socket into the daemon's ingest-and-publish path, and
+//! bucket and access-key configuration is stored by the daemon under the `s3.*`
+//! config namespace.
+//!
+//! Objects of any size therefore flow through both directions without either
+//! process buffering more than a chunk. Reads serve the version each bucket's
+//! policy selects from the unified tree (§8) and content flows through the
+//! normal verified path — local CAS first, then peer fetch, with per-16 KiB
+//! group verification. ETags are the selected version's BLAKE3 root, hex,
+//! quoted.
 #![deny(missing_docs)]
 
 pub mod auth;
 pub mod buckets;
+pub mod daemon;
 pub mod error;
 pub mod xml;
 
@@ -22,12 +33,13 @@ use axum::{
     response::{IntoResponse, Response},
     Router,
 };
+use synch_cli::control::EntryInfo;
 use synch_core::EntryKind;
-use synch_engine::Node;
 
 use crate::{
     auth::{AuthMode, SignedRequest, UNSIGNED_PAYLOAD},
     buckets::Bucket,
+    daemon::Daemon,
     error::{S3Error, S3Result},
     xml::{format_timestamp, list_buckets_xml, ListResult, ListedObject},
 };
@@ -35,25 +47,39 @@ use crate::{
 /// The default `max-keys` for a listing.
 pub const DEFAULT_MAX_KEYS: usize = 1000;
 
-/// The gateway's shared state.
+/// The gateway's shared state: a daemon to ask, and how to authenticate the
+/// clients asking.
 #[derive(Debug, Clone)]
 pub struct Gateway {
-    node: Node,
+    daemon: Daemon,
     auth: Arc<AuthMode>,
+    /// This node's own origin, read once at startup.
+    ///
+    /// Only used to recognize a bucket pinned to somebody else's view, and a
+    /// node's origin does not change while it runs — a key rotation moves the
+    /// key, not the identity (§3.1).
+    origin: Arc<String>,
 }
 
 impl Gateway {
-    /// Builds a gateway over a node.
-    pub fn new(node: Node, auth: AuthMode) -> Gateway {
-        Gateway {
-            node,
+    /// Builds a gateway over a daemon.
+    pub async fn new(daemon: Daemon, auth: AuthMode) -> S3Result<Gateway> {
+        let origin = daemon.origin().await?;
+        Ok(Gateway {
+            daemon,
             auth: Arc::new(auth),
-        }
+            origin: Arc::new(origin),
+        })
     }
 
-    /// The node the gateway serves from.
-    pub fn node(&self) -> &Node {
-        &self.node
+    /// The daemon the gateway serves from.
+    pub fn daemon(&self) -> &Daemon {
+        &self.daemon
+    }
+
+    /// This node's own origin.
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     /// The axum router, ready to serve.
@@ -106,14 +132,15 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
         if parts.method != Method::GET {
             return Err(S3Error::not_implemented("this service-level operation"));
         }
-        let names: Vec<String> = buckets::load(&gateway.node)?
+        let names: Vec<String> = buckets::load(&gateway.daemon)
+            .await?
             .into_iter()
             .map(|b| b.name)
             .collect();
         return Ok(xml_response(StatusCode::OK, list_buckets_xml(&names)));
     }
 
-    let bucket = buckets::find(&gateway.node, bucket_name)?;
+    let bucket = buckets::find(&gateway.daemon, bucket_name).await?;
 
     match (&parts.method, key.is_empty()) {
         (&Method::GET, true) | (&Method::HEAD, true) => {
@@ -143,11 +170,21 @@ async fn list_objects(
     let token = param(query, "continuation-token").filter(|t| !t.is_empty());
     let start_after = token.clone().or_else(|| param(query, "start-after"));
 
-    // The unified tree, one key per path (§8).
-    let listing =
-        gateway
-            .node
-            .unified_listing(&bucket.space, &prefix, start_after.as_deref(), None)?;
+    // The unified tree, one key per path (§8), already resolved under the
+    // bucket's policy by the daemon. `max_keys + 1` rows is what it takes to
+    // know whether there is a next page; a delimiter can fold several of them
+    // into one common prefix, so the loop below may ask for no more than it
+    // was given and still stop short.
+    let (listing, more) = gateway
+        .daemon
+        .list(
+            &bucket.space,
+            &prefix,
+            start_after.as_deref(),
+            max_keys + 1,
+            &bucket.policy.render(),
+        )
+        .await?;
 
     let mut result = ListResult {
         bucket: bucket.name.clone(),
@@ -157,17 +194,16 @@ async fn list_objects(
         continuation_token: token,
         ..ListResult::default()
     };
-    let mut last_key = None;
-    for set in listing {
-        // A listing cannot answer a key with 409, so a strict bucket leaves
-        // divergent keys out of it rather than handing a client one side's
-        // size and ETag; a direct GET of such a key says what is wrong.
-        let Ok(row) = gateway.node.resolve_set(&set, &bucket.policy) else {
-            continue;
-        };
+    // The cursor advances past every path this page has dealt with, whether it
+    // became an object, a common prefix, or nothing at all — so a page made
+    // entirely of skipped rows still hands back a token that moves.
+    let mut cursor = None;
+    for row in &listing {
         if row.kind == EntryKind::Tombstone || row.kind == EntryKind::Dir {
+            cursor = Some(row.path.clone());
             continue;
         }
+        let full = result.contents.len() + result.common_prefixes.len() >= max_keys;
         // The delimiter rolls everything below the next separator into a
         // common prefix, which is how S3 tooling renders directories.
         if let Some(delimiter) = &delimiter {
@@ -175,17 +211,17 @@ async fn list_objects(
             if let Some(idx) = rest.find(delimiter.as_str()) {
                 let common = format!("{}{}{}", prefix, &rest[..idx], delimiter);
                 if !result.common_prefixes.contains(&common) {
-                    if result.contents.len() + result.common_prefixes.len() >= max_keys {
+                    if full {
                         result.is_truncated = true;
                         break;
                     }
                     result.common_prefixes.push(common);
-                    last_key = Some(row.path.clone());
                 }
+                cursor = Some(row.path.clone());
                 continue;
             }
         }
-        if result.contents.len() + result.common_prefixes.len() >= max_keys {
+        if full {
             result.is_truncated = true;
             break;
         }
@@ -195,10 +231,15 @@ async fn list_objects(
             etag: etag(row.content.as_ref()),
             last_modified: format_timestamp(row.mtime_ns),
         });
-        last_key = Some(row.path);
+        cursor = Some(row.path.clone());
+    }
+    // Everything the daemon offered fit on the page, but it had more to offer:
+    // the page ends here anyway, and the cursor resumes past its last row.
+    if more {
+        result.is_truncated = true;
     }
     if result.is_truncated {
-        result.next_continuation_token = last_key;
+        result.next_continuation_token = cursor;
     }
     Ok(xml_response(StatusCode::OK, result.to_xml()))
 }
@@ -210,17 +251,24 @@ async fn get_object(
     headers: &BTreeMap<String, String>,
     head_only: bool,
 ) -> S3Result<Response> {
+    let policy = bucket.policy.render();
+    // Metadata first, and metadata only: `HeadObject` answers size, mtime, and
+    // ETag straight from the entry, with no content fetched at all (§9.4).
     let entry = gateway
-        .node
-        .resolve(&bucket.space, key, &bucket.policy)
-        .map_err(S3Error::from)?;
+        .daemon
+        .resolve(&bucket.space, key, &policy)
+        .await
+        .map_err(|e| e.with_key(key))?;
     if entry.kind == EntryKind::Tombstone {
         return Err(S3Error::no_such_key(key));
     }
 
-    let etag = etag(entry.content.as_ref());
     let mut response_headers = HeaderMap::new();
-    insert(&mut response_headers, header::ETAG, &etag);
+    insert(
+        &mut response_headers,
+        header::ETAG,
+        &etag(entry.content.as_ref()),
+    );
     insert(&mut response_headers, header::ACCEPT_RANGES, "bytes");
     insert(
         &mut response_headers,
@@ -258,25 +306,23 @@ async fn get_object(
         }
         None => (0, entry.size, StatusCode::OK),
     };
-
-    // Content flows through the normal verified path: local CAS first, then a
-    // peer fetch, with every 16 KiB group checked against the object root.
-    let bytes = gateway
-        .node
-        .read_range(
-            &bucket.space,
-            key,
-            &bucket.policy,
-            start,
-            Some(end.saturating_sub(start)),
-        )
-        .await?;
+    let length = end.saturating_sub(start);
     insert(
         &mut response_headers,
         header::CONTENT_LENGTH,
-        &bytes.len().to_string(),
+        &length.to_string(),
     );
-    Ok((status, response_headers, bytes).into_response())
+
+    // The content flows through the normal verified path — local CAS first,
+    // then a peer fetch, every 16 KiB group checked against the object root —
+    // and the socket's chunks become body frames one for one, so a multi-
+    // gigabyte object costs a chunk of memory here and a chunk in the daemon.
+    let body = gateway
+        .daemon
+        .read(&bucket.space, key, &policy, start, Some(length))
+        .await
+        .map_err(|e| e.with_key(key))?;
+    Ok((status, response_headers, body).into_response())
 }
 
 async fn put_object(
@@ -290,21 +336,25 @@ async fn put_object(
     // writable. A bucket pinned to a foreign origin still accepts the write,
     // but its reads keep serving the pinned origin, which is worth saying out
     // loud rather than silently surprising the client.
-    if let Some(warning) = bucket.foreign_pin_warning(&gateway.node) {
+    if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
         tracing::warn!("{warning}");
     }
-    let bytes = axum::body::to_bytes(body, usize::MAX)
+    // The body streams over the socket into the daemon's ingest pipeline —
+    // space directory, hash, CAS, stage, publish (§7.1) — and comes back as the
+    // published entry, so the ETag is the root the daemon computed rather than
+    // one this process hashed from a copy it kept.
+    let published: EntryInfo = gateway
+        .daemon
+        .put(&bucket.space, key, body)
         .await
-        .map_err(|e| S3Error::invalid(format!("could not read the request body: {e}")))?;
+        .map_err(|e| e.with_key(key))?;
 
-    // Writes go into the local space directory and then through the ordinary
-    // ingest pipeline: hash, CAS, stage entry (§7.1).
-    gateway.node.adopt(&bucket.space, key, &bytes)?;
-    let (_report, _head) = gateway.node.scan_and_publish()?;
-
-    let root = synch_core::Hash::new(&bytes);
     let mut headers = HeaderMap::new();
-    insert(&mut headers, header::ETAG, &quoted(&root.to_hex()));
+    insert(
+        &mut headers,
+        header::ETAG,
+        &etag(published.content.as_ref()),
+    );
     Ok((StatusCode::OK, headers).into_response())
 }
 

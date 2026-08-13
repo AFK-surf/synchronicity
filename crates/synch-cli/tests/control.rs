@@ -569,9 +569,11 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
         )
         .unwrap();
 
-    // Scanning refuses before hashing anything, and says what to run.
+    // Scanning refuses before hashing anything, and says what to run. The
+    // node is not broken and the request is not malformed — the state it was
+    // made in is what is wrong — so the code says "unavailable" (§3.4).
     let error = failure_message(data_dir, Request::Scan).await;
-    assert_eq!(error.code, ErrorCode::Invalid, "{error:?}");
+    assert_eq!(error.code, ErrorCode::Unavailable, "{error:?}");
     assert!(error.message.contains("synch recover"), "{error:?}");
     assert!(error.message.contains("seq 100"), "{error:?}");
 

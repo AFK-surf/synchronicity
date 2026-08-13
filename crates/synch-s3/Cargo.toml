@@ -16,25 +16,28 @@ path = "src/lib.rs"
 name = "synch-s3"
 path = "src/main.rs"
 
+# No store and no engine: the gateway is a control-socket client of the daemon
+# and nothing more (§9.1, §9.4). `synch-cli` is where the control protocol
+# lives (§11); `synch-core` supplies the record types the protocol carries.
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 hex.workspace = true
 hmac.workspace = true
-serde.workspace = true
 sha2.workspace = true
+synch-cli.workspace = true
 synch-core.workspace = true
-synch-engine.workspace = true
-synch-store.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
 reqwest.workspace = true
+synch-engine.workspace = true
 tempfile.workspace = true
 
 [lints]
