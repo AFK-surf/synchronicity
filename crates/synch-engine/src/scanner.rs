@@ -879,7 +879,12 @@ mod tests {
             .unwrap();
 
         let target = node.adopt_from(&peer, "media", "a.txt").await.unwrap();
-        assert_eq!(target, space.path().join("a.txt"));
+        // The engine reports the path under the *stored* space root, which was
+        // canonicalized at `space add` time — on macOS the tempdir's `/var/…`
+        // is a symlink to `/private/var/…`, so the raw tempdir path would not
+        // compare equal even though it names the same file.
+        let canonical_space = space.path().canonicalize().unwrap();
+        assert_eq!(target, canonical_space.join("a.txt"));
         assert_eq!(std::fs::read(&target).unwrap(), payload);
         let left: Vec<String> = std::fs::read_dir(space.path())
             .unwrap()
