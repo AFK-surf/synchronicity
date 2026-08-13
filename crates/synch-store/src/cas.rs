@@ -335,12 +335,17 @@ impl Store {
     }
 
     /// Pins or unpins an object against GC (§9.2).
-    pub fn set_pinned(&self, root: &Hash, pinned: bool) -> Result<()> {
-        self.conn().execute(
+    ///
+    /// Returns whether an object with this root was there to mark. A pin
+    /// that matched nothing guards nothing, and the caller is the one that
+    /// can say so — silently succeeding here is how a pin of never-fetched
+    /// content once vanished without a trace.
+    pub fn set_pinned(&self, root: &Hash, pinned: bool) -> Result<bool> {
+        let matched = self.conn().execute(
             "UPDATE blobs SET pinned = ?2 WHERE root = ?1",
             params![root.as_bytes().to_vec(), pinned as i64],
         )?;
-        Ok(())
+        Ok(matched > 0)
     }
 
     /// Every pinned object.

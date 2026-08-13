@@ -543,6 +543,52 @@ async fn an_untrusted_node_learns_nothing() {
 }
 
 #[tokio::test]
+async fn pinning_fetches_what_it_promises_to_keep() {
+    // §9.2: a pin is a promise the bytes stay available here. Pinning content
+    // this node had never read used to mark zero rows and report success —
+    // the promise now starts by fetching what it guards.
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    introduce(&[&nas, &laptop]);
+
+    nas.node.add_space("media", nas.space.path()).unwrap();
+    std::fs::write(nas.space.path().join("report.md"), b"keep these bytes").unwrap();
+    nas.node.scan_and_publish().unwrap();
+    laptop.node.anti_entropy_round().await.unwrap();
+
+    let entry = laptop
+        .node
+        .store()
+        .entry(nas.node.origin(), "media", "report.md")
+        .unwrap()
+        .unwrap();
+    let root = entry.content.unwrap();
+    // Metadata only so far: the pin is what brings the bytes here.
+    assert!(laptop.node.store().blob(&root).unwrap().is_none());
+
+    laptop
+        .node
+        .pin_object(&root, Some(entry.size))
+        .await
+        .unwrap();
+    assert_eq!(laptop.node.store().pinned_blobs().unwrap(), vec![root]);
+    assert!(laptop.node.store().blob(&root).unwrap().unwrap().complete);
+    assert_eq!(
+        laptop.node.store().read_all(&root).unwrap(),
+        b"keep these bytes"
+    );
+
+    // A bare root nobody holds even partially has no size to fetch by, and is
+    // refused rather than recorded as a pin that guards nothing.
+    let absent = synch_core::Hash::new(b"never published");
+    assert!(laptop.node.pin_object(&absent, None).await.is_err());
+    assert_eq!(laptop.node.store().pinned_blobs().unwrap(), vec![root]);
+
+    nas.node.shutdown().await.unwrap();
+    laptop.node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn gc_keeps_the_current_root_servable() {
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
@@ -610,7 +656,13 @@ async fn a_node_recovers_its_state_across_a_restart() {
     assert_eq!(node.origin(), &origin);
     assert_eq!(node.store().complete_head(&origin).unwrap(), Some(head));
     assert_eq!(node.next_seq().unwrap(), 2);
-    // The scanner's change detection survives too: nothing is re-hashed.
+    // The scanner's change detection survives too: nothing is re-hashed. The
+    // record is aged past the racy window first — a hash taken moments after
+    // the file's mtime is re-verified on the next scan by design.
+    for mut row in node.store().local_file_rows("media").unwrap() {
+        row.scanned_at += 2_000_000_000;
+        node.store().put_local_file(&row).unwrap();
+    }
     let report = node.scan_all().unwrap();
     assert_eq!(report.hashed, 0);
     assert_eq!(report.unchanged, 1);

@@ -225,6 +225,33 @@ impl Node {
         self.fetch_groups(root, size, &wanted).await
     }
 
+    /// Pins an object, fetching it first when it is not held whole (§9.2).
+    ///
+    /// A pin is a promise that these bytes stay available here, and a promise
+    /// about bytes this node does not hold starts by getting them: pinning
+    /// metadata-only content used to mark nothing and say so to no one. The
+    /// size travels with the entry the pin was resolved from; a bare root
+    /// nobody holds even partially has no size to fetch by, and is refused
+    /// rather than half-promised.
+    pub async fn pin_object(&self, root: &Hash, size_hint: Option<u64>) -> Result<()> {
+        let blob = self.store().blob(root)?;
+        if !blob.as_ref().is_some_and(|b| b.complete) {
+            let Some(size) = blob.as_ref().map(|b| b.size).or(size_hint) else {
+                return Err(EngineError::NotFound(format!(
+                    "no local object with root {root}; pin it as <space>/<path> so the \
+                     fetch knows the object's size"
+                )));
+            };
+            self.fetch_all(root, size).await?;
+        }
+        if !self.store().set_pinned(root, true)? {
+            return Err(EngineError::NotFound(format!(
+                "object {root} left the store before it could be pinned"
+            )));
+        }
+        Ok(())
+    }
+
     /// Fetches specific chunk groups (§6.4).
     ///
     /// The wanted ranges are split across up to `fetch_fanout` providers and
