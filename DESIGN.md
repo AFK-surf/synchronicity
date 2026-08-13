@@ -1065,6 +1065,8 @@ CREATE TABLE entries (
   content     BLOB,                      -- object root hash
   seq         INTEGER NOT NULL,
   prev        BLOB,
+  symlink_target TEXT,                   -- link target; half of a content-less
+                                         --   kind's version identity (§8)
   PRIMARY KEY (origin_id, space, path)
 );
 CREATE INDEX entries_by_path    ON entries (space, path);

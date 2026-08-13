@@ -121,7 +121,7 @@ impl Node {
             known.insert(set.path.clone());
             let target = root_dir.join(&set.path);
             let selected = match set.select(&mirror.policy) {
-                synch_store::Selection::Selected(entry) => entry,
+                synch_store::Selection::Selected(entry) => *entry,
                 // The policy selects nothing here — an `origin=` pin on an
                 // origin that publishes no version of this path — so the path
                 // is not in this mirror's view.
@@ -155,6 +155,14 @@ impl Node {
             }
             if let Some(reason) = unsafe_name(&set.path) {
                 report.skipped.push((set.path.clone(), reason));
+                continue;
+            }
+            if selected.kind == EntryKind::Symlink {
+                match materialize_symlink(&target, selected.symlink_target.as_deref()) {
+                    Ok(true) => report.written += 1,
+                    Ok(false) => report.current += 1,
+                    Err(reason) => report.skipped.push((set.path.clone(), reason)),
+                }
                 continue;
             }
             let folded = fold(&set.path);
@@ -232,6 +240,52 @@ fn mirror_key(path: &Path) -> String {
         .into_owned()
 }
 
+/// Writes a symbolic link into a mirror, or explains why it could not be.
+///
+/// §7.2 has a mirror follow the version its policy selects, and a symlink's
+/// version *is* its target — so on a platform with symbolic links the mirror
+/// writes a real one. Returns whether anything changed on disk.
+///
+/// Windows has symlinks too, but creating one needs either Developer Mode or
+/// `SeCreateSymbolicLinkPrivilege`, which a background daemon cannot assume and
+/// cannot usefully acquire. Materialization's rule there is the one it already
+/// applies to names the platform refuses: skip and report, never guess (§7.2) —
+/// writing the target's *contents* under the link's name would silently turn a
+/// link into a file and hand the next scanner on that machine a change nobody
+/// made.
+fn materialize_symlink(
+    target: &Path,
+    link_target: Option<&str>,
+) -> std::result::Result<bool, String> {
+    let Some(link_target) = link_target else {
+        return Err("symlink entry carries no target".into());
+    };
+    #[cfg(unix)]
+    {
+        if let Ok(existing) = std::fs::read_link(target) {
+            if existing.to_string_lossy() == link_target {
+                return Ok(false);
+            }
+        }
+        if target.symlink_metadata().is_ok() {
+            std::fs::remove_file(target).map_err(|e| e.to_string())?;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::os::unix::fs::symlink(link_target, target).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        Err(format!(
+            "symlink to {link_target}: creating symbolic links is not available to the daemon on \
+             this platform, so the path is skipped rather than written as a plain file"
+        ))
+    }
+}
+
 fn remove_if_present(target: &Path) -> Result<usize> {
     if target.is_file() || target.is_symlink() {
         std::fs::remove_file(target)?;
@@ -251,7 +305,13 @@ fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<usize> {
     let mut removed = 0;
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_dir() {
+        // `is_dir` follows links, and a materialized symlink pointing at a
+        // directory would then be descended into and its *contents* swept.
+        // The sweep only ever looks at what the mirror itself wrote.
+        let is_dir = std::fs::symlink_metadata(&path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if is_dir {
             removed += sweep(root, &path, known)?;
             continue;
         }
@@ -592,5 +652,70 @@ mod tests {
         assert!(unsafe_name("nul.txt").is_some());
         assert!(unsafe_name("bad<name").is_some());
         assert!(unsafe_name("trailing ").is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mirror_materializes_a_symlink_as_a_symlink() {
+        let (_d, node) = node().await;
+        let dest = tempfile::tempdir().unwrap();
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        let mut entry = synch_core::FileEntry::tombstone(100, 1, None);
+        entry.kind = EntryKind::Symlink;
+        entry.symlink_target = Some("../elsewhere".into());
+        node.store()
+            .put_entry(&origin, "media", "link", &entry)
+            .unwrap();
+
+        node.add_mirror("media", dest.path(), &VersionPolicy::Newest)
+            .unwrap();
+        let report = node.sync_mirror(dest.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        let written = dest.path().join("link");
+        assert!(std::fs::symlink_metadata(&written).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&written).unwrap(),
+            Path::new("../elsewhere")
+        );
+
+        // A second pass has nothing to do.
+        let report = node.sync_mirror(dest.path()).await.unwrap();
+        assert_eq!(report.written, 0);
+        assert_eq!(report.current, 1);
+
+        // Retargeting replaces the link rather than writing beside it.
+        let mut entry = synch_core::FileEntry::tombstone(200, 2, None);
+        entry.kind = EntryKind::Symlink;
+        entry.symlink_target = Some("../other".into());
+        node.store()
+            .put_entry(&origin, "media", "link", &entry)
+            .unwrap();
+        let report = node.sync_mirror(dest.path()).await.unwrap();
+        assert_eq!(report.written, 1);
+        assert_eq!(std::fs::read_link(&written).unwrap(), Path::new("../other"));
+        node.shutdown().await.unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn a_mirror_skips_and_reports_a_symlink_where_it_cannot_make_one() {
+        let (_d, node) = node().await;
+        let dest = tempfile::tempdir().unwrap();
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        let mut entry = synch_core::FileEntry::tombstone(100, 1, None);
+        entry.kind = EntryKind::Symlink;
+        entry.symlink_target = Some("../elsewhere".into());
+        node.store()
+            .put_entry(&origin, "media", "link", &entry)
+            .unwrap();
+
+        node.add_mirror("media", dest.path(), &VersionPolicy::Newest)
+            .unwrap();
+        let report = node.sync_mirror(dest.path()).await.unwrap();
+        assert_eq!(report.written, 0);
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(report.skipped[0].1.contains("symbolic link"), "{report:?}");
+        assert!(!dest.path().join("link").exists());
+        node.shutdown().await.unwrap();
     }
 }

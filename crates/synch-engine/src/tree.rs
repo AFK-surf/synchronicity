@@ -50,7 +50,7 @@ impl Node {
     /// pass does not re-query per path.
     pub fn resolve_set(&self, set: &VersionSet, policy: &VersionPolicy) -> Result<EntryRow> {
         match set.select(policy) {
-            Selection::Selected(entry) => Ok(entry),
+            Selection::Selected(entry) => Ok(*entry),
             Selection::Absent => Err(EngineError::not_found(reference_of(
                 policy, &set.space, &set.path,
             ))),

@@ -37,6 +37,12 @@ pub struct EntryRow {
     pub seq: u64,
     /// The previous content root (§8 lineage).
     pub prev: Option<Hash>,
+    /// The link target, for [`EntryKind::Symlink`].
+    ///
+    /// Part of the entry's version identity: a content-less kind is identified
+    /// by `(kind, target)`, so two symlinks agree only when their targets match
+    /// (§8).
+    pub symlink_target: Option<String>,
 }
 
 fn kind_to_int(kind: EntryKind) -> i64 {
@@ -243,7 +249,8 @@ impl Store {
     ) -> Result<Vec<EntryRow>> {
         let conn = self.conn();
         let sql = format!(
-            "SELECT origin_id, space, path, kind, size, mtime_ns, content, seq, prev
+            "SELECT origin_id, space, path, kind, size, mtime_ns, content, seq, prev,
+                    symlink_target
              FROM entries {filter}"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -258,11 +265,13 @@ impl Store {
                 row.get::<_, Option<Vec<u8>>>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, Option<Vec<u8>>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (origin, space, path, kind, size, mtime_ns, content, seq, prev) = row?;
+            let (origin, space, path, kind, size, mtime_ns, content, seq, prev, symlink_target) =
+                row?;
             out.push(EntryRow {
                 origin: origin_column(origin, "entries.origin_id")?,
                 space,
@@ -275,6 +284,7 @@ impl Store {
                     .transpose()?,
                 seq: seq as u64,
                 prev: prev.map(|b| hash_column(b, "entries.prev")).transpose()?,
+                symlink_target,
             });
         }
         Ok(out)
@@ -748,11 +758,13 @@ fn put_entry_in(
     entry: &FileEntry,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, content, seq, prev)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, content, seq, prev,
+                              symlink_target)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(origin_id, space, path) DO UPDATE SET
            kind = excluded.kind, size = excluded.size, mtime_ns = excluded.mtime_ns,
-           content = excluded.content, seq = excluded.seq, prev = excluded.prev",
+           content = excluded.content, seq = excluded.seq, prev = excluded.prev,
+           symlink_target = excluded.symlink_target",
         params![
             origin.canonical(),
             space,
@@ -763,6 +775,7 @@ fn put_entry_in(
             entry.content.map(|h| h.as_bytes().to_vec()),
             entry.seq as i64,
             entry.prev.map(|h| h.as_bytes().to_vec()),
+            entry.symlink_target.as_deref(),
         ],
     )?;
     Ok(())

@@ -743,6 +743,50 @@ mod tests {
         assert_eq!(store.observed_heads().unwrap().len(), 1);
     }
 
+    #[test]
+    fn a_v5_database_upgrades_with_its_entries() {
+        // v6 rebuilds `entries` to carry a symlink's target (§8 version
+        // identity), and every existing row has to come through it.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = database_at(dir.path(), 5);
+            assert!(
+                conn.query_row("SELECT symlink_target FROM entries", [], |r| r
+                    .get::<_, Option<String>>(0))
+                    .is_err(),
+                "a v5 database has no target column"
+            );
+            conn.execute(
+                "INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, content,
+                                      seq, prev)
+                 VALUES ('nas@x.example', 'media', 'a.txt', 0, 5, 42, zeroblob(32), 3, NULL)",
+                params![],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.config("schema_version").unwrap().as_deref(),
+            Some(SCHEMA_VERSION.to_string().as_str())
+        );
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        let row = store.entry(&origin, "media", "a.txt").unwrap().unwrap();
+        assert_eq!(row.size, 5);
+        assert_eq!(row.mtime_ns, 42);
+        assert_eq!(row.seq, 3);
+        assert_eq!(row.symlink_target, None, "an existing file has no target");
+        // The indexes came back with the rebuilt table.
+        assert!(store
+            .conn()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'entries_by_path'",
+                [],
+                |_| Ok(())
+            )
+            .is_ok());
+    }
+
     /// A step that fails takes its whole transaction with it, stamp included,
     /// so the database is left at the version before it rather than between two.
     #[test]

@@ -3,7 +3,7 @@
 //! These build the lines that cross the control socket; the CLI prints them
 //! verbatim.
 
-use synch_core::now_ns;
+use synch_core::{now_ns, EntryKind};
 use synch_engine::{EntryRef, Node, VersionPolicy, VersionSet};
 use synch_store::EntryRow;
 
@@ -95,12 +95,22 @@ fn version_lines(set: &VersionSet) -> Vec<String> {
         .rev()
         .map(|version| {
             let attestors: Vec<String> = version.attestors.iter().map(|o| o.short()).collect();
-            format!(
-                "    {:<18} {:<8} {:>12}  seq {:<6} {}",
-                version
+            // A content-less kind is identified by its target rather than by
+            // a root (§8), so that is what the line has to show.
+            let identity = match version.kind {
+                EntryKind::Tombstone => "(deleted)".to_string(),
+                EntryKind::Symlink => format!(
+                    "-> {}",
+                    version.symlink_target.as_deref().unwrap_or("(unknown)")
+                ),
+                _ => version
                     .content
                     .map(|h| h.to_hex()[..16].to_string())
-                    .unwrap_or_else(|| "(deleted)".into()),
+                    .unwrap_or_else(|| "(no content)".into()),
+            };
+            format!(
+                "    {:<18} {:<8} {:>12}  seq {:<6} {}",
+                identity,
                 kind_name(version.kind),
                 version.size,
                 version.seq,
@@ -365,7 +375,39 @@ mod tests {
             content: entry.content,
             seq: entry.seq,
             prev: None,
+            symlink_target: None,
         }
+    }
+
+    fn symlink_row(origin: &str, target: &str, mtime: i64) -> EntryRow {
+        EntryRow {
+            origin: OriginId::named(origin, "x.example").unwrap(),
+            space: "media".into(),
+            path: "f.txt".into(),
+            kind: EntryKind::Symlink,
+            size: target.len() as u64,
+            mtime_ns: mtime,
+            content: None,
+            seq: 1,
+            prev: None,
+            symlink_target: Some(target.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_symlink_version_shows_its_target() {
+        let set = VersionSet::from_entries(
+            "media",
+            "f.txt",
+            vec![
+                symlink_row("nas", "../a", 1),
+                symlink_row("laptop", "../a", 2),
+            ],
+        );
+        assert_eq!(set.version_count(), 1, "same target, same version");
+        let lines = version_set(&set);
+        assert!(lines[1].contains("-> ../a"), "{lines:?}");
+        assert!(lines[1].contains("symlink"), "{lines:?}");
     }
 
     #[test]

@@ -23,7 +23,8 @@ use crate::{
 /// What one scan found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanReport {
-    /// Files hashed because they looked changed.
+    /// Paths restated because they looked changed: files whose bytes were
+    /// re-hashed, and symlinks whose target or mtime moved.
     pub hashed: usize,
     /// Files skipped because `(size, mtime_ns, file_id)` matched.
     pub unchanged: usize,
@@ -103,6 +104,72 @@ impl Node {
         Ok(report)
     }
 
+    /// Indexes one symbolic link (§7.1).
+    ///
+    /// Symlinks are tracked exactly like files: a `local_files` row carrying
+    /// the link's own (lstat) mtime and its target, so an unchanged symlink
+    /// stages nothing. Republishing one every scan would defeat the property
+    /// that an unchanged tree publishes no head — and, worse, leaving the row
+    /// out meant the deletion sweep never saw the path, so a removed symlink
+    /// was never tombstoned and stayed published forever.
+    ///
+    /// The target is the change signal, and it is carried in the row's
+    /// `content` column as `blake3(target)`: content-addressing a link's
+    /// target is exactly what that column already means for a file, and it
+    /// costs no schema change. The staged entry keeps the link's real mtime,
+    /// never `now_ns()`, so the §8 `newest` order compares stable values and a
+    /// file-versus-symlink divergence resolves the same way on every node.
+    fn index_symlink(
+        &self,
+        space_id: &str,
+        path: &Path,
+        rel: &str,
+        seq: u64,
+        report: &mut ScanReport,
+    ) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        let mtime_ns = mtime_nanos(&metadata);
+        let file_id = file_identity(&metadata);
+        let target = std::fs::read_link(path)?.to_string_lossy().into_owned();
+        let signal = symlink_signal(&target);
+        let size = target.len() as u64;
+
+        let known = self.store().local_file(space_id, rel)?;
+        let unchanged = match &known {
+            Some(known) => {
+                known.content == Some(signal)
+                    && known.mtime_ns == mtime_ns
+                    && known.file_id == file_id
+            }
+            None => false,
+        };
+        if unchanged {
+            report.unchanged += 1;
+            return Ok(());
+        }
+
+        let mut entry = FileEntry::tombstone(mtime_ns, seq, None);
+        entry.kind = EntryKind::Symlink;
+        entry.symlink_target = Some(target);
+        entry.size = size;
+        report.staged.push((
+            file_key(space_id, rel)?,
+            Some(postcard::to_stdvec(&entry).map_err(|e| EngineError::Record(e.to_string()))?),
+        ));
+        report.hashed += 1;
+
+        self.store().put_local_file(&LocalFile {
+            space: space_id.to_string(),
+            relpath: rel.to_string(),
+            size,
+            mtime_ns,
+            file_id,
+            content: Some(signal),
+            scanned_at: now_ns(),
+        })?;
+        Ok(())
+    }
+
     fn index_file(
         &self,
         space_id: &str,
@@ -113,15 +180,7 @@ impl Node {
         report: &mut ScanReport,
     ) -> Result<()> {
         if is_symlink {
-            let target = std::fs::read_link(path)?.to_string_lossy().into_owned();
-            let mut entry = FileEntry::tombstone(now_ns(), seq, None);
-            entry.kind = EntryKind::Symlink;
-            entry.symlink_target = Some(target);
-            report.staged.push((
-                file_key(space_id, rel)?,
-                Some(postcard::to_stdvec(&entry).map_err(|e| EngineError::Record(e.to_string()))?),
-            ));
-            return Ok(());
+            return self.index_symlink(space_id, path, rel, seq, report);
         }
 
         let metadata = std::fs::metadata(path)?;
@@ -287,12 +346,16 @@ impl Node {
         let mut dropped = 0;
         for space in self.store().spaces()? {
             for row in self.store().local_file_rows(&space.id)? {
+                // The signal a row records is the content root for a file and
+                // the hashed link target for a symlink, so the published entry
+                // has to be read the same way or every open would re-index
+                // every link.
                 let published = trie
                     .get(root, &file_key(&space.id, &row.relpath)?)?
                     .as_deref()
                     .map(decode_entry)
                     .transpose()?
-                    .and_then(|entry| entry.content);
+                    .and_then(|entry| published_signal(&entry));
                 if published == row.content {
                     continue;
                 }
@@ -381,6 +444,23 @@ fn walk(
         }
     }
     Ok(())
+}
+
+/// The change signal a symlink's target reduces to.
+///
+/// `local_files.content` holds a content root for a file; for a link it holds
+/// the hash of the target, which is the same idea applied to the only content a
+/// link has.
+pub(crate) fn symlink_signal(target: &str) -> Hash {
+    Hash::new(target.as_bytes())
+}
+
+/// The signal a published entry implies, matching what `local_files` records.
+fn published_signal(entry: &FileEntry) -> Option<Hash> {
+    match entry.kind {
+        EntryKind::Symlink => entry.symlink_target.as_deref().map(symlink_signal),
+        _ => entry.content,
+    }
 }
 
 fn mtime_nanos(metadata: &std::fs::Metadata) -> i64 {
@@ -878,6 +958,113 @@ mod tests {
             node.scan_space("nope"),
             Err(EngineError::NotFound(_))
         ));
+        node.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unchanged_symlink_stages_nothing() {
+        // §7.1: republishing an unchanged symlink every scan would defeat the
+        // property that an unchanged tree publishes no head.
+        let (_d, space, node) = node_with_space().await;
+        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();
+
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.hashed, 2, "the file and the link");
+        assert_eq!(head.unwrap().seq, 1);
+
+        let entry = node
+            .store()
+            .entry(node.origin(), "media", "link")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.kind, EntryKind::Symlink);
+        assert_eq!(entry.symlink_target.as_deref(), Some("a.txt"));
+        // The link's own lstat mtime, never `now_ns()`.
+        let lstat = mtime_nanos(&std::fs::symlink_metadata(space.path().join("link")).unwrap());
+        assert_eq!(entry.mtime_ns, lstat);
+
+        // Scanning again finds nothing to say.
+        let (again, head) = node.scan_and_publish().unwrap();
+        assert_eq!(again.hashed, 0);
+        assert_eq!(again.unchanged, 2);
+        assert!(again.staged.is_empty(), "{:?}", again.staged);
+        assert!(head.is_none(), "an unchanged tree publishes no head");
+        node.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_retargeted_symlink_stages_an_update() {
+        let (_d, space, node) = node_with_space().await;
+        std::fs::write(space.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(space.path().join("b.txt"), b"b").unwrap();
+        std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();
+        node.scan_and_publish().unwrap();
+
+        std::fs::remove_file(space.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("b.txt", space.path().join("link")).unwrap();
+
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.hashed, 1, "only the link moved");
+        assert_eq!(head.unwrap().seq, 2);
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "link")
+                .unwrap()
+                .unwrap()
+                .symlink_target
+                .as_deref(),
+            Some("b.txt")
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deleted_symlink_is_tombstoned() {
+        // Without a `local_files` row the deletion sweep never saw the path, so
+        // a removed symlink stayed published forever.
+        let (_d, space, node) = node_with_space().await;
+        std::os::unix::fs::symlink("nowhere", space.path().join("link")).unwrap();
+        node.scan_and_publish().unwrap();
+
+        std::fs::remove_file(space.path().join("link")).unwrap();
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.deleted, 1);
+        assert!(head.is_some());
+        let entry = node
+            .store()
+            .entry(node.origin(), "media", "link")
+            .unwrap()
+            .unwrap();
+        assert!(entry.kind == EntryKind::Tombstone);
+        assert!(node.store().local_file("media", "link").unwrap().is_none());
+        node.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_survives_the_open_time_reconciliation() {
+        // `reconcile_local_files` compares a row's signal against the published
+        // entry; reading a symlink's signal as a content root would drop every
+        // link's row on every open and re-stage it forever.
+        let data = tempfile::tempdir().unwrap();
+        let space = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        {
+            let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+            node.add_space("media", space.path()).unwrap();
+            std::os::unix::fs::symlink("elsewhere", space.path().join("link")).unwrap();
+            node.scan_and_publish().unwrap();
+            node.shutdown().await.unwrap();
+        }
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        assert_eq!(node.reconcile_local_files().unwrap(), 0);
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.hashed, 0);
+        assert!(head.is_none());
         node.shutdown().await.unwrap();
     }
 }

@@ -246,6 +246,43 @@ like any other.
 promotes it: "held, and not the signing key". Exactly one key is `active` at any
 moment, which is the invariant that matters.
 
+### §7.1, §8 — symlinks, their change signal, and their version identity
+
+§7.1 tracks symlinks in `local_files` "carrying the link's own (lstat) mtime
+and its target as the change signal", and §8 identifies a content-less kind by
+`(kind, target)`. Three implementation choices follow:
+
+- **The target's signal lives in `local_files.content`, as `blake3(target)`.**
+  That column already means "the content this path reduced to" for a file, and
+  a link's only content is where it points, so no migration and no new column.
+  `Node::open`'s reconciliation reads a published entry the same way — target
+  hash for a link, content root for a file — or every open would drop every
+  link's row and re-stage it forever.
+- **`entries` grew a `symlink_target` column** (migration v6), because the
+  unified tree is computed from `entries` and version identity now depends on
+  the target. The table is rebuilt rather than `ALTER ... ADD COLUMN`-ed so the
+  stored DDL reads in declaration order instead of trailing the primary key.
+- **The staged entry keeps the link's real lstat mtime**, and its `size` is the
+  target's byte length. Stamping `now_ns()` — which is what the code did — made
+  every scan restate every link, so an unchanged tree published a head on every
+  pass, and a symlink beat every file on `newest` forever purely by being
+  rescanned most recently.
+
+The version order gains the target as a component: `(mtime_ns, content_root,
+symlink target, origin)`. §8's three-part order was written for versions that
+are identified by a content root, and two symlinks with different targets are
+two versions that share `None` there; without the extra component the order
+would break their tie on the *origin*, which §8 reserves for choosing which
+attestor is named, never which version wins.
+
+Mirrors materialize a symlink as a real symbolic link on unix. Windows has
+symlinks but creating one needs Developer Mode or
+`SeCreateSymbolicLinkPrivilege`, which a background daemon can neither assume
+nor usefully acquire, so there the path is **skipped and reported** — the same
+rule §7.2 already applies to names the platform refuses. Writing the target's
+contents under the link's name would silently turn a link into a file and hand
+the next scanner on that machine a change nobody made.
+
 ### §5.4, §8 — what retention actually retains, and what it measures against
 
 §5.4 keeps old roots for `root_retention` and sweeps the rest; §8 makes content
@@ -389,6 +426,7 @@ The chain to date:
 | 2 | 2 | 3 | drop the dead `want` table |
 | 3 | 3 | 4 | reshape `mirrors` for the unified tree (§7.2) |
 | 4 | 4 | 5 | reshape the `synch-s3` bucket map (§9.4) |
+| 5 | 5 | 6 | `entries.symlink_target`, for §8 version identity |
 
 Steps 0–2 reproduce the history that shipped before the chain existed: a
 database stamped 1, 2, or 3 by an older build lands on exactly the version the

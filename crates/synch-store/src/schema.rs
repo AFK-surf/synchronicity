@@ -60,6 +60,7 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "s3 bucket policies",
         run: v5_bucket_policies,
     },
+    Migration::Sql(V6_ENTRY_SYMLINK_TARGET),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -225,6 +226,41 @@ fn v5_bucket_policies(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// v6 — a symlink's target is part of its version identity (§8): two symlinks
+/// are the same version iff their targets match, and a symlink is never the
+/// same version as a file. `entries` is the view versions are computed from, so
+/// the target has to live there.
+///
+/// Rebuilt rather than `ALTER TABLE ... ADD COLUMN`, so the stored DDL reads in
+/// declaration order instead of trailing the primary key. `entries` is a
+/// derived cache of the trie, but copying it forward is cheaper and quieter
+/// than making every node re-materialize on upgrade.
+const V6_ENTRY_SYMLINK_TARGET: &str = r#"
+DROP INDEX entries_by_path;
+DROP INDEX entries_by_content;
+ALTER TABLE entries RENAME TO entries_v5;
+CREATE TABLE entries (
+  origin_id   TEXT NOT NULL,
+  space       TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  kind        INTEGER NOT NULL,
+  size        INTEGER NOT NULL,
+  mtime_ns    INTEGER NOT NULL,
+  content     BLOB,
+  seq         INTEGER NOT NULL,
+  prev        BLOB,
+  symlink_target TEXT,
+  PRIMARY KEY (origin_id, space, path)
+);
+INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, content, seq, prev,
+                     symlink_target)
+  SELECT origin_id, space, path, kind, size, mtime_ns, content, seq, prev, NULL
+  FROM entries_v5;
+DROP TABLE entries_v5;
+CREATE INDEX entries_by_path    ON entries (space, path);
+CREATE INDEX entries_by_content ON entries (content);
+"#;
+
 /// The §10 schema as the design document states it — the shape replaying the
 /// whole chain must produce.
 ///
@@ -282,6 +318,7 @@ CREATE TABLE entries (
   content     BLOB,
   seq         INTEGER NOT NULL,
   prev        BLOB,
+  symlink_target TEXT,
   PRIMARY KEY (origin_id, space, path)
 );
 CREATE INDEX entries_by_path    ON entries (space, path);

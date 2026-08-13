@@ -716,3 +716,50 @@ async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
     );
     node.shutdown().await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_and_a_symlink_at_one_path_diverge_on_stable_mtimes() {
+    // §8: a symlink is never the same version as a file, and §7.1 makes the
+    // link's own lstat mtime what selection compares — a symlink restated at
+    // `now_ns()` on every scan would win `newest` forever, and would churn a
+    // head every scan while doing it.
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    introduce(&[&nas, &laptop]);
+
+    nas.node.add_space("media", nas.space.path()).unwrap();
+    laptop.node.add_space("media", laptop.space.path()).unwrap();
+
+    // The laptop publishes a real file; the NAS publishes a link at the same
+    // path. The file is written second, so its mtime is the later one.
+    std::os::unix::fs::symlink("../elsewhere", nas.space.path().join("shared")).unwrap();
+    nas.node.scan_and_publish().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(laptop.space.path().join("shared"), b"real bytes").unwrap();
+    laptop.node.scan_and_publish().unwrap();
+
+    laptop.node.anti_entropy_round().await.unwrap();
+    nas.node.anti_entropy_round().await.unwrap();
+
+    for peer in [&nas, &laptop] {
+        let set = peer.node.versions("media", "shared").unwrap();
+        assert_eq!(set.version_count(), 2, "{:?}", set.versions);
+        assert!(set.is_divergent());
+        // Both nodes select the same side, from the same assertions.
+        let selected = peer
+            .node
+            .resolve("media", "shared", &VersionPolicy::Newest)
+            .unwrap();
+        assert_eq!(selected.kind, synch_core::EntryKind::File);
+        assert_eq!(selected.origin, *laptop.node.origin());
+    }
+
+    // Rescanning the NAS changes nothing: the link is unchanged, so no head.
+    let (report, head) = nas.node.scan_and_publish().unwrap();
+    assert_eq!(report.hashed, 0);
+    assert!(head.is_none(), "an unchanged symlink must not churn a head");
+
+    nas.node.shutdown().await.unwrap();
+    laptop.node.shutdown().await.unwrap();
+}

@@ -81,17 +81,25 @@ impl FromStr for VersionPolicy {
     }
 }
 
-/// One version of a path: a distinct content root, and everyone asserting it.
+/// One version of a path: a distinct assertion identity, and everyone
+/// asserting it.
 ///
-/// Origins asserting the same root collapse into one version with several
-/// attestors — agreement is the common case, and it renders as a plain file.
-/// A tombstone is a content-less version ("deleted at seq N").
+/// Identity is the content root for regular files, and the pair
+/// `(kind, target)` for content-less kinds (§8): two symlinks are the same
+/// version iff their targets match, and a symlink is never the same version as
+/// a file. Origins asserting the same identity collapse into one version with
+/// several attestors — agreement is the common case, and it renders as a plain
+/// file. A tombstone is a content-less version ("deleted at seq N").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
-    /// The content root, or `None` for the tombstone version.
+    /// The content root, or `None` for content-less kinds.
     pub content: Option<Hash>,
-    /// What the entries describe.
+    /// What the entries describe. Part of the version's identity, so a
+    /// symlink and a file at one path are two versions, not one.
     pub kind: EntryKind,
+    /// The link target, when this version is a symlink. The other half of a
+    /// content-less kind's identity.
+    pub symlink_target: Option<String>,
     /// The content length.
     pub size: u64,
     /// The greatest mtime any attestor published for it.
@@ -106,6 +114,27 @@ impl Version {
     /// True if this is the content-less deletion version.
     pub fn is_tombstone(&self) -> bool {
         self.kind == EntryKind::Tombstone
+    }
+
+    /// True if this version is a symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        self.kind == EntryKind::Symlink
+    }
+
+    /// How this version names itself in a listing: a content root, a link
+    /// target, or the deletion marker.
+    pub fn identity_text(&self) -> String {
+        match self.kind {
+            EntryKind::Tombstone => "(deleted)".to_string(),
+            EntryKind::Symlink => format!(
+                "-> {}",
+                self.symlink_target.as_deref().unwrap_or("(unknown target)")
+            ),
+            _ => self
+                .content
+                .map(|h| h.to_hex().to_string())
+                .unwrap_or_else(|| "(no content)".into()),
+        }
     }
 }
 
@@ -130,24 +159,17 @@ impl VersionSet {
         entries.sort_by_key(|entry| entry.origin.canonical());
         let mut versions: Vec<Version> = Vec::new();
         for entry in &entries {
-            // The grouping key is the content root, with every tombstone
-            // collapsing into the one content-less version.
-            let key = if entry.kind == EntryKind::Tombstone {
-                None
-            } else {
-                entry.content
-            };
-            match versions.iter_mut().find(|v| {
-                v.content == key && v.is_tombstone() == (entry.kind == EntryKind::Tombstone)
-            }) {
+            let key = identity(entry);
+            match versions.iter_mut().find(|v| identity_of_version(v) == key) {
                 Some(version) => {
                     version.mtime_ns = version.mtime_ns.max(entry.mtime_ns);
                     version.seq = version.seq.max(entry.seq);
                     version.attestors.push(entry.origin.clone());
                 }
                 None => versions.push(Version {
-                    content: key,
+                    content: content_of(entry),
                     kind: entry.kind,
+                    symlink_target: entry.symlink_target.clone(),
                     size: entry.size,
                     mtime_ns: entry.mtime_ns,
                     seq: entry.seq,
@@ -188,7 +210,7 @@ impl VersionSet {
         match policy {
             VersionPolicy::Origin(origin) => {
                 match self.entries.iter().find(|e| &e.origin == origin) {
-                    Some(entry) => Selection::Selected(entry.clone()),
+                    Some(entry) => Selection::Selected(Box::new(entry.clone())),
                     None => Selection::Absent,
                 }
             }
@@ -199,7 +221,7 @@ impl VersionSet {
                     .iter()
                     .max_by(|a, b| entry_key(a).cmp(&entry_key(b)))
                 {
-                    Some(entry) => Selection::Selected(entry.clone()),
+                    Some(entry) => Selection::Selected(Box::new(entry.clone())),
                     None => Selection::Absent,
                 }
             }
@@ -216,10 +238,7 @@ impl VersionSet {
                     version.attestors.iter().map(|o| o.to_string()).collect();
                 format!(
                     "{} size {} mtime {} seq {} asserted by {}",
-                    version
-                        .content
-                        .map(|h| h.to_hex().to_string())
-                        .unwrap_or_else(|| "(deleted)".into()),
+                    version.identity_text(),
                     version.size,
                     version.mtime_ns,
                     version.seq,
@@ -234,7 +253,11 @@ impl VersionSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     /// The policy chose this origin's assertion.
-    Selected(EntryRow),
+    ///
+    /// Boxed because it is by far the largest variant and the other two carry
+    /// nothing: every `Absent` and `Divergent` would otherwise pay for a whole
+    /// entry row.
+    Selected(Box<EntryRow>),
     /// Nothing to select: the path has no entries, or the pinned origin
     /// publishes none for it.
     Absent,
@@ -252,32 +275,68 @@ impl Selection {
     }
 }
 
+/// A version's identity as §8 defines it: the content root for regular files,
+/// the pair `(kind, target)` for content-less kinds.
+///
+/// Tombstones all collapse into one version whatever else they carry — a
+/// deletion is a deletion. A symlink is identified by its target and can never
+/// coincide with a file, because the kind is part of the key.
+type Identity = (bool, Option<[u8; 32]>, Option<String>);
+
+fn content_of(entry: &EntryRow) -> Option<Hash> {
+    match entry.kind {
+        EntryKind::Tombstone | EntryKind::Symlink => None,
+        _ => entry.content,
+    }
+}
+
+fn identity(entry: &EntryRow) -> Identity {
+    match entry.kind {
+        EntryKind::Tombstone => (true, None, None),
+        EntryKind::Symlink => (
+            false,
+            None,
+            Some(entry.symlink_target.clone().unwrap_or_default()),
+        ),
+        _ => (false, entry.content.map(|h| *h.as_bytes()), None),
+    }
+}
+
+fn identity_of_version(version: &Version) -> Identity {
+    match version.kind {
+        EntryKind::Tombstone => (true, None, None),
+        EntryKind::Symlink => (
+            false,
+            None,
+            Some(version.symlink_target.clone().unwrap_or_default()),
+        ),
+        _ => (false, version.content.map(|h| *h.as_bytes()), None),
+    }
+}
+
 /// The deterministic total order `newest` maximizes: `(mtime_ns,
-/// content_root, origin)` (§8).
+/// content_root, symlink target, origin)` (§8).
 ///
 /// Every component is data every node holds identically, so the same
 /// assertions select the same version everywhere. The content root breaks
-/// mtime ties (a tombstone, having none, loses such a tie to content), and the
-/// canonical origin breaks the remaining tie between two attestors of the same
-/// version — which one is named as the source of the bytes, never which bytes.
-fn entry_key(entry: &EntryRow) -> (i64, Option<[u8; 32]>, String) {
-    let content = if entry.kind == EntryKind::Tombstone {
-        None
-    } else {
-        entry.content.map(|h| *h.as_bytes())
-    };
-    (entry.mtime_ns, content, entry.origin.canonical())
+/// mtime ties (a tombstone, having none, loses such a tie to content); the
+/// target breaks ties between content-less kinds, which §8 identifies by
+/// `(kind, target)` and which would otherwise be indistinguishable to the
+/// order while being distinct versions; and the canonical origin breaks the
+/// remaining tie between two attestors of the same version — which one is
+/// named as the source of the bytes, never which bytes.
+fn entry_key(entry: &EntryRow) -> (i64, Option<[u8; 32]>, Option<String>, String) {
+    let (_, content, target) = identity(entry);
+    (entry.mtime_ns, content, target, entry.origin.canonical())
 }
 
 /// The same order at version granularity, for presenting a version list.
-fn version_key(version: &Version) -> (i64, Option<[u8; 32]>, String) {
+fn version_key(version: &Version) -> (i64, Option<[u8; 32]>, Option<String>, String) {
+    let (_, content, target) = identity_of_version(version);
     (
         version.mtime_ns,
-        if version.is_tombstone() {
-            None
-        } else {
-            version.content.map(|h| *h.as_bytes())
-        },
+        content,
+        target,
         version
             .attestors
             .iter()
@@ -598,5 +657,89 @@ mod tests {
             .unified_listing("s", "zz", None, None)
             .unwrap()
             .is_empty());
+    }
+
+    fn symlink(target: &str, mtime: i64, seq: u64) -> FileEntry {
+        let mut entry = FileEntry::tombstone(mtime, seq, None);
+        entry.kind = EntryKind::Symlink;
+        entry.symlink_target = Some(target.to_string());
+        entry.size = target.len() as u64;
+        entry
+    }
+
+    #[test]
+    fn two_symlinks_with_different_targets_are_two_versions() {
+        // §8: a content-less kind's version identity is (kind, target).
+        let (_d, store) = store();
+        store
+            .put_entry(&origin("nas"), "media", "link", &symlink("../a", 100, 1))
+            .unwrap();
+        store
+            .put_entry(&origin("laptop"), "media", "link", &symlink("../b", 200, 1))
+            .unwrap();
+
+        let set = store.versions_for("media", "link").unwrap();
+        assert_eq!(set.version_count(), 2);
+        assert!(set.is_divergent(), "different targets diverge");
+        let described = set.describe().join(" | ");
+        assert!(described.contains("-> ../a"), "{described}");
+        assert!(described.contains("-> ../b"), "{described}");
+
+        // The newest mtime still selects deterministically.
+        let selected = set.select(&VersionPolicy::Newest);
+        assert_eq!(
+            selected.entry().unwrap().symlink_target.as_deref(),
+            Some("../b")
+        );
+    }
+
+    #[test]
+    fn symlinks_with_the_same_target_agree() {
+        let (_d, store) = store();
+        for name in ["nas", "laptop"] {
+            store
+                .put_entry(&origin(name), "media", "link", &symlink("../a", 100, 1))
+                .unwrap();
+        }
+        let set = store.versions_for("media", "link").unwrap();
+        assert_eq!(set.version_count(), 1);
+        assert!(!set.is_divergent());
+        assert_eq!(set.versions[0].attestors.len(), 2);
+        assert!(set.versions[0].is_symlink());
+    }
+
+    #[test]
+    fn a_symlink_is_never_the_same_version_as_a_file() {
+        let (_d, store) = store();
+        store
+            .put_entry(&origin("nas"), "media", "x", &symlink("../a", 100, 1))
+            .unwrap();
+        store
+            .put_entry(
+                &origin("laptop"),
+                "media",
+                "x",
+                &FileEntry::file(3, 200, Hash::new(b"bytes"), 1),
+            )
+            .unwrap();
+        let set = store.versions_for("media", "x").unwrap();
+        assert_eq!(set.version_count(), 2);
+        assert!(set.is_divergent());
+
+        // Selection runs on the real mtimes both sides published, so every
+        // node picks the same side: the file here, which is newer.
+        let selected = set.select(&VersionPolicy::Newest);
+        assert_eq!(selected.entry().unwrap().kind, EntryKind::File);
+
+        // And with the link newer, the link wins — deterministically, and not
+        // because a scan happened to restate it.
+        store
+            .put_entry(&origin("nas"), "media", "x", &symlink("../a", 300, 2))
+            .unwrap();
+        let set = store.versions_for("media", "x").unwrap();
+        assert_eq!(
+            set.select(&VersionPolicy::Newest).entry().unwrap().kind,
+            EntryKind::Symlink
+        );
     }
 }
