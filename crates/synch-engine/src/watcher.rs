@@ -71,6 +71,10 @@ fn watch_error(e: notify::Error) -> crate::error::EngineError {
 
 impl Node {
     /// Watches every space and rescans on change until `shutdown` resolves.
+    ///
+    /// A rescan *stages*; what publishes is
+    /// [`run_publisher`](Node::run_publisher), which every host running this
+    /// loop is expected to run beside it.
     pub async fn run_watcher(&self, shutdown: impl std::future::Future<Output = ()>) {
         let mut watcher = match SpaceWatcher::start(self) {
             Ok(watcher) => watcher,
@@ -99,6 +103,9 @@ impl Node {
     }
 
     /// Runs the periodic full scan until `shutdown` resolves (§7.1).
+    ///
+    /// Like the watcher, this stages into the publisher rather than publishing
+    /// on its own.
     pub async fn run_scanner(&self, shutdown: impl std::future::Future<Output = ()>) {
         let shutdown = std::pin::pin!(shutdown);
         let mut shutdown = shutdown;
