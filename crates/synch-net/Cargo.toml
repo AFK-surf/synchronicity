@@ -9,8 +9,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+futures-core.workspace = true
 hickory-resolver.workspace = true
 iroh.workspace = true
+reqwest.workspace = true
 iroh-base.workspace = true
 postcard.workspace = true
 serde.workspace = true

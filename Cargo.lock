@@ -3730,10 +3730,12 @@ dependencies = [
 name = "synch-net"
 version = "0.1.0"
 dependencies = [
+ "futures-core",
  "hickory-resolver",
  "iroh",
  "iroh-base",
  "postcard",
+ "reqwest",
  "serde",
  "synch-core",
  "synch-mpt",

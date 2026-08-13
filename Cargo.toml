@@ -36,9 +36,10 @@ blake3 = "1.8.6"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 directories = "6.0.0"
+futures-core = "0.3"
 hex = "0.4.3"
 hmac = "0.13.0"
-hickory-resolver = { version = "0.26.1", default-features = false, features = ["dnssec-ring", "https-ring", "system-config", "tokio"] }
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["dnssec-ring", "tokio"] }
 iroh = { version = "1.0.3", default-features = false, features = ["tls-ring"] }
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 notify = "8.2.0"

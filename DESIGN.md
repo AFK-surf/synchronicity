@@ -180,23 +180,26 @@ A remote node is **trusted** iff at least one of the following holds:
    a Named origin would sync nothing, silently — doctor detects the mismatch and
    suggests the missing `--as` name or `synch domain add`.
 
-   The lookup MUST be DNSSEC-validated end to end. We use
-   `hickory-resolver` with in-process DNSSEC validation (we do not trust an upstream
-   resolver's AD bit). If the chain of trust does not validate — missing signatures,
-   expired RRSIGs, broken chain — the response is **discarded entirely** and the
-   previously cached member set is retained until its own expiry. Fail closed.
+   The lookup MUST be DNSSEC-validated end to end, and it travels one
+   transport: DNS-over-HTTP(S), RFC 8484, against `--doh <url>` (`SYNCH_DOH`,
+   default `https://1.1.1.1/dns-query`). There is no UDP path and no system
+   stub resolver in the loop — hickory is used purely as the in-process
+   DNSSEC validation engine over that transport (we never trust an upstream
+   resolver's AD bit). If the chain of trust does not validate — missing
+   signatures, expired RRSIGs, broken chain — the response is **discarded
+   entirely** and the previously cached member set is retained until its own
+   expiry. Fail closed.
 
-   Two resolver knobs exist for environments where the system path is wrong,
-   and neither weakens the stance above. `--doh <url>` (`SYNCH_DOH`) sends the
-   queries over DNS-over-HTTPS instead of the system nameservers — a transport
-   for networks that filter or rewrite port 53, not a validator we defer to;
-   answers are still validated in process. `--dnssec-anchor <file>`
-   (`SYNCH_DNSSEC_ANCHOR`) *replaces* the ICANN root trust anchor with a file
-   of DNSKEY records, for internal deployments and tests that run their own
-   signed root; with it set, nothing signed under the real root validates —
-   an override is a different universe, not an addition. Both are daemon
-   flags: every refresh, scheduled or requested over the control socket,
-   resolves the same way.
+   A plaintext `http://` endpoint is accepted for internal deployments, and
+   it is not the hole it looks like: the transport carries nothing trusted,
+   so http concedes query privacy and a denial lever — exactly what classic
+   UDP resolution always conceded — and nothing about integrity.
+   `--dnssec-anchor <file>` (`SYNCH_DNSSEC_ANCHOR`) *replaces* the ICANN
+   root trust anchor with a file of DNSKEY records, for internal deployments
+   and tests that run their own signed root; with it set, nothing signed
+   under the real root validates — an override is a different universe, not
+   an addition. Both are daemon flags: every refresh, scheduled or requested
+   over the control socket, resolves the same way.
 
    Records are re-resolved on the TTL (clamped to `[60s, 24h]`). A binding that
    disappears from DNS expires after `dns_trust_grace` (default: 1 TTL + 10 minutes)

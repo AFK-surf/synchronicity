@@ -56,14 +56,15 @@ key rotation looks like. A resolver outage fails closed: the cached bindings
 keep their own expiry, and the member set shrinks toward static-only rather
 than falling open.
 
-Resolution itself has two knobs, both daemon flags. On a network that filters
-or rewrites port 53, `synch daemon run --doh https://1.1.1.1/dns-query` (or
-`SYNCH_DOH`) sends the queries over DNS-over-HTTPS — a transport choice only;
-answers are still DNSSEC-validated in process. For an internal zone signed by
-its own root, `--dnssec-anchor /path/to/root.key` (`SYNCH_DNSSEC_ANCHOR`)
-replaces the ICANN trust anchor with that file of DNSKEY records — and then
-nothing signed under the real root validates: an override is a different
-universe, not an addition.
+Resolution travels DNS-over-HTTP(S) only — `https://1.1.1.1/dns-query` by
+default, or any endpoint named with `synch daemon run --doh <url>`
+(`SYNCH_DOH`). Plain `http://` endpoints are accepted for internal networks:
+answers are DNSSEC-validated in process either way, so the transport carries
+nothing trusted. For an internal zone signed by its own root,
+`--dnssec-anchor /path/to/root.key` (`SYNCH_DNSSEC_ANCHOR`) replaces the
+ICANN trust anchor with that file of DNSKEY records — and then nothing signed
+under the real root validates: an override is a different universe, not an
+addition.
 
 Rotate a device key. Every step is an explicit command: a node never polls its
 own domain and never switches signing keys on its own.

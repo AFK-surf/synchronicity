@@ -20,9 +20,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub offline: bool,
 
-    /// Resolve membership TXT records over this DNS-over-HTTPS endpoint
-    /// instead of the system resolvers, e.g. https://1.1.1.1/dns-query.
-    /// Answers are still DNSSEC-validated in process.
+    /// The DNS-over-HTTP(S) endpoint membership TXT records resolve
+    /// through; defaults to https://1.1.1.1/dns-query. http:// is accepted —
+    /// answers are DNSSEC-validated in process either way.
     #[arg(long, global = true, env = "SYNCH_DOH", value_name = "URL")]
     pub doh: Option<String>,
 

@@ -23,6 +23,8 @@ use synch_core::{
     NodeId, OriginId,
 };
 
+use hickory_resolver::proto::dnssec::TrustAnchors;
+
 use crate::error::NetError;
 
 /// The label the membership TXT records live under.
@@ -37,6 +39,9 @@ pub const MIN_TTL: Duration = Duration::from_secs(60);
 pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Extra grace before a binding that vanished from DNS expires (§3.2).
 pub const DEFAULT_TRUST_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// The DoH endpoint used when none is configured.
+pub const DEFAULT_DOH_URL: &str = "https://1.1.1.1/dns-query";
 
 /// The query name for a membership domain.
 pub fn query_name(domain: &str) -> String {
@@ -266,14 +271,44 @@ impl MemberSet {
     }
 }
 
+/// Parses and normalizes a DoH endpoint URL.
+///
+/// `https://` or `http://`, host required, query path defaulting to
+/// `/dns-query`. Plaintext is not the security hole it looks like: the
+/// answers are DNSSEC-validated in process exactly as on the UDP-53 default
+/// path, so http costs query privacy and a denial lever — the same things
+/// UDP already concedes — and nothing about integrity.
+fn doh_url(url: &str) -> Result<reqwest::Url, NetError> {
+    let bad = |why: String| NetError::Dns(format!("DoH endpoint {url}: {why}"));
+    let mut parsed = reqwest::Url::parse(url).map_err(|e| bad(e.to_string()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(bad("must be an https:// or http:// URL".into()));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(bad("no host".into()));
+    }
+    if matches!(parsed.path(), "" | "/") {
+        parsed.set_path("/dns-query");
+    }
+    Ok(parsed)
+}
+
 /// A DNSSEC-validating resolver for membership domains.
 ///
-/// Validation happens in process: the resolver is built with `validate = true`
-/// and every answer record is additionally required to carry a *secure* DNSSEC
-/// proof, so an insecure or bogus answer is discarded rather than trusted.
-#[derive(Debug, Clone)]
+/// One transport, DNS-over-HTTP(S), and one validator: every answer record
+/// is required to carry a *secure* DNSSEC proof computed in process, so an
+/// insecure or bogus answer is discarded rather than trusted. There is no
+/// UDP path and no system stub resolver in the loop at all — hickory is
+/// here purely as the validation engine.
+#[derive(Clone)]
 pub struct DnssecResolver {
-    resolver: hickory_resolver::TokioResolver,
+    handle: hickory_resolver::net::dnssec::DnssecDnsHandle<DohHandle>,
+}
+
+impl std::fmt::Debug for DnssecResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DnssecResolver")
+    }
 }
 
 /// A validated lookup result.
@@ -287,22 +322,23 @@ pub struct ValidatedTxt {
 
 /// How the resolver reaches the DNS and whom it ultimately trusts (§3.2).
 ///
-/// The defaults — the system's nameservers, the ICANN root trust anchor — are
-/// what production wants, and both knobs exist for environments where that
-/// path is wrong: a network whose port-53 traffic is filtered or rewritten
-/// resolves over DNS-over-HTTPS instead, and an internal test zone signed by
-/// its own root swaps the trust anchor. Neither weakens the §3.2 stance:
-/// validation still happens in process against whatever anchor is in force,
-/// and a DoH upstream is a transport, not a validator we defer to.
+/// The defaults — the public endpoint at [`DEFAULT_DOH_URL`], the ICANN root
+/// trust anchor — are what production wants; both knobs exist for the
+/// environments where they are wrong: an internal DoH endpoint (http or
+/// https) for closed networks, and an internal test zone signed by its own
+/// root swapping the trust anchor. Neither weakens the §3.2 stance:
+/// validation happens in process against whatever anchor is in force, and
+/// the endpoint is a transport, never a validator we defer to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolverOptions {
-    /// A DNS-over-HTTPS endpoint, e.g. `https://1.1.1.1/dns-query`.
+    /// The DNS-over-HTTP(S) endpoint, [`DEFAULT_DOH_URL`] when unset.
     ///
-    /// `https://host[:port][/path]`; the path defaults to `/dns-query` and
-    /// the port to 443. A hostname is bootstrap-resolved through the system
-    /// resolver once, un-validated — safe, because the endpoint's identity is
-    /// the TLS handshake against that hostname, and the answers themselves
-    /// are still DNSSEC-validated here.
+    /// `https://` or `http://`, then `host[:port][/path]`; the path defaults
+    /// to `/dns-query`. A plaintext endpoint is acceptable because the
+    /// transport carries nothing trusted: every answer is DNSSEC-validated
+    /// in process either way, so http concedes query privacy and a denial
+    /// lever — what classic UDP DNS always conceded — and nothing about
+    /// integrity.
     pub doh_url: Option<String>,
     /// A file of `DNSKEY` records (zone syntax, as `dig` prints them)
     /// *replacing* the ICANN root trust anchor.
@@ -313,179 +349,61 @@ pub struct ResolverOptions {
     pub trust_anchor: Option<std::path::PathBuf>,
 }
 
-/// A parsed DNS-over-HTTPS endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DohEndpoint {
-    /// The TLS server name: what the certificate must speak for.
-    host: String,
-    /// The TCP port, 443 unless the URL names one.
-    port: u16,
-    /// The HTTP path queries POST to.
-    path: String,
-}
-
-impl DohEndpoint {
-    /// Parses `https://host[:port][/path]`.
-    ///
-    /// Plain `http://` is refused rather than accepted quietly: the
-    /// endpoint's whole identity is its TLS handshake.
-    fn parse(url: &str) -> Result<Self, NetError> {
-        let bad = |why: &str| NetError::Dns(format!("DoH endpoint {url}: {why}"));
-        let rest = url
-            .strip_prefix("https://")
-            .ok_or_else(|| bad("must be an https:// URL"))?;
-        let (authority, path) = match rest.find('/') {
-            Some(slash) => (&rest[..slash], &rest[slash..]),
-            None => (rest, "/dns-query"),
-        };
-        // An IPv6 host is bracketed; everything else splits on the last ':'.
-        let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
-            let (host, tail) = v6
-                .split_once(']')
-                .ok_or_else(|| bad("unclosed [ in an IPv6 host"))?;
-            let port = match tail.strip_prefix(':') {
-                Some(port) => port.parse().map_err(|_| bad("bad port"))?,
-                None if tail.is_empty() => 443,
-                None => return Err(bad("junk after the IPv6 host")),
-            };
-            (host.to_string(), port)
-        } else {
-            match authority.rsplit_once(':') {
-                Some((host, port)) => {
-                    (host.to_string(), port.parse().map_err(|_| bad("bad port"))?)
-                }
-                None => (authority.to_string(), 443),
-            }
-        };
-        if host.is_empty() {
-            return Err(bad("no host"));
-        }
-        Ok(DohEndpoint {
-            host,
-            port,
-            path: path.to_string(),
-        })
-    }
-
-    /// The addresses to dial: the host itself when it is a literal, or one
-    /// bootstrap resolution through the system resolver when it is a name.
-    fn addrs(&self) -> Result<Vec<std::net::IpAddr>, NetError> {
-        use std::net::ToSocketAddrs;
-        if let Ok(ip) = self.host.parse::<std::net::IpAddr>() {
-            return Ok(vec![ip]);
-        }
-        let mut addrs: Vec<std::net::IpAddr> = (self.host.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(|e| NetError::Dns(format!("could not bootstrap-resolve {}: {e}", self.host)))?
-            .map(|addr| addr.ip())
-            .collect();
-        addrs.dedup();
-        addrs.truncate(3);
-        if addrs.is_empty() {
-            return Err(NetError::Dns(format!(
-                "{} bootstrap-resolved to no addresses",
-                self.host
-            )));
-        }
-        Ok(addrs)
-    }
-}
-
 impl DnssecResolver {
-    /// Builds a resolver from the system configuration, with in-process DNSSEC
-    /// validation enabled.
-    pub fn from_system() -> Result<Self, NetError> {
+    /// Builds a resolver with every default: the public endpoint, the ICANN
+    /// root trust anchor.
+    pub fn with_defaults() -> Result<Self, NetError> {
         Self::with_options(&ResolverOptions::default())
     }
 
     /// Builds a resolver honoring [`ResolverOptions`], with in-process DNSSEC
-    /// validation enabled either way.
+    /// validation always on.
     pub fn with_options(options: &ResolverOptions) -> Result<Self, NetError> {
-        use hickory_resolver::{
-            config::{NameServerConfig, ResolverConfig},
-            net::runtime::TokioRuntimeProvider,
-            Resolver,
-        };
-        let mut builder = match &options.doh_url {
-            Some(url) => {
-                let endpoint = DohEndpoint::parse(url)?;
-                let mut config = ResolverConfig::default();
-                for ip in endpoint.addrs()? {
-                    let mut server = NameServerConfig::https(
-                        ip,
-                        endpoint.host.as_str().into(),
-                        Some(endpoint.path.as_str().into()),
-                    );
-                    for connection in &mut server.connections {
-                        connection.port = endpoint.port;
-                    }
-                    config.add_name_server(server);
+        let anchors = match &options.trust_anchor {
+            None => std::sync::Arc::new(TrustAnchors::default()),
+            Some(path) => {
+                let anchors = TrustAnchors::from_file(path)
+                    .map_err(|e| NetError::Dns(format!("trust anchor {}: {e}", path.display())))?;
+                if anchors.is_empty() {
+                    // An empty anchor set validates nothing, forever, quietly.
+                    return Err(NetError::Dns(format!(
+                        "trust anchor {}: no DNSKEY records in the file",
+                        path.display()
+                    )));
                 }
-                Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+                std::sync::Arc::new(anchors)
             }
-            None => hickory_resolver::Resolver::builder_tokio()
-                .map_err(|e| NetError::Dns(e.to_string()))?,
         };
-        builder.options_mut().validate = true;
-        if let Some(path) = &options.trust_anchor {
-            let anchors = hickory_resolver::proto::dnssec::TrustAnchors::from_file(path)
-                .map_err(|e| NetError::Dns(format!("trust anchor {}: {e}", path.display())))?;
-            if anchors.is_empty() {
-                // An empty anchor set validates nothing, forever, quietly.
-                return Err(NetError::Dns(format!(
-                    "trust anchor {}: no DNSKEY records in the file",
-                    path.display()
-                )));
-            }
-            builder = builder.with_trust_anchor(std::sync::Arc::new(anchors));
-        }
+        let url = doh_url(options.doh_url.as_deref().unwrap_or(DEFAULT_DOH_URL))?;
+        let handle = DohHandle::new(url)?;
         Ok(DnssecResolver {
-            resolver: builder.build().map_err(|e| NetError::Dns(e.to_string()))?,
+            handle: hickory_resolver::net::dnssec::DnssecDnsHandle::with_trust_anchor(
+                handle, anchors,
+            ),
         })
     }
 
     /// Resolves `_synchronicity.<domain> TXT`, discarding anything that does
     /// not validate.
     pub async fn lookup_txt(&self, domain: &str) -> Result<ValidatedTxt, NetError> {
-        use hickory_resolver::proto::rr::RecordType;
+        use futures_core::Stream;
+        use hickory_resolver::{
+            net::xfer::DnsHandle,
+            proto::{op::Query, rr::Name, rr::RecordType},
+        };
 
         let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
         let name = query_name(&domain);
-        let lookup = self
-            .resolver
-            .lookup(name.as_str(), RecordType::TXT)
+        let mut qname =
+            Name::from_utf8(&name).map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
+        qname.set_fqdn(true);
+        let query = Query::query(qname, RecordType::TXT);
+        let mut stream = self.handle.lookup(query, Default::default());
+        let response = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx))
             .await
+            .ok_or_else(|| NetError::Dns(format!("{name}: the endpoint sent no response")))?
             .map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
-
-        let mut records = Vec::new();
-        let mut ttl = MAX_TTL;
-        for record in lookup.answers() {
-            if !record.proof.is_secure() {
-                // Fail closed: one unvalidated record poisons the answer.
-                return Err(NetError::Dns(format!(
-                    "{name}: answer is not DNSSEC-secure (proof: {:?})",
-                    record.proof
-                )));
-            }
-            ttl = ttl.min(Duration::from_secs(u64::from(record.ttl)));
-            if let hickory_resolver::proto::rr::RData::TXT(txt) = &record.data {
-                // A TXT record is a sequence of character-strings; the record
-                // text is their concatenation.
-                let joined: String = txt
-                    .txt_data
-                    .iter()
-                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                    .collect();
-                records.push(joined);
-            }
-        }
-        if records.is_empty() {
-            return Err(NetError::Dns(format!("{name}: no TXT records")));
-        }
-        Ok(ValidatedTxt {
-            records,
-            ttl: clamp_ttl(ttl),
-        })
+        secure_txt(&name, &response.answers)
     }
 
     /// Resolves and applies the §3.2 rules in one step.
@@ -494,6 +412,154 @@ impl DnssecResolver {
         let set = MemberSet::from_records(domain, &validated.records)?;
         Ok((set, validated.ttl))
     }
+}
+
+/// How long one plaintext DoH exchange may take end to end.
+/// How long one DoH exchange may take end to end.
+const DOH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// An RFC 8484 DNS-over-HTTP(S) client.
+///
+/// This is the only transport: queries are POSTed in wire format over
+/// reqwest, and every response goes through the [`DnssecDnsHandle`] wrapped
+/// around this — hickory reduced to the one thing we keep it for, in-process
+/// DNSSEC validation. The endpoint hostname (if it is not a literal like the
+/// default 1.1.1.1) resolves through the operating system once per
+/// connection, which is name-to-address plumbing for the endpoint itself,
+/// not part of the membership trust path.
+#[derive(Clone)]
+struct DohHandle {
+    client: reqwest::Client,
+    url: reqwest::Url,
+}
+
+impl DohHandle {
+    fn new(url: reqwest::Url) -> Result<Self, NetError> {
+        // No proxy: resolving names through an HTTP proxy invites a bootstrap
+        // cycle, since the proxy's own name would need resolving first.
+        let client = reqwest::Client::builder()
+            .timeout(DOH_TIMEOUT)
+            .no_proxy()
+            .build()
+            .map_err(|e| NetError::Dns(format!("DoH client: {e}")))?;
+        Ok(DohHandle { client, url })
+    }
+
+    /// POSTs one wire-format query, returning the wire-format answer.
+    async fn exchange(&self, body: Vec<u8>) -> Result<Vec<u8>, std::io::Error> {
+        let response = self
+            .client
+            .post(self.url.clone())
+            .header("content-type", "application/dns-message")
+            .header("accept", "application/dns-message")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", self.url)))?;
+        if !response.status().is_success() {
+            return Err(std::io::Error::other(format!(
+                "{} answered {}",
+                self.url,
+                response.status()
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", self.url)))?;
+        Ok(bytes.to_vec())
+    }
+}
+
+/// What one DoH exchange resolves to.
+type ExchangeResult =
+    Result<hickory_resolver::proto::op::DnsResponse, hickory_resolver::net::NetError>;
+
+/// A one-shot response stream, which is all one HTTP exchange produces.
+struct OnceResponse {
+    future: Option<Pin<Box<dyn Future<Output = ExchangeResult> + Send>>>,
+}
+
+impl futures_core::Stream for OnceResponse {
+    type Item = Result<hickory_resolver::proto::op::DnsResponse, hickory_resolver::net::NetError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.future.as_mut() {
+            None => std::task::Poll::Ready(None),
+            Some(future) => match future.as_mut().poll(cx) {
+                std::task::Poll::Pending => std::task::Poll::Pending,
+                std::task::Poll::Ready(result) => {
+                    self.future = None;
+                    std::task::Poll::Ready(Some(result))
+                }
+            },
+        }
+    }
+}
+
+impl hickory_resolver::net::xfer::DnsHandle for DohHandle {
+    type Response = OnceResponse;
+    type Runtime = hickory_resolver::net::runtime::TokioRuntimeProvider;
+
+    fn send(&self, request: hickory_resolver::proto::op::DnsRequest) -> Self::Response {
+        let handle = self.clone();
+        OnceResponse {
+            future: Some(Box::pin(async move {
+                let body = request
+                    .to_vec()
+                    .map_err(hickory_resolver::net::NetError::from)?;
+                let answer = handle
+                    .exchange(body)
+                    .await
+                    .map_err(hickory_resolver::net::NetError::from)?;
+                hickory_resolver::proto::op::DnsResponse::from_buffer(answer)
+                    .map_err(hickory_resolver::net::NetError::from)
+            })),
+        }
+    }
+}
+
+/// Applies the fail-closed §3.2 record checks to one answer set.
+///
+/// Shared by both backends so the acceptance rule cannot drift between
+/// transports: every record must carry a *secure* proof, and one unvalidated
+/// record poisons the whole answer.
+fn secure_txt(
+    name: &str,
+    answers: &[hickory_resolver::proto::rr::Record],
+) -> Result<ValidatedTxt, NetError> {
+    let mut records = Vec::new();
+    let mut ttl = MAX_TTL;
+    for record in answers {
+        if !record.proof.is_secure() {
+            // Fail closed: one unvalidated record poisons the answer.
+            return Err(NetError::Dns(format!(
+                "{name}: answer is not DNSSEC-secure (proof: {:?})",
+                record.proof
+            )));
+        }
+        ttl = ttl.min(Duration::from_secs(u64::from(record.ttl)));
+        if let hickory_resolver::proto::rr::RData::TXT(txt) = &record.data {
+            // A TXT record is a sequence of character-strings; the record
+            // text is their concatenation.
+            let joined: String = txt
+                .txt_data
+                .iter()
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect();
+            records.push(joined);
+        }
+    }
+    if records.is_empty() {
+        return Err(NetError::Dns(format!("{name}: no TXT records")));
+    }
+    Ok(ValidatedTxt {
+        records,
+        ttl: clamp_ttl(ttl),
+    })
 }
 
 /// A future returning one domain's validated member set.
@@ -532,53 +598,44 @@ mod tests {
     }
 
     #[test]
-    fn doh_endpoints_parse() {
-        let simple = DohEndpoint::parse("https://1.1.1.1/dns-query").unwrap();
-        assert_eq!(simple.host, "1.1.1.1");
-        assert_eq!(simple.port, 443);
-        assert_eq!(simple.path, "/dns-query");
-
-        // The path defaults, the port is honored, IPv6 hosts are bracketed.
-        let bare = DohEndpoint::parse("https://dns.internal.example").unwrap();
-        assert_eq!(bare.path, "/dns-query");
-        let custom = DohEndpoint::parse("https://10.0.0.53:8443/resolve").unwrap();
-        assert_eq!((custom.port, custom.path.as_str()), (8443, "/resolve"));
-        let v6 = DohEndpoint::parse("https://[::1]:8443/dns-query").unwrap();
-        assert_eq!((v6.host.as_str(), v6.port), ("::1", 8443));
-        assert_eq!(DohEndpoint::parse("https://[::1]/q").unwrap().port, 443);
-
-        // Plain http is refused by name, not accepted quietly.
-        let err = DohEndpoint::parse("http://1.1.1.1/dns-query").unwrap_err();
-        assert!(err.to_string().contains("https"), "{err}");
-        assert!(DohEndpoint::parse("https:///dns-query").is_err());
-        assert!(DohEndpoint::parse("https://[::1/q").is_err());
-        assert!(DohEndpoint::parse("https://host:port/q").is_err());
-    }
-
-    #[test]
-    fn doh_literal_hosts_need_no_bootstrap() {
-        let addrs = DohEndpoint::parse("https://9.9.9.9/dns-query")
-            .unwrap()
-            .addrs()
-            .unwrap();
-        assert_eq!(addrs, vec!["9.9.9.9".parse::<std::net::IpAddr>().unwrap()]);
-        // A name bootstraps through the system resolver; localhost resolves
-        // from the hosts file, so this stays offline-safe.
-        let local = DohEndpoint::parse("https://localhost/dns-query")
-            .unwrap()
-            .addrs()
-            .unwrap();
-        assert!(local.iter().all(|ip| ip.is_loopback()), "{local:?}");
+    fn doh_urls_normalize() {
+        let simple = doh_url("https://1.1.1.1").unwrap();
+        assert_eq!(simple.as_str(), "https://1.1.1.1/dns-query");
+        // Explicit ports, paths, schemes, and IPv6 hosts survive verbatim.
+        assert_eq!(
+            doh_url("http://10.0.0.53:8053/resolve").unwrap().as_str(),
+            "http://10.0.0.53:8053/resolve"
+        );
+        assert_eq!(
+            doh_url("http://[::1]:8053").unwrap().as_str(),
+            "http://[::1]:8053/dns-query"
+        );
+        assert_eq!(
+            doh_url("https://dns.internal.example/dns-query")
+                .unwrap()
+                .as_str(),
+            "https://dns.internal.example/dns-query"
+        );
+        let err = doh_url("ftp://1.1.1.1/dns-query").unwrap_err();
+        assert!(err.to_string().contains("https:// or http://"), "{err}");
+        assert!(doh_url("not a url").is_err());
     }
 
     #[tokio::test]
     async fn resolver_options_build_and_fail_closed() {
-        // A DoH resolver builds without touching the network.
-        DnssecResolver::with_options(&ResolverOptions {
-            doh_url: Some("https://127.0.0.1:8053/dns-query".into()),
-            trust_anchor: None,
-        })
-        .unwrap();
+        // The default, an https endpoint, and a plaintext http endpoint all
+        // build without touching the network.
+        DnssecResolver::with_defaults().unwrap();
+        for url in [
+            "https://127.0.0.1:8053/dns-query",
+            "http://127.0.0.1:8053/dns-query",
+        ] {
+            DnssecResolver::with_options(&ResolverOptions {
+                doh_url: Some(url.into()),
+                trust_anchor: None,
+            })
+            .unwrap();
+        }
 
         // A missing or empty trust anchor is refused by name: an anchor set
         // with no keys would validate nothing, forever, quietly.
@@ -606,10 +663,86 @@ mod tests {
         )
         .unwrap();
         DnssecResolver::with_options(&ResolverOptions {
-            doh_url: Some("https://127.0.0.1:8053/dns-query".into()),
+            doh_url: Some("http://127.0.0.1:8053/dns-query".into()),
             trust_anchor: Some(anchor.path().to_path_buf()),
         })
         .unwrap();
+    }
+
+    /// A live exchange against a plaintext endpoint, which must fail closed:
+    /// the transport works — the query arrives, the canned answer returns —
+    /// and the unsigned answer is refused by the in-process validator. This
+    /// is the whole DoH-over-http security argument in one test.
+    #[tokio::test]
+    async fn a_plaintext_endpoint_serves_but_never_bypasses_validation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            // The validator may chase the chain with several queries; answer
+            // each with an unsigned echo until the client gives up.
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body = loop {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break None;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let have = raw.len() - split - 4;
+                        if have >= length {
+                            break Some(raw[split + 4..split + 4 + length].to_vec());
+                        }
+                    }
+                };
+                let Some(query) = body else { continue };
+                // Echo the query back as a NOERROR answer with no records and
+                // no signatures: syntactically a response, cryptographically
+                // nothing.
+                let message = hickory_resolver::proto::op::Message::from_vec(&query)
+                    .unwrap()
+                    .into_response();
+                let reply = message.to_vec().unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n",
+                    reply.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(&reply).await;
+            }
+        });
+
+        let resolver = DnssecResolver::with_options(&ResolverOptions {
+            doh_url: Some(format!("http://127.0.0.1:{port}/dns-query")),
+            trust_anchor: None,
+        })
+        .unwrap();
+        let err = tokio::time::timeout(
+            Duration::from_secs(30),
+            resolver.lookup_txt("cluster.example"),
+        )
+        .await
+        .expect("the lookup must finish, not hang")
+        .expect_err("an unsigned answer must never validate");
+        let text = err.to_string();
+        assert!(
+            !text.contains("connection refused"),
+            "the transport itself must have worked: {text}"
+        );
+        server.abort();
     }
 
     fn record(id: Option<&str>, key: &NodeId) -> String {
