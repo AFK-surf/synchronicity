@@ -214,7 +214,11 @@ impl Node {
     /// Publishing from a wiped database would mint heads every peer rejects,
     /// with nothing on either side saying why. The error names the command that
     /// resolves it.
-    pub(crate) fn ensure_can_publish(&self) -> Result<()> {
+    ///
+    /// Public so that callers which do irreversible work *before* publishing —
+    /// hashing a tree, dropping a space — can refuse before doing it rather
+    /// than after.
+    pub fn ensure_publishable(&self) -> Result<()> {
         let state = self.recovery_state()?;
         if state.in_recovery {
             return Err(EngineError::InRecovery {
@@ -419,7 +423,7 @@ mod tests {
         assert!(!state.in_recovery);
         assert_eq!(state.observed_seq, None);
         assert_eq!(state.next_seq, 1);
-        node.ensure_can_publish().unwrap();
+        node.ensure_publishable().unwrap();
         node.shutdown().await.unwrap();
     }
 
@@ -468,7 +472,7 @@ mod tests {
             .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, now_ns())
             .unwrap();
         assert!(!node.recovery_state().unwrap().in_recovery);
-        node.ensure_can_publish().unwrap();
+        node.ensure_publishable().unwrap();
         node.shutdown().await.unwrap();
     }
 
@@ -500,7 +504,7 @@ mod tests {
 
         assert_eq!(node.next_seq().unwrap(), 1_100);
         assert!(!node.recovery_state().unwrap().in_recovery);
-        node.ensure_can_publish().unwrap();
+        node.ensure_publishable().unwrap();
 
         // An observation below the floor is not a return to recovery: the floor
         // already clears it.

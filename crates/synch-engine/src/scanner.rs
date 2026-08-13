@@ -196,7 +196,13 @@ impl Node {
     }
 
     /// Scans every space and publishes the result as one new root.
+    ///
+    /// The recovery gate (§3.4) is checked *before* the scan, not only at the
+    /// publish: a scan records what it hashed in `local_files`, so a scan whose
+    /// publish is refused would leave the node believing it had already
+    /// published files it never did.
     pub fn scan_and_publish(&self) -> Result<(ScanReport, Option<synch_core::SignedHead>)> {
+        self.ensure_publishable()?;
         let report = self.scan_all()?;
         let head = self.publish(report.staged.clone())?;
         Ok((report, head))

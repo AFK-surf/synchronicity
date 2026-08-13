@@ -333,7 +333,12 @@ impl Node {
     }
 
     /// Removes a space and its published entries.
+    ///
+    /// Staging the removal is half of a publish, so it takes the same recovery
+    /// gate (§3.4): a node that cannot publish must not drop the space either,
+    /// or the unpublish would be lost with it.
     pub fn remove_space(&self, id: &str) -> Result<Vec<StagedChange>> {
+        self.ensure_publishable()?;
         let mut staged = Vec::new();
         let root = self.current_root()?;
         let trie = Trie::new(self.store().as_ref());
@@ -391,7 +396,7 @@ impl Node {
         if staged.is_empty() {
             return Ok(None);
         }
-        self.ensure_can_publish()?;
+        self.ensure_publishable()?;
         let old_root = self.current_root()?;
         let trie = Trie::new(self.store().as_ref());
         let mut root = old_root;

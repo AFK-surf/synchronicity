@@ -449,6 +449,10 @@ async fn dispatch<S: AsyncWrite + Unpin>(
         }
 
         Request::Scan => {
+            // Refuse before hashing rather than after: a scan records what it
+            // hashed, so a scan whose publish is refused would leave the node
+            // believing it had published files it never did (§3.4).
+            node.ensure_publishable()?;
             // Hashing a tree is long and blocking, so it runs off the runtime
             // — the daemon keeps serving other requests — and each space is
             // reported as a Progress frame while the scan is still going.
