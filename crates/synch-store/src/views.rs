@@ -190,6 +190,24 @@ impl Store {
         self.query_entries(&filter, refs.as_slice())
     }
 
+    /// One origin's tombstones whose deletion time is older than `before`
+    /// (§4.2).
+    ///
+    /// The deletion time is the tombstone's own `mtime_ns`, which is set to
+    /// "now" when the scanner notices the path is gone. Always scoped to one
+    /// origin: dropping a tombstone rewrites a trie, and a node only ever
+    /// rewrites its own.
+    pub fn expired_tombstones(&self, origin: &OriginId, before: i64) -> Result<Vec<EntryRow>> {
+        self.query_entries(
+            "WHERE origin_id = ?1 AND kind = ?2 AND mtime_ns < ?3 ORDER BY space, path",
+            params![
+                origin.canonical(),
+                kind_to_int(EntryKind::Tombstone),
+                before
+            ],
+        )
+    }
+
     /// Every space id that any origin has published entries for.
     pub fn known_spaces(&self) -> Result<Vec<String>> {
         let conn = self.conn();
@@ -990,6 +1008,36 @@ mod tests {
         assert!(store.local_file_rows("other").unwrap().is_empty());
         store.remove_local_file("s", "a.txt").unwrap();
         assert!(store.local_file("s", "a.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn expired_tombstones_are_scoped_to_one_origin_and_age() {
+        let (_d, store) = store();
+        let nas = origin("nas");
+        let laptop = origin("laptop");
+        // mtime_ns is the deletion time (§4.2).
+        store
+            .put_entry(&nas, "s", "old", &FileEntry::tombstone(100, 2, None))
+            .unwrap();
+        store
+            .put_entry(&nas, "s", "fresh", &FileEntry::tombstone(900, 3, None))
+            .unwrap();
+        store
+            .put_entry(
+                &nas,
+                "s",
+                "live",
+                &FileEntry::file(1, 100, Hash::new(b"c"), 3),
+            )
+            .unwrap();
+        store
+            .put_entry(&laptop, "s", "theirs", &FileEntry::tombstone(1, 1, None))
+            .unwrap();
+
+        let expired = store.expired_tombstones(&nas, 500).unwrap();
+        assert_eq!(expired.len(), 1, "only the aged tombstone, and only ours");
+        assert_eq!(expired[0].path, "old");
+        assert!(store.expired_tombstones(&nas, 0).unwrap().is_empty());
     }
 
     #[test]

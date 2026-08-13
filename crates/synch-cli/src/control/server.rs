@@ -482,11 +482,16 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             // line below is true by the time the client reads it (§7.1).
             node.stage(report.staged.clone());
             let head = node.flush_staged().await?;
-            out.line(format!(
+            let mut summary = format!(
                 "hashed {} · unchanged {} · deleted {} · ignored {}",
                 report.hashed, report.unchanged, report.deleted, report.ignored
-            ))
-            .await?;
+            );
+            if report.expired > 0 {
+                // Only when there is something to say: tombstone expiry is
+                // rare and worth naming when it happens (§4.2).
+                summary.push_str(&format!(" · expired {}", report.expired));
+            }
+            out.line(summary).await?;
             for (path, reason) in &report.skipped {
                 out.progress(format!("skipped {path}: {reason}")).await?;
             }

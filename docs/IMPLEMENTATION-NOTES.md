@@ -26,6 +26,28 @@ per-session rather than global.
 
 ## Differences in detail
 
+### §4.2 — when a tombstone's clock starts, and who runs it down
+
+Tombstones are "retained for `tombstone_ttl` (default 90 days), then dropped in
+a later root". The design does not say what the age of a tombstone is measured
+from, and this implementation uses the tombstone's own `mtime_ns` — the field
+§4.2 calls "origin's observed mtime", which for a tombstone the scanner sets to
+the moment it noticed the path was gone. So the clock starts at the deletion,
+not at the head that carried it, and re-publishing an unchanged tombstone does
+not restart it.
+
+Expiry stages the trie-key removals and lets the publisher (§7.1) turn them
+into one root, so retiring a thousand tombstones costs one head rather than a
+thousand. It runs in two places: the periodic maintenance pass, beside binding
+expiry and GC, and every scan — including an explicit `synch scan`, which is
+how an operator forces it, and which reports `expired N` when there was
+anything to retire.
+
+Only this node's own tombstones are ever considered. A replicated trie belongs
+to its origin and is reproduced whole; dropping a key from it would be
+publishing someone else's view, which §8 forbids, so the query is scoped to the
+node's own origin rather than filtered afterwards.
+
 ### §7.1 — which callers wait for the batch, and which flush it
 
 The publisher batches staged changes into one root on either trigger the design

@@ -131,7 +131,8 @@ impl Node {
         }
     }
 
-    /// Runs the periodic maintenance loop: GC and binding expiry (§5.4, §3.2).
+    /// Runs the periodic maintenance loop: GC, binding expiry, and tombstone
+    /// expiry (§5.4, §3.2, §4.2).
     pub async fn run_maintenance(&self, shutdown: impl std::future::Future<Output = ()>) {
         let shutdown = std::pin::pin!(shutdown);
         let mut shutdown = shutdown;
@@ -148,11 +149,15 @@ impl Node {
     }
 
     /// One maintenance pass, exposed so tests and `synch doctor` can drive it.
+    ///
+    /// Tombstones past `tombstone_ttl` are *staged* here rather than published:
+    /// the publisher turns them into one head like any other batch (§4.2).
     pub fn maintenance_pass(&self) -> Result<synch_store::GcStats> {
         let expired = self.store().expire_bindings(now_ns())?;
         if expired > 0 {
             tracing::info!(expired, "dns bindings lapsed");
         }
+        self.expire_tombstones()?;
         Ok(self.store().gc_trie()?)
     }
 }

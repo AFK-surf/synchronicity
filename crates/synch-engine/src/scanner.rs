@@ -31,6 +31,8 @@ pub struct ScanReport {
     pub deleted: usize,
     /// Paths skipped by ignore rules.
     pub ignored: usize,
+    /// Tombstones dropped because they outlived `tombstone_ttl` (§4.2).
+    pub expired: usize,
     /// Paths skipped because they could not be indexed, with the reason.
     pub skipped: Vec<(String, String)>,
     /// The changes to publish.
@@ -48,6 +50,7 @@ impl ScanReport {
         self.unchanged += other.unchanged;
         self.deleted += other.deleted;
         self.ignored += other.ignored;
+        self.expired += other.expired;
         self.skipped.extend(other.skipped);
         self.staged.extend(other.staged);
     }
@@ -190,10 +193,49 @@ impl Node {
             on_space(&space.id, &one);
             report.merge(one);
         }
+        // A scan is also where an operator can force tombstone expiry (§4.2):
+        // the removals ride the same batch as everything else the scan found.
+        let expired = self.expired_tombstone_changes()?;
+        report.expired = expired.len();
+        report.staged.extend(expired);
         if !report.staged.is_empty() {
             report.staged.push(self.manifest_change()?);
         }
         Ok(report)
+    }
+
+    /// The trie-key removals that retire this node's aged-out tombstones
+    /// (§4.2).
+    ///
+    /// A tombstone says "deleted at seq N" rather than "never existed", which
+    /// is worth carrying for a while and not forever: after `tombstone_ttl`
+    /// (default 90 days) the key is removed from a later root and the path goes
+    /// back to reading as absent. Only this node's own tombstones are ever
+    /// considered — a replicated trie belongs to its origin, and this node
+    /// cannot rewrite it.
+    pub fn expired_tombstone_changes(&self) -> Result<Vec<StagedChange>> {
+        let ttl = self.config().tombstone_ttl.as_nanos().min(i64::MAX as u128) as i64;
+        let cutoff = now_ns().saturating_sub(ttl);
+        let mut changes = Vec::new();
+        for row in self.store().expired_tombstones(self.origin(), cutoff)? {
+            changes.push((file_key(&row.space, &row.path)?, None));
+        }
+        Ok(changes)
+    }
+
+    /// Stages the removal of this node's aged-out tombstones (§4.2).
+    ///
+    /// Staged rather than published: expiry flows through the ordinary
+    /// publisher, so it costs one head like any other batch. Returns how many
+    /// tombstones were staged for removal.
+    pub fn expire_tombstones(&self) -> Result<usize> {
+        let changes = self.expired_tombstone_changes()?;
+        let expired = changes.len();
+        if expired > 0 {
+            self.stage(changes);
+            tracing::info!(expired, "staging expired tombstones for removal");
+        }
+        Ok(expired)
     }
 
     /// Scans every space and publishes the result as one new root, without
@@ -578,6 +620,187 @@ mod tests {
             .list_entries(Some(node.origin()), "media", "", None, None)
             .unwrap()
             .is_empty());
+        node.shutdown().await.unwrap();
+    }
+
+    /// A node whose tombstone TTL is set for a test rather than for a cluster.
+    async fn node_with_ttl(
+        ttl: std::time::Duration,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Node) {
+        let data = tempfile::tempdir().unwrap();
+        let space = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        let mut config = NodeConfig::loopback(data.path());
+        config.tombstone_ttl = ttl;
+        let node = Node::open(config).await.unwrap();
+        node.add_space("media", space.path()).unwrap();
+        (data, space, node)
+    }
+
+    /// Rewrites a tombstone's deletion time, which is what a tombstone 90 days
+    /// old looks like without waiting 90 days.
+    fn backdate_tombstone(node: &Node, path: &str, mtime_ns: i64) {
+        let row = node
+            .store()
+            .entry(node.origin(), "media", path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.kind, EntryKind::Tombstone);
+        node.store()
+            .put_entry(
+                node.origin(),
+                "media",
+                path,
+                &FileEntry::tombstone(mtime_ns, row.seq, row.prev),
+            )
+            .unwrap();
+    }
+
+    fn in_root(node: &Node, root: Hash, path: &str) -> bool {
+        Trie::new(node.store().as_ref())
+            .get(root, &file_key("media", path).unwrap())
+            .unwrap()
+            .is_some()
+    }
+
+    /// §4.2: tombstones are retained for `tombstone_ttl`, then dropped in a
+    /// later root — and only the aged ones are.
+    #[tokio::test]
+    async fn an_expired_tombstone_leaves_the_next_root() {
+        let (_d, space, node) = node_with_ttl(std::time::Duration::from_secs(3600)).await;
+        std::fs::write(space.path().join("old.txt"), b"old").unwrap();
+        std::fs::write(space.path().join("recent.txt"), b"recent").unwrap();
+        node.scan_and_publish().unwrap();
+
+        std::fs::remove_file(space.path().join("old.txt")).unwrap();
+        std::fs::remove_file(space.path().join("recent.txt")).unwrap();
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.deleted, 2);
+        assert_eq!(report.expired, 0, "both tombstones are brand new");
+        assert!(in_root(&node, head.unwrap().root, "old.txt"));
+
+        // One of them is now older than the TTL; the other is not.
+        backdate_tombstone(&node, "old.txt", now_ns() - 2 * 3600 * 1_000_000_000);
+
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.expired, 1);
+        let root = head
+            .expect("expiry costs one head like any other batch")
+            .root;
+        assert!(
+            !in_root(&node, root, "old.txt"),
+            "the aged key must be gone"
+        );
+        assert!(in_root(&node, root, "recent.txt"), "the fresh one stays");
+        assert!(node
+            .store()
+            .entry(node.origin(), "media", "old.txt")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "recent.txt")
+                .unwrap()
+                .unwrap()
+                .kind,
+            EntryKind::Tombstone
+        );
+
+        // Nothing is left to expire, so a further scan mints nothing.
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.expired, 0);
+        assert!(head.is_none());
+        node.shutdown().await.unwrap();
+    }
+
+    /// Expiring a tombstone is not the same as forbidding the path: creating it
+    /// again republishes it as an ordinary entry.
+    #[tokio::test]
+    async fn a_path_can_be_re_created_after_its_tombstone_expires() {
+        let (_d, space, node) = node_with_ttl(std::time::Duration::from_secs(3600)).await;
+        std::fs::write(space.path().join("a.txt"), b"first").unwrap();
+        node.scan_and_publish().unwrap();
+        std::fs::remove_file(space.path().join("a.txt")).unwrap();
+        node.scan_and_publish().unwrap();
+        backdate_tombstone(&node, "a.txt", now_ns() - 2 * 3600 * 1_000_000_000);
+        node.scan_and_publish().unwrap();
+        assert!(node
+            .store()
+            .entry(node.origin(), "media", "a.txt")
+            .unwrap()
+            .is_none());
+
+        std::fs::write(space.path().join("a.txt"), b"again").unwrap();
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.hashed, 1);
+        let root = head.unwrap().root;
+        assert!(in_root(&node, root, "a.txt"));
+        let entry = node
+            .store()
+            .entry(node.origin(), "media", "a.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.kind, EntryKind::File);
+        assert_eq!(entry.content, Some(Hash::new(b"again")));
+        // The lineage starts over: what it replaced is no longer published.
+        assert_eq!(entry.prev, None);
+        node.shutdown().await.unwrap();
+    }
+
+    /// The maintenance path: expiry stages into the publisher, so it costs one
+    /// head like any other batch and needs no scan of its own.
+    #[tokio::test]
+    async fn maintenance_stages_expiry_through_the_publisher() {
+        // A TTL of zero makes every tombstone expired the moment it exists.
+        let (_d, space, node) = node_with_ttl(std::time::Duration::ZERO).await;
+        std::fs::write(space.path().join("a.txt"), b"x").unwrap();
+        node.scan_and_publish().unwrap();
+        std::fs::remove_file(space.path().join("a.txt")).unwrap();
+        node.scan_and_publish().unwrap();
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "a.txt")
+                .unwrap()
+                .unwrap()
+                .kind,
+            EntryKind::Tombstone
+        );
+
+        assert_eq!(node.publisher().pending(), 0);
+        node.maintenance_pass().unwrap();
+        assert_eq!(node.publisher().pending(), 1, "staged, not published");
+
+        let head = node.flush_staged().await.unwrap().unwrap();
+        assert!(!in_root(&node, head.root, "a.txt"));
+        assert!(node
+            .store()
+            .entry(node.origin(), "media", "a.txt")
+            .unwrap()
+            .is_none());
+        node.shutdown().await.unwrap();
+    }
+
+    /// A replicated trie belongs to its origin: expiry never touches it.
+    #[tokio::test]
+    async fn expiry_never_touches_another_origin() {
+        let (_d, _space, node) = node_with_ttl(std::time::Duration::ZERO).await;
+        let peer = synch_core::OriginId::named("laptop", "x.example").unwrap();
+        node.store()
+            .put_entry(
+                &peer,
+                "media",
+                "theirs.txt",
+                &FileEntry::tombstone(0, 1, None),
+            )
+            .unwrap();
+
+        assert!(node.expired_tombstone_changes().unwrap().is_empty());
+        assert_eq!(node.expire_tombstones().unwrap(), 0);
+        assert!(node
+            .store()
+            .entry(&peer, "media", "theirs.txt")
+            .unwrap()
+            .is_some());
         node.shutdown().await.unwrap();
     }
 
