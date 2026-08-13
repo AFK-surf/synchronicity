@@ -763,3 +763,55 @@ async fn a_file_and_a_symlink_at_one_path_diverge_on_stable_mtimes() {
     nas.node.shutdown().await.unwrap();
     laptop.node.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_fetch_falls_back_to_provider_hints_when_no_local_ad_covers_a_root() {
+    // §5.1: a node holding a root whose ads it has not replicated yet — a cold
+    // cache, or an origin just admitted — asks peers who holds it. Hints are
+    // unverified, and content is hash-verified regardless.
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    introduce(&[&nas, &laptop]);
+
+    let payload = big_payload(300_000);
+    nas.node.add_space("media", nas.space.path()).unwrap();
+    std::fs::write(nas.space.path().join("big.bin"), &payload).unwrap();
+    nas.node.scan_and_publish().unwrap();
+
+    // The laptop learns the NAS's head, and with it the `b:` ad, the ordinary
+    // way.
+    laptop
+        .node
+        .sync_with_peer(&nas.node.node_id())
+        .await
+        .unwrap();
+    let root = laptop
+        .node
+        .store()
+        .entry(nas.node.origin(), "media", "big.bin")
+        .unwrap()
+        .unwrap()
+        .content
+        .unwrap();
+
+    // Now drop every provider row the laptop holds for that object: it knows
+    // the head and the root, but no ad says who can serve it.
+    laptop
+        .node
+        .store()
+        .delete_provider(&root, nas.node.origin())
+        .unwrap();
+    assert!(laptop.node.providers_for(&root, 0, 1).unwrap().is_empty());
+
+    // The fetch asks peers, learns the hint, and completes.
+    let report = laptop
+        .node
+        .fetch_all(&root, payload.len() as u64)
+        .await
+        .unwrap();
+    assert!(report.complete, "{report:?}");
+    assert_eq!(laptop.node.store().read_all(&root).unwrap(), payload);
+
+    nas.node.shutdown().await.unwrap();
+    laptop.node.shutdown().await.unwrap();
+}

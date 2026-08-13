@@ -757,19 +757,30 @@ mod tests {
         rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
     }
 
-    /// Drops SQL comments and collapses whitespace, so two spellings of the
-    /// same declaration compare equal.
+    /// Drops SQL comments and normalizes layout, so two spellings of the same
+    /// declaration compare equal.
+    ///
+    /// Whitespace *and* spacing around `(`, `)` and `,` are normalized: none of
+    /// it is semantic, and a schema written across several lines in one place
+    /// and on one line in another has to compare equal or the comparison is
+    /// about formatting rather than about shape.
     fn normalize_ddl(sql: &str) -> String {
-        sql.lines()
+        let stripped: String = sql
+            .lines()
             .map(|line| match line.find("--") {
                 Some(idx) => &line[..idx],
                 None => line,
             })
             .collect::<Vec<_>>()
-            .join(" ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
+            .join(" ");
+        let spaced: String = stripped
+            .chars()
+            .flat_map(|c| match c {
+                '(' | ')' | ',' => vec![' ', c, ' '],
+                other => vec![other],
+            })
+            .collect();
+        spaced.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// The chain is the only path to a database, and what it produces is what
@@ -792,6 +803,67 @@ mod tests {
         );
         // And the chain leaves nothing of the tables it retired behind.
         assert!(!objects(&chained).iter().any(|(_, name, _)| name == "want"));
+    }
+
+    /// The `sql` block of `DESIGN.md` §10 — the schema as the design document
+    /// literally states it.
+    ///
+    /// Read from the file rather than copied, because a copy is exactly the
+    /// drift this test exists to catch.
+    fn design_schema() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("DESIGN.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let mut blocks: Vec<String> = Vec::new();
+        let mut current: Option<Vec<&str>> = None;
+        for line in text.lines() {
+            match (&mut current, line.trim_end()) {
+                (None, "```sql") => current = Some(Vec::new()),
+                (Some(body), "```") => {
+                    blocks.push(body.join("\n"));
+                    current = None;
+                }
+                (Some(body), line) => body.push(line),
+                (None, _) => {}
+            }
+        }
+        assert_eq!(
+            blocks.len(),
+            1,
+            "DESIGN.md should hold exactly one sql block, the §10 schema"
+        );
+        blocks.pop().expect("the §10 sql block")
+    }
+
+    /// `FINAL_SCHEMA` is the design document's §10 DDL, and this is what makes
+    /// that a fact rather than an intention.
+    ///
+    /// The chain is already checked against `FINAL_SCHEMA`; without this the
+    /// pair could drift from the document they both claim to implement — which
+    /// is how `observed_heads` lost a column in one place and kept it in the
+    /// other. Both sides are executed and compared through `sqlite_master`, so
+    /// the comparison is over what SQLite makes of the DDL rather than over two
+    /// spellings of it, and a §10 block that does not even parse fails here.
+    #[test]
+    fn the_design_document_and_the_final_schema_agree() {
+        let documented = Connection::open_in_memory().unwrap();
+        documented
+            .execute_batch(crate::schema::FINAL_SCHEMA)
+            .unwrap();
+
+        let designed = Connection::open_in_memory().unwrap();
+        designed
+            .execute_batch(&design_schema())
+            .expect("the §10 sql block must be executable DDL");
+
+        assert_eq!(
+            objects(&designed),
+            objects(&documented),
+            "DESIGN.md §10 and FINAL_SCHEMA describe different databases"
+        );
     }
 
     /// A database at the version each historical step left it at upgrades to
@@ -931,6 +1003,33 @@ mod tests {
                 |_| Ok(())
             )
             .is_ok());
+    }
+
+    #[test]
+    fn a_v6_database_upgrades_with_its_observations() {
+        // v7 records which peer claimed an observed head (§3.4); rows written
+        // before it simply do not know.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = database_at(dir.path(), 6);
+            conn.execute(
+                "INSERT INTO observed_heads (origin_id, seq, root, complete, observed_at)
+                 VALUES ('nas@x.example', 42, zeroblob(32), 1, 7)",
+                params![],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        let observed = store.observed_heads().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].seq, 42);
+        assert_eq!(observed[0].observed_at, 7);
+        assert!(observed[0].complete);
+        assert_eq!(
+            observed[0].claimed_by, None,
+            "an observation from before the column knows no claimant"
+        );
     }
 
     /// A step that fails takes its whole transaction with it, stamp included,

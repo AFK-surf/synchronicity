@@ -78,7 +78,7 @@ impl ProtocolHandler for MptProtocol {
         let _ = self.store().record_peer_seen(&remote, None, now);
 
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-            if let Err(e) = self.handle_stream(&mut send, &mut recv).await {
+            if let Err(e) = self.handle_stream(remote, &mut send, &mut recv).await {
                 tracing::debug!(peer = %remote.fmt_short(), error = %e, "mpt stream ended");
                 let _ = write_frame(
                     &mut send,
@@ -97,6 +97,7 @@ impl ProtocolHandler for MptProtocol {
 impl MptProtocol {
     async fn handle_stream(
         &self,
+        peer: NodeId,
         send: &mut iroh::endpoint::SendStream,
         recv: &mut iroh::endpoint::RecvStream,
     ) -> Result<(), NetError> {
@@ -111,7 +112,8 @@ impl MptProtocol {
                 // A dialing peer's summaries are as good an observation as the
                 // ones we collect by dialing out, and a node in recovery is
                 // more likely to be called than to be calling (§3.4).
-                self.syncer.observe_summaries(&heads, now_ns())?;
+                self.syncer
+                    .observe_summaries_from(Some(peer), &heads, now_ns())?;
                 let ours = self.syncer.local_summaries()?;
                 write_frame(
                     send,

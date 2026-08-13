@@ -411,6 +411,7 @@ mod tests {
                 42,
                 &synch_core::Hash([7u8; 32]),
                 true,
+                None,
                 synch_core::now_ns(),
             )
             .unwrap();

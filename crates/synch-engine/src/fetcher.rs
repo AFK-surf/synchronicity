@@ -1,6 +1,8 @@
 //! Content fetching: provider resolution, ranking, and verified range reads
 //! (§6.3, §6.4).
 
+use std::future::Future;
+
 use synch_core::{group_count, groups_for_byte_range, now_ns, ChunkRanges, Hash, OriginId};
 use synch_store::VersionPolicy;
 
@@ -59,6 +61,82 @@ pub struct FetchReport {
     pub providers_tried: usize,
     /// True if the whole wanted range is now present locally.
     pub complete: bool,
+}
+
+/// Splits a set of groups into `parts` contiguous shares of roughly equal size.
+///
+/// This is what makes `fetch_fanout` mean something: without it, the first
+/// provider asked for a whole object claims all of it and the others have
+/// nothing left to do. Contiguous shares rather than interleaved ones, because
+/// a bao slice over one span is cheaper to encode and verify than one over
+/// many.
+fn split_ranges(ranges: &ChunkRanges, parts: usize) -> Vec<ChunkRanges> {
+    let parts = parts.max(1) as u64;
+    let total = ranges.count();
+    if total == 0 {
+        return vec![ChunkRanges::empty(); parts as usize];
+    }
+    let mut out = Vec::with_capacity(parts as usize);
+    let mut consumed = 0u64;
+    let mut cursor = ranges.ranges.iter().copied().peekable();
+    let mut carry: Option<synch_core::GroupRange> = None;
+    for part in 0..parts {
+        // Each share ends at its proportional boundary, so rounding never
+        // leaves a group unassigned: the last share takes whatever is left.
+        let boundary = if part + 1 == parts {
+            total
+        } else {
+            total * (part + 1) / parts
+        };
+        let mut share = Vec::new();
+        while consumed < boundary {
+            let range = match carry.take().or_else(|| cursor.next()) {
+                Some(range) => range,
+                None => break,
+            };
+            let len = range.end - range.start;
+            let want = boundary - consumed;
+            if len <= want {
+                share.push(range);
+                consumed += len;
+            } else {
+                let split = range.start + want;
+                share.push(synch_core::GroupRange::new(range.start, split));
+                carry = Some(synch_core::GroupRange::new(split, range.end));
+                consumed = boundary;
+            }
+        }
+        out.push(ChunkRanges::from_ranges(share));
+    }
+    out
+}
+
+/// Runs several futures to completion together, collecting their outputs.
+///
+/// A hand-rolled join rather than a `futures` dependency: this is the only
+/// place in the workspace that needs one, and it needs the simplest possible
+/// shape — no cancellation, no early return, every branch polled to the end.
+async fn futures_join<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+    let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut out = Vec::with_capacity(pending.len());
+    std::future::poll_fn(move |cx| {
+        let mut index = 0;
+        while index < pending.len() {
+            match pending[index].as_mut().poll(cx) {
+                std::task::Poll::Ready(value) => {
+                    out.push(value);
+                    pending.remove(index);
+                }
+                std::task::Poll::Pending => index += 1,
+            }
+        }
+        if pending.is_empty() {
+            std::task::Poll::Ready(std::mem::take(&mut out))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 impl Node {
@@ -147,7 +225,14 @@ impl Node {
         self.fetch_groups(root, size, &wanted).await
     }
 
-    /// Fetches specific chunk groups.
+    /// Fetches specific chunk groups (§6.4).
+    ///
+    /// The wanted ranges are split across up to `fetch_fanout` providers and
+    /// those requests run concurrently, which is what the fanout is for: three
+    /// peers each serving a third of a large object beats one peer serving all
+    /// of it. Failures do not end the fetch — the surviving ranges go back into
+    /// the pool and the next batch of candidates is tried, so a fourth provider
+    /// that holds what the first three did not is still reached.
     pub async fn fetch_groups(
         &self,
         root: &Hash,
@@ -161,26 +246,75 @@ impl Node {
             return Ok(report);
         }
 
-        let byte_end = size;
-        let providers = self.providers_for(root, 0, byte_end.max(1))?;
-        for provider in providers.iter().take(self.config().fetch_fanout.max(1)) {
+        let mut providers = self.providers_for(root, 0, size.max(1))?;
+        if providers.is_empty() {
+            // No local ad covers this root — a cold cache, or an origin just
+            // admitted whose ads have not replicated yet. Peers may know who
+            // holds it, and a hint costs at most a wasted dial because content
+            // is hash-verified regardless (§5.1).
+            providers = self.ask_peers_for_providers(root, size).await?;
+        }
+
+        let fanout = self.config().fetch_fanout.max(1);
+        let mut candidates = providers.into_iter();
+        loop {
             if remaining.is_empty() {
                 break;
             }
-            let ask = remaining.intersect(&provider.claims);
-            if ask.is_empty() {
-                continue;
-            }
-            report.providers_tried += 1;
-            match self.fetch_from(provider, root, size, &ask).await {
-                Ok(got) => {
-                    remaining = remaining.difference(&got);
-                    report.fetched = report.fetched.union(&got);
+            // One batch: up to `fanout` providers that can help with what is
+            // still missing.
+            let mut chosen = Vec::new();
+            for provider in candidates.by_ref() {
+                if remaining.intersect(&provider.claims).is_empty() {
+                    continue;
                 }
-                Err(e) => {
-                    // Re-plan on provider failure: a peer that cannot help is
-                    // simply skipped, and the next candidate is tried.
-                    tracing::debug!(origin = %provider.origin, error = %e, "provider failed");
+                chosen.push(provider);
+                if chosen.len() >= fanout {
+                    break;
+                }
+            }
+            if chosen.is_empty() {
+                break;
+            }
+
+            // Split what is missing into one contiguous share per provider,
+            // then narrow each share to what that provider actually claims.
+            // Anything a provider does not claim simply stays in `remaining`
+            // and is offered to the next batch.
+            let shares = split_ranges(&remaining, chosen.len());
+            let batch: Vec<(Provider, ChunkRanges)> = chosen
+                .into_iter()
+                .zip(shares)
+                .map(|(provider, share)| {
+                    let ask = share.intersect(&provider.claims);
+                    (provider, ask)
+                })
+                .filter(|(_, ask)| !ask.is_empty())
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
+            report.providers_tried += batch.len();
+
+            let results = futures_join(batch.iter().map(|(provider, ask)| async move {
+                (
+                    provider.origin.clone(),
+                    self.fetch_from(provider, root, size, ask).await,
+                )
+            }))
+            .await;
+            for (origin, result) in results {
+                match result {
+                    Ok(got) => {
+                        remaining = remaining.difference(&got);
+                        report.fetched = report.fetched.union(&got);
+                    }
+                    Err(e) => {
+                        // A peer that cannot help is skipped and its slice
+                        // stays in `remaining`, so the next batch offers it to
+                        // whoever comes after.
+                        tracing::debug!(origin = %origin, error = %e, "provider failed");
+                    }
                 }
             }
         }
@@ -190,6 +324,46 @@ impl Node {
         }
         report.complete = wanted.difference(&self.local_groups(root)?).is_empty();
         Ok(report)
+    }
+
+    /// Asks trusted peers who holds an object, for roots no local ad covers
+    /// (§5.1 `FindProviders`).
+    ///
+    /// Hints are unverified: they are fed back through the ordinary ranking so
+    /// a wrong one costs a dial and nothing else, and every byte is still
+    /// checked against the object root.
+    async fn ask_peers_for_providers(&self, root: &Hash, size: u64) -> Result<Vec<Provider>> {
+        let mut learned = 0;
+        for peer in self.dialable_peers()? {
+            let addr = self
+                .peer_addr(&peer)?
+                .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
+            let client = match self.net().connect_mpt(addr).await {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
+                    continue;
+                }
+            };
+            let ads = match client.find_providers(*root).await {
+                Ok(ads) => ads,
+                Err(e) => {
+                    tracing::debug!(peer = %peer.fmt_short(), error = %e, "provider hint failed");
+                    continue;
+                }
+            };
+            for (origin, ad) in ads {
+                if &origin == self.origin() {
+                    continue;
+                }
+                self.store().put_provider(root, &origin, &ad)?;
+                learned += 1;
+            }
+        }
+        if learned > 0 {
+            tracing::debug!(hints = learned, "learned providers from peers");
+        }
+        self.providers_for(root, 0, size.max(1))
     }
 
     async fn fetch_from(
@@ -502,5 +676,111 @@ mod tests {
                 .unwrap(),
             &payload[49_990..]
         );
+    }
+
+    #[test]
+    fn ranges_split_into_contiguous_shares() {
+        let all = ChunkRanges::single(0, 9);
+        let shares = split_ranges(&all, 3);
+        assert_eq!(shares.len(), 3);
+        assert_eq!(shares[0], ChunkRanges::single(0, 3));
+        assert_eq!(shares[1], ChunkRanges::single(3, 6));
+        assert_eq!(shares[2], ChunkRanges::single(6, 9));
+        // Nothing is lost and nothing overlaps.
+        assert_eq!(shares.iter().map(|s| s.count()).sum::<u64>(), 9);
+
+        // A ragged split gives the remainder to the last share.
+        let shares = split_ranges(&ChunkRanges::single(0, 10), 3);
+        assert_eq!(shares.iter().map(|s| s.count()).sum::<u64>(), 10);
+        assert_eq!(shares[2], ChunkRanges::single(6, 10));
+
+        // Shares cross range boundaries without dropping anything.
+        let split = ChunkRanges::from_ranges([
+            synch_core::GroupRange::new(0, 2),
+            synch_core::GroupRange::new(10, 14),
+        ]);
+        let shares = split_ranges(&split, 2);
+        assert_eq!(shares.iter().map(|s| s.count()).sum::<u64>(), 6);
+        assert_eq!(
+            shares[0].union(&shares[1]),
+            split,
+            "the shares reassemble into the original"
+        );
+
+        // Degenerate cases stay well-defined.
+        assert_eq!(split_ranges(&ChunkRanges::empty(), 3).len(), 3);
+        assert_eq!(split_ranges(&all, 1)[0], all);
+    }
+
+    #[tokio::test]
+    async fn a_fetch_keeps_going_past_the_first_fanout_candidates() {
+        // §6.4: giving up after `fetch_fanout` candidates would strand a fetch
+        // whose fourth-ranked provider is the one that can actually serve it.
+        let (_d, node) = node().await;
+        let payload = vec![9u8; 100_000];
+        let root = synch_core::Hash::new(&payload);
+        let size = payload.len() as u64;
+
+        // Three providers that advertise the object and cannot be dialed, all
+        // ranked ahead of the fourth because they have measured latencies.
+        for (i, name) in ["ghost-a", "ghost-b", "ghost-c"].iter().enumerate() {
+            let (origin, key) = trust(&node, name);
+            node.store()
+                .put_provider(&root, &origin, &BlobAd::complete(size))
+                .unwrap();
+            node.store()
+                .record_peer_sync(&key, 0, (i as i64 + 1) * 10)
+                .unwrap();
+        }
+
+        // The fourth is a real node that holds the bytes.
+        let holder_dir = tempfile::tempdir().unwrap();
+        let holder_origin = OriginId::named("holder", "x.example").unwrap();
+        Node::init(holder_dir.path(), Some(holder_origin.clone())).unwrap();
+        let holder = Node::open(NodeConfig::loopback(holder_dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            holder.store().ingest_bytes(&payload, now_ns()).unwrap(),
+            root
+        );
+        for (here, there, origin) in [
+            (&node, &holder, &holder_origin),
+            (&holder, &node, node.origin()),
+        ] {
+            here.store()
+                .put_binding(&Binding {
+                    origin: origin.clone(),
+                    node_id: there.node_id(),
+                    source: BindingSource::Static,
+                    domain: None,
+                    note: None,
+                    added_at: 0,
+                    expires_at: None,
+                })
+                .unwrap();
+            here.remember_peer(&there.net().direct_addr()).unwrap();
+        }
+        node.store()
+            .put_provider(&root, &holder_origin, &BlobAd::complete(size))
+            .unwrap();
+
+        let ranked = node.providers_for(&root, 0, size).unwrap();
+        assert_eq!(ranked.len(), 4);
+        assert_eq!(
+            ranked[3].origin, holder_origin,
+            "the one that works is ranked last"
+        );
+
+        let report = node.fetch_all(&root, size).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(
+            report.providers_tried > node.config().fetch_fanout,
+            "the fetch must look past its first batch: {report:?}"
+        );
+        assert_eq!(node.store().read_all(&root).unwrap(), payload);
+
+        holder.shutdown().await.unwrap();
+        node.shutdown().await.unwrap();
     }
 }

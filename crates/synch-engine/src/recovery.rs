@@ -59,6 +59,14 @@ pub struct RecoveryState {
     pub observed_seq: Option<u64>,
     /// The root advertised at that seq, for the operator to recognize.
     pub observed_root: Option<Hash>,
+    /// Which peer claimed that seq, when it is known (§3.4).
+    ///
+    /// Detection rests on peers' unauthenticated summaries — deliberately,
+    /// since the true heads are signed by the lost key and cannot validate — so
+    /// within the §12 trust stance any member could assert a huge seq and hold
+    /// a fresh node in recovery. The attribution is what lets an operator judge
+    /// the claim rather than merely obey it.
+    pub observed_by: Option<NodeId>,
     /// The seq of this node's own complete head, if it holds one.
     pub own_seq: Option<u64>,
     /// The durable publishing floor, once `synch recover` has set one.
@@ -203,6 +211,7 @@ impl Node {
             in_recovery,
             observed_seq: observed.as_ref().map(|o| o.seq),
             observed_root: observed.as_ref().map(|o| o.root),
+            observed_by: observed.as_ref().and_then(|o| o.claimed_by),
             own_seq,
             floor: self.store().publish_floor()?,
             next_seq,
@@ -437,6 +446,7 @@ mod tests {
                 900,
                 &Hash([3u8; 32]),
                 true,
+                None,
                 now_ns(),
             )
             .unwrap();
@@ -448,7 +458,7 @@ mod tests {
     async fn an_observation_for_our_own_origin_blocks_publishing() {
         let (_d, node) = node(nas()).await;
         node.store()
-            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, now_ns())
+            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, None, now_ns())
             .unwrap();
 
         let state = node.recovery_state().unwrap();
@@ -469,7 +479,7 @@ mod tests {
         let (_d, node) = node(nas()).await;
         node.publish(&[staged_file()]).unwrap().unwrap();
         node.store()
-            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, now_ns())
+            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, None, now_ns())
             .unwrap();
         assert!(!node.recovery_state().unwrap().in_recovery);
         node.ensure_publishable().unwrap();
@@ -482,7 +492,7 @@ mod tests {
     async fn recover_sets_the_floor_above_every_observation() {
         let (_d, node) = node(nas()).await;
         node.store()
-            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, now_ns())
+            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, None, now_ns())
             .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -509,13 +519,13 @@ mod tests {
         // An observation below the floor is not a return to recovery: the floor
         // already clears it.
         node.store()
-            .record_observed_head(node.origin(), 200, &Hash([2u8; 32]), true, now_ns())
+            .record_observed_head(node.origin(), 200, &Hash([2u8; 32]), true, None, now_ns())
             .unwrap();
         assert!(!node.recovery_state().unwrap().in_recovery);
 
         // One above it is: publishing at the floor would now collide.
         node.store()
-            .record_observed_head(node.origin(), 5_000, &Hash([3u8; 32]), true, now_ns())
+            .record_observed_head(node.origin(), 5_000, &Hash([3u8; 32]), true, None, now_ns())
             .unwrap();
         assert!(node.recovery_state().unwrap().in_recovery);
         node.shutdown().await.unwrap();
@@ -568,7 +578,7 @@ mod tests {
     async fn a_dropped_progress_receiver_interrupts_the_quiesce() {
         let (_d, node) = node(nas()).await;
         node.store()
-            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, now_ns())
+            .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, None, now_ns())
             .unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(rx);
@@ -698,5 +708,32 @@ mod tests {
             ..update
         };
         assert!(none.to_string().contains("highest seq seen none"));
+    }
+
+    #[tokio::test]
+    async fn recovery_state_names_the_peer_that_claimed_the_seq() {
+        // §3.4: the claim is a peer's unverified summary, so the operator's
+        // judgement depends on knowing whose it is.
+        let (_d, node) = node(nas()).await;
+        let claimant = iroh_base::SecretKey::generate().public();
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                900,
+                &Hash([4u8; 32]),
+                true,
+                Some(&claimant),
+                now_ns(),
+            )
+            .unwrap();
+
+        let state = node.recovery_state().unwrap();
+        assert!(state.in_recovery);
+        assert_eq!(state.observed_seq, Some(900));
+        assert_eq!(state.observed_by, Some(claimant));
+
+        // And the doctor report carries it through.
+        assert_eq!(node.doctor().unwrap().recovery.observed_by, Some(claimant));
+        node.shutdown().await.unwrap();
     }
 }

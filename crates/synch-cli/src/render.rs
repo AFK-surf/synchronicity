@@ -209,20 +209,40 @@ pub fn doctor(node: &Node) -> Lines {
                 .map(|seq| seq.to_string())
                 .unwrap_or_else(|| "-".into()),
         ));
+        // Whose claim it is, because the claim is unauthenticated and the
+        // operator is the one who has to judge it (§3.4, §12).
+        out.push(format!(
+            "  claimed by {}",
+            report
+                .recovery
+                .observed_by
+                .map(|key| key.to_z32())
+                .unwrap_or_else(|| "(an unrecorded peer)".into()),
+        ));
         out.push(format!(
             "  publishing is refused: a head at seq {} would be rejected by every peer",
             report.recovery.next_seq
         ));
+        out.push(
+            "  the claim is a peer's unverified summary, not a signed head: check that peer \
+             before trusting the number"
+                .into(),
+        );
         out.push("  run `synch recover` to resume publishing above what peers have seen".into());
     } else if let Some(floor) = report.recovery.floor {
         out.push(String::new());
         out.push(format!(
-            "recovered: publishing floor {floor}, highest seq peers advertised {}",
+            "recovered: publishing floor {floor}, highest seq peers advertised {} (claimed by {})",
             report
                 .recovery
                 .observed_seq
                 .map(|seq| seq.to_string())
                 .unwrap_or_else(|| "-".into()),
+            report
+                .recovery
+                .observed_by
+                .map(|key| key.to_z32())
+                .unwrap_or_else(|| "an unrecorded peer".into()),
         ));
     }
 

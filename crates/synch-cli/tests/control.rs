@@ -564,6 +564,7 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
             100,
             &synch_core::Hash([7u8; 32]),
             true,
+            None,
             synch_core::now_ns(),
         )
         .unwrap();
@@ -642,6 +643,7 @@ async fn a_client_that_hangs_up_mid_quiesce_leaves_the_floor_alone() {
             100,
             &synch_core::Hash([7u8; 32]),
             true,
+            None,
             synch_core::now_ns(),
         )
         .unwrap();

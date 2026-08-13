@@ -1107,6 +1107,7 @@ CREATE TABLE peers_seen    (node_id BLOB PRIMARY KEY, last_addr BLOB, last_seen 
 -- observed from Hello summaries — never verified, never adopted as a head
 CREATE TABLE observed_heads (origin_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
                              root BLOB NOT NULL, complete INTEGER NOT NULL,
+                             claimed_by BLOB,   -- which peer asserted it (§3.4)
                              observed_at INTEGER NOT NULL);
 ```
 

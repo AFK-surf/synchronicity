@@ -61,6 +61,7 @@ pub const MIGRATIONS: &[Migration] = &[
         run: v5_bucket_policies,
     },
     Migration::Sql(V6_ENTRY_SYMLINK_TARGET),
+    Migration::Sql(V7_OBSERVED_CLAIMED_BY),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -261,6 +262,29 @@ CREATE INDEX entries_by_path    ON entries (space, path);
 CREATE INDEX entries_by_content ON entries (content);
 "#;
 
+/// v7 — recovery detection rests on peers' *unauthenticated* summaries, so
+/// §3.4 has `synch doctor` report which peer claimed the highest seq: within
+/// the trust stance of §12 any member could assert a huge one and hold a fresh
+/// node in recovery, and the attribution is what lets an operator judge the
+/// claim.
+///
+/// Rebuilt rather than `ALTER ... ADD COLUMN` for the same reason as v6: the
+/// stored DDL should read in declaration order.
+const V7_OBSERVED_CLAIMED_BY: &str = r#"
+ALTER TABLE observed_heads RENAME TO observed_heads_v6;
+CREATE TABLE observed_heads (
+  origin_id   TEXT PRIMARY KEY,
+  seq         INTEGER NOT NULL,
+  root        BLOB NOT NULL,
+  complete    INTEGER NOT NULL,
+  claimed_by  BLOB,
+  observed_at INTEGER NOT NULL
+);
+INSERT INTO observed_heads (origin_id, seq, root, complete, claimed_by, observed_at)
+  SELECT origin_id, seq, root, complete, NULL, observed_at FROM observed_heads_v6;
+DROP TABLE observed_heads_v6;
+"#;
+
 /// The §10 schema as the design document states it — the shape replaying the
 /// whole chain must produce.
 ///
@@ -356,6 +380,7 @@ CREATE TABLE observed_heads (
   seq         INTEGER NOT NULL,
   root        BLOB NOT NULL,
   complete    INTEGER NOT NULL,
+  claimed_by  BLOB,
   observed_at INTEGER NOT NULL
 );
 "#;

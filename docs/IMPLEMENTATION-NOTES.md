@@ -372,6 +372,35 @@ The question is asked about *our* origin, and answered by peers who are already
 authorized members (§3.2), so it carries nothing they could not already read
 out of their own bindings table.
 
+### §6.4 — what the fetch fanout splits, and when it stops looking
+
+`fetch_fanout` is "how many providers a single range fetch is split across",
+and two things had to be true for that to mean anything:
+
+- **The wanted groups are split into contiguous shares**, one per provider in
+  the batch, and the requests run concurrently. Splitting only by "what is left
+  that this provider claims" would hand the whole object to the first candidate
+  — the ordinary case, where every provider holds all of it — and leave the
+  fanout doing nothing. Shares are contiguous rather than interleaved because a
+  bao slice over one span is cheaper to encode and verify than one over many.
+  Anything a provider turns out not to claim stays in the pool for the next
+  batch.
+- **A failure is not the end of the fetch.** Providers are consumed in ranked
+  order, `fetch_fanout` at a time, until nothing is missing or the candidates
+  run out — so a fourth-ranked provider that holds what the first three did not
+  is still reached. Only the *concurrency* is bounded by the fanout, never the
+  number of peers eventually asked.
+
+The concurrency uses a small hand-rolled join rather than a `futures`
+dependency: this is the only place in the workspace that needs one, and it
+needs the simplest possible shape — no cancellation, no early return, every
+branch polled to the end.
+
+`FindProviders` is the fallback when *no* local ad covers a wanted root, which
+is the cold-cache and just-admitted-origin case §5.1 names. Learned hints are
+written to `blob_providers` and then ranked like any other, so a wrong hint
+costs one dial: content is hash-verified against the object root regardless.
+
 ### §3.4 — rotating a key-identified origin
 
 `synch key rotate` on an `OriginId::Key` origin now fails before it generates
@@ -458,6 +487,7 @@ The chain to date:
 | 3 | 3 | 4 | reshape `mirrors` for the unified tree (§7.2) |
 | 4 | 4 | 5 | reshape the `synch-s3` bucket map (§9.4) |
 | 5 | 5 | 6 | `entries.symlink_target`, for §8 version identity |
+| 6 | 6 | 7 | `observed_heads.claimed_by`, for §3.4 attribution |
 
 Steps 0–2 reproduce the history that shipped before the chain existed: a
 database stamped 1, 2, or 3 by an older build lands on exactly the version the

@@ -12,10 +12,10 @@
 //! head per origin and the publishing floor — are ordinary durable records.
 
 use rusqlite::{params, OptionalExtension};
-use synch_core::{Hash, OriginId};
+use synch_core::{Hash, NodeId, OriginId};
 
 use crate::{
-    db::{hash_column, origin_column, Store},
+    db::{hash_column, key_column, origin_column, Store},
     error::{Result, StoreError},
 };
 
@@ -37,6 +37,14 @@ pub struct ObservedHead {
     pub root: Hash,
     /// Whether the advertiser said it could serve that trie.
     pub complete: bool,
+    /// The peer that made the claim, when it is known.
+    ///
+    /// Detection rests on unauthenticated summaries — deliberately, since the
+    /// true heads are signed by the lost key and cannot validate — so within
+    /// the §12 trust stance any member could assert a huge seq and hold a fresh
+    /// node in recovery. The attribution is what lets an operator judge the
+    /// claim (§3.4).
+    pub claimed_by: Option<NodeId>,
     /// When the advertisement was seen, in unix nanoseconds.
     pub observed_at: i64,
 }
@@ -53,14 +61,16 @@ impl Store {
         seq: u64,
         root: &Hash,
         complete: bool,
+        claimed_by: Option<&NodeId>,
         now: i64,
     ) -> Result<bool> {
         let changed = self.conn().execute(
-            "INSERT INTO observed_heads (origin_id, seq, root, complete, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO observed_heads (origin_id, seq, root, complete, claimed_by, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(origin_id) DO UPDATE SET
                seq = excluded.seq, root = excluded.root,
-               complete = excluded.complete, observed_at = excluded.observed_at
+               complete = excluded.complete, claimed_by = excluded.claimed_by,
+               observed_at = excluded.observed_at
              WHERE excluded.seq > observed_heads.seq
                 OR (excluded.seq = observed_heads.seq AND excluded.root > observed_heads.root)",
             params![
@@ -68,6 +78,7 @@ impl Store {
                 seq as i64,
                 root.as_bytes().to_vec(),
                 complete as i64,
+                claimed_by.map(|k| k.as_bytes().to_vec()),
                 now,
             ],
         )?;
@@ -79,8 +90,8 @@ impl Store {
         let conn = self.conn();
         let row = conn
             .query_row(
-                "SELECT origin_id, seq, root, complete, observed_at FROM observed_heads
-                 WHERE origin_id = ?1",
+                "SELECT origin_id, seq, root, complete, claimed_by, observed_at
+                 FROM observed_heads WHERE origin_id = ?1",
                 params![origin.canonical()],
                 observed_from_row,
             )
@@ -92,7 +103,7 @@ impl Store {
     pub fn observed_heads(&self) -> Result<Vec<ObservedHead>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT origin_id, seq, root, complete, observed_at FROM observed_heads
+            "SELECT origin_id, seq, root, complete, claimed_by, observed_at FROM observed_heads
              ORDER BY origin_id",
         )?;
         let rows = stmt.query_map([], observed_from_row)?;
@@ -127,7 +138,7 @@ impl Store {
 }
 
 /// The raw column tuple of an `observed_heads` row.
-type ObservedRow = (String, i64, Vec<u8>, i64, i64);
+type ObservedRow = (String, i64, Vec<u8>, i64, Option<Vec<u8>>, i64);
 
 fn observed_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservedRow> {
     Ok((
@@ -136,16 +147,20 @@ fn observed_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObservedRow> {
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
+        row.get(5)?,
     ))
 }
 
 fn build_observed(row: ObservedRow) -> Result<ObservedHead> {
-    let (origin, seq, root, complete, observed_at) = row;
+    let (origin, seq, root, complete, claimed_by, observed_at) = row;
     Ok(ObservedHead {
         origin: origin_column(origin, "observed_heads.origin_id")?,
         seq: seq as u64,
         root: hash_column(root, "observed_heads.root")?,
         complete: complete != 0,
+        claimed_by: claimed_by
+            .map(|bytes| key_column(bytes, "observed_heads.claimed_by"))
+            .transpose()?,
         observed_at,
     })
 }
@@ -170,18 +185,18 @@ mod tests {
         assert_eq!(store.observed_head(&origin()).unwrap(), None);
 
         assert!(store
-            .record_observed_head(&origin(), 5, &Hash([1u8; 32]), true, 10)
+            .record_observed_head(&origin(), 5, &Hash([1u8; 32]), true, None, 10)
             .unwrap());
         // A lower seq from another peer does not lower the observation.
         assert!(!store
-            .record_observed_head(&origin(), 3, &Hash([9u8; 32]), true, 11)
+            .record_observed_head(&origin(), 3, &Hash([9u8; 32]), true, None, 11)
             .unwrap());
         assert_eq!(store.observed_head(&origin()).unwrap().unwrap().seq, 5);
 
         // Same seq, greater root wins — the same lexicographic order the
         // acceptance rule uses (§5.2).
         assert!(store
-            .record_observed_head(&origin(), 5, &Hash([2u8; 32]), false, 12)
+            .record_observed_head(&origin(), 5, &Hash([2u8; 32]), false, None, 12)
             .unwrap());
         let observed = store.observed_head(&origin()).unwrap().unwrap();
         assert_eq!(observed.root, Hash([2u8; 32]));
@@ -189,7 +204,7 @@ mod tests {
         assert_eq!(observed.observed_at, 12);
 
         assert!(store
-            .record_observed_head(&origin(), 9, &Hash([0u8; 32]), true, 13)
+            .record_observed_head(&origin(), 9, &Hash([0u8; 32]), true, None, 13)
             .unwrap());
         assert_eq!(store.observed_head(&origin()).unwrap().unwrap().seq, 9);
     }
@@ -199,10 +214,10 @@ mod tests {
         let (_d, store) = store();
         let laptop = OriginId::named("laptop", "x.example").unwrap();
         store
-            .record_observed_head(&origin(), 4, &Hash::EMPTY, true, 0)
+            .record_observed_head(&origin(), 4, &Hash::EMPTY, true, None, 0)
             .unwrap();
         store
-            .record_observed_head(&laptop, 7, &Hash::EMPTY, true, 0)
+            .record_observed_head(&laptop, 7, &Hash::EMPTY, true, None, 0)
             .unwrap();
         let all = store.observed_heads().unwrap();
         assert_eq!(all.len(), 2);
@@ -235,5 +250,40 @@ mod tests {
         let (_d, store) = store();
         store.set_config(FLOOR_KEY, "not a number").unwrap();
         assert!(store.publish_floor().is_err());
+    }
+
+    #[test]
+    fn an_observation_records_which_peer_claimed_it() {
+        // §3.4: detection rests on unauthenticated summaries, so who made the
+        // claim is what an operator judges it by.
+        let (_d, store) = store();
+        let loud = iroh_base::SecretKey::generate().public();
+        let quiet = iroh_base::SecretKey::generate().public();
+
+        store
+            .record_observed_head(&origin(), 10, &Hash([1u8; 32]), true, Some(&quiet), 1)
+            .unwrap();
+        assert_eq!(
+            store.observed_head(&origin()).unwrap().unwrap().claimed_by,
+            Some(quiet)
+        );
+
+        // The claimant moves with the claim: whoever asserted the highest seq
+        // is the one named.
+        store
+            .record_observed_head(&origin(), 5_000, &Hash([2u8; 32]), true, Some(&loud), 2)
+            .unwrap();
+        let observed = store.observed_head(&origin()).unwrap().unwrap();
+        assert_eq!(observed.seq, 5_000);
+        assert_eq!(observed.claimed_by, Some(loud));
+
+        // A lower claim changes nothing, claimant included.
+        store
+            .record_observed_head(&origin(), 9, &Hash([3u8; 32]), true, Some(&quiet), 3)
+            .unwrap();
+        assert_eq!(
+            store.observed_head(&origin()).unwrap().unwrap().claimed_by,
+            Some(loud)
+        );
     }
 }

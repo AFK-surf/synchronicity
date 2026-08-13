@@ -340,6 +340,7 @@ async fn put_object_is_refused_while_the_node_is_in_recovery() {
             100,
             &synch_core::Hash([7u8; 32]),
             true,
+            None,
             synch_core::now_ns(),
         )
         .unwrap();

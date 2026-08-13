@@ -141,6 +141,19 @@ impl Syncer {
         summaries: &[HeadSummary],
         now: i64,
     ) -> Result<Option<u64>, NetError> {
+        self.observe_summaries_from(None, summaries, now)
+    }
+
+    /// The same, recording which peer made the claim (§3.4).
+    ///
+    /// Detection rests on unauthenticated summaries, so the attribution is
+    /// what lets an operator judge a claim that holds a node in recovery.
+    pub fn observe_summaries_from(
+        &self,
+        claimed_by: Option<synch_core::NodeId>,
+        summaries: &[HeadSummary],
+        now: i64,
+    ) -> Result<Option<u64>, NetError> {
         let Some(own) = self.store.self_origin()? else {
             return Ok(None);
         };
@@ -150,11 +163,13 @@ impl Syncer {
                 summary.seq,
                 &summary.root,
                 summary.complete,
+                claimed_by.as_ref(),
                 now,
             )? {
                 tracing::info!(
                     origin = %own,
                     seq = summary.seq,
+                    peer = claimed_by.map(|k| k.fmt_short().to_string()).unwrap_or_default(),
                     "a peer advertises a head for our own origin"
                 );
             }
@@ -322,7 +337,7 @@ impl Syncer {
         let exchange = client
             .head_exchange(ours, |_theirs| (Vec::new(), Vec::new()))
             .await?;
-        self.observe_summaries(&exchange.summaries, now_ns())?;
+        self.observe_summaries_from(Some(client.remote_id()), &exchange.summaries, now_ns())?;
         Ok(exchange.summaries)
     }
 
@@ -369,7 +384,7 @@ impl Syncer {
 
         // Every exchange is also an observation of what peers hold for our own
         // origin, which is what `synch recover` reads (§3.4).
-        self.observe_summaries(&theirs.summaries, now_ns())?;
+        self.observe_summaries_from(Some(client.remote_id()), &theirs.summaries, now_ns())?;
 
         report.heads_pushed = theirs.pushed;
         for head in theirs.received {
