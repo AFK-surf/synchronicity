@@ -126,11 +126,24 @@ every request on both platforms.
 
 §10 gives the schema but not how it is versioned. The `config` row
 `schema_version` carries an integer, and every statement in the schema is
-`CREATE TABLE/INDEX IF NOT EXISTS`. Every change so far has been additive, so
-executing the schema against an older database *is* the migration: opening one
-applies the new statements and stamps the new version. A database written by a
-*newer* build is refused rather than guessed at. When a change stops being
-additive, this is where the rewrite step goes.
+`CREATE TABLE/INDEX IF NOT EXISTS`, so executing the schema against an older
+database *is* the migration for anything additive: opening one applies the new
+statements. A database written by a *newer* build is refused rather than
+guessed at.
+
+v3 is the first change that is not additive — it drops the dead `want` table —
+so the mechanism grew exactly one step: a `MIGRATIONS` list of `(version,
+statement)` pairs in `schema.rs`, replayed for every entry above the version
+found, after the schema is applied and before the new version is stamped. It
+carries only what re-applying the schema cannot say (drops, rewrites); additive
+changes still need no entry. The whole open — schema, migrations, stamp — is
+what it always was: refused outright for a newer database.
+
+The `want` table itself described a persistent download queue. §6.4 is
+explicitly queue-less — fetching is on-demand and request-scoped, and progress
+survives restarts through the CAS rather than through a queue — so the table
+never had a producer or a consumer, and dropping it removes a shape the design
+does not have.
 
 ### §10 — the writer task
 

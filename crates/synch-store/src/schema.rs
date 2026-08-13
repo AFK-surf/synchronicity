@@ -2,10 +2,26 @@
 
 /// The schema version stored in `config`.
 ///
-/// Every statement below is `IF NOT EXISTS` and every version bump so far has
-/// been purely additive, so applying this schema to an older database *is* the
-/// migration; [`crate::db::Store::open`] stamps the new version afterwards.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Every statement below is `IF NOT EXISTS`, so applying this schema to an
+/// older database *is* the migration for anything additive;
+/// [`crate::db::Store::open`] stamps the new version afterwards. A change that
+/// is *not* additive — v3 dropped the dead `want` table — needs a statement of
+/// its own in [`MIGRATIONS`].
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// The statements an older database needs beyond re-applying [`SCHEMA`], each
+/// paired with the version that introduced it.
+///
+/// Applying the schema covers every additive change, so this list only carries
+/// what the schema cannot say: dropped tables, dropped columns, rewrites. A
+/// database at version `v` runs every entry whose version is greater than `v`,
+/// in order, and is then stamped [`SCHEMA_VERSION`].
+pub const MIGRATIONS: &[(u32, &str)] = &[
+    // v3: the `want` table described a persistent download queue. §6.4 is
+    // explicitly queue-less — fetching is on-demand and request-scoped — so the
+    // table never had a producer or a consumer.
+    (3, "DROP TABLE IF EXISTS want"),
+];
 
 /// The §10 schema. Every statement is `IF NOT EXISTS`, so opening an existing
 /// database is a no-op.
@@ -110,8 +126,6 @@ CREATE TABLE IF NOT EXISTS local_files   (space TEXT, relpath TEXT, size INTEGER
                                           PRIMARY KEY (space, relpath));
 CREATE TABLE IF NOT EXISTS mirrors       (origin_id TEXT, space TEXT, local_path TEXT NOT NULL,
                                           PRIMARY KEY (origin_id, space));
-CREATE TABLE IF NOT EXISTS want          (root BLOB, ranges BLOB, priority INTEGER, reason TEXT,
-                                          created_at INTEGER, PRIMARY KEY (root, ranges));
 CREATE TABLE IF NOT EXISTS peers_seen    (node_id BLOB PRIMARY KEY, last_addr BLOB, last_seen INTEGER,
                                           last_sync INTEGER, latency_ewma_us INTEGER);
 "#;

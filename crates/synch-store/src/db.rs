@@ -13,7 +13,7 @@ use synch_mpt::NodeStore;
 
 use crate::{
     error::{Result, StoreError},
-    schema::{SCHEMA, SCHEMA_VERSION},
+    schema::{MIGRATIONS, SCHEMA, SCHEMA_VERSION},
 };
 
 /// Directory under the data dir holding blob payloads and outboards (§6.2).
@@ -126,12 +126,19 @@ impl Store {
                 )?;
             }
             Some(v) if v == SCHEMA_VERSION.to_string() => {}
-            // Every schema change so far has been additive and every statement
-            // is `IF NOT EXISTS`, so executing the schema above has already
-            // brought an older database up to date; all that is left is to
-            // stamp the version. A *newer* database is refused: this build
-            // cannot know what it would be reading.
-            Some(v) if v.parse::<u32>().is_ok_and(|found| found < SCHEMA_VERSION) => {
+            // Every statement is `IF NOT EXISTS`, so executing the schema above
+            // has already applied every additive change. What the schema cannot
+            // say — a dropped table — is carried by `MIGRATIONS`, which is
+            // replayed from the version found before the new one is stamped. A
+            // *newer* database is refused: this build cannot know what it would
+            // be reading.
+            Some(ref v) if v.parse::<u32>().is_ok_and(|found| found < SCHEMA_VERSION) => {
+                let found: u32 = v.parse().expect("just checked");
+                for (version, statement) in MIGRATIONS {
+                    if *version > found {
+                        conn.execute_batch(statement)?;
+                    }
+                }
                 conn.execute(
                     "UPDATE config SET value = ?1 WHERE key = 'schema_version'",
                     params![SCHEMA_VERSION.to_string()],
@@ -537,5 +544,68 @@ mod tests {
         assert_eq!(store.config("keep").unwrap().as_deref(), Some("me"));
         // The table the newer version added exists again.
         assert_eq!(store.observed_heads().unwrap().len(), 0);
+    }
+
+    /// The `want` table as v2 declared it, so the migration is exercised
+    /// against the shape a v2 database really has.
+    const V2_WANT_TABLE: &str = "CREATE TABLE IF NOT EXISTS want \
+         (root BLOB, ranges BLOB, priority INTEGER, reason TEXT, \
+          created_at INTEGER, PRIMARY KEY (root, ranges));";
+
+    fn table_exists(store: &Store, name: &str) -> bool {
+        store
+            .conn()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![name],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    }
+
+    /// v3 is the first change that is not additive: the dead `want` table is
+    /// dropped, which re-applying the schema cannot do.
+    #[test]
+    fn a_v2_database_loses_the_want_table() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path()).unwrap();
+            store.conn().execute_batch(V2_WANT_TABLE).unwrap();
+            store.set_config("keep", "me").unwrap();
+            store.set_config("schema_version", "2").unwrap();
+            assert!(table_exists(&store, "want"));
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        assert!(!table_exists(&store, "want"), "the drop must have run");
+        assert_eq!(
+            store.config("schema_version").unwrap().as_deref(),
+            Some(SCHEMA_VERSION.to_string().as_str())
+        );
+        // Everything else the database held is untouched.
+        assert_eq!(store.config("keep").unwrap().as_deref(), Some("me"));
+
+        // And re-opening an already-migrated database is a no-op, not an error.
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert!(!table_exists(&store, "want"));
+
+        // A database from the future is still refused rather than migrated.
+        store.set_config("schema_version", "4").unwrap();
+        drop(store);
+        assert!(Store::open(dir.path()).is_err());
+    }
+
+    /// A fresh database never grows the table in the first place.
+    #[test]
+    fn a_new_database_has_no_want_table() {
+        let (_dir, store) = temp_store();
+        assert!(!table_exists(&store, "want"));
+        assert_eq!(
+            store.config("schema_version").unwrap().as_deref(),
+            Some(SCHEMA_VERSION.to_string().as_str())
+        );
     }
 }

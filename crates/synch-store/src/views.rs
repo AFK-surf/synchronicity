@@ -96,21 +96,6 @@ pub struct MirrorRow {
     pub local_path: String,
 }
 
-/// A queued content want (§6.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Want {
-    /// The object root wanted.
-    pub root: Hash,
-    /// The encoded wanted ranges.
-    pub ranges: Vec<u8>,
-    /// Priority: explicit `synch get` > policy mirror > prefetch.
-    pub priority: i64,
-    /// Why it is wanted, for display.
-    pub reason: String,
-    /// When it was queued.
-    pub created_at: i64,
-}
-
 /// A peer we have seen, for ranking and `synch peers` (§6.4, §9.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSeen {
@@ -540,64 +525,6 @@ impl Store {
         Ok(out)
     }
 
-    // ---- want queue -------------------------------------------------------
-
-    /// Queues a content want.
-    pub fn put_want(&self, want: &Want) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO want (root, ranges, priority, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(root, ranges) DO UPDATE SET
-               priority = MAX(want.priority, excluded.priority)",
-            params![
-                want.root.as_bytes().to_vec(),
-                want.ranges,
-                want.priority,
-                want.reason,
-                want.created_at
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// The queued wants, highest priority first.
-    pub fn wants(&self) -> Result<Vec<Want>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT root, ranges, priority, reason, created_at FROM want
-             ORDER BY priority DESC, created_at",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (root, ranges, priority, reason, created_at) = row?;
-            out.push(Want {
-                root: hash_column(root, "want.root")?,
-                ranges,
-                priority,
-                reason,
-                created_at,
-            });
-        }
-        Ok(out)
-    }
-
-    /// Removes a want.
-    pub fn remove_want(&self, root: &Hash, ranges: &[u8]) -> Result<()> {
-        self.conn().execute(
-            "DELETE FROM want WHERE root = ?1 AND ranges = ?2",
-            params![root.as_bytes().to_vec(), ranges],
-        )?;
-        Ok(())
-    }
-
     // ---- peers ------------------------------------------------------------
 
     /// Records that a peer was seen.
@@ -1021,38 +948,6 @@ mod tests {
         assert_eq!(store.local_files("s").unwrap(), vec!["a.txt".to_string()]);
         store.remove_local_file("s", "a.txt").unwrap();
         assert!(store.local_file("s", "a.txt").unwrap().is_none());
-    }
-
-    #[test]
-    fn wants_are_prioritized() {
-        let (_d, store) = store();
-        let low = Want {
-            root: Hash::new(b"a"),
-            ranges: vec![0],
-            priority: 1,
-            reason: "prefetch".into(),
-            created_at: 0,
-        };
-        let high = Want {
-            root: Hash::new(b"b"),
-            ranges: vec![0],
-            priority: 10,
-            reason: "get".into(),
-            created_at: 1,
-        };
-        store.put_want(&low).unwrap();
-        store.put_want(&high).unwrap();
-        let wants = store.wants().unwrap();
-        assert_eq!(wants[0].root, Hash::new(b"b"));
-
-        // Re-queueing at a higher priority raises it, never lowers it.
-        let mut bump = low.clone();
-        bump.priority = 100;
-        store.put_want(&bump).unwrap();
-        assert_eq!(store.wants().unwrap()[0].priority, 100);
-
-        store.remove_want(&low.root, &low.ranges).unwrap();
-        assert_eq!(store.wants().unwrap().len(), 1);
     }
 
     #[test]

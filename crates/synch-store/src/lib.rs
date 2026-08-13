@@ -19,4 +19,4 @@ pub use gc::{GcStats, TrieStats};
 pub use heads::{Equivocation, Slot, StoredHead};
 pub use recovery::ObservedHead;
 pub use schema::SCHEMA_VERSION;
-pub use views::{EntryRow, LocalFile, MirrorRow, PeerSeen, SpaceRow, Want};
+pub use views::{EntryRow, LocalFile, MirrorRow, PeerSeen, SpaceRow};
