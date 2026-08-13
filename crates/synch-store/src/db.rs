@@ -128,17 +128,48 @@ impl Store {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Runs `f` inside a single SQLite transaction, committing on `Ok`.
+    /// Runs `f` against the raw transaction handle, committing on `Ok`.
     ///
-    /// This is the unit of atomicity for head flips and publish batches (§10).
-    pub fn transaction<T>(
+    /// The store's own multi-statement writes use this; callers outside the
+    /// crate get [`Store::transaction`], which hands out a [`Txn`] scope rather
+    /// than a `rusqlite` type.
+    pub(crate) fn with_tx<T>(
         &self,
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
         let out = f(&tx)?;
         tx.commit()?;
+        Ok(out)
+    }
+
+    /// Runs `f` inside a single SQLite transaction, committing on `Ok` and
+    /// rolling the whole thing back on `Err`.
+    ///
+    /// This is the unit of atomicity §10 asks for: "every multi-step state
+    /// change (head flips, publish batches) is a single transaction and no
+    /// partial state is ever observable". The scope handed to `f` is a [`Txn`],
+    /// which is both a [`NodeStore`] — so trie writes join the transaction —
+    /// and the head, history, and materialization surface a publish or a
+    /// promotion needs. No `rusqlite` type crosses the boundary.
+    ///
+    /// The error type is the caller's, so an engine or a net operation can run
+    /// its own failures through the same rollback: anything that converts from
+    /// [`StoreError`] works.
+    pub fn transaction<T, E>(
+        &self,
+        f: impl FnOnce(&Txn<'_>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction().map_err(StoreError::from)?;
+        // On `Err` the `Transaction` is dropped without a commit, which is a
+        // rollback: nothing the closure wrote is observable afterwards.
+        let out = f(&Txn { tx: &tx })?;
+        tx.commit().map_err(StoreError::from)?;
         Ok(out)
     }
 
@@ -267,6 +298,53 @@ impl Store {
     }
 }
 
+/// One SQLite transaction, as the rest of the workspace sees it.
+///
+/// Everything a publish or a head flip touches — trie nodes and values, the
+/// two head slots, `head_history`, and the materialized `entries` /
+/// `blob_providers` views — is reachable from here and lands in the same
+/// commit. Obtained only from [`Store::transaction`], which is what makes "one
+/// transaction" a property of the type rather than a convention.
+#[derive(Debug)]
+pub struct Txn<'a> {
+    tx: &'a rusqlite::Transaction<'a>,
+}
+
+impl Txn<'_> {
+    /// The underlying connection, for the store's own statement helpers.
+    pub(crate) fn conn(&self) -> &Connection {
+        self.tx
+    }
+}
+
+impl NodeStore for Txn<'_> {
+    type Error = StoreError;
+
+    fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
+        get_node_in(self.conn(), hash)
+    }
+
+    fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<()> {
+        put_node_in(self.conn(), hash, data)
+    }
+
+    fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
+        get_value_in(self.conn(), hash)
+    }
+
+    fn put_value(&self, hash: &Hash, data: &[u8]) -> Result<()> {
+        put_value_in(self.conn(), hash, data)
+    }
+
+    fn has_node(&self, hash: &Hash) -> Result<bool> {
+        has_node_in(self.conn(), hash)
+    }
+
+    fn has_value(&self, hash: &Hash) -> Result<bool> {
+        has_value_in(self.conn(), hash)
+    }
+}
+
 // ---- migrations ------------------------------------------------------------
 
 /// The version a database is stamped with, or 0 for an empty one.
@@ -357,66 +435,89 @@ impl NodeStore for Store {
     type Error = StoreError;
 
     fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT data FROM trie_nodes WHERE hash = ?1",
-                params![hash.as_bytes().to_vec()],
-                |r| r.get(0),
-            )
-            .optional()?)
+        get_node_in(&self.conn(), hash)
     }
 
     fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<()> {
-        self.conn().execute(
-            "INSERT OR IGNORE INTO trie_nodes (hash, data) VALUES (?1, ?2)",
-            params![hash.as_bytes().to_vec(), data],
-        )?;
-        Ok(())
+        put_node_in(&self.conn(), hash, data)
     }
 
     fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT data FROM trie_values WHERE hash = ?1",
-                params![hash.as_bytes().to_vec()],
-                |r| r.get(0),
-            )
-            .optional()?)
+        get_value_in(&self.conn(), hash)
     }
 
     fn put_value(&self, hash: &Hash, data: &[u8]) -> Result<()> {
-        self.conn().execute(
-            "INSERT OR IGNORE INTO trie_values (hash, data) VALUES (?1, ?2)",
-            params![hash.as_bytes().to_vec(), data],
-        )?;
-        Ok(())
+        put_value_in(&self.conn(), hash, data)
     }
 
     fn has_node(&self, hash: &Hash) -> Result<bool> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT 1 FROM trie_nodes WHERE hash = ?1",
-                params![hash.as_bytes().to_vec()],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+        has_node_in(&self.conn(), hash)
     }
 
     fn has_value(&self, hash: &Hash) -> Result<bool> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT 1 FROM trie_values WHERE hash = ?1",
-                params![hash.as_bytes().to_vec()],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+        has_value_in(&self.conn(), hash)
     }
+}
+
+// The trie node store, expressed against a connection so that both the store
+// and a [`Txn`] scope run exactly the same statements.
+
+fn get_node_in(conn: &Connection, hash: &Hash) -> Result<Option<Vec<u8>>> {
+    Ok(conn
+        .query_row(
+            "SELECT data FROM trie_nodes WHERE hash = ?1",
+            params![hash.as_bytes().to_vec()],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn put_node_in(conn: &Connection, hash: &Hash, data: &[u8]) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO trie_nodes (hash, data) VALUES (?1, ?2)",
+        params![hash.as_bytes().to_vec(), data],
+    )?;
+    Ok(())
+}
+
+fn get_value_in(conn: &Connection, hash: &Hash) -> Result<Option<Vec<u8>>> {
+    Ok(conn
+        .query_row(
+            "SELECT data FROM trie_values WHERE hash = ?1",
+            params![hash.as_bytes().to_vec()],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn put_value_in(conn: &Connection, hash: &Hash, data: &[u8]) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO trie_values (hash, data) VALUES (?1, ?2)",
+        params![hash.as_bytes().to_vec(), data],
+    )?;
+    Ok(())
+}
+
+fn has_node_in(conn: &Connection, hash: &Hash) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM trie_nodes WHERE hash = ?1",
+            params![hash.as_bytes().to_vec()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn has_value_in(conn: &Connection, hash: &Hash) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM trie_values WHERE hash = ?1",
+            params![hash.as_bytes().to_vec()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Reads a 32-byte hash column.
@@ -539,7 +640,7 @@ mod tests {
     #[test]
     fn transactions_roll_back_on_error() {
         let (_dir, store) = temp_store();
-        let err = store.transaction(|tx| {
+        let err = store.with_tx(|tx| {
             tx.execute(
                 "INSERT INTO config (key, value) VALUES ('a', 'b')",
                 params![],
@@ -548,6 +649,51 @@ mod tests {
         });
         assert!(err.is_err());
         assert_eq!(store.config("a").unwrap(), None);
+    }
+
+    #[test]
+    fn a_transaction_scope_writes_the_trie_and_the_heads_together() {
+        // §10: trie writes, head, history and materialization commit together
+        // or not at all. Everything the scope touches must be in one commit,
+        // and an error must take all of it back.
+        let (_dir, store) = temp_store();
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        let key = SecretKey::generate();
+
+        let err = store
+            .transaction(|txn| -> Result<()> {
+                let trie = Trie::new(txn);
+                let root = trie.insert(Hash::EMPTY, b"k", b"v")?;
+                let head = synch_core::SignedHead::sign(&key, origin.clone(), 1, root, 0);
+                txn.put_head(crate::heads::Slot::Complete, &head, 0, 0)?;
+                txn.record_history(&head)?;
+                Err(StoreError::invalid("boom"))
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("boom"), "{err}");
+        assert!(store.complete_head(&origin).unwrap().is_none());
+        assert!(store.head_history(&origin).unwrap().is_empty());
+        assert_eq!(
+            store.trie_stats().unwrap().nodes,
+            0,
+            "trie writes roll back too"
+        );
+
+        // The same body, committed, leaves all three visible together.
+        let root = store
+            .transaction(|txn| -> Result<Hash> {
+                let trie = Trie::new(txn);
+                let root = trie.insert(Hash::EMPTY, b"k", b"v")?;
+                let head = synch_core::SignedHead::sign(&key, origin.clone(), 1, root, 0);
+                txn.put_head(crate::heads::Slot::Complete, &head, 0, 0)?;
+                txn.record_history(&head)?;
+                Ok(root)
+            })
+            .unwrap();
+        assert_eq!(store.complete_head(&origin).unwrap().unwrap().root, root);
+        assert_eq!(store.head_history(&origin).unwrap().len(), 1);
+        assert!(NodeStore::has_node(&store, &root).unwrap());
     }
 
     #[test]

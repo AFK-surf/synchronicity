@@ -58,7 +58,7 @@ impl Store {
         };
         let all_nodes = self.all_hashes("trie_nodes")?;
         let all_values = self.all_hashes("trie_values")?;
-        self.transaction(|tx| {
+        self.with_tx(|tx| {
             for hash in &all_nodes {
                 if !nodes.contains(hash) {
                     tx.execute(

@@ -469,35 +469,60 @@ impl Node {
     ///
     /// Refuses while this node is in key-loss recovery (§3.4): the head it
     /// would mint carries a seq every peer rejects.
+    /// One SQLite transaction, as §10 requires: "trie writes, head, history,
+    /// and materialization commit together or not at all". A crash between any
+    /// two of those steps used to be able to leave a head whose trie was
+    /// half-written, or a head slot the derived views did not agree with.
     pub fn publish(&self, staged: &[StagedChange]) -> Result<Option<SignedHead>> {
         if staged.is_empty() {
             return Ok(None);
         }
         self.ensure_publishable()?;
-        let old_root = self.current_root()?;
-        let trie = Trie::new(self.store().as_ref());
-        let mut root = old_root;
-        for (key, value) in staged {
-            root = match value {
-                Some(v) => trie.insert(root, key, v)?,
-                None => trie.remove(root, key)?,
-            };
+        let secret = self.secret();
+        let origin = self.origin().clone();
+        let floor = self.store().publish_floor()?.unwrap_or(0);
+        let now = now_ns();
+
+        let head = self
+            .store()
+            .transaction(|txn| -> Result<Option<SignedHead>> {
+                // Read the head we are about to displace inside the transaction:
+                // the root we build on and the seq we build past have to come from
+                // the same snapshot the flip is written against.
+                let previous = txn.complete_head(&origin)?;
+                let old_root = previous.as_ref().map(|h| h.root).unwrap_or(Hash::EMPTY);
+
+                let trie = Trie::new(txn);
+                let mut root = old_root;
+                for (key, value) in staged {
+                    root = match value {
+                        Some(v) => trie.insert(root, key, v)?,
+                        None => trie.remove(root, key)?,
+                    };
+                }
+                if root == old_root {
+                    return Ok(None);
+                }
+
+                let seq = previous.as_ref().map(|h| h.seq + 1).unwrap_or(1).max(floor);
+                let head = SignedHead::sign(&secret, origin.clone(), seq, root, now);
+                if let Some(previous) = &previous {
+                    txn.record_history(previous)?;
+                }
+                txn.put_head(Slot::Complete, &head, now, now)?;
+                txn.record_history(&head)?;
+                txn.materialize_diff(&origin, old_root, root)?;
+                Ok(Some(head))
+            })?;
+
+        if let Some(head) = &head {
+            tracing::info!(
+                seq = head.seq,
+                changes = staged.len(),
+                "published a new root"
+            );
         }
-        if root == old_root {
-            return Ok(None);
-        }
-        let seq = self.next_seq()?;
-        let head = SignedHead::sign(&self.secret(), self.origin().clone(), seq, root, now_ns());
-        if let Some(previous) = self.store().complete_head(self.origin())? {
-            self.store().record_history(&previous)?;
-        }
-        self.store()
-            .put_head(Slot::Complete, &head, now_ns(), now_ns())?;
-        self.store().record_history(&head)?;
-        self.store()
-            .materialize_diff(self.origin(), old_root, root)?;
-        tracing::info!(seq, changes = staged.len(), "published a new root");
-        Ok(Some(head))
+        Ok(head)
     }
 
     /// Builds the `m:self` manifest record for this node (§4.2).
@@ -905,5 +930,80 @@ mod tests {
         assert!(paths_overlap(Path::new("/a/b"), Path::new("/a")));
         assert!(paths_overlap(Path::new("/a"), Path::new("/a/b")));
         assert!(!paths_overlap(Path::new("/a"), Path::new("/b")));
+    }
+
+    #[tokio::test]
+    async fn a_publish_that_fails_halfway_leaves_nothing_behind() {
+        // §10: trie writes, head, history and materialization commit together
+        // or not at all. A record the materializer cannot decode fails the
+        // last of those steps, after the trie has been written, the head
+        // signed, and both history rows inserted — exactly the window a crash
+        // used to be able to land in.
+        let dir = node_dir();
+        let space = tempfile::tempdir().unwrap();
+        let node = spawn(dir.path(), None).await;
+        node.add_space("media", space.path()).unwrap();
+        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
+        let (_, head) = node.scan_and_publish().unwrap();
+        let before = head.unwrap();
+        let entries_before = node
+            .store()
+            .list_entries(Some(node.origin()), "media", "", None, None)
+            .unwrap();
+
+        // A well-formed `f:` key whose value is not a `FileEntry`.
+        let poison = vec![(
+            file_key("media", "poisoned").unwrap(),
+            Some(vec![0xffu8; 8]),
+        )];
+        let err = node.publish(&poison).unwrap_err().to_string();
+        assert!(err.contains("corrupt record"), "{err}");
+
+        // Nothing moved: not the head, not the history, not the views, not the
+        // trie.
+        assert_eq!(node.own_head().unwrap().unwrap(), before);
+        assert_eq!(node.current_root().unwrap(), before.root);
+        assert_eq!(node.store().head_history(node.origin()).unwrap().len(), 1);
+        assert_eq!(
+            node.store()
+                .list_entries(Some(node.origin()), "media", "", None, None)
+                .unwrap(),
+            entries_before
+        );
+        assert!(node
+            .store()
+            .entry(node.origin(), "media", "poisoned")
+            .unwrap()
+            .is_none());
+
+        // And a publish after it still works, from the head that survived.
+        let after = node
+            .publish(&[node.manifest_change().unwrap()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.seq, before.seq + 1);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_publish_shows_its_head_history_and_views_together() {
+        let dir = node_dir();
+        let node = spawn(dir.path(), None).await;
+        let root = node
+            .publish(&[node.manifest_change().unwrap()])
+            .unwrap()
+            .unwrap();
+        // The head, its history row, and the materialized view of its leaves
+        // all exist as of the same commit.
+        assert_eq!(node.own_head().unwrap().unwrap().root, root.root);
+        assert!(node
+            .store()
+            .head_history(node.origin())
+            .unwrap()
+            .iter()
+            .any(|h| h.root == root.root));
+        assert!(synch_mpt::NodeStore::has_node(node.store().as_ref(), &root.root).unwrap());
+        assert!(node.manifest_of(node.origin()).unwrap().is_some());
+        node.shutdown().await.unwrap();
     }
 }

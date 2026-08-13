@@ -11,7 +11,7 @@ use synch_core::{
 use synch_mpt::{ChangeKind, ResolvedChange, Trie};
 
 use crate::{
-    db::{hash_column, origin_column, Store},
+    db::{hash_column, origin_column, Store, Txn},
     error::{Result, StoreError},
     unified::VersionPolicy,
 };
@@ -386,7 +386,7 @@ impl Store {
     ) -> Result<usize> {
         let changes: Vec<ResolvedChange> = Trie::new(self).diff_resolved(old_root, new_root)?;
         let count = changes.len();
-        self.transaction(|tx| {
+        self.with_tx(|tx| {
             for change in &changes {
                 apply_change(tx, origin, change)?;
             }
@@ -699,8 +699,46 @@ impl Store {
     }
 }
 
+impl Txn<'_> {
+    /// Rewrites `entries` and `blob_providers` for one origin from the diff
+    /// between two roots, inside the transaction (§5.2, §10).
+    ///
+    /// This is the half of a head flip that the derived views see, and it
+    /// commits with the flip: a crash can never leave `entries` — what the
+    /// unified tree, mirrors, and `synch-s3` serve from — missing a promoted
+    /// head's delta.
+    pub fn materialize_diff(
+        &self,
+        origin: &OriginId,
+        old_root: Hash,
+        new_root: Hash,
+    ) -> Result<usize> {
+        let changes: Vec<ResolvedChange> = Trie::new(self).diff_resolved(old_root, new_root)?;
+        for change in &changes {
+            apply_change(self.conn(), origin, change)?;
+        }
+        Ok(changes.len())
+    }
+
+    /// Deletes every entry row for an origin, inside the transaction.
+    pub fn delete_origin_entries(&self, origin: &OriginId) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM entries WHERE origin_id = ?1",
+            params![origin.canonical()],
+        )?)
+    }
+
+    /// Deletes every provider row for an origin, inside the transaction.
+    pub fn delete_origin_providers(&self, origin: &OriginId) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM blob_providers WHERE origin_id = ?1",
+            params![origin.canonical()],
+        )?)
+    }
+}
+
 fn apply_change(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     origin: &OriginId,
     change: &ResolvedChange,
 ) -> Result<()> {

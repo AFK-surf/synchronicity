@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension, Row};
 use synch_core::{Hash, OriginId, SignedHead};
 
 use crate::{
-    db::{hash_column, key_column, origin_column, Store},
+    db::{hash_column, key_column, origin_column, Store, Txn},
     error::{Result, StoreError},
 };
 
@@ -76,27 +76,34 @@ fn build_head(
     })
 }
 
+fn head_in(
+    conn: &rusqlite::Connection,
+    origin: &OriginId,
+    slot: Slot,
+) -> Result<Option<StoredHead>> {
+    let row = conn
+        .query_row(
+            "SELECT origin_id, seq, root, created_at, signed_by, sig, received_at, verified_at
+             FROM heads WHERE origin_id = ?1 AND slot = ?2",
+            params![origin.canonical(), slot.as_str()],
+            head_from_row,
+        )
+        .optional()?;
+    let Some((origin, seq, root, created_at, signed_by, sig, received_at, verified_at)) = row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(StoredHead {
+        head: build_head(origin, seq, root, created_at, signed_by, sig)?,
+        received_at,
+        verified_at,
+    }))
+}
+
 impl Store {
     /// Reads one head slot.
     pub fn head(&self, origin: &OriginId, slot: Slot) -> Result<Option<StoredHead>> {
-        let conn = self.conn();
-        let row = conn
-            .query_row(
-                "SELECT origin_id, seq, root, created_at, signed_by, sig, received_at, verified_at
-                 FROM heads WHERE origin_id = ?1 AND slot = ?2",
-                params![origin.canonical(), slot.as_str()],
-                head_from_row,
-            )
-            .optional()?;
-        let Some((origin, seq, root, created_at, signed_by, sig, received_at, verified_at)) = row
-        else {
-            return Ok(None);
-        };
-        Ok(Some(StoredHead {
-            head: build_head(origin, seq, root, created_at, signed_by, sig)?,
-            received_at,
-            verified_at,
-        }))
+        head_in(&self.conn(), origin, slot)
     }
 
     /// The complete (materialized, servable) head for an origin.
@@ -178,7 +185,7 @@ impl Store {
             return Ok(None);
         };
         let displaced = self.complete_head(origin)?;
-        self.transaction(|tx| {
+        self.with_tx(|tx| {
             if let Some(old) = &displaced {
                 record_history_in(tx, old)?;
             }
@@ -339,7 +346,7 @@ impl Store {
         }
 
         let pruned = doomed.len();
-        self.transaction(|tx| {
+        self.with_tx(|tx| {
             for (seq, root) in &doomed {
                 tx.execute(
                     "DELETE FROM head_history WHERE origin_id = ?1 AND seq = ?2 AND root = ?3",
@@ -366,6 +373,51 @@ impl Store {
             out.push(hash_column(row?, "heads.root")?);
         }
         Ok(out)
+    }
+}
+
+impl Txn<'_> {
+    /// Reads one head slot inside the transaction.
+    pub fn head(&self, origin: &OriginId, slot: Slot) -> Result<Option<StoredHead>> {
+        head_in(self.conn(), origin, slot)
+    }
+
+    /// The complete head, read inside the transaction.
+    pub fn complete_head(&self, origin: &OriginId) -> Result<Option<SignedHead>> {
+        Ok(self.head(origin, Slot::Complete)?.map(|s| s.head))
+    }
+
+    /// The pending head, read inside the transaction.
+    pub fn pending_head(&self, origin: &OriginId) -> Result<Option<SignedHead>> {
+        Ok(self.head(origin, Slot::Pending)?.map(|s| s.head))
+    }
+
+    /// Writes a head into a slot, inside the transaction.
+    ///
+    /// The caller must have verified the signature *and* the binding first
+    /// (§4.4), exactly as for [`Store::put_head`].
+    pub fn put_head(
+        &self,
+        slot: Slot,
+        head: &SignedHead,
+        received_at: i64,
+        verified_at: i64,
+    ) -> Result<()> {
+        put_head_in(self.conn(), slot, head, received_at, verified_at)
+    }
+
+    /// Clears a head slot, inside the transaction.
+    pub fn clear_head(&self, origin: &OriginId, slot: Slot) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM heads WHERE origin_id = ?1 AND slot = ?2",
+            params![origin.canonical(), slot.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Records a head in `head_history`, inside the transaction.
+    pub fn record_history(&self, head: &SignedHead) -> Result<()> {
+        record_history_in(self.conn(), head)
     }
 }
 

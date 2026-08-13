@@ -195,24 +195,40 @@ impl Syncer {
 
     /// Flips the pending head to complete if its whole trie is present,
     /// re-materializing the derived views from the node-level diff.
+    ///
+    /// The flip and the materialization are one SQLite transaction (§5.2,
+    /// §10): a crash between them would leave `entries` — what the unified
+    /// tree, mirrors, and `synch-s3` serve from — missing a promoted head's
+    /// delta, with nothing left to say so.
     pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<bool, NetError> {
-        let Some(pending) = self.store.pending_head(origin)? else {
-            return Ok(false);
-        };
-        let trie = Trie::new(self.store.as_ref());
-        if !trie.is_complete(pending.root)? {
-            return Ok(false);
+        let promoted = self.store.transaction(|txn| -> Result<_, NetError> {
+            let Some(pending) = txn.head(origin, Slot::Pending)? else {
+                return Ok(None);
+            };
+            let trie = Trie::new(txn);
+            if !trie.is_complete(pending.head.root)? {
+                return Ok(None);
+            }
+            let displaced = txn.complete_head(origin)?;
+            let old_root = displaced
+                .as_ref()
+                .map(|h| h.root)
+                .unwrap_or(synch_core::Hash::EMPTY);
+            if let Some(old) = &displaced {
+                txn.record_history(old)?;
+            }
+            txn.put_head(Slot::Complete, &pending.head, pending.received_at, now)?;
+            txn.clear_head(origin, Slot::Pending)?;
+            txn.materialize_diff(origin, old_root, pending.head.root)?;
+            Ok(Some(pending.head))
+        })?;
+        match promoted {
+            Some(head) => {
+                tracing::debug!(origin = %origin, seq = head.seq, "head flipped to complete");
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        let old_root = self
-            .store
-            .complete_head(origin)?
-            .map(|h| h.root)
-            .unwrap_or(synch_core::Hash::EMPTY);
-        self.store.promote_pending(origin, now)?;
-        self.store
-            .materialize_diff(origin, old_root, pending.root)?;
-        tracing::debug!(origin = %origin, seq = pending.seq, "head flipped to complete");
-        Ok(true)
     }
 
     /// Fetches the pending head's trie from `client`, verifying every node
@@ -690,5 +706,48 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].seq, 2);
         assert!(!summaries[0].complete);
+    }
+
+    #[test]
+    fn a_promotion_that_fails_to_materialize_does_not_flip_the_head() {
+        // §5.2: the flip and the materialization are one transaction, so a
+        // crash can never leave `entries` missing a promoted head's delta. A
+        // record the materializer cannot decode stands in for the crash.
+        let (_d, store, key, origin) = setup();
+        let syncer = Syncer::new(store.clone());
+
+        let good = publish(&store, &["a"]);
+        let complete = SignedHead::sign(&key, origin.clone(), 1, good, 0);
+        assert!(matches!(
+            syncer.offer_head(&complete, 0).unwrap(),
+            HeadOutcome::Completed
+        ));
+
+        // A pending head whose trie is fully present but carries a well-formed
+        // `f:` key with a value that is not a `FileEntry`.
+        let trie = Trie::new(store.as_ref());
+        let poisoned = trie
+            .insert(good, &file_key("s", "poisoned").unwrap(), &[0xffu8; 8])
+            .unwrap();
+        let pending = SignedHead::sign(&key, origin.clone(), 2, poisoned, 0);
+        store
+            .put_head(synch_store::Slot::Pending, &pending, 0, 0)
+            .unwrap();
+
+        let err = syncer.try_promote(&origin, 0).unwrap_err().to_string();
+        assert!(err.contains("corrupt record"), "{err}");
+
+        // The complete head is untouched, the pending head is still pending,
+        // and no history row claims the promotion happened.
+        assert_eq!(store.complete_head(&origin).unwrap().unwrap().seq, 1);
+        assert_eq!(store.pending_head(&origin).unwrap().unwrap().seq, 2);
+        assert!(!store
+            .head_history(&origin)
+            .unwrap()
+            .iter()
+            .any(|h| h.root == poisoned));
+        assert!(store.entry(&origin, "s", "poisoned").unwrap().is_none());
+        // And the entry the *complete* head materialized is still there.
+        assert!(store.entry(&origin, "s", "a").unwrap().is_some());
     }
 }

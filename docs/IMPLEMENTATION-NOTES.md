@@ -438,15 +438,39 @@ survives restarts through the CAS rather than through a queue — so the table
 never had a producer or a consumer, and dropping it removes a shape the design
 does not have.
 
-### §10 — one connection rather than a writer task and a reader pool
+### §10 — one connection, and the scope that makes "one transaction" a type
 
 §10 asks for "all access through one mutex-guarded connection", and that is
 literally what this is: one `rusqlite::Connection` behind a `Mutex`, WAL mode,
-`synchronous=NORMAL`. The invariant the section names — every multi-step state
-change is a single transaction and no partial state is ever observable — is
-what the [`Store::transaction`](../crates/synch-store/src/db.rs) scope
-enforces, and §10 accepts the cost the arrangement carries: readers serialize
-behind the same mutex instead of running concurrently.
+`synchronous=NORMAL`. §10 accepts the cost the arrangement carries: readers
+serialize behind the same mutex instead of running concurrently.
+
+The invariant the section actually cares about — every multi-step state change
+is a single transaction, and no partial state is ever observable — is enforced
+by `Store::transaction`, which hands the caller a `Txn` scope. A `Txn` is both
+a `NodeStore`, so trie writes join the transaction, and the head, history, and
+materialization surface a publish or a promotion needs. Since the scope is the
+only way to reach those methods, "trie writes, head, history, and
+materialization commit together or not at all" is a property of the type rather
+than a convention someone has to remember.
+
+Two details:
+
+- **The scope carries the caller's error type.** `Store::transaction` is
+  generic over any error that converts from `StoreError`, so `Node::publish`
+  rolls back on an `EngineError` and `Syncer::try_promote` on a `NetError`
+  without either of them adopting the store's. No `rusqlite` type crosses the
+  crate boundary in either direction.
+- **Reads that decide the write happen inside it.** `Node::publish` reads the
+  head it is about to displace from within the transaction, so the root it
+  builds on and the seq it builds past come from the same snapshot the flip is
+  written against, rather than from a moment when the mutex was not held.
+
+A non-obvious consequence: a mid-publish failure now takes the *trie writes*
+back too. Content-addressed nodes are harmless garbage that GC would sweep
+eventually, but rolling them back means a failed publish leaves the database
+byte-for-byte where it started, which is what makes the crash-safety tests able
+to assert equality rather than "close enough".
 
 ### §6.2 — outboard file naming
 

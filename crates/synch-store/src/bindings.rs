@@ -240,7 +240,7 @@ impl Store {
     /// existing expiry so they lapse after `dns_trust_grace` rather than being
     /// yanked on a single propagation glitch (§3.2).
     pub fn refresh_dns_bindings(&self, domain: &str, bindings: &[Binding]) -> Result<()> {
-        self.transaction(|tx| {
+        self.with_tx(|tx| {
             for binding in bindings {
                 tx.execute(
                     "INSERT INTO bindings (origin_id, node_id, source, domain, note, added_at, expires_at)
