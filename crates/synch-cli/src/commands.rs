@@ -182,6 +182,17 @@ fn to_request(cli: &Cli) -> Result<Request> {
         Command::Log { reference } => Request::Log {
             reference: reference.clone(),
         },
+        Command::Recover { wait, gap } => {
+            // Parsed here as well as on the daemon, so a typo fails before a
+            // connection is made rather than an hour into a quiesce.
+            if let Some(wait) = wait {
+                crate::cli::parse_duration(wait).context("--wait")?;
+            }
+            Request::Recover {
+                wait: wait.clone(),
+                gap: *gap,
+            }
+        }
         Command::Doctor { rebuild } => Request::Doctor { rebuild: *rebuild },
         Command::Scan => Request::Scan,
     })

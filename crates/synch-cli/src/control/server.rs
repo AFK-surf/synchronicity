@@ -25,6 +25,12 @@ use crate::{
     render,
 };
 
+/// The shortest gap between recovery collection rounds.
+///
+/// A quiesce measured in seconds still sleeps between rounds rather than
+/// spinning on the peers it is polling.
+const POLL_FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The control server: a bound listener plus the node it serves.
 ///
 /// Binding is separate from running so a daemon can report that it is (or is
@@ -300,6 +306,8 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             ))
             .await?;
         }
+
+        Request::Recover { wait, gap } => recover(node, out, wait, gap).await?,
 
         Request::DaemonStatus | Request::Doctor { rebuild: false } => {
             for line in render::doctor(node)? {
@@ -734,6 +742,97 @@ async fn stream_entry<S: AsyncWrite + Unpin>(
         }
         offset += bytes.len() as u64;
         out.chunk(bytes).await?;
+    }
+    Ok(())
+}
+
+/// Runs `synch recover`, streaming a line per collection round (§3.4, §9.3).
+///
+/// The quiesce is an hour by default, so it must not look like a hung command:
+/// each round reports what it reached and how much of the wait is left. The
+/// recovery itself runs as a task, and a client that walks away takes it down
+/// with it — the floor is set once, deliberately, or not at all.
+async fn recover<S: AsyncWrite + Unpin>(
+    node: &Node,
+    out: &mut Frames<S>,
+    wait: Option<String>,
+    gap: Option<u64>,
+) -> Done {
+    let mut options = node.recovery_options();
+    if let Some(text) = &wait {
+        options.wait = crate::cli::parse_duration(text)
+            .map_err(|e| ControlError::invalid(format!("--wait: {e}")))?;
+    }
+    if let Some(gap) = gap {
+        options.gap = gap;
+    }
+    // Never sleep past the end of the wait, and keep short waits responsive.
+    options.poll = options.poll.min(options.wait).max(POLL_FLOOR);
+
+    let state = node.recovery_state()?;
+    if state.in_recovery {
+        out.line(format!(
+            "{} is in recovery: peers advertise a head at seq {}",
+            state.origin,
+            state
+                .observed_seq
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| "-".into())
+        ))
+        .await?;
+    }
+    out.line(format!(
+        "collecting head summaries from every reachable peer for {}s",
+        options.wait.as_secs()
+    ))
+    .await?;
+
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recovering = {
+        let node = node.clone();
+        tokio::spawn(async move { node.recover(options, progress_tx).await })
+    };
+    while let Some(update) = progress_rx.recv().await {
+        if let Err(e) = out.progress(update.to_string()).await {
+            // The client hung up mid-quiesce: stop the collection rather than
+            // finish an hour of it for nobody.
+            recovering.abort();
+            return Err(e.into());
+        }
+    }
+    let report = recovering
+        .await
+        .map_err(|e| ControlError::internal(format!("the recovery task failed: {e}")))??;
+
+    out.line(format!(
+        "{} round(s) over {}s · {} peer(s) answered, {} unreachable",
+        report.rounds,
+        report.waited.as_secs(),
+        report.reached,
+        report.unreachable
+    ))
+    .await?;
+    match (report.observed_seq, report.floor) {
+        (Some(observed), Some(floor)) => {
+            out.line(format!(
+                "highest seq peers advertised: {observed}; publishing resumes at seq {floor} \
+                 ({observed} + gap {})",
+                report.gap
+            ))
+            .await?;
+            out.line(
+                "peers that were unreachable throughout may still hold newer pre-recovery \
+                 history; `synch doctor` reports it as a fork if they return",
+            )
+            .await?;
+        }
+        _ => {
+            out.line(format!(
+                "no peer advertises a head for {}: nothing to recover, publishing starts at seq 1",
+                report.origin
+            ))
+            .await?
+        }
     }
     Ok(())
 }

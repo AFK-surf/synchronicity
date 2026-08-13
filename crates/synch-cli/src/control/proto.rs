@@ -110,7 +110,10 @@ impl From<synch_engine::EngineError> for ControlError {
         let code = match &e {
             E::NotInitialized => ErrorCode::NotInitialized,
             E::NotFound(_) => ErrorCode::NotFound,
-            E::Invalid(_) | E::Key(_) => ErrorCode::Invalid,
+            // A node in recovery is not broken and the request is not
+            // malformed; what is wrong is the state it was made in, and the
+            // message says which command resolves it (§3.4).
+            E::Invalid(_) | E::Key(_) | E::InRecovery { .. } => ErrorCode::Invalid,
             _ => ErrorCode::Internal,
         };
         ControlError::new(code, format!("{e}"))
@@ -281,6 +284,13 @@ pub enum Request {
     },
     /// `synch pin ls`
     PinLs,
+    /// `synch recover [--wait <dur>] [--gap <n>]`
+    Recover {
+        /// How long to collect peer summaries, as the user typed it.
+        wait: Option<String>,
+        /// How far above the highest observed seq to resume publishing.
+        gap: Option<u64>,
+    },
     /// `synch doctor`
     Doctor {
         /// Rebuild the derived views from the authoritative trie first.

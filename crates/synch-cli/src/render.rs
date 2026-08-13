@@ -111,6 +111,59 @@ pub fn doctor(node: &Node) -> Lines {
         }
     }
 
+    if report.recovery.in_recovery {
+        out.push(String::new());
+        out.push("KEY-LOSS RECOVERY (§3.4):".into());
+        out.push(format!(
+            "  this node holds no head of its own for {}, but peers advertise one at seq {}",
+            report.recovery.origin,
+            report
+                .recovery
+                .observed_seq
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ));
+        out.push(format!(
+            "  publishing is refused: a head at seq {} would be rejected by every peer",
+            report.recovery.next_seq
+        ));
+        out.push("  run `synch recover` to resume publishing above what peers have seen".into());
+    } else if let Some(floor) = report.recovery.floor {
+        out.push(String::new());
+        out.push(format!(
+            "recovered: publishing floor {floor}, highest seq peers advertised {}",
+            report
+                .recovery
+                .observed_seq
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ));
+    }
+
+    if !report.unreconciled.is_empty() {
+        out.push(String::new());
+        out.push("UNRECONCILED PRE-RECOVERY HISTORY (§3.4):".into());
+        for entry in &report.unreconciled {
+            out.push(format!(
+                "  origin {} has unreconciled pre-recovery history at seq {}",
+                entry.origin, entry.seq
+            ));
+            out.push(format!(
+                "    root {} signed by {}, which is no longer bound to it",
+                entry.root,
+                entry.signed_by.to_z32()
+            ));
+            out.push(format!(
+                "    current head {} does not supersede it; the origin's operator resolves \
+                 the fork, never the protocol",
+                entry
+                    .current_seq
+                    .map(|seq| format!("seq {seq}"))
+                    .unwrap_or_else(|| "(none held)".into()),
+            ));
+        }
+    }
+
     if !report.unbound_origins.is_empty() {
         out.push(String::new());
         out.push("unbound origins (see §3.4):".into());

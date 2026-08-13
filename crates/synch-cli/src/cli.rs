@@ -124,6 +124,18 @@ pub enum Command {
         #[command(subcommand)]
         command: PinCommand,
     },
+    /// Resume publishing after key or database loss (§3.4).
+    Recover {
+        /// How long to collect peer summaries before lifting the publishing
+        /// floor: a plain number of seconds, or a duration like `90m`, `1h`,
+        /// `2h30m`. Defaults to one hour.
+        #[arg(long)]
+        wait: Option<String>,
+        /// How far above the highest seq any peer advertised publishing
+        /// resumes. Defaults to 1000.
+        #[arg(long)]
+        gap: Option<u64>,
+    },
     /// Connectivity, membership, equivocation, and GC report.
     Doctor {
         /// Rebuild the derived views from the authoritative trie.
@@ -280,6 +292,49 @@ pub enum PinCommand {
     Ls,
 }
 
+/// Parses a `--wait` duration: bare seconds, or `<n>d<n>h<n>m<n>s` in any
+/// combination (`0`, `45`, `90m`, `1h`, `2h30m`).
+///
+/// Kept deliberately small: this is the only duration the command surface takes
+/// and it does not warrant a dependency.
+pub fn parse_duration(text: &str) -> anyhow::Result<std::time::Duration> {
+    let text = text.trim();
+    if text.is_empty() {
+        anyhow::bail!("a duration looks like 30s, 90m, 1h, 2h30m, or a plain number of seconds");
+    }
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Ok(std::time::Duration::from_secs(seconds));
+    }
+    let mut total: u64 = 0;
+    let mut digits = String::new();
+    let mut saw_unit = false;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        let unit = match ch {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            other => anyhow::bail!("{other} is not a duration unit; use s, m, h, or d"),
+        };
+        let value: u64 = digits
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{text}: every unit needs a number in front of it"))?;
+        total = total
+            .checked_add(value.saturating_mul(unit))
+            .ok_or_else(|| anyhow::anyhow!("{text} is longer than this program can wait"))?;
+        digits.clear();
+        saw_unit = true;
+    }
+    if !saw_unit || !digits.is_empty() {
+        anyhow::bail!("{text}: a duration looks like 30s, 90m, 1h, 2h30m, or plain seconds");
+    }
+    Ok(std::time::Duration::from_secs(total))
+}
+
 /// A parsed `--range` argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
@@ -358,6 +413,8 @@ mod tests {
             vec!["synch", "mirror", "ls"],
             vec!["synch", "pin", "add", "aabb"],
             vec!["synch", "peers"],
+            vec!["synch", "recover"],
+            vec!["synch", "recover", "--wait", "90m", "--gap", "5000"],
             vec!["synch", "doctor"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
@@ -370,6 +427,27 @@ mod tests {
         assert!(cli.offline);
         let cli = Cli::try_parse_from(["synch", "id", "--offline"]).unwrap();
         assert!(cli.offline);
+    }
+
+    #[test]
+    fn durations_parse() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("90m").unwrap(), Duration::from_secs(5_400));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3_600));
+        assert_eq!(parse_duration("2h30m").unwrap(), Duration::from_secs(9_000));
+        assert_eq!(parse_duration(" 1d ").unwrap(), Duration::from_secs(86_400));
+
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("soon").is_err());
+        assert!(parse_duration("1w").is_err());
+        assert!(
+            parse_duration("1h30").is_err(),
+            "a trailing number is not a unit"
+        );
+        assert!(parse_duration("h").is_err());
     }
 
     #[test]
