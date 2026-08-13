@@ -25,9 +25,18 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut stopped = stop_tx.subscribe();
 
     // Bind before announcing: a client that sees the banner can connect.
-    let server = Server::bind(node.clone(), stop_tx.clone())
-        .await
-        .with_context(|| format!("could not bind the control socket for {}", node.origin()))?;
+    let server = match Server::bind(node.clone(), stop_tx.clone()).await {
+        Ok(server) => server,
+        Err(e) => {
+            // The endpoint is already up; close it properly or iroh shouts
+            // "Aborting ungracefully" over the error that actually matters —
+            // usually "another daemon already owns this datadir".
+            let origin = node.origin().clone();
+            let _ = node.shutdown().await;
+            return Err(anyhow::Error::new(e)
+                .context(format!("could not bind the control socket for {origin}")));
+        }
+    };
     println!(
         "origin {} on {}",
         node.origin(),

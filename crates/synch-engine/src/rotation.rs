@@ -117,12 +117,12 @@ impl Node {
     /// Generates the next device key without changing which one signs (§3.4
     /// step 1).
     ///
-    /// The key is stored in the `retiring` state: it is held, it is not the
+    /// The key is stored in the `staged` state: it is held, it is not the
     /// signing key, and [`Node::activate_key`] is what promotes it.
     pub fn rotate_key(&self) -> Result<RotationPlan> {
         // Refuse before generating anything. A key-identified origin *is* its
         // device key (§3.1), so there is no name to rebind and no record to
-        // publish — storing a `retiring` key for it would leave an orphan the
+        // publish — storing a `staged` key for it would leave an orphan the
         // node can never activate and nothing ever cleans up.
         let (domain, name) = match self.origin() {
             OriginId::Named { domain, id } => (domain.clone(), id.clone()),
@@ -138,7 +138,7 @@ impl Node {
         let secret = SecretKey::generate();
         let new_key = secret.public();
         self.store()
-            .add_device_key(&secret, KeyState::Retiring, now_ns())?;
+            .add_device_key(&secret, KeyState::Staged, now_ns())?;
         Ok(RotationPlan {
             new_key,
             domain: Some(domain),
@@ -153,7 +153,11 @@ impl Node {
     /// under the old key until [`Node::retire_key`] drops it, so peers whose
     /// DNS refresh lags are never locked out mid-window. New dials go out under
     /// the new key, which is the identity peers are being moved to.
-    pub async fn activate_key(&self, new_key: &NodeId) -> Result<Activation> {
+    pub async fn activate_key(
+        &self,
+        new_key: &NodeId,
+        bind: Option<std::net::SocketAddr>,
+    ) -> Result<Activation> {
         if self.origin().as_key().is_some() {
             return Err(EngineError::invalid(
                 "key-identified origins cannot rotate: the device key is the identity",
@@ -181,12 +185,19 @@ impl Node {
             })?;
 
         // A second endpoint on a fixed bind port would collide with the one
-        // already running, so the incoming key always takes an ephemeral port
-        // on the same interface. Peers reach it by discovery or by the address
-        // hints in the record that carries the new key.
+        // already running, so without an explicit address the incoming key
+        // takes an ephemeral port on the same interface. Static-address
+        // deployments pass `bind`: the operator is renumbering the node's
+        // known address, and that is their call to make, not a side effect —
+        // an ephemeral port silently strands whatever address peers were told.
         let mut options = self.config().net.clone();
-        if let Some(addr) = &mut options.bind_addr {
-            addr.set_port(0);
+        match bind {
+            Some(addr) => options.bind_addr = Some(addr),
+            None => {
+                if let Some(addr) = &mut options.bind_addr {
+                    addr.set_port(0);
+                }
+            }
         }
         let net = Net::bind(self.store().clone(), held.secret.clone(), options).await?;
 
@@ -322,7 +333,7 @@ mod tests {
         );
         // And activation still refuses, for anyone who gets that far.
         let stranger = SecretKey::generate().public();
-        let err = node.activate_key(&stranger).await.unwrap_err();
+        let err = node.activate_key(&stranger, None).await.unwrap_err();
         assert!(err.to_string().contains("cannot rotate"), "{err}");
         node.shutdown().await.unwrap();
     }
@@ -346,7 +357,7 @@ mod tests {
         assert_eq!(first.signed_by, old_key);
 
         let new_key = node.rotate_key().unwrap().new_key;
-        let activation = node.activate_key(&new_key).await.unwrap();
+        let activation = node.activate_key(&new_key, None).await.unwrap();
 
         assert_eq!(activation.previous_key, old_key);
         assert_eq!(node.node_id(), new_key);
@@ -385,9 +396,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = node(dir.path(), Some(named())).await;
         let stranger = SecretKey::generate().public();
-        let err = node.activate_key(&stranger).await.unwrap_err();
+        let err = node.activate_key(&stranger, None).await.unwrap_err();
         assert!(err.to_string().contains("no such device key"), "{err}");
-        let err = node.activate_key(&node.node_id()).await.unwrap_err();
+        let err = node.activate_key(&node.node_id(), None).await.unwrap_err();
         assert!(err.to_string().contains("already the active key"), "{err}");
         node.shutdown().await.unwrap();
     }
@@ -403,7 +414,7 @@ mod tests {
         let err = node.retire_key(&old_key).await.unwrap_err();
         assert!(err.to_string().contains("is the active key"), "{err}");
 
-        node.activate_key(&new_key).await.unwrap();
+        node.activate_key(&new_key, None).await.unwrap();
         node.retire_key(&old_key).await.unwrap();
 
         assert!(node.retiring_nets().is_empty());
@@ -428,7 +439,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = node(dir.path(), Some(named())).await;
         let new_key = node.rotate_key().unwrap().new_key;
-        node.activate_key(&new_key).await.unwrap();
+        node.activate_key(&new_key, None).await.unwrap();
         node.shutdown().await.unwrap();
 
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();

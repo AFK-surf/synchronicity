@@ -377,6 +377,11 @@ impl Node {
     /// gate (§3.4): a node that cannot publish must not drop the space either,
     /// or the unpublish would be lost with it.
     pub fn remove_space(&self, id: &str) -> Result<Vec<StagedChange>> {
+        // "removed ghost and unpublished 0 record(s)" for a space that never
+        // existed is a lie with a friendly face.
+        if !self.store().spaces()?.iter().any(|space| space.id == id) {
+            return Err(EngineError::NotFound(format!("no space {id}")));
+        }
         self.ensure_publishable()?;
         let mut staged = Vec::new();
         let root = self.current_root()?;
@@ -630,8 +635,12 @@ impl Node {
 }
 
 fn canonical_dir(path: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(path)?;
-    Ok(std::fs::canonicalize(path)?)
+    // A bare os error with no path reads as a daemon fault; naming the path
+    // and the operation makes "Permission denied" point at the right thing.
+    std::fs::create_dir_all(path)
+        .map_err(|e| EngineError::invalid(format!("could not create {}: {e}", path.display())))?;
+    std::fs::canonicalize(path)
+        .map_err(|e| EngineError::invalid(format!("could not resolve {}: {e}", path.display())))
 }
 
 /// True if either path contains the other.

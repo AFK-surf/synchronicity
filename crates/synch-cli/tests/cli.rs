@@ -305,9 +305,11 @@ fn the_command_surface_works_over_the_socket() {
     assert_eq!(keys.lines().count(), 3, "{keys}");
     assert_eq!(keys.matches("active").count(), 1, "{keys}");
     assert!(keys.contains("bound by 0 of 0 reachable peer(s)"), "{keys}");
+    // The freshly generated key is staged, not "retiring": the operator just
+    // minted it, and the label must not say it is on the way out.
     let new_key = keys
         .lines()
-        .find(|line| line.contains("retiring"))
+        .find(|line| line.contains("staged"))
         .and_then(|line| line.split_whitespace().next())
         .expect("the generated key")
         .to_string();
@@ -419,8 +421,11 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
         &nas_daemon.address,
     ]);
 
-    // `ls` on the laptop is empty until the NAS publishes and pushes.
-    assert!(laptop.run(&["ls", "media"]).trim().is_empty());
+    // `ls` on the laptop refuses the space by name until some origin
+    // publishes it — silence is reserved for "exists but empty".
+    let (ok, _, stderr) = laptop.try_run(&["ls", "media"]);
+    assert!(!ok);
+    assert!(stderr.contains("no space media"), "{stderr}");
 
     nas.run(&["space", "add", "media", &nas_space.path().to_string_lossy()]);
     nas.run(&["scan"]);
@@ -430,7 +435,9 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut converged = false;
     while Instant::now() < deadline {
-        if laptop.run(&["ls", "media"]).contains("big.bin") {
+        // The space 404s until the first head lands, then lists.
+        let (ok, stdout, _) = laptop.try_run(&["ls", "media"]);
+        if ok && stdout.contains("big.bin") {
             converged = true;
             break;
         }

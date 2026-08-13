@@ -360,6 +360,7 @@ async fn every_command_variant_round_trips() {
         data_dir,
         Request::KeyActivate {
             key: new_key.clone(),
+            bind: None,
         },
     )
     .await;
@@ -422,6 +423,45 @@ async fn errors_cross_the_socket_with_their_code() {
         .await,
         ErrorCode::NotFound
     );
+    // Silence is reserved for "exists but empty": an unknown space, an
+    // unknown origin, a path nothing publishes, and a ghost space each say
+    // so instead of printing nothing and exiting 0.
+    assert_eq!(
+        failure(
+            data_dir,
+            Request::Ls {
+                reference: "nospace".into(),
+                all: false,
+            }
+        )
+        .await,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        failure(
+            data_dir,
+            Request::Ls {
+                reference: "stranger@cluster.example:media".into(),
+                all: false,
+            }
+        )
+        .await,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        failure(
+            data_dir,
+            Request::Status {
+                reference: Some("media/gone.txt".into()),
+            }
+        )
+        .await,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        failure(data_dir, Request::SpaceRm { id: "ghost".into() }).await,
+        ErrorCode::NotFound
+    );
     assert_eq!(
         failure(
             data_dir,
@@ -476,6 +516,7 @@ async fn errors_cross_the_socket_with_their_code() {
             data_dir,
             Request::KeyActivate {
                 key: SecretKey::generate().public().to_z32(),
+                bind: None,
             }
         )
         .await,

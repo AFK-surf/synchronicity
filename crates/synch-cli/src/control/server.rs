@@ -318,9 +318,21 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::KeyActivate { key } => {
+        Request::KeyActivate { key, bind } => {
             let key = parse_key(&key)?;
-            let activation = node.activate_key(&key).await?;
+            let bind = bind
+                .map(|text| {
+                    text.parse::<std::net::SocketAddr>()
+                        .map_err(|_| ControlError::invalid("--bind wants HOST:PORT"))
+                })
+                .transpose()?;
+            let had_fixed_bind = bind.is_none()
+                && node
+                    .config()
+                    .net
+                    .bind_addr
+                    .is_some_and(|addr| addr.port() != 0);
+            let activation = node.activate_key(&key, bind).await?;
             out.line(format!(
                 "signing as {} from seq {}",
                 activation.new_key.to_z32(),
@@ -338,6 +350,18 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 render::addr(&node.net().direct_addr())
             ))
             .await?;
+            if had_fixed_bind {
+                // The configured address stayed with the retiring endpoint; a
+                // static-address deployment that expected the daemon's --bind
+                // to keep meaning "this node" has to be told it moved.
+                out.line(
+                    "note: the configured bind address still serves the retiring key; \
+                     the new key took an ephemeral port. Pass `--bind` to \
+                     `synch key activate` to choose it, and update peers' \
+                     `trust add --addr` to the address above",
+                )
+                .await?;
+            }
             // Peers learn the re-signed head at the next round anyway; pushing
             // makes the switch visible immediately where reachable.
             if let Err(e) = node.push_head(&activation.head).await {
@@ -425,10 +449,18 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                     } else {
                         "lapsed"
                     },
+                    // "(self)" is a status; an operator's --note is quoted so
+                    // the two can never be misread as each other.
                     binding
                         .note
                         .as_ref()
-                        .map(|n| format!("  ({n})"))
+                        .map(|n| {
+                            if n == "self" {
+                                "  (self)".to_string()
+                            } else {
+                                format!("  note {n:?}")
+                            }
+                        })
                         .unwrap_or_default(),
                 ))
                 .await?;
@@ -554,6 +586,13 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
 
         Request::Ls { reference, all } => {
             let reference = parse_reference(&reference)?;
+            // An unknown space and an empty listing print the same nothing,
+            // and only one of them is fine: silence must mean "empty", never
+            // "you misspelled it and nobody said so".
+            ensure_known_space(node, &reference.space)?;
+            if let Some(origin) = &reference.origin {
+                ensure_known_origin(node, origin)?;
+            }
             match &reference.origin {
                 // The origin-prefixed form lists exactly one origin's view,
                 // which is the old per-origin listing (§9.2).
@@ -600,16 +639,35 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 None => (None, String::new()),
             };
+            let explicit = space.is_some();
             let spaces = match space {
-                Some(space) => vec![space],
+                Some(space) => {
+                    ensure_known_space(node, &space)?;
+                    vec![space]
+                }
                 None => node.store().known_spaces()?,
             };
-            for space in spaces {
-                for set in node.unified_listing(&space, &path, None, None)? {
+            let mut printed = false;
+            for space in &spaces {
+                for set in node.unified_listing(space, &path, None, None)? {
                     for line in render::version_set(&set) {
                         out.line(line).await?;
+                        printed = true;
                     }
                 }
+            }
+            // A named path that matches nothing is an answer, not a shrug: an
+            // empty exit-0 status is indistinguishable from "fine". A bare
+            // space stays quiet when empty — the space check above already
+            // vouched that it exists.
+            if explicit && !path.is_empty() && !printed {
+                return Err(ControlError::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "no origin publishes {}/{path}",
+                        spaces.first().map(String::as_str).unwrap_or_default()
+                    ),
+                ));
             }
         }
 
@@ -867,11 +925,40 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             if peers.is_empty() {
                 out.line("no dialable peers: nothing to sync with").await?;
             }
+            // All dials go out together: a dead peer costs its own connect
+            // timeout, not a serial stall for every peer queued behind it.
+            let mut rounds = tokio::task::JoinSet::new();
             for peer in peers {
-                match node.sync_with_peer(&peer).await {
+                let node = node.clone();
+                rounds.spawn(async move {
+                    let outcome = node.sync_with_peer(&peer).await;
+                    (peer, outcome)
+                });
+            }
+            let mut results = Vec::new();
+            while let Some(joined) = rounds.join_next().await {
+                results
+                    .push(joined.map_err(|e| ControlError::internal(format!("sync round: {e}")))?);
+            }
+            results.sort_by_key(|(peer, _)| peer.to_z32());
+            let now = now_ns();
+            for (peer, outcome) in results {
+                // The peer as the operator knows it — the origins its key is
+                // bound to — with the key for disambiguation, not as the name.
+                let origins = node.store().live_origins_for_key(&peer, now)?;
+                let name = if origins.is_empty() {
+                    "(unnamed key)".to_string()
+                } else {
+                    origins
+                        .iter()
+                        .map(|o| o.canonical())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                match outcome {
                     Ok(report) => {
                         out.line(format!(
-                            "{}  heads accepted {} · tries completed {} · pushed {}",
+                            "{name} ({})  accepted {} head(s) · completed {} origin trie(s) · pushed {}",
                             peer.fmt_short(),
                             report.heads_accepted,
                             report.tries_completed,
@@ -881,7 +968,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     // One unreachable peer must not hide what the others said.
                     Err(e) => {
-                        out.line(format!("{}  unreachable: {e}", peer.fmt_short()))
+                        out.line(format!("{name} ({})  unreachable: {e}", peer.fmt_short()))
                             .await?
                     }
                 }
@@ -1100,6 +1187,33 @@ async fn recover<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Refuses a space no local configuration and no origin's entries know.
+///
+/// An unknown space and an empty one print the same nothing; this is what
+/// keeps that silence meaning "empty" rather than "misspelled".
+fn ensure_known_space(node: &Node, space: &str) -> std::result::Result<(), ControlError> {
+    if node.store().spaces()?.iter().any(|s| s.id == space)
+        || node.store().known_spaces()?.iter().any(|s| s == space)
+    {
+        return Ok(());
+    }
+    Err(ControlError::new(
+        ErrorCode::NotFound,
+        format!("no space {space}: not a local space, and no origin publishes one"),
+    ))
+}
+
+/// Refuses an origin this node holds no binding for and is not itself.
+fn ensure_known_origin(node: &Node, origin: &OriginId) -> std::result::Result<(), ControlError> {
+    if node.origin() == origin || node.store().bindings()?.iter().any(|b| &b.origin == origin) {
+        return Ok(());
+    }
+    Err(ControlError::new(
+        ErrorCode::NotFound,
+        format!("unknown origin {origin}: no binding for it (see `synch trust ls`)"),
+    ))
+}
+
 async fn refresh_domains<S: AsyncWrite + Unpin>(
     node: &Node,
     out: &mut Frames<S>,
@@ -1108,10 +1222,19 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(
     // A domain the node was never told about is a typo, and it is refused
     // before a resolver is even built.
     let domain = domain.map(|d| node.configured_domain(d)).transpose()?;
+    let requested = match &domain {
+        Some(domain) => vec![domain.clone()],
+        None => node.domains()?,
+    };
+    if requested.is_empty() {
+        out.line("no membership domains configured; nothing to refresh (static trust only)")
+            .await?;
+        return Ok(());
+    }
     let resolver = match synch_net::DnssecResolver::from_system() {
         Ok(resolver) => resolver,
         Err(e) => {
-            out.progress(format!("no DNSSEC resolver available: {e}"))
+            out.line(format!("no DNSSEC resolver available: {e}"))
                 .await?;
             return Ok(());
         }
@@ -1121,6 +1244,17 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(
         .await
     {
         Ok(refreshes) => {
+            // A domain that refreshed nothing failed to resolve — say so per
+            // domain, or an offline refresh prints nothing and exits 0.
+            for missing in requested
+                .iter()
+                .filter(|d| !refreshes.iter().any(|r| &&r.domain == d))
+            {
+                out.line(format!(
+                    "{missing}: refresh failed; cached bindings kept (details in the daemon log)"
+                ))
+                .await?;
+            }
             for refresh in refreshes {
                 out.line(format!(
                     "{}: {} binding(s), {} rejected record(s), ttl {}s",

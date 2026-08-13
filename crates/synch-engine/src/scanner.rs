@@ -223,7 +223,6 @@ impl Node {
         }
 
         let (content, size) = self.store().ingest_file(path, now_ns())?;
-        report.hashed += 1;
 
         if stat_match && known.as_ref().is_some_and(|k| k.content == Some(content)) {
             // Racily clean and actually clean. Refreshing `scanned_at` is what
@@ -242,6 +241,10 @@ impl Node {
             report.unchanged += 1;
             return Ok(());
         }
+        // Counted only once the content actually differs: a racy re-hash that
+        // came back identical is "unchanged" to the operator, and reporting it
+        // as both hashed and unchanged made a no-op scan read as work.
+        report.hashed += 1;
 
         let previous = self
             .store()

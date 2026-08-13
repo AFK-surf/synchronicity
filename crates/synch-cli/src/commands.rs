@@ -91,7 +91,12 @@ fn to_request(cli: &Cli) -> Result<Request> {
 
         Command::Key { command } => match command {
             KeyCommand::Rotate => Request::KeyRotate,
-            KeyCommand::Activate { key } => Request::KeyActivate { key: key.clone() },
+            // The global --bind names the new endpoint's address; every other
+            // request ignores it, and `daemon run` never reaches here.
+            KeyCommand::Activate { key } => Request::KeyActivate {
+                key: key.clone(),
+                bind: cli.bind.clone(),
+            },
             KeyCommand::Retire { key } => Request::KeyRetire { key: key.clone() },
             KeyCommand::Ls => Request::KeyLs,
         },

@@ -171,7 +171,10 @@ pub enum Command {
 pub enum KeyCommand {
     /// Generate the next device key and print the TXT record to publish.
     Rotate,
-    /// Switch signing to a generated key, keeping the old one serving.
+    /// Switch signing to a generated key, keeping the old one serving. The
+    /// global `--bind` names the new endpoint's HOST:PORT; without it the new
+    /// key takes an ephemeral port, and the old address stays with the
+    /// retiring endpoint until `key retire` frees it.
     Activate {
         /// The z-base-32 device key to activate.
         key: String,
@@ -417,6 +420,14 @@ mod tests {
             vec!["synch", "id"],
             vec!["synch", "key", "rotate"],
             vec!["synch", "key", "activate", "abc"],
+            vec![
+                "synch",
+                "key",
+                "activate",
+                "abc",
+                "--bind",
+                "127.0.0.1:4433",
+            ],
             vec!["synch", "key", "retire", "abc"],
             vec!["synch", "key", "ls"],
             vec!["synch", "daemon", "run"],

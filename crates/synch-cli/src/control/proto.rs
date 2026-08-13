@@ -36,8 +36,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// requests, a client-to-daemon [`Upload`] frame, and a [`Response::Entry`]
 /// frame that carries entry metadata rather than a rendered line. Bumped to 6
 /// by `synch sync` (a new [`Request`] variant) and by `TreePut` growing a
-/// [`Response::Ready`] ack before the client streams.
-pub const CONTROL_VERSION: u32 = 6;
+/// [`Response::Ready`] ack before the client streams. Bumped to 7 when
+/// `key activate` grew `--bind` — a new field reshaping an existing variant.
+pub const CONTROL_VERSION: u32 = 7;
 
 /// How many payload bytes one `Chunk` frame carries.
 ///
@@ -179,10 +180,16 @@ pub enum Request {
     Id,
     /// `synch key rotate`
     KeyRotate,
-    /// `synch key activate <key>`
+    /// `synch key activate <key> [--bind <addr>]`
     KeyActivate {
         /// The z-base-32 device key to switch signing to.
         key: String,
+        /// The address the new key's endpoint binds, `HOST:PORT`.
+        ///
+        /// `None` takes an ephemeral port on the configured interface. A
+        /// static-address deployment names the next address here — the old
+        /// one stays with the retiring endpoint until `key retire` frees it.
+        bind: Option<String>,
     },
     /// `synch key retire <key>`
     KeyRetire {
