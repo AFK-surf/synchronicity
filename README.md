@@ -60,6 +60,21 @@ synch key retire <K_old>                   # drop that endpoint, delete the secr
 synch key ls                               # this node's keys and their state
 ```
 
+Recover an origin whose device key and database are gone. The node keeps its
+name, comes up on a fresh key, and finds that its peers hold history it does
+not — so it refuses to publish until an operator says how far to skip ahead:
+
+```sh
+synch recover                              # collect peer summaries for an hour
+synch recover --wait 90m --gap 5000        # or wait longer, or skip further
+synch doctor                               # says it is in recovery, and how far peers got
+```
+
+Publishing resumes at `<highest seq any peer advertised> + gap` (default 1000),
+which is what makes a collision with history held only by an unreachable peer
+improbable. If such a peer turns up later, its pre-recovery heads are kept as
+provable fork evidence and `synch doctor` reports them on both sides.
+
 Read across the cluster. Content is fetched on demand and verified per 16 KiB
 group, so a range read costs a range:
 

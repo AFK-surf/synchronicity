@@ -9,14 +9,6 @@ Sections refer to `DESIGN.md`.
 
 ## Deferred, with the module boundary in place
 
-### §3.4 — key-loss recovery quiesce
-
-The `recovery_quiesce` / `seq_gap` protocol for a node rebuilding from an empty
-database under an existing origin id is not implemented. A recovering node
-currently republishes from `seq = 1`, which its peers will refuse as not newer —
-visible, not silently wrong. The pieces it needs (head history, equivocation
-detection, `synch doctor` reporting) are all present.
-
 ### §7.1 — ignore rules
 
 `.syncignore` implements the common gitignore subset: `*`, `?`, `**`, a leading
@@ -50,6 +42,21 @@ One consequence is visible with an explicit `--bind HOST:PORT`: two endpoints
 cannot share a port, so the incoming key binds an ephemeral port on the same
 interface, and the fixed port stays with the outgoing key until it is retired.
 
+### §9.2 — what `synch recover --wait` accepts
+
+The design writes `--wait <dur>` without saying what a duration looks like.
+This implementation takes a plain number of seconds (`0`, `45`) or a sequence
+of unit-suffixed numbers (`30s`, `90m`, `1h`, `2h30m`, `1d`) — parsed by hand
+rather than by adding a dependency for the one duration on the command
+surface. It is parsed twice: on the client, so a typo fails before a connection
+is made, and on the daemon, where a bad value comes back as an ordinary
+structured error.
+
+The quiesce reports one `Progress` frame per collection round, so an hour-long
+wait shows what it is reaching rather than looking hung, and the recovery runs
+as a task the connection owns: a client that hangs up aborts it, and the floor
+is set once, deliberately, or not at all.
+
 ### §9.3 — `Line` frames for textual output
 
 The design describes `cat`, `get`, and a long `ls` streaming their payload "as a
@@ -59,6 +66,38 @@ exactly that. Textual output (`ls`, `status`, `log`, `doctor`, …) streams
 `End`, but framed per line, so the CLI does not have to re-split a byte stream
 it is only going to print line by line. `Progress` and the structured `Error`
 are as specified.
+
+### §3.4 — when a node counts as "in recovery"
+
+The design defines the state as "holds no head of its own but finds peers
+advertising heads for its own origin". This implementation compares the
+advertised seq against the seq the node *would publish at*, not against zero:
+a node is in recovery when it holds no head of its own and some peer has
+advertised a head at or above its next seq. The two agree exactly on a fresh
+database, where the next seq is 1 and any advertisement at all means recovery.
+They differ afterwards, and deliberately: once `synch recover` has set a floor
+of `max_observed + gap`, an observation *below* that floor is not a return to
+recovery — publishing at the floor would still be accepted — while one above it
+is, because it would not.
+
+The heads behind those advertisements are never verified, never adopted, and
+never counted as history. They are recorded in an `observed_heads` table keyed
+by origin, holding the greatest `(seq, root)` any peer has claimed, and the node
+only tracks its *own* origin that way: for every other origin the ordinary
+acceptance rule is both sufficient and stricter.
+
+The publishing floor is durable (a `config` row) and only ever rises, so a
+recovered node stays above its peers' history across restarts, and `synch
+recover` never lowers a seq. A gap of 0 is refused rather than honored: a floor
+at the highest seq peers advertised is precisely the collision the gap exists to
+make improbable.
+
+Two consequences of "publishing is refused" are worth naming. The gate runs
+*before* a scan, not only at the publish it feeds: a scan records what it hashed
+in `local_files`, so a scan whose publish was refused would leave the node
+believing it had published files it never did. And `synch key activate` takes
+the same gate, because re-signing the current root as `seq + 1` is a publish
+like any other.
 
 ### §3.4 — the state of a key between `rotate` and `activate`
 
@@ -82,6 +121,16 @@ restricted once `bind` has made it, and the `0700` directory around it is what
 covers that instant. Windows has no equivalent, which is the case §9.3 already
 anticipates — there the token carries the whole check, and it is checked on
 every request on both platforms.
+
+### §10 — schema versions and migration
+
+§10 gives the schema but not how it is versioned. The `config` row
+`schema_version` carries an integer, and every statement in the schema is
+`CREATE TABLE/INDEX IF NOT EXISTS`. Every change so far has been additive, so
+executing the schema against an older database *is* the migration: opening one
+applies the new statements and stamps the new version. A database written by a
+*newer* build is refused rather than guessed at. When a change stops being
+additive, this is where the rewrite step goes.
 
 ### §10 — the writer task
 

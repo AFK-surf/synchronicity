@@ -324,6 +324,46 @@ async fn put_object_publishes_into_the_local_space() {
     harness.stop().await;
 }
 
+/// A node in key-loss recovery cannot publish, so it cannot accept a write
+/// either. That surfaces as an S3 error naming the command that clears it,
+/// rather than a panic or a silently dropped upload (§3.4, §9.4).
+#[tokio::test]
+async fn put_object_is_refused_while_the_node_is_in_recovery() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    harness
+        .node
+        .store()
+        .record_observed_head(
+            harness.node.origin(),
+            100,
+            &synch_core::Hash([7u8; 32]),
+            true,
+            synch_core::now_ns(),
+        )
+        .unwrap();
+
+    let response = client()
+        .put(harness.url("/my-media/uploads/report.bin"))
+        .body("some bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("ServiceUnavailable"), "{body}");
+    assert!(body.contains("synch recover"), "{body}");
+
+    // Nothing was published under a seq the cluster would refuse.
+    assert!(harness
+        .node
+        .store()
+        .complete_head(harness.node.origin())
+        .unwrap()
+        .is_none());
+
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn foreign_buckets_are_read_only() {
     // §9.4: buckets whose origin is not the local node are read-only, because

@@ -492,6 +492,163 @@ async fn scan_and_mirror_sync_stream_progress() {
     daemon.shutdown().await;
 }
 
+/// `synch recover` over the socket: the quiesce reports each round as it goes,
+/// and the node it ran on can publish again (§3.4, §9.3).
+#[tokio::test]
+async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    let space = space_with(&[("notes.txt", b"hello")]);
+    lines(
+        data_dir,
+        Request::SpaceAdd {
+            id: "media".into(),
+            path: space.path().to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+
+    // A peer has advertised a head for this node's own origin at seq 100 — the
+    // observation an ordinary `Hello` exchange leaves behind (§5.1).
+    daemon
+        .node
+        .store()
+        .record_observed_head(
+            daemon.node.origin(),
+            100,
+            &synch_core::Hash([7u8; 32]),
+            true,
+            synch_core::now_ns(),
+        )
+        .unwrap();
+
+    // Scanning refuses before hashing anything, and says what to run.
+    let error = failure_message(data_dir, Request::Scan).await;
+    assert_eq!(error.code, ErrorCode::Invalid, "{error:?}");
+    assert!(error.message.contains("synch recover"), "{error:?}");
+    assert!(error.message.contains("seq 100"), "{error:?}");
+
+    // Doctor says the same thing in its own words.
+    let doctor = lines(data_dir, Request::Doctor { rebuild: false }).await;
+    assert!(doctor.contains("KEY-LOSS RECOVERY"), "{doctor}");
+    assert!(doctor.contains("seq 100"), "{doctor}");
+
+    let request = Request::Recover {
+        wait: Some("0".into()),
+        gap: Some(5),
+    };
+    let all = frames(data_dir, request).await.expect("recover should run");
+    let progress: Vec<String> = all
+        .iter()
+        .filter_map(|frame| match frame {
+            Response::Progress(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(progress.len(), 1, "{progress:?}");
+    assert!(progress[0].contains("round 1"), "{progress:?}");
+    assert!(progress[0].contains("highest seq seen 100"), "{progress:?}");
+    let text: Vec<String> = all
+        .iter()
+        .filter_map(|frame| match frame {
+            Response::Line(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let text = text.join("\n");
+    assert!(text.contains("is in recovery"), "{text}");
+    assert!(text.contains("publishing resumes at seq 105"), "{text}");
+
+    // And the node publishes again, above everything that was advertised.
+    let scan = lines(data_dir, Request::Scan).await;
+    assert!(scan.contains("published seq 105"), "{scan}");
+
+    let doctor = lines(data_dir, Request::Doctor { rebuild: false }).await;
+    assert!(!doctor.contains("KEY-LOSS RECOVERY"), "{doctor}");
+
+    // A duration this program cannot read fails before any waiting happens.
+    let error = failure_message(
+        data_dir,
+        Request::Recover {
+            wait: Some("whenever".into()),
+            gap: None,
+        },
+    )
+    .await;
+    assert_eq!(error.code, ErrorCode::Invalid);
+    assert!(error.message.contains("--wait"), "{error:?}");
+
+    daemon.shutdown().await;
+}
+
+/// A client that walks away mid-quiesce leaves nothing behind: the daemon
+/// keeps serving, and the publishing floor is untouched (§3.4).
+#[tokio::test]
+async fn a_client_that_hangs_up_mid_quiesce_leaves_the_floor_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    daemon
+        .node
+        .store()
+        .record_observed_head(
+            daemon.node.origin(),
+            100,
+            &synch_core::Hash([7u8; 32]),
+            true,
+            synch_core::now_ns(),
+        )
+        .unwrap();
+
+    // An hour-long quiesce, abandoned as soon as it has said something.
+    let mut client = Client::connect(data_dir).await.unwrap();
+    client
+        .send(&Request::Recover {
+            wait: Some("1h".into()),
+            gap: None,
+        })
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(30), client.next())
+        .await
+        .expect("the quiesce must report as it goes")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(first, Response::Line(_) | Response::Progress(_)));
+    drop(client);
+
+    // The daemon is still there, and nothing was half-applied.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let id = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        lines(data_dir, Request::Id),
+    )
+    .await
+    .expect("the daemon must keep serving");
+    assert!(id.contains("nas@cluster.example"), "{id}");
+    assert_eq!(daemon.node.store().publish_floor().unwrap(), None);
+    assert!(daemon.node.recovery_state().unwrap().in_recovery);
+
+    daemon.shutdown().await;
+}
+
+/// The structured error a failing request produces, message and all.
+async fn failure_message(
+    data_dir: &Path,
+    request: Request,
+) -> synch_cli::control::proto::ControlError {
+    let mut client = Client::connect(data_dir).await.unwrap();
+    client.send(&request).await.unwrap();
+    loop {
+        match client.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the request should have failed"),
+            Err(e) => return e,
+        }
+    }
+}
+
 /// The `Progress` frames of a response.
 async fn progress_of(data_dir: &Path, request: Request) -> Vec<String> {
     frames(data_dir, request)

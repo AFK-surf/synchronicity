@@ -291,6 +291,14 @@ fn the_command_surface_works_over_the_socket() {
     assert!(doctor.contains("equivocation: none detected"), "{doctor}");
     assert!(cli.run(&["daemon", "status"]).contains("storage:"));
 
+    // `synch recover` on a node no peer has ever advertised: it collects one
+    // round, finds nothing to resume from, and leaves the seq alone (§3.4).
+    let recover = cli.run(&["recover", "--wait", "0"]);
+    assert!(recover.contains("nothing to recover"), "{recover}");
+    let (ok, _, stderr) = cli.try_run(&["recover", "--wait", "whenever"]);
+    assert!(!ok);
+    assert!(stderr.contains("--wait"), "{stderr}");
+
     daemon.stop(&cli);
 
     // With the daemon gone, the socket is gone with it.

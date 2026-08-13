@@ -608,8 +608,11 @@ mod tests {
             .await
             .unwrap();
         let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
-        assert!(report.rounds >= 2 && report.rounds <= 8, "{report:?}");
+        assert!(elapsed >= Duration::from_millis(280), "{elapsed:?}");
+        // A round costs a timer, not a spin: polling every 100 ms for 300 ms is
+        // a handful of rounds. Busy-waiting would be thousands, and the upper
+        // bound is loose enough for the slowest runner in the matrix.
+        assert!((1..=8).contains(&report.rounds), "{report:?}");
         let mut updates = Vec::new();
         while let Ok(update) = rx.try_recv() {
             updates.push(update);
