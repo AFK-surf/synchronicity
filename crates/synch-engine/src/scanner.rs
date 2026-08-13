@@ -385,6 +385,29 @@ impl Node {
         Ok(target)
     }
 
+    /// Adopts one origin's version of a path, streaming it into the local
+    /// space directory (§8, `synch take`).
+    ///
+    /// The bytes-in-hand [`Node::adopt`] is what a caller with a small payload
+    /// uses; this is the form that never has the payload in hand. `take` of a
+    /// multi-gigabyte file used to read the object into memory and hand the
+    /// slice over — the object is fetched into the CAS either way, so the only
+    /// thing that buffering bought was a copy the size of the file.
+    pub async fn adopt_from(
+        &self,
+        origin: &synch_core::OriginId,
+        space_id: &str,
+        path: &str,
+    ) -> Result<PathBuf> {
+        let policy = synch_store::VersionPolicy::Origin(origin.clone());
+        // Resolving the target first means a path outside every indexed space
+        // is refused before anything is fetched.
+        let target = self.adoption_target(space_id, path)?;
+        let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
+        self.write_blob_to(&range.root, range.size, &target)?;
+        Ok(target)
+    }
+
     /// Adopts a peer's *deletion* of a path as our own (§8, `synch take`).
     ///
     /// Deletions are adoptable exactly as content is: our local copy goes, and
@@ -465,6 +488,15 @@ pub struct Adoption {
 }
 
 impl Adoption {
+    /// Stages a write at an arbitrary path.
+    ///
+    /// [`Node::open_adoption`] is the form that resolves a `<space>/<path>`
+    /// first; this one is for a target that is already known — a mirror's file
+    /// (§7.2), which by construction lives outside every indexed space.
+    pub fn at(target: impl Into<PathBuf>) -> Result<Adoption> {
+        Adoption::open(target.into())
+    }
+
     fn open(target: PathBuf) -> Result<Adoption> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
@@ -821,6 +853,52 @@ mod tests {
             .unwrap();
         assert_eq!(entry.content, Some(Hash::new(b"theirs")));
         assert_eq!(entry.prev, Some(Hash::new(b"mine")));
+        node.shutdown().await.unwrap();
+    }
+
+    /// The streamed form of adoption: the object goes from the CAS into the
+    /// space a piece at a time, never through a buffer the size of the file
+    /// (§9.4). The staging file it passes through is invisible to a scan and
+    /// gone by the time the adoption returns.
+    #[tokio::test]
+    async fn adopting_a_peer_version_streams_it_into_the_space() {
+        let (_d, space, node) = node_with_space().await;
+        std::fs::write(space.path().join("a.txt"), b"mine").unwrap();
+        node.scan_and_publish().unwrap();
+
+        let peer = synch_core::OriginId::named("nas", "x.example").unwrap();
+        let payload: Vec<u8> = (0..1_200_000u32).map(|i| (i * 11 % 251) as u8).collect();
+        let root = node.store().ingest_bytes(&payload, now_ns()).unwrap();
+        node.store()
+            .put_entry(
+                &peer,
+                "media",
+                "a.txt",
+                &FileEntry::file(payload.len() as u64, 9_000, root, 4),
+            )
+            .unwrap();
+
+        let target = node.adopt_from(&peer, "media", "a.txt").await.unwrap();
+        assert_eq!(target, space.path().join("a.txt"));
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        let left: Vec<String> = std::fs::read_dir(space.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["a.txt".to_string()]);
+
+        node.scan_and_publish().unwrap();
+        let entry = node
+            .store()
+            .entry(node.origin(), "media", "a.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.content, Some(root));
+        assert_eq!(entry.prev, Some(Hash::new(b"mine")));
+
+        // A path outside every indexed space is refused before anything is
+        // fetched, exactly as the bytes-in-hand form refuses it.
+        assert!(node.adopt_from(&peer, "absent", "a.txt").await.is_err());
         node.shutdown().await.unwrap();
     }
 

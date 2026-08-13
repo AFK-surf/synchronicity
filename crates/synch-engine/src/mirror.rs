@@ -185,17 +185,9 @@ impl Node {
                     .push((set.path.clone(), "entry has no content".into()));
                 continue;
             };
-            if target.exists() {
-                let same = std::fs::metadata(&target)
-                    .map(|m| m.len() == selected.size)
-                    .unwrap_or(false)
-                    && std::fs::read(&target)
-                        .map(|bytes| synch_core::Hash::new(&bytes) == content)
-                        .unwrap_or(false);
-                if same {
-                    report.current += 1;
-                    continue;
-                }
+            if already_current(&target, selected.size, &content) {
+                report.current += 1;
+                continue;
             }
 
             let fetched = self.fetch_all(&content, selected.size).await?;
@@ -206,11 +198,11 @@ impl Node {
                 ));
                 continue;
             }
-            let bytes = self.store().read_all(&content)?;
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&target, &bytes)?;
+            // Copied out of the CAS a piece at a time and renamed into place: a
+            // mirror of multi-gigabyte objects must not hold one in memory, and
+            // a pass interrupted halfway must not leave a truncated file
+            // wearing a complete file's name.
+            self.write_blob_to(&content, selected.size, &target)?;
             report.written += 1;
         }
 
@@ -283,6 +275,24 @@ fn materialize_symlink(
             "symlink to {link_target}: creating symbolic links is not available to the daemon on \
              this platform, so the path is skipped rather than written as a plain file"
         ))
+    }
+}
+
+/// True if `target` already holds exactly the object `content` names.
+///
+/// Size first, because it settles almost every case for the price of a `stat`;
+/// the hash only then, and streamed, because a mirror carries objects far
+/// larger than memory and this question is asked of every path on every pass.
+/// Anything unreadable answers "no", and the pass rewrites it.
+fn already_current(target: &Path, size: u64, content: &synch_core::Hash) -> bool {
+    if std::fs::metadata(target).map(|m| m.len()).ok() != Some(size) {
+        return false;
+    }
+    match std::fs::File::open(target) {
+        Ok(file) => synch_core::hash_reader(std::io::BufReader::new(file))
+            .map(|hash| hash == *content)
+            .unwrap_or(false),
+        Err(_) => false,
     }
 }
 
@@ -414,6 +424,38 @@ mod tests {
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.written, 0);
         assert_eq!(report.current, 1);
+        node.shutdown().await.unwrap();
+    }
+
+    /// An object larger than any chunk crosses into the mirror in pieces, and
+    /// the staging file it lands in is gone by the time the pass returns
+    /// (§9.4).
+    #[tokio::test]
+    async fn a_large_object_is_mirrored_in_pieces_and_leaves_no_staging_file() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        let payload: Vec<u8> = (0..1_500_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        publish_entry(&node, &peer(), "big.bin", &payload, 1);
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1);
+        assert_eq!(
+            std::fs::read(target.path().join("big.bin")).unwrap(),
+            payload
+        );
+        let left: Vec<String> = std::fs::read_dir(target.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["big.bin".to_string()]);
+
+        // And the "already current" check answers without reading the object
+        // back into memory, so the second pass writes nothing.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.current, 1);
+        assert_eq!(report.written, 0);
         node.shutdown().await.unwrap();
     }
 

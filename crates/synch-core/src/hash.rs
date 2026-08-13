@@ -43,6 +43,24 @@ impl Hash {
     }
 }
 
+/// Hashes everything a reader yields, in bounded pieces.
+///
+/// The whole-slice [`Hash::new`] is fine for a record; this is for content.
+/// "Is the file on disk already the version the tree names?" is a question a
+/// mirror asks about multi-gigabyte objects (§7.2), and it must never be
+/// answered by reading one into memory.
+pub fn hash_reader(mut reader: impl std::io::Read) -> std::io::Result<Hash> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(Hash(*hasher.finalize().as_bytes()));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
 impl From<blake3::Hash> for Hash {
     fn from(h: blake3::Hash) -> Self {
         Hash(*h.as_bytes())
@@ -109,6 +127,18 @@ mod tests {
     #[test]
     fn matches_plain_blake3() {
         assert_eq!(Hash::new(b"abc").0, *blake3::hash(b"abc").as_bytes());
+    }
+
+    #[test]
+    fn a_reader_hashes_the_same_as_a_slice() {
+        // Longer than the internal buffer, so the multi-read path is the one
+        // being checked.
+        let payload: Vec<u8> = (0..700_000u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(
+            hash_reader(payload.as_slice()).unwrap(),
+            Hash::new(&payload)
+        );
+        assert_eq!(hash_reader(&[][..]).unwrap(), Hash::new(b""));
     }
 
     #[test]

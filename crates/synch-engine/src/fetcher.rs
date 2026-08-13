@@ -504,7 +504,47 @@ impl Node {
         self.read_path(space, path, &VersionPolicy::Origin(origin.clone()))
             .await
     }
+
+    /// Writes an object the CAS already holds into `target`, a bounded piece at
+    /// a time.
+    ///
+    /// The fetch has to have happened first — [`Node::fetch_all`] or
+    /// [`Node::prepare_range`] — because this only copies what is verified and
+    /// local. Everything that materializes an object onto disk goes through
+    /// here: a mirror writing a file (§7.2), `synch take` adopting a peer's
+    /// version (§8), and the gateway's fetch-to-file. None of them may hold the
+    /// object in memory, which is the whole reason this is not
+    /// `write(read_all(root))`.
+    ///
+    /// The bytes land in a staging file that is renamed into place, so a reader
+    /// of `target` sees the old contents or the new ones and never a half-copy.
+    pub fn write_blob_to(&self, root: &Hash, size: u64, target: &std::path::Path) -> Result<()> {
+        let mut out = crate::scanner::Adoption::at(target)?;
+        let mut offset = 0u64;
+        while offset < size {
+            let take = COPY_CHUNK.min(size - offset);
+            let bytes = self.store().read_range(root, offset, take)?;
+            if bytes.is_empty() {
+                // Short of the size the entry declares: the object is not
+                // whole locally, and a truncated file must not be left behind
+                // wearing the name of a complete one.
+                return Err(EngineError::not_found(format!(
+                    "{root} has no bytes at offset {offset} of {size}"
+                )));
+            }
+            offset += bytes.len() as u64;
+            out.write(&bytes)?;
+        }
+        out.commit()?;
+        Ok(())
+    }
 }
+
+/// How much of an object is held in memory while it is copied out of the CAS.
+///
+/// The same order as the control socket's chunk: large enough that the
+/// per-piece cost disappears, small enough that object size stops mattering.
+const COPY_CHUNK: u64 = 256 * 1024;
 
 #[cfg(test)]
 mod tests {

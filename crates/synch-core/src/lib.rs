@@ -12,7 +12,7 @@ pub mod path;
 pub mod record;
 pub mod wire;
 
-pub use hash::{Hash, HashParseError};
+pub use hash::{hash_reader, Hash, HashParseError};
 pub use head::{head_signing_input, HeadError, HeadSummary, SignedHead, HEAD_SIGNING_DOMAIN};
 pub use origin::{NodeId, OriginId, OriginParseError};
 pub use path::{normalize_native_path, normalize_path, PathError, MAX_KEY_LEN};

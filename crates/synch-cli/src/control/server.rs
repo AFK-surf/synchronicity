@@ -688,10 +688,12 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
             } else {
-                let bytes = node
-                    .read_entry(&origin, &reference.space, &reference.path)
+                // Streamed into the space directly out of the CAS: `take` of a
+                // multi-gigabyte file costs a chunk of memory, not a copy of
+                // the object (§9.4).
+                let path = node
+                    .adopt_from(&origin, &reference.space, &reference.path)
                     .await?;
-                let path = node.adopt(&reference.space, &reference.path, &bytes)?;
                 out.line(format!("adopted into {}", path.display())).await?;
             }
             // `take` publishes before it answers, for the same reason
