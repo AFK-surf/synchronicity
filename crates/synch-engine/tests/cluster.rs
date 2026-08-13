@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use synch_core::{now_ns, OriginId};
-use synch_engine::{Node, NodeConfig};
+use synch_engine::{Node, NodeConfig, VersionPolicy};
 use synch_store::{Binding, BindingSource};
 
 struct Peer {
@@ -127,10 +127,10 @@ async fn three_nodes_converge_and_fetch_verified_content() {
     // groups covering that range are fetched, and they are verified.
     let slice = laptop
         .node
-        .read_entry_range(
-            nas.node.origin(),
+        .read_range(
             "media",
             "talks/keynote.mp4",
+            &VersionPolicy::Origin(nas.node.origin().clone()),
             150_000,
             Some(4096),
         )
@@ -275,8 +275,127 @@ async fn an_edit_propagates_and_divergence_is_observable() {
     laptop.node.shutdown().await.unwrap();
 }
 
+/// §8 executed across real nodes: two origins publish different content for the
+/// same `(space, path)`, and a third — which published nothing — sees one tree
+/// with one divergent path, selects deterministically, and watches the
+/// divergence end when one side adopts the other.
 #[tokio::test]
-async fn a_mirror_materializes_a_peers_space() {
+async fn the_unified_tree_carries_every_version_of_a_divergent_path() {
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    let vps = spawn("vps").await;
+    introduce(&[&nas, &laptop, &vps]);
+
+    // Both publishers index their own copy of the same space id, with
+    // different content for the same path. The laptop's copy is the newer one.
+    nas.node.add_space("media", nas.space.path()).unwrap();
+    laptop.node.add_space("media", laptop.space.path()).unwrap();
+    std::fs::write(nas.space.path().join("shared.txt"), b"from the nas").unwrap();
+    nas.node.scan_publish_push().await.unwrap().unwrap();
+    // Distinct mtimes: the filesystem is what supplies them, and `newest`
+    // reads them as published.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    std::fs::write(laptop.space.path().join("shared.txt"), b"from the laptop").unwrap();
+    laptop.node.scan_publish_push().await.unwrap().unwrap();
+
+    for peer in [&nas, &laptop, &vps] {
+        for other in [&nas, &laptop] {
+            if peer.node.origin() != other.node.origin() {
+                peer.node
+                    .sync_with_peer(&other.node.node_id())
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    // The observer's unified view: one tree, one path, two versions.
+    let listing = vps.node.unified_listing("media", "", None, None).unwrap();
+    assert_eq!(listing.len(), 1, "one path, not one per origin");
+    assert_eq!(listing[0].path, "shared.txt");
+    assert_eq!(listing[0].version_count(), 2);
+    assert!(listing[0].is_divergent());
+    assert!(listing[0].exists());
+
+    // `newest` is a deterministic total order over the assertions, so every
+    // node computes the same answer from the same data.
+    let mut selected = Vec::new();
+    for peer in [&nas, &laptop, &vps] {
+        let entry = peer
+            .node
+            .resolve("media", "shared.txt", &VersionPolicy::Newest)
+            .unwrap();
+        selected.push((entry.origin.clone(), entry.content));
+    }
+    assert_eq!(selected[0], selected[1]);
+    assert_eq!(selected[1], selected[2]);
+    assert_eq!(selected[0].0, *laptop.node.origin(), "the newer mtime wins");
+    assert_eq!(
+        vps.node
+            .read_path("media", "shared.txt", &VersionPolicy::Newest)
+            .await
+            .unwrap(),
+        b"from the laptop"
+    );
+
+    // An origin pin — what `--from` builds — reads the other version.
+    assert_eq!(
+        vps.node
+            .read_path(
+                "media",
+                "shared.txt",
+                &VersionPolicy::Origin(nas.node.origin().clone())
+            )
+            .await
+            .unwrap(),
+        b"from the nas"
+    );
+
+    // `strict` refuses, and names both versions in the refusal.
+    let err = vps
+        .node
+        .resolve("media", "shared.txt", &VersionPolicy::Strict)
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("nas@cluster.example"), "{text}");
+    assert!(text.contains("laptop@cluster.example"), "{text}");
+    assert!(vps
+        .node
+        .read_path("media", "shared.txt", &VersionPolicy::Strict)
+        .await
+        .is_err());
+
+    // Adoption is how divergence ends: the nas takes the laptop's version as
+    // its own, and the two assertions collapse into one unanimous version.
+    let theirs = nas
+        .node
+        .read_entry(laptop.node.origin(), "media", "shared.txt")
+        .await
+        .unwrap();
+    nas.node.adopt("media", "shared.txt", &theirs).unwrap();
+    nas.node.scan_publish_push().await.unwrap().unwrap();
+    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
+
+    let set = vps.node.versions("media", "shared.txt").unwrap();
+    assert_eq!(set.version_count(), 1, "one version, two attestors");
+    assert!(!set.is_divergent());
+    assert_eq!(set.versions[0].attestors.len(), 2);
+    // And `strict` now reads it without complaint.
+    assert_eq!(
+        vps.node
+            .read_path("media", "shared.txt", &VersionPolicy::Strict)
+            .await
+            .unwrap(),
+        b"from the laptop"
+    );
+
+    for peer in [&nas, &laptop, &vps] {
+        peer.node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_mirror_materializes_the_unified_tree() {
     let nas = spawn("nas").await;
     let vps = spawn("vps").await;
     introduce(&[&nas, &vps]);
@@ -290,13 +409,9 @@ async fn a_mirror_materializes_a_peers_space() {
 
     let target = tempfile::tempdir().unwrap();
     vps.node
-        .add_mirror(nas.node.origin(), "media", target.path())
+        .add_mirror("media", target.path(), &VersionPolicy::Newest)
         .unwrap();
-    let report = vps
-        .node
-        .sync_mirror(nas.node.origin(), "media")
-        .await
-        .unwrap();
+    let report = vps.node.sync_mirror(target.path()).await.unwrap();
     assert_eq!(report.written, 2, "{report:?}");
     assert!(report.skipped.is_empty(), "{report:?}");
     assert_eq!(
@@ -312,11 +427,7 @@ async fn a_mirror_materializes_a_peers_space() {
     std::fs::remove_file(nas.space.path().join("a.txt")).unwrap();
     nas.node.scan_publish_push().await.unwrap();
     vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
-    let report = vps
-        .node
-        .sync_mirror(nas.node.origin(), "media")
-        .await
-        .unwrap();
+    let report = vps.node.sync_mirror(target.path()).await.unwrap();
     assert_eq!(report.removed, 1);
     assert!(!target.path().join("a.txt").exists());
 

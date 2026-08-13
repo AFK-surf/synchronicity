@@ -20,6 +20,7 @@ pub mod recovery;
 pub mod reference;
 pub mod rotation;
 pub mod scanner;
+pub mod tree;
 pub mod watcher;
 
 pub use aae::RoundReport;
@@ -38,4 +39,6 @@ pub use recovery::{
 pub use reference::EntryRef;
 pub use rotation::{Activation, RotationPlan};
 pub use scanner::ScanReport;
+pub use synch_store::{Selection, Version, VersionPolicy, VersionSet};
+pub use tree::reference_of;
 pub use watcher::SpaceWatcher;

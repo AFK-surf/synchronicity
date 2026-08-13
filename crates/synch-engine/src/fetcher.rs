@@ -2,6 +2,7 @@
 //! (§6.3, §6.4).
 
 use synch_core::{group_count, groups_for_byte_range, now_ns, ChunkRanges, Hash, OriginId};
+use synch_store::VersionPolicy;
 
 use crate::{
     error::{EngineError, Result},
@@ -23,7 +24,7 @@ pub struct Provider {
 
 /// A byte window of an object that is present and verified locally.
 ///
-/// What [`Node::prepare_entry_range`] hands back so a caller can stream the
+/// What [`Node::prepare_range`] hands back so a caller can stream the
 /// window out of the CAS in pieces of its own choosing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedRange {
@@ -242,50 +243,57 @@ impl Node {
         self.publish(&[change])
     }
 
-    /// Reads a byte range of a published entry, fetching whatever is missing
-    /// first — the engine half of `synch cat --range` (§7.2).
+    /// Reads a byte range of the policy-selected version of a path, fetching
+    /// whatever is missing first — the engine half of `synch cat --range`
+    /// (§7.2, §8).
     ///
     /// Buffers the whole range: callers streaming a large object want
-    /// [`Node::prepare_entry_range`] and then chunked
+    /// [`Node::prepare_range`] and then chunked
     /// [`Store::read_range`](synch_store::Store::read_range) reads instead.
-    pub async fn read_entry_range(
+    pub async fn read_range(
         &self,
-        origin: &OriginId,
         space: &str,
         path: &str,
+        policy: &VersionPolicy,
         start: u64,
         len: Option<u64>,
     ) -> Result<Vec<u8>> {
-        let range = self
-            .prepare_entry_range(origin, space, path, start, len)
-            .await?;
+        let range = self.prepare_range(space, path, policy, start, len).await?;
         Ok(self
             .store()
             .read_range(&range.root, range.start, range.end - range.start)?)
     }
 
-    /// Resolves an entry, fetches whatever of the requested range is missing,
-    /// and reports where the bytes now live locally.
+    /// Reads the policy-selected version of a path in full.
+    pub async fn read_path(
+        &self,
+        space: &str,
+        path: &str,
+        policy: &VersionPolicy,
+    ) -> Result<Vec<u8>> {
+        self.read_range(space, path, policy, 0, None).await
+    }
+
+    /// Selects a version under a policy, fetches whatever of the requested
+    /// range is missing, and reports where the bytes now live locally.
     ///
     /// Every byte is verified against the object's bao tree before it is
     /// committed to the CAS, so a subsequent
     /// [`Store::read_range`](synch_store::Store::read_range) over the returned
     /// window reads only verified content.
-    pub async fn prepare_entry_range(
+    pub async fn prepare_range(
         &self,
-        origin: &OriginId,
         space: &str,
         path: &str,
+        policy: &VersionPolicy,
         start: u64,
         len: Option<u64>,
     ) -> Result<PreparedRange> {
-        let entry = self
-            .store()
-            .entry(origin, space, path)?
-            .ok_or_else(|| EngineError::not_found(format!("{origin}:{space}/{path}")))?;
+        let entry = self.resolve(space, path, policy)?;
         if entry.kind == synch_core::EntryKind::Tombstone {
             return Err(EngineError::not_found(format!(
-                "{origin}:{space}/{path} was deleted at seq {}",
+                "{} was deleted at seq {}",
+                crate::tree::reference_of(policy, space, path),
                 entry.seq
             )));
         }
@@ -316,9 +324,11 @@ impl Node {
         })
     }
 
-    /// Reads a published entry in full.
+    /// Reads one origin's entry in full — the pinned form of
+    /// [`Node::read_path`], which is what `synch take` adopts from.
     pub async fn read_entry(&self, origin: &OriginId, space: &str, path: &str) -> Result<Vec<u8>> {
-        self.read_entry_range(origin, space, path, 0, None).await
+        self.read_path(space, path, &VersionPolicy::Origin(origin.clone()))
+            .await
     }
 }
 
@@ -334,6 +344,10 @@ mod tests {
         Node::init(dir.path(), None).unwrap();
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
         (dir, node)
+    }
+
+    fn pin(origin: &OriginId) -> VersionPolicy {
+        VersionPolicy::Origin(origin.clone())
     }
 
     fn trust(node: &Node, name: &str) -> (OriginId, synch_core::NodeId) {
@@ -476,14 +490,14 @@ mod tests {
             payload
         );
         assert_eq!(
-            node.read_entry_range(&origin, "s", "big.bin", 100, Some(50))
+            node.read_range("s", "big.bin", &pin(&origin), 100, Some(50))
                 .await
                 .unwrap(),
             &payload[100..150]
         );
         // A range that runs past the end is clamped, not an error.
         assert_eq!(
-            node.read_entry_range(&origin, "s", "big.bin", 49_990, Some(1000))
+            node.read_range("s", "big.bin", &pin(&origin), 49_990, Some(1000))
                 .await
                 .unwrap(),
             &payload[49_990..]

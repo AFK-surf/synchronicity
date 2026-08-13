@@ -733,9 +733,9 @@ mod tests {
         let shared = tempfile::tempdir().unwrap();
         node.store()
             .put_mirror(
-                &OriginId::named("nas", "x.example").unwrap(),
-                "media",
                 &shared.path().to_string_lossy(),
+                "media",
+                &synch_store::VersionPolicy::Newest,
             )
             .unwrap();
         let err = node.add_space("media", shared.path()).unwrap_err();
@@ -763,9 +763,9 @@ mod tests {
 
         node.store()
             .put_mirror(
-                &OriginId::named("nas", "x.example").unwrap(),
-                "media",
                 &link.to_string_lossy(),
+                "media",
+                &synch_store::VersionPolicy::Newest,
             )
             .unwrap();
 

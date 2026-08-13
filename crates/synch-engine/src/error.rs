@@ -36,6 +36,23 @@ pub enum EngineError {
     /// A caller supplied an invalid argument.
     #[error("{0}")]
     Invalid(String),
+    /// A `strict` read met a divergent path (§8).
+    ///
+    /// Divergence is data, not a fault: the versions are carried here so the
+    /// surface that refused the read can name them.
+    #[error(
+        "{space}/{path} has {} versions and the policy is strict:\n  {}",
+        versions.len(),
+        versions.join("\n  ")
+    )]
+    Divergent {
+        /// The space.
+        space: String,
+        /// The path within it.
+        path: String,
+        /// One rendered line per version, newest first.
+        versions: Vec<String>,
+    },
     /// This node is in key-loss recovery and must not publish (§3.4).
     ///
     /// Publishing anyway would mint heads at a seq every peer correctly
