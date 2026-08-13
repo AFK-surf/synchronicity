@@ -15,7 +15,9 @@ pub mod mpt;
 pub mod reconcile;
 
 pub use blob::{BlobClient, BlobProtocol, Slice};
-pub use dns::{DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError};
+pub use dns::{
+    DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError, ResolverOptions,
+};
 pub use endpoint::{Net, NetOptions};
 pub use error::{NetError, Result};
 pub use mpt::{HeadExchange, MptClient, MptProtocol, NodesResponse, ValuesResponse};

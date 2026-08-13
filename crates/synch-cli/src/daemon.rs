@@ -62,7 +62,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // refresh, because `run_maintenance` expires bindings and nothing renews
     // them (§3.2). It also carries the §3.4 unknown-key trigger.
     let dns = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
-        match synch_net::DnssecResolver::from_system() {
+        match synch_net::DnssecResolver::with_options(&node.config().dns) {
             Ok(resolver) => node.run_dns(&resolver, shutdown).await,
             Err(e) => {
                 tracing::warn!(error = %e, "no DNSSEC resolver available; membership will not refresh");

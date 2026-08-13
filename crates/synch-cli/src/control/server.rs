@@ -1323,7 +1323,9 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(
             .await?;
         return Ok(());
     }
-    let resolver = match synch_net::DnssecResolver::from_system() {
+    // The daemon's own resolver settings: a refresh asked for over the socket
+    // resolves exactly the way the daemon's scheduled refreshes do.
+    let resolver = match synch_net::DnssecResolver::with_options(&node.config().dns) {
         Ok(resolver) => resolver,
         Err(e) => {
             out.line(format!("no DNSSEC resolver available: {e}"))

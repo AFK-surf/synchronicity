@@ -285,13 +285,160 @@ pub struct ValidatedTxt {
     pub ttl: Duration,
 }
 
+/// How the resolver reaches the DNS and whom it ultimately trusts (§3.2).
+///
+/// The defaults — the system's nameservers, the ICANN root trust anchor — are
+/// what production wants, and both knobs exist for environments where that
+/// path is wrong: a network whose port-53 traffic is filtered or rewritten
+/// resolves over DNS-over-HTTPS instead, and an internal test zone signed by
+/// its own root swaps the trust anchor. Neither weakens the §3.2 stance:
+/// validation still happens in process against whatever anchor is in force,
+/// and a DoH upstream is a transport, not a validator we defer to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolverOptions {
+    /// A DNS-over-HTTPS endpoint, e.g. `https://1.1.1.1/dns-query`.
+    ///
+    /// `https://host[:port][/path]`; the path defaults to `/dns-query` and
+    /// the port to 443. A hostname is bootstrap-resolved through the system
+    /// resolver once, un-validated — safe, because the endpoint's identity is
+    /// the TLS handshake against that hostname, and the answers themselves
+    /// are still DNSSEC-validated here.
+    pub doh_url: Option<String>,
+    /// A file of `DNSKEY` records (zone syntax, as `dig` prints them)
+    /// *replacing* the ICANN root trust anchor.
+    ///
+    /// For internal deployments and tests that run their own signed root.
+    /// With this set, nothing signed under the real root validates any more:
+    /// an override is a different universe, not an addition to this one.
+    pub trust_anchor: Option<std::path::PathBuf>,
+}
+
+/// A parsed DNS-over-HTTPS endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DohEndpoint {
+    /// The TLS server name: what the certificate must speak for.
+    host: String,
+    /// The TCP port, 443 unless the URL names one.
+    port: u16,
+    /// The HTTP path queries POST to.
+    path: String,
+}
+
+impl DohEndpoint {
+    /// Parses `https://host[:port][/path]`.
+    ///
+    /// Plain `http://` is refused rather than accepted quietly: the
+    /// endpoint's whole identity is its TLS handshake.
+    fn parse(url: &str) -> Result<Self, NetError> {
+        let bad = |why: &str| NetError::Dns(format!("DoH endpoint {url}: {why}"));
+        let rest = url
+            .strip_prefix("https://")
+            .ok_or_else(|| bad("must be an https:// URL"))?;
+        let (authority, path) = match rest.find('/') {
+            Some(slash) => (&rest[..slash], &rest[slash..]),
+            None => (rest, "/dns-query"),
+        };
+        // An IPv6 host is bracketed; everything else splits on the last ':'.
+        let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+            let (host, tail) = v6
+                .split_once(']')
+                .ok_or_else(|| bad("unclosed [ in an IPv6 host"))?;
+            let port = match tail.strip_prefix(':') {
+                Some(port) => port.parse().map_err(|_| bad("bad port"))?,
+                None if tail.is_empty() => 443,
+                None => return Err(bad("junk after the IPv6 host")),
+            };
+            (host.to_string(), port)
+        } else {
+            match authority.rsplit_once(':') {
+                Some((host, port)) => {
+                    (host.to_string(), port.parse().map_err(|_| bad("bad port"))?)
+                }
+                None => (authority.to_string(), 443),
+            }
+        };
+        if host.is_empty() {
+            return Err(bad("no host"));
+        }
+        Ok(DohEndpoint {
+            host,
+            port,
+            path: path.to_string(),
+        })
+    }
+
+    /// The addresses to dial: the host itself when it is a literal, or one
+    /// bootstrap resolution through the system resolver when it is a name.
+    fn addrs(&self) -> Result<Vec<std::net::IpAddr>, NetError> {
+        use std::net::ToSocketAddrs;
+        if let Ok(ip) = self.host.parse::<std::net::IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        let mut addrs: Vec<std::net::IpAddr> = (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .map_err(|e| NetError::Dns(format!("could not bootstrap-resolve {}: {e}", self.host)))?
+            .map(|addr| addr.ip())
+            .collect();
+        addrs.dedup();
+        addrs.truncate(3);
+        if addrs.is_empty() {
+            return Err(NetError::Dns(format!(
+                "{} bootstrap-resolved to no addresses",
+                self.host
+            )));
+        }
+        Ok(addrs)
+    }
+}
+
 impl DnssecResolver {
     /// Builds a resolver from the system configuration, with in-process DNSSEC
     /// validation enabled.
     pub fn from_system() -> Result<Self, NetError> {
-        let mut builder = hickory_resolver::Resolver::builder_tokio()
-            .map_err(|e| NetError::Dns(e.to_string()))?;
+        Self::with_options(&ResolverOptions::default())
+    }
+
+    /// Builds a resolver honoring [`ResolverOptions`], with in-process DNSSEC
+    /// validation enabled either way.
+    pub fn with_options(options: &ResolverOptions) -> Result<Self, NetError> {
+        use hickory_resolver::{
+            config::{NameServerConfig, ResolverConfig},
+            net::runtime::TokioRuntimeProvider,
+            Resolver,
+        };
+        let mut builder = match &options.doh_url {
+            Some(url) => {
+                let endpoint = DohEndpoint::parse(url)?;
+                let mut config = ResolverConfig::default();
+                for ip in endpoint.addrs()? {
+                    let mut server = NameServerConfig::https(
+                        ip,
+                        endpoint.host.as_str().into(),
+                        Some(endpoint.path.as_str().into()),
+                    );
+                    for connection in &mut server.connections {
+                        connection.port = endpoint.port;
+                    }
+                    config.add_name_server(server);
+                }
+                Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+            }
+            None => hickory_resolver::Resolver::builder_tokio()
+                .map_err(|e| NetError::Dns(e.to_string()))?,
+        };
         builder.options_mut().validate = true;
+        if let Some(path) = &options.trust_anchor {
+            let anchors = hickory_resolver::proto::dnssec::TrustAnchors::from_file(path)
+                .map_err(|e| NetError::Dns(format!("trust anchor {}: {e}", path.display())))?;
+            if anchors.is_empty() {
+                // An empty anchor set validates nothing, forever, quietly.
+                return Err(NetError::Dns(format!(
+                    "trust anchor {}: no DNSKEY records in the file",
+                    path.display()
+                )));
+            }
+            builder = builder.with_trust_anchor(std::sync::Arc::new(anchors));
+        }
         Ok(DnssecResolver {
             resolver: builder.build().map_err(|e| NetError::Dns(e.to_string()))?,
         })
@@ -382,6 +529,87 @@ mod tests {
 
     fn key() -> NodeId {
         SecretKey::generate().public()
+    }
+
+    #[test]
+    fn doh_endpoints_parse() {
+        let simple = DohEndpoint::parse("https://1.1.1.1/dns-query").unwrap();
+        assert_eq!(simple.host, "1.1.1.1");
+        assert_eq!(simple.port, 443);
+        assert_eq!(simple.path, "/dns-query");
+
+        // The path defaults, the port is honored, IPv6 hosts are bracketed.
+        let bare = DohEndpoint::parse("https://dns.internal.example").unwrap();
+        assert_eq!(bare.path, "/dns-query");
+        let custom = DohEndpoint::parse("https://10.0.0.53:8443/resolve").unwrap();
+        assert_eq!((custom.port, custom.path.as_str()), (8443, "/resolve"));
+        let v6 = DohEndpoint::parse("https://[::1]:8443/dns-query").unwrap();
+        assert_eq!((v6.host.as_str(), v6.port), ("::1", 8443));
+        assert_eq!(DohEndpoint::parse("https://[::1]/q").unwrap().port, 443);
+
+        // Plain http is refused by name, not accepted quietly.
+        let err = DohEndpoint::parse("http://1.1.1.1/dns-query").unwrap_err();
+        assert!(err.to_string().contains("https"), "{err}");
+        assert!(DohEndpoint::parse("https:///dns-query").is_err());
+        assert!(DohEndpoint::parse("https://[::1/q").is_err());
+        assert!(DohEndpoint::parse("https://host:port/q").is_err());
+    }
+
+    #[test]
+    fn doh_literal_hosts_need_no_bootstrap() {
+        let addrs = DohEndpoint::parse("https://9.9.9.9/dns-query")
+            .unwrap()
+            .addrs()
+            .unwrap();
+        assert_eq!(addrs, vec!["9.9.9.9".parse::<std::net::IpAddr>().unwrap()]);
+        // A name bootstraps through the system resolver; localhost resolves
+        // from the hosts file, so this stays offline-safe.
+        let local = DohEndpoint::parse("https://localhost/dns-query")
+            .unwrap()
+            .addrs()
+            .unwrap();
+        assert!(local.iter().all(|ip| ip.is_loopback()), "{local:?}");
+    }
+
+    #[tokio::test]
+    async fn resolver_options_build_and_fail_closed() {
+        // A DoH resolver builds without touching the network.
+        DnssecResolver::with_options(&ResolverOptions {
+            doh_url: Some("https://127.0.0.1:8053/dns-query".into()),
+            trust_anchor: None,
+        })
+        .unwrap();
+
+        // A missing or empty trust anchor is refused by name: an anchor set
+        // with no keys would validate nothing, forever, quietly.
+        let err = DnssecResolver::with_options(&ResolverOptions {
+            doh_url: None,
+            trust_anchor: Some("/does/not/exist.key".into()),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("trust anchor"), "{err}");
+
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let err = DnssecResolver::with_options(&ResolverOptions {
+            doh_url: None,
+            trust_anchor: Some(empty.path().to_path_buf()),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("no DNSKEY records"), "{err}");
+
+        // A syntactically valid DNSKEY record is accepted and replaces the
+        // ICANN root: building proves the whole path parses and loads.
+        let anchor = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            anchor.path(),
+            format!(". IN DNSKEY 257 3 13 {}==\n", "A".repeat(86)),
+        )
+        .unwrap();
+        DnssecResolver::with_options(&ResolverOptions {
+            doh_url: Some("https://127.0.0.1:8053/dns-query".into()),
+            trust_anchor: Some(anchor.path().to_path_buf()),
+        })
+        .unwrap();
     }
 
     fn record(id: Option<&str>, key: &NodeId) -> String {

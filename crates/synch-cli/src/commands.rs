@@ -41,6 +41,8 @@ pub fn node_config(cli: &Cli) -> Result<NodeConfig> {
     } else if cli.offline {
         config.net.bind_addr = Some("127.0.0.1:0".parse().expect("valid loopback address"));
     }
+    config.dns.doh_url = cli.doh.clone();
+    config.dns.trust_anchor = cli.dnssec_anchor.clone();
     Ok(config)
 }
 

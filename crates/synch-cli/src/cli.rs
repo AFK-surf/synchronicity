@@ -20,6 +20,18 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub offline: bool,
 
+    /// Resolve membership TXT records over this DNS-over-HTTPS endpoint
+    /// instead of the system resolvers, e.g. https://1.1.1.1/dns-query.
+    /// Answers are still DNSSEC-validated in process.
+    #[arg(long, global = true, env = "SYNCH_DOH", value_name = "URL")]
+    pub doh: Option<String>,
+
+    /// Replace the ICANN DNSSEC root trust anchor with this file of DNSKEY
+    /// records (zone syntax, as `dig DNSKEY` prints) — for internal
+    /// deployments and testing against a self-signed root.
+    #[arg(long, global = true, env = "SYNCH_DNSSEC_ANCHOR", value_name = "FILE")]
+    pub dnssec_anchor: Option<PathBuf>,
+
     /// Increase log verbosity.
     #[arg(short, long, global = true)]
     pub verbose: bool,

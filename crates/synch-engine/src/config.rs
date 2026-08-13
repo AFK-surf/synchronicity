@@ -50,6 +50,9 @@ pub struct NodeConfig {
     pub seq_gap: u64,
     /// The human-friendly node name published in `m:self`.
     pub name: String,
+    /// How the DNSSEC resolver reaches the DNS: an optional DoH endpoint and
+    /// an optional root-trust-anchor override (§3.2).
+    pub dns: synch_net::ResolverOptions,
 }
 
 impl NodeConfig {
@@ -70,6 +73,7 @@ impl NodeConfig {
             recovery_quiesce: crate::recovery::DEFAULT_RECOVERY_QUIESCE,
             seq_gap: crate::recovery::DEFAULT_SEQ_GAP,
             name: hostname(),
+            dns: synch_net::ResolverOptions::default(),
         }
     }
 

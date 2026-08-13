@@ -186,6 +186,18 @@ A remote node is **trusted** iff at least one of the following holds:
    expired RRSIGs, broken chain — the response is **discarded entirely** and the
    previously cached member set is retained until its own expiry. Fail closed.
 
+   Two resolver knobs exist for environments where the system path is wrong,
+   and neither weakens the stance above. `--doh <url>` (`SYNCH_DOH`) sends the
+   queries over DNS-over-HTTPS instead of the system nameservers — a transport
+   for networks that filter or rewrite port 53, not a validator we defer to;
+   answers are still validated in process. `--dnssec-anchor <file>`
+   (`SYNCH_DNSSEC_ANCHOR`) *replaces* the ICANN root trust anchor with a file
+   of DNSKEY records, for internal deployments and tests that run their own
+   signed root; with it set, nothing signed under the real root validates —
+   an override is a different universe, not an addition. Both are daemon
+   flags: every refresh, scheduled or requested over the control socket,
+   resolves the same way.
+
    Records are re-resolved on the TTL (clamped to `[60s, 24h]`). A binding that
    disappears from DNS expires after `dns_trust_grace` (default: 1 TTL + 10 minutes)
    to absorb propagation glitches. Adding a machine to the cluster becomes: generate
