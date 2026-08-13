@@ -229,7 +229,8 @@ No trie rewrite, no re-hashing, no history loss.
    the existing one. Both keys are now bound; peers pick this up on their next
    validated refresh.
 3. Once the new record has had time to propagate — one TTL is the safe bound, and
-   `synch key ls` reports which of the node's keys peers have actually bound — the
+   `synch key ls` asks each reachable peer (`GetBindings`, §5.1) which of our keys
+   it currently holds bound and reports the tally per key — the
    operator runs `synch key activate <K_new>`. That re-signs the current root as a
    new head (`seq+1`, `signed_by = K_new`) and brings up a second iroh endpoint as
    `K_new`. **Both endpoints stay live** until the old binding has expired everywhere
@@ -261,8 +262,13 @@ explicitly driven state rather than something a node does on startup:
 1. **Detection.** A node that holds no head of its own but finds peers advertising
    heads for its own origin is *in recovery*. It refuses to publish — a node that
    silently started over at `seq = 1` would have every peer correctly reject it, and
-   the reason would be invisible. `synch doctor` reports the state and the highest
-   seq seen so far, and publishing commands fail pointing at `synch recover`.
+   the reason would be invisible. `synch doctor` reports the state, the highest seq
+   seen so far, and **which peer claimed it** — detection rests on peers'
+   unauthenticated summaries (deliberately: the true heads are signed by the lost
+   key and cannot validate), so within the trust stance (§12) any member could
+   assert a huge seq and hold a fresh node in recovery; the attribution is what
+   lets an operator judge the claim. Publishing commands fail pointing at
+   `synch recover`.
 2. **Observation.** The heads peers hold for this origin are signed by the lost key,
    which is no longer bound, so they cannot be accepted as heads (§4.4) — but their
    *existence* is what matters. Peers report `(origin, seq, root, complete)` for every
@@ -376,10 +382,16 @@ Notes:
   the new root and the diff surfaces it, even to peers partitioned for years. Their
   purpose is interpretation: distinguishing "deleted at seq N" from "never existed"
   in `synch status`/`synch log`. They are retained for
-  `tombstone_ttl` (default 90 days), then dropped in a later root. The real residual
-  risk is different: the *origin itself* restoring from an old database backup
-  republishes its old trie at a higher seq, resurrecting its own deletions — visible
-  in `head_history`, not preventable by the protocol.
+  `tombstone_ttl` (default 90 days), then dropped in a later root. Two residual
+  risks, both accepted and both with the same remedy: (1) the *origin itself*
+  restoring from an old database backup republishes its old trie at a higher seq,
+  resurrecting its own deletions — visible in `head_history`, not preventable by
+  the protocol; (2) under the unified tree (§8), a deletion whose divergence was
+  never resolved expires: if another origin still publishes a live version when
+  the tombstone's TTL runs out, that live version becomes the only one and
+  `newest` surfaces silently re-serve the file. The remedy for both is ending the
+  divergence while it is visible — `synch take` the deletion (§8) on the holdout,
+  or the holdout deletes its copy — rather than letting the TTL decide.
 - **`BlobAd` granularity — one record per object per holder.** An earlier draft
   advertised every hash-tree node individually; that is unsound at scale: a single
   100 GB file yields ~6.1 M leaf groups and ~12 M trie records — larger than the
@@ -480,9 +492,17 @@ Values     { values: Vec<(Hash, Bytes)>, missing: Vec<Hash> }
 
 // provider hints for cold caches: a node holding an object root whose ads it has
 // not replicated yet (bootstrap, or an origin just admitted). Hints are unverified —
-// content is hash-verified regardless, so a wrong hint only wastes a dial:
+// content is hash-verified regardless, so a wrong hint only wastes a dial. The
+// fetcher falls back to this when it wants a root no local ad covers:
 FindProviders { object_root: Hash }
 Providers  { ads: Vec<(OriginId, BlobAd)> }
+
+// binding introspection: which device keys does the answering peer currently hold
+// bound for an origin? Purely informational within the trusted cluster; this is
+// what `synch key ls` aggregates to tell an operator when a rotation's new key
+// has actually propagated (§3.4):
+GetBindings  { origin: OriginId }
+BindingsFor  { origin: OriginId, keys: Vec<NodeId> }
 ```
 
 ### 5.2 Reconciliation algorithm
@@ -506,9 +526,14 @@ while frontier ≠ ∅:
     nodes ← GetNodes(want) from this peer (or any peer advertising complete ≥ H.seq)
     verify each node hashes to its requested hash      // reject & disconnect on mismatch
     store nodes; frontier ← their children ∪ out-of-line value hashes
-atomically: set complete_head(O) ← H; clear pending    // single SQLite transaction
-re-materialize changed leaves into `entries` / `blob_providers` (computed from the
-node-level diff between old and new root — only touched subtrees are visited)
+atomically, in ONE SQLite transaction:
+    set complete_head(O) ← H; clear pending
+    re-materialize changed leaves into `entries` / `blob_providers` (computed from
+    the node-level diff between old and new root — only touched subtrees visited)
+// the flip and the materialization are the same transaction (§10): a crash can
+// never leave `entries` — what the unified tree, mirrors, and s3 serve from —
+// missing a promoted head's delta. Local publishes obey the same rule: trie
+// writes, head, history, and materialization commit together or not at all.
 ```
 
 Properties:
@@ -669,7 +694,12 @@ behavior with zero kernel dependencies:
 - **Scanner**: a periodic (default 1 h) and on-demand full walk. A file is considered
   unchanged if `(size, mtime_ns, file_id)` matches the `local_files` table — only then
   is hashing skipped. Changed files are re-hashed (streaming blake3, outboard emitted
-  as a by-product), the CAS is updated, and a new `FileEntry` is staged.
+  as a by-product), the CAS is updated, and a new `FileEntry` is staged. **Symlinks
+  are tracked exactly like files**: recorded in `local_files`, carrying the link's
+  own (lstat) mtime and its target as the change signal — an unchanged symlink
+  stages nothing (republishing one every scan would defeat the "unchanged tree
+  publishes no head" property), a retargeted one stages an update, and a deleted
+  one is swept into a tombstone like any other path.
 - **Publisher**: staged changes are batched (default: quiesce 2 s or 1000 entries) into
   a single new trie root: bump `seq`, sign, store, `HeadPush` to connected peers. One
   save in an editor costs one head; a 100k-file initial index costs a handful.
@@ -725,9 +755,12 @@ content.** What it does do is aggregate:
 
 - Each `(origin, space, path)` triple remains an independent assertion: "this is my
   current copy". A path's state in the unified tree is the *set* of those assertions.
-- A **version** of a path is a distinct content root among the origins' current
-  entries for it. Origins asserting the same root collapse into one version with
-  several attestors — agreement is the common case, and it renders as a plain file.
+- A **version** of a path is a distinct assertion identity among the origins'
+  current entries for it: for regular files, the content root; for content-less
+  kinds, the pair (kind, target) — two symlinks are the same version iff their
+  targets match, and a symlink is never the same version as a file. Origins
+  asserting the same identity collapse into one version with several attestors —
+  agreement is the common case, and it renders as a plain file.
 - A path **exists** in the tree iff at least one origin currently publishes a live
   (non-tombstone) entry for it. Origins that never published a path simply don't
   contribute — absence is not an assertion. A tombstone *is* an assertion ("deleted
@@ -745,19 +778,31 @@ content.** What it does do is aggregate:
     origin)`, a total order, so every node selects the same version from the same
     assertions. This is presentation, not resolution: nothing is written, no
     assertion changes, and the losing versions remain first-class and marked.
+    Two trust caveats are inherent and accepted (§12): `mtime_ns` is
+    member-supplied file metadata — a member with a skewed clock or a deliberate
+    `touch -d` wins `newest` on every surface until its entries are outranked,
+    adopted over, or the member is removed; and determinism holds only over *the
+    same assertions* — two nodes that have synced different subsets of heads
+    select differently until anti-entropy converges them, so a lagging mirror
+    can briefly serve different bytes than a current one, unmarked. Deployments
+    for which either is unacceptable use `strict` or an `origin=` pin.
   - `origin=<id>` — pin to one origin's view (the old per-origin behavior, still the
     right tool for "serve exactly what the NAS publishes").
   - `strict` — refuse to read a divergent path, returning the version list instead;
     for workflows where silently reading either side is worse than failing.
   Policy is a property of the reading surface: a flag on `cat`/`get` (`--from
   <origin>`, `--strict`), a stored policy per mirror and per s3 bucket (§7.2, §9.4).
-- **Adoption is explicit**: `synch take <origin>:<space>/<path>` fetches that origin's
-  content, writes it into the local space, and thereby (via the indexing pipeline)
-  publishes it as the local node's own new entry. Adoption is how divergence ends:
-  as publishers converge on one root, their assertions collapse back into a single
-  unanimous version. `prev` is set to the replaced local content root, recording
-  1-step lineage so UIs can distinguish "adopted theirs on top of X" from "changed
-  independently".
+- **Adoption is explicit — and deletions are adoptable**: `synch take
+  <origin>:<space>/<path>` makes that origin's version our own. For a live
+  version, it fetches the content, writes it into the local space, and thereby
+  (via the indexing pipeline) publishes it as the local node's own new entry.
+  For a **tombstone** version, it deletes our local copy from the space, and the
+  next scan publishes our own tombstone — adopting the deletion exactly as one
+  adopts content. Adoption is how *all* divergence ends, deletion divergence
+  included: as publishers converge on one identity, their assertions collapse
+  back into a single unanimous version. `prev` is set to the replaced local
+  content root, recording 1-step lineage so UIs can distinguish "adopted theirs
+  on top of X" from "changed independently".
 - **History**: retained old roots (§5.4) give each origin a record of its own
   publishes: `synch log <space>/<path>` walks historical roots' leaves for the key
   and shows each version's seq and content root. An old version's *bytes* remain
@@ -799,6 +844,9 @@ two code paths to the same state, two processes contending on one SQLite file, a
 worse — a short-lived second iroh endpoint sharing the daemon's device key, fighting
 it over relay registration and discovery records. One writer, one endpoint, one
 lifecycle is worth more than the convenience of running commands without a daemon.
+The rule binds every process, `synch-s3` included (§9.4): concurrent publishers on
+one database do not merely contend, they can mint same-seq forks and lose published
+files.
 
 ### 9.2 Command surface (v1)
 
@@ -811,16 +859,19 @@ synch daemon run|status|stop
 synch id                                     print OriginId + current device key(s)
 synch key rotate|activate|retire|ls          operator-driven device-key rotation (§3.4)
 
-synch trust add [--as <name>]|rebind|rm|ls   static membership (named or key-identified)
-synch domain add|rm|ls|refresh <domain>      DNSSEC membership (refresh: re-resolve now)
+synch trust add [--as <name>] [--addr <hint>]|rebind|rm|ls
+                                             static membership (named or key-identified)
+synch domain add|rm|ls|refresh [<domain>]    DNSSEC membership (refresh: re-resolve one
+                                             domain now, or all when none is named)
 synch peers                                  live peers, addresses, last sync, lag
 
 synch space add <id> <path>                  index a local directory as a space
 synch space ls|rm
 synch scan                                   walk every space now: hash changes, publish
 
-synch ls   [<origin>:]<space>[/<dir>]        list the unified tree (divergent paths
-                                             marked with version counts); origin-
+synch ls   [<origin>:]<space>[/<dir>] [--all] list the unified tree (divergent paths
+                                             marked with version counts; --all shows
+                                             every version with attestors); origin-
                                              prefixed form lists one origin's view
 synch status [<space>[/<path>]]              the version inspector: every version of
                                              a path, its attestors, side by side
@@ -833,7 +884,8 @@ synch log  [<origin>:]<space>/<path>         per-origin publish history
 synch mirror add <space> <dir> [--policy …]  continuous materialization of the unified
 synch mirror rm|ls|sync                      tree under a version policy (§7.2)
 
-synch pin add|rm|ls <root|path>              keep content in CAS regardless of policy
+synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of policy
+                                             (a path pins its selected version's root)
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
 synch doctor                                 connectivity, DNSSEC, equivocation, GC stats
 ```
@@ -874,9 +926,24 @@ renders a daemon-side failure as its own exit status rather than a transport err
 
 ### 9.4 S3-compatible gateway (`synch-s3`)
 
-The second binary target embeds the same engine crate and exposes a subset of the S3
-HTTP API, so existing S3 tooling (aws cli, rclone, restic, mc, the SDKs) can read
-and write a synchronicity cluster without knowing anything about it.
+The second binary target exposes a subset of the S3 HTTP API, so existing S3
+tooling (aws cli, rclone, restic, mc, the SDKs) can read and write a synchronicity
+cluster without knowing anything about it.
+
+**The gateway is a control-socket client of the daemon — nothing more.** It never
+opens the database, never binds an iroh endpoint, and holds no persistent state of
+its own; its only datadir touch is reading `control.token`, exactly like the CLI.
+This is §9.1's one-writer/one-endpoint rule applied to the gateway, and it is not
+optional hygiene: a second process computing `next_seq` beside the daemon can sign
+two heads at the same seq — self-equivocation broadcast cluster-wide, with the
+losing batch's files recorded as scanned but present in no surviving root. Every
+gateway operation is a daemon request: reads stream over the socket's `Chunk`
+frames straight into the HTTP response, writes stream the HTTP body over the
+socket into the daemon's ingest-and-publish path, and bucket/access-key
+configuration is stored by the daemon (config namespace `s3.*`) via dedicated
+requests — so `synch-s3 bucket add`/`key add` are socket clients too, and the
+daemon remains the only writer and the only endpoint. Objects of any size flow
+through both directions **without either process buffering more than a chunk**.
 
 - **Bucket mapping**: a bucket names a space of the unified tree plus a version
   policy — `synch-s3 bucket add <bucket> <space> [--policy newest|origin=<id>|strict]`
@@ -1037,7 +1104,8 @@ CREATE TABLE peers_seen    (node_id BLOB PRIMARY KEY, last_addr BLOB, last_seen 
 -- recovery (§3.4): the greatest (seq, root) any peer has advertised for an origin,
 -- observed from Hello summaries — never verified, never adopted as a head
 CREATE TABLE observed_heads (origin_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
-                             root BLOB NOT NULL, observed_at INTEGER NOT NULL);
+                             root BLOB NOT NULL, complete INTEGER NOT NULL,
+                             observed_at INTEGER NOT NULL);
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can
@@ -1143,7 +1211,11 @@ CI (GitHub Actions):
   trust not to DoS each other. There are therefore **no per-peer rate limits and no
   per-origin publish quotas** — a member behaving abusively is a membership problem,
   and the remedy is the membership machinery: `synch trust rm` or removal from the
-  DNS record set cuts the node off entirely. What remains are sanity bounds that
+  DNS record set cuts the node off from all *future* participation — connections
+  refused, new heads ignored. Data it already published stays replicated (nothing
+  cascades deletion through everyone's tries — that would hand any removal a blast
+  radius) and ages out with normal retention; `synch doctor` lists origins whose
+  data is held without a live binding. What remains are sanity bounds that
   cap the cost of any *single* malformed or extreme message: `GetNodes`/`GetValues`
   batches are capped at 256 hashes, and trie keys are bounded to 4 KiB (so ingest
   depth ≤ ~8 K nibbles).
