@@ -109,6 +109,19 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Removes one key's bindings for an origin, whatever their source.
+    ///
+    /// This is `trust rm <origin> --key <key>`: after a rotation window
+    /// closes, the retired key's binding is the one thing left to clean up,
+    /// and removing the whole origin to get at it threw away the new key too.
+    pub fn remove_key_binding(&self, origin: &OriginId, node_id: &NodeId) -> Result<bool> {
+        let n = self.conn().execute(
+            "DELETE FROM bindings WHERE origin_id = ?1 AND node_id = ?2",
+            params![origin.canonical(), node_id.as_bytes().to_vec()],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Removes every binding for an origin.
     pub fn remove_origin_bindings(&self, origin: &OriginId) -> Result<usize> {
         Ok(self.conn().execute(

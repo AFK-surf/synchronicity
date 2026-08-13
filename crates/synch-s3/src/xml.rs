@@ -134,6 +134,33 @@ pub fn format_timestamp(nanos: i64) -> String {
     )
 }
 
+/// Formats unix nanoseconds as the RFC 7231 HTTP-date the `Last-Modified`
+/// *header* requires: `Thu, 13 Aug 2026 17:05:17 GMT`.
+///
+/// The XML body wants RFC 3339 and the header wants HTTP-date, and they are
+/// not interchangeable: AWS SDKs parse the header strictly, so an RFC 3339
+/// value there broke rclone outright.
+pub fn format_http_date(nanos: i64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let nanos = nanos.max(0);
+    let seconds = nanos / 1_000_000_000;
+    let days = seconds / 86_400;
+    let time = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    // 1970-01-01 was a Thursday.
+    let weekday = WEEKDAYS[(days + 4).rem_euclid(7) as usize];
+    format!(
+        "{weekday}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
+        MONTHS[(month - 1) as usize],
+        time / 3600,
+        (time % 3600) / 60,
+        time % 60,
+    )
+}
+
 /// Howard Hinnant's `civil_from_days`, for the epoch-days to Y/M/D conversion.
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
@@ -211,5 +238,16 @@ mod tests {
         assert!(format_timestamp(leap).starts_with("2024-02-29T"));
         // Negative input clamps rather than panicking.
         assert_eq!(format_timestamp(-1), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn http_dates_format_as_rfc7231() {
+        // The epoch was a Thursday, and the header format carries no millis.
+        assert_eq!(format_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        let nanos = 1_704_164_645_678_000_000i64;
+        assert_eq!(format_http_date(nanos), "Tue, 02 Jan 2024 03:04:05 GMT");
+        let leap = 1_709_208_000_000_000_000i64;
+        assert_eq!(format_http_date(leap), "Thu, 29 Feb 2024 12:00:00 GMT");
+        assert_eq!(format_http_date(-1), "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 }

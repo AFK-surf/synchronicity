@@ -513,6 +513,28 @@ impl Store {
         }))
     }
 
+    /// The paths whose current entries name this content root, as
+    /// `space/path` strings.
+    ///
+    /// What `pin ls` prints next to a bare hash: which files, if any, the
+    /// pinned object currently is. A pin can outlive every entry naming it —
+    /// that is its purpose — so an empty answer is meaningful, not an error.
+    pub fn paths_naming(&self, root: &Hash) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT space, path FROM entries WHERE content = ?1 ORDER BY space, path",
+        )?;
+        let rows = stmt.query_map(params![root.as_bytes().to_vec()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (space, path) = row?;
+            out.push(format!("{space}/{path}"));
+        }
+        Ok(out)
+    }
+
     /// Every row the scanner has recorded for a space.
     ///
     /// The full rows, not just the paths: startup reconciliation compares the

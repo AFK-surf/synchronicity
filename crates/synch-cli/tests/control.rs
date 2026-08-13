@@ -241,14 +241,36 @@ async fn every_command_variant_round_trips() {
     )
     .await
     .contains(&rebound));
+    // The rotation-window cleanup: one key's binding goes, the other stays.
     assert!(lines(
         data_dir,
         Request::TrustRm {
             origin: "laptop@cluster.example".into(),
+            key: Some(peer_key.clone()),
         }
     )
     .await
-    .contains("removed 2 binding(s)"));
+    .contains("binding to"));
+    assert_eq!(
+        failure(
+            data_dir,
+            Request::TrustRm {
+                origin: "laptop@cluster.example".into(),
+                key: Some(peer_key.clone()),
+            }
+        )
+        .await,
+        ErrorCode::NotFound
+    );
+    assert!(lines(
+        data_dir,
+        Request::TrustRm {
+            origin: "laptop@cluster.example".into(),
+            key: None,
+        }
+    )
+    .await
+    .contains("removed 1 binding(s)"));
 
     // Domains. `add` attempts a refresh, which has no resolver here and must
     // still record the domain rather than fail.
@@ -332,9 +354,12 @@ async fn every_command_variant_round_trips() {
     assert!(doctor.contains("equivocation: none detected"), "{doctor}");
     let rebuilt = lines(data_dir, Request::Doctor { rebuild: true }).await;
     assert!(rebuilt.contains("rebuilt"), "{rebuilt}");
-    assert!(lines(data_dir, Request::DaemonStatus)
-        .await
-        .contains("storage:"));
+    // Status is the glance, not the byte-identical twin of doctor.
+    let status = lines(data_dir, Request::DaemonStatus).await;
+    assert!(status.contains("origin nas@cluster.example"), "{status}");
+    assert!(status.contains("spaces: 1 (media)"), "{status}");
+    assert!(status.contains("head: seq"), "{status}");
+    assert!(!status.contains("storage:"), "{status}");
 
     // Rotation, end to end and operator-driven (§3.4).
     let rotate = lines(data_dir, Request::KeyRotate).await;

@@ -41,7 +41,7 @@ use crate::{
     buckets::Bucket,
     daemon::Daemon,
     error::{S3Error, S3Result},
-    xml::{format_timestamp, list_buckets_xml, ListResult, ListedObject},
+    xml::{format_http_date, format_timestamp, list_buckets_xml, ListResult, ListedObject},
 };
 
 /// The default `max-keys` for a listing.
@@ -143,9 +143,14 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
     let bucket = buckets::find(&gateway.daemon, bucket_name).await?;
 
     match (&parts.method, key.is_empty()) {
-        (&Method::GET, true) | (&Method::HEAD, true) => {
-            list_objects(gateway, &bucket, &query).await
-        }
+        // Buckets are mapped by the operator, not minted over HTTP — but SDK
+        // write paths (rclone's among them) probe with CreateBucket and
+        // HeadBucket before an upload and give up if either fails. A bucket
+        // that exists answers both truthfully; one that does not already
+        // failed the lookup above with NoSuchBucket.
+        (&Method::PUT, true) => Ok((StatusCode::OK).into_response()),
+        (&Method::HEAD, true) => Ok((StatusCode::OK).into_response()),
+        (&Method::GET, true) => list_objects(gateway, &bucket, &query).await,
         (&Method::GET, false) => get_object(gateway, &bucket, key, &headers, false).await,
         (&Method::HEAD, false) => get_object(gateway, &bucket, key, &headers, true).await,
         (&Method::PUT, false) => put_object(gateway, &bucket, key, body).await,
@@ -277,10 +282,12 @@ async fn get_object(
         &etag(entry.content.as_ref()),
     );
     insert(&mut response_headers, header::ACCEPT_RANGES, "bytes");
+    // The header wants HTTP-date, not the RFC 3339 the XML body uses — SDKs
+    // parse `Last-Modified` strictly, and rclone refused the wrong shape.
     insert(
         &mut response_headers,
         header::LAST_MODIFIED,
-        &format_timestamp(entry.mtime_ns),
+        &format_http_date(entry.mtime_ns),
     );
     insert(
         &mut response_headers,

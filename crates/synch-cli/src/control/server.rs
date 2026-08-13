@@ -381,7 +381,50 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
 
         Request::Recover { wait, gap } => recover(node, out, wait, gap).await?,
 
-        Request::DaemonStatus | Request::Doctor { rebuild: false } => {
+        // Status is the glance, doctor is the examination: the two used to be
+        // byte-identical, which made one of them a lie of emphasis.
+        Request::DaemonStatus => {
+            let origin = node.origin();
+            out.line(format!(
+                "origin {origin} · signing as {}",
+                node.node_id().fmt_short()
+            ))
+            .await?;
+            out.line(format!(
+                "address: {}",
+                render::addr(&node.net().direct_addr())
+            ))
+            .await?;
+            let spaces = node.store().spaces()?;
+            let names: Vec<&str> = spaces.iter().map(|s| s.id.as_str()).collect();
+            out.line(format!(
+                "spaces: {} ({}) · mirrors: {}",
+                spaces.len(),
+                names.join(", "),
+                node.store().mirrors()?.len()
+            ))
+            .await?;
+            let head = node.store().complete_head(origin)?;
+            out.line(format!(
+                "head: {} · peers seen: {}",
+                head.map(|h| format!("seq {}", h.seq))
+                    .unwrap_or_else(|| "none published yet".into()),
+                node.store().peers_seen()?.len()
+            ))
+            .await?;
+            let recovery = node.recovery_state()?;
+            if recovery.in_recovery {
+                out.line(format!(
+                    "IN RECOVERY: a peer advertises seq {} for {origin}; run `synch recover`",
+                    recovery.observed_seq.unwrap_or_default()
+                ))
+                .await?;
+            }
+            out.line("(`synch doctor` for the full examination)")
+                .await?;
+        }
+
+        Request::Doctor { rebuild: false } => {
             for line in render::doctor(node)? {
                 out.line(line).await?;
             }
@@ -424,16 +467,48 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
         Request::TrustRebind { origin, key } => {
             let origin = parse_origin(&origin)?;
             let key = parse_key(&key)?;
+            let earlier: Vec<String> = node
+                .store()
+                .bindings()?
+                .into_iter()
+                .filter(|b| b.origin == origin && b.node_id != key)
+                .map(|b| b.node_id.to_z32())
+                .collect();
             node.trust_rebind(&origin, key)?;
             out.line(format!("{origin} now also accepts {}", key.to_z32()))
                 .await?;
+            // Rebinding is additive on purpose — the rotation window needs
+            // both keys live — but the old binding will stall every dial once
+            // its endpoint dies, and nothing else says whose job that is.
+            for old in earlier {
+                out.line(format!(
+                    "{old} stays bound through the rotation window; drop it with \
+                     `synch trust rm {origin} --key {old}` once the peer retires it"
+                ))
+                .await?;
+            }
         }
 
-        Request::TrustRm { origin } => {
+        Request::TrustRm { origin, key } => {
             let origin = parse_origin(&origin)?;
-            let removed = node.store().remove_origin_bindings(&origin)?;
-            out.line(format!("removed {removed} binding(s) for {origin}"))
-                .await?;
+            match key {
+                Some(key) => {
+                    let key = parse_key(&key)?;
+                    if !node.store().remove_key_binding(&origin, &key)? {
+                        return Err(ControlError::new(
+                            ErrorCode::NotFound,
+                            format!("{origin} has no binding to {}", key.to_z32()),
+                        ));
+                    }
+                    out.line(format!("removed {origin}'s binding to {}", key.to_z32()))
+                        .await?;
+                }
+                None => {
+                    let removed = node.store().remove_origin_bindings(&origin)?;
+                    out.line(format!("removed {removed} binding(s) for {origin}"))
+                        .await?;
+                }
+            }
         }
 
         Request::TrustLs => {
@@ -850,7 +925,24 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
 
         Request::PinLs => {
             for root in node.store().pinned_blobs()? {
-                out.line(root.to_string()).await?;
+                // A bare hash answers "what is pinned" without answering
+                // "what is it": the size and the paths currently naming the
+                // object are what make the list reviewable.
+                let size = node
+                    .store()
+                    .blob(&root)?
+                    .map(|b| format!("{} B", b.size))
+                    .unwrap_or_else(|| "(bytes not held)".into());
+                let paths = node.store().paths_naming(&root)?;
+                out.line(format!(
+                    "{root}  {size}  {}",
+                    if paths.is_empty() {
+                        "(no current entry names it)".to_string()
+                    } else {
+                        paths.join(" · ")
+                    }
+                ))
+                .await?;
             }
         }
 

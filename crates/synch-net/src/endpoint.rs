@@ -18,6 +18,14 @@ use crate::{
     mpt::{MptClient, MptProtocol},
 };
 
+/// How long a dial may take before the peer is reported unreachable.
+///
+/// Generous enough for hole-punching and a relay fallback; bounded so a dead
+/// address costs seconds, not the 30–60 s QUIC would spend retrying — every
+/// stale binding used to stall `sync`, `take`, and each head push for that
+/// long, silently.
+pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How the endpoint should be bound.
 #[derive(Debug, Clone, Default)]
 pub struct NetOptions {
@@ -161,10 +169,14 @@ impl Net {
         if !self.store.is_trusted_key(&addr.id, synch_core::now_ns())? {
             return Err(NetError::Untrusted(addr.id.fmt_short().to_string()));
         }
-        self.endpoint()
-            .connect(addr, alpn)
-            .await
-            .map_err(|e| NetError::Endpoint(e.to_string()))
+        let peer = addr.id.fmt_short().to_string();
+        match tokio::time::timeout(DIAL_TIMEOUT, self.endpoint().connect(addr, alpn)).await {
+            Ok(connected) => connected.map_err(|e| NetError::Endpoint(e.to_string())),
+            Err(_) => Err(NetError::Endpoint(format!(
+                "{peer} did not answer within {}s",
+                DIAL_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// Shuts the router and endpoint down cleanly.

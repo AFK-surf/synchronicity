@@ -340,7 +340,8 @@ fn the_command_surface_works_over_the_socket() {
     let doctor = cli.run(&["doctor"]);
     assert!(doctor.contains("origin: nas@cluster.example"), "{doctor}");
     assert!(doctor.contains("equivocation: none detected"), "{doctor}");
-    assert!(cli.run(&["daemon", "status"]).contains("storage:"));
+    assert!(cli.run(&["daemon", "status"]).contains("head: seq"));
+    assert!(cli.run(&["doctor"]).contains("storage:"));
 
     // `synch recover` on a node no peer has ever advertised: it collects one
     // round, finds nothing to resume from, and leaves the seq alone (§3.4).

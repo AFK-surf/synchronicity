@@ -136,8 +136,9 @@ fn to_request(cli: &Cli) -> Result<Request> {
                 origin: origin.clone(),
                 key: key.clone(),
             },
-            TrustCommand::Rm { origin } => Request::TrustRm {
+            TrustCommand::Rm { origin, key } => Request::TrustRm {
                 origin: origin.clone(),
+                key: key.clone(),
             },
             TrustCommand::Ls => Request::TrustLs,
         },

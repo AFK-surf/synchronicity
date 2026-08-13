@@ -151,7 +151,40 @@ async fn get_head_list_and_range_round_trip() {
         etag,
         format!("\"{}\"", blake3::hash(b"hello from s3").to_hex())
     );
+    // The Last-Modified *header* is RFC 7231 HTTP-date, not the RFC 3339 the
+    // XML body carries — SDKs parse it strictly and rclone refused the
+    // wrong shape outright.
+    let last_modified = response
+        .headers()
+        .get("last-modified")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        last_modified.ends_with(" GMT")
+            && last_modified.as_bytes()[3] == b','
+            && !last_modified.contains('-'),
+        "not an HTTP-date: {last_modified}"
+    );
     assert_eq!(response.bytes().await.unwrap().as_ref(), b"hello from s3");
+
+    // The SDK write path probes with HeadBucket and CreateBucket before an
+    // upload; a mapped bucket answers both, an unmapped one 404s.
+    for method in [reqwest::Method::HEAD, reqwest::Method::PUT] {
+        let response = http
+            .request(method.clone(), harness.url("/my-media"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{method} on a mapped bucket");
+        let response = http
+            .request(method.clone(), harness.url("/not-mapped"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{method} on an unmapped bucket");
+    }
 
     // A large object comes back byte-for-byte, and its declared length is the
     // object's — a streamed body must still say how long it is.

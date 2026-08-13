@@ -347,6 +347,23 @@ impl Node {
             return Ok(report);
         };
 
+        // A node holding its own current head is not resuming from loss, and
+        // peers echoing our published history back is not history to leap
+        // over: re-running recover after a successful recovery used to burn
+        // another gap's worth of seqs every time. Only an observation beyond
+        // our own head says some peer holds history we lost.
+        if let Some(own) = self.store().complete_head(self.origin())? {
+            if own.seq >= observed.seq {
+                tracing::info!(
+                    origin = %self.origin(),
+                    own = own.seq,
+                    observed = observed.seq,
+                    "peers advertise nothing beyond our own head; the floor stays put"
+                );
+                return Ok(report);
+            }
+        }
+
         // Never below what this node would publish anyway, and never below a
         // floor already in force.
         let floor = observed
@@ -549,6 +566,61 @@ mod tests {
         assert_eq!(report.observed_seq, None);
         assert_eq!(report.floor, None);
         assert_eq!(node.next_seq().unwrap(), 1);
+        node.shutdown().await.unwrap();
+    }
+
+    /// Re-running recover on a node that holds its own head leaves the floor
+    /// alone: peers echoing our published history back is not history to leap
+    /// over, and each accidental re-run used to burn another gap of seqs.
+    #[tokio::test]
+    async fn recover_is_idempotent_once_the_node_holds_its_own_head() {
+        let (_d, node) = node(nas()).await;
+        node.publish(&[staged_file()]).unwrap().unwrap();
+        let own = node.store().complete_head(node.origin()).unwrap().unwrap();
+        node.store()
+            .record_observed_head(node.origin(), own.seq, &own.root, true, None, now_ns())
+            .unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let report = node
+            .recover(
+                RecoveryOptions {
+                    wait: Duration::ZERO,
+                    gap: 1_000,
+                    poll: Duration::from_secs(30),
+                },
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.floor, None, "{report:?}");
+        assert_eq!(node.next_seq().unwrap(), own.seq + 1);
+
+        // A peer holding genuinely newer history than our own head still
+        // raises the floor: only the echo is ignored, not real evidence.
+        node.store()
+            .record_observed_head(
+                node.origin(),
+                own.seq + 50,
+                &Hash([9u8; 32]),
+                true,
+                None,
+                now_ns(),
+            )
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let report = node
+            .recover(
+                RecoveryOptions {
+                    wait: Duration::ZERO,
+                    gap: 1_000,
+                    poll: Duration::from_secs(30),
+                },
+                tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.floor, Some(own.seq + 50 + 1_000));
         node.shutdown().await.unwrap();
     }
 

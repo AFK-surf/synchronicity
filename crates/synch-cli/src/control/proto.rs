@@ -37,8 +37,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// frame that carries entry metadata rather than a rendered line. Bumped to 6
 /// by `synch sync` (a new [`Request`] variant) and by `TreePut` growing a
 /// [`Response::Ready`] ack before the client streams. Bumped to 7 when
-/// `key activate` grew `--bind` — a new field reshaping an existing variant.
-pub const CONTROL_VERSION: u32 = 7;
+/// `key activate` grew `--bind` and to 8 when `trust rm` grew `--key` — each
+/// a new field reshaping an existing variant.
+pub const CONTROL_VERSION: u32 = 8;
 
 /// How many payload bytes one `Chunk` frame carries.
 ///
@@ -222,10 +223,13 @@ pub enum Request {
         /// Its new z-base-32 device key.
         key: String,
     },
-    /// `synch trust rm <origin>`
+    /// `synch trust rm <origin> [--key <key>]`
     TrustRm {
         /// The origin to stop trusting.
         origin: String,
+        /// Drop only this key's binding, keeping the origin's others (§3.4:
+        /// the cleanup step after a rotation window closes).
+        key: Option<String>,
     },
     /// `synch trust ls`
     TrustLs,

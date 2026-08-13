@@ -231,6 +231,10 @@ pub enum TrustCommand {
     Rm {
         /// The origin to stop trusting.
         origin: String,
+        /// Drop only this z-base-32 key's binding, keeping the origin's other
+        /// keys — the cleanup step after a peer's rotation window closes.
+        #[arg(long)]
+        key: Option<String>,
     },
     /// List bindings.
     Ls,
