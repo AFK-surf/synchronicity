@@ -240,8 +240,37 @@ async fn dispatch<S: AsyncWrite + Unpin>(
         }
 
         Request::KeyLs => {
+            // §3.4 step 3: the switch-over judgement is "have my peers picked
+            // up the new binding yet?", which this node cannot answer from its
+            // own view of DNS. So each reachable peer is asked what it holds
+            // bound for us, and the tally is reported per key.
+            let peers = node.peer_bindings(node.origin()).await?;
+            let reachable: Vec<&synch_engine::PeerBindings> =
+                peers.iter().filter(|p| p.reachable()).collect();
             for key in node.device_keys()? {
-                out.line(format!("{} {}", key.node_id.to_z32(), key.state.as_str()))
+                let holding = reachable.iter().filter(|p| p.holds(&key.node_id)).count();
+                out.line(format!(
+                    "{} {:<8} bound by {} of {} reachable peer(s)",
+                    key.node_id.to_z32(),
+                    key.state.as_str(),
+                    holding,
+                    reachable.len()
+                ))
+                .await?;
+                for peer in &peers {
+                    let verdict = match &peer.keys {
+                        Ok(_) if peer.holds(&key.node_id) => "holds it".to_string(),
+                        Ok(_) => "does not hold it yet".to_string(),
+                        Err(e) => format!("unreachable: {e}"),
+                    };
+                    out.line(format!("    {} {verdict}", peer.peer.to_z32()))
+                        .await?;
+                }
+            }
+            if peers.is_empty() {
+                out.line("  no trusted peers to ask").await?;
+            } else if reachable.is_empty() {
+                out.line("  no peer could be reached; the tallies above count nobody")
                     .await?;
             }
         }
@@ -250,23 +279,16 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             let plan = node.rotate_key()?;
             out.line(format!("generated device key {}", plan.new_key.to_z32()))
                 .await?;
-            match plan.txt_record() {
-                Some(record) => {
-                    out.line("publish alongside the existing record:").await?;
-                    out.line(record).await?;
-                    out.line(format!(
-                        "then, once it has propagated, run `synch key activate {}`",
-                        plan.new_key.to_z32()
-                    ))
-                    .await?;
-                }
-                None => {
-                    out.line(
-                        "this origin is key-identified and cannot rotate; \
-                         re-init with --id or have peers `synch trust add --as <name>`",
-                    )
-                    .await?
-                }
+            // A key-identified origin is refused by `rotate_key` itself, so
+            // the record is always there by the time we get here.
+            if let Some(record) = plan.txt_record() {
+                out.line("publish alongside the existing record:").await?;
+                out.line(record).await?;
+                out.line(format!(
+                    "then, once it has propagated, run `synch key activate {}`",
+                    plan.new_key.to_z32()
+                ))
+                .await?;
             }
         }
 

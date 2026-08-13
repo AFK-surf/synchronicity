@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     hash::Hash,
     head::{HeadSummary, SignedHead},
-    origin::OriginId,
+    origin::{NodeId, OriginId},
     record::BlobAd,
 };
 
@@ -92,6 +92,26 @@ pub enum MptMessage {
     Error {
         /// A short human-readable reason.
         reason: String,
+    },
+    /// "Which device keys do you currently hold bound for this origin?"
+    ///
+    /// Purely informational within the trusted cluster: this is what
+    /// `synch key ls` aggregates to tell an operator whether a rotation's new
+    /// key has actually propagated (§3.4, §5.1).
+    ///
+    /// Appended after [`MptMessage::Error`] rather than beside the other
+    /// request/response pairs: postcard numbers variants by position, so a new
+    /// variant may only ever go on the end.
+    GetBindings {
+        /// The origin being asked about.
+        origin: OriginId,
+    },
+    /// The device keys the answering peer holds bound for an origin.
+    BindingsFor {
+        /// The origin asked about.
+        origin: OriginId,
+        /// The bound device keys, in the peer's own order.
+        keys: Vec<NodeId>,
     },
 }
 

@@ -110,7 +110,11 @@ async fn every_command_variant_round_trips() {
     let id = lines(data_dir, Request::Id).await;
     assert!(id.contains("nas@cluster.example"), "{id}");
     assert!(id.contains("active"), "{id}");
-    assert_eq!(lines(data_dir, Request::KeyLs).await.lines().count(), 1);
+    // One key, plus the line saying there was nobody to ask about it (§3.4).
+    let keys = lines(data_dir, Request::KeyLs).await;
+    assert!(keys.contains("bound by 0 of 0 reachable peer(s)"), "{keys}");
+    assert!(keys.contains("no trusted peers to ask"), "{keys}");
+    assert_eq!(keys.lines().count(), 2, "{keys}");
 
     // Spaces, scanning, and listing.
     assert!(lines(
@@ -344,7 +348,7 @@ async fn every_command_variant_round_trips() {
         .unwrap()
         .to_string();
     let keys = lines(data_dir, Request::KeyLs).await;
-    assert_eq!(keys.lines().count(), 2, "{keys}");
+    assert_eq!(keys.lines().count(), 3, "{keys}");
     assert_eq!(keys.matches("active").count(), 1, "{keys}");
 
     let old_key = daemon.node.node_id().to_z32();
@@ -368,7 +372,11 @@ async fn every_command_variant_round_trips() {
     .await;
     assert!(retired.contains("secret deleted"), "{retired}");
     assert!(daemon.node.retiring_endpoints().is_empty());
-    assert_eq!(lines(data_dir, Request::KeyLs).await.lines().count(), 1);
+    // One key, plus the line saying there was nobody to ask about it (§3.4).
+    let keys = lines(data_dir, Request::KeyLs).await;
+    assert!(keys.contains("bound by 0 of 0 reachable peer(s)"), "{keys}");
+    assert!(keys.contains("no trusted peers to ask"), "{keys}");
+    assert_eq!(keys.lines().count(), 2, "{keys}");
 
     // Removing the space unpublishes its entries.
     assert!(lines(data_dir, Request::SpaceRm { id: "media".into() })

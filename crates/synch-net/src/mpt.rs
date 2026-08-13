@@ -13,7 +13,8 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use synch_core::{
-    now_ns, BlobAd, Hash, HeadSummary, MptMessage, OriginId, SignedHead, MAX_BATCH, PROTO_VERSION,
+    now_ns, BlobAd, Hash, HeadSummary, MptMessage, NodeId, OriginId, SignedHead, MAX_BATCH,
+    PROTO_VERSION,
 };
 use synch_mpt::NodeStore;
 use synch_store::{Slot, Store};
@@ -181,6 +182,15 @@ impl MptProtocol {
                 write_frame(send, &MptMessage::Providers { ads }).await?;
                 Ok(())
             }
+            MptMessage::GetBindings { origin } => {
+                // What this peer currently holds bound, live keys only — a
+                // lapsed binding is exactly what the asker wants to know is
+                // gone (§3.4). Informational within the trusted cluster: the
+                // caller is already an authorized member (§3.2, §12).
+                let keys = self.store().keys_for_origin(&origin, now_ns())?;
+                write_frame(send, &MptMessage::BindingsFor { origin, keys }).await?;
+                Ok(())
+            }
             other => Err(unexpected("a request", &other)),
         }
     }
@@ -224,6 +234,8 @@ fn message_name(msg: &MptMessage) -> &'static str {
         MptMessage::FindProviders { .. } => "FindProviders",
         MptMessage::Providers { .. } => "Providers",
         MptMessage::Error { .. } => "Error",
+        MptMessage::GetBindings { .. } => "GetBindings",
+        MptMessage::BindingsFor { .. } => "BindingsFor",
     }
 }
 
@@ -381,6 +393,37 @@ impl MptClient {
             MptMessage::Providers { ads } => Ok(ads),
             MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
             other => Err(unexpected("Providers", &other)),
+        }
+    }
+
+    /// Asks the peer which device keys it currently holds bound for an origin
+    /// (§5.1).
+    ///
+    /// This is how `synch key ls` answers "have my peers picked up the new
+    /// binding yet?" — the judgement §3.4 says a rotation's switch-over needs
+    /// and that a node cannot make from its own view of DNS.
+    pub async fn get_bindings(&self, origin: &OriginId) -> Result<Vec<NodeId>, NetError> {
+        let (mut send, mut recv) = self.connection.open_bi().await?;
+        write_frame(
+            &mut send,
+            &MptMessage::GetBindings {
+                origin: origin.clone(),
+            },
+        )
+        .await?;
+        let _ = send.finish();
+        match read_frame::<MptMessage>(&mut recv).await? {
+            MptMessage::BindingsFor {
+                origin: answered,
+                keys,
+            } if &answered == origin => Ok(keys),
+            MptMessage::BindingsFor {
+                origin: answered, ..
+            } => Err(NetError::Unexpected(format!(
+                "asked about {origin}, answered about {answered}"
+            ))),
+            MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
+            other => Err(unexpected("BindingsFor", &other)),
         }
     }
 }

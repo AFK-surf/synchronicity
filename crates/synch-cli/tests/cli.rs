@@ -300,8 +300,11 @@ fn the_command_surface_works_over_the_socket() {
     );
     assert!(rotate.contains("v=sync1 id=nas nk="), "{rotate}");
     let keys = cli.run(&["key", "ls"]);
-    assert_eq!(keys.lines().count(), 2, "{keys}");
+    // Two keys, and the note that no peer could be asked whether either has
+    // propagated (§3.4 step 3).
+    assert_eq!(keys.lines().count(), 3, "{keys}");
     assert_eq!(keys.matches("active").count(), 1, "{keys}");
+    assert!(keys.contains("bound by 0 of 0 reachable peer(s)"), "{keys}");
     let new_key = keys
         .lines()
         .find(|line| line.contains("retiring"))
@@ -322,8 +325,9 @@ fn the_command_surface_works_over_the_socket() {
     assert!(cli.run(&["doctor"]).contains("retiring:"));
     cli.run(&["key", "retire", &old_key]);
     let keys = cli.run(&["key", "ls"]);
-    assert_eq!(keys.lines().count(), 1, "{keys}");
+    assert_eq!(keys.lines().count(), 2, "{keys}");
     assert!(keys.contains(&new_key), "{keys}");
+    assert!(!keys.contains(&old_key), "{keys}");
 
     // A publish after the rotation is signed by the new key and keeps counting
     // up from where the old one left off.

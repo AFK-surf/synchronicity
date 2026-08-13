@@ -65,8 +65,16 @@ synch key rotate                           # generate K_new, print the TXT recor
 synch key activate <K_new>                 # re-sign the head, serve on both keys
 # remove the old record
 synch key retire <K_old>                   # drop that endpoint, delete the secret
-synch key ls                               # this node's keys and their state
+synch key ls                               # this node's keys, and which peers hold each bound
 ```
+
+`synch key ls` is what answers the only question the middle step really turns
+on — *have my peers picked up the new record yet?* It asks every reachable
+trusted peer which of our device keys it currently holds bound and reports the
+tally per key, naming the peers it could not reach rather than counting their
+silence either way. A key-identified origin has no name to rebind, so `synch
+key rotate` refuses it outright rather than generating a key that could never
+be activated.
 
 Recover an origin whose device key and database are gone. The node keeps its
 name, comes up on a fresh key, and finds that its peers hold history it does

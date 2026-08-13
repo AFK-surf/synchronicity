@@ -37,7 +37,7 @@ pub use recovery::{
     UnreconciledHistory, DEFAULT_RECOVERY_QUIESCE, DEFAULT_SEQ_GAP,
 };
 pub use reference::EntryRef;
-pub use rotation::{Activation, RotationPlan};
+pub use rotation::{Activation, PeerBindings, RotationPlan};
 pub use scanner::ScanReport;
 pub use synch_store::{Selection, Version, VersionPolicy, VersionSet};
 pub use tree::reference_of;

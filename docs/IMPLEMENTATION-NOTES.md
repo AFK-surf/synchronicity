@@ -350,6 +350,37 @@ The refresh resolves through a `MemberResolver` trait rather than a concrete
 signed zone. `DnssecResolver` is the only implementation a running node ever
 uses, and it is unchanged: in-process validation, per-record `Proof::is_secure()`.
 
+### §3.4, §5.1 — what `synch key ls` counts, and what it refuses to count
+
+`GetBindings`/`BindingsFor` are appended to `MptMessage` *after* `Error`, which
+is where a new variant has to go: postcard numbers variants by position, so
+only the end is free.
+
+`synch key ls` asks every trusted peer it can dial and reports, per local key,
+"bound by N of M reachable peers" plus a line per peer. Two choices worth
+naming:
+
+- **The peer answers with live bindings only.** A lapsed binding is precisely
+  what the asker wants to know is gone, so an expired row counts as absent.
+- **An unreachable peer is reported, never counted.** "Three of four peers hold
+  `K_new`, one is asleep" is a different fact from "three of four hold it and
+  one does not", and the operator judgement §3.4 hands to a human depends on
+  telling them apart. When nothing could be reached, the tallies say `0 of 0`
+  and a line says so, rather than reading as a unanimous no.
+
+The question is asked about *our* origin, and answered by peers who are already
+authorized members (§3.2), so it carries nothing they could not already read
+out of their own bindings table.
+
+### §3.4 — rotating a key-identified origin
+
+`synch key rotate` on an `OriginId::Key` origin now fails before it generates
+anything. The device key *is* the identity there (§3.1), so there is no `id=`
+to rebind and no record to publish; the old behavior stored a `retiring` key
+that could never be activated and that nothing ever cleaned up. The message
+names both ways out: re-init under a named origin, or have peers bind the key
+with `synch trust add --as <name>`.
+
 ### §7.1 — spaces added while the daemon runs
 
 The watcher registers every configured space root with `notify` and

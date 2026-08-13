@@ -63,10 +63,55 @@ pub struct Activation {
     pub head: SignedHead,
 }
 
+/// What one peer answered about the bindings it holds for an origin (§5.1).
+#[derive(Debug, Clone)]
+pub struct PeerBindings {
+    /// The peer's device key — how it was dialed, and how it is named back.
+    pub peer: NodeId,
+    /// The keys it holds bound, or why it could not be asked.
+    pub keys: std::result::Result<Vec<NodeId>, String>,
+}
+
+impl PeerBindings {
+    /// True if the peer answered at all.
+    pub fn reachable(&self) -> bool {
+        self.keys.is_ok()
+    }
+
+    /// True if the peer answered and holds this key bound.
+    pub fn holds(&self, key: &NodeId) -> bool {
+        self.keys.as_ref().map(|k| k.contains(key)).unwrap_or(false)
+    }
+}
+
 impl Node {
     /// This node's own device keys and their states.
     pub fn device_keys(&self) -> Result<Vec<DeviceKey>> {
         Ok(self.store().device_keys()?)
+    }
+
+    /// Asks every trusted peer which of our device keys it currently holds
+    /// bound (§3.4 step 3, §5.1).
+    ///
+    /// This is the judgement a rotation's switch-over needs and that a node
+    /// cannot make from its own view of DNS: whether the *peers* have picked
+    /// up the new record yet. Unreachable peers are reported as unreachable
+    /// rather than counted either way — "three of four peers hold K_new, one
+    /// is asleep" is a different fact from "three of four hold it and one does
+    /// not".
+    pub async fn peer_bindings(&self, origin: &OriginId) -> Result<Vec<PeerBindings>> {
+        let mut out = Vec::new();
+        for peer in self.dialable_peers()? {
+            let addr = self
+                .peer_addr(&peer)?
+                .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
+            let keys = match self.net().connect_mpt(addr).await {
+                Ok(client) => client.get_bindings(origin).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            out.push(PeerBindings { peer, keys });
+        }
+        Ok(out)
     }
 
     /// Generates the next device key without changing which one signs (§3.4
@@ -75,18 +120,29 @@ impl Node {
     /// The key is stored in the `retiring` state: it is held, it is not the
     /// signing key, and [`Node::activate_key`] is what promotes it.
     pub fn rotate_key(&self) -> Result<RotationPlan> {
+        // Refuse before generating anything. A key-identified origin *is* its
+        // device key (§3.1), so there is no name to rebind and no record to
+        // publish — storing a `retiring` key for it would leave an orphan the
+        // node can never activate and nothing ever cleans up.
+        let (domain, name) = match self.origin() {
+            OriginId::Named { domain, id } => (domain.clone(), id.clone()),
+            OriginId::Key(key) => {
+                return Err(EngineError::invalid(format!(
+                    "origin key:{} is key-identified, so its device key is its identity and \
+                     cannot rotate: re-init with --id <name>@<domain>, or have peers run \
+                     `synch trust add --as <name>`",
+                    key.to_z32()
+                )))
+            }
+        };
         let secret = SecretKey::generate();
         let new_key = secret.public();
         self.store()
             .add_device_key(&secret, KeyState::Retiring, now_ns())?;
-        let (domain, name) = match self.origin() {
-            OriginId::Named { domain, id } => (Some(domain.clone()), Some(id.clone())),
-            OriginId::Key(_) => (None, None),
-        };
         Ok(RotationPlan {
             new_key,
-            domain,
-            name,
+            domain: Some(domain),
+            name: Some(name),
         })
     }
 
@@ -253,9 +309,20 @@ mod tests {
     async fn a_key_identified_origin_cannot_rotate() {
         let dir = tempfile::tempdir().unwrap();
         let node = node(dir.path(), None).await;
-        assert!(node.rotate_key().unwrap().txt_record().is_none());
-        let key = node.rotate_key().unwrap().new_key;
-        let err = node.activate_key(&key).await.unwrap_err();
+        // Refused upfront, before a key is generated: the old behavior stored
+        // a `retiring` key that could never be activated and that nothing ever
+        // cleaned up.
+        let err = node.rotate_key().unwrap_err();
+        assert!(err.to_string().contains("key-identified"), "{err}");
+        assert!(err.to_string().contains("--id"), "{err}");
+        assert_eq!(
+            node.device_keys().unwrap().len(),
+            1,
+            "no orphan key was stored"
+        );
+        // And activation still refuses, for anyone who gets that far.
+        let stranger = SecretKey::generate().public();
+        let err = node.activate_key(&stranger).await.unwrap_err();
         assert!(err.to_string().contains("cannot rotate"), "{err}");
         node.shutdown().await.unwrap();
     }
@@ -367,6 +434,107 @@ mod tests {
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
         assert_eq!(node.node_id(), new_key);
         assert_eq!(node.net().id(), new_key);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn key_ls_learns_which_peers_hold_our_keys() {
+        // §3.4 step 3 / §5.1: `GetBindings` is what tells an operator that a
+        // rotation's new key has actually propagated. Two loopback nodes, and
+        // B's view of A's bindings is what A reads back.
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a_origin = OriginId::named("a", "cluster.example").unwrap();
+        let b_origin = OriginId::named("b", "cluster.example").unwrap();
+        Node::init(a_dir.path(), Some(a_origin.clone())).unwrap();
+        Node::init(b_dir.path(), Some(b_origin.clone())).unwrap();
+        let a = Node::open(crate::config::NodeConfig::loopback(a_dir.path()))
+            .await
+            .unwrap();
+        let b = Node::open(crate::config::NodeConfig::loopback(b_dir.path()))
+            .await
+            .unwrap();
+
+        // Mutual trust, direct addresses only.
+        for (here, there, origin) in [(&a, &b, &b_origin), (&b, &a, &a_origin)] {
+            here.store()
+                .put_binding(&Binding {
+                    origin: origin.clone(),
+                    node_id: there.node_id(),
+                    source: BindingSource::Static,
+                    domain: None,
+                    note: None,
+                    added_at: 0,
+                    expires_at: None,
+                })
+                .unwrap();
+            here.remember_peer(&there.net().direct_addr()).unwrap();
+        }
+
+        // Before the rotation: B holds exactly A's current key for A.
+        let answers = a.peer_bindings(&a_origin).await.unwrap();
+        assert_eq!(answers.len(), 1);
+        assert!(answers[0].reachable(), "{:?}", answers[0].keys);
+        assert_eq!(answers[0].peer, b.node_id());
+        assert!(answers[0].holds(&a.node_id()));
+
+        // A generates K_new. B has not heard of it yet.
+        let plan = a.rotate_key().unwrap();
+        let answers = a.peer_bindings(&a_origin).await.unwrap();
+        assert!(!answers[0].holds(&plan.new_key), "not published yet");
+
+        // B refreshes bindings from a record set carrying both of A's keys,
+        // which is what the rotation window looks like on the wire (§3.2).
+        let records = vec![
+            format!("v=sync1 id=a nk={}", a.node_id().to_z32()),
+            format!("v=sync1 id=a nk={}", plan.new_key.to_z32()),
+        ];
+        let set = synch_net::MemberSet::from_records("cluster.example", &records).unwrap();
+        b.apply_member_set(&set, std::time::Duration::from_secs(300))
+            .unwrap();
+
+        let answers = a.peer_bindings(&a_origin).await.unwrap();
+        assert!(answers[0].reachable());
+        assert!(
+            answers[0].holds(&plan.new_key),
+            "the new key has propagated: {:?}",
+            answers[0].keys
+        );
+        assert!(
+            answers[0].holds(&a.node_id()),
+            "and the old one is still bound"
+        );
+
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_peer_is_reported_rather_than_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = OriginId::named("a", "cluster.example").unwrap();
+        Node::init(dir.path(), Some(origin.clone())).unwrap();
+        let node = Node::open(crate::config::NodeConfig::loopback(dir.path()))
+            .await
+            .unwrap();
+        // A trusted peer that is not listening anywhere.
+        let absent = iroh_base::SecretKey::generate().public();
+        node.store()
+            .put_binding(&Binding {
+                origin: OriginId::named("ghost", "cluster.example").unwrap(),
+                node_id: absent,
+                source: BindingSource::Static,
+                domain: None,
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+
+        let answers = node.peer_bindings(&origin).await.unwrap();
+        assert_eq!(answers.len(), 1);
+        assert!(!answers[0].reachable());
+        assert!(!answers[0].holds(&node.node_id()), "silence is not a no");
         node.shutdown().await.unwrap();
     }
 }
