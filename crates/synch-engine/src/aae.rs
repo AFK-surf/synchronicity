@@ -100,12 +100,13 @@ impl Node {
     }
 
     /// Scans, publishes, and pushes the resulting head in one step.
+    ///
+    /// The scan stages into the publisher and then flushes it, so the result is
+    /// one batch and one head — including anything a watcher-triggered rescan
+    /// had already staged — and the head is out before this returns.
     pub async fn scan_publish_push(&self) -> Result<Option<SignedHead>> {
-        let (_report, head) = self.scan_and_publish()?;
-        if let Some(head) = &head {
-            self.push_head(head).await?;
-        }
-        Ok(head)
+        self.scan_and_stage()?;
+        self.flush_staged().await
     }
 
     /// The next anti-entropy delay: the configured interval with ±50 % jitter.

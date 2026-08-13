@@ -3,7 +3,7 @@
 //! The daemon holds the one endpoint, the one database writer, and the one
 //! lifecycle. It serves the control socket concurrently with the engine's
 //! standing work — the anti-entropy scheduler, the scanner, the filesystem
-//! watcher, and the maintenance/GC pass.
+//! watcher, the batching publisher, and the maintenance/GC pass.
 
 use anyhow::{Context, Result};
 use synch_engine::{Node, NodeConfig};
@@ -48,6 +48,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let maintenance = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
         node.run_maintenance(shutdown).await
     });
+    // What turns the scanner's and the watcher's staged changes into heads: one
+    // batch per quiet period or per 1000 entries, whichever comes first (§7.1).
+    let publisher = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+        node.run_publisher(shutdown).await
+    });
 
     // An initial scan and push, so a fresh daemon converges immediately rather
     // than waiting a full interval.
@@ -64,7 +69,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         _ = stopped.recv() => {}
     }
 
-    let _ = tokio::join!(control, aae, scanner, watcher, maintenance);
+    let _ = tokio::join!(control, aae, scanner, watcher, maintenance, publisher);
     node.shutdown().await?;
     Ok(())
 }

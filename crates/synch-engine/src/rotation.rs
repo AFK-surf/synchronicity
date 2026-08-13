@@ -270,7 +270,7 @@ mod tests {
         // Publish something, so the re-signed head carries a real root.
         let entry = synch_core::FileEntry::file(3, 0, synch_core::Hash::new(b"c"), 1);
         let first = node
-            .publish(vec![(
+            .publish(&[(
                 node.key_for("s", "a.txt").unwrap(),
                 Some(postcard::to_stdvec(&entry).unwrap()),
             )])
@@ -305,7 +305,7 @@ mod tests {
 
         // Publishing now signs under the new key.
         let next = node
-            .publish(vec![(node.key_for("s", "a.txt").unwrap(), None)])
+            .publish(&[(node.key_for("s", "a.txt").unwrap(), None)])
             .unwrap()
             .unwrap();
         assert_eq!(next.signed_by, new_key);

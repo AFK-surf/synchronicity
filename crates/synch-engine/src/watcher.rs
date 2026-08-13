@@ -88,7 +88,9 @@ impl Node {
                     if !triggered {
                         return;
                     }
-                    if let Err(e) = self.scan_publish_push().await {
+                    // Staged, not published: a burst of editor saves is one
+                    // batch and therefore one head (§7.1).
+                    if let Err(e) = self.scan_and_stage() {
                         tracing::warn!(error = %e, "rescan failed");
                     }
                 }
@@ -104,7 +106,7 @@ impl Node {
             tokio::select! {
                 _ = &mut shutdown => return,
                 _ = tokio::time::sleep(self.config().scan_interval) => {
-                    if let Err(e) = self.scan_publish_push().await {
+                    if let Err(e) = self.scan_and_stage() {
                         tracing::warn!(error = %e, "periodic scan failed");
                     }
                 }

@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(state.observed_seq, Some(100));
         assert_eq!(state.own_seq, None);
 
-        let err = node.publish(vec![staged_file()]).unwrap_err();
+        let err = node.publish(&[staged_file()]).unwrap_err();
         assert!(matches!(err, EngineError::InRecovery { .. }));
         assert!(err.to_string().contains("synch recover"), "{err}");
         node.shutdown().await.unwrap();
@@ -467,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn holding_our_own_head_settles_the_question() {
         let (_d, node) = node(nas()).await;
-        node.publish(vec![staged_file()]).unwrap().unwrap();
+        node.publish(&[staged_file()]).unwrap().unwrap();
         node.store()
             .record_observed_head(node.origin(), 100, &Hash([1u8; 32]), true, now_ns())
             .unwrap();

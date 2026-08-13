@@ -18,6 +18,7 @@ use synch_store::{Binding, BindingSource, KeyState, Slot, Store};
 use crate::{
     config::NodeConfig,
     error::{EngineError, Result},
+    publisher::Publisher,
 };
 
 /// A staged trie change: a key, and its new value or `None` to remove it.
@@ -47,6 +48,8 @@ struct NodeInner {
     /// never switches keys on its own.
     secret: std::sync::RwLock<SecretKey>,
     config: NodeConfig,
+    /// The batch between staging and one signed root (§7.1).
+    publisher: Publisher,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
 }
 
@@ -109,7 +112,8 @@ impl Node {
             .secret;
         let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let syncer = Syncer::new(store.clone());
-        Ok(Node {
+        let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
+        let node = Node {
             inner: Arc::new(NodeInner {
                 store,
                 net: std::sync::RwLock::new(net),
@@ -118,14 +122,31 @@ impl Node {
                 origin,
                 secret: std::sync::RwLock::new(secret),
                 config,
+                publisher,
                 ad_clock: std::sync::Mutex::new(Default::default()),
             }),
-        })
+        };
+        // A batch that was still buffered when the process died was never
+        // published, and the scanner would skip those files forever (§7.1).
+        // Opening is where that is noticed and undone.
+        let reindexed = node.reconcile_local_files()?;
+        if reindexed > 0 {
+            tracing::info!(
+                paths = reindexed,
+                "re-indexing paths whose staged changes never reached a root"
+            );
+        }
+        Ok(node)
     }
 
     /// The metadata and content store.
     pub fn store(&self) -> &Arc<Store> {
         &self.inner.store
+    }
+
+    /// The batch between staging and one signed root (§7.1).
+    pub fn publisher(&self) -> &Publisher {
+        &self.inner.publisher
     }
 
     /// The endpoint under the active device key.
@@ -392,7 +413,7 @@ impl Node {
     ///
     /// Refuses while this node is in key-loss recovery (§3.4): the head it
     /// would mint carries a seq every peer rejects.
-    pub fn publish(&self, staged: Vec<StagedChange>) -> Result<Option<SignedHead>> {
+    pub fn publish(&self, staged: &[StagedChange]) -> Result<Option<SignedHead>> {
         if staged.is_empty() {
             return Ok(None);
         }
@@ -400,7 +421,7 @@ impl Node {
         let old_root = self.current_root()?;
         let trie = Trie::new(self.store().as_ref());
         let mut root = old_root;
-        for (key, value) in &staged {
+        for (key, value) in staged {
             root = match value {
                 Some(v) => trie.insert(root, key, v)?,
                 None => trie.remove(root, key)?,
@@ -646,7 +667,7 @@ mod tests {
 
         let entry = synch_core::FileEntry::file(3, 0, Hash::new(b"c"), 1);
         let head = node
-            .publish(vec![(
+            .publish(&[(
                 node.key_for("s", "a.txt").unwrap(),
                 Some(postcard::to_stdvec(&entry).unwrap()),
             )])
@@ -662,7 +683,7 @@ mod tests {
             .is_some());
 
         let head2 = node
-            .publish(vec![(node.key_for("s", "a.txt").unwrap(), None)])
+            .publish(&[(node.key_for("s", "a.txt").unwrap(), None)])
             .unwrap()
             .unwrap();
         assert_eq!(head2.seq, 2);
@@ -680,10 +701,10 @@ mod tests {
     async fn publishing_nothing_is_a_no_op() {
         let dir = node_dir();
         let node = spawn(dir.path(), None).await;
-        assert!(node.publish(Vec::new()).unwrap().is_none());
+        assert!(node.publish(&[]).unwrap().is_none());
         // A change that does not alter the root does not mint a head either.
         assert!(node
-            .publish(vec![(node.key_for("s", "absent").unwrap(), None)])
+            .publish(&[(node.key_for("s", "absent").unwrap(), None)])
             .unwrap()
             .is_none());
         node.shutdown().await.unwrap();
@@ -696,7 +717,7 @@ mod tests {
         let space = tempfile::tempdir().unwrap();
         node.add_space("media", space.path()).unwrap();
         let change = node.manifest_change().unwrap();
-        node.publish(vec![change]).unwrap().unwrap();
+        node.publish(&[change]).unwrap().unwrap();
 
         let manifest = node.manifest_of(node.origin()).unwrap().unwrap();
         assert_eq!(manifest.software, SOFTWARE);
@@ -805,7 +826,7 @@ mod tests {
 
         assert!(!node.ad_update_due(&Hash::new(b"never seen")).unwrap());
         let change = node.ad_change(&root).unwrap().unwrap();
-        node.publish(vec![change]).unwrap();
+        node.publish(&[change]).unwrap();
         assert!(node.published_ad(&root).unwrap().unwrap().is_complete());
         node.shutdown().await.unwrap();
     }

@@ -239,7 +239,7 @@ impl Node {
         let Some(change) = self.ad_change(root)? else {
             return Ok(None);
         };
-        self.publish(vec![change])
+        self.publish(&[change])
     }
 
     /// Reads a byte range of a published entry, fetching whatever is missing

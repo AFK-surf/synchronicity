@@ -15,6 +15,7 @@ pub mod ignore;
 pub mod membership;
 pub mod mirror;
 pub mod node;
+pub mod publisher;
 pub mod recovery;
 pub mod reference;
 pub mod rotation;
@@ -29,6 +30,7 @@ pub use ignore::IgnoreSet;
 pub use membership::{DoctorReport, DomainRefresh, HeadStatus};
 pub use mirror::MirrorReport;
 pub use node::{InitReport, Node, StagedChange};
+pub use publisher::{Publisher, DEFAULT_PUBLISH_BATCH_MAX, DEFAULT_PUBLISH_QUIESCE};
 pub use recovery::{
     ObserveRound, RecoveryOptions, RecoveryProgress, RecoveryReport, RecoveryState,
     UnreconciledHistory, DEFAULT_RECOVERY_QUIESCE, DEFAULT_SEQ_GAP,

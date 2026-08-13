@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use synch_core::{blob_key, file_key, normalize_native_path, now_ns, EntryKind, FileEntry, Hash};
+use synch_mpt::Trie;
 use synch_store::LocalFile;
 
 use crate::{
@@ -195,7 +196,8 @@ impl Node {
         Ok(report)
     }
 
-    /// Scans every space and publishes the result as one new root.
+    /// Scans every space and publishes the result as one new root, without
+    /// going through the publisher's batch.
     ///
     /// The recovery gate (§3.4) is checked *before* the scan, not only at the
     /// publish: a scan records what it hashed in `local_files`, so a scan whose
@@ -204,8 +206,64 @@ impl Node {
     pub fn scan_and_publish(&self) -> Result<(ScanReport, Option<synch_core::SignedHead>)> {
         self.ensure_publishable()?;
         let report = self.scan_all()?;
-        let head = self.publish(report.staged.clone())?;
+        let head = self.publish(&report.staged)?;
         Ok((report, head))
+    }
+
+    /// Scans every space and stages the result for the publisher (§7.1).
+    ///
+    /// This is what a watcher hint and the periodic rescan use: a burst of
+    /// saves becomes one batch and therefore one head. Nothing is published
+    /// until the batch flushes.
+    ///
+    /// The recovery gate is taken here for the same reason it is taken in
+    /// [`Node::scan_and_publish`] — the scan writes `local_files` either way.
+    pub fn scan_and_stage(&self) -> Result<ScanReport> {
+        self.ensure_publishable()?;
+        let report = self.scan_all()?;
+        self.stage(report.staged.iter().cloned());
+        Ok(report)
+    }
+
+    /// Re-indexes local paths whose staged changes never reached a root.
+    ///
+    /// `scan_space` records `(size, mtime_ns, file_id)` in `local_files` as it
+    /// indexes, and that record is what makes the *next* scan skip the file.
+    /// Batching puts a window between the two: a daemon that dies with a batch
+    /// still buffered would leave rows claiming a file is published while no
+    /// root mentions it, and every later scan would skip it — silent, permanent
+    /// drift.
+    ///
+    /// So on open, every `local_files` row is checked against this node's own
+    /// current trie, and any row the trie does not corroborate is dropped: the
+    /// next scan re-hashes that path and stages it again. Both tables are
+    /// local, so the check costs one trie lookup per indexed file and no I/O
+    /// beyond the database. Returns how many rows were dropped.
+    pub fn reconcile_local_files(&self) -> Result<usize> {
+        let root = self.current_root()?;
+        let trie = Trie::new(self.store().as_ref());
+        let mut dropped = 0;
+        for space in self.store().spaces()? {
+            for row in self.store().local_file_rows(&space.id)? {
+                let published = trie
+                    .get(root, &file_key(&space.id, &row.relpath)?)?
+                    .as_deref()
+                    .map(decode_entry)
+                    .transpose()?
+                    .and_then(|entry| entry.content);
+                if published == row.content {
+                    continue;
+                }
+                tracing::debug!(
+                    space = %space.id,
+                    path = %row.relpath,
+                    "re-indexing a path the published root does not corroborate"
+                );
+                self.store().remove_local_file(&space.id, &row.relpath)?;
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
     }
 
     /// Adopts a peer's version of a path as our own (§8, `synch take`).
@@ -514,12 +572,79 @@ mod tests {
 
         let staged = node.remove_space("media").unwrap();
         assert!(!staged.is_empty());
-        node.publish(staged).unwrap().unwrap();
+        node.publish(&staged).unwrap().unwrap();
         assert!(node
             .store()
             .list_entries(Some(node.origin()), "media", "", None, None)
             .unwrap()
             .is_empty());
+        node.shutdown().await.unwrap();
+    }
+
+    /// The crash the batching publisher makes possible, and the countermeasure
+    /// (§7.1): a scan writes `local_files` as it indexes, so a daemon that dies
+    /// with the batch still buffered must not leave the next scan skipping
+    /// those files forever.
+    #[tokio::test]
+    async fn a_batch_lost_to_a_crash_is_re_indexed_on_open() {
+        let data = tempfile::tempdir().unwrap();
+        let space = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        {
+            let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+            node.add_space("media", space.path()).unwrap();
+            std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
+
+            // Scan into the publisher and then lose the process: the files are
+            // hashed and recorded, and nothing is ever published.
+            let report = node.scan_and_stage().unwrap();
+            assert_eq!(report.hashed, 1);
+            assert!(node.publisher().pending() > 0);
+            assert!(node.own_head().unwrap().is_none());
+            assert_eq!(node.store().local_files("media").unwrap().len(), 1);
+            node.shutdown().await.unwrap();
+        }
+
+        // Opening notices that `local_files` claims a file the trie does not
+        // publish, and drops the row so the next scan re-hashes it.
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        assert!(node.store().local_files("media").unwrap().is_empty());
+
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.hashed, 1, "the file must be re-hashed, not skipped");
+        assert_eq!(head.unwrap().seq, 1);
+        let entry = node
+            .store()
+            .entry(node.origin(), "media", "a.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.content, Some(Hash::new(b"hello")));
+        node.shutdown().await.unwrap();
+    }
+
+    /// Reconciliation is a repair, not a re-scan: a node whose published root
+    /// agrees with `local_files` keeps every row, so ordinary restarts do not
+    /// re-hash the tree.
+    #[tokio::test]
+    async fn reconciliation_leaves_a_published_tree_alone() {
+        let data = tempfile::tempdir().unwrap();
+        let space = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        {
+            let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+            node.add_space("media", space.path()).unwrap();
+            std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
+            node.scan_and_publish().unwrap();
+            node.shutdown().await.unwrap();
+        }
+
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        assert_eq!(node.reconcile_local_files().unwrap(), 0);
+        assert_eq!(node.store().local_files("media").unwrap().len(), 1);
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.hashed, 0);
+        assert_eq!(report.unchanged, 1);
+        assert!(head.is_none());
         node.shutdown().await.unwrap();
     }
 

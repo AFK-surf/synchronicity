@@ -461,6 +461,46 @@ impl Store {
         }))
     }
 
+    /// Every row the scanner has recorded for a space.
+    ///
+    /// The full rows, not just the paths: startup reconciliation compares the
+    /// recorded content hash against what the node's own trie actually
+    /// publishes (§7.1).
+    pub fn local_file_rows(&self, space: &str) -> Result<Vec<LocalFile>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT space, relpath, size, mtime_ns, file_id, content, scanned_at
+             FROM local_files WHERE space = ?1 ORDER BY relpath",
+        )?;
+        let rows = stmt.query_map(params![space], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (space, relpath, size, mtime_ns, file_id, content, scanned_at) = row?;
+            out.push(LocalFile {
+                space,
+                relpath,
+                size: size as u64,
+                mtime_ns,
+                file_id,
+                content: content
+                    .map(|b| hash_column(b, "local_files.content"))
+                    .transpose()?,
+                scanned_at,
+            });
+        }
+        Ok(out)
+    }
+
     /// Every path the scanner has recorded for a space.
     pub fn local_files(&self, space: &str) -> Result<Vec<String>> {
         let conn = self.conn();
@@ -946,6 +986,8 @@ mod tests {
         store.put_local_file(&f).unwrap();
         assert_eq!(store.local_file("s", "a.txt").unwrap().unwrap(), f);
         assert_eq!(store.local_files("s").unwrap(), vec!["a.txt".to_string()]);
+        assert_eq!(store.local_file_rows("s").unwrap(), vec![f.clone()]);
+        assert!(store.local_file_rows("other").unwrap().is_empty());
         store.remove_local_file("s", "a.txt").unwrap();
         assert!(store.local_file("s", "a.txt").unwrap().is_none());
     }

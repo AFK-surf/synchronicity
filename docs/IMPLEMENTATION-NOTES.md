@@ -26,6 +26,53 @@ per-session rather than global.
 
 ## Differences in detail
 
+### §7.1 — which callers wait for the batch, and which flush it
+
+The publisher batches staged changes into one root on either trigger the design
+names: `publish_quiesce` (2 s of quiet) or `publish_batch_max` (1000 entries).
+What §7.1 does not say is which callers may return *before* their batch has
+become a head, and this implementation splits them by whether a person is
+waiting for an answer:
+
+- The watcher and the periodic rescan **stage** and return. This is the case
+  batching exists for: a burst of editor saves is one batch and one head.
+- `synch scan`, `synch take`, and `synch space rm` **flush** before they answer.
+  Each is already one batch by construction, so flushing costs no extra head,
+  and it keeps their output (`published seq N`, `unpublished N record(s)`)
+  describing something peers can already ask for. `synch-s3`'s `PutObject`
+  keeps its own, stricter timing — see §9.4 below.
+
+A flush publishes the *whole* buffer, not the flushing caller's share of it, so
+a `synch scan` that lands while a watcher rescan is still buffered publishes
+both. A publish that is refused (§3.4) puts its batch back rather than dropping
+it; a *push* that fails does not fail the flush, because the head exists and
+the next anti-entropy round carries it. A clean daemon stop flushes what is
+left.
+
+One visible consequence of batching: `FileEntry.seq` is the seq the scan
+expected to publish at, and a batch that lands after some unrelated publish
+(an ad milestone, a key activation) can carry a seq one below the head that
+actually delivers it. The trie, the head, and `entries.seq`'s ordering are
+unaffected; only that advisory field can lag, and re-scanning the file restates
+it.
+
+### §7.1 — reconciling `local_files` on open
+
+Batching introduces a failure the synchronous publisher did not have.
+`scan_space` records `(size, mtime_ns, file_id)` in `local_files` as it indexes,
+and that record is exactly what makes the *next* scan skip the file. If a
+daemon dies with a batch still buffered, the files were hashed and recorded but
+no root mentions them, and every later scan skips them: silent, permanent
+drift.
+
+So `Node::open` reconciles before it returns anything. Every `local_files` row
+is compared against this node's own current trie, and a row whose content hash
+the trie does not corroborate is dropped, so the next scan re-hashes that path
+and stages it again. Both tables are local — one trie lookup per indexed file,
+no filesystem I/O — which is why the check is unconditional rather than
+guarded by a crash marker. It is a repair, not a rescan: a node whose root
+agrees with its rows keeps every one of them and re-hashes nothing.
+
 ### §3.4 — which endpoint dials during the overlap window
 
 The design says `synch key activate` "brings up a second iroh endpoint as
@@ -234,8 +281,9 @@ Restoring identity would mean calling `GetFileInformationByHandle` through a
 
 The design says `PutObject` "responds once durably staged, with the head publish
 following the usual batching". This implementation runs the scan and publish
-synchronously before responding, so the ETag returned is always backed by a
-published entry. It is stricter than specified, not looser.
+synchronously before responding — deliberately around the batching publisher
+rather than through it — so the ETag returned is always backed by a published
+entry. It is stricter than specified, not looser.
 
 ### §9.4 — SigV4 test vectors
 

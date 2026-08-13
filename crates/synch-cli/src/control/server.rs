@@ -443,7 +443,10 @@ async fn dispatch<S: AsyncWrite + Unpin>(
         Request::SpaceRm { id } => {
             let staged = node.remove_space(&id)?;
             let removed = staged.len();
-            node.publish(staged)?;
+            // Explicit commands publish before they answer, so the count they
+            // report is one that peers can already see (§7.1).
+            node.stage(staged);
+            node.flush_staged().await?;
             out.line(format!("removed {id} and unpublished {removed} record(s)"))
                 .await?;
         }
@@ -474,7 +477,11 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             let report = scanning
                 .await
                 .map_err(|e| ControlError::internal(format!("the scan task failed: {e}")))??;
-            let head = node.publish(report.staged.clone())?;
+            // An explicit scan is already one batch, so it stages and then
+            // flushes rather than waiting out the quiesce: the "published seq"
+            // line below is true by the time the client reads it (§7.1).
+            node.stage(report.staged.clone());
+            let head = node.flush_staged().await?;
             out.line(format!(
                 "hashed {} · unchanged {} · deleted {} · ignored {}",
                 report.hashed, report.unchanged, report.deleted, report.ignored
@@ -486,10 +493,7 @@ async fn dispatch<S: AsyncWrite + Unpin>(
             match head {
                 Some(head) => {
                     out.line(format!("published seq {} root {}", head.seq, head.root))
-                        .await?;
-                    if let Err(e) = node.push_head(&head).await {
-                        tracing::debug!(error = %e, "could not push the new head");
-                    }
+                        .await?
                 }
                 None => out.line("nothing changed").await?,
             }
@@ -623,11 +627,9 @@ async fn dispatch<S: AsyncWrite + Unpin>(
                 .await?;
             let path = node.adopt(&reference.space, &reference.path, &bytes)?;
             out.line(format!("adopted into {}", path.display())).await?;
-            let (_report, head) = node.scan_and_publish()?;
-            if let Some(head) = head {
-                if let Err(e) = node.push_head(&head).await {
-                    tracing::debug!(error = %e, "could not push the new head");
-                }
+            // `take` publishes before it answers, for the same reason
+            // `scan` does: the seq it prints has to be a real one (§7.1).
+            if let Some(head) = node.scan_publish_push().await? {
                 out.line(format!("published seq {}", head.seq)).await?;
             }
         }

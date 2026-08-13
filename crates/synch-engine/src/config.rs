@@ -27,6 +27,11 @@ pub struct NodeConfig {
     pub watch_debounce: Duration,
     /// Full rescan interval (§7.1).
     pub scan_interval: Duration,
+    /// How long staging must go quiet before the publisher turns a batch into
+    /// one new signed root (§7.1).
+    pub publish_quiesce: Duration,
+    /// How many staged entries force a batch out without waiting (§7.1).
+    pub publish_batch_max: usize,
     /// Minimum interval between `BlobAd` republishes for one in-flight object
     /// (§6.3).
     pub ad_update_interval: Duration,
@@ -53,6 +58,8 @@ impl NodeConfig {
             aae_interval: Duration::from_secs(30),
             watch_debounce: Duration::from_millis(500),
             scan_interval: Duration::from_secs(3600),
+            publish_quiesce: crate::publisher::DEFAULT_PUBLISH_QUIESCE,
+            publish_batch_max: crate::publisher::DEFAULT_PUBLISH_BATCH_MAX,
             ad_update_interval: Duration::from_secs(60),
             fetch_fanout: 3,
             root_retention: Duration::from_secs(7 * 24 * 3600),
@@ -92,6 +99,8 @@ mod tests {
         assert_eq!(config.aae_interval, Duration::from_secs(30));
         assert_eq!(config.watch_debounce, Duration::from_millis(500));
         assert_eq!(config.scan_interval, Duration::from_secs(3600));
+        assert_eq!(config.publish_quiesce, Duration::from_secs(2));
+        assert_eq!(config.publish_batch_max, 1_000);
         assert_eq!(config.ad_update_interval, Duration::from_secs(60));
         assert_eq!(config.fetch_fanout, 3);
         assert_eq!(config.root_retention, Duration::from_secs(7 * 24 * 3600));
