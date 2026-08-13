@@ -23,7 +23,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// Client and daemon are normally the same binary, so this exists to catch the
 /// upgrade-while-running case rather than to support mixed versions (§9.3).
-pub const CONTROL_VERSION: u32 = 1;
+///
+/// Bumped to 2 by `synch recover`, which added a [`Request`] variant: postcard
+/// identifies variants by position, so a client and a daemon from either side
+/// of that change must say so plainly rather than mis-decode each other.
+pub const CONTROL_VERSION: u32 = 2;
 
 /// How many payload bytes one `Chunk` frame carries.
 ///
