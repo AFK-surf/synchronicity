@@ -14,8 +14,8 @@ Status: draft v0.1 · 2026-08-12
   cluster (what exists, who has it), and can fetch any content from any node that holds
   it. Metadata is replicated everywhere; content moves on demand or by policy.
 - **Cross-platform**: Linux, macOS, Windows, and BSDs. No platform-specific kernel
-  features (no FUSE, no kernel drivers, no admin privileges). The default distribution is
-  a single static, dependency-free CLI binary.
+  features (no FUSE, no kernel drivers, no admin privileges). The default distribution
+  is two static, dependency-free binaries: the CLI/daemon and the S3 gateway (§9.1).
 - **Hierarchy-agnostic networking**: every node is a peer. There are no servers,
   coordinators, leaders, or super-nodes. Any node can sync with, relay for, and serve
   any other node. Built on [iroh](https://github.com/n0-computer/iroh).
@@ -637,8 +637,12 @@ The fetcher:
    providers.
 2. Streams and verifies groups as they arrive; verified groups are committed to the
    CAS and the completeness bitmap immediately (progress survives restarts).
-3. Re-plans on provider failure or on ads changing. Wants are a persistent queue
-   (`want` table) with priorities: explicit `synch get` > policy mirror > prefetch.
+3. Re-plans on provider failure: a provider that cannot help is dropped from the
+   plan and its groups are re-split across the remainder. Fetching is on-demand and
+   request-scoped — the caller (`synch cat/get`, a mirror pass, the s3 gateway)
+   drives it and owns retry policy; there is no persistent download queue. Progress
+   still survives restarts, because verified groups are committed to the CAS as
+   they arrive and a re-issued fetch skips whatever is already held.
 
 This is intentionally the same shape as iroh-blobs' protocol; we keep our own ALPN and
 message frame so the availability semantics (partial serving, `SliceEnd`) stay under
@@ -710,11 +714,12 @@ Principles: **every origin publishes only its own copy; the system never merges.
   publishes it as the local node's own new entry. `prev` is set to the replaced local
   content root, recording 1-step lineage so UIs can distinguish "adopted theirs on top
   of X" from "changed independently".
-- **History**: retained old roots (§5.4) give each origin a time machine over its own
-  publishes: `synch log <space>/<path>` walks historical roots' leaves for the key;
-  `synch cat --at <seq>` reads an old version if its content is still in someone's CAS
-  (content GC is pin/retention-driven, so history depth is a storage policy, not a
-  protocol constant).
+- **History**: retained old roots (§5.4) give each origin a record of its own
+  publishes: `synch log <space>/<path>` walks historical roots' leaves for the key
+  and shows each version's seq and content root. An old version's *bytes* remain
+  readable for as long as some node's CAS still holds that root (content GC is
+  pin/retention-driven, so history depth is a storage policy, not a protocol
+  constant); reading one back is done by content root, not by a time-travel flag.
 - No branches, no merge commits, no vector clocks in v1. `prev` plus per-origin `seq`
   is deliberately the entire causality story; experience (Syncthing, Unison) says
   users resolve file conflicts by *looking at the file*, not the DAG.
@@ -763,11 +768,12 @@ synch id                                     print OriginId + current device key
 synch key rotate|activate|retire|ls          operator-driven device-key rotation (§3.4)
 
 synch trust add [--as <name>]|rebind|rm|ls   static membership (named or key-identified)
-synch domain add|rm|ls <domain>              DNSSEC membership
+synch domain add|rm|ls|refresh <domain>      DNSSEC membership (refresh: re-resolve now)
 synch peers                                  live peers, addresses, last sync, lag
 
 synch space add <id> <path>                  index a local directory as a space
 synch space ls|rm
+synch scan                                   walk every space now: hash changes, publish
 
 synch ls   [<origin>:]<space>/[<dir>]        list entries (default: all origins, merged view)
 synch status [<space>[/<path>]]              agreement/divergence across origins
@@ -775,7 +781,8 @@ synch cat  <origin>:<space>/<path> [--range] verified streaming read
 synch get  <origin>:<space>/<path> [-o …]    fetch to file
 synch take <origin>:<space>/<path>           adopt a peer's version as my own
 synch log  [<origin>:]<space>/<path>         per-origin publish history
-synch mirror add|rm|ls                       continuous read-only materialization
+synch mirror add|rm|ls|sync                  continuous read-only materialization
+                                             (sync: bring every mirror up to date now)
 
 synch pin add|rm|ls <root|path>              keep content in CAS regardless of policy
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
@@ -853,14 +860,21 @@ and write a synchronicity cluster without knowing anything about it.
 
 One database per node, `synchronicity.db` in the platform data dir
 (`~/.local/share/synchronicity`, `~/Library/Application Support/…`, `%APPDATA%\…`).
-WAL mode, `synchronous=NORMAL`, single writer task (all writes funneled through one
-tokio task; reads from a pool). All multi-step state changes (head flips, publish
-batches) are single transactions.
+WAL mode, `synchronous=NORMAL`, all access through one mutex-guarded connection —
+the invariant that matters is that every multi-step state change (head flips,
+publish batches) is a single transaction and no partial state is ever observable;
+read concurrency is deliberately traded away for that simplicity.
+
+The schema carries a version number in `config` (`schema_version`); every statement
+is `IF NOT EXISTS` and changes are additive, so applying the schema *is* the
+upgrade, and a database written by a newer version is refused rather than guessed
+at. `config` also holds `self_origin_id` and, after a recovery (§3.4), the
+`publish_floor`.
 
 ```sql
 -- node & config
 CREATE TABLE config        (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                                         -- includes 'self_origin_id'
+                                         -- 'schema_version', 'self_origin_id', 'publish_floor'
 CREATE TABLE device_keys (                -- own keys; >1 row only during rotation
   node_id     BLOB PRIMARY KEY,
   secret_key  BLOB NOT NULL,
@@ -947,10 +961,13 @@ CREATE TABLE local_files   (space TEXT, relpath TEXT, size INTEGER, mtime_ns INT
                             PRIMARY KEY (space, relpath));
 CREATE TABLE mirrors       (origin_id TEXT, space TEXT, local_path TEXT NOT NULL,
                             PRIMARY KEY (origin_id, space));
-CREATE TABLE want          (root BLOB, ranges BLOB, priority INTEGER, reason TEXT,
-                            created_at INTEGER, PRIMARY KEY (root, ranges));
 CREATE TABLE peers_seen    (node_id BLOB PRIMARY KEY, last_addr BLOB, last_seen INTEGER,
                             last_sync INTEGER, latency_ewma_us INTEGER);
+
+-- recovery (§3.4): the greatest (seq, root) any peer has advertised for an origin,
+-- observed from Hello summaries — never verified, never adopted as a head
+CREATE TABLE observed_heads (origin_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
+                             root BLOB NOT NULL, observed_at INTEGER NOT NULL);
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can
@@ -1051,11 +1068,15 @@ CI (GitHub Actions):
   and reported with retained signed proofs (§4.4). A malicious *origin* publishing
   garbage about its own files only pollutes its own namespace, which the version
   model already treats as "their claim, not truth".
-- **Denial of service**: per-peer rate limits on `GetNodes`/`GetSlice`; batch-size caps;
-  trie-depth caps on ingest (key length is bounded to 4 KiB, so depth ≤ ~8 K nibbles);
-  publish-size quota per origin (configurable, default 10 M trie leaves — with
-  per-object blob ads (§6.3) that corresponds to millions of files and objects, not
-  a handful of large files) so one member can't OOM the cluster's metadata.
+- **Resource exhaustion — a trust stance, not a defense**: every peer that can send
+  us a request at all is an authorized member (§3.2), and members are extended basic
+  trust not to DoS each other. There are therefore **no per-peer rate limits and no
+  per-origin publish quotas** — a member behaving abusively is a membership problem,
+  and the remedy is the membership machinery: `synch trust rm` or removal from the
+  DNS record set cuts the node off entirely. What remains are sanity bounds that
+  cap the cost of any *single* malformed or extreme message: `GetNodes`/`GetValues`
+  batches are capped at 256 hashes, and trie keys are bounded to 4 KiB (so ingest
+  depth ≤ ~8 K nibbles).
 - **Privacy**: metadata (paths, sizes, mtimes) is visible to *all* members — inherent
   to omnipresence. Content is fetched on demand, so bytes only land where requested or
   mirrored. At-rest encryption of the CAS and DB is delegated to OS disk encryption in
@@ -1074,8 +1095,8 @@ CI (GitHub Actions):
   already permits it).
 - Smarter placement policies ("keep ≥ 2 replicas of every object cluster-wide"),
   built on the same `BlobAd` availability data.
-- A local read-only HTTP gateway (`synch serve`) for browser access; optional
-  platform-specific mounts (FUSE/WinFsp/NFSv3-loopback) as *plugins*, never as core.
+- Optional platform-specific mounts (FUSE/WinFsp/NFSv3-loopback) as *plugins*,
+  never as core. (HTTP access ships as the S3 gateway, §9.4.)
 - Bandwidth scheduling / QoS between anti-entropy and bulk fetches.
 
 ---
@@ -1105,13 +1126,14 @@ Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`
    chose) the old object — divergence visible, nothing auto-resolved, adoption one
    `synch take` away.
 6. `nas`'s operator rotates its key: `synch key rotate`, publish the second
-   `id=nas nk=<K_new>` TXT record, wait for validated visibility. `nas` re-signs its
-   head as `K_new` at `seq=3` and brings up the `K_new` endpoint alongside the old
-   one for the TTL window. `laptop` and `vps` pick up the rebinding on their next
-   validated DNS refresh and now dial `K_new`.
-   Every trie node, entry, and blob ad is untouched — `nas@cluster…` is the same
-   origin it always was. The old TXT record is removed and `K_old` expires out of
-   everyone's bindings a TTL later.
+   `id=nas nk=<K_new>` TXT record, wait for propagation, then `synch key activate
+   <K_new>` — which re-signs the head as `K_new` at `seq=3` and brings up the
+   `K_new` endpoint alongside the old one for the TTL window. Nothing here happens
+   on the node's own initiative (§3.4). `laptop` and `vps` pick up the rebinding on
+   their next validated DNS refresh and now dial `K_new`. Every trie node, entry,
+   and blob ad is untouched — `nas@cluster…` is the same origin it always was. The
+   operator removes the old TXT record and runs `synch key retire <K_old>` once it
+   has expired out of everyone's bindings a TTL later.
 
 ---
 
