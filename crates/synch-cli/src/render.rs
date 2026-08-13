@@ -135,6 +135,35 @@ pub fn ago(timestamp: i64) -> String {
     }
 }
 
+/// One membership domain's health, for `domain ls` and `doctor`.
+///
+/// Three failing domains must not read like three healthy ones: the line
+/// carries the binding count, the refresh times, and the last failure —
+/// the reason itself, not a pointer at the daemon log.
+pub fn domain_health(health: &synch_engine::DomainHealth, now: i64) -> String {
+    let mut line = format!("{}  {} binding(s)", health.domain, health.bindings);
+    match &health.schedule {
+        None => line.push_str("  not yet resolved by this daemon"),
+        Some(schedule) => {
+            if schedule.last_success > 0 {
+                line.push_str(&format!("  refreshed {}", ago(schedule.last_success)));
+            } else {
+                line.push_str("  never refreshed successfully");
+            }
+            let due = schedule.due_at.saturating_sub(now) / 1_000_000_000;
+            if due > 0 {
+                line.push_str(&format!("  next in {due}s"));
+            } else {
+                line.push_str("  due now");
+            }
+            if let Some(error) = &schedule.last_error {
+                line.push_str(&format!("  LAST ERROR: {error}"));
+            }
+        }
+    }
+    line
+}
+
 /// The `synch doctor` / `synch daemon status` report.
 pub fn doctor(node: &Node) -> Lines {
     let report = node.doctor()?;
@@ -153,8 +182,9 @@ pub fn doctor(node: &Node) -> Lines {
     if report.domains.is_empty() {
         out.push("  (no DNSSEC domains configured; static trust only)".into());
     } else {
-        for domain in &report.domains {
-            out.push(format!("  domain {domain}"));
+        let now = now_ns();
+        for health in node.domain_health()? {
+            out.push(format!("  domain {}", domain_health(&health, now)));
         }
     }
     let now = now_ns();

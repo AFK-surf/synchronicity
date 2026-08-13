@@ -39,12 +39,40 @@ fn cooldown_ns() -> i64 {
 /// Held in memory rather than in the database: it is a scheduling detail of a
 /// running daemon, and a restart re-resolving every domain once is exactly
 /// right.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DomainSchedule {
     /// When the TTL this domain's last answer carried runs out.
     pub due_at: i64,
     /// When a lookup was last attempted, successful or not.
     pub last_attempt: i64,
+    /// When a lookup last succeeded, 0 for never.
+    pub last_success: i64,
+    /// Why the last attempt failed, cleared by the next success.
+    ///
+    /// "DNSSEC bogus", "no records", and "resolver down" demand different
+    /// operator responses; holding the reason here is what lets `doctor` and
+    /// `domain ls` say which without a trip to the daemon log.
+    pub last_error: Option<String>,
+}
+
+/// What one domain's refresh attempt came to: the refresh, or why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainOutcome {
+    /// The domain attempted.
+    pub domain: String,
+    /// The refresh, or the failure the operator has to read.
+    pub result: std::result::Result<DomainRefresh, String>,
+}
+
+/// One configured domain's health, as `doctor` and `domain ls` report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainHealth {
+    /// The membership domain.
+    pub domain: String,
+    /// Live DNS bindings this domain currently vouches for.
+    pub bindings: usize,
+    /// The schedule state, `None` before the first attempt of this process.
+    pub schedule: Option<DomainSchedule>,
 }
 
 /// What one domain refresh did.
@@ -233,7 +261,7 @@ impl Node {
     pub async fn refresh_domains(
         &self,
         resolver: &dyn MemberResolver,
-    ) -> Result<Vec<DomainRefresh>> {
+    ) -> Result<Vec<DomainOutcome>> {
         let domains = self.domains()?;
         self.refresh_these(resolver, &domains, now_ns()).await
     }
@@ -259,7 +287,7 @@ impl Node {
         &self,
         resolver: &dyn MemberResolver,
         domain: Option<&str>,
-    ) -> Result<Vec<DomainRefresh>> {
+    ) -> Result<Vec<DomainOutcome>> {
         let domains = match domain {
             None => self.domains()?,
             Some(name) => vec![self.configured_domain(name)?],
@@ -276,7 +304,7 @@ impl Node {
         &self,
         resolver: &dyn MemberResolver,
         now: i64,
-    ) -> Result<Vec<DomainRefresh>> {
+    ) -> Result<Vec<DomainOutcome>> {
         let due: Vec<String> = {
             let schedule = self.dns_schedule();
             self.domains()?
@@ -298,7 +326,7 @@ impl Node {
         &self,
         resolver: &dyn MemberResolver,
         now: i64,
-    ) -> Result<Vec<DomainRefresh>> {
+    ) -> Result<Vec<DomainOutcome>> {
         let ready: Vec<String> = {
             let schedule = self.dns_schedule();
             self.domains()?
@@ -373,21 +401,28 @@ impl Node {
         resolver: &dyn MemberResolver,
         domains: &[String],
         now: i64,
-    ) -> Result<Vec<DomainRefresh>> {
+    ) -> Result<Vec<DomainOutcome>> {
         let mut out = Vec::new();
         for domain in domains {
             // Stamped before the lookup runs, so a resolver that hangs or fails
             // cannot be retried in a tight loop.
             self.note_dns_attempt(domain, now, MIN_TTL);
-            match self.refresh_domain(resolver, domain).await {
+            let result = match self.refresh_domain(resolver, domain).await {
                 Ok(refresh) => {
                     self.note_dns_attempt(domain, now, refresh.ttl);
-                    out.push(refresh);
+                    self.note_dns_outcome(domain, now, None);
+                    Ok(refresh)
                 }
                 Err(e) => {
                     tracing::warn!(domain, error = %e, "membership refresh failed; keeping cached bindings");
+                    self.note_dns_outcome(domain, now, Some(e.to_string()));
+                    Err(e.to_string())
                 }
-            }
+            };
+            out.push(DomainOutcome {
+                domain: domain.clone(),
+                result,
+            });
         }
         Ok(out)
     }
@@ -398,6 +433,45 @@ impl Node {
         let entry = schedule.entry(domain.to_string()).or_default();
         entry.last_attempt = now;
         entry.due_at = due_at;
+    }
+
+    fn note_dns_outcome(&self, domain: &str, now: i64, error: Option<String>) {
+        let mut schedule = self.dns_schedule();
+        let entry = schedule.entry(domain.to_string()).or_default();
+        match error {
+            None => {
+                entry.last_success = now;
+                entry.last_error = None;
+            }
+            Some(error) => entry.last_error = Some(error),
+        }
+    }
+
+    /// Every configured domain's health: bindings held, schedule, last error.
+    ///
+    /// Three failing domains used to look exactly like three healthy ones in
+    /// `doctor`; this is the difference.
+    pub fn domain_health(&self) -> Result<Vec<DomainHealth>> {
+        let bindings = self.store().bindings()?;
+        let schedule = self.dns_schedule().clone();
+        Ok(self
+            .domains()?
+            .into_iter()
+            .map(|domain| {
+                let held = bindings
+                    .iter()
+                    .filter(|b| {
+                        b.source == synch_store::BindingSource::Dns
+                            && b.domain.as_deref() == Some(&domain)
+                    })
+                    .count();
+                DomainHealth {
+                    schedule: schedule.get(&domain).cloned(),
+                    domain,
+                    bindings: held,
+                }
+            })
+            .collect())
     }
 
     /// Builds the `synch doctor` report.
@@ -819,11 +893,16 @@ mod tests {
 
         resolver.fail(true);
         let later = start + (MIN_TTL.as_nanos() as i64) + 1;
-        assert!(node
-            .refresh_due_domains(&resolver, later)
-            .await
-            .unwrap()
-            .is_empty());
+        // The failed attempt is an outcome, not a silence: the reason reaches
+        // whoever asked, and the health report holds it for `doctor`.
+        let outcomes = node.refresh_due_domains(&resolver, later).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].result.is_err(), "{outcomes:?}");
+        let health = node.domain_health().unwrap();
+        assert_eq!(health.len(), 1);
+        let schedule = health[0].schedule.as_ref().unwrap();
+        assert!(schedule.last_error.is_some(), "{schedule:?}");
+        assert!(schedule.last_success > 0, "the first refresh succeeded");
         let origin = OriginId::named("nas", "cluster.example").unwrap();
         assert!(
             node.store().is_bound(&origin, &nas, later).unwrap(),

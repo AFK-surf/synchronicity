@@ -545,22 +545,34 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
         Request::DomainAdd { domain } => {
             node.add_domain(&domain)?;
             out.line(format!("added {domain}")).await?;
-            refresh_domains(node, out, Some(&domain)).await?;
+            // Lenient: the add stands even when the first refresh fails —
+            // configuring a domain before its records are published is a
+            // legitimate order of operations.
+            refresh_domains(node, out, Some(&domain), false).await?;
         }
 
         Request::DomainRm { domain } => {
-            node.remove_domain(&domain)?;
+            if !node.remove_domain(&domain)? {
+                return Err(ControlError::new(
+                    ErrorCode::NotFound,
+                    format!("{domain} is not a configured membership domain"),
+                ));
+            }
             out.line(format!("removed {domain} and its bindings"))
                 .await?;
         }
 
         Request::DomainLs => {
-            for domain in node.domains()? {
-                out.line(domain).await?;
+            for health in node.domain_health()? {
+                out.line(render::domain_health(&health, now_ns())).await?;
             }
         }
 
-        Request::DomainRefresh { domain } => refresh_domains(node, out, domain.as_deref()).await?,
+        // Strict: a failed refresh is a failed command. Scripts and
+        // monitoring read the exit code, not the prose.
+        Request::DomainRefresh { domain } => {
+            refresh_domains(node, out, domain.as_deref(), true).await?
+        }
 
         Request::Peers => {
             let now = now_ns();
@@ -1310,6 +1322,7 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(
     node: &Node,
     out: &mut Frames<S>,
     domain: Option<&str>,
+    strict: bool,
 ) -> Done {
     // A domain the node was never told about is a typo, and it is refused
     // before a resolver is even built.
@@ -1330,26 +1343,22 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(
         Err(e) => {
             out.line(format!("no DNSSEC resolver available: {e}"))
                 .await?;
+            if strict {
+                return Err(ControlError::new(
+                    ErrorCode::Unavailable,
+                    format!("no DNSSEC resolver available: {e}"),
+                ));
+            }
             return Ok(());
         }
     };
-    match node
+    let outcomes = node
         .refresh_domains_named(&resolver, domain.as_deref())
-        .await
-    {
-        Ok(refreshes) => {
-            // A domain that refreshed nothing failed to resolve — say so per
-            // domain, or an offline refresh prints nothing and exits 0.
-            for missing in requested
-                .iter()
-                .filter(|d| !refreshes.iter().any(|r| &&r.domain == d))
-            {
-                out.line(format!(
-                    "{missing}: refresh failed; cached bindings kept (details in the daemon log)"
-                ))
-                .await?;
-            }
-            for refresh in refreshes {
+        .await?;
+    let mut failed = 0usize;
+    for outcome in &outcomes {
+        match &outcome.result {
+            Ok(refresh) => {
                 out.line(format!(
                     "{}: {} binding(s), {} rejected record(s), ttl {}s",
                     refresh.domain,
@@ -1367,8 +1376,21 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(
                     .await?;
                 }
             }
+            // The reason itself, not a pointer at the daemon log: "DNSSEC
+            // bogus", "no records", and "resolver down" each demand a
+            // different response from whoever is reading.
+            Err(why) => {
+                failed += 1;
+                out.line(format!("{}: {why} — cached bindings kept", outcome.domain))
+                    .await?;
+            }
         }
-        Err(e) => out.progress(format!("refresh failed: {e}")).await?,
+    }
+    if strict && failed > 0 {
+        return Err(ControlError::new(
+            ErrorCode::Unavailable,
+            format!("{failed} of {} domain(s) failed to refresh", outcomes.len()),
+        ));
     }
     Ok(())
 }
