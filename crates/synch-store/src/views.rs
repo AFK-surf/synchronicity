@@ -13,6 +13,7 @@ use synch_mpt::{ChangeKind, ResolvedChange, Trie};
 use crate::{
     db::{hash_column, origin_column, Store},
     error::{Result, StoreError},
+    unified::VersionPolicy,
 };
 
 /// One row of the `entries` view.
@@ -85,15 +86,18 @@ pub struct LocalFile {
     pub scanned_at: i64,
 }
 
-/// A configured read-only mirror (§7.2).
+/// A configured read-only mirror of the unified tree (§7.2).
+///
+/// Keyed by the directory it writes into: a mirror materializes one space of
+/// the unified tree under a version policy, rather than one origin's view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorRow {
-    /// The origin whose space is mirrored.
-    pub origin: OriginId,
-    /// The space being mirrored.
-    pub space: String,
     /// The local directory the mirror materializes into.
     pub local_path: String,
+    /// The space being mirrored.
+    pub space: String,
+    /// Which version of each path the mirror writes (§8).
+    pub policy: VersionPolicy,
 }
 
 /// A peer we have seen, for ranking and `synch peers` (§6.4, §9.2).
@@ -216,7 +220,11 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn query_entries(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<EntryRow>> {
+    pub(crate) fn query_entries(
+        &self,
+        filter: &str,
+        args: impl rusqlite::Params,
+    ) -> Result<Vec<EntryRow>> {
         let conn = self.conn();
         let sql = format!(
             "SELECT origin_id, space, path, kind, size, mtime_ns, content, seq, prev
@@ -539,31 +547,39 @@ impl Store {
 
     // ---- mirrors ----------------------------------------------------------
 
-    /// Registers a read-only mirror.
-    pub fn put_mirror(&self, origin: &OriginId, space: &str, local_path: &str) -> Result<()> {
+    /// Registers (or re-points) the mirror at a local directory.
+    pub fn put_mirror(&self, local_path: &str, space: &str, policy: &VersionPolicy) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO mirrors (origin_id, space, local_path) VALUES (?1, ?2, ?3)
-             ON CONFLICT(origin_id, space) DO UPDATE SET local_path = excluded.local_path",
-            params![origin.canonical(), space, local_path],
+            "INSERT INTO mirrors (local_path, space, policy) VALUES (?1, ?2, ?3)
+             ON CONFLICT(local_path) DO UPDATE SET
+               space = excluded.space, policy = excluded.policy",
+            params![local_path, space, policy.render()],
         )?;
         Ok(())
     }
 
-    /// Removes a mirror.
-    pub fn remove_mirror(&self, origin: &OriginId, space: &str) -> Result<bool> {
+    /// Removes the mirror at a local directory.
+    pub fn remove_mirror(&self, local_path: &str) -> Result<bool> {
         let n = self.conn().execute(
-            "DELETE FROM mirrors WHERE origin_id = ?1 AND space = ?2",
-            params![origin.canonical(), space],
+            "DELETE FROM mirrors WHERE local_path = ?1",
+            params![local_path],
         )?;
         Ok(n > 0)
+    }
+
+    /// The mirror configured for a local directory, if any.
+    pub fn mirror(&self, local_path: &str) -> Result<Option<MirrorRow>> {
+        Ok(self
+            .mirrors()?
+            .into_iter()
+            .find(|m| m.local_path == local_path))
     }
 
     /// Every configured mirror.
     pub fn mirrors(&self) -> Result<Vec<MirrorRow>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT origin_id, space, local_path FROM mirrors ORDER BY origin_id, space",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT local_path, space, policy FROM mirrors ORDER BY local_path")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -573,11 +589,11 @@ impl Store {
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (origin, space, local_path) = row?;
+            let (local_path, space, policy) = row?;
             out.push(MirrorRow {
-                origin: origin_column(origin, "mirrors.origin_id")?,
-                space,
                 local_path,
+                space,
+                policy: policy.parse()?,
             });
         }
         Ok(out)
@@ -983,10 +999,26 @@ mod tests {
         assert!(store.remove_space("media").unwrap());
         assert!(!store.remove_space("media").unwrap());
 
-        let o = origin("nas");
-        store.put_mirror(&o, "media", "/mnt/nas-media").unwrap();
+        // A mirror is keyed by the directory it writes into, and carries the
+        // version policy it materializes under (§7.2).
+        store
+            .put_mirror("/mnt/nas-media", "media", &VersionPolicy::Newest)
+            .unwrap();
         assert_eq!(store.mirrors().unwrap().len(), 1);
-        assert!(store.remove_mirror(&o, "media").unwrap());
+        let policy = VersionPolicy::Origin(origin("nas"));
+        store
+            .put_mirror("/mnt/nas-media", "media", &policy)
+            .unwrap();
+        let mirrors = store.mirrors().unwrap();
+        assert_eq!(mirrors.len(), 1, "re-pointing a directory is an update");
+        assert_eq!(mirrors[0].policy, policy);
+        assert_eq!(
+            store.mirror("/mnt/nas-media").unwrap().unwrap().space,
+            "media"
+        );
+        assert!(store.mirror("/elsewhere").unwrap().is_none());
+        assert!(store.remove_mirror("/mnt/nas-media").unwrap());
+        assert!(!store.remove_mirror("/mnt/nas-media").unwrap());
     }
 
     #[test]

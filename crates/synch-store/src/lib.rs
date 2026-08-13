@@ -9,6 +9,7 @@ pub mod gc;
 pub mod heads;
 pub mod recovery;
 pub mod schema;
+pub mod unified;
 pub mod views;
 
 pub use bindings::{Binding, BindingSource};
@@ -19,4 +20,5 @@ pub use gc::{GcStats, TrieStats};
 pub use heads::{Equivocation, Slot, StoredHead};
 pub use recovery::ObservedHead;
 pub use schema::SCHEMA_VERSION;
+pub use unified::{Selection, Version, VersionPolicy, VersionSet};
 pub use views::{EntryRow, LocalFile, MirrorRow, PeerSeen, SpaceRow};

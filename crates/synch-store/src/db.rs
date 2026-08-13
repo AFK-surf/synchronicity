@@ -13,7 +13,7 @@ use synch_mpt::NodeStore;
 
 use crate::{
     error::{Result, StoreError},
-    schema::{MIGRATIONS, SCHEMA, SCHEMA_VERSION},
+    schema::{Migration, MIGRATIONS},
 };
 
 /// Directory under the data dir holding blob payloads and outboards (§6.2).
@@ -104,53 +104,13 @@ impl Store {
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.conn();
+        let mut conn = self.conn();
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // WAL keeps readers off the writer's back; NORMAL is the §10 setting.
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?;
-        conn.execute_batch(SCHEMA)?;
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT value FROM config WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match existing {
-            None => {
-                conn.execute(
-                    "INSERT INTO config (key, value) VALUES ('schema_version', ?1)",
-                    params![SCHEMA_VERSION.to_string()],
-                )?;
-            }
-            Some(v) if v == SCHEMA_VERSION.to_string() => {}
-            // Every statement is `IF NOT EXISTS`, so executing the schema above
-            // has already applied every additive change. What the schema cannot
-            // say — a dropped table — is carried by `MIGRATIONS`, which is
-            // replayed from the version found before the new one is stamped. A
-            // *newer* database is refused: this build cannot know what it would
-            // be reading.
-            Some(ref v) if v.parse::<u32>().is_ok_and(|found| found < SCHEMA_VERSION) => {
-                let found: u32 = v.parse().expect("just checked");
-                for (version, statement) in MIGRATIONS {
-                    if *version > found {
-                        conn.execute_batch(statement)?;
-                    }
-                }
-                conn.execute(
-                    "UPDATE config SET value = ?1 WHERE key = 'schema_version'",
-                    params![SCHEMA_VERSION.to_string()],
-                )?;
-                tracing::info!(from = %v, to = SCHEMA_VERSION, "database schema upgraded");
-            }
-            Some(v) => {
-                return Err(StoreError::invalid(format!(
-                    "database schema version {v} is not supported by this build (expected {SCHEMA_VERSION})"
-                )))
-            }
-        }
+        migrate(&mut conn, MIGRATIONS)?;
         Ok(())
     }
 
@@ -307,6 +267,90 @@ impl Store {
     }
 }
 
+// ---- migrations ------------------------------------------------------------
+
+/// The version a database is stamped with, or 0 for an empty one.
+///
+/// A database with a `config` table but no stamp is refused rather than
+/// guessed at: every database this software has ever written stamps itself
+/// inside the transaction that shaped it (§10), so an unstamped one is not a
+/// version this build can reason about.
+fn stamped_version(conn: &Connection) -> Result<u32> {
+    let bootstrapped = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !bootstrapped {
+        return Ok(0);
+    }
+    let stamp: Option<String> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match stamp {
+        None => Err(StoreError::invalid(
+            "this database has a config table but no schema_version stamp, \
+             so its shape cannot be determined",
+        )),
+        Some(text) => text.trim().parse::<u32>().map_err(|_| {
+            StoreError::invalid(format!(
+                "database schema version {text:?} is not a version number this build understands"
+            ))
+        }),
+    }
+}
+
+/// Replays `chain` from wherever `conn` currently is up to its end (§10).
+///
+/// Each step is one transaction that also carries the `schema_version` stamp,
+/// so an interrupted upgrade leaves the database at some version of the chain
+/// and never between two. A database stamped past the end of the chain is
+/// refused: this build cannot know what it would be reading.
+///
+/// Takes the chain as an argument rather than reading [`MIGRATIONS`] directly
+/// so that tests can drive a chain whose steps fail on purpose.
+pub(crate) fn migrate(conn: &mut Connection, chain: &[Migration]) -> Result<u32> {
+    let target = chain.len() as u32;
+    let found = stamped_version(conn)?;
+    if found > target {
+        return Err(StoreError::invalid(format!(
+            "database schema version {found} is newer than this build supports (expected {target}): \
+             upgrade synchronicity rather than downgrading the database"
+        )));
+    }
+    for version in found..target {
+        let tx = conn.transaction()?;
+        match &chain[version as usize] {
+            Migration::Sql(sql) => tx.execute_batch(sql)?,
+            Migration::Rust { name, run } => run(&tx).map_err(|e| {
+                StoreError::invalid(format!(
+                    "migration to version {} ({name}): {e}",
+                    version + 1
+                ))
+            })?,
+        }
+        // Inside the same transaction as the change it describes: that is what
+        // makes a crash land exactly on a version.
+        tx.execute(
+            "INSERT INTO config (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![(version + 1).to_string()],
+        )?;
+        tx.commit()?;
+    }
+    if found != target {
+        tracing::info!(from = found, to = target, "database schema migrated");
+    }
+    Ok(target)
+}
+
 // ---- the trie node store ---------------------------------------------------
 
 impl NodeStore for Store {
@@ -396,6 +440,8 @@ pub(crate) fn origin_column(text: String, column: &'static str) -> Result<Origin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::SCHEMA_VERSION;
+    use rusqlite::Transaction;
     use synch_mpt::Trie;
 
     fn temp_store() -> (tempfile::TempDir, Store) {
@@ -511,7 +557,8 @@ mod tests {
             let store = Store::open(dir.path()).unwrap();
             store.set_config("schema_version", "999").unwrap();
         }
-        assert!(Store::open(dir.path()).is_err());
+        let err = Store::open(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("newer than this build"), "{err}");
 
         // Nor is a version this build cannot even parse.
         let dir = tempfile::tempdir().unwrap();
@@ -520,37 +567,15 @@ mod tests {
             store.set_config("schema_version", "tomorrow").unwrap();
         }
         assert!(Store::open(dir.path()).is_err());
-    }
 
-    /// An older database is migrated in place: the schema is additive and
-    /// every statement is `IF NOT EXISTS`, so opening it is the upgrade.
-    #[test]
-    fn an_older_schema_is_upgraded_in_place() {
+        // Nor one that never said what shape it is in.
         let dir = tempfile::tempdir().unwrap();
         {
             let store = Store::open(dir.path()).unwrap();
-            store.set_config("keep", "me").unwrap();
-            store
-                .conn()
-                .execute_batch("DROP TABLE observed_heads")
-                .unwrap();
-            store.set_config("schema_version", "1").unwrap();
+            store.clear_config("schema_version").unwrap();
         }
-        let store = Store::open(dir.path()).unwrap();
-        assert_eq!(
-            store.config("schema_version").unwrap().as_deref(),
-            Some(SCHEMA_VERSION.to_string().as_str())
-        );
-        assert_eq!(store.config("keep").unwrap().as_deref(), Some("me"));
-        // The table the newer version added exists again.
-        assert_eq!(store.observed_heads().unwrap().len(), 0);
+        assert!(Store::open(dir.path()).is_err());
     }
-
-    /// The `want` table as v2 declared it, so the migration is exercised
-    /// against the shape a v2 database really has.
-    const V2_WANT_TABLE: &str = "CREATE TABLE IF NOT EXISTS want \
-         (root BLOB, ranges BLOB, priority INTEGER, reason TEXT, \
-          created_at INTEGER, PRIMARY KEY (root, ranges));";
 
     fn table_exists(store: &Store, name: &str) -> bool {
         store
@@ -565,44 +590,225 @@ mod tests {
             .is_some()
     }
 
-    /// v3 is the first change that is not additive: the dead `want` table is
-    /// dropped, which re-applying the schema cannot do.
+    /// Every object `sqlite_master` holds, with its DDL normalized so that
+    /// comments and line breaks do not count as differences.
+    fn objects(conn: &Connection) -> Vec<(String, String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, COALESCE(sql, '') FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    normalize_ddl(&row.get::<_, String>(2)?),
+                ))
+            })
+            .unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    /// Drops SQL comments and collapses whitespace, so two spellings of the
+    /// same declaration compare equal.
+    fn normalize_ddl(sql: &str) -> String {
+        sql.lines()
+            .map(|line| match line.find("--") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The chain is the only path to a database, and what it produces is what
+    /// §10 documents — compared object by object over the whole of
+    /// `sqlite_master`, not just by table name.
     #[test]
-    fn a_v2_database_loses_the_want_table() {
+    fn the_chain_produces_the_documented_schema() {
+        let mut chained = Connection::open_in_memory().unwrap();
+        migrate(&mut chained, MIGRATIONS).unwrap();
+
+        let documented = Connection::open_in_memory().unwrap();
+        documented
+            .execute_batch(crate::schema::FINAL_SCHEMA)
+            .unwrap();
+
+        assert_eq!(
+            objects(&chained),
+            objects(&documented),
+            "replaying the chain must yield exactly the documented §10 schema"
+        );
+        // And the chain leaves nothing of the tables it retired behind.
+        assert!(!objects(&chained).iter().any(|(_, name, _)| name == "want"));
+    }
+
+    /// A database at the version each historical step left it at upgrades to
+    /// the current one with its data intact.
+    ///
+    /// The old shapes are built here from the chain itself — a database stamped
+    /// `v` is exactly what replaying the first `v` steps produces — so the test
+    /// exercises the real historical layouts rather than an approximation.
+    fn database_at(dir: &Path, version: u32) -> Connection {
+        let mut conn = Connection::open(dir.join(DB_FILE)).unwrap();
+        migrate(&mut conn, &MIGRATIONS[..version as usize]).unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_v2_database_upgrades_with_its_data() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = Store::open(dir.path()).unwrap();
-            store.conn().execute_batch(V2_WANT_TABLE).unwrap();
-            store.set_config("keep", "me").unwrap();
-            store.set_config("schema_version", "2").unwrap();
-            assert!(table_exists(&store, "want"));
+            let conn = database_at(dir.path(), 2);
+            assert!(
+                conn.query_row("SELECT COUNT(*) FROM want", [], |r| r.get::<_, i64>(0))
+                    .is_ok(),
+                "a v2 database still has the want table"
+            );
+            conn.execute(
+                "INSERT INTO config (key, value) VALUES ('keep', 'me')",
+                params![],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mirrors (origin_id, space, local_path) VALUES (?1, ?2, ?3)",
+                params!["nas@x.example", "media", "/mnt/nas"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO config (key, value) VALUES ('s3_buckets', ?1)",
+                params!["photos\tnas@x.example\tmedia"],
+            )
+            .unwrap();
         }
 
         let store = Store::open(dir.path()).unwrap();
-        assert!(!table_exists(&store, "want"), "the drop must have run");
         assert_eq!(
             store.config("schema_version").unwrap().as_deref(),
             Some(SCHEMA_VERSION.to_string().as_str())
         );
-        // Everything else the database held is untouched.
+        assert!(!table_exists(&store, "want"), "v3 drops it");
         assert_eq!(store.config("keep").unwrap().as_deref(), Some("me"));
-
-        // And re-opening an already-migrated database is a no-op, not an error.
-        drop(store);
-        let store = Store::open(dir.path()).unwrap();
-        assert!(!table_exists(&store, "want"));
-
-        // A database from the future is still refused rather than migrated.
-        store.set_config("schema_version", "4").unwrap();
-        drop(store);
-        assert!(Store::open(dir.path()).is_err());
+        // v4 carried the mirror over as an origin pin, preserving its behavior.
+        let mirrors = store.mirrors().unwrap();
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0].local_path, "/mnt/nas");
+        assert_eq!(mirrors[0].space, "media");
+        assert_eq!(mirrors[0].policy.render(), "origin=nas@x.example");
+        // v5 did the same for the s3 bucket map.
+        assert_eq!(
+            store.config("s3_buckets").unwrap().as_deref(),
+            Some("photos\tmedia\torigin=nas@x.example")
+        );
     }
 
-    /// A fresh database never grows the table in the first place.
     #[test]
-    fn a_new_database_has_no_want_table() {
-        let (_dir, store) = temp_store();
-        assert!(!table_exists(&store, "want"));
+    fn a_v3_database_upgrades_with_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = database_at(dir.path(), 3);
+            assert!(
+                conn.query_row("SELECT COUNT(*) FROM want", [], |r| r.get::<_, i64>(0))
+                    .is_err(),
+                "a v3 database has already lost the want table"
+            );
+            conn.execute(
+                "INSERT INTO mirrors (origin_id, space, local_path) VALUES (?1, ?2, ?3)",
+                params!["laptop@x.example", "media", "/mnt/one"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO observed_heads (origin_id, seq, root, complete, observed_at)
+                 VALUES ('nas@x.example', 7, zeroblob(32), 1, 1)",
+                params![],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.config("schema_version").unwrap().as_deref(),
+            Some(SCHEMA_VERSION.to_string().as_str())
+        );
+        assert_eq!(
+            store.mirrors().unwrap()[0].policy.render(),
+            "origin=laptop@x.example"
+        );
+        // The v2 table and its rows are untouched by the later steps.
+        assert_eq!(store.observed_heads().unwrap().len(), 1);
+    }
+
+    /// A step that fails takes its whole transaction with it, stamp included,
+    /// so the database is left at the version before it rather than between two.
+    #[test]
+    fn a_failing_step_leaves_the_version_where_it_was() {
+        fn explode(_tx: &Transaction<'_>) -> Result<()> {
+            Err(StoreError::invalid("boom"))
+        }
+        let chain: &[Migration] = &[
+            Migration::Sql(
+                "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE first (a TEXT);",
+            ),
+            Migration::Rust {
+                name: "explodes",
+                run: explode,
+            },
+            Migration::Sql("CREATE TABLE third (a TEXT);"),
+        ];
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        let err = migrate(&mut conn, chain).unwrap_err().to_string();
+        assert!(err.contains("explodes"), "{err}");
+        assert!(err.contains("boom"), "{err}");
+
+        // Version 1 committed; the failing step's transaction rolled back
+        // whole, so nothing it or the step after it would have created exists.
+        let stamp: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, "1");
+        assert!(conn
+            .query_row("SELECT COUNT(*) FROM first", [], |r| r.get::<_, i64>(0))
+            .is_ok());
+        assert!(conn
+            .query_row("SELECT COUNT(*) FROM third", [], |r| r.get::<_, i64>(0))
+            .is_err());
+
+        // And resuming from that version replays the rest of the chain, so a
+        // crashed upgrade is finished by the next open rather than repaired.
+        let fixed: &[Migration] = &[
+            Migration::Sql(
+                "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE first (a TEXT);",
+            ),
+            Migration::Sql("CREATE TABLE second (a TEXT);"),
+            Migration::Sql("CREATE TABLE third (a TEXT);"),
+        ];
+        assert_eq!(migrate(&mut conn, fixed).unwrap(), 3);
+        assert!(conn
+            .query_row("SELECT COUNT(*) FROM third", [], |r| r.get::<_, i64>(0))
+            .is_ok());
+    }
+
+    /// Re-opening a database at the current version changes nothing.
+    #[test]
+    fn migrating_a_current_database_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let before = objects(&store.conn());
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(objects(&store.conn()), before);
         assert_eq!(
             store.config("schema_version").unwrap().as_deref(),
             Some(SCHEMA_VERSION.to_string().as_str())
