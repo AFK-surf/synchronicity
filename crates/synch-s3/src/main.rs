@@ -53,12 +53,16 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum BucketCommand {
-    /// Map a bucket onto `<origin>:<space>`.
+    /// Map a bucket onto a space of the unified tree.
     Add {
         /// The bucket name.
         bucket: String,
-        /// The view, as `<origin>:<space>`.
+        /// The space, or `<origin>:<space>` as shorthand for an origin pin.
         reference: String,
+        /// Which version of each key reads serve: `newest` (default),
+        /// `origin=<id>`, or `strict`.
+        #[arg(long)]
+        policy: Option<String>,
     },
     /// Remove a bucket mapping.
     Rm {
@@ -127,19 +131,16 @@ async fn run(args: Cli) -> Result<()> {
 async fn dispatch(node: &Node, command: Command) -> Result<()> {
     match command {
         Command::Bucket { command } => match command {
-            BucketCommand::Add { bucket, reference } => {
-                let bucket = buckets::add(node, &bucket, &reference)?;
-                println!(
-                    "{} -> {}:{}{}",
-                    bucket.name,
-                    bucket.origin,
-                    bucket.space,
-                    if bucket.writable_by(node) {
-                        " (writable)"
-                    } else {
-                        " (read-only)"
-                    }
-                );
+            BucketCommand::Add {
+                bucket,
+                reference,
+                policy,
+            } => {
+                let bucket = buckets::add(node, &bucket, &reference, policy.as_deref())?;
+                println!("{} -> {} ({})", bucket.name, bucket.space, bucket.policy);
+                if let Some(warning) = bucket.foreign_pin_warning(node) {
+                    println!("warning: {warning}");
+                }
             }
             BucketCommand::Rm { bucket } => {
                 if buckets::remove(node, &bucket)? {
@@ -150,17 +151,7 @@ async fn dispatch(node: &Node, command: Command) -> Result<()> {
             }
             BucketCommand::Ls => {
                 for bucket in buckets::load(node)? {
-                    println!(
-                        "{:<24} {}:{}{}",
-                        bucket.name,
-                        bucket.origin,
-                        bucket.space,
-                        if bucket.writable_by(node) {
-                            " (writable)"
-                        } else {
-                            " (read-only)"
-                        }
-                    );
+                    println!("{:<24} {:<20} {}", bucket.name, bucket.space, bucket.policy);
                 }
             }
         },
@@ -216,7 +207,11 @@ async fn dispatch(node: &Node, command: Command) -> Result<()> {
             let bound = listener.local_addr()?;
             println!("synch-s3 listening on http://{bound}");
             for bucket in buckets::load(node)? {
-                println!("  {} -> {}:{}", bucket.name, bucket.origin, bucket.space);
+                println!("  {} -> {} ({})", bucket.name, bucket.space, bucket.policy);
+                if let Some(warning) = bucket.foreign_pin_warning(node) {
+                    tracing::warn!("{warning}");
+                    println!("  warning: {warning}");
+                }
             }
             axum::serve(listener, gateway.router())
                 .with_graceful_shutdown(async {

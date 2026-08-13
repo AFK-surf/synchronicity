@@ -75,31 +75,61 @@ which is what makes a collision with history held only by an unreachable peer
 improbable. If such a peer turns up later, its pre-recovery heads are kept as
 provable fork evidence and `synch doctor` reports them on both sides.
 
-Read across the cluster. Content is fetched on demand and verified per 16 KiB
-group, so a range read costs a range:
+Read across the cluster. What you see is **one tree** aggregated from every
+node, in which each path carries one version per distinct content published for
+it. Content is fetched on demand and verified per 16 KiB group, so a range read
+costs a range:
 
 ```sh
-synch ls media/talks
-synch status media/talks/keynote.mp4       # every origin's view, side by side
-synch cat nas@cluster.example.com:media/talks/keynote.mp4 --range 0..1048576
-synch get nas@cluster.example.com:media/notes.txt -o notes.txt
+synch ls media/talks                       # the unified tree; divergent paths marked ⑂2
+synch ls media/talks --all                 # every version of every path, with attestors
+synch ls nas@cluster.example.com:media     # one origin's view instead
+synch status media/talks/keynote.mp4       # every version, side by side
+synch cat media/talks/keynote.mp4 --range 0..1048576
+synch cat media/notes.txt --from nas@cluster.example.com   # pin one origin
+synch cat media/notes.txt --strict         # refuse a divergent path, list its versions
+synch get media/notes.txt -o notes.txt
 synch take nas@cluster.example.com:media/notes.txt   # adopt their version as ours
-synch mirror add nas@cluster.example.com:media /mnt/nas-media
 synch doctor                               # membership, heads, equivocation, storage
+```
+
+Reading a bare `<space>/<path>` has to pick one of the versions, and does it by
+an explicit policy: `newest` (the default — the greatest `(mtime, content root,
+origin)`, so every node picks the same one), `origin=<id>`, or `strict`.
+Selection is presentation, not resolution: nothing is written, no assertion
+changes, and the other versions stay visible until a `synch take` ends the
+divergence.
+
+Mirror a space into a directory, continuously, under a policy of its own:
+
+```sh
+synch mirror add media /mnt/media                          # newest, by default
+synch mirror add media /mnt/nas --policy origin=nas@cluster.example.com
+synch mirror add media /mnt/safe --policy strict           # skip divergent paths, report them
+synch mirror ls
+synch mirror sync
+synch mirror rm /mnt/safe
 ```
 
 Serve the same data over S3:
 
 ```sh
-synch-s3 bucket add media nas@cluster.example.com:media
+synch-s3 bucket add media media                            # newest, by default
+synch-s3 bucket add nas-media nas@cluster.example.com:media  # shorthand for an origin pin
+synch-s3 bucket add safe-media media --policy strict
 synch-s3 key add AKIAEXAMPLE <secret>
 synch-s3 serve --listen 127.0.0.1:9000
 # or, for local development only:
 synch-s3 serve --anonymous
 ```
 
-ETags are the object's BLAKE3 root in hex, quoted. Buckets mapping to the local
-node's own origin are writable; foreign-origin buckets are read-only.
+A bucket names a space of the unified tree plus a version policy; reads serve
+the selected version and ETags are that version's BLAKE3 root in hex, quoted. A
+`strict` bucket answers a divergent key with `409 Conflict` naming the
+versions. Writes always publish the local node's own view — the version model
+forbids publishing someone else's — so a bucket pinned to a foreign origin
+accepts writes but keeps reading that origin's versions, and the gateway warns
+about that shape.
 
 ## Layout
 

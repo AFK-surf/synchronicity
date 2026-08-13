@@ -78,6 +78,68 @@ actually delivers it. The trie, the head, and `entries.seq`'s ordering are
 unaffected; only that advisory field can lag, and re-scanning the file restates
 it.
 
+### §8 — where the version order's ties are broken
+
+`newest` is "the greatest `(mtime_ns, content_root, origin)`", and §8 requires
+it to be a total order so every node selects the same version from the same
+assertions. Two things that phrase does not pin down:
+
+- **A tombstone has no content root.** It sorts as `None`, which is below every
+  `Some`, so at equal mtimes a deletion loses to content. The tombstone still
+  wins on a *later* mtime, which is what makes "deleted after you last wrote"
+  read as a deletion.
+- **The `origin` component never decides which version wins** — two entries
+  with the same content root *are* the same version — so it decides only which
+  attestor is named as the source of the bytes. The maximum is taken over
+  entries rather than versions, which yields both answers at once and is the
+  same result either way.
+
+The order is computed over `entries` alone: mtime, content root, and canonical
+origin are all data every node holds identically, so no node needs to ask
+another what it selected.
+
+### §8, §9.2 — how divergence is marked in a listing
+
+§14 shows a divergent path marked `⑂2`, and that is what `synch ls` prints: the
+U+2442 mark followed by the number of versions. A *count*, not a flag, because
+the count is the fact and it is what `synch status` will lay out. Agreement
+prints no mark at all, so an ordinary tree looks ordinary. The mark is only
+produced by the unified listing; the origin-prefixed form of `ls` shows one
+origin's view and has nothing to mark.
+
+`synch status` uses the same vocabulary: `<space>/<path>  N version(s)` and one
+indented line per version — content root, kind, size, seq, attestors — newest
+first, which is the order selection runs in.
+
+### §8, §9.2 — an origin-pinned reference and `--from` are the same thing
+
+§7.2 gives `cat`/`get` both an `<origin>:` prefix and a `--from <origin>` flag.
+They express the same policy, so naming both is a contradiction rather than a
+preference and is refused with a message saying so. `--strict` on an
+origin-pinned reference is refused too: a pin already names one version, so
+strict has nothing to refuse. `--from` and `--strict` together are refused by
+the argument parser before a connection is made.
+
+### §7.2 — when a path leaves a mirror
+
+§7.2 says a mirror keeps a directory in sync with the policy-selected version
+of every path. The removal side has two halves, and only one of them is
+visible in a listing:
+
+- **The selected version is a tombstone.** The mirror follows the assertion it
+  selected, so the file goes. Under `newest` a deletion newer than the content
+  removes it; under `origin=<id>` only that origin's deletion does.
+- **The path has left the unified tree.** When every entry for a path is gone —
+  tombstones expired (§4.2), an origin untrusted — there is nothing left to
+  select, and nothing in the listing to notice. So each pass ends by walking
+  the mirror directory and removing files whose path the tree no longer carries
+  at all. Directories are left in place.
+
+Two related choices: an `origin=` pin that selects nothing (that origin
+publishes no version of the path) removes the file too, since the path is not
+in the pinned view; and a path a `strict` mirror skipped is left exactly as it
+is — skipping is a refusal to act, not a decision to delete.
+
 ### §7.1 — reconciling `local_files` on open
 
 Batching introduces a failure the synchronous publisher did not have.
@@ -191,22 +253,47 @@ covers that instant. Windows has no equivalent, which is the case §9.3 already
 anticipates — there the token carries the whole check, and it is checked on
 every request on both platforms.
 
-### §10 — schema versions and migration
+### §10 — the migration chain, and what is *not* in it
 
-§10 gives the schema but not how it is versioned. The `config` row
-`schema_version` carries an integer, and every statement in the schema is
-`CREATE TABLE/INDEX IF NOT EXISTS`, so executing the schema against an older
-database *is* the migration for anything additive: opening one applies the new
-statements. A database written by a *newer* build is refused rather than
-guessed at.
+§10 specifies the chain: `MIGRATIONS[v]` takes a database from version `v` to
+`v + 1`, each step is one transaction that carries the `schema_version` stamp,
+a fresh database replays the whole chain, and a newer-than-known database is
+refused. That is implemented literally in `schema.rs` and `db.rs`, with the
+chain indexed from zero — `MIGRATIONS[0]` takes an *empty* file to version 1,
+the original schema — so "fresh database" and "database at version 0" are the
+same case and there is one code path, not two. There is no `IF NOT EXISTS`
+anywhere.
 
-v3 is the first change that is not additive — it drops the dead `want` table —
-so the mechanism grew exactly one step: a `MIGRATIONS` list of `(version,
-statement)` pairs in `schema.rs`, replayed for every entry above the version
-found, after the schema is applied and before the new version is stamped. It
-carries only what re-applying the schema cannot say (drops, rewrites); additive
-changes still need no entry. The whole open — schema, migrations, stamp — is
-what it always was: refused outright for a newer database.
+Three details §10 leaves open:
+
+- **A step may be SQL or Rust** (`Migration::Sql` / `Migration::Rust`), and
+  both run under the same transaction rule. The Rust form exists for what SQL
+  in this schema cannot express — v5 rewrites the `synch-s3` bucket map, which
+  lives as tab-separated text in a `config` row rather than as a table.
+- **An unstamped database is refused**, not adopted. Every database this
+  software has written stamps itself inside the transaction that shaped it, so
+  a `config` table with no `schema_version` row is not a version the binary can
+  reason about; guessing "it must be current" is exactly the drift the chain
+  exists to prevent.
+- **The §10 DDL is kept as a test-only constant** (`FINAL_SCHEMA`), and a test
+  asserts that a database built from it and one built by replaying the chain
+  have identical `sqlite_master` contents — every object, with its SQL
+  normalized for comments and whitespace. It is `#[cfg(test)]` precisely so it
+  cannot become a second bootstrap path.
+
+The chain to date:
+
+| Step | Takes | To | What |
+| --- | --- | --- | --- |
+| 0 | empty | 1 | the original schema, as it first shipped |
+| 1 | 1 | 2 | `observed_heads`, for key-loss recovery (§3.4) |
+| 2 | 2 | 3 | drop the dead `want` table |
+| 3 | 3 | 4 | reshape `mirrors` for the unified tree (§7.2) |
+| 4 | 4 | 5 | reshape the `synch-s3` bucket map (§9.4) |
+
+Steps 0–2 reproduce the history that shipped before the chain existed: a
+database stamped 1, 2, or 3 by an older build lands on exactly the version the
+chain says it is at, and upgrades from there.
 
 The `want` table itself described a persistent download queue. §6.4 is
 explicitly queue-less — fetching is on-demand and request-scoped, and progress
@@ -306,6 +393,33 @@ following the usual batching". This implementation runs the scan and publish
 synchronously before responding — deliberately around the batching publisher
 rather than through it — so the ETag returned is always backed by a published
 entry. It is stricter than specified, not looser.
+
+### §9.4 — the bucket map's shape, and what a strict bucket lists
+
+The bucket map has never been a table: it is tab-separated text in the
+`s3_buckets` `config` row, because it belongs to the gateway rather than to the
+node. Reshaping it from `<bucket>\t<origin>\t<space>` to
+`<bucket>\t<space>\t<policy>` is therefore a Rust step in the ordinary
+migration chain (v5, §10) rather than a table rewrite, and an existing bucket
+comes out as an `origin=` pin on the origin it used to name — serving exactly
+what it served before. Both shapes have three fields, so a loader that tried to
+sniff which one it had would eventually guess wrong; doing it once, in a
+numbered step, means the reader only ever sees one shape.
+
+§9.4 says a `strict` bucket answers a divergent key with `409 Conflict` naming
+the versions, and `GetObject`/`HeadObject` do exactly that (code
+`DivergentVersions`, the version list in the message). It does not say what
+`ListObjectsV2` should do, and a listing has no way to say 409 about one key —
+so a strict bucket **omits divergent keys from its listings** rather than
+publishing one side's size and ETag under a name it refuses to resolve. A
+direct `GET` of such a key then explains what is wrong. `newest` and `origin=`
+buckets list every key the tree carries.
+
+Writes need no such care: §9.4 makes every bucket writable because a write is a
+publish of the *local* node's view. A bucket pinned to a foreign origin still
+accepts the write — it simply will not read back through that bucket — and the
+gateway logs the warning §9.4 asks for whenever such a bucket is configured,
+served, or written to.
 
 ### §9.4 — SigV4 test vectors
 

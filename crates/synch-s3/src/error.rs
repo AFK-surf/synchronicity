@@ -112,20 +112,14 @@ impl S3Error {
         )
     }
 
-    /// `MethodNotAllowed`, used for writes to a foreign-origin bucket.
+    /// `409 Conflict`: a `strict` bucket was asked for a divergent key (§8,
+    /// §9.4).
     ///
-    /// The version model (§8) forbids publishing someone else's view, so
-    /// foreign buckets are strictly read-only.
-    pub fn read_only(bucket: &str) -> S3Error {
-        S3Error::new(
-            StatusCode::FORBIDDEN,
-            "AccessDenied",
-            format!(
-                "bucket {bucket} maps to another origin's view and is read-only; \
-                 publishing another origin's entries is not permitted"
-            ),
-        )
-        .with_resource(format!("/{bucket}"))
+    /// The versions are named in the body, because refusing without saying
+    /// what the alternatives are would leave the caller nothing to act on.
+    pub fn divergent(key: &str, message: impl Into<String>) -> S3Error {
+        S3Error::new(StatusCode::CONFLICT, "DivergentVersions", message)
+            .with_resource(key.to_string())
     }
 
     /// `InvalidArgument`.
@@ -159,6 +153,15 @@ impl From<synch_engine::EngineError> for S3Error {
         use synch_engine::EngineError;
         match e {
             EngineError::NotFound(what) => S3Error::new(StatusCode::NOT_FOUND, "NoSuchKey", what),
+            // §9.4: a strict bucket answers a divergent key with 409, naming
+            // the versions it refused to choose between.
+            divergent @ EngineError::Divergent { .. } => {
+                let key = match &divergent {
+                    EngineError::Divergent { path, .. } => path.clone(),
+                    _ => unreachable!("just matched"),
+                };
+                S3Error::divergent(&key, divergent.to_string())
+            }
             EngineError::Invalid(what) => S3Error::invalid(what),
             // A node in key-loss recovery cannot publish, so it cannot accept a
             // write either. That is a state the operator clears with `synch
@@ -202,9 +205,11 @@ mod tests {
         assert!(xml.contains("<Code>NoSuchKey</Code>"), "{xml}");
         assert!(xml.contains("<Resource>a/b.txt</Resource>"), "{xml}");
 
-        let e = S3Error::read_only("photos");
-        assert_eq!(e.status, StatusCode::FORBIDDEN);
-        assert!(e.to_xml().contains("read-only"));
+        let e = S3Error::divergent("a/b.txt", "two versions: nas, laptop");
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        let xml = e.to_xml();
+        assert!(xml.contains("<Code>DivergentVersions</Code>"), "{xml}");
+        assert!(xml.contains("nas, laptop"), "{xml}");
 
         assert_eq!(
             S3Error::not_implemented("DeleteObject").status,

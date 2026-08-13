@@ -28,9 +28,11 @@ impl Harness {
         let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
         node.add_space("media", space.path()).unwrap();
 
-        let reference = format!("{}:media", node.origin().canonical());
-        buckets::add(&node, "my-media", &reference).unwrap();
-        buckets::add(&node, "nas-media", "nas@cluster.example:media").unwrap();
+        // The default policy over the unified tree, an origin pin on a
+        // foreign origin, and a strict bucket over the same space (§9.4).
+        buckets::add(&node, "my-media", "media", None).unwrap();
+        buckets::add(&node, "nas-media", "nas@cluster.example:media", None).unwrap();
+        buckets::add(&node, "strict-media", "media", Some("strict")).unwrap();
 
         let gateway = Gateway::new(node.clone(), auth);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -364,20 +366,148 @@ async fn put_object_is_refused_while_the_node_is_in_recovery() {
     harness.stop().await;
 }
 
+/// §9.4: a write is always a publish of the *local* node's view, so a bucket
+/// pinned to a foreign origin still accepts it — but its reads keep serving
+/// the pinned origin, which is why the gateway warns about that shape.
 #[tokio::test]
-async fn foreign_buckets_are_read_only() {
-    // §9.4: buckets whose origin is not the local node are read-only, because
-    // the version model forbids publishing someone else's view.
+async fn a_foreign_pinned_bucket_writes_our_view_and_reads_theirs() {
     let harness = Harness::start(AuthMode::Anonymous).await;
-    let response = client()
-        .put(harness.url("/nas-media/anything.txt"))
-        .body("nope")
+    let http = client();
+    let response = http
+        .put(harness.url("/nas-media/ours.txt"))
+        .body("ours")
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 403);
+    assert_eq!(response.status(), 200);
+
+    // It landed in our own view...
+    let response = http
+        .get(harness.url("/my-media/ours.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"ours");
+
+    // ...and not in the pinned origin's, which is what the bucket serves.
+    let response = http
+        .get(harness.url("/nas-media/ours.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    let bucket = buckets::find(&harness.node, "nas-media").unwrap();
+    assert!(bucket.pins_a_foreign_origin(&harness.node));
+    let warning = bucket.foreign_pin_warning(&harness.node).unwrap();
+    assert!(warning.contains("read-only"), "{warning}");
+    harness.stop().await;
+}
+
+/// §8, §9.4: `newest` serves the winning version, `strict` answers a divergent
+/// key with 409 naming the versions, and the unified listing shows one key.
+#[tokio::test]
+async fn divergent_keys_are_served_by_policy() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    harness.publish("shared.txt", b"ours");
+
+    // A peer publishes a different version of the same path. Only the peer's
+    // own assertion is ever written — this is the read model diverging, not a
+    // write path into someone else's trie.
+    let peer = synch_core::OriginId::named("nas", "cluster.example").unwrap();
+    let theirs = b"theirs";
+    let root = harness
+        .node
+        .store()
+        .ingest_bytes(theirs, synch_core::now_ns())
+        .unwrap();
+    let ours = harness
+        .node
+        .store()
+        .entry(harness.node.origin(), "media", "shared.txt")
+        .unwrap()
+        .unwrap();
+    harness
+        .node
+        .store()
+        .put_entry(
+            &peer,
+            "media",
+            "shared.txt",
+            &synch_core::FileEntry::file(theirs.len() as u64, ours.mtime_ns + 1_000, root, 1),
+        )
+        .unwrap();
+
+    // The unified listing carries one key for the path, not one per origin.
+    let body = http
+        .get(harness.url("/my-media?list-type=2"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body.matches("<Key>shared.txt</Key>").count(), 1, "{body}");
+
+    // `newest` serves the winning version, and its ETag is that version's root.
+    let response = http
+        .get(harness.url("/my-media/shared.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["etag"].to_str().unwrap(),
+        format!("\"{}\"", blake3::hash(theirs).to_hex())
+    );
+    assert_eq!(response.bytes().await.unwrap().as_ref(), theirs);
+
+    // A strict bucket refuses the key with 409 and names both versions.
+    let response = http
+        .get(harness.url("/strict-media/shared.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
     let body = response.text().await.unwrap();
-    assert!(body.contains("read-only"), "{body}");
+    assert!(body.contains("DivergentVersions"), "{body}");
+    assert!(body.contains("nas@cluster.example"), "{body}");
+    assert!(
+        body.contains(&blake3::hash(theirs).to_hex().to_string()),
+        "{body}"
+    );
+
+    // HEAD refuses it the same way.
+    let response = http
+        .head(harness.url("/strict-media/shared.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+
+    // An undisputed key in the same strict bucket still reads.
+    harness.publish("undisputed.txt", b"only one");
+    let response = http
+        .get(harness.url("/strict-media/undisputed.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // And the strict bucket leaves the divergent key out of its listing
+    // rather than handing over one side's metadata.
+    let body = http
+        .get(harness.url("/strict-media?list-type=2"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!body.contains("<Key>shared.txt</Key>"), "{body}");
+    assert!(body.contains("<Key>undisputed.txt</Key>"), "{body}");
     harness.stop().await;
 }
 

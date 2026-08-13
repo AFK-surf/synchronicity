@@ -2,9 +2,10 @@
 //!
 //! The gateway embeds the same engine crate the CLI does, so existing S3
 //! tooling can read and write a cluster without knowing anything about it.
-//! Reads serve an origin's published entries and content flows through the
-//! normal verified path — local CAS first, then peer fetch, with per-16 KiB
-//! group verification. ETags are the object's BLAKE3 root, hex, quoted.
+//! Reads serve the version each bucket's policy selects from the unified tree
+//! (§8) and content flows through the normal verified path — local CAS first,
+//! then peer fetch, with per-16 KiB group verification. ETags are the selected
+//! version's BLAKE3 root, hex, quoted.
 #![deny(missing_docs)]
 
 pub mod auth;
@@ -142,14 +143,11 @@ async fn list_objects(
     let token = param(query, "continuation-token").filter(|t| !t.is_empty());
     let start_after = token.clone().or_else(|| param(query, "start-after"));
 
-    // Over-read by one so we can tell truncation from exhaustion.
-    let rows = gateway.node.store().list_entries(
-        Some(&bucket.origin),
-        &bucket.space,
-        &prefix,
-        start_after.as_deref(),
-        None,
-    )?;
+    // The unified tree, one key per path (§8).
+    let listing =
+        gateway
+            .node
+            .unified_listing(&bucket.space, &prefix, start_after.as_deref(), None)?;
 
     let mut result = ListResult {
         bucket: bucket.name.clone(),
@@ -160,7 +158,13 @@ async fn list_objects(
         ..ListResult::default()
     };
     let mut last_key = None;
-    for row in rows {
+    for set in listing {
+        // A listing cannot answer a key with 409, so a strict bucket leaves
+        // divergent keys out of it rather than handing a client one side's
+        // size and ETag; a direct GET of such a key says what is wrong.
+        let Ok(row) = gateway.node.resolve_set(&set, &bucket.policy) else {
+            continue;
+        };
         if row.kind == EntryKind::Tombstone || row.kind == EntryKind::Dir {
             continue;
         }
@@ -208,10 +212,11 @@ async fn get_object(
 ) -> S3Result<Response> {
     let entry = gateway
         .node
-        .store()
-        .entry(&bucket.origin, &bucket.space, key)?
-        .filter(|e| e.kind != EntryKind::Tombstone)
-        .ok_or_else(|| S3Error::no_such_key(key))?;
+        .resolve(&bucket.space, key, &bucket.policy)
+        .map_err(S3Error::from)?;
+    if entry.kind == EntryKind::Tombstone {
+        return Err(S3Error::no_such_key(key));
+    }
 
     let etag = etag(entry.content.as_ref());
     let mut response_headers = HeaderMap::new();
@@ -258,10 +263,10 @@ async fn get_object(
     // peer fetch, with every 16 KiB group checked against the object root.
     let bytes = gateway
         .node
-        .read_entry_range(
-            &bucket.origin,
+        .read_range(
             &bucket.space,
             key,
+            &bucket.policy,
             start,
             Some(end.saturating_sub(start)),
         )
@@ -280,8 +285,13 @@ async fn put_object(
     key: &str,
     body: Body,
 ) -> S3Result<Response> {
-    if !bucket.writable_by(&gateway.node) {
-        return Err(S3Error::read_only(&bucket.name));
+    // §9.4: a write is always a publish of the local node's own view — the
+    // version model forbids publishing someone else's — so every bucket is
+    // writable. A bucket pinned to a foreign origin still accepts the write,
+    // but its reads keep serving the pinned origin, which is worth saying out
+    // loud rather than silently surprising the client.
+    if let Some(warning) = bucket.foreign_pin_warning(&gateway.node) {
+        tracing::warn!("{warning}");
     }
     let bytes = axum::body::to_bytes(body, usize::MAX)
         .await

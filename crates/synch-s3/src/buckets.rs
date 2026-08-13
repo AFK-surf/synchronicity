@@ -1,13 +1,15 @@
-//! Bucket mapping: a bucket names a *view* — `<origin>:<space>` (§9.4).
+//! Bucket mapping: a bucket names a space of the unified tree plus a version
+//! policy (§9.4).
 //!
-//! Buckets whose origin is the local node are writable; foreign-origin buckets
-//! are read-only, because the version model forbids publishing someone else's
-//! view (§8).
+//! Reads serve the policy-selected version of each key (§8). Writes are always
+//! publishes of the *local* node's own view — the version model forbids
+//! publishing someone else's — so every bucket is writable, and a bucket that
+//! pins a foreign origin is effectively read-only in practice, since reads
+//! would not see our writes. The gateway warns about exactly that shape.
 
 use std::str::FromStr;
 
-use synch_core::OriginId;
-use synch_engine::{EntryRef, Node};
+use synch_engine::{EntryRef, Node, VersionPolicy};
 
 use crate::error::{S3Error, S3Result};
 
@@ -19,16 +21,38 @@ const BUCKETS_CONFIG: &str = "s3_buckets";
 pub struct Bucket {
     /// The bucket name.
     pub name: String,
-    /// The origin whose published view the bucket serves.
-    pub origin: OriginId,
-    /// The space within that origin.
+    /// The space of the unified tree the bucket serves.
     pub space: String,
+    /// Which version of each path reads return (§8).
+    pub policy: VersionPolicy,
 }
 
 impl Bucket {
-    /// True if the bucket maps to the local node's own view, and so is writable.
-    pub fn writable_by(&self, node: &Node) -> bool {
-        &self.origin == node.origin()
+    /// The origin whose view this bucket pins, if it pins one.
+    pub fn pinned_origin(&self) -> Option<&synch_core::OriginId> {
+        self.policy.pinned_origin()
+    }
+
+    /// True if the bucket pins an origin other than the local node's.
+    ///
+    /// Writes still land — they publish our own view — but reads keep serving
+    /// the pinned origin, so what was written will not come back (§9.4).
+    pub fn pins_a_foreign_origin(&self, node: &Node) -> bool {
+        self.pinned_origin().is_some_and(|o| o != node.origin())
+    }
+
+    /// The warning §9.4 asks the gateway to log for such a bucket.
+    pub fn foreign_pin_warning(&self, node: &Node) -> Option<String> {
+        self.pinned_origin()
+            .filter(|o| *o != node.origin())
+            .map(|origin| {
+                format!(
+                    "bucket {} pins {origin}, so writes to it publish {}'s view \
+                     and reads keep serving {origin}'s: it is effectively read-only",
+                    self.name,
+                    node.origin()
+                )
+            })
     }
 }
 
@@ -51,6 +75,11 @@ pub fn validate_name(name: &str) -> S3Result<()> {
 }
 
 /// Reads the configured buckets.
+///
+/// Each line is `<bucket>\t<space>\t<policy>`. Databases written before the
+/// unified tree stored `<bucket>\t<origin>\t<space>`; migration v5 (§10)
+/// rewrites those in place, so nothing here has to guess which shape it is
+/// looking at.
 pub fn load(node: &Node) -> S3Result<Vec<Bucket>> {
     let Some(text) = node.store().config(BUCKETS_CONFIG)? else {
         return Ok(Vec::new());
@@ -58,17 +87,17 @@ pub fn load(node: &Node) -> S3Result<Vec<Bucket>> {
     let mut out = Vec::new();
     for line in text.lines() {
         let mut parts = line.split('\t');
-        let (Some(name), Some(origin), Some(space)) = (parts.next(), parts.next(), parts.next())
+        let (Some(name), Some(space), Some(policy)) = (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
-        let Ok(origin) = OriginId::from_str(origin) else {
+        let Ok(policy) = VersionPolicy::from_str(policy) else {
             continue;
         };
         out.push(Bucket {
             name: name.to_string(),
-            origin,
             space: space.to_string(),
+            policy,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -83,30 +112,43 @@ pub fn find(node: &Node, name: &str) -> S3Result<Bucket> {
         .ok_or_else(|| S3Error::no_such_bucket(name))
 }
 
-/// Adds or replaces a bucket mapping from an `<origin>:<space>` reference.
-pub fn add(node: &Node, name: &str, reference: &str) -> S3Result<Bucket> {
+/// Adds or replaces a bucket mapping.
+///
+/// `reference` is a space — `media` — or the origin-pinned shorthand
+/// `<origin>:<space>`, which is the same thing as `--policy origin=<origin>`.
+pub fn add(node: &Node, name: &str, reference: &str, policy: Option<&str>) -> S3Result<Bucket> {
     validate_name(name)?;
     let reference: EntryRef = reference
         .parse()
         .map_err(|e: synch_engine::EngineError| S3Error::invalid(e.to_string()))?;
-    let origin = reference
-        .origin
-        .clone()
-        .ok_or_else(|| S3Error::invalid("a bucket needs an explicit <origin>:<space>"))?;
     if !reference.path.is_empty() {
         return Err(S3Error::invalid(
             "a bucket maps to a whole space, not a path within one",
         ));
     }
+    let policy = match (&reference.origin, policy) {
+        (Some(_), Some(_)) => {
+            return Err(S3Error::invalid(
+                "the reference already pins an origin; drop --policy or the <origin>: prefix",
+            ))
+        }
+        (Some(origin), None) => VersionPolicy::Origin(origin.clone()),
+        (None, Some(text)) => VersionPolicy::from_str(text)
+            .map_err(|e: synch_store::StoreError| S3Error::invalid(e.to_string()))?,
+        (None, None) => VersionPolicy::Newest,
+    };
     let bucket = Bucket {
         name: name.to_string(),
-        origin,
         space: reference.space,
+        policy,
     };
     let mut buckets = load(node)?;
     buckets.retain(|b| b.name != bucket.name);
     buckets.push(bucket.clone());
     save(node, &buckets)?;
+    if let Some(warning) = bucket.foreign_pin_warning(node) {
+        tracing::warn!("{warning}");
+    }
     Ok(bucket)
 }
 
@@ -122,7 +164,7 @@ pub fn remove(node: &Node, name: &str) -> S3Result<bool> {
 fn save(node: &Node, buckets: &[Bucket]) -> S3Result<()> {
     let text = buckets
         .iter()
-        .map(|b| format!("{}\t{}\t{}", b.name, b.origin.canonical(), b.space))
+        .map(|b| format!("{}\t{}\t{}", b.name, b.space, b.policy.render()))
         .collect::<Vec<_>>()
         .join("\n");
     node.store().set_config(BUCKETS_CONFIG, &text)?;
@@ -144,10 +186,10 @@ mod tests {
     #[tokio::test]
     async fn buckets_round_trip() {
         let (_d, node) = node().await;
-        let reference = format!("{}:media", node.origin().canonical());
-        let bucket = add(&node, "my-photos", &reference).unwrap();
+        let bucket = add(&node, "my-photos", "media", None).unwrap();
         assert_eq!(bucket.space, "media");
-        assert!(bucket.writable_by(&node));
+        assert_eq!(bucket.policy, VersionPolicy::Newest);
+        assert!(!bucket.pins_a_foreign_origin(&node));
 
         assert_eq!(load(&node).unwrap().len(), 1);
         assert_eq!(find(&node, "my-photos").unwrap(), bucket);
@@ -159,10 +201,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreign_buckets_are_not_writable() {
+    async fn a_policy_may_be_given_either_way() {
         let (_d, node) = node().await;
-        let bucket = add(&node, "nas-media", "nas@cluster.example:media").unwrap();
-        assert!(!bucket.writable_by(&node));
+        // The shorthand and the flag mean the same thing.
+        let shorthand = add(&node, "nas-media", "nas@cluster.example:media", None).unwrap();
+        let flagged = add(
+            &node,
+            "nas-media-2",
+            "media",
+            Some("origin=nas@cluster.example"),
+        )
+        .unwrap();
+        assert_eq!(shorthand.policy, flagged.policy);
+        assert_eq!(shorthand.space, flagged.space);
+        assert!(shorthand.pins_a_foreign_origin(&node));
+        assert!(shorthand.foreign_pin_warning(&node).is_some());
+
+        let strict = add(&node, "strict-media", "media", Some("strict")).unwrap();
+        assert_eq!(strict.policy, VersionPolicy::Strict);
+        assert!(strict.foreign_pin_warning(&node).is_none());
+
+        // Pinning our own origin is not foreign, so there is nothing to warn
+        // about.
+        let ours = add(
+            &node,
+            "ours",
+            &format!("{}:media", node.origin().canonical()),
+            None,
+        )
+        .unwrap();
+        assert!(!ours.pins_a_foreign_origin(&node));
+        assert!(ours.foreign_pin_warning(&node).is_none());
+
+        // And the mapping survives a reload with its policy intact.
+        let loaded = find(&node, "strict-media").unwrap();
+        assert_eq!(loaded.policy, VersionPolicy::Strict);
         node.shutdown().await.unwrap();
     }
 
@@ -170,9 +243,17 @@ mod tests {
     async fn rejects_bad_mappings() {
         let (_d, node) = node().await;
         // A bucket maps to a whole space.
-        assert!(add(&node, "bad", "nas@cluster.example:media/sub").is_err());
-        // And needs an explicit origin.
-        assert!(add(&node, "bad", "media").is_err());
+        assert!(add(&node, "bad", "nas@cluster.example:media/sub", None).is_err());
+        // A pin cannot be given twice, two ways.
+        assert!(add(
+            &node,
+            "bad",
+            "nas@cluster.example:media",
+            Some("origin=other@cluster.example")
+        )
+        .is_err());
+        // And a policy has to be one of the three.
+        assert!(add(&node, "bad", "media", Some("whatever")).is_err());
         node.shutdown().await.unwrap();
     }
 
