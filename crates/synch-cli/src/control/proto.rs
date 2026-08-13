@@ -34,8 +34,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// `<space>/<path>` form — both reshape an existing variant's fields. Bumped to
 /// 5 by the gateway becoming a control-socket client (§9.4): six structured
 /// requests, a client-to-daemon [`Upload`] frame, and a [`Response::Entry`]
-/// frame that carries entry metadata rather than a rendered line.
-pub const CONTROL_VERSION: u32 = 5;
+/// frame that carries entry metadata rather than a rendered line. Bumped to 6
+/// by `synch sync` (a new [`Request`] variant) and by `TreePut` growing a
+/// [`Response::Ready`] ack before the client streams.
+pub const CONTROL_VERSION: u32 = 6;
 
 /// How many payload bytes one `Chunk` frame carries.
 ///
@@ -428,6 +430,13 @@ pub enum Request {
         /// The record to append. One line: newlines separate records.
         record: String,
     },
+    /// `synch sync` — one push-pull exchange with every dialable peer, now.
+    ///
+    /// Anti-entropy runs on its jittered interval and owes nobody an early
+    /// round; this is the operator saying "I am watching, do one now" — after
+    /// a publish they want a peer to see, or in a script that would otherwise
+    /// poll `status` until the interval elapses.
+    SyncNow,
 }
 
 /// One entry of the unified tree, as it crosses the socket (§8).

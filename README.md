@@ -131,7 +131,9 @@ synch mirror rm /mnt/safe
 ```
 
 Keep bytes around regardless of retention. A pin names an object root, or a
-path — in which case the version the reading policy selects supplies the root:
+path — in which case the version the reading policy selects supplies the root.
+Pinning content this node has never read fetches it first: the pin is a
+promise the bytes stay available here, and it starts by getting them.
 
 ```sh
 synch pin add media/talks/keynote.mp4
@@ -141,7 +143,9 @@ synch pin ls
 synch pin rm media/talks/keynote.mp4
 ```
 
-Serve the same data over S3:
+Serve the same data over S3. The gateway is a control-socket client of the
+daemon — it opens no database of its own — so a `synch daemon run` must be
+live on the same data directory for any `synch-s3` command to work:
 
 ```sh
 synch-s3 bucket add media media                            # newest, by default

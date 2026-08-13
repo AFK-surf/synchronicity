@@ -103,6 +103,16 @@ async fn main() -> Result<()> {
         .init();
 
     if let Err(e) = run(args).await {
+        // A reader that hung up early (`bucket ls | head`) surfaces as a
+        // broken-pipe write error: the reader saying "enough", not a failure.
+        let reader_hung_up = e.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+        });
+        if reader_hung_up {
+            std::process::exit(0);
+        }
         eprintln!("synch-s3: {e:#}");
         std::process::exit(1);
     }

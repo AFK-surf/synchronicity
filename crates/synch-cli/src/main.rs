@@ -19,6 +19,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     if let Err(e) = commands::run(args).await {
+        // Rust starts processes with SIGPIPE ignored, so a reader that hung
+        // up early (`synch ls | head`) surfaces as a broken-pipe write error.
+        // That is the reader saying "enough", not a failure to report.
+        let reader_hung_up = e.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+        });
+        if reader_hung_up {
+            std::process::exit(0);
+        }
         eprintln!("synch: {e:#}");
         std::process::exit(1);
     }

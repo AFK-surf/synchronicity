@@ -774,14 +774,19 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         Request::PinAdd { target } => {
-            let root = pin_target(node, &target)?;
-            node.store().set_pinned(&root, true)?;
+            let (root, size) = pin_target(node, &target)?;
+            node.pin_object(&root, size).await?;
             out.line(format!("pinned {root}")).await?;
         }
 
         Request::PinRm { target } => {
-            let root = pin_target(node, &target)?;
-            node.store().set_pinned(&root, false)?;
+            let (root, _) = pin_target(node, &target)?;
+            if !node.store().set_pinned(&root, false)? {
+                return Err(ControlError::new(
+                    ErrorCode::NotFound,
+                    format!("no object {root} in the local store"),
+                ));
+            }
             out.line(format!("unpinned {root}")).await?;
         }
 
@@ -853,6 +858,32 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             if let Some(value) = node.store().config(key)? {
                 for record in value.lines() {
                     out.line(record).await?;
+                }
+            }
+        }
+
+        Request::SyncNow => {
+            let peers = node.dialable_peers()?;
+            if peers.is_empty() {
+                out.line("no dialable peers: nothing to sync with").await?;
+            }
+            for peer in peers {
+                match node.sync_with_peer(&peer).await {
+                    Ok(report) => {
+                        out.line(format!(
+                            "{}  heads accepted {} · tries completed {} · pushed {}",
+                            peer.fmt_short(),
+                            report.heads_accepted,
+                            report.tries_completed,
+                            report.heads_pushed,
+                        ))
+                        .await?;
+                    }
+                    // One unreachable peer must not hide what the others said.
+                    Err(e) => {
+                        out.line(format!("{}  unreachable: {e}", peer.fmt_short()))
+                            .await?
+                    }
                 }
             }
         }
@@ -1179,9 +1210,9 @@ fn parse_policy(text: Option<&str>) -> std::result::Result<VersionPolicy, Contro
 /// the reading policy picks — the same selection every other read goes
 /// through, so a pin and a `synch cat` of the same reference always mean the
 /// same object. An `<origin>:` prefix pins that origin's version.
-fn pin_target(node: &Node, text: &str) -> std::result::Result<Hash, ControlError> {
+fn pin_target(node: &Node, text: &str) -> std::result::Result<(Hash, Option<u64>), ControlError> {
     if let Ok(root) = Hash::from_str(text) {
-        return Ok(root);
+        return Ok((root, None));
     }
     // A reference always carries a path, so anything without a separator was
     // meant to be a root and is reported as one rather than as a bad space.
@@ -1199,7 +1230,8 @@ fn pin_target(node: &Node, text: &str) -> std::result::Result<Hash, ControlError
     }
     let policy = policy_for(&reference, None, false)?;
     let entry = node.resolve(&reference.space, &reference.path, &policy)?;
-    entry.content.ok_or_else(|| {
+    let root = entry.content.ok_or_else(|| {
         ControlError::invalid(format!("{text} selects a version with no content to pin"))
-    })
+    })?;
+    Ok((root, Some(entry.size)))
 }

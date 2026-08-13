@@ -67,6 +67,8 @@ pub enum Command {
     },
     /// Live peers, addresses, last sync, lag.
     Peers,
+    /// Run one anti-entropy exchange with every dialable peer, now.
+    Sync,
     /// Index a local directory as a space.
     Space {
         /// The space subcommand.
@@ -421,6 +423,15 @@ mod tests {
             vec!["synch", "daemon", "status"],
             vec!["synch", "daemon", "stop"],
             vec!["synch", "trust", "add", "abc", "--as", "nas"],
+            vec![
+                "synch",
+                "trust",
+                "add",
+                "abc",
+                "--as",
+                "nas@cluster.example.com",
+            ],
+            vec!["synch", "sync"],
             vec!["synch", "trust", "rebind", "nas@x.example", "abc"],
             vec!["synch", "trust", "rm", "nas@x.example"],
             vec!["synch", "trust", "ls"],

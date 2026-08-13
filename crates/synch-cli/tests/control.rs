@@ -116,6 +116,10 @@ async fn every_command_variant_round_trips() {
     assert!(keys.contains("no trusted peers to ask"), "{keys}");
     assert_eq!(keys.lines().count(), 2, "{keys}");
 
+    // A manual round with nobody to run it against says so and succeeds.
+    let sync = lines(data_dir, Request::SyncNow).await;
+    assert!(sync.contains("no dialable peers"), "{sync}");
+
     // Spaces, scanning, and listing.
     assert!(lines(
         data_dir,

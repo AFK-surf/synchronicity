@@ -103,13 +103,30 @@ fn to_request(cli: &Cli) -> Result<Request> {
                 domain,
                 note,
                 addr,
-            } => Request::TrustAdd {
-                key: key.clone(),
-                name: name.clone(),
-                domain: domain.clone(),
-                note: note.clone(),
-                addr: addr.clone(),
-            },
+            } => {
+                // Origins are spelled name@domain everywhere else, so
+                // `--as nas@cluster.example` means what it says: the name and
+                // the domain, in the one token the user already knows.
+                let (name, domain) = match name.as_deref().and_then(|n| n.split_once('@')) {
+                    Some((n, d)) => {
+                        if domain.as_deref().is_some_and(|given| given != d) {
+                            anyhow::bail!(
+                                "--as names domain {d} but --domain says {}: drop one",
+                                domain.as_deref().unwrap_or_default()
+                            );
+                        }
+                        (Some(n.to_string()), Some(d.to_string()))
+                    }
+                    None => (name.clone(), domain.clone()),
+                };
+                Request::TrustAdd {
+                    key: key.clone(),
+                    name,
+                    domain,
+                    note: note.clone(),
+                    addr: addr.clone(),
+                }
+            }
             TrustCommand::Rebind { origin, key } => Request::TrustRebind {
                 origin: origin.clone(),
                 key: key.clone(),
@@ -134,6 +151,7 @@ fn to_request(cli: &Cli) -> Result<Request> {
         },
 
         Command::Peers => Request::Peers,
+        Command::Sync => Request::SyncNow,
 
         Command::Space { command } => match command {
             // The daemon's working directory is its own; a relative path is
@@ -304,4 +322,77 @@ fn absolute(path: &Path) -> Result<String> {
     let path = std::path::absolute(path)
         .with_context(|| format!("could not resolve {}", path.display()))?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn request_for(args: &[&str]) -> Result<Request> {
+        to_request(&Cli::parse_from(args))
+    }
+
+    /// Origins are spelled `name@domain` everywhere else, so `--as` takes
+    /// that form too and splits it, rather than bouncing it off the
+    /// member-label regex.
+    #[test]
+    fn trust_add_accepts_the_origin_form() {
+        let request = request_for(&[
+            "synch",
+            "trust",
+            "add",
+            "abc",
+            "--as",
+            "nas@cluster.example.com",
+        ])
+        .unwrap();
+        assert_eq!(
+            request,
+            Request::TrustAdd {
+                key: "abc".into(),
+                name: Some("nas".into()),
+                domain: Some("cluster.example.com".into()),
+                note: None,
+                addr: None,
+            }
+        );
+
+        // A bare label with a separate --domain is unchanged.
+        let request = request_for(&[
+            "synch",
+            "trust",
+            "add",
+            "abc",
+            "--as",
+            "nas",
+            "--domain",
+            "x.example",
+        ])
+        .unwrap();
+        assert_eq!(
+            request,
+            Request::TrustAdd {
+                key: "abc".into(),
+                name: Some("nas".into()),
+                domain: Some("x.example".into()),
+                note: None,
+                addr: None,
+            }
+        );
+
+        // Two domains that disagree are an error, not a silent pick.
+        let err = request_for(&[
+            "synch",
+            "trust",
+            "add",
+            "abc",
+            "--as",
+            "nas@a.example",
+            "--domain",
+            "b.example",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("drop one"), "{err}");
+    }
 }
