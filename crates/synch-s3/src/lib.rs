@@ -199,7 +199,12 @@ async fn list_objects(
     // entirely of skipped rows still hands back a token that moves.
     let mut cursor = None;
     for row in &listing {
-        if row.kind == EntryKind::Tombstone || row.kind == EntryKind::Dir {
+        // Only a regular file is an S3 object. A directory marker and a
+        // tombstone are obviously not, and neither is a symlink: its version
+        // identity is its target, not content (§8), so it has no object root
+        // to be an ETag and no bytes to serve. Listing one would advertise a
+        // key whose GET can only fail.
+        if row.kind != EntryKind::File {
             cursor = Some(row.path.clone());
             continue;
         }
@@ -259,7 +264,9 @@ async fn get_object(
         .resolve(&bucket.space, key, &policy)
         .await
         .map_err(|e| e.with_key(key))?;
-    if entry.kind == EntryKind::Tombstone {
+    // Whatever a listing leaves out, a direct read leaves out too, or the
+    // gateway would answer for keys it will not admit to having.
+    if entry.kind != EntryKind::File {
         return Err(S3Error::no_such_key(key));
     }
 

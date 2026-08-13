@@ -603,6 +603,71 @@ async fn divergent_keys_are_served_by_policy() {
     harness.stop().await;
 }
 
+/// A symlink is not an S3 object: its version identity is its target rather
+/// than content (§8), so it has no root to be an ETag and no bytes to serve.
+/// It stays out of listings, and a direct read of it is a missing key —
+/// otherwise the gateway would advertise a key whose GET can only fail.
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_keys_are_not_objects() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    harness.publish("real.txt", b"the real thing");
+    std::os::unix::fs::symlink("real.txt", harness.space_path.join("link.txt")).unwrap();
+    harness.node.scan_and_publish().unwrap();
+
+    // The daemon does track the symlink — this is the gateway declining to
+    // present it, not the tree forgetting it.
+    let entry = harness
+        .node
+        .store()
+        .entry(harness.node.origin(), "media", "link.txt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.kind, synch_core::EntryKind::Symlink);
+    assert_eq!(entry.symlink_target.as_deref(), Some("real.txt"));
+
+    let body = http
+        .get(harness.url("/my-media?list-type=2"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("<Key>real.txt</Key>"), "{body}");
+    assert!(!body.contains("<Key>link.txt</Key>"), "{body}");
+    assert!(body.contains("<KeyCount>1</KeyCount>"), "{body}");
+
+    for method in ["GET", "HEAD"] {
+        let response = http
+            .request(method.parse().unwrap(), harness.url("/my-media/link.txt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{method}");
+    }
+
+    // Writing to the same key is still an ordinary write: it replaces the link
+    // with a file, and the file is an object like any other.
+    let response = http
+        .put(harness.url("/my-media/link.txt"))
+        .body("now a file")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let response = http
+        .get(harness.url("/my-media/link.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"now a file");
+
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn deferred_operations_report_not_implemented() {
     let harness = Harness::start(AuthMode::Anonymous).await;
