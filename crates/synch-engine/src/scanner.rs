@@ -20,6 +20,16 @@ use crate::{
     node::{Node, StagedChange},
 };
 
+/// How far past a file's mtime its hash must have been taken before the
+/// `(size, mtime_ns, file_id)` stat check is proof of "unchanged".
+///
+/// Two seconds covers every timestamp granularity in practice: nanoseconds
+/// where the kernel grants them, a scheduler tick (1–10 ms) where it uses the
+/// coarse clock, and the full-second stamps of older filesystems. Inside the
+/// window a same-size in-place rewrite can share the hashed write's mtime,
+/// so the stat proves nothing and the bytes are hashed again.
+const RACY_WINDOW_NS: i64 = 2_000_000_000;
+
 /// What one scan found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanReport {
@@ -189,19 +199,49 @@ impl Node {
         let file_id = file_identity(&metadata);
 
         let known = self.store().local_file(space_id, rel)?;
-        let unchanged = match &known {
+        let stat_match = match &known {
             Some(known) => {
                 known.size == size && known.mtime_ns == mtime_ns && known.file_id == file_id
             }
             None => false,
         };
-        if unchanged {
+        // A matching stat only proves "unchanged" once the hash it vouches for
+        // was taken comfortably after the file's mtime. Filesystem timestamps
+        // are granular — a jiffy on most Linux configurations, a full second
+        // on older filesystems — so a same-size in-place rewrite landing
+        // within one tick of the write we hashed is invisible to the stat.
+        // Until the record has aged past that window, the stat is racily
+        // clean (git's term for the same hazard) and the content must speak
+        // for itself.
+        let trusted = match &known {
+            Some(known) => known.scanned_at.saturating_sub(known.mtime_ns) >= RACY_WINDOW_NS,
+            None => false,
+        };
+        if stat_match && trusted {
             report.unchanged += 1;
             return Ok(());
         }
 
         let (content, size) = self.store().ingest_file(path, now_ns())?;
         report.hashed += 1;
+
+        if stat_match && known.as_ref().is_some_and(|k| k.content == Some(content)) {
+            // Racily clean and actually clean. Refreshing `scanned_at` is what
+            // lets the stat become trustworthy: once it is two seconds past
+            // the mtime it vouches for, no unnoticed rewrite can share that
+            // mtime, and the next scan skips the hash again.
+            self.store().put_local_file(&LocalFile {
+                space: space_id.to_string(),
+                relpath: rel.to_string(),
+                size,
+                mtime_ns,
+                file_id,
+                content: Some(content),
+                scanned_at: now_ns(),
+            })?;
+            report.unchanged += 1;
+            return Ok(());
+        }
 
         let previous = self
             .store()
@@ -703,6 +743,19 @@ mod tests {
         (data, space, node)
     }
 
+    /// Ages every scan record past the racy window, as if the test had waited
+    /// two seconds: records hashed moments after their file's mtime are
+    /// racily clean and re-hashed on the next scan, which is correct but not
+    /// what tests of the trusted stat check are exercising.
+    fn age_quick_checks(node: &Node) {
+        for space in node.store().spaces().unwrap() {
+            for mut row in node.store().local_file_rows(&space.id).unwrap() {
+                row.scanned_at += super::RACY_WINDOW_NS;
+                node.store().put_local_file(&row).unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn scans_hashes_and_publishes() {
         let (_d, space, node) = node_with_space().await;
@@ -742,11 +795,57 @@ mod tests {
         let (_d, space, node) = node_with_space().await;
         std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
         node.scan_and_publish().unwrap();
+        age_quick_checks(&node);
 
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 0);
         assert_eq!(report.unchanged, 1);
         assert!(head.is_none(), "an unchanged tree publishes no new head");
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_racy_same_size_rewrite_is_still_detected() {
+        // The stat quick check is (size, mtime, file_id). A same-size rewrite
+        // landing within the filesystem's timestamp granularity leaves all
+        // three identical — forced here with set_times, which is what a
+        // coarse-clock kernel does on its own — and used to be silently
+        // never published. Within the racy window the bytes speak instead.
+        let (_d, space, node) = node_with_space().await;
+        let path = space.path().join("rolling.txt");
+        std::fs::write(&path, b"revision 1").unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (_, head) = node.scan_and_publish().unwrap();
+        assert_eq!(head.unwrap().seq, 1);
+
+        std::fs::write(&path, b"revision 2").unwrap();
+        let times = std::fs::FileTimes::new().set_modified(mtime);
+        std::fs::File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.hashed, 1, "a racily clean stat proves nothing");
+        assert_eq!(head.unwrap().seq, 2);
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "rolling.txt")
+                .unwrap()
+                .unwrap()
+                .content,
+            Some(Hash::new(b"revision 2"))
+        );
+
+        // An untouched file leaves the racy window by being re-hashed once:
+        // the refreshed record ages into a trustworthy stat.
+        age_quick_checks(&node);
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.hashed, 0);
+        assert_eq!(report.unchanged, 1);
+        assert!(head.is_none());
         node.shutdown().await.unwrap();
     }
 
@@ -1165,6 +1264,7 @@ mod tests {
         let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
         assert_eq!(node.reconcile_local_files().unwrap(), 0);
         assert_eq!(node.store().local_files("media").unwrap().len(), 1);
+        age_quick_checks(&node);
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 0);
         assert_eq!(report.unchanged, 1);
@@ -1207,6 +1307,7 @@ mod tests {
         assert_eq!(entry.mtime_ns, lstat);
 
         // Scanning again finds nothing to say.
+        age_quick_checks(&node);
         let (again, head) = node.scan_and_publish().unwrap();
         assert_eq!(again.hashed, 0);
         assert_eq!(again.unchanged, 2);
@@ -1223,6 +1324,7 @@ mod tests {
         std::fs::write(space.path().join("b.txt"), b"b").unwrap();
         std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();
         node.scan_and_publish().unwrap();
+        age_quick_checks(&node);
 
         std::fs::remove_file(space.path().join("link")).unwrap();
         std::os::unix::fs::symlink("b.txt", space.path().join("link")).unwrap();
