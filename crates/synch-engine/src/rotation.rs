@@ -374,6 +374,14 @@ mod tests {
             .is_bound(node.origin(), &new_key, now_ns())
             .unwrap());
 
+        // The retiring key stays bound to our own origin through the window,
+        // but it is still *us*: a node that dialed it reported itself
+        // unreachable in `sync` and `key ls` for the whole window.
+        assert!(
+            !node.dialable_peers().unwrap().contains(&old_key),
+            "the node must not dial its own retiring key"
+        );
+
         // Both endpoints are live: the new one dials, the old one still serves.
         assert_eq!(node.net().id(), new_key);
         assert_ne!(node.net().direct_addr(), old_addr);

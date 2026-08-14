@@ -416,6 +416,34 @@ async fn every_command_variant_round_trips() {
     daemon.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_sync_that_reaches_nobody_says_so_in_the_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+
+    // A trusted peer with no address fails its dial immediately, which keeps
+    // this test fast; the exit contract is the same as for a timeout.
+    lines(
+        data_dir,
+        Request::TrustAdd {
+            key: SecretKey::generate().public().to_z32(),
+            name: Some("ghost".into()),
+            domain: Some("cluster.example".into()),
+            note: None,
+            addr: None,
+        },
+    )
+    .await;
+    let frames = frames(data_dir, Request::SyncNow).await;
+    // The per-peer line still streams out before the error frame lands.
+    assert_eq!(
+        frames.expect_err("reaching zero of one peer is a failure"),
+        ErrorCode::Unavailable
+    );
+    daemon.shutdown().await;
+}
+
 /// Reads the `Chunk` payload of a response.
 async fn read(data_dir: &Path, request: Request) -> Vec<u8> {
     let frames = frames(data_dir, request).await.expect("a payload");
@@ -485,6 +513,16 @@ async fn errors_cross_the_socket_with_their_code() {
     );
     assert_eq!(
         failure(data_dir, Request::SpaceRm { id: "ghost".into() }).await,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        failure(
+            data_dir,
+            Request::MirrorRm {
+                path: "/no/such/mirror".into(),
+            }
+        )
+        .await,
         ErrorCode::NotFound
     );
     assert_eq!(

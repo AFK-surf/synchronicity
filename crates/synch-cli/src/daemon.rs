@@ -16,9 +16,12 @@ use crate::{control::Server, render};
 /// Stopping happens on `Ctrl-C` or on a `synch daemon stop` request; both fire
 /// the same broadcast, which every task shuts down on.
 pub async fn run(config: NodeConfig) -> Result<()> {
+    // No "(run `synch init` first?)" stapled onto every failure: the
+    // uninitialized case already says exactly that itself, and the hint sent
+    // an operator with a taken port off to re-init a healthy node.
     let node = Node::open(config)
         .await
-        .context("could not open the node (run `synch init` first?)")?;
+        .context("could not open the node")?;
     let (stop_tx, _) = broadcast::channel::<()>(1);
     // Subscribed before anything can ask us to stop, so a `daemon stop` that
     // arrives during the initial scan is not sent to nobody.

@@ -81,6 +81,24 @@ impl Daemon {
             .ok_or_else(|| S3Error::store("the daemon did not report an origin"))
     }
 
+    /// Whether any origin publishes `space`, or a local space claims the id.
+    ///
+    /// `bucket add` warns on false rather than refusing: mapping a bucket
+    /// before its space first syncs is a legitimate order of operations, but
+    /// doing it to a typo'd id used to be indistinguishable from success.
+    pub async fn space_known(&self, space: &str) -> S3Result<bool> {
+        match self
+            .lines(Request::Status {
+                reference: Some(space.to_string()),
+            })
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.status == axum::http::StatusCode::NOT_FOUND => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The version a policy selects for one path, with no content fetched —
     /// what `HeadObject` answers from.
     pub async fn resolve(&self, space: &str, path: &str, policy: &str) -> S3Result<EntryInfo> {

@@ -40,12 +40,21 @@ impl Node {
 
     /// The trusted device keys this node may dial, excluding its own.
     pub fn dialable_peers(&self) -> Result<Vec<NodeId>> {
-        let own = self.node_id();
+        // Every key this node holds, not just the active one: through a
+        // rotation window the retiring key is still bound to our own origin,
+        // and filtering only the active key made the node dial itself and
+        // report itself unreachable — in exactly the window where an operator
+        // is watching `sync` and `key ls` the hardest (§3.4).
+        let own: Vec<NodeId> = self
+            .device_keys()?
+            .into_iter()
+            .map(|key| key.node_id)
+            .collect();
         Ok(self
             .store()
             .trusted_keys(now_ns())?
             .into_iter()
-            .filter(|k| *k != own)
+            .filter(|k| !own.contains(k))
             .collect())
     }
 

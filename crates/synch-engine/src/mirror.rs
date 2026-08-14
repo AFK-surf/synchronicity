@@ -129,14 +129,25 @@ impl Node {
                     report.removed += remove_if_present(&target)?;
                     continue;
                 }
-                // A `strict` mirror never guesses: the path is left exactly as
-                // it is and reported (§7.2).
+                // A `strict` mirror never guesses (§7.2) — and that includes
+                // not letting yesterday's copy stand in for a guess: a stale
+                // file left behind reads as current to whoever mounts the
+                // mirror, which is the silent wrong answer strict exists to
+                // refuse. The path is reported and *removed* until the
+                // divergence ends.
                 synch_store::Selection::Divergent => {
+                    let removed = remove_if_present(&target)?;
+                    report.removed += removed;
                     report.skipped.push((
                         set.path.clone(),
                         format!(
-                            "{} versions and the policy is strict: {}",
+                            "{} versions and the policy is strict{}: {}",
                             set.version_count(),
+                            if removed > 0 {
+                                " (stale copy removed)"
+                            } else {
+                                ""
+                            },
                             set.describe().join("; ")
                         ),
                     ));
@@ -531,8 +542,27 @@ mod tests {
         assert!(report.skipped[0].1.contains("nas@x.example"), "{report:?}");
         assert!(!target.path().join("split.txt").exists());
 
+        // A path that was materialized and *then* diverged does not leave its
+        // stale copy behind: yesterday's file standing in for a guess is the
+        // silent wrong answer strict exists to refuse.
+        publish_entry(&node, &peer(), "agreed.txt", b"revised", 400);
+        publish_entry(&node, &other(), "agreed.txt", b"opposed", 500);
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert!(
+            !target.path().join("agreed.txt").exists(),
+            "the stale copy must be removed while the path is divergent"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|(p, why)| p == "agreed.txt" && why.contains("stale copy removed")),
+            "{report:?}"
+        );
+
         // Once the publishers agree, the path stops being skipped.
         publish_entry(&node, &other(), "split.txt", b"theirs", 300);
+        publish_entry(&node, &other(), "agreed.txt", b"revised", 600);
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert!(report.skipped.is_empty(), "{report:?}");
         assert_eq!(

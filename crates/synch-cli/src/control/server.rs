@@ -505,6 +505,14 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 None => {
                     let removed = node.store().remove_origin_bindings(&origin)?;
+                    // "removed 0 binding(s)" with exit 0 is the cheerful lie
+                    // the rest of the rm family refuses to tell.
+                    if removed == 0 {
+                        return Err(ControlError::new(
+                            ErrorCode::NotFound,
+                            format!("no bindings for {origin}"),
+                        ));
+                    }
                     out.line(format!("removed {removed} binding(s) for {origin}"))
                         .await?;
                 }
@@ -563,7 +571,12 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         Request::DomainLs => {
-            for health in node.domain_health()? {
+            let domains = node.domain_health()?;
+            if domains.is_empty() {
+                out.progress("(no membership domains configured; static trust only)")
+                    .await?;
+            }
+            for health in domains {
                 out.line(render::domain_health(&health, now_ns())).await?;
             }
         }
@@ -576,7 +589,14 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
 
         Request::Peers => {
             let now = now_ns();
-            for peer in node.store().peers_seen()? {
+            let seen = node.store().peers_seen()?;
+            if seen.is_empty() {
+                // On stderr, as every empty listing here is: a human learns
+                // the silence is "nothing yet", a script still gets clean
+                // stdout to parse.
+                out.progress("(no peers seen yet)").await?;
+            }
+            for peer in seen {
                 let origins = node.store().live_origins_for_key(&peer.node_id, now)?;
                 let names: Vec<String> = origins.iter().map(|o| o.canonical()).collect();
                 out.line(format!(
@@ -596,12 +616,24 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         Request::SpaceAdd { id, path } => {
+            // A typo'd path used to become a fresh empty directory with no
+            // signal; creating it is a feature, doing so silently was not.
+            let created = !std::path::Path::new(&path).is_dir();
             node.add_space(&id, &path)?;
             out.line(format!("indexing {path} as {id}")).await?;
+            if created {
+                out.line(format!("note: created {path}, which did not exist"))
+                    .await?;
+            }
         }
 
         Request::SpaceLs => {
-            for space in node.store().spaces()? {
+            let spaces = node.store().spaces()?;
+            if spaces.is_empty() {
+                out.progress("(no local spaces; add one with `synch space add`)")
+                    .await?;
+            }
+            for space in spaces {
                 out.line(format!("{:<20} {}", space.id, space.local_path))
                     .await?;
             }
@@ -875,18 +907,33 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             let stored = node.add_mirror(&space, &path, &policy)?;
             out.line(format!("mirroring {space} into {stored} ({policy})"))
                 .await?;
-        }
-
-        Request::MirrorRm { path } => {
-            if node.remove_mirror(&path)? {
-                out.line("removed").await?;
-            } else {
-                out.line("no such mirror").await?;
+            // Configuring the mirror before the space first syncs is a
+            // legitimate order of operations; doing it to a typo'd id is
+            // not, and the two used to be indistinguishable.
+            if ensure_known_space(node, &space).is_err() {
+                out.line(format!(
+                    "note: no origin publishes {space} yet; the mirror stays empty until one does"
+                ))
+                .await?;
             }
         }
 
+        Request::MirrorRm { path } => {
+            if !node.remove_mirror(&path)? {
+                return Err(ControlError::new(
+                    ErrorCode::NotFound,
+                    format!("no mirror at {path}"),
+                ));
+            }
+            out.line("removed").await?;
+        }
+
         Request::MirrorLs => {
-            for mirror in node.store().mirrors()? {
+            let mirrors = node.store().mirrors()?;
+            if mirrors.is_empty() {
+                out.progress("(no mirrors configured)").await?;
+            }
+            for mirror in mirrors {
                 out.line(format!(
                     "{:<20} {:<24} {}",
                     mirror.space,
@@ -936,7 +983,11 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         Request::PinLs => {
-            for root in node.store().pinned_blobs()? {
+            let pinned = node.store().pinned_blobs()?;
+            if pinned.is_empty() {
+                out.progress("(nothing pinned)").await?;
+            }
+            for root in pinned {
                 // A bare hash answers "what is pinned" without answering
                 // "what is it": the size and the paths currently naming the
                 // object are what make the list reviewable.
@@ -1031,6 +1082,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
             // All dials go out together: a dead peer costs its own connect
             // timeout, not a serial stall for every peer queued behind it.
+            let attempted = peers.len();
             let mut rounds = tokio::task::JoinSet::new();
             for peer in peers {
                 let node = node.clone();
@@ -1039,14 +1091,14 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                     (peer, outcome)
                 });
             }
-            let mut results = Vec::new();
-            while let Some(joined) = rounds.join_next().await {
-                results
-                    .push(joined.map_err(|e| ControlError::internal(format!("sync round: {e}")))?);
-            }
-            results.sort_by_key(|(peer, _)| peer.to_z32());
+            // Streamed in completion order, not sorted: ten seconds of
+            // silence while the fast peers' answers wait on the slowest dial
+            // reads as a hang, and every line names its peer anyway.
+            let mut reached = 0usize;
             let now = now_ns();
-            for (peer, outcome) in results {
+            while let Some(joined) = rounds.join_next().await {
+                let (peer, outcome) =
+                    joined.map_err(|e| ControlError::internal(format!("sync round: {e}")))?;
                 // The peer as the operator knows it — the origins its key is
                 // bound to — with the key for disambiguation, not as the name.
                 let origins = node.store().live_origins_for_key(&peer, now)?;
@@ -1061,6 +1113,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 match outcome {
                     Ok(report) => {
+                        reached += 1;
                         out.line(format!(
                             "{name} ({})  accepted {} head(s) · completed {} origin trie(s) · pushed {}",
                             peer.fmt_short(),
@@ -1076,6 +1129,14 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                             .await?
                     }
                 }
+            }
+            // Nothing to sync with is fine; reaching nothing is not, and
+            // scripts read the exit code, not the prose.
+            if attempted > 0 && reached == 0 {
+                return Err(ControlError::new(
+                    ErrorCode::Unavailable,
+                    format!("none of the {attempted} dialable peer(s) could be reached"),
+                ));
             }
         }
 

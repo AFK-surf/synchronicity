@@ -89,7 +89,16 @@ impl Net {
             .alpns(vec![ALPN_MPT.to_vec(), ALPN_BLOB.to_vec()])
             .bind()
             .await
-            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+            .map_err(|e| {
+                // Name the address: "Failed to bind sockets" with no port sent
+                // an operator to `synch init` when the fix was another --bind.
+                NetError::Endpoint(match options.bind_addr {
+                    Some(addr) => {
+                        format!("could not bind {addr}: {e} (is the port already in use?)")
+                    }
+                    None => e.to_string(),
+                })
+            })?;
 
         let router = Router::builder(endpoint)
             .accept(

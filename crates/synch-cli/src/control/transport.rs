@@ -135,6 +135,28 @@ mod imp {
     /// A connection as the CLI sees it.
     pub type ClientConn = UnixStream;
 
+    /// The longest socket path `bind` accepts: `sun_path` minus its NUL.
+    const MAX_SOCKET_PATH: usize = 107;
+
+    /// Refuses a data directory whose control socket could never be bound.
+    ///
+    /// The kernel's own answer is "path must be shorter than SUN_LEN" — an
+    /// acronym, no measurement, no remedy — and it arrives one command *after*
+    /// `synch init` said everything was fine. This check runs at init and at
+    /// bind, so the answer names the length, the limit, and the fix.
+    pub fn check_socket_path(data_dir: &Path) -> io::Result<()> {
+        let path = socket_path(data_dir);
+        let len = path.as_os_str().len();
+        if len > MAX_SOCKET_PATH {
+            return Err(io::Error::other(format!(
+                "the control socket path {} is {len} bytes and the OS limit \
+                 is {MAX_SOCKET_PATH}: use a shorter --data-dir",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// The socket path for a data directory.
     pub fn endpoint_name(data_dir: &Path) -> String {
         socket_path(data_dir).display().to_string()
@@ -158,6 +180,7 @@ mod imp {
         /// Staleness is decided by connecting: a socket that accepts belongs to
         /// a live daemon and this fails; one that refuses is removed.
         pub async fn bind(data_dir: &Path) -> io::Result<Listener> {
+            check_socket_path(data_dir)?;
             harden_data_dir(data_dir)?;
             let path = socket_path(data_dir);
             if path.exists() {
@@ -239,6 +262,11 @@ mod imp {
         format!("\\\\.\\pipe\\synchronicity-{}", &hash.to_hex()[..16])
     }
 
+    /// Pipe names are hashed to a fixed length; there is nothing to check.
+    pub fn check_socket_path(_data_dir: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     /// The daemon's listening pipe.
     ///
     /// A named pipe has no on-disk presence, so there is no stale instance to
@@ -313,11 +341,24 @@ mod imp {
 
 #[cfg(unix)]
 pub use imp::socket_path;
-pub use imp::{connect, endpoint_name, ClientConn, Listener, ServerConn};
+pub use imp::{check_socket_path, connect, endpoint_name, ClientConn, Listener, ServerConn};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel's own refusal is "SUN_LEN", one command after `init` said
+    /// everything was fine; the check names the length, the limit, and the
+    /// fix — and runs at init, where the operator can still act on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_over_the_os_limit_is_refused_by_name() {
+        check_socket_path(Path::new("/tmp/short")).unwrap();
+        let long = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
+        let text = check_socket_path(&long).unwrap_err().to_string();
+        assert!(text.contains("bytes"), "{text}");
+        assert!(text.contains("--data-dir"), "{text}");
+    }
 
     #[test]
     fn a_token_is_32_random_bytes_and_replaceable() {

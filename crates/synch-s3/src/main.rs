@@ -144,16 +144,27 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                 if let Some(warning) = bucket.foreign_pin_warning(&daemon.origin().await?) {
                     println!("warning: {warning}");
                 }
-            }
-            BucketCommand::Rm { bucket } => {
-                if buckets::remove(daemon, &bucket).await? {
-                    println!("removed {bucket}");
-                } else {
-                    println!("no such bucket");
+                // Mapping a bucket before its space first syncs is legal;
+                // mapping one onto a typo used to look exactly the same.
+                if !daemon.space_known(&bucket.space).await? {
+                    println!(
+                        "warning: no origin publishes {} yet; the bucket serves nothing until one does",
+                        bucket.space
+                    );
                 }
             }
+            BucketCommand::Rm { bucket } => {
+                if !buckets::remove(daemon, &bucket).await? {
+                    bail!("no bucket named {bucket}");
+                }
+                println!("removed {bucket}");
+            }
             BucketCommand::Ls => {
-                for bucket in buckets::load(daemon).await? {
+                let buckets = buckets::load(daemon).await?;
+                if buckets.is_empty() {
+                    eprintln!("(no buckets mapped; add one with `synch-s3 bucket add`)");
+                }
+                for bucket in buckets {
                     println!("{:<24} {:<20} {}", bucket.name, bucket.space, bucket.policy);
                 }
             }
@@ -171,14 +182,17 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                 println!("added access key {id}");
             }
             KeyCommand::Rm { id } => {
-                if auth::remove_key(daemon, &id).await? {
-                    println!("removed {id}");
-                } else {
-                    println!("no such access key");
+                if !auth::remove_key(daemon, &id).await? {
+                    bail!("no access key {id}");
                 }
+                println!("removed {id}");
             }
             KeyCommand::Ls => {
-                for key in auth::load_keys(daemon).await? {
+                let keys = auth::load_keys(daemon).await?;
+                if keys.is_empty() {
+                    eprintln!("(no access keys; the gateway will refuse to serve without one)");
+                }
+                for key in keys {
                     println!("{}", key.id);
                 }
             }

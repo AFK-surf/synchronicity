@@ -55,6 +55,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(id) => Some(OriginId::from_str(id).context("--id wants <name>@<domain>")?),
                 None => None,
             };
+            // Refuse a data dir whose control socket could never be bound —
+            // finding out one command later, from the kernel, in acronyms,
+            // is how a newcomer gives up.
+            transport::check_socket_path(&data_dir)?;
             // The datadir holds a signing key and the control token: it is the
             // owner's alone from the moment it exists (§9.3).
             transport::harden_data_dir(&data_dir)?;
