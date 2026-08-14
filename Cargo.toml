@@ -51,6 +51,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
 tempfile = "3.27.0"
+time = "0.3"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }

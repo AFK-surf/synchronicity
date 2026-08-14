@@ -13,6 +13,8 @@ pub mod error;
 pub mod frame;
 pub mod mpt;
 pub mod reconcile;
+#[doc(hidden)]
+pub mod sim;
 
 pub use blob::{BlobClient, BlobProtocol, Slice};
 pub use dns::{
