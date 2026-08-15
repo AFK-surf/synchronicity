@@ -34,7 +34,7 @@ Primary, `litestream replicate`:
 
 ```yaml
 dbs:
-  - path: /var/lib/controlplane/cp.db
+  - path: /var/lib/synch-controlplane/cp.db
     replicas:
       - type: s3
         bucket: cp-litestream
@@ -45,8 +45,8 @@ dbs:
 Replica restore loop (cron/systemd timer, ~60s):
 
 ```sh
-litestream restore -o /var/lib/controlplane/cp.db.new "$REPLICA_URL" \
-  && mv -f /var/lib/controlplane/cp.db.new /var/lib/controlplane/cp.db \
+litestream restore -o /var/lib/synch-controlplane/cp.db.new "$REPLICA_URL" \
+  && mv -f /var/lib/synch-controlplane/cp.db.new /var/lib/synch-controlplane/cp.db \
   && curl -fsS -X POST http://127.0.0.1:8080/reload
 ```
 
@@ -74,7 +74,7 @@ secrets.** Protect the replication bucket accordingly.
 1. **Key ceremony** (on the primary host):
 
    ```sh
-   controlplane keygen sync.example.dev /var/lib/controlplane/csk.key
+   controlplane keygen sync.example.dev /var/lib/synch-controlplane/csk.key
    ```
 
    Prints the key tag, the **DS record** for the parent zone, and the
