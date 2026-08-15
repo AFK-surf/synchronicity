@@ -9,12 +9,13 @@ import api/orgs_api
 import api/static
 import auth/session.{type Session}
 import dns/doh
+import dns/serve.{type Serving}
 import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
 import gleam/option.{type Option, None, Some}
+import store/pool
+import store/sqlite
 import wisp.{type Request, type Response}
-import zone/refresh
-import zone/snapshot
 
 pub type Context {
   Context(
@@ -23,22 +24,18 @@ pub type Context {
     ds: String,
     /// Present on the primary only; replicas serve DNS and health alone.
     auth: Option(AuthContext),
-    /// Replica only: the database path POST /reload refreshes from — the
-    /// immediate-pickup half of the external refresh contract.
-    reload_db: Option(String),
+    /// Read-only serving context (pool + apex), both roles. A replica
+    /// needs no reload signal: every checkout reopens the database file,
+    /// so an atomically renamed replacement is picked up on next use.
+    serving: Serving,
   )
 }
 
 pub fn handle(req: Request, ctx: Context) -> Response {
   case wisp.path_segments(req) {
-    ["dns-query"] -> doh.handle(req)
-    ["healthz"] -> healthz()
+    ["dns-query"] -> doh.handle(req, ctx.serving)
+    ["healthz"] -> healthz(ctx.serving)
     ["api", "zone", "anchor"] -> anchor(ctx)
-    ["reload"] ->
-      case req.method, ctx.reload_db {
-        Post, Some(db_path) -> reload(db_path)
-        _, _ -> wisp.not_found()
-      }
     ["auth", ..] | ["api", ..] ->
       case ctx.auth {
         Some(auth) -> primary_routes(req, auth)
@@ -178,32 +175,27 @@ fn with_session(
   })
 }
 
-fn reload(db_path: String) -> Response {
-  case refresh.reload(db_path) {
-    Ok(serial) ->
-      json.object([#("soa_serial", json.int(serial))])
-      |> json.to_string
-      |> wisp.json_response(200)
-    Error(message) ->
-      json.object([#("error", json.string(message))])
-      |> json.to_string
-      |> wisp.json_response(500)
-  }
-}
-
-fn healthz() -> Response {
-  case snapshot.current() {
-    Ok(snap) ->
+fn healthz(serving: Serving) -> Response {
+  let looked =
+    pool.with_connection(serving.pool, fn(conn) {
+      sqlite.query(
+        conn,
+        "SELECT m.soa_serial, min(p.sig_expires_at)
+         FROM zone_meta m, presigned_rrsets p",
+        [],
+      )
+    })
+  case looked {
+    Ok(Ok([[sqlite.Int(serial), sqlite.Int(expires)]])) ->
       json.object([
         #("status", json.string("ok")),
-        #("soa_serial", json.int(snap.serial)),
-        #("sig_expires_at", json.int(snap.min_sig_expires)),
-        #("loaded_at", json.int(snap.loaded_at)),
+        #("soa_serial", json.int(serial)),
+        #("sig_expires_at", json.int(expires)),
       ])
       |> json.to_string
       |> wisp.json_response(200)
-    Error(Nil) ->
-      json.object([#("status", json.string("no zone loaded"))])
+    _ ->
+      json.object([#("status", json.string("no zone available"))])
       |> json.to_string
       |> wisp.json_response(503)
   }

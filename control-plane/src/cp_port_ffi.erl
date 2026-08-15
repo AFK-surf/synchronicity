@@ -2,7 +2,31 @@
 %% Framing is {packet,4} both ways; replies are delivered to the process
 %% that opened the port, so a connection is single-owner by construction.
 -module(cp_port_ffi).
--export([priv_path/1, open/2, rpc/3, close/1, os_pid/1]).
+-export([priv_path/1, open/2, rpc/3, close/1, os_pid/1, give/2, take/1,
+         kill/1]).
+
+%% Ownership transfer, for pooling: the current owner hands the port to
+%% Pid. port_connect links Pid<->Port, so the receiver must call take/1
+%% to drop that link — death detection is rpc/3's monitor, and an
+%% unlinked port cannot kill a non-trapping owner.
+give(Port, Pid) ->
+    try
+        true = erlang:port_connect(Port, Pid),
+        erlang:unlink(Port),
+        {ok, nil}
+    catch
+        error:_ -> {error, nil}
+    end.
+
+take(Port) ->
+    catch erlang:unlink(Port),
+    nil.
+
+%% Force-close from any process (ownership not required): reclaims
+%% workers whose borrower died holding them.
+kill(Port) ->
+    catch erlang:port_close(Port),
+    nil.
 
 priv_path(File) ->
     case code:priv_dir(controlplane) of

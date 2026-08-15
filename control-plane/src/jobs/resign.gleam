@@ -10,7 +10,6 @@ import gleam/string
 import store/db
 import store/sqlite
 import zone/publish
-import zone/snapshot
 
 @external(erlang, "cp_sys_ffi", "now_unix")
 fn now_unix() -> Int
@@ -45,10 +44,6 @@ pub fn run_once(db_path: String, csk: Csk) -> Nil {
         Ok([[sqlite.Int(threshold)]]) if now >= threshold -> {
           case publish.publish(conn, csk, now, "system:resign") {
             Ok(serial) -> {
-              case snapshot.load(conn, now) {
-                Ok(snap) -> snapshot.install(snap)
-                Error(_) -> Nil
-              }
               io.println(
                 "resign: republished, serial " <> int.to_string(serial),
               )

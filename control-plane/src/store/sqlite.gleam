@@ -7,6 +7,7 @@
 //// a connection across processes wrap it in an actor that owns it.
 
 import gleam/bit_array
+import gleam/erlang/process
 import gleam/list
 import gleam/result
 
@@ -172,6 +173,47 @@ pub fn close(conn: Connection) -> Nil {
 /// kill it out from under the connection).
 pub fn os_pid(conn: Connection) -> Int {
   ffi_os_pid(conn.port)
+}
+
+/// Discards all connection state — open transaction, temp tables — and
+/// reopens the database file at the path given to `open`. Pooled
+/// connections run this at checkout: a borrower can never observe a
+/// previous borrower's state, and an atomically replaced database file
+/// (the replica refresh contract) is picked up on next use. Per-connection
+/// pragmas do not survive; the pool re-applies them after.
+pub fn reset(conn: Connection) -> Result(Nil, Error) {
+  use resp <- result.try(rpc(conn, <<0x05>>))
+  case resp {
+    <<0x81>> -> Ok(Nil)
+    other -> Error(expect_error(other))
+  }
+}
+
+@external(erlang, "cp_port_ffi", "give")
+fn ffi_give(port: Port, to: process.Pid) -> Result(Nil, Nil)
+
+@external(erlang, "cp_port_ffi", "take")
+fn ffi_take(port: Port) -> Nil
+
+@external(erlang, "cp_port_ffi", "kill")
+fn ffi_kill(port: Port) -> Nil
+
+/// Transfers ownership of the connection to another process (pooling).
+/// Only the current owner may give; the receiver must `take` before use.
+pub fn give(conn: Connection, to: process.Pid) -> Result(Nil, Nil) {
+  ffi_give(conn.port, to)
+}
+
+/// Completes an ownership transfer on the receiving side.
+pub fn take(conn: Connection) -> Nil {
+  ffi_take(conn.port)
+}
+
+/// Force-closes a connection from any process — for reclaiming workers
+/// whose borrower died. The worker exits; SQLite discards any open
+/// transaction.
+pub fn kill(conn: Connection) -> Nil {
+  ffi_kill(conn.port)
 }
 
 fn rpc(conn: Connection, payload: BitArray) -> Result(BitArray, Error) {

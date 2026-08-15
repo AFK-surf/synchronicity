@@ -1,7 +1,7 @@
 %% Test-only helpers: unique temp database paths, and killing the csqlite
 %% OS process out from under a connection for the crash-isolation test.
 -module(test_ffi).
--export([tmp_db/0, kill9/1]).
+-export([tmp_db/0, kill9/1, rename/2]).
 
 tmp_db() ->
     %% unique_integer is only unique within one VM run; the wall clock keeps
@@ -15,4 +15,8 @@ tmp_db() ->
 
 kill9(OsPid) ->
     _ = os:cmd("kill -9 " ++ integer_to_list(OsPid)),
+    nil.
+
+rename(From, To) ->
+    ok = file:rename(From, To),
     nil.

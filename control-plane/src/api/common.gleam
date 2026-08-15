@@ -10,7 +10,6 @@ import gleam/string
 import store/sqlite.{type Connection, Int as VInt, Text}
 import wisp.{type Response}
 import zone/publish
-import zone/snapshot
 
 pub type Role {
   Owner
@@ -112,9 +111,8 @@ pub fn transaction(
 /// Runs `work` and a full zone republish in one transaction. Every product
 /// mutation goes through here — the zone on disk is never out of step with
 /// the tables, and an invariant violation rolls the whole thing back.
-/// After commit the in-memory snapshot is reinstalled, so the primary's
-/// own DNS/DoH answers reflect the mutation immediately, not at the next
-/// restart or re-sign.
+/// DNS answers read the database directly, so the commit itself is what
+/// makes the mutation visible — there is no cache to refresh.
 pub fn zone_mutation(
   conn: Connection,
   ctx: AuthContext,
@@ -132,14 +130,6 @@ pub fn zone_mutation(
     })
   case outcome {
     Ok(#(payload, serial)) -> {
-      // Committed: the database is authoritative. Serving the fresh zone
-      // is best-effort here — on failure the primary keeps the previous
-      // snapshot (visible in /healthz) and replicas/resign still converge.
-      case snapshot.load(conn, now_unix()) {
-        Ok(snap) -> snapshot.install(snap)
-        Error(_) ->
-          wisp.log_error("zone_mutation: committed but snapshot reload failed")
-      }
       json.object([
         #("ok", json.bool(True)),
         #("soa_serial", json.int(serial)),

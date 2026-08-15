@@ -69,8 +69,21 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1]
+  [v1, v2]
 }
+
+/// V2: DNS answers query SQLite directly (no in-memory snapshot), so
+/// canonical DNS order must be computable in SQL — `sort_key` is the
+/// reversed-label byte encoding whose BLOB order equals RFC 4034 §6.1
+/// order. The nsec_chain table is redundant once NSEC rows are reachable
+/// by sort_key (every owner carries its NSEC RRset in presigned_rrsets).
+/// Publish rewrites every presigned row, so the empty default only exists
+/// until the boot republish.
+const v2 = "
+ALTER TABLE presigned_rrsets ADD COLUMN sort_key BLOB NOT NULL DEFAULT x'';
+CREATE INDEX presigned_by_sort_key ON presigned_rrsets (sort_key, rtype);
+DROP TABLE nsec_chain;
+"
 
 /// V1: the whole product schema.
 ///

@@ -11,18 +11,19 @@ import auth/oidc
 import auth/session
 import dnssec/keys
 import email/mailer.{type Mailer}
-import exception
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None}
-import store/db
+import store/pool.{type Pool}
 import store/sqlite.{type Connection, Text}
 import wisp.{type Request, type Response}
 
 pub type AuthContext {
   AuthContext(
-    db_path: String,
+    /// Request-scoped connections come from here; every checkout is
+    /// reset to pristine.
+    pool: Pool,
     public_url: String,
     mail: Mailer,
     google: Option(Provider),
@@ -32,21 +33,13 @@ pub type AuthContext {
   )
 }
 
-/// Opens a request-scoped connection (csqlite processes are cheap and the
-/// dashboard's write rate is tiny; WAL + busy_timeout serialize writers).
-///
-/// The close is deferred, not sequential: a panic anywhere in `next` must
-/// still tear the connection down. Wisp rescues crashes, so the process
-/// survives — without the defer, a panic inside an open BEGIN IMMEDIATE
-/// would leave a csqlite process holding the database write lock for the
-/// life of the HTTP connection, wedging every subsequent write. Closing
-/// the port makes SQLite discard any open transaction.
+/// Runs `next` with a pooled, freshly reset connection. The pool returns
+/// the worker on every exit path — panics included — and a borrower that
+/// dies holding one is reclaimed by monitor, so a crashed handler can
+/// never wedge the database write lock.
 pub fn with_db(ctx: AuthContext, next: fn(Connection) -> Response) -> Response {
-  case db.open_primary(ctx.db_path) {
-    Ok(conn) -> {
-      use <- exception.defer(fn() { sqlite.close(conn) })
-      next(conn)
-    }
+  case pool.with_connection(ctx.pool, next) {
+    Ok(response) -> response
     Error(_) -> error_json(500, "internal", "database unavailable")
   }
 }

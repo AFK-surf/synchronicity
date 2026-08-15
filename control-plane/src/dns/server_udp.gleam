@@ -1,11 +1,10 @@
 //// DNS over UDP: a passive-recv loop on one socket. Datagram in, answer
-//// out, truncating to the query's EDNS limit; the snapshot read is
-//// zero-copy so the single loop keeps up far past this service's QPS.
+//// out, truncating to the query's EDNS limit. Answers come straight from
+//// pooled SQLite reads; the loop is serial, which is ample for this
+//// service's QPS.
 
-import dns/query
-import dns/wire
+import dns/serve.{type Serving}
 import gleam/erlang/process
-import zone/snapshot
 
 /// gen_udp socket (opaque).
 pub type Socket
@@ -31,10 +30,10 @@ fn udp_recv(
 fn udp_send(socket: Socket, peer: Peer, packet: BitArray) -> Result(Nil, Nil)
 
 /// Binds the port and starts the serving loop in its own process.
-pub fn start(port: Int) -> Result(Nil, String) {
+pub fn start(port: Int, serving: Serving) -> Result(Nil, String) {
   case udp_open(port) {
     Ok(socket) -> {
-      process.spawn(fn() { loop(socket) })
+      process.spawn(fn() { loop(socket, serving) })
       Ok(Nil)
     }
     Error(Nil) ->
@@ -44,33 +43,19 @@ pub fn start(port: Int) -> Result(Nil, String) {
   }
 }
 
-fn loop(socket: Socket) -> Nil {
+fn loop(socket: Socket, serving: Serving) -> Nil {
   case udp_recv(socket, 30_000) {
-    Error(Timeout) -> loop(socket)
+    Error(Timeout) -> loop(socket, serving)
     Error(Closed) -> Nil
     Ok(#(peer, packet)) -> {
-      case handle(packet) {
+      case serve.handle_packet(serving, packet, True) {
         Ok(response) -> {
           let _ = udp_send(socket, peer, response)
           Nil
         }
         Error(Nil) -> Nil
       }
-      loop(socket)
+      loop(socket, serving)
     }
-  }
-}
-
-/// One datagram's worth of work; pure given the installed snapshot.
-pub fn handle(packet: BitArray) -> Result(BitArray, Nil) {
-  case wire.decode_query(packet) {
-    Ok(q) ->
-      case snapshot.current() {
-        Ok(snap) -> Ok(query.fit_udp(q, query.answer(snap, q)))
-        // No snapshot loaded yet: SERVFAIL (rcode 2) beats silence.
-        Error(Nil) -> Ok(query.error_stub(q.id, 2))
-      }
-    Error(wire.Unsupported(id)) -> Ok(query.error_stub(id, query.rcode_notimp))
-    Error(wire.Malformed) -> Error(Nil)
   }
 }

@@ -95,3 +95,24 @@ pub fn in_zone(name: Name, apex: Name) -> Bool {
   let name_len = list.length(name)
   name_len >= apex_len && list.drop(name, name_len - apex_len) == apex
 }
+
+/// A byte string whose plain byte order equals canonical DNS order
+/// (RFC 4034 §6.1): labels reversed, each terminated by 0x00 — which
+/// sorts below every permitted label byte, so ancestors sort before
+/// descendants and label boundaries compare correctly. This is what lets
+/// SQLite BLOB comparison answer NSEC predecessor queries.
+pub fn sort_key(name: Name) -> BitArray {
+  name
+  |> list.reverse
+  |> list.map(fn(label) { <<label:utf8, 0>> })
+  |> bit_array.concat
+}
+
+/// The exclusive upper bound of `name`'s descendant range: every name at
+/// or under `name` has a sort_key in [sort_key(name), sort_key_upper(name)).
+/// A key with this key as prefix is either the name itself (nothing after
+/// the prefix) or a descendant (next byte is a label byte, ≤ 0x7a) — so
+/// appending 0xff bounds exactly that set and nothing else.
+pub fn sort_key_upper(name: Name) -> BitArray {
+  bit_array.concat([sort_key(name), <<0xff>>])
+}

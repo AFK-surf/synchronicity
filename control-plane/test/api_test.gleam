@@ -1,6 +1,9 @@
 import api/auth_api
 import api/router
 import auth/session
+import dns/name as dns_name
+import dns/serve
+import dns/wire
 import dnssec/keys
 import email/mailer
 import exception
@@ -18,7 +21,6 @@ import wisp
 import wisp/simulate
 import zone/model
 import zone/publish
-import zone/snapshot
 
 @external(erlang, "test_ffi", "tmp_db")
 fn tmp_db() -> String
@@ -52,10 +54,14 @@ fn harness() -> Harness {
       [],
     )
   let assert Ok(#(token, live)) = session.create(conn, "u-admin", now_unix())
+  let assert Ok(_) = publish.publish(conn, csk, now_unix(), "test:boot")
   sqlite.close(conn)
+  let assert Ok(api_pool) = db.start_primary_pool(db_path, 2)
+  let assert Ok(dns_pool) = db.start_read_pool(db_path, 2)
+  let assert Ok(apex) = dns_name.parse("sync.test.")
   let auth =
     auth_api.AuthContext(
-      db_path,
+      api_pool,
       "http://cp.test",
       mailer.LogOnly,
       None,
@@ -63,7 +69,7 @@ fn harness() -> Harness {
       csk,
     )
   Harness(
-    router.Context("anchor", "ds", Some(auth), None),
+    router.Context("anchor", "ds", Some(auth), serve.Serving(dns_pool, apex)),
     db_path,
     token,
     live.csrf,
@@ -497,10 +503,9 @@ pub fn invite_accept_test() {
   sqlite.close(conn2)
 }
 
-pub fn mutation_reinstalls_served_snapshot_test() {
-  // The bug this guards against: zone_mutation committing the republish
-  // but leaving the primary's in-memory snapshot stale, so the primary's
-  // own DNS kept answering with the pre-mutation zone until restart.
+pub fn mutation_visible_to_dns_immediately_test() {
+  // Guards the core visibility promise: a committed mutation is what the
+  // DNS serving path answers with — there is no cache to go stale.
   let h = harness()
   let assert 200 =
     call_json(
@@ -519,12 +524,43 @@ pub fn mutation_reinstalls_served_snapshot_test() {
       "/api/orgs/snaporg/networks",
       json.object([#("name", json.string("prod"))]),
     ).status
-  let assert Ok(conn) = db.open_primary(h.db_path)
-  let assert Ok(meta) = model.read_meta(conn)
-  sqlite.close(conn)
-  // The globally served snapshot is the committed zone, immediately.
-  let assert Ok(snap) = snapshot.current()
-  assert snap.serial == meta.soa_serial
+  let created =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/snaporg/devices",
+      json.object([#("label", json.string("nas")), #("nk", json.string(nk()))]),
+    )
+  assert created.status == 200
+  let assert Ok(#(_, rest)) =
+    string.split_once(simulate.read_body(created), "device_id\":\"")
+  let assert Ok(#(device_id, _)) = string.split_once(rest, "\"")
+  let assert 200 =
+    call(
+      h,
+      authed(h, Put, "/api/orgs/snaporg/networks/prod/devices/" <> device_id),
+    ).status
+  // The DNS path reads the same database the mutation committed to: the
+  // device's membership record resolves on the very next query, through
+  // the same pooled serving path the real servers use.
+  let router.Context(_, _, _, serving) = h.ctx
+  let assert Ok(qname) =
+    dns_name.parse("_synchronicity.prod.snaporg.sync.test.")
+  let question = <<
+    9:int-size(16),
+    0:int-size(16),
+    1:int-size(16),
+    0:int-size(48),
+    dns_name.encode(qname):bits,
+    16:int-size(16),
+    1:int-size(16),
+  >>
+  let assert Ok(response) = serve.handle_packet(serving, question, False)
+  let assert Ok(msg) = wire.decode_message(response)
+  // NOERROR with exactly the freshly published TXT record.
+  assert msg.flags % 16 == 0
+  let assert [rr] = msg.answers
+  assert rr.rtype == wire.type_txt
 }
 
 pub fn with_db_discards_conn_on_panic_test() {

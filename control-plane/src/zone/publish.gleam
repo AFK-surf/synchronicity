@@ -128,7 +128,7 @@ pub fn publish_in_tx(
     list.try_fold(signed, Nil, fn(_, s) {
       sqlite.exec(
         conn,
-        "INSERT INTO presigned_rrsets VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO presigned_rrsets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
           Text(name.to_string(s.owner)),
           VInt(s.rtype),
@@ -138,28 +138,9 @@ pub fn publish_in_tx(
           VInt(expiration),
           VInt(meta.soa_serial),
           VInt(now),
+          Blob(name.sort_key(s.owner)),
         ],
       )
-      |> result.map_error(Db)
-      |> result.replace(Nil)
-    }),
-  )
-
-  use _ <- result.try(exec(conn, "DELETE FROM nsec_chain"))
-  let owners = build.owners_in_order(rrsets)
-  let nexts = case owners {
-    [first, ..rest] -> list.zip(owners, list.append(rest, [first]))
-    [] -> []
-  }
-  use Nil <- result.try(
-    list.index_fold(nexts, Ok(Nil), fn(acc, pair, index) {
-      use Nil <- result.try(acc)
-      let #(owner, next) = pair
-      sqlite.exec(conn, "INSERT INTO nsec_chain VALUES (?, ?, ?)", [
-        Text(name.to_string(owner)),
-        Text(name.to_string(next)),
-        VInt(index),
-      ])
       |> result.map_error(Db)
       |> result.replace(Nil)
     }),

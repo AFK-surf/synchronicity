@@ -1,7 +1,9 @@
 //// Connection lifecycle: which pragmas a connection runs before anyone
 //// else touches it, and which modes the two roles are allowed.
 
+import gleam/otp/actor
 import gleam/result
+import store/pool
 import store/sqlite.{type Connection, type Error}
 
 /// The primary's writer: WAL (required by external replication tooling
@@ -38,4 +40,32 @@ fn pragmas(conn: Connection, sql: String) -> Result(Nil, Error) {
       Error(e)
     }
   }
+}
+
+/// The primary's per-checkout pragmas (WAL is set at boot and sticky in
+/// the file; foreign keys and busy timeout are per-connection and must be
+/// re-applied after every pool reset).
+pub const primary_pragmas = "PRAGMA busy_timeout=5000;
+   PRAGMA foreign_keys=ON;
+   PRAGMA synchronous=NORMAL;"
+
+/// Read-only serving pragmas.
+pub const read_pragmas = "PRAGMA busy_timeout=5000;
+   PRAGMA query_only=ON;"
+
+/// The dashboard/API pool: read-write workers over an existing database.
+pub fn start_primary_pool(
+  path: String,
+  size: Int,
+) -> Result(pool.Pool, actor.StartError) {
+  pool.start(path, sqlite.ReadWrite, primary_pragmas, size)
+}
+
+/// The DNS serving pool: read-only workers; checkout-reset makes replica
+/// file swaps visible on the next query.
+pub fn start_read_pool(
+  path: String,
+  size: Int,
+) -> Result(pool.Pool, actor.StartError) {
+  pool.start(path, sqlite.ReadOnly, read_pragmas, size)
 }

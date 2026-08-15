@@ -15,6 +15,7 @@ import auth/google
 import auth/magic
 import config.{type Config, Primary, Replica}
 import dns/name
+import dns/serve as dns_serve
 import dns/server_tcp
 import dns/server_udp
 import dnssec/keys
@@ -34,8 +35,6 @@ import thirtytwo
 import wisp/wisp_mist
 import zone/model
 import zone/publish
-import zone/refresh
-import zone/snapshot
 
 @external(erlang, "cp_sys_ffi", "argv")
 fn argv() -> List(String)
@@ -138,9 +137,7 @@ fn open_primary_db(cfg: Config) -> Result(sqlite.Connection, String) {
   Ok(conn)
 }
 
-fn prepare_primary(
-  cfg: Config,
-) -> Result(#(sqlite.Connection, keys.Csk), String) {
+fn prepare_primary(cfg: Config) -> Result(keys.Csk, String) {
   use conn <- result.try(open_primary_db(cfg))
   use csk <- result.try(keys.load(cfg.key_file))
   use Nil <- result.try(publish.ensure_meta(conn, cfg.base_domain, csk))
@@ -152,9 +149,8 @@ fn prepare_primary(
     publish.publish(conn, csk, now_unix(), "system:boot")
     |> result.map_error(fn(e) { "publishing zone: " <> string.inspect(e) }),
   )
-  use snap <- result.try(snapshot.load(conn, now_unix()))
-  snapshot.install(snap)
-  Ok(#(conn, csk))
+  sqlite.close(conn)
+  Ok(csk)
 }
 
 fn serve() -> Result(Nil, String) {
@@ -167,30 +163,46 @@ fn serve() -> Result(Nil, String) {
 
 /// A replica serves DNS/DoH from a database an external process refreshes
 /// (atomic rename); it holds no key material and mounts no product API.
+/// No reload signal exists or is needed: every pooled checkout reopens
+/// the database file, so a swapped replacement is seen on the next query.
 fn serve_replica(cfg: Config) -> Result(Nil, String) {
-  use _serial <- result.try(refresh.reload(cfg.db_path))
-  // Anchor/DS come from the replicated public key material.
+  // Anchor/DS come from the replicated public key material; this also
+  // verifies the database is readable and not from a newer build.
   use meta <- result.try({
     use conn <- result.try(
       db.open_read(cfg.db_path)
       |> result.map_error(fn(e) { "opening db: " <> string.inspect(e) }),
     )
+    use version <- result.try(
+      migrate.current_version(conn)
+      |> result.map_error(fn(e) {
+        "reading schema version: " <> string.inspect(e)
+      }),
+    )
+    use Nil <- result.try(case version > migrate.build_version() {
+      True -> Error("database is from a newer build — refusing")
+      False -> Ok(Nil)
+    })
     let meta =
       model.read_meta(conn)
       |> result.map_error(fn(e) { "reading zone_meta: " <> string.inspect(e) })
     sqlite.close(conn)
     meta
   })
+  use dns_pool <- result.try(
+    db.start_read_pool(cfg.db_path, 4)
+    |> result.map_error(fn(_) { "could not start read pool" }),
+  )
+  let serving = dns_serve.Serving(dns_pool, meta.apex)
   let ctx =
     router.Context(
       keys.anchor_line(meta.apex, meta.dnskey_public),
       keys.ds_line(meta.apex, meta.dnskey_public),
       option.None,
-      option.Some(cfg.db_path),
+      serving,
     )
-  refresh.start_poll(cfg.db_path)
-  use Nil <- result.try(server_udp.start(cfg.dns_port))
-  use Nil <- result.try(server_tcp.start(cfg.dns_port))
+  use Nil <- result.try(server_udp.start(cfg.dns_port, serving))
+  use Nil <- result.try(server_tcp.start(cfg.dns_port, serving))
   let handler = fn(req) { router.handle(req, ctx) }
   use _ <- result.try(
     wisp_mist.handler(handler, "replica-has-no-sessions-0000000000000000")
@@ -213,7 +225,7 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
 }
 
 fn serve_primary(cfg: Config) -> Result(Nil, String) {
-  use #(_conn, csk) <- result.try(prepare_primary(cfg))
+  use csk <- result.try(prepare_primary(cfg))
   use apex <- result.try(
     name.parse(cfg.base_domain) |> result.replace_error("bad base domain"),
   )
@@ -223,9 +235,18 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
     option.None -> mailer.LogOnly
   }
   io.println("mailer: " <> mailer.describe(mail))
+  use api_pool <- result.try(
+    db.start_primary_pool(cfg.db_path, 4)
+    |> result.map_error(fn(_) { "could not start api pool" }),
+  )
+  use dns_pool <- result.try(
+    db.start_read_pool(cfg.db_path, 4)
+    |> result.map_error(fn(_) { "could not start read pool" }),
+  )
+  let serving = dns_serve.Serving(dns_pool, apex)
   let auth =
     auth_api.AuthContext(
-      cfg.db_path,
+      api_pool,
       cfg.public_url,
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
@@ -237,11 +258,11 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       keys.anchor_line(apex, csk.public),
       keys.ds_line(apex, csk.public),
       option.Some(auth),
-      option.None,
+      serving,
     )
 
-  use Nil <- result.try(server_udp.start(cfg.dns_port))
-  use Nil <- result.try(server_tcp.start(cfg.dns_port))
+  use Nil <- result.try(server_udp.start(cfg.dns_port, serving))
+  use Nil <- result.try(server_tcp.start(cfg.dns_port, serving))
   resign.start(cfg.db_path, csk)
 
   let secret = cfg.session_secret

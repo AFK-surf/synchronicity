@@ -32,7 +32,8 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   SQLite behind `csqlite/` — a small C port program speaking a framed
   stdio protocol, one OS process per connection, so the BEAM never loads
   SQLite (no NIFs; links against the system libsqlite3). Zones are
-  pre-signed at mutation time and served from an in-memory snapshot.
+  pre-signed at mutation time and served straight from SQLite through a
+  pool of reset-on-checkout workers (one read transaction per answer).
 - **Frontend**: Vite + React + TypeScript + Tailwind (`web/`).
 - **Replication**: primary + read-only DNS replicas fed by external,
   operator-owned tooling (e.g. litestream). See `ops/RUNBOOK.md`.

@@ -15,6 +15,8 @@
  *   0x02 EXEC   u32 sql_len, sql, u16 nparams, nparams TLV values
  *   0x03 CLOSE  (empty)
  *   0x04 SCRIPT sql = rest of frame     -- sqlite3_exec, no params, no rows
+ *   0x05 RESET  (empty)  -- close + reopen the OPENed path: discards all
+ *                           connection state and picks up a replaced file
  *
  * Responses:
  *   0x81 OK
@@ -59,6 +61,7 @@ enum {
   OP_EXEC = 0x02,
   OP_CLOSE = 0x03,
   OP_SCRIPT = 0x04,
+  OP_RESET = 0x05,
   RESP_OK = 0x81,
   RESP_DONE = 0x82,
   RESP_ROWS = 0x83,
@@ -472,6 +475,36 @@ static void handle_exec(sqlite3 *db, Cur *c) {
 
 /* ---- main loop --------------------------------------------------------- */
 
+/* Opens `zpath` with the mode's flags and the full hostile-file hardening
+ * applied. On failure the handle is closed and *out is NULL. */
+static int open_hardened(const char *zpath, uint8_t mode, sqlite3 **out) {
+  int flags = mode == 0   ? SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW
+              : mode == 1 ? SQLITE_OPEN_READWRITE
+                          : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+  flags |= SQLITE_OPEN_EXRESCODE;
+  sqlite3 *db = NULL;
+  int rc = sqlite3_open_v2(zpath, &db, flags, NULL);
+  if (rc != SQLITE_OK) {
+    if (db) sqlite3_close_v2(db);
+    *out = NULL;
+    return rc;
+  }
+  sqlite3_extended_result_codes(db, 1);
+  /* Replicas open database files written by external replication
+   * tooling — treat every file as potentially hostile. */
+  sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, 1, NULL);
+  sqlite3_db_config(db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, NULL);
+  sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, NULL);
+  sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 16 * 1024 * 1024);
+  sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024);
+  sqlite3_limit(db, SQLITE_LIMIT_EXPR_DEPTH, 200);
+  sqlite3_limit(db, SQLITE_LIMIT_VDBE_OP, 250000);
+  sqlite3_busy_timeout(db, 5000);
+  sqlite3_exec(db, "PRAGMA cell_size_check=ON", NULL, NULL, NULL);
+  *out = db;
+  return SQLITE_OK;
+}
+
 int main(void) {
   /* The database (and its -wal/-shm/journal companions) holds user and
    * key-binding state; never create it world-readable. */
@@ -481,6 +514,8 @@ int main(void) {
   signal(SIGPIPE, SIG_IGN);
 
   sqlite3 *db = NULL;
+  char *saved_path = NULL;
+  uint8_t saved_mode = 0;
   uint8_t hdr[4];
 
   while (read_exact(hdr, 4)) {
@@ -531,33 +566,37 @@ int main(void) {
         }
         memcpy(zpath, path, path_len);
         zpath[path_len] = '\0';
-        int flags = mode == 0   ? SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW
-                    : mode == 1 ? SQLITE_OPEN_READWRITE
-                                : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-        flags |= SQLITE_OPEN_EXRESCODE;
-        int rc = sqlite3_open_v2(zpath, &db, flags, NULL);
-        free(zpath);
+        int rc = open_hardened(zpath, mode, &db);
         if (rc != SQLITE_OK) {
-          const char *msg = db ? sqlite3_errmsg(db) : "open failed";
-          reply_err_msg(rc, msg);
-          if (db) {
-            sqlite3_close_v2(db);
-            db = NULL;
-          }
+          free(zpath);
+          reply_err_msg(rc, "open failed");
           break;
         }
-        sqlite3_extended_result_codes(db, 1);
-        /* Replicas open database files written by external replication
-         * tooling — treat every file as potentially hostile. */
-        sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, 1, NULL);
-        sqlite3_db_config(db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, NULL);
-        sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, NULL);
-        sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 16 * 1024 * 1024);
-        sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024);
-        sqlite3_limit(db, SQLITE_LIMIT_EXPR_DEPTH, 200);
-        sqlite3_limit(db, SQLITE_LIMIT_VDBE_OP, 250000);
-        sqlite3_busy_timeout(db, 5000);
-        sqlite3_exec(db, "PRAGMA cell_size_check=ON", NULL, NULL, NULL);
+        /* Remember the identity for RESET: pooled connections reopen the
+         * same path so an atomically renamed replacement file is picked
+         * up on the next checkout. */
+        free(saved_path);
+        saved_path = zpath;
+        saved_mode = mode;
+        reply_ok();
+        break;
+      }
+      case OP_RESET: {
+        /* Discard all connection state — open transaction, temp tables,
+         * statement caches — and reopen the saved path fresh. */
+        if (!saved_path) {
+          reply_err_msg(SQLITE_MISUSE, "RESET before OPEN");
+          break;
+        }
+        if (db) {
+          sqlite3_close_v2(db);
+          db = NULL;
+        }
+        int rc = open_hardened(saved_path, saved_mode, &db);
+        if (rc != SQLITE_OK) {
+          reply_err_msg(rc, "reopen failed");
+          break;
+        }
         reply_ok();
         break;
       }

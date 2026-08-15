@@ -113,8 +113,15 @@ out=$(delv @127.0.0.1 -p 5360 -a "$WORKDIR/anchor.bindkeys" \
       +root="$CP_BASE_DOMAIN" "$QNAME" TXT 2>&1)
 grep -q "fully validated" <<<"$out" || { echo "FAIL: replica validation"; echo "$out"; cat "$WORKDIR/replica.log"; exit 1; }
 echo "ok: replica serves the same fully-validated zone (no key material)"
-curl -fsS -X POST "http://127.0.0.1:8054/reload" >/dev/null
-echo "ok: replica /reload responds"
+# Refresh contract: atomically replace the replica's DB file with a newer
+# copy (the primary re-published above, so serials differ) — the very next
+# query must see it, with no reload signal of any kind.
+cp "$CP_DB_PATH" "$WORKDIR/replica.db.new"
+mv -f "$WORKDIR/replica.db.new" "$WORKDIR/replica.db"
+out=$(delv @127.0.0.1 -p 5360 -a "$WORKDIR/anchor.bindkeys" \
+  +root=sync.test "_synchronicity.prod.acme.sync.test" TXT 2>&1) || true
+grep -q "fully validated" <<<"$out" || { echo "FAIL: replica after file swap"; echo "$out"; cat "$WORKDIR/replica.log"; exit 1; }
+echo "ok: replica serves the swapped database file on the next query, fully validated"
 
 # The actual synchronicity client resolver, over DoH.
 export CP_DOH_URL="http://127.0.0.1:$CP_HTTP_PORT/dns-query"

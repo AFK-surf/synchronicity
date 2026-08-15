@@ -19,14 +19,16 @@ TXT records, served over port 53 (UDP+TCP) and RFC 8484 DoH.
   - the primary keeps the DB in WAL mode (it does, always);
   - something replaces each replica's DB file via *write-new + atomic
     rename*;
-  - the replica notices within ~10s (mtime poll) or immediately after
-    `curl -X POST 127.0.0.1:<http>/reload`.
+  - nothing else: every query checks a pooled worker out, and checkout
+    reopens the database file — a swapped file is served on the very
+    next query. There is no reload signal and no poll.
 
-  Staleness bound: refresh interval R + 10s poll + reload. With R=60s
+  Staleness bound: your refresh interval R, full stop. With R=60s
   that is well inside the 300s record TTL and the client's 10-minute
   trust grace. If refresh stops, the replica keeps serving its last good
-  snapshot (signatures stay valid for days) and `/healthz` shows the
-  stale `loaded_at`. A DB from a newer build is refused, never probed.
+  database file (signatures stay valid for days) and `/healthz` shows
+  the stale serial. A DB from a newer build is refused at every
+  checkout, never probed.
 
 ### Example litestream setup (operator-owned, not shipped config)
 
@@ -46,8 +48,7 @@ Replica restore loop (cron/systemd timer, ~60s):
 
 ```sh
 litestream restore -o /var/lib/synch-controlplane/cp.db.new "$REPLICA_URL" \
-  && mv -f /var/lib/synch-controlplane/cp.db.new /var/lib/synch-controlplane/cp.db \
-  && curl -fsS -X POST http://127.0.0.1:8080/reload
+  && mv -f /var/lib/synch-controlplane/cp.db.new /var/lib/synch-controlplane/cp.db
 ```
 
 **The database contains OAuth client secrets and per-org OIDC client
