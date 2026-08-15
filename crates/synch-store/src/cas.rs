@@ -538,12 +538,18 @@ impl Store {
                 encode_ranges_validated(data.as_slice(), outboard, &bao_ranges, &mut encoded)
             }
             None => {
+                // Both files are read positionally, never slurped. An outboard
+                // is 1/256 of its object, so reading it whole costs 40 MB on a
+                // 10 GB object — and this runs once per served window (§6.4)
+                // and once per chunk of a streaming read, which turns a large
+                // object's transfer into a repeated scan of its own hash tree.
+                // What each call actually touches is the sibling hashes on the
+                // path to the requested groups.
                 let data = File::open(self.blob_path(&blob.root))?;
-                let outboard_data = std::fs::read(self.outboard_path(&blob.root))?;
                 let outboard = PreOrderOutboard {
                     root: root_hash,
                     tree,
-                    data: outboard_data,
+                    data: DataFile(File::open(self.outboard_path(&blob.root))?),
                 };
                 encode_ranges_validated(DataFile(data), outboard, &bao_ranges, &mut encoded)
             }
