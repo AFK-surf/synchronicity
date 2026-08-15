@@ -1,0 +1,26 @@
+# The primary: dashboard/API + authoritative DNS + DoH. One per deployment.
+# Fill CP_* in /etc/synch-controlplane/primary.env (see RUNBOOK.md).
+[Unit]
+Description=synchronicity control plane (primary)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=synch-controlplane
+Group=synch-controlplane
+EnvironmentFile=/etc/synch-controlplane/primary.env
+WorkingDirectory=/opt/synch-controlplane
+ExecStart=/opt/synch-controlplane/bin/controlplane serve
+Restart=on-failure
+RestartSec=2
+# Port 53 without root:
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/synch-controlplane
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

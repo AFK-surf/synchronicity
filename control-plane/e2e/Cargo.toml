@@ -1,0 +1,17 @@
+# Cross-validation harness: points the ACTUAL synchronicity resolver
+# (synch-net's DnssecResolver, hickory underneath) at the control plane's
+# DoH endpoint with the control plane's trust anchor. Deliberately NOT a
+# member of the root Cargo workspace — `cargo test --workspace` stays fast
+# and network-free; this crate runs from control-plane/e2e/run.sh.
+[package]
+name = "cp-e2e"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+synch-net = { path = "../../crates/synch-net" }
+synch-core = { path = "../../crates/synch-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

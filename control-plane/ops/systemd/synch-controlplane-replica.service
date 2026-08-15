@@ -1,0 +1,26 @@
+# A replica: DNS + DoH from a database file an EXTERNAL process refreshes
+# (litestream restore loop, rsync — operator-owned; see RUNBOOK.md). The
+# service itself never runs or supervises the replication tool.
+[Unit]
+Description=synchronicity control plane (replica)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=synch-controlplane
+Group=synch-controlplane
+EnvironmentFile=/etc/synch-controlplane/replica.env
+WorkingDirectory=/opt/synch-controlplane
+ExecStart=/opt/synch-controlplane/bin/controlplane serve
+Restart=on-failure
+RestartSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/synch-controlplane
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

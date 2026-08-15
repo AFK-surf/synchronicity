@@ -1,0 +1,32 @@
+# Control-plane development tasks. Run from control-plane/.
+# Requires: asdf (erlang + gleam per .tool-versions), cc, libsqlite3-dev, node.
+
+# Build the csqlite port program (system libsqlite3).
+csqlite:
+    make -C csqlite
+
+# Run backend unit tests.
+test: csqlite
+    gleam test
+
+# Type-check, test, build the SPA, and stage it for the Gleam server.
+web-build:
+    cd web && npm ci && npx tsc -b && npx vitest run && npx vite build
+    rm -rf priv/web && cp -r web/dist priv/web
+
+# Backend + frontend dev servers (backend on :8080, vite proxies to it).
+dev: csqlite
+    #!/usr/bin/env bash
+    set -euo pipefail
+    gleam run -- serve &
+    trap 'kill %1' EXIT
+    cd web && npm run dev
+
+# Full e2e: build, seed a throwaway zone, validate with delv and the
+# actual synchronicity Rust resolver (control-plane/e2e).
+e2e: csqlite
+    ./e2e/run.sh
+
+# Verify the migration chain replays from scratch.
+migrate-check: csqlite
+    gleam run -- migrate-check

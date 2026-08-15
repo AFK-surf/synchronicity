@@ -1,0 +1,7 @@
+build/
+priv/csqlite
+erl_crash.dump
+web/node_modules/
+web/dist/
+e2e/target/
+priv/web/
