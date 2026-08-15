@@ -1321,10 +1321,13 @@ mod tests {
     /// `#[tokio::test]` gives a current-thread runtime, which is what makes
     /// this decisive rather than probabilistic: there is exactly one thread
     /// that can poll tasks. A ticker task counts how many times it is polled
-    /// across the scan. Run inline — `self.scan_and_stage()`, as this used to
-    /// be — the whole scan happens between two statements of a single poll, no
-    /// other task can be polled while it does, and the count cannot move at
-    /// all. It moves only if the hashing genuinely left the runtime.
+    /// across the scan, and the assertion is on the *rate*, not on movement.
+    /// Movement alone proves nothing — any await that returns `Pending` once
+    /// lets the ticker run a handful of times, so a scan that offloaded only
+    /// its SQLite commit and hashed inline would still show a count that
+    /// moved. A thread free for the duration of 16 MiB of BLAKE3 is polled
+    /// orders of magnitude more often than that; a thread doing the hashing
+    /// itself cannot be polled at all while it does.
     #[tokio::test]
     async fn a_scan_does_not_block_the_runtime() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1356,10 +1359,17 @@ mod tests {
         let report = node.scan_and_stage_off_runtime().await.unwrap();
         let after = ticks.load(Ordering::Relaxed);
 
+        // A free current-thread runtime spins this ticker millions of times
+        // per second, so the bar is set far above what a single `Pending`
+        // return can account for and far below what the machine has to manage
+        // to clear it.
+        const FREE_RUNTIME_TICKS: usize = 10_000;
+
         assert_eq!(report.hashed, 32);
         assert!(
-            after > before,
-            "the runtime was not polling anything while the scan ran ({before} -> {after})"
+            after - before > FREE_RUNTIME_TICKS,
+            "the runtime was barely polling while the scan ran ({before} -> {after}): the \
+             hashing is back on a runtime worker"
         );
         ticker.abort();
         node.shutdown().await.unwrap();

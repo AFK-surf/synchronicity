@@ -1073,6 +1073,15 @@ dispatched to tokio's blocking pool (`synch_engine::blocking`,
 lookups — one indexed `SELECT`, a single `stat` — stay inline, where the handoff
 would cost more than the work itself.
 
+This relocates the queue rather than removing it: the one connection mutex is
+still the bottleneck, and a long exclusive holder (a GC pass, a full publish
+batch) now parks blocking-pool threads instead of runtime workers. What it buys
+is that the parked threads are no longer the ones that have to poll the
+endpoint, the timers, and every other connection — the daemon stays responsive
+while it is slow, rather than going silent. Since a blocking task cannot be
+cancelled, anything that must happen even if the caller walks away — restaging a
+failed publish batch — belongs inside the closure, not around the await.
+
 **Migrations.** The schema's single source of truth is an ordered chain of
 migrations: `MIGRATIONS[v]` takes a database from version `v` to `v+1`, and version
 1 is the original schema. A fresh database is built by replaying the whole chain

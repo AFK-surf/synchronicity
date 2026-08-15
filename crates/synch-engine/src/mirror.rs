@@ -106,7 +106,6 @@ impl Node {
 
     async fn sync_mirror_row(&self, mirror: &MirrorRow) -> Result<MirrorReport> {
         let root_dir = PathBuf::from(&mirror.local_path);
-        let listing = self.unified_listing(&mirror.space, "", None, None)?;
 
         // A pass runs in three phases, because only the middle one is
         // asynchronous. Deciding what each path needs is filesystem work — an
@@ -118,13 +117,26 @@ impl Node {
         // out and run on the blocking pool instead (§10).
         //
         // Phase 1 keeps listing order, which is what the symlink-escape guard
-        // below depends on: a link the mirror writes for `sub` is on disk
-        // before `sub/passwd` is judged, exactly as when the two steps were
-        // interleaved.
+        // depends on: a link the mirror writes for `sub` is on disk before
+        // `sub/passwd` is judged, exactly as when the two steps were
+        // interleaved. Phase 2 re-checks it immediately before each write, so
+        // the gap between the check and the write it guards stays one write
+        // wide rather than one pass wide.
+        //
+        // The listing joins phase 1 rather than preceding it: it is an
+        // unlimited range scan over every path in the space, plus one
+        // `VersionSet` per path, which is more SQLite work than anything the
+        // plan itself does.
         let plan = {
+            let node = self.clone();
+            let space = mirror.space.clone();
             let root_dir = root_dir.clone();
             let policy = mirror.policy.clone();
-            crate::blocking::offload(move || plan_pass(&root_dir, &listing, &policy)).await?
+            crate::blocking::offload(move || {
+                let listing = node.unified_listing(&space, "", None, None)?;
+                plan_pass(&root_dir, &listing, &policy)
+            })
+            .await?
         };
         let MirrorPass {
             mut report,
@@ -146,9 +158,30 @@ impl Node {
             // mirror of multi-gigabyte objects must not hold one in memory, and
             // a pass interrupted halfway must not leave a truncated file
             // wearing a complete file's name.
-            self.write_blob_to(&want.content, want.size, want.target)
-                .await?;
-            report.written += 1;
+            //
+            // The escape guard is taken again here, in the same blocking step
+            // as the write it protects. Phase 1 checked this path too, but a
+            // fetch stands between the two and the whole point of the guard is
+            // to describe the directory the write is about to land in.
+            let node = self.clone();
+            let root = root_dir.clone();
+            let path = want.path.clone();
+            let written = crate::blocking::offload(move || {
+                if escapes_via_symlink(&root, &path) {
+                    return Ok(false);
+                }
+                node.write_blob_to_blocking(&want.content, want.size, &want.target)?;
+                Ok(true)
+            })
+            .await?;
+            if written {
+                report.written += 1;
+            } else {
+                report.skipped.push((
+                    want.path,
+                    "path resolves through a symlink; refusing to write outside the mirror".into(),
+                ));
+            }
         }
 
         // Phase 3: a path that has left the unified tree altogether — every

@@ -446,7 +446,11 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         Request::Doctor { rebuild: false } => {
-            for line in render::doctor(node)? {
+            // The examination asks the trie whether each origin's root is held
+            // whole — a full walk the first time it is asked of a root — and
+            // counts every entry of every space to do it.
+            let examining = node.clone();
+            for line in offload(move || render::doctor(&examining)).await? {
                 out.line(line).await?;
             }
         }
@@ -457,7 +461,11 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             let n = offload(move || Ok(rebuilding.rebuild_views()?)).await?;
             out.line(format!("rebuilt {n} derived rows from the trie"))
                 .await?;
-            for line in render::doctor(node)? {
+            // The examination asks the trie whether each origin's root is held
+            // whole — a full walk the first time it is asked of a root — and
+            // counts every entry of every space to do it.
+            let examining = node.clone();
+            for line in offload(move || render::doctor(&examining)).await? {
                 out.line(line).await?;
             }
         }
@@ -742,13 +750,15 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 // The origin-prefixed form lists exactly one origin's view,
                 // which is the old per-origin listing (§9.2).
                 Some(origin) => {
-                    let rows = node.store().list_entries(
-                        Some(origin),
-                        &reference.space,
-                        &reference.dir_prefix(),
-                        None,
-                        None,
-                    )?;
+                    // Unlimited, so the query is the size of the space.
+                    let store = node.store().clone();
+                    let origin = origin.clone();
+                    let space = reference.space.clone();
+                    let prefix = reference.dir_prefix();
+                    let rows = offload(move || {
+                        Ok(store.list_entries(Some(&origin), &space, &prefix, None, None)?)
+                    })
+                    .await?;
                     for row in &rows {
                         out.line(render::entry_line(row, None)).await?;
                     }
@@ -756,12 +766,13 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 // The unified tree: one line per path, divergence marked with
                 // the number of versions the path carries (§8).
                 None => {
-                    let listing = node.unified_listing(
-                        &reference.space,
-                        &reference.dir_prefix(),
-                        None,
-                        None,
-                    )?;
+                    let listing = {
+                        let listing = node.clone();
+                        let space = reference.space.clone();
+                        let prefix = reference.dir_prefix();
+                        offload(move || Ok(listing.unified_listing(&space, &prefix, None, None)?))
+                            .await?
+                    };
                     for set in &listing {
                         if !set.exists() {
                             // Every publisher has tombstoned it: the path has
@@ -949,7 +960,12 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                     "--from and --to name the same origin; nothing to compare",
                 ));
             }
-            let report = node.compare(&reference.space, &reference.dir_prefix(), &from, &to)?;
+            // A comparison materializes both origins' listings in full.
+            let comparing = node.clone();
+            let space = reference.space.clone();
+            let prefix = reference.dir_prefix();
+            let report =
+                offload(move || Ok(comparing.compare(&space, &prefix, &from, &to)?)).await?;
             for line in render::compare(&report, json) {
                 out.line(line).await?;
             }

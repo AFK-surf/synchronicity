@@ -143,18 +143,26 @@ impl Node {
         // On the blocking pool: a publish inserts every staged change into the
         // trie, signs a head, re-materializes the changed leaves and fsyncs the
         // lot as one SQLite transaction — up to `publish_batch_max` entries of
-        // it. The batch travels into the closure and back out, so a failure can
-        // still be restaged (§7.1, §10).
+        // it (§7.1, §10).
+        //
+        // The restage happens *inside* the closure, not around the await. A
+        // blocking task cannot be cancelled, so once it starts it always either
+        // publishes the batch or puts it back — while anything written around
+        // the await would be skipped entirely if this future were dropped
+        // first. It can be: control connections are spawned detached
+        // (`control::Server::run`), so a `daemon stop` landing mid-flush drops
+        // one wherever it happens to be parked, and this used to be the one
+        // await point where that meant a batch taken out of the buffer and
+        // never put back.
         let node = self.clone();
-        let (result, batch) =
-            crate::blocking::offload(move || Ok((node.publish(&batch), batch))).await?;
-        let head = match result {
-            Ok(head) => head,
+        let head = crate::blocking::offload(move || match node.publish(&batch) {
+            Ok(head) => Ok(head),
             Err(e) => {
-                self.publisher().restage(batch);
-                return Err(e);
+                node.publisher().restage(batch);
+                Err(e)
             }
-        };
+        })
+        .await?;
         if let Some(head) = &head {
             if let Err(e) = self.push_head(head).await {
                 tracing::debug!(error = %e, "could not push the new head");
