@@ -7,6 +7,7 @@
 #![deny(missing_docs)]
 
 pub mod blob;
+mod blocking;
 pub mod dns;
 pub mod endpoint;
 pub mod error;

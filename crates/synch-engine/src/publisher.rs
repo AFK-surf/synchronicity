@@ -140,7 +140,15 @@ impl Node {
         if batch.is_empty() {
             return Ok(None);
         }
-        let head = match self.publish(&batch) {
+        // On the blocking pool: a publish inserts every staged change into the
+        // trie, signs a head, re-materializes the changed leaves and fsyncs the
+        // lot as one SQLite transaction — up to `publish_batch_max` entries of
+        // it. The batch travels into the closure and back out, so a failure can
+        // still be restaged (§7.1, §10).
+        let node = self.clone();
+        let (result, batch) =
+            crate::blocking::offload(move || Ok((node.publish(&batch), batch))).await?;
+        let head = match result {
             Ok(head) => head,
             Err(e) => {
                 self.publisher().restage(batch);

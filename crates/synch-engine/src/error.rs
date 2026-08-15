@@ -18,6 +18,16 @@ pub enum EngineError {
     /// Filesystem I/O failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A blocking operation did not run to completion.
+    ///
+    /// Blocking work — scanning, hashing, publishing, CAS reads and writes —
+    /// runs on tokio's blocking pool rather than on a runtime worker
+    /// ([`crate::blocking`]), and the pool reports only two failures: the
+    /// closure panicked, or the runtime is shutting down under it. Neither
+    /// says anything about the state the operation was midway through, which
+    /// is why it is surfaced rather than treated as a no-op.
+    #[error("a blocking task did not complete: {0}")]
+    Blocking(String),
     /// A record could not be encoded or decoded.
     #[error("record: {0}")]
     Record(String),

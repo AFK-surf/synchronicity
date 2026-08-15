@@ -8,6 +8,7 @@
 #![deny(missing_docs)]
 
 pub mod aae;
+mod blocking;
 pub mod compare;
 pub mod config;
 pub mod error;

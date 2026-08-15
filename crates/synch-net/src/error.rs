@@ -50,6 +50,13 @@ pub enum NetError {
     /// The store failed.
     #[error(transparent)]
     Store(#[from] synch_store::StoreError),
+    /// A blocking store operation did not run to completion.
+    ///
+    /// Store work runs on tokio's blocking pool rather than on a runtime
+    /// worker ([`crate::blocking`]); the pool reports only a panicked closure
+    /// or a runtime shutting down under it.
+    #[error("a blocking task did not complete: {0}")]
+    Blocking(String),
     /// A trie operation failed.
     #[error(transparent)]
     Mpt(#[from] synch_mpt::MptError),

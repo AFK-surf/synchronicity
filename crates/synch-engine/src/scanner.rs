@@ -395,6 +395,19 @@ impl Node {
         Ok(report)
     }
 
+    /// [`Node::scan_and_stage`] run on the blocking pool.
+    ///
+    /// This is the form every async caller wants. A scan walks every space,
+    /// stats every path, and re-hashes whatever moved — work bounded by the
+    /// size of the tree, not by anything the runtime can preempt. Run inline on
+    /// a worker thread it stops that thread from polling for as long as it
+    /// takes, which on a multi-gigabyte space is the daemon going quiet: no
+    /// peer answered, no control request served, no timer fired on time (§10).
+    pub async fn scan_and_stage_off_runtime(&self) -> Result<ScanReport> {
+        let node = self.clone();
+        crate::blocking::offload(move || node.scan_and_stage()).await
+    }
+
     /// Re-indexes local paths whose staged changes never reached a root.
     ///
     /// `scan_space` records `(size, mtime_ns, file_id)` in `local_files` as it
@@ -473,7 +486,8 @@ impl Node {
         // is refused before anything is fetched.
         let target = self.adoption_target(space_id, path)?;
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
-        self.write_blob_to(&range.root, range.size, &target)?;
+        self.write_blob_to(&range.root, range.size, target.clone())
+            .await?;
         Ok(target)
     }
 
@@ -1298,6 +1312,56 @@ mod tests {
         assert_eq!(report.hashed, 0);
         assert_eq!(report.unchanged, 1);
         assert!(head.is_none());
+        node.shutdown().await.unwrap();
+    }
+
+    /// §10: the scan runs off the runtime, so a node indexing a tree is still
+    /// a node that answers.
+    ///
+    /// `#[tokio::test]` gives a current-thread runtime, which is what makes
+    /// this decisive rather than probabilistic: there is exactly one thread
+    /// that can poll tasks. A ticker task counts how many times it is polled
+    /// across the scan. Run inline — `self.scan_and_stage()`, as this used to
+    /// be — the whole scan happens between two statements of a single poll, no
+    /// other task can be polled while it does, and the count cannot move at
+    /// all. It moves only if the hashing genuinely left the runtime.
+    #[tokio::test]
+    async fn a_scan_does_not_block_the_runtime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_d, space, node) = node_with_space().await;
+        // Enough bytes that the hashing is unmistakably longer than a poll.
+        for i in 0..32 {
+            std::fs::write(
+                space.path().join(format!("f{i}.bin")),
+                vec![i as u8; 512 * 1024],
+            )
+            .unwrap();
+        }
+
+        let ticks = std::sync::Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        // Let the ticker reach its loop before the measurement starts.
+        tokio::task::yield_now().await;
+
+        let before = ticks.load(Ordering::Relaxed);
+        let report = node.scan_and_stage_off_runtime().await.unwrap();
+        let after = ticks.load(Ordering::Relaxed);
+
+        assert_eq!(report.hashed, 32);
+        assert!(
+            after > before,
+            "the runtime was not polling anything while the scan ran ({before} -> {after})"
+        );
+        ticker.abort();
         node.shutdown().await.unwrap();
     }
 

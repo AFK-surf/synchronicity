@@ -108,16 +108,117 @@ impl Node {
         let root_dir = PathBuf::from(&mirror.local_path);
         let listing = self.unified_listing(&mirror.space, "", None, None)?;
 
-        // Detect folding collisions before writing anything: the
-        // lexicographically first path wins and the rest are reported.
-        let mut claimed: HashMap<String, String> = HashMap::new();
-        let mut report = MirrorReport::default();
-        // Every path the unified tree still carries, whatever the policy makes
-        // of it — what the sweep at the end uses to recognize a file whose path
-        // has left the tree.
-        let mut known: HashSet<String> = HashSet::new();
+        // A pass runs in three phases, because only the middle one is
+        // asynchronous. Deciding what each path needs is filesystem work — an
+        // lstat per ancestor, a whole-file hash for anything that might already
+        // be current — and so is writing the answer; only fetching the content
+        // that is missing is network work. Alternating between the two inside
+        // one loop would put every one of those hashes on the runtime worker
+        // that happened to poll this future, so the blocking halves are hoisted
+        // out and run on the blocking pool instead (§10).
+        //
+        // Phase 1 keeps listing order, which is what the symlink-escape guard
+        // below depends on: a link the mirror writes for `sub` is on disk
+        // before `sub/passwd` is judged, exactly as when the two steps were
+        // interleaved.
+        let plan = {
+            let root_dir = root_dir.clone();
+            let policy = mirror.policy.clone();
+            crate::blocking::offload(move || plan_pass(&root_dir, &listing, &policy)).await?
+        };
+        let MirrorPass {
+            mut report,
+            known,
+            wanted,
+        } = plan;
 
-        for set in &listing {
+        // Phase 2: fetch what phase 1 could not satisfy locally, and copy each
+        // object out of the CAS as it lands.
+        for want in wanted {
+            let fetched = self.fetch_all(&want.content, want.size).await?;
+            if !fetched.complete {
+                report
+                    .skipped
+                    .push((want.path, "no provider could serve the content".into()));
+                continue;
+            }
+            // Copied out of the CAS a piece at a time and renamed into place: a
+            // mirror of multi-gigabyte objects must not hold one in memory, and
+            // a pass interrupted halfway must not leave a truncated file
+            // wearing a complete file's name.
+            self.write_blob_to(&want.content, want.size, want.target)
+                .await?;
+            report.written += 1;
+        }
+
+        // Phase 3: a path that has left the unified tree altogether — every
+        // origin's entry for it gone, tombstones included — leaves the mirror
+        // too. The listing cannot report those, so the last step is to look at
+        // what is on disk and drop whatever the tree no longer names.
+        report.removed += crate::blocking::offload(move || {
+            let root = root_dir;
+            sweep(&root, &root, &known)
+        })
+        .await?;
+        Ok(report)
+    }
+
+    /// Brings every configured mirror up to date.
+    pub async fn sync_all_mirrors(&self) -> Result<Vec<(String, MirrorReport)>> {
+        let mut out = Vec::new();
+        for mirror in self.store().mirrors()? {
+            let report = self.sync_mirror_row(&mirror).await?;
+            out.push((mirror.local_path, report));
+        }
+        Ok(out)
+    }
+}
+
+/// One path a pass has decided it must fetch and write.
+#[derive(Debug)]
+struct WantedContent {
+    /// The path within the space, for the report.
+    path: String,
+    /// Where it goes on disk.
+    target: PathBuf,
+    /// The object to materialize.
+    content: synch_core::Hash,
+    /// Its size, which is what the fetch and the copy are bounded by.
+    size: u64,
+}
+
+/// What one pass settled before any content was fetched.
+#[derive(Debug, Default)]
+struct MirrorPass {
+    /// Everything already accounted for: removals, symlinks, skips, and paths
+    /// that were already current.
+    report: MirrorReport,
+    /// Every path the unified tree still carries, whatever the policy makes of
+    /// it — what the sweep uses to recognize a file whose path has left the
+    /// tree.
+    known: HashSet<String>,
+    /// What is left for the asynchronous half to fetch.
+    wanted: Vec<WantedContent>,
+}
+
+/// Decides, and performs, everything one pass can settle without the network.
+///
+/// Blocking from end to end: [`Node::sync_mirror_row`] runs it on the blocking
+/// pool.
+fn plan_pass(
+    root_dir: &Path,
+    listing: &[synch_store::VersionSet],
+    policy: &VersionPolicy,
+) -> Result<MirrorPass> {
+    // Detect folding collisions before writing anything: the
+    // lexicographically first path wins and the rest are reported.
+    let mut claimed: HashMap<String, String> = HashMap::new();
+    let mut report = MirrorReport::default();
+    let mut known: HashSet<String> = HashSet::new();
+    let mut wanted: Vec<WantedContent> = Vec::new();
+
+    {
+        for set in listing {
             known.insert(set.path.clone());
             let target = root_dir.join(&set.path);
             // Defense in depth against a peer that plants a symlink and a file
@@ -126,14 +227,14 @@ impl Node {
             // `sub/passwd` would resolve through it to `/etc/passwd`, outside
             // the mirror root. Refuse — for writes and removals alike — any
             // path whose ancestors include a symlink the mirror itself wrote.
-            if escapes_via_symlink(&root_dir, &set.path) {
+            if escapes_via_symlink(root_dir, &set.path) {
                 report.skipped.push((
                     set.path.clone(),
                     "path resolves through a symlink; refusing to write outside the mirror".into(),
                 ));
                 continue;
             }
-            let selected = match set.select(&mirror.policy) {
+            let selected = match set.select(policy) {
                 synch_store::Selection::Selected(entry) => *entry,
                 // The policy selects nothing here — an `origin=` pin on an
                 // origin that publishes no version of this path — so the path
@@ -214,39 +315,20 @@ impl Node {
                 continue;
             }
 
-            let fetched = self.fetch_all(&content, selected.size).await?;
-            if !fetched.complete {
-                report.skipped.push((
-                    set.path.clone(),
-                    "no provider could serve the content".into(),
-                ));
-                continue;
-            }
-            // Copied out of the CAS a piece at a time and renamed into place: a
-            // mirror of multi-gigabyte objects must not hold one in memory, and
-            // a pass interrupted halfway must not leave a truncated file
-            // wearing a complete file's name.
-            self.write_blob_to(&content, selected.size, &target)?;
-            report.written += 1;
+            wanted.push(WantedContent {
+                path: set.path.clone(),
+                target,
+                content,
+                size: selected.size,
+            });
         }
-
-        // A path that has left the unified tree altogether — every origin's
-        // entry for it gone, tombstones included — leaves the mirror too. The
-        // listing cannot report those, so the last step is to look at what is
-        // on disk and drop whatever the tree no longer names.
-        report.removed += sweep(&root_dir, &root_dir, &known)?;
-        Ok(report)
     }
 
-    /// Brings every configured mirror up to date.
-    pub async fn sync_all_mirrors(&self) -> Result<Vec<(String, MirrorReport)>> {
-        let mut out = Vec::new();
-        for mirror in self.store().mirrors()? {
-            let report = self.sync_mirror_row(&mirror).await?;
-            out.push((mirror.local_path, report));
-        }
-        Ok(out)
-    }
+    Ok(MirrorPass {
+        report,
+        known,
+        wanted,
+    })
 }
 
 /// The stored key for a mirror: its canonical directory path.
