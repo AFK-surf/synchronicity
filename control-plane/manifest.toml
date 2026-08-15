@@ -44,5 +44,6 @@ gleam_stdlib = { version = ">= 0.44.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
 glisten = { version = ">= 7.0.0 and < 10.0.0" }
 mist = { version = ">= 4.0.0 and < 7.0.0" }
+simplifile = { version = ">= 2.0.0 and < 3.0.0" }
 thirtytwo = { version = ">= 1.0.0 and < 2.0.0" }
 wisp = { version = ">= 1.5.0 and < 3.0.0" }
