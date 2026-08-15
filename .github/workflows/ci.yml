@@ -94,3 +94,17 @@ jobs:
             echo "::error::RecoveryPartitioned.cfg found no fork; §3.4's admitted limitation no longer matches the model"
             exit 1
           fi
+
+  bench:
+    name: benchmark (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # A correctness check on the benchmark, not a performance gate: a shared
+      # CI runner's timings are too noisy to threshold, and a benchmark nobody
+      # runs rots into one that no longer compiles against the code it measures.
+      # Small parameters keep it under a minute; the real numbers come from
+      # running it on a machine whose scheduler you own.
+      - run: cargo run --release -p synch-engine --example bench -- --files 500 --object-mib 16

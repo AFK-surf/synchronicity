@@ -648,8 +648,22 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     }
 
     /// True if the whole trie under `root` is present locally and servable.
+    ///
+    /// The answer is computed from the trie, never assumed from the fact that
+    /// a head names the root — but it is computed *once* per root. A walk of
+    /// everything reachable is not a per-`Hello` cost a converged cluster
+    /// should pay (§5.1), and a content-addressed root that was complete
+    /// cannot become incomplete: no node is ever rewritten under an existing
+    /// hash, and GC marks from every head a root can be reached through.
     pub fn is_complete(&self, root: Hash) -> Result<bool, MptError> {
-        Ok(self.missing(root, 1)?.is_empty())
+        if Self::wrap(self.store.is_known_complete(&root))? {
+            return Ok(true);
+        }
+        let complete = self.missing(root, 1)?.is_empty();
+        if complete {
+            Self::wrap(self.store.note_complete(&root))?;
+        }
+        Ok(complete)
     }
 
     /// Everything reachable from `root`, for mark-and-sweep GC (§5.4).

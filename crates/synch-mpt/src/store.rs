@@ -39,6 +39,28 @@ pub trait NodeStore {
     fn has_value(&self, hash: &Hash) -> Result<bool, Self::Error> {
         Ok(self.get_value(hash)?.is_some())
     }
+
+    /// True if this store has already established that every node and value
+    /// under `root` is present.
+    ///
+    /// "Do I hold this whole trie?" has no cheap answer — it is a walk of
+    /// everything reachable — and it is asked on every `Hello` (§5.1), which
+    /// makes a converged cluster pay for the size of its metadata on every
+    /// anti-entropy round rather than for what changed. A root is immutable
+    /// and content-addressed, so the answer, once *computed*, cannot stop
+    /// being true: nothing rewrites a node under an existing hash, and GC
+    /// marks from every head it could be reached through. A store that can
+    /// remember the answer says so here; the default remembers nothing.
+    fn is_known_complete(&self, _root: &Hash) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    /// Records that every node and value under `root` was found present.
+    ///
+    /// Only ever called after a full walk has established it.
+    fn note_complete(&self, _root: &Hash) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 impl<S: NodeStore + ?Sized> NodeStore for &S {
@@ -61,6 +83,12 @@ impl<S: NodeStore + ?Sized> NodeStore for &S {
     }
     fn has_value(&self, hash: &Hash) -> Result<bool, Self::Error> {
         (**self).has_value(hash)
+    }
+    fn is_known_complete(&self, root: &Hash) -> Result<bool, Self::Error> {
+        (**self).is_known_complete(root)
+    }
+    fn note_complete(&self, root: &Hash) -> Result<(), Self::Error> {
+        (**self).note_complete(root)
     }
 }
 

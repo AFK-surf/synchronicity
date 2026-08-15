@@ -50,6 +50,12 @@ impl Store {
 
     /// Runs one mark-and-sweep pass over `trie_nodes` and `trie_values`.
     pub fn gc_trie(&self) -> Result<GcStats> {
+        // The sweep never touches a node reachable from a retained root, so a
+        // *current* head's completeness is unaffected — but a root that was
+        // complete before it fell out of the retained set has just had its
+        // nodes taken, and the memo would still vouch for it. GC is rare and a
+        // walk is cheap next to a wrong "yes, I can serve that".
+        self.forget_complete_roots();
         let roots = self.retained_roots()?;
         let (nodes, values) = self.gc_mark()?;
         let mut stats = GcStats {

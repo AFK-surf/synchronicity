@@ -108,7 +108,25 @@ pub struct DeviceKey {
 pub struct Store {
     conn: Mutex<Connection>,
     data_dir: PathBuf,
+    /// Roots a full walk has established this store holds entirely.
+    ///
+    /// "Do I hold this whole trie?" is asked on every `Hello` (§5.1) and
+    /// answered by walking everything reachable — so without this a converged
+    /// cluster pays for the size of its metadata on every anti-entropy round,
+    /// on both sides, forever. A content-addressed root that was complete
+    /// stays complete, so the walk is owed once per root and not once per
+    /// exchange. Process-local and rebuilt on demand: losing it costs one
+    /// walk, never correctness.
+    complete_roots: Mutex<std::collections::HashSet<Hash>>,
 }
+
+/// How many roots the completeness memo holds before it is dropped wholesale.
+///
+/// One entry per root this node has confirmed, which is one per published head
+/// and one per peer head adopted; a long-lived node would otherwise accumulate
+/// them without bound. Dropping the lot costs a walk on the roots still in use
+/// and nothing else, which is why there is no LRU here.
+const COMPLETE_ROOTS_MAX: usize = 4096;
 
 impl Store {
     /// Opens (creating if needed) the store rooted at `data_dir`.
@@ -125,6 +143,7 @@ impl Store {
         let store = Store {
             conn: Mutex::new(conn),
             data_dir,
+            complete_roots: Mutex::new(std::collections::HashSet::new()),
         };
         store.init()?;
         // WAL/SHM sidecars are created by `init` (WAL mode); tighten them too.
@@ -141,6 +160,7 @@ impl Store {
         let store = Store {
             conn: Mutex::new(Connection::open_in_memory()?),
             data_dir,
+            complete_roots: Mutex::new(std::collections::HashSet::new()),
         };
         store.init()?;
         Ok(store)
@@ -378,6 +398,10 @@ impl Txn<'_> {
     }
 }
 
+/// A transaction deliberately keeps the [`NodeStore`] completeness memo's
+/// defaults — it never reads it and never writes to it. A scope that can still
+/// roll back must not be able to record "I hold all of this" about nodes the
+/// commit might never land.
 impl NodeStore for Txn<'_> {
     type Error = StoreError;
 
@@ -517,6 +541,37 @@ impl NodeStore for Store {
 
     fn has_value(&self, hash: &Hash) -> Result<bool> {
         has_value_in(&self.conn(), hash)
+    }
+
+    fn is_known_complete(&self, root: &Hash) -> Result<bool> {
+        Ok(self.complete_roots().contains(root))
+    }
+
+    fn note_complete(&self, root: &Hash) -> Result<()> {
+        let mut roots = self.complete_roots();
+        if roots.len() >= COMPLETE_ROOTS_MAX {
+            roots.clear();
+        }
+        roots.insert(*root);
+        Ok(())
+    }
+}
+
+impl Store {
+    fn complete_roots(&self) -> MutexGuard<'_, std::collections::HashSet<Hash>> {
+        self.complete_roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forgets which roots are known complete.
+    ///
+    /// GC never sweeps a node reachable from a head, so the memo survives it
+    /// intact — this exists for the paths that remove trie state outside that
+    /// discipline, where the honest answer is to make the store earn the
+    /// answer again.
+    pub fn forget_complete_roots(&self) {
+        self.complete_roots().clear();
     }
 }
 
