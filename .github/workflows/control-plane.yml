@@ -1,0 +1,60 @@
+name: control-plane
+
+on:
+  push:
+    branches: [main]
+    paths: ['control-plane/**', '.github/workflows/control-plane.yml']
+  pull_request:
+    paths: ['control-plane/**', '.github/workflows/control-plane.yml']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gleam:
+    runs-on: ubuntu-latest
+    defaults:
+      run: { working-directory: control-plane }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: control-plane/.tool-versions
+          version-type: strict
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - run: make -C csqlite
+      - run: gleam format --check src test
+      - run: gleam deps download
+      - run: gleam test
+      - run: gleam build
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run: { working-directory: control-plane/web }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: control-plane/web/package-lock.json
+      - run: npm ci
+      - run: npx tsc -b
+      - run: npx vite build
+
+  e2e-crossval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: control-plane/.tool-versions
+          version-type: strict
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: control-plane/e2e
+      - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev bind9-dnsutils
+      - run: cd control-plane && make -C csqlite && gleam deps download
+      - run: cd control-plane && ./e2e/run.sh
