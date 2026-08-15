@@ -395,6 +395,19 @@ impl Node {
         Ok(report)
     }
 
+    /// [`Node::scan_and_stage`] run on the blocking pool.
+    ///
+    /// This is the form every async caller wants. A scan walks every space,
+    /// stats every path, and re-hashes whatever moved — work bounded by the
+    /// size of the tree, not by anything the runtime can preempt. Run inline on
+    /// a worker thread it stops that thread from polling for as long as it
+    /// takes, which on a multi-gigabyte space is the daemon going quiet: no
+    /// peer answered, no control request served, no timer fired on time (§10).
+    pub async fn scan_and_stage_off_runtime(&self) -> Result<ScanReport> {
+        let node = self.clone();
+        crate::blocking::offload(move || node.scan_and_stage()).await
+    }
+
     /// Re-indexes local paths whose staged changes never reached a root.
     ///
     /// `scan_space` records `(size, mtime_ns, file_id)` in `local_files` as it
@@ -473,7 +486,8 @@ impl Node {
         // is refused before anything is fetched.
         let target = self.adoption_target(space_id, path)?;
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
-        self.write_blob_to(&range.root, range.size, &target)?;
+        self.write_blob_to(&range.root, range.size, target.clone())
+            .await?;
         Ok(target)
     }
 
@@ -1298,6 +1312,66 @@ mod tests {
         assert_eq!(report.hashed, 0);
         assert_eq!(report.unchanged, 1);
         assert!(head.is_none());
+        node.shutdown().await.unwrap();
+    }
+
+    /// §10: the scan runs off the runtime, so a node indexing a tree is still
+    /// a node that answers.
+    ///
+    /// `#[tokio::test]` gives a current-thread runtime, which is what makes
+    /// this decisive rather than probabilistic: there is exactly one thread
+    /// that can poll tasks. A ticker task counts how many times it is polled
+    /// across the scan, and the assertion is on the *rate*, not on movement.
+    /// Movement alone proves nothing — any await that returns `Pending` once
+    /// lets the ticker run a handful of times, so a scan that offloaded only
+    /// its SQLite commit and hashed inline would still show a count that
+    /// moved. A thread free for the duration of 16 MiB of BLAKE3 is polled
+    /// orders of magnitude more often than that; a thread doing the hashing
+    /// itself cannot be polled at all while it does.
+    #[tokio::test]
+    async fn a_scan_does_not_block_the_runtime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_d, space, node) = node_with_space().await;
+        // Enough bytes that the hashing is unmistakably longer than a poll.
+        for i in 0..32 {
+            std::fs::write(
+                space.path().join(format!("f{i}.bin")),
+                vec![i as u8; 512 * 1024],
+            )
+            .unwrap();
+        }
+
+        let ticks = std::sync::Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        // Let the ticker reach its loop before the measurement starts.
+        tokio::task::yield_now().await;
+
+        let before = ticks.load(Ordering::Relaxed);
+        let report = node.scan_and_stage_off_runtime().await.unwrap();
+        let after = ticks.load(Ordering::Relaxed);
+
+        // A free current-thread runtime spins this ticker millions of times
+        // per second, so the bar is set far above what a single `Pending`
+        // return can account for and far below what the machine has to manage
+        // to clear it.
+        const FREE_RUNTIME_TICKS: usize = 10_000;
+
+        assert_eq!(report.hashed, 32);
+        assert!(
+            after - before > FREE_RUNTIME_TICKS,
+            "the runtime was barely polling while the scan ran ({before} -> {after}): the \
+             hashing is back on a runtime worker"
+        );
+        ticker.abort();
         node.shutdown().await.unwrap();
     }
 

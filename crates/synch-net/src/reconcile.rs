@@ -266,19 +266,38 @@ impl Syncer {
         // difference between an incremental sync costing the change and costing
         // the whole tree. Only a root we have *established* is complete will do:
         // that check is memoized, so it is a lookup after the first time.
-        let trie = Trie::new(self.store.as_ref());
-        let reference = match self.store.complete_head(origin)? {
-            Some(head) if trie.is_complete(head.root)? => Some(head.root),
-            _ => None,
+        //
+        // Establishing it the first time is a full walk, so it goes off the
+        // runtime — as does every batch of the walk below, and every batch of
+        // nodes and values committed between the round trips (§10).
+        let reference = {
+            let store = self.store.clone();
+            let origin = origin.clone();
+            crate::blocking::offload(move || {
+                let trie = Trie::new(store.as_ref());
+                Ok(match store.complete_head(&origin)? {
+                    Some(head) if trie.is_complete(head.root)? => Some(head.root),
+                    _ => None,
+                })
+            })
+            .await?
         };
         let mut walk = synch_mpt::MissingWalk::since(reference, pending.root);
         let mut unproductive = 0u32;
         loop {
-            let trie = Trie::new(self.store.as_ref());
             // One walk across the whole fetch, resumed rather than restarted:
             // beginning again at the root for every batch makes a cold fetch
-            // re-descend everything it has already pulled, once per batch.
-            let missing = walk.next_batch(&trie, MAX_BATCH)?;
+            // re-descend everything it has already pulled, once per batch. The
+            // walk travels into the blocking pool and back so its position
+            // survives each round trip.
+            let store = self.store.clone();
+            let (missing, returned) = crate::blocking::offload(move || {
+                let trie = Trie::new(store.as_ref());
+                let missing = walk.next_batch(&trie, MAX_BATCH)?;
+                Ok((missing, walk))
+            })
+            .await?;
+            walk = returned;
             if missing.is_empty() {
                 if walk.is_exhausted() {
                     break;
@@ -290,33 +309,47 @@ impl Syncer {
             let mut learned = 0usize;
             if !missing.nodes.is_empty() {
                 let response = client.get_nodes(&missing.nodes).await?;
-                for (hash, bytes) in &response.nodes {
-                    // Verify each node against the hash it was requested by. A
-                    // malicious or corrupt peer can withhold, never inject.
-                    let actual = TrieNode::hash_of_encoded(bytes)
-                        .map_err(|_| NetError::NodeHashMismatch { expected: *hash })?;
-                    if actual != *hash {
-                        return Err(NetError::NodeHashMismatch { expected: *hash });
+                let store = self.store.clone();
+                let requested = missing.nodes.clone();
+                learned += crate::blocking::offload(move || {
+                    let mut stored = 0usize;
+                    for (hash, bytes) in &response.nodes {
+                        // Verify each node against the hash it was requested
+                        // by. A malicious or corrupt peer can withhold, never
+                        // inject.
+                        let actual = TrieNode::hash_of_encoded(bytes)
+                            .map_err(|_| NetError::NodeHashMismatch { expected: *hash })?;
+                        if actual != *hash {
+                            return Err(NetError::NodeHashMismatch { expected: *hash });
+                        }
+                        if !requested.contains(hash) {
+                            return Err(NetError::Unexpected(format!(
+                                "peer served unrequested trie node {hash}"
+                            )));
+                        }
+                        synch_mpt::NodeStore::put_node(store.as_ref(), hash, bytes)?;
+                        stored += 1;
                     }
-                    if !missing.nodes.contains(hash) {
-                        return Err(NetError::Unexpected(format!(
-                            "peer served unrequested trie node {hash}"
-                        )));
-                    }
-                    synch_mpt::NodeStore::put_node(self.store.as_ref(), hash, bytes)?;
-                    learned += 1;
-                }
+                    Ok(stored)
+                })
+                .await?;
             }
             if !missing.values.is_empty() {
                 let response = client.get_values(&missing.values).await?;
-                for (hash, bytes) in &response.values {
-                    let actual = synch_core::Hash::new(bytes);
-                    if actual != *hash {
-                        return Err(NetError::ValueHashMismatch { expected: *hash });
+                let store = self.store.clone();
+                learned += crate::blocking::offload(move || {
+                    let mut stored = 0usize;
+                    for (hash, bytes) in &response.values {
+                        let actual = synch_core::Hash::new(bytes);
+                        if actual != *hash {
+                            return Err(NetError::ValueHashMismatch { expected: *hash });
+                        }
+                        synch_mpt::NodeStore::put_value(store.as_ref(), hash, bytes)?;
+                        stored += 1;
                     }
-                    synch_mpt::NodeStore::put_value(self.store.as_ref(), hash, bytes)?;
-                    learned += 1;
-                }
+                    Ok(stored)
+                })
+                .await?;
             }
 
             if learned == 0 {
@@ -344,9 +377,17 @@ impl Syncer {
         // The walk drained with nothing missing, which *is* the answer to "do I
         // hold all of this?" — so record it rather than let the promotion below
         // and the next `Hello` each rediscover it by walking the trie again.
-        synch_mpt::NodeStore::note_complete(self.store.as_ref(), &pending.root)?;
-
-        if self.try_promote(origin, now_ns())? {
+        // The promotion that follows re-materializes every changed leaf in one
+        // transaction, so the pair stays off the runtime like the rest.
+        let store = self.store.clone();
+        let syncer = self.clone();
+        let origin = origin.clone();
+        let promoted = crate::blocking::offload(move || {
+            synch_mpt::NodeStore::note_complete(store.as_ref(), &pending.root)?;
+            syncer.try_promote(&origin, now_ns())
+        })
+        .await?;
+        if promoted {
             Ok(FetchOutcome::Completed)
         } else {
             Ok(FetchOutcome::Partial)
@@ -360,18 +401,41 @@ impl Syncer {
     /// exchange with an empty decision, so a recovering node learns how far
     /// peers say its origin had got without adopting anything.
     pub async fn observe_with(&self, client: &MptClient) -> Result<Vec<HeadSummary>, NetError> {
-        let ours = self.local_summaries()?;
+        let ours = self.summaries_off_runtime().await?;
         let exchange = client
             .head_exchange(ours, |_theirs| (Vec::new(), Vec::new()))
             .await?;
-        self.observe_summaries_from(Some(client.remote_id()), &exchange.summaries, now_ns())?;
+        let syncer = self.clone();
+        let peer = client.remote_id();
+        let summaries = exchange.summaries.clone();
+        crate::blocking::offload(move || {
+            syncer.observe_summaries_from(Some(peer), &summaries, now_ns())
+        })
+        .await?;
         Ok(exchange.summaries)
+    }
+
+    /// [`Syncer::offer_head`] on the blocking pool.
+    async fn offer_head_off_runtime(&self, head: &SignedHead) -> Result<HeadOutcome, NetError> {
+        let syncer = self.clone();
+        let head = head.clone();
+        crate::blocking::offload(move || syncer.offer_head(&head, now_ns())).await
+    }
+
+    /// [`Syncer::local_summaries`] on the blocking pool.
+    ///
+    /// Summarizing asks the trie whether each advertised root is held whole,
+    /// which is a walk the first time it is asked of a root (§5.1) — not
+    /// something to do on a runtime worker.
+    async fn summaries_off_runtime(&self) -> Result<Vec<HeadSummary>, NetError> {
+        let syncer = self.clone();
+        crate::blocking::offload(move || syncer.local_summaries()).await
     }
 
     /// Runs one full `Hello` push-pull exchange with a peer, then fetches
     /// whatever it advertised that we do not have (§5.2, §5.3).
     pub async fn sync_with(&self, client: &MptClient) -> Result<SyncReport, NetError> {
-        let ours = self.local_summaries()?;
+        let ours = self.summaries_off_runtime().await?;
         let store = self.store.clone();
 
         let mut report = SyncReport::default();
@@ -411,11 +475,21 @@ impl Syncer {
 
         // Every exchange is also an observation of what peers hold for our own
         // origin, which is what `synch recover` reads (§3.4).
-        self.observe_summaries_from(Some(client.remote_id()), &theirs.summaries, now_ns())?;
+        {
+            let syncer = self.clone();
+            let peer = client.remote_id();
+            let summaries = theirs.summaries.clone();
+            crate::blocking::offload(move || {
+                syncer.observe_summaries_from(Some(peer), &summaries, now_ns())
+            })
+            .await?;
+        }
 
         report.heads_pushed = theirs.pushed;
         for head in theirs.received {
-            let outcome = match self.offer_head(&head, now_ns()) {
+            // Adoption may promote the head, which walks the trie and
+            // re-materializes every changed leaf in one transaction (§5.2).
+            let outcome = match self.offer_head_off_runtime(&head).await {
                 Ok(outcome) => outcome,
                 Err(e) if is_origin_fault(&e) => {
                     contain(&head.origin, &e, &mut report);

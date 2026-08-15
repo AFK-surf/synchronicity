@@ -347,7 +347,12 @@ impl Node {
         }
 
         if !report.fetched.is_empty() {
-            self.on_content_progress(root)?;
+            // Publishing an updated ad is a trie write and a signed head, so
+            // the milestone check and the publish it may trigger both go off
+            // the runtime (§6.3).
+            let node = self.clone();
+            let root = *root;
+            crate::blocking::offload(move || node.on_content_progress(&root).map(|_| ())).await?;
         }
         report.complete = wanted.difference(&self.local_groups(root)?).is_empty();
         Ok(report)
@@ -460,9 +465,14 @@ impl Node {
         len: Option<u64>,
     ) -> Result<Vec<u8>> {
         let range = self.prepare_range(space, path, policy, start, len).await?;
-        Ok(self
-            .store()
-            .read_range(&range.root, range.start, range.end - range.start)?)
+        // The read verifies every group it returns against the object's bao
+        // tree, reading payload and outboard off disk to do it: blocking work
+        // proportional to the range, so it runs on the blocking pool.
+        let store = self.store().clone();
+        crate::blocking::offload(move || {
+            Ok(store.read_range(&range.root, range.start, range.end - range.start)?)
+        })
+        .await
     }
 
     /// Reads the policy-selected version of a path in full.
@@ -545,7 +555,30 @@ impl Node {
     ///
     /// The bytes land in a staging file that is renamed into place, so a reader
     /// of `target` sees the old contents or the new ones and never a half-copy.
-    pub fn write_blob_to(&self, root: &Hash, size: u64, target: &std::path::Path) -> Result<()> {
+    ///
+    /// Async because the copy is the size of the object: every piece is a
+    /// verified CAS read and a file write, so the whole loop runs on the
+    /// blocking pool rather than on the worker thread that called it (§10).
+    pub async fn write_blob_to(
+        &self,
+        root: &Hash,
+        size: u64,
+        target: impl Into<std::path::PathBuf>,
+    ) -> Result<()> {
+        let node = self.clone();
+        let root = *root;
+        let target = target.into();
+        crate::blocking::offload(move || node.write_blob_to_blocking(&root, size, &target)).await
+    }
+
+    /// The body of [`Node::write_blob_to`], for callers already off the
+    /// runtime.
+    pub fn write_blob_to_blocking(
+        &self,
+        root: &Hash,
+        size: u64,
+        target: &std::path::Path,
+    ) -> Result<()> {
         let mut out = crate::scanner::Adoption::at(target)?;
         let mut offset = 0u64;
         while offset < size {

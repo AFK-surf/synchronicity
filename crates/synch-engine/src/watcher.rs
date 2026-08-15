@@ -148,8 +148,11 @@ impl Node {
                         tracing::warn!(error = %e, "re-registering spaces failed");
                     }
                     // Staged, not published: a burst of editor saves is one
-                    // batch and therefore one head (§7.1).
-                    if let Err(e) = self.scan_and_stage() {
+                    // batch and therefore one head (§7.1). Off the runtime,
+                    // because the rescan walks every space and re-hashes
+                    // whatever moved — unbounded work that must not sit on a
+                    // worker thread the endpoint needs (§10).
+                    if let Err(e) = self.scan_and_stage_off_runtime().await {
                         tracing::warn!(error = %e, "rescan failed");
                     }
                 }
@@ -168,7 +171,7 @@ impl Node {
             tokio::select! {
                 _ = &mut shutdown => return,
                 _ = tokio::time::sleep(self.config().scan_interval) => {
-                    if let Err(e) = self.scan_and_stage() {
+                    if let Err(e) = self.scan_and_stage_off_runtime().await {
                         tracing::warn!(error = %e, "periodic scan failed");
                     }
                 }

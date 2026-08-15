@@ -114,7 +114,7 @@ impl Node {
     /// one batch and one head — including anything a watcher-triggered rescan
     /// had already staged — and the head is out before this returns.
     pub async fn scan_publish_push(&self) -> Result<Option<SignedHead>> {
-        self.scan_and_stage()?;
+        self.scan_and_stage_off_runtime().await?;
         self.flush_staged().await
     }
 
@@ -148,8 +148,13 @@ impl Node {
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
+                // On the blocking pool: a GC pass sweeps the trie and unlinks
+                // every unreferenced payload, which is proportional to what
+                // the store has accumulated since the last one (§5.4).
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
-                    if let Err(e) = self.maintenance_pass() {
+                    let node = self.clone();
+                    let pass = crate::blocking::offload(move || node.maintenance_pass()).await;
+                    if let Err(e) = pass {
                         tracing::warn!(error = %e, "maintenance pass failed");
                     }
                 }

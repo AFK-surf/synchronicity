@@ -1059,6 +1059,29 @@ the invariant that matters is that every multi-step state change (head flips,
 publish batches) is a single transaction and no partial state is ever observable;
 read concurrency is deliberately traded away for that simplicity.
 
+**Blocking work never runs on the runtime.** The store and the CAS are
+synchronous by design — `synch-store` has no async runtime dependency at all —
+and so is everything built directly on them: the scanner's directory walks and
+BLAKE3 hashing, publish transactions, slice encode and decode, mirror
+materialization, GC. None of that belongs on a tokio worker thread. A worker
+hashing a 10 GB file is a worker that is not polling the endpoint, the control
+socket, or a timer, and the multi-thread runtime has only one worker per core,
+so a few concurrent scans would stall the daemon outright. Every long or
+unbounded blocking operation reachable from an async context is therefore
+dispatched to tokio's blocking pool (`synch_engine::blocking`,
+`synch_net::blocking`, and the control server's own helper). Short bounded
+lookups — one indexed `SELECT`, a single `stat` — stay inline, where the handoff
+would cost more than the work itself.
+
+This relocates the queue rather than removing it: the one connection mutex is
+still the bottleneck, and a long exclusive holder (a GC pass, a full publish
+batch) now parks blocking-pool threads instead of runtime workers. What it buys
+is that the parked threads are no longer the ones that have to poll the
+endpoint, the timers, and every other connection — the daemon stays responsive
+while it is slow, rather than going silent. Since a blocking task cannot be
+cancelled, anything that must happen even if the caller walks away — restaging a
+failed publish batch — belongs inside the closure, not around the await.
+
 **Migrations.** The schema's single source of truth is an ordered chain of
 migrations: `MIGRATIONS[v]` takes a database from version `v` to `v+1`, and version
 1 is the original schema. A fresh database is built by replaying the whole chain

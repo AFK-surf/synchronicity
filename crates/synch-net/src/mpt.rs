@@ -120,9 +120,16 @@ impl MptProtocol {
                 // A dialing peer's summaries are as good an observation as the
                 // ones we collect by dialing out, and a node in recovery is
                 // more likely to be called than to be calling (§3.4).
-                self.syncer
-                    .observe_summaries_from(Some(peer), &heads, now_ns())?;
-                let ours = self.syncer.local_summaries()?;
+                //
+                // Summarizing means asking the trie whether we hold each root
+                // whole — a walk on the first ask for a root, memoized after —
+                // so the pair runs on the blocking pool (§5.1).
+                let syncer = self.syncer.clone();
+                let ours = crate::blocking::offload(move || {
+                    syncer.observe_summaries_from(Some(peer), &heads, now_ns())?;
+                    syncer.local_summaries()
+                })
+                .await?;
                 write_frame(
                     send,
                     &MptMessage::Hello {
@@ -136,9 +143,18 @@ impl MptProtocol {
                 // we have that it lacks.
                 match read_frame::<MptMessage>(recv).await? {
                     MptMessage::Heads { heads } => {
-                        for head in heads {
-                            let _ = self.syncer.offer_head(&head, now_ns())?;
-                        }
+                        // Each offer verifies a signature, records history, and
+                        // may promote the head — which walks the trie and
+                        // re-materializes the changed leaves in one
+                        // transaction (§5.2).
+                        let syncer = self.syncer.clone();
+                        crate::blocking::offload(move || {
+                            for head in heads {
+                                let _ = syncer.offer_head(&head, now_ns())?;
+                            }
+                            Ok(())
+                        })
+                        .await?;
                     }
                     other => return Err(unexpected("Heads", &other)),
                 }
@@ -152,36 +168,52 @@ impl MptProtocol {
                 Ok(())
             }
             MptMessage::HeadPush { head } => {
-                let outcome = self.syncer.offer_head(&head, now_ns())?;
+                let syncer = self.syncer.clone();
+                let pushed = head.clone();
+                let outcome =
+                    crate::blocking::offload(move || syncer.offer_head(&pushed, now_ns())).await?;
                 tracing::debug!(origin = %head.origin, ?outcome, "head pushed to us");
                 // The ack tells the pusher we processed it; an empty Heads is
                 // the smallest well-typed acknowledgement in the schema.
                 write_frame(send, &MptMessage::Heads { heads: Vec::new() }).await?;
                 Ok(())
             }
+            // Both batch reads run on the blocking pool: `MAX_BATCH` row reads
+            // out of SQLite is a bounded amount of work, but not a small one,
+            // and a cold store answers them from disk.
             MptMessage::GetNodes { hashes } => {
                 check_batch(hashes.len())?;
-                let mut nodes = Vec::new();
-                let mut missing = Vec::new();
-                for hash in hashes {
-                    match self.store().get_node(&hash)? {
-                        Some(data) => nodes.push((hash, data)),
-                        None => missing.push(hash),
+                let store = self.store().clone();
+                let (nodes, missing) = crate::blocking::offload(move || {
+                    let mut nodes = Vec::new();
+                    let mut missing = Vec::new();
+                    for hash in hashes {
+                        match store.get_node(&hash)? {
+                            Some(data) => nodes.push((hash, data)),
+                            None => missing.push(hash),
+                        }
                     }
-                }
+                    Ok((nodes, missing))
+                })
+                .await?;
                 write_frame(send, &MptMessage::Nodes { nodes, missing }).await?;
                 Ok(())
             }
             MptMessage::GetValues { hashes } => {
                 check_batch(hashes.len())?;
-                let mut values = Vec::new();
-                let mut missing = Vec::new();
-                for hash in hashes {
-                    match self.store().get_value(&hash)? {
-                        Some(data) => values.push((hash, data)),
-                        None => missing.push(hash),
+                let store = self.store().clone();
+                let (values, missing) = crate::blocking::offload(move || {
+                    let mut values = Vec::new();
+                    let mut missing = Vec::new();
+                    for hash in hashes {
+                        match store.get_value(&hash)? {
+                            Some(data) => values.push((hash, data)),
+                            None => missing.push(hash),
+                        }
                     }
-                }
+                    Ok((values, missing))
+                })
+                .await?;
                 write_frame(send, &MptMessage::Values { values, missing }).await?;
                 Ok(())
             }

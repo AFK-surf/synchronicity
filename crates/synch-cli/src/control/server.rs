@@ -26,6 +26,27 @@ use crate::{
     render,
 };
 
+/// Runs a blocking store or filesystem operation off the runtime.
+///
+/// The daemon serves this socket on the same runtime that carries the endpoint,
+/// the scanner, and every timer in the process (§9.1). A request that streams an
+/// object, rebuilds the derived views, or unpublishes a space does real disk
+/// work, and doing it on the worker thread that polled the connection stops that
+/// worker from polling anything else for as long as it takes (§10). Requests
+/// that only read a handful of indexed rows stay inline.
+async fn offload<T, F>(f: F) -> std::result::Result<T, ControlError>
+where
+    F: FnOnce() -> std::result::Result<T, ControlError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => Err(ControlError::internal(format!(
+            "a blocking task did not complete: {e}"
+        ))),
+    }
+}
+
 /// The shortest gap between recovery collection rounds.
 ///
 /// A quiesce measured in seconds still sleeps between rounds rather than
@@ -425,16 +446,26 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         Request::Doctor { rebuild: false } => {
-            for line in render::doctor(node)? {
+            // The examination asks the trie whether each origin's root is held
+            // whole — a full walk the first time it is asked of a root — and
+            // counts every entry of every space to do it.
+            let examining = node.clone();
+            for line in offload(move || render::doctor(&examining)).await? {
                 out.line(line).await?;
             }
         }
 
         Request::Doctor { rebuild: true } => {
-            let n = node.rebuild_views()?;
+            // A rebuild re-materializes every leaf of every origin's trie.
+            let rebuilding = node.clone();
+            let n = offload(move || Ok(rebuilding.rebuild_views()?)).await?;
             out.line(format!("rebuilt {n} derived rows from the trie"))
                 .await?;
-            for line in render::doctor(node)? {
+            // The examination asks the trie whether each origin's root is held
+            // whole — a full walk the first time it is asked of a root — and
+            // counts every entry of every space to do it.
+            let examining = node.clone();
+            for line in offload(move || render::doctor(&examining)).await? {
                 out.line(line).await?;
             }
         }
@@ -640,7 +671,10 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         Request::SpaceRm { id } => {
-            let staged = node.remove_space(&id)?;
+            // Unpublishing a space scans its whole prefix out of the trie.
+            let removing = node.clone();
+            let removed_id = id.clone();
+            let staged = offload(move || Ok(removing.remove_space(&removed_id)?)).await?;
             let removed = staged.len();
             // Explicit commands publish before they answer, so the count they
             // report is one that peers can already see (§7.1).
@@ -716,13 +750,15 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 // The origin-prefixed form lists exactly one origin's view,
                 // which is the old per-origin listing (§9.2).
                 Some(origin) => {
-                    let rows = node.store().list_entries(
-                        Some(origin),
-                        &reference.space,
-                        &reference.dir_prefix(),
-                        None,
-                        None,
-                    )?;
+                    // Unlimited, so the query is the size of the space.
+                    let store = node.store().clone();
+                    let origin = origin.clone();
+                    let space = reference.space.clone();
+                    let prefix = reference.dir_prefix();
+                    let rows = offload(move || {
+                        Ok(store.list_entries(Some(&origin), &space, &prefix, None, None)?)
+                    })
+                    .await?;
                     for row in &rows {
                         out.line(render::entry_line(row, None)).await?;
                     }
@@ -730,12 +766,13 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 // The unified tree: one line per path, divergence marked with
                 // the number of versions the path carries (§8).
                 None => {
-                    let listing = node.unified_listing(
-                        &reference.space,
-                        &reference.dir_prefix(),
-                        None,
-                        None,
-                    )?;
+                    let listing = {
+                        let listing = node.clone();
+                        let space = reference.space.clone();
+                        let prefix = reference.dir_prefix();
+                        offload(move || Ok(listing.unified_listing(&space, &prefix, None, None)?))
+                            .await?
+                    };
                     for set in &listing {
                         if !set.exists() {
                             // Every publisher has tombstoned it: the path has
@@ -923,7 +960,12 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                     "--from and --to name the same origin; nothing to compare",
                 ));
             }
-            let report = node.compare(&reference.space, &reference.dir_prefix(), &from, &to)?;
+            // A comparison materializes both origins' listings in full.
+            let comparing = node.clone();
+            let space = reference.space.clone();
+            let prefix = reference.dir_prefix();
+            let report =
+                offload(move || Ok(comparing.compare(&space, &prefix, &from, &to)?)).await?;
             for line in render::compare(&report, json) {
                 out.line(line).await?;
             }
@@ -1205,7 +1247,17 @@ async fn put_stream<S: AsyncRead + AsyncWrite + Unpin>(
     out.ready().await?;
     loop {
         match out.upload().await? {
-            Upload::Chunk(bytes) => adoption.write(&bytes)?,
+            // Each piece is a write to the staging file, so it goes off the
+            // runtime: the upload is the size of the object, and the worker
+            // thread polling this connection is also serving every other one.
+            // The staging handle travels into the blocking pool and back.
+            Upload::Chunk(bytes) => {
+                adoption = offload(move || {
+                    adoption.write(&bytes)?;
+                    Ok(adoption)
+                })
+                .await?;
+            }
             Upload::End => break,
             // The staging file goes with the dropped `Adoption`; the space is
             // left exactly as it was.
@@ -1217,7 +1269,8 @@ async fn put_stream<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
-    let target = adoption.commit()?;
+    // The commit fsyncs the payload and renames it into place.
+    let target = offload(move || Ok(adoption.commit()?)).await?;
 
     // The ordinary indexing pipeline takes it from here: hash, CAS, stage,
     // publish. A write answers with a published seq for the same reason `scan`
@@ -1282,7 +1335,12 @@ async fn stream_entry<S: AsyncWrite + Unpin>(
     let mut offset = range.start;
     while offset < range.end {
         let take = (CHUNK_SIZE as u64).min(range.end - offset);
-        let bytes = node.store().read_range(&range.root, offset, take)?;
+        // Every piece is a verified read out of the CAS — payload and outboard
+        // off disk — so it runs on the blocking pool rather than on the worker
+        // polling this connection.
+        let store = node.store().clone();
+        let root = range.root;
+        let bytes = offload(move || Ok(store.read_range(&root, offset, take)?)).await?;
         if bytes.is_empty() {
             break;
         }

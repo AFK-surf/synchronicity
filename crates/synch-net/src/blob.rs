@@ -104,13 +104,21 @@ impl BlobProtocol {
                 // what it verifiably holds. Encoding validates the local copy
                 // against the root, so a corrupted payload fails here rather
                 // than being served.
-                let (encoded, served) = match self.store.encode_slice(&root, &ranges) {
-                    Ok(pair) => pair,
-                    Err(synch_store::StoreError::MissingBlob(_)) => {
-                        (Vec::new(), ChunkRanges::empty())
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+                //
+                // It reads the payload and its outboard off disk to do it, and
+                // a window is up to `MAX_SLICE_GROUPS` — so it runs on the
+                // blocking pool. Serving one peer's large object must not stop
+                // this node's connection tasks from polling (§10).
+                let store = self.store.clone();
+                let (encoded, served) =
+                    crate::blocking::offload(move || match store.encode_slice(&root, &ranges) {
+                        Ok(pair) => Ok(pair),
+                        Err(synch_store::StoreError::MissingBlob(_)) => {
+                            Ok((Vec::new(), ChunkRanges::empty()))
+                        }
+                        Err(e) => Err(e.into()),
+                    })
+                    .await?;
                 write_bytes(send, &encoded).await?;
                 write_frame(send, &BlobMessage::SliceEnd { served }).await?;
                 Ok(())
@@ -181,7 +189,7 @@ impl BlobClient {
     /// keeps everything it verified.
     pub async fn fetch_into(
         &self,
-        store: &Store,
+        store: &Arc<Store>,
         root: Hash,
         size: u64,
         ranges: &ChunkRanges,
@@ -207,13 +215,18 @@ impl BlobClient {
                 continue;
             }
             barren = 0;
-            got = got.union(&store.write_slice(
-                &root,
-                size,
-                &slice.served,
-                &slice.encoded,
-                now_ns(),
-            )?);
+            // Committing a window decodes it against the object root and
+            // writes both the sparse payload and its outboard, then fsyncs
+            // them before the bitmap advances — the heaviest disk work a fetch
+            // does, and it happens once per window. Off the runtime it goes.
+            let store = store.clone();
+            let served = slice.served.clone();
+            let encoded = slice.encoded;
+            let written = crate::blocking::offload(move || {
+                Ok(store.write_slice(&root, size, &served, &encoded, now_ns())?)
+            })
+            .await?;
+            got = got.union(&written);
         }
         Ok(got)
     }

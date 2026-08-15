@@ -185,7 +185,11 @@ impl Node {
 
     /// Opens an initialized data directory and binds the endpoint.
     pub async fn open(mut config: NodeConfig) -> Result<Node> {
-        let store = Arc::new(Store::open(&config.data_dir)?);
+        // Opening runs migrations and hardens file permissions, both of which
+        // are filesystem work, so it goes to the blocking pool like everything
+        // else that touches the disk.
+        let data_dir = config.data_dir.clone();
+        let store = Arc::new(crate::blocking::offload(move || Ok(Store::open(&data_dir)?)).await?);
         let origin = store.self_origin()?.ok_or(EngineError::NotInitialized)?;
         let secret = store
             .active_device_key()?
@@ -217,8 +221,12 @@ impl Node {
         };
         // A batch that was still buffered when the process died was never
         // published, and the scanner would skip those files forever (§7.1).
-        // Opening is where that is noticed and undone.
-        let reindexed = node.reconcile_local_files()?;
+        // Opening is where that is noticed and undone — one trie lookup per
+        // indexed file, so it goes off the runtime with the rest.
+        let reindexed = {
+            let node = node.clone();
+            crate::blocking::offload(move || node.reconcile_local_files()).await?
+        };
         if reindexed > 0 {
             tracing::info!(
                 paths = reindexed,
