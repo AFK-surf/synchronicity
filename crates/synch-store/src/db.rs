@@ -231,7 +231,10 @@ impl Store {
         let tx = conn.unchecked_transaction().map_err(StoreError::from)?;
         // On `Err` the `Transaction` is dropped without a commit, which is a
         // rollback: nothing the closure wrote is observable afterwards.
-        let out = f(&Txn { tx: &tx })?;
+        let out = f(&Txn {
+            tx: &tx,
+            store: self,
+        })?;
         tx.commit().map_err(StoreError::from)?;
         Ok(out)
     }
@@ -389,6 +392,7 @@ impl Store {
 #[derive(Debug)]
 pub struct Txn<'a> {
     tx: &'a rusqlite::Transaction<'a>,
+    store: &'a Store,
 }
 
 impl Txn<'_> {
@@ -398,12 +402,20 @@ impl Txn<'_> {
     }
 }
 
-/// A transaction deliberately keeps the [`NodeStore`] completeness memo's
-/// defaults — it never reads it and never writes to it. A scope that can still
-/// roll back must not be able to record "I hold all of this" about nodes the
-/// commit might never land.
 impl NodeStore for Txn<'_> {
     type Error = StoreError;
+
+    /// Reads the store's completeness memo, which was established by walks over
+    /// committed data and says nothing about this transaction's own writes.
+    fn is_known_complete(&self, root: &Hash) -> Result<bool> {
+        self.store.is_known_complete(root)
+    }
+
+    /// Deliberately records nothing. A scope that can still roll back must not
+    /// vouch for nodes the commit might never land.
+    fn note_complete(&self, _root: &Hash) -> Result<()> {
+        Ok(())
+    }
 
     fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
         get_node_in(self.conn(), hash)

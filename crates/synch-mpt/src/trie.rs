@@ -102,6 +102,156 @@ impl Missing {
 /// A key/value pair as yielded by iteration and range scans.
 pub type Entry = (Vec<u8>, Vec<u8>);
 
+/// The §5.2 frontier, as a walk that keeps its place.
+///
+/// A fetch asks "what does this root need?" repeatedly, a batch at a time, and
+/// two things about how it asks decide what the whole exchange costs.
+///
+/// **It resumes.** Restarting the walk at the root for every batch makes a cold
+/// fetch quadratic: each round re-descends everything already fetched to reach
+/// the next batch of absent nodes, so a trie of `n` nodes costs roughly
+/// `n²/batch` node reads. The walk therefore holds its frontier across batches
+/// and only revisits a node once the caller has stored it.
+///
+/// **It prunes against what is already held.** Content addressing makes
+/// subtree *equality* free — matching hashes are the same subtree — but says
+/// nothing about whether a subtree is *held*, and a node is committed the
+/// moment it arrives, so a present node's children may well be absent. That is
+/// why a walk cannot simply stop at a node it has. Given a root it holds
+/// *whole*, though, it can: a hash appearing in that trie is a subtree it has
+/// all of. Handed the origin's last complete root, the walk skips everything
+/// the new root shares with it and descends only the paths that actually
+/// changed — which is what makes an incremental sync cost the change rather
+/// than the tree (§5.2).
+#[derive(Debug)]
+pub struct MissingWalk {
+    /// `(the hash at this position in the reference trie, the hash wanted)`.
+    frontier: Vec<(Option<Hash>, Hash)>,
+    seen: HashSet<Hash>,
+    /// Reported absent and awaiting the caller's fetch, so they can be
+    /// revisited — and their children discovered — once they land.
+    deferred: Vec<(Option<Hash>, Hash)>,
+}
+
+impl MissingWalk {
+    /// A walk over everything reachable from `root`, pruning nothing.
+    pub fn new(root: Hash) -> MissingWalk {
+        MissingWalk::since(None, root)
+    }
+
+    /// A walk that skips every subtree `root` shares with `known_complete`.
+    ///
+    /// The reference root must be one this store holds in full; pass `None`
+    /// when there is no such root, or when it has not been established. A
+    /// wrong reference would have the walk skip subtrees it does not hold, and
+    /// report a trie complete that it cannot serve.
+    pub fn since(known_complete: Option<Hash>, root: Hash) -> MissingWalk {
+        let frontier = match root_opt(root) {
+            None => Vec::new(),
+            Some(root) => vec![(known_complete.and_then(root_opt), root)],
+        };
+        MissingWalk {
+            frontier,
+            seen: HashSet::new(),
+            deferred: Vec::new(),
+        }
+    }
+
+    /// True once the walk has covered everything and nothing is outstanding.
+    pub fn is_exhausted(&self) -> bool {
+        self.frontier.is_empty() && self.deferred.is_empty()
+    }
+
+    /// Re-queues everything reported absent, for after the caller has stored
+    /// it. Nodes that arrived expand into their children; ones that did not
+    /// are reported again, which is what lets a caller notice it is making no
+    /// progress.
+    pub fn resume(&mut self) {
+        for (reference, hash) in self.deferred.drain(..) {
+            self.seen.remove(&hash);
+            self.frontier.push((reference, hash));
+        }
+    }
+
+    /// Walks until `max` absent hashes are found or the frontier drains.
+    pub fn next_batch<S: NodeStore + ?Sized>(
+        &mut self,
+        trie: &Trie<'_, S>,
+        max: usize,
+    ) -> Result<Missing, MptError> {
+        let mut missing = Missing::default();
+        while let Some((reference, hash)) = self.frontier.pop() {
+            if missing.len() >= max {
+                self.frontier.push((reference, hash));
+                break;
+            }
+            // The same hash in a trie held whole: this subtree is already here,
+            // values and all.
+            if reference == Some(hash) {
+                continue;
+            }
+            if !self.seen.insert(hash) {
+                continue;
+            }
+            let Some(data) = trie.load_raw(&hash)? else {
+                missing.nodes.push(hash);
+                self.deferred.push((reference, hash));
+                continue;
+            };
+            let node = TrieNode::decode(&data)?;
+            let reference_node = match reference {
+                Some(reference) => trie
+                    .load_raw(&reference)?
+                    .map(|bytes| TrieNode::decode(&bytes))
+                    .transpose()?,
+                None => None,
+            };
+            self.frontier
+                .extend(paired_children(reference_node.as_ref(), &node));
+            for value_hash in node.value_hashes() {
+                if !trie.has_value_raw(&value_hash)? {
+                    missing.values.push(value_hash);
+                }
+            }
+        }
+        Ok(missing)
+    }
+}
+
+/// Pairs a node's children with the ones at the same positions in the
+/// reference trie, so the walk can prune where the two agree.
+///
+/// Pairing is only attempted where the two nodes have the same shape. Anywhere
+/// else the children are walked with no reference, which costs traversal and
+/// never correctness — pruning is an optimization, and declining to prune is
+/// always safe.
+fn paired_children(reference: Option<&TrieNode>, node: &TrieNode) -> Vec<(Option<Hash>, Hash)> {
+    match (reference, node) {
+        (
+            Some(TrieNode::Branch {
+                children: theirs, ..
+            }),
+            TrieNode::Branch { children, .. },
+        ) => children
+            .iter()
+            .enumerate()
+            .filter_map(|(i, child)| child.map(|child| (theirs[i], child)))
+            .collect(),
+        (
+            Some(TrieNode::Ext {
+                prefix: their_prefix,
+                child: their_child,
+            }),
+            TrieNode::Ext { prefix, child },
+        ) if their_prefix == prefix => vec![(Some(*their_child), *child)],
+        (_, node) => node
+            .child_hashes()
+            .into_iter()
+            .map(|child| (None, child))
+            .collect(),
+    }
+}
+
 /// Everything reachable from a root, for mark-and-sweep GC (§5.4).
 #[derive(Debug, Clone, Default)]
 pub struct Reachable {
@@ -138,6 +288,16 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     fn load(&self, hash: &Hash) -> Result<TrieNode, MptError> {
         let data = Self::wrap(self.store.get_node(hash))?.ok_or(MptError::MissingNode(*hash))?;
         TrieNode::decode(&data)
+    }
+
+    /// Reads a node's bytes without requiring it to be present, for the walks
+    /// whose whole purpose is finding out whether it is.
+    pub(crate) fn load_raw(&self, hash: &Hash) -> Result<Option<Vec<u8>>, MptError> {
+        Self::wrap(self.store.get_node(hash))
+    }
+
+    pub(crate) fn has_value_raw(&self, hash: &Hash) -> Result<bool, MptError> {
+        Self::wrap(self.store.has_value(hash))
     }
 
     fn put(&self, node: &TrieNode) -> Result<Hash, MptError> {
@@ -616,35 +776,11 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
 
     /// Which hashes reachable from `root` are absent from the store.
     ///
-    /// This is the §5.2 frontier: the caller fetches these, stores them, and
-    /// calls again until nothing is missing.
+    /// A one-shot walk from scratch. A fetch wants [`MissingWalk`] instead: it
+    /// keeps its place between batches, and can prune against a trie it
+    /// already holds whole.
     pub fn missing(&self, root: Hash, max: usize) -> Result<Missing, MptError> {
-        let mut missing = Missing::default();
-        let mut seen = HashSet::new();
-        let mut frontier = match root_opt(root) {
-            None => return Ok(missing),
-            Some(h) => vec![h],
-        };
-        while let Some(hash) = frontier.pop() {
-            if missing.len() >= max {
-                break;
-            }
-            if !seen.insert(hash) {
-                continue;
-            }
-            let Some(data) = Self::wrap(self.store.get_node(&hash))? else {
-                missing.nodes.push(hash);
-                continue;
-            };
-            let node = TrieNode::decode(&data)?;
-            frontier.extend(node.child_hashes());
-            for value_hash in node.value_hashes() {
-                if !Self::wrap(self.store.has_value(&value_hash))? {
-                    missing.values.push(value_hash);
-                }
-            }
-        }
-        Ok(missing)
+        MissingWalk::new(root).next_batch(self, max)
     }
 
     /// True if the whole trie under `root` is present locally and servable.

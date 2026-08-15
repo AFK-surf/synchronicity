@@ -521,6 +521,11 @@ impl Node {
             })?;
 
         if let Some(head) = &head {
+            // This node just built the whole trie under that root, so it holds
+            // it whole by construction. Recording that here is what keeps the
+            // first `Hello` after every publish from proving it again by
+            // walking the entire trie (§5.1).
+            synch_mpt::NodeStore::note_complete(self.store().as_ref(), &head.root)?;
             tracing::info!(
                 seq = head.seq,
                 changes = staged.len(),

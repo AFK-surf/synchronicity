@@ -260,12 +260,31 @@ impl Syncer {
         let Some(pending) = self.store.pending_head(origin)? else {
             return Ok(FetchOutcome::Idle);
         };
+        // What this origin's trie looked like when we last held all of it. Every
+        // subtree the new root shares with it is already here, so the walk can
+        // skip it outright and descend only what changed (§5.2) — which is the
+        // difference between an incremental sync costing the change and costing
+        // the whole tree. Only a root we have *established* is complete will do:
+        // that check is memoized, so it is a lookup after the first time.
+        let trie = Trie::new(self.store.as_ref());
+        let reference = match self.store.complete_head(origin)? {
+            Some(head) if trie.is_complete(head.root)? => Some(head.root),
+            _ => None,
+        };
+        let mut walk = synch_mpt::MissingWalk::since(reference, pending.root);
         let mut unproductive = 0u32;
         loop {
             let trie = Trie::new(self.store.as_ref());
-            let missing = trie.missing(pending.root, MAX_BATCH)?;
+            // One walk across the whole fetch, resumed rather than restarted:
+            // beginning again at the root for every batch makes a cold fetch
+            // re-descend everything it has already pulled, once per batch.
+            let missing = walk.next_batch(&trie, MAX_BATCH)?;
             if missing.is_empty() {
-                break;
+                if walk.is_exhausted() {
+                    break;
+                }
+                walk.resume();
+                continue;
             }
 
             let mut learned = 0usize;
@@ -317,7 +336,15 @@ impl Syncer {
             } else {
                 unproductive = 0;
             }
+            // Everything just stored goes back on the frontier, so the nodes
+            // that arrived expand into their own children.
+            walk.resume();
         }
+
+        // The walk drained with nothing missing, which *is* the answer to "do I
+        // hold all of this?" — so record it rather than let the promotion below
+        // and the next `Hello` each rediscover it by walking the trie again.
+        synch_mpt::NodeStore::note_complete(self.store.as_ref(), &pending.root)?;
 
         if self.try_promote(origin, now_ns())? {
             Ok(FetchOutcome::Completed)

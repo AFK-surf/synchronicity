@@ -152,13 +152,12 @@ async fn metadata(options: &Options, publisher: &Peer, follower: &Peer) {
         "AAE sync, 1 entry changed",
         &format!("{incremental:>12.2?}"),
     );
-    // §5.2 wants this proportional to the change, not to the tree. Bandwidth is
-    // — only the changed path's nodes cross the wire — but the frontier walk
-    // that decides what to ask for is not, so this ratio is a long way from the
-    // `files` it would be if the cost really were O(change). Raise `--files`
-    // and watch it stay flat: that is the walk, not the transfer.
+    // §5.2 wants this proportional to the change rather than to the tree, in
+    // work as well as bandwidth. The absolute number above is the one to watch:
+    // raise `--files` and it should barely move, while the cold sync beside it
+    // grows with the tree.
     println!(
-        "  {:<34} {:>12} — cold over incremental (ideally ~{})",
+        "  {:<34} {:>12} — cold over incremental, on {} files",
         "structural sharing factor",
         format!("{:.0}x", cold.as_secs_f64() / incremental.as_secs_f64()),
         files

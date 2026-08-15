@@ -539,13 +539,17 @@ check (H.seq, H.root) > (local.seq, local.root) lexicographically (else ignore)
   // (seq, root) rule accepts an equal-seq, greater-root head; the displaced head
   // is retained in head_history as equivocation evidence (§4.4).
 record H as pending_head(O)                            // durable; complete head untouched
-frontier ← { H.root }
-while frontier ≠ ∅:
-    want ← { h ∈ frontier : h ∉ trie_nodes }          // structural sharing: skip known subtrees
-    if want = ∅: break
+R ← complete_head(O).root, if this node holds that trie WHOLE, else ⊥
+frontier ← { (R, H.root) }                             // (reference position, wanted)
+while frontier ≠ ∅:                                    // ONE walk, resumed between batches
+    drop (r, h) where r = h                            // same hash under a trie held whole:
+                                                       //   that subtree is already here
+    want ← { h : (r, h) ∈ frontier, h ∉ trie_nodes }
+    if want = ∅ and frontier is drained: break
     nodes ← GetNodes(want) from this peer (or any peer advertising complete ≥ H.seq)
     verify each node hashes to its requested hash      // reject & disconnect on mismatch
-    store nodes; frontier ← their children ∪ out-of-line value hashes
+    store nodes; re-queue what was fetched, pairing each child with the child at
+    the same position under r, so the next descent can prune the same way
 atomically, in ONE SQLite transaction:
     set complete_head(O) ← H; clear pending
     re-materialize changed leaves into `entries` / `blob_providers` (computed from
@@ -563,8 +567,24 @@ Properties:
   in-progress target is recorded as the `pending` head, and the `complete` head —
   the one `entries` is materialized from, the one advertised as servable — flips only
   when the trie is fully present under the new root.
-- **Bandwidth ∝ change**: unchanged subtrees are pruned at the first shared hash.
-  Fully-in-sync check is a single root-hash comparison in `Hello`.
+- **Bandwidth *and work* ∝ change**: unchanged subtrees are pruned at the first
+  shared hash. The distinction is worth stating because getting one without the
+  other is easy and was once the case here: a walk that filters *requests* by
+  presence still descends into everything present, so bandwidth is proportional to
+  the change while CPU is proportional to the tree. Pruning traversal needs a
+  stronger fact than "I have this node" — a node is committed the moment it
+  arrives, so a present node's children may be absent, and presence alone proves
+  nothing about a subtree. The reference root `R` supplies it: hashes matching a
+  trie held *whole* are subtrees held whole. Cold sync has no such reference and
+  is honestly proportional to the trie, but it walks it once — the frontier is
+  resumed between batches, never restarted at the root, or a fetch of `n` nodes in
+  batches of `b` would re-descend what it has already pulled and cost `n²/b`.
+- **A completeness answer is computed once**: "do I hold this trie whole?" is asked
+  on every `Hello`, and answering it means walking everything reachable. A root is
+  immutable, so the answer cannot change once computed: a store may remember it,
+  and a node that just built or just fetched a root records it outright rather than
+  proving it again. Without that a converged cluster pays for the size of its
+  metadata on every anti-entropy round, on both sides, forever.
 - **Verified piecewise**: every trie node is checked against the hash it was requested
   by; a malicious or corrupt peer cannot inject data, only fail to help.
 - **Peer-agnostic**: because trie nodes are content-addressed, missing nodes may be
