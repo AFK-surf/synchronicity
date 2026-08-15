@@ -29,6 +29,27 @@ pub const MAX_BATCH: usize = 256;
 /// This bounds memory use per stream against a hostile peer (§12, DoS).
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
+/// The most chunk groups one slice exchange carries — 8 MiB of payload.
+///
+/// A bao slice is encoded into memory whole, on both sides, and travels in one
+/// frame, so an unbounded `GetSlice` is two problems at once: an object larger
+/// than [`MAX_FRAME_LEN`] could never be served at all, and a peer could make a
+/// provider allocate an object-sized buffer just by asking for one (§6.4, §12).
+/// Requests are therefore served a window at a time and the requester loops.
+/// The ceiling leaves room for the hash pairs bao interleaves with the payload,
+/// which stay well under the remaining 8 MiB even when a window is asked for
+/// one group at a time.
+pub const MAX_SLICE_GROUPS: u64 = 512;
+
+/// The most ranges one [`ChunkRanges`] may carry across the wire.
+///
+/// Set operations are quadratic in the number of ranges, so a request built
+/// from a million singleton ranges is a CPU exhaustion vector even though it
+/// fits in a frame. No honest request needs anything near this many: a window
+/// is [`MAX_SLICE_GROUPS`] groups, so it cannot describe more than that many
+/// disjoint runs.
+pub const MAX_RANGES: usize = 4096;
+
 /// A message on the `sync/mpt/1` ALPN (§5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MptMessage {
@@ -249,6 +270,34 @@ impl ChunkRanges {
     pub fn union(&self, other: &ChunkRanges) -> ChunkRanges {
         ChunkRanges::from_ranges(self.ranges.iter().chain(other.ranges.iter()).copied())
     }
+
+    /// The first `groups` groups of this set, in order.
+    ///
+    /// How a fetch walks a large object: one bounded window per exchange
+    /// ([`MAX_SLICE_GROUPS`]) rather than one request for the whole thing.
+    pub fn take(&self, groups: u64) -> ChunkRanges {
+        let mut out = Vec::new();
+        let mut budget = groups;
+        for range in &self.ranges {
+            if budget == 0 {
+                break;
+            }
+            let len = range.end.saturating_sub(range.start);
+            if len <= budget {
+                out.push(*range);
+                budget -= len;
+            } else {
+                out.push(GroupRange::new(range.start, range.start + budget));
+                break;
+            }
+        }
+        ChunkRanges { ranges: out }
+    }
+
+    /// How many ranges the set is made of.
+    pub fn range_count(&self) -> usize {
+        self.ranges.len()
+    }
 }
 
 /// A message on the `sync/blob/1` ALPN (§6.4).
@@ -359,6 +408,21 @@ mod tests {
         assert_eq!(r.count(), 7);
         assert!(r.contains(0));
         assert!(!r.contains(4));
+    }
+
+    #[test]
+    fn chunk_ranges_take_bounds_a_window() {
+        let r = ChunkRanges::from_ranges([GroupRange::new(0, 4), GroupRange::new(10, 20)]);
+        assert_eq!(r.take(0), ChunkRanges::empty());
+        assert_eq!(r.take(3).ranges, vec![GroupRange::new(0, 3)]);
+        // A window that spans a gap keeps both sides and splits the second.
+        assert_eq!(
+            r.take(6).ranges,
+            vec![GroupRange::new(0, 4), GroupRange::new(10, 12)]
+        );
+        // Asking for more than there is yields everything, not a wider set.
+        assert_eq!(r.take(1000), r);
+        assert_eq!(r.take(6).count(), 6);
     }
 
     #[test]

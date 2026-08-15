@@ -499,6 +499,12 @@ impl Store {
     /// The provider serves the intersection of what was asked for and what it
     /// verifiably holds; the requester learns exact availability from the
     /// returned ranges, which is what `SliceEnd` carries.
+    ///
+    /// At most [`synch_core::MAX_SLICE_GROUPS`] groups are served per call, whatever was
+    /// asked for. The encoding is built in memory and travels in one frame, so
+    /// an unclamped request would let a peer name an object-sized allocation —
+    /// and no honest requester needs one, because `SliceEnd` tells it exactly
+    /// how far it got and its next window starts there (§6.4, §12).
     pub fn encode_slice(
         &self,
         root: &Hash,
@@ -507,7 +513,8 @@ impl Store {
         let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
         let served = requested
             .intersect(&blob.verified_groups())
-            .intersect(&ChunkRanges::single(0, group_count(blob.size)));
+            .intersect(&ChunkRanges::single(0, group_count(blob.size)))
+            .take(synch_core::MAX_SLICE_GROUPS);
         if served.is_empty() {
             return Ok((Vec::new(), served));
         }
@@ -531,12 +538,18 @@ impl Store {
                 encode_ranges_validated(data.as_slice(), outboard, &bao_ranges, &mut encoded)
             }
             None => {
+                // Both files are read positionally, never slurped. An outboard
+                // is 1/256 of its object, so reading it whole costs 40 MB on a
+                // 10 GB object — and this runs once per served window (§6.4)
+                // and once per chunk of a streaming read, which turns a large
+                // object's transfer into a repeated scan of its own hash tree.
+                // What each call actually touches is the sibling hashes on the
+                // path to the requested groups.
                 let data = File::open(self.blob_path(&blob.root))?;
-                let outboard_data = std::fs::read(self.outboard_path(&blob.root))?;
                 let outboard = PreOrderOutboard {
                     root: root_hash,
                     tree,
-                    data: outboard_data,
+                    data: DataFile(File::open(self.outboard_path(&blob.root))?),
                 };
                 encode_ranges_validated(DataFile(data), outboard, &bao_ranges, &mut encoded)
             }
@@ -966,6 +979,31 @@ mod tests {
             fetcher.write_slice(&wrong, bytes.len() as u64, &served, &encoded, 0),
             Err(StoreError::Verification { .. })
         ));
+    }
+
+    #[test]
+    fn a_slice_is_clamped_to_one_window() {
+        // The encoding is built in memory and travels in one frame, so what a
+        // peer asks for cannot decide how much a provider allocates: a request
+        // for everything is answered with the first window and a `served` that
+        // says so, which is where the requester's next window starts.
+        let (_d, provider) = store();
+        let bytes = data((synch_core::MAX_SLICE_GROUPS as usize + 200) * 16384);
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let groups = group_count(bytes.len() as u64);
+        assert!(groups > synch_core::MAX_SLICE_GROUPS);
+
+        let (encoded, served) = provider
+            .encode_slice(&root, &ChunkRanges::single(0, groups))
+            .unwrap();
+        assert_eq!(served.count(), synch_core::MAX_SLICE_GROUPS);
+        assert_eq!(served, ChunkRanges::single(0, synch_core::MAX_SLICE_GROUPS));
+        assert!(encoded.len() < synch_core::MAX_FRAME_LEN);
+
+        // And the window after it picks up exactly where that one stopped.
+        let rest = ChunkRanges::single(0, groups).difference(&served);
+        let (_, served_next) = provider.encode_slice(&root, &rest).unwrap();
+        assert_eq!(served_next.ranges[0].start, synch_core::MAX_SLICE_GROUPS);
     }
 
     #[test]

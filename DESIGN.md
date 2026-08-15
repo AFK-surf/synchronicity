@@ -561,13 +561,17 @@ check (H.seq, H.root) > (local.seq, local.root) lexicographically (else ignore)
   // (seq, root) rule accepts an equal-seq, greater-root head; the displaced head
   // is retained in head_history as equivocation evidence (§4.4).
 record H as pending_head(O)                            // durable; complete head untouched
-frontier ← { H.root }
-while frontier ≠ ∅:
-    want ← { h ∈ frontier : h ∉ trie_nodes }          // structural sharing: skip known subtrees
-    if want = ∅: break
+R ← complete_head(O).root, if this node holds that trie WHOLE, else ⊥
+frontier ← { (R, H.root) }                             // (reference position, wanted)
+while frontier ≠ ∅:                                    // ONE walk, resumed between batches
+    drop (r, h) where r = h                            // same hash under a trie held whole:
+                                                       //   that subtree is already here
+    want ← { h : (r, h) ∈ frontier, h ∉ trie_nodes }
+    if want = ∅ and frontier is drained: break
     nodes ← GetNodes(want) from this peer (or any peer advertising complete ≥ H.seq)
     verify each node hashes to its requested hash      // reject & disconnect on mismatch
-    store nodes; frontier ← their children ∪ out-of-line value hashes
+    store nodes; re-queue what was fetched, pairing each child with the child at
+    the same position under r, so the next descent can prune the same way
 atomically, in ONE SQLite transaction:
     set complete_head(O) ← H; clear pending
     re-materialize changed leaves into `entries` / `blob_providers` (computed from
@@ -585,8 +589,24 @@ Properties:
   in-progress target is recorded as the `pending` head, and the `complete` head —
   the one `entries` is materialized from, the one advertised as servable — flips only
   when the trie is fully present under the new root.
-- **Bandwidth ∝ change**: unchanged subtrees are pruned at the first shared hash.
-  Fully-in-sync check is a single root-hash comparison in `Hello`.
+- **Bandwidth *and work* ∝ change**: unchanged subtrees are pruned at the first
+  shared hash. The distinction is worth stating because getting one without the
+  other is easy and was once the case here: a walk that filters *requests* by
+  presence still descends into everything present, so bandwidth is proportional to
+  the change while CPU is proportional to the tree. Pruning traversal needs a
+  stronger fact than "I have this node" — a node is committed the moment it
+  arrives, so a present node's children may be absent, and presence alone proves
+  nothing about a subtree. The reference root `R` supplies it: hashes matching a
+  trie held *whole* are subtrees held whole. Cold sync has no such reference and
+  is honestly proportional to the trie, but it walks it once — the frontier is
+  resumed between batches, never restarted at the root, or a fetch of `n` nodes in
+  batches of `b` would re-descend what it has already pulled and cost `n²/b`.
+- **A completeness answer is computed once**: "do I hold this trie whole?" is asked
+  on every `Hello`, and answering it means walking everything reachable. A root is
+  immutable, so the answer cannot change once computed: a store may remember it,
+  and a node that just built or just fetched a root records it outright rather than
+  proving it again. Without that a converged cluster pays for the size of its
+  metadata on every anti-entropy round, on both sides, forever.
 - **Verified piecewise**: every trie node is checked against the hash it was requested
   by; a malicious or corrupt peer cannot inject data, only fail to help.
 - **Peer-agnostic**: because trie nodes are content-addressed, missing nodes may be
@@ -701,6 +721,13 @@ GetSlice   { root: Hash, ranges: ChunkRanges }   // ChunkRanges in 16 KiB group 
 // response: bao slice stream, verified incrementally by the requester
 SliceEnd   { served: ChunkRanges }               // what the provider actually had
 ```
+
+A slice is encoded into memory whole and travels in one framed message, so one
+exchange carries a bounded **window** — 512 groups, 8 MiB of payload — whatever
+was asked for. The provider clamps to it and says so in `SliceEnd`; the
+requester walks a larger range one window at a time, committing each as it
+arrives. Without the bound, an object larger than a frame could not be served at
+all, and the size of a provider's allocation would be the requester's to choose.
 
 The fetcher:
 
@@ -1266,7 +1293,19 @@ CI (GitHub Actions):
   data is held without a live binding. What remains are sanity bounds that
   cap the cost of any *single* malformed or extreme message: `GetNodes`/`GetValues`
   batches are capped at 256 hashes, and trie keys are bounded to 4 KiB (so ingest
-  depth ≤ ~8 K nibbles).
+  depth ≤ ~8 K nibbles). A `GetSlice` is bounded the same way, on both axes: at
+  most 512 groups are encoded per exchange (§6.4), and at most 4 096 ranges are
+  accepted in one request, because the range set operations are quadratic in the
+  number of ranges. Trust does not extend to the *shape* of replicated
+  structure, because a member gets it wrong by accident as readily as on
+  purpose: nothing canonicalizes the node graph a peer serves, so every walk
+  over it — the promotion diff above all — keeps its frames on the heap and
+  stops descending past the ~8 K nibbles a valid key can occupy. A recursive
+  walk would meet a hand-built deep chain with a stack overflow, and that aborts
+  the process rather than failing the exchange. In the same spirit, a record
+  this node cannot apply fails *its own origin* and no other: the head does not
+  flip, the exchange carries on, and the count of origins left behind is in the
+  sync report.
 - **Privacy**: metadata (paths, sizes, mtimes) is visible to *all* members — inherent
   to omnipresence. Content is fetched on demand, so bytes only land where requested or
   mirrored. At-rest encryption of the CAS and DB is delegated to OS disk encryption in

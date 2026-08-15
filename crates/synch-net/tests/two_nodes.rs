@@ -435,3 +435,122 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
 fn count_nodes(store: &Store) -> usize {
     store.trie_stats().unwrap().nodes
 }
+
+/// An object larger than one frame transfers, a window at a time (§6.4).
+///
+/// A bao slice is encoded into memory whole and travels in a single framed
+/// message, so a fetch that asked for a whole large object asked the provider
+/// for something it could neither hold nor send: everything above
+/// `MAX_FRAME_LEN` failed with a truncated stream, which is to say the store
+/// could not replicate a video file. The requester now walks the object in
+/// `MAX_SLICE_GROUPS` windows, and the provider clamps to the same bound
+/// whatever it is asked for.
+#[tokio::test]
+async fn an_object_larger_than_one_frame_transfers() {
+    let publisher = Node::spawn("nas").await;
+    let follower = Node::spawn("laptop").await;
+    trust_each_other(&[&publisher, &follower]);
+
+    let payload: Vec<u8> = (0..20u32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    publisher.publish(1, &[("big.bin", payload.as_slice())]);
+    let root = publisher
+        .store
+        .list_entries(Some(&publisher.origin), "media", "", None, None)
+        .unwrap()[0]
+        .content
+        .unwrap();
+
+    let blob = follower
+        .net
+        .connect_blob(publisher.net.direct_addr())
+        .await
+        .unwrap();
+    let all = ChunkRanges::single(0, synch_core::group_count(payload.len() as u64));
+    let got = blob
+        .fetch_into(&follower.store, root, payload.len() as u64, &all)
+        .await
+        .unwrap();
+    assert_eq!(got.count(), synch_core::group_count(payload.len() as u64));
+    assert_eq!(follower.store.read_all(&root).unwrap().len(), payload.len());
+
+    publisher.net.shutdown().await.unwrap();
+    follower.net.shutdown().await.unwrap();
+}
+
+/// One origin publishing a record this node cannot decode does not stop it
+/// converging with the others (§5.2).
+///
+/// Materialization is deliberately atomic — a head whose delta will not apply
+/// does not flip — but that failure used to end the whole exchange, and the
+/// poisoned head is durable, so a single bad record from any trusted origin
+/// stopped *every* origin's metadata from reaching this node, on every sync
+/// from then on.
+#[tokio::test]
+async fn a_poisoned_origin_does_not_hold_up_the_others() {
+    let poisoned = Node::spawn("nas").await;
+    let healthy = Node::spawn("vps").await;
+    let follower = Node::spawn("laptop").await;
+    trust_each_other(&[&poisoned, &healthy, &follower]);
+
+    // A well-formed `f:` key whose value is not a FileEntry: signed, complete,
+    // and impossible to materialize.
+    let trie = Trie::new(poisoned.store.as_ref());
+    let root = trie
+        .insert(
+            Hash::EMPTY,
+            &file_key("media", "bad").unwrap(),
+            &[0xffu8; 8],
+        )
+        .unwrap();
+    let head = SignedHead::sign(&poisoned.secret, poisoned.origin.clone(), 1, root, now_ns());
+    poisoned
+        .store
+        .put_head(Slot::Complete, &head, now_ns(), now_ns())
+        .unwrap();
+
+    healthy.publish(1, &[("good.txt", b"readable")]);
+
+    // The poisoned node picks up the healthy origin's head, so one exchange
+    // now carries both — `nas@…` sorts before `vps@…`, so the bad one is
+    // handled first and used to end the exchange before the good one was read.
+    let to_healthy = poisoned
+        .net
+        .connect_mpt(healthy.net.direct_addr())
+        .await
+        .unwrap();
+    Syncer::new(poisoned.store.clone())
+        .sync_with(&to_healthy)
+        .await
+        .unwrap();
+
+    let client = follower
+        .net
+        .connect_mpt(poisoned.net.direct_addr())
+        .await
+        .unwrap();
+    let report = Syncer::new(follower.store.clone())
+        .sync_with(&client)
+        .await
+        .unwrap();
+
+    // The poisoned origin is reported and left behind; the healthy one lands.
+    assert!(report.heads_failed >= 1, "{report:?}");
+    assert_eq!(
+        follower
+            .store
+            .list_entries(Some(&healthy.origin), "media", "", None, None)
+            .unwrap()
+            .len(),
+        1,
+        "{report:?}"
+    );
+    assert!(follower
+        .store
+        .list_entries(Some(&poisoned.origin), "media", "", None, None)
+        .unwrap()
+        .is_empty());
+
+    for node in [&poisoned, &healthy, &follower] {
+        node.net.shutdown().await.unwrap();
+    }
+}

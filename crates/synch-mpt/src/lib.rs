@@ -30,4 +30,4 @@ pub use nibbles::{common_prefix_len, Nibbles};
 pub use node::{TrieNode, ValueRef, BRANCH_TAG, EXT_TAG, LEAF_TAG};
 pub use proof::Proof;
 pub use store::{MemStore, NodeStore};
-pub use trie::{root_opt, Entry, Missing, Reachable, Trie};
+pub use trie::{root_opt, Entry, Missing, MissingWalk, Reachable, Trie};

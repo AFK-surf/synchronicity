@@ -12,7 +12,7 @@ use crate::{
     nibbles::Nibbles,
     node::ValueRef,
     store::NodeStore,
-    trie::{root_opt, Cursor, Trie},
+    trie::{root_opt, Cursor, Frame, Trie, MAX_DEPTH_NIBBLES},
 };
 
 /// What happened to one key between two roots.
@@ -58,23 +58,69 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         }
         let a = self.cursor_at(root_opt(old_root))?;
         let b = self.cursor_at(root_opt(new_root))?;
-        let mut path = Vec::new();
-        self.diff_rec(&a, &b, &mut path, &mut out)?;
+        self.diff_walk(a, b, &mut out)?;
         out.sort_by(|x, y| x.key.cmp(&y.key));
         Ok(out)
     }
 
-    fn diff_rec(
+    /// Walks both tries in lockstep with an explicit heap stack.
+    ///
+    /// The new root is a peer's, reached over the network, and the *shape* it
+    /// describes is not canonicalized by anything the fetch checks — a hostile
+    /// peer can chain extension nodes to any depth. Recursion here would meet
+    /// that with a stack overflow, which aborts the process rather than
+    /// returning an error, and this walk runs inside head promotion (§5.2), so
+    /// the frames live on the heap and the descent stops at
+    /// [`MAX_DEPTH_NIBBLES`] — past which no key short enough to be valid can
+    /// begin (§12).
+    fn diff_walk(&self, a: Cursor, b: Cursor, out: &mut Vec<Change>) -> Result<(), MptError> {
+        let mut path: Vec<u8> = Vec::new();
+        let mut stack: Vec<(Frame, Cursor)> = Vec::new();
+
+        if !self.enter(&a, &b, &path, out)? {
+            return Ok(());
+        }
+        stack.push((Frame { cursor: a, next: 0 }, b));
+
+        while let Some(top) = stack.len().checked_sub(1) {
+            let nibble = stack[top].0.next;
+            if nibble >= 16 || path.len() >= MAX_DEPTH_NIBBLES {
+                stack.pop();
+                path.pop();
+                continue;
+            }
+            stack[top].0.next += 1;
+            let ca = self.cursor_child(&stack[top].0.cursor, nibble)?;
+            let cb = self.cursor_child(&stack[top].1, nibble)?;
+            path.push(nibble);
+            if self.enter(&ca, &cb, &path, out)? {
+                stack.push((
+                    Frame {
+                        cursor: ca,
+                        next: 0,
+                    },
+                    cb,
+                ));
+            } else {
+                path.pop();
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the difference between the values at one position, and reports
+    /// whether the subtree below it is worth descending into.
+    fn enter(
         &self,
         a: &Cursor,
         b: &Cursor,
-        path: &mut Vec<u8>,
+        path: &[u8],
         out: &mut Vec<Change>,
-    ) -> Result<(), MptError> {
+    ) -> Result<bool, MptError> {
         match (a.node_ref(), b.node_ref()) {
-            (None, None) => return Ok(()),
+            (None, None) => return Ok(false),
             // Structural sharing: identical nodes have identical subtrees.
-            (Some(x), Some(y)) if x == y => return Ok(()),
+            (Some(x), Some(y)) if x == y => return Ok(false),
             _ => {}
         }
         let va = a.value_ref();
@@ -89,17 +135,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
                 new: vb.cloned(),
             });
         }
-        for nibble in 0..16u8 {
-            let ca = self.cursor_child(a, nibble)?;
-            let cb = self.cursor_child(b, nibble)?;
-            if ca.node_ref().is_none() && cb.node_ref().is_none() {
-                continue;
-            }
-            path.push(nibble);
-            self.diff_rec(&ca, &cb, path, out)?;
-            path.pop();
-        }
-        Ok(())
+        Ok(true)
     }
 
     /// Diffs two roots and resolves every value to bytes.

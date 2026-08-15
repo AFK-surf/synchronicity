@@ -52,7 +52,7 @@ pub struct Cli {
     pub relay: Vec<String>,
 
     /// Publish and resolve peer addresses through this pkarr relay — a
-    /// self-hosted iroh-dns-server such as https://dns.example.com/pkarr —
+    /// self-hosted iroh-dns-server such as <https://dns.example.com/pkarr> —
     /// instead of n0's iroh.link. Discovery is addressing, not membership:
     /// it can strand a dial but never redirect one (§3.3). Takes effect
     /// where the endpoint is bound: `synch daemon run`.

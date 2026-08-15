@@ -260,12 +260,31 @@ impl Syncer {
         let Some(pending) = self.store.pending_head(origin)? else {
             return Ok(FetchOutcome::Idle);
         };
+        // What this origin's trie looked like when we last held all of it. Every
+        // subtree the new root shares with it is already here, so the walk can
+        // skip it outright and descend only what changed (§5.2) — which is the
+        // difference between an incremental sync costing the change and costing
+        // the whole tree. Only a root we have *established* is complete will do:
+        // that check is memoized, so it is a lookup after the first time.
+        let trie = Trie::new(self.store.as_ref());
+        let reference = match self.store.complete_head(origin)? {
+            Some(head) if trie.is_complete(head.root)? => Some(head.root),
+            _ => None,
+        };
+        let mut walk = synch_mpt::MissingWalk::since(reference, pending.root);
         let mut unproductive = 0u32;
         loop {
             let trie = Trie::new(self.store.as_ref());
-            let missing = trie.missing(pending.root, MAX_BATCH)?;
+            // One walk across the whole fetch, resumed rather than restarted:
+            // beginning again at the root for every batch makes a cold fetch
+            // re-descend everything it has already pulled, once per batch.
+            let missing = walk.next_batch(&trie, MAX_BATCH)?;
             if missing.is_empty() {
-                break;
+                if walk.is_exhausted() {
+                    break;
+                }
+                walk.resume();
+                continue;
             }
 
             let mut learned = 0usize;
@@ -317,7 +336,15 @@ impl Syncer {
             } else {
                 unproductive = 0;
             }
+            // Everything just stored goes back on the frontier, so the nodes
+            // that arrived expand into their own children.
+            walk.resume();
         }
+
+        // The walk drained with nothing missing, which *is* the answer to "do I
+        // hold all of this?" — so record it rather than let the promotion below
+        // and the next `Hello` each rediscover it by walking the trie again.
+        synch_mpt::NodeStore::note_complete(self.store.as_ref(), &pending.root)?;
 
         if self.try_promote(origin, now_ns())? {
             Ok(FetchOutcome::Completed)
@@ -388,14 +415,23 @@ impl Syncer {
 
         report.heads_pushed = theirs.pushed;
         for head in theirs.received {
-            let outcome = self.offer_head(&head, now_ns())?;
+            let outcome = match self.offer_head(&head, now_ns()) {
+                Ok(outcome) => outcome,
+                Err(e) if is_origin_fault(&e) => {
+                    contain(&head.origin, &e, &mut report);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             match outcome {
                 HeadOutcome::Pending => {
                     report.heads_accepted += 1;
-                    match self.fetch_pending(client, &head.origin).await? {
-                        FetchOutcome::Completed => report.tries_completed += 1,
-                        FetchOutcome::Abandoned => report.heads_abandoned += 1,
-                        _ => {}
+                    match self.fetch_pending(client, &head.origin).await {
+                        Ok(FetchOutcome::Completed) => report.tries_completed += 1,
+                        Ok(FetchOutcome::Abandoned) => report.heads_abandoned += 1,
+                        Ok(_) => {}
+                        Err(e) if is_origin_fault(&e) => contain(&head.origin, &e, &mut report),
+                        Err(e) => return Err(e),
                     }
                 }
                 HeadOutcome::Completed => {
@@ -423,14 +459,43 @@ impl Syncer {
             if !servable {
                 continue;
             }
-            match self.fetch_pending(client, &pending.origin).await? {
-                FetchOutcome::Completed => report.tries_completed += 1,
-                FetchOutcome::Abandoned => report.heads_abandoned += 1,
-                _ => {}
+            match self.fetch_pending(client, &pending.origin).await {
+                Ok(FetchOutcome::Completed) => report.tries_completed += 1,
+                Ok(FetchOutcome::Abandoned) => report.heads_abandoned += 1,
+                Ok(_) => {}
+                Err(e) if is_origin_fault(&e) => contain(&pending.origin, &e, &mut report),
+                Err(e) => return Err(e),
             }
         }
         Ok(report)
     }
+}
+
+/// True if a failure is about *one origin's* replicated data rather than about
+/// the peer or the connection.
+///
+/// A record that will not decode, or a trie operation that will not complete
+/// over it, is a fault in what some origin published — durable, and reproduced
+/// on every exchange that reaches it. A protocol violation
+/// ([`NetError::NodeHashMismatch`]) or a broken stream is about the peer we are
+/// talking to, and still ends the exchange.
+fn is_origin_fault(error: &NetError) -> bool {
+    matches!(error, NetError::Store(_) | NetError::Mpt(_))
+}
+
+/// Logs a contained per-origin failure and records it in the report.
+///
+/// One origin publishing something this node cannot materialize must not stop
+/// it from converging with every *other* origin the same peer serves: the
+/// failing head keeps its slot, the exchange carries on, and the count says
+/// plainly that something was left behind (§5.2).
+fn contain(origin: &OriginId, error: &NetError, report: &mut SyncReport) {
+    tracing::warn!(
+        origin = %origin,
+        error = %error,
+        "origin left behind: its published data could not be applied"
+    );
+    report.heads_failed += 1;
 }
 
 /// What one exchange achieved, for logging and tests.
@@ -446,6 +511,8 @@ pub struct SyncReport {
     pub tries_completed: usize,
     /// Pending heads abandoned because nobody could serve their nodes.
     pub heads_abandoned: usize,
+    /// Origins skipped because their own published data could not be applied.
+    pub heads_failed: usize,
 }
 
 #[cfg(test)]

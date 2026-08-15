@@ -593,6 +593,11 @@ impl Node {
             })?;
 
         if let Some(head) = &head {
+            // This node just built the whole trie under that root, so it holds
+            // it whole by construction. Recording that here is what keeps the
+            // first `Hello` after every publish from proving it again by
+            // walking the entire trie (§5.1).
+            synch_mpt::NodeStore::note_complete(self.store().as_ref(), &head.root)?;
             tracing::info!(
                 seq = head.seq,
                 changes = staged.len(),
@@ -606,10 +611,7 @@ impl Node {
     pub fn manifest_change(&self) -> Result<StagedChange> {
         let mut spaces = Vec::new();
         for space in self.store().spaces()? {
-            let count = self
-                .store()
-                .list_entries(Some(self.origin()), &space.id, "", None, None)?
-                .len() as u64;
+            let count = self.store().count_entries(self.origin(), &space.id)?;
             spaces.push(SpaceInfo {
                 id: space.id,
                 description: space.local_path,
