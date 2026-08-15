@@ -233,6 +233,28 @@ at accept. Optionally, the TXT record may carry a hint: `relay=https://...` or
 `addr=host:port`, which is fed into iroh as dialing hints. To reach a named
 origin, a node dials whichever device key(s) are currently bound to it.
 
+`--dht` on `synch daemon run` adds Mainline DHT discovery alongside the
+pkarr/DNS one, off by default. It is the same signed pkarr record, stored on the
+BitTorrent DHT instead of handed to a server: pkarr relays and DNS resolvers are
+caches in front of that DHT, and `--dht` talks to it directly. This is additive,
+not exclusive — a dial resolves through every configured lookup at once and takes
+whichever answers first — so a node keeps its address reachable when the
+discovery server is down, blocked, or simply never deployed, and a deployment can
+run with no discovery server at all. It costs a UDP socket and an hourly
+republish. `--dht-bootstrap <host:port>` replaces mainline's public bootstrap
+nodes, which is what makes a swarm private: point every node at your own
+bootstrap nodes and they form a DHT that reaches none of mainline's and is
+reached by none of them. It only makes the DHT private, though — the pkarr/DNS
+lookup is a separate leg and still goes wherever it is pointed, so a deployment
+that must touch no outside infrastructure pairs `--dht-bootstrap` with
+`--discovery`, which is the leg that moves the pkarr side in house.
+Because the DHT is a public, world-readable index, only
+relay URLs are published to it by default; `--dht-publish-addrs` adds direct IP
+addresses, worth it for a node already answering on a public address, where it
+buys peers a dial without the relay round trip. Trust is unchanged: a DHT record
+is discovery, so it can strand a dial but never redirect one. `--offline`
+refuses all three flags, as it does `--relay` and `--discovery`.
+
 ### 3.4 Key rotation
 
 Because every piece of durable state — tries, heads, entries, provider views, content

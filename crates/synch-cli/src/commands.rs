@@ -43,6 +43,9 @@ pub fn node_config(cli: &Cli) -> Result<NodeConfig> {
     }
     config.net.relay_urls = cli.relay.clone();
     config.net.discovery_url = cli.discovery.clone();
+    config.net.dht = cli.dht;
+    config.net.dht_bootstrap = cli.dht_bootstrap.clone();
+    config.net.dht_publish_direct_addrs = cli.dht_publish_addrs;
     config.dns.doh_url = cli.doh.clone();
     config.dns.trust_anchor = cli.dnssec_anchor.clone();
     Ok(config)
@@ -419,5 +422,34 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("drop one"), "{err}");
+    }
+
+    #[test]
+    fn the_dht_flags_reach_the_endpoint() {
+        let config = node_config(&Cli::parse_from([
+            "synch",
+            "--data-dir",
+            "/tmp/synch-test",
+            "--dht",
+            "--dht-bootstrap",
+            "boot.example:6881",
+            "--dht-publish-addrs",
+            "daemon",
+            "run",
+        ]))
+        .unwrap();
+        assert!(config.net.dht);
+        assert_eq!(config.net.dht_bootstrap, ["boot.example:6881"]);
+        assert!(config.net.dht_publish_direct_addrs);
+
+        let config = node_config(&Cli::parse_from([
+            "synch",
+            "--data-dir",
+            "/tmp/synch-test",
+            "daemon",
+            "run",
+        ]))
+        .unwrap();
+        assert!(!config.net.dht);
     }
 }

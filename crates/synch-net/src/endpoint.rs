@@ -10,6 +10,7 @@ use iroh::{
     Endpoint, EndpointAddr, RelayUrl, TransportAddr,
 };
 use iroh_base::SecretKey;
+use iroh_mainline_address_lookup::DhtAddressLookup;
 use synch_core::{NodeId, ALPN_BLOB, ALPN_MPT};
 use synch_store::Store;
 
@@ -55,6 +56,33 @@ pub struct NetOptions {
     /// authenticates the device key and membership is enforced at accept.
     /// `None` means n0's. Ignored when `offline`.
     pub discovery_url: Option<String>,
+    /// Publishes and resolves addresses on the BitTorrent Mainline DHT as
+    /// well, alongside whichever pkarr/DNS lookup is configured (§3.3).
+    ///
+    /// Same pkarr records, no server in the middle: the DHT holds the
+    /// signed packet the pkarr relay would have held, so a node stays
+    /// dialable when the discovery server is down, blocked, or simply not
+    /// run. It is additive — a dial resolves through every configured
+    /// lookup at once and takes whichever answers first — and it costs a
+    /// UDP socket plus an hourly republish. Off by default. Ignored when
+    /// `offline`.
+    pub dht: bool,
+    /// Bootstrap nodes for the DHT, as `HOST:PORT`, replacing mainline's
+    /// public bootstrap set.
+    ///
+    /// This is what makes the swarm private: point every node at your own
+    /// bootstrap nodes and they form a DHT of their own, reaching none of
+    /// mainline's millions and reached by none of them. Empty means
+    /// mainline's public bootstrap nodes. Ignored unless `dht`.
+    pub dht_bootstrap: Vec<String>,
+    /// Publishes direct IP addresses to the DHT, not just relay URLs.
+    ///
+    /// The DHT is a public, world-readable index, so by default only relay
+    /// URLs go into the record — an IP address there tells anyone who asks
+    /// where this node's operator sits. Turn it on for a node that already
+    /// answers on a public address, where the gain is real: peers dial it
+    /// straight, without a relay round trip. Ignored unless `dht`.
+    pub dht_publish_direct_addrs: bool,
     /// Notified when a connection is refused because the dialing device key
     /// has no live binding (§3.4).
     ///
@@ -73,6 +101,9 @@ impl NetOptions {
             offline: true,
             relay_urls: Vec::new(),
             discovery_url: None,
+            dht: false,
+            dht_bootstrap: Vec::new(),
+            dht_publish_direct_addrs: false,
             on_unknown_key: None,
         }
     }
@@ -96,6 +127,48 @@ fn parse_discovery_url(raw: &str) -> Result<reqwest::Url, NetError> {
     reqwest::Url::parse(raw).map_err(|e| NetError::Endpoint(format!("discovery url {raw}: {e}")))
 }
 
+/// Checks a DHT bootstrap entry is `HOST:PORT`, naming the offender.
+///
+/// Mainline resolves these itself, at DHT construction, and drops whatever
+/// does not resolve without a word — a typo would leave the node alone in a
+/// DHT of one, publishing into the void. So the shape is checked here, where
+/// there is still someone to tell. The host is left to the resolver: a name,
+/// an IPv4 literal, and an IPv6 literal in brackets are all legal here, though
+/// mainline is an IPv4 network and will discard the last one.
+fn check_dht_bootstrap(raw: &str) -> Result<(), NetError> {
+    let offender = |why: &str| NetError::Endpoint(format!("dht bootstrap node {raw}: {why}"));
+    let (host, port) = raw
+        .rsplit_once(':')
+        .ok_or_else(|| offender("wants HOST:PORT"))?;
+    if host.is_empty() {
+        return Err(offender("has no host"));
+    }
+    if port.parse::<u16>().is_err() {
+        return Err(offender("wants a port number after the colon"));
+    }
+    Ok(())
+}
+
+/// Builds the Mainline DHT address lookup from the DHT options.
+fn dht_address_lookup(
+    bootstrap: &[String],
+    publish_direct_addrs: bool,
+) -> Result<iroh_mainline_address_lookup::Builder, NetError> {
+    let mut builder = DhtAddressLookup::builder();
+    if !bootstrap.is_empty() {
+        for node in bootstrap {
+            check_dht_bootstrap(node)?;
+        }
+        let mut dht = n0_mainline::DhtBuilder::default();
+        dht.bootstrap(bootstrap);
+        builder = builder.dht_builder(dht);
+    }
+    if publish_direct_addrs {
+        builder = builder.addr_filter(iroh::address_lookup::AddrFilter::unfiltered());
+    }
+    Ok(builder)
+}
+
 /// A bound endpoint serving both ALPNs.
 #[derive(Debug, Clone)]
 pub struct Net {
@@ -111,23 +184,36 @@ impl Net {
         options: NetOptions,
     ) -> Result<Net, NetError> {
         // §3.3's discovery stack: n0's pkarr/DNS address lookup and public
-        // relays by default, overridable for self-hosted deployments. None of
-        // it is trusted — see NetOptions — so these are plain configuration.
+        // relays by default, overridable for self-hosted deployments, plus the
+        // Mainline DHT on request. None of it is trusted — see NetOptions — so
+        // these are plain configuration.
         let mut builder = Endpoint::builder(presets::N0).secret_key(secret);
-        if let Some(raw) = &options.discovery_url {
-            let url = parse_discovery_url(raw)?;
-            builder = builder
-                .clear_address_lookup()
-                .address_lookup(PkarrPublisher::builder(url.clone()))
-                .address_lookup(PkarrResolver::builder(url));
-        }
-        if !options.relay_urls.is_empty() {
-            builder = builder.relay_mode(parse_relay_mode(&options.relay_urls)?);
-        }
         if options.offline {
+            // Nothing to configure once nothing may leave the machine, and the
+            // knobs below would only be cleared again on the way out.
             builder = builder
                 .relay_mode(RelayMode::Disabled)
                 .clear_address_lookup();
+        } else {
+            if let Some(raw) = &options.discovery_url {
+                let url = parse_discovery_url(raw)?;
+                builder = builder
+                    .clear_address_lookup()
+                    .address_lookup(PkarrPublisher::builder(url.clone()))
+                    .address_lookup(PkarrResolver::builder(url));
+            }
+            // Added last, and without clearing: the DHT joins whichever lookup
+            // is already mounted rather than replacing it, so a dial resolves
+            // through both and takes whichever answers first.
+            if options.dht {
+                builder = builder.address_lookup(dht_address_lookup(
+                    &options.dht_bootstrap,
+                    options.dht_publish_direct_addrs,
+                )?);
+            }
+            if !options.relay_urls.is_empty() {
+                builder = builder.relay_mode(parse_relay_mode(&options.relay_urls)?);
+            }
         }
         if let Some(addr) = options.bind_addr {
             builder = builder
@@ -264,5 +350,71 @@ mod tests {
         parse_discovery_url("https://dns.example.com/pkarr").unwrap();
         let err = parse_discovery_url("dns.example.com/pkarr").unwrap_err();
         assert!(err.to_string().contains("dns.example.com/pkarr"), "{err}");
+    }
+
+    #[test]
+    fn dht_bootstrap_nodes_check_out_or_name_the_offender() {
+        check_dht_bootstrap("router.bittorrent.com:6881").unwrap();
+        check_dht_bootstrap("10.0.0.1:6881").unwrap();
+        check_dht_bootstrap("[2001:db8::1]:6881").unwrap();
+        for (raw, why) in [
+            ("router.bittorrent.com", "wants HOST:PORT"),
+            (":6881", "has no host"),
+            ("router.bittorrent.com:", "wants a port"),
+            ("router.bittorrent.com:dht", "wants a port"),
+            ("router.bittorrent.com:99999", "wants a port"),
+        ] {
+            let err = check_dht_bootstrap(raw).unwrap_err().to_string();
+            assert!(err.contains(raw) && err.contains(why), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn dht_bootstrap_is_validated_before_a_socket_is_opened() {
+        // Not a tokio test on purpose: a bad entry has to be caught before
+        // DhtBuilder::build, which needs a runtime and would panic here.
+        let err = dht_address_lookup(&["router.bittorrent.com".to_string()], false).unwrap_err();
+        assert!(err.to_string().contains("router.bittorrent.com"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_bootstrap_node_fails_the_bind_before_any_socket_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let err = Net::bind(
+            store,
+            SecretKey::generate(),
+            NetOptions {
+                dht: true,
+                dht_bootstrap: vec!["router.bittorrent.com".to_string()],
+                ..NetOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("router.bittorrent.com"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn offline_binds_local_only_with_the_dht_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let net = Net::bind(
+            store,
+            SecretKey::generate(),
+            NetOptions {
+                dht: true,
+                dht_bootstrap: vec!["router.bittorrent.com:6881".to_string()],
+                ..NetOptions::loopback()
+            },
+        )
+        .await
+        .unwrap();
+        // No relay, and every address is a loopback socket: --offline keeps
+        // its promise whatever else was asked for.
+        let addr = net.addr();
+        assert!(addr.relay_urls().next().is_none());
+        assert!(addr.ip_addrs().all(|a| a.ip().is_loopback()), "{addr:?}");
+        net.shutdown().await.unwrap();
     }
 }
