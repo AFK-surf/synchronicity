@@ -13,11 +13,15 @@ gleam build
 WORKDIR=$(mktemp -d)
 LOG="$WORKDIR/serve.log"
 cleanup() {
-  # setsid gives the server its own process group; kill the whole group,
-  # or the BEAM child of `gleam run` outlives the wrapper and keeps the
+  # setsid gives each server its own process group; kill whole groups, or
+  # the BEAM child of `gleam run` outlives the wrapper and keeps the
   # ports — every later run then talks to a stale zone.
-  [[ -n "${SERVER_PID:-}" ]] && kill -- -"$SERVER_PID" 2>/dev/null || true
-  cat "$LOG" 2>/dev/null | tail -20 || true
+  for pid in "${SERVER_PID:-}" "${REPLICA_PID:-}"; do
+    [[ -n "$pid" ]] || continue
+    local pgid
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || true
+    [[ -n "$pgid" ]] && kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  done
 }
 trap cleanup EXIT
 
@@ -88,6 +92,29 @@ delv_check "_synchronicity.nope.acme.$CP_BASE_DOMAIN" TXT \
   "negative response, fully validated" "NXDOMAIN proof validates"
 # DNSKEY itself.
 delv_check "$CP_BASE_DOMAIN" DNSKEY "257 3 13" "DNSKEY validates"
+
+# Replica: hand a checkpointed copy of the database to a replica process
+# (the external-refresh contract), and validate against it too.
+python3 - "$CP_DB_PATH" <<'EOF'
+import sqlite3, sys
+sqlite3.connect(sys.argv[1]).execute("PRAGMA wal_checkpoint(FULL)")
+EOF
+cp "$CP_DB_PATH" "$WORKDIR/replica.db"
+env -u CP_KEY_FILE -u CP_SESSION_SECRET \
+  CP_ROLE=replica CP_DB_PATH="$WORKDIR/replica.db" \
+  CP_HTTP_PORT=8054 CP_DNS_PORT=5360 \
+  setsid gleam run -- serve > "$WORKDIR/replica.log" 2>&1 &
+REPLICA_PID=$!
+for i in $(seq 1 50); do
+  curl -fsS "http://127.0.0.1:8054/healthz" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+out=$(delv @127.0.0.1 -p 5360 -a "$WORKDIR/anchor.bindkeys" \
+      +root="$CP_BASE_DOMAIN" "$QNAME" TXT 2>&1)
+grep -q "fully validated" <<<"$out" || { echo "FAIL: replica validation"; echo "$out"; cat "$WORKDIR/replica.log"; exit 1; }
+echo "ok: replica serves the same fully-validated zone (no key material)"
+curl -fsS -X POST "http://127.0.0.1:8054/reload" >/dev/null
+echo "ok: replica /reload responds"
 
 # The actual synchronicity client resolver, over DoH.
 export CP_DOH_URL="http://127.0.0.1:$CP_HTTP_PORT/dns-query"

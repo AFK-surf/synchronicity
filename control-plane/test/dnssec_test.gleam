@@ -32,13 +32,13 @@ pub fn key_tag_known_vector_test() {
 pub fn ds_and_anchor_render_test() {
   let csk = keys.Csk(<<1:size(256)>>, <<2:size(512)>>)
   let assert Ok(apex) = name.parse("sync.example.")
-  let ds = keys.ds_line(apex, csk)
+  let ds = keys.ds_line(apex, csk.public)
   assert string.starts_with(ds, "sync.example. IN DS ")
   assert string.contains(ds, " 13 2 ")
   // digest is 32 bytes → 64 hex chars at the end
   let assert Ok(#(_, hex)) = string.split_once(ds, " 13 2 ")
   assert string.length(hex) == 64
-  let anchor = keys.anchor_line(apex, csk)
+  let anchor = keys.anchor_line(apex, csk.public)
   assert string.starts_with(anchor, "sync.example. IN DNSKEY 257 3 13 ")
 }
 

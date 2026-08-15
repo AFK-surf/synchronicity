@@ -60,7 +60,12 @@ fn harness() -> Harness {
       None,
       csk,
     )
-  Harness(router.Context("anchor", "ds", Some(auth)), db_path, token, live.csrf)
+  Harness(
+    router.Context("anchor", "ds", Some(auth), None),
+    db_path,
+    token,
+    live.csrf,
+  )
 }
 
 fn authed(h: Harness, method: http.Method, path: String) -> wisp.Request {

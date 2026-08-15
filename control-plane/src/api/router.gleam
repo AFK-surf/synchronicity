@@ -13,6 +13,7 @@ import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import wisp.{type Request, type Response}
+import zone/refresh
 import zone/snapshot
 
 pub type Context {
@@ -22,6 +23,9 @@ pub type Context {
     ds: String,
     /// Present on the primary only; replicas serve DNS and health alone.
     auth: Option(AuthContext),
+    /// Replica only: the database path POST /reload refreshes from — the
+    /// immediate-pickup half of the external refresh contract.
+    reload_db: Option(String),
   )
 }
 
@@ -30,6 +34,11 @@ pub fn handle(req: Request, ctx: Context) -> Response {
     ["dns-query"] -> doh.handle(req)
     ["healthz"] -> healthz()
     ["api", "zone", "anchor"] -> anchor(ctx)
+    ["reload"] ->
+      case req.method, ctx.reload_db {
+        Post, Some(db_path) -> reload(db_path)
+        _, _ -> wisp.not_found()
+      }
     ["auth", ..] | ["api", ..] ->
       case ctx.auth {
         Some(auth) -> primary_routes(req, auth)
@@ -167,6 +176,19 @@ fn with_session(
   auth_api.with_db(auth, fn(conn) {
     middleware.require_session(req, conn, next)
   })
+}
+
+fn reload(db_path: String) -> Response {
+  case refresh.reload(db_path) {
+    Ok(serial) ->
+      json.object([#("soa_serial", json.int(serial))])
+      |> json.to_string
+      |> wisp.json_response(200)
+    Error(message) ->
+      json.object([#("error", json.string(message))])
+      |> json.to_string
+      |> wisp.json_response(500)
+  }
 }
 
 fn healthz() -> Response {

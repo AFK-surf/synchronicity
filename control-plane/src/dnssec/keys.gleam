@@ -64,9 +64,10 @@ pub fn ds_digest(apex: Name, dnskey_rdata: BitArray) -> BitArray {
   )
 }
 
-/// The DS record for the parent zone, presentation form.
-pub fn ds_line(apex: Name, csk: Csk) -> String {
-  let rd = dnskey_rdata(csk)
+/// The DS record for the parent zone, presentation form. Takes the public
+/// key alone — replicas hold no private material and still serve this.
+pub fn ds_line(apex: Name, public: BitArray) -> String {
+  let rd = rdata.dnskey(flags, algorithm, public)
   name.to_string(apex)
   <> " IN DS "
   <> int.to_string(key_tag(rd))
@@ -78,14 +79,14 @@ pub fn ds_line(apex: Name, csk: Csk) -> String {
 
 /// The trust-anchor line, in the exact file syntax the synchronicity
 /// client's `--dnssec-anchor` reads (see synch-net's sim::anchor_record).
-pub fn anchor_line(apex: Name, csk: Csk) -> String {
+pub fn anchor_line(apex: Name, public: BitArray) -> String {
   name.to_string(apex)
   <> " IN DNSKEY "
   <> int.to_string(flags)
   <> " 3 "
   <> int.to_string(algorithm)
   <> " "
-  <> bit_array.base64_encode(csk.public, True)
+  <> bit_array.base64_encode(public, True)
 }
 
 /// Writes the key file; refuses to overwrite an existing one — replacing

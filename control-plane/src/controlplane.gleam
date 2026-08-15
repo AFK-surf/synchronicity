@@ -12,6 +12,7 @@ import api/auth_api
 import api/router
 import auth/github
 import auth/google
+import auth/magic
 import config.{type Config, Primary, Replica}
 import dns/name
 import dns/server_tcp
@@ -24,13 +25,16 @@ import gleam/io
 import gleam/option
 import gleam/result
 import gleam/string
+import jobs/resign
 import mist
 import store/db
 import store/migrate
 import store/sqlite
 import thirtytwo
 import wisp/wisp_mist
+import zone/model
 import zone/publish
+import zone/refresh
 import zone/snapshot
 
 @external(erlang, "cp_sys_ffi", "argv")
@@ -51,6 +55,7 @@ pub fn main() {
     ["ds", apex, key_file] -> print_key_material(apex, key_file)
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(seed)
+    ["seed-admin", email] -> run_or_die(fn() { seed_admin(email) })
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
@@ -99,9 +104,9 @@ fn print_material(apex: name.Name, csk: keys.Csk) -> Nil {
   let rd = keys.dnskey_rdata(csk)
   io.println("; key tag " <> int.to_string(keys.key_tag(rd)))
   io.println("; DS record for the parent zone:")
-  io.println(keys.ds_line(apex, csk))
+  io.println(keys.ds_line(apex, csk.public))
   io.println("; trust-anchor line for synch --dnssec-anchor:")
-  io.println(keys.anchor_line(apex, csk))
+  io.println(keys.anchor_line(apex, csk.public))
 }
 
 fn migrate_check() -> Nil {
@@ -156,8 +161,55 @@ fn serve() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
   case cfg.role {
     Primary -> serve_primary(cfg)
-    Replica -> Error("replica role lands with the replication milestone")
+    Replica -> serve_replica(cfg)
   }
+}
+
+/// A replica serves DNS/DoH from a database an external process refreshes
+/// (atomic rename); it holds no key material and mounts no product API.
+fn serve_replica(cfg: Config) -> Result(Nil, String) {
+  use _serial <- result.try(refresh.reload(cfg.db_path))
+  // Anchor/DS come from the replicated public key material.
+  use meta <- result.try({
+    use conn <- result.try(
+      db.open_read(cfg.db_path)
+      |> result.map_error(fn(e) { "opening db: " <> string.inspect(e) }),
+    )
+    let meta =
+      model.read_meta(conn)
+      |> result.map_error(fn(e) { "reading zone_meta: " <> string.inspect(e) })
+    sqlite.close(conn)
+    meta
+  })
+  let ctx =
+    router.Context(
+      keys.anchor_line(meta.apex, meta.dnskey_public),
+      keys.ds_line(meta.apex, meta.dnskey_public),
+      option.None,
+      option.Some(cfg.db_path),
+    )
+  refresh.start_poll(cfg.db_path)
+  use Nil <- result.try(server_udp.start(cfg.dns_port))
+  use Nil <- result.try(server_tcp.start(cfg.dns_port))
+  let handler = fn(req) { router.handle(req, ctx) }
+  use _ <- result.try(
+    wisp_mist.handler(handler, "replica-has-no-sessions-0000000000000000")
+    |> mist.new
+    |> mist.bind("0.0.0.0")
+    |> mist.port(cfg.http_port)
+    |> mist.start
+    |> result.map_error(fn(_) { "could not start HTTP listener" }),
+  )
+  io.println(
+    "replica serving "
+    <> cfg.base_domain
+    <> " — dns :"
+    <> int.to_string(cfg.dns_port)
+    <> " http :"
+    <> int.to_string(cfg.http_port),
+  )
+  process.sleep_forever()
+  Ok(Nil)
 }
 
 fn serve_primary(cfg: Config) -> Result(Nil, String) {
@@ -182,13 +234,15 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
     )
   let ctx =
     router.Context(
-      keys.anchor_line(apex, csk),
-      keys.ds_line(apex, csk),
+      keys.anchor_line(apex, csk.public),
+      keys.ds_line(apex, csk.public),
       option.Some(auth),
+      option.None,
     )
 
   use Nil <- result.try(server_udp.start(cfg.dns_port))
   use Nil <- result.try(server_tcp.start(cfg.dns_port))
+  resign.start(cfg.db_path, csk)
 
   let secret = cfg.session_secret
   let handler = fn(req) { router.handle(req, ctx) }
@@ -305,6 +359,24 @@ fn seed() -> Result(Nil, String) {
   io.println("nas_revoked=" <> nas_revoked)
   io.println("laptop_active=" <> laptop_active)
   io.println("laptop_retiring=" <> laptop_retiring)
+  Ok(Nil)
+}
+
+/// First-user bootstrap: prints a one-time magic link for `email`.
+fn seed_admin(email: String) -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use conn <- result.try(open_primary_db(cfg))
+  use token <- result.try(
+    magic.create_token(conn, email, now_unix())
+    |> result.map_error(fn(e) { "creating token: " <> string.inspect(e) }),
+  )
+  io.println(
+    "one-time sign-in link (15 minutes):\n"
+    <> cfg.public_url
+    <> "/auth/magic/redeem?token="
+    <> token,
+  )
+  sqlite.close(conn)
   Ok(Nil)
 }
 
