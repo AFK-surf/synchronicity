@@ -21,7 +21,7 @@ jobs:
         with:
           version-file: control-plane/.tool-versions
           version-type: strict
-          rebar3-version: "3"
+          rebar3-version: "3.27.0"
       - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - run: make -C csqlite
       - run: gleam format --check src test
@@ -53,7 +53,7 @@ jobs:
         with:
           version-file: control-plane/.tool-versions
           version-type: strict
-          rebar3-version: "3"
+          rebar3-version: "3.27.0"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
