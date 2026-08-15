@@ -17,6 +17,7 @@ glisten = ">= 7.0.0 and < 10.0.0"
 thirtytwo = ">= 1.0.0 and < 2.0.0"
 envoy = ">= 1.0.0 and < 2.0.0"
 simplifile = ">= 2.0.0 and < 3.0.0"
+exception = ">= 2.0.0 and < 3.0.0"
 gen_smtp = ">= 1.2.0 and < 2.0.0"
 
 [dev-dependencies]

@@ -11,6 +11,7 @@ import auth/oidc
 import auth/session
 import dnssec/keys
 import email/mailer.{type Mailer}
+import exception
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
@@ -33,12 +34,18 @@ pub type AuthContext {
 
 /// Opens a request-scoped connection (csqlite processes are cheap and the
 /// dashboard's write rate is tiny; WAL + busy_timeout serialize writers).
+///
+/// The close is deferred, not sequential: a panic anywhere in `next` must
+/// still tear the connection down. Wisp rescues crashes, so the process
+/// survives — without the defer, a panic inside an open BEGIN IMMEDIATE
+/// would leave a csqlite process holding the database write lock for the
+/// life of the HTTP connection, wedging every subsequent write. Closing
+/// the port makes SQLite discard any open transaction.
 pub fn with_db(ctx: AuthContext, next: fn(Connection) -> Response) -> Response {
   case db.open_primary(ctx.db_path) {
     Ok(conn) -> {
-      let response = next(conn)
-      sqlite.close(conn)
-      response
+      use <- exception.defer(fn() { sqlite.close(conn) })
+      next(conn)
     }
     Error(_) -> error_json(500, "internal", "database unavailable")
   }

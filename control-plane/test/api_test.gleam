@@ -3,6 +3,7 @@ import api/router
 import auth/session
 import dnssec/keys
 import email/mailer
+import exception
 import gleam/crypto
 import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
@@ -524,4 +525,26 @@ pub fn mutation_reinstalls_served_snapshot_test() {
   // The globally served snapshot is the committed zone, immediately.
   let assert Ok(snap) = snapshot.current()
   assert snap.serial == meta.soa_serial
+}
+
+pub fn with_db_discards_conn_on_panic_test() {
+  // A panic inside a request handler must not leak the connection: wisp
+  // rescues crashes, so the process survives — only with_db's deferred
+  // close stands between a panicking handler and a csqlite process
+  // holding the write lock for the life of the HTTP connection.
+  let h = harness()
+  let assert router.Context(_, _, Some(auth), _) = h.ctx
+  let _ =
+    exception.rescue(fn() {
+      auth_api.with_db(auth, fn(conn) {
+        let assert Ok(_) = sqlite.exec(conn, "BEGIN IMMEDIATE", [])
+        panic as "handler crashed mid-transaction"
+      })
+    })
+  // The write lock must be free immediately; a leaked connection would
+  // make this block for busy_timeout and fail with SQLITE_BUSY.
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) = sqlite.exec(conn, "BEGIN IMMEDIATE", [])
+  let assert Ok(_) = sqlite.exec(conn, "ROLLBACK", [])
+  sqlite.close(conn)
 }
