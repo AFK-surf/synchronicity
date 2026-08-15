@@ -179,6 +179,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
+      csk,
     )
   let ctx =
     router.Context(

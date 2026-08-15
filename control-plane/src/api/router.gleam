@@ -3,8 +3,12 @@
 //// and no writes, by construction).
 
 import api/auth_api.{type AuthContext}
+import api/middleware
+import api/networks_api
+import api/orgs_api
+import auth/session.{type Session}
 import dns/doh
-import gleam/http.{Get, Post}
+import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import wisp.{type Request, type Response}
@@ -43,8 +47,106 @@ fn primary_routes(req: Request, auth: AuthContext) -> Response {
     ["auth", "magic", "redeem"], Get -> auth_api.magic_redeem(req, auth)
     ["api", "logout"], Post -> auth_api.logout(req, auth)
     ["api", "me"], Get -> auth_api.me(req, auth)
+
+    ["api", "orgs"], Post -> {
+      use live <- with_session(req, auth)
+      orgs_api.create_org(req, auth, live)
+    }
+    ["api", "orgs", slug], Get -> {
+      use live <- with_session(req, auth)
+      orgs_api.get_org(auth, live, slug)
+    }
+    ["api", "orgs", slug, "members"], Get -> {
+      use live <- with_session(req, auth)
+      orgs_api.list_members(auth, live, slug)
+    }
+    ["api", "orgs", slug, "members", user], Patch -> {
+      use live <- with_session(req, auth)
+      orgs_api.change_role(req, auth, live, slug, user)
+    }
+    ["api", "orgs", slug, "members", user], Delete -> {
+      use live <- with_session(req, auth)
+      orgs_api.remove_member(auth, live, slug, user)
+    }
+    ["api", "orgs", slug, "invites"], Post -> {
+      use live <- with_session(req, auth)
+      orgs_api.create_invite(req, auth, live, slug)
+    }
+    ["api", "invites", "accept"], Post -> {
+      use live <- with_session(req, auth)
+      orgs_api.accept_invite(req, auth, live)
+    }
+    ["api", "orgs", slug, "audit"], Get -> {
+      use live <- with_session(req, auth)
+      orgs_api.audit_log(req, auth, live, slug)
+    }
+
+    ["api", "orgs", slug, "networks"], Get -> {
+      use live <- with_session(req, auth)
+      networks_api.list_networks(auth, live, slug)
+    }
+    ["api", "orgs", slug, "networks"], Post -> {
+      use live <- with_session(req, auth)
+      networks_api.create_network(req, auth, live, slug)
+    }
+    ["api", "orgs", slug, "networks", net], Get -> {
+      use live <- with_session(req, auth)
+      networks_api.network_detail(auth, live, slug, net)
+    }
+    ["api", "orgs", slug, "networks", net], Delete -> {
+      use live <- with_session(req, auth)
+      networks_api.delete_network(req, auth, live, slug, net)
+    }
+    ["api", "orgs", slug, "networks", net, "devices", dev], Put -> {
+      use live <- with_session(req, auth)
+      networks_api.assign_device(auth, live, slug, net, dev)
+    }
+    ["api", "orgs", slug, "networks", net, "devices", dev], Delete -> {
+      use live <- with_session(req, auth)
+      networks_api.unassign_device(auth, live, slug, net, dev)
+    }
+
+    ["api", "orgs", slug, "devices"], Get -> {
+      use live <- with_session(req, auth)
+      networks_api.list_devices(auth, live, slug)
+    }
+    ["api", "orgs", slug, "devices"], Post -> {
+      use live <- with_session(req, auth)
+      networks_api.create_device(req, auth, live, slug)
+    }
+    ["api", "orgs", slug, "devices", dev], Patch -> {
+      use live <- with_session(req, auth)
+      networks_api.patch_device(req, auth, live, slug, dev)
+    }
+    ["api", "orgs", slug, "devices", dev], Delete -> {
+      use live <- with_session(req, auth)
+      networks_api.delete_device(auth, live, slug, dev)
+    }
+    ["api", "orgs", slug, "devices", dev, "keys"], Post -> {
+      use live <- with_session(req, auth)
+      networks_api.add_key(req, auth, live, slug, dev)
+    }
+    ["api", "orgs", slug, "devices", dev, "keys", key, "retire"], Post -> {
+      use live <- with_session(req, auth)
+      networks_api.retire_key(auth, live, slug, dev, key)
+    }
+    ["api", "orgs", slug, "devices", dev, "keys", key, "revoke"], Post -> {
+      use live <- with_session(req, auth)
+      networks_api.revoke_key(auth, live, slug, dev, key)
+    }
+
     _, _ -> wisp.not_found()
   }
+}
+
+fn with_session(
+  req: Request,
+  auth: AuthContext,
+  next: fn(Session) -> Response,
+) -> Response {
+  auth_api.with_db(auth, fn(conn) {
+    middleware.require_session(req, conn, next)
+  })
 }
 
 fn healthz() -> Response {

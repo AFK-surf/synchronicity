@@ -8,6 +8,7 @@ import auth/identity
 import auth/magic
 import auth/oauth.{type Provider}
 import auth/session
+import dnssec/keys
 import email/mailer.{type Mailer}
 import gleam/dynamic/decode
 import gleam/json
@@ -24,6 +25,8 @@ pub type AuthContext {
     mail: Mailer,
     google: Option(Provider),
     github: Option(Provider),
+    /// The zone key — product mutations re-sign the zone in-transaction.
+    csk: keys.Csk,
   )
 }
 
