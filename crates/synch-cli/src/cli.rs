@@ -5,6 +5,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 /// synchronicity — an omnipresent peer-to-peer file store.
+///
+/// Every doc comment below is `--help` text first and rustdoc second, so a URL
+/// in one is written the way a terminal should print it, without the angle
+/// brackets rustdoc wants.
+#[allow(rustdoc::bare_urls)]
 #[derive(Debug, Parser)]
 #[command(name = "synch", version, about, long_about = None)]
 pub struct Cli {
@@ -59,6 +64,43 @@ pub struct Cli {
         conflicts_with = "offline"
     )]
     pub discovery: Option<String>,
+
+    /// Also publish and resolve peer addresses on the BitTorrent Mainline
+    /// DHT, alongside the pkarr/DNS lookup. The same signed pkarr records,
+    /// with no discovery server in the middle, so a node stays dialable when
+    /// that server is down or blocked (§3.3). Takes effect where the endpoint
+    /// is bound: `synch daemon run`.
+    #[arg(long, global = true, env = "SYNCH_DHT", conflicts_with = "offline")]
+    pub dht: bool,
+
+    /// Bootstrap the DHT from these nodes instead of mainline's public ones;
+    /// repeat for several. Pointing every node at your own bootstrap nodes
+    /// gives the deployment a DHT of its own, reaching none of mainline's and
+    /// reached by none of them. That covers the DHT leg only — pair it with
+    /// --discovery to move the pkarr/DNS leg in house too (§3.3).
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_DHT_BOOTSTRAP",
+        value_name = "HOST:PORT",
+        value_delimiter = ',',
+        requires = "dht",
+        conflicts_with = "offline"
+    )]
+    pub dht_bootstrap: Vec<String>,
+
+    /// Publish this node's direct IP addresses to the DHT, not just its relay
+    /// URLs. The DHT is a public index, so this tells anyone who asks where
+    /// the node sits; it is for a node already answering on a public address,
+    /// where it buys peers a dial without the relay round trip (§3.3).
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_DHT_PUBLISH_ADDRS",
+        requires = "dht",
+        conflicts_with = "offline"
+    )]
+    pub dht_publish_addrs: bool,
 
     /// Increase log verbosity.
     #[arg(short, long, global = true)]
@@ -454,6 +496,66 @@ mod tests {
     #[test]
     fn the_command_surface_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn dht_discovery_is_opt_in_and_never_mixes_with_offline() {
+        let cli = Cli::parse_from(["synch", "daemon", "run"]);
+        assert!(!cli.dht);
+        assert!(cli.dht_bootstrap.is_empty());
+        assert!(!cli.dht_publish_addrs);
+
+        // The DHT joins the pkarr/DNS lookup rather than replacing it, so
+        // --dht and --discovery are usable together.
+        let cli = Cli::parse_from([
+            "synch",
+            "daemon",
+            "run",
+            "--dht",
+            "--dht-bootstrap",
+            "boot1.example:6881,boot2.example:6881",
+            "--dht-publish-addrs",
+            "--discovery",
+            "https://dns.example.com/pkarr",
+        ]);
+        assert!(cli.dht);
+        assert_eq!(
+            cli.dht_bootstrap,
+            ["boot1.example:6881", "boot2.example:6881"]
+        );
+        assert!(cli.dht_publish_addrs);
+
+        // --offline means nothing leaves the machine, so it refuses every DHT
+        // flag rather than quietly ignoring it, as it already does for
+        // --relay and --discovery.
+        for args in [
+            vec!["synch", "daemon", "run", "--offline", "--dht"],
+            vec![
+                "synch",
+                "daemon",
+                "run",
+                "--offline",
+                "--dht-bootstrap",
+                "boot.example:6881",
+            ],
+            vec!["synch", "daemon", "run", "--offline", "--dht-publish-addrs"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+
+        // The DHT sub-knobs are meaningless without the DHT itself.
+        for args in [
+            vec![
+                "synch",
+                "daemon",
+                "run",
+                "--dht-bootstrap",
+                "boot.example:6881",
+            ],
+            vec!["synch", "daemon", "run", "--dht-publish-addrs"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
