@@ -266,6 +266,9 @@ impl Node {
         size: u64,
         wanted: &ChunkRanges,
     ) -> Result<FetchReport> {
+        if size == 0 {
+            return self.take_empty_object(root);
+        }
         let mut report = FetchReport::default();
         let mut remaining = wanted.difference(&self.local_groups(root)?);
         if remaining.is_empty() {
@@ -355,6 +358,35 @@ impl Node {
             crate::blocking::offload(move || node.on_content_progress(&root).map(|_| ())).await?;
         }
         report.complete = wanted.difference(&self.local_groups(root)?).is_empty();
+        Ok(report)
+    }
+
+    /// Produces an object of no bytes locally, rather than fetching it.
+    ///
+    /// A zero-length object has nothing to transfer: no bytes, and no group a
+    /// provider could serve. Asking for one anyway is what broke empty files —
+    /// [`group_count`] counts an empty object as one group so that "complete"
+    /// is representable, but bao encodes nothing over an empty tree, so every
+    /// window came back served-nothing, the fetch ran out of providers with
+    /// that group still missing, and a mirror reported the path as `no
+    /// provider could serve the content` (§6.4).
+    ///
+    /// Nobody has to serve it. An empty object's content is settled by its
+    /// size, and its root is what BLAKE3 gives for no input — so this node can
+    /// produce the object itself and get, byte for byte and hash for hash, what
+    /// a provider would have sent. Ingesting it here is also what leaves the
+    /// CAS row every later read goes through: `synch cat`, `get`, and `take` of
+    /// an empty file all resolve through the store like any other object.
+    fn take_empty_object(&self, root: &Hash) -> Result<FetchReport> {
+        let mut report = FetchReport::default();
+        if self.store().blob(root)?.is_some_and(|blob| blob.complete) {
+            report.complete = true;
+            return Ok(report);
+        }
+        // An entry that declares no bytes while naming some other object is
+        // inconsistent: nothing is invented for it, and the caller reports it
+        // unservable exactly as it would any root nobody can supply.
+        report.complete = self.store().ingest_bytes(&[], now_ns())? == *root;
         Ok(report)
     }
 
@@ -776,6 +808,47 @@ mod tests {
                 .unwrap(),
             &payload[49_990..]
         );
+    }
+
+    /// An object of no bytes needs no provider.
+    ///
+    /// It used to need one and never find it: an empty object counts as one
+    /// chunk group, nothing encodes for that group, so every window came back
+    /// served-nothing and the fetch gave up — which is how `synch cat` and
+    /// mirrors of empty files reported that nobody could serve them.
+    #[tokio::test]
+    async fn an_empty_object_needs_no_provider() {
+        let (_d, node) = node().await;
+        let (peer, _) = trust(&node, "nas");
+        let empty = Hash::new(b"");
+        // Published by a peer, never held here: no CAS row, no provider ad,
+        // and — being offline in this test — nobody to ask either.
+        node.store()
+            .put_entry(
+                &peer,
+                "s",
+                "empty.txt",
+                &synch_core::FileEntry::file(0, 0, empty, 1),
+            )
+            .unwrap();
+
+        let report = node.fetch_all(&empty, 0).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(report.providers_tried, 0, "nobody should have been asked");
+        // And it reads back through the store like any other object.
+        assert!(node
+            .read_entry(&peer, "s", "empty.txt")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // An entry claiming no bytes while naming some other object is not
+        // completed by inventing content for it.
+        let report = node
+            .fetch_all(&Hash::new(b"not the empty object"), 0)
+            .await
+            .unwrap();
+        assert!(!report.complete, "{report:?}");
     }
 
     #[test]

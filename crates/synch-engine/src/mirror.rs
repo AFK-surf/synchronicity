@@ -863,6 +863,37 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// A file with no bytes is still a file: it materializes, empty, whether or
+    /// not this node has ever held a copy of the (empty) object.
+    #[tokio::test]
+    async fn an_empty_file_is_mirrored() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        // Published by a peer and never ingested here: the local CAS has no row
+        // for the empty object, which is the state a mirror actually meets.
+        node.store()
+            .put_entry(
+                &peer(),
+                "media",
+                "empty.txt",
+                &FileEntry::file(0, 1, Hash::new(b""), 1),
+            )
+            .unwrap();
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(std::fs::read(target.path().join("empty.txt")).unwrap(), b"");
+
+        // And a second pass sees it as current rather than writing it again.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.current, 1, "{report:?}");
+        assert_eq!(report.written, 0, "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
     #[test]
     fn name_safety_checks() {
         assert!(unsafe_name("fine/path.txt").is_none());
