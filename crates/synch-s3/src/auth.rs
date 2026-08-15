@@ -284,10 +284,22 @@ pub fn expected_signature(
     hex::encode(hmac(&key, to_sign.as_bytes()))
 }
 
+/// How far a request's `x-amz-date` may sit from the gateway clock before it is
+/// rejected. This window is the only thing bounding replay of a captured signed
+/// request, so it is kept tight — the AWS default is the same 15 minutes.
+pub const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
+
 /// Verifies a request against the configured mode.
 ///
+/// `now_unix` is the gateway's current time in Unix seconds; it bounds how long
+/// a captured signed request stays replayable.
+///
 /// Returns the authenticated access key id, or `None` in anonymous mode.
-pub fn verify(mode: &AuthMode, request: &SignedRequest<'_>) -> S3Result<Option<String>> {
+pub fn verify(
+    mode: &AuthMode,
+    request: &SignedRequest<'_>,
+    now_unix: i64,
+) -> S3Result<Option<String>> {
     let keys = match mode {
         AuthMode::Anonymous => return Ok(None),
         AuthMode::SigV4(keys) => keys,
@@ -302,6 +314,23 @@ pub fn verify(mode: &AuthMode, request: &SignedRequest<'_>) -> S3Result<Option<S
         .get("x-amz-date")
         .ok_or_else(|| S3Error::access_denied("no x-amz-date header"))?;
 
+    // Bound replay: a signed request is only valid within the skew window, and
+    // the credential-scope date must match the day of x-amz-date (a signature
+    // is only valid for the day it was scoped to). Without this a captured
+    // request replays indefinitely on the gateway's plaintext port.
+    let signed_at =
+        parse_amz_date(amz_date).ok_or_else(|| S3Error::access_denied("malformed x-amz-date"))?;
+    if (now_unix - signed_at).abs() > MAX_CLOCK_SKEW_SECS {
+        return Err(S3Error::access_denied(
+            "x-amz-date outside the accepted window",
+        ));
+    }
+    if amz_date.get(..8) != Some(header.date.as_str()) {
+        return Err(S3Error::access_denied(
+            "credential scope date does not match x-amz-date",
+        ));
+    }
+
     let key = keys
         .iter()
         .find(|k| k.id == header.access_key)
@@ -312,6 +341,62 @@ pub fn verify(mode: &AuthMode, request: &SignedRequest<'_>) -> S3Result<Option<S
         return Err(S3Error::signature_mismatch());
     }
     Ok(Some(key.id.clone()))
+}
+
+/// Parses an ISO8601 basic `x-amz-date` (`YYYYMMDDTHHMMSSZ`) into Unix seconds.
+/// Returns `None` on any structural or range error.
+pub fn parse_amz_date(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r).and_then(|v| v.parse::<i64>().ok());
+    let (year, month, day) = (num(0..4)?, num(4..6)?, num(6..8)?);
+    let (hour, min, sec) = (num(9..11)?, num(11..13)?, num(13..15)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + min * 60 + sec)
+}
+
+/// Days since the Unix epoch for a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`), so date arithmetic needs no calendar dependency.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Inverse of [`days_from_civil`]: `(year, month, day)` from a day count since
+/// the Unix epoch.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Formats Unix seconds as an ISO8601 basic `x-amz-date` (`YYYYMMDDTHHMMSSZ`).
+/// The scope date a signature needs is its first eight characters.
+pub fn format_amz_date(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z",
+        secs / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60
+    )
 }
 
 /// Compares two byte strings without leaking their contents through timing.
@@ -477,8 +562,11 @@ mod tests {
             headers: &map,
             payload_hash: UNSIGNED_PAYLOAD,
         };
+        // Verify at the request's own signing time so the skew check passes and
+        // the signature is what is under test.
+        let now = parse_amz_date("20240102T030405Z").unwrap();
         assert_eq!(
-            verify(&AuthMode::SigV4(keys.clone()), &request).unwrap(),
+            verify(&AuthMode::SigV4(keys.clone()), &request, now).unwrap(),
             Some("AKID".to_string())
         );
 
@@ -487,7 +575,56 @@ mod tests {
             path: "/bucket/other.txt",
             ..request.clone()
         };
-        assert!(verify(&AuthMode::SigV4(keys), &tampered).is_err());
+        assert!(verify(&AuthMode::SigV4(keys), &tampered, now).is_err());
+    }
+
+    #[test]
+    fn verification_rejects_stale_and_future_dates() {
+        let keys = vec![AccessKey {
+            id: "AKID".into(),
+            secret: "secret".into(),
+        }];
+        let mut map = headers(&[("host", "example.com"), ("x-amz-date", "20240102T030405Z")]);
+        let header = SigV4Header {
+            access_key: "AKID".into(),
+            date: "20240102".into(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+            signed_headers: vec!["host".into(), "x-amz-date".into()],
+            signature: String::new(),
+        };
+        let request = SignedRequest {
+            method: "GET",
+            path: "/bucket/key.txt",
+            query: &[],
+            headers: &map,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        let signature = expected_signature("secret", &header, "20240102T030405Z", &request);
+        map.insert(
+            "authorization".into(),
+            format!(
+                "{ALGORITHM} Credential=AKID/20240102/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature={signature}"
+            ),
+        );
+        let request = SignedRequest {
+            method: "GET",
+            path: "/bucket/key.txt",
+            query: &[],
+            headers: &map,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        let signed_at = parse_amz_date("20240102T030405Z").unwrap();
+        // Correct signature, but the clock is an hour past the window: rejected.
+        assert!(verify(
+            &AuthMode::SigV4(keys.clone()),
+            &request,
+            signed_at + MAX_CLOCK_SKEW_SECS + 3_600
+        )
+        .is_err());
+        // Within the window: accepted.
+        assert!(verify(&AuthMode::SigV4(keys), &request, signed_at + 60).is_ok());
     }
 
     #[test]
@@ -504,7 +641,8 @@ mod tests {
             headers: &empty,
             payload_hash: UNSIGNED_PAYLOAD,
         };
-        assert!(verify(&AuthMode::SigV4(keys.clone()), &request).is_err());
+        let now = parse_amz_date("20240102T030405Z").unwrap();
+        assert!(verify(&AuthMode::SigV4(keys.clone()), &request, now).is_err());
 
         let map = headers(&[
             ("x-amz-date", "20240102T030405Z"),
@@ -518,7 +656,7 @@ mod tests {
             headers: &map,
             ..request
         };
-        assert!(verify(&AuthMode::SigV4(keys), &request).is_err());
+        assert!(verify(&AuthMode::SigV4(keys), &request, now).is_err());
     }
 
     #[test]
@@ -531,7 +669,7 @@ mod tests {
             headers: &empty,
             payload_hash: UNSIGNED_PAYLOAD,
         };
-        assert_eq!(verify(&AuthMode::Anonymous, &request).unwrap(), None);
+        assert_eq!(verify(&AuthMode::Anonymous, &request, 0).unwrap(), None);
     }
 
     #[test]

@@ -533,9 +533,21 @@ fn secure_txt(
     name: &str,
     answers: &[hickory_resolver::proto::rr::Record],
 ) -> Result<ValidatedTxt, NetError> {
+    let mut qname = hickory_resolver::proto::rr::Name::from_utf8(name)
+        .map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
+    qname.set_fqdn(true);
     let mut records = Vec::new();
     let mut ttl = MAX_TTL;
     for record in answers {
+        // DNSSEC proves an RRset is signed by a zone chaining to the trust
+        // anchor — it does not bind the answer to the question. A response
+        // shaped by the (untrusted) DoH transport could carry a validly
+        // signed TXT from an attacker-controlled zone; accepting it would
+        // bind attacker keys into the member set. Only records owned by the
+        // queried name count.
+        if record.name != qname {
+            continue;
+        }
         if !record.proof.is_secure() {
             // Fail closed: one unvalidated record poisons the answer.
             return Err(NetError::Dns(format!(

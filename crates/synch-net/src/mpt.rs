@@ -78,6 +78,14 @@ impl ProtocolHandler for MptProtocol {
         let _ = self.store().record_peer_seen(&remote, None, now);
 
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            // §3.2 enforcement is per message, not just per connection: a
+            // binding revoked or expired mid-connection must cut off further
+            // requests, not linger for the life of the QUIC session.
+            if !matches!(self.store().is_trusted_key(&remote, now_ns()), Ok(true)) {
+                tracing::debug!(peer = %remote.fmt_short(), "closing connection: binding lapsed");
+                connection.close(0u32.into(), b"untrusted");
+                break;
+            }
             if let Err(e) = self.handle_stream(remote, &mut send, &mut recv).await {
                 tracing::debug!(peer = %remote.fmt_short(), error = %e, "mpt stream ended");
                 let _ = write_frame(

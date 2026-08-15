@@ -120,6 +120,19 @@ impl Node {
         for set in &listing {
             known.insert(set.path.clone());
             let target = root_dir.join(&set.path);
+            // Defense in depth against a peer that plants a symlink and a file
+            // beneath it (`sub` -> `/etc`, then `sub/passwd`): materialized in
+            // path order the symlink lands first, and a later write to
+            // `sub/passwd` would resolve through it to `/etc/passwd`, outside
+            // the mirror root. Refuse — for writes and removals alike — any
+            // path whose ancestors include a symlink the mirror itself wrote.
+            if escapes_via_symlink(&root_dir, &set.path) {
+                report.skipped.push((
+                    set.path.clone(),
+                    "path resolves through a symlink; refusing to write outside the mirror".into(),
+                ));
+                continue;
+            }
             let selected = match set.select(&mirror.policy) {
                 synch_store::Selection::Selected(entry) => *entry,
                 // The policy selects nothing here — an `origin=` pin on an
@@ -305,6 +318,24 @@ fn already_current(target: &Path, size: u64, content: &synch_core::Hash) -> bool
             .unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// Returns true if any ancestor of `rel` under `root` is a symlink, so that
+/// writing or deleting at `root/rel` would resolve through it and escape the
+/// mirror root. The final component (the target itself) is not an ancestor and
+/// is allowed to be a symlink.
+fn escapes_via_symlink(root: &Path, rel: &str) -> bool {
+    let mut cur = root.to_path_buf();
+    let mut components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+    components.pop();
+    for component in components {
+        cur.push(component);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn remove_if_present(target: &Path) -> Result<usize> {
@@ -724,6 +755,22 @@ mod tests {
         assert!(unsafe_name("nul.txt").is_some());
         assert!(unsafe_name("bad<name").is_some());
         assert!(unsafe_name("trailing ").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_ancestor_is_refused() {
+        // A peer publishes a symlink `sub -> /etc` and, path-ordered after it, a
+        // file `sub/passwd`. The symlink materializes first; without the guard
+        // the file write would resolve through it to `/etc/passwd`.
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/etc", root.path().join("sub")).unwrap();
+        assert!(escapes_via_symlink(root.path(), "sub/passwd"));
+        // A real directory ancestor is fine, and the symlink leaf itself is fine.
+        std::fs::create_dir(root.path().join("real")).unwrap();
+        assert!(!escapes_via_symlink(root.path(), "real/file.txt"));
+        assert!(!escapes_via_symlink(root.path(), "sub"));
+        assert!(!escapes_via_symlink(root.path(), "brandnew/file.txt"));
     }
 
     #[cfg(unix)]

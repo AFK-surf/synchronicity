@@ -35,6 +35,39 @@ use crate::{
 /// The bao block size synchronicity uses everywhere: 16 KiB chunk groups.
 pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(CHUNK_GROUP_LOG2);
 
+/// Distinguishes concurrent staging files within one process. The name also
+/// carries the pid, so two daemons over one CAS never collide either.
+static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Flushes a file's contents to stable storage. A blob row is only ever written
+/// after this returns, so a crash cannot leave a `complete=1` index row whose
+/// bytes never reached the disk (§6.2 durability).
+fn fsync_file(file: &File) -> Result<()> {
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Flushes a directory entry (a rename or create) to stable storage so the file
+/// is findable after a crash, not just its contents. A no-op on platforms that
+/// cannot open a directory as a file.
+fn fsync_parent(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+/// Writes a file and flushes it (contents and directory entry) to stable
+/// storage before returning.
+fn write_and_sync(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(data)?;
+    fsync_file(&file)?;
+    fsync_parent(path);
+    Ok(())
+}
+
 /// A row of the local blob index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobRow {
@@ -184,9 +217,15 @@ impl Store {
         // Stream the file once, teeing into a staging file in the CAS so the
         // payload lands without a second read.
         std::fs::create_dir_all(self.cas_dir())?;
-        let staging = self
-            .cas_dir()
-            .join(format!("incoming-{}.tmp", std::process::id()));
+        // Unique per ingest, not just per process: two concurrent ingests
+        // (a scan and a control-socket `put`, or parallel space scans) must not
+        // share one staging file, or each would truncate the other's stream and
+        // rename a corrupt payload into place under a correct-looking root.
+        let staging = self.cas_dir().join(format!(
+            "incoming-{}-{}.tmp",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let root = {
             let source = File::open(path)?;
             let sink = File::create(&staging)?;
@@ -208,7 +247,13 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::rename(&staging, &target)?;
-        std::fs::write(self.outboard_path(&root), &outboard)?;
+        // Flush the payload contents, the outboard, and the directory entries
+        // before the index row claims this blob is complete.
+        if let Ok(payload) = File::open(&target) {
+            let _ = fsync_file(&payload);
+        }
+        fsync_parent(&target);
+        write_and_sync(&self.outboard_path(&root), &outboard)?;
         self.write_blob_row(&root, size, true, None, None, now)?;
         Ok((root, size))
     }
@@ -218,8 +263,8 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, data)?;
-        std::fs::write(self.outboard_path(root), outboard)?;
+        write_and_sync(&path, data)?;
+        write_and_sync(&self.outboard_path(root), outboard)?;
         Ok(())
     }
 
@@ -600,6 +645,7 @@ impl Store {
             tree,
             data: outboard_file,
         };
+        let payload_for_sync = payload.try_clone().ok();
         decode_ranges(
             std::io::Cursor::new(encoded),
             &bao_ranges,
@@ -610,6 +656,16 @@ impl Store {
             root: *root,
             reason: e.to_string(),
         })?;
+
+        // Persist the verified groups (payload and outboard) before the bitmap
+        // in the index advances to cover them — otherwise a crash could leave
+        // the index claiming groups the disk never received.
+        if let Some(payload) = &payload_for_sync {
+            let _ = fsync_file(payload);
+        }
+        if let Ok(ob) = File::open(self.outboard_path(root)) {
+            let _ = fsync_file(&ob);
+        }
 
         let verified = existing
             .map(|r| r.verified_groups())

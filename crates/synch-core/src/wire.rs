@@ -182,8 +182,15 @@ impl ChunkRanges {
     }
 
     /// Total number of groups covered.
+    ///
+    /// Saturating: `GroupRange`s in a `GetSlice` arrive from peers unbounded, so
+    /// a range near `[0, u64::MAX)` must not panic (debug) or silently wrap
+    /// (release) here.
     pub fn count(&self) -> u64 {
-        self.ranges.iter().map(|r| r.end - r.start).sum()
+        self.ranges
+            .iter()
+            .map(|r| r.end.saturating_sub(r.start))
+            .fold(0u64, u64::saturating_add)
     }
 
     /// True if `group` is covered.

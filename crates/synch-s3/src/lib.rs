@@ -110,15 +110,22 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
         .unwrap_or_else(|| UNSIGNED_PAYLOAD.to_string());
 
     let path = percent_decode(parts.uri.path());
+    // Sign over the *decoded* path: `canonical_uri` URI-encodes each segment
+    // exactly once, mirroring what a spec-compliant client signs. Passing the
+    // still-encoded wire path here would re-encode the `%` and double-encode any
+    // key with a space, Unicode, or reserved character, so every such request
+    // would fail with SignatureDoesNotMatch. (Query params are already handled
+    // this way — decoded in `parse_query`, re-encoded once in `canonical_request`.)
     auth::verify(
         &gateway.auth,
         &SignedRequest {
             method: parts.method.as_str(),
-            path: parts.uri.path(),
+            path: &path,
             query: &query,
             headers: &headers,
             payload_hash: &payload_hash,
         },
+        now_unix_secs(),
     )?;
 
     // Path-style addressing: /<bucket>/<key...>
@@ -470,6 +477,14 @@ fn param(query: &[(String, String)], name: &str) -> Option<String> {
 }
 
 /// Decodes percent-escapes and `+` in a URI component.
+/// The gateway's wall clock in Unix seconds, for the SigV4 skew check.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
