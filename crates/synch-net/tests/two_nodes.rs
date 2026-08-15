@@ -338,6 +338,106 @@ async fn untrusted_peers_are_refused() {
     stranger.net.shutdown().await.unwrap();
 }
 
+/// A request costs a stream, not a session.
+///
+/// Every fetch used to dial: a mirror pass or a large `get` opened one QUIC
+/// session per file, each one a handshake here and a connection left idling
+/// out over there. Requests to the same peer and ALPN now share one session,
+/// and only a session that is actually gone is replaced.
+#[tokio::test]
+async fn requests_to_a_peer_share_one_session() {
+    let client = Node::spawn("laptop").await;
+    let server = Node::spawn("nas").await;
+    trust_each_other(&[&client, &server]);
+
+    let first = client
+        .net
+        .connect_mpt(server.net.direct_addr())
+        .await
+        .unwrap();
+    let second = client
+        .net
+        .connect_mpt(server.net.direct_addr())
+        .await
+        .unwrap();
+    assert_eq!(
+        first.connection().stable_id(),
+        second.connection().stable_id(),
+        "a second request must not open a second session"
+    );
+    // Both really are usable, not just equal.
+    second.get_nodes(&[Hash::new(b"nothing")]).await.unwrap();
+
+    // A session that has gone is not handed out again: the next request dials.
+    first.connection().close(0u32.into(), b"done");
+    let third = client
+        .net
+        .connect_mpt(server.net.direct_addr())
+        .await
+        .unwrap();
+    assert_ne!(
+        third.connection().stable_id(),
+        first.connection().stable_id(),
+        "a closed session must be replaced, not reused"
+    );
+    third.get_nodes(&[Hash::new(b"nothing")]).await.unwrap();
+
+    // The two ALPNs are separate sessions, so the metadata one is untouched by
+    // a content dial.
+    client
+        .net
+        .connect_blob(server.net.direct_addr())
+        .await
+        .unwrap();
+    let again = client
+        .net
+        .connect_mpt(server.net.direct_addr())
+        .await
+        .unwrap();
+    assert_eq!(
+        again.connection().stable_id(),
+        third.connection().stable_id()
+    );
+
+    client.net.shutdown().await.unwrap();
+    server.net.shutdown().await.unwrap();
+}
+
+/// A binding that lapses does not leave a session open behind it (§3.2).
+#[tokio::test]
+async fn a_lapsed_binding_drops_the_session_it_was_dialed_under() {
+    let client = Node::spawn("laptop").await;
+    let server = Node::spawn("nas").await;
+    trust_each_other(&[&client, &server]);
+
+    let held = client
+        .net
+        .connect_mpt(server.net.direct_addr())
+        .await
+        .unwrap();
+    client
+        .store
+        .remove_binding(
+            &server.origin,
+            &server.secret.public(),
+            synch_store::BindingSource::Static,
+        )
+        .unwrap();
+
+    let refused = client.net.connect_mpt(server.net.direct_addr()).await;
+    assert!(
+        matches!(refused, Err(synch_net::NetError::Untrusted(_))),
+        "a peer we no longer trust must not be dialed: {refused:?}"
+    );
+    assert!(
+        held.connection().close_reason().is_some(),
+        "and the session it was dialed under must not stay open"
+    );
+
+    client.net.shutdown().await.unwrap();
+    server.net.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn reactive_head_push_propagates() {
     let publisher = Node::spawn("nas").await;

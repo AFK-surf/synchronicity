@@ -1,7 +1,7 @@
 //! The iroh endpoint wrapper, with both ALPNs mounted and membership enforced
 //! at accept time (§2, §3.2).
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use iroh::{
     address_lookup::{PkarrPublisher, PkarrResolver},
@@ -169,11 +169,25 @@ fn dht_address_lookup(
     Ok(builder)
 }
 
+/// The live outbound connections this endpoint holds, keyed by peer and ALPN.
+type Dialed = std::sync::Mutex<HashMap<(NodeId, &'static [u8]), Connection>>;
+
 /// A bound endpoint serving both ALPNs.
 #[derive(Debug, Clone)]
 pub struct Net {
     router: Router,
     store: Arc<Store>,
+    /// One live connection per peer and ALPN, reused across requests.
+    ///
+    /// A QUIC session is not a request: opening one costs a handshake, a
+    /// hole-punch or a relay round trip, and — until it idles out on both
+    /// sides — a slot in each endpoint's connection table. Dialing per request
+    /// made a mirror pass or a large fetch open one session *per file*, which
+    /// is what turned `mirror sync` over a big tree into thousands of
+    /// handshakes: the provider filled with paths idling out, and the fetching
+    /// endpoint drowned in its own churn. Streams are what a request costs
+    /// here; the session is held open and shared.
+    dialed: Arc<Dialed>,
 }
 
 impl Net {
@@ -247,7 +261,11 @@ impl Net {
             )
             .spawn();
 
-        Ok(Net { router, store })
+        Ok(Net {
+            router,
+            store,
+            dialed: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        })
     }
 
     /// The underlying iroh endpoint.
@@ -290,12 +308,12 @@ impl Net {
         }
     }
 
-    /// Dials a peer on the metadata ALPN.
+    /// Connects to a peer on the metadata ALPN, reusing a live session.
     pub async fn connect_mpt(&self, addr: impl Into<EndpointAddr>) -> Result<MptClient, NetError> {
         Ok(MptClient::new(self.connect(addr, ALPN_MPT).await?))
     }
 
-    /// Dials a peer on the content ALPN.
+    /// Connects to a peer on the content ALPN, reusing a live session.
     pub async fn connect_blob(
         &self,
         addr: impl Into<EndpointAddr>,
@@ -306,26 +324,85 @@ impl Net {
     async fn connect(
         &self,
         addr: impl Into<EndpointAddr>,
-        alpn: &[u8],
+        alpn: &'static [u8],
     ) -> Result<Connection, NetError> {
         let addr = addr.into();
-        // Dial only peers we ourselves trust: trust is unilateral per node, and
-        // both sides must hold it for a session to work (§3.2).
+        // Checked on every request, cached session or not: trust is unilateral
+        // per node, both sides must hold it for a session to work (§3.2), and a
+        // binding that lapses mid-session must stop the next request rather
+        // than ride the connection it was opened under.
         if !self.store.is_trusted_key(&addr.id, synch_core::now_ns())? {
+            // And the session we were holding goes with the trust: a binding
+            // that lapsed is not a peer to keep a connection open with.
+            self.forget(&addr.id);
             return Err(NetError::Untrusted(addr.id.fmt_short().to_string()));
         }
-        let peer = addr.id.fmt_short().to_string();
-        match tokio::time::timeout(DIAL_TIMEOUT, self.endpoint().connect(addr, alpn)).await {
-            Ok(connected) => connected.map_err(|e| NetError::Endpoint(e.to_string())),
-            Err(_) => Err(NetError::Endpoint(format!(
-                "{peer} did not answer within {}s",
-                DIAL_TIMEOUT.as_secs()
-            ))),
+        if let Some(connection) = self.live(&addr.id, alpn) {
+            return Ok(connection);
         }
+        let id = addr.id;
+        let peer = id.fmt_short().to_string();
+        let connection =
+            match tokio::time::timeout(DIAL_TIMEOUT, self.endpoint().connect(addr, alpn)).await {
+                Ok(connected) => connected.map_err(|e| NetError::Endpoint(e.to_string()))?,
+                Err(_) => {
+                    return Err(NetError::Endpoint(format!(
+                        "{peer} did not answer within {}s",
+                        DIAL_TIMEOUT.as_secs()
+                    )))
+                }
+            };
+        // A concurrent dial to the same peer may have got there first. Both
+        // sessions work and each caller holds its own, so the displaced one is
+        // only dropped here — not closed — and lives as long as its user does.
+        let _ = self.dialed().insert((id, alpn), connection.clone());
+        Ok(connection)
+    }
+
+    /// The session held for a peer and ALPN, if one is still live.
+    ///
+    /// A session the peer closed — a lapsed binding, a restart — or one that
+    /// idled out is dropped here rather than handed out, so the caller dials
+    /// again instead of failing on a dead connection.
+    fn live(&self, id: &NodeId, alpn: &'static [u8]) -> Option<Connection> {
+        let mut dialed = self.dialed();
+        match dialed.get(&(*id, alpn)) {
+            Some(connection) if connection.close_reason().is_none() => Some(connection.clone()),
+            Some(_) => {
+                dialed.remove(&(*id, alpn));
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Closes and drops every session held with a peer.
+    fn forget(&self, id: &NodeId) {
+        let dropped: Vec<Connection> = {
+            let mut dialed = self.dialed();
+            let keys: Vec<(NodeId, &'static [u8])> = dialed
+                .keys()
+                .filter(|(peer, _)| peer == id)
+                .copied()
+                .collect();
+            keys.iter().filter_map(|key| dialed.remove(key)).collect()
+        };
+        for connection in dropped {
+            connection.close(0u32.into(), b"untrusted");
+        }
+    }
+
+    fn dialed(&self) -> std::sync::MutexGuard<'_, HashMap<(NodeId, &'static [u8]), Connection>> {
+        self.dialed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Shuts the router and endpoint down cleanly.
     pub async fn shutdown(&self) -> Result<(), NetError> {
+        // The held sessions go first: the endpoint closes them anyway, and
+        // dropping them here means a shutdown does not race its own cache.
+        self.dialed().clear();
         self.router
             .shutdown()
             .await
