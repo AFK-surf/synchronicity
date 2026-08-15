@@ -6,7 +6,9 @@
 import dns/name.{type Name}
 import dns/rdata
 import dns/wire
+import dnssec/keys
 import gleam/dict
+import gleam/int
 import gleam/list
 import gleam/order
 import gleam/result
@@ -65,7 +67,7 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
     )
   let dnskey =
     Rrset(apex, wire.type_dnskey, ttl_infra, [
-      rdata.dnskey(257, 13, input.meta.dnskey_public),
+      rdata.dnskey(keys.flags, keys.algorithm, input.meta.dnskey_public),
     ])
 
   use glue <- result.try(glue_rrsets(input, apex))
@@ -160,7 +162,7 @@ fn validate_members(members: List(model.Member)) -> Result(Nil, BuildError) {
   // Label grammar and nk shape.
   use Nil <- result.try(
     list.try_fold(members, Nil, fn(_, m) {
-      case valid_label(m.label) {
+      case name.valid_device_label(m.label) {
         False -> Error(InvalidLabel(m.label))
         True ->
           case model.validate_nk(m.nk_z32) {
@@ -193,46 +195,12 @@ fn validate_members(members: List(model.Member)) -> Result(Nil, BuildError) {
   })
 }
 
-fn valid_label(label: String) -> Bool {
-  // Device labels: [a-z0-9-]{1,63} (normalize_label's grammar; hyphen
-  // position is free, unlike DNS labels).
-  let bytes = <<label:utf8>>
-  let size = byte_size_of(bytes)
-  size >= 1 && size <= 63 && label_bytes_ok(bytes)
-}
-
-fn byte_size_of(bytes: BitArray) -> Int {
-  case bytes {
-    <<>> -> 0
-    <<_:int-size(8), rest:bits>> -> 1 + byte_size_of(rest)
-    _ -> 0
-  }
-}
-
-fn label_bytes_ok(bytes: BitArray) -> Bool {
-  case bytes {
-    <<>> -> True
-    <<b:int-size(8), rest:bits>> ->
-      { { b >= 97 && b <= 122 } || { b >= 48 && b <= 57 } || b == 45 }
-      && label_bytes_ok(rest)
-    _ -> False
-  }
-}
-
 /// Sorts full RRsets canonically — publish stores them in chain order.
 pub fn sort_rrsets(rrsets: List(Rrset)) -> List(Rrset) {
   list.sort(rrsets, fn(a, b) {
     case name.compare(a.owner, b.owner) {
-      order.Eq -> int_compare(a.rtype, b.rtype)
+      order.Eq -> int.compare(a.rtype, b.rtype)
       other -> other
     }
   })
-}
-
-fn int_compare(a: Int, b: Int) -> order.Order {
-  case a < b, a == b {
-    True, _ -> order.Lt
-    _, True -> order.Eq
-    _, _ -> order.Gt
-  }
 }

@@ -76,21 +76,7 @@ pub fn publish(
   now: Int,
   actor: String,
 ) -> Result(Int, PublishError) {
-  use _ <- result.try(exec(conn, "BEGIN IMMEDIATE"))
-  case publish_in_tx(conn, csk, now, actor) {
-    Ok(serial) ->
-      case exec(conn, "COMMIT") {
-        Ok(Nil) -> Ok(serial)
-        Error(e) -> {
-          let _ = exec(conn, "ROLLBACK")
-          Error(e)
-        }
-      }
-    Error(e) -> {
-      let _ = exec(conn, "ROLLBACK")
-      Error(e)
-    }
-  }
+  sqlite.transaction(conn, Db, fn() { publish_in_tx(conn, csk, now, actor) })
 }
 
 /// The publish body, for callers that already opened the transaction.
@@ -214,33 +200,18 @@ pub fn set_ns_hosts(
   conn: Connection,
   hosts: List(#(String, String, String)),
 ) -> Result(Nil, sqlite.Error) {
-  use _ <- result.try(sqlite.exec(conn, "BEGIN IMMEDIATE", []))
-  let work = {
+  sqlite.transaction(conn, fn(e) { e }, fn() {
     use _ <- result.try(sqlite.exec(conn, "DELETE FROM zone_ns", []))
     list.try_fold(hosts, Nil, fn(_, host) {
       let #(hostname, ipv4, ipv6) = host
       sqlite.exec(conn, "INSERT INTO zone_ns VALUES (?, ?, ?)", [
         Text(hostname),
-        text_or_null(ipv4),
-        text_or_null(ipv6),
+        sqlite.text_or_null(ipv4),
+        sqlite.text_or_null(ipv6),
       ])
       |> result.replace(Nil)
     })
-  }
-  case work {
-    Ok(Nil) -> sqlite.exec(conn, "COMMIT", []) |> result.replace(Nil)
-    Error(e) -> {
-      let _ = sqlite.exec(conn, "ROLLBACK", [])
-      Error(e)
-    }
-  }
-}
-
-fn text_or_null(s: String) -> sqlite.Value {
-  case s {
-    "" -> sqlite.Null
-    _ -> Text(s)
-  }
+  })
 }
 
 fn exec(conn: Connection, sql: String) -> Result(Nil, PublishError) {

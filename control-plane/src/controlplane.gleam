@@ -1,12 +1,13 @@
-//// Entry point for the synchronicity control plane.
+//// Entry point for the synchronicity control plane: CLI dispatch and the
+//// two supervision trees (primary, replica).
 ////
 //// Subcommands:
 ////   serve                 run the service (configuration from CP_* env)
 ////   keygen <apex> <file>  generate the zone CSK; print DNSKEY / DS / anchor
 ////   ds <apex> <file>      print DS + anchor material for an existing key
 ////   seed                  create a demo org/network/devices and publish
+////   seed-admin <email>    first-user bootstrap: print a one-time magic link
 ////   migrate-check         replay the migration chain against a scratch DB
-////   seed-admin <email>    (later) first-user bootstrap
 
 import api/auth_api
 import api/router
@@ -33,7 +34,7 @@ import store/db
 import store/migrate
 import store/pool
 import store/sqlite
-import thirtytwo
+import tools/seed
 import wisp/wisp_mist
 import zone/model
 import zone/publish
@@ -44,9 +45,6 @@ fn argv() -> List(String)
 @external(erlang, "cp_sys_ffi", "now_unix")
 fn now_unix() -> Int
 
-@external(erlang, "cp_crypto_ffi", "ed25519_generate_public")
-fn ed25519_generate_public() -> BitArray
-
 @external(erlang, "erlang", "halt")
 fn halt(code: Int) -> Nil
 
@@ -55,12 +53,12 @@ pub fn main() {
     ["keygen", apex, key_file] -> keygen(apex, key_file)
     ["ds", apex, key_file] -> print_key_material(apex, key_file)
     ["migrate-check"] -> migrate_check()
-    ["seed"] -> run_or_die(seed)
+    ["seed"] -> run_or_die(run_seed)
     ["seed-admin", email] -> run_or_die(fn() { seed_admin(email) })
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | seed | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | seed | seed-admin <email> | migrate-check",
       )
       halt(2)
     }
@@ -314,100 +312,14 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   Ok(Nil)
 }
 
-/// Demo data: org acme, network prod, device nas (one active key, one
-/// revoked), device laptop (rotation window: active + retiring). Prints
-/// the generated keys so e2e can assert on exact contents.
-fn seed() -> Result(Nil, String) {
+/// Loads config, opens the database and hands off to tools/seed.
+fn run_seed() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
-  use #(conn, csk) <- result.try({
-    use conn <- result.try(open_primary_db(cfg))
-    use csk <- result.try(keys.load(cfg.key_file))
-    use Nil <- result.try(publish.ensure_meta(conn, cfg.base_domain, csk))
-    use _ <- result.try(
-      publish.set_ns_hosts(conn, cfg.ns_hosts)
-      |> result.map_error(fn(e) { "ns hosts: " <> string.inspect(e) }),
-    )
-    Ok(#(conn, csk))
-  })
-  let nk = fn() { thirtytwo.z_base_32_encode(ed25519_generate_public()) }
-  let nas_active = nk()
-  let nas_revoked = nk()
-  let laptop_active = nk()
-  let laptop_retiring = nk()
-  let now = int.to_string(now_unix())
-  use _ <- result.try(
-    sqlite.script(
-      conn,
-      "INSERT OR IGNORE INTO users VALUES ('seed-user', 'seed@example.com', 'Seed', "
-        <> now
-        <> ");
-       INSERT OR IGNORE INTO orgs VALUES ('org-acme', 'acme', 'Acme', "
-        <> now
-        <> ");
-       INSERT OR IGNORE INTO org_members VALUES ('org-acme', 'seed-user', 'owner', "
-        <> now
-        <> ");
-       INSERT OR IGNORE INTO networks VALUES ('net-prod', 'org-acme', 'prod', "
-        <> now
-        <> ");
-       DELETE FROM network_devices;
-       DELETE FROM device_keys;
-       DELETE FROM devices;
-       INSERT INTO devices VALUES ('dev-nas', 'org-acme', 'nas', NULL, NULL, 'seed-user', "
-        <> now
-        <> ");
-       INSERT INTO devices VALUES ('dev-laptop', 'org-acme', 'laptop', NULL, NULL, 'seed-user', "
-        <> now
-        <> ");
-       INSERT INTO network_devices VALUES ('net-prod', 'dev-nas', "
-        <> now
-        <> ");
-       INSERT INTO network_devices VALUES ('net-prod', 'dev-laptop', "
-        <> now
-        <> ");",
-    )
-    |> result.map_error(fn(e) { "seeding: " <> string.inspect(e) }),
-  )
-  let add_key = fn(id: String, device: String, z32: String, state: String) {
-    sqlite.exec(
-      conn,
-      "INSERT INTO device_keys VALUES (?, ?, ?, ?, ?, ?, NULL)",
-      [
-        sqlite.Text(id),
-        sqlite.Text(device),
-        sqlite.Text(z32),
-        sqlite.Blob(unwrap_nk(z32)),
-        sqlite.Text(state),
-        sqlite.Int(now_unix()),
-      ],
-    )
-    |> result.map_error(fn(e) { "seeding key: " <> string.inspect(e) })
-  }
-  use _ <- result.try(add_key("key-nas-1", "dev-nas", nas_active, "active"))
-  use _ <- result.try(add_key("key-nas-0", "dev-nas", nas_revoked, "revoked"))
-  use _ <- result.try(add_key(
-    "key-laptop-1",
-    "dev-laptop",
-    laptop_active,
-    "active",
-  ))
-  use _ <- result.try(add_key(
-    "key-laptop-0",
-    "dev-laptop",
-    laptop_retiring,
-    "retiring",
-  ))
-  use serial <- result.try(
-    publish.publish(conn, csk, now_unix(), "system:seed")
-    |> result.map_error(fn(e) { "publishing: " <> string.inspect(e) }),
-  )
-  io.println("seeded domain=prod.acme." <> cfg.base_domain)
-  io.println("serial=" <> int.to_string(serial))
-  io.println("nas_active=" <> nas_active)
-  io.println("nas_revoked=" <> nas_revoked)
-  io.println("laptop_active=" <> laptop_active)
-  io.println("laptop_retiring=" <> laptop_retiring)
-  Ok(Nil)
+  use conn <- result.try(open_primary_db(cfg))
+  use csk <- result.try(keys.load(cfg.key_file))
+  let seeded = seed.run(cfg, conn, csk)
+  sqlite.close(conn)
+  seeded
 }
 
 /// First-user bootstrap: prints a one-time magic link for `email`.
@@ -426,12 +338,4 @@ fn seed_admin(email: String) -> Result(Nil, String) {
   )
   sqlite.close(conn)
   Ok(Nil)
-}
-
-fn unwrap_nk(z32: String) -> BitArray {
-  let decoded = thirtytwo.z_base_32_decode(z32)
-  case decoded {
-    Ok(bytes) -> bytes
-    Error(Nil) -> <<>>
-  }
 }

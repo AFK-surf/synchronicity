@@ -3,12 +3,10 @@ import dns/rdata
 import dns/wire
 import dnssec/keys
 import dnssec/sign
+import fixtures
 import gleam/bit_array
 import gleam/list
 import gleam/string
-
-@external(erlang, "test_ffi", "tmp_db")
-fn tmp_path() -> String
 
 pub fn generate_shapes_test() {
   let csk = keys.generate()
@@ -43,7 +41,7 @@ pub fn ds_and_anchor_render_test() {
 }
 
 pub fn save_load_round_trip_test() {
-  let path = tmp_path() <> ".key"
+  let path = fixtures.tmp_db() <> ".key"
   let csk = keys.generate()
   let assert Ok(Nil) = keys.save(path, csk)
   let assert Ok(loaded) = keys.load(path)

@@ -1,17 +1,8 @@
+import fixtures.{ready_db, tmp_db}
 import gleam/erlang/process
 import store/db
-import store/migrate
 import store/pool
 import store/sqlite.{Int as VInt}
-
-@external(erlang, "test_ffi", "tmp_db")
-fn tmp_db() -> String
-
-fn ready_db(path: String) -> Nil {
-  let assert Ok(conn) = db.open_primary(path)
-  let assert Ok(_) = migrate.migrate(conn)
-  sqlite.close(conn)
-}
 
 pub fn checkout_reset_isolates_borrowers_test() {
   let path = tmp_db()

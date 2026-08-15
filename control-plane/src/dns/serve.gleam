@@ -12,12 +12,20 @@ pub type Serving {
   Serving(pool: Pool, apex: Name)
 }
 
+/// How the packet arrived. Datagram answers must fit the query's EDNS
+/// limit (truncate, client retries over TCP); stream answers (TCP, DoH)
+/// have no size limit.
+pub type Transport {
+  Udp
+  Stream
+}
+
 /// One message's worth of work, transport-agnostic. `Error(Nil)` means
 /// drop the datagram (unparseable beyond salvage).
 pub fn handle_packet(
   serving: Serving,
   packet: BitArray,
-  udp: Bool,
+  transport: Transport,
 ) -> Result(BitArray, Nil) {
   case wire.decode_query(packet) {
     Ok(q) -> {
@@ -27,9 +35,9 @@ pub fn handle_packet(
         })
       case answered {
         Ok(response) ->
-          case udp {
-            True -> Ok(query.fit_udp(q, response))
-            False -> Ok(response)
+          case transport {
+            Udp -> Ok(query.fit_udp(q, response))
+            Stream -> Ok(response)
           }
         // Pool exhausted or database unavailable: SERVFAIL beats silence.
         Error(_) -> Ok(query.error_stub(q.id, query.rcode_servfail))

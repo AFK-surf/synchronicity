@@ -1,5 +1,7 @@
-//// Connection lifecycle: which pragmas a connection runs before anyone
-//// else touches it, and which modes the two roles are allowed.
+//// The pragma sets each role runs before touching a connection, plus
+//// direct openers for boot, CLI tools and tests. Request and serving
+//// paths never open connections here — they borrow from `store/pool`,
+//// which re-applies these pragma sets after every checkout reset.
 
 import gleam/otp/actor
 import gleam/result
@@ -53,7 +55,9 @@ pub const primary_pragmas = "PRAGMA busy_timeout=5000;
 pub const read_pragmas = "PRAGMA busy_timeout=5000;
    PRAGMA query_only=ON;"
 
-/// The dashboard/API pool: read-write workers over an existing database.
+/// An unsupervised read-write pool — tests and one-shot tools only.
+/// Production pools are supervision-tree children (`pool.supervised` in
+/// controlplane's serve functions).
 pub fn start_primary_pool(
   path: String,
   size: Int,
@@ -61,8 +65,7 @@ pub fn start_primary_pool(
   pool.start(path, sqlite.ReadWrite, primary_pragmas, size)
 }
 
-/// The DNS serving pool: read-only workers; checkout-reset makes replica
-/// file swaps visible on the next query.
+/// An unsupervised read-only pool — tests and one-shot tools only.
 pub fn start_read_pool(
   path: String,
   size: Int,

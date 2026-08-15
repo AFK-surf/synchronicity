@@ -49,23 +49,16 @@ pub fn migrate(conn: Connection) -> Result(Int, MigrateError) {
 }
 
 fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
-  let step = {
-    use _ <- result.try(sqlite.exec(conn, "BEGIN IMMEDIATE", []))
-    use _ <- result.try(sqlite.script(conn, sql))
-    use _ <- result.try(sqlite.script(
-      conn,
-      "PRAGMA user_version = " <> int.to_string(to),
-    ))
-    use _ <- result.try(sqlite.exec(conn, "COMMIT", []))
+  sqlite.transaction(conn, Failed(to, _), fn() {
+    use _ <- result.try(
+      sqlite.script(conn, sql) |> result.map_error(Failed(to, _)),
+    )
+    use _ <- result.try(
+      sqlite.script(conn, "PRAGMA user_version = " <> int.to_string(to))
+      |> result.map_error(Failed(to, _)),
+    )
     Ok(to)
-  }
-  case step {
-    Ok(v) -> Ok(v)
-    Error(e) -> {
-      let _ = sqlite.exec(conn, "ROLLBACK", [])
-      Error(Failed(to, e))
-    }
-  }
+  })
 }
 
 fn migrations() -> List(String) {

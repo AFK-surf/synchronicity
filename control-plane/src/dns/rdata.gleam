@@ -7,10 +7,9 @@ import dns/wire
 import gleam/bit_array
 import gleam/int
 import gleam/list
-import gleam/string
 
 @external(erlang, "cp_udp_ffi", "parse_ip")
-pub fn parse_ip(text: String) -> Result(BitArray, Nil)
+fn parse_ip(text: String) -> Result(BitArray, Nil)
 
 /// A full uncompressed RR: owner, type, class IN, ttl, rdata.
 pub fn rr(owner: Name, rtype: Int, ttl: Int, rdata: BitArray) -> BitArray {
@@ -212,11 +211,4 @@ pub fn sync1_text(
     "" -> with_relay
     a -> with_relay <> " addr=" <> a
   }
-}
-
-/// Splits rendered TXT strings for size sanity — a record is ~120 bytes,
-/// far under the 255-byte character-string limit, but the encoder handles
-/// oversized strings anyway.
-pub fn txt_length_ok(text: String) -> Bool {
-  string.byte_size(text) <= 255
 }

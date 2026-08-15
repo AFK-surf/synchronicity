@@ -4,10 +4,9 @@ import auth/session
 import dns/name as dns_name
 import dns/serve
 import dns/wire
-import dnssec/keys
 import email/mailer
 import exception
-import gleam/crypto
+import fixtures.{nk, now_unix, tmp_db}
 import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
 import gleam/list
@@ -16,24 +15,11 @@ import gleam/string
 import store/db
 import store/migrate
 import store/sqlite
-import thirtytwo
+import util/id
 import wisp
 import wisp/simulate
 import zone/model
 import zone/publish
-
-@external(erlang, "test_ffi", "tmp_db")
-fn tmp_db() -> String
-
-@external(erlang, "cp_sys_ffi", "now_unix")
-fn now_unix() -> Int
-
-@external(erlang, "cp_crypto_ffi", "ed25519_generate_public")
-fn ed25519_generate_public() -> BitArray
-
-fn nk() -> String {
-  thirtytwo.z_base_32_encode(ed25519_generate_public())
-}
 
 type Harness {
   Harness(ctx: router.Context, db_path: String, token: String, csrf: String)
@@ -44,9 +30,7 @@ fn harness() -> Harness {
   let db_path = tmp_db()
   let assert Ok(conn) = db.open_primary(db_path)
   let assert Ok(_) = migrate.migrate(conn)
-  let csk = keys.generate()
-  let assert Ok(Nil) = publish.ensure_meta(conn, "sync.test", csk)
-  let assert Ok(Nil) = publish.set_ns_hosts(conn, [#("ns1", "127.0.0.1", "")])
+  let csk = fixtures.zone_boot(conn)
   let assert Ok(_) =
     sqlite.exec(
       conn,
@@ -462,7 +446,7 @@ pub fn invite_accept_test() {
     conn
   }
   let token = "test-invite-token"
-  let token_hash = crypto.hash(crypto.Sha256, <<token:utf8>>)
+  let token_hash = id.hash_token(token)
   let assert Ok(_) =
     sqlite.exec(
       conn,
@@ -555,7 +539,7 @@ pub fn mutation_visible_to_dns_immediately_test() {
     16:int-size(16),
     1:int-size(16),
   >>
-  let assert Ok(response) = serve.handle_packet(serving, question, False)
+  let assert Ok(response) = serve.handle_packet(serving, question, serve.Stream)
   let assert Ok(msg) = wire.decode_message(response)
   // NOERROR with exactly the freshly published TXT record.
   assert msg.flags % 16 == 0

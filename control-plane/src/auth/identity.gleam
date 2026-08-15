@@ -9,7 +9,7 @@
 
 import gleam/option.{type Option, None, Some}
 import gleam/string
-import store/sqlite.{type Connection, Int as VInt, Null, Text}
+import store/sqlite.{type Connection, Int as VInt, Text}
 import util/id
 
 pub type LoginError {
@@ -50,15 +50,11 @@ pub fn login(
           }
         Ok(None) -> {
           let user_id = id.new()
-          let name_value = case display_name {
-            Some(name) -> Text(name)
-            None -> Null
-          }
           case
             sqlite.exec(conn, "INSERT INTO users VALUES (?, ?, ?, ?)", [
               Text(user_id),
               Text(email),
-              name_value,
+              sqlite.optional_text(display_name),
               VInt(now),
             ])
           {
@@ -114,7 +110,7 @@ fn find_identity(
   }
 }
 
-pub fn find_user_by_email(
+fn find_user_by_email(
   conn: Connection,
   email: String,
 ) -> Result(Option(String), sqlite.Error) {
@@ -135,16 +131,12 @@ fn insert_identity(
   subject: String,
   now: Int,
 ) -> Result(String, LoginError) {
-  let oidc_value = case oidc_provider_id {
-    Some(oidc_id) -> Text(oidc_id)
-    None -> Null
-  }
   case
     sqlite.exec(conn, "INSERT INTO auth_identities VALUES (?, ?, ?, ?, ?, ?)", [
       Text(id.new()),
       Text(user_id),
       Text(provider),
-      oidc_value,
+      sqlite.optional_text(oidc_provider_id),
       Text(subject),
       VInt(now),
     ])

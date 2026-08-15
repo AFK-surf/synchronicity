@@ -1,9 +1,8 @@
-%% Thin FFI over inet/gen_udp for the DNS server. Socket functions arrive
-%% with the port-53 milestone; parse_ip is needed as soon as glue records
-%% exist.
+%% Thin FFI over inet/gen_udp for the supervised DNS server, plus
+%% parse_ip for glue-record addresses (dns/rdata).
 -module(cp_udp_ffi).
--export([parse_ip/1, udp_open/1, udp_recv/2, udp_send/3, udp_open_active/1,
-         udp_active_once/1, udp_event/1]).
+-export([parse_ip/1, udp_send/3, udp_open_active/1, udp_active_once/1,
+         udp_event/1]).
 
 %% Active-once socket for the supervised server: datagrams arrive as
 %% messages (one at a time — reactivated after each is handled), and
@@ -25,21 +24,6 @@ udp_active_once(Socket) ->
 udp_event({udp, _Socket, Ip, Port, Packet}) -> {packet, {Ip, Port}, Packet};
 udp_event({udp_closed, _Socket}) -> socket_closed;
 udp_event(_) -> socket_error.
-
-%% Passive-mode socket: the serving loop calls udp_recv, so datagrams
-%% never race into an unbounded mailbox.
-udp_open(Port) ->
-    case gen_udp:open(Port, [binary, {active, false}, {reuseaddr, true}]) of
-        {ok, Socket} -> {ok, Socket};
-        {error, _} -> {error, nil}
-    end.
-
-udp_recv(Socket, TimeoutMs) ->
-    case gen_udp:recv(Socket, 0, TimeoutMs) of
-        {ok, {Ip, Port, Packet}} -> {ok, {{Ip, Port}, Packet}};
-        {error, timeout} -> {error, timeout};
-        {error, _} -> {error, closed}
-    end.
 
 udp_send(Socket, {Ip, Port}, Packet) ->
     case gen_udp:send(Socket, Ip, Port, Packet) of

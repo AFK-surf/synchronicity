@@ -1,7 +1,7 @@
 import dns/name as dns_name
 import dns/serve
 import dns/server_udp
-import dnssec/keys
+import fixtures.{ready_db, tmp_db}
 import gleam/bit_array
 import gleam/erlang/process
 import gleam/otp/static_supervisor as sup
@@ -11,17 +11,12 @@ import store/pool
 import store/sqlite
 import zone/publish
 
-@external(erlang, "test_ffi", "tmp_db")
-fn tmp_db() -> String
-
 @external(erlang, "test_ffi", "udp_roundtrip")
 fn udp_roundtrip(port: Int, packet: BitArray) -> Result(BitArray, Nil)
 
 pub fn pool_restarts_under_supervision_test() {
   let path = tmp_db()
-  let assert Ok(conn) = db.open_primary(path)
-  let assert Ok(_) = migrate.migrate(conn)
-  sqlite.close(conn)
+  ready_db(path)
   let pool_name = process.new_name("t_sup_pool")
   let assert Ok(_) =
     sup.new(sup.OneForOne)
@@ -51,9 +46,7 @@ pub fn udp_server_rebinds_after_crash_test() {
   let path = tmp_db()
   let assert Ok(conn) = db.open_primary(path)
   let assert Ok(_) = migrate.migrate(conn)
-  let csk = keys.generate()
-  let assert Ok(Nil) = publish.ensure_meta(conn, "sync.test", csk)
-  let assert Ok(Nil) = publish.set_ns_hosts(conn, [#("ns1", "127.0.0.1", "")])
+  let csk = fixtures.zone_boot(conn)
   let assert Ok(_) = publish.publish(conn, csk, 1000, "test")
   sqlite.close(conn)
   let assert Ok(read_pool) = db.start_read_pool(path, 1)

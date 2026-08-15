@@ -1,27 +1,13 @@
-import dns/name.{type Name}
+import dns/name
 import dns/query
 import dns/wire
 import dnssec/keys
+import fixtures.{demo_conn, nk}
 import gleam/bit_array
 import gleam/list
 import gleam/option.{None, Some}
-import store/db
-import store/migrate
-import store/sqlite.{type Connection}
-import thirtytwo
 import zone/build
 import zone/model.{type ZoneInput, Member, NsHost, TxtName, ZoneInput, ZoneMeta}
-import zone/publish
-
-@external(erlang, "cp_crypto_ffi", "ed25519_generate_public")
-fn ed25519_generate_public() -> BitArray
-
-@external(erlang, "test_ffi", "tmp_db")
-fn tmp_db() -> String
-
-fn nk() -> String {
-  thirtytwo.z_base_32_encode(ed25519_generate_public())
-}
 
 fn demo_input(csk: keys.Csk) -> ZoneInput {
   let assert Ok(apex) = name.parse("sync.test.")
@@ -39,59 +25,6 @@ fn demo_input(csk: keys.Csk) -> ZoneInput {
       ]),
     ],
   )
-}
-
-/// A published demo zone in a real database: org acme, network prod,
-/// device nas (one key) and laptop (rotation window, two keys). Answer
-/// tests read it exactly the way the servers do.
-fn demo_conn() -> #(Connection, Name) {
-  let assert Ok(conn) = db.open_primary(tmp_db())
-  let assert Ok(_) = migrate.migrate(conn)
-  let csk = keys.generate()
-  let assert Ok(Nil) = publish.ensure_meta(conn, "sync.test", csk)
-  let assert Ok(Nil) = publish.set_ns_hosts(conn, [#("ns1", "127.0.0.1", "")])
-  let assert Ok(_) =
-    sqlite.script(
-      conn,
-      "INSERT INTO users VALUES ('u1', 'a@example.com', NULL, 0);
-       INSERT INTO orgs VALUES ('o1', 'acme', 'Acme', 0);
-       INSERT INTO networks VALUES ('n1', 'o1', 'prod', 0);
-       INSERT INTO devices VALUES ('d1', 'o1', 'nas', NULL, NULL, 'u1', 0);
-       INSERT INTO devices VALUES ('d2', 'o1', 'laptop', NULL, NULL, 'u1', 0);
-       INSERT INTO network_devices VALUES ('n1', 'd1', 0);
-       INSERT INTO network_devices VALUES ('n1', 'd2', 0);",
-    )
-  add_key(conn, "k1", "d1", "active", 1)
-  add_key(conn, "k2", "d2", "active", 2)
-  add_key(conn, "k3", "d2", "retiring", 3)
-  let assert Ok(_) = publish.publish(conn, csk, 1000, "test")
-  let assert Ok(apex) = name.parse("sync.test.")
-  #(conn, apex)
-}
-
-fn add_key(
-  conn: Connection,
-  id: String,
-  device: String,
-  state: String,
-  at: Int,
-) -> Nil {
-  let key = nk()
-  let assert Ok(bytes) = thirtytwo.z_base_32_decode(key)
-  let assert Ok(_) =
-    sqlite.exec(
-      conn,
-      "INSERT INTO device_keys VALUES (?, ?, ?, ?, ?, ?, NULL)",
-      [
-        sqlite.Text(id),
-        sqlite.Text(device),
-        sqlite.Text(key),
-        sqlite.Blob(bytes),
-        sqlite.Text(state),
-        sqlite.Int(at),
-      ],
-    )
-  Nil
 }
 
 fn txt_query(qname: String, qtype: Int, do_bit: Bool) -> wire.Query {

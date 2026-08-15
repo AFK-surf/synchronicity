@@ -15,6 +15,7 @@ import gleam/dynamic/decode
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None}
+import gleam/result
 import store/pool.{type Pool}
 import store/sqlite.{type Connection, Text}
 import wisp.{type Request, type Response}
@@ -140,7 +141,7 @@ pub fn oidc_callback(req: Request, ctx: AuthContext) -> Response {
                     error_json(404, "no_oidc", "provider was removed mid-flow")
                   Ok(org) -> {
                     let outcome = {
-                      use tokens <- gleam_result_try(oauth.exchange(
+                      use tokens <- result.try(oauth.exchange(
                         org.provider,
                         code,
                         redirect_uri(ctx, "oidc"),
@@ -173,16 +174,6 @@ pub fn oidc_callback(req: Request, ctx: AuthContext) -> Response {
         }
       })
     _, _ -> error_json(400, "bad_callback", "missing code or state")
-  }
-}
-
-fn gleam_result_try(
-  result: Result(a, e),
-  next: fn(a) -> Result(b, e),
-) -> Result(b, e) {
-  case result {
-    Ok(value) -> next(value)
-    Error(e) -> Error(e)
   }
 }
 

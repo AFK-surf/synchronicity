@@ -27,3 +27,9 @@ pub fn new() -> String {
 pub fn secret() -> String {
   bit_array.base64_url_encode(crypto.strong_random_bytes(32), False)
 }
+
+/// The storage form of a bearer secret: its SHA-256. Sessions, magic
+/// links and invites all store this, never the token itself.
+pub fn hash_token(token: String) -> BitArray {
+  crypto.hash(crypto.Sha256, <<token:utf8>>)
+}

@@ -3,12 +3,14 @@
 
 import api/auth_api.{type AuthContext}
 import api/middleware.{error_json, now_unix}
+import gleam/dynamic/decode
 import gleam/json.{type Json}
 import gleam/list
 import gleam/result
 import gleam/string
 import store/sqlite.{type Connection, Int as VInt, Text}
-import wisp.{type Response}
+import wisp.{type Request, type Response}
+import zone/build
 import zone/publish
 
 pub type Role {
@@ -75,7 +77,7 @@ pub fn require_org(
         Error(Nil) -> error_json(500, "internal", "corrupt role")
       }
     Ok(_) -> error_json(404, "not_found", "no such org")
-    Error(_) -> error_json(500, "internal", "database error")
+    Error(_) -> db_error()
   }
 }
 
@@ -87,25 +89,11 @@ pub fn transaction(
   conn: Connection,
   work: fn() -> Result(a, Response),
 ) -> Result(a, Response) {
-  case sqlite.exec(conn, "BEGIN IMMEDIATE", []) {
-    Error(_) ->
-      Error(error_json(500, "internal", "could not begin transaction"))
-    Ok(_) ->
-      case work() {
-        Ok(value) ->
-          case sqlite.exec(conn, "COMMIT", []) {
-            Ok(_) -> Ok(value)
-            Error(_) -> {
-              let _ = sqlite.exec(conn, "ROLLBACK", [])
-              Error(error_json(500, "internal", "commit failed"))
-            }
-          }
-        Error(response) -> {
-          let _ = sqlite.exec(conn, "ROLLBACK", [])
-          Error(response)
-        }
-      }
-  }
+  sqlite.transaction(
+    conn,
+    fn(_) { error_json(500, "internal", "transaction failed") },
+    work,
+  )
 }
 
 /// Runs `work` and a full zone republish in one transaction. Every product
@@ -144,13 +132,55 @@ pub fn zone_mutation(
 
 fn publish_error(e: publish.PublishError) -> Response {
   case e {
-    publish.Build(build_error) ->
-      error_json(
-        409,
-        "invariant",
-        "zone build refused: " <> string.inspect(build_error),
-      )
-    _ -> error_json(500, "internal", "publish failed: " <> string.inspect(e))
+    publish.Build(build_error) -> {
+      let #(code, message) = build_refusal(build_error)
+      error_json(409, code, "zone build refused: " <> message)
+    }
+    // Db / Model / KeyMismatch are server faults, not client mistakes:
+    // the detail goes to the log, never into a response body.
+    _ -> {
+      wisp.log_error("zone publish failed: " <> string.inspect(e))
+      error_json(500, "internal", "publish failed")
+    }
+  }
+}
+
+/// Human text (and a stable error code) for every way a zone build can
+/// refuse — constructor dumps never reach API clients.
+fn build_refusal(e: build.BuildError) -> #(String, String) {
+  case e {
+    build.NoNameservers -> #(
+      "no_nameservers",
+      "the zone has no nameservers configured",
+    )
+    build.OwnerOutsideZone(owner) -> #(
+      "owner_outside_zone",
+      "record owner " <> owner <> " is outside the zone",
+    )
+    build.DuplicateLabelInZone(label) -> #(
+      "duplicate_label",
+      "device label '"
+        <> label
+        <> "' appears more than twice in one network — beyond the two-key rotation window",
+    )
+    build.InvalidLabel(label) -> #(
+      "invalid_label",
+      "device label '"
+        <> label
+        <> "' is not valid — lowercase letters, digits and hyphens, at most 63 bytes",
+    )
+    build.InvalidNk(_) -> #(
+      "invalid_nk",
+      "a device key is not a 52-character z-base-32 ed25519 public key",
+    )
+    build.AmbiguousNk(_) -> #(
+      "ambiguous_nk",
+      "one key is bound to two different device labels — a key may belong to one device only (§3.2 ambiguity rule)",
+    )
+    build.BadGlueAddress(address) -> #(
+      "bad_glue",
+      "nameserver glue address '" <> address <> "' is not a valid IP address",
+    )
   }
 }
 
@@ -166,12 +196,23 @@ pub fn constraint_response(error: sqlite.Error) -> Response {
         True, _ ->
           "this key is already bound to a device — a key may belong to one device only (§3.2 ambiguity rule)"
         _, True -> "a device with this label is already in the network"
-        _, _ -> message
+        // Unmapped constraint: raw SQLite messages name tables and
+        // columns — log the detail, answer generically.
+        _, _ -> {
+          wisp.log_error("unmapped constraint failure: " <> message)
+          "the change conflicts with an existing record"
+        }
       }
       error_json(409, "conflict", named)
     }
-    _ -> error_json(500, "internal", "database error")
+    _ -> db_error()
   }
+}
+
+/// The uniform 500 for any storage failure — details belong in the log,
+/// never the response body.
+pub fn db_error() -> Response {
+  error_json(500, "internal", "database error")
 }
 
 pub fn audit(
@@ -196,30 +237,50 @@ pub fn audit(
   |> result.replace(Nil)
 }
 
-/// DNS-label grammar for org slugs and network names (no leading or
-/// trailing hyphen — these become labels in the public zone).
-pub fn valid_dns_label(label: String) -> Bool {
-  let size = string.byte_size(label)
-  size >= 1
-  && size <= 63
-  && !string.starts_with(label, "-")
-  && !string.ends_with(label, "-")
-  && chars_ok(<<label:utf8>>)
+/// Decodes a JSON request body, or answers 400.
+pub fn body_decoder(
+  req: Request,
+  decoder: decode.Decoder(a),
+  next: fn(a) -> Response,
+) -> Response {
+  use body <- wisp.require_string_body(req)
+  case json.parse(body, decoder) {
+    Ok(value) -> next(value)
+    Error(_) -> error_json(400, "bad_request", "malformed JSON body")
+  }
 }
 
-/// Device-label grammar ([a-z0-9-]{1,63}, hyphen position free).
-pub fn valid_device_label(label: String) -> Bool {
-  let size = string.byte_size(label)
-  size >= 1 && size <= 63 && chars_ok(<<label:utf8>>)
+/// Resolves a network name within an org to its id.
+pub fn find_network(
+  conn: Connection,
+  org_id: String,
+  network: String,
+) -> Result(String, Nil) {
+  case
+    sqlite.query(conn, "SELECT id FROM networks WHERE org_id = ? AND name = ?", [
+      Text(org_id),
+      Text(network),
+    ])
+  {
+    Ok([[Text(network_id)]]) -> Ok(network_id)
+    _ -> Error(Nil)
+  }
 }
 
-fn chars_ok(bytes: BitArray) -> Bool {
-  case bytes {
-    <<>> -> True
-    <<b:int-size(8), rest:bits>> ->
-      { { b >= 97 && b <= 122 } || { b >= 48 && b <= 57 } || b == 45 }
-      && chars_ok(rest)
-    _ -> False
+/// Resolves a device id within an org to its label.
+pub fn find_device(
+  conn: Connection,
+  org_id: String,
+  device_id: String,
+) -> Result(String, Nil) {
+  case
+    sqlite.query(conn, "SELECT label FROM devices WHERE id = ? AND org_id = ?", [
+      Text(device_id),
+      Text(org_id),
+    ])
+  {
+    Ok([[Text(label)]]) -> Ok(label)
+    _ -> Error(Nil)
   }
 }
 
@@ -233,7 +294,7 @@ pub fn rows_json(
 ) -> Response {
   case rows {
     Ok(items) -> ok_json(json.array(items, encode))
-    Error(_) -> error_json(500, "internal", "database error")
+    Error(_) -> db_error()
   }
 }
 
@@ -249,8 +310,4 @@ pub fn int_at(row: List(sqlite.Value), index: Int) -> Int {
     [VInt(value), ..] -> value
     _ -> 0
   }
-}
-
-pub fn int_json(value: Int) -> Json {
-  json.int(value)
 }

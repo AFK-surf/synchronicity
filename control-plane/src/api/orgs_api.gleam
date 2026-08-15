@@ -2,14 +2,14 @@
 
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
-  Admin, Member, Owner, audit, constraint_response, ok_json, require_org,
-  text_at, transaction, valid_dns_label,
+  Admin, Member, Owner, audit, body_decoder, constraint_response, db_error,
+  ok_json, require_org, text_at, transaction,
 }
 import api/middleware.{error_json, now_unix}
 import auth/oidc
 import auth/session.{type Session}
+import dns/name
 import email/mailer
-import gleam/crypto
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
@@ -19,18 +19,6 @@ import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
 
-fn body_decoder(
-  req: Request,
-  decoder: decode.Decoder(a),
-  next: fn(a) -> Response,
-) -> Response {
-  use body <- wisp.require_string_body(req)
-  case json.parse(body, decoder) {
-    Ok(value) -> next(value)
-    Error(_) -> error_json(400, "bad_request", "malformed JSON body")
-  }
-}
-
 pub fn create_org(req: Request, ctx: AuthContext, live: Session) -> Response {
   let decoder = {
     use slug <- decode.field("slug", decode.string)
@@ -38,7 +26,7 @@ pub fn create_org(req: Request, ctx: AuthContext, live: Session) -> Response {
     decode.success(#(slug, org_name))
   }
   use #(slug, org_name) <- body_decoder(req, decoder)
-  case valid_dns_label(slug) {
+  case name.valid_dns_label(slug) {
     False ->
       error_json(
         400,
@@ -122,7 +110,7 @@ pub fn get_org(ctx: AuthContext, live: Session, slug: String) -> Response {
             #("device_count", json.int(device_count)),
           ]),
         )
-      _, _ -> error_json(500, "internal", "database error")
+      _, _ -> db_error()
     }
   })
 }
@@ -240,7 +228,7 @@ pub fn remove_member(
           }
         }
       Ok(_) -> error_json(404, "not_found", "no such member")
-      Error(_) -> error_json(500, "internal", "database error")
+      Error(_) -> db_error()
     }
   })
 }
@@ -286,7 +274,7 @@ pub fn create_invite(
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
         let token = id.secret()
-        let token_hash = crypto.hash(crypto.Sha256, <<token:utf8>>)
+        let token_hash = id.hash_token(token)
         let insert =
           sqlite.exec(
             conn,
@@ -342,7 +330,7 @@ pub fn accept_invite(
   }
   use token <- body_decoder(req, decoder)
   with_db(ctx, fn(conn) {
-    let token_hash = crypto.hash(crypto.Sha256, <<token:utf8>>)
+    let token_hash = id.hash_token(token)
     let lookup =
       sqlite.query(
         conn,
@@ -401,7 +389,7 @@ pub fn accept_invite(
         }
       }
       Ok(_) -> error_json(404, "bad_invite", "invalid or expired invite")
-      Error(_) -> error_json(500, "internal", "database error")
+      Error(_) -> db_error()
     }
   })
 }
@@ -431,7 +419,7 @@ pub fn get_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
           ]),
         )
       Ok(_) -> ok_json(json.null())
-      Error(_) -> error_json(500, "internal", "database error")
+      Error(_) -> db_error()
     }
   })
 }

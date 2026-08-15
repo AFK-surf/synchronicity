@@ -2,8 +2,8 @@
  * csqlite — SQLite behind a stdio port, one process per connection.
  *
  * The BEAM must never load SQLite into its own address space: a database
- * fault here kills this process and nothing else; the owning actor sees the
- * port exit and reopens. The protocol is deliberately synchronous — one
+ * fault here kills this process and nothing else; the pool sees the port
+ * exit and replaces the worker. The protocol is deliberately synchronous — one
  * request, one response — because the caller serializes access per
  * connection anyway.
  *

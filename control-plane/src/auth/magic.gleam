@@ -4,7 +4,6 @@
 
 import auth/identity
 import email/mailer.{type Mailer}
-import gleam/crypto
 import gleam/option.{None}
 import gleam/result
 import gleam/string
@@ -22,7 +21,7 @@ pub type RedeemError {
 }
 
 fn hash(token: String) -> BitArray {
-  crypto.hash(crypto.Sha256, <<token:utf8>>)
+  id.hash_token(token)
 }
 
 /// Requests a magic link. Always Ok for the caller — whether the address
@@ -60,7 +59,9 @@ pub fn request(
   }
 }
 
-/// Token creation, exposed for tests (request never reveals the token).
+/// Token creation, separate from `request` because that path never
+/// reveals the token: tests and the `seed-admin` bootstrap call this
+/// directly to get a usable link.
 pub fn create_token(
   conn: Connection,
   email: String,

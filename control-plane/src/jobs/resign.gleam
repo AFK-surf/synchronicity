@@ -56,6 +56,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
 /// One check; exposed so tests can drive it without the timer.
 pub fn run_once(db_path: String, csk: Csk) -> Nil {
+  // Deliberately not pooled: this hourly job needs a writer, and the API
+  // pool's workers are sized for request traffic — an owned short-lived
+  // connection cannot starve it. Pools are for request/serving paths.
   case db.open_primary(db_path) {
     Error(_) -> io.println_error("resign: database unavailable")
     Ok(conn) -> {

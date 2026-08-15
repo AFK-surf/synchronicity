@@ -57,7 +57,7 @@ fn tag_fold(bytes: BitArray, index: Int, acc: Int) -> Int {
 }
 
 /// SHA-256 DS digest: hash(owner wire form || DNSKEY rdata).
-pub fn ds_digest(apex: Name, dnskey_rdata: BitArray) -> BitArray {
+fn ds_digest(apex: Name, dnskey_rdata: BitArray) -> BitArray {
   crypto.hash(
     crypto.Sha256,
     bit_array.concat([name.encode(apex), dnskey_rdata]),

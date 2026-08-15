@@ -1,8 +1,13 @@
 //// HTTP routing. The DNS endpoints and health/anchor are role-agnostic;
 //// the product API mounts on the primary only (a replica has no sessions
 //// and no writes, by construction).
+////
+//// Naming convention in api/: endpoint modules carry the `_api` suffix
+//// (auth_api, orgs_api, networks_api, devices_api); plumbing does not
+//// (router, middleware, common, static — static serves files, not an API).
 
 import api/auth_api.{type AuthContext}
+import api/devices_api
 import api/middleware
 import api/networks_api
 import api/orgs_api
@@ -14,8 +19,8 @@ import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import store/pool
-import store/sqlite
 import wisp.{type Request, type Response}
+import zone/model
 
 pub type Context {
   Context(
@@ -134,31 +139,31 @@ fn primary_routes(req: Request, auth: AuthContext) -> Response {
 
     ["api", "orgs", slug, "devices"], Get -> {
       use live <- with_session(req, auth)
-      networks_api.list_devices(auth, live, slug)
+      devices_api.list_devices(auth, live, slug)
     }
     ["api", "orgs", slug, "devices"], Post -> {
       use live <- with_session(req, auth)
-      networks_api.create_device(req, auth, live, slug)
+      devices_api.create_device(req, auth, live, slug)
     }
     ["api", "orgs", slug, "devices", dev], Patch -> {
       use live <- with_session(req, auth)
-      networks_api.patch_device(req, auth, live, slug, dev)
+      devices_api.patch_device(req, auth, live, slug, dev)
     }
     ["api", "orgs", slug, "devices", dev], Delete -> {
       use live <- with_session(req, auth)
-      networks_api.delete_device(auth, live, slug, dev)
+      devices_api.delete_device(auth, live, slug, dev)
     }
     ["api", "orgs", slug, "devices", dev, "keys"], Post -> {
       use live <- with_session(req, auth)
-      networks_api.add_key(req, auth, live, slug, dev)
+      devices_api.add_key(req, auth, live, slug, dev)
     }
     ["api", "orgs", slug, "devices", dev, "keys", key, "retire"], Post -> {
       use live <- with_session(req, auth)
-      networks_api.retire_key(auth, live, slug, dev, key)
+      devices_api.retire_key(auth, live, slug, dev, key)
     }
     ["api", "orgs", slug, "devices", dev, "keys", key, "revoke"], Post -> {
       use live <- with_session(req, auth)
-      networks_api.revoke_key(auth, live, slug, dev, key)
+      devices_api.revoke_key(auth, live, slug, dev, key)
     }
 
     _, _ -> wisp.not_found()
@@ -177,16 +182,9 @@ fn with_session(
 
 fn healthz(serving: Serving) -> Response {
   let looked =
-    pool.with_connection(serving.pool, fn(conn) {
-      sqlite.query(
-        conn,
-        "SELECT m.soa_serial, min(p.sig_expires_at)
-         FROM zone_meta m, presigned_rrsets p",
-        [],
-      )
-    })
+    pool.with_connection(serving.pool, fn(conn) { model.health(conn) })
   case looked {
-    Ok(Ok([[sqlite.Int(serial), sqlite.Int(expires)]])) ->
+    Ok(Ok(#(serial, expires))) ->
       json.object([
         #("status", json.string("ok")),
         #("soa_serial", json.int(serial)),

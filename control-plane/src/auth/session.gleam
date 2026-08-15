@@ -3,7 +3,6 @@
 //// stores its SHA-256. CSRF is a per-session secret the SPA echoes in a
 //// header on every mutation.
 
-import gleam/crypto
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import util/id
 
@@ -17,7 +16,7 @@ pub type Session {
 }
 
 fn hash(token: String) -> BitArray {
-  crypto.hash(crypto.Sha256, <<token:utf8>>)
+  id.hash_token(token)
 }
 
 /// Creates a session; returns the bearer token for the cookie.
@@ -74,12 +73,5 @@ pub fn delete(conn: Connection, token: String) -> Nil {
     sqlite.exec(conn, "DELETE FROM sessions WHERE token_hash = ?", [
       Blob(hash(token)),
     ])
-  Nil
-}
-
-/// Removes every session for a user ("sign out everywhere", member removal).
-pub fn delete_all(conn: Connection, user_id: String) -> Nil {
-  let _ =
-    sqlite.exec(conn, "DELETE FROM sessions WHERE user_id = ?", [Text(user_id)])
   Nil
 }

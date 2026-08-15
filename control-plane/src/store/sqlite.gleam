@@ -2,13 +2,16 @@
 //// one process per connection, spoken to over a length-framed stdio
 //// protocol. A database fault kills the port process, never the VM.
 ////
-//// A `Connection` must be used from the process that opened it — the port
-//// delivers replies to its owning process only. Callers that need to share
-//// a connection across processes wrap it in an actor that owns it.
+//// A `Connection` must be used from the process that owns it — the port
+//// delivers replies to its owning process only. Sharing happens by
+//// ownership transfer (`give`/`take`): `store/pool` hands whole
+//// connections to borrowers this way, so call sites keep this direct
+//// interface with no per-statement message copying.
 
 import gleam/bit_array
 import gleam/erlang/process
 import gleam/list
+import gleam/option
 import gleam/result
 
 /// An Erlang port handle (opaque, from cp_port_ffi).
@@ -150,6 +153,55 @@ pub fn script(conn: Connection, sql: String) -> Result(Nil, Error) {
   }
 }
 
+/// Runs `work` inside BEGIN IMMEDIATE / COMMIT with rollback on every
+/// failure path. IMMEDIATE takes the write lock up front, so a
+/// read-then-write inside can never deadlock upgrading. This is the one
+/// implementation of the begin/commit/rollback mechanism; `fail` lifts a
+/// begin or commit failure into the caller's error type.
+pub fn transaction(
+  conn: Connection,
+  fail: fn(Error) -> e,
+  work: fn() -> Result(a, e),
+) -> Result(a, e) {
+  run_transaction(conn, "BEGIN IMMEDIATE", fail, work)
+}
+
+/// Read-only variant: a deferred BEGIN takes no write lock, and under WAL
+/// pins one database version for every read inside.
+pub fn read_transaction(
+  conn: Connection,
+  fail: fn(Error) -> e,
+  work: fn() -> Result(a, e),
+) -> Result(a, e) {
+  run_transaction(conn, "BEGIN", fail, work)
+}
+
+fn run_transaction(
+  conn: Connection,
+  begin: String,
+  fail: fn(Error) -> e,
+  work: fn() -> Result(a, e),
+) -> Result(a, e) {
+  case exec(conn, begin, []) {
+    Error(e) -> Error(fail(e))
+    Ok(_) ->
+      case work() {
+        Ok(value) ->
+          case exec(conn, "COMMIT", []) {
+            Ok(_) -> Ok(value)
+            Error(e) -> {
+              let _ = exec(conn, "ROLLBACK", [])
+              Error(fail(e))
+            }
+          }
+        Error(err) -> {
+          let _ = exec(conn, "ROLLBACK", [])
+          Error(err)
+        }
+      }
+  }
+}
+
 /// Convenience: run a statement and demand rows (Done becomes []).
 pub fn query(
   conn: Connection,
@@ -160,6 +212,23 @@ pub fn query(
     Ok(Rows(_, rows)) -> Ok(rows)
     Ok(Done(_, _)) -> Ok([])
     Error(e) -> Error(e)
+  }
+}
+
+/// Text value with "" mapped to NULL — the optional-column convention the
+/// product schema uses throughout.
+pub fn text_or_null(text: String) -> Value {
+  case text {
+    "" -> Null
+    _ -> Text(text)
+  }
+}
+
+/// Text value from an Option, None as NULL.
+pub fn optional_text(text: option.Option(String)) -> Value {
+  case text {
+    option.Some(value) -> Text(value)
+    option.None -> Null
   }
 }
 

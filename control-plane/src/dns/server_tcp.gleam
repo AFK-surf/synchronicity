@@ -41,7 +41,7 @@ fn drain(
 ) -> BitArray {
   case buffer {
     <<size:int-size(16), message:bytes-size(size), rest:bits>> -> {
-      case serve.handle_packet(serving, message, False) {
+      case serve.handle_packet(serving, message, serve.Stream) {
         Ok(response) -> {
           let framed = <<
             bit_array.byte_size(response):int-size(16),

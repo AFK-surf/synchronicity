@@ -9,7 +9,9 @@ import gleam/dynamic/decode
 import gleam/http
 import gleam/http/request
 import gleam/httpc
+import gleam/int
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
@@ -79,11 +81,11 @@ pub fn start(
       [
         Text(state),
         Text(provider.key),
-        option_text(oidc_provider_id),
+        sqlite.optional_text(oidc_provider_id),
         Text(verifier),
         Text(nonce),
         Null,
-        option_text(link_user_id),
+        sqlite.optional_text(link_user_id),
         VInt(now),
         VInt(now + 600),
       ],
@@ -101,13 +103,6 @@ pub fn start(
       #("nonce", nonce),
     ])
   Ok(provider.authorization_endpoint <> "?" <> query)
-}
-
-fn option_text(value: Option(String)) -> sqlite.Value {
-  case value {
-    Some(text) -> Text(text)
-    None -> Null
-  }
 }
 
 /// Consumes a state row — single use, expired rows never match.
@@ -178,7 +173,7 @@ pub fn exchange(
     status ->
       Error(
         "token endpoint returned "
-        <> string.inspect(status)
+        <> int.to_string(status)
         <> ": "
         <> string.slice(resp.body, 0, 200),
       )
@@ -282,7 +277,7 @@ pub fn validate_claims(
   expected_nonce: String,
   now: Int,
 ) -> Result(Nil, String) {
-  use Nil <- result.try(case list_contains(expected_issuers, claims.iss) {
+  use Nil <- result.try(case list.contains(expected_issuers, claims.iss) {
     True -> Ok(Nil)
     False -> Error("id_token issuer mismatch: " <> claims.iss)
   })
@@ -297,12 +292,5 @@ pub fn validate_claims(
   case claims.nonce {
     Some(nonce) if nonce == expected_nonce -> Ok(Nil)
     _ -> Error("id_token nonce mismatch")
-  }
-}
-
-fn list_contains(items: List(String), needle: String) -> Bool {
-  case items {
-    [] -> False
-    [first, ..rest] -> first == needle || list_contains(rest, needle)
   }
 }

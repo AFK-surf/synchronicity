@@ -64,6 +64,23 @@ pub fn read(conn: Connection) -> Result(ZoneInput, ModelError) {
   Ok(ZoneInput(meta, ns_hosts, txt_names))
 }
 
+/// The health probe's view of the zone: current serial and the soonest
+/// RRSIG expiry. Error(Nil) covers every unhealthy shape — no zone_meta,
+/// nothing presigned, database unavailable.
+pub fn health(conn: Connection) -> Result(#(Int, Int), Nil) {
+  case
+    sqlite.query(
+      conn,
+      "SELECT m.soa_serial, min(p.sig_expires_at)
+       FROM zone_meta m, presigned_rrsets p",
+      [],
+    )
+  {
+    Ok([[sqlite.Int(serial), sqlite.Int(expires)]]) -> Ok(#(serial, expires))
+    _ -> Error(Nil)
+  }
+}
+
 pub fn read_meta(conn: Connection) -> Result(ZoneMeta, ModelError) {
   let sql =
     "SELECT base_domain, soa_serial, dnskey_public, key_tag,

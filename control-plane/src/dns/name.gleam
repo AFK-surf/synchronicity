@@ -52,6 +52,34 @@ fn valid_bytes(bytes: BitArray) -> Bool {
   }
 }
 
+/// Hostname-style label grammar for org slugs and network names —
+/// [a-z0-9-]{1,63} with no leading or trailing hyphen. These become
+/// labels in the public zone; the product layer validates with this and
+/// zone building re-checks device labels via `valid_device_label`.
+pub fn valid_dns_label(label: String) -> Bool {
+  valid_device_label(label)
+  && !string.starts_with(label, "-")
+  && !string.ends_with(label, "-")
+}
+
+/// Device-label grammar (the client's normalize_label): [a-z0-9-]{1,63},
+/// hyphen position free — unlike hostname labels.
+pub fn valid_device_label(label: String) -> Bool {
+  let bytes = <<label:utf8>>
+  let size = bit_array.byte_size(bytes)
+  size >= 1 && size <= 63 && plain_bytes_ok(bytes)
+}
+
+fn plain_bytes_ok(bytes: BitArray) -> Bool {
+  case bytes {
+    <<>> -> True
+    <<b:int-size(8), rest:bits>> ->
+      { { b >= 97 && b <= 122 } || { b >= 48 && b <= 57 } || b == 45 }
+      && plain_bytes_ok(rest)
+    _ -> False
+  }
+}
+
 /// Presentation form, always absolute: ["a", "b"] is "a.b.".
 pub fn to_string(name: Name) -> String {
   case name {

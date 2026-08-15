@@ -8,6 +8,7 @@ import dns/serve.{type Serving}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom
 import gleam/erlang/process
+import gleam/int
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
@@ -18,7 +19,8 @@ pub type Socket
 /// Peer address (opaque {ip, port} pair, passed straight back to send).
 pub type Peer
 
-/// One classified active-mode socket message.
+/// One classified active-mode socket message — named Event rather than
+/// Msg because these arrive from the socket, not from actor mail.
 pub type Event {
   Packet(peer: Peer, data: BitArray)
   SocketClosed
@@ -51,7 +53,7 @@ pub fn supervised(
     let builder =
       actor.new_with_initialiser(10_000, fn(_subject) {
         case udp_open_active(port) {
-          Error(Nil) -> Error("could not bind UDP port " <> string_of(port))
+          Error(Nil) -> Error("could not bind UDP port " <> int.to_string(port))
           Ok(socket) -> {
             let selector =
               process.new_selector()
@@ -71,17 +73,10 @@ pub fn supervised(
   })
 }
 
-fn string_of(n: Int) -> String {
-  int_to_string(n)
-}
-
-@external(erlang, "erlang", "integer_to_binary")
-fn int_to_string(n: Int) -> String
-
 fn handle(state: State, event: Event) -> actor.Next(State, Event) {
   case event {
     Packet(peer, data) -> {
-      case serve.handle_packet(state.serving, data, True) {
+      case serve.handle_packet(state.serving, data, serve.Udp) {
         Ok(response) -> {
           let _ = udp_send(state.socket, peer, response)
           Nil

@@ -13,7 +13,7 @@ import gleam/json
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import store/sqlite.{type Connection, Int as VInt, Null, Text}
+import store/sqlite.{type Connection, Int as VInt, Text}
 import util/id
 
 pub type Discovered {
@@ -90,10 +90,6 @@ pub fn save(
   now: Int,
 ) -> Result(Discovered, String) {
   use found <- result.try(discover(issuer))
-  let userinfo = case found.userinfo_endpoint {
-    Some(url) -> Text(url)
-    None -> Null
-  }
   let write = {
     use _ <- result.try(
       sqlite.exec(conn, "DELETE FROM oidc_providers WHERE org_id = ?", [
@@ -111,7 +107,7 @@ pub fn save(
         Text(client_secret),
         Text(found.authorization_endpoint),
         Text(found.token_endpoint),
-        userinfo,
+        sqlite.optional_text(found.userinfo_endpoint),
         VInt(now),
       ],
     )

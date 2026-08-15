@@ -60,9 +60,10 @@ pub fn answer(conn: Connection, apex: Name, q: Query) -> BitArray {
     True, True, True -> {
       // One read transaction per answer: WAL pins the zone version for
       // the handful of lookups below.
-      let _ = sqlite.exec(conn, "BEGIN", [])
-      let outcome = in_zone_answer(conn, apex, q, do_bit, additional)
-      let _ = sqlite.exec(conn, "COMMIT", [])
+      let outcome =
+        sqlite.read_transaction(conn, fn(e) { e }, fn() {
+          in_zone_answer(conn, apex, q, do_bit, additional)
+        })
       case outcome {
         Ok(response) -> response
         // Database unavailable or corrupt row: no answer beats a wrong
@@ -334,7 +335,7 @@ fn closest_encloser(
 // -- transport helpers -------------------------------------------------------
 
 /// The UDP payload limit a query allows (RFC 6891; 512 without EDNS).
-pub fn udp_limit(q: Query) -> Int {
+fn udp_limit(q: Query) -> Int {
   case q.edns {
     Some(wire.Edns(size, _)) -> {
       let clamped = case size < 512 {

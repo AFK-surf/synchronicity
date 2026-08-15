@@ -1,4 +1,5 @@
 import dns/name
+import dns/query
 import dns/rdata
 import dns/wire
 import gleam/bit_array
@@ -176,7 +177,7 @@ pub fn response_round_trip_test() {
       False,
       answers,
       wire.empty_section(),
-      rdata.opt(1400, True),
+      rdata.opt(query.advertised_udp_size, True),
     )
   let assert Ok(msg) = wire.decode_message(resp)
   assert msg.id == 0xbeef

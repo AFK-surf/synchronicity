@@ -49,7 +49,7 @@ fn base64url_decode(text: String) -> Result(BitArray, Nil) {
 }
 
 fn respond(message: BitArray, serving: Serving) -> Response {
-  case serve.handle_packet(serving, message, False) {
+  case serve.handle_packet(serving, message, serve.Stream) {
     Ok(response) -> dns_body(response)
     Error(Nil) -> wisp.bad_request("not a DNS message")
   }

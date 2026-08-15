@@ -1,11 +1,9 @@
+import fixtures.{tmp_db}
 import gleam/bit_array
 import gleam/string
 import store/db
 import store/migrate
 import store/sqlite.{Blob, Done, Float, Int, Null, Rows, Text}
-
-@external(erlang, "test_ffi", "tmp_db")
-fn tmp_db() -> String
 
 @external(erlang, "test_ffi", "kill9")
 fn kill9(os_pid: Int) -> Nil

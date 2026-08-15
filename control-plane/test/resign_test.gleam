@@ -1,23 +1,15 @@
-import dnssec/keys
+import fixtures.{now_unix, tmp_db}
 import jobs/resign
 import store/db
 import store/migrate
 import store/sqlite
 import zone/publish
 
-@external(erlang, "test_ffi", "tmp_db")
-fn tmp_db() -> String
-
-@external(erlang, "cp_sys_ffi", "now_unix")
-fn now_unix() -> Int
-
 pub fn resign_republishes_near_expiry_test() {
   let path = tmp_db()
   let assert Ok(conn) = db.open_primary(path)
   let assert Ok(_) = migrate.migrate(conn)
-  let csk = keys.generate()
-  let assert Ok(Nil) = publish.ensure_meta(conn, "sync.test", csk)
-  let assert Ok(Nil) = publish.set_ns_hosts(conn, [#("ns1", "127.0.0.1", "")])
+  let csk = fixtures.zone_boot(conn)
   let assert Ok(1) = publish.publish(conn, csk, now_unix(), "test")
 
   // Fresh signatures: the job leaves the zone alone.

@@ -3,22 +3,12 @@ import auth/magic
 import auth/oauth
 import auth/session
 import email/mailer
+import fixtures.{fresh_conn}
 import gleam/bit_array
 import gleam/json
 import gleam/option.{None, Some}
 import gleam/string
-import store/db
-import store/migrate
 import store/sqlite.{Text}
-
-@external(erlang, "test_ffi", "tmp_db")
-fn tmp_db() -> String
-
-fn fresh_conn() -> sqlite.Connection {
-  let assert Ok(conn) = db.open_primary(tmp_db())
-  let assert Ok(_) = migrate.migrate(conn)
-  conn
-}
 
 pub fn session_lifecycle_test() {
   let conn = fresh_conn()
