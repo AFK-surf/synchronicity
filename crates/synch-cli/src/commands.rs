@@ -1,7 +1,8 @@
 //! Command dispatch.
 //!
-//! Two commands touch the data directory directly: `synch init`, which creates
-//! it before any daemon can exist, and `synch daemon run`, which *is* the
+//! Three commands touch the data directory directly: `synch init`, which creates
+//! it before any daemon can exist; `synch id set`, which names a key-identified
+//! node while the daemon is stopped; and `synch daemon run`, which *is* the
 //! daemon. Every other command is a control-socket request to a running daemon
 //! (§9.1) — there is no in-process fallback.
 
@@ -17,8 +18,8 @@ use synch_engine::{EntryRef, Node, NodeConfig};
 
 use crate::{
     cli::{
-        Cli, Command, DaemonCommand, DomainCommand, KeyCommand, MirrorCommand, PinCommand,
-        SpaceCommand, TrustCommand,
+        Cli, Command, DaemonCommand, DomainCommand, IdCommand, KeyCommand, MirrorCommand,
+        PinCommand, SpaceCommand, TrustCommand,
     },
     control::{proto::Response, transport, Client, Request},
     daemon,
@@ -74,6 +75,22 @@ pub async fn run(cli: Cli) -> Result<()> {
             println!("next:       synch daemon run");
             Ok(())
         }
+        Command::Id {
+            command: Some(IdCommand::Set { id }),
+        } => {
+            let origin = OriginId::from_str(id).context("id set wants <name>@<domain>")?;
+            if Client::connect(&data_dir).await.is_ok() {
+                anyhow::bail!(
+                    "a daemon is running for {}; stop it first with `synch daemon stop`                      so it does not keep signing as the old origin",
+                    data_dir.display()
+                );
+            }
+            let report = Node::adopt_named_origin(&data_dir, origin)?;
+            println!("origin:     {}  (was {})", report.origin, report.previous);
+            println!("device key: {}", report.node_id.to_z32());
+            println!("next:       synch daemon run && synch scan");
+            Ok(())
+        }
         Command::Daemon {
             command: DaemonCommand::Run,
         } => daemon::run(node_config(&cli)?).await,
@@ -88,6 +105,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 fn to_request(cli: &Cli) -> Result<Request> {
     Ok(match &cli.command {
         Command::Init { .. } => unreachable!("handled before dispatch"),
+        Command::Id {
+            command: Some(IdCommand::Set { .. }),
+        } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => unreachable!("handled before dispatch"),
@@ -98,7 +118,7 @@ fn to_request(cli: &Cli) -> Result<Request> {
             command: DaemonCommand::Stop,
         } => Request::DaemonStop,
 
-        Command::Id => Request::Id,
+        Command::Id { command: None } => Request::Id,
 
         Command::Key { command } => match command {
             KeyCommand::Rotate => Request::KeyRotate,

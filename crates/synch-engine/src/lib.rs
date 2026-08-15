@@ -32,7 +32,7 @@ pub use fetcher::{FetchReport, PreparedRange, Provider};
 pub use ignore::IgnoreSet;
 pub use membership::{DoctorReport, DomainHealth, DomainOutcome, DomainRefresh, HeadStatus};
 pub use mirror::MirrorReport;
-pub use node::{InitReport, Node, StagedChange};
+pub use node::{AdoptOriginReport, InitReport, Node, StagedChange};
 pub use publisher::{Publisher, DEFAULT_PUBLISH_BATCH_MAX, DEFAULT_PUBLISH_QUIESCE};
 pub use recovery::{
     ObserveRound, RecoveryOptions, RecoveryProgress, RecoveryReport, RecoveryState,

@@ -121,8 +121,12 @@ pub enum Command {
         #[arg(long)]
         id: Option<String>,
     },
-    /// Print the OriginId and current device key(s).
-    Id,
+    /// Print the OriginId and current device key(s), or name a key-identified node.
+    Id {
+        /// The id subcommand. With none, print the current identity.
+        #[command(subcommand)]
+        command: Option<IdCommand>,
+    },
     /// Device-key rotation.
     Key {
         /// The key subcommand.
@@ -262,6 +266,18 @@ pub enum Command {
     },
     /// Scan every configured space and publish the result.
     Scan,
+}
+
+/// `synch id set ...`
+#[derive(Debug, Subcommand)]
+pub enum IdCommand {
+    /// Adopt a named origin for a key-identified node, without rotating the
+    /// device key. The daemon must be stopped first; `synch scan` after it
+    /// restarts publishes under the new name.
+    Set {
+        /// The stable origin id, as `<name>@<domain>`.
+        id: String,
+    },
 }
 
 /// `synch key ...`
@@ -583,6 +599,7 @@ mod tests {
         for args in [
             vec!["synch", "init", "--id", "nas@cluster.example.com"],
             vec!["synch", "id"],
+            vec!["synch", "id", "set", "orb@cluster.example.com"],
             vec!["synch", "key", "rotate"],
             vec!["synch", "key", "activate", "abc"],
             vec![

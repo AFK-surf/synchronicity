@@ -73,6 +73,17 @@ pub struct InitReport {
     pub data_dir: PathBuf,
 }
 
+/// What `adopt_named_origin` did.
+#[derive(Debug, Clone)]
+pub struct AdoptOriginReport {
+    /// The origin this node was publishing as.
+    pub previous: OriginId,
+    /// The named origin it will publish as after the next scan.
+    pub origin: OriginId,
+    /// The active device key, unchanged.
+    pub node_id: NodeId,
+}
+
 impl Node {
     /// Creates an identity and database in `data_dir`.
     ///
@@ -108,6 +119,67 @@ impl Node {
             origin,
             node_id,
             data_dir,
+        })
+    }
+
+    /// Names a key-identified node without generating a new device key.
+    ///
+    /// OriginId is otherwise permanent (§3.1). This is the missing half of
+    /// §3.2 auto-detection: a node that came up as `key:<nk>` can take the
+    /// `<id>@<domain>` that key is already published under. The next
+    /// `synch scan` publishes a head under the new name; the daemon must be
+    /// restarted first so it signs as that name.
+    pub fn adopt_named_origin(
+        data_dir: impl AsRef<Path>,
+        origin: OriginId,
+    ) -> Result<AdoptOriginReport> {
+        if origin.as_key().is_some() {
+            return Err(EngineError::invalid(
+                "id set wants <name>@<domain>, not a key identity",
+            ));
+        }
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let store = Store::open(&data_dir)?;
+        let previous = store.self_origin()?.ok_or(EngineError::NotInitialized)?;
+        let node_id = store
+            .active_device_key()?
+            .ok_or(EngineError::NoActiveKey)?
+            .node_id;
+        match &previous {
+            OriginId::Named { .. } => {
+                return Err(EngineError::invalid(format!(
+                    "origin is already {previous}; a named identity cannot be renamed"
+                )));
+            }
+            OriginId::Key(key) if key != &node_id => {
+                return Err(EngineError::invalid(
+                    "this node's key identity is not its active device key",
+                ));
+            }
+            OriginId::Key(_) => {}
+        }
+        store.set_self_origin(&origin)?;
+        store.remove_binding(&previous, &node_id, BindingSource::Static)?;
+        store.put_binding(&Binding {
+            origin: origin.clone(),
+            node_id,
+            source: BindingSource::Static,
+            domain: None,
+            note: Some("self".into()),
+            added_at: now_ns(),
+            expires_at: None,
+        })?;
+        // Drop the key-origin view so the unified tree does not keep a second
+        // copy of every path under the old name. Blobs stay; the next scan
+        // republishes them under the new origin.
+        store.clear_head(&previous, Slot::Complete)?;
+        store.clear_head(&previous, Slot::Pending)?;
+        store.delete_origin_entries(&previous)?;
+        store.delete_origin_providers(&previous)?;
+        Ok(AdoptOriginReport {
+            previous,
+            origin,
+            node_id,
         })
     }
 
@@ -718,6 +790,43 @@ mod tests {
             .is_bound(node.origin(), &node.node_id(), now_ns())
             .unwrap());
         node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn a_key_identity_can_adopt_a_name() {
+        let dir = node_dir();
+        let report = Node::init(dir.path(), None).unwrap();
+        let named = OriginId::named("orb", "cluster.example").unwrap();
+        let adopted = Node::adopt_named_origin(dir.path(), named.clone()).unwrap();
+        assert_eq!(adopted.previous, OriginId::Key(report.node_id));
+        assert_eq!(adopted.origin, named);
+        assert_eq!(adopted.node_id, report.node_id);
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.self_origin().unwrap(), Some(named.clone()));
+        assert!(store.is_bound(&named, &report.node_id, now_ns()).unwrap());
+        assert!(!store
+            .is_bound(&adopted.previous, &report.node_id, now_ns())
+            .unwrap());
+        assert!(store.complete_head(&adopted.previous).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_named_identity_cannot_be_renamed() {
+        let dir = node_dir();
+        let origin = OriginId::named("nas", "cluster.example").unwrap();
+        Node::init(dir.path(), Some(origin)).unwrap();
+        let other = OriginId::named("orb", "cluster.example").unwrap();
+        let err = Node::adopt_named_origin(dir.path(), other).unwrap_err();
+        assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+    }
+
+    #[test]
+    fn adopt_named_origin_refuses_a_key_identity() {
+        let dir = node_dir();
+        let report = Node::init(dir.path(), None).unwrap();
+        let err = Node::adopt_named_origin(dir.path(), OriginId::Key(report.node_id)).unwrap_err();
+        assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
     }
 
     #[tokio::test]

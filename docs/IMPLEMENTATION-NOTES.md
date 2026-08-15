@@ -432,6 +432,20 @@ that could never be activated and that nothing ever cleaned up. The message
 names both ways out: re-init under a named origin, or have peers bind the key
 with `synch trust add --as <name>`.
 
+### §3.2 — naming a key-identified node
+
+§3.1 says OriginId never changes. §3.2 also says a node can learn its name
+by finding its device key in a validated membership set. `synch init` without
+`--id` always stored `key:<nk>`, and nothing ever adopted the DNS name later,
+so two members of the same domain would connect (the key is trusted) and then
+drop each other's heads as unbound (the claimed origin is not).
+
+`synch id set <name>@<domain>` is that adoption, and only that: Key → Named,
+same device key, daemon stopped. The old key-origin head and entries are
+dropped so the unified tree does not keep a second copy of every path; blobs
+stay, and the next `synch scan` publishes them under the new name. A named
+origin still cannot be renamed.
+
 ### §7.1 — spaces added while the daemon runs
 
 The watcher registers every configured space root with `notify` and
