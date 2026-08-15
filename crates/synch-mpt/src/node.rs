@@ -1,7 +1,7 @@
 //! Trie nodes, their canonical encoding, and their domain-separated hashing (§4.3).
 
 use serde::{Deserialize, Serialize};
-use synch_core::{Hash, INLINE_VALUE_MAX};
+use synch_core::{Hash, INLINE_VALUE_MAX, MAX_KEY_LEN};
 
 use crate::{error::MptError, nibbles::Nibbles};
 
@@ -115,6 +115,21 @@ impl TrieNode {
         let canonical = node.encode();
         if canonical != bytes {
             return Err(MptError::Decode("non-canonical node encoding".into()));
+        }
+        // Bound the node's key portion at the sync trust boundary. A key is
+        // never longer than MAX_KEY_LEN bytes (§12), so a single node's nibble
+        // run can never exceed twice that. Without this check a peer could
+        // serve a hash-valid Leaf whose key_rest is megabytes of nibbles;
+        // `diff`/`collect` descend one nibble per stack frame, so ingesting it
+        // (materialize_diff after a head flip) overflows the stack and aborts
+        // the daemon — the very DoS the 4 KiB key bound is meant to prevent.
+        let nibble_len = match &node {
+            TrieNode::Leaf { key_rest, .. } => key_rest.len(),
+            TrieNode::Ext { prefix, .. } => prefix.len(),
+            TrieNode::Branch { .. } => 0,
+        };
+        if nibble_len > MAX_KEY_LEN * 2 {
+            return Err(MptError::KeyTooLong(nibble_len / 2));
         }
         Ok(hash_encoded(node.tag(), bytes))
     }

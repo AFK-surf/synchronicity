@@ -78,6 +78,27 @@ impl Node {
         let ignore = IgnoreSet::for_space(&root_dir);
         let seq = self.next_seq()?;
 
+        // A vanished space root — an unmounted drive, a renamed mount, a
+        // directory momentarily gone — must not read as "every file deleted".
+        // `walk` treats a missing directory as empty, so without this guard the
+        // deletion sweep below would tombstone the whole space and publish that
+        // cluster-wide. Refuse to scan a root that is absent or not a directory.
+        match std::fs::metadata(&root_dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(EngineError::invalid(format!(
+                    "space {space_id} root {} is not a directory",
+                    root_dir.display()
+                )))
+            }
+            Err(e) => {
+                return Err(EngineError::invalid(format!(
+                    "space {space_id} root {} is unavailable: {e}",
+                    root_dir.display()
+                )))
+            }
+        }
+
         let mut report = ScanReport::default();
         let mut found = Vec::new();
         walk(&root_dir, &root_dir, &ignore, &mut report, &mut found)?;

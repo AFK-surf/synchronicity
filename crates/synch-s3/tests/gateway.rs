@@ -811,14 +811,26 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
     assert_eq!(response.status(), 403);
     assert!(response.text().await.unwrap().contains("AccessDenied"));
 
-    // A garbage signature is refused.
+    // Dates must fall within the gateway's clock-skew window (§12 replay bound),
+    // so every signed request below is stamped from the current time.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let amz_date = synch_s3::auth::format_amz_date(now);
+    let scope_date = amz_date[..8].to_string();
+
+    // A garbage signature is refused — with a fresh date, so the request reaches
+    // the signature check rather than being turned away for a stale timestamp.
     let response = http
         .get(harness.url("/my-media/secret.txt"))
-        .header("x-amz-date", "20240102T030405Z")
+        .header("x-amz-date", &amz_date)
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240102/us-east-1/s3/aws4_request, \
-             SignedHeaders=host;x-amz-date, Signature=00",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/{scope_date}/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature=00"
+            ),
         )
         .send()
         .await
@@ -832,16 +844,15 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
 
     // A correctly signed request succeeds.
     let host = harness.base.trim_start_matches("http://").to_string();
-    let amz_date = "20240102T030405Z";
     let headers: std::collections::BTreeMap<String, String> = [
         ("host".to_string(), host.clone()),
-        ("x-amz-date".to_string(), amz_date.to_string()),
+        ("x-amz-date".to_string(), amz_date.clone()),
     ]
     .into_iter()
     .collect();
     let header = synch_s3::auth::SigV4Header {
         access_key: "AKIDEXAMPLE".into(),
-        date: "20240102".into(),
+        date: scope_date.clone(),
         region: "us-east-1".into(),
         service: "s3".into(),
         signed_headers: vec!["host".into(), "x-amz-date".into()],
@@ -855,17 +866,17 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
         payload_hash: synch_s3::auth::UNSIGNED_PAYLOAD,
     };
     let signature =
-        synch_s3::auth::expected_signature(&keys[0].secret, &header, amz_date, &request);
+        synch_s3::auth::expected_signature(&keys[0].secret, &header, &amz_date, &request);
 
     let response = http
         .get(harness.url("/my-media/secret.txt"))
         .header("host", host)
-        .header("x-amz-date", amz_date)
+        .header("x-amz-date", &amz_date)
         .header("x-amz-content-sha256", synch_s3::auth::UNSIGNED_PAYLOAD)
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240102/us-east-1/s3/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/{scope_date}/us-east-1/s3/aws4_request, \
                  SignedHeaders=host;x-amz-date, Signature={signature}"
             ),
         )

@@ -21,6 +21,34 @@ pub const CAS_DIR: &str = "store";
 /// The database file name (§10).
 pub const DB_FILE: &str = "synchronicity.db";
 
+/// Restricts the data directory to owner-only access (§3). No-op off Unix.
+fn harden_permissions(data_dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = data_dir;
+}
+
+/// Restricts the database and its WAL/SHM sidecars to owner-only. No-op off
+/// Unix. Called after `init`, once WAL mode has created the sidecars.
+fn harden_db_files(data_dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in [DB_FILE, "synchronicity.db-wal", "synchronicity.db-shm"] {
+            let path = data_dir.join(name);
+            if path.exists() {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = data_dir;
+}
+
 /// The state of a locally held device key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyState {
@@ -88,12 +116,19 @@ impl Store {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(data_dir.join(CAS_DIR))?;
+        // The DB holds this node's device secret key and the S3 access keys, so
+        // it must not be world-readable (§3). `synch init` hardens the datadir,
+        // but the daemon can be pointed at a fresh dir (or a restored backup)
+        // without it — so the store defends its own files unconditionally.
+        harden_permissions(&data_dir);
         let conn = Connection::open(data_dir.join(DB_FILE))?;
         let store = Store {
             conn: Mutex::new(conn),
             data_dir,
         };
         store.init()?;
+        // WAL/SHM sidecars are created by `init` (WAL mode); tighten them too.
+        harden_db_files(&store.data_dir);
         Ok(store)
     }
 

@@ -195,8 +195,11 @@ pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) ->
         .into_iter()
         .filter(|(s, e)| s < e)
         .map(|(s, e)| {
+            // Clamp to the object size *before* rounding the end up, so the
+            // outward round can never overflow u64 for an `e` within one
+            // granularity of u64::MAX.
             let s = (s / AD_SPAN_GRANULARITY) * AD_SPAN_GRANULARITY;
-            let e = e.div_ceil(AD_SPAN_GRANULARITY) * AD_SPAN_GRANULARITY;
+            let e = e.min(size).div_ceil(AD_SPAN_GRANULARITY) * AD_SPAN_GRANULARITY;
             (s.min(size), e.min(size).max(s.min(size)))
         })
         .filter(|(s, e)| s < e)
@@ -316,7 +319,18 @@ pub fn parse_file_key(key: &[u8]) -> Result<(String, String), KeyError> {
     if path.is_empty() {
         return Err(KeyError::Malformed);
     }
-    Ok((space.to_string(), path.to_string()))
+    // The path invariant (no `.`/`..`, no leading/empty segments, NFC — §4.1)
+    // must be enforced at the trust boundary, not just when we build our own
+    // keys. A peer's origin trie is single-writer and replicated wholesale, so
+    // a malicious peer can publish `f:space//etc/x` or `f:space/../../x`; if we
+    // accept it, the raw path flows into the entries view and then into
+    // `root_dir.join(path)` during mirror materialization, escaping the mirror
+    // root. Reject any key whose path is not already canonical.
+    let normalized = normalize_path(path).map_err(|_| KeyError::Malformed)?;
+    if normalized != path {
+        return Err(KeyError::Malformed);
+    }
+    Ok((space.to_string(), normalized))
 }
 
 /// Builds the trie key `b:<32-byte object root>`.
@@ -393,6 +407,21 @@ mod tests {
         assert!(file_key("s", "/abs").is_err());
         assert!(parse_file_key(b"f:nopath").is_err());
         assert!(parse_blob_key(b"b:short").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_non_normalized_paths() {
+        // A peer's origin trie is attacker-controlled bytes. `parse_file_key`
+        // must reject any path that is not already canonical, so a hand-crafted
+        // key can never flow into `root_dir.join(path)` and escape a mirror.
+        assert!(parse_file_key(b"f:media//etc/passwd").is_err()); // absolute
+        assert!(parse_file_key(b"f:media/../../etc/passwd").is_err()); // dot-dot
+        assert!(parse_file_key(b"f:media/a/../b").is_err()); // interior dot-dot
+        assert!(parse_file_key(b"f:media/a//b").is_err()); // empty component
+        assert!(parse_file_key(b"f:media/./a").is_err()); // dot component
+                                                          // A canonical path still round-trips.
+        let key = file_key("media", "a/b/c.txt").unwrap();
+        assert_eq!(parse_file_key(&key).unwrap().1, "a/b/c.txt");
     }
 
     #[test]

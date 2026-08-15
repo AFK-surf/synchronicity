@@ -59,6 +59,14 @@ impl ProtocolHandler for BlobProtocol {
         }
 
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            // §3.2 enforcement is per message, not just per connection: a
+            // binding revoked or expired mid-connection must cut off further
+            // requests, not linger for the life of the QUIC session.
+            if !matches!(self.store.is_trusted_key(&remote, now_ns()), Ok(true)) {
+                tracing::debug!(peer = %remote.fmt_short(), "closing connection: binding lapsed");
+                connection.close(0u32.into(), b"untrusted");
+                break;
+            }
             if let Err(e) = self.handle_stream(&mut send, &mut recv).await {
                 tracing::debug!(peer = %remote.fmt_short(), error = %e, "blob stream ended");
             }
