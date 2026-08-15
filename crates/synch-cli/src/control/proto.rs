@@ -308,6 +308,17 @@ pub enum Request {
         /// The entry reference.
         reference: String,
     },
+    /// `synch compare <space>[/<dir>] --to <origin> [--from <origin>]`
+    Compare {
+        /// The space and optional directory to compare, as `<space>[/<dir>]`.
+        reference: String,
+        /// The baseline origin; `None` means this node's own origin.
+        from: Option<String>,
+        /// The target origin to compare against. Required.
+        to: String,
+        /// Emit machine-readable JSON instead of the status listing.
+        json: bool,
+    },
     /// `synch mirror add <space> <dir> [--policy ...]`
     MirrorAdd {
         /// The space of the unified tree to materialize.

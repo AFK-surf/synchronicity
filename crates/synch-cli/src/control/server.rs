@@ -898,6 +898,37 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
+        Request::Compare {
+            reference,
+            from,
+            to,
+            json,
+        } => {
+            let reference = parse_reference(&reference)?;
+            // Origins are named by --from/--to, never on the reference itself:
+            // an origin-pinned reference would be a third, contradictory way to
+            // say the same thing.
+            if reference.origin.is_some() {
+                return Err(ControlError::invalid(
+                    "compare takes a space, not an origin-pinned reference; name origins with --from and --to",
+                ));
+            }
+            let from = match &from {
+                Some(text) => parse_origin(text)?,
+                None => node.origin().clone(),
+            };
+            let to = parse_origin(&to)?;
+            if from == to {
+                return Err(ControlError::invalid(
+                    "--from and --to name the same origin; nothing to compare",
+                ));
+            }
+            let report = node.compare(&reference.space, &reference.dir_prefix(), &from, &to)?;
+            for line in render::compare(&report, json) {
+                out.line(line).await?;
+            }
+        }
+
         Request::MirrorAdd {
             space,
             path,

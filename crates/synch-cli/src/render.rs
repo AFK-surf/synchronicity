@@ -4,7 +4,7 @@
 //! verbatim.
 
 use synch_core::{now_ns, EntryKind};
-use synch_engine::{EntryRef, Node, VersionPolicy, VersionSet};
+use synch_engine::{CompareReport, CompareStatus, EntryRef, Node, VersionPolicy, VersionSet};
 use synch_store::EntryRow;
 
 use crate::control::ControlError;
@@ -407,10 +407,85 @@ pub fn log(node: &Node, reference: &EntryRef) -> Lines {
     Ok(out)
 }
 
+/// A name-status comparison between two origins, `git status --short` style.
+pub fn compare(report: &CompareReport, json: bool) -> Vec<String> {
+    if json {
+        return vec![compare_json(report)];
+    }
+    let mut out = vec![format!(
+        "comparing {}:  {} \u{2192} {}",
+        report.space, report.from, report.to
+    )];
+    if report.changes.is_empty() {
+        out.push("no differences".into());
+        return out;
+    }
+    for change in &report.changes {
+        out.push(format!("{}  {}", change.status.marker(), change.path));
+    }
+    out.push(String::new());
+    out.push(format!(
+        "{} changed  ({} created \u{00b7} {} modified \u{00b7} {} deleted)",
+        report.changes.len(),
+        report.created(),
+        report.modified(),
+        report.deleted(),
+    ));
+    out
+}
+
+/// The compare report as one line of JSON, for `--json`.
+fn compare_json(report: &CompareReport) -> String {
+    let status = |s: CompareStatus| match s {
+        CompareStatus::Created => "created",
+        CompareStatus::Modified => "modified",
+        CompareStatus::Deleted => "deleted",
+    };
+    let changes: Vec<String> = report
+        .changes
+        .iter()
+        .map(|c| {
+            format!(
+                "{{\"status\":\"{}\",\"path\":{}}}",
+                status(c.status),
+                json_string(&c.path)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"space\":{},\"from\":{},\"to\":{},\"changes\":[{}]}}",
+        json_string(&report.space),
+        json_string(&report.from.to_string()),
+        json_string(&report.to.to_string()),
+        changes.join(",")
+    )
+}
+
+/// Escapes a string as a JSON string literal (quotes included). Paths can carry
+/// quotes and backslashes, so hand-formatting JSON has to escape them.
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use synch_core::{EntryKind, FileEntry, Hash, OriginId};
+    use synch_engine::CompareChange;
     use synch_store::VersionSet;
 
     fn row(origin: &str, content: &[u8], mtime: i64) -> EntryRow {
@@ -464,6 +539,64 @@ mod tests {
     fn divergence_is_marked_with_its_version_count() {
         assert_eq!(divergence_mark(2), "⑂2");
         assert_eq!(divergence_mark(7), "⑂7");
+    }
+
+    fn sample_report() -> CompareReport {
+        CompareReport {
+            from: OriginId::named("nas", "x.example").unwrap(),
+            to: OriginId::named("laptop", "x.example").unwrap(),
+            space: "media".into(),
+            changes: vec![
+                CompareChange {
+                    path: "a.jpg".into(),
+                    status: CompareStatus::Modified,
+                },
+                CompareChange {
+                    path: "new.txt".into(),
+                    status: CompareStatus::Created,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn compare_renders_name_status_lines_and_a_summary() {
+        let lines = compare(&sample_report(), false);
+        assert!(lines[0].contains("comparing media"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "M  a.jpg"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "A  new.txt"), "{lines:?}");
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .contains("1 created \u{00b7} 1 modified \u{00b7} 0 deleted"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn compare_with_no_changes_says_so() {
+        let mut report = sample_report();
+        report.changes.clear();
+        let lines = compare(&report, false);
+        assert!(lines.iter().any(|l| l == "no differences"), "{lines:?}");
+    }
+
+    #[test]
+    fn compare_json_escapes_and_lists_changes() {
+        let mut report = sample_report();
+        report.changes.push(CompareChange {
+            path: "weird\"name\\x.txt".into(),
+            status: CompareStatus::Deleted,
+        });
+        let json = compare(&report, true);
+        assert_eq!(json.len(), 1);
+        assert!(json[0].starts_with("{\"space\":\"media\""), "{}", json[0]);
+        assert!(
+            json[0].contains("\"status\":\"deleted\",\"path\":\"weird\\\"name\\\\x.txt\""),
+            "{}",
+            json[0]
+        );
     }
 
     #[test]
