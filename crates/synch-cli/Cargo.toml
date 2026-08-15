@@ -1,0 +1,41 @@
+[package]
+name = "synch-cli"
+description = "The synchronicity CLI and daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "synch_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "synch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+iroh.workspace = true
+iroh-base.workspace = true
+postcard.workspace = true
+serde.workspace = true
+synch-core.workspace = true
+synch-engine.workspace = true
+synch-mpt.workspace = true
+synch-net.workspace = true
+synch-store.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

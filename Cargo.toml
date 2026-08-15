@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zeynepbabur/synchronicity"
+authors = ["the synchronicity authors"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "allow"
+
+[workspace.dependencies]
+synch-core = { path = "crates/synch-core", version = "0.1.0" }
+synch-mpt = { path = "crates/synch-mpt", version = "0.1.0" }
+synch-store = { path = "crates/synch-store", version = "0.1.0" }
+synch-net = { path = "crates/synch-net", version = "0.1.0" }
+synch-engine = { path = "crates/synch-engine", version = "0.1.0" }
+synch-cli = { path = "crates/synch-cli", version = "0.1.0" }
+
+anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "query"] }
+bao-tree = { version = "0.16.0", default-features = false, features = ["validate"] }
+blake3 = "1.8.6"
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+directories = "6.0.0"
+futures-core = "0.3"
+hex = "0.4.3"
+hmac = "0.13.0"
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["dnssec-ring", "tokio"] }
+iroh = { version = "1.0.3", default-features = false, features = ["tls-ring"] }
+iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
+notify = "8.2.0"
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+proptest = "1.11.0"
+range-collections = "0.4.6"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+time = "0.3"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+tokio-util = { version = "0.7.19", features = ["compat"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-normalization = "0.1.25"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

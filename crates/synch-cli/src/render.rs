@@ -1,0 +1,512 @@
+//! Formatting shared by the daemon's request handlers.
+//!
+//! These build the lines that cross the control socket; the CLI prints them
+//! verbatim.
+
+use synch_core::{now_ns, EntryKind};
+use synch_engine::{EntryRef, Node, VersionPolicy, VersionSet};
+use synch_store::EntryRow;
+
+use crate::control::ControlError;
+
+type Lines = Result<Vec<String>, ControlError>;
+
+/// Renders an endpoint address, with its direct and relay paths.
+pub fn addr(addr: &iroh::EndpointAddr) -> String {
+    let parts: Vec<String> = addr
+        .ip_addrs()
+        .map(|a| a.to_string())
+        .chain(addr.relay_urls().map(|u| u.to_string()))
+        .collect();
+    if parts.is_empty() {
+        addr.id.to_z32()
+    } else {
+        format!("{} via {}", addr.id.to_z32(), parts.join(", "))
+    }
+}
+
+/// The name of an entry kind, as `ls` and `status` print it.
+pub fn kind_name(kind: synch_core::EntryKind) -> &'static str {
+    match kind {
+        synch_core::EntryKind::File => "file",
+        synch_core::EntryKind::Dir => "dir",
+        synch_core::EntryKind::Symlink => "symlink",
+        synch_core::EntryKind::Tombstone => "deleted",
+    }
+}
+
+/// The mark a divergent path carries in a listing: the number of versions it
+/// holds (§8, §14).
+///
+/// Deliberately a *count* rather than a flag — "two versions" is the fact, and
+/// it is the number `synch status` will lay out.
+pub fn divergence_mark(versions: usize) -> String {
+    format!("\u{2442}{versions}")
+}
+
+/// One line of an origin-pinned listing: a single origin's entry.
+pub fn entry_line(row: &EntryRow, mark: Option<&str>) -> String {
+    format!(
+        "{:>12}  {:<8}  {}{}",
+        row.size,
+        kind_name(row.kind),
+        row.path,
+        mark.map(|m| format!("  {m}")).unwrap_or_default()
+    )
+}
+
+/// One path of the unified tree, as `synch ls` prints it.
+///
+/// The line describes the version the reader would get — the `newest` policy's
+/// selection — and the mark says how many others there are. With `all`, every
+/// version follows, indented, with its attestors.
+pub fn unified_line(node: &Node, set: &VersionSet, all: bool) -> Lines {
+    let selected = node.resolve_set(set, &VersionPolicy::Newest)?;
+    let mark = set
+        .is_divergent()
+        .then(|| divergence_mark(set.version_count()));
+    let mut out = vec![entry_line(&selected, mark.as_deref())];
+    if all {
+        out.extend(version_lines(set));
+    }
+    Ok(out)
+}
+
+/// Every version of a path, newest first — the body of `synch status`.
+pub fn version_set(set: &VersionSet) -> Vec<String> {
+    let mut out = vec![format!(
+        "{}/{}  {} version(s){}",
+        set.space,
+        set.path,
+        set.version_count(),
+        if set.is_divergent() {
+            format!("  {}", divergence_mark(set.version_count()))
+        } else {
+            String::new()
+        }
+    )];
+    out.extend(version_lines(set));
+    out
+}
+
+fn version_lines(set: &VersionSet) -> Vec<String> {
+    set.versions
+        .iter()
+        .rev()
+        .map(|version| {
+            let attestors: Vec<String> = version.attestors.iter().map(|o| o.short()).collect();
+            // A content-less kind is identified by its target rather than by
+            // a root (§8), so that is what the line has to show.
+            let identity = match version.kind {
+                EntryKind::Tombstone => "(deleted)".to_string(),
+                EntryKind::Symlink => format!(
+                    "-> {}",
+                    version.symlink_target.as_deref().unwrap_or("(unknown)")
+                ),
+                _ => version
+                    .content
+                    .map(|h| h.to_hex()[..16].to_string())
+                    .unwrap_or_else(|| "(no content)".into()),
+            };
+            format!(
+                "    {:<18} {:<8} {:>12}  seq {:<6} {}",
+                identity,
+                kind_name(version.kind),
+                version.size,
+                version.seq,
+                attestors.join(", ")
+            )
+        })
+        .collect()
+}
+
+/// A coarse "how long ago" rendering of a unix-nanosecond timestamp.
+pub fn ago(timestamp: i64) -> String {
+    if timestamp == 0 {
+        return "never".into();
+    }
+    let seconds = (now_ns() - timestamp) / 1_000_000_000;
+    match seconds {
+        s if s < 0 => "just now".into(),
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86400),
+    }
+}
+
+/// One membership domain's health, for `domain ls` and `doctor`.
+///
+/// Three failing domains must not read like three healthy ones: the line
+/// carries the binding count, the refresh times, and the last failure —
+/// the reason itself, not a pointer at the daemon log.
+pub fn domain_health(health: &synch_engine::DomainHealth, now: i64) -> String {
+    let mut line = format!("{}  {} binding(s)", health.domain, health.bindings);
+    match &health.schedule {
+        None => line.push_str("  not yet resolved by this daemon"),
+        Some(schedule) => {
+            if schedule.last_success > 0 {
+                line.push_str(&format!("  refreshed {}", ago(schedule.last_success)));
+            } else {
+                line.push_str("  never refreshed successfully");
+            }
+            let due = schedule.due_at.saturating_sub(now) / 1_000_000_000;
+            if due > 0 {
+                line.push_str(&format!("  next in {due}s"));
+            } else {
+                line.push_str("  due now");
+            }
+            if let Some(error) = &schedule.last_error {
+                line.push_str(&format!("  LAST ERROR: {error}"));
+            }
+        }
+    }
+    line
+}
+
+/// The `synch doctor` / `synch daemon status` report.
+pub fn doctor(node: &Node) -> Lines {
+    let report = node.doctor()?;
+    let mut out = Vec::new();
+    out.push(format!("origin: {}", report.origin));
+    for (key, state) in &report.device_keys {
+        out.push(format!("  key {} ({state})", key.to_z32()));
+    }
+    out.push(format!("address: {}", addr(&node.net().direct_addr())));
+    for net in node.retiring_endpoints() {
+        out.push(format!("retiring: {}", addr(&net)));
+    }
+
+    out.push(String::new());
+    out.push("membership:".into());
+    if report.domains.is_empty() {
+        out.push("  (no DNSSEC domains configured; static trust only)".into());
+    } else {
+        let now = now_ns();
+        for health in node.domain_health()? {
+            out.push(format!("  domain {}", domain_health(&health, now)));
+        }
+    }
+    let now = now_ns();
+    for binding in &report.bindings {
+        out.push(format!(
+            "  {:<32} {} {:<7} {}",
+            binding.origin.canonical(),
+            binding.node_id.to_z32(),
+            binding.source.as_str(),
+            if binding.is_live(now) {
+                "live"
+            } else {
+                "LAPSED"
+            },
+        ));
+    }
+
+    out.push(String::new());
+    out.push("heads:".into());
+    for head in &report.heads {
+        out.push(format!(
+            "  {:<32} seq {:<8} {:<12} {:<10} {} entries",
+            head.origin.canonical(),
+            head.complete_seq
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into()),
+            match head.pending_seq {
+                Some(seq) => format!("pending {seq}"),
+                None => String::new(),
+            },
+            if head.servable { "servable" } else { "PARTIAL" },
+            head.entries,
+        ));
+        if !head.bound {
+            out.push(
+                "    ! no live binding: this origin's data stays unavailable \
+                 until it republishes under a bound key"
+                    .into(),
+            );
+        }
+    }
+
+    if report.recovery.in_recovery {
+        out.push(String::new());
+        out.push("KEY-LOSS RECOVERY (§3.4):".into());
+        out.push(format!(
+            "  this node holds no head of its own for {}, but peers advertise one at seq {}",
+            report.recovery.origin,
+            report
+                .recovery
+                .observed_seq
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ));
+        // Whose claim it is, because the claim is unauthenticated and the
+        // operator is the one who has to judge it (§3.4, §12).
+        out.push(format!(
+            "  claimed by {}",
+            report
+                .recovery
+                .observed_by
+                .map(|key| key.to_z32())
+                .unwrap_or_else(|| "(an unrecorded peer)".into()),
+        ));
+        out.push(format!(
+            "  publishing is refused: a head at seq {} would be rejected by every peer",
+            report.recovery.next_seq
+        ));
+        out.push(
+            "  the claim is a peer's unverified summary, not a signed head: check that peer \
+             before trusting the number"
+                .into(),
+        );
+        out.push("  run `synch recover` to resume publishing above what peers have seen".into());
+    } else if let Some(floor) = report.recovery.floor {
+        out.push(String::new());
+        out.push(format!(
+            "recovered: publishing floor {floor}, highest seq peers advertised {} (claimed by {})",
+            report
+                .recovery
+                .observed_seq
+                .map(|seq| seq.to_string())
+                .unwrap_or_else(|| "-".into()),
+            report
+                .recovery
+                .observed_by
+                .map(|key| key.to_z32())
+                .unwrap_or_else(|| "an unrecorded peer".into()),
+        ));
+    }
+
+    if !report.unreconciled.is_empty() {
+        out.push(String::new());
+        out.push("UNRECONCILED PRE-RECOVERY HISTORY (§3.4):".into());
+        for entry in &report.unreconciled {
+            out.push(format!(
+                "  origin {} has unreconciled pre-recovery history at seq {}",
+                entry.origin, entry.seq
+            ));
+            out.push(format!(
+                "    root {} signed by {}, which is no longer bound to it",
+                entry.root,
+                entry.signed_by.to_z32()
+            ));
+            out.push(format!(
+                "    current head {} does not supersede it; the origin's operator resolves \
+                 the fork, never the protocol",
+                entry
+                    .current_seq
+                    .map(|seq| format!("seq {seq}"))
+                    .unwrap_or_else(|| "(none held)".into()),
+            ));
+        }
+    }
+
+    if !report.unbound_origins.is_empty() {
+        out.push(String::new());
+        out.push("origins held without a live binding (§3.4, §12):".into());
+        for (origin, entries) in &report.unbound_origins {
+            out.push(format!("  {origin}: {entries} entr(ies) still held"));
+        }
+        out.push(
+            "  removal cuts off future participation only; what they published stays \
+             replicated and ages out with ordinary retention"
+                .into(),
+        );
+    }
+
+    out.push(String::new());
+    if report.equivocations.is_empty() {
+        out.push("equivocation: none detected".into());
+    } else {
+        out.push("EQUIVOCATION DETECTED:".into());
+        for e in &report.equivocations {
+            out.push(format!(
+                "  {} signed {} roots at seq {}",
+                e.origin,
+                e.heads.len(),
+                e.seq
+            ));
+            for head in &e.heads {
+                out.push(format!(
+                    "    root {} signed by {}",
+                    head.root,
+                    head.signed_by.to_z32()
+                ));
+            }
+            out.push(
+                "    likely cause: duplicate id assignment, or a restored database backup".into(),
+            );
+        }
+    }
+
+    if !report.lapsed.is_empty() {
+        out.push(String::new());
+        out.push(format!("lapsed bindings: {}", report.lapsed.len()));
+    }
+
+    out.push(String::new());
+    out.push(format!(
+        "storage: {} trie nodes, {} trie values, {} objects ({} complete)",
+        report.trie.nodes, report.trie.values, report.blobs.0, report.blobs.1
+    ));
+    Ok(out)
+}
+
+/// The per-origin publish history of one path.
+pub fn log(node: &Node, reference: &EntryRef) -> Lines {
+    let origins = match &reference.origin {
+        Some(origin) => vec![origin.clone()],
+        None => node
+            .store()
+            .entries_for_path(&reference.space, &reference.path)?
+            .into_iter()
+            .map(|r| r.origin)
+            .collect(),
+    };
+    let key = synch_core::file_key(&reference.space, &reference.path)
+        .map_err(|e| ControlError::invalid(e.to_string()))?;
+    let trie = synch_mpt::Trie::new(node.store().as_ref());
+    let mut out = Vec::new();
+    for origin in origins {
+        out.push(origin.to_string());
+        let mut roots = Vec::new();
+        if let Some(head) = node.store().complete_head(&origin)? {
+            roots.push((head.seq, head.root));
+        }
+        for head in node.store().head_history(&origin)? {
+            roots.push((head.seq, head.root));
+        }
+        roots.sort_by_key(|r| std::cmp::Reverse(r.0));
+        roots.dedup();
+        let mut last: Option<Option<Vec<u8>>> = None;
+        for (seq, root) in roots {
+            // Old roots are retained for `root_retention`, so history is a
+            // storage policy rather than a protocol constant.
+            let value = trie.get(root, &key).ok().flatten();
+            if last.as_ref() == Some(&value) {
+                continue;
+            }
+            match &value {
+                Some(bytes) => {
+                    let entry = synch_engine::scanner::decode_entry(bytes)?;
+                    out.push(format!(
+                        "  seq {:<6} {:<10} {:>12}  {}",
+                        seq,
+                        kind_name(entry.kind),
+                        entry.size,
+                        entry
+                            .content
+                            .map(|h| h.to_hex()[..16].to_string())
+                            .unwrap_or_else(|| "-".into())
+                    ));
+                }
+                None => out.push(format!("  seq {seq:<6} (absent)")),
+            }
+            last = Some(value);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synch_core::{EntryKind, FileEntry, Hash, OriginId};
+    use synch_store::VersionSet;
+
+    fn row(origin: &str, content: &[u8], mtime: i64) -> EntryRow {
+        let entry = FileEntry::file(3, mtime, Hash::new(content), 1);
+        EntryRow {
+            origin: OriginId::named(origin, "x.example").unwrap(),
+            space: "media".into(),
+            path: "f.txt".into(),
+            kind: entry.kind,
+            size: entry.size,
+            mtime_ns: entry.mtime_ns,
+            content: entry.content,
+            seq: entry.seq,
+            prev: None,
+            symlink_target: None,
+        }
+    }
+
+    fn symlink_row(origin: &str, target: &str, mtime: i64) -> EntryRow {
+        EntryRow {
+            origin: OriginId::named(origin, "x.example").unwrap(),
+            space: "media".into(),
+            path: "f.txt".into(),
+            kind: EntryKind::Symlink,
+            size: target.len() as u64,
+            mtime_ns: mtime,
+            content: None,
+            seq: 1,
+            prev: None,
+            symlink_target: Some(target.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_symlink_version_shows_its_target() {
+        let set = VersionSet::from_entries(
+            "media",
+            "f.txt",
+            vec![
+                symlink_row("nas", "../a", 1),
+                symlink_row("laptop", "../a", 2),
+            ],
+        );
+        assert_eq!(set.version_count(), 1, "same target, same version");
+        let lines = version_set(&set);
+        assert!(lines[1].contains("-> ../a"), "{lines:?}");
+        assert!(lines[1].contains("symlink"), "{lines:?}");
+    }
+
+    #[test]
+    fn divergence_is_marked_with_its_version_count() {
+        assert_eq!(divergence_mark(2), "⑂2");
+        assert_eq!(divergence_mark(7), "⑂7");
+    }
+
+    #[test]
+    fn an_agreed_path_carries_no_mark() {
+        let set = VersionSet::from_entries(
+            "media",
+            "f.txt",
+            vec![row("nas", b"same", 1), row("laptop", b"same", 2)],
+        );
+        assert!(!set.is_divergent());
+        let lines = version_set(&set);
+        assert!(lines[0].contains("1 version(s)"), "{lines:?}");
+        assert!(!lines[0].contains('⑂'), "{lines:?}");
+        // One version, both attestors named on it.
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("nas"), "{lines:?}");
+        assert!(lines[1].contains("laptop"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_divergent_path_lists_every_version_newest_first() {
+        let set = VersionSet::from_entries(
+            "media",
+            "f.txt",
+            vec![row("nas", b"theirs", 100), row("laptop", b"ours", 200)],
+        );
+        let lines = version_set(&set);
+        assert!(lines[0].contains("2 version(s)"), "{lines:?}");
+        assert!(lines[0].contains("⑂2"), "{lines:?}");
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains("laptop"), "the newest first: {lines:?}");
+        assert!(lines[2].contains("nas"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_tombstone_version_says_so() {
+        let mut deleted = row("nas", b"gone", 300);
+        deleted.kind = EntryKind::Tombstone;
+        deleted.content = None;
+        let set =
+            VersionSet::from_entries("media", "f.txt", vec![row("laptop", b"live", 100), deleted]);
+        let lines = version_set(&set);
+        assert!(lines[1].contains("(deleted)"), "{lines:?}");
+        assert!(lines[1].contains("deleted"), "{lines:?}");
+    }
+}

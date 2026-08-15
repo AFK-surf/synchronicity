@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The test suite binds only loopback sockets and disables relays and
+      # discovery, so it needs no network access.
+      # --no-fail-fast so one run reports every platform failure, rather than
+      # surfacing them one CI round-trip at a time.
+      - run: cargo test --workspace --all-targets --no-fail-fast
+      - run: cargo test --workspace --doc --no-fail-fast
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  tla:
+    name: tla+ (recovery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Fetch TLC
+        run: |
+          curl -sSL -o tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  tla2tools.jar" \
+            | sha256sum -c -
+      # The connected-cluster model: every invariant and property must hold.
+      - name: Check the recovery guarantee
+        run: |
+          java -XX:+UseParallelGC -jar tla2tools.jar \
+            -config specs/RecoveryCI.cfg -workers auto -deadlock specs/Recovery.tla
+      # The partitioned model MUST produce the §3.4 fork counterexample.  If
+      # this run ever passes, the modeled semantics drifted from what the
+      # design document promises — surface that, don't celebrate it.
+      - name: Confirm the documented fork is still reachable
+        run: |
+          if java -XX:+UseParallelGC -jar tla2tools.jar \
+            -config specs/RecoveryPartitioned.cfg -workers auto -deadlock specs/Recovery.tla; then
+            echo "::error::RecoveryPartitioned.cfg found no fork; §3.4's admitted limitation no longer matches the model"
+            exit 1
+          fi

@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to build"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Fully static Linux builds via cargo-zigbuild, which cross-compiles
+          # to musl without a per-target C toolchain.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zigbuild: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zigbuild: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            zigbuild: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            zigbuild: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            zigbuild: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install zig and cargo-zigbuild
+        if: matrix.zigbuild
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }} \
+              --bin synch --bin synch-s3
+          else
+            cargo build --release --target ${{ matrix.target }} \
+              --bin synch --bin synch-s3
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          name="synchronicity-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/synch.exe" "dist/${name}/"
+            cp "target/${{ matrix.target }}/release/synch-s3.exe" "dist/${name}/"
+          else
+            cp "target/${{ matrix.target }}/release/synch" "dist/${name}/"
+            cp "target/${{ matrix.target }}/release/synch-s3" "dist/${name}/"
+          fi
+          cp README.md LICENSE DESIGN.md "dist/${name}/"
+
+          cd dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a "${name}.zip" "${name}" > /dev/null
+            archive="${name}.zip"
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+            archive="${name}.tar.gz"
+          fi
+
+          # SHA256SUMS, computed with whichever tool the runner has.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "${archive}" > "${archive}.sha256"
+          else
+            shasum -a 256 "${archive}" > "${archive}.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+          cat artifacts/*/*.sha256 > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

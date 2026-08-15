@@ -1,0 +1,34 @@
+[package]
+name = "synch-net"
+description = "iroh endpoint, mptsync and blob ALPN handlers, and the DNSSEC membership resolver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+futures-core.workspace = true
+hickory-resolver.workspace = true
+iroh.workspace = true
+reqwest.workspace = true
+iroh-base.workspace = true
+postcard.workspace = true
+serde.workspace = true
+synch-core.workspace = true
+synch-mpt.workspace = true
+synch-store.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true
+synch-mpt.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
