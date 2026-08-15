@@ -3,7 +3,7 @@
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
   Admin, Member, Owner, audit, constraint_response, ok_json, require_org,
-  text_at, valid_dns_label,
+  text_at, transaction, valid_dns_label,
 }
 import api/middleware.{error_json, now_unix}
 import auth/oidc
@@ -48,35 +48,40 @@ pub fn create_org(req: Request, ctx: AuthContext, live: Session) -> Response {
     True ->
       with_db(ctx, fn(conn) {
         let org_id = id.new()
-        let insert = {
-          use _ <- result.try(
-            sqlite.exec(conn, "INSERT INTO orgs VALUES (?, ?, ?, ?)", [
-              Text(org_id),
-              Text(slug),
-              Text(org_name),
-              VInt(now_unix()),
-            ]),
-          )
-          use _ <- result.try(
-            sqlite.exec(
-              conn,
-              "INSERT INTO org_members VALUES (?, ?, 'owner', ?)",
-              [
-                Text(org_id),
-                Text(live.user_id),
-                VInt(now_unix()),
-              ],
-            ),
-          )
-          audit(
-            conn,
-            live.user_id,
-            org_id,
-            "org.create",
-            json.object([#("slug", json.string(slug))]),
-          )
-        }
-        case insert {
+        // One transaction: an org must never exist without its owner.
+        case
+          transaction(conn, fn() {
+            {
+              use _ <- result.try(
+                sqlite.exec(conn, "INSERT INTO orgs VALUES (?, ?, ?, ?)", [
+                  Text(org_id),
+                  Text(slug),
+                  Text(org_name),
+                  VInt(now_unix()),
+                ]),
+              )
+              use _ <- result.try(
+                sqlite.exec(
+                  conn,
+                  "INSERT INTO org_members VALUES (?, ?, 'owner', ?)",
+                  [
+                    Text(org_id),
+                    Text(live.user_id),
+                    VInt(now_unix()),
+                  ],
+                ),
+              )
+              audit(
+                conn,
+                live.user_id,
+                org_id,
+                "org.create",
+                json.object([#("slug", json.string(slug))]),
+              )
+            }
+            |> result.map_error(constraint_response)
+          })
+        {
           Ok(Nil) ->
             ok_json(
               json.object([
@@ -84,7 +89,7 @@ pub fn create_org(req: Request, ctx: AuthContext, live: Session) -> Response {
                 #("slug", json.string(slug)),
               ]),
             )
-          Error(e) -> constraint_response(e)
+          Error(response) -> response
         }
       })
   }
@@ -347,30 +352,40 @@ pub fn accept_invite(
       )
     case lookup {
       Ok([[Text(invite_id), Text(org_id), Text(role)]]) -> {
-        let apply = {
-          use _ <- result.try(
-            sqlite.exec(
-              conn,
-              "INSERT OR IGNORE INTO org_members VALUES (?, ?, ?, ?)",
-              [Text(org_id), Text(live.user_id), Text(role), VInt(now_unix())],
-            ),
-          )
-          use _ <- result.try(
-            sqlite.exec(
-              conn,
-              "UPDATE invites SET accepted_at = ? WHERE id = ?",
-              [VInt(now_unix()), Text(invite_id)],
-            ),
-          )
-          audit(
-            conn,
-            live.user_id,
-            org_id,
-            "invite.accept",
-            json.object([#("invite", json.string(invite_id))]),
-          )
-        }
-        case apply {
+        // Membership + invite consumption move together or not at all.
+        let applied =
+          transaction(conn, fn() {
+            {
+              use _ <- result.try(
+                sqlite.exec(
+                  conn,
+                  "INSERT OR IGNORE INTO org_members VALUES (?, ?, ?, ?)",
+                  [
+                    Text(org_id),
+                    Text(live.user_id),
+                    Text(role),
+                    VInt(now_unix()),
+                  ],
+                ),
+              )
+              use _ <- result.try(
+                sqlite.exec(
+                  conn,
+                  "UPDATE invites SET accepted_at = ? WHERE id = ?",
+                  [VInt(now_unix()), Text(invite_id)],
+                ),
+              )
+              audit(
+                conn,
+                live.user_id,
+                org_id,
+                "invite.accept",
+                json.object([#("invite", json.string(invite_id))]),
+              )
+            }
+            |> result.map_error(constraint_response)
+          })
+        case applied {
           Ok(Nil) -> {
             let slug =
               sqlite.query(conn, "SELECT slug FROM orgs WHERE id = ?", [
@@ -382,7 +397,7 @@ pub fn accept_invite(
             }
             ok_json(json.object([#("org", json.string(slug_text))]))
           }
-          Error(e) -> constraint_response(e)
+          Error(response) -> response
         }
       }
       Ok(_) -> error_json(404, "bad_invite", "invalid or expired invite")
@@ -467,25 +482,31 @@ pub fn put_oidc(
 pub fn delete_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
   with_db(ctx, fn(conn) {
     use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
-    let work = {
-      use _ <- result.try(
-        sqlite.exec(
-          conn,
-          "DELETE FROM auth_identities WHERE oidc_provider_id IN
-           (SELECT id FROM oidc_providers WHERE org_id = ?)",
-          [Text(org_id)],
-        ),
-      )
-      use _ <- result.try(
-        sqlite.exec(conn, "DELETE FROM oidc_providers WHERE org_id = ?", [
-          Text(org_id),
-        ]),
-      )
-      audit(conn, live.user_id, org_id, "oidc.remove", json.object([]))
-    }
-    case work {
+    // Identities and their provider row go together: a provider without
+    // its identities is fine, identities without their provider are not.
+    let removed =
+      transaction(conn, fn() {
+        {
+          use _ <- result.try(
+            sqlite.exec(
+              conn,
+              "DELETE FROM auth_identities WHERE oidc_provider_id IN
+               (SELECT id FROM oidc_providers WHERE org_id = ?)",
+              [Text(org_id)],
+            ),
+          )
+          use _ <- result.try(
+            sqlite.exec(conn, "DELETE FROM oidc_providers WHERE org_id = ?", [
+              Text(org_id),
+            ]),
+          )
+          audit(conn, live.user_id, org_id, "oidc.remove", json.object([]))
+        }
+        |> result.map_error(constraint_response)
+      })
+    case removed {
       Ok(Nil) -> ok_json(json.object([#("ok", json.bool(True))]))
-      Error(e) -> constraint_response(e)
+      Error(response) -> response
     }
   })
 }

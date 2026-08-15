@@ -17,6 +17,7 @@ import wisp
 import wisp/simulate
 import zone/model
 import zone/publish
+import zone/snapshot
 
 @external(erlang, "test_ffi", "tmp_db")
 fn tmp_db() -> String
@@ -493,4 +494,34 @@ pub fn invite_accept_test() {
       [],
     )
   sqlite.close(conn2)
+}
+
+pub fn mutation_reinstalls_served_snapshot_test() {
+  // The bug this guards against: zone_mutation committing the republish
+  // but leaving the primary's in-memory snapshot stale, so the primary's
+  // own DNS kept answering with the pre-mutation zone until restart.
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("snaporg")),
+        #("name", json.string("Snap")),
+      ]),
+    ).status
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/snaporg/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(meta) = model.read_meta(conn)
+  sqlite.close(conn)
+  // The globally served snapshot is the committed zone, immediately.
+  let assert Ok(snap) = snapshot.current()
+  assert snap.serial == meta.soa_serial
 }

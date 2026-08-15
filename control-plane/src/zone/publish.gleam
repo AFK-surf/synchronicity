@@ -227,21 +227,32 @@ pub fn ensure_meta(
   }
 }
 
-/// Replaces the nameserver set (operator configuration, applied at boot).
+/// Replaces the nameserver set (operator configuration, applied at boot)
+/// — atomically, so a crash mid-boot can't leave a half-written NS set.
 pub fn set_ns_hosts(
   conn: Connection,
   hosts: List(#(String, String, String)),
 ) -> Result(Nil, sqlite.Error) {
-  use _ <- result.try(sqlite.exec(conn, "DELETE FROM zone_ns", []))
-  list.try_fold(hosts, Nil, fn(_, host) {
-    let #(hostname, ipv4, ipv6) = host
-    sqlite.exec(conn, "INSERT INTO zone_ns VALUES (?, ?, ?)", [
-      Text(hostname),
-      text_or_null(ipv4),
-      text_or_null(ipv6),
-    ])
-    |> result.replace(Nil)
-  })
+  use _ <- result.try(sqlite.exec(conn, "BEGIN IMMEDIATE", []))
+  let work = {
+    use _ <- result.try(sqlite.exec(conn, "DELETE FROM zone_ns", []))
+    list.try_fold(hosts, Nil, fn(_, host) {
+      let #(hostname, ipv4, ipv6) = host
+      sqlite.exec(conn, "INSERT INTO zone_ns VALUES (?, ?, ?)", [
+        Text(hostname),
+        text_or_null(ipv4),
+        text_or_null(ipv6),
+      ])
+      |> result.replace(Nil)
+    })
+  }
+  case work {
+    Ok(Nil) -> sqlite.exec(conn, "COMMIT", []) |> result.replace(Nil)
+    Error(e) -> {
+      let _ = sqlite.exec(conn, "ROLLBACK", [])
+      Error(e)
+    }
+  }
 }
 
 fn text_or_null(s: String) -> sqlite.Value {

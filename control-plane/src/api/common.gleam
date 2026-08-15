@@ -10,6 +10,7 @@ import gleam/string
 import store/sqlite.{type Connection, Int as VInt, Text}
 import wisp.{type Response}
 import zone/publish
+import zone/snapshot
 
 pub type Role {
   Owner
@@ -79,48 +80,75 @@ pub fn require_org(
   }
 }
 
+/// Runs `work` inside BEGIN IMMEDIATE / COMMIT with rollback on every
+/// failure path — for multi-statement mutations that do not touch the
+/// zone (org creation, invite acceptance, OIDC config removal). Partial
+/// writes must be unrepresentable, not merely unlikely.
+pub fn transaction(
+  conn: Connection,
+  work: fn() -> Result(a, Response),
+) -> Result(a, Response) {
+  case sqlite.exec(conn, "BEGIN IMMEDIATE", []) {
+    Error(_) ->
+      Error(error_json(500, "internal", "could not begin transaction"))
+    Ok(_) ->
+      case work() {
+        Ok(value) ->
+          case sqlite.exec(conn, "COMMIT", []) {
+            Ok(_) -> Ok(value)
+            Error(_) -> {
+              let _ = sqlite.exec(conn, "ROLLBACK", [])
+              Error(error_json(500, "internal", "commit failed"))
+            }
+          }
+        Error(response) -> {
+          let _ = sqlite.exec(conn, "ROLLBACK", [])
+          Error(response)
+        }
+      }
+  }
+}
+
 /// Runs `work` and a full zone republish in one transaction. Every product
 /// mutation goes through here — the zone on disk is never out of step with
 /// the tables, and an invariant violation rolls the whole thing back.
+/// After commit the in-memory snapshot is reinstalled, so the primary's
+/// own DNS/DoH answers reflect the mutation immediately, not at the next
+/// restart or re-sign.
 pub fn zone_mutation(
   conn: Connection,
   ctx: AuthContext,
   actor: String,
   work: fn() -> Result(Json, Response),
 ) -> Response {
-  case sqlite.exec(conn, "BEGIN IMMEDIATE", []) {
-    Error(_) -> error_json(500, "internal", "could not begin transaction")
-    Ok(_) -> {
-      let outcome = {
-        use payload <- result.try(work())
-        use serial <- result.try(
-          publish.publish_in_tx(conn, ctx.csk, now_unix(), actor)
-          |> result.map_error(publish_error),
-        )
-        Ok(#(payload, serial))
+  let outcome =
+    transaction(conn, fn() {
+      use payload <- result.try(work())
+      use serial <- result.try(
+        publish.publish_in_tx(conn, ctx.csk, now_unix(), actor)
+        |> result.map_error(publish_error),
+      )
+      Ok(#(payload, serial))
+    })
+  case outcome {
+    Ok(#(payload, serial)) -> {
+      // Committed: the database is authoritative. Serving the fresh zone
+      // is best-effort here — on failure the primary keeps the previous
+      // snapshot (visible in /healthz) and replicas/resign still converge.
+      case snapshot.load(conn, now_unix()) {
+        Ok(snap) -> snapshot.install(snap)
+        Error(_) ->
+          wisp.log_error("zone_mutation: committed but snapshot reload failed")
       }
-      case outcome {
-        Ok(#(payload, serial)) ->
-          case sqlite.exec(conn, "COMMIT", []) {
-            Ok(_) ->
-              json.object([
-                #("ok", json.bool(True)),
-                #("soa_serial", json.int(serial)),
-                #("result", payload),
-              ])
-              |> json.to_string
-              |> wisp.json_response(200)
-            Error(_) -> {
-              let _ = sqlite.exec(conn, "ROLLBACK", [])
-              error_json(500, "internal", "commit failed")
-            }
-          }
-        Error(response) -> {
-          let _ = sqlite.exec(conn, "ROLLBACK", [])
-          response
-        }
-      }
+      json.object([
+        #("ok", json.bool(True)),
+        #("soa_serial", json.int(serial)),
+        #("result", payload),
+      ])
+      |> json.to_string
+      |> wisp.json_response(200)
     }
+    Error(response) -> response
   }
 }
 

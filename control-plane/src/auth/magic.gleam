@@ -108,26 +108,21 @@ pub fn redeem(
   now: Int,
 ) -> Result(String, RedeemError) {
   let token_hash = hash(token)
-  let lookup =
+  // Consume atomically: the guarded UPDATE is the check. Two concurrent
+  // redeems of one token race SELECT-then-UPDATE; only one can win a
+  // single statement.
+  let consumed =
     sqlite.query(
       conn,
-      "SELECT email FROM magic_link_tokens
-       WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?",
-      [Blob(token_hash), VInt(now)],
+      "UPDATE magic_link_tokens SET consumed_at = ?
+       WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?
+       RETURNING email",
+      [VInt(now), Blob(token_hash), VInt(now)],
     )
-  case lookup {
-    Ok([[Text(email)]]) -> {
-      use _ <- result.try(
-        sqlite.exec(
-          conn,
-          "UPDATE magic_link_tokens SET consumed_at = ? WHERE token_hash = ?",
-          [VInt(now), Blob(token_hash)],
-        )
-        |> result.map_error(Db),
-      )
+  case consumed {
+    Ok([[Text(email)]]) ->
       identity.login(conn, "magic", None, email, email, True, None, now)
       |> result.map_error(Login)
-    }
     Ok(_) -> Error(BadToken)
     Error(e) -> Error(Db(e))
   }
