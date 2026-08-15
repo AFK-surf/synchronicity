@@ -41,6 +41,9 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
 
 ```sh
 asdf install            # erlang + gleam per .tool-versions
+                        # also install rebar3 (builds Erlang deps like ranch):
+                        #   curl -fsSL -o ~/bin/rebar3 https://s3.amazonaws.com/rebar3/rebar3 && chmod +x ~/bin/rebar3
+                        # CI gets it from setup-beam's rebar3-version input
 make -C csqlite         # needs libsqlite3-dev
 gleam test              # backend suite
 just dev                # backend :8080 + vite dev server
