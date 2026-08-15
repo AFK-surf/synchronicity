@@ -14,6 +14,11 @@ pub type Role {
   Replica
 }
 
+/// Bind address and port, from `address:port` (IPv6 as `[::1]:53`).
+pub type Listen {
+  Listen(address: String, port: Int)
+}
+
 pub type Config {
   Config(
     role: Role,
@@ -22,8 +27,8 @@ pub type Config {
     db_path: String,
     /// Primary only; replicas must not have key material.
     key_file: String,
-    http_port: Int,
-    dns_port: Int,
+    http_listen: Listen,
+    dns_listen: Listen,
     /// (hostname, ipv4, ipv6) — hostname relative to apex unless dotted.
     ns_hosts: List(#(String, String, String)),
     public_url: String,
@@ -54,12 +59,14 @@ pub fn load() -> Result(Config, String) {
         Error(Nil) -> Ok("")
       }
   })
-  use http_port <- result.try(port_from("CP_HTTP_PORT", 8080))
-  use dns_port <- result.try(port_from("CP_DNS_PORT", 53))
+  use _ <- result.try(removed("CP_HTTP_PORT", "CP_HTTP_LISTEN"))
+  use _ <- result.try(removed("CP_DNS_PORT", "CP_DNS_LISTEN"))
+  use http_listen <- result.try(listen_from("CP_HTTP_LISTEN", "0.0.0.0:8080"))
+  use dns_listen <- result.try(listen_from("CP_DNS_LISTEN", "0.0.0.0:53"))
   use ns_hosts <- result.try(ns_hosts())
   let public_url =
     envoy.get("CP_PUBLIC_URL")
-    |> result.unwrap("http://127.0.0.1:" <> int.to_string(http_port))
+    |> result.unwrap("http://127.0.0.1:" <> int.to_string(http_listen.port))
   use session_secret <- result.try(case role {
     Primary -> {
       use secret <- result.try(required("CP_SESSION_SECRET"))
@@ -76,8 +83,8 @@ pub fn load() -> Result(Config, String) {
     base_domain,
     db_path,
     key_file,
-    http_port,
-    dns_port,
+    http_listen,
+    dns_listen,
     ns_hosts,
     public_url,
     session_secret,
@@ -115,6 +122,72 @@ fn credential_pair(
 
 fn required(key: String) -> Result(String, String) {
   envoy.get(key) |> result.replace_error(key <> " is required")
+}
+
+@external(erlang, "cp_udp_ffi", "valid_listen")
+fn valid_listen(address: String) -> Bool
+
+fn removed(old: String, instead: String) -> Result(Nil, String) {
+  case envoy.get(old) {
+    Ok(_) -> Error(old <> " is removed; set " <> instead <> " to address:port")
+    Error(Nil) -> Ok(Nil)
+  }
+}
+
+fn listen_from(key: String, default: String) -> Result(Listen, String) {
+  let text = envoy.get(key) |> result.unwrap(default)
+  parse_listen(key, text)
+}
+
+fn parse_listen(key: String, text: String) -> Result(Listen, String) {
+  use #(address, port_text) <- result.try(
+    split_host_port(text) |> result.replace_error(listen_error(key)),
+  )
+  use port <- result.try(
+    parse_port_number(port_text) |> result.replace_error(listen_error(key)),
+  )
+  case valid_listen(address) {
+    True -> Ok(Listen(address, port))
+    False -> Error(listen_error(key))
+  }
+}
+
+fn listen_error(key: String) -> String {
+  key <> " must be address:port (IPv4, [IPv6], or localhost)"
+}
+
+fn split_host_port(text: String) -> Result(#(String, String), Nil) {
+  case string.starts_with(text, "[") {
+    True ->
+      case string.split_once(text, "]:") {
+        Ok(#(host, port)) ->
+          case string.drop_start(host, 1) {
+            "" -> Error(Nil)
+            address -> Ok(#(address, port))
+          }
+        Error(Nil) -> Error(Nil)
+      }
+    False ->
+      case string.split_once(text, ":") {
+        Ok(#(host, port)) ->
+          case host != "" && port != "" && !string.contains(port, ":") {
+            True -> Ok(#(host, port))
+            False -> Error(Nil)
+          }
+        Error(Nil) -> Error(Nil)
+      }
+  }
+}
+
+fn parse_port_number(text: String) -> Result(Int, Nil) {
+  case int.parse(text) {
+    Ok(port) ->
+      case port >= 0 && port <= 65_535 {
+        True -> Ok(port)
+        False -> Error(Nil)
+      }
+    Error(Nil) -> Error(Nil)
+  }
 }
 
 fn port_from(key: String, default: Int) -> Result(Int, String) {

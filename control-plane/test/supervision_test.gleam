@@ -57,7 +57,7 @@ pub fn udp_server_rebinds_after_crash_test() {
   let assert Ok(_) =
     sup.new(sup.OneForOne)
     |> sup.restart_tolerance(intensity: 10, period: 5)
-    |> sup.add(server_udp.supervised(udp_name, port, serving))
+    |> sup.add(server_udp.supervised(udp_name, "127.0.0.1", port, serving))
     |> sup.start
   let question = <<
     7:int-size(16),

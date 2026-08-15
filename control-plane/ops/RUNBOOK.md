@@ -62,7 +62,8 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_BASE_DOMAIN` | both | zone apex, e.g. `sync.example.dev` |
 | `CP_DB_PATH` | both | SQLite file |
 | `CP_KEY_FILE` | primary | zone key file; **must be unset on replicas** |
-| `CP_HTTP_PORT` / `CP_DNS_PORT` | both | defaults 8080 / 53 |
+| `CP_HTTP_LISTEN` | both | `address:port`, default `0.0.0.0:8080` |
+| `CP_DNS_LISTEN` | both | `address:port`, default `0.0.0.0:53` |
 | `CP_NS_HOSTS` | primary | `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53` |
 | `CP_PUBLIC_URL` | primary | external URL for links/OAuth callbacks |
 | `CP_SESSION_SECRET` | primary | ≥32 chars; signs session cookies |

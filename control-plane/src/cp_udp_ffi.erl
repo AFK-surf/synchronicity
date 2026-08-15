@@ -1,17 +1,43 @@
 %% Thin FFI over inet/gen_udp for the supervised DNS server, plus
 %% parse_ip for glue-record addresses (dns/rdata).
 -module(cp_udp_ffi).
--export([parse_ip/1, udp_send/3, udp_open_active/1, udp_active_once/1,
-         udp_event/1]).
+-export([parse_ip/1, udp_send/3, udp_open_active/2, udp_active_once/1,
+         udp_event/1, valid_listen/1]).
 
 %% Active-once socket for the supervised server: datagrams arrive as
 %% messages (one at a time — reactivated after each is handled), and
 %% socket death arrives as a message too, so the owning actor can exit
 %% abnormally and be restarted instead of dying silently.
-udp_open_active(Port) ->
-    case gen_udp:open(Port, [binary, {active, once}, {reuseaddr, true}]) of
-        {ok, Socket} -> {ok, Socket};
-        {error, _} -> {error, nil}
+valid_listen(Address) ->
+    case listen_ip(Address) of
+        {ok, _} -> true;
+        error -> false
+    end.
+
+udp_open_active(Address, Port) ->
+    case listen_ip(Address) of
+        {ok, Ip} ->
+            Family = case tuple_size(Ip) of
+                         4 -> inet;
+                         8 -> inet6
+                     end,
+            case gen_udp:open(Port, [Family, binary, {active, once},
+                                     {reuseaddr, true}, {ip, Ip}]) of
+                {ok, Socket} -> {ok, Socket};
+                {error, _} -> {error, nil}
+            end;
+        error ->
+            {error, nil}
+    end.
+
+listen_ip(Address) when is_binary(Address) ->
+    listen_ip(unicode:characters_to_list(Address));
+listen_ip("localhost") ->
+    {ok, {127, 0, 0, 1}};
+listen_ip(Address) when is_list(Address) ->
+    case inet:parse_address(Address) of
+        {ok, Ip} -> {ok, Ip};
+        {error, _} -> error
     end.
 
 udp_active_once(Socket) ->

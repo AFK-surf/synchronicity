@@ -28,7 +28,7 @@ pub type Event {
 }
 
 @external(erlang, "cp_udp_ffi", "udp_open_active")
-fn udp_open_active(port: Int) -> Result(Socket, Nil)
+fn udp_open_active(listen: String, port: Int) -> Result(Socket, Nil)
 
 @external(erlang, "cp_udp_ffi", "udp_active_once")
 fn udp_active_once(socket: Socket) -> Result(Nil, Nil)
@@ -46,14 +46,16 @@ type State {
 /// The UDP server as a supervised child.
 pub fn supervised(
   name: process.Name(Event),
+  listen: String,
   port: Int,
   serving: Serving,
 ) -> supervision.ChildSpecification(Nil) {
   supervision.worker(fn() {
     let builder =
       actor.new_with_initialiser(10_000, fn(_subject) {
-        case udp_open_active(port) {
-          Error(Nil) -> Error("could not bind UDP port " <> int.to_string(port))
+        case udp_open_active(listen, port) {
+          Error(Nil) ->
+            Error("could not bind UDP " <> listen <> ":" <> int.to_string(port))
           Ok(socket) -> {
             let selector =
               process.new_selector()

@@ -11,11 +11,12 @@ import glisten
 
 /// DNS-over-TCP as a supervised child (glisten brings its own subtree).
 pub fn supervised(
+  listen: String,
   port: Int,
   serving: Serving,
 ) -> supervision.ChildSpecification(static_supervisor.Supervisor) {
   glisten.new(fn(_conn) { #(#(<<>>, serving), None) }, loop)
-  |> glisten.bind("0.0.0.0")
+  |> glisten.bind(listen)
   |> glisten.supervised(port)
 }
 

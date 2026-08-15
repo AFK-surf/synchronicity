@@ -25,7 +25,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if curl -fsS "http://127.0.0.1:${CP_HTTP_PORT:-8053}/healthz" >/dev/null 2>&1; then
+HTTP_PORT=8053
+DNS_PORT=5359
+
+if curl -fsS "http://127.0.0.1:${HTTP_PORT}/healthz" >/dev/null 2>&1; then
   echo "FAIL: something is already serving on the e2e ports — stale server?"
   exit 1
 fi
@@ -34,10 +37,10 @@ export CP_ROLE=primary
 export CP_BASE_DOMAIN=sync.test
 export CP_DB_PATH="$WORKDIR/cp.db"
 export CP_KEY_FILE="$WORKDIR/csk.key"
-export CP_HTTP_PORT=8053
-export CP_DNS_PORT=5359
+export CP_HTTP_LISTEN=127.0.0.1:$HTTP_PORT
+export CP_DNS_LISTEN=127.0.0.1:$DNS_PORT
 export CP_NS_HOSTS="ns1=127.0.0.1"
-export CP_PUBLIC_URL="http://127.0.0.1:$CP_HTTP_PORT"
+export CP_PUBLIC_URL="http://127.0.0.1:$HTTP_PORT"
 export CP_SESSION_SECRET="e2e-only-session-secret-not-for-production"
 
 gleam run -- keygen "$CP_BASE_DOMAIN" "$CP_KEY_FILE" | tee "$WORKDIR/keygen.out"
@@ -56,10 +59,10 @@ setsid gleam run -- serve > "$LOG" 2>&1 &
 SERVER_PID=$!
 
 for i in $(seq 1 50); do
-  curl -fsS "http://127.0.0.1:$CP_HTTP_PORT/healthz" >/dev/null 2>&1 && break
+  curl -fsS "http://127.0.0.1:$HTTP_PORT/healthz" >/dev/null 2>&1 && break
   sleep 0.2
 done
-curl -fsS "http://127.0.0.1:$CP_HTTP_PORT/healthz"; echo
+curl -fsS "http://127.0.0.1:$HTTP_PORT/healthz"; echo
 
 DOMAIN="prod.acme.$CP_BASE_DOMAIN"
 QNAME="_synchronicity.$DOMAIN"
@@ -67,7 +70,7 @@ QNAME="_synchronicity.$DOMAIN"
 delv_check() {
   local qname=$1 qtype=$2 expect=$3 label=$4
   local out
-  out=$(delv @127.0.0.1 -p "$CP_DNS_PORT" -a "$WORKDIR/anchor.bindkeys" \
+  out=$(delv @127.0.0.1 -p "$DNS_PORT" -a "$WORKDIR/anchor.bindkeys" \
         +root="$CP_BASE_DOMAIN" "$qname" "$qtype" 2>&1) || true
   if ! grep -q "fully validated" <<<"$out"; then
     echo "FAIL($label): not fully validated"; echo "$out"; exit 1
@@ -81,7 +84,7 @@ delv_check() {
 # Positive answer over UDP.
 delv_check "$QNAME" TXT "v=sync1" "positive TXT validates"
 # Positive over TCP.
-out=$(delv @127.0.0.1 -p "$CP_DNS_PORT" +tcp -a "$WORKDIR/anchor.bindkeys" \
+out=$(delv @127.0.0.1 -p "$DNS_PORT" +tcp -a "$WORKDIR/anchor.bindkeys" \
       +root="$CP_BASE_DOMAIN" "$QNAME" TXT 2>&1)
 grep -q "fully validated" <<<"$out" || { echo "FAIL: TCP validation"; echo "$out"; exit 1; }
 echo "ok: positive TXT validates over TCP"
@@ -102,7 +105,8 @@ EOF
 cp "$CP_DB_PATH" "$WORKDIR/replica.db"
 env -u CP_KEY_FILE -u CP_SESSION_SECRET \
   CP_ROLE=replica CP_DB_PATH="$WORKDIR/replica.db" \
-  CP_HTTP_PORT=8054 CP_DNS_PORT=5360 \
+  CP_HTTP_LISTEN=127.0.0.1:8054 \
+  CP_DNS_LISTEN=127.0.0.1:5360 \
   setsid gleam run -- serve > "$WORKDIR/replica.log" 2>&1 &
 REPLICA_PID=$!
 for i in $(seq 1 50); do
@@ -124,7 +128,7 @@ grep -q "fully validated" <<<"$out" || { echo "FAIL: replica after file swap"; e
 echo "ok: replica serves the swapped database file on the next query, fully validated"
 
 # The actual synchronicity client resolver, over DoH.
-export CP_DOH_URL="http://127.0.0.1:$CP_HTTP_PORT/dns-query"
+export CP_DOH_URL="http://127.0.0.1:$HTTP_PORT/dns-query"
 export CP_ANCHOR_FILE="$WORKDIR/anchor.key"
 export CP_DOMAIN="$DOMAIN"
 export CP_NAS_ACTIVE=$(get_seed nas_active)

@@ -57,3 +57,38 @@ The e2e is the load-bearing test: `delv` must report `fully validated`
 for positive, NODATA and NXDOMAIN answers over UDP and TCP, and the
 actual client resolver (`crates/synch-net`) must validate and parse the
 member set over DoH — rotation windows, revocations and all.
+
+## Configuration
+
+The service reads only `CP_*` environment variables. Missing required
+values refuse to start — there are no defaults for anything that
+changes what the service *is*. Unset optional providers (SMTP, Google,
+GitHub) disable that path.
+
+IPv6 listen addresses are written in brackets: `[::1]:53`.
+`CP_HTTP_PORT` and `CP_DNS_PORT` are gone; the port lives in the
+listen address.
+
+| Variable | Role | Meaning |
+|---|---|---|
+| `CP_ROLE` | both | Required. `primary` or `replica`. |
+| `CP_BASE_DOMAIN` | both | Required. Zone apex, no trailing dot (`sync.example.dev`). |
+| `CP_DB_PATH` | both | Required. SQLite file. |
+| `CP_KEY_FILE` | primary | Required on the primary (zone CSK). **Must be unset on replicas.** |
+| `CP_HTTP_LISTEN` | both | HTTP / DoH bind as `address:port`. Default `0.0.0.0:8080`. |
+| `CP_DNS_LISTEN` | both | Authoritative DNS (UDP + TCP) bind as `address:port`. Default `0.0.0.0:53`. |
+| `CP_NS_HOSTS` | primary | Semicolon-separated `host=ipv4[,ipv6]` NS glue, e.g. `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53`. Hostnames without dots are relative to the apex. |
+| `CP_PUBLIC_URL` | primary | External base URL for links and OAuth callbacks. Default `http://127.0.0.1:<http-port>`. |
+| `CP_SESSION_SECRET` | primary | Required on the primary, ≥32 characters. Signs session cookies. |
+| `CP_SMTP_HOST` | primary | SMTP hostname. Absent means log-only magic-link mail. |
+| `CP_SMTP_PORT` | primary | SMTP port. Default `587`. Used only when `CP_SMTP_HOST` is set. |
+| `CP_SMTP_USER` | primary | SMTP username. Default empty. |
+| `CP_SMTP_PASS` | primary | SMTP password. Default empty. |
+| `CP_SMTP_FROM` | primary | Required when `CP_SMTP_HOST` is set. Envelope From. |
+| `CP_GOOGLE_CLIENT_ID` | primary | Google OAuth client id. Both id and secret must be set to enable Google sign-in. |
+| `CP_GOOGLE_CLIENT_SECRET` | primary | Google OAuth client secret. |
+| `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in. |
+| `CP_GITHUB_CLIENT_SECRET` | primary | GitHub OAuth client secret. |
+
+Day-2 operations (replicas, key ceremony, backups) live in
+`ops/RUNBOOK.md`.

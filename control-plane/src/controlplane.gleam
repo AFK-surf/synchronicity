@@ -204,8 +204,8 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   let http =
     wisp_mist.handler(handler, "replica-has-no-sessions-0000000000000000")
     |> mist.new
-    |> mist.bind("0.0.0.0")
-    |> mist.port(cfg.http_port)
+    |> mist.bind(cfg.http_listen.address)
+    |> mist.port(cfg.http_listen.port)
   use _ <- result.try(
     sup.new(sup.OneForOne)
     |> sup.restart_tolerance(intensity: 60, period: 10)
@@ -216,8 +216,17 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       db.read_pragmas,
       4,
     ))
-    |> sup.add(server_udp.supervised(udp_name, cfg.dns_port, serving))
-    |> sup.add(server_tcp.supervised(cfg.dns_port, serving))
+    |> sup.add(server_udp.supervised(
+      udp_name,
+      cfg.dns_listen.address,
+      cfg.dns_listen.port,
+      serving,
+    ))
+    |> sup.add(server_tcp.supervised(
+      cfg.dns_listen.address,
+      cfg.dns_listen.port,
+      serving,
+    ))
     |> sup.add(mist.supervised(http))
     |> sup.start
     |> result.map_error(fn(_) { "could not start supervision tree" }),
@@ -225,10 +234,10 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   io.println(
     "replica serving "
     <> cfg.base_domain
-    <> " — dns :"
-    <> int.to_string(cfg.dns_port)
-    <> " http :"
-    <> int.to_string(cfg.http_port),
+    <> " — dns "
+    <> endpoint(cfg.dns_listen)
+    <> " http "
+    <> endpoint(cfg.http_listen),
   )
   process.sleep_forever()
   Ok(Nil)
@@ -271,8 +280,8 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   let http =
     wisp_mist.handler(handler, cfg.session_secret)
     |> mist.new
-    |> mist.bind("0.0.0.0")
-    |> mist.port(cfg.http_port)
+    |> mist.bind(cfg.http_listen.address)
+    |> mist.port(cfg.http_listen.port)
   // One tree, one policy: every long-lived process restarts in place; the
   // node itself only gives up when a child exhausts a generous restart
   // budget — the control plane must not die because one part hiccuped.
@@ -293,8 +302,17 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       db.read_pragmas,
       4,
     ))
-    |> sup.add(server_udp.supervised(udp_name, cfg.dns_port, serving))
-    |> sup.add(server_tcp.supervised(cfg.dns_port, serving))
+    |> sup.add(server_udp.supervised(
+      udp_name,
+      cfg.dns_listen.address,
+      cfg.dns_listen.port,
+      serving,
+    ))
+    |> sup.add(server_tcp.supervised(
+      cfg.dns_listen.address,
+      cfg.dns_listen.port,
+      serving,
+    ))
     |> sup.add(mist.supervised(http))
     |> sup.add(resign.supervised(cfg.db_path, csk))
     |> sup.start
@@ -303,10 +321,10 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   io.println(
     "serving "
     <> cfg.base_domain
-    <> " — dns :"
-    <> int.to_string(cfg.dns_port)
-    <> " http :"
-    <> int.to_string(cfg.http_port),
+    <> " — dns "
+    <> endpoint(cfg.dns_listen)
+    <> " http "
+    <> endpoint(cfg.http_listen),
   )
   process.sleep_forever()
   Ok(Nil)
@@ -338,4 +356,11 @@ fn seed_admin(email: String) -> Result(Nil, String) {
   )
   sqlite.close(conn)
   Ok(Nil)
+}
+
+fn endpoint(listen: config.Listen) -> String {
+  case string.contains(listen.address, ":") {
+    True -> "[" <> listen.address <> "]:" <> int.to_string(listen.port)
+    False -> listen.address <> ":" <> int.to_string(listen.port)
+  }
 }
