@@ -49,6 +49,8 @@ pub fn node_config(cli: &Cli) -> Result<NodeConfig> {
     config.net.dht_publish_direct_addrs = cli.dht_publish_addrs;
     config.dns.doh_url = cli.doh.clone();
     config.dns.trust_anchor = cli.dnssec_anchor.clone();
+    config.dns.rekor = cli.rekor.map(Into::into);
+    config.dns.rekor_key = cli.rekor_key.clone();
     Ok(config)
 }
 

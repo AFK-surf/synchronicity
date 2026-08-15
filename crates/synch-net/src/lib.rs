@@ -14,14 +14,17 @@ pub mod error;
 pub mod frame;
 pub mod mpt;
 pub mod reconcile;
+pub mod rekor;
 #[doc(hidden)]
 pub mod sim;
 
 pub use blob::{BlobClient, BlobProtocol, Slice};
 pub use dns::{
-    DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError, ResolverOptions,
+    DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError, RekorPolicy,
+    ResolverOptions,
 };
 pub use endpoint::{Net, NetOptions};
 pub use error::{NetError, Result};
 pub use mpt::{HeadExchange, MptClient, MptProtocol, NodesResponse, ValuesResponse};
 pub use reconcile::{FetchOutcome, HeadOutcome, SyncReport, Syncer};
+pub use rekor::{ProofError, RekorProof};

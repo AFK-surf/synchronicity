@@ -34,6 +34,8 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
+        rekor: None,
+        rekor_key: None,
     })
     .unwrap();
 

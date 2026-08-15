@@ -66,6 +66,16 @@ ICANN trust anchor with that file of DNSKEY records — and then nothing signed
 under the real root validates: an override is a different universe, not an
 addition.
 
+DNSSEC answers *is this key authorized for this zone?* by delegation, and a
+compromised or coerced parent can substitute the key quietly. `--rekor
+require` (`SYNCH_REKOR`) additionally demands that the zone key which signed
+an answer appear in a public transparency log, with the proof carried inside
+the zone and verified offline: a substituted key then has to be a *public*
+substitution, where the zone's operator can see it, or fail validation.
+`--rekor-key <file>` (`SYNCH_REKOR_KEY`) points at a self-hosted log's
+verification key, with the same different-universe semantics as the trust
+anchor. See [docs/REKOR-ZONE-KEY.md](docs/REKOR-ZONE-KEY.md).
+
 Rotate a device key. Every step is an explicit command: a node never polls its
 own domain and never switches signing keys on its own.
 

@@ -5,6 +5,9 @@
 ////   serve                 run the service (configuration from CP_* env)
 ////   keygen <apex> <file>  generate the zone CSK; print DNSKEY / DS / anchor
 ////   ds <apex> <file>      print DS + anchor material for an existing key
+////   rekor-publish <apex> <file>
+////                         log the zone key in the transparency log, verify
+////                         the proof locally, store and serve it
 ////   seed                  create a demo org/network/devices and publish
 ////   seed-admin <email>    first-user bootstrap: print a one-time magic link
 ////   migrate-check         replay the migration chain against a scratch DB
@@ -30,6 +33,8 @@ import gleam/result
 import gleam/string
 import jobs/resign
 import mist
+import rekor/client
+import rekor/publish as rekor
 import store/db
 import store/migrate
 import store/pool
@@ -52,13 +57,15 @@ pub fn main() {
   case argv() {
     ["keygen", apex, key_file] -> keygen(apex, key_file)
     ["ds", apex, key_file] -> print_key_material(apex, key_file)
+    ["rekor-publish", apex, key_file] ->
+      run_or_die(fn() { rekor_publish(apex, key_file) })
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(run_seed)
     ["seed-admin", email] -> run_or_die(fn() { seed_admin(email) })
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | seed | seed-admin <email> | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | seed | seed-admin <email> | migrate-check",
       )
       halt(2)
     }
@@ -106,6 +113,46 @@ fn print_material(apex: name.Name, csk: keys.Csk) -> Nil {
   io.println(keys.ds_line(apex, csk.public))
   io.println("; trust-anchor line for synch --dnssec-anchor:")
   io.println(keys.anchor_line(apex, csk.public))
+}
+
+/// Puts the zone key on the public record and republishes, so the proof
+/// record is served beside the key it is about (§5.2, §5.3).
+///
+/// Idempotent: re-running refreshes the stored checkpoint against a grown
+/// tree without minting a second entry. The zone is republished either way,
+/// which is also how a phase-2 deployment escapes the publish gate after
+/// its first successful logging.
+fn rekor_publish(apex_text: String, key_file: String) -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use apex <- result.try(
+    name.parse(apex_text) |> result.replace_error("invalid apex domain"),
+  )
+  use csk <- result.try(keys.load(key_file))
+  use log_key <- result.try(client.log_key())
+  use conn <- result.try(open_primary_db(cfg))
+  let now = now_unix()
+  use outcome <- result.try(
+    rekor.run(conn, apex, csk, client.http(client.url()), log_key, now)
+    |> result.map_error(fn(e) { "logging the zone key: " <> string.inspect(e) }),
+  )
+  use _ <- result.try(
+    publish.publish(conn, csk, now, "system:rekor-publish")
+    |> result.map_error(fn(e) { "republishing zone: " <> string.inspect(e) }),
+  )
+  sqlite.close(conn)
+  io.println(
+    "zone key "
+    <> int.to_string(outcome.key_tag)
+    <> " "
+    <> outcome.action
+    <> ": log index "
+    <> int.to_string(outcome.log_index)
+    <> case outcome.refreshed {
+      True -> " (proof refreshed, no new entry)"
+      False -> " (entry added)"
+    },
+  )
+  Ok(Nil)
 }
 
 fn migrate_check() -> Nil {

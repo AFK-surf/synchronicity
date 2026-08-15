@@ -29,6 +29,8 @@ async fn control_plane_zone_validates_and_parses() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(doh_url),
         trust_anchor: Some(anchor.into()),
+        rekor: None,
+        rekor_key: None,
     })
     .expect("resolver construction");
 

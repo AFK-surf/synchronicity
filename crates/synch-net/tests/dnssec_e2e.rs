@@ -32,6 +32,8 @@ async fn a_signed_zone_validates_end_to_end() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
+        rekor: None,
+        rekor_key: None,
     })
     .unwrap();
 
@@ -64,6 +66,8 @@ async fn a_zone_signed_by_an_unanchored_key_is_refused() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
+        rekor: None,
+        rekor_key: None,
     })
     .unwrap();
     resolver
@@ -87,6 +91,8 @@ async fn an_unsigned_zone_is_refused() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
+        rekor: None,
+        rekor_key: None,
     })
     .unwrap();
     resolver

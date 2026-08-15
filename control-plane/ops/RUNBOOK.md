@@ -70,6 +70,9 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link mail (absent = log-only) |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |
+| `CP_REKOR_URL` | primary | zone-key transparency log, default `https://rekor.sigstore.dev` |
+| `CP_REKOR_KEY` | primary | file pinning the log's verification key; required by `rekor-publish` |
+| `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
 
 > **Why the database gets its own directory.** Each SQLite connection
 > runs in a `csqlite` worker sandboxed (Landlock on Linux, `unveil`/
@@ -94,20 +97,37 @@ secrets.** Protect the replication bucket accordingly.
    key file offline; `keygen` refuses to overwrite an existing file.
    (`controlplane ds <apex> <keyfile>` reprints all of it.)
 
-2. Start the primary (systemd unit in `ops/systemd/`). First boot
+2. **Log the zone key** (optional in phase 0/1, see below):
+
+   ```sh
+   CP_REKOR_KEY=/etc/synch-controlplane/rekor.pub \
+     controlplane rekor-publish sync.example.dev \
+       /var/lib/synch-controlplane/csk.key
+   ```
+
+   Puts the key on a public transparency log, verifies the returned
+   proof locally with the same rules clients apply, stores it, and
+   republishes so the proof is served at `_synchronicity-rekor.<apex>`
+   (docs/REKOR-ZONE-KEY.md). It is separate from `keygen` because
+   `keygen` must stay runnable on an offline host and this step needs
+   egress; it is idempotent, so re-running only refreshes the stored
+   checkpoint against a grown tree. Nothing is stored that did not
+   verify.
+
+3. Start the primary (systemd unit in `ops/systemd/`). First boot
    migrates the DB, writes zone metadata and publishes the (empty) zone.
 
-3. **First user**: `controlplane seed-admin you@example.com` prints a
+4. **First user**: `controlplane seed-admin you@example.com` prints a
    one-time sign-in link.
 
-4. Start replicas + your replication tooling on the `ns` hosts.
+5. Start replicas + your replication tooling on the `ns` hosts.
 
-5. **Delegate at the parent zone**:
+6. **Delegate at the parent zone**:
    - `NS` records pointing at `ns1.<base>`, `ns2.<base>`;
    - glue `A`/`AAAA` for those names (they match `CP_NS_HOSTS`);
    - the `DS` record from step 1.
 
-6. **Verify from outside** (must print `; fully validated`):
+7. **Verify from outside** (must print `; fully validated`):
 
    ```sh
    delv _synchronicity.<net>.<org>.<base> TXT +rtrace
@@ -140,6 +160,15 @@ control plane itself with
   this is a planned outage of new-validation, existing caches keep
   working. **Zone key rollover** (proactive) is the same dance with both
   DS records present during the window; v1 keeps this manual and rare.
+  With transparency enabled, the new key is logged *before* it signs
+  anything: `keygen`, then `rekor-publish`, then the DS steps.
+- **Zone key transparency** (docs/REKOR-ZONE-KEY.md): `rekor-publish`
+  puts the zone key on a public log and the zone serves the proof at
+  `_synchronicity-rekor.<apex>`. Rollout is phased — publish first
+  (`CP_REKOR_REQUIRE` unset), turn the gate on once every key in play has
+  a verified record. With the gate on, *every* publish path refuses while
+  the active key has none, including the hourly re-sign; that is
+  deliberate, and `rekor-publish` is how you get out of it.
 - **Backups**: the litestream bucket *is* the database backup. The key
   file is backed up offline from the ceremony. Those two artifacts
   restore the whole service.

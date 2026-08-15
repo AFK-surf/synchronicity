@@ -62,8 +62,32 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2]
+  [v1, v2, v3]
 }
+
+/// V3: zone-key transparency (docs/REKOR-ZONE-KEY.md §5.2). One row per
+/// zone-key lifecycle event, holding the entry exactly as it was logged
+/// plus the checkpoint and audit path that prove it is in the tree. The
+/// primary key is (key_tag, action) because a key is created once, rolled
+/// over once and retired once; re-publishing refreshes the row rather than
+/// minting a second entry for the same claim.
+const v3 = "
+CREATE TABLE rekor_records (
+  key_tag         INTEGER NOT NULL,
+  apex            TEXT    NOT NULL,
+  action          TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
+  dsse_payload    BLOB    NOT NULL,
+  dsse_signature  BLOB    NOT NULL,
+  log_id          BLOB    NOT NULL CHECK (length(log_id) = 32),
+  log_index       INTEGER NOT NULL,
+  checkpoint      BLOB    NOT NULL,
+  inclusion_path  BLOB    NOT NULL,
+  integrated_at   INTEGER NOT NULL,
+  verified_at     INTEGER NOT NULL,
+  PRIMARY KEY (key_tag, action)
+);
+CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
+"
 
 /// V2: DNS answers query SQLite directly (no in-memory snapshot), so
 /// canonical DNS order must be computable in SQL — `sort_key` is the

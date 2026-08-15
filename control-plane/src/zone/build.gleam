@@ -20,6 +20,14 @@ pub const ttl_data = 300
 /// Infrastructure records: NS, DNSKEY, glue.
 pub const ttl_infra = 3600
 
+/// Zone-key proofs: a day, clamped to the client's own 24 h ceiling. The
+/// zone key changes rarely, and the client caches this separately from the
+/// membership answer — so the steady-state refresh stays one TXT query.
+pub const ttl_rekor = 86_400
+
+/// The label the zone-key proofs live under, one below the apex.
+pub const rekor_label = "_synchronicity-rekor"
+
 pub type Rrset {
   Rrset(owner: Name, rtype: Int, ttl: Int, rdatas: List(BitArray))
 }
@@ -84,8 +92,28 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
       )
     })
 
-  let data = list.flatten([[soa, ns, dnskey], glue, txt])
+  let data =
+    list.flatten([[soa, ns, dnskey], glue, txt, rekor_rrsets(input, apex)])
   Ok(list.append(data, nsec_chain(data)))
+}
+
+/// The zone-key transparency records (docs/REKOR-ZONE-KEY.md §3): one TXT
+/// record per proof, at the apex, under `_synchronicity-rekor`. They are
+/// signed like every other RRset and re-signed on every publish; a zone
+/// with no proofs simply has no such owner name, which is what phase 0
+/// looks like from a client.
+fn rekor_rrsets(input: ZoneInput, apex: Name) -> List(Rrset) {
+  case input.rekor_proofs {
+    [] -> []
+    proofs -> [
+      Rrset(
+        [rekor_label, ..apex],
+        wire.type_txt,
+        ttl_rekor,
+        list.map(proofs, rdata.txt),
+      ),
+    ]
+  }
 }
 
 /// The canonical owner order and the NSEC records it induces — exposed for

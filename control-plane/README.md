@@ -15,6 +15,11 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
 
 - **Organizations** have **users** (owner / admin / member roles, via
   invites) and **devices**.
+- The zone key can be put on a public transparency log
+  (`controlplane rekor-publish`), with the proof served inside the zone at
+  `_synchronicity-rekor.<apex>` so clients verify it offline — a
+  substituted DS then has to be a *public* substitution or fail
+  validation. See [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md).
 - Each org has **networks**; a network is one synchronicity cluster and
   owns one membership name: `_synchronicity.<network>.<org>.<base>`.
 - A **device** is one `id=` label plus its keys. Key rotation follows
@@ -92,6 +97,9 @@ listen address.
 | `CP_GOOGLE_CLIENT_SECRET` | primary | Google OAuth client secret. |
 | `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in. |
 | `CP_GITHUB_CLIENT_SECRET` | primary | GitHub OAuth client secret. |
+| `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint. Default `https://rekor.sigstore.dev`. |
+| `CP_REKOR_KEY` | primary | File pinning the log's verification key. Required by `rekor-publish`: this build ships no embedded log key. |
+| `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 
 Day-2 operations (replicas, key ceremony, backups) live in
 `ops/RUNBOOK.md`.

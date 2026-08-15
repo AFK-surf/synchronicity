@@ -23,9 +23,15 @@ use synch_core::{
     NodeId, OriginId,
 };
 
-use hickory_resolver::proto::dnssec::TrustAnchors;
+use hickory_resolver::proto::{
+    dnssec::TrustAnchors,
+    rr::{Name, RecordType},
+};
 
-use crate::error::NetError;
+use crate::{
+    error::NetError,
+    rekor::{self, LogKeys, ProofError, RekorProof, VerifiedRecord, ZoneKey},
+};
 
 /// The label the membership TXT records live under.
 pub const TXT_PREFIX: &str = "_synchronicity";
@@ -46,6 +52,15 @@ pub const DEFAULT_DOH_URL: &str = "https://1.1.1.1/dns-query";
 /// The query name for a membership domain.
 pub fn query_name(domain: &str) -> String {
     format!("{TXT_PREFIX}.{domain}")
+}
+
+/// The query name a zone's key-transparency proofs live under (§3).
+///
+/// One name per zone, at the apex — one zone key, one proof set. The client
+/// learns the apex from the RRSIG signer field it already validates, not
+/// from the membership name it asked about.
+pub fn rekor_query_name(apex: &str) -> String {
+    format!("{}.{}", rekor::REKOR_TXT_PREFIX, apex)
 }
 
 /// Clamps a TTL into the §3.2 window.
@@ -303,6 +318,8 @@ fn doh_url(url: &str) -> Result<reqwest::Url, NetError> {
 #[derive(Clone)]
 pub struct DnssecResolver {
     handle: hickory_resolver::net::dnssec::DnssecDnsHandle<DohHandle>,
+    rekor: RekorPolicy,
+    log_keys: std::sync::Arc<LogKeys>,
 }
 
 impl std::fmt::Debug for DnssecResolver {
@@ -347,6 +364,60 @@ pub struct ResolverOptions {
     /// With this set, nothing signed under the real root validates any more:
     /// an override is a different universe, not an addition to this one.
     pub trust_anchor: Option<std::path::PathBuf>,
+    /// Whether a validated answer additionally requires a verified
+    /// transparency-log record for the zone key that signed it (§4.1).
+    ///
+    /// `None` takes the default [`ResolverOptions::rekor_policy`] resolves:
+    /// require on the ICANN path once a log key is pinned, off otherwise
+    /// and behind a pinned anchor. The option is three-state on purpose —
+    /// "unset" has to mean *the default for this trust configuration*,
+    /// while an explicit `--rekor` overrides it in both directions.
+    pub rekor: Option<RekorPolicy>,
+    /// A file of transparency-log verification key(s) *replacing* the
+    /// embedded one (§4.1).
+    ///
+    /// PEM `PUBLIC KEY` blocks or one base64 SubjectPublicKeyInfo per line.
+    /// Same semantics as `trust_anchor`: an override is a different
+    /// universe. A self-hosted log lives here.
+    pub rekor_key: Option<std::path::PathBuf>,
+}
+
+/// Whether zone-key transparency is enforced (§4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RekorPolicy {
+    /// A validated answer is discarded unless the zone key that signed it
+    /// carries a verified log record. Fail closed, as §4.3 requires.
+    Require,
+    /// No log record is consulted. DNSSEC alone decides, as it did before
+    /// this design existed.
+    Off,
+}
+
+impl ResolverOptions {
+    /// The policy in force, resolving the default when none was chosen.
+    ///
+    /// The default is `require` against the ICANN root — but only once a
+    /// log key is actually pinned, by `rekor_key` or by a build whose
+    /// embedded snapshot has landed. Requiring a record that no pinned key
+    /// could ever verify would fail every refresh of every deployment the
+    /// moment it upgraded, which is enforcement before rollout
+    /// (docs/REKOR-ZONE-KEY.md §7); an explicit `require` still gets that
+    /// strictness, stated rather than inherited. Behind `trust_anchor` the
+    /// default is `off`: a pinned anchor file is already a direct key pin,
+    /// so there is no delegation chain left for a substitution attack to
+    /// ride — opt-in in that universe, not absent.
+    pub fn rekor_policy(&self) -> RekorPolicy {
+        match self.rekor {
+            Some(policy) => policy,
+            None => {
+                let pinned = self.rekor_key.is_some() || !LogKeys::embedded().is_empty();
+                match (&self.trust_anchor, pinned) {
+                    (None, true) => RekorPolicy::Require,
+                    _ => RekorPolicy::Off,
+                }
+            }
+        }
+    }
 }
 
 impl DnssecResolver {
@@ -376,41 +447,200 @@ impl DnssecResolver {
         };
         let url = doh_url(options.doh_url.as_deref().unwrap_or(DEFAULT_DOH_URL))?;
         let handle = DohHandle::new(url)?;
+        let log_keys = match &options.rekor_key {
+            None => LogKeys::embedded(),
+            Some(path) => LogKeys::from_file(path).map_err(|e| NetError::Dns(e.to_string()))?,
+        };
         Ok(DnssecResolver {
             handle: hickory_resolver::net::dnssec::DnssecDnsHandle::with_trust_anchor(
                 handle, anchors,
             ),
+            rekor: options.rekor_policy(),
+            log_keys: std::sync::Arc::new(log_keys),
         })
+    }
+
+    /// Whether this resolver requires zone-key transparency (§4.1).
+    pub fn rekor_policy(&self) -> RekorPolicy {
+        self.rekor
     }
 
     /// Resolves `_synchronicity.<domain> TXT`, discarding anything that does
     /// not validate.
     pub async fn lookup_txt(&self, domain: &str) -> Result<ValidatedTxt, NetError> {
-        use futures_core::Stream;
-        use hickory_resolver::{
-            net::xfer::DnsHandle,
-            proto::{op::Query, rr::Name, rr::RecordType},
-        };
-
         let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
         let name = query_name(&domain);
-        let mut qname =
-            Name::from_utf8(&name).map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
-        qname.set_fqdn(true);
-        let query = Query::query(qname, RecordType::TXT);
-        let mut stream = self.handle.lookup(query, Default::default());
-        let response = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx))
-            .await
-            .ok_or_else(|| NetError::Dns(format!("{name}: the endpoint sent no response")))?
-            .map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
+        let response = self.lookup(&name, RecordType::TXT).await?;
         secure_txt(&name, &response.answers)
     }
 
     /// Resolves and applies the §3.2 rules in one step.
+    ///
+    /// Under [`RekorPolicy::Require`] this is where §4.2's three validated
+    /// lookups happen, over the one DoH transport: the membership TXT, the
+    /// DNSKEY at the apex its RRSIG names, and the proof record beside it.
+    /// A refused proof refuses the whole answer — the caller keeps its
+    /// cached member set until its own expiry, exactly as for a bogus chain.
     pub async fn member_set(&self, domain: &str) -> Result<(MemberSet, Duration), NetError> {
-        let validated = self.lookup_txt(domain).await?;
-        let set = MemberSet::from_records(domain, &validated.records)?;
+        let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
+        let name = query_name(&domain);
+        let response = self.lookup(&name, RecordType::TXT).await?;
+        let validated = secure_txt(&name, &response.answers)?;
+        if self.rekor == RekorPolicy::Require {
+            let (apex, key_tag) = signing_key_of(&name, &response.answers)?;
+            self.verify_zone_key(&apex, key_tag).await?;
+        }
+        let set = MemberSet::from_records(&domain, &validated.records)?;
         Ok((set, validated.ttl))
+    }
+
+    /// Verifies that the zone key which signed an answer is on the public
+    /// record (§4.2). Two more validated lookups, then no network at all.
+    pub async fn verify_zone_key(
+        &self,
+        apex: &Name,
+        key_tag: u16,
+    ) -> Result<VerifiedRecord, NetError> {
+        let apex_text = apex.to_string();
+        let dnskey_rdata = self.zone_dnskey(apex, key_tag).await?;
+
+        let name = rekor_query_name(apex_text.trim_end_matches('.'));
+        let response = self.lookup(&name, RecordType::TXT).await?;
+        let absent = || NetError::RekorAbsent {
+            name: name.clone(),
+            key_tag,
+        };
+        // A name that does not exist and a name that exists with no proof
+        // for this key tag are the same fact to a client: this key was never
+        // logged, as far as the zone is willing to say.
+        let records = match secure_txt(&name, &response.answers) {
+            Ok(validated) => validated.records,
+            Err(NetError::Dns(_)) if response.answers.is_empty() => return Err(absent()),
+            Err(e) => return Err(e),
+        };
+
+        let mut proof = None;
+        for record in &records {
+            match RekorProof::from_txt(record) {
+                // Other key tags belong to the other half of a rollover
+                // window; they are not this answer's business.
+                Ok(candidate) if candidate.key_tag == key_tag => proof = Some(candidate),
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(NetError::RekorMalformed {
+                        name: name.clone(),
+                        reason: e.to_string(),
+                    })
+                }
+            }
+        }
+        let proof = proof.ok_or_else(absent)?;
+
+        let key = ZoneKey {
+            apex: &apex_text,
+            key_tag,
+            dnskey_rdata: &dnskey_rdata,
+        };
+        rekor::verify(&proof, &key, &self.log_keys).map_err(|e| rekor_error(&name, e))
+    }
+
+    /// The validated DNSKEY rdata for one key tag at `apex` (§4.2 step 2).
+    async fn zone_dnskey(&self, apex: &Name, key_tag: u16) -> Result<Vec<u8>, NetError> {
+        use hickory_resolver::proto::{
+            dnssec::{rdata::DNSSECRData, PublicKey},
+            rr::RData,
+        };
+
+        let name = apex.to_string();
+        let response = self.lookup(&name, RecordType::DNSKEY).await?;
+        for record in &response.answers {
+            if record.name != *apex || !record.proof.is_secure() {
+                continue;
+            }
+            let RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)) = &record.data else {
+                continue;
+            };
+            if dnskey.calculate_key_tag().ok() != Some(key_tag) {
+                continue;
+            }
+            // The rdata as the wire carries it — the exact bytes the entry's
+            // subject digest commits to.
+            let mut rdata = Vec::with_capacity(4 + 64);
+            rdata.extend_from_slice(&dnskey.flags().to_be_bytes());
+            rdata.push(3);
+            rdata.push(u8::from(dnskey.public_key().algorithm()));
+            rdata.extend_from_slice(dnskey.public_key().public_bytes());
+            return Ok(rdata);
+        }
+        Err(NetError::Dns(format!(
+            "{name}: no DNSSEC-secure DNSKEY with key tag {key_tag}, \
+             which is the key the answer was signed by"
+        )))
+    }
+
+    /// One validated lookup over the single transport.
+    async fn lookup(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Result<hickory_resolver::proto::op::DnsResponse, NetError> {
+        use futures_core::Stream;
+        use hickory_resolver::{net::xfer::DnsHandle, proto::op::Query};
+
+        let mut qname = Name::from_utf8(name).map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
+        qname.set_fqdn(true);
+        let query = Query::query(qname, record_type);
+        let mut stream = self.handle.lookup(query, Default::default());
+        std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx))
+            .await
+            .ok_or_else(|| NetError::Dns(format!("{name}: the endpoint sent no response")))?
+            .map_err(|e| NetError::Dns(format!("{name}: {e}")))
+    }
+}
+
+/// The apex and key tag of the key that signed an answer.
+///
+/// Taken from the RRSIG the validator accepted, never from the answer's
+/// contents: this is the one place the client learns which zone key it is
+/// about to demand a public record for.
+fn signing_key_of(
+    name: &str,
+    answers: &[hickory_resolver::proto::rr::Record],
+) -> Result<(Name, u16), NetError> {
+    use hickory_resolver::proto::{
+        dnssec::rdata::DNSSECRData,
+        rr::{RData, RecordType},
+    };
+
+    let mut qname = Name::from_utf8(name).map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
+    qname.set_fqdn(true);
+    for record in answers {
+        if record.name != qname || !record.proof.is_secure() {
+            continue;
+        }
+        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
+            continue;
+        };
+        if rrsig.input().type_covered != RecordType::TXT {
+            continue;
+        }
+        return Ok((rrsig.input().signer_name.clone(), rrsig.input().key_tag));
+    }
+    Err(NetError::Dns(format!(
+        "{name}: the validated answer carries no RRSIG naming its signer"
+    )))
+}
+
+/// Lifts a verification failure into the error class `synch doctor` explains.
+fn rekor_error(name: &str, error: ProofError) -> NetError {
+    let name = name.to_string();
+    match error {
+        ProofError::Malformed(reason) => NetError::RekorMalformed { name, reason },
+        ProofError::Possession(reason) => NetError::RekorPossession { name, reason },
+        ProofError::Binding(reason) => NetError::RekorBinding { name, reason },
+        ProofError::Inclusion(reason) => NetError::RekorInclusion { name, reason },
+        ProofError::Checkpoint(reason) => NetError::RekorCheckpoint { name, reason },
+        ProofError::UnknownLog(reason) => NetError::RekorUnknownLog { name, reason },
     }
 }
 
@@ -647,6 +877,8 @@ mod tests {
             DnssecResolver::with_options(&ResolverOptions {
                 doh_url: Some(url.into()),
                 trust_anchor: None,
+                rekor: None,
+                rekor_key: None,
             })
             .unwrap();
         }
@@ -656,6 +888,8 @@ mod tests {
         let err = DnssecResolver::with_options(&ResolverOptions {
             doh_url: None,
             trust_anchor: Some("/does/not/exist.key".into()),
+            rekor: None,
+            rekor_key: None,
         })
         .unwrap_err();
         assert!(err.to_string().contains("trust anchor"), "{err}");
@@ -664,6 +898,8 @@ mod tests {
         let err = DnssecResolver::with_options(&ResolverOptions {
             doh_url: None,
             trust_anchor: Some(empty.path().to_path_buf()),
+            rekor: None,
+            rekor_key: None,
         })
         .unwrap_err();
         assert!(err.to_string().contains("no DNSKEY records"), "{err}");
@@ -679,6 +915,8 @@ mod tests {
         DnssecResolver::with_options(&ResolverOptions {
             doh_url: Some("http://127.0.0.1:8053/dns-query".into()),
             trust_anchor: Some(anchor.path().to_path_buf()),
+            rekor: None,
+            rekor_key: None,
         })
         .unwrap();
     }
@@ -742,6 +980,8 @@ mod tests {
         let resolver = DnssecResolver::with_options(&ResolverOptions {
             doh_url: Some(format!("http://127.0.0.1:{port}/dns-query")),
             trust_anchor: None,
+            rekor: None,
+            rekor_key: None,
         })
         .unwrap();
         let err = tokio::time::timeout(

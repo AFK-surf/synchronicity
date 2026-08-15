@@ -7,6 +7,9 @@ import gleam/bit_array
 import gleam/list
 import gleam/result
 import gleam/string
+import rekor/proof
+import rekor/publish as rekor_publish
+import rekor/store as rekor_store
 import store/sqlite.{type Connection, Text}
 import thirtytwo
 
@@ -37,7 +40,15 @@ pub type TxtName {
 }
 
 pub type ZoneInput {
-  ZoneInput(meta: ZoneMeta, ns_hosts: List(NsHost), txt_names: List(TxtName))
+  ZoneInput(
+    meta: ZoneMeta,
+    ns_hosts: List(NsHost),
+    txt_names: List(TxtName),
+    /// Zone-key transparency proofs for the key the zone publishes, in the
+    /// base64url form one TXT record carries. Empty until `rekor-publish`
+    /// has run — phase 0 of the rollout serves a zone without them.
+    rekor_proofs: List(String),
+  )
 }
 
 pub type ModelError {
@@ -61,7 +72,30 @@ pub fn read(conn: Connection) -> Result(ZoneInput, ModelError) {
   use meta <- result.try(read_meta(conn))
   use ns_hosts <- result.try(read_ns(conn, meta.apex))
   use txt_names <- result.try(read_txt_names(conn, meta.apex))
-  Ok(ZoneInput(meta, ns_hosts, txt_names))
+  use rekor_proofs <- result.try(read_rekor_proofs(conn, meta.key_tag))
+  Ok(ZoneInput(meta, ns_hosts, txt_names, rekor_proofs))
+}
+
+/// The proof records for the key this zone publishes.
+///
+/// A stored row that cannot be turned back into a proof is dropped rather
+/// than served: a malformed record would make every client refuse the whole
+/// zone, which is a worse outcome than the one the row was meant to fix.
+fn read_rekor_proofs(
+  conn: Connection,
+  key_tag: Int,
+) -> Result(List(String), ModelError) {
+  use records <- result.try(
+    rekor_store.servable(conn, key_tag) |> result.map_error(Db),
+  )
+  Ok(
+    records
+    |> list.filter_map(fn(record) {
+      rekor_publish.to_proof(record)
+      |> result.map(proof.to_txt)
+      |> result.replace_error(Nil)
+    }),
+  )
 }
 
 /// The health probe's view of the zone: current serial and the soonest

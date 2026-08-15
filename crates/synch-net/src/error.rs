@@ -63,6 +63,68 @@ pub enum NetError {
     /// The DNSSEC resolver failed or refused a response (§3.2, fail closed).
     #[error("dns: {0}")]
     Dns(String),
+    /// The zone publishes no transparency record for the key that signed the
+    /// answer (docs/REKOR-ZONE-KEY.md §4.3).
+    ///
+    /// Absence on a not-yet-upgraded control plane reads differently from
+    /// every variant below it, which are alarms: this one is a zone that has
+    /// not caught up, or a key nobody ever logged.
+    #[error("zone key transparency: {name} publishes no record for key tag {key_tag}")]
+    RekorAbsent {
+        /// The proof record's owner name.
+        name: String,
+        /// The key tag the answer's RRSIG named.
+        key_tag: u16,
+    },
+    /// A proof record exists but is not a v1 `RekorProof`.
+    #[error("zone key transparency: malformed proof at {name}: {reason}")]
+    RekorMalformed {
+        /// The proof record's owner name.
+        name: String,
+        /// What failed to decode.
+        reason: String,
+    },
+    /// The entry's DSSE signature is not the zone key's: whoever logged it
+    /// did not hold the key it claims to log.
+    #[error("zone key transparency: {name}: possession: {reason}")]
+    RekorPossession {
+        /// The proof record's owner name.
+        name: String,
+        /// Which possession check failed.
+        reason: String,
+    },
+    /// The logged Statement does not describe the key and zone observed.
+    #[error("zone key transparency: {name}: binding: {reason}")]
+    RekorBinding {
+        /// The proof record's owner name.
+        name: String,
+        /// Which binding check failed.
+        reason: String,
+    },
+    /// The entry is not in the tree its checkpoint commits to.
+    #[error("zone key transparency: {name}: inclusion: {reason}")]
+    RekorInclusion {
+        /// The proof record's owner name.
+        name: String,
+        /// Where the audit path failed.
+        reason: String,
+    },
+    /// The checkpoint is not signed by the log it claims to come from.
+    #[error("zone key transparency: {name}: checkpoint: {reason}")]
+    RekorCheckpoint {
+        /// The proof record's owner name.
+        name: String,
+        /// Which checkpoint check failed.
+        reason: String,
+    },
+    /// The entry lives in a log this client was never told to trust.
+    #[error("zone key transparency: {name}: unknown log: {reason}")]
+    RekorUnknownLog {
+        /// The proof record's owner name.
+        name: String,
+        /// Which log was named, and what is pinned instead.
+        reason: String,
+    },
     /// A caller supplied an invalid argument.
     #[error("{0}")]
     Invalid(String),

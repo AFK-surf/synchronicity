@@ -139,10 +139,13 @@ flags/env:
 | `rekor` | `--rekor <require\|off>` / `SYNCH_REKOR` | Whether a validated answer additionally requires a verified log record for the signing zone key. |
 | `rekor_key` | `--rekor-key <file>` / `SYNCH_REKOR_KEY` | File of log checkpoint-verification key(s), *replacing* the embedded Sigstore production key — the same "an override is a different universe" semantics as `--dnssec-anchor`. |
 
-Defaults: `require` when validating against the ICANN root; `off` when
-`--dnssec-anchor` is in force. A pinned anchor file is already a direct key
-pin — there is no delegation chain left for a substitution attack to ride —
-so the requirement is opt-in there (self-hosted log + `--rekor-key`).
+Defaults: `require` when validating against the ICANN root *and* a log key
+is pinned (embedded or `--rekor-key`) — a build with an empty pin set
+defaults to `off`, because requiring a record nothing could verify is
+enforcement before rollout (§7); `off` when `--dnssec-anchor` is in force. A
+pinned anchor file is already a direct key pin — there is no delegation
+chain left for a substitution attack to ride — so the requirement is opt-in
+there (self-hosted log + `--rekor-key`).
 The embedded default key is snapshotted from Sigstore's TUF root at build
 time; a full in-client TUF workflow is explicitly out of v1 (§8).
 
