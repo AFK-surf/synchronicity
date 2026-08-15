@@ -169,6 +169,25 @@ pub enum Command {
         /// `[<origin>:]<space>/<path>`.
         reference: String,
     },
+    /// Show which files differ between two origins' published trees.
+    ///
+    /// Name-status only (created/modified/deleted), no content is fetched.
+    /// Compares this node's own tree against `--to` by default, or two remotes
+    /// with `--from`.
+    Compare {
+        /// `<space>[/<dir>]` — the space, or a directory within it. No origin
+        /// prefix: name origins with `--from` and `--to`.
+        reference: String,
+        /// The origin to compare against. Required.
+        #[arg(long, value_name = "ORIGIN")]
+        to: String,
+        /// The baseline origin. Defaults to this node's own origin.
+        #[arg(long, value_name = "ORIGIN")]
+        from: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Continuous read-only materialization.
     Mirror {
         /// The mirror subcommand.
@@ -507,6 +526,17 @@ mod tests {
             vec!["synch", "get", "nas@x:media/a.txt", "-o", "/tmp/a"],
             vec!["synch", "take", "nas@x:media/a.txt"],
             vec!["synch", "log", "media/a.txt"],
+            vec!["synch", "compare", "media", "--to", "nas@x"],
+            vec![
+                "synch",
+                "compare",
+                "media/photos",
+                "--from",
+                "laptop@x",
+                "--to",
+                "nas@x",
+            ],
+            vec!["synch", "compare", "media", "--to", "nas@x", "--json"],
             vec!["synch", "mirror", "add", "media", "/mnt/nas"],
             vec![
                 "synch", "mirror", "add", "media", "/mnt/nas", "--policy", "strict",

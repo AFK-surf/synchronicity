@@ -901,6 +901,9 @@ synch get  [<origin>:]<space>/<path> [-o …]  fetch the selected version to a f
            [--from <o>|--strict]
 synch take <origin>:<space>/<path>           adopt a version as my own (ends divergence)
 synch log  [<origin>:]<space>/<path>         per-origin publish history
+synch compare <space>[/<dir>] --to <origin>  name-status diff (created/modified/deleted)
+           [--from <origin>] [--json]        between two origins' published trees; no
+                                             content fetched, --from defaults to self
 synch mirror add <space> <dir> [--policy …]  continuous materialization of the unified
 synch mirror rm|ls|sync                      tree under a version policy (§7.2)
 

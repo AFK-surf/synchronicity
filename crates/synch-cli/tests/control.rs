@@ -1040,6 +1040,118 @@ async fn the_tree_can_be_listed_and_resolved_structurally() {
     daemon.shutdown().await;
 }
 
+/// `synch compare` reports which files differ between the local node and a peer,
+/// name-status only, over the control socket.
+#[tokio::test]
+async fn compare_reports_name_status_between_the_local_node_and_a_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    // The local node publishes these under its own origin (nas@cluster.example).
+    let space = space_with(&[
+        ("keep.txt", b"same"),
+        ("changed.txt", b"ours"),
+        ("only_local.txt", b"here"),
+    ]);
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    lines(
+        data_dir,
+        Request::SpaceAdd {
+            id: "media".into(),
+            path: space.path().to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+    lines(data_dir, Request::Scan).await;
+
+    // A peer publishes: keep.txt identical, changed.txt with other bytes, and a
+    // file the local node does not have.
+    let peer = OriginId::named("laptop", "cluster.example").unwrap();
+    let put = |path: &str, bytes: &[u8]| {
+        let root = daemon
+            .node
+            .store()
+            .ingest_bytes(bytes, synch_core::now_ns())
+            .unwrap();
+        daemon
+            .node
+            .store()
+            .put_entry(
+                &peer,
+                "media",
+                path,
+                &synch_core::FileEntry::file(bytes.len() as u64, 1, root, 1),
+            )
+            .unwrap();
+    };
+    put("keep.txt", b"same");
+    put("changed.txt", b"theirs");
+    put("only_peer.txt", b"new");
+
+    // Default baseline is the local node; --to names the peer.
+    let text = lines(
+        data_dir,
+        Request::Compare {
+            reference: "media".into(),
+            from: None,
+            to: "laptop@cluster.example".into(),
+            json: false,
+        },
+    )
+    .await;
+    assert!(text.contains("M  changed.txt"), "{text}");
+    assert!(text.contains("A  only_peer.txt"), "{text}");
+    assert!(text.contains("D  only_local.txt"), "{text}");
+    assert!(
+        !text.contains("keep.txt"),
+        "identical file must not appear:\n{text}"
+    );
+    assert!(
+        text.contains("1 created \u{00b7} 1 modified \u{00b7} 1 deleted"),
+        "{text}"
+    );
+
+    // JSON form carries the same three changes.
+    let json = lines(
+        data_dir,
+        Request::Compare {
+            reference: "media".into(),
+            from: None,
+            to: "laptop@cluster.example".into(),
+            json: true,
+        },
+    )
+    .await;
+    assert!(
+        json.contains("\"status\":\"modified\",\"path\":\"changed.txt\""),
+        "{json}"
+    );
+    assert!(
+        json.contains("\"status\":\"created\",\"path\":\"only_peer.txt\""),
+        "{json}"
+    );
+    assert!(
+        json.contains("\"status\":\"deleted\",\"path\":\"only_local.txt\""),
+        "{json}"
+    );
+
+    // An unknown target origin is refused rather than reported as a full delete.
+    assert_eq!(
+        failure(
+            data_dir,
+            Request::Compare {
+                reference: "media".into(),
+                from: None,
+                to: "ghost@cluster.example".into(),
+                json: false,
+            },
+        )
+        .await,
+        ErrorCode::NotFound
+    );
+
+    daemon.shutdown().await;
+}
+
 /// A divergent path is left out of a `strict` listing rather than answered with
 /// one side's metadata, and resolving it directly says what is wrong (§8).
 #[tokio::test]

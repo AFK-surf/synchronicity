@@ -239,6 +239,17 @@ fn to_request(cli: &Cli) -> Result<Request> {
         Command::Log { reference } => Request::Log {
             reference: reference.clone(),
         },
+        Command::Compare {
+            reference,
+            to,
+            from,
+            json,
+        } => Request::Compare {
+            reference: reference.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            json: *json,
+        },
         Command::Recover { wait, gap } => {
             // Parsed here as well as on the daemon, so a typo fails before a
             // connection is made rather than an hour into a quiesce.
