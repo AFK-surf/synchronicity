@@ -6,10 +6,36 @@
 
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{
+    event::{AccessKind, AccessMode},
+    EventKind, RecommendedWatcher, RecursiveMode, Watcher as _,
+};
 use tokio::sync::mpsc;
 
 use crate::{error::Result, node::Node};
+
+/// Whether an event could have changed what a scan would find.
+///
+/// Reading is not changing, and the distinction is not a nicety here: a scan
+/// opens and reads every space directory and every file it has to hash, and
+/// inotify reports those opens, reads, and closes as events in their own
+/// right. Hinting on them makes the watcher chase its own tail — hint,
+/// rescan, read, hint — one full rescan of every space per debounce window,
+/// forever, on a tree nobody has touched. That is what an idle daemon was
+/// spending a large fraction of a core on, and what an idle *peer* was then
+/// spending it on too, because each of those rescans went on to stage,
+/// publish, and push.
+///
+/// So access events are dropped, with one exception: a close-after-write is
+/// how an editor's final write shows up on some platforms. Everything else —
+/// create, modify, remove, and anything the backend could not classify —
+/// still hints, and the scan itself decides whether anything really moved.
+fn changes_something(event: &notify::Event) -> bool {
+    match event.kind {
+        EventKind::Access(access) => matches!(access, AccessKind::Close(AccessMode::Write)),
+        _ => true,
+    }
+}
 
 /// A debounced rescan trigger over every configured space.
 #[derive(Debug)]
@@ -27,7 +53,7 @@ impl SpaceWatcher {
     pub fn start(node: &Node) -> Result<SpaceWatcher> {
         let (tx, rx) = mpsc::channel(64);
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            if event.is_ok() {
+            if event.is_ok_and(|event| changes_something(&event)) {
                 // A full channel already means a rescan is pending, so dropping
                 // the hint loses nothing.
                 let _ = tx.try_send(());
@@ -184,6 +210,45 @@ impl Node {
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
+    use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
+
+    fn event(kind: EventKind) -> notify::Event {
+        notify::Event::new(kind)
+    }
+
+    /// The watcher must not hint on its own reading.
+    ///
+    /// A scan opens and reads every space directory and every file it hashes,
+    /// and inotify reports each of those as an event. Hinting on them costs a
+    /// full rescan of every space per debounce window, forever, on a tree
+    /// nobody has touched — measured at a fifth of a core on an idle daemon
+    /// indexing 2 000 small files, and proportional to the tree from there.
+    #[test]
+    fn reads_are_not_change_hints_but_writes_are() {
+        for read in [
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Any),
+            EventKind::Access(AccessKind::Other),
+        ] {
+            assert!(!changes_something(&event(read)), "{read:?}");
+        }
+        for change in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Remove(RemoveKind::File),
+            // How an editor's finished write shows up where the backend
+            // reports it as an access.
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            // Unclassifiable: hint, and let the scan decide.
+            EventKind::Any,
+            EventKind::Other,
+        ] {
+            assert!(changes_something(&event(change)), "{change:?}");
+        }
+    }
 
     #[tokio::test]
     async fn a_watcher_starts_over_configured_spaces() {
