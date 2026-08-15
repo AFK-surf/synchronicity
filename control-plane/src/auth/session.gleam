@@ -3,7 +3,6 @@
 //// stores its SHA-256. CSRF is a per-session secret the SPA echoes in a
 //// header on every mutation.
 
-import gleam/bit_array
 import gleam/crypto
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import util/id

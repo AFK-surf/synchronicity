@@ -6,6 +6,7 @@ import api/auth_api.{type AuthContext}
 import api/middleware
 import api/networks_api
 import api/orgs_api
+import api/static
 import auth/session.{type Session}
 import dns/doh
 import gleam/http.{Delete, Get, Patch, Post, Put}
@@ -34,7 +35,12 @@ pub fn handle(req: Request, ctx: Context) -> Response {
         Some(auth) -> primary_routes(req, auth)
         None -> wisp.not_found()
       }
-    _ -> wisp.not_found()
+    _ ->
+      case ctx.auth {
+        // The dashboard ships with the primary; replicas serve DNS only.
+        Some(_) -> static.serve(req, wisp.not_found)
+        None -> wisp.not_found()
+      }
   }
 }
 

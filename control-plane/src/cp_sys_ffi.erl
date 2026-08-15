@@ -1,7 +1,19 @@
 %% Thin FFI for the two system facilities gleam_erlang does not expose:
 %% wall-clock time and the program's arguments.
 -module(cp_sys_ffi).
--export([now_unix/0, argv/0, snapshot_put/1, snapshot_get/0]).
+-export([now_unix/0, argv/0, snapshot_put/1, snapshot_get/0, priv_dir/1]).
+
+priv_dir(Sub) ->
+    case code:priv_dir(controlplane) of
+        {error, _} ->
+            {error, nil};
+        Dir ->
+            Path = filename:join(Dir, unicode:characters_to_list(Sub)),
+            case filelib:is_dir(Path) of
+                true -> {ok, unicode:characters_to_binary(Path)};
+                false -> {error, nil}
+            end
+    end.
 
 now_unix() ->
     erlang:system_time(second).

@@ -41,6 +41,7 @@ jobs:
           cache-dependency-path: control-plane/web/package-lock.json
       - run: npm ci
       - run: npx tsc -b
+      - run: npx vitest run
       - run: npx vite build
 
   e2e-crossval:

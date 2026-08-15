@@ -9,9 +9,10 @@ csqlite:
 test: csqlite
     gleam test
 
-# Type-check and build the SPA.
+# Type-check, test, build the SPA, and stage it for the Gleam server.
 web-build:
-    cd web && npm ci && npx tsc -b && npx vite build
+    cd web && npm ci && npx tsc -b && npx vitest run && npx vite build
+    rm -rf priv/web && cp -r web/dist priv/web
 
 # Backend + frontend dev servers (backend on :8080, vite proxies to it).
 dev: csqlite

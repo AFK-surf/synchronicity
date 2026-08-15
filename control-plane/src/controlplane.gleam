@@ -29,7 +29,6 @@ import store/db
 import store/migrate
 import store/sqlite
 import thirtytwo
-import wisp
 import wisp/wisp_mist
 import zone/publish
 import zone/snapshot
