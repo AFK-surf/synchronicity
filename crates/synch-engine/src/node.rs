@@ -534,10 +534,7 @@ impl Node {
     pub fn manifest_change(&self) -> Result<StagedChange> {
         let mut spaces = Vec::new();
         for space in self.store().spaces()? {
-            let count = self
-                .store()
-                .list_entries(Some(self.origin()), &space.id, "", None, None)?
-                .len() as u64;
+            let count = self.store().count_entries(self.origin(), &space.id)?;
             spaces.push(SpaceInfo {
                 id: space.id,
                 description: space.local_path,

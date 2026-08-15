@@ -218,6 +218,21 @@ impl Store {
         )
     }
 
+    /// How many entries one origin has published for a space.
+    ///
+    /// The manifest carries this number and rebuilds it on every publish
+    /// (§4.2), so it is asked for once per batch over the whole space: counting
+    /// in SQL rather than materializing every row to call `.len()` on it keeps
+    /// a 100 000-file index from rebuilding itself in memory each time.
+    pub fn count_entries(&self, origin: &OriginId, space: &str) -> Result<u64> {
+        let count: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM entries WHERE origin_id = ?1 AND space = ?2",
+            params![origin.canonical(), space],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
     /// Every origin that has materialized entries.
     ///
     /// Used by `synch doctor` to name origins whose data this node still holds
@@ -901,6 +916,31 @@ mod tests {
 
         store.delete_entry(&o, "media", "a/b.txt").unwrap();
         assert!(store.entry(&o, "media", "a/b.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn counting_entries_is_scoped_to_one_origin_and_space() {
+        let (_d, store) = store();
+        let nas = origin("nas");
+        let laptop = origin("laptop");
+        let e = FileEntry::file(1, 0, Hash::new(b"c"), 1);
+        store.put_entry(&nas, "media", "a", &e).unwrap();
+        store.put_entry(&nas, "media", "b", &e).unwrap();
+        store.put_entry(&nas, "docs", "c", &e).unwrap();
+        store.put_entry(&laptop, "media", "d", &e).unwrap();
+
+        assert_eq!(store.count_entries(&nas, "media").unwrap(), 2);
+        assert_eq!(store.count_entries(&nas, "docs").unwrap(), 1);
+        assert_eq!(store.count_entries(&laptop, "media").unwrap(), 1);
+        assert_eq!(store.count_entries(&nas, "nothing").unwrap(), 0);
+        // And it agrees with the listing it stands in for.
+        assert_eq!(
+            store.count_entries(&nas, "media").unwrap() as usize,
+            store
+                .list_entries(Some(&nas), "media", "", None, None)
+                .unwrap()
+                .len()
+        );
     }
 
     #[test]

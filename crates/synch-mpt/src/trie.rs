@@ -53,6 +53,22 @@ impl Cursor {
     }
 }
 
+/// How deep, in nibbles, any walk over trie structure descends.
+///
+/// A key is at most [`MAX_KEY_LEN`] bytes (§12), so a value below this depth
+/// belongs to a key that could never have been inserted and can only come from
+/// a peer that built the structure by hand. Walks prune there rather than
+/// following it down.
+pub const MAX_DEPTH_NIBBLES: usize = MAX_KEY_LEN * 2;
+
+/// One level of an explicit walk stack: the cursor at that level, and which
+/// child nibble to visit next.
+#[derive(Debug)]
+pub(crate) struct Frame {
+    pub(crate) cursor: Cursor,
+    pub(crate) next: u8,
+}
+
 /// Maps the empty-trie sentinel onto `None`.
 pub fn root_opt(root: Hash) -> Option<Hash> {
     if root.is_empty_sentinel() {
@@ -507,6 +523,15 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         Ok(out)
     }
 
+    /// Walks a subtree, collecting values, with an explicit heap stack.
+    ///
+    /// Depth is attacker-controlled — a peer's trie is fetched by hash and
+    /// nothing about the *shape* it describes is canonicalized, so it may chain
+    /// extension nodes to any depth — and a recursive walk would abort the
+    /// process on a stack overflow rather than return an error (§12). The
+    /// frames therefore live on the heap, and the walk stops descending past
+    /// [`MAX_DEPTH_NIBBLES`], below which no key short enough to be valid can
+    /// begin.
     fn collect(
         &self,
         cursor: &Cursor,
@@ -515,37 +540,74 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         limit: Option<usize>,
         out: &mut Vec<Entry>,
     ) -> Result<(), MptError> {
-        if limit.is_some_and(|l| out.len() >= l) {
-            return Ok(());
-        }
-        if let Some(value) = cursor.value_ref() {
-            let key = Nibbles::from_nibbles(path)
-                .to_bytes()
-                .ok_or(MptError::OddDepthValue)?;
-            let include = match after {
-                Some(a) => key.as_slice() > a.to_bytes().unwrap_or_default().as_slice(),
-                None => true,
-            };
-            if include {
-                out.push((key, self.resolve(value)?));
-            }
-        }
-        for nibble in 0..16u8 {
+        let after_bytes = after.map(|a| a.to_bytes().unwrap_or_default());
+        let base = path.len();
+        let mut stack: Vec<Frame> = Vec::new();
+
+        self.take_value(cursor, path, after_bytes.as_deref(), limit, out)?;
+        stack.push(Frame {
+            cursor: cursor.clone(),
+            next: 0,
+        });
+
+        while let Some(top) = stack.len().checked_sub(1) {
             if limit.is_some_and(|l| out.len() >= l) {
                 return Ok(());
             }
-            path.push(nibble);
-            let skip = match after {
-                Some(a) => subtree_is_below(path, a.as_slice()),
-                None => false,
-            };
-            if !skip {
-                let child = self.cursor_child(cursor, nibble)?;
-                if !child.is_empty() {
-                    self.collect(&child, path, after, limit, out)?;
+            let nibble = stack[top].next;
+            if nibble >= 16 || path.len() >= MAX_DEPTH_NIBBLES {
+                stack.pop();
+                if path.len() > base {
+                    path.pop();
                 }
+                continue;
             }
-            path.pop();
+            stack[top].next += 1;
+            path.push(nibble);
+            let skip = after.is_some_and(|a| subtree_is_below(path, a.as_slice()));
+            if skip {
+                path.pop();
+                continue;
+            }
+            let child = self.cursor_child(&stack[top].cursor, nibble)?;
+            if child.is_empty() {
+                path.pop();
+                continue;
+            }
+            self.take_value(&child, path, after_bytes.as_deref(), limit, out)?;
+            stack.push(Frame {
+                cursor: child,
+                next: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Emits the value sitting exactly at `path`, if there is one and the scan
+    /// cursor has passed it.
+    fn take_value(
+        &self,
+        cursor: &Cursor,
+        path: &[u8],
+        after: Option<&[u8]>,
+        limit: Option<usize>,
+        out: &mut Vec<Entry>,
+    ) -> Result<(), MptError> {
+        if limit.is_some_and(|l| out.len() >= l) {
+            return Ok(());
+        }
+        let Some(value) = cursor.value_ref() else {
+            return Ok(());
+        };
+        let key = Nibbles::from_nibbles(path)
+            .to_bytes()
+            .ok_or(MptError::OddDepthValue)?;
+        let include = match after {
+            Some(a) => key.as_slice() > a,
+            None => true,
+        };
+        if include {
+            out.push((key, self.resolve(value)?));
         }
         Ok(())
     }

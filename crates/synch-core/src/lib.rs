@@ -23,7 +23,7 @@ pub use record::{
 };
 pub use wire::{
     BlobMessage, ChunkRanges, GroupRange, MptMessage, ALPN_BLOB, ALPN_MPT, MAX_BATCH,
-    MAX_FRAME_LEN, PROTO_VERSION,
+    MAX_FRAME_LEN, MAX_RANGES, MAX_SLICE_GROUPS, PROTO_VERSION,
 };
 
 /// The software identification string published in [`NodeManifest::software`].

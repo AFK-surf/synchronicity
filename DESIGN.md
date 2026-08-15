@@ -680,6 +680,13 @@ GetSlice   { root: Hash, ranges: ChunkRanges }   // ChunkRanges in 16 KiB group 
 SliceEnd   { served: ChunkRanges }               // what the provider actually had
 ```
 
+A slice is encoded into memory whole and travels in one framed message, so one
+exchange carries a bounded **window** — 512 groups, 8 MiB of payload — whatever
+was asked for. The provider clamps to it and says so in `SliceEnd`; the
+requester walks a larger range one window at a time, committing each as it
+arrives. Without the bound, an object larger than a frame could not be served at
+all, and the size of a provider's allocation would be the requester's to choose.
+
 The fetcher:
 
 1. Resolves providers from `blob_providers`, ranks them (recent latency EWMA, then
@@ -1241,7 +1248,19 @@ CI (GitHub Actions):
   data is held without a live binding. What remains are sanity bounds that
   cap the cost of any *single* malformed or extreme message: `GetNodes`/`GetValues`
   batches are capped at 256 hashes, and trie keys are bounded to 4 KiB (so ingest
-  depth ≤ ~8 K nibbles).
+  depth ≤ ~8 K nibbles). A `GetSlice` is bounded the same way, on both axes: at
+  most 512 groups are encoded per exchange (§6.4), and at most 4 096 ranges are
+  accepted in one request, because the range set operations are quadratic in the
+  number of ranges. Trust does not extend to the *shape* of replicated
+  structure, because a member gets it wrong by accident as readily as on
+  purpose: nothing canonicalizes the node graph a peer serves, so every walk
+  over it — the promotion diff above all — keeps its frames on the heap and
+  stops descending past the ~8 K nibbles a valid key can occupy. A recursive
+  walk would meet a hand-built deep chain with a stack overflow, and that aborts
+  the process rather than failing the exchange. In the same spirit, a record
+  this node cannot apply fails *its own origin* and no other: the head does not
+  flip, the exchange carries on, and the count of origins left behind is in the
+  sync report.
 - **Privacy**: metadata (paths, sizes, mtimes) is visible to *all* members — inherent
   to omnipresence. Content is fetched on demand, so bytes only land where requested or
   mirrored. At-rest encryption of the CAS and DB is delegated to OS disk encryption in

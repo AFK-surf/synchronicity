@@ -11,13 +11,17 @@ use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
 };
-use synch_core::{now_ns, BlobMessage, ChunkRanges, Hash};
+use synch_core::{now_ns, BlobMessage, ChunkRanges, Hash, MAX_RANGES, MAX_SLICE_GROUPS};
 use synch_store::Store;
 
 use crate::{
     error::NetError,
     frame::{read_bytes, read_frame, write_bytes, write_frame},
 };
+
+/// How many consecutive empty windows a provider may answer with before a
+/// fetch gives up on it and lets the caller try someone else.
+const MAX_BARREN_WINDOWS: u32 = 4;
 
 /// The `sync/blob/1` protocol handler.
 #[derive(Debug, Clone)]
@@ -84,6 +88,18 @@ impl BlobProtocol {
     ) -> Result<(), NetError> {
         match read_frame::<BlobMessage>(recv).await? {
             BlobMessage::GetSlice { root, ranges } => {
+                // The range set arrives straight off the wire, unnormalized and
+                // unbounded: the set operations below it are quadratic in the
+                // number of ranges, so a request made of a million singleton
+                // ranges costs the provider far more than it costs the asker
+                // (§12). Bound it, and normalize before anything else reads it.
+                if ranges.range_count() > MAX_RANGES {
+                    return Err(NetError::Unexpected(format!(
+                        "slice request of {} ranges exceeds the {MAX_RANGES} limit",
+                        ranges.range_count()
+                    )));
+                }
+                let ranges = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
                 // A provider serves the intersection of what was asked for and
                 // what it verifiably holds. Encoding validates the local copy
                 // against the root, so a corrupted payload fails here rather
@@ -157,6 +173,12 @@ impl BlobClient {
 
     /// Requests a slice and commits it to the local CAS, verifying every group
     /// against the object root before anything is stored.
+    ///
+    /// A provider serves at most [`MAX_SLICE_GROUPS`] groups per exchange, so
+    /// anything larger is walked one window at a time until the request is
+    /// covered — which is what lets an object bigger than one frame transfer at
+    /// all. Each window is committed as it arrives, so an interrupted fetch
+    /// keeps everything it verified.
     pub async fn fetch_into(
         &self,
         store: &Store,
@@ -164,10 +186,35 @@ impl BlobClient {
         size: u64,
         ranges: &ChunkRanges,
     ) -> Result<ChunkRanges, NetError> {
-        let slice = self.get_slice(root, ranges).await?;
-        if slice.served.is_empty() {
-            return Ok(ChunkRanges::empty());
+        let mut remaining = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
+        let mut got = ChunkRanges::empty();
+        let mut barren = 0u32;
+        while !remaining.is_empty() {
+            let window = remaining.take(MAX_SLICE_GROUPS);
+            let slice = self.get_slice(root, &window).await?;
+            // The window is retired either way: an empty answer is the
+            // provider telling us its advertised spans overstate what it has,
+            // and asking again would only repeat the round trip.
+            remaining = remaining.difference(&window);
+            if slice.served.is_empty() {
+                barren += 1;
+                if barren >= MAX_BARREN_WINDOWS {
+                    // A provider that claims an object and serves none of it
+                    // must not be able to hold a fetch in an unbounded walk
+                    // across the whole thing; the caller has other candidates.
+                    break;
+                }
+                continue;
+            }
+            barren = 0;
+            got = got.union(&store.write_slice(
+                &root,
+                size,
+                &slice.served,
+                &slice.encoded,
+                now_ns(),
+            )?);
         }
-        Ok(store.write_slice(&root, size, &slice.served, &slice.encoded, now_ns())?)
+        Ok(got)
     }
 }

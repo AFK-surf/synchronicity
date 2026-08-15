@@ -103,10 +103,15 @@ impl Node {
         let mut found = Vec::new();
         walk(&root_dir, &root_dir, &ignore, &mut report, &mut found)?;
 
-        let mut seen: Vec<String> = Vec::with_capacity(found.len());
+        // A set, not a list: the deletion sweep below asks "did the walk see
+        // this?" once per row the scanner has ever recorded, and a linear
+        // membership test makes a scan quadratic in the size of the space —
+        // seconds of pure comparison on the 40 000-entry tree §4 uses as its
+        // working example, and worse than the hashing on anything larger.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (path, rel, is_symlink) in &found {
             self.index_file(space_id, path, rel, seq, *is_symlink, &mut report)?;
-            seen.push(rel.clone());
+            seen.insert(rel.as_str());
         }
 
         // Anything the scanner previously recorded but did not see is gone.
@@ -114,7 +119,7 @@ impl Node {
         // tombstone exists so `synch status`/`synch log` can tell "deleted at
         // seq N" from "never existed" (§4.2).
         for known in self.store().local_files(space_id)? {
-            if seen.contains(&known) {
+            if seen.contains(known.as_str()) {
                 continue;
             }
             let prev = self
