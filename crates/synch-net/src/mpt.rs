@@ -25,6 +25,9 @@ use crate::{
     reconcile::Syncer,
 };
 
+/// How often a live session refreshes the sighting it recorded at accept.
+const PEER_SEEN_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The `sync/mpt/1` protocol handler.
 #[derive(Debug, Clone)]
 pub struct MptProtocol {
@@ -77,6 +80,13 @@ impl ProtocolHandler for MptProtocol {
         }
         let _ = self.store().record_peer_seen(&remote, None, now);
 
+        // A session outlives the request that opened it, so "last seen" cannot
+        // be recorded only at accept: a peer that has been syncing steadily
+        // over one connection for an hour would read as an hour absent in
+        // `synch peers`. Refreshed as requests arrive, but at most once an
+        // interval — the sighting is for an operator's eyes, not worth a write
+        // per stream.
+        let mut refreshed = std::time::Instant::now();
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
             // §3.2 enforcement is per message, not just per connection: a
             // binding revoked or expired mid-connection must cut off further
@@ -85,6 +95,10 @@ impl ProtocolHandler for MptProtocol {
                 tracing::debug!(peer = %remote.fmt_short(), "closing connection: binding lapsed");
                 connection.close(0u32.into(), b"untrusted");
                 break;
+            }
+            if refreshed.elapsed() >= PEER_SEEN_REFRESH {
+                let _ = self.store().record_peer_seen(&remote, None, now_ns());
+                refreshed = std::time::Instant::now();
             }
             if let Err(e) = self.handle_stream(remote, &mut send, &mut recv).await {
                 tracing::debug!(peer = %remote.fmt_short(), error = %e, "mpt stream ended");
