@@ -7,6 +7,7 @@ import auth/google
 import auth/identity
 import auth/magic
 import auth/oauth.{type Provider}
+import auth/oidc
 import auth/session
 import dnssec/keys
 import email/mailer.{type Mailer}
@@ -55,7 +56,25 @@ fn redirect_uri(ctx: AuthContext, key: String) -> String {
   ctx.public_url <> "/auth/callback/" <> key
 }
 
-pub fn start(_req: Request, ctx: AuthContext, key: String) -> Response {
+/// `?link=1` on a start URL, from a live session, records that the
+/// resulting identity should be linked to the session's user instead of
+/// logging anyone in — the sanctioned path for custom-OIDC identities.
+fn maybe_link_user(req: Request, conn: Connection) -> Option(String) {
+  case list.key_find(wisp.get_query(req), "link") {
+    Ok("1") ->
+      case wisp.get_cookie(req, session.cookie_name, wisp.Signed) {
+        Ok(token) ->
+          case session.get(conn, token, now_unix()) {
+            Ok(live) -> option.Some(live.user_id)
+            Error(Nil) -> None
+          }
+        Error(Nil) -> None
+      }
+    _ -> None
+  }
+}
+
+pub fn start(req: Request, ctx: AuthContext, key: String) -> Response {
   case provider_for(ctx, key) {
     Error(Nil) -> error_json(404, "unknown_provider", "provider not configured")
     Ok(provider) ->
@@ -66,7 +85,7 @@ pub fn start(_req: Request, ctx: AuthContext, key: String) -> Response {
             provider,
             redirect_uri(ctx, key),
             None,
-            None,
+            maybe_link_user(req, conn),
             now_unix(),
           )
         {
@@ -74,6 +93,143 @@ pub fn start(_req: Request, ctx: AuthContext, key: String) -> Response {
           Error(_) -> error_json(500, "internal", "could not start flow")
         }
       })
+  }
+}
+
+/// Sign-in (or link) with an org's custom OIDC provider, by org slug.
+pub fn oidc_start(
+  req: Request,
+  ctx: AuthContext,
+  org_slug: String,
+) -> Response {
+  with_db(ctx, fn(conn) {
+    case oidc.for_org_slug(conn, org_slug) {
+      Error(Nil) ->
+        error_json(404, "no_oidc", "this org has no OIDC provider configured")
+      Ok(org) ->
+        case
+          oauth.start(
+            conn,
+            org.provider,
+            redirect_uri(ctx, "oidc"),
+            option.Some(org.provider_id),
+            maybe_link_user(req, conn),
+            now_unix(),
+          )
+        {
+          Ok(url) -> wisp.redirect(url)
+          Error(_) -> error_json(500, "internal", "could not start flow")
+        }
+    }
+  })
+}
+
+pub fn oidc_callback(req: Request, ctx: AuthContext) -> Response {
+  let params = wisp.get_query(req)
+  case list.key_find(params, "code"), list.key_find(params, "state") {
+    Ok(code), Ok(state) ->
+      with_db(ctx, fn(conn) {
+        case oauth.take_state(conn, state, now_unix()) {
+          Error(Nil) ->
+            error_json(400, "bad_state", "expired or replayed OAuth state")
+          Ok(flow) ->
+            case flow.provider, flow.oidc_provider_id {
+              "oidc", option.Some(provider_id) ->
+                case oidc.by_id(conn, provider_id) {
+                  Error(Nil) ->
+                    error_json(404, "no_oidc", "provider was removed mid-flow")
+                  Ok(org) -> {
+                    let outcome = {
+                      use tokens <- gleam_result_try(oauth.exchange(
+                        org.provider,
+                        code,
+                        redirect_uri(ctx, "oidc"),
+                        flow.pkce_verifier,
+                      ))
+                      oidc.identity_from_tokens(
+                        org,
+                        tokens,
+                        flow.nonce,
+                        now_unix(),
+                      )
+                    }
+                    case outcome {
+                      Error(message) ->
+                        error_json(502, "identity_failed", message)
+                      Ok(who) ->
+                        conclude(
+                          req,
+                          conn,
+                          "oidc",
+                          option.Some(provider_id),
+                          who,
+                          flow.link_user_id,
+                        )
+                    }
+                  }
+                }
+              _, _ -> error_json(400, "bad_state", "state is not an OIDC flow")
+            }
+        }
+      })
+    _, _ -> error_json(400, "bad_callback", "missing code or state")
+  }
+}
+
+fn gleam_result_try(
+  result: Result(a, e),
+  next: fn(a) -> Result(b, e),
+) -> Result(b, e) {
+  case result {
+    Ok(value) -> next(value)
+    Error(e) -> Error(e)
+  }
+}
+
+/// Shared tail of every callback: link to the session's user when the
+/// flow was started with ?link=1, otherwise log in under the policy.
+fn conclude(
+  req: Request,
+  conn: Connection,
+  provider_key: String,
+  oidc_provider_id: Option(String),
+  who: oauth.ProviderIdentity,
+  link_user_id: Option(String),
+) -> Response {
+  case link_user_id {
+    option.Some(user_id) ->
+      case
+        identity.link(
+          conn,
+          user_id,
+          provider_key,
+          oidc_provider_id,
+          who.subject,
+          now_unix(),
+        )
+      {
+        Ok(_) -> wisp.redirect("/settings?linked=" <> provider_key)
+        Error(_) -> error_json(409, "conflict", "identity already linked")
+      }
+    None ->
+      case
+        identity.login(
+          conn,
+          provider_key,
+          oidc_provider_id,
+          who.subject,
+          who.email,
+          who.email_trusted,
+          who.name,
+          now_unix(),
+        )
+      {
+        Ok(user_id) -> sign_in(req, conn, user_id)
+        Error(identity.NeedsExplicitLink(_)) ->
+          wisp.redirect("/login?error=needs-link")
+        Error(identity.Db(_)) ->
+          error_json(500, "internal", "could not record identity")
+      }
   }
 }
 
@@ -134,25 +290,7 @@ fn finish_oauth(
       }
       case fetched {
         Error(message) -> error_json(502, "identity_failed", message)
-        Ok(who) ->
-          case
-            identity.login(
-              conn,
-              key,
-              None,
-              who.subject,
-              who.email,
-              who.email_trusted,
-              who.name,
-              now_unix(),
-            )
-          {
-            Ok(user_id) -> sign_in(req, conn, user_id)
-            Error(identity.NeedsExplicitLink(_)) ->
-              wisp.redirect("/login?error=needs-link")
-            Error(identity.Db(_)) ->
-              error_json(500, "internal", "could not record identity")
-          }
+        Ok(who) -> conclude(req, conn, key, None, who, flow.link_user_id)
       }
     }
   }

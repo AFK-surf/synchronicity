@@ -6,6 +6,7 @@ import api/common.{
   text_at, valid_dns_label,
 }
 import api/middleware.{error_json, now_unix}
+import auth/oidc
 import auth/session.{type Session}
 import email/mailer
 import gleam/crypto
@@ -386,6 +387,105 @@ pub fn accept_invite(
       }
       Ok(_) -> error_json(404, "bad_invite", "invalid or expired invite")
       Error(_) -> error_json(500, "internal", "database error")
+    }
+  })
+}
+
+/// OIDC configuration is owner-only in both directions: it is
+/// takeover-adjacent (it decides who can sign in under the org's issuer).
+pub fn get_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
+  with_db(ctx, fn(conn) {
+    use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+    let rows =
+      sqlite.query(
+        conn,
+        "SELECT issuer, client_id, authorization_endpoint, token_endpoint,
+                discovered_at
+         FROM oidc_providers WHERE org_id = ?",
+        [Text(org_id)],
+      )
+    case rows {
+      Ok([row]) ->
+        ok_json(
+          json.object([
+            #("issuer", json.string(text_at(row, 0))),
+            #("client_id", json.string(text_at(row, 1))),
+            #("authorization_endpoint", json.string(text_at(row, 2))),
+            #("token_endpoint", json.string(text_at(row, 3))),
+            #("discovered_at", json.int(common.int_at(row, 4))),
+          ]),
+        )
+      Ok(_) -> ok_json(json.null())
+      Error(_) -> error_json(500, "internal", "database error")
+    }
+  })
+}
+
+pub fn put_oidc(
+  req: Request,
+  ctx: AuthContext,
+  live: Session,
+  slug: String,
+) -> Response {
+  let decoder = {
+    use issuer <- decode.field("issuer", decode.string)
+    use client_id <- decode.field("client_id", decode.string)
+    use client_secret <- decode.field("client_secret", decode.string)
+    decode.success(#(issuer, client_id, client_secret))
+  }
+  use #(issuer, client_id, client_secret) <- body_decoder(req, decoder)
+  with_db(ctx, fn(conn) {
+    use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+    // Discovery runs now, over verified TLS; a mismatched or unreachable
+    // issuer refuses the whole save.
+    case oidc.save(conn, org_id, issuer, client_id, client_secret, now_unix()) {
+      Ok(found) -> {
+        let _ =
+          audit(
+            conn,
+            live.user_id,
+            org_id,
+            "oidc.configure",
+            json.object([#("issuer", json.string(issuer))]),
+          )
+        ok_json(
+          json.object([
+            #("issuer", json.string(issuer)),
+            #(
+              "authorization_endpoint",
+              json.string(found.authorization_endpoint),
+            ),
+            #("token_endpoint", json.string(found.token_endpoint)),
+          ]),
+        )
+      }
+      Error(message) -> error_json(502, "discovery_failed", message)
+    }
+  })
+}
+
+pub fn delete_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
+  with_db(ctx, fn(conn) {
+    use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+    let work = {
+      use _ <- result.try(
+        sqlite.exec(
+          conn,
+          "DELETE FROM auth_identities WHERE oidc_provider_id IN
+           (SELECT id FROM oidc_providers WHERE org_id = ?)",
+          [Text(org_id)],
+        ),
+      )
+      use _ <- result.try(
+        sqlite.exec(conn, "DELETE FROM oidc_providers WHERE org_id = ?", [
+          Text(org_id),
+        ]),
+      )
+      audit(conn, live.user_id, org_id, "oidc.remove", json.object([]))
+    }
+    case work {
+      Ok(Nil) -> ok_json(json.object([#("ok", json.bool(True))]))
+      Error(e) -> constraint_response(e)
     }
   })
 }

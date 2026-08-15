@@ -40,6 +40,8 @@ pub fn handle(req: Request, ctx: Context) -> Response {
 
 fn primary_routes(req: Request, auth: AuthContext) -> Response {
   case wisp.path_segments(req), req.method {
+    ["auth", "oidc", org_slug], Get -> auth_api.oidc_start(req, auth, org_slug)
+    ["auth", "callback", "oidc"], Get -> auth_api.oidc_callback(req, auth)
     ["auth", "start", provider], Get -> auth_api.start(req, auth, provider)
     ["auth", "callback", provider], Get ->
       auth_api.callback(req, auth, provider)
@@ -79,6 +81,18 @@ fn primary_routes(req: Request, auth: AuthContext) -> Response {
     ["api", "orgs", slug, "audit"], Get -> {
       use live <- with_session(req, auth)
       orgs_api.audit_log(req, auth, live, slug)
+    }
+    ["api", "orgs", slug, "oidc"], Get -> {
+      use live <- with_session(req, auth)
+      orgs_api.get_oidc(auth, live, slug)
+    }
+    ["api", "orgs", slug, "oidc"], Put -> {
+      use live <- with_session(req, auth)
+      orgs_api.put_oidc(req, auth, live, slug)
+    }
+    ["api", "orgs", slug, "oidc"], Delete -> {
+      use live <- with_session(req, auth)
+      orgs_api.delete_oidc(auth, live, slug)
     }
 
     ["api", "orgs", slug, "networks"], Get -> {
