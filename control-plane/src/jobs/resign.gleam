@@ -3,9 +3,12 @@
 //// 14-day validity). Replicas therefore have days of slack, not minutes.
 
 import dnssec/keys.{type Csk}
-import gleam/erlang/process
+import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/io
+import gleam/otp/actor
+import gleam/otp/supervision
+import gleam/result
 import gleam/string
 import store/db
 import store/sqlite
@@ -16,15 +19,39 @@ fn now_unix() -> Int
 
 const check_interval_ms = 3_600_000
 
-pub fn start(db_path: String, csk: Csk) -> Nil {
-  process.spawn(fn() { loop(db_path, csk) })
-  Nil
+pub type Msg {
+  Tick
 }
 
-fn loop(db_path: String, csk: Csk) -> Nil {
-  process.sleep(check_interval_ms)
-  run_once(db_path, csk)
-  loop(db_path, csk)
+type State {
+  State(db_path: String, csk: Csk, subject: Subject(Msg))
+}
+
+/// The re-sign job as a supervised child: an hourly self-timer. A crash
+/// mid-check is contained and restarted by the supervisor — DNS serving
+/// never goes down with it.
+pub fn supervised(
+  db_path: String,
+  csk: Csk,
+) -> supervision.ChildSpecification(Nil) {
+  supervision.worker(fn() {
+    let builder =
+      actor.new_with_initialiser(1000, fn(subject) {
+        let _ = process.send_after(subject, check_interval_ms, Tick)
+        actor.initialised(State(db_path, csk, subject))
+        |> Ok
+      })
+      |> actor.on_message(handle)
+    use started <- result.try(actor.start(builder))
+    Ok(actor.Started(started.pid, Nil))
+  })
+}
+
+fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
+  let Tick = msg
+  run_once(state.db_path, state.csk)
+  let _ = process.send_after(state.subject, check_interval_ms, Tick)
+  actor.continue(state)
 }
 
 /// One check; exposed so tests can drive it without the timer.

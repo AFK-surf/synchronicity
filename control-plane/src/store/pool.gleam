@@ -17,12 +17,15 @@ import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
 import gleam/otp/actor
+import gleam/otp/supervision
 import gleam/result
 import store/migrate
 import store/sqlite.{type Connection}
 
+/// A stable handle: the dispatcher is addressed by registered name, so
+/// the handle keeps working across supervisor restarts of the pool.
 pub opaque type Pool {
-  Pool(subject: Subject(Msg), owner: Pid, pragmas: String)
+  Pool(subject: Subject(Msg), pragmas: String)
 }
 
 pub opaque type Msg {
@@ -51,34 +54,64 @@ type State {
   )
 }
 
-/// Starts a pool of `size` workers over `path`. `pragmas` are re-applied
-/// after every checkout reset (per-connection pragmas do not survive a
-/// handle reopen).
+/// The pool as a supervised child: the dispatcher registers under `name`
+/// and `handle(name, pragmas)` addresses it before, during, and after any
+/// restart. `pragmas` are re-applied after every checkout reset
+/// (per-connection pragmas do not survive a handle reopen).
+pub fn supervised(
+  name: process.Name(Msg),
+  path: String,
+  mode: sqlite.Mode,
+  pragmas: String,
+  size: Int,
+) -> supervision.ChildSpecification(Pool) {
+  supervision.worker(fn() {
+    use started <- result.try(actor.start(builder(name, path, mode, size)))
+    Ok(actor.Started(started.pid, handle(name, pragmas)))
+  })
+}
+
+/// The stable client handle for a (possibly not yet started) named pool.
+pub fn handle(name: process.Name(Msg), pragmas: String) -> Pool {
+  Pool(process.named_subject(name), pragmas)
+}
+
+/// Starts an unsupervised pool (tests, one-shot tools).
 pub fn start(
   path: String,
   mode: sqlite.Mode,
   pragmas: String,
   size: Int,
 ) -> Result(Pool, actor.StartError) {
-  let builder =
-    actor.new_with_initialiser(10_000, fn(subject) {
-      // Trapped exits: an idle worker dying must be a discarded message,
-      // not a pool-killing signal.
-      process.trap_exits(True)
-      let idle = open_workers(path, mode, size, [])
-      let selector =
-        process.new_selector()
-        |> process.select(subject)
-        |> process.select_monitors(BorrowerDown)
-        |> process.select_trapped_exits(PortExit)
-      actor.initialised(State(path, mode, size, idle, [], []))
-      |> actor.selecting(selector)
-      |> actor.returning(subject)
-      |> Ok
-    })
-    |> actor.on_message(handle)
-  use started <- result.try(actor.start(builder))
-  Ok(Pool(started.data, started.pid, pragmas))
+  let name = process.new_name("cp_pool")
+  use _started <- result.try(actor.start(builder(name, path, mode, size)))
+  Ok(handle(name, pragmas))
+}
+
+fn builder(
+  name: process.Name(Msg),
+  path: String,
+  mode: sqlite.Mode,
+  size: Int,
+) -> actor.Builder(State, Msg, Subject(Msg)) {
+  actor.new_with_initialiser(10_000, fn(subject) {
+    // Trapped exits: an idle worker dying must not be a pool-killing
+    // signal — but a shutdown request must still be honored (see the
+    // PortExit handling).
+    process.trap_exits(True)
+    let idle = open_workers(path, mode, size, [])
+    let selector =
+      process.new_selector()
+      |> process.select(subject)
+      |> process.select_monitors(BorrowerDown)
+      |> process.select_trapped_exits(PortExit)
+    actor.initialised(State(path, mode, size, idle, [], []))
+    |> actor.selecting(selector)
+    |> actor.returning(subject)
+    |> Ok
+  })
+  |> actor.named(name)
+  |> actor.on_message(handle_msg)
 }
 
 fn open_workers(
@@ -163,16 +196,24 @@ fn release(pool: Pool, conn: Connection) -> Nil {
   // until this worker's next checkout reset. Drop any open transaction
   // now — a no-op error on a clean connection, deliberate on a dirty one.
   let _ = sqlite.exec(conn, "ROLLBACK", [])
-  case sqlite.give(conn, pool.owner) {
+  // Owner is resolved through the registered name so a checkin lands in
+  // the restarted dispatcher, not a dead pid.
+  let returned = case process.subject_owner(pool.subject) {
+    Ok(owner) -> sqlite.give(conn, owner)
+    Error(Nil) -> Error(Nil)
+  }
+  case returned {
     Ok(Nil) -> process.send(pool.subject, Checkin(process.self(), conn))
     Error(Nil) -> {
+      // Dispatcher gone (mid-restart) or worker dead: this connection is
+      // an orphan of the old generation — discard it.
       sqlite.kill(conn)
       process.send(pool.subject, Discard(process.self()))
     }
   }
 }
 
-fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
+fn handle_msg(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Checkout(caller, reply) -> actor.continue(lend(state, caller, reply))
     Checkin(caller, conn) -> {
@@ -197,9 +238,16 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       actor.continue(state)
     }
     BorrowerDown(_) -> actor.continue(state)
-    // An idle worker died; its port message is noise. Dead connections
-    // are culled at lend time (ownership transfer to them fails).
-    PortExit(_) -> actor.continue(state)
+    PortExit(exit_message) ->
+      case exit_message.reason {
+        // A port detaching cleanly (transfer-window race): noise. Dead
+        // connections are culled at lend time.
+        process.Normal -> actor.continue(state)
+        // Anything else is either a supervisor shutdown request or an
+        // abnormal linked death — terminate; the supervisor decides what
+        // happens next. Live workers die with us via their janitors.
+        _ -> actor.stop()
+      }
   }
 }
 

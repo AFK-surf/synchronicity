@@ -5,20 +5,18 @@ import dns/serve.{type Serving}
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/option.{None}
+import gleam/otp/static_supervisor
+import gleam/otp/supervision
 import glisten
 
-pub fn start(port: Int, serving: Serving) -> Result(Nil, String) {
-  let started =
-    glisten.new(fn(_conn) { #(#(<<>>, serving), None) }, loop)
-    |> glisten.bind("0.0.0.0")
-    |> glisten.start(port)
-  case started {
-    Ok(_) -> Ok(Nil)
-    Error(_) ->
-      Error(
-        "could not bind TCP port — privileged ports need CAP_NET_BIND_SERVICE",
-      )
-  }
+/// DNS-over-TCP as a supervised child (glisten brings its own subtree).
+pub fn supervised(
+  port: Int,
+  serving: Serving,
+) -> supervision.ChildSpecification(static_supervisor.Supervisor) {
+  glisten.new(fn(_conn) { #(#(<<>>, serving), None) }, loop)
+  |> glisten.bind("0.0.0.0")
+  |> glisten.supervised(port)
 }
 
 fn loop(

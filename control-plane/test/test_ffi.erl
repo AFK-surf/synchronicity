@@ -1,7 +1,7 @@
 %% Test-only helpers: unique temp database paths, and killing the csqlite
 %% OS process out from under a connection for the crash-isolation test.
 -module(test_ffi).
--export([tmp_db/0, kill9/1, rename/2]).
+-export([tmp_db/0, kill9/1, rename/2, udp_roundtrip/2]).
 
 tmp_db() ->
     %% unique_integer is only unique within one VM run; the wall clock keeps
@@ -20,3 +20,13 @@ kill9(OsPid) ->
 rename(From, To) ->
     ok = file:rename(From, To),
     nil.
+
+udp_roundtrip(Port, Packet) ->
+    {ok, S} = gen_udp:open(0, [binary, {active, false}]),
+    ok = gen_udp:send(S, {127, 0, 0, 1}, Port, Packet),
+    R = case gen_udp:recv(S, 0, 2000) of
+            {ok, {_, _, Resp}} -> {ok, Resp};
+            {error, _} -> {error, nil}
+        end,
+    gen_udp:close(S),
+    R.

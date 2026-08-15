@@ -24,12 +24,14 @@ import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/option
+import gleam/otp/static_supervisor as sup
 import gleam/result
 import gleam/string
 import jobs/resign
 import mist
 import store/db
 import store/migrate
+import store/pool
 import store/sqlite
 import thirtytwo
 import wisp/wisp_mist
@@ -189,10 +191,9 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
     sqlite.close(conn)
     meta
   })
-  use dns_pool <- result.try(
-    db.start_read_pool(cfg.db_path, 4)
-    |> result.map_error(fn(_) { "could not start read pool" }),
-  )
+  let dns_name = process.new_name("cp_dns_pool")
+  let udp_name = process.new_name("cp_udp_server")
+  let dns_pool = pool.handle(dns_name, db.read_pragmas)
   let serving = dns_serve.Serving(dns_pool, meta.apex)
   let ctx =
     router.Context(
@@ -201,16 +202,27 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       option.None,
       serving,
     )
-  use Nil <- result.try(server_udp.start(cfg.dns_port, serving))
-  use Nil <- result.try(server_tcp.start(cfg.dns_port, serving))
   let handler = fn(req) { router.handle(req, ctx) }
-  use _ <- result.try(
+  let http =
     wisp_mist.handler(handler, "replica-has-no-sessions-0000000000000000")
     |> mist.new
     |> mist.bind("0.0.0.0")
     |> mist.port(cfg.http_port)
-    |> mist.start
-    |> result.map_error(fn(_) { "could not start HTTP listener" }),
+  use _ <- result.try(
+    sup.new(sup.OneForOne)
+    |> sup.restart_tolerance(intensity: 60, period: 10)
+    |> sup.add(pool.supervised(
+      dns_name,
+      cfg.db_path,
+      sqlite.ReadOnly,
+      db.read_pragmas,
+      4,
+    ))
+    |> sup.add(server_udp.supervised(udp_name, cfg.dns_port, serving))
+    |> sup.add(server_tcp.supervised(cfg.dns_port, serving))
+    |> sup.add(mist.supervised(http))
+    |> sup.start
+    |> result.map_error(fn(_) { "could not start supervision tree" }),
   )
   io.println(
     "replica serving "
@@ -235,14 +247,11 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
     option.None -> mailer.LogOnly
   }
   io.println("mailer: " <> mailer.describe(mail))
-  use api_pool <- result.try(
-    db.start_primary_pool(cfg.db_path, 4)
-    |> result.map_error(fn(_) { "could not start api pool" }),
-  )
-  use dns_pool <- result.try(
-    db.start_read_pool(cfg.db_path, 4)
-    |> result.map_error(fn(_) { "could not start read pool" }),
-  )
+  let api_name = process.new_name("cp_api_pool")
+  let dns_name = process.new_name("cp_dns_pool")
+  let udp_name = process.new_name("cp_udp_server")
+  let api_pool = pool.handle(api_name, db.primary_pragmas)
+  let dns_pool = pool.handle(dns_name, db.read_pragmas)
   let serving = dns_serve.Serving(dns_pool, apex)
   let auth =
     auth_api.AuthContext(
@@ -260,20 +269,38 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       option.Some(auth),
       serving,
     )
-
-  use Nil <- result.try(server_udp.start(cfg.dns_port, serving))
-  use Nil <- result.try(server_tcp.start(cfg.dns_port, serving))
-  resign.start(cfg.db_path, csk)
-
-  let secret = cfg.session_secret
   let handler = fn(req) { router.handle(req, ctx) }
-  use _ <- result.try(
-    wisp_mist.handler(handler, secret)
+  let http =
+    wisp_mist.handler(handler, cfg.session_secret)
     |> mist.new
     |> mist.bind("0.0.0.0")
     |> mist.port(cfg.http_port)
-    |> mist.start
-    |> result.map_error(fn(_) { "could not start HTTP listener" }),
+  // One tree, one policy: every long-lived process restarts in place; the
+  // node itself only gives up when a child exhausts a generous restart
+  // budget — the control plane must not die because one part hiccuped.
+  use _ <- result.try(
+    sup.new(sup.OneForOne)
+    |> sup.restart_tolerance(intensity: 60, period: 10)
+    |> sup.add(pool.supervised(
+      api_name,
+      cfg.db_path,
+      sqlite.ReadWrite,
+      db.primary_pragmas,
+      4,
+    ))
+    |> sup.add(pool.supervised(
+      dns_name,
+      cfg.db_path,
+      sqlite.ReadOnly,
+      db.read_pragmas,
+      4,
+    ))
+    |> sup.add(server_udp.supervised(udp_name, cfg.dns_port, serving))
+    |> sup.add(server_tcp.supervised(cfg.dns_port, serving))
+    |> sup.add(mist.supervised(http))
+    |> sup.add(resign.supervised(cfg.db_path, csk))
+    |> sup.start
+    |> result.map_error(fn(_) { "could not start supervision tree" }),
   )
   io.println(
     "serving "
