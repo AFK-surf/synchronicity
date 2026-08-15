@@ -368,10 +368,9 @@ pub struct ResolverOptions {
     /// transparency-log record for the zone key that signed it (§4.1).
     ///
     /// `None` takes the default [`ResolverOptions::rekor_policy`] resolves:
-    /// require on the ICANN path once a log key is pinned, off otherwise
-    /// and behind a pinned anchor. The option is three-state on purpose —
-    /// "unset" has to mean *the default for this trust configuration*,
-    /// while an explicit `--rekor` overrides it in both directions.
+    /// require, everywhere. The option is three-state on purpose — "unset"
+    /// means the default, while an explicit `--rekor` states a choice, and
+    /// `off` is a choice this design wants stated, never inherited.
     pub rekor: Option<RekorPolicy>,
     /// A file of transparency-log verification key(s) *replacing* the
     /// embedded one (§4.1).
@@ -396,27 +395,16 @@ pub enum RekorPolicy {
 impl ResolverOptions {
     /// The policy in force, resolving the default when none was chosen.
     ///
-    /// The default is `require` against the ICANN root — but only once a
-    /// log key is actually pinned, by `rekor_key` or by a build whose
-    /// embedded snapshot has landed. Requiring a record that no pinned key
-    /// could ever verify would fail every refresh of every deployment the
-    /// moment it upgraded, which is enforcement before rollout
-    /// (docs/REKOR-ZONE-KEY.md §7); an explicit `require` still gets that
-    /// strictness, stated rather than inherited. Behind `trust_anchor` the
-    /// default is `off`: a pinned anchor file is already a direct key pin,
-    /// so there is no delegation chain left for a substitution attack to
-    /// ride — opt-in in that universe, not absent.
+    /// The default is `require`, everywhere — the embedded Sigstore
+    /// snapshot means a stock build can always verify, and a zone key that
+    /// is not on the public record is exactly what this design exists to
+    /// refuse. That holds behind `trust_anchor` too: a pinned anchor closes
+    /// the delegation chain to substitution, but the log requirement is
+    /// about the key being *public*, and an internal deployment that wants
+    /// neither the public log nor its own says `off` in so many words
+    /// rather than inheriting it from an unrelated flag.
     pub fn rekor_policy(&self) -> RekorPolicy {
-        match self.rekor {
-            Some(policy) => policy,
-            None => {
-                let pinned = self.rekor_key.is_some() || !LogKeys::embedded().is_empty();
-                match (&self.trust_anchor, pinned) {
-                    (None, true) => RekorPolicy::Require,
-                    _ => RekorPolicy::Off,
-                }
-            }
-        }
+        self.rekor.unwrap_or(RekorPolicy::Require)
     }
 }
 

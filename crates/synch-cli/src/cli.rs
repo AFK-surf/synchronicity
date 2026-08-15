@@ -38,10 +38,9 @@ pub struct Cli {
     pub dnssec_anchor: Option<PathBuf>,
 
     /// Whether a membership answer additionally requires the zone key that
-    /// signed it to carry a verified transparency-log record. Defaults to
-    /// require on the ICANN path once a log key is pinned (built in, or
-    /// via --rekor-key), and off behind --dnssec-anchor, which is already
-    /// a direct key pin.
+    /// signed it to carry a verified transparency-log record. The default
+    /// is require — the Sigstore production log keys are built in — and
+    /// off is a choice to state, not inherit, --dnssec-anchor or not.
     #[arg(long, global = true, env = "SYNCH_REKOR", value_name = "MODE")]
     pub rekor: Option<RekorMode>,
 

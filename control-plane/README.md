@@ -98,7 +98,7 @@ listen address.
 | `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in. |
 | `CP_GITHUB_CLIENT_SECRET` | primary | GitHub OAuth client secret. |
 | `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint. Default `https://rekor.sigstore.dev`. |
-| `CP_REKOR_KEY` | primary | File pinning the log's verification key. Required by `rekor-publish`: this build ships no embedded log key. |
+| `CP_REKOR_KEY` | primary | File pinning the log's verification key; defaults to the embedded rekor.sigstore.dev snapshot. Set it for a self-hosted log. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 
 Day-2 operations (replicas, key ceremony, backups) live in

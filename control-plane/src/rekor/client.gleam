@@ -46,34 +46,38 @@ pub fn url() -> String {
   |> result.unwrap("https://rekor.sigstore.dev")
 }
 
+/// The verification key of the default log at [`url`]: rekor.sigstore.dev's
+/// ECDSA P-256 key, snapshotted from Sigstore's TUF `trusted_root.json` —
+/// the same snapshot the client embeds (see EMBEDDED_LOG_KEYS in
+/// crates/synch-net/src/rekor.rs, which carries the provenance note). One
+/// key, not the client's whole set: this side submits to one log and must
+/// verify what that log returns.
+const embedded_log_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw=="
+
 /// The pinned log verification key (`CP_REKOR_KEY`): the DER
 /// SubjectPublicKeyInfo and the raw point.
 ///
-/// There is no embedded default in this build. A key that cannot be named
-/// is a proof that cannot be checked, and storing an unchecked proof would
-/// hand the client something it will refuse — the one outcome this whole
-/// verify-before-store step exists to prevent.
+/// Unset, it is the embedded key for the default public log. Set, the file
+/// replaces it entirely — an operator who redirects `CP_REKOR_URL` names
+/// the matching key here, because a key that cannot be named is a proof
+/// that cannot be checked, and storing an unchecked proof would hand the
+/// client something it will refuse.
 pub fn log_key() -> Result(#(BitArray, BitArray), String) {
-  use path <- result.try(
-    envoy.get("CP_REKOR_KEY")
-    |> result.replace_error(
-      "CP_REKOR_KEY is required to publish or verify a log record: this build "
-      <> "ships no embedded log key",
-    ),
-  )
-  use text <- result.try(
-    simplifile.read(path)
-    |> result.map_error(fn(e) {
-      "reading " <> path <> ": " <> simplifile.describe_error(e)
-    }),
-  )
-  proof.parse_log_key(text)
-  |> result.map_error(fn(e) {
-    case e {
-      proof.UnknownLog(why) -> path <> ": " <> why
-      other -> path <> ": " <> string_of(other)
+  case envoy.get("CP_REKOR_KEY") {
+    Error(Nil) ->
+      proof.parse_log_key(embedded_log_key)
+      |> result.map_error(fn(e) { "embedded log key: " <> string_of(e) })
+    Ok(path) -> {
+      use text <- result.try(
+        simplifile.read(path)
+        |> result.map_error(fn(e) {
+          "reading " <> path <> ": " <> simplifile.describe_error(e)
+        }),
+      )
+      proof.parse_log_key(text)
+      |> result.map_error(fn(e) { path <> ": " <> string_of(e) })
     }
-  })
+  }
 }
 
 fn string_of(error: proof.ProofError) -> String {

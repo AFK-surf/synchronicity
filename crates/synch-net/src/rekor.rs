@@ -76,13 +76,26 @@ pub const ZONE_KEY_FLAGS: u16 = 257;
 
 /// The log verification keys compiled into this build.
 ///
-/// The production Sigstore key is snapshotted here from Sigstore's TUF root
-/// at build time; a full in-client TUF workflow is out of v1 (§8). Until
-/// that snapshot lands this constant is empty, and a client that requires a
-/// log record must be told which log to trust with `--rekor-key` — an empty
-/// pin set verifies nothing rather than trusting anything, which is the same
-/// stance an empty DNSSEC trust anchor gets.
-pub const EMBEDDED_LOG_KEYS: &str = "";
+/// A snapshot of Sigstore's production transparency logs, taken from the
+/// TUF repository's `trusted_root.json` (consistent-snapshot target
+/// `6494e21e…`, its SHA-256 checked against the signed `targets.json`;
+/// fetched 2026-08-15 from `tuf-repo-cdn.sigstore.dev`). A full in-client
+/// TUF workflow is out of v1 (§8) — rotating these keys is a new build, the
+/// same way rotating the ICANN trust anchor is.
+///
+/// Note that this format's `log_id` is always SHA-256 over the DER
+/// SubjectPublicKeyInfo, computed here from the key bytes themselves. The
+/// trusted root agrees for the P-256 log and *disagrees* for the Ed25519
+/// one (its `logId.keyId` is derived differently there); what a proof's
+/// `log_id` field must match is this convention, not Sigstore's.
+pub const EMBEDDED_LOG_KEYS: &str = "\
+# Sigstore production transparency logs, snapshotted from the TUF
+# repository's trusted_root.json. See EMBEDDED_LOG_KEYS in rekor.rs.
+# rekor.sigstore.dev — ECDSA P-256, valid from 2021-01-12
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==
+# log2025-1.rekor.sigstore.dev — Ed25519, valid from 2025-09-23
+MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=
+";
 
 /// Why a zone-key transparency record was refused.
 ///
@@ -1170,10 +1183,29 @@ mod tests {
     }
 
     #[test]
-    fn the_embedded_pin_set_is_honest_about_being_empty() {
-        // Until the TUF snapshot lands there is no embedded key: requiring a
-        // record without --rekor-key must fail closed, not trust anything.
-        assert!(LogKeys::embedded().is_empty());
+    fn the_embedded_pin_set_is_the_sigstore_snapshot() {
+        // The exact production keys, pinned by id — which is SHA-256 over
+        // the DER SubjectPublicKeyInfo, *this format's* convention. (The
+        // trusted root's own logId agrees for the P-256 log and not for the
+        // Ed25519 one; a proof's log_id must match ours.) A changed id here
+        // is a changed key, which is a rollover ceremony, not an edit.
+        let keys = LogKeys::embedded();
+        assert_eq!(keys.keys().len(), 2);
+        let rekor_v1: [u8; 32] =
+            hex::decode("c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let rekor_v2: [u8; 32] =
+            hex::decode("b54813cb63d8859870a5e78500cc6adcfdf59723edae93ee8d25faf2475a0690")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert!(keys.find(&rekor_v1).is_some(), "rekor.sigstore.dev");
+        assert!(
+            keys.find(&rekor_v2).is_some(),
+            "log2025-1.rekor.sigstore.dev"
+        );
     }
 
     #[test]

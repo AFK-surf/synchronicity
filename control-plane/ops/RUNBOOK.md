@@ -71,7 +71,7 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |
 | `CP_REKOR_URL` | primary | zone-key transparency log, default `https://rekor.sigstore.dev` |
-| `CP_REKOR_KEY` | primary | file pinning the log's verification key; required by `rekor-publish` |
+| `CP_REKOR_KEY` | primary | file pinning the log's verification key; defaults to the embedded rekor.sigstore.dev snapshot |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
 
 > **Why the database gets its own directory.** Each SQLite connection
@@ -97,12 +97,12 @@ secrets.** Protect the replication bucket accordingly.
    key file offline; `keygen` refuses to overwrite an existing file.
    (`controlplane ds <apex> <keyfile>` reprints all of it.)
 
-2. **Log the zone key** (optional in phase 0/1, see below):
+2. **Log the zone key** (before any client resolves the zone —
+   clients require the record by default):
 
    ```sh
-   CP_REKOR_KEY=/etc/synch-controlplane/rekor.pub \
-     controlplane rekor-publish sync.example.dev \
-       /var/lib/synch-controlplane/csk.key
+   controlplane rekor-publish sync.example.dev \
+     /var/lib/synch-controlplane/csk.key
    ```
 
    Puts the key on a public transparency log, verifies the returned

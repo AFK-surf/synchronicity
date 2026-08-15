@@ -139,15 +139,15 @@ flags/env:
 | `rekor` | `--rekor <require\|off>` / `SYNCH_REKOR` | Whether a validated answer additionally requires a verified log record for the signing zone key. |
 | `rekor_key` | `--rekor-key <file>` / `SYNCH_REKOR_KEY` | File of log checkpoint-verification key(s), *replacing* the embedded Sigstore production key — the same "an override is a different universe" semantics as `--dnssec-anchor`. |
 
-Defaults: `require` when validating against the ICANN root *and* a log key
-is pinned (embedded or `--rekor-key`) — a build with an empty pin set
-defaults to `off`, because requiring a record nothing could verify is
-enforcement before rollout (§7); `off` when `--dnssec-anchor` is in force. A
-pinned anchor file is already a direct key pin — there is no delegation
-chain left for a substitution attack to ride — so the requirement is opt-in
-there (self-hosted log + `--rekor-key`).
-The embedded default key is snapshotted from Sigstore's TUF root at build
-time; a full in-client TUF workflow is explicitly out of v1 (§8).
+Default: `require`, everywhere — behind `--dnssec-anchor` as much as on the
+ICANN path. A pinned anchor closes the delegation chain to substitution,
+but the requirement is about the key being *public*; an internal deployment
+that wants neither the public log nor its own says `--rekor off` in so many
+words rather than inheriting it from an unrelated flag. The embedded
+default keys are the Sigstore production logs, snapshotted from Sigstore's
+TUF `trusted_root.json` at build time (the snapshot's target hash is
+checked against the signed TUF targets metadata, and rotating it is a new
+build); a full in-client TUF workflow is explicitly out of v1 (§8).
 
 ### 4.2 Refresh pipeline
 
@@ -306,15 +306,23 @@ monitor the operator runs) can watch too — that independence is the point.
 
 ## 7. Rollout
 
-- **Phase 0 — publish**: control plane logs keys, serves proof records;
-  enforcement gate off. Existing clients never query the new name; zero
-  impact.
-- **Phase 1 — verify, warn**: clients verify when the record is present;
-  failures surface in `synch doctor` and logs but do not discard answers.
-  Absence is only a note.
-- **Phase 2 — require**: `--rekor require` becomes the default on the ICANN
-  path; control-plane publish gate turns on. Escape hatch remains per-daemon
-  `--rekor off`.
+Clients ship with `require` as the default from the first release — the
+strictness is the point, and a default that waits is a window in which a
+substitution stays quiet. That puts an ordering obligation on operators,
+stated plainly: **log the zone key and serve its proof record before the
+cluster's clients upgrade.** An upgraded client refreshing against a zone
+that serves no record fails closed (cached set retained, degrading toward
+static-only trust) until the record appears or the daemon is told
+`--rekor off`.
+
+The control-plane side is still phased:
+
+- **Phase 0 — publish**: `rekor-publish` at the ceremony, proof records
+  served; the publish gate (`CP_REKOR_REQUIRE`) stays off so a zone whose
+  key is not yet logged can still publish while its operator catches up.
+- **Phase 1 — gate**: `CP_REKOR_REQUIRE=true` — the primary refuses to
+  publish a zone whose active key lacks a verified record, closing the gap
+  between "the ceremony forgot" and "clients notice".
 
 ## 8. Alternatives considered and future work
 

@@ -427,32 +427,18 @@ fn regenerate_the_shared_fixture() {
 }
 
 #[test]
-fn the_policy_default_follows_the_trust_configuration() {
-    // Require on the ICANN path once a log key is pinned, off with nothing
-    // to verify against or behind a pinned anchor — and an explicit flag
-    // overrides in both directions (§4.1, §7).
+fn the_policy_default_is_require_everywhere() {
+    // Require is the default in every trust configuration — the embedded
+    // Sigstore snapshot means a stock build can always verify — and off is
+    // an explicit choice, behind an anchor as much as on the ICANN path
+    // (§4.1).
     let icann = ResolverOptions::default();
-    assert_eq!(
-        icann.rekor_policy(),
-        RekorPolicy::Off,
-        "no embedded log key has landed yet: requiring by default would be \
-         enforcement before rollout"
-    );
-    assert_eq!(
-        ResolverOptions {
-            rekor_key: Some("/tmp/rekor.pub".into()),
-            ..Default::default()
-        }
-        .rekor_policy(),
-        RekorPolicy::Require,
-        "pinning a log is what turns the default on"
-    );
+    assert_eq!(icann.rekor_policy(), RekorPolicy::Require);
     let anchored = ResolverOptions {
         trust_anchor: Some("/tmp/anchor.key".into()),
-        rekor_key: Some("/tmp/rekor.pub".into()),
         ..Default::default()
     };
-    assert_eq!(anchored.rekor_policy(), RekorPolicy::Off);
+    assert_eq!(anchored.rekor_policy(), RekorPolicy::Require);
     assert_eq!(
         ResolverOptions {
             rekor: Some(RekorPolicy::Require),

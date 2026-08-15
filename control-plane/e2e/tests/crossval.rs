@@ -11,7 +11,7 @@
 //!                   z-base-32 device keys the seeded zone published
 
 use synch_core::OriginId;
-use synch_net::dns::{DnssecResolver, ResolverOptions};
+use synch_net::dns::{DnssecResolver, RekorPolicy, ResolverOptions};
 
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
@@ -29,7 +29,9 @@ async fn control_plane_zone_validates_and_parses() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(doh_url),
         trust_anchor: Some(anchor.into()),
-        rekor: None,
+        // DNSSEC-only coverage: the zone-key transparency path has its own
+        // suite, and this zone logs nothing.
+        rekor: Some(RekorPolicy::Off),
         rekor_key: None,
     })
     .expect("resolver construction");
