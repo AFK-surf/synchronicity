@@ -1,0 +1,258 @@
+//// The one write path for zone contents: bump the serial, rebuild and
+//// re-sign the whole zone, replace the presigned RRsets and NSEC chain —
+//// all inside one transaction with whatever product mutation triggered
+//// it. The zone is small; a full re-sign is sub-second and leaves no
+//// partial-invalidation logic to get wrong.
+
+import dns/name.{type Name}
+import dns/rdata
+import dnssec/keys.{type Csk}
+import dnssec/sign
+import gleam/bit_array
+import gleam/int
+import gleam/list
+import gleam/result
+import store/sqlite.{type Connection, Blob, Int as VInt, Text}
+import zone/build.{type Rrset}
+import zone/model
+
+pub type PublishError {
+  Db(sqlite.Error)
+  Model(model.ModelError)
+  Build(build.BuildError)
+  /// The key file's public half does not match zone_meta — wrong key file.
+  KeyMismatch
+}
+
+/// A signed RRset ready to store and serve.
+pub type Signed {
+  Signed(
+    owner: Name,
+    rtype: Int,
+    ttl: Int,
+    rrset_wire: BitArray,
+    rrsig_wire: BitArray,
+  )
+}
+
+/// Signs every RRset. Pure; shared with tests, which point the actual
+/// validators at its output.
+pub fn sign_rrsets(
+  rrsets: List(Rrset),
+  csk: Csk,
+  key_tag: Int,
+  apex: Name,
+  inception: Int,
+  expiration: Int,
+) -> List(Signed) {
+  list.map(rrsets, fn(rrset) {
+    let sorted = list.sort(rrset.rdatas, bit_array.compare)
+    let rrset_wire =
+      sorted
+      |> list.map(fn(rd) { rdata.rr(rrset.owner, rrset.rtype, rrset.ttl, rd) })
+      |> bit_array.concat
+    let rrsig_wire =
+      sign.sign_rrset(
+        csk,
+        key_tag,
+        apex,
+        rrset.owner,
+        rrset.rtype,
+        rrset.ttl,
+        sorted,
+        inception,
+        expiration,
+      )
+    Signed(rrset.owner, rrset.rtype, rrset.ttl, rrset_wire, rrsig_wire)
+  })
+}
+
+/// Publishes the zone: serial+1, rebuild, re-sign, replace. Runs in its
+/// own transaction; call `publish_in_tx` instead when a product mutation
+/// already holds one. Returns the new serial.
+pub fn publish(
+  conn: Connection,
+  csk: Csk,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  use _ <- result.try(exec(conn, "BEGIN IMMEDIATE"))
+  case publish_in_tx(conn, csk, now, actor) {
+    Ok(serial) ->
+      case exec(conn, "COMMIT") {
+        Ok(Nil) -> Ok(serial)
+        Error(e) -> {
+          let _ = exec(conn, "ROLLBACK")
+          Error(e)
+        }
+      }
+    Error(e) -> {
+      let _ = exec(conn, "ROLLBACK")
+      Error(e)
+    }
+  }
+}
+
+/// The publish body, for callers that already opened the transaction.
+pub fn publish_in_tx(
+  conn: Connection,
+  csk: Csk,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  use _ <- result.try(exec(
+    conn,
+    "UPDATE zone_meta SET soa_serial = soa_serial + 1 WHERE id = 1",
+  ))
+  use input <- result.try(model.read(conn) |> result.map_error(Model))
+  let meta = input.meta
+  use Nil <- result.try(case meta.dnskey_public == csk.public {
+    True -> Ok(Nil)
+    False -> Error(KeyMismatch)
+  })
+  use rrsets <- result.try(build.build(input) |> result.map_error(Build))
+  let inception = now - meta.sig_inception_skew
+  let expiration = now + meta.sig_validity
+  let signed =
+    sign_rrsets(
+      build.sort_rrsets(rrsets),
+      csk,
+      meta.key_tag,
+      meta.apex,
+      inception,
+      expiration,
+    )
+
+  use _ <- result.try(exec(conn, "DELETE FROM presigned_rrsets"))
+  use Nil <- result.try(
+    list.try_fold(signed, Nil, fn(_, s) {
+      sqlite.exec(
+        conn,
+        "INSERT INTO presigned_rrsets VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+          Text(name.to_string(s.owner)),
+          VInt(s.rtype),
+          VInt(s.ttl),
+          Blob(s.rrset_wire),
+          Blob(s.rrsig_wire),
+          VInt(expiration),
+          VInt(meta.soa_serial),
+          VInt(now),
+        ],
+      )
+      |> result.map_error(Db)
+      |> result.replace(Nil)
+    }),
+  )
+
+  use _ <- result.try(exec(conn, "DELETE FROM nsec_chain"))
+  let owners = build.owners_in_order(rrsets)
+  let nexts = case owners {
+    [first, ..rest] -> list.zip(owners, list.append(rest, [first]))
+    [] -> []
+  }
+  use Nil <- result.try(
+    list.index_fold(nexts, Ok(Nil), fn(acc, pair, index) {
+      use Nil <- result.try(acc)
+      let #(owner, next) = pair
+      sqlite.exec(conn, "INSERT INTO nsec_chain VALUES (?, ?, ?)", [
+        Text(name.to_string(owner)),
+        Text(name.to_string(next)),
+        VInt(index),
+      ])
+      |> result.map_error(Db)
+      |> result.replace(Nil)
+    }),
+  )
+
+  use _ <- result.try(
+    sqlite.exec(
+      conn,
+      "INSERT INTO audit_log (at, actor, org_id, action, detail)
+       VALUES (?, ?, NULL, 'zone.publish', ?)",
+      [
+        VInt(now),
+        Text(actor),
+        Text(
+          "{\"serial\":"
+          <> int.to_string(meta.soa_serial)
+          <> ",\"rrsets\":"
+          <> int.to_string(list.length(signed))
+          <> "}",
+        ),
+      ],
+    )
+    |> result.map_error(Db),
+  )
+  Ok(meta.soa_serial)
+}
+
+/// Bootstraps zone_meta on first start; on later starts verifies the
+/// stored zone identity against the configuration. A mismatch is refused —
+/// pointing a primary at the wrong database or key must not "fix" itself.
+pub fn ensure_meta(
+  conn: Connection,
+  base_domain: String,
+  csk: Csk,
+) -> Result(Nil, String) {
+  let dnskey_rd = keys.dnskey_rdata(csk)
+  let tag = keys.key_tag(dnskey_rd)
+  case model.read_meta(conn) {
+    Ok(meta) -> {
+      let same_domain = name.to_string(meta.apex) == base_domain <> "."
+      case same_domain, meta.dnskey_public == csk.public {
+        True, True -> Ok(Nil)
+        False, _ ->
+          Error(
+            "zone_meta base domain "
+            <> name.to_string(meta.apex)
+            <> " does not match configured "
+            <> base_domain,
+          )
+        _, False ->
+          Error(
+            "zone key file does not match the key this zone was created with",
+          )
+      }
+    }
+    Error(model.NoZoneMeta) ->
+      sqlite.exec(
+        conn,
+        "INSERT INTO zone_meta VALUES (1, ?, 0, ?, ?, 3600, 1209600, 604800)",
+        [Text(base_domain), Blob(csk.public), VInt(tag)],
+      )
+      |> result.replace(Nil)
+      |> result.map_error(fn(_) { "could not initialize zone_meta" })
+    Error(_) -> Error("could not read zone_meta")
+  }
+}
+
+/// Replaces the nameserver set (operator configuration, applied at boot).
+pub fn set_ns_hosts(
+  conn: Connection,
+  hosts: List(#(String, String, String)),
+) -> Result(Nil, sqlite.Error) {
+  use _ <- result.try(sqlite.exec(conn, "DELETE FROM zone_ns", []))
+  list.try_fold(hosts, Nil, fn(_, host) {
+    let #(hostname, ipv4, ipv6) = host
+    sqlite.exec(conn, "INSERT INTO zone_ns VALUES (?, ?, ?)", [
+      Text(hostname),
+      text_or_null(ipv4),
+      text_or_null(ipv6),
+    ])
+    |> result.replace(Nil)
+  })
+}
+
+fn text_or_null(s: String) -> sqlite.Value {
+  case s {
+    "" -> sqlite.Null
+    _ -> Text(s)
+  }
+}
+
+fn exec(conn: Connection, sql: String) -> Result(Nil, PublishError) {
+  sqlite.exec(conn, sql, [])
+  |> result.map_error(Db)
+  |> result.replace(Nil)
+}

@@ -2,7 +2,15 @@
 %% :crypto speaks DER-encoded signatures; DNSSEC wants raw r||s (64 bytes,
 %% RFC 6605 §4) — the conversion lives here, next to the calls that need it.
 -module(cp_crypto_ffi).
--export([ec_generate/0, ecdsa_sign_raw/2, ecdsa_verify_raw/3]).
+-export([ec_generate/0, ecdsa_sign_raw/2, ecdsa_verify_raw/3,
+         ed25519_generate_public/0]).
+
+%% A fresh Ed25519 public key (32 bytes) — device keys are Ed25519 iroh
+%% NodeIds, and seeded demo/test zones need real curve points because the
+%% synchronicity client rejects undecodable nk= values.
+ed25519_generate_public() ->
+    {Pub, _Priv} = crypto:generate_key(eddsa, ed25519),
+    Pub.
 
 %% -> {Private32, Public64} — the public key without its 0x04 point prefix,
 %% which is exactly the DNSKEY key material.
