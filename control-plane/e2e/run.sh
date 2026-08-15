@@ -34,6 +34,7 @@ export CP_HTTP_PORT=8053
 export CP_DNS_PORT=5359
 export CP_NS_HOSTS="ns1=127.0.0.1"
 export CP_PUBLIC_URL="http://127.0.0.1:$CP_HTTP_PORT"
+export CP_SESSION_SECRET="e2e-only-session-secret-not-for-production"
 
 gleam run -- keygen "$CP_BASE_DOMAIN" "$CP_KEY_FILE" | tee "$WORKDIR/keygen.out"
 # Zone-file syntax for the synchronicity client's --dnssec-anchor...

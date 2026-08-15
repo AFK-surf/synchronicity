@@ -8,15 +8,20 @@
 ////   migrate-check         replay the migration chain against a scratch DB
 ////   seed-admin <email>    (later) first-user bootstrap
 
+import api/auth_api
 import api/router
+import auth/github
+import auth/google
 import config.{type Config, Primary, Replica}
 import dns/name
 import dns/server_tcp
 import dns/server_udp
 import dnssec/keys
+import email/mailer
 import gleam/erlang/process
 import gleam/int
 import gleam/io
+import gleam/option
 import gleam/result
 import gleam/string
 import mist
@@ -161,12 +166,31 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   use apex <- result.try(
     name.parse(cfg.base_domain) |> result.replace_error("bad base domain"),
   )
-  let ctx = router.Context(keys.anchor_line(apex, csk), keys.ds_line(apex, csk))
+  let mail = case cfg.smtp {
+    option.Some(#(host, port, user, pass, from)) ->
+      mailer.Smtp(host, port, user, pass, from)
+    option.None -> mailer.LogOnly
+  }
+  io.println("mailer: " <> mailer.describe(mail))
+  let auth =
+    auth_api.AuthContext(
+      cfg.db_path,
+      cfg.public_url,
+      mail,
+      option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
+      option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
+    )
+  let ctx =
+    router.Context(
+      keys.anchor_line(apex, csk),
+      keys.ds_line(apex, csk),
+      option.Some(auth),
+    )
 
   use Nil <- result.try(server_udp.start(cfg.dns_port))
   use Nil <- result.try(server_tcp.start(cfg.dns_port))
 
-  let secret = wisp.random_string(64)
+  let secret = cfg.session_secret
   let handler = fn(req) { router.handle(req, ctx) }
   use _ <- result.try(
     wisp_mist.handler(handler, secret)

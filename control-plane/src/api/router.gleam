@@ -2,8 +2,11 @@
 //// the product API mounts on the primary only (a replica has no sessions
 //// and no writes, by construction).
 
+import api/auth_api.{type AuthContext}
 import dns/doh
+import gleam/http.{Get, Post}
 import gleam/json
+import gleam/option.{type Option, None, Some}
 import wisp.{type Request, type Response}
 import zone/snapshot
 
@@ -12,6 +15,8 @@ pub type Context {
     /// Trust-anchor line + DS record, prebuilt at boot (public data).
     anchor: String,
     ds: String,
+    /// Present on the primary only; replicas serve DNS and health alone.
+    auth: Option(AuthContext),
   )
 }
 
@@ -20,7 +25,25 @@ pub fn handle(req: Request, ctx: Context) -> Response {
     ["dns-query"] -> doh.handle(req)
     ["healthz"] -> healthz()
     ["api", "zone", "anchor"] -> anchor(ctx)
+    ["auth", ..] | ["api", ..] ->
+      case ctx.auth {
+        Some(auth) -> primary_routes(req, auth)
+        None -> wisp.not_found()
+      }
     _ -> wisp.not_found()
+  }
+}
+
+fn primary_routes(req: Request, auth: AuthContext) -> Response {
+  case wisp.path_segments(req), req.method {
+    ["auth", "start", provider], Get -> auth_api.start(req, auth, provider)
+    ["auth", "callback", provider], Get ->
+      auth_api.callback(req, auth, provider)
+    ["auth", "magic"], Post -> auth_api.magic_request(req, auth)
+    ["auth", "magic", "redeem"], Get -> auth_api.magic_redeem(req, auth)
+    ["api", "logout"], Post -> auth_api.logout(req, auth)
+    ["api", "me"], Get -> auth_api.me(req, auth)
+    _, _ -> wisp.not_found()
   }
 }
 
