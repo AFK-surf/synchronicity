@@ -4,7 +4,15 @@
 # operator runs beside us.
 
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra -Werror -std=c11
+CFLAGS  ?= -O2
+# The warning and hardening set is not optional and survives an
+# environment-supplied CFLAGS: this program parses length-framed bytes
+# and opens database files written by external tooling.
+# (-U_FORTIFY_SOURCE first: some toolchains predefine it, and a
+# redefinition warning would trip -Werror.)
+override CFLAGS += -std=c11 -Wall -Wextra -Werror -fno-common \
+  -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE
+LDFLAGS += -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 PRIV    := ../priv
 TARGET  := $(PRIV)/csqlite
 
@@ -18,7 +26,7 @@ check-header:
 
 $(TARGET): wrapper.c
 	@mkdir -p $(PRIV)
-	$(CC) $(CFLAGS) -o $@ wrapper.c -lsqlite3
+	$(CC) $(CFLAGS) -o $@ wrapper.c $(LDFLAGS) -lsqlite3
 
 clean:
 	rm -f $(TARGET)

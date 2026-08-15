@@ -1,3 +1,4 @@
+import gleam/bit_array
 import gleam/string
 import store/db
 import store/migrate
@@ -173,5 +174,46 @@ pub fn duplicate_label_per_network_rejected_test() {
   let assert Error(sqlite.Sqlite(_, message)) =
     sqlite.exec(conn, "INSERT INTO network_devices VALUES ('n1', 'd2', 0)", [])
   assert string.contains(message, "label already used")
+  sqlite.close(conn)
+}
+
+pub fn empty_path_refused_test() {
+  // Fail-open guard: "" would open an anonymous temp DB and discard
+  // every write on exit. Refused on both sides of the protocol.
+  let assert Error(sqlite.Sqlite(_, message)) =
+    sqlite.open("", sqlite.ReadWriteCreate)
+  assert string.contains(message, "empty database path")
+}
+
+pub fn embedded_nul_sql_refused_test() {
+  let assert Ok(conn) = db.open_primary(tmp_db())
+  let assert Ok(nul) = bit_array.to_string(<<0>>)
+  let assert Error(sqlite.Sqlite(_, message)) =
+    sqlite.exec(conn, "SELECT 1; " <> nul <> "DROP TABLE x", [])
+  assert string.contains(message, "NUL")
+  sqlite.close(conn)
+}
+
+pub fn hostile_schema_defenses_active_test() {
+  // TRUSTED_SCHEMA off and DEFENSIVE on: writable_schema is refused, so
+  // a hostile replicated file cannot rewrite its own schema through us.
+  let assert Ok(conn) = db.open_primary(tmp_db())
+  let assert Ok(_) = sqlite.script(conn, "CREATE TABLE t(a);")
+  let assert Ok(_) = sqlite.exec(conn, "PRAGMA writable_schema=ON", [])
+  let assert Error(sqlite.Sqlite(_, _)) =
+    sqlite.exec(
+      conn,
+      "UPDATE sqlite_schema SET sql='CREATE TABLE t(evil)' WHERE name='t'",
+      [],
+    )
+  sqlite.close(conn)
+}
+
+pub fn oversized_value_refused_test() {
+  // SQLITE_LIMIT_LENGTH is capped at 16 MiB: a value that would balloon
+  // the response comes back as a clean error, not a giant frame.
+  let assert Ok(conn) = db.open_primary(tmp_db())
+  let assert Error(sqlite.Sqlite(_, _)) =
+    sqlite.query(conn, "SELECT zeroblob(32*1024*1024)", [])
   sqlite.close(conn)
 }

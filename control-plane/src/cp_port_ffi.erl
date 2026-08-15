@@ -60,7 +60,20 @@ rpc(Port, Payload, TimeoutMs) ->
             error:badarg -> {error, closed}
         end,
     erlang:demonitor(Ref, [flush]),
-    Result.
+    case Result of
+        {error, timeout} ->
+            %% The reply for this request is still coming. If the port
+            %% survived, that stale frame would be matched by the NEXT
+            %% rpc on this connection and returned as the wrong query's
+            %% result — so a timed-out connection is killed, exactly as
+            %% the Gleam docs promise. (Selective receive matches on the
+            %% port identity, so a late frame from this dead port can
+            %% never satisfy a future connection's receive.)
+            catch erlang:port_close(Port),
+            Result;
+        _ ->
+            Result
+    end.
 
 close(Port) ->
     catch port_close(Port),

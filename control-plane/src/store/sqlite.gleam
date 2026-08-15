@@ -70,7 +70,9 @@ pub type Error {
   Sqlite(code: Int, message: String)
   /// The port process is gone (crash or close); reopen to continue.
   ConnectionClosed
-  /// No reply within the deadline; the connection is unusable after this.
+  /// No reply within the deadline. The transport closes the port on
+  /// timeout, so the connection is genuinely dead — the late reply can
+  /// never be misread as the answer to a later query. Reopen to continue.
   RpcTimeout
   /// The reply did not parse — a bug, not an operational state.
   Protocol
@@ -81,7 +83,14 @@ pub type Error {
 const rpc_timeout_ms = 60_000
 
 /// Opens a database, spawning one csqlite OS process to own it.
+/// An empty path is refused here and by the worker: SQLite would treat
+/// it as an anonymous temp database and the service would come up
+/// "healthy" while discarding every write.
 pub fn open(path: String, mode: Mode) -> Result(Connection, Error) {
+  use Nil <- result.try(case path {
+    "" -> Error(Sqlite(21, "empty database path"))
+    _ -> Ok(Nil)
+  })
   use exe <- result.try(result.replace_error(
     priv_path("csqlite"),
     MissingBinary,
@@ -126,6 +135,12 @@ pub fn exec(
 }
 
 /// Runs a multi-statement script (no parameters, no result rows).
+///
+/// SECURITY: `sql` must be a compile-time literal or assembled only from
+/// literals and integers — never from user input, ever. This is the one
+/// API with no parameter support; a concatenated string here is a full
+/// multi-statement injection. Anything user-influenced goes through
+/// `exec` with `?` placeholders.
 pub fn script(conn: Connection, sql: String) -> Result(Nil, Error) {
   use resp <- result.try(rpc(conn, <<0x04, sql:utf8>>))
   case resp {
