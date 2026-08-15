@@ -222,11 +222,16 @@ and its published trie is replicated by everyone. (Finer-grained ACLs are future
 
 Membership (who is allowed) is separate from address discovery (where they are).
 For dialing, we use iroh's standard discovery stack — pkarr/DNS node discovery and
-relay servers — so nodes behind NATs work out of the box. Optionally, the TXT record
-may carry a hint: `relay=https://...` or `addr=host:port`, which is fed into iroh as
-dialing hints. Self-hosted deployments can run their own iroh relay; nothing in
-synchronicity assumes n0's infrastructure. To reach a named origin, a node dials
-whichever device key(s) are currently bound to it.
+relay servers — so nodes behind NATs work out of the box. The defaults are n0's
+public infrastructure (the `iroh.link` discovery service and n0's relays); the
+`--discovery <pkarr-url>` and `--relay <url>` flags on `synch daemon run` point
+discovery and relays at a self-hosted iroh-dns-server / iroh-relay instead, so
+nothing in synchronicity requires n0's infrastructure. None of this stack is
+trusted: a broken or hostile lookup or relay can strand a dial but never redirect
+one — the QUIC handshake authenticates the device key, and membership is enforced
+at accept. Optionally, the TXT record may carry a hint: `relay=https://...` or
+`addr=host:port`, which is fed into iroh as dialing hints. To reach a named
+origin, a node dials whichever device key(s) are currently bound to it.
 
 ### 3.4 Key rotation
 

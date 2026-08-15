@@ -32,6 +32,34 @@ pub struct Cli {
     #[arg(long, global = true, env = "SYNCH_DNSSEC_ANCHOR", value_name = "FILE")]
     pub dnssec_anchor: Option<PathBuf>,
 
+    /// Dial and listen through this iroh relay server instead of n0's public
+    /// relays; repeat for several. A relay forwards encrypted traffic only —
+    /// choosing one is an availability decision, not a trust one (§3.3).
+    /// Takes effect where the endpoint is bound: `synch daemon run`.
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_RELAY",
+        value_name = "URL",
+        value_delimiter = ',',
+        conflicts_with = "offline"
+    )]
+    pub relay: Vec<String>,
+
+    /// Publish and resolve peer addresses through this pkarr relay — a
+    /// self-hosted iroh-dns-server such as https://dns.example.com/pkarr —
+    /// instead of n0's iroh.link. Discovery is addressing, not membership:
+    /// it can strand a dial but never redirect one (§3.3). Takes effect
+    /// where the endpoint is bound: `synch daemon run`.
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_DISCOVERY",
+        value_name = "URL",
+        conflicts_with = "offline"
+    )]
+    pub discovery: Option<String>,
+
     /// Increase log verbosity.
     #[arg(short, long, global = true)]
     pub verbose: bool,
@@ -525,6 +553,51 @@ mod tests {
         assert!(cli.offline);
         let cli = Cli::try_parse_from(["synch", "id", "--offline"]).unwrap();
         assert!(cli.offline);
+    }
+
+    #[test]
+    fn relay_and_discovery_parse_and_conflict_with_offline() {
+        let cli = Cli::try_parse_from([
+            "synch",
+            "--relay",
+            "https://relay-a.example.com",
+            "--relay",
+            "https://relay-b.example.com",
+            "--discovery",
+            "https://dns.example.com/pkarr",
+            "daemon",
+            "run",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.relay,
+            [
+                "https://relay-a.example.com".to_string(),
+                "https://relay-b.example.com".to_string()
+            ]
+        );
+        assert_eq!(
+            cli.discovery.as_deref(),
+            Some("https://dns.example.com/pkarr")
+        );
+        // Offline means no relays and no discovery; both at once is a
+        // mistake to refuse, not a combination to interpret.
+        assert!(Cli::try_parse_from([
+            "synch",
+            "--offline",
+            "--relay",
+            "https://r.example.com",
+            "id"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "synch",
+            "--offline",
+            "--discovery",
+            "https://d.example.com",
+            "id"
+        ])
+        .is_err());
     }
 
     #[test]

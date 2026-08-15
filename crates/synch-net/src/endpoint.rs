@@ -4,9 +4,10 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use iroh::{
+    address_lookup::{PkarrPublisher, PkarrResolver},
     endpoint::{presets, Connection, RelayMode},
     protocol::Router,
-    Endpoint, EndpointAddr, TransportAddr,
+    Endpoint, EndpointAddr, RelayUrl, TransportAddr,
 };
 use iroh_base::SecretKey;
 use synch_core::{NodeId, ALPN_BLOB, ALPN_MPT};
@@ -38,6 +39,22 @@ pub struct NetOptions {
     /// never touch the network; self-hosted deployments can use it on closed
     /// networks.
     pub offline: bool,
+    /// Iroh relay server URLs replacing n0's public relay map (§3.3).
+    ///
+    /// Self-hosted deployments point every node at their own relay here.
+    /// A relay forwards encrypted QUIC traffic only — it learns neither
+    /// membership nor content — so choosing one is an availability decision,
+    /// not a trust one. Empty means n0's relays. Ignored when `offline`.
+    pub relay_urls: Vec<String>,
+    /// A pkarr relay URL for address discovery — a self-hosted
+    /// iroh-dns-server such as `https://dns.example.com/pkarr` — replacing
+    /// n0's iroh.link publisher and resolver (§3.3).
+    ///
+    /// Discovery is addressing, not membership: a broken or hostile lookup
+    /// can strand a dial but never redirect one, because the QUIC handshake
+    /// authenticates the device key and membership is enforced at accept.
+    /// `None` means n0's. Ignored when `offline`.
+    pub discovery_url: Option<String>,
     /// Notified when a connection is refused because the dialing device key
     /// has no live binding (§3.4).
     ///
@@ -54,9 +71,29 @@ impl NetOptions {
         NetOptions {
             bind_addr: Some("127.0.0.1:0".parse().expect("valid loopback address")),
             offline: true,
+            relay_urls: Vec::new(),
+            discovery_url: None,
             on_unknown_key: None,
         }
     }
+}
+
+/// Parses relay URLs into a custom relay mode, naming the offender.
+fn parse_relay_mode(urls: &[String]) -> Result<RelayMode, NetError> {
+    let mut parsed = Vec::with_capacity(urls.len());
+    for raw in urls {
+        let url: RelayUrl = raw
+            .parse()
+            .map_err(|e| NetError::Endpoint(format!("relay url {raw}: {e}")))?;
+        parsed.push(url);
+    }
+    Ok(RelayMode::custom(parsed))
+}
+
+/// Parses the pkarr relay URL address discovery publishes to and resolves
+/// through, naming it on failure.
+fn parse_discovery_url(raw: &str) -> Result<reqwest::Url, NetError> {
+    reqwest::Url::parse(raw).map_err(|e| NetError::Endpoint(format!("discovery url {raw}: {e}")))
 }
 
 /// A bound endpoint serving both ALPNs.
@@ -73,7 +110,20 @@ impl Net {
         secret: SecretKey,
         options: NetOptions,
     ) -> Result<Net, NetError> {
-        let mut builder = Endpoint::builder(presets::Minimal).secret_key(secret);
+        // §3.3's discovery stack: n0's pkarr/DNS address lookup and public
+        // relays by default, overridable for self-hosted deployments. None of
+        // it is trusted — see NetOptions — so these are plain configuration.
+        let mut builder = Endpoint::builder(presets::N0).secret_key(secret);
+        if let Some(raw) = &options.discovery_url {
+            let url = parse_discovery_url(raw)?;
+            builder = builder
+                .clear_address_lookup()
+                .address_lookup(PkarrPublisher::builder(url.clone()))
+                .address_lookup(PkarrResolver::builder(url));
+        }
+        if !options.relay_urls.is_empty() {
+            builder = builder.relay_mode(parse_relay_mode(&options.relay_urls)?);
+        }
         if options.offline {
             builder = builder
                 .relay_mode(RelayMode::Disabled)
@@ -194,5 +244,25 @@ impl Net {
             .shutdown()
             .await
             .map_err(|e| NetError::Endpoint(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_urls_parse_or_name_the_offender() {
+        let mode = parse_relay_mode(&["https://relay.example.com".to_string()]).unwrap();
+        assert!(matches!(mode, RelayMode::Custom(_)));
+        let err = parse_relay_mode(&["not a url".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("not a url"), "{err}");
+    }
+
+    #[test]
+    fn discovery_urls_parse_or_name_the_offender() {
+        parse_discovery_url("https://dns.example.com/pkarr").unwrap();
+        let err = parse_discovery_url("dns.example.com/pkarr").unwrap_err();
+        assert!(err.to_string().contains("dns.example.com/pkarr"), "{err}");
     }
 }
