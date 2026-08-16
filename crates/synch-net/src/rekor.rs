@@ -1478,6 +1478,48 @@ mod tests {
         assert_eq!(&bytes[43..45], &13u16.to_be_bytes());
     }
 
+    /// A record that does not fit the format is refused, not mangled.
+    ///
+    /// This encoder used to clamp the 16-bit length and truncate the blob;
+    /// the Gleam one, which no longer exists, wrapped it modulo 65536. Two
+    /// different wrong answers, in a format whose whole purpose is that a
+    /// publisher and a client agree byte for byte. There is one encoder now,
+    /// and what it does with an unrepresentable record is a refusal — which
+    /// is the only answer that cannot be silently wrong.
+    #[test]
+    fn an_oversized_record_is_refused_rather_than_mangled() {
+        let base = proof();
+        for oversized in [
+            RekorProof {
+                statement: vec![0; 65_536],
+                ..base.clone()
+            },
+            RekorProof {
+                canonicalized_body: vec![0; 65_536],
+                ..base.clone()
+            },
+            RekorProof {
+                checkpoint: vec![0; 65_536],
+                ..base.clone()
+            },
+            RekorProof {
+                inclusion_path: vec![[0u8; 32]; 256],
+                ..base.clone()
+            },
+        ] {
+            assert!(oversized.encode().is_none());
+            assert!(oversized.to_txt().is_none());
+        }
+        // 65535 bytes and 255 hops are the last that fit.
+        assert!(RekorProof {
+            statement: vec![0; 65_535],
+            inclusion_path: vec![[0u8; 32]; 255],
+            ..base
+        }
+        .encode()
+        .is_some());
+    }
+
     #[test]
     fn a_truncated_or_padded_record_is_malformed() {
         let bytes = proof().encode().expect("a small record encodes");
