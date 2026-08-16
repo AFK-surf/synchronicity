@@ -65,8 +65,6 @@ pub type PublishError {
   /// The DNSSEC chain could not be collected. Almost always one thing: the
   /// DS is not live in the parent yet, and logging comes after that now.
   NoChain(String)
-  /// The certificate could not be built or read back.
-  BadCertificate(String)
 }
 
 pub type Outcome {

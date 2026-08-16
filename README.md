@@ -213,10 +213,11 @@ about that shape.
 | `synch-core` | `OriginId`, `Hash`, records, signed heads, the postcard wire schemas |
 | `synch-mpt` | the Merkle-Patricia Trie: nodes, hashing, diff, proofs, cursors |
 | `synch-store` | the SQLite schema and the content-addressed blob store |
-| `synch-net` | the iroh endpoint, both ALPNs, reconciliation, the DNSSEC resolver |
+| `synch-net` | the iroh endpoint, both ALPNs, reconciliation, the DNSSEC resolver, and the zone-key transparency verifier |
 | `synch-engine` | the embeddable node: scanner, publisher, anti-entropy, fetcher, mirrors |
 | `synch-cli` | the `synch` binary: the daemon, the control socket, and the CLI client |
 | `synch-s3` | the `synch-s3` binary and the gateway library |
+| `synch-monitor` | the `synch-monitor` binary: walks the transparency log's tiles and classifies every entry that names a watched zone |
 
 All logic lives in the library crates, so any Rust application can embed a full
 node by depending on `synch-engine`.

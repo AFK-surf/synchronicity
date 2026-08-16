@@ -29,10 +29,15 @@ async fn control_plane_zone_validates_and_parses() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(doh_url),
         trust_anchor: Some(anchor.into()),
-        // DNSSEC-only coverage: the zone-key transparency path has its own
-        // suite, and this zone logs nothing.
+        // DNSSEC-only coverage here: the zone-key transparency path has its
+        // own suite, and this zone logs nothing — `rekor-publish` needs a
+        // real Rekor v2 endpoint, and an e2e that POSTed to the public log
+        // on every run would be publishing throwaway keys forever. The leg
+        // below asserts that this zone's silence is fail-closed rather than
+        // tolerated.
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
+        rekor_state: None,
     })
     .expect("resolver construction");
 
@@ -104,4 +109,44 @@ async fn control_plane_zone_validates_and_parses() {
     // not hang or fall open.
     let missing = resolver.member_set(&format!("nope.{domain}")).await;
     assert!(missing.is_err(), "nonexistent domain must not resolve");
+}
+
+/// The same zone, under the default policy: refused.
+///
+/// The e2e zone deliberately logs nothing, and "logs nothing" must mean "no
+/// client resolves it" rather than "clients quietly carry on". This is the
+/// §4.3 posture asserted against a real control plane rather than a
+/// simulated one — the answer is discarded entirely and a caller keeps
+/// whatever it had cached.
+#[tokio::test]
+async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
+    let Some(doh_url) = env("CP_DOH_URL") else {
+        eprintln!("CP_DOH_URL not set; skipping (run via e2e/run.sh)");
+        return;
+    };
+    let anchor = env("CP_ANCHOR_FILE").expect("CP_ANCHOR_FILE");
+    let domain = env("CP_DOMAIN").expect("CP_DOMAIN");
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        doh_url: Some(doh_url),
+        trust_anchor: Some(anchor.into()),
+        // No `rekor` field at all: `require` is the default everywhere.
+        rekor: None,
+        rekor_key: None,
+        rekor_state: None,
+    })
+    .expect("resolver construction");
+
+    let error = resolver
+        .member_set(&domain)
+        .await
+        .expect_err("a zone with no proof record must not resolve by default");
+    eprintln!("ok: unlogged zone refused under the default policy: {error}");
+
+    // And the plain TXT lookup still works — it is the member-set path that
+    // gained a requirement, not every query the resolver makes.
+    resolver
+        .lookup_txt(&domain)
+        .await
+        .expect("the TXT lookup itself never consults the log");
 }

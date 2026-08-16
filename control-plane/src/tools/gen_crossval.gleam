@@ -9,7 +9,7 @@
 
 import dnssec/keys
 import gleam/io
-import gleam/option.{None, Some}
+import gleam/option.{Some}
 import rekor/cert
 import simplifile
 
