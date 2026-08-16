@@ -128,10 +128,19 @@ pub const ZONE_KEY_FLAGS: u16 = 257;
 /// same way rotating the ICANN trust anchor is.
 ///
 /// Note that this format's `log_id` is always SHA-256 over the DER
-/// SubjectPublicKeyInfo, computed here from the key bytes themselves. The
-/// trusted root agrees for the P-256 log and *disagrees* for the Ed25519
-/// one (its `logId.keyId` is derived differently there); what a proof's
-/// `log_id` field must match is this convention, not Sigstore's.
+/// SubjectPublicKeyInfo, computed here from the key bytes themselves.
+///
+/// **There are two 32-byte log ids in play and only one of them is ours.**
+/// Rekor's `TransparencyLogEntry.logId.keyId` — which sits a few lines away
+/// from the checkpoint in the same JSON response, and is exactly as long, and
+/// looks exactly as plausible — is the C2SP **note key id**,
+/// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`. Copying that value into a proof
+/// produces a record that matches no pin and fails with "unknown log", which
+/// reads like a misconfigured pin set rather than the mix-up it is. The
+/// trusted root shows the same split: it agrees with us for the P-256 log and
+/// disagrees for the Ed25519 one. What a proof's `log_id` must match is this
+/// convention. (Found the hard way while driving a live submission; the
+/// control plane's `rekor/proof.log_id` was right all along.)
 pub const EMBEDDED_LOG_KEYS: &str = "\
 # Sigstore production transparency logs, snapshotted from the TUF
 # repository's trusted_root.json. See EMBEDDED_LOG_KEYS in rekor.rs.

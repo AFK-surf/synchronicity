@@ -407,6 +407,16 @@ pub fn p256_spki(point: BitArray) -> BitArray {
 }
 
 /// The log id a proof names: SHA-256 over the DER SubjectPublicKeyInfo.
+///
+/// **Do not substitute the `logId.keyId` the log returns.** Rekor's
+/// `TransparencyLogEntry.logId.keyId` is the C2SP *note* key id —
+/// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)` — a different 32-byte value that
+/// arrives in the same JSON response, a few fields from the checkpoint, and
+/// looks every bit as much like the answer. A proof built with it matches no
+/// client pin and fails as "unknown log", which reads like a bad pin set
+/// rather than the mix-up it is. This function is the only place the
+/// convention is decided, and `publish` calls it with the *pinned* key rather
+/// than anything the server said.
 pub fn log_id(spki: BitArray) -> BitArray {
   crypto.hash(crypto.Sha256, spki)
 }

@@ -91,10 +91,12 @@ Merkle leaf commits to. So a **self-signed certificate carrying the apex as a
 where anyone walking the log's tiles can index it.
 
 This is confirmed live, not inferred: such an entry was published to
-`log2025-1.rekor.sigstore.dev` (HTTP 201, `logIndex 67673583`, SAN
-`DNS:zone-key-transparency.demo.invalid`), its inclusion proof and checkpoint
-signature both verify, and its leaf was read back out of the static tiles. It
-is checked in as `crates/synch-net/tests/fixtures/rekor_v3`.
+`log2025-1.rekor.sigstore.dev` (HTTP 201 Created, `logIndex 67766084`, SAN
+`DNS:zone-key-transparency.demo.invalid`), carrying both custom extensions
+below in a 944-byte certificate. Its leaf was read back out of the static
+tiles and the whole record — inclusion, checkpoint, possession, bindings,
+chain — verifies offline through the real client verifier. It is checked in
+as `crates/synch-net/tests/fixtures/rekor_v3`.
 
 The certificate is therefore a **key envelope, not a trust assertion**.
 Nothing anywhere — not Rekor, not the client, not the monitor — verifies its
@@ -309,14 +311,19 @@ carried verbatim precisely because the log computed it — nothing on either
 side re-canonicalizes JSON. The Statement rides alongside because the body
 commits only to its DSSE PAE *digest*; the client re-derives that digest from
 the Statement bytes (`data.digest == SHA-256(PAE)`), reads the entry signature
-and verifier out of the body, and refuses any disagreement. Roughly 5.5 KB for a log
-of 10⁸ entries (~27 path hashes) — the body is now ~3.6 KB because it carries
-the certificate, and the certificate carries ~1.9 KB of DNSSEC chain.
-base64url ≈ 7.4 KB across TXT character-strings: inside the DoH/TCP message
-limit, over the 4 KB EDNS0 UDP advertisement (so these answers go over TCP or
-DoH, which is the only transport this design has anyway), and clamped to the
-client's existing 24 h TTL ceiling. That growth is a real cost, paid by
-clients on behalf of monitors — see §6.
+and verifier out of the body, and refuses any disagreement. Measured, from the real published record in
+`tests/fixtures/rekor_v3`: **3050 bytes, 4067 base64url characters**. That is
+a floor rather than a typical figure, for two reasons the fixture makes
+explicit — its entry sits near the tree's frontier, so its audit path is 8
+hashes rather than the ~26 a deep entry in a 10⁸-entry log carries (+576 B),
+and its chain is self-anchored at the apex rather than climbing to the ICANN
+root (a real root-terminated chain is ~1.9 KB of DER, which is ~2.6 KB more
+once base64'd inside the body). A deep, ICANN-rooted proof is therefore about
+**5.5 KB, ≈ 7.4 KB base64url** across TXT character-strings: inside the
+DoH/TCP message limit, over the 4 KB EDNS0 UDP advertisement (so these
+answers go over TCP or DoH, which is the only transport this design has
+anyway), and clamped to the client's existing 24 h TTL ceiling. That growth
+is a real cost, paid by clients on behalf of monitors — see §6.
 
 Why in-band rather than an HTTPS side-channel or a live Rekor query:
 
@@ -708,8 +715,10 @@ finish.
   log plus `--rekor-key`/`CP_REKOR_KEY`, accepting that transparency then
   reaches only as far as who can read that log.
 - **Clients subsidize monitors, in bandwidth.** A proof record grows from
-  ~3.1 KB to ~7.4 KB base64url, most of it the ~1.9 KB DNSSEC chain and the
-  certificate around it. The client downloads all of it and uses the chain
+  ~3.1 KB to ~7.4 KB base64url for a deep, ICANN-rooted entry — most of it
+  the ~1.9 KB DNSSEC chain and the certificate around it. (The measured
+  record in the conformance fixture is 4067 characters; §3 explains why that
+  is a floor.) The client downloads all of it and uses the chain
   only to enforce a property it already knows — see §4.2.1 for why it must
   anyway. Amortized by the 24 h TTL, but it is a real transfer of cost from
   the parties who benefit (monitors, and through them every operator) to the
@@ -833,16 +842,31 @@ interoperation but cannot be made to misbehave on demand.
 
 **Real bytes, checked in.**
 
-- `crates/synch-net/tests/fixtures/rekor_v3` — the published entry from §2.1
-  (`logIndex 67673583`), read back out of the log's own tiles. Verified
-  offline: the leaf, an 18-hop RFC 6962 inclusion walk through a real tree of
+- `crates/synch-net/tests/fixtures/rekor_v3` — a published entry
+  (`logIndex 67766084`, HTTP 201), read back out of the log's own tiles, and
+  **total**: the real `rekor::verify` runs to a successful `VerifiedRecord`
+  over it. The leaf, the RFC 6962 inclusion walk through a real tree of
   67.7 M entries, the checkpoint under the *embedded* Sigstore key, three
   witness cosignatures with decodable timestamps, the body's tags, the
-  certificate, and its single SAN. Its Statement was not preserved by the
-  demo publisher — a `hashedrekord` leaf commits only to the digest, which is
-  exactly why §3's record carries the Statement alongside — so the test
-  asserts a full `rekor::verify` reaches the first check needing those bytes
-  and fails precisely there.
+  certificate, its single SAN, possession, the statement-digest link, the
+  Statement's byte-exact round trip through this build's renderer, and the
+  carried DNSSEC chain. With teeth: the same proof offered for a different
+  key, or a different apex, is refused. `crates/synch-monitor/tests/
+  real_entry.rs` classifies the same bytes, so one fixture covers both halves
+  of the invariant.
+
+  Two limits, stated in its PROVENANCE.txt rather than glossed. The chain is
+  **self-anchored** — we own no DNSSEC-signed domain, so the apex is its own
+  trust anchor and a monitor rooted at ICANN files this entry tier C,
+  correctly; ICANN-rooted validation is the `dnssec_chain` fixture's job. And
+  it is a `rollover` whose predecessor private key was not retained, so it
+  classifies tier B, with the tier A path exercised by seeding the
+  predecessor's SPKI out of the extension itself.
+
+  It also settles empirically what §2.2's bisect opened: the certificate
+  carries **both** extensions under the narrowed OIDs at **944 bytes** and the
+  log accepted it. Size was the open question after the OID fix, and it is
+  now answered by a `201` rather than by an estimate.
 - `crates/synch-net/tests/fixtures/dnssec_chain` — a real `cloudflare.com`
   delegation captured from the live DNS, validated offline to the ICANN root:
   RSASHA256 at the root, ECDSAP256SHA256 below it, a two-level DS ladder, and
@@ -866,6 +890,18 @@ matches captured bytes, and proves nothing about a remote parser's
 tolerances — and the mitigation is equally specific: before changing anything
 about the certificate's shape, submit one and read the status code. Rejected
 submissions are not logged, so bisecting against the real log is free.
+
+The same session turned up a second trap worth naming, because it is a
+*plausible* wrong answer rather than an obvious one: Rekor's
+`TransparencyLogEntry.logId.keyId` is the C2SP note key id,
+`SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`, not `SHA-256(DER SPKI)`. Both are 32
+bytes, both arrive in the same JSON response within a few fields of each
+other, and substituting one for the other yields a proof that matches no pin
+and fails as "unknown log" — which reads like a misconfigured client. The
+production code was always right (it derives the id from the *pinned* key,
+never from anything the server said); only the submission driver was wrong.
+Both `rekor::EMBEDDED_LOG_KEYS` and `rekor/proof.log_id` now say so where
+somebody would look.
 
 **Synthetic material, for the failures reality will not perform.**
 

@@ -1,52 +1,121 @@
-A genuine Rekor v2 entry whose verifier is a certificate — the v3 shape.
+A genuine Rekor v2 entry whose verifier is a certificate — the v3 shape,
+complete, and verifiable end to end.
 
-Published 2026-08-16 to https://log2025-1.rekor.sigstore.dev (HTTP 201,
-logIndex 67673583) and read back out of the log's own static tiles on the
-same day. Nothing in this repository authored the log's half of any of it.
+Published 2026-08-16 to https://log2025-1.rekor.sigstore.dev (HTTP 201
+Created, logIndex 67766084) and read back out of the log's own static tiles
+on the same day. Nothing in this repository authored the log's half of any of
+it: not the checkpoint, not the witness cosignatures, not the tree the audit
+path walks.
 
-  canonicalized_body.json  the Merkle leaf preimage, verbatim, as it came out
-                           of the entry bundle at api/v2/tile/entries/x264/349
-                           (offset 239, uint16-BE length framing).
-  certificate.der          the same certificate, extracted from
-                           spec.hashedRekordV002.signature.verifier
-                             .x509Certificate.rawBytes.
-  checkpoint.txt           api/v2/checkpoint at tree size 67 686 055, with the
-                           log's Ed25519 signature and three witness
-                           cosignatures (witness.stagemole.eu,
-                           witness.navigli.sunlight.geomys.org,
-                           staging.witness.transparency.goog).
-  inclusion_path.bin       18 audit-path hashes, derived from the log's hash
-                           tiles by recomputing complete-subtree hashes — not
-                           taken from any server-supplied proof.
-  log_index.txt            67673583.
+  statement.json           470 B  the in-toto Statement, byte-exact — the
+                                  DSSE PAE preimage the leaf's digest commits
+                                  to. Preserved this time, which is what makes
+                                  the fixture total (see "what this proves").
+  certificate.der          944 B  the entry's verifier, extracted from
+                                  spec.hashedRekordV002.signature.verifier
+                                    .x509Certificate.rawBytes.
+  canonicalized_body.json 1631 B  the Merkle leaf preimage, verbatim, as the
+                                  log returned it.
+  checkpoint.txt           643 B  the signed note at tree size 67 766 085,
+                                  with the log's Ed25519 signature and three
+                                  witness cosignatures (witness.stagemole.eu,
+                                  witness.navigli.sunlight.geomys.org,
+                                  staging.witness.transparency.goog).
+  proof.bin               3050 B  the encoded RekorProof v3 record — the
+                                  exact bytes a zone serves at
+                                  _synchronicity-rekor.<apex>, carrying 8
+                                  audit-path hashes. The tests decode this
+                                  through the client's own reader rather than
+                                  reassembling the record field by field.
+  log_index.txt                   67766084.
+  anchor.txt               144 B  the DNSSEC trust anchor this zone is under,
+                                  in --dnssec-anchor syntax.
 
-The certificate is exactly the shape §2 specifies: self-signed P-256,
-CN "synchronicity zone key", basicConstraints CA:FALSE critical, keyUsage
-digitalSignature critical, and one dNSName SAN —
-`zone-key-transparency.demo.invalid`. It proves the load-bearing claim the
-whole of v3 rests on: **Rekor performs no certificate validation**, so an
-apex written into a SAN lands, in the clear, inside the log's Merkle leaf.
+The certificate is the shape §2 specifies: self-signed P-256, CN
+"synchronicity zone key", basicConstraints CA:FALSE critical, keyUsage
+digitalSignature critical, one dNSName SAN
+`zone-key-transparency.demo.invalid`, and **both custom extensions** — the
+DNSSEC chain under 2.25.1555716359 and the succession countersignature under
+2.25.1138370866, the narrowed OIDs from §2.2.
 
-What this fixture can prove, and does, in
-tests/rekor_zone_key.rs::real_rekor_v3:
+Those extensions are why this fixture exists in its current form. An earlier
+version of this design used full 128-bit UUID arcs, and the log refused every
+certificate carrying them with an opaque `400 invalid hashedrekord request` —
+Go's encoding/asn1 rejects OID components that overflow int32, so Rekor's
+parser failed before it ever reached the extension. No local test could see
+it: OpenSSL and Erlang's public_key both parse the wide form happily. The
+201 above, at 944 bytes with both extensions present, is the empirical answer
+to both questions that raised — the arcs are acceptable and the size is fine.
+
+
+What this fixture proves, in tests/rekor_zone_key.rs::real_rekor_v3
+-------------------------------------------------------------------
+
+It is **total**: `rekor::verify` — the actual client verifier, no test
+double — runs to a successful VerifiedRecord over these bytes:
+
+  - the served proof record decodes through the client's wire reader;
+  - the log id matches a key in the *embedded* Sigstore pin set;
+  - the checkpoint verifies under that key, and its three witness
+    cosignatures decode as C2SP cosignature/v1 blobs with sane timestamps;
   - the leaf is SHA-256(0x00 || canonicalized_body) and the RFC 6962 walk
-    over the audit path reaches the checkpoint's root, in a real tree of
+    over 8 audit-path hashes reaches the checkpoint's root, in a real tree of
     67.7 million entries;
-  - the checkpoint verifies under the *embedded* Sigstore log key;
   - the body parses as hashedrekord 0.0.2 with an x509Certificate verifier;
-  - the certificate parses, and its single dNSName SAN is the apex;
-  - signature.content verifies under the certificate's own key with the
-    entry's data.digest as the prehashed message. (Confirmed independently:
+  - the certificate parses, its single dNSName SAN is the apex, and its
+    SubjectPublicKeyInfo is the zone key;
+  - signature.content verifies under that key with the entry's data.digest as
+    the prehashed message (independently confirmed with
     `openssl pkeyutl -verify -pubin -inkey pub.pem -sigfile sig.der
-     -in digest.bin -pkeyopt digest:sha256` → Signature Verified Successfully.
-    Because that digest *is* SHA-256(PAE), the same signature verifies as
-    ECDSA-SHA256 over the PAE, which is how ring is asked the question.)
+     -in digest.bin -pkeyopt digest:sha256` → Signature Verified
+    Successfully). Because that digest *is* SHA-256(PAE), the same signature
+    verifies as ECDSA-SHA256 over the PAE, which is how ring is asked;
+  - data.digest is SHA-256 of the DSSE PAE of statement.json;
+  - the Statement round-trips through this build's canonical renderer byte
+    for byte, and binds the apex, key tag, flags, algorithm and DNSKEY digest;
+  - the carried DNSSEC chain validates against the anchor in anchor.txt;
+  - the result is action `rollover`, log_index 67766084, tree_size 67766085,
+    origin log2025-1.rekor.sigstore.dev.
 
-What it cannot prove, stated plainly: the in-toto Statement behind the digest
-was not preserved by whoever published this demo entry, and a hashedrekord
-leaf commits only to the digest — which is precisely why §3's record carries
-the Statement bytes alongside the body. So the fixture cannot exercise the
-statement-digest, statement-binding or chain checks, and the test asserts
-that a full `rekor::verify` over it fails at exactly that step and no
-earlier one. The synthetic suite covers the rest, and the DNSSEC chain half
-is anchored to reality separately by tests/fixtures/dnssec_chain.
+With teeth: the same proof offered for a different key, and for a different
+apex, is refused as a binding failure; and one flipped byte in the body
+leaves the leaf outside the tree.
+
+crates/synch-monitor/tests/real_entry.rs classifies the very same bytes, so
+one fixture covers both halves of the invariant — the client accepts it, and
+the monitor does not put it in the silent bin.
+
+
+What it does not prove, stated plainly
+--------------------------------------
+
+**The chain is self-anchored.** We own no DNSSEC-signed domain, so the chain
+inside this certificate terminates at the apex itself rather than climbing to
+the ICANN root: `zone-key-transparency.demo.invalid` is its own trust anchor,
+which is why anchor.txt ships beside it and why the tests pass that anchor in
+exactly as a `--dnssec-anchor` operator would. **A public monitor rooted at
+ICANN files this entry tier C** — correctly, since nothing outside that
+private universe can tell whether the key was ever delegated. Real-world,
+ICANN-rooted chain validation is anchored separately by
+tests/fixtures/dnssec_chain, a live `cloudflare.com` delegation with a
+two-level DS ladder, RSASHA256 at the root and ECDSAP256SHA256 below it. This
+fixture is about interoperating with the log; that one is about interoperating
+with the DNS.
+
+**It is a rollover whose predecessor key was not retained.** The succession
+extension names key tag 56306 and the countersignature is real and verifies,
+but the private half was discarded after publication. So a monitor that has
+not been told about that predecessor classifies this entry **tier B** — which
+is the correct and expected answer for an uncountersigned-looking rotation,
+and is asserted as such. The monitor suite also seeds the predecessor's SPKI
+out of the extension itself to exercise the tier A path over the same real
+bytes.
+
+The demo apex is under `.invalid` (RFC 2606), so it can never resolve and
+cannot be mistaken for a live deployment.
+
+Regenerating: this cannot be regenerated from the repository — it is a
+permanent public record. Re-publishing would mint a new entry at a new index,
+which is the point of an append-only log. If the certificate's shape ever
+changes, submit one entry by hand, read the status code before trusting any
+local test, and replace this whole directory together with its index.

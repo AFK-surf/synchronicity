@@ -845,23 +845,32 @@ fn regenerate_the_shared_fixture() {
 
 // ---------------------------------------------- real Sigstore conformance
 
-/// A real published Rekor v2 entry with a certificate verifier, read offline.
+/// A real published Rekor v2 entry with a certificate verifier, verified in
+/// full, offline.
 ///
 /// The bytes in `tests/fixtures/rekor_v3` are a genuine `hashedrekord` v0.0.2
 /// entry published to `log2025-1.rekor.sigstore.dev` (see PROVENANCE.txt) and
 /// read back out of the log's own static tiles; nothing in this repository
-/// authored the log's half. It proves the claim the whole of v3 rests on:
-/// Rekor performs no certificate validation, so an apex written into a
-/// `dNSName` SAN lands, in the clear, inside the Merkle leaf.
+/// authored the log's half of any of it. The certificate carries **both**
+/// custom extensions under the narrowed OIDs, at 944 bytes — which is the
+/// empirical answer to two questions a local test cannot settle: whether
+/// Rekor accepts a certificate this size, and whether it accepts these
+/// extensions at all.
 ///
-/// One thing it cannot prove, and the test says so out loud: whoever
-/// published this demo entry did not preserve the in-toto Statement behind
-/// the digest, and a `hashedrekord` leaf commits only to that digest — which
-/// is exactly *why* §3's record carries the Statement bytes alongside the
-/// body. So the run below asserts that a full `rekor::verify` gets all the way
-/// to the first check that needs those bytes — possession, which verifies the
-/// entry signature over the Statement's PAE — and fails precisely there,
-/// having passed every check the real log's bytes can answer.
+/// It proves the claim the whole of v3 rests on: Rekor performs no
+/// certificate validation, so an apex written into a `dNSName` SAN lands, in
+/// the clear, inside the Merkle leaf where a monitor can index it.
+///
+/// This fixture is **total** — the Statement was preserved this time, so the
+/// real client verifier runs to completion over real bytes rather than
+/// stopping at the first check it cannot answer. The one thing it is not is
+/// ICANN-rooted: we own no DNSSEC-signed domain, so the chain inside the
+/// certificate is self-anchored at the apex, and the test supplies that apex
+/// as the trust anchor exactly as a `--dnssec-anchor` deployment would. A
+/// public monitor rooted at ICANN files this entry tier C, correctly.
+/// Real-world ICANN-rooted chain validation is anchored separately by
+/// `tests/fixtures/dnssec_chain` (a live `cloudflare.com` delegation); this
+/// fixture is about interoperating with the log.
 mod real_rekor_v3 {
     use super::*;
 
@@ -872,8 +881,76 @@ mod real_rekor_v3 {
         std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()))
     }
 
-    /// The embedded id of `log2025-1.rekor.sigstore.dev`: the one Ed25519 key
-    /// among the embedded pins, by our SHA-256(SPKI) convention.
+    const APEX: &str = "zone-key-transparency.demo.invalid";
+    const LOG_INDEX: u64 = 67_766_084;
+    const KEY_TAG: u16 = 1339;
+
+    /// The proof exactly as a zone serves it: the checked-in `proof.bin` is
+    /// the encoded `RekorProof` v3 record, decoded here through the client's
+    /// own wire decoder. Reassembling it field by field would test the
+    /// fixture against itself; decoding it tests the format.
+    fn proof_from_fixture() -> RekorProof {
+        let proof = RekorProof::decode(&v3("proof.bin"))
+            .expect("the served proof record must decode through the client's own reader");
+        // The loose files are the same bytes, so a reader of this directory
+        // can inspect each piece without a decoder.
+        assert_eq!(proof.statement, v3("statement.json"));
+        assert_eq!(proof.canonicalized_body, v3("canonicalized_body.json"));
+        assert_eq!(proof.checkpoint, v3("checkpoint.txt"));
+        assert_eq!(proof.log_index, LOG_INDEX);
+        assert_eq!(proof.key_tag, KEY_TAG);
+        proof
+    }
+
+    /// The zone's DNSKEY rdata, derived from the certificate's own
+    /// SubjectPublicKeyInfo — the way a monitor derives it, with no DNS
+    /// query, because the threat model has a compromised DNS provider in it.
+    ///
+    /// The shipped anchor file is asserted to be about the same key, so the
+    /// fixture cannot drift into being two keys wearing one name.
+    fn zone_dnskey_rdata() -> Vec<u8> {
+        let body = HashedRekordBody::parse(&v3("canonicalized_body.json")).unwrap();
+        let public = &body.certificate.spki[27..]; // the uncompressed point, sans 0x04
+        let mut rdata = vec![0x01, 0x01, 0x03, 0x0d]; // flags 257, protocol 3, alg 13
+        rdata.extend_from_slice(public);
+        assert_eq!(
+            chain::key_tag(&rdata),
+            KEY_TAG,
+            "the certificate's key must be the key the entry names"
+        );
+        let anchor = String::from_utf8(v3("anchor.txt")).expect("the anchor is text");
+        assert!(
+            anchor.contains(&rekor::base64_encode(public)),
+            "the shipped anchor must be this same key, or the fixture is about two keys"
+        );
+        rdata
+    }
+
+    /// The anchor as the resolver holds it. Written to a temp file because
+    /// `TrustAnchors::from_file` is the only public constructor, and using
+    /// the real parser is the point — the fixture ships the anchor in the
+    /// syntax an operator actually types.
+    fn anchors() -> (
+        tempfile::TempDir,
+        hickory_resolver::proto::dnssec::TrustAnchors,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("anchor.key");
+        std::fs::write(&path, v3("anchor.txt")).expect("write anchor");
+        let anchors = hickory_resolver::proto::dnssec::TrustAnchors::from_file(&path)
+            .expect("the shipped anchor must parse");
+        (dir, anchors)
+    }
+
+    /// The embedded id of `log2025-1.rekor.sigstore.dev`.
+    ///
+    /// Note which id this is. Rekor's own `entry.logId.keyId` in the same
+    /// JSON response is the **C2SP note key id** —
+    /// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)` — a different, equally
+    /// 32-byte, entirely plausible-looking value. Copying that one instead
+    /// produces a proof that fails to match any pin. Ours is
+    /// `SHA-256(DER SPKI)` throughout, and `rekor::log_id` is the only place
+    /// that decision is made.
     fn embedded_log2025_1_id() -> [u8; 32] {
         let expected: [u8; 32] =
             hex::decode("b54813cb63d8859870a5e78500cc6adcfdf59723edae93ee8d25faf2475a0690")
@@ -887,27 +964,67 @@ mod real_rekor_v3 {
         expected
     }
 
-    fn proof_from_fixture() -> RekorProof {
-        let path = v3("inclusion_path.bin");
-        RekorProof {
-            key_tag: 2143,
-            log_id: embedded_log2025_1_id(),
-            log_index: String::from_utf8(v3("log_index.txt"))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap(),
-            // The Statement is not recoverable — see PROVENANCE.txt.
-            statement: b"{}".to_vec(),
-            canonicalized_body: v3("canonicalized_body.json"),
-            checkpoint: v3("checkpoint.txt"),
-            inclusion_path: path
-                .chunks(32)
-                .map(|c| <[u8; 32]>::try_from(c).unwrap())
-                .collect(),
-        }
+    /// The whole client verifier, over real bytes, to a successful result.
+    #[test]
+    fn the_real_entry_verifies_end_to_end() {
+        let proof = proof_from_fixture();
+        assert_eq!(proof.log_id, embedded_log2025_1_id());
+        let rdata = zone_dnskey_rdata();
+        let key = ZoneKey {
+            apex: APEX,
+            key_tag: KEY_TAG,
+            dnskey_rdata: &rdata,
+        };
+        let (_dir, anchors) = anchors();
+
+        let record = rekor::verify(&proof, &key, &LogKeys::embedded(), &anchors)
+            .expect("a real published entry must verify under the embedded pins");
+
+        assert_eq!(record.log_index, LOG_INDEX);
+        assert_eq!(record.tree_size, 67_766_085);
+        assert_eq!(record.origin, "log2025-1.rekor.sigstore.dev");
+        // A rollover: the statement names the key it replaces, and a client
+        // accepts rollover as authorization (retire it would refuse).
+        assert_eq!(record.action, "rollover");
     }
 
+    /// The same bytes, offered as proof for a *different* key: refused.
+    ///
+    /// The binding this breaks is the one that matters — an attacker who can
+    /// read the log can copy any published proof, so a proof that verified
+    /// for a key it does not name would authorize every key in existence.
+    #[test]
+    fn the_real_entry_is_refused_for_a_different_key() {
+        let proof = proof_from_fixture();
+        let (_dir, anchors) = anchors();
+        let mut rdata = zone_dnskey_rdata();
+        rdata[8] ^= 0x40; // a different P-256 point, same shape
+        let stranger = ZoneKey {
+            apex: APEX,
+            key_tag: KEY_TAG,
+            dnskey_rdata: &rdata,
+        };
+        let error = rekor::verify(&proof, &stranger, &LogKeys::embedded(), &anchors)
+            .expect_err("a real proof must not authorize a key it does not name");
+        assert!(
+            matches!(&error, ProofError::Binding(_)),
+            "the certificate names another key: {error}"
+        );
+
+        // And offered for a different apex, with the right key.
+        let rdata = zone_dnskey_rdata();
+        let elsewhere = ZoneKey {
+            apex: "somewhere.else.invalid",
+            key_tag: KEY_TAG,
+            dnskey_rdata: &rdata,
+        };
+        assert!(matches!(
+            rekor::verify(&proof, &elsewhere, &LogKeys::embedded(), &anchors).unwrap_err(),
+            ProofError::Binding(_)
+        ));
+    }
+
+    /// Inclusion in the real tree, with teeth.
     #[test]
     fn the_real_entry_is_included_in_the_real_tree() {
         let proof = proof_from_fixture();
@@ -929,9 +1046,9 @@ mod real_rekor_v3 {
             &proof.inclusion_path,
             checkpoint.root_hash,
         )
-        .expect("18 hops through a real tree of 67.7 million entries");
+        .expect("the audit path must reach the real root");
 
-        // With teeth: one byte off the body and the leaf is not in the tree.
+        // One byte off the body and the leaf is not in the tree.
         let mut tampered = proof;
         tampered.canonicalized_body[0] ^= 0x01;
         assert!(rekor::verify_inclusion(
@@ -944,64 +1061,83 @@ mod real_rekor_v3 {
         .is_err());
     }
 
+    /// The certificate really does carry the apex into the leaf, and really
+    /// does carry both extensions at a size the log accepted.
     #[test]
-    fn the_real_entrys_certificate_carries_its_apex_into_the_leaf() {
+    fn the_real_entrys_certificate_carries_its_apex_and_both_extensions() {
         let body = HashedRekordBody::parse(&v3("canonicalized_body.json"))
             .expect("a real entry body must parse");
         assert_eq!(body.certificate_der, v3("certificate.der"));
-        assert_eq!(
-            body.certificate.single_dns_name().unwrap(),
-            "zone-key-transparency.demo.invalid"
-        );
-        // And the apex is literally inside the bytes the Merkle leaf commits
-        // to — which is the property a monitor's SAN index depends on.
-        let leaf_preimage = v3("canonicalized_body.json");
-        let der = &body.certificate_der;
+        assert_eq!(body.certificate.single_dns_name().unwrap(), APEX);
+
+        // The apex is literally inside the bytes the Merkle leaf commits to —
+        // the property a monitor's SAN index depends on.
         assert!(
-            String::from_utf8_lossy(&leaf_preimage).contains(&rekor::base64_encode(der)),
+            String::from_utf8_lossy(&v3("canonicalized_body.json"))
+                .contains(&rekor::base64_encode(&body.certificate_der)),
             "the certificate is carried verbatim in the canonicalized body"
         );
-        assert!(der
-            .windows(34)
-            .any(|w| w == b"zone-key-transparency.demo.invalid"));
+        assert!(body
+            .certificate_der
+            .windows(APEX.len())
+            .any(|w| w == APEX.as_bytes()));
 
-        // The entry signature is the certificate's own key's, over the
-        // entry's digest as a prehash. Because that digest is SHA-256(PAE),
-        // this is the same signature the client checks over the PAE.
+        // Both extensions survived the round trip, under the narrowed OIDs.
+        // 944 bytes is the empirical answer to "will Rekor take a
+        // certificate this size, with arcs like these": it did, HTTP 201.
+        assert_eq!(body.certificate_der.len(), 944);
+        let carried = body
+            .certificate
+            .extension(OID_DNSSEC_CHAIN)
+            .expect("the real certificate carries the chain extension");
+        let carried = synch_net::zonecert::DnssecChain::decode(carried).expect("and it decodes");
+        assert_eq!(carried.links.first().unwrap().zone, format!("{APEX}."));
+        let succession = body
+            .certificate
+            .extension(OID_SUCCESSION)
+            .expect("the real certificate carries the succession extension");
+        let succession =
+            synch_net::zonecert::Succession::decode(succession).expect("and it decodes");
+        assert_eq!(succession.predecessor_key_tag, 56306);
+
         assert_eq!(body.digest.len(), 32);
         assert_eq!(body.certificate.spki.len(), 91);
     }
 
+    /// The real Statement round-trips through this build's canonical form,
+    /// byte for byte.
+    ///
+    /// The control plane rendered these bytes and the log committed to their
+    /// digest. Two renderers have to agree on them exactly — "equivalent
+    /// JSON" is not equivalent when a Merkle leaf commits to a digest — so
+    /// this is the crossval for the Statement half of the format, against
+    /// bytes the log has permanently recorded.
     #[test]
-    fn the_real_entry_fails_only_where_its_statement_is_missing() {
-        // Everything the real log's bytes can answer, answered by running
-        // the actual client verifier: the pinned log, the checkpoint, the
-        // inclusion walk, the body's kind and tags, the certificate, its
-        // single SAN, and the SPKI binding. The first thing it cannot answer
-        // is the digest, because the Statement behind it was not preserved.
-        let proof = proof_from_fixture();
-        let apex = "zone-key-transparency.demo.invalid";
-        let spki = HashedRekordBody::parse(&proof.canonicalized_body)
-            .unwrap()
-            .certificate
-            .spki;
-        let mut rdata = vec![0x01, 0x01, 0x03, 0x0d];
-        rdata.extend_from_slice(&spki[27..]);
-        let key = ZoneKey {
-            apex,
-            key_tag: 2143,
-            dnskey_rdata: &rdata,
-        };
-        let error = rekor::verify(
-            &proof,
-            &key,
-            &LogKeys::embedded(),
-            &hickory_resolver::proto::dnssec::TrustAnchors::default(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(&error, ProofError::Possession(_)),
-            "the first unanswerable check is possession over a statement we do not have: {error}"
+    fn the_real_statement_round_trips_through_this_builds_canonical_form() {
+        let statement = v3("statement.json");
+        let parsed = rekor::ZoneKeyStatement::parse(&statement).expect("a real Statement parses");
+        assert_eq!(
+            String::from_utf8_lossy(&parsed.to_json()),
+            String::from_utf8_lossy(&statement),
+            "this build must re-render the logged Statement byte for byte"
+        );
+        assert_eq!(parsed.apex, format!("{APEX}."));
+        assert_eq!(parsed.key_tag, KEY_TAG);
+        assert_eq!(parsed.action, "rollover");
+        assert_eq!(parsed.replaces_key_tag, Some(56306));
+        assert_eq!(parsed.flags, 257);
+        assert_eq!(parsed.algorithm, 13);
+        assert_eq!(
+            parsed.subject_sha256,
+            hex::encode(rekor::sha256(&zone_dnskey_rdata()))
+        );
+
+        // And the leaf's digest is that Statement's DSSE PAE — the link
+        // between the log's commitment and the bytes served beside it.
+        let body = HashedRekordBody::parse(&v3("canonicalized_body.json")).unwrap();
+        assert_eq!(
+            body.digest,
+            rekor::sha256(&rekor::pae(rekor::DSSE_PAYLOAD_TYPE, &statement))
         );
     }
 }
