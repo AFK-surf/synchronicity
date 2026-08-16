@@ -24,10 +24,37 @@ jobs:
           rebar3-version: "3.27.0"
       - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - run: make -C csqlite
+      # Ubuntu runner kernels ship Landlock in the LSM stack, so the
+      # sandbox is REQUIRED to hold here: a worker that comes up
+      # unconfined (or a seccomp allowlist that kills legitimate work)
+      # fails the job instead of only warning to stderr in production.
+      - run: CSQLITE_SMOKE_REQUIRE=1 perl csqlite/smoke.pl priv/csqlite
       - run: gleam format --check src test
       - run: gleam deps download
       - run: gleam test
       - run: gleam build
+
+  # GitHub has no hosted OpenBSD runners, so boot one in a VM. Covers
+  # the pledge/unveil half of the csqlite sandbox: enforcement is
+  # unconditional on OpenBSD, so a pledge promise list that is too
+  # narrow (worker aborted mid-query) or an unveil that does not stick
+  # fails this job rather than surfacing in production.
+  csqlite-openbsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/openbsd-vm@v1
+        with:
+          release: "7.7"
+          usesh: true
+          # sqlite3 comes from ports (under /usr/local, hence the -I/-L
+          # via environment, which the Makefile appends to); gmake
+          # because the Makefile uses GNU `override`; perl is in base.
+          prepare: pkg_add gmake sqlite3
+          run: |
+            cd control-plane
+            env CFLAGS="-O2 -I/usr/local/include" LDFLAGS="-L/usr/local/lib" gmake -C csqlite
+            CSQLITE_SMOKE_REQUIRE=1 perl csqlite/smoke.pl priv/csqlite
 
   web:
     runs-on: ubuntu-latest

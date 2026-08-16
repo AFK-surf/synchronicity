@@ -20,8 +20,10 @@ TARGET  := $(PRIV)/csqlite
 
 all: check-header $(TARGET)
 
+# $(CFLAGS) so an environment-supplied -I reaches the probe: on OpenBSD
+# sqlite3 comes from ports and lives under /usr/local.
 check-header:
-	@echo '#include <sqlite3.h>' | $(CC) -E -x c - >/dev/null 2>&1 || \
+	@echo '#include <sqlite3.h>' | $(CC) $(CFLAGS) -E -x c - >/dev/null 2>&1 || \
 	  { echo 'error: sqlite3.h not found — install libsqlite3-dev (or equivalent)' >&2; exit 1; }
 
 $(TARGET): wrapper.c
