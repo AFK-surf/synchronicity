@@ -5,6 +5,22 @@ ship. Scope: the control plane's zone CSK and the clients that validate zones
 signed by it. Device keys are out of scope — they already ride inside the
 signed zone this design protects.
 
+> **Amended by docs/EXTERNAL-DNS-PROVIDER.md.** The claim this document
+> describes was reworked for provider-hosted zones, and the rework shipped
+> with no legacy path: the statement's subject is now the **key set** the
+> entry's chain proves (the apex DNSKEY RRset — predicate
+> `…/zone-key/v2`), the entry signature is **attribution** by the
+> certificate's own key rather than possession by the zone key, the chain's
+> apex link carries the apex DNSKEY RRset and the walk proves the set
+> (DS → covered key → RRset, with membership deciding), and the served
+> proof record is wire v4 with no key-tag selector. Where this document
+> says the entry is signed by the zone key itself, or that the certificate's
+> SubjectPublicKeyInfo is the zone key, read it as the v1 design it was;
+> §2.1 of the external-DNS document explains why possession never carried
+> the authorization. Everything else here — the leaf shape, the
+> monitorability argument, the chain requirement, the log conventions, the
+> ceremonies — stands.
+
 ## 1. Problem and threat model
 
 DNSSEC answers one question: *is this key authorized for this zone?* The
