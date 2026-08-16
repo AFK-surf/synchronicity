@@ -794,6 +794,15 @@ Materialization reads the unified tree (§8), so every materializing surface nam
   stdout with verified random access; this is where hash-tree reads shine (e.g.
   seeking in a large video).
 
+Materialized files carry the metadata their selected version published, not the
+metadata of the copy: the origin's `mtime_ns`, and the permission bits of its
+advisory `unix_mode` (§4.2, masked — setuid/setgid/sticky are never reproduced,
+since the mode is a peer's assertion and the daemon may be privileged). A file
+whose bytes are already current but whose mode or mtime has drifted is stamped
+back in place rather than refetched. A symbolic link's metadata is not
+reproduced: its target *is* its version (§8), and stamping a link's own times
+needs a facility the standard library does not expose.
+
 Materialization safety: trie paths are case-sensitive NFC UTF-8, but local
 filesystems may not be. When two published paths collide under the target
 filesystem's folding (case-insensitivity, Unicode normalization), materialization
@@ -1157,6 +1166,7 @@ CREATE TABLE entries (
   kind        INTEGER NOT NULL,
   size        INTEGER NOT NULL,
   mtime_ns    INTEGER NOT NULL,
+  unix_mode   INTEGER,                   -- advisory mode a mirror reproduces (§7.2)
   content     BLOB,                      -- object root hash
   seq         INTEGER NOT NULL,
   prev        BLOB,

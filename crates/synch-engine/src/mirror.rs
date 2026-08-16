@@ -13,14 +13,21 @@
 //! paths collide under the target filesystem's folding, or a name is invalid on
 //! the platform, the entry is **skipped and reported** — never silently
 //! clobbered.
+//!
+//! A materialized file carries the metadata its entry published as well as its
+//! bytes: the origin's mtime, and its advisory unix mode masked to the
+//! permission bits (§4.2). A mirror is meant to be usable as the tree it
+//! mirrors — `rsync`ed onward, served, executed — and a directory of
+//! `0644 Just Now` files is a different tree from the one the origin published.
 
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use synch_core::EntryKind;
-use synch_store::{MirrorRow, VersionPolicy};
+use synch_store::{EntryRow, MirrorRow, VersionPolicy};
 
 use crate::{
     error::{EngineError, Result},
@@ -34,11 +41,15 @@ pub struct MirrorReport {
     pub written: usize,
     /// Files already up to date.
     pub current: usize,
+    /// Files whose bytes were already current but whose mode or mtime had
+    /// drifted from the selected version, and were stamped back onto it.
+    pub retouched: usize,
     /// Files removed: the selected version is a tombstone, or the path has
     /// left the unified tree entirely.
     pub removed: usize,
     /// Entries skipped, with the reason — including every path a `strict`
-    /// mirror refused to guess at.
+    /// mirror refused to guess at, and every path whose bytes landed but whose
+    /// metadata the filesystem refused.
     pub skipped: Vec<(String, String)>,
 }
 
@@ -166,21 +177,34 @@ impl Node {
             let node = self.clone();
             let root = root_dir.clone();
             let path = want.path.clone();
-            let written = crate::blocking::offload(move || {
+            let outcome = crate::blocking::offload(move || {
                 if escapes_via_symlink(&root, &path) {
-                    return Ok(false);
+                    return Ok(Written::Escaped);
                 }
                 node.write_blob_to_blocking(&want.content, want.size, &want.target)?;
-                Ok(true)
+                // The bytes are the file; its metadata is stamped on right
+                // after, and a filesystem that refuses the stamp — a mount
+                // that will not take the mode, a foreign owner — is reported
+                // rather than allowed to fail the whole pass.
+                Ok(match apply_metadata(&want.target, want.meta) {
+                    Ok(()) => Written::Fully,
+                    Err(e) => Written::WithoutMetadata(e.to_string()),
+                })
             })
             .await?;
-            if written {
-                report.written += 1;
-            } else {
-                report.skipped.push((
+            match outcome {
+                Written::Fully => report.written += 1,
+                Written::WithoutMetadata(why) => {
+                    report.written += 1;
+                    report.skipped.push((
+                        want.path,
+                        format!("content written, but its metadata could not be reproduced: {why}"),
+                    ));
+                }
+                Written::Escaped => report.skipped.push((
                     want.path,
                     "path resolves through a symlink; refusing to write outside the mirror".into(),
-                ));
+                )),
             }
         }
 
@@ -218,6 +242,19 @@ struct WantedContent {
     content: synch_core::Hash,
     /// Its size, which is what the fetch and the copy are bounded by.
     size: u64,
+    /// The metadata to stamp on once the bytes are there.
+    meta: Metadata,
+}
+
+/// How one write in phase 2 ended.
+#[derive(Debug)]
+enum Written {
+    /// Bytes and metadata both.
+    Fully,
+    /// The bytes landed; the filesystem refused the metadata.
+    WithoutMetadata(String),
+    /// Refused by the symlink-escape guard: nothing was written.
+    Escaped,
 }
 
 /// What one pass settled before any content was fetched.
@@ -343,8 +380,26 @@ fn plan_pass(
                     .push((set.path.clone(), "entry has no content".into()));
                 continue;
             };
+            let meta = Metadata::of(&selected);
             if already_current(&target, selected.size, &content) {
-                report.current += 1;
+                // Right bytes, and possibly the wrong mode or mtime: a local
+                // `chmod`, a file this mirror wrote before it stamped metadata
+                // at all, or a mode the origin has since changed without
+                // touching the content. Repairing it is a `stat` and a syscall
+                // or two — refetching the object to fix a permission bit is
+                // not.
+                if metadata_matches(&target, meta) {
+                    report.current += 1;
+                } else if let Err(e) = apply_metadata(&target, meta) {
+                    report.skipped.push((
+                        set.path.clone(),
+                        format!(
+                            "content is current, but its metadata could not be reproduced: {e}"
+                        ),
+                    ));
+                } else {
+                    report.retouched += 1;
+                }
                 continue;
             }
 
@@ -353,6 +408,7 @@ fn plan_pass(
                 target,
                 content,
                 size: selected.size,
+                meta,
             });
         }
     }
@@ -376,6 +432,13 @@ fn mirror_key(path: &Path) -> String {
 /// §7.2 has a mirror follow the version its policy selects, and a symlink's
 /// version *is* its target — so on a platform with symbolic links the mirror
 /// writes a real one. Returns whether anything changed on disk.
+///
+/// The link's own metadata is not reproduced: its mode is meaningless on every
+/// unix that matters, and stamping a link's times without following it needs
+/// `utimensat(AT_SYMLINK_NOFOLLOW)`, which `std` does not expose. Following the
+/// link instead would stamp whatever it points at — including a file outside
+/// the mirror — which is precisely what this module refuses to do everywhere
+/// else.
 ///
 /// Windows has symlinks too, but creating one needs either Developer Mode or
 /// `SeCreateSymbolicLinkPrivilege`, which a background daemon cannot assume and
@@ -414,6 +477,116 @@ fn materialize_symlink(
             "symlink to {link_target}: creating symbolic links is not available to the daemon on \
              this platform, so the path is skipped rather than written as a plain file"
         ))
+    }
+}
+
+/// The metadata a mirror reproduces alongside a file's bytes (§4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Metadata {
+    /// The origin's observed mtime, in unix nanoseconds.
+    mtime_ns: i64,
+    /// The origin's advisory unix mode, or `None` where it published none —
+    /// a Windows origin, or a row materialized before the view carried the
+    /// column. Unknown means "leave the mode alone", never "reset it".
+    unix_mode: Option<u32>,
+}
+
+impl Metadata {
+    fn of(entry: &EntryRow) -> Metadata {
+        Metadata {
+            mtime_ns: entry.mtime_ns,
+            unix_mode: entry.unix_mode,
+        }
+    }
+}
+
+/// The bits of a published mode a mirror will reproduce.
+///
+/// The permission bits only: setuid, setgid and the sticky bit are deliberately
+/// dropped. A mirror writes bytes a *peer* chose under a name that peer chose,
+/// and the daemon may be running as root; reproducing a setuid bit would turn
+/// "publish a file" into "plant a setuid binary in someone else's tree". §4.2
+/// calls the mode advisory and best-effort, so declining the three bits that
+/// grant authority costs nothing materialization promised.
+const MODE_MASK: u32 = 0o777;
+
+/// How far a stored timestamp may sit below the published one and still count
+/// as that timestamp.
+///
+/// Filesystems coarsen: ext4 keeps nanoseconds, HFS+ whole seconds, FAT two.
+/// Demanding exact equality would make every pass over such a filesystem
+/// "repair" every file it had itself just stamped, forever. A stamp is only
+/// ever coarsened downward, so a stored value inside this window below the
+/// published one is the published one.
+const MTIME_GRANULARITY_NS: i64 = 2_000_000_000;
+
+/// True if `target` already carries the metadata `meta` describes.
+///
+/// An unreadable target answers "no" and the pass tries to stamp it, which
+/// reports the real error rather than this guess.
+fn metadata_matches(target: &Path, meta: Metadata) -> bool {
+    let Ok(on_disk) = std::fs::metadata(target) else {
+        return false;
+    };
+    let stored = crate::scanner::mtime_nanos(&on_disk);
+    if !(0..MTIME_GRANULARITY_NS).contains(&meta.mtime_ns.saturating_sub(stored)) {
+        return false;
+    }
+    #[cfg(unix)]
+    if let Some(mode) = meta.unix_mode {
+        use std::os::unix::fs::PermissionsExt;
+        if on_disk.permissions().mode() & MODE_MASK != mode & MODE_MASK {
+            return false;
+        }
+    }
+    true
+}
+
+/// Stamps an entry's metadata onto a materialized file.
+///
+/// Times first and mode second, with owner-write restored while the stamp
+/// happens: setting a file's times needs a writable descriptor, so a file whose
+/// published mode is read-only — `0444` is an ordinary mode for published media
+/// — could not be stamped once its own mode had been applied. The pass that got
+/// the mode right would break the pass after it.
+fn apply_metadata(target: &Path, meta: Metadata) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let stamped = {
+        use std::os::unix::fs::PermissionsExt;
+        let current = std::fs::metadata(target)?.permissions().mode() & 0o7777;
+        let desired = meta.unix_mode.map(|m| m & MODE_MASK).unwrap_or(current);
+        let borrowed_write = current & 0o200 == 0;
+        if borrowed_write {
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(current | 0o200))?;
+        }
+        // Held rather than propagated, so a failed stamp cannot leave the file
+        // wearing the write bit this function lent it.
+        let stamped = set_modified(target, meta.mtime_ns);
+        if desired != current || borrowed_write {
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(desired))?;
+        }
+        stamped
+    };
+    #[cfg(not(unix))]
+    let stamped = set_modified(target, meta.mtime_ns);
+    stamped
+}
+
+/// Sets a file's modification time to a unix-nanosecond stamp.
+fn set_modified(target: &Path, mtime_ns: i64) -> std::io::Result<()> {
+    let times = std::fs::FileTimes::new().set_modified(system_time(mtime_ns));
+    std::fs::File::options()
+        .write(true)
+        .open(target)?
+        .set_times(times)
+}
+
+/// A unix-nanosecond stamp as a [`SystemTime`], pre-epoch stamps included.
+fn system_time(ns: i64) -> SystemTime {
+    if ns >= 0 {
+        UNIX_EPOCH + Duration::from_nanos(ns as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_nanos(ns.unsigned_abs())
     }
 }
 
@@ -533,6 +706,8 @@ fn fold(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use synch_core::{now_ns, FileEntry, Hash, OriginId};
 
     async fn node() -> (tempfile::TempDir, Node) {
@@ -551,15 +726,38 @@ mod tests {
     }
 
     fn publish_entry(node: &Node, origin: &OriginId, path: &str, content: &[u8], mtime: i64) {
+        publish_entry_with_mode(node, origin, path, content, mtime, None);
+    }
+
+    fn publish_entry_with_mode(
+        node: &Node,
+        origin: &OriginId,
+        path: &str,
+        content: &[u8],
+        mtime: i64,
+        mode: Option<u32>,
+    ) {
         let root = node.store().ingest_bytes(content, now_ns()).unwrap();
+        let mut entry = FileEntry::file(content.len() as u64, mtime, root, 1);
+        entry.unix_mode = mode;
         node.store()
-            .put_entry(
-                origin,
-                "media",
-                path,
-                &FileEntry::file(content.len() as u64, mtime, root, 1),
-            )
+            .put_entry(origin, "media", path, &entry)
             .unwrap();
+    }
+
+    /// A plausible published stamp: a real wall-clock nanosecond value, so the
+    /// tests exercise what a scanner actually publishes rather than a stamp
+    /// near the epoch that every filesystem stores exactly.
+    const STAMP: i64 = 1_700_000_000_123_456_789;
+
+    fn on_disk_mtime(path: &Path) -> i64 {
+        crate::scanner::mtime_nanos(&std::fs::metadata(path).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn on_disk_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[tokio::test]
@@ -892,6 +1090,175 @@ mod tests {
         assert_eq!(report.current, 1, "{report:?}");
         assert_eq!(report.written, 0, "{report:?}");
         node.shutdown().await.unwrap();
+    }
+
+    /// §7.2: a mirrored file is the published file, which includes the mtime
+    /// its origin observed — not the moment the copy happened to land.
+    #[tokio::test]
+    async fn a_mirror_reproduces_the_published_mtime() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        publish_entry(&node, &peer(), "a/b.txt", b"hello", STAMP);
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        let written = target.path().join("a/b.txt");
+        let stored = on_disk_mtime(&written);
+        assert!(
+            (0..MTIME_GRANULARITY_NS).contains(&(STAMP - stored)),
+            "the file carries {stored}, not the published {STAMP}"
+        );
+
+        // And the stamp is stable: a second pass sees a current file rather
+        // than re-touching what it just wrote.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.current, 1, "{report:?}");
+        assert_eq!(report.retouched, 0, "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mirror_reproduces_the_published_mode() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        // The scanner publishes the whole `st_mode`, file-type bits included.
+        publish_entry_with_mode(
+            &node,
+            &peer(),
+            "run.sh",
+            b"#!/bin/sh\n",
+            STAMP,
+            Some(0o100751),
+        );
+        // An origin that publishes no mode leaves the copy's own alone rather
+        // than having some default asserted over it.
+        publish_entry(&node, &peer(), "plain.txt", b"x", STAMP);
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 2, "{report:?}");
+        assert_eq!(on_disk_mode(&target.path().join("run.sh")), 0o751);
+        assert!(target.path().join("plain.txt").exists());
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.current, 2, "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// Metadata that drifts is repaired in place: the bytes are already right,
+    /// and refetching an object to fix a permission bit would be absurd.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drifted_metadata_is_repaired_without_rewriting_the_content() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        publish_entry_with_mode(&node, &peer(), "f.txt", b"hello", STAMP, Some(0o100640));
+        node.sync_mirror(target.path()).await.unwrap();
+
+        let written = target.path().join("f.txt");
+        std::fs::set_permissions(&written, std::fs::Permissions::from_mode(0o600)).unwrap();
+        set_modified(&written, 1_800_000_000_000_000_000).unwrap();
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.retouched, 1, "{report:?}");
+        assert_eq!(report.written, 0, "the bytes were never in question");
+        assert_eq!(report.current, 0, "{report:?}");
+        assert_eq!(on_disk_mode(&written), 0o640);
+        assert!((0..MTIME_GRANULARITY_NS).contains(&(STAMP - on_disk_mtime(&written))));
+        assert_eq!(std::fs::read(&written).unwrap(), b"hello");
+        node.shutdown().await.unwrap();
+    }
+
+    /// A read-only file can still be stamped. Setting a file's times needs a
+    /// writable descriptor, so applying the mode before the time would leave a
+    /// mirror unable to repair exactly the files whose mode it got right.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_file_can_still_be_restamped() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        publish_entry_with_mode(
+            &node,
+            &peer(),
+            "ro.txt",
+            b"published",
+            STAMP,
+            Some(0o100444),
+        );
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        let written = target.path().join("ro.txt");
+        assert_eq!(on_disk_mode(&written), 0o444);
+
+        // Something moved the timestamp on a file the mirror had already made
+        // read-only. The next pass has to put it back.
+        std::fs::set_permissions(&written, std::fs::Permissions::from_mode(0o644)).unwrap();
+        set_modified(&written, 1_800_000_000_000_000_000).unwrap();
+        std::fs::set_permissions(&written, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.retouched, 1, "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(on_disk_mode(&written), 0o444, "the mode is put back too");
+        assert!((0..MTIME_GRANULARITY_NS).contains(&(STAMP - on_disk_mtime(&written))));
+        node.shutdown().await.unwrap();
+    }
+
+    /// The mode is advisory and a peer chose it: the bits that grant authority
+    /// are not reproduced.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setuid_and_friends_are_not_materialized() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        publish_entry_with_mode(&node, &peer(), "trap", b"payload", STAMP, Some(0o104755));
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        let mode = std::fs::metadata(target.path().join("trap"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "the permission bits are reproduced");
+        assert_eq!(mode & 0o7000, 0, "setuid, setgid and sticky are not");
+
+        // And the dropped bits are not read back as drift on the next pass.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.current, 1, "{report:?}");
+        assert_eq!(report.retouched, 0, "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// A coarse filesystem stores a stamp truncated, never advanced; treating
+    /// that as drift would re-touch every file on every pass forever.
+    #[test]
+    fn a_coarsened_timestamp_is_not_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let whole_second = (STAMP / 1_000_000_000) * 1_000_000_000;
+        set_modified(&path, whole_second).unwrap();
+
+        let published = Metadata {
+            mtime_ns: STAMP,
+            unix_mode: None,
+        };
+        assert!(metadata_matches(&path, published));
+        // A stamp that genuinely moved — in either direction — is drift.
+        set_modified(&path, STAMP + 1_000_000_000).unwrap();
+        assert!(!metadata_matches(&path, published));
+        set_modified(&path, STAMP - 10 * 1_000_000_000).unwrap();
+        assert!(!metadata_matches(&path, published));
     }
 
     #[test]

@@ -1024,10 +1024,11 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 out.progress(format!("{} …", mirror.local_path)).await?;
                 let report = node.sync_mirror(&mirror.local_path).await?;
                 out.line(format!(
-                    "{}  written {} · current {} · removed {} · skipped {}",
+                    "{}  written {} · current {} · retouched {} · removed {} · skipped {}",
                     mirror.local_path,
                     report.written,
                     report.current,
+                    report.retouched,
                     report.removed,
                     report.skipped.len()
                 ))

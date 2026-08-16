@@ -716,7 +716,7 @@ fn published_signal(entry: &FileEntry) -> Option<Hash> {
     }
 }
 
-fn mtime_nanos(metadata: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_nanos(metadata: &std::fs::Metadata) -> i64 {
     metadata
         .modified()
         .ok()
@@ -829,6 +829,30 @@ mod tests {
         assert_eq!(
             node.store().providers(&a.content.unwrap()).unwrap().len(),
             1
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// A scan publishes the file's mode, and it reaches the view every
+    /// materializing surface reads (§4.2, §7.2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scan_publishes_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, space, node) = node_with_space().await;
+        let path = space.path().join("run.sh");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        node.scan_and_publish().unwrap();
+        let entry = node
+            .store()
+            .entry(node.origin(), "media", "run.sh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.unix_mode.expect("a scan on unix publishes a mode") & 0o777,
+            0o750
         );
         node.shutdown().await.unwrap();
     }
