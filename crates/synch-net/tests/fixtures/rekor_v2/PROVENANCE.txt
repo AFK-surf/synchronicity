@@ -1,0 +1,18 @@
+Real Rekor v2 conformance fixture — a genuine hashedrekord v0.0.2 entry.
+
+Published 2026-08-16 to https://log2025-1.rekor.sigstore.dev/api/v2/log/entries
+(HTTP 201, logIndex 67589472). The entry logs a synchronicity zone-key
+in-toto Statement (statement.json) via its DSSE PAE:
+
+  digest    = SHA-256( PAE("application/vnd.in-toto+json", statement.json) )
+  signature = ECDSA P-256/SHA-256 over that PAE, by zonekey.pub.pem
+  verifier  = zonekey.pub.pem (DER SPKI), keyDetails PKIX_ECDSA_P256_SHA_256
+
+log_entry.json is the verbatim server response: canonicalizedBody (the leaf
+preimage, base64), inclusionProof (rootHash, treeSize, hashes, checkpoint),
+logIndex. Validated end to end:
+  leaf = SHA-256(0x00 || base64decode(canonicalizedBody))
+  -> RFC 6962 inclusion walk reaches inclusionProof.rootHash
+  -> checkpoint root == rootHash
+  -> checkpoint signed by log2025-1.rekor.sigstore.dev (embedded Ed25519 key)
+  -> body digest == SHA-256(PAE(statement)); body verifier == zone key
