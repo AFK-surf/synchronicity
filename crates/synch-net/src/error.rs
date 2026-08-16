@@ -143,6 +143,17 @@ pub enum NetError {
         /// Which log was named, and what is pinned instead.
         reason: String,
     },
+    /// The entry carries no DNSSEC chain, or one that does not establish
+    /// that this key was delegated for this zone. Refused on the monitors'
+    /// behalf: an entry a monitor would file as noise must not be an entry a
+    /// client accepts (docs/REKOR-ZONE-KEY.md §5.5).
+    #[error("zone key transparency: {name}: {reason}")]
+    RekorChain {
+        /// The proof record's owner name.
+        name: String,
+        /// How the chain failed, in the validator's own words.
+        reason: String,
+    },
     /// A caller supplied an invalid argument.
     #[error("{0}")]
     Invalid(String),

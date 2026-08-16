@@ -8,6 +8,7 @@
 
 pub mod blob;
 mod blocking;
+pub mod chain;
 pub mod dns;
 pub mod endpoint;
 pub mod error;
@@ -18,6 +19,8 @@ pub mod rekor;
 #[doc(hidden)]
 pub mod sim;
 pub mod tuf;
+pub mod x509;
+pub mod zonecert;
 
 pub use blob::{BlobClient, BlobProtocol, Slice};
 pub use dns::{

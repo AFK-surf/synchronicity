@@ -18,10 +18,10 @@
 //!
 //! # Wire format
 //!
-//! `RekorProof` v2, big-endian throughout:
+//! `RekorProof` v3, big-endian throughout:
 //!
 //! ```text
-//! u8       version            = 2
+//! u8       version            = 3
 //! u16      key_tag              selects the record during a rollover window
 //! u8[32]   log_id               SHA-256 of the log's DER SubjectPublicKeyInfo
 //! u64      log_index
@@ -31,43 +31,72 @@
 //! u8+[32]* inclusion_path       Merkle audit path, leaf to root
 //! ```
 //!
-//! # What this format pins — and why it is the *real* Rekor v2 entry
+//! # What this format pins — and why the verifier is a *certificate*
 //!
 //! A proof is only checkable if both halves agree byte for byte on what was
-//! hashed. Where v1 invented its own leaf convention, v2 carries the exact
-//! two byte strings the public log itself commits to, so a proof minted by
-//! `log2025-1.rekor.sigstore.dev` verifies end to end (the conformance
-//! fixture `tests/fixtures/rekor_v2` is a real published entry):
+//! hashed, so this record carries the exact two byte strings the public log
+//! itself commits to:
 //!
-//! 1. **The log entry** is a `hashedrekord` v0.0.2 body — Rekor v2 has no
-//!    DSSE entry type, so a DSSE-signed Statement is logged as a
+//! 1. **The log entry** is a `hashedrekord` v0.0.2 body. Rekor v2 accepts no
+//!    other entry type — `internal/server/service.go` rejects everything with
+//!    "invalid type, must be hashedrekord", and the deprecated DSSE type only
+//!    ever stored a `payloadHash` — so a DSSE-signed Statement is logged as a
 //!    `hashedrekord` over the DSSE **PAE**: `data.digest = SHA-256(PAE)`,
-//!    `signature.content` = the ECDSA-P256 signature over the PAE (DER, not
-//!    raw), `signature.verifier.publicKey.rawBytes` = the signer's DER
-//!    SubjectPublicKeyInfo. The log returns these bytes as `canonicalizedBody`
-//!    and this record carries them **verbatim** — nothing here re-canonicalizes
-//!    JSON, because the log already did and the leaf commits to its output.
-//! 2. **The Merkle leaf** is `SHA-256(0x00 || canonicalized_body)`, and an
+//!    `signature.content` = the ECDSA-P256 signature over that digest (DER,
+//!    not raw). The log returns these bytes as `canonicalizedBody` and this
+//!    record carries them **verbatim** — nothing here re-canonicalizes JSON,
+//!    because the log already did and the leaf commits to its output.
+//! 2. **The verifier is an `x509Certificate`, never a raw public key.** This
+//!    is the whole of v3. A raw-key entry is *apex-anonymous*: its leaf holds
+//!    a digest, a signature and 91 bytes of SubjectPublicKeyInfo, and nothing
+//!    that names a zone. Nobody could monitor a zone for newly published
+//!    keys, which makes the transparency claim hollow — the threat model has
+//!    a compromised upstream DNS provider in it, so DNS-served state cannot
+//!    be the monitoring channel. Rekor's `Verifier` is a oneof of exactly two
+//!    arms, and it performs **no** certificate validation on the second one
+//!    (`pkg/verifier/certificate`: parse, take the public key, stop), copying
+//!    the certificate DER verbatim into the canonicalized body. So a
+//!    self-signed certificate carrying the apex as a `dNSName` SAN puts the
+//!    zone name, in the clear, inside the Merkle leaf — where a monitor
+//!    walking the log's tiles can index it (docs/REKOR-ZONE-KEY.md §5.5).
+//! 3. **The Merkle leaf** is `SHA-256(0x00 || canonicalized_body)`, and an
 //!    interior node is `SHA-256(0x01 || left || right)` — RFC 6962 §2.1.
 //!
 //! The Statement travels alongside the body (not inside it) because the body
 //! commits only to the PAE *digest*; the client re-derives that digest from
-//! the Statement bytes and refuses the proof if they disagree. Neither
-//! convention is negotiable per deployment: a v3 of the record format is how
-//! either changes.
+//! the Statement bytes and refuses the proof if they disagree. None of this
+//! is negotiable per deployment: a v4 of the record format is how it changes.
 
 use std::path::Path;
 
+use hickory_resolver::proto::dnssec::TrustAnchors;
 use ring::{digest, signature};
 
+use crate::{
+    chain::{self, ChainError},
+    x509::{same_dns_name, Certificate},
+    zonecert::{self, DnssecChain, Succession},
+};
+
 /// The only `RekorProof` version this build accepts.
-pub const PROOF_VERSION: u8 = 2;
+///
+/// There is no v2 path left. A v2 record is a raw-public-key entry with no
+/// apex anywhere in its leaf; accepting one would be accepting exactly the
+/// unmonitorable shape v3 exists to abolish, so it is refused as a malformed
+/// version and nothing more.
+pub const PROOF_VERSION: u8 = 3;
 
 /// The label the proof records live under, one below the zone apex.
 pub const REKOR_TXT_PREFIX: &str = "_synchronicity-rekor";
 
 /// The DSSE payload type of an in-toto Statement.
 pub const DSSE_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
+
+/// The only entry kind Rekor v2 accepts, and the only one this design logs.
+pub const HASHEDREKORD_KIND: &str = "hashedrekord";
+
+/// The entry API version the body must declare.
+pub const HASHEDREKORD_API_VERSION: &str = "0.0.2";
 
 /// The `hashedrekord` v0.0.2 digest algorithm name the body carries.
 pub const HASHEDREKORD_DIGEST_ALGORITHM: &str = "SHA2_256";
@@ -139,6 +168,16 @@ pub enum ProofError {
     /// this client was never told to trust.
     #[error("unknown log: {0}")]
     UnknownLog(String),
+    /// The entry carries no DNSSEC chain, or one that does not establish
+    /// that this key was ever authorized for this zone.
+    ///
+    /// A client already knows the answer — it validated the delegation
+    /// natively. It enforces this **on behalf of monitors**: an entry whose
+    /// chain is absent or broken is one a monitor files as noise, so a client
+    /// that accepted it would hand an attacker a key that works against
+    /// victims *and* raises no alarm (§5.5, the tier-C invariant).
+    #[error("chain: {0}")]
+    Chain(String),
 }
 
 /// One decoded zone-key transparency record.
@@ -156,7 +195,8 @@ pub struct RekorProof {
     pub statement: Vec<u8>,
     /// The Rekor `hashedrekord` entry body, exactly as the log returned it in
     /// `canonicalizedBody` — the Merkle leaf preimage. The entry signature
-    /// and the signer's public key live inside these bytes.
+    /// and the signer's *certificate* live inside these bytes, and the
+    /// certificate is what carries the apex and the monitors' evidence.
     pub canonicalized_body: Vec<u8>,
     /// The signed note the log published, verbatim.
     pub checkpoint: Vec<u8>,
@@ -313,15 +353,46 @@ pub struct VerifiedRecord {
 /// Verifies a proof completely, offline (§4.2).
 ///
 /// The chain, in the order the validated algorithm runs it: the log vouches
-/// for a leaf (checkpoint, inclusion) whose body commits to the DSSE PAE of
-/// this Statement (digest), which the zone key itself signed (possession)
-/// with the key the log names (key binding), and the Statement names this
-/// exact key and zone (statement binding). Any single failure refuses the
-/// whole record — there is no partial credit.
+/// for a leaf (checkpoint, inclusion) whose body names this zone in a
+/// certificate (apex binding) holding this exact DNSKEY (key binding), whose
+/// signature the zone key itself made (possession), whose digest is the DSSE
+/// PAE of this Statement, and whose Statement names this exact key and zone
+/// (statement binding). Any single failure refuses the whole record — there
+/// is no partial credit.
+///
+/// # The two custom extensions, and why exactly one of them is enforced
+///
+/// The client learns nothing from either: it validated this zone's delegation
+/// natively, all the way to its trust anchor, before reaching this function,
+/// and it has no use for a claim about which key came before. But *the client
+/// enforces whatever property makes an entry discoverable, or an attacker
+/// simply omits it* — so the asymmetry between the two is not symmetry:
+///
+/// - **The DNSSEC chain is required, and verified cryptographically.** Its
+///   absence would *silence* a monitor: a chainless or broken-chain entry is
+///   tier C, the bin a monitor records and does not alert on. An attacker who
+///   could get such an entry accepted would hold a key that works against
+///   victims and rings no bell — strictly worse than no log at all. So the
+///   client refuses it, which makes "client-accepted" imply "at least tier B"
+///   (docs/REKOR-ZONE-KEY.md §5.5). RRSIG validity *windows* are deliberately
+///   not checked here; see [`crate::chain`] for the two reasons.
+/// - **The succession countersignature is not required.** Its absence
+///   *alarms* — tier B, the loud bin — so omitting it makes an attacker more
+///   visible, not less, and forging it needs the predecessor's private key,
+///   which is a compromise transparency was never going to survive anyway.
+///   Requiring it here would instead break the two legitimate cases that
+///   cannot have one: a zone's genesis key, and disaster recovery after the
+///   old private key is gone.
+///
+/// A `retire` entry is refused outright rather than chain-checked: retirement
+/// is a monitor breadcrumb (§2), never authorization, and a chainless retire
+/// is legal on the publish side — so accepting one here would reopen exactly
+/// the hole the chain requirement closes.
 pub fn verify(
     proof: &RekorProof,
     key: &ZoneKey<'_>,
     logs: &LogKeys,
+    anchors: &TrustAnchors,
 ) -> Result<VerifiedRecord, ProofError> {
     if proof.key_tag != key.key_tag {
         return Err(ProofError::Binding(format!(
@@ -356,36 +427,60 @@ pub fn verify(
     checkpoint.verify_signature(log_key)?;
 
     // The body the leaf committed to: a hashedrekord over a PAE digest,
-    // carrying the entry signature and the key that made it.
+    // carrying the entry signature and the certificate that names the signer.
     let body = HashedRekordBody::parse(&proof.canonicalized_body)?;
+
+    // Apex binding: the certificate the log recorded names *this* zone, and
+    // exactly one zone. This is the check that turns a leaf into something a
+    // monitor for this apex would have seen — an entry naming another apex is
+    // an entry the operator's monitor was never going to look at.
+    let dns_name = body
+        .certificate
+        .single_dns_name()
+        .map_err(|e| ProofError::Binding(e.to_string()))?;
+    if !same_dns_name(dns_name, key.apex) {
+        return Err(ProofError::Binding(format!(
+            "the entry's certificate names {dns_name}, the answer was signed by {}",
+            key.apex
+        )));
+    }
+
+    // Key binding: the certificate's SubjectPublicKeyInfo is exactly this
+    // DNSKEY. A possession check alone would pass a signature by the observed
+    // key under an entry that names a *different* key to a monitor.
+    if body.certificate.spki != key.der_spki()? {
+        return Err(ProofError::Binding(
+            "the logged certificate's key is not this zone's DNSKEY".into(),
+        ));
+    }
+
+    // Possession: the entry signature is the zone key's own. Rekor signs the
+    // hashedrekord's `data.digest` as a prehash — which, because that digest
+    // *is* SHA-256(PAE), is the same signature as ECDSA-SHA256 over the PAE
+    // itself. Verifying it over the PAE is how ring is asked the question.
+    // Rekor entry signatures are ASN.1/DER, not the raw r||s of DNSSEC.
+    let pae = pae(DSSE_PAYLOAD_TYPE, &proof.statement);
+    let public = key.public_key()?;
+    verify_ecdsa_p256_asn1(public, &pae, &body.signature)
+        .map_err(|_| ProofError::Possession("the entry signature is not this zone key's".into()))?;
 
     // The entry commits to the DSSE PAE of *this* Statement — the body holds
     // only its digest, so the Statement bytes cannot be swapped under it.
-    let pae = pae(DSSE_PAYLOAD_TYPE, &proof.statement);
     if body.digest != sha256(&pae) {
         return Err(ProofError::Binding(
             "the logged entry's digest is not this statement's DSSE PAE".into(),
         ));
     }
 
-    // Possession: the entry signature over the PAE is the zone key's own.
-    // Rekor entry signatures are ASN.1/DER, not the raw r||s of DNSSEC.
-    let public = key.public_key()?;
-    verify_ecdsa_p256_asn1(public, &pae, &body.signature)
-        .map_err(|_| ProofError::Possession("the entry signature is not this zone key's".into()))?;
-
-    // Key binding: the verifier the log recorded is exactly this DNSKEY. A
-    // possession check alone would pass a signature by the observed key under
-    // an entry that names a *different* key to a monitor.
-    if body.verifier_spki != key.der_spki()? {
-        return Err(ProofError::Binding(
-            "the logged verifier key is not this zone's DNSKEY".into(),
-        ));
-    }
-
     // Statement binding: the Statement describes the key and zone observed.
     let statement = ZoneKeyStatement::parse(&proof.statement)?;
     statement.check_binds(key)?;
+
+    // Discoverability: the entry carries a chain that proves, to anyone
+    // reading the log and nothing else, that this key was delegated for this
+    // zone. Enforced for the monitors' sake, not the client's (see above).
+    let chain = body.dnssec_chain().map_err(chain_error)?;
+    chain::validate(&chain, key.apex, key.dnskey_rdata, anchors).map_err(chain_error)?;
 
     Ok(VerifiedRecord {
         log_index: proof.log_index,
@@ -395,35 +490,44 @@ pub fn verify(
     })
 }
 
+/// Lifts a chain failure into the proof's own error class.
+fn chain_error(error: ChainError) -> ProofError {
+    ProofError::Chain(error.to_string())
+}
+
 /// The fields a `hashedrekord` v0.0.2 body carries that a proof turns on.
 ///
-/// Rekor v2 has no DSSE entry type; a DSSE-signed Statement is logged as a
-/// `hashedrekord` over the DSSE PAE (docs/REKOR-ZONE-KEY.md §2). The body is
+/// Rekor v2 accepts no other entry type; a DSSE-signed Statement is logged as
+/// a `hashedrekord` over the DSSE PAE (docs/REKOR-ZONE-KEY.md §2). The body is
 /// the log's own `canonicalizedBody`, verified here by re-deriving nothing —
-/// the digest, signature and verifier are read out and checked against what
+/// the digest, signature and certificate are read out and checked against what
 /// the DNSSEC chain independently observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HashedRekordBody {
+pub struct HashedRekordBody {
     /// The SHA-256 the entry commits to — must equal `SHA-256(PAE)`.
-    digest: Vec<u8>,
+    pub digest: Vec<u8>,
     /// The entry signature, DER/ASN.1 ECDSA over the PAE.
-    signature: Vec<u8>,
-    /// The signer's DER SubjectPublicKeyInfo.
-    verifier_spki: Vec<u8>,
+    pub signature: Vec<u8>,
+    /// The signer's certificate: the apex-carrying key envelope, parsed.
+    pub certificate: Certificate,
+    /// The certificate's DER, verbatim — what a monitor re-reads and what
+    /// anyone auditing the log entry sees.
+    pub certificate_der: Vec<u8>,
 }
 
 impl HashedRekordBody {
     /// Parses the body, refusing anything whose known members are the wrong
-    /// shape and asserting the algorithm and key-details tags this design
-    /// logs. Unknown members are tolerated so the entry format can grow.
-    fn parse(bytes: &[u8]) -> Result<HashedRekordBody, ProofError> {
+    /// shape and asserting every tag this design logs. Unknown members are
+    /// tolerated so the entry format can grow.
+    ///
+    /// The `publicKey` arm of Rekor's verifier oneof is **not** handled, at
+    /// all: an entry whose verifier is a bare key names no apex anywhere in
+    /// its leaf, which is exactly the unmonitorable shape v3 abolishes. There
+    /// is no branch to reach, no legacy path and no fallback.
+    pub fn parse(bytes: &[u8]) -> Result<HashedRekordBody, ProofError> {
         let bad = |why: String| ProofError::Malformed(format!("entry body: {why}"));
         let value: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|e| bad(e.to_string()))?;
-        let spec = &value["spec"]["hashedRekordV002"];
-        if spec.is_null() {
-            return Err(bad("not a hashedrekord v0.0.2 entry".into()));
-        }
         let text = |v: &serde_json::Value, what: &str| -> Result<String, ProofError> {
             v.as_str()
                 .map(str::to_string)
@@ -432,6 +536,19 @@ impl HashedRekordBody {
         let b64 = |v: &serde_json::Value, what: &str| -> Result<Vec<u8>, ProofError> {
             base64_decode(&text(v, what)?).map_err(|_| bad(format!("{what} is not base64")))
         };
+
+        let kind = text(&value["kind"], "kind")?;
+        let api_version = text(&value["apiVersion"], "apiVersion")?;
+        if kind != HASHEDREKORD_KIND || api_version != HASHEDREKORD_API_VERSION {
+            return Err(ProofError::Binding(format!(
+                "the entry is {kind} {api_version}, not \
+                 {HASHEDREKORD_KIND} {HASHEDREKORD_API_VERSION}"
+            )));
+        }
+        let spec = &value["spec"]["hashedRekordV002"];
+        if spec.is_null() {
+            return Err(bad("not a hashedrekord v0.0.2 entry".into()));
+        }
 
         let data = &spec["data"];
         let algorithm = text(&data["algorithm"], "data.algorithm")?;
@@ -448,14 +565,52 @@ impl HashedRekordBody {
                 "entry key details {key_details} are not {HASHEDREKORD_KEY_DETAILS}"
             )));
         }
+        let certificate_der = match verifier["x509Certificate"]["rawBytes"].is_string() {
+            true => b64(
+                &verifier["x509Certificate"]["rawBytes"],
+                "verifier.x509Certificate.rawBytes",
+            )?,
+            false => {
+                return Err(ProofError::Binding(
+                    "the entry's verifier is not an x509Certificate, so its leaf names \
+                     no zone and no monitor could ever have seen it"
+                        .into(),
+                ))
+            }
+        };
+        let certificate =
+            Certificate::parse(&certificate_der).map_err(|e| bad(e.to_string()))?;
         Ok(HashedRekordBody {
             digest: b64(&data["digest"], "data.digest")?,
             signature: b64(&signature["content"], "signature.content")?,
-            verifier_spki: b64(
-                &verifier["publicKey"]["rawBytes"],
-                "verifier.publicKey.rawBytes",
-            )?,
+            certificate,
+            certificate_der,
         })
+    }
+
+    /// The DNSSEC chain the certificate carries, decoded.
+    ///
+    /// [`ChainError::Absent`] when the extension is not there at all — the
+    /// distinction matters, because an absent chain is a hard client refusal
+    /// while a *broken* one is the same refusal with a different story.
+    pub fn dnssec_chain(&self) -> Result<DnssecChain, ChainError> {
+        match self.certificate.extension(zonecert::OID_DNSSEC_CHAIN) {
+            None => Err(ChainError::Absent),
+            Some(value) => {
+                DnssecChain::decode(value).map_err(|e| ChainError::Malformed(e.to_string()))
+            }
+        }
+    }
+
+    /// The succession countersignature, if the certificate carries one.
+    ///
+    /// Only a monitor reads this (§5.5): its *absence* escalates to tier B
+    /// rather than demoting to tier C, so there is nothing here for a client
+    /// to enforce and nothing an attacker gains by omitting it.
+    pub fn succession(&self) -> Option<Result<Succession, crate::x509::X509Error>> {
+        self.certificate
+            .extension(zonecert::OID_SUCCESSION)
+            .map(Succession::decode)
     }
 }
 
@@ -619,6 +774,18 @@ impl ZoneKeyStatement {
             return Err(ProofError::Binding(format!(
                 "the entry names algorithm {} flags {}, not the CSK convention {ZONE_KEY_ALGORITHM}/{ZONE_KEY_FLAGS}",
                 self.algorithm, self.flags
+            )));
+        }
+        // Only a key being *put into service* is authorization. A `retire`
+        // entry is a breadcrumb for monitors and is allowed to be chainless
+        // on the publish side (a retired zone may have no DS left), so a
+        // client that accepted one would accept an entry carrying no proof
+        // of delegation at all — the exact evasion the chain requirement
+        // exists to close.
+        if !matches!(self.action.as_str(), "create" | "rollover") {
+            return Err(ProofError::Binding(format!(
+                "the entry's action is {}, and only create or rollover authorizes a key",
+                self.action
             )));
         }
         Ok(())

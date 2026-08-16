@@ -23,9 +23,12 @@ use hickory_resolver::proto::{
 };
 
 use crate::{
+    chain,
     dns::TXT_PREFIX,
     rekor::{self, RekorProof, ZoneKeyStatement},
     tuf::{self, TufBundle},
+    x509::{self, SelfSigned},
+    zonecert::{ChainLink, DnssecChain, Succession, OID_DNSSEC_CHAIN, OID_SUCCESSION},
 };
 
 /// One signed zone: an origin, its TXT membership records, and the key that
@@ -127,10 +130,110 @@ impl SimZone {
         sign_p256_der(&self.pkcs8, &rekor::pae(rekor::DSSE_PAYLOAD_TYPE, payload))
     }
 
-    /// The zone key's DER SubjectPublicKeyInfo — what a logged entry records
-    /// as its `verifier.publicKey.rawBytes`.
+    /// The zone key's DER SubjectPublicKeyInfo — what the logged entry's
+    /// certificate carries as its SubjectPublicKeyInfo.
     pub fn spki(&self) -> Vec<u8> {
         rekor::p256_spki(self.dnskey.public_key().public_bytes())
+    }
+
+    /// The apex DNSKEY RRset and its RRSIG, as records.
+    ///
+    /// `inception` moves the signature's validity window, which is how a test
+    /// asks for a chain that was valid when it was logged and is expired now
+    /// — the archival case the client and the monitor must both still accept.
+    pub fn dnskey_records(&self, inception: time::OffsetDateTime) -> Vec<Record> {
+        let mut set = RecordSet::new(self.origin.clone(), RecordType::DNSKEY, 0);
+        set.insert(
+            Record::from_rdata(
+                self.origin.clone(),
+                self.ttl,
+                RData::DNSSEC(DNSSECRData::DNSKEY(self.dnskey.clone())),
+            ),
+            0,
+        );
+        let rrsig =
+            RRSIG::from_rrset(&set, DNSClass::IN, inception, &self.signer).expect("sign dnskey set");
+        set.insert_rrsig(Record::from_rdata(
+            self.origin.clone(),
+            self.ttl,
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+        ));
+        set.records(true).cloned().collect()
+    }
+
+    /// The DNSSEC chain this zone's entries carry.
+    ///
+    /// A simulated zone *is* its own trust anchor — the tests install its
+    /// DNSKEY with `--dnssec-anchor` — so the chain is the degenerate
+    /// one-link shape: the anchored zone's own DNSKEY RRset, self-signed.
+    /// Real deployments anchored at the ICANN root produce the DS ladder
+    /// instead; both shapes are validated by the same walk (`crate::chain`).
+    pub fn dnssec_chain(&self) -> DnssecChain {
+        self.dnssec_chain_at(time::OffsetDateTime::now_utc() - time::Duration::hours(1))
+    }
+
+    /// The same chain with the RRSIG inception moved (see `dnskey_records`).
+    pub fn dnssec_chain_at(&self, inception: time::OffsetDateTime) -> DnssecChain {
+        DnssecChain {
+            links: vec![ChainLink {
+                zone: self.apex(),
+                rrs: chain::encode_rrs(&self.dnskey_records(inception)).expect("encode chain link"),
+            }],
+        }
+    }
+
+    /// The self-signed certificate that carries this zone's name into a
+    /// Merkle leaf, with whatever extensions the caller wants inside it.
+    ///
+    /// Nothing validates this certificate — not Rekor, not the client, not
+    /// the monitor. It is a key envelope whose SAN is the payload.
+    pub fn certificate(&self, extensions: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        self.certificate_for(&self.apex(), extensions)
+    }
+
+    /// The same certificate naming an arbitrary apex — how a test mints the
+    /// entry an attacker would: this zone's key, somebody else's name.
+    pub fn certificate_for(&self, apex: &str, extensions: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        let spki = self.spki();
+        let serial = rekor::sha256(&spki);
+        SelfSigned {
+            common_name: "synchronicity zone key",
+            dns_name: apex.trim_end_matches('.'),
+            spki: &spki,
+            serial: &serial[..20],
+            not_before: x509::x509_time(1_700_000_000),
+            not_after: x509::x509_time(4_900_000_000),
+            extensions,
+        }
+        .build(|tbs| sign_p256_der(&self.pkcs8, tbs))
+    }
+
+    /// The certificate an ordinary `create` or `rollover` entry carries: the
+    /// chain, and a countersignature when there is a predecessor to make one.
+    pub fn zone_key_certificate(&self, succession: Option<&Succession>) -> Vec<u8> {
+        let mut extensions = vec![(
+            OID_DNSSEC_CHAIN.to_vec(),
+            self.dnssec_chain().encode(),
+        )];
+        if let Some(succession) = succession {
+            extensions.push((OID_SUCCESSION.to_vec(), succession.encode()));
+        }
+        self.certificate(&extensions)
+    }
+
+    /// This zone key countersigning its successor: what an operator's
+    /// *previous* key does during a planned rollover, and the one thing an
+    /// attacker holding only a substituted DS cannot produce.
+    pub fn countersign(&self, apex: &str, successor_spki: &[u8]) -> Succession {
+        let key_tag = self.key_tag();
+        Succession {
+            predecessor_key_tag: key_tag,
+            predecessor_spki: self.spki(),
+            signature: sign_p256_der(
+                &self.pkcs8,
+                &Succession::signed_bytes(apex, key_tag, successor_spki),
+            ),
+        }
     }
 
     /// The Statement this zone's control plane would publish for its key.
@@ -425,11 +528,23 @@ impl SimLog {
 
     /// Logs a Statement the zone key signs, and returns the whole proof —
     /// what `controlplane rekor-publish` ends up storing. The entry is a real
-    /// `hashedrekord` v0.0.2 body over the Statement's DSSE PAE.
+    /// `hashedrekord` v0.0.2 body over the Statement's DSSE PAE, with the
+    /// zone's apex-naming certificate as its verifier.
     pub fn log_statement(&mut self, zone: &SimZone, statement: &ZoneKeyStatement) -> RekorProof {
+        self.log_certified(zone, statement, &zone.zone_key_certificate(None))
+    }
+
+    /// The same, with a certificate the caller chose — how a test logs an
+    /// entry whose chain is missing, broken, or about somebody else's key.
+    pub fn log_certified(
+        &mut self,
+        zone: &SimZone,
+        statement: &ZoneKeyStatement,
+        certificate: &[u8],
+    ) -> RekorProof {
         let payload = statement.to_json();
         let signature = zone.sign_dsse(&payload);
-        let body = hashedrekord_body(&payload, &signature, &zone.spki());
+        let body = hashedrekord_body(&payload, &signature, certificate);
         self.log_body(statement.key_tag, payload, body)
     }
 
@@ -891,21 +1006,23 @@ fn split_point(n: usize) -> usize {
 ///
 /// The field order is the live log's, byte for byte (`apiVersion`, `kind`,
 /// `spec` → `hashedRekordV002` → `data{algorithm,digest}`,
-/// `signature{content, verifier{keyDetails, publicKey{rawBytes}}}`), because
-/// the Merkle leaf commits to these exact bytes. `digest` is always the
-/// SHA-256 of the PAE of `statement`, so a test that logs a mangled statement
-/// still produces an internally consistent entry — the flaw it is probing
-/// surfaces at the check it means to, not at a digest mismatch.
+/// `signature{content, verifier{keyDetails, x509Certificate{rawBytes}}}`),
+/// because the Merkle leaf commits to these exact bytes — this is the shape
+/// a genuine `log2025-1.rekor.sigstore.dev` entry has (see the conformance
+/// fixture `tests/fixtures/rekor_v3`). `digest` is always the SHA-256 of the
+/// PAE of `statement`, so a test that logs a mangled statement still produces
+/// an internally consistent entry — the flaw it is probing surfaces at the
+/// check it means to, not at a digest mismatch.
 #[doc(hidden)]
-pub fn hashedrekord_body(statement: &[u8], signature_der: &[u8], verifier_spki: &[u8]) -> Vec<u8> {
+pub fn hashedrekord_body(statement: &[u8], signature_der: &[u8], certificate: &[u8]) -> Vec<u8> {
     let digest = rekor::sha256(&rekor::pae(rekor::DSSE_PAYLOAD_TYPE, statement));
     let mut out = String::new();
     out.push_str("{\"apiVersion\":\"0.0.2\",\"kind\":\"hashedrekord\",\"spec\":{\"hashedRekordV002\":{\"data\":{\"algorithm\":\"SHA2_256\",\"digest\":\"");
     out.push_str(&rekor::base64_encode(&digest));
     out.push_str("\"},\"signature\":{\"content\":\"");
     out.push_str(&rekor::base64_encode(signature_der));
-    out.push_str("\",\"verifier\":{\"keyDetails\":\"PKIX_ECDSA_P256_SHA_256\",\"publicKey\":{\"rawBytes\":\"");
-    out.push_str(&rekor::base64_encode(verifier_spki));
+    out.push_str("\",\"verifier\":{\"keyDetails\":\"PKIX_ECDSA_P256_SHA_256\",\"x509Certificate\":{\"rawBytes\":\"");
+    out.push_str(&rekor::base64_encode(certificate));
     out.push_str("\"}}}}}}");
     out.into_bytes()
 }

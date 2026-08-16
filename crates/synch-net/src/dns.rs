@@ -328,6 +328,11 @@ fn doh_url(url: &str) -> Result<reqwest::Url, NetError> {
 #[derive(Clone)]
 pub struct DnssecResolver {
     handle: hickory_resolver::net::dnssec::DnssecDnsHandle<DohHandle>,
+    /// The DNSSEC trust anchors in force — the ICANN root, or whatever
+    /// `--dnssec-anchor` replaced it with. Held here as well as inside the
+    /// validating handle because the DNSSEC chain a log entry carries is
+    /// checked against the same anchors the live answers are.
+    anchors: std::sync::Arc<TrustAnchors>,
     rekor: RekorPolicy,
     pins: std::sync::Arc<std::sync::Mutex<Pins>>,
 }
@@ -509,8 +514,16 @@ impl DnssecResolver {
         };
         Ok(DnssecResolver {
             handle: hickory_resolver::net::dnssec::DnssecDnsHandle::with_trust_anchor(
-                handle, anchors,
+                handle,
+                anchors.clone(),
             ),
+            // The same anchor set the live validator uses, kept so that the
+            // DNSSEC chain a log entry carries is checked against the trust
+            // this resolver actually holds — "an override is a different
+            // universe" has to hold in both directions, or a client running
+            // `--dnssec-anchor` would demand a chain to the ICANN root it
+            // does not trust.
+            anchors,
             rekor: options.rekor_policy(),
             pins: std::sync::Arc::new(std::sync::Mutex::new(pins)),
         })
@@ -708,7 +721,8 @@ impl DnssecResolver {
             key_tag,
             dnskey_rdata: &dnskey_rdata,
         };
-        rekor::verify(&proof, &key, &self.log_keys()).map_err(|e| rekor_error(&name, e))
+        rekor::verify(&proof, &key, &self.log_keys(), &self.anchors)
+            .map_err(|e| rekor_error(&name, e))
     }
 
     /// The validated DNSKEY rdata for one key tag at `apex` (§4.2 step 2).
@@ -808,6 +822,7 @@ fn rekor_error(name: &str, error: ProofError) -> NetError {
         ProofError::Inclusion(reason) => NetError::RekorInclusion { name, reason },
         ProofError::Checkpoint(reason) => NetError::RekorCheckpoint { name, reason },
         ProofError::UnknownLog(reason) => NetError::RekorUnknownLog { name, reason },
+        ProofError::Chain(reason) => NetError::RekorChain { name, reason },
     }
 }
 
