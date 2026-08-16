@@ -5,8 +5,10 @@ import gleam/option.{None}
 fn primary_env() -> Nil {
   envoy.set("CP_ROLE", "primary")
   envoy.set("CP_BASE_DOMAIN", "sync.test")
-  envoy.set("CP_DB_PATH", "/tmp/cp.db")
-  envoy.set("CP_KEY_FILE", "/tmp/csk.key")
+  // The database sits in its own subdirectory so the csqlite sandbox's
+  // directory grant never covers the sibling signing key.
+  envoy.set("CP_DB_PATH", "/var/lib/cp/db/cp.db")
+  envoy.set("CP_KEY_FILE", "/var/lib/cp/csk.key")
   envoy.set("CP_SESSION_SECRET", "0123456789abcdef0123456789abcdef")
   envoy.unset("CP_HTTP_PORT")
   envoy.unset("CP_DNS_PORT")
@@ -85,4 +87,23 @@ pub fn separate_port_env_is_removed_test() {
   let assert Error(message) = config.load()
   assert message
     == "CP_HTTP_PORT is removed; set CP_HTTP_LISTEN to address:port"
+}
+
+pub fn db_path_must_be_absolute_test() {
+  primary_env()
+  envoy.set("CP_DB_PATH", "cp.db")
+  let assert Error(message) = config.load()
+  assert message == "CP_DB_PATH must be an absolute path, got: cp.db"
+}
+
+pub fn db_must_not_share_a_directory_with_the_key_test() {
+  primary_env()
+  envoy.set("CP_DB_PATH", "/var/lib/cp/cp.db")
+  envoy.set("CP_KEY_FILE", "/var/lib/cp/csk.key")
+  let assert Error(message) = config.load()
+  assert message
+    == "CP_DB_PATH and CP_KEY_FILE must not share a directory: the csqlite "
+    <> "sandbox grants the database's directory, so the signing key must "
+    <> "sit elsewhere. Put the database in its own subdirectory, e.g. "
+    <> "/var/lib/cp/db/."
 }

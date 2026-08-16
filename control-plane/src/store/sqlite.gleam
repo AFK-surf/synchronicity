@@ -29,6 +29,12 @@ fn priv_path(file: String) -> Result(String, Nil)
 @external(erlang, "cp_port_ffi", "open")
 fn port_open(exe: String, args: List(String)) -> Result(Port, Nil)
 
+/// The directory part of the database path, handed to csqlite as its
+/// one argument so the worker can confine its filesystem access
+/// (Landlock on Linux, unveil on OpenBSD) before reading any frames.
+@external(erlang, "filename", "dirname")
+fn dirname(path: String) -> String
+
 @external(erlang, "cp_port_ffi", "rpc")
 fn port_rpc(
   port: Port,
@@ -99,7 +105,10 @@ pub fn open(path: String, mode: Mode) -> Result(Connection, Error) {
     priv_path("csqlite"),
     MissingBinary,
   ))
-  use port <- result.try(result.replace_error(port_open(exe, []), MissingBinary))
+  use port <- result.try(result.replace_error(
+    port_open(exe, [dirname(path)]),
+    MissingBinary,
+  ))
   let conn = Connection(port)
   let mode_byte = case mode {
     ReadOnly -> 0

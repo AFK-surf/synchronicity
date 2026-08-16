@@ -31,9 +31,12 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
 - **Backend**: Gleam on OTP 27 (pinned via `.tool-versions`, asdf).
   SQLite behind `csqlite/` — a small C port program speaking a framed
   stdio protocol, one OS process per connection, so the BEAM never loads
-  SQLite (no NIFs; links against the system libsqlite3). Zones are
-  pre-signed at mutation time and served straight from SQLite through a
-  pool of reset-on-checkout workers (one read transaction per answer).
+  SQLite (no NIFs; links against the system libsqlite3). Each worker
+  sandboxes itself before reading its first frame: Landlock + a seccomp
+  allowlist + rlimits on Linux, pledge + unveil on OpenBSD, confining
+  it to stdio and the database's own directory. Zones are pre-signed at
+  mutation time and served straight from SQLite through a pool of
+  reset-on-checkout workers (one read transaction per answer).
 - **Frontend**: Vite + React + TypeScript + Tailwind (`web/`).
 - **Replication**: primary + read-only DNS replicas fed by external,
   operator-owned tooling (e.g. litestream). See `ops/RUNBOOK.md`.
@@ -73,8 +76,8 @@ listen address.
 |---|---|---|
 | `CP_ROLE` | both | Required. `primary` or `replica`. |
 | `CP_BASE_DOMAIN` | both | Required. Zone apex, no trailing dot (`sync.example.dev`). |
-| `CP_DB_PATH` | both | Required. SQLite file. |
-| `CP_KEY_FILE` | primary | Required on the primary (zone CSK). **Must be unset on replicas.** |
+| `CP_DB_PATH` | both | Required. SQLite file, absolute path, in its own directory (the sandbox grants that directory — keep the key out of it). |
+| `CP_KEY_FILE` | primary | Required on the primary (zone CSK). Must live outside the database's directory. **Must be unset on replicas.** |
 | `CP_HTTP_LISTEN` | both | HTTP / DoH bind as `address:port`. Default `0.0.0.0:8080`. |
 | `CP_DNS_LISTEN` | both | Authoritative DNS (UDP + TCP) bind as `address:port`. Default `0.0.0.0:53`. |
 | `CP_NS_HOSTS` | primary | Semicolon-separated `host=ipv4[,ipv6]` NS glue, e.g. `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53`. Hostnames without dots are relative to the apex. |

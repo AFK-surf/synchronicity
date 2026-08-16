@@ -7,6 +7,20 @@
  * request, one response — because the caller serializes access per
  * connection anyway.
  *
+ * Usage: csqlite [datadir]
+ *
+ * `datadir` is the directory holding the database. It is not trusted
+ * input — the spawner passes it — and it exists so the sandbox can be
+ * sealed before the first frame of untrusted input is read: on Linux a
+ * Landlock ruleset confines filesystem access to that directory (plus
+ * /dev/urandom, which SQLite reads for randomness), then a seccomp
+ * allowlist reduces the kernel surface to stdio + file I/O + memory;
+ * on OpenBSD the same shape via unveil(2) + pledge(2). Without the
+ * argument the filesystem stays unconfined (a warning says so) but the
+ * syscall filter still applies. OPEN/RESET are not re-checked in
+ * userland: the kernel is the authority, and an out-of-directory path
+ * simply fails to open.
+ *
  * Framing: every message, both directions, is a 4-byte big-endian length
  * followed by that many payload bytes ({packet,4} on the BEAM side).
  *
@@ -30,15 +44,37 @@
  * All integers big-endian.
  */
 
+/* -std=c11 alone hides O_PATH and syscall(), both needed by the Linux
+ * sandbox; this must precede every include. */
+#define _GNU_SOURCE
+
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sqlite3.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <stddef.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#if defined(__has_include)
+#if __has_include(<linux/landlock.h>)
+#include <linux/landlock.h>
+#define CSQLITE_HAVE_LANDLOCK 1
+#endif
+#endif
+#endif
 
 #if SQLITE_VERSION_NUMBER < 3037000
 #error "csqlite needs SQLite >= 3.37.0 (sqlite3_changes64, SQLITE_OPEN_EXRESCODE)"
@@ -55,6 +91,439 @@ _Static_assert(sizeof(size_t) >= 8, "csqlite assumes a 64-bit size_t");
  * SQLITE_TOOBIG error instead of a giant binary pushed into the VM (or,
  * at 2^32, a truncated length prefix that desyncs the framing). */
 #define MAX_RESP (64u * 1024u * 1024u)
+
+/* ---- sandbox ----------------------------------------------------------- */
+/*
+ * Sealed before the first read of untrusted input; every failure is
+ * best-effort-with-a-loud-warning rather than fatal, because a worker
+ * that cannot start at all is an outage while a worker missing one
+ * defense layer still has the others (and the message lands in the
+ * journal, where it is not ignorable). Platforms other than Linux and
+ * OpenBSD get no confinement; the port still runs.
+ */
+
+#if defined(__linux__)
+
+/* Filesystem: Landlock (5.13+), unprivileged. The ruleset handles every
+ * access kind this kernel's ABI knows so anything unlisted is denied,
+ * then grants the database directory just what SQLite needs for the db,
+ * its -wal/-shm/journal companions, and temp spill files (main() points
+ * the VFS temp path here). The grant is the *database's* directory, which
+ * is why the operator keeps the signing key elsewhere: Landlock cannot
+ * express a filename, only a directory. */
+#ifdef CSQLITE_HAVE_LANDLOCK
+/* Returns 1 if the rule was added, 0 on any failure (already warned). */
+static int grant_path(int rfd, const char *path, uint64_t access) {
+  struct landlock_path_beneath_attr pb = {0};
+  pb.parent_fd = open(path, O_PATH | O_CLOEXEC);
+  if (pb.parent_fd < 0) {
+    fprintf(stderr, "csqlite: landlock: cannot open %s: %s\n", path,
+            strerror(errno));
+    return 0;
+  }
+  pb.allowed_access = access;
+  int ok = syscall(__NR_landlock_add_rule, rfd, LANDLOCK_RULE_PATH_BENEATH,
+                   &pb, 0) == 0;
+  if (!ok)
+    fprintf(stderr, "csqlite: landlock: add rule for %s: %s\n", path,
+            strerror(errno));
+  close(pb.parent_fd);
+  return ok;
+}
+
+static void confine_fs(const char *datadir) {
+  long abi = syscall(__NR_landlock_create_ruleset, NULL, 0,
+                     LANDLOCK_CREATE_RULESET_VERSION);
+  if (abi < 0) {
+    fputs("csqlite: landlock unsupported here; filesystem unconfined\n",
+          stderr);
+    return;
+  }
+  struct landlock_ruleset_attr attr = {0};
+  attr.handled_access_fs =
+      LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE |
+      LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
+      LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+      LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_DIR |
+      LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_SOCK |
+      LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+      LANDLOCK_ACCESS_FS_MAKE_SYM;
+  uint64_t dir_access =
+      LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE |
+      LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+      LANDLOCK_ACCESS_FS_MAKE_REG;
+#ifdef LANDLOCK_ACCESS_FS_REFER
+  if (abi >= 2) attr.handled_access_fs |= LANDLOCK_ACCESS_FS_REFER;
+#endif
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+  /* SQLite truncates journals and the WAL; only an ABI that handles
+   * truncate needs (or accepts) the explicit grant. */
+  if (abi >= 3) {
+    attr.handled_access_fs |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    dir_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+  }
+#endif
+  int rfd = (int)syscall(__NR_landlock_create_ruleset, &attr, sizeof(attr), 0);
+  if (rfd < 0) {
+    fprintf(stderr, "csqlite: landlock: create ruleset: %s\n",
+            strerror(errno));
+    return;
+  }
+  /* If the database directory itself could not be granted, sealing the
+   * ruleset would deny every OPEN — a worker that is confined but cannot
+   * serve. Warn-and-continue policy: leave the filesystem unconfined and
+   * loud rather than sealed and dead. (/dev/urandom is best-effort: a
+   * failed grant only costs SQLite its preferred randomness source.) */
+  if (!grant_path(rfd, datadir, dir_access)) {
+    fputs("csqlite: landlock: database directory not granted; leaving "
+          "filesystem unconfined\n",
+          stderr);
+    close(rfd);
+    return;
+  }
+  grant_path(rfd, "/dev/urandom", LANDLOCK_ACCESS_FS_READ_FILE);
+  if (syscall(__NR_landlock_restrict_self, rfd, 0) != 0)
+    fprintf(stderr, "csqlite: landlock: restrict self: %s\n",
+            strerror(errno));
+  close(rfd);
+}
+#else
+static void confine_fs(const char *datadir) {
+  (void)datadir;
+  fputs("csqlite: built without landlock headers; filesystem unconfined\n",
+        stderr);
+}
+#endif
+
+/* Syscalls: a hand-rolled BPF allowlist (no libseccomp dependency) of
+ * what glibc + SQLite actually reach for — stdio, one database's file
+ * I/O, memory, locking, time/sleep (busy_timeout). No exec, no
+ * sockets, no clone. Anything else kills the worker; the pool replaces
+ * it and the SIGSYS is visible in the journal. */
+#if defined(__x86_64__)
+#define CSQLITE_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#define CSQLITE_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#elif defined(__riscv) && __riscv_xlen == 64
+#define CSQLITE_AUDIT_ARCH AUDIT_ARCH_RISCV64
+#endif
+
+#ifndef SECCOMP_RET_KILL_PROCESS
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#endif
+
+static void confine_syscalls(void) {
+#ifndef CSQLITE_AUDIT_ARCH
+  fputs("csqlite: no seccomp arch mapping for this target; syscalls "
+        "unconfined\n",
+        stderr);
+#else
+  static const long allowed[] = {
+  /* frames + database + journal/WAL I/O */
+#ifdef __NR_read
+      __NR_read,
+#endif
+#ifdef __NR_write
+      __NR_write,
+#endif
+#ifdef __NR_readv
+      __NR_readv,
+#endif
+#ifdef __NR_writev
+      __NR_writev,
+#endif
+#ifdef __NR_pread64
+      __NR_pread64,
+#endif
+#ifdef __NR_pwrite64
+      __NR_pwrite64,
+#endif
+#ifdef __NR_open
+      __NR_open,
+#endif
+#ifdef __NR_openat
+      __NR_openat,
+#endif
+#ifdef __NR_close
+      __NR_close,
+#endif
+#ifdef __NR_lseek
+      __NR_lseek,
+#endif
+#ifdef __NR_ftruncate
+      __NR_ftruncate,
+#endif
+#ifdef __NR_fallocate
+      __NR_fallocate,
+#endif
+#ifdef __NR_fsync
+      __NR_fsync,
+#endif
+#ifdef __NR_fdatasync
+      __NR_fdatasync,
+#endif
+#ifdef __NR_unlink
+      __NR_unlink,
+#endif
+#ifdef __NR_unlinkat
+      __NR_unlinkat,
+#endif
+  /* fcntl covers SQLite's POSIX advisory locks */
+#ifdef __NR_fcntl
+      __NR_fcntl,
+#endif
+#ifdef __NR_flock
+      __NR_flock,
+#endif
+  /* unixDeviceCharacteristics() probes the fs on the commit path; a
+   * libsqlite3 built with SQLITE_ENABLE_BATCH_ATOMIC_WRITE issues an
+   * ioctl there. The distro build linked here does not, but the Makefile
+   * does not pin the build, so allow it rather than SIGSYS on first write
+   * against a differently-configured SQLite. */
+#ifdef __NR_ioctl
+      __NR_ioctl,
+#endif
+  /* journal/WAL files are fchmod'd to match the database */
+#ifdef __NR_fchmod
+      __NR_fchmod,
+#endif
+#ifdef __NR_fchown
+      __NR_fchown,
+#endif
+  /* path metadata: stat family, access, readlink, getcwd */
+#ifdef __NR_stat
+      __NR_stat,
+#endif
+#ifdef __NR_lstat
+      __NR_lstat,
+#endif
+#ifdef __NR_fstat
+      __NR_fstat,
+#endif
+#ifdef __NR_newfstatat
+      __NR_newfstatat,
+#endif
+#ifdef __NR_statx
+      __NR_statx,
+#endif
+#ifdef __NR_access
+      __NR_access,
+#endif
+#ifdef __NR_faccessat
+      __NR_faccessat,
+#endif
+#ifdef __NR_faccessat2
+      __NR_faccessat2,
+#endif
+#ifdef __NR_readlink
+      __NR_readlink,
+#endif
+#ifdef __NR_readlinkat
+      __NR_readlinkat,
+#endif
+#ifdef __NR_getcwd
+      __NR_getcwd,
+#endif
+  /* memory: malloc, SQLite page cache, WAL -shm mapping. mmap and
+   * mprotect are handled separately below, with a PROT_EXEC check — this
+   * is a C process with no JIT, so nothing legitimately maps writable-
+   * then-executable, and denying it removes the last step of the usual
+   * "corrupt a page, run it" chain against a hostile database file. */
+#ifdef __NR_munmap
+      __NR_munmap,
+#endif
+#ifdef __NR_mremap
+      __NR_mremap,
+#endif
+#ifdef __NR_madvise
+      __NR_madvise,
+#endif
+#ifdef __NR_brk
+      __NR_brk,
+#endif
+#ifdef __NR_futex
+      __NR_futex,
+#endif
+  /* identity + randomness (temp names, xRandomness fallback) */
+#ifdef __NR_getpid
+      __NR_getpid,
+#endif
+#ifdef __NR_gettid
+      __NR_gettid,
+#endif
+#ifdef __NR_getuid
+      __NR_getuid,
+#endif
+#ifdef __NR_geteuid
+      __NR_geteuid,
+#endif
+#ifdef __NR_getgid
+      __NR_getgid,
+#endif
+#ifdef __NR_getegid
+      __NR_getegid,
+#endif
+#ifdef __NR_getrandom
+      __NR_getrandom,
+#endif
+  /* time + sleep: sqlite3_busy_timeout parks in nanosleep */
+#ifdef __NR_clock_gettime
+      __NR_clock_gettime,
+#endif
+#ifdef __NR_clock_getres
+      __NR_clock_getres,
+#endif
+#ifdef __NR_gettimeofday
+      __NR_gettimeofday,
+#endif
+#ifdef __NR_nanosleep
+      __NR_nanosleep,
+#endif
+#ifdef __NR_clock_nanosleep
+      __NR_clock_nanosleep,
+#endif
+#ifdef __NR_sched_yield
+      __NR_sched_yield,
+#endif
+  /* shutdown + signal return */
+#ifdef __NR_rt_sigreturn
+      __NR_rt_sigreturn,
+#endif
+#ifdef __NR_restart_syscall
+      __NR_restart_syscall,
+#endif
+#ifdef __NR_exit
+      __NR_exit,
+#endif
+#ifdef __NR_exit_group
+      __NR_exit_group,
+#endif
+  };
+  enum { NALLOWED = sizeof(allowed) / sizeof(allowed[0]) };
+
+  /* Upper bound (x86_64, every guard live): 4 prologue + 2 x32 check
+   * + 5 mmap + 5 mprotect + 2 per allowlisted syscall + 1 final. Other
+   * arches emit fewer; over-sizing is a few unused stack slots. */
+  struct sock_filter prog[17 + 2 * NALLOWED];
+  size_t n = 0;
+  prog[n++] = (struct sock_filter)BPF_STMT(
+      BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
+  prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                           CSQLITE_AUDIT_ARCH, 1, 0);
+  prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                                           SECCOMP_RET_KILL_PROCESS);
+  prog[n++] = (struct sock_filter)BPF_STMT(
+      BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
+#if defined(__x86_64__)
+  /* The x32 ABI shares the arch token; its numbers carry bit 30. */
+  prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K,
+                                           0x40000000u, 0, 1);
+  prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                                           SECCOMP_RET_KILL_PROCESS);
+#endif
+  /* W^X: mmap/mprotect are allowed only without PROT_EXEC. Each block is
+   * "if nr==call, load args[2] (prot, low word — every mapped arch here
+   * is little-endian), kill on PROT_EXEC else allow; if nr!=call skip the
+   * four-instruction body with the accumulator still holding nr". Both
+   * interior arms return, so a taken block never falls through and the
+   * allowlist below always sees nr, never a stale prot value. */
+#if defined(__NR_mmap) || defined(__NR_mprotect)
+  static const int prot_calls[] = {
+#ifdef __NR_mmap
+      __NR_mmap,
+#endif
+#ifdef __NR_mprotect
+      __NR_mprotect,
+#endif
+  };
+  for (size_t i = 0; i < sizeof(prot_calls) / sizeof(prot_calls[0]); i++) {
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                             (uint32_t)prot_calls[i], 0, 4);
+    prog[n++] = (struct sock_filter)BPF_STMT(
+        BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[2]));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K,
+                                             (uint32_t)PROT_EXEC, 0, 1);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                                             SECCOMP_RET_KILL_PROCESS);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                                             SECCOMP_RET_ALLOW);
+  }
+#endif
+  for (size_t i = 0; i < NALLOWED; i++) {
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                             (uint32_t)allowed[i], 0, 1);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                                             SECCOMP_RET_ALLOW);
+  }
+  prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                                           SECCOMP_RET_KILL_PROCESS);
+
+  struct sock_fprog fprog = {(unsigned short)n, prog};
+  if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog, 0, 0) != 0)
+    fprintf(stderr, "csqlite: seccomp install failed: %s\n", strerror(errno));
+#endif
+}
+
+static void sandbox(const char *datadir) {
+  /* The database holds user and key-binding state: no core dumps, and
+   * not ptrace-able by an unprivileged peer. */
+  struct rlimit no_core = {0, 0};
+  if (setrlimit(RLIMIT_CORE, &no_core) != 0)
+    fprintf(stderr, "csqlite: RLIMIT_CORE: %s\n", strerror(errno));
+  if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0)
+    fprintf(stderr, "csqlite: PR_SET_DUMPABLE: %s\n", strerror(errno));
+  /* db + wal + shm + journal + dir fsync handles + urandom: 64 is
+   * generous for one connection and starves nothing legitimate. */
+  struct rlimit few_files = {64, 64};
+  if (setrlimit(RLIMIT_NOFILE, &few_files) != 0)
+    fprintf(stderr, "csqlite: RLIMIT_NOFILE: %s\n", strerror(errno));
+  /* Required (unprivileged) by both landlock_restrict_self and
+   * SECCOMP_MODE_FILTER. */
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+    fprintf(stderr, "csqlite: no_new_privs: %s\n", strerror(errno));
+  if (datadir)
+    confine_fs(datadir);
+  else
+    fputs("csqlite: no data directory argument; filesystem unconfined\n",
+          stderr);
+  /* Last: the landlock setup above needs syscalls the filter denies. */
+  confine_syscalls();
+}
+
+#elif defined(__OpenBSD__)
+
+static void sandbox(const char *datadir) {
+  if (datadir) {
+    if (unveil(datadir, "rwc") != 0)
+      fprintf(stderr, "csqlite: unveil %s: %s\n", datadir, strerror(errno));
+    /* Best-effort, as on Linux: absent /dev/urandom degrades SQLite's
+     * randomness source, it does not stop the worker. */
+    if (unveil("/dev/urandom", "r") != 0)
+      fprintf(stderr, "csqlite: unveil /dev/urandom: %s\n", strerror(errno));
+    if (unveil(NULL, NULL) != 0)
+      fprintf(stderr, "csqlite: unveil lock: %s\n", strerror(errno));
+  } else {
+    fputs("csqlite: no data directory argument; filesystem unconfined\n",
+          stderr);
+  }
+  /* stdio: frames, mmap, ftruncate, nanosleep. rpath/wpath/cpath: the
+   * database and its journal/WAL siblings. flock: SQLite's POSIX
+   * locks. fattr: journal/WAL fchmod-to-match-the-database. No chown
+   * promise: SQLite only fchowns journals when running as root, which
+   * this service never is. */
+  if (pledge("stdio rpath wpath cpath flock fattr", NULL) != 0)
+    fprintf(stderr, "csqlite: pledge: %s\n", strerror(errno));
+}
+
+#else
+
+/* No confinement on this platform (dev hosts, e.g. macOS); documented
+ * in the header comment rather than warned per-spawn, because the pool
+ * starts a worker per connection and the noise would drown real
+ * warnings. */
+static void sandbox(const char *datadir) { (void)datadir; }
+
+#endif
 
 enum {
   OP_OPEN = 0x01,
@@ -475,13 +944,36 @@ static void handle_exec(sqlite3 *db, Cur *c) {
 
 /* ---- main loop --------------------------------------------------------- */
 
+/* No SQL statement may name a second file. ATTACH is the obvious way SQL
+ * opens a path other than the OPENed one; VACUUM INTO reaches the VFS
+ * through the same SQLITE_ATTACH authorization. Nothing the control plane
+ * runs needs either, and denying them keeps a compromised query from
+ * touching the signing key (or anything else) that shares the granted
+ * directory — a distinction the kernel confinement cannot draw, and the
+ * one layer that still holds on a host without Landlock. */
+static int deny_second_file(void *unused, int action, const char *a,
+                            const char *b, const char *c, const char *d) {
+  (void)unused;
+  (void)a;
+  (void)b;
+  (void)c;
+  (void)d;
+  if (action == SQLITE_ATTACH || action == SQLITE_DETACH) return SQLITE_DENY;
+  return SQLITE_OK;
+}
+
 /* Opens `zpath` with the mode's flags and the full hostile-file hardening
  * applied. On failure the handle is closed and *out is NULL. */
 static int open_hardened(const char *zpath, uint8_t mode, sqlite3 **out) {
-  int flags = mode == 0   ? SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW
+  /* NOFOLLOW in every mode: the database is opened by absolute path and
+   * the replica refresh contract is an atomic rename, never a symlink, so
+   * a symlinked target is always someone redirecting the open — and for a
+   * writable mode it would land the db (and its -wal/-shm) outside the
+   * granted directory. */
+  int flags = mode == 0   ? SQLITE_OPEN_READONLY
               : mode == 1 ? SQLITE_OPEN_READWRITE
                           : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-  flags |= SQLITE_OPEN_EXRESCODE;
+  flags |= SQLITE_OPEN_EXRESCODE | SQLITE_OPEN_NOFOLLOW;
   sqlite3 *db = NULL;
   int rc = sqlite3_open_v2(zpath, &db, flags, NULL);
   if (rc != SQLITE_OK) {
@@ -501,17 +993,36 @@ static int open_hardened(const char *zpath, uint8_t mode, sqlite3 **out) {
   sqlite3_limit(db, SQLITE_LIMIT_VDBE_OP, 250000);
   sqlite3_busy_timeout(db, 5000);
   sqlite3_exec(db, "PRAGMA cell_size_check=ON", NULL, NULL, NULL);
+  /* ATTACH / VACUUM INTO / DETACH are refused (see deny_second_file):
+   * the sandbox grants one directory, so SQL must not be able to name a
+   * file in it beyond the database. */
+  sqlite3_set_authorizer(db, deny_second_file, NULL);
   *out = db;
   return SQLITE_OK;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
   /* The database (and its -wal/-shm/journal companions) holds user and
    * key-binding state; never create it world-readable. */
   umask(077);
   /* The owner closing the port must be a clean shutdown (EPIPE path in
    * write_exact), not death by signal 13. */
   signal(SIGPIPE, SIG_IGN);
+  /* Seal before the first frame: everything after this point handles
+   * untrusted input with the kernel surface already reduced. */
+  const char *datadir = argc > 1 ? argv[1] : NULL;
+  sandbox(datadir);
+
+  /* Sorts and statement journals spill into the granted directory rather
+   * than an ungranted /tmp: temp_store stays at its FILE default and the
+   * VFS temp path points at the database's own directory. (temp_store=
+   * MEMORY, the obvious alternative, turns a disk-bounded sort into an
+   * unbounded heap allocation — a fleet-wide ORDER BY would then size the
+   * worker's RSS instead of spilling.) The hard heap limit is a backstop
+   * for the paths that still allocate: a runaway query gets SQLITE_NOMEM,
+   * not the cgroup's OOM killer. */
+  if (datadir) sqlite3_temp_directory = sqlite3_mprintf("%s", datadir);
+  sqlite3_hard_heap_limit64(256 * 1024 * 1024);
 
   sqlite3 *db = NULL;
   char *saved_path = NULL;

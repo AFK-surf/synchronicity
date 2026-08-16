@@ -24,10 +24,57 @@ jobs:
           rebar3-version: "3.27.0"
       - run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - run: make -C csqlite
+      # Ubuntu runner kernels ship Landlock in the LSM stack, so the
+      # sandbox is REQUIRED to hold here: a worker that comes up
+      # unconfined (or a seccomp allowlist that kills legitimate work)
+      # fails the job instead of only warning to stderr in production.
+      - run: CSQLITE_SMOKE_REQUIRE=1 perl csqlite/smoke.pl priv/csqlite
       - run: gleam format --check src test
       - run: gleam deps download
       - run: gleam test
       - run: gleam build
+
+  # GitHub has no hosted OpenBSD runners, so boot one in a VM and run
+  # the whole control-plane suite there: the sandbox smoke test first
+  # (enforcement is unconditional on OpenBSD, so a pledge promise list
+  # that is too narrow or an unveil that does not stick fails fast),
+  # then the full gleam test suite, which drives the pool and store
+  # through real pledged workers.
+  openbsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/openbsd-vm@v1
+        with:
+          release: "7.9"
+          usesh: true
+          # Everything from ports lands under /usr/local (hence the
+          # -I/-L via environment, which the Makefile appends to).
+          # gmake because the Makefile uses GNU `override`; perl is in
+          # base. The ports gleam is built against OTP 28, so erlang%28
+          # keeps erl/escript on that major (the exact patch pin in
+          # .tool-versions is a Linux-CI concern; here the point is the
+          # OS).
+          prepare: pkg_add gmake sqlite3 erlang%28 gleam
+          run: |
+            set -e
+            export PATH="/usr/local/lib/erlang28/bin:$PATH"
+            # The ports gleam shells out to a version-suffixed
+            # `rebar3-28` (to bind rebar3 to its OTP) and no such
+            # package exists. Install the official escript (3.25.x
+            # supports OTP 28) as `rebar3` — escript derives its entry
+            # module from the script's basename, so the file must be
+            # named `rebar3` for `rebar3:main/1` to resolve — then make
+            # `rebar3-28` a shim that execs it under that basename.
+            ftp -o /usr/local/bin/rebar3 https://github.com/erlang/rebar3/releases/download/3.25.1/rebar3
+            chmod +x /usr/local/bin/rebar3
+            printf '#!/bin/sh\nexec /usr/local/bin/rebar3 "$@"\n' > /usr/local/bin/rebar3-28
+            chmod +x /usr/local/bin/rebar3-28
+            cd control-plane
+            env CFLAGS="-O2 -I/usr/local/include" LDFLAGS="-L/usr/local/lib" gmake -C csqlite
+            CSQLITE_SMOKE_REQUIRE=1 perl csqlite/smoke.pl priv/csqlite
+            gleam deps download
+            gleam test
 
   web:
     runs-on: ubuntu-latest
