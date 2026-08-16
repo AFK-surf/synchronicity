@@ -166,7 +166,6 @@ fn rekor_publish(
     rekor.run(
       conn,
       apex,
-      csk,
       client.http(client.url()),
       log_key,
       now,
@@ -295,8 +294,7 @@ fn serve() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
   case cfg.role, cfg.dns_mode {
     Primary, config.Serve -> serve_primary(cfg)
-    Primary, config.External(provider_cfg, op_key_file) ->
-      serve_external(cfg, provider_cfg, op_key_file)
+    Primary, config.External(provider_cfg) -> serve_external(cfg, provider_cfg)
     // config.load refuses external on a replica, so this arm is serve mode.
     Replica, _ -> serve_replica(cfg)
   }
@@ -482,9 +480,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
 fn serve_external(
   cfg: Config,
   provider_cfg: config.ProviderConfig,
-  op_key_file: String,
 ) -> Result(Nil, String) {
-  use signer <- result.try(keys.load(op_key_file))
   use log_key <- result.try(client.log_key())
   use apex <- result.try(
     name.parse(cfg.base_domain) |> result.replace_error("bad base domain"),
@@ -555,7 +551,6 @@ fn serve_external(
     |> sup.add(zonekey_watch.supervised(
       cfg.db_path,
       apex,
-      signer,
       chain.doh(chain.resolver_url()),
       client.http(client.url()),
       log_key,
@@ -607,9 +602,8 @@ fn describe_zone(describe: String) -> String {
 /// What an operator runs at cutover instead of waiting for the sweep.
 fn provider_sync_once() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
-  use #(provider_cfg, _) <- result.try(case cfg.dns_mode {
-    config.External(provider_cfg, op_key_file) ->
-      Ok(#(provider_cfg, op_key_file))
+  use provider_cfg <- result.try(case cfg.dns_mode {
+    config.External(provider_cfg) -> Ok(provider_cfg)
     config.Serve -> Error("provider-sync needs CP_DNS_MODE=external")
   })
   use #(prov, provider_name, zone_id) <- result.try(connect_provider(

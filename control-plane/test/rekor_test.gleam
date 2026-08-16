@@ -313,7 +313,6 @@ fn publish_run(
   rekor_publish.run(
     conn,
     apex,
-    csk,
     log,
     log_key,
     now,
@@ -379,11 +378,16 @@ pub fn publish_stores_a_verified_record_test() {
   // What was stored is what a client will be handed, and it verifies.
   let assert Ok(stored) = rekor_publish.to_proof(record)
   let assert Ok(_) = proof.verify_against_log(stored, spki, point)
-  // Attribution: the signature the log indexed is inside the stored body,
-  // and it is the signer\'s.
-  let assert Ok(#(_digest, signature, _certificate)) =
+  // Attribution: the signature the log indexed verifies under the entry\'s
+  // own certificate — an ephemeral signer nothing holds a key file for.
+  let assert Ok(#(_digest, signature, certificate)) =
     proof.parse_body(record.canonicalized_body)
-  assert statement.verify(csk.public, record.statement, signature)
+  let assert Ok(#(cert_spki, _san)) = cert_spki_and_san(certificate)
+  let assert Ok(signer_public) = bit_array.slice(cert_spki, 27, 64)
+  assert statement.verify(signer_public, record.statement, signature)
+  // And it is NOT the zone key\'s signature: the signer is ephemeral, so
+  // the CSK never signs entries — possession is nobody\'s claim to make.
+  assert !statement.verify(csk.public, record.statement, signature)
   sqlite.close(conn)
 }
 
@@ -625,7 +629,7 @@ pub fn the_checked_in_certificate_is_this_encoders_output_test() {
 /// yet" is the error an operator meets, and it says so.
 pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
   let conn = fixtures.fresh_conn()
-  let csk = fixtures.zone_boot(conn)
+  let _csk = fixtures.zone_boot(conn)
   let assert Ok(apex) = name.parse("sync.test.")
   let #(log, spki, point) = fake_log(keys.generate())
 
@@ -633,7 +637,6 @@ pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
     rekor_publish.run(
       conn,
       apex,
-      csk,
       log,
       #(spki, point),
       1000,
@@ -656,7 +659,6 @@ pub fn a_retire_may_be_chainless_test() {
     rekor_publish.run(
       conn,
       apex,
-      csk,
       log,
       #(spki, point),
       1000,

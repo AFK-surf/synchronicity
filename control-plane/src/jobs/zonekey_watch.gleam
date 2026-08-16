@@ -5,8 +5,9 @@
 //// schedule, so the claim cannot be a ceremony an operator runs — it has
 //// to follow the wire. Every fifteen minutes this actor resolves the apex
 //// DNSKEY RRset over DoH; when the set differs from what the last logged
-//// claim covered, it collects the chain, logs a fresh claim signed by the
-//// operational key, and pokes the reconciler so the `_synchronicity-rekor`
+//// claim covered, it collects the chain, logs a fresh claim (signed by an
+//// ephemeral key `rekor/publish` mints and discards — attribution is not
+//// authorization), and pokes the reconciler so the `_synchronicity-rekor`
 //// record follows into the provider zone.
 ////
 //// The failure direction is closed: a provider that cuts to a
@@ -20,7 +21,7 @@
 
 import dns/name as dns_name
 import dns/wire
-import dnssec/keys.{type Csk}
+import dnssec/keys
 import gleam/bit_array
 import gleam/crypto
 import gleam/erlang/process.{type Name, type Subject}
@@ -53,7 +54,6 @@ type State {
   State(
     db_path: String,
     apex: dns_name.Name,
-    signer: Csk,
     resolver: chain.Resolver,
     log: Log,
     log_key: #(BitArray, BitArray),
@@ -65,7 +65,6 @@ type State {
 pub fn supervised(
   db_path: String,
   apex: dns_name.Name,
-  signer: Csk,
   resolver: chain.Resolver,
   log: Log,
   log_key: #(BitArray, BitArray),
@@ -80,7 +79,6 @@ pub fn supervised(
         actor.initialised(State(
           db_path,
           apex,
-          signer,
           resolver,
           log,
           log_key,
@@ -104,7 +102,6 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         run_once_with(
           conn,
           state.apex,
-          state.signer,
           state.resolver,
           state.log,
           state.log_key,
@@ -126,7 +123,6 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 pub fn run_once_with(
   conn: Connection,
   apex: dns_name.Name,
-  signer: Csk,
   resolver: chain.Resolver,
   log: Log,
   log_key: #(BitArray, BitArray),
@@ -149,16 +145,7 @@ pub fn run_once_with(
         True -> False
         False ->
           case
-            rekor.run(
-              conn,
-              apex,
-              signer,
-              log,
-              log_key,
-              now,
-              resolver,
-              rekor.Current,
-            )
+            rekor.run(conn, apex, log, log_key, now, resolver, rekor.Current)
           {
             Ok(outcome) -> {
               let _ = state.record_logged(conn, now)

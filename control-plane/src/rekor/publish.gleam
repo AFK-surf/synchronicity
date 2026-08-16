@@ -12,9 +12,11 @@
 //// memory. The sequence is: get the DS live in the parent, publish the
 //// DNSKEY RRset in the zone, *then* log; collection reads the RRset and the
 //// chain in one pass, so the claim and its proof cannot disagree. The DSSE
-//// signature is attribution — it names the `signer` (the CSK in serve mode,
-//// an operational key when the zone is provider-hosted) via the entry's
-//// certificate, and authorizes nothing. Authorization is the chain.
+//// signature is attribution and nothing more — it verifies under the
+//// entry's own certificate, whose key is an **ephemeral signer minted per
+//// entry and immediately discarded**. Authorization is the chain; a signer
+//// that lives for one signature is the honest expression of that, and it
+//// leaves no key file to protect or rotate.
 ////
 //// A `retire` is the one exception: a zone being retired may have no DS
 //// left to build a chain from, so a chainless retire is allowed and marked
@@ -32,10 +34,10 @@
 //// about it.
 
 import dns/name.{type Name}
-import dnssec/keys.{type Csk}
+import dnssec/keys
 import gleam/crypto
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/result
 import rekor/cert
 import rekor/chain
@@ -69,9 +71,6 @@ pub type PublishError {
   LogUnavailable(String)
   /// The proof did not verify locally — never stored.
   Unverified(proof.ProofError)
-  /// The entry the log returned does not carry the signer's signature, which
-  /// can only mean the key file and the statement disagree about who signs.
-  NotOurSignature
   /// The DNSSEC chain could not be collected. Almost always one thing: the
   /// DS is not live in the parent yet, and logging comes after that now.
   NoChain(String)
@@ -90,12 +89,19 @@ pub type Outcome {
   )
 }
 
-/// Publishes (or refreshes) the record for the claimed set at `apex`, DSSE-
-/// signed by `signer`.
+/// Publishes (or refreshes) the record for the claimed set at `apex`.
+///
+/// The DSSE signer is an **ephemeral key minted here, per entry**, and
+/// discarded the moment the entry is verified. Nothing downstream ever
+/// needs it again: the client verifies the signature against the entry's
+/// own certificate (attribution — the entry is what its signer made), and
+/// authorization is carried entirely by the chain. A signer that exists
+/// only for the microseconds of one signature is the honest expression of
+/// that: there is no key file to protect, rotate, or pretend means more
+/// than it does.
 pub fn run(
   conn: Connection,
   apex: Name,
-  signer: Csk,
   log: Log,
   log_key: #(BitArray, BitArray),
   now: Int,
@@ -140,30 +146,24 @@ pub fn run(
   // chain carries fresh RRSIGs, so rebuilding either would mint a second
   // leaf for one claim — Rekor is content-addressed, so reusing them is what
   // makes a republish a refresh.
-  use #(signature, certificate, refreshed) <- result.try(
-    case reusable(stored, statement_bytes) {
-      Ok(#(signature, certificate)) -> Ok(#(signature, certificate, True))
-      Error(Nil) -> {
-        let certificate =
-          cert.build(
-            name.to_string(apex),
-            signer.public,
-            signer.private,
-            now,
-            now + certificate_lifetime_seconds,
-            links,
-          )
-        Ok(#(statement.sign(signer, statement_bytes), certificate, False))
-      }
-    },
-  )
-
-  use Nil <- result.try(
-    case statement.verify(signer.public, statement_bytes, signature) {
-      True -> Ok(Nil)
-      False -> Error(NotOurSignature)
-    },
-  )
+  let #(signature, certificate, refreshed) = case
+    reusable(stored, statement_bytes)
+  {
+    Ok(#(signature, certificate)) -> #(signature, certificate, True)
+    Error(Nil) -> {
+      let signer = keys.generate()
+      let certificate =
+        cert.build(
+          name.to_string(apex),
+          signer.public,
+          signer.private,
+          now,
+          now + certificate_lifetime_seconds,
+          links,
+        )
+      #(statement.sign(signer, statement_bytes), certificate, False)
+    }
+  }
 
   // The submission is a hashedrekord over the DSSE PAE: its digest, the DER
   // signature, and the certificate that names the signer and this zone.
@@ -190,11 +190,13 @@ pub fn run(
     )
 
   // Verify the returned proof by the rules the client applies, before a row
-  // exists: the body's digest is this Statement's PAE, the entry signature is
-  // the signer's, the certificate the log recorded names this signer and
-  // this apex, and the entry is in the tree the checkpoint commits to.
+  // exists: the body's digest is this Statement's PAE, the entry signature
+  // verifies under the certificate's own key, the certificate names this
+  // apex, and the entry is in the tree the checkpoint commits to. Checked
+  // against the *entry's* certificate, never a key we hold — on a refresh
+  // the certificate is a prior run's, whose ephemeral signer is long gone.
   use verified <- result.try(
-    verify_entry(record, apex, signer) |> result.map_error(Unverified),
+    verify_entry(record, apex) |> result.map_error(Unverified),
   )
   use _ <- result.try(
     proof.verify_against_log(record, log_key.0, log_key.1)
@@ -315,12 +317,11 @@ type Verified {
 @external(erlang, "cp_crypto_ffi", "cert_spki_and_san")
 fn cert_spki_and_san(der: BitArray) -> Result(#(BitArray, String), Nil)
 
-/// The client's verification, run before storing: the digest, attribution,
-/// and the certificate's two bindings — its signer and its name.
+/// The client's verification, run before storing: the digest, attribution
+/// against the certificate's own key, and the certificate's name binding.
 fn verify_entry(
   record: Proof,
   apex: Name,
-  signer: Csk,
 ) -> Result(Verified, proof.ProofError) {
   use #(digest, signature, certificate) <- result.try(proof.parse_body(
     record.canonicalized_body,
@@ -346,11 +347,6 @@ fn verify_entry(
       "the logged certificate does not decode, or has no single dNSName SAN",
     )),
   )
-  use Nil <- result.try(case spki == proof.p256_spki(signer.public) {
-    True -> Ok(Nil)
-    False ->
-      Error(proof.Binding("the logged certificate's key is not this signer's"))
-  })
   use Nil <- result.try(case san == cert.san_name(name.to_string(apex)) {
     True -> Ok(Nil)
     False ->
@@ -358,11 +354,30 @@ fn verify_entry(
         "the logged certificate names " <> san <> ", not this apex",
       ))
   })
+  // Attribution against the certificate's own key — the exact check the
+  // client runs, and the only one possible: on a refresh the certificate
+  // is a prior run's, whose ephemeral signer no longer exists anywhere.
+  use signer_public <- result.try(case spki {
+    <<_prefix:bytes-size(27), point:bytes-size(64)>> ->
+      case proof.p256_spki(point) == spki {
+        True -> Ok(point)
+        False ->
+          Error(proof.Attribution(
+            "the certificate's key is not a P-256 SubjectPublicKeyInfo",
+          ))
+      }
+    _ ->
+      Error(proof.Attribution(
+        "the certificate's key is not a P-256 SubjectPublicKeyInfo",
+      ))
+  })
   use Nil <- result.try(
-    case statement.verify(signer.public, record.statement, signature) {
+    case statement.verify(signer_public, record.statement, signature) {
       True -> Ok(Nil)
       False ->
-        Error(proof.Attribution("the entry signature is not this signer's"))
+        Error(proof.Attribution(
+          "the entry signature is not the certificate's key's",
+        ))
     },
   )
   Ok(Verified(

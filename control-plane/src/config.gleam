@@ -24,10 +24,11 @@ pub type DnsMode {
   /// This service is the authoritative DNSSEC nameserver — today's shape.
   Serve
   /// A managed provider hosts and signs the zone; this service publishes
-  /// the data records through its API and runs no DNS listeners, no zone
-  /// key. `op_key_file` holds the operational key that signs transparency
-  /// claims — attribution, never a zone key.
-  External(provider: ProviderConfig, op_key_file: String)
+  /// the data records through its API and runs no DNS listeners and no key
+  /// material at all — transparency claims are signed with an ephemeral
+  /// key minted per entry, because the signature is attribution and
+  /// authorization is the chain (docs/EXTERNAL-DNS-PROVIDER.md §2.1).
+  External(provider: ProviderConfig)
 }
 
 /// Which provider, and how to reach it. `zone_id` empty means "discover by
@@ -95,10 +96,6 @@ pub fn load() -> Result(Config, String) {
       }
   })
   use _ <- result.try(validate_db_path(db_path, key_file))
-  use _ <- result.try(case dns_mode {
-    External(_, op_key_file) -> validate_db_path(db_path, op_key_file)
-    Serve -> Ok(Nil)
-  })
   use _ <- result.try(removed("CP_HTTP_PORT", "CP_HTTP_LISTEN"))
   use _ <- result.try(removed("CP_DNS_PORT", "CP_DNS_LISTEN"))
   use http_listen <- result.try(listen_from("CP_HTTP_LISTEN", "0.0.0.0:8080"))
@@ -161,10 +158,7 @@ pub fn load() -> Result(Config, String) {
 fn dns_mode(role: Role) -> Result(DnsMode, String) {
   let provider_env_present =
     list.any(
-      [
-        "CP_DNS_PROVIDER", "CP_CLOUDFLARE_API_TOKEN", "CP_BUNNY_API_KEY",
-        "CP_OP_KEY_FILE",
-      ],
+      ["CP_DNS_PROVIDER", "CP_CLOUDFLARE_API_TOKEN", "CP_BUNNY_API_KEY"],
       fn(key) { result.is_ok(envoy.get(key)) },
     )
   case envoy.get("CP_DNS_MODE") {
@@ -172,9 +166,9 @@ fn dns_mode(role: Role) -> Result(DnsMode, String) {
       case provider_env_present {
         True ->
           Error(
-            "provider configuration (CP_DNS_PROVIDER / CP_*_API_* / "
-            <> "CP_OP_KEY_FILE) is set but CP_DNS_MODE is not external — "
-            <> "remove it, or set CP_DNS_MODE=external",
+            "provider configuration (CP_DNS_PROVIDER / CP_*_API_*) is set "
+            <> "but CP_DNS_MODE is not external — remove it, or set "
+            <> "CP_DNS_MODE=external",
           )
         False -> Ok(Serve)
       }
@@ -187,9 +181,8 @@ fn dns_mode(role: Role) -> Result(DnsMode, String) {
           )
         Primary -> Ok(Nil)
       })
-      use op_key_file <- result.try(required("CP_OP_KEY_FILE"))
       use provider <- result.try(provider_config())
-      Ok(External(provider, op_key_file))
+      Ok(External(provider))
     }
     Ok(other) -> Error("CP_DNS_MODE must be serve or external, got " <> other)
   }

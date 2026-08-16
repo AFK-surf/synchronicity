@@ -130,12 +130,15 @@ key. V2 decouples them:
 - **Subject**: the *provider's* apex DNSKEY material — the SPKI of each
   zone-signing key observed signing answers for the apex (see §3.3 on key
   sets), plus apex and key tag, as today.
-- **Signer**: a control-plane **operational key** — an ECDSA P-256 keypair
-  generated like the CSK (`keygen` machinery reused), stored at
-  `CP_OP_KEY_FILE`, and never published in DNS. Its only job is
-  attribution: monitors can tell operator-minted entries from third-party
-  submissions about the same zone. It signs the DSSE envelope; the Rekor
-  `hashedrekord` verifier certificate names it.
+- **Signer**: an **ephemeral ECDSA P-256 key, minted per entry and
+  immediately discarded**. The signature is attribution and nothing more —
+  the entry is what its signer made — and authorization is carried entirely
+  by the chain, so a signer that exists for one signature is the honest
+  expression of the model: no key file to store, protect, or rotate, and
+  no false suggestion that the signing identity means anything. It signs
+  the DSSE envelope; the Rekor `hashedrekord` verifier certificate names
+  it, and on a refresh the stored entry's own certificate is what the
+  signature verifies against.
 - **Versioning**: a new predicate type string
   (`https://synchronicity.sh/zone-key/v2`) so both client and monitor
   dispatch on it. The v1 rendering rules carry over: byte-exact, fixed
@@ -214,7 +217,6 @@ that configures nothing gets today's behavior, bit for bit:
 ```
 CP_DNS_MODE=serve|external            # default: serve
 CP_DNS_PROVIDER=cloudflare|bunny|log-only   # required iff external
-CP_OP_KEY_FILE=/path/to/opkey         # operational DSSE key, external only
 
 CP_CLOUDFLARE_API_TOKEN=...           # zone-scoped token
 CP_CLOUDFLARE_ZONE_ID=...             # optional; discovered via GET /zones?name= if absent
@@ -326,7 +328,7 @@ the §3.3 loop:
    validating DoH for chain assembly.
 2. Compare the zone-signing key set against `observed_zone_keys`.
 3. On change: collect the full chain, build the v2 statement over the new
-   set, sign with the operational key, submit through the injected
+   set, sign with a freshly minted ephemeral key, submit through the injected
    `rekor/client.Log`, verify inclusion, store the record
    (`rekor/store.gleam` conventions), update `observed_zone_keys`, and
    poke the reconciler so the `_synchronicity-rekor` TXT follows. Audit
@@ -492,8 +494,7 @@ Migrating a live serve-mode deployment; a green-field external deployment
 runs the same steps minus the decommissioning.
 
 1. **Prepare.** Create/verify the provider zone for the apex; enable
-   DNSSEC on it (the provider's own toggle and ceremony). Generate
-   the operational key (`keygen` machinery, `CP_OP_KEY_FILE`). Upgrade
+   DNSSEC on it (the provider's own toggle and ceremony). Upgrade
    client fleets to a claim-v2-capable build (§3.4) — this can lead the
    cutover by any amount; v2-capable clients still verify v1 zones.
 2. **Dual-run.** Flip the control plane to `external` with the provider
@@ -525,8 +526,9 @@ runs the same steps minus the decommissioning.
   formats from then on.
 - **Possession attribution is gone for external zones.** Anyone can log a
   v2 entry about any zone (they always could log *something*; now the
-  client accepts chained third-party entries too). The operational-key
-  signature lets monitors distinguish operator entries, but
+  client accepts chained third-party entries too). No signer identity
+  distinguishes operator entries from anyone else's — deliberately: the
+  signature is per-entry ephemeral, and
   authorization rests entirely on the chain — which §2.1 argues is where
   it always rested.
 - **The wire is eventually consistent.** Commit no longer equals
@@ -602,10 +604,11 @@ runs the same steps minus the decommissioning.
    parsing (`dns.rs`); confirm each provider's chunking preserves
    concatenation order for >255-byte member records, and add a crossval
    case.
-4. **Operational-key registry** — should monitors maintain a list of
-   known operator keys (making third-party v2 entries loudly
-   distinguishable), and where would that list live? Pure monitor
-   policy; nothing in the client depends on it.
+4. **Signer identity is gone by construction** — entries are signed by
+   per-entry ephemeral keys, so monitors cannot distinguish operator
+   entries from third-party ones by signer. Resolved deliberately: the
+   distinction was never security (§2.1), and the operator's own record
+   of what they published is the judgement that matters.
 5. **Rate limits under churn** — a large deployment's mutation burst maps
    to how many provider calls after coalescing? Needs numbers from the
    phase-2 e2e stub under load before defaults (debounce, batch size)
