@@ -6,6 +6,29 @@ use synch_net::NetOptions;
 
 use crate::error::{EngineError, Result};
 
+/// How a mirror stages a file it is rewriting (`docs/DELTA-SYNC.md` §3.5).
+///
+/// Whichever of these is chosen, the write is staged and renamed: a reader of
+/// the target sees the old bytes or the new ones and never a half-patched file
+/// (§7.2). What differs is how the staging file gets its head start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MirrorDeltaWrite {
+    /// Clone the old file into staging with `FICLONE` where the filesystem
+    /// supports it (btrfs, XFS, bcachefs), copy it otherwise, then write only
+    /// the groups that changed. The clone is O(1) and shares extents, so the
+    /// write cost is proportional to the change rather than to the file.
+    #[default]
+    Reflink,
+    /// Skip the clone attempt and copy the old file into staging before
+    /// patching it. For filesystems where the ioctl only ever fails and the
+    /// per-write attempt is noise in the logs.
+    Copy,
+    /// Never patch: write every file out of the CAS in full, exactly as a
+    /// mirror did before delta existed. For operators who want bit-identical
+    /// write behavior, and for isolating a suspected patch bug.
+    Off,
+}
+
 /// Where a node's data directory lives by default (§10).
 pub fn default_data_dir() -> Result<PathBuf> {
     directories::ProjectDirs::from("", "", "synchronicity")
@@ -37,6 +60,17 @@ pub struct NodeConfig {
     pub ad_update_interval: Duration,
     /// How many providers a single range fetch is split across (§6.4).
     pub fetch_fanout: usize,
+    /// The smallest object a fetch will run the delta descent for
+    /// (`docs/DELTA-SYNC.md` §4, default 16 MiB — one ad span).
+    ///
+    /// Below it the proof round trips cost more than the bytes they could
+    /// save, and inline blobs (§6.2) never delta at all. Setting it to
+    /// [`u64::MAX`] turns delta off for this node, which is the escape hatch
+    /// for diagnosing a fetch that is behaving strangely.
+    pub delta_min_size: u64,
+    /// How a mirror writes a file whose previous version is already on disk
+    /// (`docs/DELTA-SYNC.md` §3.5).
+    pub mirror_delta_write: MirrorDeltaWrite,
     /// How long old roots are retained (§5.4).
     pub root_retention: Duration,
     /// How long this node's own tombstones are kept before a later root drops
@@ -68,6 +102,8 @@ impl NodeConfig {
             publish_batch_max: crate::publisher::DEFAULT_PUBLISH_BATCH_MAX,
             ad_update_interval: Duration::from_secs(60),
             fetch_fanout: 3,
+            delta_min_size: synch_core::AD_SPAN_GRANULARITY,
+            mirror_delta_write: MirrorDeltaWrite::default(),
             root_retention: Duration::from_secs(7 * 24 * 3600),
             tombstone_ttl: Duration::from_secs(90 * 24 * 3600),
             recovery_quiesce: crate::recovery::DEFAULT_RECOVERY_QUIESCE,
@@ -111,6 +147,8 @@ mod tests {
         assert_eq!(config.publish_batch_max, 1_000);
         assert_eq!(config.ad_update_interval, Duration::from_secs(60));
         assert_eq!(config.fetch_fanout, 3);
+        assert_eq!(config.delta_min_size, 16 * 1024 * 1024);
+        assert_eq!(config.mirror_delta_write, MirrorDeltaWrite::Reflink);
         assert_eq!(config.root_retention, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(config.tombstone_ttl, Duration::from_secs(90 * 24 * 3600));
         assert_eq!(config.recovery_quiesce, Duration::from_secs(3600));

@@ -604,6 +604,86 @@ impl Adoption {
         })
     }
 
+    /// Stages a write that starts out as a copy of a file already on disk
+    /// (`docs/DELTA-SYNC.md` §3.5).
+    ///
+    /// The atomicity invariant is unchanged — the bytes still land in a staging
+    /// file that is renamed over the target, so a reader sees the old file or
+    /// the new one — but the staging file no longer starts empty. A mirror
+    /// rewriting a 100 GB image whose previous version is sitting right there
+    /// clones it and patches the megabyte that changed, instead of copying
+    /// 100 GB out of the CAS to reproduce bytes that are already on the disk.
+    ///
+    /// With `reflink`, the clone is attempted with `FICLONE` first: on btrfs,
+    /// XFS and bcachefs that shares the source's extents copy-on-write, so it
+    /// is O(1) and consumes no space until the patch writes. Everywhere else —
+    /// ext4, a different device, a kernel without the ioctl — it falls back to
+    /// [`std::fs::copy`], which on Linux is itself a kernel-side
+    /// `copy_file_range` rather than a bounce through user space. Either way
+    /// the network savings that got us here are untouched; only the local write
+    /// is more or less clever.
+    pub fn cloning(
+        target: impl Into<PathBuf>,
+        source: &Path,
+        reflink: bool,
+    ) -> Result<(Adoption, CloneKind)> {
+        let mut adoption = Adoption::open(target.into())?;
+        let file = adoption
+            .file
+            .as_ref()
+            .ok_or_else(|| EngineError::invalid("a fresh staging file has no handle"))?;
+        if reflink {
+            match std::fs::File::open(source).and_then(|src| reflink_file(&src, file)) {
+                Ok(()) => return Ok((adoption, CloneKind::Reflink)),
+                Err(e) => {
+                    tracing::debug!(source = %source.display(), error = %e, "reflink unavailable");
+                }
+            }
+        }
+        // The staging file exists and is empty; `fs::copy` wants to create its
+        // own, so the handle is dropped for the duration and reopened after.
+        adoption.file = None;
+        let copied = std::fs::copy(source, &adoption.staging);
+        adoption.file = Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&adoption.staging)?,
+        );
+        copied?;
+        Ok((adoption, CloneKind::Copy))
+    }
+
+    /// Writes one piece of the payload at a fixed offset.
+    ///
+    /// The patching counterpart of [`Adoption::write`], for a staging file that
+    /// already has contents: only the pieces that differ from what
+    /// [`Adoption::cloning`] started with are written.
+    pub fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Sets the staging file's length, for a clone of a file whose size the new
+    /// version does not share.
+    pub fn set_len(&mut self, len: u64) -> Result<()> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.set_len(len)?;
+        Ok(())
+    }
+
     /// Appends one piece of the payload.
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
         use std::io::Write;
@@ -634,6 +714,41 @@ impl Adoption {
         drop(file);
         std::fs::rename(&self.staging, &self.target)?;
         Ok(self.target.clone())
+    }
+}
+
+/// How [`Adoption::cloning`] managed to give the staging file its head start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneKind {
+    /// Extents shared with the source, copy-on-write: no data was moved.
+    Reflink,
+    /// The source's bytes were copied.
+    Copy,
+}
+
+/// Shares a file's extents with another file, where the filesystem can.
+///
+/// `FICLONE` is Linux's reflink ioctl; every other platform (and every
+/// filesystem that does not implement it) reports it unsupported, which is a
+/// perfectly good answer — the caller copies instead.
+fn reflink_file(source: &std::fs::File, dest: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "sparc", target_arch = "sparc64"))
+    ))]
+    {
+        rustix::fs::ioctl_ficlone(dest, source).map_err(std::io::Error::from)
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        not(any(target_arch = "sparc", target_arch = "sparc64"))
+    )))]
+    {
+        let _ = (source, dest);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "reflink is not available on this platform",
+        ))
     }
 }
 

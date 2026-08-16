@@ -27,7 +27,7 @@ pub mod watcher;
 
 pub use aae::RoundReport;
 pub use compare::{CompareChange, CompareReport, CompareStatus};
-pub use config::{default_data_dir, NodeConfig};
+pub use config::{default_data_dir, MirrorDeltaWrite, NodeConfig};
 pub use error::{EngineError, Result};
 pub use fetcher::{FetchReport, PreparedRange, Provider};
 pub use ignore::IgnoreSet;
@@ -41,7 +41,7 @@ pub use recovery::{
 };
 pub use reference::EntryRef;
 pub use rotation::{Activation, PeerBindings, RotationPlan};
-pub use scanner::{Adoption, ScanReport};
-pub use synch_store::{Selection, Version, VersionPolicy, VersionSet};
+pub use scanner::{Adoption, CloneKind, ScanReport};
+pub use synch_store::{Donor, ProvenSubtree, Selection, Version, VersionPolicy, VersionSet};
 pub use tree::reference_of;
 pub use watcher::SpaceWatcher;

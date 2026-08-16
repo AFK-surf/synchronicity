@@ -19,11 +19,18 @@ struct Peer {
 }
 
 async fn spawn(name: &str) -> Peer {
+    spawn_with(name, |_| {}).await
+}
+
+/// A node with its configuration adjusted before it opens.
+async fn spawn_with(name: &str, tune: impl FnOnce(&mut NodeConfig)) -> Peer {
     let data = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     let origin = OriginId::named(name, "cluster.example").unwrap();
     Node::init(data.path(), Some(origin)).unwrap();
-    let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+    let mut config = NodeConfig::loopback(data.path());
+    tune(&mut config);
+    let node = Node::open(config).await.unwrap();
     Peer {
         _data: data,
         space,
@@ -1021,4 +1028,129 @@ async fn adopting_a_deletion_refuses_a_path_outside_a_space() {
         .unwrap()
         .is_none());
     node.node.shutdown().await.unwrap();
+}
+
+/// One chunk group, so the delta tests can talk in the units the tree does.
+const GROUP: usize = 16 * 1024;
+
+/// An edit to a mirrored file moves the edit, and the mirror patches the copy
+/// it already has rather than rewriting it (`docs/DELTA-SYNC.md` §1, §3.5).
+///
+/// The mirror holds the previous version twice over — in its CAS, because that
+/// is what the last pass fetched into, and on the disk, because that is what
+/// the last pass wrote. Both are donors. What has to cross the network is the
+/// new version's tree over the region that changed, and the group that changed;
+/// what has to be written is that group, into a clone of the file already
+/// there.
+///
+/// The node is configured with a small `delta_min_size` so the test can work in
+/// megabytes rather than the 16 MiB an unconfigured node would insist on.
+#[tokio::test]
+async fn a_mirror_reuses_local_bytes_and_patches_the_file_it_already_has() {
+    let nas = spawn("nas").await;
+    let vps = spawn_with("vps", |config| config.delta_min_size = 32 * 1024).await;
+    introduce(&[&nas, &vps]);
+
+    nas.node.add_space("media", nas.space.path()).unwrap();
+    let v1 = big_payload(64 * GROUP);
+    let source = nas.space.path().join("disk.img");
+    std::fs::write(&source, &v1).unwrap();
+    nas.node.scan_publish_push().await.unwrap();
+    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
+
+    let target = tempfile::tempdir().unwrap();
+    let mirrored = target.path().join("disk.img");
+    vps.node
+        .add_mirror("media", target.path(), &VersionPolicy::Newest)
+        .unwrap();
+    let report = vps.node.sync_mirror(target.path()).await.unwrap();
+    assert_eq!(report.written, 1, "{report:?}");
+    assert_eq!(report.patched, 0, "nothing was here to patch: {report:?}");
+    assert_eq!(report.reused_bytes, 0, "{report:?}");
+    assert_eq!(report.fetched_bytes, v1.len() as u64, "{report:?}");
+    assert_eq!(std::fs::read(&mirrored).unwrap(), v1);
+
+    // One 16 KiB group of a megabyte changes.
+    let mut v2 = v1.clone();
+    v2[40 * GROUP + 5] ^= 0xff;
+    std::fs::write(&source, &v2).unwrap();
+    nas.node.scan_publish_push().await.unwrap();
+    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
+
+    let report = vps.node.sync_mirror(target.path()).await.unwrap();
+    assert_eq!(report.written, 1, "{report:?}");
+    assert_eq!(
+        report.patched, 1,
+        "the file on disk was patched: {report:?}"
+    );
+    assert_eq!(
+        report.fetched_bytes, GROUP as u64,
+        "only the edited group crossed the network: {report:?}"
+    );
+    assert_eq!(
+        report.reused_bytes,
+        (v2.len() - GROUP) as u64,
+        "everything else came out of local storage: {report:?}"
+    );
+    assert_eq!(std::fs::read(&mirrored).unwrap(), v2);
+
+    // The staging file is gone: a patched write leaves no more residue than a
+    // whole one does (§9.4).
+    let left: Vec<String> = std::fs::read_dir(target.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec!["disk.img".to_string()]);
+
+    // And the pass after it has nothing to do at all.
+    let report = vps.node.sync_mirror(target.path()).await.unwrap();
+    assert_eq!(report.current, 1, "{report:?}");
+    assert_eq!(report.written + report.patched, 0, "{report:?}");
+
+    nas.node.shutdown().await.unwrap();
+    vps.node.shutdown().await.unwrap();
+}
+
+/// An appended file keeps everything it had: the tail is fetched, the prefix is
+/// not (`docs/DELTA-SYNC.md` §7's append case).
+#[tokio::test]
+async fn an_appended_file_transfers_only_what_was_appended() {
+    let nas = spawn("nas").await;
+    let vps = spawn_with("vps", |config| config.delta_min_size = 32 * 1024).await;
+    introduce(&[&nas, &vps]);
+
+    nas.node.add_space("media", nas.space.path()).unwrap();
+    let v1 = big_payload(48 * GROUP);
+    let source = nas.space.path().join("app.log");
+    std::fs::write(&source, &v1).unwrap();
+    nas.node.scan_publish_push().await.unwrap();
+    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
+
+    let target = tempfile::tempdir().unwrap();
+    vps.node
+        .add_mirror("media", target.path(), &VersionPolicy::Newest)
+        .unwrap();
+    vps.node.sync_mirror(target.path()).await.unwrap();
+
+    // The log grows by four groups. Every complete subtree of the old prefix
+    // keeps its chaining value, so the descent proves them equal and only the
+    // appended groups — plus the tail group the append reshaped — are fetched.
+    let mut v2 = v1.clone();
+    v2.extend(big_payload(4 * GROUP));
+    std::fs::write(&source, &v2).unwrap();
+    nas.node.scan_publish_push().await.unwrap();
+    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
+
+    let report = vps.node.sync_mirror(target.path()).await.unwrap();
+    assert_eq!(report.written, 1, "{report:?}");
+    assert_eq!(
+        report.fetched_bytes,
+        4 * GROUP as u64,
+        "only the appended groups were fetched: {report:?}"
+    );
+    assert_eq!(report.reused_bytes, v1.len() as u64, "{report:?}");
+    assert_eq!(std::fs::read(target.path().join("app.log")).unwrap(), v2);
+
+    nas.node.shutdown().await.unwrap();
+    vps.node.shutdown().await.unwrap();
 }

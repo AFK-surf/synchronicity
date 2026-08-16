@@ -4,7 +4,7 @@
 use std::future::Future;
 
 use synch_core::{group_count, groups_for_byte_range, now_ns, ChunkRanges, Hash, OriginId};
-use synch_store::VersionPolicy;
+use synch_store::{Donor, EntryRow, ProvenSubtree, VersionPolicy, VersionSet};
 
 use crate::{
     error::{EngineError, Result},
@@ -57,6 +57,20 @@ impl PreparedRange {
 pub struct FetchReport {
     /// The groups newly verified and committed.
     pub fetched: ChunkRanges,
+    /// The groups that never crossed the network: bytes a local donor already
+    /// held, proven against the new root and committed
+    /// (`docs/DELTA-SYNC.md` §3.4).
+    ///
+    /// What lets a caller say "reused 98.9 GB, fetched 1.1 GB" rather than
+    /// reporting a suspiciously fast transfer.
+    pub promoted: ChunkRanges,
+    /// Which donor supplied which groups.
+    ///
+    /// A mirror needs the breakdown and not just the total: the file already
+    /// sitting at its destination is byte-identical to the new version exactly
+    /// where *that* donor supplied it, and that is the set it can leave alone
+    /// when it patches (§3.5).
+    pub reused: Vec<(Donor, ChunkRanges)>,
     /// How many providers were contacted.
     pub providers_tried: usize,
     /// True if the whole wanted range is now present locally.
@@ -225,6 +239,18 @@ impl Node {
         self.fetch_groups(root, size, &wanted).await
     }
 
+    /// Fetches an object in full, offering donors it might be assembled from
+    /// (`docs/DELTA-SYNC.md` §3.2).
+    pub async fn fetch_all_from(
+        &self,
+        root: &Hash,
+        size: u64,
+        donors: &[Donor],
+    ) -> Result<FetchReport> {
+        let wanted = ChunkRanges::single(0, group_count(size));
+        self.fetch_groups_from(root, size, &wanted, donors).await
+    }
+
     /// Pins an object, fetching it first when it is not held whole (§9.2).
     ///
     /// A pin is a promise that these bytes stay available here, and a promise
@@ -266,6 +292,30 @@ impl Node {
         size: u64,
         wanted: &ChunkRanges,
     ) -> Result<FetchReport> {
+        self.fetch_groups_from(root, size, wanted, &[]).await
+    }
+
+    /// Fetches specific chunk groups, offering local donors first
+    /// (`docs/DELTA-SYNC.md` §3.3).
+    ///
+    /// Everything [`Node::fetch_groups`] does, with a descent in front of it:
+    /// the object's tree is asked for at span granularity, compared against
+    /// what the donors hold at the same offsets, and every span that turns out
+    /// to be byte-identical is promoted out of local storage instead of being
+    /// transferred. What is left descends to the leaf level and is compared
+    /// again, and only what survives *that* reaches the network.
+    ///
+    /// The floor is worth stating plainly: with no donors, no provider that
+    /// answers, or no span in common, this is [`Node::fetch_groups`] plus at
+    /// most one small exchange — which is why the delta attempt needs no
+    /// similarity heuristic in front of it (§3.3).
+    pub async fn fetch_groups_from(
+        &self,
+        root: &Hash,
+        size: u64,
+        wanted: &ChunkRanges,
+        donors: &[Donor],
+    ) -> Result<FetchReport> {
         if size == 0 {
             return self.take_empty_object(root);
         }
@@ -276,8 +326,31 @@ impl Node {
             return Ok(report);
         }
 
-        let mut providers = self.providers_for(root, 0, size.max(1))?;
-        if providers.is_empty() {
+        // Objects below `delta_min_size` skip the descent entirely: the round
+        // trips cost more than the bytes they could save (§4).
+        if !donors.is_empty() && size >= self.config().delta_min_size {
+            report.reused = self.delta_descent(root, size, &remaining, donors).await?;
+            for (_, groups) in &report.reused {
+                report.promoted = report.promoted.union(groups);
+            }
+            remaining = remaining.difference(&report.promoted);
+            if !report.promoted.is_empty() {
+                tracing::debug!(
+                    root = %root,
+                    promoted = report.promoted.count(),
+                    remaining = remaining.count(),
+                    "delta descent reused local bytes"
+                );
+            }
+        }
+
+        // A descent that satisfied everything leaves nobody to dial.
+        let mut providers = if remaining.is_empty() {
+            Vec::new()
+        } else {
+            self.providers_for(root, 0, size.max(1))?
+        };
+        if providers.is_empty() && !remaining.is_empty() {
             // No local ad covers this root — a cold cache, or an origin just
             // admitted whose ads have not replicated yet. Peers may know who
             // holds it, and a hint costs at most a wasted dial because content
@@ -349,7 +422,12 @@ impl Node {
             }
         }
 
-        if !report.fetched.is_empty() {
+        if !report.fetched.is_empty() || !report.promoted.is_empty() {
+            // Promoted groups count as progress exactly as fetched ones do:
+            // they are verified, they are held, and the point of advertising
+            // them is that other mirrors of the same space can then delta from
+            // *this* node rather than from the origin (§3.4, §6.3).
+            //
             // Publishing an updated ad is a trie write and a signed head, so
             // the milestone check and the publish it may trigger both go off
             // the runtime (§6.3).
@@ -359,6 +437,269 @@ impl Node {
         }
         report.complete = wanted.difference(&self.local_groups(root)?).is_empty();
         Ok(report)
+    }
+
+    /// The local objects and files that might already hold bytes of a version
+    /// (`docs/DELTA-SYNC.md` §3.2).
+    ///
+    /// In the order the descent should try them: the entry's `prev` root first,
+    /// because 1-step lineage (§4.2, §8) names the version this one replaced
+    /// and that is the common case by a wide margin; then every other version
+    /// of the same path, which is what a divergent origin or a losing version
+    /// under `newest` leaves lying around. A candidate is offered only if the
+    /// CAS actually holds something of it — a donor with no bytes is a wasted
+    /// pass over the proof list.
+    ///
+    /// The object being fetched is never its own donor: the groups it already
+    /// holds are subtracted from the fetch before the descent starts.
+    pub fn donors_for(&self, selected: &EntryRow, versions: &VersionSet) -> Result<Vec<Donor>> {
+        let mut roots: Vec<Hash> = Vec::new();
+        let mut push = |root: Option<Hash>| {
+            if let Some(root) = root {
+                if selected.content != Some(root) && !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        };
+        push(selected.prev);
+        for entry in &versions.entries {
+            push(entry.content);
+            push(entry.prev);
+        }
+        let mut donors = Vec::new();
+        for root in roots {
+            let holds = self
+                .store()
+                .blob(&root)?
+                .is_some_and(|blob| !blob.verified_groups().is_empty());
+            if holds {
+                donors.push(Donor::Object(root));
+            }
+        }
+        Ok(donors)
+    }
+
+    /// Discovers how much of an object this node can supply itself, in two
+    /// rounds of proof (`docs/DELTA-SYNC.md` §3.3).
+    ///
+    /// Round one asks for the tree at span granularity — 32 bytes per 16 MiB,
+    /// about 200 KB for a 100 GB object — and promotes every span a donor
+    /// turns out to agree with, whole. Round two asks for leaf chaining values
+    /// inside what is left, which is the changed region and nothing else, and
+    /// promotes group by group. What survives both rounds is the delta, and it
+    /// is all the caller has to fetch.
+    ///
+    /// Nothing here can fail the fetch. A provider that will not answer, a
+    /// donor that has rotted, a file rewritten end to end — each just leaves
+    /// more work for the ordinary fetch path, which is exactly what would have
+    /// happened without any of this.
+    async fn delta_descent(
+        &self,
+        root: &Hash,
+        size: u64,
+        wanted: &ChunkRanges,
+        donors: &[Donor],
+    ) -> Result<Vec<(Donor, ChunkRanges)>> {
+        let groups = group_count(size);
+        // The whole tree is only as tall as the object: descending "to the span
+        // level" of an object that *is* one span would ask for nothing at all,
+        // because the root's own hash is not a chaining value anything can be
+        // compared against (§2). One level below the top is the deepest cut
+        // that still says something.
+        let top = groups.next_power_of_two().trailing_zeros().min(63) as u8;
+        let span_level = synch_core::AD_SPAN_LEVEL.min(top.saturating_sub(1));
+        let mut levels = vec![span_level];
+        if span_level > 0 {
+            levels.push(0);
+        }
+
+        let mut reused: Vec<(Donor, ChunkRanges)> = Vec::new();
+        let mut remaining = wanted.clone();
+        for level in levels {
+            if remaining.is_empty() {
+                break;
+            }
+            let proven = self.fetch_proofs(root, size, &remaining, level).await?;
+            if proven.is_empty() {
+                continue;
+            }
+            for (donor, got) in self.promote_from(root, size, donors, proven).await? {
+                remaining = remaining.difference(&got);
+                match reused.iter_mut().find(|(existing, _)| existing == &donor) {
+                    Some((_, ranges)) => *ranges = ranges.union(&got),
+                    None => reused.push((donor, got)),
+                }
+            }
+        }
+        Ok(reused)
+    }
+
+    /// Collects proofs for `ranges` from whoever will serve them.
+    ///
+    /// Sequential across providers rather than fanned out like a fetch: a proof
+    /// is a few hundred kilobytes at the span level and the round trips, not
+    /// the bytes, are what it costs. A provider that answers with nothing —
+    /// because it holds none of the object, or has gone away — simply hands the
+    /// remainder to the next candidate.
+    async fn fetch_proofs(
+        &self,
+        root: &Hash,
+        size: u64,
+        ranges: &ChunkRanges,
+        level: u8,
+    ) -> Result<Vec<ProvenSubtree>> {
+        let mut providers = self.providers_for(root, 0, size.max(1))?;
+        if providers.is_empty() {
+            providers = self.ask_peers_for_providers(root, size).await?;
+        }
+        let mut remaining = ranges.clone();
+        let mut proven = Vec::new();
+        for provider in providers {
+            if remaining.is_empty() {
+                break;
+            }
+            let ask = remaining.intersect(&provider.claims);
+            if ask.is_empty() {
+                continue;
+            }
+            match self.proofs_from(&provider, root, size, &ask, level).await {
+                Ok(outcome) => {
+                    remaining = remaining.difference(&outcome.served);
+                    proven.extend(outcome.proven);
+                }
+                Err(e) => {
+                    tracing::debug!(origin = %provider.origin, error = %e, "proof request failed");
+                }
+            }
+        }
+        Ok(proven)
+    }
+
+    async fn proofs_from(
+        &self,
+        provider: &Provider,
+        root: &Hash,
+        size: u64,
+        ask: &ChunkRanges,
+        level: u8,
+    ) -> Result<synch_net::ProofOutcome> {
+        let mut last_error = None;
+        for key in &provider.keys {
+            let addr = match self.peer_addr(key)? {
+                Some(addr) => addr,
+                None => iroh::EndpointAddr::new(*key),
+            };
+            let started = std::time::Instant::now();
+            match self.net().connect_blob(addr).await {
+                Ok(client) => {
+                    let outcome = client
+                        .fetch_proof_into(self.store(), *root, size, ask, level)
+                        .await?;
+                    let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
+                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
+                    return Ok(outcome);
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(match last_error {
+            Some(e) => EngineError::Net(e),
+            None => EngineError::not_found(format!("no dialable key for {}", provider.origin)),
+        })
+    }
+
+    /// Offers every donor the subtrees a proof round established, in order.
+    ///
+    /// All of it is disk work — outboard lookups, whole spans read and hashed,
+    /// payload and bitmap commits — so all of it goes to the blocking pool
+    /// (§10).
+    async fn promote_from(
+        &self,
+        root: &Hash,
+        size: u64,
+        donors: &[Donor],
+        proven: Vec<ProvenSubtree>,
+    ) -> Result<Vec<(Donor, ChunkRanges)>> {
+        let node = self.clone();
+        let root = *root;
+        let donors = donors.to_vec();
+        crate::blocking::offload(move || node.promote_blocking(&root, size, &donors, proven)).await
+    }
+
+    /// The body of [`Node::promote_from`], for callers already off the runtime.
+    fn promote_blocking(
+        &self,
+        root: &Hash,
+        size: u64,
+        donors: &[Donor],
+        proven: Vec<ProvenSubtree>,
+    ) -> Result<Vec<(Donor, ChunkRanges)>> {
+        let mut out = Vec::new();
+        let mut left = proven;
+        for donor in donors {
+            if left.is_empty() {
+                break;
+            }
+            if donor.root() == Some(*root) {
+                continue;
+            }
+            let candidates = self.donor_candidates(donor, &left)?;
+            if candidates.is_empty() {
+                continue;
+            }
+            let got = self
+                .store()
+                .promote(root, size, donor, &candidates, now_ns())?;
+            if got.is_empty() {
+                continue;
+            }
+            left.retain(|subtree| !got.overlaps(subtree.start, subtree.end()));
+            out.push((donor.clone(), got));
+        }
+        Ok(out)
+    }
+
+    /// Narrows a proof round's subtrees to the ones a donor plausibly matches.
+    ///
+    /// For a CAS donor this is the cheap half of the descent: a whole subtree's
+    /// chaining value is two positional reads out of the donor's outboard, so
+    /// asking whether it agrees about a 16 MiB span costs nothing next to
+    /// hashing one. Below [`CV_LOOKUP_MIN_GROUPS`] the arithmetic inverts — a
+    /// tree descent per 16 KiB group is more work than just hashing the group —
+    /// and the subtree goes forward as a candidate to be settled by the
+    /// promotion's own re-hash. A file donor has no tree at all, so everything
+    /// goes forward and its bytes answer for themselves.
+    fn donor_candidates(
+        &self,
+        donor: &Donor,
+        proven: &[ProvenSubtree],
+    ) -> Result<Vec<ProvenSubtree>> {
+        let Donor::Object(donor_root) = donor else {
+            return Ok(proven.to_vec());
+        };
+        let looked_up: Vec<usize> = proven
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.whole && s.groups >= CV_LOOKUP_MIN_GROUPS)
+            .map(|(index, _)| index)
+            .collect();
+        let spans: Vec<(u64, u64)> = looked_up
+            .iter()
+            .map(|&index| (proven[index].start, proven[index].groups))
+            .collect();
+        let cvs = self.store().subtree_cvs(donor_root, &spans)?;
+        let mut rejected = std::collections::HashSet::new();
+        for (position, &index) in looked_up.iter().enumerate() {
+            if cvs.get(position).copied().flatten() != Some(proven[index].cv) {
+                rejected.insert(index);
+            }
+        }
+        Ok(proven
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !rejected.contains(index))
+            .map(|(_, subtree)| *subtree)
+            .collect())
     }
 
     /// Produces an object of no bytes locally, rather than fetching it.
@@ -553,7 +894,22 @@ impl Node {
                 entry.size
             )));
         }
-        let report = self.fetch_range(&root, entry.size, start, end).await?;
+        // Every read path resolved an entry to get here, which means the
+        // lineage that makes delta possible is already in hand: `synch cat`, a
+        // `take`, and the gateway's range reads all get the descent for the
+        // price of one `VersionSet` lookup (§3.5).
+        let donors = match self.store().versions_for(space, path) {
+            Ok(versions) => self.donors_for(&entry, &versions)?,
+            Err(e) => {
+                tracing::debug!(error = %e, "no version set for donors");
+                Vec::new()
+            }
+        };
+        let wanted = ChunkRanges::from_ranges([groups_for_byte_range(start, end)])
+            .intersect(&ChunkRanges::single(0, group_count(entry.size)));
+        let report = self
+            .fetch_groups_from(&root, entry.size, &wanted, &donors)
+            .await?;
         if !report.complete {
             return Err(EngineError::not_found(format!(
                 "no provider could serve bytes {start}..{end} of {root}"
@@ -630,7 +986,74 @@ impl Node {
         out.commit()?;
         Ok(())
     }
+
+    /// Materializes an object over a file that is already most of it
+    /// (`docs/DELTA-SYNC.md` §3.5).
+    ///
+    /// `keep` is the set of groups the file at `target` was *proven* to hold
+    /// correctly — the ones a donor promotion took from it and checked against
+    /// the new object's tree. Everything else is written out of the CAS.
+    ///
+    /// The staging file is a clone of the target rather than a fresh empty one,
+    /// so the groups in `keep` cost nothing to reproduce: on a filesystem with
+    /// reflink they are not even copied, only shared. The old-or-new invariant
+    /// is exactly as before — the patched clone is renamed over the target when
+    /// it is complete, and a crash before that leaves the target untouched.
+    /// Patching the live file in place would be faster still and is refused:
+    /// a crash halfway through would leave a franken-file wearing a complete
+    /// file's name, which is the one thing the staging rename exists to prevent
+    /// (§7.2).
+    pub fn patch_blob_to_blocking(
+        &self,
+        root: &Hash,
+        size: u64,
+        target: &std::path::Path,
+        keep: &ChunkRanges,
+        reflink: bool,
+    ) -> Result<()> {
+        let (mut out, kind) = crate::scanner::Adoption::cloning(target, target, reflink)?;
+        // The old file is rarely the same length as the new one — an appended
+        // log never is — and the clone starts out as long as it was.
+        out.set_len(size)?;
+        let rewrite = ChunkRanges::single(0, group_count(size)).difference(keep);
+        tracing::debug!(
+            target = %target.display(),
+            clone = ?kind,
+            patched = rewrite.count(),
+            kept = keep.count(),
+            "patching a mirrored file"
+        );
+        for range in &rewrite.ranges {
+            let end = range
+                .end
+                .saturating_mul(synch_core::CHUNK_GROUP_SIZE)
+                .min(size);
+            let mut offset = range.start.saturating_mul(synch_core::CHUNK_GROUP_SIZE);
+            while offset < end {
+                let take = COPY_CHUNK.min(end - offset);
+                let bytes = self.store().read_range(root, offset, take)?;
+                if bytes.is_empty() {
+                    return Err(EngineError::not_found(format!(
+                        "{root} has no bytes at offset {offset} of {size}"
+                    )));
+                }
+                out.write_at(offset, &bytes)?;
+                offset += bytes.len() as u64;
+            }
+        }
+        out.commit()?;
+        Ok(())
+    }
 }
+
+/// The smallest subtree worth asking a donor's outboard about.
+///
+/// Reading a chaining value out of a donor is a walk down its tree — a handful
+/// of positional reads — while hashing a subtree is a read of the bytes. For a
+/// 16 MiB span the walk wins by four orders of magnitude; for a single 16 KiB
+/// group it loses, and the group is settled by the re-hash that promotion does
+/// anyway. This is roughly where the two meet.
+const CV_LOOKUP_MIN_GROUPS: u64 = 16;
 
 /// How much of an object is held in memory while it is copied out of the CAS.
 ///
@@ -849,6 +1272,73 @@ mod tests {
             .await
             .unwrap();
         assert!(!report.complete, "{report:?}");
+    }
+
+    /// Donors are the versions this node can actually supply bytes from, in
+    /// the order §3.2 of `docs/DELTA-SYNC.md` wants them tried.
+    #[tokio::test]
+    async fn donors_are_the_lineage_this_node_can_still_read() {
+        let (_d, node) = node().await;
+        let (peer, _) = trust(&node, "nas");
+        let (rival, _) = trust(&node, "laptop");
+        let payload = |seed: u8| vec![seed; 100_000];
+
+        let previous = node.store().ingest_bytes(&payload(1), now_ns()).unwrap();
+        let rival_root = node.store().ingest_bytes(&payload(2), now_ns()).unwrap();
+        let new_root = Hash::new(b"the version being fetched");
+        // A version nobody here has any bytes of: named in the tree, useless
+        // as a donor, and left out rather than tried.
+        let unheld = Hash::new(b"a version this node never fetched");
+
+        let mut selected = synch_core::FileEntry::file(100_000, 5, new_root, 2);
+        selected.prev = Some(previous);
+        node.store()
+            .put_entry(&peer, "s", "disk.img", &selected)
+            .unwrap();
+        let mut theirs = synch_core::FileEntry::file(100_000, 4, rival_root, 1);
+        theirs.prev = Some(unheld);
+        node.store()
+            .put_entry(&rival, "s", "disk.img", &theirs)
+            .unwrap();
+
+        let versions = node.store().versions_for("s", "disk.img").unwrap();
+        let entry = versions
+            .entries
+            .iter()
+            .find(|e| e.origin == peer)
+            .unwrap()
+            .clone();
+        let donors = node.donors_for(&entry, &versions).unwrap();
+        assert_eq!(
+            donors,
+            vec![Donor::Object(previous), Donor::Object(rival_root)],
+            "the replaced version first, then the other version of the path"
+        );
+        assert!(
+            !donors.contains(&Donor::Object(new_root)),
+            "the object being fetched is never its own donor"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// An object below `delta_min_size` never pays for a descent: with no
+    /// providers to answer one, the fetch reports exactly what it did before.
+    #[tokio::test]
+    async fn a_small_object_skips_the_descent() {
+        let (_d, node) = node().await;
+        let donor = node
+            .store()
+            .ingest_bytes(&vec![4u8; 100_000], now_ns())
+            .unwrap();
+        let root = Hash::new(b"a small object nobody has");
+        let report = node
+            .fetch_all_from(&root, 100_000, &[Donor::Object(donor)])
+            .await
+            .unwrap();
+        assert!(report.promoted.is_empty(), "{report:?}");
+        assert!(report.reused.is_empty(), "{report:?}");
+        assert!(!report.complete, "{report:?}");
+        node.shutdown().await.unwrap();
     }
 
     #[test]
