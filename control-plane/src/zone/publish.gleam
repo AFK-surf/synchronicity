@@ -17,6 +17,7 @@ import rekor/gate
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import zone/build.{type Rrset}
 import zone/model
+import zone/render_external
 
 pub type PublishError {
   Db(sqlite.Error)
@@ -172,6 +173,97 @@ pub fn publish_in_tx(
     |> result.map_error(Db),
   )
   Ok(meta.soa_serial)
+}
+
+/// The external-mode publish: serial+1 and validation, in its own
+/// transaction. Returns the new serial.
+pub fn publish_external(
+  conn: Connection,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  sqlite.transaction(conn, Db, fn() { publish_external_in_tx(conn, now, actor) })
+}
+
+/// The external-mode publish body (docs/EXTERNAL-DNS-PROVIDER.md): bump the
+/// serial — still the generation counter the reconciler tracks — and
+/// re-validate the product invariants through the renderer, refusing the
+/// whole mutation on a violation exactly as the serving builder would.
+/// Nothing is signed and nothing is presigned; commit marks "the database
+/// changed", and the reconciler's next pass makes the wire follow.
+pub fn publish_external_in_tx(
+  conn: Connection,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  use _ <- result.try(exec(
+    conn,
+    "UPDATE zone_meta SET soa_serial = soa_serial + 1 WHERE id = 1",
+  ))
+  use input <- result.try(model.read(conn) |> result.map_error(Model))
+  use records <- result.try(
+    render_external.render(input) |> result.map_error(Build),
+  )
+  use _ <- result.try(
+    sqlite.exec(
+      conn,
+      "INSERT INTO audit_log (at, actor, org_id, action, detail)
+       VALUES (?, ?, NULL, 'zone.publish', ?)",
+      [
+        VInt(now),
+        Text(actor),
+        Text(
+          "{\"serial\":"
+          <> int.to_string(input.meta.soa_serial)
+          <> ",\"records\":"
+          <> int.to_string(list.length(records))
+          <> ",\"mode\":\"external\"}",
+        ),
+      ],
+    )
+    |> result.map_error(Db),
+  )
+  Ok(input.meta.soa_serial)
+}
+
+/// Bootstraps zone_meta for external mode: there is no zone key — the
+/// provider signs — so the key columns hold an empty key and tag 0, and on
+/// later boots only the domain is verified. A database that carries a real
+/// key was a serve-mode zone; refusing is what stops a mode flip from
+/// quietly abandoning a served zone.
+pub fn ensure_meta_external(
+  conn: Connection,
+  base_domain: String,
+) -> Result(Nil, String) {
+  case model.read_meta(conn) {
+    Ok(meta) -> {
+      let same_domain = name.to_string(meta.apex) == base_domain <> "."
+      case same_domain, meta.dnskey_public == <<>> {
+        True, True -> Ok(Nil)
+        False, _ ->
+          Error(
+            "zone_meta base domain "
+            <> name.to_string(meta.apex)
+            <> " does not match configured "
+            <> base_domain,
+          )
+        _, False ->
+          Error(
+            "this database belongs to a serve-mode zone (it has a zone key); "
+            <> "refusing to run CP_DNS_MODE=external against it",
+          )
+      }
+    }
+    Error(model.NoZoneMeta) ->
+      sqlite.exec(
+        conn,
+        "INSERT INTO zone_meta VALUES (1, ?, 0, ?, 0, 3600, 1209600, 604800)",
+        [Text(base_domain), Blob(<<>>)],
+      )
+      |> result.replace(Nil)
+      |> result.map_error(fn(_) { "could not initialize zone_meta" })
+    Error(_) -> Error("could not read zone_meta")
+  }
 }
 
 /// Bootstraps zone_meta on first start; on later starts verifies the

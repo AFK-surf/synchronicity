@@ -9,7 +9,6 @@ import auth/magic
 import auth/oauth.{type Provider}
 import auth/oidc
 import auth/session
-import dnssec/keys
 import email/mailer.{type Mailer}
 import gleam/dynamic/decode
 import gleam/json
@@ -19,6 +18,7 @@ import gleam/result
 import store/pool.{type Pool}
 import store/sqlite.{type Connection, Text}
 import wisp.{type Request, type Response}
+import zone/publish
 
 pub type AuthContext {
   AuthContext(
@@ -29,8 +29,15 @@ pub type AuthContext {
     mail: Mailer,
     google: Option(Provider),
     github: Option(Provider),
-    /// The zone key — product mutations re-sign the zone in-transaction.
-    csk: keys.Csk,
+    /// How a product mutation publishes the zone, injected per mode: serve
+    /// mode re-signs in-transaction with the CSK; external mode bumps the
+    /// serial and re-validates, and the wire follows via the reconciler.
+    publish_in_tx: fn(Connection, Int, String) ->
+      Result(Int, publish.PublishError),
+    /// Runs after a zone mutation commits — a no-op in serve mode (commit
+    /// is publication), the reconciler poke in external mode. Never inside
+    /// the transaction: provider calls must not hold the write lock.
+    published: fn() -> Nil,
   )
 }
 

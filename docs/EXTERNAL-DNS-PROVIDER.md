@@ -1,6 +1,10 @@
-# External DNS providers — publishing the zone through Cloudflare, Route 53, or Bunny
+# External DNS providers — publishing the zone through Cloudflare or Bunny
 
-Status: **design proposal — nothing here is implemented.**
+Status: **implemented.** The claim change (predicate v2, proof wire v4,
+the key-set chain walk) ships in `crates/synch-net` / `crates/synch-monitor`
+and `control-plane/src/rekor`; external mode ships as `CP_DNS_MODE=external`
+with the Cloudflare and Bunny legs under `control-plane/src/provider`. This
+document remains the rationale and the operational guide.
 
 This document designs a control-plane mode in which the membership zone is
 hosted by an external managed DNS provider instead of being served by the
@@ -15,7 +19,7 @@ Contents:
 3. [Zone-key claim v2 — transparency without possession](#3-zone-key-claim-v2--transparency-without-possession)
 4. [Control plane: `CP_DNS_MODE=external`](#4-control-plane-cp_dns_modeexternal)
 5. [The provider abstraction](#5-the-provider-abstraction)
-6. [Provider notes: Cloudflare, Route 53, Bunny](#6-provider-notes-cloudflare-route-53-bunny)
+6. [Provider notes: Cloudflare, Bunny](#6-provider-notes-cloudflare-bunny)
 7. [Cutover runbook](#7-cutover-runbook)
 8. [Costs, stated plainly](#8-costs-stated-plainly)
 9. [Testing](#9-testing)
@@ -209,7 +213,7 @@ that configures nothing gets today's behavior, bit for bit:
 
 ```
 CP_DNS_MODE=serve|external            # default: serve
-CP_DNS_PROVIDER=cloudflare|route53|bunny    # required iff external
+CP_DNS_PROVIDER=cloudflare|bunny|log-only   # required iff external
 CP_OP_KEY_FILE=/path/to/opkey         # operational DSSE key, external only
 
 CP_CLOUDFLARE_API_TOKEN=...           # zone-scoped token
@@ -293,9 +297,8 @@ One sync pass:
    managed name without our ownership marker — is recorded in
    `last_error`, logged, and stops the pass. The reconciler never
    clobbers.
-5. `provider.apply(changes)` — batched; atomic where the provider allows
-   (Route 53's ChangeBatch), sequential otherwise. The diff is
-   idempotent, so a partial apply is repaired by the next pass.
+5. `provider.apply(changes)` — sequential per record on both legs; the
+   diff is idempotent, so a partial apply is repaired by the next pass.
 6. Update `provider_sync_state` (hash, `last_synced_serial`, timestamps)
    and write an `audit_log` row (`action='provider.sync'`, detail:
    creates/replaces/deletes counts and the serial), matching the
@@ -337,9 +340,8 @@ key is not ours and moves without asking us.
 
 In serve mode, commit is publication. In external mode it is not: a
 mutation is visible on the wire after the reconciler's next pass plus the
-provider's own propagation (typically seconds; Route 53 exposes
-`ChangeInfo` status, Cloudflare and Bunny are effectively immediate at the
-edge). API semantics are unchanged — `zone_mutation` returns success at
+provider's own propagation (typically seconds; Cloudflare and Bunny are
+effectively immediate at the edge). API semantics are unchanged — `zone_mutation` returns success at
 commit, as today — but the meaning narrows from "published" to "accepted
 and will converge". The dashboard and `/healthz` carry the convergence
 state; nothing pretends the window doesn't exist.
@@ -356,7 +358,7 @@ unrepresentable):
 -- stored; this row records only what the reconciler last did.
 CREATE TABLE provider_sync_state (
   id                 INTEGER PRIMARY KEY CHECK (id = 1),
-  provider           TEXT    NOT NULL CHECK (provider IN ('cloudflare','route53','bunny')),
+  provider           TEXT    NOT NULL CHECK (provider IN ('cloudflare','bunny','log-only')),
   provider_zone_id   TEXT    NOT NULL,
   applied_hash       BLOB    CHECK (applied_hash IS NULL OR length(applied_hash) = 32),
   last_synced_serial INTEGER,
@@ -409,8 +411,8 @@ pub type Record {
   Record(name: String, rtype: Rtype, ttl: Int, value: String)
 }
 
-/// A record as the provider holds it. `id` is the provider's handle,
-/// "" for Route 53 (no per-record ids; deletes go by name/type/value).
+/// A record as the provider holds it. `id` is the provider's handle —
+/// an opaque string, empty where a provider has no per-record ids.
 pub type Existing {
   Existing(id: String, record: Record)
 }
@@ -456,7 +458,7 @@ table-testable:
   ever replaced or deleted; a foreign A record squatting there is a
   conflict, not a casualty.
 
-## 6. Provider notes: Cloudflare, Route 53, Bunny
+## 6. Provider notes: Cloudflare, Bunny
 
 **Cloudflare** — phase 1, the reference leg (`provider/cloudflare.gleam`).
 v4 REST, single `Authorization: Bearer` token, scopable to Zone:DNS:Edit
@@ -472,25 +474,7 @@ static outside algorithm migrations, and pre-publishes on rotation — the
 friendliest case for §3.3. `CP_CLOUDFLARE_API_URL` overrides the base URL
 so the e2e stub can stand in, mirroring `CP_REKOR_URL`.
 
-**Route 53** — phase 2 (`provider/route53.gleam` + `provider/sigv4.gleam`).
-The API cost is authentication: AWS SigV4 request signing does not exist
-in the Gleam ecosystem and is written from scratch — HMAC-SHA256 via
-`gleam/crypto`, canonical request, credential scope
-(`<date>/us-east-1/route53/aws4_request`), validated against AWS's
-published test-vector suite as its own pure module before any HTTP leg
-uses it. The API itself is friendlier than its auth: no record ids;
-`ChangeResourceRecordSets` takes an atomic ChangeBatch of
-UPSERT/DELETE at RRset granularity, which maps `Changes` cleanly (all
-values for one name/type travel together); `ListResourceRecordSets`
-paginates by name/type cursor. Bodies are XML both ways. TXT strings must
-be pre-chunked into quoted 255-byte segments by the leg. DNSSEC: opt-in
-per zone, KSK in customer KMS (alg 13), ZSK managed by Route 53; rotation
-is infrequent and pre-published, but the KMS KSK is operator-controlled —
-the runbook covers creating it. `CP_ROUTE53_ZONE_ID` is required
-explicitly; hosted-zone name lookup is ambiguous (private zones, duplicate
-names) and discovery would guess.
-
-**Bunny** — phase 3, gated (`provider/bunny.gleam`). Simplest API of the
+**Bunny** — phase 2, gated (`provider/bunny.gleam`). Simplest API of the
 three: `AccessKey` header, JSON, records addressed by numeric id within
 `GET/POST /dnszone/{id}`. The gate: **whether Bunny signs hosted zones
 (DNSSEC) is unverified**, and external mode is meaningless without it —
@@ -508,7 +492,7 @@ Migrating a live serve-mode deployment; a green-field external deployment
 runs the same steps minus the decommissioning.
 
 1. **Prepare.** Create/verify the provider zone for the apex; enable
-   DNSSEC on it (Cloudflare toggle / Route 53 KMS KSK ceremony). Generate
+   DNSSEC on it (the provider's own toggle and ceremony). Generate
    the operational key (`keygen` machinery, `CP_OP_KEY_FILE`). Upgrade
    client fleets to a claim-v2-capable build (§3.4) — this can lead the
    cutover by any amount; v2-capable clients still verify v1 zones.
@@ -558,14 +542,14 @@ runs the same steps minus the decommissioning.
   + propagation). Pre-publishing providers (all three, normally) make
   this theoretical; the cost is priced anyway.
 - **Answer shape is the provider's.** Negative proofs become whatever the
-  provider serves (Cloudflare's on-the-fly "black lies" NSEC, Route 53's
-  NSEC3). Standard validators — hickory included — accept all of them,
+  provider serves (Cloudflare's on-the-fly "black lies" NSEC). Standard
+  validators — hickory included — accept all of them,
   but the exact-NSEC guarantees of serve mode are not preserved.
 - **Egress and credentials on the primary.** The control plane now holds
   a DNS-write credential and calls provider APIs continuously —
   consistent with the existing `tuf/fetch` egress posture, but a bigger
   secret than any it holds today. Zone-scoped tokens where the provider
-  offers them (Cloudflare yes, Route 53 via IAM policy, Bunny no).
+  offers them (Cloudflare yes, Bunny no).
 
 ## 9. Testing
 
@@ -574,11 +558,9 @@ runs the same steps minus the decommissioning.
   tables — adoption, marker-missing conflict, foreign-type immunity,
   scope discipline, idempotence (`diff(desired, desired-as-existing)` is
   empty); the desired-set hash's stability under permutation.
-- **SigV4 golden vectors**: `provider/sigv4.gleam` verified against the
-  AWS test-vector suite, no network, before any leg uses it.
-- **Provider legs as codecs**: request/response mapping tested on
-  captured JSON/XML fixtures (the `rekor_test` pattern — no network in
-  tests, house rule).
+- **Provider legs at their pure edges**: Cloudflare's TXT presentation
+  folding and Bunny's relative-name conversion as unit tests; no network
+  in tests, house rule.
 - **Reconciler and watcher**: `run_once_with(db_path, provider, now)` /
   `run_once_with(db_path, resolver, log, now)` ladders exactly like
   `resign.run_once_with`, driven with in-memory fakes; asserted:
@@ -604,9 +586,8 @@ runs the same steps minus the decommissioning.
 2. **External mode core + Cloudflare** — config/mode wiring, renderer,
    migration v4, reconciler, watcher, `provider/provider.gleam`,
    Cloudflare leg, healthz, e2e stub.
-3. **Route 53** — `sigv4.gleam` (golden-vectored) then the leg.
-4. **Bunny** — DNSSEC verification first; leg only if it passes.
-5. **Polish** — dashboard sync-state surfacing, post-apply DoH
+3. **Bunny** — DNSSEC verification against a real account gates GA.
+4. **Polish** — dashboard sync-state surfacing, post-apply DoH
    verification probe (the reconciler confirming the edge actually
    serves what it pushed), runbook hardening from a real cutover.
 
@@ -615,8 +596,8 @@ runs the same steps minus the decommissioning.
 1. **Bunny DNSSEC** — can a Bunny-hosted zone be signed at all? Gates
    phase 4 entirely.
 2. **Watch cadence vs. rotation reality** — 15 minutes is a guess;
-   confirm Cloudflare/Route 53 pre-publication overlap windows from
-   their documentation or observation before pinning the default.
+   confirm Cloudflare's pre-publication overlap window from its
+   documentation or observation before pinning the default.
 3. **Chunking boundary** — the client concatenates TXT strings before
    parsing (`dns.rs`); confirm each provider's chunking preserves
    concatenation order for >255-byte member records, and add a crossval
@@ -631,5 +612,5 @@ runs the same steps minus the decommissioning.
    are pinned.
 6. **`_synchronicity-owner` name** — as designed the marker is a real
    published TXT (harmless, but visible). An alternative is provider-side
-   comment/tag fields where they exist; Route 53 has none, so the record
-   is the portable choice.
+   comment/tag fields where they exist; not every provider has them, so
+   the record is the portable choice.

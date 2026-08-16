@@ -200,7 +200,10 @@ fn glue_rrsets(
   |> result.map(list.flatten)
 }
 
-fn validate(input: ZoneInput) -> Result(Nil, BuildError) {
+/// Re-checks every product invariant the API layer enforces. Exported so
+/// the external-mode renderer refuses exactly what the serving builder
+/// refuses - one rule set, two consumers.
+pub fn validate(input: ZoneInput) -> Result(Nil, BuildError) {
   let apex = input.meta.apex
   use Nil <- result.try(
     list.try_fold(input.txt_names, Nil, fn(_, txt_name) {

@@ -62,8 +62,47 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3]
+  [v1, v2, v3, v4]
 }
+
+/// V4: external DNS provider mode (docs/EXTERNAL-DNS-PROVIDER.md).
+///
+/// `provider_sync_state` is one row — one deployment has one apex, one
+/// provider. Desired state is derived from the product tables, never
+/// stored: the row records only what the reconciler last did and how it
+/// went, so `/healthz` can answer "in sync?" from `applied_hash` with no
+/// provider round-trip. `last_error` and `last_error_at` travel together by
+/// CHECK — an error without a time, or a time without an error, is a shape
+/// the reporting code would misread.
+///
+/// `observed_zone_keys` is the key watcher's memory: the provider's signing
+/// keys as last seen on the validated wire, and when each was covered by a
+/// logged claim. Keyed by the SHA-256 of the DNSKEY rdata, the digest every
+/// other part of this design names keys by; the rdata itself is stored so a
+/// re-log can claim the exact observed bytes.
+const v4 = "
+CREATE TABLE provider_sync_state (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  provider           TEXT    NOT NULL CHECK (provider IN ('cloudflare','bunny','log-only')),
+  provider_zone_id   TEXT    NOT NULL,
+  applied_hash       BLOB             CHECK (applied_hash IS NULL OR length(applied_hash) = 32),
+  last_synced_serial INTEGER,
+  last_ok_at         INTEGER,
+  last_attempt_at    INTEGER NOT NULL,
+  last_error         TEXT,
+  last_error_at      INTEGER,
+  CHECK ((last_error IS NULL) = (last_error_at IS NULL))
+);
+CREATE TABLE observed_zone_keys (
+  key_sha256   BLOB    NOT NULL CHECK (length(key_sha256) = 32),
+  key_tag      INTEGER NOT NULL,
+  dnskey_rdata BLOB    NOT NULL,
+  first_seen   INTEGER NOT NULL,
+  last_seen    INTEGER NOT NULL,
+  logged_at    INTEGER,
+  PRIMARY KEY (key_sha256)
+);
+"
 
 /// V3: zone-key transparency and the relayed TUF material
 /// (docs/REKOR-ZONE-KEY.md §5.2, §10.3).
@@ -324,7 +363,9 @@ CREATE TABLE zone_meta (
   id                 INTEGER PRIMARY KEY CHECK (id = 1),
   base_domain        TEXT NOT NULL,
   soa_serial         INTEGER NOT NULL,
-  dnskey_public      BLOB NOT NULL CHECK (length(dnskey_public) = 64),
+  -- 64 bytes: a P-256 zone key (serve mode). 0 bytes: external mode,
+  -- where the provider holds the zone keys and this row carries none.
+  dnskey_public      BLOB NOT NULL CHECK (length(dnskey_public) IN (64, 0)),
   key_tag            INTEGER NOT NULL,
   sig_inception_skew INTEGER NOT NULL,
   sig_validity       INTEGER NOT NULL,

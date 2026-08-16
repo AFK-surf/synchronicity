@@ -19,6 +19,27 @@ pub type Role {
   Replica
 }
 
+/// How the zone reaches the wire (docs/EXTERNAL-DNS-PROVIDER.md).
+pub type DnsMode {
+  /// This service is the authoritative DNSSEC nameserver — today's shape.
+  Serve
+  /// A managed provider hosts and signs the zone; this service publishes
+  /// the data records through its API and runs no DNS listeners, no zone
+  /// key. `op_key_file` holds the operational key that signs transparency
+  /// claims — attribution, never a zone key.
+  External(provider: ProviderConfig, op_key_file: String)
+}
+
+/// Which provider, and how to reach it. `zone_id` empty means "discover by
+/// zone name at boot" where the provider's API allows it. `api_url` empty
+/// means the provider's real endpoint; tests and the e2e stub override it.
+pub type ProviderConfig {
+  Cloudflare(api_token: String, zone_id: String, api_url: String)
+  Bunny(api_key: String, zone_id: String, api_url: String)
+  /// No credentials: print the change set instead of applying it.
+  LogOnly
+}
+
 /// Bind address and port, from `address:port` (IPv6 as `[::1]:53`).
 pub type Listen {
   Listen(address: String, port: Int)
@@ -44,6 +65,7 @@ pub type Config {
     /// (client_id, client_secret) — absent disables the provider.
     google: Option(#(String, String)),
     github: Option(#(String, String)),
+    dns_mode: DnsMode,
   )
 }
 
@@ -54,22 +76,52 @@ pub fn load() -> Result(Config, String) {
     Ok(other) -> Error("CP_ROLE must be primary or replica, got " <> other)
     Error(Nil) -> Error("CP_ROLE is required (primary | replica)")
   })
+  use dns_mode <- result.try(dns_mode(role))
   use base_domain <- result.try(required("CP_BASE_DOMAIN"))
   use db_path <- result.try(required("CP_DB_PATH"))
-  use key_file <- result.try(case role {
-    Primary -> required("CP_KEY_FILE")
-    Replica ->
+  use key_file <- result.try(case role, dns_mode {
+    // External mode holds no zone key — the provider signs the zone, and a
+    // CP_KEY_FILE lying around would be dead config pretending otherwise.
+    Primary, External(..) ->
+      case envoy.get("CP_KEY_FILE") {
+        Ok(_) -> Error("CP_KEY_FILE must NOT be set with CP_DNS_MODE=external")
+        Error(Nil) -> Ok("")
+      }
+    Primary, Serve -> required("CP_KEY_FILE")
+    Replica, _ ->
       case envoy.get("CP_KEY_FILE") {
         Ok(_) -> Error("CP_KEY_FILE must NOT be set on a replica")
         Error(Nil) -> Ok("")
       }
   })
   use _ <- result.try(validate_db_path(db_path, key_file))
+  use _ <- result.try(case dns_mode {
+    External(_, op_key_file) -> validate_db_path(db_path, op_key_file)
+    Serve -> Ok(Nil)
+  })
   use _ <- result.try(removed("CP_HTTP_PORT", "CP_HTTP_LISTEN"))
   use _ <- result.try(removed("CP_DNS_PORT", "CP_DNS_LISTEN"))
   use http_listen <- result.try(listen_from("CP_HTTP_LISTEN", "0.0.0.0:8080"))
+  use _ <- result.try(case dns_mode {
+    // No listeners in external mode: the provider answers. A listen address
+    // configured anyway is a lie waiting to be believed.
+    External(..) ->
+      case envoy.get("CP_DNS_LISTEN") {
+        Ok(_) ->
+          Error("CP_DNS_LISTEN must NOT be set with CP_DNS_MODE=external")
+        Error(Nil) -> Ok(Nil)
+      }
+    Serve -> Ok(Nil)
+  })
   use dns_listen <- result.try(listen_from("CP_DNS_LISTEN", "0.0.0.0:53"))
-  use ns_hosts <- result.try(ns_hosts())
+  use ns_hosts <- result.try(case dns_mode {
+    External(..) ->
+      case envoy.get("CP_NS_HOSTS") {
+        Ok(_) -> Error("CP_NS_HOSTS must NOT be set with CP_DNS_MODE=external")
+        Error(Nil) -> Ok([])
+      }
+    Serve -> ns_hosts()
+  })
   let public_url =
     envoy.get("CP_PUBLIC_URL")
     |> result.unwrap("http://127.0.0.1:" <> int.to_string(http_listen.port))
@@ -97,7 +149,77 @@ pub fn load() -> Result(Config, String) {
     smtp,
     credential_pair("CP_GOOGLE_CLIENT_ID", "CP_GOOGLE_CLIENT_SECRET"),
     credential_pair("CP_GITHUB_CLIENT_ID", "CP_GITHUB_CLIENT_SECRET"),
+    dns_mode,
   ))
+}
+
+/// `CP_DNS_MODE`: `serve` (the default — today's behavior, zero-config
+/// compatible) or `external`. External mode names its provider and its
+/// operational key, refuses on a replica, and — the other direction —
+/// provider configuration present while the mode is `serve` is refused as
+/// dead config: a credential that quietly does nothing is a lie.
+fn dns_mode(role: Role) -> Result(DnsMode, String) {
+  let provider_env_present =
+    list.any(
+      [
+        "CP_DNS_PROVIDER", "CP_CLOUDFLARE_API_TOKEN", "CP_BUNNY_API_KEY",
+        "CP_OP_KEY_FILE",
+      ],
+      fn(key) { result.is_ok(envoy.get(key)) },
+    )
+  case envoy.get("CP_DNS_MODE") {
+    Error(Nil) | Ok("serve") ->
+      case provider_env_present {
+        True ->
+          Error(
+            "provider configuration (CP_DNS_PROVIDER / CP_*_API_* / "
+            <> "CP_OP_KEY_FILE) is set but CP_DNS_MODE is not external — "
+            <> "remove it, or set CP_DNS_MODE=external",
+          )
+        False -> Ok(Serve)
+      }
+    Ok("external") -> {
+      use Nil <- result.try(case role {
+        Replica ->
+          Error(
+            "CP_DNS_MODE=external is a primary-only mode: the provider's "
+            <> "fleet is the redundancy, and a replica has nothing to serve",
+          )
+        Primary -> Ok(Nil)
+      })
+      use op_key_file <- result.try(required("CP_OP_KEY_FILE"))
+      use provider <- result.try(provider_config())
+      Ok(External(provider, op_key_file))
+    }
+    Ok(other) -> Error("CP_DNS_MODE must be serve or external, got " <> other)
+  }
+}
+
+fn provider_config() -> Result(ProviderConfig, String) {
+  case envoy.get("CP_DNS_PROVIDER") {
+    Ok("cloudflare") -> {
+      use token <- result.try(required("CP_CLOUDFLARE_API_TOKEN"))
+      Ok(Cloudflare(
+        api_token: token,
+        zone_id: envoy.get("CP_CLOUDFLARE_ZONE_ID") |> result.unwrap(""),
+        api_url: envoy.get("CP_CLOUDFLARE_API_URL") |> result.unwrap(""),
+      ))
+    }
+    Ok("bunny") -> {
+      use key <- result.try(required("CP_BUNNY_API_KEY"))
+      Ok(Bunny(
+        api_key: key,
+        zone_id: envoy.get("CP_BUNNY_ZONE_ID") |> result.unwrap(""),
+        api_url: envoy.get("CP_BUNNY_API_URL") |> result.unwrap(""),
+      ))
+    }
+    Ok("log-only") -> Ok(LogOnly)
+    Ok(other) ->
+      Error(
+        "CP_DNS_PROVIDER must be cloudflare, bunny or log-only, got " <> other,
+      )
+    Error(Nil) -> Error("CP_DNS_PROVIDER is required with CP_DNS_MODE=external")
+  }
 }
 
 fn smtp_config() -> Result(

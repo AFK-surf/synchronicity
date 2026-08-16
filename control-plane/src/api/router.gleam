@@ -17,31 +17,54 @@ import dns/doh
 import dns/serve.{type Serving}
 import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
+import provider/state as provider_state
 import store/pool
 import tuf/store as tuf_store
 import wisp.{type Request, type Response}
 import zone/model
 
+/// How this deployment's zone reaches the wire, as routing needs to know
+/// it: a serving node answers DoH and reports RRSIG health; an external
+/// node has no DNS surface at all and reports reconciler health instead.
+pub type ZoneSurface {
+  ServingZone(serving: Serving)
+  ExternalZone(pool: pool.Pool)
+}
+
 pub type Context {
   Context(
     /// Trust-anchor line + DS record, prebuilt at boot (public data).
+    /// Empty in external mode — there is no zone key of ours to anchor.
     anchor: String,
     ds: String,
     /// Present on the primary only; replicas serve DNS and health alone.
     auth: Option(AuthContext),
-    /// Read-only serving context (pool + apex), both roles. A replica
+    /// Read-only serving context (pool + apex) on serving roles. A replica
     /// needs no reload signal: every checkout reopens the database file,
     /// so an atomically renamed replacement is picked up on next use.
-    serving: Serving,
+    zone: ZoneSurface,
   )
 }
 
 pub fn handle(req: Request, ctx: Context) -> Response {
   case wisp.path_segments(req) {
-    ["dns-query"] -> doh.handle(req, ctx.serving)
-    ["healthz"] -> healthz(ctx.serving)
-    ["api", "zone", "anchor"] -> anchor(ctx)
+    ["dns-query"] ->
+      case ctx.zone {
+        ServingZone(serving) -> doh.handle(req, serving)
+        ExternalZone(_) -> wisp.not_found()
+      }
+    ["healthz"] ->
+      case ctx.zone {
+        ServingZone(serving) -> healthz(serving)
+        ExternalZone(pool) -> healthz_external(pool)
+      }
+    ["api", "zone", "anchor"] ->
+      case ctx.anchor {
+        "" -> wisp.not_found()
+        _ -> anchor(ctx)
+      }
     ["auth", ..] | ["api", ..] ->
       case ctx.auth {
         Some(auth) -> primary_routes(req, auth)
@@ -206,6 +229,63 @@ fn healthz(serving: Serving) -> Response {
       ])
       |> json.to_string
       |> wisp.json_response(200)
+    _ ->
+      json.object([#("status", json.string("no zone available"))])
+      |> json.to_string
+      |> wisp.json_response(503)
+  }
+}
+
+/// External-mode health: the reconciler's view, with no provider
+/// round-trip. Staleness is reported, never fatal — the provider keeps
+/// serving whatever was last applied, the same stance `healthz` takes on
+/// absent TUF material in serve mode.
+fn healthz_external(zone_pool: pool.Pool) -> Response {
+  let looked =
+    pool.with_connection(zone_pool, fn(conn) {
+      #(
+        model.read_meta(conn),
+        provider_state.get(conn),
+        provider_state.observed_keys(conn),
+      )
+    })
+  case looked {
+    Ok(#(Ok(meta), Ok(state), Ok(keys))) -> {
+      let synced = case state {
+        Ok(s) ->
+          s.last_synced_serial == option.Some(meta.soa_serial)
+          && s.last_error == option.None
+        Error(Nil) -> False
+      }
+      let logged = list.filter(keys, fn(key) { key.logged_at != option.None })
+      json.object([
+        #("status", json.string("ok")),
+        #("mode", json.string("external")),
+        #("soa_serial", json.int(meta.soa_serial)),
+        #("provider_in_sync", json.bool(synced)),
+        #("keys_observed", json.int(list.length(keys))),
+        #("keys_logged", json.int(list.length(logged))),
+        ..case state {
+          Ok(s) -> [
+            #("provider", json.string(s.provider)),
+            #("provider_zone_id", json.string(s.provider_zone_id)),
+            #(
+              "provider_last_synced_serial",
+              json.nullable(s.last_synced_serial, json.int),
+            ),
+            #("provider_last_ok_at", json.nullable(s.last_ok_at, json.int)),
+            #("provider_last_error", json.nullable(s.last_error, json.string)),
+            #(
+              "provider_last_error_at",
+              json.nullable(s.last_error_at, json.int),
+            ),
+          ]
+          Error(Nil) -> [#("provider", json.string("never synced"))]
+        }
+      ])
+      |> json.to_string
+      |> wisp.json_response(200)
+    }
     _ ->
       json.object([#("status", json.string("no zone available"))])
       |> json.to_string
