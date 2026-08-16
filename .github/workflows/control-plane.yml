@@ -51,15 +51,21 @@ jobs:
           # Everything from ports lands under /usr/local (hence the
           # -I/-L via environment, which the Makefile appends to).
           # gmake because the Makefile uses GNU `override`; perl is in
-          # base. The ports gleam is built against OTP 28 and shells
-          # out to the version-suffixed rebar3-28, so erlang%28 and the
-          # ports rebar3 keep the whole toolchain on one OTP (the exact
-          # pin in .tool-versions is a Linux-CI concern; here the point
-          # is the OS).
-          prepare: pkg_add gmake sqlite3 erlang%28 gleam rebar3
+          # base. The ports gleam is built against OTP 28, so erlang%28
+          # keeps erl/escript on that major (the exact patch pin in
+          # .tool-versions is a Linux-CI concern; here the point is the
+          # OS).
+          prepare: pkg_add gmake sqlite3 erlang%28 gleam
           run: |
             set -e
             export PATH="/usr/local/lib/erlang28/bin:$PATH"
+            # The ports gleam shells out to a version-suffixed
+            # `rebar3-28` (to bind rebar3 to its OTP) and no such
+            # package exists, so install the official escript under
+            # exactly that name; 3.25.x supports OTP 28. It runs under
+            # whichever escript is first on PATH, i.e. erlang28's.
+            ftp -o /usr/local/bin/rebar3-28 https://github.com/erlang/rebar3/releases/download/3.25.1/rebar3
+            chmod +x /usr/local/bin/rebar3-28
             cd control-plane
             env CFLAGS="-O2 -I/usr/local/include" LDFLAGS="-L/usr/local/lib" gmake -C csqlite
             CSQLITE_SMOKE_REQUIRE=1 perl csqlite/smoke.pl priv/csqlite
