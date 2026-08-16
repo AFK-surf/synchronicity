@@ -5,8 +5,16 @@
 csqlite:
     make -C csqlite
 
+# Build the synch-rekor port program (the rekor wire formats, from
+# crates/synch-rekor-port — needs a Rust toolchain).
+rekorport:
+    make -C rekorport
+
+# Both port programs. Nothing this service does works without them.
+ports: csqlite rekorport
+
 # Run backend unit tests.
-test: csqlite
+test: ports
     gleam test
 
 # Type-check, test, build the SPA, and stage it for the Gleam server.
@@ -15,7 +23,7 @@ web-build:
     rm -rf priv/web && cp -r web/dist priv/web
 
 # Backend + frontend dev servers (backend on :8080, vite proxies to it).
-dev: csqlite
+dev: ports
     #!/usr/bin/env bash
     set -euo pipefail
     gleam run -- serve &
@@ -24,9 +32,9 @@ dev: csqlite
 
 # Full e2e: build, seed a throwaway zone, validate with delv and the
 # actual synchronicity Rust resolver (control-plane/e2e).
-e2e: csqlite
+e2e: ports
     ./e2e/run.sh
 
 # Verify the migration chain replays from scratch.
-migrate-check: csqlite
+migrate-check: ports
     gleam run -- migrate-check

@@ -22,49 +22,57 @@
 //// such. Clients never treat a retire as authorization (they refuse the
 //// action outright), so the exception cannot be turned into an evasion.
 ////
-//// Nothing is stored that has not been verified here first, by the rules
-//// crates/synch-net's verifier applies: possession (the DSSE signature is
-//// the zone key's), binding (the certificate names this key and this apex),
-//// inclusion, and the log's signature on the checkpoint. A row in
-//// `rekor_records` means *this service checked it*. The one rule this side
-//// cannot re-run is the cryptographic chain walk — that lives in the Rust
-//// verifier, and the e2e crossval is what keeps this side honest about it.
+//// What this module does *not* do is touch a single byte of any of those
+//// formats. Minting the certificate, rendering the Statement, signing,
+//// DER-encoding the two extensions, and verifying what the log returned all
+//// happen in `rekor/port` — one implementation, the client's own
+//// (crates/synch-net), in a separate OS process. This module is the
+//// ceremony: what the action is, which key it replaces, what to reuse, what
+//// to store, and what to tell the operator.
+////
+//// Nothing is stored that has not been verified first, by the rules
+//// crates/synch-net's verifier applies — because it *is* that verifier:
+//// possession, the certificate's key and name bindings, inclusion, the log's
+//// signature on the checkpoint, and the DNSSEC chain walk this side could
+//// never run before. A row in `rekor_records` means a client would accept
+//// this proof. If the port program is missing or fails, the publish fails:
+//// there is no path here that stores an unverified record.
 
 import dns/name.{type Name}
 import dnssec/keys.{type Csk}
-import gleam/crypto
+import gleam/bit_array
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import rekor/cert
+import gleam/string
 import rekor/chain
 import rekor/client.{type Log, Submission}
-import rekor/proof.{type Proof, Proof}
-import rekor/statement
+import rekor/port.{type Session}
 import rekor/store
 import store/sqlite.{type Connection}
-
-/// How long a zone-key certificate claims to be valid.
-///
-/// A century. The window is **semantically meaningless** — nothing in Rekor,
-/// in the client or in the monitor reads it, because the certificate is a key
-/// envelope and not a trust assertion — but X.509 has a mandatory field
-/// there, so it is filled in with something honest rather than something
-/// that looks like a policy.
-const certificate_lifetime_seconds = 3_155_760_000
 
 pub type PublishError {
   Db(sqlite.Error)
   /// The log refused, or could not be reached.
   LogUnavailable(String)
-  /// The proof did not verify locally — never stored.
-  Unverified(proof.ProofError)
-  /// The entry the log returned does not carry this key's signature, which
-  /// can only mean the key file and the statement disagree about who signs.
-  NotOurSignature
+  /// The entry was not verified — never stored. Covers a verification
+  /// failure and an unusable port program alike: both mean this service
+  /// cannot say a client would accept the record, and both must stop the
+  /// publish.
+  Unverified(port.Failure)
   /// The DNSSEC chain could not be collected. Almost always one thing: the
   /// DS is not live in the parent yet, and logging comes after that now.
   NoChain(String)
+}
+
+/// One sentence for an operator, who wants to know what to do next.
+pub fn describe(error: PublishError) -> String {
+  case error {
+    Db(e) -> "the database refused: " <> string.inspect(e)
+    LogUnavailable(why) -> why
+    Unverified(failure) -> port.describe(failure)
+    NoChain(why) -> why
+  }
 }
 
 pub type Outcome {
@@ -83,113 +91,136 @@ pub type Outcome {
   )
 }
 
+/// Collects the DNSSEC chain a fresh entry will carry.
+///
+/// A `retire` collects nothing: a retired zone may have no DS left, and
+/// clients refuse a retire as authorization outright, so the exception cannot
+/// be turned into an evasion. For everything else, failing here is the point
+/// — an entry without a chain is refused by every client, so discovering it
+/// now, with an operator standing at the terminal reading "is the DS live in
+/// the parent yet?", beats discovering it later from a cluster that will not
+/// resolve.
+///
+/// Nothing is validated here. The bytes go to the port program, which walks
+/// them cryptographically against the trust anchor *before* the certificate
+/// is built, so a chain no reader could anchor never reaches the log.
+pub fn collect_links(
+  resolver: chain.Resolver,
+  apex: Name,
+  action: String,
+) -> Result(List(port.ChainLink), PublishError) {
+  case action {
+    "retire" -> Ok([])
+    _ -> chain.collect(resolver, apex) |> result.map_error(NoChain)
+  }
+}
+
 /// Publishes (or refreshes) the record for `csk` at `apex`.
 ///
 /// The action follows the ceremony (§5.4): the first key logged for a zone
 /// is a `create`; a key logged while another already has a record is a
-/// `rollover` naming the tag it replaces. `predecessor` is the *previous*
-/// zone key's material, present only when the operator still holds it —
-/// which is what turns a monitor's tier B into a tier A.
+/// `rollover` naming the tag it replaces. `predecessor_key_file` is the
+/// *previous* zone key's file, given only when the operator still holds it —
+/// which is what turns a monitor's tier B into a tier A. The key files are
+/// passed by path and opened by the port program: the zone's whole secret
+/// never enters argv, and stays in one process rather than two.
 pub fn run(
   conn: Connection,
+  session: Session,
   apex: Name,
   csk: Csk,
+  key_file: String,
   log: Log,
-  log_key: #(BitArray, BitArray),
+  log_spki: BitArray,
   now: Int,
-  resolver: chain.Resolver,
   action: String,
-  predecessor: Option(Csk),
+  predecessor_key_file: String,
+  links: List(port.ChainLink),
+  anchor_file: String,
 ) -> Result(Outcome, PublishError) {
+  let apex_text = name.to_string(apex)
   let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
-  let spki_sha256 =
-    crypto.hash(crypto.Sha256, proof.p256_spki(csk.public))
   use replaces <- result.try(previous_key_tag(conn, key_tag))
-  let statement_bytes =
-    statement.to_json(statement.for_key(apex, csk.public, action, replaces))
 
-  // Reuse the exact bytes a prior run already logged when the Statement is
-  // byte-identical. ECDSA signing is randomized *and* a freshly collected
-  // chain carries fresh RRSIGs, so rebuilding either would mint a second
-  // leaf for one claim — Rekor is content-addressed, so reusing them is what
-  // makes a republish a refresh.
+  // What a prior run logged for this key and action, if anything. The port
+  // program decides whether it is reusable: the Statement has to be
+  // byte-identical *and* the stored certificate has to already carry the
+  // countersignature this run was asked for. Statement equality alone is a
+  // key identity test — the Statement names the key by the SHA-256 of its
+  // DNSKEY rdata — so a row belonging to another key that happens to share
+  // this 16-bit tag can never be mistaken for this key's.
   use stored <- result.try(
-    store.get(conn, spki_sha256, key_tag, action) |> result.map_error(Db),
+    store.for_key_tag(conn, key_tag) |> result.map_error(Db),
   )
-  use #(signature, certificate, refreshed) <- result.try(case
-    reusable(stored, statement_bytes, predecessor)
-  {
-    Ok(#(signature, certificate)) -> Ok(#(signature, certificate, True))
-    Error(Nil) -> {
-      use certificate <- result.try(mint_certificate(
-        apex,
-        csk,
-        action,
-        now,
-        resolver,
-        predecessor,
-      ))
-      Ok(#(statement.sign(csk, statement_bytes), certificate, False))
-    }
-  })
+  let priors =
+    stored
+    |> list.filter(fn(record) { record.action == action })
+    |> list.map(fn(record) { #(record.statement, record.canonicalized_body) })
 
-  use Nil <- result.try(
-    case statement.verify(csk.public, statement_bytes, signature) {
-      True -> Ok(Nil)
-      False -> Error(NotOurSignature)
-    },
+  use minted <- result.try(
+    port.mint(
+      session,
+      apex: apex_text,
+      key_file: key_file,
+      action: action,
+      now: now,
+      replaces: replaces,
+      predecessor_key_file: predecessor_key_file,
+      anchor_file: anchor_file,
+      links: links,
+      priors: priors,
+    )
+    |> result.map_error(Unverified),
   )
 
   // The submission is a hashedrekord over the DSSE PAE: its digest, the DER
   // signature, and the certificate that names this key and this zone.
-  let digest =
-    crypto.hash(
-      crypto.Sha256,
-      statement.pae(statement.dsse_payload_type, statement_bytes),
-    )
-  let submission = Submission(digest, signature, certificate)
   use logged <- result.try(
-    log.submit(submission) |> result.map_error(LogUnavailable),
+    log.submit(Submission(minted.digest, minted.signature, minted.certificate))
+    |> result.map_error(LogUnavailable),
   )
 
-  let record =
-    Proof(
+  // Verify what came back the way a client will, before a row exists. This
+  // is the client's own verifier over the log's own bytes: if it refuses, the
+  // publish fails and nothing is written.
+  use verified <- result.try(
+    port.verify(
+      session,
+      apex: apex_text,
+      public: csk.public,
       key_tag: key_tag,
-      // Our log-id convention is SHA-256 of the DER SPKI; the server's own
-      // keyId is derived differently, so name the log by our pinned key.
-      log_id: proof.log_id(log_key.0),
       log_index: logged.log_index,
-      statement: statement_bytes,
+      statement: minted.statement,
       canonicalized_body: logged.canonicalized_body,
       checkpoint: logged.checkpoint,
       inclusion_path: logged.inclusion_path,
+      log_spki: log_spki,
+      action: action,
+      anchor_file: anchor_file,
     )
-
-  // Verify the returned proof by the rules the client applies, before a row
-  // exists: the body's digest is this Statement's PAE, the entry signature is
-  // this key's, the certificate the log recorded names this key and this
-  // apex, and the entry is in the tree the checkpoint commits to.
-  use verified <- result.try(
-    verify_entry(record, apex, csk) |> result.map_error(Unverified),
-  )
-  use _ <- result.try(
-    proof.verify_against_log(record, log_key.0, log_key.1)
     |> result.map_error(Unverified),
   )
+
   use Nil <- result.try(
     store.put(
       conn,
       store.Record(
-        spki_sha256: spki_sha256,
+        spki_sha256: minted.key_id,
         key_tag: key_tag,
-        apex: name.to_string(apex),
+        apex: apex_text,
         action: action,
-        statement: statement_bytes,
+        statement: minted.statement,
         canonicalized_body: logged.canonicalized_body,
-        log_id: record.log_id,
+        log_id: verified.log_id,
         log_index: logged.log_index,
         checkpoint: logged.checkpoint,
-        inclusion_path: proof.join_path(logged.inclusion_path),
+        // The stored audit path is the hashes, concatenated.
+        inclusion_path: bit_array.concat(logged.inclusion_path),
+        // Stored rather than re-encoded on the way out: the bytes a zone
+        // serves are then exactly the bytes that verified, and the serving
+        // path — which runs on every mutation, and on replicas — needs no
+        // port program at all.
+        proof_txt: verified.proof_txt,
         chainless: verified.chainless,
         integrated_at: logged.integrated_at,
         verified_at: now,
@@ -201,7 +232,7 @@ pub fn run(
     key_tag,
     action,
     logged.log_index,
-    refreshed,
+    minted.reused,
     verified.chainless,
     verified.countersigned_by,
   ))
@@ -209,210 +240,15 @@ pub fn run(
 
 /// The action for a fresh publish: a zone's first logged key is a `create`,
 /// any later one is a `rollover` naming the tag it replaces.
-pub fn action_for(conn: Connection, key_tag: Int) -> Result(String, PublishError) {
+pub fn action_for(
+  conn: Connection,
+  key_tag: Int,
+) -> Result(String, PublishError) {
   use replaces <- result.try(previous_key_tag(conn, key_tag))
   Ok(case replaces {
     Some(_) -> "rollover"
     None -> "create"
   })
-}
-
-/// The signature and certificate a prior run logged, when the Statement is
-/// unchanged, the stored body still parses, **and** the stored certificate
-/// already carries the countersignature this run was asked for.
-///
-/// That last condition is the whole reason this is not a one-liner. The §5.4
-/// recovery for "you forgot the predecessor keyfile" is to re-run with it,
-/// and the Statement bytes are identical either way — the predecessor's key
-/// tag lives in the certificate, not the Statement. Reusing on Statement
-/// equality alone therefore threw the new `Succession` away and reported
-/// success, leaving the zone tier B in every monitor forever, with no way to
-/// fix it short of hand-editing the database. Minting a fresh certificate is
-/// the right answer: it is a new leaf, but it is the leaf the operator asked
-/// for, and the old one stays in the log as the history it is.
-fn reusable(
-  stored: Result(store.Record, Nil),
-  statement_bytes: BitArray,
-  predecessor: Option(Csk),
-) -> Result(#(BitArray, BitArray), Nil) {
-  use record <- result.try(case stored {
-    Ok(record) if record.statement == statement_bytes -> Ok(record)
-    _ -> Error(Nil)
-  })
-  use #(_digest, signature, certificate) <- result.try(
-    proof.parse_body(record.canonicalized_body) |> result.replace_error(Nil),
-  )
-  use Nil <- result.try(case predecessor {
-    // Nothing new to add: whatever was logged stands.
-    None -> Ok(Nil)
-    // A predecessor was named. Reuse only if the logged certificate already
-    // countersigns with *that* key; otherwise this run has something to say
-    // that the stored entry does not.
-    Some(old) ->
-      case cert_extension(certificate, cert.oid_succession) {
-        Error(Nil) -> Error(Nil)
-        Ok(value) ->
-          case cert.decode_succession(value) {
-            Ok(succession) ->
-              case succession.predecessor_spki == proof.p256_spki(old.public) {
-                True -> Ok(Nil)
-                False -> Error(Nil)
-              }
-            Error(Nil) -> Error(Nil)
-          }
-      }
-  })
-  Ok(#(signature, certificate))
-}
-
-/// Builds the certificate a fresh entry carries.
-///
-/// `create` and `rollover` must carry a chain, and failing here is the point:
-/// an entry without one is refused by every client, so discovering it now —
-/// with an operator standing at the terminal reading "is the DS live in the
-/// parent yet?" — beats discovering it later from a cluster that will not
-/// resolve. There is deliberately no escape hatch: with logging moved to
-/// after the DS is live, even a zone's genesis key has a chain. What a
-/// genesis key lacks is a *countersignature*, which is fine and expected.
-fn mint_certificate(
-  apex: Name,
-  csk: Csk,
-  action: String,
-  now: Int,
-  resolver: chain.Resolver,
-  predecessor: Option(Csk),
-) -> Result(BitArray, PublishError) {
-  let apex_text = name.to_string(apex)
-  use links <- result.try(case action {
-    // A retired zone may have no DS left to build a chain from. Clients
-    // refuse a retire as authorization outright, so this cannot be turned
-    // into an evasion — it is a breadcrumb for monitors and nothing else.
-    "retire" -> Ok(None)
-    _ ->
-      case chain.collect(resolver, apex) {
-        Error(why) -> Error(NoChain(why))
-        Ok(links) ->
-          // Walk what was just collected before it goes anywhere. This side
-          // cannot check the signatures — that is the client's and the
-          // monitor's job — but it can check the chain reaches the root, and
-          // a chain that does not is one every reader refuses.
-          case chain.check_shape(links, apex) {
-            Error(why) -> Error(NoChain(why))
-            Ok(Nil) ->
-              Ok(Some(list.map(links, fn(link) { cert.Link(link.zone, link.rrs) })))
-          }
-      }
-  })
-  let succession =
-    option.map(predecessor, fn(old) {
-      let old_tag = keys.key_tag(keys.dnskey_rdata(old))
-      cert.Succession(
-        predecessor_key_tag: old_tag,
-        predecessor_spki: proof.p256_spki(old.public),
-        signature: statement.sign_bytes(
-          old,
-          cert.succession_signed_bytes(
-            apex_text,
-            old_tag,
-            proof.p256_spki(csk.public),
-          ),
-        ),
-      )
-    })
-  Ok(cert.build(
-    apex_text,
-    csk.public,
-    csk.private,
-    now,
-    now + certificate_lifetime_seconds,
-    links,
-    succession,
-  ))
-}
-
-/// What verifying a returned entry established, beyond "it is sound".
-type Verified {
-  Verified(chainless: Bool, countersigned_by: Option(Int))
-}
-
-@external(erlang, "cp_crypto_ffi", "cert_spki_and_san")
-fn cert_spki_and_san(der: BitArray) -> Result(#(BitArray, String), Nil)
-
-/// The client's verification, run before storing: the digest, possession,
-/// and the certificate's two bindings — its key and its name.
-fn verify_entry(
-  record: Proof,
-  apex: Name,
-  csk: Csk,
-) -> Result(Verified, proof.ProofError) {
-  use #(digest, signature, certificate) <- result.try(proof.parse_body(
-    record.canonicalized_body,
-  ))
-  use Nil <- result.try(
-    case
-      digest
-      == crypto.hash(
-        crypto.Sha256,
-        statement.pae(statement.dsse_payload_type, record.statement),
-      )
-    {
-      True -> Ok(Nil)
-      False ->
-        Error(proof.Binding(
-          "the logged entry's digest is not this statement's DSSE PAE",
-        ))
-    },
-  )
-  use #(spki, san) <- result.try(
-    cert_spki_and_san(certificate)
-    |> result.replace_error(proof.Malformed(
-      "the logged certificate does not decode, or has no single dNSName SAN",
-    )),
-  )
-  use Nil <- result.try(case spki == proof.p256_spki(csk.public) {
-    True -> Ok(Nil)
-    False ->
-      Error(proof.Binding(
-        "the logged certificate's key is not this zone's DNSKEY",
-      ))
-  })
-  use Nil <- result.try(case san == cert.san_name(name.to_string(apex)) {
-    True -> Ok(Nil)
-    False ->
-      Error(proof.Binding("the logged certificate names " <> san <> ", not this apex"))
-  })
-  use Nil <- result.try(
-    case statement.verify(csk.public, record.statement, signature) {
-      True -> Ok(Nil)
-      False ->
-        Error(proof.Possession("the entry signature is not this zone key's"))
-    },
-  )
-  Ok(Verified(
-    chainless: !cert_has_extension(certificate, cert.oid_dnssec_chain),
-    countersigned_by: countersigned_by(certificate),
-  ))
-}
-
-@external(erlang, "cp_crypto_ffi", "cert_extension")
-fn cert_extension(der: BitArray, oid: #(Int, Int, Int)) -> Result(BitArray, Nil)
-
-fn cert_has_extension(der: BitArray, oid: #(Int, Int, Int)) -> Bool {
-  case cert_extension(der, oid) {
-    Ok(_) -> True
-    Error(Nil) -> False
-  }
-}
-
-/// The predecessor key tag the succession extension names, for the operator's
-/// benefit: a publish that quietly lost its countersignature would otherwise
-/// look exactly like one that never had one, and the difference is a tier B
-/// alert in every monitor watching this zone.
-fn countersigned_by(der: BitArray) -> Option(Int) {
-  case cert_extension(der, cert.oid_succession) {
-    Error(Nil) -> None
-    Ok(value) -> option.from_result(cert.succession_key_tag(value))
-  }
 }
 
 /// The already-logged key this one replaces, if any.
@@ -436,18 +272,4 @@ fn list_first_other(tags: List(Int), key_tag: Int) -> Result(Int, Nil) {
         False -> Ok(first)
       }
   }
-}
-
-/// The proof a served TXT record carries, rebuilt from a stored row.
-pub fn to_proof(record: store.Record) -> Result(Proof, proof.ProofError) {
-  use path <- result.try(proof.split_path(record.inclusion_path))
-  Ok(Proof(
-    key_tag: record.key_tag,
-    log_id: record.log_id,
-    log_index: record.log_index,
-    statement: record.statement,
-    canonicalized_body: record.canonicalized_body,
-    checkpoint: record.checkpoint,
-    inclusion_path: path,
-  ))
 }

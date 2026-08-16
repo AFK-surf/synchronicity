@@ -74,6 +74,7 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_REKOR_KEY` | primary | file pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev snapshot |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query` |
+| `CP_DNSSEC_ANCHOR` | primary | optional trust anchor file the collected chain is validated against; unset = the IANA root, which is what you want for a zone under the real DNS |
 | `CP_TUF_URL` | primary | Sigstore TUF repository relayed in the zone, default `https://tuf-repo-cdn.sigstore.dev` |
 
 > **Why the database gets its own directory.** Each SQLite connection
@@ -114,9 +115,11 @@ secrets.** Protect the replication bucket accordingly.
    ```
 
    Puts the key on a public transparency log, verifies the returned
-   proof locally with the same rules clients apply, stores it, and
-   republishes so the proof is served at `_synchronicity-rekor.<apex>`
-   (docs/REKOR-ZONE-KEY.md). It is separate from `keygen` because
+   proof locally with the client's own verifier — run in the
+   `priv/synch-rekor` port program, which must be built and present —
+   stores it, and republishes so the proof is served at
+   `_synchronicity-rekor.<apex>` (docs/REKOR-ZONE-KEY.md). If that
+   program is missing or refuses, the command fails and stores nothing. It is separate from `keygen` because
    `keygen` must stay runnable on an offline host and this step needs
    egress; it is idempotent, so re-running only refreshes the stored
    checkpoint against a grown tree. Nothing is stored that did not

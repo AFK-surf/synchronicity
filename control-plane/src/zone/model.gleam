@@ -7,8 +7,6 @@ import gleam/bit_array
 import gleam/list
 import gleam/result
 import gleam/string
-import rekor/proof
-import rekor/publish as rekor_publish
 import rekor/store as rekor_store
 import store/sqlite.{type Connection, Text}
 import thirtytwo
@@ -98,9 +96,10 @@ fn read_tuf_bundle(conn: Connection) -> Result(String, ModelError) {
 
 /// The proof records for the key this zone publishes.
 ///
-/// A stored row that cannot be turned back into a proof is dropped rather
-/// than served: a malformed record would make every client refuse the whole
-/// zone, which is a worse outcome than the one the row was meant to fix.
+/// Read, not rebuilt. The record was encoded by the port program from the
+/// entry it had just verified and stored as that exact string (`rekor/store`,
+/// schema v8), so building a zone consults no wire-format code and no
+/// subprocess: a replica serves the same bytes with neither.
 fn read_rekor_proofs(
   conn: Connection,
   key_tag: Int,
@@ -108,18 +107,7 @@ fn read_rekor_proofs(
   use records <- result.try(
     rekor_store.servable(conn, key_tag) |> result.map_error(Db),
   )
-  Ok(
-    records
-    |> list.filter_map(fn(record) {
-      // A row that will not encode is dropped for the same reason a
-      // malformed one is: serving it would make every client refuse the
-      // whole zone, which is worse than the gap the row was meant to close.
-      case rekor_publish.to_proof(record) {
-        Ok(built) -> proof.to_txt(built) |> result.replace_error(Nil)
-        Error(_) -> Error(Nil)
-      }
-    }),
-  )
+  Ok(list.map(records, fn(record) { record.proof_txt }))
 }
 
 /// The health probe's view of the zone: current serial and the soonest

@@ -47,6 +47,7 @@ import jobs/resign
 import mist
 import rekor/chain
 import rekor/client
+import rekor/port as rekor_port
 import rekor/publish as rekor
 import store/db
 import store/migrate
@@ -151,35 +152,59 @@ fn rekor_publish(
   use apex <- result.try(
     name.parse(apex_text) |> result.replace_error("invalid apex domain"),
   )
+  // Loaded here as well as by the port program: this side needs the public
+  // half to name the key and to re-sign the zone afterwards, and a key file
+  // that will not load should say so before anything is submitted.
   use csk <- result.try(keys.load(key_file))
   use previous <- result.try(case previous_file {
-    None -> Ok(None)
-    Some(path) -> keys.load(path) |> result.map(Some)
+    None -> Ok("")
+    Some(path) -> keys.load(path) |> result.replace(path)
   })
-  use log_key <- result.try(client.log_key())
+  // Every wire format this command touches lives behind the port program. If
+  // it is not there, the publish stops here: an entry that cannot be verified
+  // locally is one this service must not store.
+  use session <- result.try(
+    rekor_port.open() |> result.map_error(rekor_port.describe),
+  )
+  use #(log_spki, _log_id) <- result.try(
+    rekor_port.log_key(session, client.log_key_path())
+    |> result.map_error(rekor_port.describe),
+  )
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
   let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
   use action <- result.try(case forced_action {
     "" ->
       rekor.action_for(conn, key_tag)
-      |> result.map_error(fn(e) { "reading stored records: " <> string.inspect(e) })
+      |> result.map_error(fn(e) {
+        "reading stored records: " <> rekor.describe(e)
+      })
     forced -> Ok(forced)
   })
+  use links <- result.try(
+    rekor.collect_links(chain.doh(chain.resolver_url()), apex, action)
+    |> result.map_error(fn(e) {
+      "collecting the DNSSEC chain: " <> rekor.describe(e)
+    }),
+  )
   use outcome <- result.try(
     rekor.run(
       conn,
+      session,
       apex,
       csk,
+      key_file,
       client.http(client.url()),
-      log_key,
+      log_spki,
       now,
-      chain.doh(chain.resolver_url()),
       action,
       previous,
+      links,
+      chain.anchor_file(),
     )
-    |> result.map_error(fn(e) { "logging the zone key: " <> string.inspect(e) }),
+    |> result.map_error(fn(e) { "logging the zone key: " <> rekor.describe(e) }),
   )
+  rekor_port.close(session)
   use _ <- result.try(
     publish.publish(conn, csk, now, "system:rekor-publish")
     |> result.map_error(fn(e) { "republishing zone: " <> string.inspect(e) }),
@@ -202,7 +227,9 @@ fn rekor_publish(
     }
     <> case outcome.countersigned_by {
       Some(tag) ->
-        ", countersigned by key tag " <> int.to_string(tag) <> " (monitors see tier A)"
+        ", countersigned by key tag "
+        <> int.to_string(tag)
+        <> " (monitors see tier A)"
       // Genesis and disaster recovery both land here, and both are expected
       // — but a monitor watching this zone will alert on it, so say so.
       None -> ", NOT countersigned: monitors will alert (tier B)"

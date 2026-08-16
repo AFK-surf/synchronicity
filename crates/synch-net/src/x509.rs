@@ -220,24 +220,20 @@ fn parse_san(value: &[u8]) -> Result<Vec<String>, X509Error> {
 
 // ---------------------------------------------------------------- building
 //
-// **Everything below this line is the cross-validation encoder, not the
-// production one.** Certificates that reach the public log are built by
-// `control-plane/src/cp_crypto_ffi.erl` with OTP's `public_key` — the ASN.1
-// module is the reference encoder, and a certificate an external tool cannot
-// read would defeat the point of putting it in a public log. This half is
-// reachable only from `crate::sim` and the test suites.
+// **This is the production encoder.** Every certificate that reaches the
+// public log is built here: the control plane mints them through the
+// `synch-rekor` port program (crates/synch-rekor-port), which calls
+// `SelfSigned::build` with the zone CSK. There was once a second encoder, in
+// OTP's `public_key` on the Gleam side, and the two agreeing was policed by
+// checked-in fixtures — but two implementations of one DER format is exactly
+// the arrangement that produced three shipped bugs elsewhere in this format
+// family, so there is one now, and it is this one.
 //
-// It earns its place by being a *second, independent* encoder: the shared
-// fixtures under `control-plane/test/fixtures/rekor/crossval` are written by
-// the Gleam side and read by the parser above, and this builder lets the
-// tests mint certificate shapes the control plane will not produce on demand
-// — a SAN that is not a name, two SAN extensions, a chain for the wrong zone.
-// Two implementations of one DER format drift silently unless something
-// outside both of them holds the bytes still; this is one of the two.
-//
-// It is not feature-gated because `sim` is not either, and a `cfg` that hid
-// it would also hide it from the crossval. What it needs instead is this
-// note, so a reader does not assume `x509::SelfSigned` ships.
+// The tests reach it too, and for a reason worth keeping: they mint
+// certificate shapes the control plane will not produce on demand — a SAN
+// that is not a name, two SAN extensions, a chain for the wrong zone — which
+// is how the parser above is exercised against bytes an attacker would pick
+// rather than bytes we would.
 
 /// The one certificate shape this design mints.
 ///

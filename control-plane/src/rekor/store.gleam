@@ -29,6 +29,15 @@ pub type Record {
     log_index: Int,
     checkpoint: BitArray,
     inclusion_path: BitArray,
+    /// The `RekorProof` v3 record this row serves, base64url — the exact
+    /// string one TXT record carries.
+    ///
+    /// Stored rather than re-encoded on the way out. The encoder lives in the
+    /// port program, and the serving path runs on every mutation and on
+    /// replicas; storing what was verified means the bytes a zone serves are
+    /// the bytes that verified, and that no zone build depends on a
+    /// subprocess.
+    proof_txt: String,
     /// Whether this entry carries no DNSSEC chain. Only ever a `retire`: a
     /// retired zone may have no DS left to build one from, and clients
     /// refuse a retire as authorization outright, so the exception cannot be
@@ -49,9 +58,9 @@ pub fn put(conn: Connection, record: Record) -> Result(Nil, sqlite.Error) {
     conn,
     "INSERT INTO rekor_records
        (spki_sha256, key_tag, apex, action, statement, canonicalized_body,
-        log_id, log_index, checkpoint, inclusion_path, chainless,
+        log_id, log_index, checkpoint, inclusion_path, proof_txt, chainless,
         integrated_at, verified_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (spki_sha256, action) DO UPDATE SET
        key_tag = excluded.key_tag,
        apex = excluded.apex,
@@ -61,6 +70,7 @@ pub fn put(conn: Connection, record: Record) -> Result(Nil, sqlite.Error) {
        log_index = excluded.log_index,
        checkpoint = excluded.checkpoint,
        inclusion_path = excluded.inclusion_path,
+       proof_txt = excluded.proof_txt,
        chainless = excluded.chainless,
        integrated_at = excluded.integrated_at,
        verified_at = excluded.verified_at",
@@ -75,6 +85,7 @@ pub fn put(conn: Connection, record: Record) -> Result(Nil, sqlite.Error) {
       VInt(record.log_index),
       Blob(record.checkpoint),
       Blob(record.inclusion_path),
+      Text(record.proof_txt),
       VInt(case record.chainless {
         True -> 1
         False -> 0
@@ -96,31 +107,12 @@ pub fn for_key_tag(
 ) -> Result(List(Record), sqlite.Error) {
   let sql =
     "SELECT spki_sha256, key_tag, apex, action, statement, canonicalized_body,
-            log_id, log_index, checkpoint, inclusion_path, chainless,
+            log_id, log_index, checkpoint, inclusion_path, proof_txt, chainless,
             integrated_at, verified_at
      FROM rekor_records WHERE key_tag = ?
      ORDER BY verified_at DESC, action"
   use rows <- result.try(sqlite.query(conn, sql, [VInt(key_tag)]))
   Ok(list.filter_map(rows, decode))
-}
-
-/// One record by key identity and action, for the idempotent republish path.
-///
-/// Keyed on the SPKI digest rather than the key tag: two keys sharing a tag
-/// must not be able to read each other's row and conclude "already
-/// published".
-pub fn get(
-  conn: Connection,
-  spki_sha256: BitArray,
-  key_tag: Int,
-  action: String,
-) -> Result(Result(Record, Nil), sqlite.Error) {
-  use records <- result.try(for_key_tag(conn, key_tag))
-  Ok(
-    list.find(records, fn(record) {
-      record.action == action && record.spki_sha256 == spki_sha256
-    }),
-  )
 }
 
 /// Every key tag with a verified record, for the dashboard and `/healthz`.
@@ -168,6 +160,7 @@ fn decode(row: List(sqlite.Value)) -> Result(Record, Nil) {
       VInt(log_index),
       Blob(checkpoint),
       Blob(path),
+      Text(proof_txt),
       VInt(chainless),
       VInt(integrated_at),
       VInt(verified_at),
@@ -183,6 +176,7 @@ fn decode(row: List(sqlite.Value)) -> Result(Record, Nil) {
         log_index,
         checkpoint,
         path,
+        proof_txt,
         chainless != 0,
         integrated_at,
         verified_at,

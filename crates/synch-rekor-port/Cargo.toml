@@ -1,0 +1,25 @@
+[package]
+name = "synch-rekor-port"
+description = "The rekor wire formats behind a framed stdio port, for the control plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The binary is named for what the BEAM opens, not for the crate: it lands in
+# control-plane/priv/ beside csqlite, and `cp_port_ffi:priv_path/1` looks it
+# up by exactly this name.
+[[bin]]
+name = "synch-rekor"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+hickory-resolver.workspace = true
+ring.workspace = true
+synch-net.workspace = true
+
+[lints]
+workspace = true

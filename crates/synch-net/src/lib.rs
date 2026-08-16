@@ -16,6 +16,15 @@ pub mod frame;
 pub mod mpt;
 pub mod reconcile;
 pub mod rekor;
+/// Test support: a signed zone, a transparency log and a TUF repository a
+/// client cannot tell from the real things.
+///
+/// Behind the `sim` feature, which nothing that ships turns on. It is a
+/// thousand lines of fixture machinery with no place in a production call
+/// path, and leaving it ungated put every one of its types in this library's
+/// API surface — the suites in this repo enable it through their
+/// dev-dependencies, which is the whole audience it has.
+#[cfg(feature = "sim")]
 #[doc(hidden)]
 pub mod sim;
 pub mod tuf;

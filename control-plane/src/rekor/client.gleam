@@ -26,15 +26,14 @@ import gleam/json
 import gleam/list
 import gleam/result
 import gleam/string
-import rekor/proof
-import simplifile
 
 /// What is submitted for one entry: the SHA-256 of the DSSE PAE, the DER
 /// ECDSA signature over that PAE, and the signer's **certificate**.
 ///
 /// A certificate rather than a raw key because Rekor copies it verbatim into
 /// the Merkle leaf without validating any of it, which is the only way the
-/// apex gets somewhere a monitor can see it (`rekor/cert`).
+/// apex gets somewhere a monitor can see it. It is built by the port program
+/// (`rekor/port`), which is the one place that shape is written.
 pub type Submission {
   Submission(digest: BitArray, signature: BitArray, certificate: BitArray)
 }
@@ -67,49 +66,21 @@ pub fn url() -> String {
   |> result.unwrap("https://log2025-1.rekor.sigstore.dev")
 }
 
-/// The verification key of the default log at [`url`]:
-/// log2025-1.rekor.sigstore.dev's Ed25519 key, snapshotted from Sigstore's
-/// TUF `trusted_root.json` — the same snapshot the client embeds (see
-/// EMBEDDED_LOG_KEYS in crates/synch-net/src/rekor.rs, which carries the
-/// provenance note). One key, not the client's whole set: this side submits
-/// to one log and must verify what that log returns.
-const embedded_log_key = "MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244="
-
-/// The pinned log verification key (`CP_REKOR_KEY`): the DER
-/// SubjectPublicKeyInfo and the raw point.
+/// The file pinning the log's verification key (`CP_REKOR_KEY`), or `""`
+/// for the built-in default.
 ///
-/// Unset, it is the embedded key for the default public log. Set, the file
-/// replaces it entirely — an operator who redirects `CP_REKOR_URL` names
-/// the matching key here, because a key that cannot be named is a proof
-/// that cannot be checked, and storing an unchecked proof would hand the
-/// client something it will refuse.
-pub fn log_key() -> Result(#(BitArray, BitArray), String) {
-  case envoy.get("CP_REKOR_KEY") {
-    Error(Nil) ->
-      proof.parse_log_key(embedded_log_key)
-      |> result.map_error(fn(e) { "embedded log key: " <> string_of(e) })
-    Ok(path) -> {
-      use text <- result.try(
-        simplifile.read(path)
-        |> result.map_error(fn(e) {
-          "reading " <> path <> ": " <> simplifile.describe_error(e)
-        }),
-      )
-      proof.parse_log_key(text)
-      |> result.map_error(fn(e) { path <> ": " <> string_of(e) })
-    }
-  }
-}
-
-fn string_of(error: proof.ProofError) -> String {
-  case error {
-    proof.Malformed(why) -> why
-    proof.Possession(why) -> why
-    proof.Binding(why) -> why
-    proof.Inclusion(why) -> why
-    proof.CheckpointFailed(why) -> why
-    proof.UnknownLog(why) -> why
-  }
+/// The path is handed to the port program, which resolves it against
+/// crates/synch-net's own key reader and hands back the DER
+/// SubjectPublicKeyInfo and the log id it implies. Unset, the default is the
+/// public log at [`url`] — one key, not the client's whole pin set, because
+/// this side submits to one log and must verify what *that* log returns.
+///
+/// Set, the file replaces it entirely: an operator who redirects
+/// `CP_REKOR_URL` names the matching key here, because a key that cannot be
+/// named is a proof that cannot be checked, and storing an unchecked proof
+/// would hand the client something it will refuse.
+pub fn log_key_path() -> String {
+  envoy.get("CP_REKOR_KEY") |> result.unwrap("")
 }
 
 /// The HTTP log at `base` — `POST <base>/api/v2/log/entries`.
