@@ -39,22 +39,40 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
-/// The DNSSEC chain extension:
-/// `2.25.293397732029928475482264626946701631422`
-/// (UUID `dcba5907-a9a9-4de1-89fe-7b22794d9fbe`).
+/// The DNSSEC chain extension: `2.25.1555716359`.
 ///
 /// We hold no IANA Private Enterprise Number, and inventing an arc under
-/// somebody else's is how OID collisions happen. `2.25` is the UUID arc:
-/// `2.25.<uuid as a 128-bit integer>` is allocated by generating a UUID,
-/// needs no registration, and can collide with nothing. Fixed for the life
-/// of this format, and duplicated with the same comment in
-/// crates/synch-net/src/zonecert.rs.
-pub const oid_dnssec_chain = #(2, 25, 293_397_732_029_928_475_482_264_626_946_701_631_422)
+/// somebody else's is how OID collisions happen. `2.25` is the UUID arc,
+/// which needs no registration.
+///
+/// **The arc must stay inside 31 bits. Do not widen it.** Rekor is Go, its
+/// certificate parser is `crypto/x509`, and Go's `encoding/asn1` rejects any
+/// OID component that overflows `int32` — so a full 128-bit UUID arc fails
+/// inside `x509.ParseCertificate` *before* Rekor looks at the extension, and
+/// the submission comes back `400 invalid hashedrekord request` naming no
+/// field. This version of the format did exactly that, and it was found by
+/// live submission rather than by any test: Erlang's `public_key` (which
+/// builds these certificates) and OpenSSL (which reads them back) both parse
+/// the wide form without complaint, so everything here passed against a
+/// certificate the log would refuse.
+///
+/// `1555716359` is `0xdcba5907` — the first four bytes of the original UUID
+/// `dcba5907-a9a9-4de1-89fe-7b22794d9fbe` — masked into 31 bits.
+///
+/// **Provisional.** `2.25.<31-bit>` is a UUID with 97 leading zero bits, so
+/// it carries a small collision risk against anyone else doing the same
+/// trick; the long-term fix is an IANA Private Enterprise Number and OIDs
+/// under `1.3.6.1.4.1.<PEN>` (docs/REKOR-ZONE-KEY.md §8.3). Duplicated with
+/// the same warning in crates/synch-net/src/zonecert.rs, and pinned by the
+/// crossval fixtures so the two cannot drift.
+pub const oid_dnssec_chain = #(2, 25, 1_555_716_359)
 
-/// The succession countersignature extension:
-/// `2.25.90191032005037091005377665797806520834`
-/// (UUID `43da2932-67ac-4e03-bcbe-c8c9fee67a02`).
-pub const oid_succession = #(2, 25, 90_191_032_005_037_091_005_377_665_797_806_520_834)
+/// The succession countersignature extension: `2.25.1138370866`.
+///
+/// `1138370866` is `0x43da2932` — the first four bytes of UUID
+/// `43da2932-67ac-4e03-bcbe-c8c9fee67a02` — which already fits in 31 bits.
+/// The same `int32` constraint applies; see [`oid_dnssec_chain`].
+pub const oid_succession = #(2, 25, 1_138_370_866)
 
 /// The DSSE payload type a succession countersignature is made over.
 pub const succession_payload_type = "application/vnd.synchronicity.succession+json"

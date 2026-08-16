@@ -110,23 +110,67 @@ Certificate (self-signed, ECDSA P-256/SHA-256)
   basicConstraints   CA:FALSE            critical
   keyUsage           digitalSignature    critical
   subjectAltName     dNSName = <apex>    non-critical
-  2.25.293397732029928475482264626946701631422   the DNSSEC chain
-  2.25.90191032005037091005377665797806520834    the succession countersignature
+  2.25.1555716359    the DNSSEC chain
+  2.25.1138370866    the succession countersignature
 ```
 
 ### 2.2 The two custom extensions
 
 We hold no IANA Private Enterprise Number, and inventing an arc under
-somebody else's is how OID collisions happen. `2.25` is the UUID arc:
-`2.25.<uuid as a 128-bit integer>` needs no registration and can collide with
-nothing. Both OIDs are fixed for the life of this format and are hardcoded as
-named constants on both sides (`crates/synch-net/src/zonecert.rs`,
-`control-plane/src/rekor/cert.gleam`).
+somebody else's is how OID collisions happen. `2.25` is the UUID arc, which
+needs no registration. Both OIDs are hardcoded as named constants on both
+sides (`crates/synch-net/src/zonecert.rs`,
+`control-plane/src/rekor/cert.gleam`) and pinned by the crossval fixtures.
 
-| OID | UUID | Carries |
+| OID | DER content bytes | Carries |
 |---|---|---|
-| `2.25.293397732029928475482264626946701631422` | `dcba5907-a9a9-4de1-89fe-7b22794d9fbe` | the DNSSEC chain |
-| `2.25.90191032005037091005377665797806520834` | `43da2932-67ac-4e03-bcbe-c8c9fee67a02` | the succession countersignature |
+| `2.25.1555716359` | `69 85 e5 e9 b2 07` | the DNSSEC chain |
+| `2.25.1138370866` | `69 84 9e e8 d2 32` | the succession countersignature |
+
+**The arcs must stay inside 31 bits, and this is not a style preference.**
+Rekor is Go, its certificate parser is `crypto/x509`, and Go's
+`encoding/asn1` `parseBase128Int` rejects any OID component that overflows
+`int32`. A wider arc therefore fails inside `x509.ParseCertificate` *before*
+Rekor looks at the extension at all, and the submission comes back
+`400 invalid hashedrekord request` naming no field.
+
+This design originally used full 128-bit UUID arcs
+(`2.25.293397732029928475482264626946701631422` and
+`2.25.90191032005037091005377665797806520834`) and **they are unusable**. The
+failure was found by live submission and could not have been found any other
+way: OpenSSL and Erlang's `public_key` — the encoder that builds these
+certificates and the tool that reads them back — both parse a 128-bit arc
+happily, so every test on both sides of this repo passed against a
+certificate the log would refuse. Bisected against
+`log2025-1.rekor.sigstore.dev`, where a rejected submission is not logged and
+so costs nothing:
+
+| Certificate | Size | Result |
+|---|---|---|
+| bare (no custom extensions) | 410 B | `201` |
+| chain extension only | 771 B | `400 invalid hashedrekord request` |
+| succession extension only | 616 B | `400 invalid hashedrekord request` |
+| both | 973 B | `400 invalid hashedrekord request` |
+
+and then, with the extension *bytes held byte-identical* and only the OID
+changed:
+
+| OID | Result |
+|---|---|
+| `2.25.<128-bit uuid arc>` | `400 invalid hashedrekord request` |
+| `1.3.6.1.4.1.99999.1` | `201` |
+
+The extension structure was never the problem. The arcs in use now are the
+first four bytes of the original UUIDs masked into 31 bits — `0xdcba5907` and
+`0x43da2932` — so they stay inside `int32` while remaining syntactically
+UUID-arc OIDs. Both sides assert the `int32` bound in a unit test, so
+widening one fails locally instead of in production.
+
+**These OIDs are provisional.** `2.25.<31-bit>` is a syntactically valid
+UUID-arc OID but semantically a UUID with 97 leading zero bits, which carries
+a small collision risk against anyone else doing the same trick. The right
+long-term fix is an IANA Private Enterprise Number and OIDs under
+`1.3.6.1.4.1.<PEN>` — recorded as follow-up in §8.3.
 
 **Extension A — the DNSSEC chain.** Non-critical.
 
@@ -762,6 +806,16 @@ reach.
 
 ### 8.3 Future work
 
+**Register an IANA Private Enterprise Number and move both extension OIDs
+under `1.3.6.1.4.1.<PEN>`.** The current `2.25.<31-bit>` arcs are provisional:
+they are UUID-arc OIDs whose UUID has 97 leading zero bits, chosen because a
+full-width UUID arc is unusable against a Go certificate parser (§2.2). They
+are almost certainly unique in practice and they are cheap to change — one
+constant on each side and a fixture regeneration — but "almost certainly
+unique" is not what an allocation is for. Doing this is a format change and
+should ride a proof-version bump, so it is worth batching with any other
+breaking change rather than done alone.
+
 Cryptographic witness verification (this build counts cosignature lines and
 reads their timestamps but pins no witness keys, so `--min-witnesses` is a
 structural check); an in-client TUF root for log-key rotation (designed in
@@ -802,6 +856,16 @@ interoperation but cannot be made to misbehave on demand.
   what keeps a hand-rolled DER reader and OTP's ASN.1 encoder from agreeing
   with themselves rather than with each other. It caught a real bug on its
   first run — the Rust OID constants encoded `2.25` as 40×1+25.
+
+**What no fixture can catch.** The `int32` OID constraint in §2.2 was invisible
+to every test here, and would have been invisible to any test built the same
+way: both encoders agreed, both parsers agreed, the DER was well-formed, and
+OpenSSL rendered it correctly. Only the *log* disagreed. The lesson is
+specific — a conformance fixture proves this implementation matches itself and
+matches captured bytes, and proves nothing about a remote parser's
+tolerances — and the mitigation is equally specific: before changing anything
+about the certificate's shape, submit one and read the status code. Rejected
+submissions are not logged, so bisecting against the real log is free.
 
 **Synthetic material, for the failures reality will not perform.**
 

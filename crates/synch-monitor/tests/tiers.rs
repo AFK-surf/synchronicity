@@ -181,7 +181,10 @@ fn nothing_a_client_accepts_lands_in_the_silent_bin() {
         // rather than refused here — and the three it must refuse, which are
         // exactly the tier C bin.
         let must_accept = match name {
-            "genesis" | "rotation" | "substitution" | "forged countersignature"
+            "genesis"
+            | "rotation"
+            | "substitution"
+            | "forged countersignature"
             | "expired chain" => true,
             "chainless" | "broken chain" | "wrong-key chain" => false,
             other => panic!("unclassified shape {other}: say whether a client takes it"),

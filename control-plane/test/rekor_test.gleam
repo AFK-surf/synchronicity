@@ -723,3 +723,56 @@ fn cert_spki_and_san(der: BitArray) -> Result(#(BitArray, String), Nil)
 
 @external(erlang, "cp_crypto_ffi", "cert_extension")
 fn cert_extension(der: BitArray, oid: #(Int, Int, Int)) -> Result(BitArray, Nil)
+
+/// The OID arcs must stay inside 31 bits, and OTP must encode them to exactly
+/// the bytes the Rust constants carry.
+///
+/// Rekor is Go: `encoding/asn1` rejects OID components that overflow `int32`,
+/// so `x509.ParseCertificate` fails on a wider arc and the log refuses the
+/// whole submission with an opaque `400`. Nothing local caught the original
+/// 128-bit UUID arcs — OTP's `public_key` writes them and OpenSSL reads them
+/// back without complaint — so this suite passed for a certificate the log
+/// would not accept. That failure mode is why the bytes are asserted here
+/// rather than merely commented, and why the two encoders are compared
+/// through what OTP *actually emitted* into a certificate.
+pub fn the_oid_arcs_stay_inside_an_int32_test() {
+  let int32_max = 2_147_483_647
+  assert oid_arc(cert.oid_dnssec_chain) <= int32_max
+  assert oid_arc(cert.oid_succession) <= int32_max
+
+  // The DER an OID gets: tag 0x06, length 6, then 0x69 (= 40 × 2 + 25) and
+  // the arc in base-128. Byte-identical to crates/synch-net/src/zonecert.rs.
+  let der = fixture("crossval/certificate.der")
+  assert contains(der, <<0x06, 0x06, 0x69, 0x85, 0xe5, 0xe9, 0xb2, 0x07>>)
+  assert contains(der, <<0x06, 0x06, 0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32>>)
+
+  // And each arc is the first four bytes of its UUID masked to 31 bits, so a
+  // future edit cannot pick a new number and keep the explanation.
+  assert oid_arc(cert.oid_dnssec_chain) == int.bitwise_and(0xdcba5907, int32_max)
+  assert oid_arc(cert.oid_succession) == int.bitwise_and(0x43da2932, int32_max)
+}
+
+fn oid_arc(oid: #(Int, Int, Int)) -> Int {
+  oid.2
+}
+
+fn contains(haystack: BitArray, needle: BitArray) -> Bool {
+  let size = bit_array.byte_size(needle)
+  scan_for(haystack, needle, size, bit_array.byte_size(haystack) - size)
+}
+
+fn scan_for(
+  haystack: BitArray,
+  needle: BitArray,
+  size: Int,
+  at: Int,
+) -> Bool {
+  case at < 0 {
+    True -> False
+    False ->
+      case bit_array.slice(haystack, at, size) == Ok(needle) {
+        True -> True
+        False -> scan_for(haystack, needle, size, at - 1)
+      }
+  }
+}

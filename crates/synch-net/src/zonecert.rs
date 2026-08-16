@@ -24,35 +24,65 @@
 //! resolving *now* has no use for. Both are monitor food — the client parses
 //! past them and does not care (see `rekor::verify`).
 //!
-//! # Why the OIDs live under `2.25`
+//! # Why the OIDs look the way they do
 //!
 //! We hold no IANA Private Enterprise Number, and inventing an arc under
 //! someone else's is how OID collisions happen. `2.25` is the UUID arc:
-//! `2.25.<uuid as a 128-bit integer>` is allocated by generating a UUID,
-//! needs no registration and can collide with nothing. The two below are
-//! fixed for the life of this format and are duplicated, deliberately and
-//! with the same comment, in `control-plane/src/rekor/cert.gleam`.
+//! `2.25.<uuid>` is allocated by generating a UUID, needs no registration,
+//! and — at full 128-bit width — can collide with nothing.
+//!
+//! **The full width is unusable here.** Rekor is Go, its certificate parser
+//! is `crypto/x509`, and Go's `encoding/asn1` `parseBase128Int` rejects any
+//! OID component that overflows `int32`. A 128-bit arc therefore fails inside
+//! `x509.ParseCertificate`, *before* Rekor ever looks at the extension — the
+//! submission comes back `400 invalid hashedrekord request` with nothing to
+//! say which field was at fault.
+//!
+//! This was found by live submission, not by any local test, and could not
+//! have been found any other way: OpenSSL and Erlang's `public_key` both parse
+//! a 128-bit arc happily, so every test on both sides of this repo passed
+//! against a certificate the log would refuse. Bisected by submitting
+//! variants — bare certificate `201`, same certificate plus either extension
+//! `400`, and then, with the extension bytes held byte-identical and only the
+//! OID changed, `1.3.6.1.4.1.99999.1` `201`. The extension *structure* was
+//! never the problem.
+//!
+//! So both arcs are the first four bytes of the original UUID masked into 31
+//! bits — inside `int32`, still syntactically a UUID-arc OID.
+//!
+//! **These OIDs are provisional.** `2.25.<31-bit>` is a UUID with 97 leading
+//! zero bits, which is a real if small collision risk against anyone else
+//! doing the same trick. The long-term fix is an IANA Private Enterprise
+//! Number and OIDs under `1.3.6.1.4.1.<PEN>` — see docs/REKOR-ZONE-KEY.md
+//! §8.3. Until then, do not widen these arcs: the log will refuse the entry.
+//!
+//! Both are duplicated, deliberately and with the same warning, in
+//! `control-plane/src/rekor/cert.gleam`, and the crossval fixtures pin the
+//! bytes so the two cannot drift.
 
 use crate::x509::{tlv, Der, X509Error};
 
-/// The DNSSEC chain extension: `2.25.293397732029928475482264626946701631422`
-/// (UUID `dcba5907-a9a9-4de1-89fe-7b22794d9fbe`).
+/// The DNSSEC chain extension: `2.25.1555716359`.
+///
+/// `1555716359` is `0xdcba5907` — the first four bytes of UUID
+/// `dcba5907-a9a9-4de1-89fe-7b22794d9fbe` — masked into 31 bits. **Do not
+/// restore the full 128-bit UUID arc**: Go's `encoding/asn1` rejects OID
+/// components that overflow `int32`, so Rekor's certificate parser fails on
+/// the wide form and the log refuses the entry with an opaque `400`. See the
+/// module docs — this cost a live submission to find, because OpenSSL and
+/// Erlang both parse the wide form without complaint.
 ///
 /// These are the OID's DER *content* bytes: `0x69` is `2.25` packed into the
-/// first byte (40 × 2 + 25 = 105), and the rest is the UUID's integer value
-/// in base-128 continuation form.
-pub const OID_DNSSEC_CHAIN: &[u8] = &[
-    0x69, 0x83, 0xb9, 0xba, 0xac, 0xc1, 0xf5, 0x9a, 0xca, 0xb7, 0xc3, 0x89, 0xff, 0x9e, 0xe4, 0xa7,
-    0xca, 0xb6, 0xbf, 0x3e,
-];
+/// first byte (40 × 2 + 25 = 105), and the rest is the arc in base-128
+/// continuation form.
+pub const OID_DNSSEC_CHAIN: &[u8] = &[0x69, 0x85, 0xe5, 0xe9, 0xb2, 0x07];
 
-/// The succession countersignature extension:
-/// `2.25.90191032005037091005377665797806520834`
-/// (UUID `43da2932-67ac-4e03-bcbe-c8c9fee67a02`).
-pub const OID_SUCCESSION: &[u8] = &[
-    0x69, 0x81, 0x87, 0xda, 0x94, 0xcc, 0xcc, 0xfa, 0xe2, 0xb8, 0x87, 0xbc, 0xdf, 0xb2, 0x99, 0x9f,
-    0xf7, 0x99, 0xf4, 0x02,
-];
+/// The succession countersignature extension: `2.25.1138370866`.
+///
+/// `1138370866` is `0x43da2932` — the first four bytes of UUID
+/// `43da2932-67ac-4e03-bcbe-c8c9fee67a02` — which already fits in 31 bits.
+/// The same `int32` constraint applies; see [`OID_DNSSEC_CHAIN`].
+pub const OID_SUCCESSION: &[u8] = &[0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32];
 
 /// The DSSE payload type a succession countersignature is made over.
 pub const SUCCESSION_PAYLOAD_TYPE: &str = "application/vnd.synchronicity.succession+json";
@@ -308,5 +338,66 @@ mod tests {
         // succession type, never the in-toto one.
         let bytes = Succession::signed_bytes("sync.example.dev", 1, b"k");
         assert!(bytes.starts_with(b"DSSEv1 45 application/vnd.synchronicity.succession+json "));
+    }
+
+    /// Both OID arcs must stay inside `int32`, forever.
+    ///
+    /// Go's `encoding/asn1` — and therefore Rekor's `x509.ParseCertificate`,
+    /// and therefore Rekor — rejects any OID component that overflows
+    /// `int32`. An arc that violates this makes the log refuse the whole
+    /// submission with an opaque `400 invalid hashedrekord request`, and
+    /// nothing local catches it: OpenSSL and Erlang's `public_key` both parse
+    /// the wide form happily, which is why the original 128-bit UUID arcs
+    /// passed every test in this repo and still could not be published.
+    ///
+    /// So the constraint is asserted here rather than only written in a
+    /// comment. If this test fails, the fix is a *narrower* arc, never a
+    /// wider parser.
+    #[test]
+    fn the_oid_arcs_fit_in_an_int32_because_go_rejects_anything_larger() {
+        /// Decodes `2.<second> [.<arc>]*` from an OID's DER content bytes.
+        fn arcs(oid: &[u8]) -> Vec<u128> {
+            let (first, rest) = oid.split_first().expect("a non-empty OID");
+            let mut out = vec![(first / 40) as u128, (first % 40) as u128];
+            let mut acc: u128 = 0;
+            for byte in rest {
+                acc = acc << 7 | u128::from(byte & 0x7f);
+                if byte & 0x80 == 0 {
+                    out.push(acc);
+                    acc = 0;
+                }
+            }
+            assert_eq!(acc, 0, "the OID ends mid-component");
+            out
+        }
+
+        for (name, oid, expected) in [
+            ("DNSSEC chain", OID_DNSSEC_CHAIN, 1_555_716_359_u128),
+            ("succession", OID_SUCCESSION, 1_138_370_866),
+        ] {
+            let arcs = arcs(oid);
+            assert_eq!(arcs[0], 2, "{name}: not under the UUID arc");
+            assert_eq!(arcs[1], 25, "{name}: not under the UUID arc");
+            assert_eq!(arcs.len(), 3, "{name}: expected exactly one arc under 2.25");
+            assert_eq!(arcs[2], expected, "{name}: the arc changed");
+            assert!(
+                arcs[2] <= i32::MAX as u128,
+                "{name}: arc {} overflows int32 — Rekor's Go parser will \
+                 refuse the certificate and the log will reject the entry",
+                arcs[2]
+            );
+        }
+
+        // Each arc really is the first four bytes of its UUID, masked to 31
+        // bits — the derivation, so a future edit cannot quietly pick a new
+        // number and keep the comment.
+        assert_eq!(
+            u128::from(u32::from_be_bytes([0xdc, 0xba, 0x59, 0x07]) & 0x7fff_ffff),
+            1_555_716_359
+        );
+        assert_eq!(
+            u128::from(u32::from_be_bytes([0x43, 0xda, 0x29, 0x32]) & 0x7fff_ffff),
+            1_138_370_866
+        );
     }
 }
