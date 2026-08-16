@@ -9,15 +9,19 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+base64.workspace = true
 futures-core.workspace = true
+hex.workspace = true
 hickory-resolver.workspace = true
 iroh.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 iroh-base.workspace = true
 iroh-mainline-address-lookup.workspace = true
 n0-mainline.workspace = true
 postcard.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 synch-core.workspace = true
 synch-mpt.workspace = true
 synch-store.workspace = true
@@ -27,7 +31,9 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+hex.workspace = true
 postcard.workspace = true
+time.workspace = true
 synch-mpt.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

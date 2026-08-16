@@ -8,20 +8,28 @@
 
 pub mod blob;
 mod blocking;
+pub mod chain;
 pub mod dns;
 pub mod endpoint;
 pub mod error;
 pub mod frame;
 pub mod mpt;
 pub mod reconcile;
+pub mod rekor;
 #[doc(hidden)]
 pub mod sim;
+pub mod tuf;
+pub mod x509;
+pub mod zonecert;
 
 pub use blob::{BlobClient, BlobProtocol, Slice};
 pub use dns::{
-    DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError, ResolverOptions,
+    DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError, RekorPolicy,
+    ResolverOptions,
 };
 pub use endpoint::{Net, NetOptions};
 pub use error::{NetError, Result};
 pub use mpt::{HeadExchange, MptClient, MptProtocol, NodesResponse, ValuesResponse};
 pub use reconcile::{FetchOutcome, HeadOutcome, SyncReport, Syncer};
+pub use rekor::{ProofError, RekorProof};
+pub use tuf::{PinState, TufBundle, TufError};

@@ -59,7 +59,7 @@ secrets.** Protect the replication bucket accordingly.
 | Variable | Role | Meaning |
 |---|---|---|
 | `CP_ROLE` | both | `primary` or `replica` |
-| `CP_BASE_DOMAIN` | both | zone apex, e.g. `sync.example.dev` |
+| `CP_BASE_DOMAIN` | both | zone apex, e.g. `sync.example` |
 | `CP_DB_PATH` | both | SQLite file; **absolute, in its own directory** (see below) |
 | `CP_KEY_FILE` | primary | zone key file; **not in the database's directory**; unset on replicas |
 | `CP_HTTP_LISTEN` | both | `address:port`, default `0.0.0.0:8080` |
@@ -70,6 +70,11 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link mail (absent = log-only) |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |
+| `CP_REKOR_URL` | primary | zone-key transparency log, default `https://log2025-1.rekor.sigstore.dev` |
+| `CP_REKOR_KEY` | primary | file pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev snapshot |
+| `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
+| `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query` |
+| `CP_TUF_URL` | primary | Sigstore TUF repository relayed in the zone, default `https://tuf-repo-cdn.sigstore.dev` |
 
 > **Why the database gets its own directory.** Each SQLite connection
 > runs in a `csqlite` worker sandboxed (Landlock on Linux, `unveil`/
@@ -86,7 +91,7 @@ secrets.** Protect the replication bucket accordingly.
 1. **Key ceremony** (on the primary host):
 
    ```sh
-   controlplane keygen sync.example.dev /var/lib/synch-controlplane/csk.key
+   controlplane keygen sync.example /var/lib/synch-controlplane/csk.key
    ```
 
    Prints the key tag, the **DS record** for the parent zone, and the
@@ -94,20 +99,89 @@ secrets.** Protect the replication bucket accordingly.
    key file offline; `keygen` refuses to overwrite an existing file.
    (`controlplane ds <apex> <keyfile>` reprints all of it.)
 
-2. Start the primary (systemd unit in `ops/systemd/`). First boot
+2. **Put the DS at the parent registrar and wait for it to be live.**
+   `dig +dnssec <apex> DS` against a public resolver until it answers.
+   This step now comes *before* logging, which reverses the earlier
+   order — see step 3 for why.
+
+3. **Log the zone key** (before any client resolves the zone —
+   clients require the record by default):
+
+   ```sh
+   controlplane rekor-publish sync.example \
+     /var/lib/synch-controlplane/csk.key
+   ```
+
+   Puts the key on a public transparency log, verifies the returned
+   proof locally with the same rules clients apply, stores it, and
+   republishes so the proof is served at `_synchronicity-rekor.<apex>`
+   (docs/REKOR-ZONE-KEY.md). It is separate from `keygen` because
+   `keygen` must stay runnable on an offline host and this step needs
+   egress; it is idempotent, so re-running only refreshes the stored
+   checkpoint against a grown tree. Nothing is stored that did not
+   verify.
+
+   **It needs the DS to be live first.** The entry carries the DNSSEC
+   chain from the apex's DS up to the root, which is what lets a monitor
+   decide offline whether this key was ever delegated — and there is
+   nothing to collect until the parent publishes the DS. If it is not
+   there yet the command says so:
+
+   ```
+   no DS RRset at sync.example. — is the DS live in the parent yet?
+   ```
+
+   **Expect every monitor watching this apex to report the key.** That is
+   what publishing to a transparency log now means, and there is nothing to
+   suppress it with: a monitor cannot tell your rotation from a
+   substitution, because an attacker holding your registrar can build the
+   same chain you just did. It reports the authorization and leaves the
+   judgement to you. The command says so:
+
+   ```
+   zone key 34918 rollover: log index 67673584 (entry added),
+   DNSSEC chain carried (monitors will report this key)
+   ```
+
+   So tell whoever watches the monitor **before** you run it, and write the
+   key tag down. Your own record of what you published is the only thing
+   that distinguishes a report you caused from one you did not.
+
+4. **Relay Sigstore's TUF metadata** (once there is egress):
+
+   ```sh
+   controlplane tuf-refresh
+   ```
+
+   Walks `CP_TUF_URL` the way TUF consistent snapshots are meant to be
+   walked — timestamp names the snapshot, the snapshot names the targets,
+   the targets name `trusted_root.json` by digest — stores every file
+   verbatim and republishes so the bundle is served at
+   `_synchronicity-tuf.<apex>` (docs/REKOR-ZONE-KEY.md §10). Clients
+   verify that chain offline against a TUF root built into them and adopt
+   the log keys it names, so Sigstore's log rotations stop being a client
+   upgrade. This service checks structure, versions and expiries only —
+   it is a relay, not the verifier — and refuses a fetch that would walk
+   clients backwards. The hourly job refetches on its own once the stored
+   timestamp is within three days of expiring; run this by hand after any
+   long outage, or on an egress host before couriering the database in an
+   air-gapped deployment. Skipping it entirely is fine: clients keep the
+   log keys their build shipped with.
+
+4. Start the primary (systemd unit in `ops/systemd/`). First boot
    migrates the DB, writes zone metadata and publishes the (empty) zone.
 
-3. **First user**: `controlplane seed-admin you@example.com` prints a
+5. **First user**: `controlplane seed-admin you@example.com` prints a
    one-time sign-in link.
 
-4. Start replicas + your replication tooling on the `ns` hosts.
+6. Start replicas + your replication tooling on the `ns` hosts.
 
-5. **Delegate at the parent zone**:
+7. **Delegate at the parent zone**:
    - `NS` records pointing at `ns1.<base>`, `ns2.<base>`;
    - glue `A`/`AAAA` for those names (they match `CP_NS_HOSTS`);
    - the `DS` record from step 1.
 
-6. **Verify from outside** (must print `; fully validated`):
+8. **Verify from outside** (must print `; fully validated`):
 
    ```sh
    delv _synchronicity.<net>.<org>.<base> TXT +rtrace
@@ -140,6 +214,62 @@ control plane itself with
   this is a planned outage of new-validation, existing caches keep
   working. **Zone key rollover** (proactive) is the same dance with both
   DS records present during the window; v1 keeps this manual and rare.
+  With transparency enabled the order is: `keygen`, publish both DNSKEYs,
+  **add the DS at the parent and wait**, then `rekor-publish <apex>
+  <newkey>`, then switch signing, then `rekor-retire <apex> <oldkey>`.
+  Logging comes after the DS because the entry carries the DNSSEC chain
+  that the DS makes buildable; the two-key window is what covers the gap,
+  since the old key keeps signing until the new one is logged. Every
+  monitor watching the apex will report the new key — tell them first,
+  and record the key tag.
+- **Zone key transparency** (docs/REKOR-ZONE-KEY.md): `rekor-publish`
+  puts the zone key on a public log and the zone serves the proof at
+  `_synchronicity-rekor.<apex>`. Rollout is phased — publish first
+  (`CP_REKOR_REQUIRE` unset), turn the gate on once every key in play has
+  a verified record. With the gate on, *every* publish path refuses while
+  the active key has none, including the hourly re-sign; that is
+  deliberate, and `rekor-publish` is how you get out of it.
+- **Watch the log** (docs/REKOR-ZONE-KEY.md §5.5). A required log with no
+  watcher is a formality. `synch-monitor` reads the whole log's tiles and
+  reports **every newly authorized key** for the apexes you watch:
+
+  ```sh
+  echo '{"known":{"keys":{"sync.example":[]}}}' > /var/lib/synch-monitor/state.json
+  synch-monitor --state /var/lib/synch-monitor/state.json
+  ```
+
+  Exit codes: `0` nothing new, `10` unauthorized claims naming your apex
+  (recorded, no alarm — no client would have accepted one), `20` **a key
+  was authorized for your apex that this monitor had not seen: check it
+  against what you published**, `2` the run could not finish. These
+  numbers changed when the tiering was reduced to two; a rule written
+  against the old `30` now matches nothing, which is the intended way to
+  find out.
+
+  New authorizations go to **stdout**, one line each with the apex, key
+  tag, the DS your registrar should be showing, the SPKI digest and the
+  log index. Everything else goes to stderr. A cron job that mails stdout
+  mails exactly the events that need a human.
+
+  **The monitor cannot tell your rotation from a substitution**, and does
+  not try: an attacker who has taken your registrar holds the DS, so
+  their entry carries a valid chain exactly like yours. It tells you a
+  key was authorized; *you* decide whether you authorized it. So keep a
+  record of every key you publish — that record is the discriminator, and
+  nothing in the log can replace it. Run the monitor from somewhere that
+  is not the control plane's network; the independence is the point. Seed
+  the state file with the keys you have already accounted for, so the
+  first run reports only what you did not know. The keys it records are
+  bookkeeping about what it has already told you, **not** a trust list:
+  an attacker's key is recorded once reported, the same as yours.
+- **Log-pin refresh** (docs/REKOR-ZONE-KEY.md §10): `tuf-refresh` relays
+  Sigstore's TUF metadata at `_synchronicity-tuf.<apex>` so clients'
+  transparency-log pins follow Sigstore's rotations. `/healthz` reports
+  `tuf_root_version` and `tuf_timestamp_expires_at`; an expiry that stops
+  moving means the hourly refetch is failing — check egress to
+  `CP_TUF_URL`. It is never urgent: an expired or absent bundle leaves
+  every client on the pins it already has, which is where they were
+  before this existed.
 - **Backups**: the litestream bucket *is* the database backup. The key
   file is backed up offline from the ceremony. Those two artifacts
   restore the whole service.

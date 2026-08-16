@@ -24,6 +24,8 @@ fn demo_input(csk: keys.Csk) -> ZoneInput {
         Member("laptop", nk(), "", ""),
       ]),
     ],
+    [],
+    "",
   )
 }
 

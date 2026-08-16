@@ -1,0 +1,28 @@
+[package]
+name = "synch-monitor"
+description = "Watches a Rekor v2 log for zone-key entries and classifies what it finds"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+hex.workspace = true
+hickory-resolver.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+synch-net.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true

@@ -7,8 +7,13 @@ import gleam/bit_array
 import gleam/list
 import gleam/result
 import gleam/string
+import rekor/proof
+import rekor/publish as rekor_publish
+import rekor/store as rekor_store
 import store/sqlite.{type Connection, Text}
 import thirtytwo
+import tuf/bundle
+import tuf/store as tuf_store
 
 pub type ZoneMeta {
   ZoneMeta(
@@ -37,7 +42,19 @@ pub type TxtName {
 }
 
 pub type ZoneInput {
-  ZoneInput(meta: ZoneMeta, ns_hosts: List(NsHost), txt_names: List(TxtName))
+  ZoneInput(
+    meta: ZoneMeta,
+    ns_hosts: List(NsHost),
+    txt_names: List(TxtName),
+    /// Zone-key transparency proofs for the key the zone publishes, in the
+    /// base64url form one TXT record carries. Empty until `rekor-publish`
+    /// has run — phase 0 of the rollout serves a zone without them.
+    rekor_proofs: List(String),
+    /// The relayed Sigstore TUF bundle (§10.1), base64url. Empty until
+    /// `tuf-refresh` has run, which is a zone whose clients keep the pins
+    /// they already have — a non-event, not a fault.
+    tuf_bundle: String,
+  )
 }
 
 pub type ModelError {
@@ -61,7 +78,48 @@ pub fn read(conn: Connection) -> Result(ZoneInput, ModelError) {
   use meta <- result.try(read_meta(conn))
   use ns_hosts <- result.try(read_ns(conn, meta.apex))
   use txt_names <- result.try(read_txt_names(conn, meta.apex))
-  Ok(ZoneInput(meta, ns_hosts, txt_names))
+  use rekor_proofs <- result.try(read_rekor_proofs(conn, meta.key_tag))
+  use tuf_bundle <- result.try(read_tuf_bundle(conn))
+  Ok(ZoneInput(meta, ns_hosts, txt_names, rekor_proofs, tuf_bundle))
+}
+
+/// The relayed TUF bundle, or the empty string when nothing is stored.
+///
+/// A database error here would be an odd way to stop serving a zone over
+/// material the client is free to ignore, so it is reported like any other
+/// read; what is *not* an error is having no material at all.
+fn read_tuf_bundle(conn: Connection) -> Result(String, ModelError) {
+  use stored <- result.try(tuf_store.get(conn) |> result.map_error(Db))
+  case stored {
+    Ok(material) -> Ok(bundle.to_txt(tuf_store.to_bundle(material)))
+    Error(Nil) -> Ok("")
+  }
+}
+
+/// The proof records for the key this zone publishes.
+///
+/// A stored row that cannot be turned back into a proof is dropped rather
+/// than served: a malformed record would make every client refuse the whole
+/// zone, which is a worse outcome than the one the row was meant to fix.
+fn read_rekor_proofs(
+  conn: Connection,
+  key_tag: Int,
+) -> Result(List(String), ModelError) {
+  use records <- result.try(
+    rekor_store.servable(conn, key_tag) |> result.map_error(Db),
+  )
+  Ok(
+    records
+    |> list.filter_map(fn(record) {
+      // A row that will not encode is dropped for the same reason a
+      // malformed one is: serving it would make every client refuse the
+      // whole zone, which is worse than the gap the row was meant to close.
+      case rekor_publish.to_proof(record) {
+        Ok(built) -> proof.to_txt(built) |> result.replace_error(Nil)
+        Error(_) -> Error(Nil)
+      }
+    }),
+  )
 }
 
 /// The health probe's view of the zone: current serial and the soonest

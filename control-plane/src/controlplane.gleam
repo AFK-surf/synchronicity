@@ -5,6 +5,18 @@
 ////   serve                 run the service (configuration from CP_* env)
 ////   keygen <apex> <file>  generate the zone CSK; print DNSKEY / DS / anchor
 ////   ds <apex> <file>      print DS + anchor material for an existing key
+////   rekor-publish <apex> <file>
+////                         log the zone key in the transparency log, verify
+////                         the proof locally, store and serve it. Run this
+////                         *after* the DS is live in the parent — the entry
+////                         carries a DNSSEC chain, and there is no chain to
+////                         build before then (§5.2).
+////   rekor-retire <apex> <file>
+////                         log a retirement breadcrumb for a key. Allowed to
+////                         be chainless: a retired zone may have no DS left,
+////                         and clients never treat a retire as authorization.
+////   tuf-refresh           refetch Sigstore's TUF metadata and relay it in
+////                         the zone, so clients' log pins follow it
 ////   seed                  create a demo org/network/devices and publish
 ////   seed-admin <email>    first-user bootstrap: print a one-time magic link
 ////   migrate-check         replay the migration chain against a scratch DB
@@ -30,11 +42,15 @@ import gleam/result
 import gleam/string
 import jobs/resign
 import mist
+import rekor/chain
+import rekor/client
+import rekor/publish as rekor
 import store/db
 import store/migrate
 import store/pool
 import store/sqlite
 import tools/seed
+import tuf/fetch as tuf_fetch
 import wisp/wisp_mist
 import zone/model
 import zone/publish
@@ -52,13 +68,18 @@ pub fn main() {
   case argv() {
     ["keygen", apex, key_file] -> keygen(apex, key_file)
     ["ds", apex, key_file] -> print_key_material(apex, key_file)
+    ["rekor-publish", apex, key_file] ->
+      run_or_die(fn() { rekor_publish(apex, key_file, "") })
+    ["rekor-retire", apex, key_file] ->
+      run_or_die(fn() { rekor_publish(apex, key_file, "retire") })
+    ["tuf-refresh"] -> run_or_die(tuf_refresh)
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(run_seed)
     ["seed-admin", email] -> run_or_die(fn() { seed_admin(email) })
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | seed | seed-admin <email> | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | rekor-retire <apex> <keyfile> | tuf-refresh | seed | seed-admin <email> | migrate-check",
       )
       halt(2)
     }
@@ -106,6 +127,119 @@ fn print_material(apex: name.Name, csk: keys.Csk) -> Nil {
   io.println(keys.ds_line(apex, csk.public))
   io.println("; trust-anchor line for synch --dnssec-anchor:")
   io.println(keys.anchor_line(apex, csk.public))
+}
+
+/// Puts the zone key on the public record and republishes, so the proof
+/// record is served beside the key it is about (§5.2, §5.3).
+///
+/// Idempotent: re-running refreshes the stored checkpoint against a grown
+/// tree without minting a second entry. The zone is republished either way,
+/// which is also how a phase-2 deployment escapes the publish gate after
+/// its first successful logging.
+fn rekor_publish(
+  apex_text: String,
+  key_file: String,
+  forced_action: String,
+) -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use apex <- result.try(
+    name.parse(apex_text) |> result.replace_error("invalid apex domain"),
+  )
+  use csk <- result.try(keys.load(key_file))
+  use log_key <- result.try(client.log_key())
+  use conn <- result.try(open_primary_db(cfg))
+  let now = now_unix()
+  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
+  use action <- result.try(case forced_action {
+    "" ->
+      rekor.action_for(conn, key_tag)
+      |> result.map_error(fn(e) {
+        "reading stored records: " <> string.inspect(e)
+      })
+    forced -> Ok(forced)
+  })
+  use outcome <- result.try(
+    rekor.run(
+      conn,
+      apex,
+      csk,
+      client.http(client.url()),
+      log_key,
+      now,
+      chain.doh(chain.resolver_url()),
+      action,
+    )
+    |> result.map_error(fn(e) { "logging the zone key: " <> string.inspect(e) }),
+  )
+  use _ <- result.try(
+    publish.publish(conn, csk, now, "system:rekor-publish")
+    |> result.map_error(fn(e) { "republishing zone: " <> string.inspect(e) }),
+  )
+  sqlite.close(conn)
+  io.println(
+    "zone key "
+    <> int.to_string(outcome.key_tag)
+    <> " "
+    <> outcome.action
+    <> ": log index "
+    <> int.to_string(outcome.log_index)
+    <> case outcome.refreshed {
+      True -> " (proof refreshed, no new entry)"
+      False -> " (entry added)"
+    }
+    <> case outcome.chainless {
+      True -> ", no DNSSEC chain (retire breadcrumb)"
+      // Every monitor watching this apex will report this key the first time
+      // it sees it — that is what publishing to a transparency log now
+      // means, and an operator who is surprised by the report is an operator
+      // who did not publish this key.
+      False -> ", DNSSEC chain carried (monitors will report this key)"
+    },
+  )
+  Ok(Nil)
+}
+
+/// Refetches Sigstore's TUF metadata and republishes, so the bundle record
+/// is served beside the proofs it will be used to check (§10.3).
+///
+/// The air-gapped ceremony runs this where there is egress and couriers the
+/// database, as with everything else. Failing costs nothing: clients keep
+/// the pins they have, which is what a control plane that never ran this at
+/// all leaves them with.
+fn tuf_refresh() -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use csk <- result.try(keys.load(cfg.key_file))
+  use conn <- result.try(open_primary_db(cfg))
+  let now = now_unix()
+  let source = tuf_fetch.url()
+  use outcome <- result.try(tuf_fetch.refresh(
+    conn,
+    tuf_fetch.http(source),
+    source,
+    now,
+  ))
+  use _ <- result.try(
+    publish.publish(conn, csk, now, "system:tuf-refresh")
+    |> result.map_error(fn(e) { "republishing zone: " <> string.inspect(e) }),
+  )
+  sqlite.close(conn)
+  io.println(
+    "tuf: root "
+    <> int.to_string(outcome.root_version)
+    <> ", timestamp "
+    <> int.to_string(outcome.timestamp_version)
+    <> " (expires "
+    <> int.to_string(outcome.timestamp_expires)
+    <> "), snapshot "
+    <> int.to_string(outcome.snapshot_version)
+    <> ", targets "
+    <> int.to_string(outcome.targets_version)
+    <> case outcome.changed {
+      True -> " — relayed"
+      False -> " — unchanged"
+    },
+  )
+  Ok(Nil)
 }
 
 fn migrate_check() -> Nil {

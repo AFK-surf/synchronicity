@@ -7,7 +7,7 @@
 //! negative cases prove the acceptance was the validator's doing.
 
 use iroh_base::SecretKey;
-use synch_net::{sim::SimZone, DnssecResolver, ResolverOptions};
+use synch_net::{sim::SimZone, DnssecResolver, RekorPolicy, ResolverOptions};
 
 fn anchor_file(record: &str) -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().unwrap();
@@ -32,6 +32,11 @@ async fn a_signed_zone_validates_end_to_end() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
+        // DNSSEC-only coverage: the zone-key transparency path has its own
+        // suite, and this zone logs nothing.
+        rekor: Some(RekorPolicy::Off),
+        rekor_key: None,
+        rekor_state: None,
     })
     .unwrap();
 
@@ -64,6 +69,11 @@ async fn a_zone_signed_by_an_unanchored_key_is_refused() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
+        // DNSSEC-only coverage: the zone-key transparency path has its own
+        // suite, and this zone logs nothing.
+        rekor: Some(RekorPolicy::Off),
+        rekor_key: None,
+        rekor_state: None,
     })
     .unwrap();
     resolver
@@ -87,6 +97,11 @@ async fn an_unsigned_zone_is_refused() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
+        // DNSSEC-only coverage: the zone-key transparency path has its own
+        // suite, and this zone logs nothing.
+        rekor: Some(RekorPolicy::Off),
+        rekor_key: None,
+        rekor_state: None,
     })
     .unwrap();
     resolver

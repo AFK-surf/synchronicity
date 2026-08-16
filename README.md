@@ -66,6 +66,38 @@ ICANN trust anchor with that file of DNSKEY records — and then nothing signed
 under the real root validates: an override is a different universe, not an
 addition.
 
+DNSSEC answers *is this key authorized for this zone?* by delegation, and a
+compromised or coerced parent can substitute the key quietly. By default the
+zone key that signed an answer must additionally appear in the public
+Sigstore Rekor v2 transparency log — the production log keys are built in —
+with the proof carried inside the zone and verified offline: a substituted
+key then has to be a *public* substitution, where the zone's operator can
+see it, or fail validation. The zone key is logged as a genuine
+`hashedrekord` entry whose verifier is a **self-signed certificate naming the
+apex** — Rekor validates certificates not at all and copies the DER into the
+Merkle leaf verbatim, which is what puts a monitorable zone name inside the
+log — carrying the zone's DNSSEC chain as a custom extension. A real
+published entry is checked in as a conformance fixture, so an entry minted by
+`log2025-1.rekor.sigstore.dev` verifies end to end. `synch-monitor` is the
+other half: it walks the log's tiles, indexes every leaf by the name in its
+certificate, and reports every newly authorized key for the zones you watch —
+the CT-monitor posture, where the log tells you a key exists and your own
+record of what you published tells you whether to worry.
+`--rekor off` (`SYNCH_REKOR`) states the opt-out;
+`--rekor-key <file>` (`SYNCH_REKOR_KEY`) points at a self-hosted log's
+verification key, with the same different-universe semantics as the trust
+anchor. See [docs/REKOR-ZONE-KEY.md](docs/REKOR-ZONE-KEY.md).
+
+Sigstore rotates those log keys, so the pinned set follows them on its own.
+A zone may also relay Sigstore's TUF metadata, verbatim, at
+`_synchronicity-tuf.<apex>`; the daemon verifies that chain offline against
+a TUF root built into the binary and adopts the resulting log keys,
+persisting them in `<data-dir>/rekor-pins.json`. Nothing about it can fail a
+refresh — an absent, stale or invalid bundle simply leaves the current pins
+standing — and the versions only ever move forward, so a hostile relay can
+withhold an update but never walk one back. `--rekor-key` turns the whole
+mechanism off: a named key file is a static universe in both directions.
+
 Rotate a device key. Every step is an explicit command: a node never polls its
 own domain and never switches signing keys on its own.
 
@@ -182,10 +214,11 @@ about that shape.
 | `synch-core` | `OriginId`, `Hash`, records, signed heads, the postcard wire schemas |
 | `synch-mpt` | the Merkle-Patricia Trie: nodes, hashing, diff, proofs, cursors |
 | `synch-store` | the SQLite schema and the content-addressed blob store |
-| `synch-net` | the iroh endpoint, both ALPNs, reconciliation, the DNSSEC resolver |
+| `synch-net` | the iroh endpoint, both ALPNs, reconciliation, the DNSSEC resolver, and the zone-key transparency verifier |
 | `synch-engine` | the embeddable node: scanner, publisher, anti-entropy, fetcher, mirrors |
 | `synch-cli` | the `synch` binary: the daemon, the control socket, and the CLI client |
 | `synch-s3` | the `synch-s3` binary and the gateway library |
+| `synch-monitor` | the `synch-monitor` binary: walks the transparency log's tiles and classifies every entry that names a watched zone |
 
 All logic lives in the library crates, so any Rust application can embed a full
 node by depending on `synch-engine`.

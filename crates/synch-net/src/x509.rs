@@ -1,0 +1,689 @@
+//! Just enough X.509 to put a zone name inside a Merkle leaf.
+//!
+//! Rekor v2's `Verifier` is a protobuf oneof — a raw public key or an X.509
+//! certificate — and Rekor performs **no** certificate validation whatsoever
+//! (`pkg/verifier/certificate`: parse, take `cert.PublicKey`, stop; no chain
+//! building, no Fulcio root, no expiry, no CA policy). The whole `Signature`
+//! message, certificate DER included, is copied verbatim into the
+//! canonicalized body the leaf commits to. A self-signed certificate carrying
+//! the apex as a `dNSName` SAN therefore writes the zone name, in the clear,
+//! into the log's own Merkle leaf — which is the only way this design gets a
+//! *monitorable name* out of a log that has exactly one entry type and no
+//! room for a payload (docs/REKOR-ZONE-KEY.md §2).
+//!
+//! So the certificate here is a **key envelope, not a trust assertion**.
+//! Nothing validates its signature, its issuer or its validity window; it
+//! exists to carry three things — the SubjectPublicKeyInfo, the apex, and two
+//! custom extensions (see [`crate::zonecert`]) — through a field Rekor
+//! serializes verbatim.
+//!
+//! This module is deliberately a *narrow* DER reader and writer rather than a
+//! general X.509 stack: it extracts a SPKI, the `dNSName` SANs and an
+//! extension by OID, and it builds the one certificate shape the control
+//! plane emits. A general parser would be a much larger attack surface for
+//! bytes an attacker chooses, and every field this design turns on is one of
+//! those three.
+
+use std::fmt;
+
+use hickory_resolver::proto::rr::Name;
+
+/// Why a certificate could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("certificate: {0}")]
+pub struct X509Error(String);
+
+impl X509Error {
+    fn new(why: impl fmt::Display) -> X509Error {
+        X509Error(why.to_string())
+    }
+}
+
+impl From<&str> for X509Error {
+    fn from(why: &str) -> X509Error {
+        X509Error(why.to_string())
+    }
+}
+
+// ------------------------------------------------------------------- OIDs
+
+/// `id-ce-basicConstraints` (2.5.29.19).
+pub const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+/// `id-ce-keyUsage` (2.5.29.15).
+pub const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+/// `id-ce-subjectAltName` (2.5.29.17).
+pub const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
+/// `id-at-commonName` (2.5.4.3).
+pub const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+/// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2).
+pub const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+
+// ---------------------------------------------------------------- parsing
+
+/// One extension, as it sits in the certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extension {
+    /// The OID's DER *content* bytes — the value after tag and length, which
+    /// is how every OID constant in this file is written.
+    pub oid: Vec<u8>,
+    /// Whether a consumer that does not understand it must reject the
+    /// certificate. Nothing in this design does; recorded for completeness.
+    pub critical: bool,
+    /// The `extnValue` OCTET STRING's contents.
+    pub value: Vec<u8>,
+}
+
+/// The parts of a certificate this design turns on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Certificate {
+    /// The DER SubjectPublicKeyInfo, byte-exact: the key the log vouches for.
+    pub spki: Vec<u8>,
+    /// Every `dNSName` in the subjectAltName extension, in order.
+    pub dns_names: Vec<String>,
+    /// Every extension, in order.
+    pub extensions: Vec<Extension>,
+}
+
+impl Certificate {
+    /// Parses a DER `Certificate`.
+    ///
+    /// Only the fields below are read; everything else is skipped by
+    /// structure. In particular the signature is *not* checked — a
+    /// self-signature over a key envelope proves nothing the SPKI does not
+    /// already prove, and Rekor did not check it either.
+    pub fn parse(der: &[u8]) -> Result<Certificate, X509Error> {
+        let mut outer = Der::new(der).sequence("Certificate")?;
+        let mut tbs = outer.sequence("tbsCertificate")?;
+        // [0] EXPLICIT Version — optional, and always present in a v3
+        // certificate, which is the only kind that can carry extensions.
+        let _ = tbs.optional(0xa0);
+        tbs.any("serialNumber")?;
+        tbs.sequence("signature")?;
+        tbs.any("issuer")?;
+        tbs.any("validity")?;
+        tbs.any("subject")?;
+        let spki = tbs.raw_sequence("subjectPublicKeyInfo")?.to_vec();
+
+        // issuerUniqueID [1], subjectUniqueID [2], extensions [3] — all
+        // optional, and only the last matters here.
+        let _ = tbs.optional(0x81);
+        let _ = tbs.optional(0x82);
+        let mut extensions = Vec::new();
+        if let Some(bytes) = tbs.optional(0xa3) {
+            let mut list = Der::new(bytes).sequence("Extensions")?;
+            while !list.is_empty() {
+                let mut ext = list.sequence("Extension")?;
+                let oid = ext.tagged(0x06, "extnID")?.to_vec();
+                let critical = match ext.optional(0x01) {
+                    // DER says FALSE is absent, but a BOOLEAN that says so
+                    // explicitly is still readable, and refusing it here
+                    // would refuse a certificate over a spelling.
+                    Some(value) => value.first().is_some_and(|b| *b != 0),
+                    None => false,
+                };
+                let value = ext.tagged(0x04, "extnValue")?.to_vec();
+                extensions.push(Extension {
+                    oid,
+                    critical,
+                    value,
+                });
+            }
+        }
+
+        // Exactly one subjectAltName, or none. RFC 5280 says an extension
+        // appears at most once, and taking the *first* of two would let a
+        // certificate mean one thing to this parser and another to any reader
+        // that took the last — which, for the extension that carries the zone
+        // name, is the whole game.
+        let mut sans = extensions.iter().filter(|e| e.oid == OID_SUBJECT_ALT_NAME);
+        let dns_names = match (sans.next(), sans.next()) {
+            (Some(san), None) => parse_san(&san.value)?,
+            (None, _) => Vec::new(),
+            (Some(_), Some(_)) => {
+                return Err(X509Error::new(
+                    "the certificate carries more than one subjectAltName extension",
+                ))
+            }
+        };
+        Ok(Certificate {
+            spki,
+            dns_names,
+            extensions,
+        })
+    }
+
+    /// The value of the extension with this OID, if the certificate has it.
+    pub fn extension(&self, oid: &[u8]) -> Option<&[u8]> {
+        self.extensions
+            .iter()
+            .find(|e| e.oid == oid)
+            .map(|e| e.value.as_slice())
+    }
+
+    /// The single `dNSName` a zone-key certificate must carry, **parsed**.
+    ///
+    /// Exactly one: a certificate with two names is a certificate that means
+    /// two things to a monitor indexing by name, and this design has no use
+    /// for that ambiguity.
+    ///
+    /// Parsed, and returned parsed, because a `dNSName` that is not a DNS
+    /// name is not a SAN this design can act on — and because handing callers
+    /// a raw string is how the client and the monitor once ended up disagreeing
+    /// about whether `victim.example..` named the same zone as
+    /// `victim.example.` (see [`crate::chain::authorize`]). A name that does
+    /// not parse is refused here, once, for everybody.
+    pub fn single_dns_name(&self) -> Result<Name, X509Error> {
+        let text = match self.dns_names.as_slice() {
+            [one] => one,
+            names => {
+                return Err(X509Error::new(format!(
+                    "a zone-key certificate carries exactly one dNSName SAN, not {}",
+                    names.len()
+                )))
+            }
+        };
+        let mut name = Name::from_utf8(text)
+            .map_err(|e| X509Error::new(format!("the dNSName SAN {text:?} is not a name: {e}")))?;
+        name.set_fqdn(true);
+        if name.is_root() {
+            // An empty SAN parses as the DNS root, which is a name but never
+            // a zone this design mints a key for. Refusing it here keeps `""`
+            // from becoming a value that compares equal to something.
+            return Err(X509Error::new(
+                "the dNSName SAN is the DNS root, which is not a zone this design logs",
+            ));
+        }
+        Ok(name.to_lowercase())
+    }
+}
+
+/// The `dNSName` entries of a `GeneralNames`.
+///
+/// Other name forms (rfc822, IP, URI, …) are skipped rather than refused:
+/// they cannot be mistaken for a zone name, and refusing them would be a
+/// parse rule with no security content.
+fn parse_san(value: &[u8]) -> Result<Vec<String>, X509Error> {
+    let mut names = Vec::new();
+    let mut list = Der::new(value).sequence("GeneralNames")?;
+    while !list.is_empty() {
+        let (tag, body) = list.next("GeneralName")?;
+        if tag == 0x82 {
+            names.push(
+                std::str::from_utf8(body)
+                    .map_err(|_| X509Error::new("a dNSName is not UTF-8"))?
+                    .to_string(),
+            );
+        }
+    }
+    Ok(names)
+}
+
+// ---------------------------------------------------------------- building
+//
+// **Everything below this line is the cross-validation encoder, not the
+// production one.** Certificates that reach the public log are built by
+// `control-plane/src/cp_crypto_ffi.erl` with OTP's `public_key` — the ASN.1
+// module is the reference encoder, and a certificate an external tool cannot
+// read would defeat the point of putting it in a public log. This half is
+// reachable only from `crate::sim` and the test suites.
+//
+// It earns its place by being a *second, independent* encoder: the shared
+// fixtures under `control-plane/test/fixtures/rekor/crossval` are written by
+// the Gleam side and read by the parser above, and this builder lets the
+// tests mint certificate shapes the control plane will not produce on demand
+// — a SAN that is not a name, two SAN extensions, a chain for the wrong zone.
+// Two implementations of one DER format drift silently unless something
+// outside both of them holds the bytes still; this is one of the two.
+//
+// It is not feature-gated because `sim` is not either, and a `cfg` that hid
+// it would also hide it from the crossval. What it needs instead is this
+// note, so a reader does not assume `x509::SelfSigned` ships.
+
+/// The one certificate shape this design mints.
+///
+/// Everything here is either load-bearing (the SPKI, the SAN, the two custom
+/// extensions) or ceremony X.509 requires. The validity window is ceremony:
+/// nothing on any verification path reads it, because nothing treats this
+/// certificate as a trust assertion.
+#[derive(Debug, Clone)]
+pub struct SelfSigned<'a> {
+    /// The subject and issuer common name — one string, because a
+    /// self-signed certificate's issuer *is* its subject.
+    pub common_name: &'a str,
+    /// The zone apex, written as the single `dNSName` SAN. This is the whole
+    /// reason the certificate exists.
+    pub dns_name: &'a str,
+    /// The DER SubjectPublicKeyInfo of the zone key.
+    pub spki: &'a [u8],
+    /// The serial number's big-endian magnitude bytes (positive; a leading
+    /// zero is inserted if the high bit is set).
+    pub serial: &'a [u8],
+    /// `notBefore` and `notAfter` as `YYMMDDHHMMSSZ` / `YYYYMMDDHHMMSSZ`,
+    /// already chosen by the caller (see [`x509_time`], which picks the
+    /// encoding RFC 5280 requires for the year in question).
+    pub not_before: Time,
+    /// See `not_before`.
+    pub not_after: Time,
+    /// The custom extensions, `(OID content bytes, extnValue contents)`,
+    /// emitted non-critical in the order given.
+    pub extensions: &'a [(Vec<u8>, Vec<u8>)],
+}
+
+/// An X.509 time, in the encoding its year forces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Time {
+    /// `UTCTime`, for years 1950–2049.
+    Utc(String),
+    /// `GeneralizedTime`, for everything else.
+    Generalized(String),
+}
+
+impl Time {
+    fn der(&self) -> Vec<u8> {
+        match self {
+            Time::Utc(text) => tlv(0x17, text.as_bytes()),
+            Time::Generalized(text) => tlv(0x18, text.as_bytes()),
+        }
+    }
+}
+
+/// The X.509 time for a unix timestamp, in whichever encoding RFC 5280
+/// mandates for its year.
+pub fn x509_time(unix: i64) -> Time {
+    let (year, month, day, hour, minute, second) = civil(unix);
+    match (1950..=2049).contains(&year) {
+        true => Time::Utc(format!(
+            "{:02}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z",
+            year % 100
+        )),
+        false => Time::Generalized(format!(
+            "{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z"
+        )),
+    }
+}
+
+/// Howard Hinnant's `civil_from_days`, plus the time of day.
+fn civil(unix: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let days = unix.div_euclid(86_400) + 719_468;
+    let rest = unix.rem_euclid(86_400);
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (
+        year + i64::from(month <= 2),
+        month,
+        day,
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60,
+    )
+}
+
+impl SelfSigned<'_> {
+    /// The `tbsCertificate` DER — the bytes the self-signature covers.
+    pub fn tbs(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        // [0] EXPLICIT version = 2, i.e. v3: the version that has extensions.
+        body.extend_from_slice(&tlv(0xa0, &tlv(0x02, &[0x02])));
+        body.extend_from_slice(&integer(self.serial));
+        body.extend_from_slice(&algorithm_identifier());
+        let name = rdn_common_name(self.common_name);
+        body.extend_from_slice(&name);
+        let mut validity = self.not_before.der();
+        validity.extend_from_slice(&self.not_after.der());
+        body.extend_from_slice(&tlv(0x30, &validity));
+        body.extend_from_slice(&name);
+        body.extend_from_slice(self.spki);
+        body.extend_from_slice(&tlv(0xa3, &tlv(0x30, &self.extension_der())));
+        tlv(0x30, &body)
+    }
+
+    fn extension_der(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        // basicConstraints CA:FALSE, critical — an empty SEQUENCE is
+        // `cA` defaulted to FALSE, which is the DER spelling of "not a CA".
+        out.extend_from_slice(&extension(OID_BASIC_CONSTRAINTS, true, &tlv(0x30, &[])));
+        // keyUsage digitalSignature, critical: one bit, seven unused.
+        out.extend_from_slice(&extension(OID_KEY_USAGE, true, &tlv(0x03, &[0x07, 0x80])));
+        // The apex. Non-critical, because criticality is a rule for
+        // validators and nothing validates this certificate.
+        let san = tlv(0x30, &tlv(0x82, self.dns_name.as_bytes()));
+        out.extend_from_slice(&extension(OID_SUBJECT_ALT_NAME, false, &san));
+        for (oid, value) in self.extensions {
+            out.extend_from_slice(&extension(oid, false, value));
+        }
+        out
+    }
+
+    /// Builds the whole certificate, asking `sign` for an ECDSA-P256/SHA-256
+    /// DER signature over the `tbsCertificate`.
+    ///
+    /// The signature is ceremony — no verifier in this system checks it — but
+    /// a certificate whose self-signature does not verify is a certificate
+    /// some *other* tool will reject while looking at our log entry, and
+    /// making the log's contents inspectable is the entire point.
+    pub fn build(&self, sign: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+        let tbs = self.tbs();
+        let signature = sign(&tbs);
+        let mut body = tbs;
+        body.extend_from_slice(&algorithm_identifier());
+        // A BIT STRING with no unused bits, wrapping the DER signature.
+        let mut bits = vec![0x00];
+        bits.extend_from_slice(&signature);
+        body.extend_from_slice(&tlv(0x03, &bits));
+        tlv(0x30, &body)
+    }
+}
+
+/// `AlgorithmIdentifier { ecdsa-with-SHA256 }` — no parameters, as RFC 5758
+/// requires for the ECDSA-with-SHA2 family.
+fn algorithm_identifier() -> Vec<u8> {
+    tlv(0x30, &tlv(0x06, OID_ECDSA_SHA256))
+}
+
+/// `Name ::= RDNSequence` holding one `commonName`.
+fn rdn_common_name(cn: &str) -> Vec<u8> {
+    let attribute = tlv(
+        0x30,
+        &[tlv(0x06, OID_COMMON_NAME), tlv(0x0c, cn.as_bytes())].concat(),
+    );
+    tlv(0x30, &tlv(0x31, &attribute))
+}
+
+/// One `Extension`, with `critical` omitted when FALSE as DER requires.
+fn extension(oid: &[u8], critical: bool, value: &[u8]) -> Vec<u8> {
+    let mut body = tlv(0x06, oid);
+    if critical {
+        body.extend_from_slice(&tlv(0x01, &[0xff]));
+    }
+    body.extend_from_slice(&tlv(0x04, value));
+    tlv(0x30, &body)
+}
+
+/// A positive `INTEGER` from big-endian magnitude bytes.
+pub fn integer(magnitude: &[u8]) -> Vec<u8> {
+    let trimmed = match magnitude.iter().position(|b| *b != 0) {
+        Some(at) => &magnitude[at..],
+        None => &[0][..],
+    };
+    let mut body = Vec::with_capacity(trimmed.len() + 1);
+    if trimmed[0] & 0x80 != 0 {
+        body.push(0x00);
+    }
+    body.extend_from_slice(trimmed);
+    tlv(0x02, &body)
+}
+
+/// A DER tag-length-value.
+pub fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 6);
+    out.push(tag);
+    let len = body.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let first = bytes
+            .iter()
+            .position(|b| *b != 0)
+            .unwrap_or(bytes.len() - 1);
+        out.push(0x80 | (bytes.len() - first) as u8);
+        out.extend_from_slice(&bytes[first..]);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+// ------------------------------------------------------------ DER reader
+
+/// A bounds-checked DER reader over one definite-length sequence's contents.
+///
+/// Definite lengths only, no indefinite form, no re-entrant recursion beyond
+/// what the callers above spell out by hand — the shapes this reads are all
+/// known in advance.
+#[derive(Debug)]
+pub struct Der<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Der<'a> {
+    /// A reader over raw DER bytes.
+    pub fn new(bytes: &'a [u8]) -> Der<'a> {
+        Der { bytes, at: 0 }
+    }
+
+    /// Whether every element has been read.
+    pub fn is_empty(&self) -> bool {
+        self.at >= self.bytes.len()
+    }
+
+    /// The next element, as `(tag, contents)`.
+    pub fn next(&mut self, what: &str) -> Result<(u8, &'a [u8]), X509Error> {
+        let bad = |why: &str| X509Error::new(format!("{what}: {why}"));
+        let tag = *self.bytes.get(self.at).ok_or_else(|| bad("truncated"))?;
+        let first = *self
+            .bytes
+            .get(self.at + 1)
+            .ok_or_else(|| bad("truncated length"))?;
+        let (len, header) = match first {
+            n if n < 0x80 => (usize::from(n), 2),
+            0x80 => return Err(bad("indefinite lengths are not DER")),
+            n => {
+                let count = usize::from(n & 0x7f);
+                if count > 4 {
+                    return Err(bad("length is absurdly long"));
+                }
+                let start = self.at + 2;
+                let slice = self
+                    .bytes
+                    .get(start..start + count)
+                    .ok_or_else(|| bad("truncated length"))?;
+                if slice[0] == 0 {
+                    return Err(bad("a non-minimal length is not DER"));
+                }
+                (
+                    slice
+                        .iter()
+                        .fold(0usize, |acc, b| (acc << 8) | usize::from(*b)),
+                    2 + count,
+                )
+            }
+        };
+        let start = self.at + header;
+        let body = self
+            .bytes
+            .get(start..start + len)
+            .ok_or_else(|| bad("element runs past the end"))?;
+        self.at = start + len;
+        Ok((tag, body))
+    }
+
+    /// The next element, which must carry `tag`.
+    pub fn tagged(&mut self, tag: u8, what: &str) -> Result<&'a [u8], X509Error> {
+        let at = self.at;
+        let (actual, body) = self.next(what)?;
+        if actual != tag {
+            self.at = at;
+            return Err(X509Error::new(format!(
+                "{what}: expected tag 0x{tag:02x}, found 0x{actual:02x}"
+            )));
+        }
+        Ok(body)
+    }
+
+    /// The next element if it carries `tag`, leaving the reader untouched
+    /// otherwise — how the optional members of a certificate are read.
+    pub fn optional(&mut self, tag: u8) -> Option<&'a [u8]> {
+        let at = self.at;
+        match self.next("optional") {
+            Ok((actual, body)) if actual == tag => Some(body),
+            _ => {
+                self.at = at;
+                None
+            }
+        }
+    }
+
+    /// A reader over the next element's contents, which must be a SEQUENCE.
+    pub fn sequence(&mut self, what: &str) -> Result<Der<'a>, X509Error> {
+        Ok(Der::new(self.tagged(0x30, what)?))
+    }
+
+    /// The next SEQUENCE including its own header — for members carried
+    /// verbatim, like the SubjectPublicKeyInfo the key binding compares.
+    pub fn raw_sequence(&mut self, what: &str) -> Result<&'a [u8], X509Error> {
+        let start = self.at;
+        self.tagged(0x30, what)?;
+        Ok(&self.bytes[start..self.at])
+    }
+
+    /// Skips one element of any tag.
+    pub fn any(&mut self, what: &str) -> Result<&'a [u8], X509Error> {
+        Ok(self.next(what)?.1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spki() -> Vec<u8> {
+        let mut der = vec![
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+        ];
+        der.extend_from_slice(&[0x11; 64]);
+        der
+    }
+
+    #[test]
+    fn a_built_certificate_parses_back_to_what_went_in() {
+        let extra = vec![(vec![0x41, 0x01], b"payload".to_vec())];
+        let spec = SelfSigned {
+            common_name: "synchronicity zone key",
+            dns_name: "sync.example",
+            spki: &spki(),
+            serial: &[0x01, 0x02, 0x03],
+            not_before: x509_time(1_760_000_000),
+            not_after: x509_time(4_900_000_000),
+            extensions: &extra,
+        };
+        // A stand-in signature: nothing verifies it, and the parser must not
+        // care what it is (Rekor does not either).
+        let der = spec.build(|_| vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]);
+        let cert = Certificate::parse(&der).expect("the certificate must parse");
+        assert_eq!(cert.spki, spki());
+        assert_eq!(cert.dns_names, vec!["sync.example".to_string()]);
+        assert_eq!(cert.single_dns_name().unwrap().to_string(), "sync.example.");
+        assert_eq!(cert.extension(&[0x41, 0x01]), Some(&b"payload"[..]));
+        assert_eq!(cert.extension(&[0x41, 0x02]), None);
+        // The standard three are present, and the two that must be critical
+        // are — a monitor reading this certificate in another toolchain must
+        // see a well-formed end-entity certificate, not a curiosity.
+        let by_oid = |oid: &[u8]| cert.extensions.iter().find(|e| e.oid == oid).cloned();
+        assert!(by_oid(OID_BASIC_CONSTRAINTS).unwrap().critical);
+        assert!(by_oid(OID_KEY_USAGE).unwrap().critical);
+        assert!(!by_oid(OID_SUBJECT_ALT_NAME).unwrap().critical);
+        // notBefore is a UTCTime in 2025 and notAfter a GeneralizedTime in
+        // 2125 — the boundary RFC 5280 draws at 2050.
+        assert_eq!(spec.not_before, Time::Utc("251009085320Z".into()));
+        assert_eq!(spec.not_after, Time::Generalized("21250410230640Z".into()));
+    }
+
+    #[test]
+    fn two_dns_names_are_refused_and_none_is_too() {
+        let mut cert = Certificate {
+            spki: spki(),
+            dns_names: vec!["a.example".into(), "b.example".into()],
+            extensions: Vec::new(),
+        };
+        assert!(cert.single_dns_name().is_err());
+        cert.dns_names.clear();
+        assert!(cert.single_dns_name().is_err());
+    }
+
+    #[test]
+    fn truncated_and_malformed_der_is_refused_rather_than_panicking() {
+        let spec = SelfSigned {
+            common_name: "cn",
+            dns_name: "sync.example",
+            spki: &spki(),
+            serial: &[0x01],
+            not_before: x509_time(1_760_000_000),
+            not_after: x509_time(1_760_000_001),
+            extensions: &[],
+        };
+        let der = spec.build(|_| vec![0x30, 0x03, 0x02, 0x01, 0x01]);
+        for cut in [0, 1, 2, 5, 30, der.len() - 1] {
+            assert!(Certificate::parse(&der[..cut]).is_err(), "cut {cut}");
+        }
+        assert!(Certificate::parse(&[0x31, 0x00]).is_err());
+        assert!(Certificate::parse(&[0x30, 0x80, 0x00, 0x00]).is_err());
+    }
+
+    /// A SAN that is not a DNS name is refused here, not normalized away.
+    ///
+    /// `"x.."` used to reach callers as a string and compare equal to `"x."`
+    /// under a trailing-dot trim, which is how a client-accepted entry ended
+    /// up in a monitor's silent bin (see `crate::chain::authorize`). Parsing
+    /// at the boundary means no caller ever sees the ambiguous form.
+    #[test]
+    fn a_san_that_is_not_a_name_is_refused() {
+        let with = |san: &str| Certificate {
+            spki: spki(),
+            dns_names: vec![san.to_string()],
+            extensions: Vec::new(),
+        };
+        for bad in ["sync.example..", "sync.example...", "sync..example", ""] {
+            assert!(
+                with(bad).single_dns_name().is_err(),
+                "{bad:?} must not be a usable SAN"
+            );
+        }
+        // Spellings that *are* one name normalize to one value.
+        let canonical = with("sync.example.").single_dns_name().unwrap();
+        for same in ["sync.example", "SYNC.EXAMPLE.", "Sync.Example"] {
+            assert_eq!(with(same).single_dns_name().unwrap(), canonical, "{same}");
+        }
+        // Not a suffix match: a certificate for the parent is not a
+        // certificate for the child, however tempting the substring is.
+        assert_ne!(with("example.").single_dns_name().unwrap(), canonical);
+    }
+
+    #[test]
+    fn long_form_lengths_round_trip() {
+        // A SAN of 300 bytes forces the multi-byte length path in both the
+        // writer and the reader, which is where hand-rolled DER usually dies.
+        let long = "a".repeat(300);
+        let extra = vec![(vec![0x41, 0x09], vec![0x7f; 500])];
+        let spec = SelfSigned {
+            common_name: "cn",
+            dns_name: &long,
+            spki: &spki(),
+            serial: &[0xff, 0xff],
+            not_before: x509_time(0),
+            not_after: x509_time(1),
+            extensions: &extra,
+        };
+        let der = spec.build(|_| vec![0x30, 0x03, 0x02, 0x01, 0x01]);
+        let cert = Certificate::parse(&der).unwrap();
+        assert_eq!(cert.dns_names, vec![long]);
+        assert_eq!(cert.extension(&[0x41, 0x09]).unwrap().len(), 500);
+        // A serial whose top bit is set gains a leading zero, and one that
+        // is all zeros collapses to a single zero byte.
+        assert_eq!(integer(&[0xff, 0xff]), vec![0x02, 0x03, 0x00, 0xff, 0xff]);
+        assert_eq!(integer(&[0x00, 0x00]), vec![0x02, 0x01, 0x00]);
+        assert_eq!(integer(&[0x00, 0x7f]), vec![0x02, 0x01, 0x7f]);
+    }
+}

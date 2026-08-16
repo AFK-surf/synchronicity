@@ -62,8 +62,81 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2]
+  [v1, v2, v3]
 }
+
+/// V3: zone-key transparency and the relayed TUF material
+/// (docs/REKOR-ZONE-KEY.md §5.2, §10.3).
+///
+/// `rekor_records` holds one row per zone-key lifecycle event: the entry
+/// exactly as the log serialized it, beside the checkpoint and audit path
+/// that prove it is in the tree. What is stored is what the log returned,
+/// not a decomposition of it — so the certificate naming the zone stays
+/// inside `canonicalized_body`, where Rekor put it.
+///
+/// Identity is `(spki_sha256, action)`: the SHA-256 of the key's DER
+/// SubjectPublicKeyInfo, which is what names a key everywhere else in this
+/// design — a monitor's record of the keys it has reported for a zone is
+/// keyed by the same digest. An RFC 4034 key
+/// tag is only a 16-bit checksum over the DNSKEY rdata, so two distinct keys
+/// collide with odds near 1/65536 per rollover; keying rows on it would let
+/// one key's row silently replace another's, taking its proof out of the
+/// served zone with no error anywhere. `key_tag` remains an indexed column
+/// because it is what a client selects on — it reads the tag from the RRSIG
+/// it just validated — but selection is not identity: a lookup may return two
+/// rows for one tag, and the client tries each until one verifies.
+///
+/// `chainless` records whether an entry carries a DNSSEC chain, and the CHECK
+/// confines that to `retire`: a zone being retired may have no DS left in its
+/// parent to build a chain from, while anything a client treats as
+/// authorization must carry one. Recording it saves re-parsing DER to tell an
+/// operator what monitors will make of a key.
+///
+/// `tuf_material` is a single row, because there is one Sigstore repository
+/// and one current view of it — the files verbatim, their versions, and the
+/// timestamp expiry the hourly job watches. This service is a relay, not the
+/// verifier: these columns exist so it can refuse regressions and know when to
+/// refetch, and the cryptographic gate is the client's. `root_json` holds the
+/// root chain as one blob of u32-length-prefixed files, ascending — the same
+/// framing the bundle record uses, so serving is a copy rather than a
+/// re-encode.
+const v3 = "
+CREATE TABLE rekor_records (
+  spki_sha256        BLOB    NOT NULL CHECK (length(spki_sha256) = 32),
+  key_tag            INTEGER NOT NULL,
+  apex               TEXT    NOT NULL,
+  action             TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
+  statement          BLOB    NOT NULL,
+  canonicalized_body BLOB    NOT NULL,
+  log_id             BLOB    NOT NULL CHECK (length(log_id) = 32),
+  log_index          INTEGER NOT NULL,
+  checkpoint         BLOB    NOT NULL,
+  inclusion_path     BLOB    NOT NULL,
+  chainless          INTEGER NOT NULL DEFAULT 0
+                     CHECK (chainless = 0 OR action = 'retire'),
+  integrated_at      INTEGER NOT NULL,
+  verified_at        INTEGER NOT NULL,
+  PRIMARY KEY (spki_sha256, action)
+);
+CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
+CREATE INDEX rekor_records_by_key_tag ON rekor_records (key_tag);
+CREATE TABLE tuf_material (
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  source            TEXT    NOT NULL,
+  root_json         BLOB    NOT NULL,
+  root_count        INTEGER NOT NULL CHECK (root_count BETWEEN 1 AND 255),
+  root_version      INTEGER NOT NULL,
+  timestamp_json    BLOB    NOT NULL,
+  timestamp_version INTEGER NOT NULL,
+  timestamp_expires INTEGER NOT NULL,
+  snapshot_json     BLOB    NOT NULL,
+  snapshot_version  INTEGER NOT NULL,
+  targets_json      BLOB    NOT NULL,
+  targets_version   INTEGER NOT NULL,
+  trusted_root      BLOB    NOT NULL,
+  fetched_at        INTEGER NOT NULL
+);
+"
 
 /// V2: DNS answers query SQLite directly (no in-memory snapshot), so
 /// canonical DNS order must be computable in SQL — `sort_key` is the

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// synchronicity — an omnipresent peer-to-peer file store.
 ///
@@ -36,6 +36,21 @@ pub struct Cli {
     /// deployments and testing against a self-signed root.
     #[arg(long, global = true, env = "SYNCH_DNSSEC_ANCHOR", value_name = "FILE")]
     pub dnssec_anchor: Option<PathBuf>,
+
+    /// Whether a membership answer additionally requires the zone key that
+    /// signed it to carry a verified transparency-log record. The default
+    /// is require — the Sigstore production log keys are built in — and
+    /// off is a choice to state, not inherit, --dnssec-anchor or not.
+    #[arg(long, global = true, env = "SYNCH_REKOR", value_name = "MODE")]
+    pub rekor: Option<RekorMode>,
+
+    /// Replace the built-in transparency-log key with this file of log
+    /// verification key(s) — PEM PUBLIC KEY blocks, or one base64
+    /// SubjectPublicKeyInfo per line — for a self-hosted log. As with
+    /// --dnssec-anchor, an override is a different universe: nothing signed
+    /// by the built-in log verifies any more.
+    #[arg(long, global = true, env = "SYNCH_REKOR_KEY", value_name = "FILE")]
+    pub rekor_key: Option<PathBuf>,
 
     /// Dial and listen through this iroh relay server instead of n0's public
     /// relays; repeat for several. A relay forwards encrypted traffic only —
@@ -109,6 +124,24 @@ pub struct Cli {
     /// The command to run.
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// The `--rekor` setting: whether zone-key transparency is enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RekorMode {
+    /// Discard a validated answer whose zone key has no verified log record.
+    Require,
+    /// Do not consult the log at all.
+    Off,
+}
+
+impl From<RekorMode> for synch_net::RekorPolicy {
+    fn from(mode: RekorMode) -> Self {
+        match mode {
+            RekorMode::Require => synch_net::RekorPolicy::Require,
+            RekorMode::Off => synch_net::RekorPolicy::Off,
+        }
+    }
 }
 
 /// The top-level commands.

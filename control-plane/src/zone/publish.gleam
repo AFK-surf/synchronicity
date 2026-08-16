@@ -12,6 +12,7 @@ import gleam/bit_array
 import gleam/int
 import gleam/list
 import gleam/result
+import rekor/gate
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import zone/build.{type Rrset}
 import zone/model
@@ -22,6 +23,11 @@ pub type PublishError {
   Build(build.BuildError)
   /// The key file's public half does not match zone_meta — wrong key file.
   KeyMismatch
+  /// `CP_REKOR_REQUIRE` is set and the active zone key has no verified
+  /// transparency-log record (docs/REKOR-ZONE-KEY.md §5.3). Refusing to
+  /// publish is the same stance as the §3.2 build-time checks: never emit
+  /// a zone clients are going to reject.
+  NoRekorRecord(key_tag: Int)
 }
 
 /// A signed RRset ready to store and serve.
@@ -96,6 +102,15 @@ pub fn publish_in_tx(
     True -> Ok(Nil)
     False -> Error(KeyMismatch)
   })
+  use Nil <- result.try(
+    gate.check(conn, meta.key_tag)
+    |> result.map_error(fn(e) {
+      case e {
+        gate.NoRecord(key_tag) -> NoRekorRecord(key_tag)
+        gate.Db(error) -> Db(error)
+      }
+    }),
+  )
   use rrsets <- result.try(build.build(input) |> result.map_error(Build))
   let inception = now - meta.sig_inception_skew
   let expiration = now + meta.sig_validity

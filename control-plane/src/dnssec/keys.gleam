@@ -67,10 +67,14 @@ fn ds_digest(apex: Name, dnskey_rdata: BitArray) -> BitArray {
 /// The DS record for the parent zone, presentation form. Takes the public
 /// key alone — replicas hold no private material and still serve this.
 pub fn ds_line(apex: Name, public: BitArray) -> String {
+  name.to_string(apex) <> " IN DS " <> ds_fields(apex, public)
+}
+
+/// The DS rdata fields alone — `<tag> <algorithm> 2 <digest>`. The zone-key
+/// log entry names the key this way too, so the two cannot disagree.
+pub fn ds_fields(apex: Name, public: BitArray) -> String {
   let rd = rdata.dnskey(flags, algorithm, public)
-  name.to_string(apex)
-  <> " IN DS "
-  <> int.to_string(key_tag(rd))
+  int.to_string(key_tag(rd))
   <> " "
   <> int.to_string(algorithm)
   <> " 2 "

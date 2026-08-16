@@ -20,6 +20,20 @@ pub const ttl_data = 300
 /// Infrastructure records: NS, DNSKEY, glue.
 pub const ttl_infra = 3600
 
+/// Zone-key proofs: a day, clamped to the client's own 24 h ceiling. The
+/// zone key changes rarely, and the client caches this separately from the
+/// membership answer — so the steady-state refresh stays one TXT query.
+pub const ttl_rekor = 86_400
+
+/// The label the zone-key proofs live under, one below the apex.
+pub const rekor_label = "_synchronicity-rekor"
+
+/// The label the relayed TUF bundle lives under, one below the apex
+/// (docs/REKOR-ZONE-KEY.md §10.1). Same 24 h TTL as the proofs, and the
+/// same reasoning: the client caches it separately from the membership
+/// answer, so the steady-state refresh stays one TXT query.
+pub const tuf_label = "_synchronicity-tuf"
+
 pub type Rrset {
   Rrset(owner: Name, rtype: Int, ttl: Int, rdatas: List(BitArray))
 }
@@ -84,8 +98,49 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
       )
     })
 
-  let data = list.flatten([[soa, ns, dnskey], glue, txt])
+  let data =
+    list.flatten([
+      [soa, ns, dnskey],
+      glue,
+      txt,
+      rekor_rrsets(input, apex),
+      tuf_rrsets(input, apex),
+    ])
   Ok(list.append(data, nsec_chain(data)))
+}
+
+/// The zone-key transparency records (docs/REKOR-ZONE-KEY.md §3): one TXT
+/// record per proof, at the apex, under `_synchronicity-rekor`. They are
+/// signed like every other RRset and re-signed on every publish; a zone
+/// with no proofs simply has no such owner name, which is what phase 0
+/// looks like from a client.
+fn rekor_rrsets(input: ZoneInput, apex: Name) -> List(Rrset) {
+  case input.rekor_proofs {
+    [] -> []
+    proofs -> [
+      Rrset(
+        [rekor_label, ..apex],
+        wire.type_txt,
+        ttl_rekor,
+        list.map(proofs, rdata.txt),
+      ),
+    ]
+  }
+}
+
+/// The relayed TUF bundle (docs/REKOR-ZONE-KEY.md §10.1): one TXT record
+/// at the apex, under `_synchronicity-tuf`, signed like every other RRset.
+///
+/// No material means no owner name — not an error. A zone that relays
+/// nothing is a zone whose clients keep the pins they have, which is the
+/// behavior this design started from and degrades back to.
+fn tuf_rrsets(input: ZoneInput, apex: Name) -> List(Rrset) {
+  case input.tuf_bundle {
+    "" -> []
+    text -> [
+      Rrset([tuf_label, ..apex], wire.type_txt, ttl_rekor, [rdata.txt(text)]),
+    ]
+  }
 }
 
 /// The canonical owner order and the NSEC records it induces — exposed for

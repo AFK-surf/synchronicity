@@ -15,6 +15,32 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
 
 - **Organizations** have **users** (owner / admin / member roles, via
   invites) and **devices**.
+- The zone key can be put on the public Sigstore Rekor v2 transparency log
+  (`controlplane rekor-publish`), with the proof served inside the zone at
+  `_synchronicity-rekor.<apex>` so clients verify it offline — a
+  substituted DS then has to be a *public* substitution or fail
+  validation. The entry's verifier is a **self-signed certificate naming
+  the apex in a `dNSName` SAN**: Rekor validates certificates not at all
+  and copies the DER verbatim into the Merkle leaf, so the zone name lands
+  where anyone reading the log can index it. Inside it rides one custom
+  extension — the DNSSEC chain from the apex's DS up to the root — which is
+  what lets a monitor confirm offline that the key really is authorized for
+  the zone the entry names. `rekor-publish`
+  collects the chain over DoH, mints the certificate, POSTs a
+  `hashedrekord` v0.0.2 `CreateEntryRequest` to `CP_REKOR_URL`, then
+  verifies the returned entry locally (canonicalized body, inclusion,
+  checkpoint, possession, the certificate's key and name bindings) before
+  storing it. **Run it after the DS is live in the parent** — there is no
+  chain to collect before then. A self-hosted, Rekor-v2-compatible log
+  works via `CP_REKOR_KEY`.
+  See [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md) §2, §3, §5.
+- The zone also **relays Sigstore's TUF metadata** verbatim at
+  `_synchronicity-tuf.<apex>` (`controlplane tuf-refresh`, and the hourly
+  job when the stored timestamp nears expiry), so clients' log-key pins
+  follow Sigstore's rotations without an upgrade. This service is a relay,
+  not the verifier: it checks structure, versions and expiries, and the
+  cryptographic gate is the client's, against a TUF root built into it.
+  Relaying nothing costs nothing — clients keep the pins they have.
 - Each org has **networks**; a network is one synchronicity cluster and
   owns one membership name: `_synchronicity.<network>.<org>.<base>`.
 - A **device** is one `id=` label plus its keys. Key rotation follows
@@ -75,7 +101,7 @@ listen address.
 | Variable | Role | Meaning |
 |---|---|---|
 | `CP_ROLE` | both | Required. `primary` or `replica`. |
-| `CP_BASE_DOMAIN` | both | Required. Zone apex, no trailing dot (`sync.example.dev`). |
+| `CP_BASE_DOMAIN` | both | Required. Zone apex, no trailing dot (`sync.example`). |
 | `CP_DB_PATH` | both | Required. SQLite file, absolute path, in its own directory (the sandbox grants that directory — keep the key out of it). |
 | `CP_KEY_FILE` | primary | Required on the primary (zone CSK). Must live outside the database's directory. **Must be unset on replicas.** |
 | `CP_HTTP_LISTEN` | both | HTTP / DoH bind as `address:port`. Default `0.0.0.0:8080`. |
@@ -92,6 +118,11 @@ listen address.
 | `CP_GOOGLE_CLIENT_SECRET` | primary | Google OAuth client secret. |
 | `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in. |
 | `CP_GITHUB_CLIENT_SECRET` | primary | GitHub OAuth client secret. |
+| `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Default `https://log2025-1.rekor.sigstore.dev`. |
+| `CP_REKOR_KEY` | primary | File pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev (Ed25519) snapshot. Set it for a self-hosted log. |
+| `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
+| `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
+| `CP_TUF_URL` | primary | Sigstore TUF repository this zone relays, so clients' log pins follow it. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched by `controlplane tuf-refresh` and by the hourly job within three days of the stored timestamp's expiry. |
 
 Day-2 operations (replicas, key ceremony, backups) live in
 `ops/RUNBOOK.md`.

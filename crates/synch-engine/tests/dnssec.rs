@@ -10,7 +10,7 @@
 use iroh_base::SecretKey;
 use synch_core::OriginId;
 use synch_engine::{Node, NodeConfig};
-use synch_net::{sim::SimZone, DnssecResolver, ResolverOptions};
+use synch_net::{sim::SimZone, DnssecResolver, RekorPolicy, ResolverOptions};
 
 #[tokio::test]
 async fn validated_records_become_bindings_and_outages_keep_them() {
@@ -34,6 +34,11 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
+        // DNSSEC-only coverage: the zone-key transparency path has its own
+        // suite, and this zone logs nothing.
+        rekor: Some(RekorPolicy::Off),
+        rekor_key: None,
+        rekor_state: None,
     })
     .unwrap();
 
