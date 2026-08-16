@@ -48,9 +48,12 @@ pub const OID_DNSSEC_CHAIN: &[u8] = &[0x69, 0x85, 0xe5, 0xe9, 0xb2, 0x07];
 /// because a Merkle leaf has no message to compress against. The records a
 /// link carries are the ones *owned* by `zone`:
 ///
-/// - the apex link holds the apex's `DS` RRset and its `RRSIG` (signed by the
-///   parent) — and no DNSKEY, because the monitor derives the DNSKEY from the
-///   certificate's own public key rather than believing a copy of it;
+/// - the bottom link is the **declaration** at
+///   `_synchronicity-transparency.<apex>`: its `TXT` RRset and the `RRSIG`
+///   the apex made over it, which is what makes the entry the zone's own
+///   statement rather than a transcription of its public records;
+/// - the apex link holds the apex's `DNSKEY` RRset + `RRSIG` — the key set
+///   the entry claims — and its `DS` RRset + `RRSIG` (signed by the parent);
 /// - every ancestor link holds that zone's `DNSKEY` RRset + `RRSIG` and its
 ///   `DS` RRset + `RRSIG`;
 /// - the root link holds only the root `DNSKEY` RRset + `RRSIG`, which the
@@ -63,10 +66,10 @@ pub struct ChainLink {
     pub rrs: Vec<u8>,
 }
 
-/// `DnssecChain ::= SEQUENCE OF Link`, apex first, root last.
+/// `DnssecChain ::= SEQUENCE OF Link`, declaration first, root last.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DnssecChain {
-    /// The links, ordered from the apex upward.
+    /// The links, ordered upward from the declaration below the apex.
     pub links: Vec<ChainLink>,
 }
 

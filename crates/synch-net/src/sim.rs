@@ -172,13 +172,55 @@ impl SimZone {
         set.records(true).cloned().collect()
     }
 
+    /// One TXT RRset at `owner`, signed by this zone's key as this zone.
+    ///
+    /// `owner` is free rather than derived so a test can sign a name the zone
+    /// would never publish — a wildcard, or a name under somebody else — and
+    /// see the validator refuse it for the right reason.
+    pub fn signed_txt(
+        &self,
+        owner: Name,
+        text: &str,
+        inception: time::OffsetDateTime,
+    ) -> Vec<Record> {
+        let mut set = RecordSet::new(owner.clone(), RecordType::TXT, 0);
+        set.insert(
+            Record::from_rdata(
+                owner.clone(),
+                self.ttl,
+                RData::TXT(TXT::new(vec![text.to_string()])),
+            ),
+            0,
+        );
+        let rrsig =
+            RRSIG::from_rrset(&set, DNSClass::IN, inception, &self.signer).expect("sign txt rrset");
+        set.insert_rrsig(Record::from_rdata(
+            owner,
+            self.ttl,
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+        ));
+        set.records(true).cloned().collect()
+    }
+
+    /// The zone's transparency declaration and the RRSIG it made over it —
+    /// the chain's bottom link, and the thing that makes an entry the zone's
+    /// own statement rather than a copy of its public records.
+    pub fn declaration_records(&self, inception: time::OffsetDateTime) -> Vec<Record> {
+        self.signed_txt(
+            self.transparency_name(),
+            chain::TRANSPARENCY_TEXT,
+            inception,
+        )
+    }
+
     /// The DNSSEC chain this zone's entries carry.
     ///
     /// A simulated zone *is* its own trust anchor — the tests install its
-    /// DNSKEY with `--dnssec-anchor` — so the chain is the degenerate
-    /// one-link shape: the anchored zone's own DNSKEY RRset, self-signed.
-    /// Real deployments anchored at the ICANN root produce the DS ladder
-    /// instead; both shapes are validated by the same walk (`crate::chain`).
+    /// DNSKEY with `--dnssec-anchor` — so the ladder above the declaration is
+    /// the degenerate one-link shape: the anchored zone's own DNSKEY RRset,
+    /// self-signed. Real deployments anchored at the ICANN root produce the
+    /// DS ladder instead; both shapes are validated by the same walk
+    /// (`crate::chain`).
     pub fn dnssec_chain(&self) -> DnssecChain {
         self.dnssec_chain_at(time::OffsetDateTime::now_utc() - time::Duration::hours(1))
     }
@@ -186,10 +228,18 @@ impl SimZone {
     /// The same chain with the RRSIG inception moved (see `dnskey_records`).
     pub fn dnssec_chain_at(&self, inception: time::OffsetDateTime) -> DnssecChain {
         DnssecChain {
-            links: vec![ChainLink {
-                zone: self.apex(),
-                rrs: chain::encode_rrs(&self.dnskey_records(inception)).expect("encode chain link"),
-            }],
+            links: vec![
+                ChainLink {
+                    zone: self.transparency_name().to_string(),
+                    rrs: chain::encode_rrs(&self.declaration_records(inception))
+                        .expect("encode declaration link"),
+                },
+                ChainLink {
+                    zone: self.apex(),
+                    rrs: chain::encode_rrs(&self.dnskey_records(inception))
+                        .expect("encode chain link"),
+                },
+            ],
         }
     }
 
@@ -274,6 +324,11 @@ impl SimZone {
     /// set — here the one-key degenerate case, a CSK zone.
     pub fn zone_key_statement(&self, action: &str) -> ZoneKeyStatement {
         ZoneKeyStatement::for_keys(&self.apex(), &[self.dnskey_rdata()], action)
+    }
+
+    /// The name this zone's transparency declaration lives under.
+    pub fn transparency_name(&self) -> Name {
+        chain::transparency_name(&self.origin).expect("transparency name")
     }
 
     /// The name the proof records live under.
@@ -373,6 +428,21 @@ impl SimZone {
                         0,
                     );
                 }
+                set
+            }
+            // The declaration is served like any other record: the chain
+            // carries a copy, but a zone that publishes one really does have
+            // it in DNS, and the collector reads it from there.
+            RecordType::TXT if name == self.transparency_name() => {
+                let mut set = RecordSet::new(name.clone(), RecordType::TXT, 0);
+                set.insert(
+                    Record::from_rdata(
+                        name,
+                        self.ttl,
+                        RData::TXT(TXT::new(vec![chain::TRANSPARENCY_TEXT.to_string()])),
+                    ),
+                    0,
+                );
                 set
             }
             RecordType::TXT if name == self.rekor_name() && !self.rekor_txt.is_empty() => {
@@ -480,9 +550,9 @@ impl SimDelegation {
         }
     }
 
-    /// The chain an entry for this apex carries: apex DS, then the TLD's own
-    /// DNSKEY and DS, then the root's DNSKEY — apex first, root last, exactly
-    /// as [`crate::chain`] walks it.
+    /// The chain an entry for this apex carries: the apex's declaration, its
+    /// DNSKEY set and DS, then the TLD's own DNSKEY and DS, then the root's
+    /// DNSKEY — bottom first, root last, exactly as [`crate::chain`] walks it.
     pub fn chain(&self) -> DnssecChain {
         self.chain_at(time::OffsetDateTime::now_utc() - time::Duration::hours(1))
     }
@@ -502,6 +572,11 @@ impl SimDelegation {
         tld_records.extend(self.root.ds_records_for(&self.tld, inception));
         DnssecChain {
             links: vec![
+                ChainLink {
+                    zone: self.apex.transparency_name().to_string(),
+                    rrs: chain::encode_rrs(&self.apex.declaration_records(inception))
+                        .expect("encode declaration link"),
+                },
                 link(&self.apex, apex_records),
                 link(&self.tld, tld_records),
                 link(&self.root, self.root.dnskey_records(inception)),

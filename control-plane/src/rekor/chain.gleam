@@ -16,7 +16,10 @@
 //// The collection itself is ordinary recursive DNS work, done over DoH
 //// against a configurable resolver, one RRset at a time:
 ////
-////   link 0    <apex>    DNSKEY + RRSIG        the claimed key set, proved
+////   link 0    _synchronicity-transparency.<apex>
+////                       TXT + RRSIG           the zone's declaration,
+////                                             signed by the apex
+////   link 1    <apex>    DNSKEY + RRSIG        the claimed key set, proved
 ////                       DS + RRSIG            by the parent-signed DS
 ////   link i    <zone>    DNSKEY + RRSIG        self-signed
 ////                       DS + RRSIG            signed by *its* parent
@@ -28,6 +31,15 @@
 //// claim: the walk proves DS → covered key → RRset, and a reader checks the
 //// key that signed an answer for membership. A split-key zone's DS never
 //// names the signing ZSK, and this is how DNSSEC itself authorizes it.
+////
+//// The chain starts one label *below* the apex, at the declaration, because
+//// everything above it is public: any passer-by can read a zone's DNSKEY and
+//// DS records out of an open resolver, so a chain that began at the apex
+//// would be evidence anybody could assemble about anybody's zone. The
+//// declaration is the part that takes write access to the zone, which is the
+//// authority the entry claims to speak with — and it takes no *key* access,
+//// so a zone whose DNSSEC keys live inside a managed provider publishes one
+//// with an ordinary record write.
 ////
 //// Nothing here validates anything. The resolver's answers are copied into
 //// the certificate verbatim and every reader — client and monitor alike —
@@ -78,22 +90,34 @@ pub type Link {
   Link(zone: String, rrs: BitArray)
 }
 
-/// Collects the chain for `apex`, from its own DNSKEY RRset and DS up to the
-/// root — and returns the apex DNSKEY rdatas beside the links, because that
-/// observed RRset is exactly the key set the resulting entry claims.
+/// Collects the chain for `apex`: the zone's declaration, then its own
+/// DNSKEY RRset and DS, then up to the root — and returns the apex DNSKEY
+/// rdatas beside the links, because that observed RRset is exactly the key
+/// set the resulting entry claims.
 ///
 /// Fails rather than returning a short chain: an entry with half a chain is
 /// an entry every reader rejects, and finding that out at publish time —
 /// where an operator is standing there reading the error — is worth much
-/// more than finding it out later from a client that will not resolve.
+/// more than finding it out later from a client that will not resolve. That
+/// includes the declaration: a zone that has not published one yet cannot
+/// log, and says so here rather than logging something no client accepts.
 pub fn collect(
   resolver: Resolver,
   apex: Name,
 ) -> Result(#(List(Link), List(BitArray)), String) {
   let labels = name.to_string(apex) |> string.split(".") |> drop_empty
+  use declaration <- result.try(declaration_link(resolver, apex))
   use #(apex_link, rdatas) <- result.try(apex_link(resolver, apex))
   use ancestors <- result.try(ancestor_links(resolver, labels, []))
-  Ok(#([apex_link, ..ancestors], rdatas))
+  Ok(#([declaration, apex_link, ..ancestors], rdatas))
+}
+
+/// The bottom link: the apex's own `_synchronicity-transparency` TXT RRset
+/// and the RRSIG it made over it.
+fn declaration_link(resolver: Resolver, apex: Name) -> Result(Link, String) {
+  let owner = [rdata.transparency_label, ..apex]
+  use rrs <- result.try(rrset(resolver, owner, wire.type_txt))
+  Ok(Link(name.to_string(owner), rrs))
 }
 
 /// Walks a chain's *shape*, the way a reader will walk its signatures.
@@ -111,18 +135,28 @@ pub fn collect(
 /// could anchor. A publish that cannot be verified is a publish that must
 /// fail here, loudly, while an operator is still watching.
 pub fn check_shape(links: List(Link), apex: Name) -> Result(Nil, String) {
+  let declared_at = name.to_string([rdata.transparency_label, ..apex])
+  let apex_text = name.to_string(apex)
   case links {
-    [] -> Error("the chain has no links")
-    [first, ..] ->
-      case first.zone == name.to_string(apex) {
-        False ->
+    [] | [_] ->
+      Error("the chain is too short to carry a declaration and an apex")
+    [declaration, ..ladder] ->
+      case declaration.zone == declared_at, ladder {
+        False, _ ->
           Error(
             "the chain starts at "
+            <> declaration.zone
+            <> ", not the declaration at "
+            <> declared_at,
+          )
+        True, [first, ..] if first.zone != apex_text ->
+          Error(
+            "the chain's second link is "
             <> first.zone
             <> ", not the apex "
-            <> name.to_string(apex),
+            <> apex_text,
           )
-        True -> check_ladder(links, apex)
+        True, _ -> check_ladder(ladder, apex)
       }
   }
 }

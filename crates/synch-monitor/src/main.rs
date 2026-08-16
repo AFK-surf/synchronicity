@@ -233,7 +233,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
             let Ok(name) = parsed.certificate.single_dns_name() else {
                 continue;
             };
-            if !state.known.apexes().any(|apex| apex == name) {
+            if !state.known.watches(&name) {
                 continue;
             }
             // A watched apex: prove the leaf really is this entry before

@@ -58,8 +58,18 @@ pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
       Record(build.tuf_label <> "." <> apex, provider.Txt, ttl_rekor, text),
     ]
   }
+  // Unconditional, exactly as in serve mode: the declaration is what makes
+  // every logged entry the zone's own statement, so a zone without one has
+  // no working transparency at all.
+  let transparency =
+    Record(
+      rdata.transparency_label <> "." <> apex,
+      provider.Txt,
+      ttl_rekor,
+      rdata.transparency_text,
+    )
   Ok(sort(
-    [diff.owner_record(apex), ..members]
+    [diff.owner_record(apex), transparency, ..members]
     |> list.append(rekor)
     |> list.append(tuf),
   ))
@@ -79,6 +89,7 @@ pub fn managed_names(input: ZoneInput) -> List(String) {
     diff.owner_label <> "." <> apex,
     build.rekor_label <> "." <> apex,
     build.tuf_label <> "." <> apex,
+    rdata.transparency_label <> "." <> apex,
     ..owners
   ]
   |> list.unique

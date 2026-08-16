@@ -26,7 +26,7 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 const APEX: &str = "zone-key-transparency.demo.invalid";
-const LOG_INDEX: u64 = 68_018_370;
+const LOG_INDEX: u64 = 68_295_246;
 
 /// The zone is its own trust anchor: we own no DNSSEC-signed domain, so the
 /// chain in the certificate terminates at the apex rather than at the ICANN
@@ -57,7 +57,7 @@ fn the_real_published_entry_classifies_tier_a() {
     let [key] = finding.keys.as_slice() else {
         panic!("a one-key zone proves one key: {:?}", finding.keys);
     };
-    assert_eq!(key.key_tag, 31460);
+    assert_eq!(key.key_tag, 32784);
 
     // The chain validated and proves this set, which is the whole verdict.
     assert!(
@@ -71,7 +71,7 @@ fn the_real_published_entry_classifies_tier_a() {
     // compromised DNS provider in it. The DS is the line a registrar would
     // show, so an operator can compare without believing the entry.
     assert!(
-        key.ds.starts_with("31460 13 2 "),
+        key.ds.starts_with("32784 13 2 "),
         "the derived DS: {}",
         key.ds
     );

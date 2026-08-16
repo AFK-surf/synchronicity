@@ -194,6 +194,23 @@ pub fn opt(udp_size: Int, do_bit: Bool) -> wire.Section {
   )
 }
 
+/// The label the zone's transparency declaration lives under, one below the
+/// apex (docs/REKOR-ZONE-KEY.md §2.1).
+///
+/// This record is what makes a log entry the zone's own statement. A
+/// delegation chain is public data anybody can collect, so an entry proving
+/// only that would be something a stranger could mint about a zone that never
+/// heard of them; the declaration is the part only somebody who can write to
+/// the zone can produce. It is signed like every other RRset, and a copy of
+/// it — with its RRSIG — is the bottom link of every chain this service logs.
+///
+/// It lives here, beside `sync1_text`, because both the zone builder and the
+/// chain collector need it and they sit on opposite sides of an import cycle.
+pub const transparency_label = "_synchronicity-transparency"
+
+/// What the declaration says.
+pub const transparency_text = "v=sync1 transparency"
+
 /// Renders a `v=sync1` membership TXT record's text. Field order matters
 /// only for v=; the client ignores unknown fields and order otherwise.
 pub fn sync1_text(

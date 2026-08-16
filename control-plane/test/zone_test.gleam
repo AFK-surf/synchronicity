@@ -43,16 +43,18 @@ pub fn build_produces_expected_names_test() {
   let assert Ok(rrsets) = build.build(demo_input(csk))
   let owners = build.owners_in_order(rrsets)
   let strings = list.map(owners, name.to_string)
-  // apex first (canonical minimum), then depth-sorted names.
+  // apex first (canonical minimum), then depth-sorted names. The zone's
+  // transparency declaration sorts right after it: `_` precedes every letter.
   assert strings
     == [
       "sync.test.",
+      "_synchronicity-transparency.sync.test.",
       "_synchronicity.prod.acme.sync.test.",
       "ns1.sync.test.",
     ]
   // Every owner has an NSEC; the chain wraps.
   let nsecs = list.filter(rrsets, fn(r) { r.rtype == wire.type_nsec })
-  assert list.length(nsecs) == 3
+  assert list.length(nsecs) == 4
 }
 
 pub fn build_refuses_bad_input_test() {
@@ -150,13 +152,16 @@ pub fn nodata_at_empty_non_terminal_test() {
   let assert Ok(msg) = wire.decode_message(query.answer(conn, apex, q))
   assert rcode(msg.flags) == 0
   assert msg.answers == []
-  // Covering NSEC: owner is the apex (predecessor), whose next name is a
-  // descendant of the ENT — the validator's ENT proof.
+  // Covering NSEC: the owner is the ENT's canonical predecessor — the
+  // transparency declaration — whose next name is a descendant of the ENT.
+  // That is the validator's ENT proof.
+  let assert Ok(predecessor) =
+    name.parse("_synchronicity-transparency.sync.test.")
   let nsec_owners =
     msg.authority
     |> list.filter(fn(rr) { rr.rtype == wire.type_nsec })
     |> list.map(fn(rr) { rr.name })
-  assert nsec_owners == [apex]
+  assert nsec_owners == [predecessor]
 }
 
 pub fn nxdomain_test() {

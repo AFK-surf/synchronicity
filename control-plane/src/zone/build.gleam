@@ -98,9 +98,18 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
       )
     })
 
+  // The declaration is unconditional: this service is a synchronicity
+  // control plane for this apex, and the record is how the apex says so. A
+  // zone that stopped publishing it would have every entry it ever logged
+  // stop verifying, so there is no state in which omitting it is right.
+  let transparency =
+    Rrset([rdata.transparency_label, ..apex], wire.type_txt, ttl_rekor, [
+      rdata.txt(rdata.transparency_text),
+    ])
+
   let data =
     list.flatten([
-      [soa, ns, dnskey],
+      [soa, ns, dnskey, transparency],
       glue,
       txt,
       rekor_rrsets(input, apex),

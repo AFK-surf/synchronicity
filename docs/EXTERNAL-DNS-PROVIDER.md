@@ -31,8 +31,8 @@ Contents:
 The control plane is today a from-scratch authoritative DNSSEC nameserver:
 `zone/model.gleam` reads the product tables into a `ZoneInput`,
 `zone/build.gleam` renders the full zone (SOA, NS, DNSKEY, glue, membership
-TXT, `_synchronicity-rekor` and `_synchronicity-tuf` TXT, and the NSEC
-chain), `zone/publish.gleam` signs every RRset with the zone CSK and writes
+TXT, the `_synchronicity-transparency` declaration, `_synchronicity-rekor`
+and `_synchronicity-tuf` TXT, and the NSEC chain), `zone/publish.gleam` signs every RRset with the zone CSK and writes
 the result into `presigned_rrsets` — all inside the API transaction, so
 commit is publication — and the UDP/TCP/DoH listeners answer straight out
 of SQLite.
@@ -79,18 +79,22 @@ a verified Rekor log record. The proof check
    the zone whose RRSIG signed the answer.
 3. **Authorization** — the certificate's embedded DNSSEC chain
    (`zonecert.rs`, the `OID_DNSSEC_CHAIN` extension: raw signed RRsets
-   from the apex up to the root) is cryptographically verified against the
-   trust anchors by `chain::authorize`, and what it proves is the apex
-   DNSKEY RRset — the **authorized key set**. The key that signed the
-   answer must be a member. The client verifies this chain even though it
-   just validated the live one, because an entry whose chain is absent or
-   broken would be invisible to a monitor (rekor.rs's "why the client
-   verifies a chain it does not need").
-4. **Attribution** — the entry signature over the DSSE PAE verifies under
+   from the zone's declaration up to the root) is cryptographically
+   verified against the trust anchors by `chain::authorize`, and what it
+   proves is the apex DNSKEY RRset — the **authorized key set**. The key
+   that signed the answer must be a member. The client verifies this chain
+   even though it just validated the live one, because an entry whose chain
+   is absent or broken would be invisible to a monitor (rekor.rs's "why the
+   client verifies a chain it does not need").
+4. **The declaration** — the chain's bottom link is the apex's own
+   `_synchronicity-transparency.<apex>` TXT RRset, signed by the keys the
+   ladder above it proved. Without it the entry would prove only public
+   records, which anyone can read out of an open resolver.
+5. **Attribution** — the entry signature over the DSSE PAE verifies under
    the certificate's own key: the entry is what its signer made, whoever
    that is.
 
-### 2.1 Why there is no possession check
+### 2.1 Why the zone key signs nothing, and what does the work instead
 
 The entry signature deliberately does **not** have to come from a zone
 key, and requiring that would add no security.
@@ -101,18 +105,28 @@ Authorization is the hard one: the entry must embed a DNSSEC chain in
 which the parent's signed DS covers a key that signs the rogue key into
 the apex RRset — which requires the attacker to have compromised the
 parent zone or the registrar. And an attacker who minted a rogue key holds
-its private half, so any possession requirement would cost them nothing.
-Possession could only ever add *attribution* — the entry was made by the
-key's holder, not a bystander — never *authorization*. Authorization is
-the chain, and only the chain.
+its private half, so a signature by that key would cost them nothing. It
+could only ever add *attribution* — the entry was made by the key's holder,
+not a bystander — never *authorization*.
+
+But attribution is not worthless, and dropping it outright would leave a
+real gap: a delegation ladder is public, so anyone could collect a zone's
+DNSKEY and DS records and mint an entry about a zone that never heard of
+them, leaving monitors unable to tell an operator's own publication from a
+stranger's. The **declaration** closes that without reaching for the
+private key. Publishing `_synchronicity-transparency.<apex>` requires write
+access to the zone, which is exactly the authority the entry claims to
+speak with — and it is an ordinary record write, so a zone whose DNSSEC
+keys live inside a managed provider can do it. That is the whole trick: the
+proof of authority moved from *holding the key* to *controlling the zone*,
+and only the second is available to a provider-managed deployment.
 
 Transparency's protection is *detectability*, not prevention. A
 rogue-but-chained key is accepted by clients and simultaneously exposed in
 the public log, where the monitor (`crates/synch-monitor`) files it as
-evidence. That property needs log inclusion and the chain; it never needs
-the entry signature to come from any particular key. This is exactly what
-lets a provider-held zone key — one nobody but the provider can sign with
-— be logged and enforced like any other.
+evidence — and, because the monitor watches the whole delegation path
+rather than one name, a takeover mounted from an ancestor zone shows up
+there too.
 
 ## 3. The zone-key claim
 
@@ -226,6 +240,9 @@ are ours to publish:
 - membership TXT at `_synchronicity.<network>.<org_slug>.<apex>`, one
   string per non-revoked device key, via the same `rdata.sync1_text`
   rendering;
+- `_synchronicity-transparency.<apex>` TXT — the zone's declaration
+  (§2.1), rendered unconditionally: a zone that stopped publishing it would
+  have every entry it ever logged stop verifying;
 - `_synchronicity-rekor.<apex>` TXT — the v2 proof records;
 - `_synchronicity-tuf.<apex>` TXT — the relayed TUF bundle.
 

@@ -1,4 +1,4 @@
-//! The DNSSEC chain validator, against a real delegation and a synthetic one.
+//! The DNSSEC chain validator: what a chain has to carry to authorize a key.
 //!
 //! `synch_net::chain` is the one piece of this design that both halves of the
 //! system run: the client refuses a proof whose chain does not validate, and
@@ -6,194 +6,195 @@
 //! invariant that couples them — *client-accepted implies tier A* — only
 //! holds because there is one implementation, so this suite tests it as the
 //! shared thing it is rather than through either caller.
+//!
+//! Everything here is signed by zones the suite holds keys for, because the
+//! contract under test is not "does a delegation ladder verify" — real bytes
+//! answer that, next to the walk itself in `src/chain.rs` — but "what does a
+//! chain have to *say* before it authorizes anything". The answer is the
+//! declaration at `_synchronicity-transparency.<apex>`, and no third party's
+//! zone can be borrowed to test it.
 
-use hickory_resolver::proto::dnssec::TrustAnchors;
+use hickory_resolver::proto::{dnssec::TrustAnchors, rr::Name};
 use synch_net::{
-    chain::{self, ChainError},
-    zonecert::{ChainLink, DnssecChain},
+    chain::{self, ChainError, TRANSPARENCY_TEXT},
+    sim::{SimDelegation, SimZone},
+    zonecert::ChainLink,
 };
 
-/// An apex as the validator takes it: parsed, never a bare string. Passing a
-/// string is how the client and the monitor once disagreed about what a name
-/// was (see `synch_net::chain::authorize`), so the type no longer allows it.
-fn apex(text: &str) -> hickory_resolver::proto::rr::Name {
+fn apex(text: &str) -> Name {
     chain::parse_name(text).expect("a test apex is a name")
 }
 
-fn fixture(name: &str) -> Vec<u8> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/dnssec_chain")
-        .join(name);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()))
+/// An hour ago: RRSIG validity has to bracket "now" for the sim's answers,
+/// and the chain walk reads no clock at all.
+fn inception() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() - time::Duration::hours(1)
 }
 
-/// A genuine delegation, validated offline against the ICANN root anchor.
-///
-/// This is the reality anchor for the chain half of the design: the bytes are
-/// what 8.8.8.8 answered for `cloudflare.com` in August 2026 (see
-/// PROVENANCE.txt), and nothing here authored the root's or Verisign's
-/// signatures. It exercises RSASHA256 at the root, ECDSAP256SHA256 below it,
-/// a two-level DS ladder, and hickory's RRSIG canonical form — the places a
-/// hand-written validator quietly gets wrong.
+/// A chain link carrying `records`, owned by `zone`.
+fn link(zone: &Name, records: Vec<hickory_resolver::proto::rr::Record>) -> ChainLink {
+    ChainLink {
+        zone: zone.to_string(),
+        rrs: chain::encode_rrs(&records).expect("encode link"),
+    }
+}
+
+/// The anchors a reader of `zone`'s self-anchored chain installs.
+fn anchored_at(zone: &SimZone) -> TrustAnchors {
+    let mut file = tempfile::NamedTempFile::new().expect("temp anchor");
+    std::io::Write::write_all(&mut file, zone.anchor_record().as_bytes()).expect("write anchor");
+    TrustAnchors::from_file(file.path()).expect("read anchor")
+}
+
+/// A self-anchored zone's chain validates and proves its own key set.
 #[test]
-fn a_real_delegation_validates_against_the_icann_anchor() {
-    let chain =
-        DnssecChain::decode(&fixture("cloudflare-com.der")).expect("the fixture is a chain");
-    assert_eq!(chain.links.len(), 3);
-    assert_eq!(chain.links[0].zone, "cloudflare.com.");
-    assert_eq!(chain.links[2].zone, ".");
+fn a_declared_zone_proves_the_keys_its_declaration_sits_under() {
+    let zone = SimZone::new("cluster.example", Vec::new());
+    let (proven, valid) = chain::validate(
+        &zone.dnssec_chain(),
+        &apex("cluster.example."),
+        &anchored_at(&zone),
+    )
+    .expect("a declared zone validates");
+    assert_eq!(valid.anchor_zone, "cluster.example.");
+    assert!(valid.anchored_directly, "the apex is its own anchor here");
+    assert_eq!(valid.links, 1, "the declaration is not a delegation step");
+    assert_eq!(proven, vec![zone.dnskey_rdata()]);
+}
 
-    let dnskey = fixture("cloudflare-com-dnskey.bin");
-    assert_eq!(chain::key_tag(&dnskey), 2371);
-
-    let anchors = TrustAnchors::default();
-    let (proven, valid) = chain::validate(&chain, &apex("cloudflare.com."), &anchors)
-        .expect("a real delegation must validate");
+/// The same over a real ladder shape: root → TLD → apex, three delegation
+/// links under the declaration.
+#[test]
+fn a_declared_zone_under_a_delegation_ladder_validates_too() {
+    let ladder = SimDelegation::new("cluster.example", Vec::new());
+    let (proven, valid) = chain::validate(
+        &ladder.chain(),
+        &apex("cluster.example."),
+        &anchored_at(&ladder.root),
+    )
+    .expect("a declared zone under a ladder validates");
     assert_eq!(valid.anchor_zone, ".");
     assert!(!valid.anchored_directly);
-    assert_eq!(valid.links, 3);
-    // The proven set is the apex DNSKEY RRset — a real split-key zone, so
-    // the DS-covered KSK is in it and it is not alone: the ZSKs that
-    // actually sign answers are the point of proving the whole RRset.
-    assert!(proven.contains(&dnskey), "the KSK the DS covers is proven");
-    assert!(proven.len() > 1, "a split-key zone proves its ZSKs too");
-    // The archival property, asserted without depending on how old the
-    // fixture happens to be today: every RRSIG in it has an expiration, and
-    // the chain validates just the same at a moment past all of them, because
-    // the validator never consults a clock.
-    let expirations = rrsig_expirations(&chain);
-    assert_eq!(expirations.len(), 5);
-    let long_after = expirations.iter().max().expect("expirations") + 365 * 86_400;
-    assert!(expirations.iter().all(|&e| e < long_after));
-    chain::validate(&chain, &apex("cloudflare.com."), &anchors)
-        .expect("an expired chain still validates: that is the point");
-
-    // Case and the trailing dot are DNS spelling, not identity.
-    chain::validate(&chain, &apex("CloudFlare.com"), &anchors).unwrap();
+    assert_eq!(
+        valid.links, 3,
+        "apex, TLD, root — the declaration is not one"
+    );
+    assert_eq!(proven, vec![ladder.apex.dnskey_rdata()]);
 }
 
-/// The proven set is closed: a key the chain never proved is not in it.
+/// A chain that starts at the apex authorizes nothing, however well the
+/// delegation under it verifies.
+///
+/// This is the claim-about-a-stranger's-zone case: the ladder is public data,
+/// so a chain without a declaration is something anyone could have assembled
+/// about a zone that never heard of them.
 #[test]
-fn a_real_delegation_does_not_cover_a_key_it_never_named() {
-    let chain = DnssecChain::decode(&fixture("cloudflare-com.der")).unwrap();
-    let anchors = TrustAnchors::default();
-    let (proven, _) = chain::validate(&chain, &apex("cloudflare.com."), &anchors).unwrap();
-    let mut other = fixture("cloudflare-com-dnskey.bin");
-    other[20] ^= 0x01;
+fn a_chain_that_skips_the_declaration_is_refused() {
+    let ladder = SimDelegation::new("cluster.example", Vec::new());
+    let mut bare = ladder.chain();
+    bare.links.remove(0);
+    let error = chain::validate(&bare, &apex("cluster.example."), &anchored_at(&ladder.root))
+        .expect_err("a ladder alone must not authorize");
     assert!(
-        !proven.contains(&other),
-        "membership is byte-exact — a one-bit key variant proves nothing"
+        matches!(&error, ChainError::Structure(why) if why.contains(chain::TRANSPARENCY_LABEL)),
+        "the refusal must name the missing declaration: {error}"
     );
+}
 
-    // And it says nothing about a different zone, however well it validates.
+/// A declaration for one zone does not carry another.
+///
+/// The bottom link is checked against the apex the certificate names, so
+/// splicing a zone's real declaration under somebody else's ladder fails on
+/// the name before any signature is consulted.
+#[test]
+fn a_declaration_from_another_zone_does_not_transfer() {
+    let ours = SimDelegation::new("cluster.example", Vec::new());
+    let theirs = SimZone::new("other.example", Vec::new());
+    let mut spliced = ours.chain();
+    spliced.links[0] = link(
+        &theirs.transparency_name(),
+        theirs.declaration_records(inception()),
+    );
     assert!(matches!(
-        chain::validate(&chain, &apex("example.com."), &anchors),
+        chain::validate(
+            &spliced,
+            &apex("cluster.example."),
+            &anchored_at(&ours.root)
+        ),
         Err(ChainError::Structure(_))
     ));
 }
 
-/// Every way a chain can be broken, one at a time.
+/// A declaration the apex's keys did not sign is refused.
+///
+/// Built by signing the right name, with the right text, under a key that is
+/// not in the chain-proven set — the shape an attacker who can publish in
+/// *some* zone but not this one would produce.
 #[test]
-fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
-    let anchors = TrustAnchors::default();
-    let original = DnssecChain::decode(&fixture("cloudflare-com.der")).unwrap();
-
-    // No links at all: absent, not malformed — the distinction is what
-    // separates "this control plane has not upgraded" from "somebody
-    // stripped the evidence out".
-    assert_eq!(
-        chain::validate(&DnssecChain::default(), &apex("cloudflare.com."), &anchors),
-        Err(ChainError::Absent)
+fn a_declaration_signed_by_a_stranger_is_refused() {
+    let ladder = SimDelegation::new("cluster.example", Vec::new());
+    let impostor = SimZone::for_name(apex("cluster.example."), Vec::new());
+    let mut forged = ladder.chain();
+    // `impostor` signs as `cluster.example.` — same owner name, same signer
+    // name, a key the apex's DNSKEY RRset does not contain.
+    forged.links[0] = link(
+        &ladder.apex.transparency_name(),
+        impostor.declaration_records(inception()),
     );
-
-    // A byte flipped inside the root's DNSKEY RRSIG: the signature no longer
-    // verifies, so the chain never reaches an anchored key.
-    let mut broken = original.clone();
-    let last = broken.links.len() - 1;
-    let at = broken.links[last].rrs.len() - 20;
-    broken.links[last].rrs[at] ^= 0x01;
     assert!(matches!(
-        chain::validate(&broken, &apex("cloudflare.com."), &anchors),
+        chain::validate(
+            &forged,
+            &apex("cluster.example."),
+            &anchored_at(&ladder.root)
+        ),
         Err(ChainError::Signature(_))
     ));
-
-    // The root link removed: the top of what is left is `com.`, which no
-    // trust anchor names.
-    let mut headless = original.clone();
-    headless.links.pop();
-    assert!(matches!(
-        chain::validate(&headless, &apex("cloudflare.com."), &anchors),
-        Err(ChainError::Anchor(_))
-    ));
-
-    // The middle link removed: `cloudflare.com.` is not a child of the root,
-    // so the ladder does not connect even though both remaining links are
-    // internally sound.
-    let mut spliced = original.clone();
-    spliced.links.remove(1);
-    assert!(matches!(
-        chain::validate(&spliced, &apex("cloudflare.com."), &anchors),
-        Err(ChainError::Structure(_))
-    ));
-
-    // A link whose records are not RRs at all.
-    let mut garbled = original.clone();
-    garbled.links[0].rrs = b"not a resource record".to_vec();
-    assert!(matches!(
-        chain::validate(&garbled, &apex("cloudflare.com."), &anchors),
-        Err(ChainError::Malformed(_)) | Err(ChainError::Structure(_))
-    ));
-
-    // An empty trust-anchor set trusts nothing, and says so as an anchor
-    // failure rather than quietly succeeding.
-    assert!(matches!(
-        chain::validate(&original, &apex("cloudflare.com."), &TrustAnchors::empty()),
-        Err(ChainError::Anchor(_))
-    ));
 }
 
-/// A link that carries records owned by another name is refused outright.
-///
-/// Without this the ladder check could be satisfied by a link whose *label*
-/// says `com.` while its records are somebody else's zone.
+/// A TXT record at the declaration's name that does not say what a
+/// declaration says is not one.
 #[test]
-fn a_link_cannot_smuggle_another_zones_records() {
-    let anchors = TrustAnchors::default();
-    let original = DnssecChain::decode(&fixture("cloudflare-com.der")).unwrap();
-    let mut relabelled = original.clone();
-    relabelled.links[1] = ChainLink {
-        zone: "example.com.".into(),
-        rrs: original.links[1].rrs.clone(),
-    };
-    assert!(matches!(
-        chain::validate(&relabelled, &apex("cloudflare.com."), &anchors),
-        Err(ChainError::Structure(_))
-    ));
+fn a_record_that_does_not_read_as_a_declaration_is_not_one() {
+    let zone = SimZone::new("cluster.example", Vec::new());
+    let mut chain_ = zone.dnssec_chain();
+    let owner = zone.transparency_name();
+    chain_.links[0] = link(
+        &owner,
+        zone.signed_txt(owner.clone(), "v=sync1 something", inception()),
+    );
+    let error = chain::validate(&chain_, &apex("cluster.example."), &anchored_at(&zone))
+        .expect_err("a differently-worded record is not a declaration");
+    assert!(
+        matches!(&error, ChainError::Structure(why) if why.contains(TRANSPARENCY_TEXT)),
+        "{error}"
+    );
 }
 
-/// Every RRSIG expiration in a chain, decoded here rather than reported by
-/// the validator.
+/// A wildcard cannot declare on a zone's behalf.
 ///
-/// The validator deliberately keeps no record of validity windows — it has no
-/// clock to compare them against, and nothing consumes them (see
-/// `chain`'s module docs). But a test claiming "this chain is expired and
-/// still validates" has to prove the first half, or it passes vacuously. So
-/// the test decodes the windows itself, out of the same bytes.
-fn rrsig_expirations(chain: &DnssecChain) -> Vec<u64> {
-    use hickory_resolver::proto::{
-        dnssec::rdata::DNSSECRData,
-        rr::{RData, Record},
-        serialize::binary::{BinDecodable, BinDecoder},
-    };
-    let mut out = Vec::new();
-    for link in &chain.links {
-        let mut decoder = BinDecoder::new(&link.rrs);
-        while decoder.peek().is_some() {
-            let record = Record::read(&mut decoder).expect("a well-formed link");
-            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = record.data {
-                out.push(u64::from(sig.input().sig_expiration.get()));
-            }
-        }
+/// A zone with `*.<apex> TXT` answers for every name under it, this one
+/// included, and a resolver hands back a valid RRSIG for a record the zone
+/// never wrote. RFC 4035 §5.3.2 gives the tell — the RRSIG's label count is
+/// short — and it is checked, because otherwise a zone that happens to run a
+/// catch-all TXT would be declaring things nobody in it decided.
+#[test]
+fn a_wildcard_expansion_is_not_a_declaration() {
+    let zone = SimZone::new("cluster.example", Vec::new());
+    // Signed as `*.cluster.example.` and served under the declaration's name:
+    // the signature is genuine and the labels are one short, exactly as a
+    // resolver would return a wildcard expansion.
+    let wildcard = apex("*.cluster.example.");
+    let mut records = zone.signed_txt(wildcard, TRANSPARENCY_TEXT, inception());
+    let owner = zone.transparency_name();
+    for record in &mut records {
+        record.name = owner.clone();
     }
-    out
+    let mut chain_ = zone.dnssec_chain();
+    chain_.links[0] = link(&owner, records);
+    let error = chain::validate(&chain_, &apex("cluster.example."), &anchored_at(&zone))
+        .expect_err("a wildcard expansion must not declare");
+    assert!(
+        matches!(&error, ChainError::Structure(why) if why.contains("wildcard")),
+        "{error}"
+    );
 }

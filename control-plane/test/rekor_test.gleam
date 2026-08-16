@@ -741,31 +741,56 @@ pub fn parse_body_refuses_a_foreign_entry_kind_test() {
   let assert Error(proof.Binding(_)) = proof.parse_body(<<older:utf8>>)
 }
 
-/// A chain that stops below the root is refused before it is ever published.
-pub fn a_chain_that_does_not_reach_the_root_is_refused_test() {
+/// A chain that is not declaration-then-ladder-to-root is refused before it
+/// is ever published — while an operator is still standing there to read why.
+pub fn a_malformed_chain_is_refused_before_publishing_test() {
   let assert Ok(apex) = name.parse("sync.test.")
+  let declaration = chain.Link("_synchronicity-transparency.sync.test.", <<0>>)
   let full = [
+    declaration,
     chain.Link("sync.test.", <<1>>),
     chain.Link("test.", <<2>>),
     chain.Link(".", <<3>>),
   ]
   let assert Ok(Nil) = chain.check_shape(full, apex)
 
-  // The shape CP_DNSSEC_CHAIN_ROOT_DNSKEY=false used to emit: a TLD DNSKEY on
-  // top, anchoring against nothing any reader holds.
-  let rootless = [chain.Link("sync.test.", <<1>>), chain.Link("test.", <<2>>)]
+  // No declaration: a bare ladder is public data anyone could have collected,
+  // so it is not this zone's statement about itself.
+  let bare = [
+    chain.Link("sync.test.", <<1>>),
+    chain.Link("test.", <<2>>),
+    chain.Link(".", <<3>>),
+  ]
+  let assert Error(why) = chain.check_shape(bare, apex)
+  assert string.contains(why, "_synchronicity-transparency")
+
+  // A TLD DNSKEY on top, anchoring against nothing any reader holds.
+  let rootless = [
+    declaration,
+    chain.Link("sync.test.", <<1>>),
+    chain.Link("test.", <<2>>),
+  ]
   let assert Error(why) = chain.check_shape(rootless, apex)
   assert string.contains(why, "root")
 
   // A ladder with a rung missing.
-  let spliced = [chain.Link("sync.test.", <<1>>), chain.Link(".", <<3>>)]
+  let spliced = [
+    declaration,
+    chain.Link("sync.test.", <<1>>),
+    chain.Link(".", <<3>>),
+  ]
   let assert Error(_) = chain.check_shape(spliced, apex)
 
-  // A chain that is not about this apex at all.
+  // A declaration for somebody else's zone.
   let assert Error(_) =
     chain.check_shape(
-      [chain.Link("other.test.", <<1>>), chain.Link(".", <<3>>)],
+      [
+        chain.Link("_synchronicity-transparency.other.test.", <<0>>),
+        chain.Link("other.test.", <<1>>),
+        chain.Link(".", <<3>>),
+      ],
       apex,
     )
+  let assert Error(_) = chain.check_shape([declaration], apex)
   let assert Error(_) = chain.check_shape([], apex)
 }

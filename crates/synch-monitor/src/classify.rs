@@ -61,7 +61,9 @@ impl Tier {
 /// made against their own record of what they published.
 ///
 /// The apexes are also the watch list: an apex with an empty key list is how
-/// an operator says "tell me about this zone, I have seen nothing yet".
+/// an operator says "tell me about this zone, I have seen nothing yet". What
+/// is watched is not just that name but its whole **delegation path**, in
+/// both directions — see [`KnownKeys::watches`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KnownKeys {
     /// `apex` → the SHA-256 hex of each already-reported key's DNSKEY rdata.
@@ -110,6 +112,32 @@ impl KnownKeys {
         self.keys
             .keys()
             .filter_map(|apex| chain::parse_name(apex).ok())
+    }
+
+    /// Whether an entry naming `apex` is this monitor's business.
+    ///
+    /// Not just the configured names: **anything on their delegation path**,
+    /// above or below. Watching only the exact name would leave the one
+    /// attack the design cannot prevent completely invisible. A zone's
+    /// ancestors own its namespace outright — a parent can nullify the
+    /// delegation, absorb the child, and publish a declaration and a chain
+    /// about *itself* that a resolver will validate — so an entry for
+    /// `example.com` is exactly how a takeover of `cp.example.com` would
+    /// appear in the log. A monitor pointed at the child that ignored the
+    /// parent would be watching the one place the attacker has no need to
+    /// touch.
+    ///
+    /// Downward for the mirror case: an entry for `sub.cp.example.com` is
+    /// somebody standing up a control plane inside the operator's own zone,
+    /// which is either a delegation they made or one they need to hear about.
+    ///
+    /// The cost is noise, and it is the right trade. A zone's own operators
+    /// are the only people who can say whether `example.com` publishing
+    /// synchronicity entries is ordinary or an emergency, and they can only
+    /// say it if they are told.
+    pub fn watches(&self, apex: &Name) -> bool {
+        self.apexes()
+            .any(|watched| watched.zone_of(apex) || apex.zone_of(&watched))
     }
 }
 
@@ -259,6 +287,29 @@ mod tests {
         // key being re-reported once it has been recorded.
         known.insert(&name("sync.example"), b"a key");
         assert_eq!(known.keys["sync.example."].len(), 1);
+    }
+
+    /// The watch follows the delegation path, both ways.
+    ///
+    /// The upward half is the one that matters: a parent can nullify its
+    /// child's delegation and publish a perfectly valid entry about itself,
+    /// so an operator watching only `cp.example.` would never see the
+    /// takeover of `cp.example.` go by.
+    #[test]
+    fn watching_a_zone_watches_its_whole_delegation_path() {
+        let mut known = KnownKeys::default();
+        known.keys.insert("cp.example.".into(), vec![]);
+
+        assert!(known.watches(&name("cp.example.")), "the zone itself");
+        assert!(known.watches(&name("example.")), "its parent");
+        assert!(known.watches(&name(".")), "the root above it");
+        assert!(known.watches(&name("a.cp.example.")), "a zone beneath it");
+
+        // Not everything, though: a sibling shares no delegation path, and
+        // a name that merely ends in the same letters is not a suffix in the
+        // DNS sense.
+        assert!(!known.watches(&name("other.example.")));
+        assert!(!known.watches(&name("notcp.example.")));
     }
 
     /// A watch entry that is not a DNS name watches nothing.
