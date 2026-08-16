@@ -52,7 +52,7 @@ fn the_real_published_entry_classifies_tier_b() {
         .expect("an entry with a P-256 key and a SAN is classifiable");
 
     assert_eq!(finding.tier, Tier::B, "{}", finding.line());
-    assert_eq!(finding.apex, APEX);
+    assert_eq!(finding.apex, format!("{APEX}."));
     assert_eq!(finding.log_index, LOG_INDEX);
     assert_eq!(finding.key_tag, 1339);
 
@@ -101,7 +101,10 @@ fn the_same_entry_is_tier_a_once_its_predecessor_is_known() {
         .expect("the real certificate carries a succession extension")
         .expect("and it decodes");
     let mut known = KnownKeys::default();
-    known.insert(APEX, &succession.predecessor_spki);
+    known.insert(
+        &synch_net::chain::parse_name(APEX).unwrap(),
+        &succession.predecessor_spki,
+    );
 
     let finding = classify(&body, LOG_INDEX, &known, &anchors).expect("classifiable");
     assert_eq!(finding.tier, Tier::A, "{}", finding.line());

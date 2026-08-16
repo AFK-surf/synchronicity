@@ -74,7 +74,7 @@ use ring::{digest, signature};
 
 use crate::{
     chain::{self, ChainError},
-    x509::{same_dns_name, Certificate},
+    x509::Certificate,
     zonecert::{self, DnssecChain, Succession},
 };
 
@@ -439,29 +439,51 @@ pub fn verify(
     // carrying the entry signature and the certificate that names the signer.
     let body = HashedRekordBody::parse(&proof.canonicalized_body)?;
 
-    // Apex binding: the certificate the log recorded names *this* zone, and
-    // exactly one zone. This is the check that turns a leaf into something a
-    // monitor for this apex would have seen — an entry naming another apex is
-    // an entry the operator's monitor was never going to look at.
-    let dns_name = body
-        .certificate
-        .single_dns_name()
-        .map_err(|e| ProofError::Binding(e.to_string()))?;
-    if !same_dns_name(dns_name, key.apex) {
+    // Who the certificate says it is about — the parsed apex and the key its
+    // SubjectPublicKeyInfo implies. Read through `chain::identify`, the same
+    // reader the monitor uses, so no spelling of a name can mean one thing
+    // here and another there.
+    let claimed = chain::identify(&body.certificate).map_err(chain_error)?;
+
+    // Apex binding: the zone the certificate names is the zone whose RRSIG
+    // signed this answer. This is the check that turns a leaf into something
+    // a monitor for this apex would have seen — an entry naming another apex
+    // is an entry the operator's monitor was never going to look at.
+    let observed_apex = chain::parse_name(key.apex).map_err(chain_error)?;
+    if claimed.apex != observed_apex {
         return Err(ProofError::Binding(format!(
-            "the entry's certificate names {dns_name}, the answer was signed by {}",
-            key.apex
+            "the entry's certificate names {}, the answer was signed by {observed_apex}",
+            claimed.apex
         )));
     }
 
     // Key binding: the certificate's SubjectPublicKeyInfo is exactly this
     // DNSKEY. A possession check alone would pass a signature by the observed
-    // key under an entry that names a *different* key to a monitor.
+    // key under an entry that names a *different* key to a monitor. Asserted
+    // twice over — the SPKI byte-for-byte, and the DNSKEY rdata the chain
+    // will be walked against — because the second is what a monitor sees.
     if body.certificate.spki != key.der_spki()? {
         return Err(ProofError::Binding(
             "the logged certificate's key is not this zone's DNSKEY".into(),
         ));
     }
+    if claimed.dnskey_rdata != key.dnskey_rdata {
+        return Err(ProofError::Binding(
+            "the chain would be walked against a different key than the answer was signed by"
+                .into(),
+        ));
+    }
+
+    // Discoverability: the entry carries a chain that proves, to anyone
+    // reading the log and nothing else, that this key was delegated for this
+    // zone. `chain::authorize` is the *only* way to ask, and it is the same
+    // call the monitor makes — neither side gets to choose the apex it feeds
+    // the walk. See `chain::authorize` for the break that rule exists to
+    // prevent. Enforced for the monitors' sake, not the client's (see the doc
+    // comment above): a client that accepted a chainless entry would hand an
+    // attacker a key that works and rings no bell.
+    let authorized = chain::authorize(&body.certificate, anchors).map_err(chain_error)?;
+    debug_assert_eq!(authorized.apex, claimed.apex);
 
     // Possession: the entry signature is the zone key's own. Rekor signs the
     // hashedrekord's `data.digest` as a prehash — which, because that digest
@@ -484,12 +506,6 @@ pub fn verify(
     // Statement binding: the Statement describes the key and zone observed.
     let statement = ZoneKeyStatement::parse(&proof.statement)?;
     statement.check_binds(key)?;
-
-    // Discoverability: the entry carries a chain that proves, to anyone
-    // reading the log and nothing else, that this key was delegated for this
-    // zone. Enforced for the monitors' sake, not the client's (see above).
-    let chain = body.dnssec_chain().map_err(chain_error)?;
-    chain::validate(&chain, key.apex, key.dnskey_rdata, anchors).map_err(chain_error)?;
 
     Ok(VerifiedRecord {
         log_index: proof.log_index,
@@ -1195,11 +1211,16 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Two DNS names, compared the way DNS compares them: case-insensitively,
-/// with the root dot optional.
+/// Two DNS names, compared as DNS compares them: parsed and normalized, so a
+/// spelling that is not a name (`"x.."`) never equals one that is (`"x."`).
+///
+/// A name that does not parse equals nothing, including itself — which is the
+/// right answer for a Statement field that is supposed to be a zone.
 fn same_name(a: &str, b: &str) -> bool {
-    a.trim_end_matches('.')
-        .eq_ignore_ascii_case(b.trim_end_matches('.'))
+    match (chain::parse_name(a), chain::parse_name(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Lowercase hex, the form the Statement's digests are written in.

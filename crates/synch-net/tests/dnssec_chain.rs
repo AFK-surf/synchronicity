@@ -13,6 +13,13 @@ use synch_net::{
     zonecert::{ChainLink, DnssecChain},
 };
 
+/// An apex as the validator takes it: parsed, never a bare string. Passing a
+/// string is how the client and the monitor once disagreed about what a name
+/// was (see `synch_net::chain::authorize`), so the type no longer allows it.
+fn apex(text: &str) -> hickory_resolver::proto::rr::Name {
+    chain::parse_name(text).expect("a test apex is a name")
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/dnssec_chain")
@@ -40,7 +47,7 @@ fn a_real_delegation_validates_against_the_icann_anchor() {
     assert_eq!(chain::key_tag(&dnskey), 2371);
 
     let anchors = TrustAnchors::default();
-    let valid = chain::validate(&chain, "cloudflare.com.", &dnskey, &anchors)
+    let valid = chain::validate(&chain, &apex("cloudflare.com."), &dnskey, &anchors)
         .expect("a real delegation must validate");
     assert_eq!(valid.anchor_zone, ".");
     assert!(!valid.anchored_directly);
@@ -55,11 +62,11 @@ fn a_real_delegation_validates_against_the_icann_anchor() {
     assert_eq!(expirations.len(), 4);
     let long_after = expirations.iter().max().expect("expirations") + 365 * 86_400;
     assert!(expirations.iter().all(|&e| e < long_after));
-    chain::validate(&chain, "cloudflare.com.", &dnskey, &anchors)
+    chain::validate(&chain, &apex("cloudflare.com."), &dnskey, &anchors)
         .expect("an expired chain still validates: that is the point");
 
     // Case and the trailing dot are DNS spelling, not identity.
-    chain::validate(&chain, "CloudFlare.com", &dnskey, &anchors).unwrap();
+    chain::validate(&chain, &apex("CloudFlare.com"), &dnskey, &anchors).unwrap();
 }
 
 /// The same chain, asked about a key it says nothing about.
@@ -70,7 +77,7 @@ fn a_real_delegation_does_not_cover_a_key_it_never_named() {
     let mut other = fixture("cloudflare-com-dnskey.bin");
     other[20] ^= 0x01;
     assert!(matches!(
-        chain::validate(&chain, "cloudflare.com.", &other, &anchors),
+        chain::validate(&chain, &apex("cloudflare.com."), &other, &anchors),
         Err(ChainError::KeyNotCovered(_))
     ));
 
@@ -78,7 +85,7 @@ fn a_real_delegation_does_not_cover_a_key_it_never_named() {
     assert!(matches!(
         chain::validate(
             &chain,
-            "example.com.",
+            &apex("example.com."),
             &fixture("cloudflare-com-dnskey.bin"),
             &anchors
         ),
@@ -99,7 +106,7 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     assert_eq!(
         chain::validate(
             &DnssecChain::default(),
-            "cloudflare.com.",
+            &apex("cloudflare.com."),
             &dnskey,
             &anchors
         ),
@@ -113,7 +120,7 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     let at = broken.links[last].rrs.len() - 20;
     broken.links[last].rrs[at] ^= 0x01;
     assert!(matches!(
-        chain::validate(&broken, "cloudflare.com.", &dnskey, &anchors),
+        chain::validate(&broken, &apex("cloudflare.com."), &dnskey, &anchors),
         Err(ChainError::Signature(_))
     ));
 
@@ -122,7 +129,7 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     let mut headless = original.clone();
     headless.links.pop();
     assert!(matches!(
-        chain::validate(&headless, "cloudflare.com.", &dnskey, &anchors),
+        chain::validate(&headless, &apex("cloudflare.com."), &dnskey, &anchors),
         Err(ChainError::Anchor(_))
     ));
 
@@ -132,7 +139,7 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     let mut spliced = original.clone();
     spliced.links.remove(1);
     assert!(matches!(
-        chain::validate(&spliced, "cloudflare.com.", &dnskey, &anchors),
+        chain::validate(&spliced, &apex("cloudflare.com."), &dnskey, &anchors),
         Err(ChainError::Structure(_))
     ));
 
@@ -140,7 +147,7 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     let mut garbled = original.clone();
     garbled.links[0].rrs = b"not a resource record".to_vec();
     assert!(matches!(
-        chain::validate(&garbled, "cloudflare.com.", &dnskey, &anchors),
+        chain::validate(&garbled, &apex("cloudflare.com."), &dnskey, &anchors),
         Err(ChainError::Malformed(_)) | Err(ChainError::Structure(_))
     ));
 
@@ -149,7 +156,7 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     assert!(matches!(
         chain::validate(
             &original,
-            "cloudflare.com.",
+            &apex("cloudflare.com."),
             &dnskey,
             &TrustAnchors::empty()
         ),
@@ -172,7 +179,7 @@ fn a_link_cannot_smuggle_another_zones_records() {
         rrs: original.links[1].rrs.clone(),
     };
     assert!(matches!(
-        chain::validate(&relabelled, "cloudflare.com.", &dnskey, &anchors),
+        chain::validate(&relabelled, &apex("cloudflare.com."), &dnskey, &anchors),
         Err(ChainError::Structure(_))
     ));
 }

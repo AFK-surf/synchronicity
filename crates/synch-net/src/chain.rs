@@ -49,7 +49,10 @@ use hickory_resolver::proto::{
     serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder, NameEncoding},
 };
 
-use crate::zonecert::{ChainLink, DnssecChain};
+use crate::{
+    x509::Certificate,
+    zonecert::{self, ChainLink, DnssecChain},
+};
 
 /// Why a carried chain does not establish that a key was authorized.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -91,6 +94,118 @@ pub struct ValidChain {
     pub anchored_directly: bool,
 }
 
+/// Everything a zone-key certificate establishes about itself.
+///
+/// Produced only by [`authorize`], and that is the point: the apex here has
+/// been *parsed*, so no caller can hand the chain walk a string that means
+/// one thing to a comparison and another to a name parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authorized {
+    /// The apex, parsed and normalized from the certificate's single
+    /// `dNSName` SAN.
+    pub apex: Name,
+    /// The DNSKEY rdata implied by the certificate's SubjectPublicKeyInfo —
+    /// derived, never looked up.
+    pub dnskey_rdata: Vec<u8>,
+    /// What the carried chain established.
+    pub chain: ValidChain,
+}
+
+/// The one path from a certificate to "this key is delegated for this zone".
+///
+/// **Both the client and the monitor must reach the chain through here, and
+/// neither may supply its own apex.** That constraint is not stylistic; it is
+/// the fix for a real break. The two sides used to share `validate` but
+/// compose the call themselves, and they diverged on what to feed it: the
+/// client passed the well-formed apex it had from DNS, the monitor passed the
+/// raw SAN string. A certificate whose SAN was `victim.example..` then
+/// satisfied the client's trailing-dot-trimming comparison *and* validated —
+/// because the client fed the chain a different, well-formed name — while the
+/// monitor's chain walk failed to parse the SAN at all and filed the entry
+/// tier C, the silent bin. Every client accepts, no monitor alerts: exactly
+/// the evasion the tiering exists to prevent.
+///
+/// Sharing a primitive is not sharing a decision. The sequence — extract the
+/// SAN, parse it once, derive the key from the SPKI, walk the chain against
+/// *those* — is the thing that has to be common, so it lives here and the
+/// callers get a parsed [`Authorized`] back rather than the chance to
+/// improvise.
+pub fn authorize(
+    certificate: &Certificate,
+    anchors: &TrustAnchors,
+) -> Result<Authorized, ChainError> {
+    let Identity { apex, dnskey_rdata } = identify(certificate)?;
+    let carried = match certificate.extension(zonecert::OID_DNSSEC_CHAIN) {
+        None => return Err(ChainError::Absent),
+        Some(value) => {
+            DnssecChain::decode(value).map_err(|e| ChainError::Malformed(e.to_string()))?
+        }
+    };
+    let chain = validate(&carried, &apex, &dnskey_rdata, anchors)?;
+    Ok(Authorized {
+        apex,
+        dnskey_rdata,
+        chain,
+    })
+}
+
+/// Who a certificate says it is about, before any signature is checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// The apex, parsed and normalized from the single `dNSName` SAN.
+    pub apex: Name,
+    /// The DNSKEY rdata implied by the SubjectPublicKeyInfo.
+    pub dnskey_rdata: Vec<u8>,
+}
+
+/// The cheap half of [`authorize`]: the name and the key, no crypto.
+///
+/// Exposed so a caller can compare a certificate's claims against what it
+/// observed *before* paying for a chain walk, and so a mismatch reports as
+/// the binding failure it is rather than as a confusing chain error. It
+/// cannot be used to route around [`authorize`]: that calls this itself and
+/// walks the chain against what *it* returns, never against a caller's
+/// string.
+pub fn identify(certificate: &Certificate) -> Result<Identity, ChainError> {
+    let apex = certificate
+        .single_dns_name()
+        .map_err(|e| ChainError::Structure(e.to_string()))?;
+    let dnskey_rdata = zone_key_rdata(&certificate.spki).ok_or_else(|| {
+        ChainError::Structure(
+            "the certificate's key is not the P-256 SubjectPublicKeyInfo this design logs".into(),
+        )
+    })?;
+    Ok(Identity { apex, dnskey_rdata })
+}
+
+/// The DNSKEY rdata a certificate's public key implies: the CSK convention
+/// this design logs (flags 257, protocol 3, algorithm 13).
+///
+/// `None` for anything that is not the 91-byte P-256 SubjectPublicKeyInfo —
+/// somebody else's certificate that happens to carry a SAN, about which the
+/// honest answer is to say nothing.
+pub fn zone_key_rdata(spki: &[u8]) -> Option<Vec<u8>> {
+    let point = spki.get(27..)?;
+    if point.len() != 64 || crate::rekor::p256_spki(point) != spki {
+        return None;
+    }
+    let mut rdata = Vec::with_capacity(4 + 64);
+    rdata.extend_from_slice(&crate::rekor::ZONE_KEY_FLAGS.to_be_bytes());
+    rdata.push(3);
+    rdata.push(crate::rekor::ZONE_KEY_ALGORITHM);
+    rdata.extend_from_slice(point);
+    Some(rdata)
+}
+
+/// Parses a DNS name the way every comparison in this design must.
+///
+/// Normalizing rather than trimming: `"x.."` is not a name at all and must
+/// never compare equal to `"x."`. Every apex that crosses a trust boundary
+/// goes through here.
+pub fn parse_name(text: &str) -> Result<Name, ChainError> {
+    name(text)
+}
+
 /// Validates a carried chain against `anchors`, for `apex` and the exact
 /// DNSKEY rdata the certificate's public key implies.
 ///
@@ -101,7 +216,7 @@ pub struct ValidChain {
 /// what the monitor concludes.
 pub fn validate(
     chain: &DnssecChain,
-    apex: &str,
+    apex: &Name,
     dnskey_rdata: &[u8],
     anchors: &TrustAnchors,
 ) -> Result<ValidChain, ChainError> {
@@ -109,7 +224,7 @@ pub fn validate(
     if links.is_empty() {
         return Err(ChainError::Absent);
     }
-    let apex_name = name(apex)?;
+    let apex_name = apex.clone();
     let parsed: Vec<ParsedLink> = links
         .iter()
         .map(ParsedLink::parse)
@@ -438,14 +553,13 @@ pub fn key_tag(dnskey_rdata: &[u8]) -> u16 {
 
 /// The DS presentation fields `<tag> <alg> 2 <hex sha256>` for a key at a
 /// zone — what the Statement carries and what an operator hands a registrar.
-pub fn ds_fields(zone: &str, dnskey_rdata: &[u8]) -> Result<String, ChainError> {
-    let zone = name(zone)?;
-    Ok(format!(
+pub fn ds_fields(zone: &Name, dnskey_rdata: &[u8]) -> String {
+    format!(
         "{} {} 2 {}",
         key_tag(dnskey_rdata),
         dnskey_rdata.get(3).copied().unwrap_or(0),
-        hex::encode(ds_digest_sha256(&zone, dnskey_rdata))
-    ))
+        hex::encode(ds_digest_sha256(zone, dnskey_rdata))
+    )
 }
 
 /// Serializes records as the uncompressed wire run a [`ChainLink`] carries.
@@ -496,11 +610,35 @@ mod tests {
         let anchors = TrustAnchors::default();
         let error = validate(
             &DnssecChain::default(),
-            "sync.example.dev.",
+            &parse_name("sync.example.dev.").unwrap(),
             &[0; 68],
             &anchors,
         )
         .unwrap_err();
         assert_eq!(error, ChainError::Absent);
+    }
+
+    /// Names are normalized, never trimmed.
+    ///
+    /// This is the rule whose absence broke the central invariant: the client
+    /// compared a certificate's SAN to the observed apex by trimming trailing
+    /// dots, so `victim.example..` compared equal to `victim.example.` and was
+    /// accepted — while the monitor, which parsed the SAN, could not read it
+    /// at all and filed the entry in the silent bin. Every client accepts, no
+    /// monitor alerts. Parsing rejects the spelling outright, on both sides,
+    /// because both now go through one place.
+    #[test]
+    fn a_name_that_is_not_a_name_equals_nothing() {
+        let good = parse_name("victim.example.").expect("a name");
+        // Spellings that are the same name.
+        for same in ["victim.example", "VICTIM.EXAMPLE.", "Victim.Example"] {
+            assert_eq!(parse_name(same).expect(same), good, "{same}");
+        }
+        // Spellings that are not names at all, and so cannot equal one.
+        for bad in ["victim.example..", "victim.example...", "victim..example"] {
+            assert!(parse_name(bad).is_err(), "{bad} must not parse");
+        }
+        // And not a suffix match, however tempting the substring is.
+        assert_ne!(parse_name("example.").unwrap(), good);
     }
 }

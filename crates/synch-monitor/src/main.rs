@@ -170,14 +170,14 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
                 // a shape this design says nothing about. Not an event.
                 continue;
             };
-            let Some(name) = parsed.certificate.single_dns_name().ok() else {
+            // Parsed, never trimmed. The watch filter and the chain walk
+            // have to agree on what a name is, or an entry can be recognised
+            // as belonging to a watched zone and then classified against a
+            // different one (see `synch_net::chain::authorize`).
+            let Ok(name) = parsed.certificate.single_dns_name() else {
                 continue;
             };
-            if !state
-                .known
-                .apexes()
-                .any(|apex| synch_net::x509::same_dns_name(apex, name))
-            {
+            if !state.known.apexes().any(|apex| apex == name) {
                 continue;
             }
             // A watched apex: prove the leaf really is this entry before
@@ -218,7 +218,9 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     // the known predecessor that makes their second one look routine.
     for (finding, spki) in &findings {
         if finding.tier == Tier::A {
-            state.known.insert(&finding.apex, spki);
+            if let Ok(apex) = synch_net::chain::parse_name(&finding.apex) {
+                state.known.insert(&apex, spki);
+            }
         }
     }
     state.origin = checkpoint.origin.clone();

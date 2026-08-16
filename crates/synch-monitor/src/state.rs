@@ -87,7 +87,10 @@ mod tests {
             next_index: 67_673_584,
             known: KnownKeys::default(),
         };
-        state.known.insert("sync.example.dev", b"a key");
+        state.known.insert(
+            &synch_net::chain::parse_name("sync.example.dev").unwrap(),
+            b"a key",
+        );
         state.save(&path).unwrap();
         assert_eq!(MonitorState::load(&path).unwrap(), state);
         assert!(!MonitorState::load(&path).unwrap().is_fresh());

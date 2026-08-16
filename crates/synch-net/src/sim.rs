@@ -61,12 +61,20 @@ impl SimZone {
     /// Builds a zone for `origin` (e.g. `cluster.example`) publishing `txt`
     /// under `_synchronicity.<origin>`, signed by a fresh ECDSA P-256 key.
     pub fn new(origin: &str, txt: Vec<String>) -> SimZone {
+        SimZone::for_name(
+            Name::from_utf8(format!("{origin}.")).expect("origin name"),
+            txt,
+        )
+    }
+
+    /// The same, for a name that is already an FQDN — including the root,
+    /// which `new`'s "append a dot" spelling cannot express.
+    pub fn for_name(origin: Name, txt: Vec<String>) -> SimZone {
         let algorithm = Algorithm::ECDSAP256SHA256;
         let pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).expect("keygen");
         let key = EcdsaSigningKey::from_pkcs8(&pkcs8, algorithm).expect("key load");
         let public = key.to_public_key().expect("public key");
         let dnskey = DNSKEY::from_key(&public);
-        let origin = Name::from_utf8(format!("{origin}.")).expect("origin name");
         let signer = DnssecSigner::new(
             dnskey.clone(),
             Box::new(key),
@@ -182,23 +190,68 @@ impl SimZone {
         }
     }
 
+    /// The DS RRset for `child`, signed by *this* zone — a real delegation
+    /// step, as a parent publishes it.
+    pub fn ds_records_for(&self, child: &SimZone, inception: time::OffsetDateTime) -> Vec<Record> {
+        use hickory_resolver::proto::dnssec::{rdata::DS, DigestType};
+        let mut set = RecordSet::new(child.origin.clone(), RecordType::DS, 0);
+        // Built by hand rather than with `DS::from_key`, which derives the key
+        // tag from the bare public key instead of the whole DNSKEY rdata that
+        // RFC 4034 App. B specifies. `calculate_key_tag` is the correct one —
+        // it is what the chain validator matches RRSIGs against, and what the
+        // real `cloudflare.com` fixture agrees with.
+        let ds = DS::new(
+            child.dnskey.calculate_key_tag().expect("key tag"),
+            child.dnskey.public_key().algorithm(),
+            DigestType::SHA256,
+            child
+                .dnskey
+                .to_digest(&child.origin, DigestType::SHA256)
+                .expect("ds digest")
+                .as_ref()
+                .to_owned(),
+        );
+        set.insert(
+            Record::from_rdata(
+                child.origin.clone(),
+                self.ttl,
+                RData::DNSSEC(DNSSECRData::DS(ds)),
+            ),
+            0,
+        );
+        let rrsig =
+            RRSIG::from_rrset(&set, DNSClass::IN, inception, &self.signer).expect("sign ds set");
+        set.insert_rrsig(Record::from_rdata(
+            child.origin.clone(),
+            self.ttl,
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+        ));
+        set.records(true).cloned().collect()
+    }
+
     /// The self-signed certificate that carries this zone's name into a
     /// Merkle leaf, with whatever extensions the caller wants inside it.
     ///
     /// Nothing validates this certificate — not Rekor, not the client, not
     /// the monitor. It is a key envelope whose SAN is the payload.
     pub fn certificate(&self, extensions: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-        self.certificate_for(&self.apex(), extensions)
+        self.certificate_for(self.apex().trim_end_matches('.'), extensions)
     }
 
-    /// The same certificate naming an arbitrary apex — how a test mints the
-    /// entry an attacker would: this zone's key, somebody else's name.
+    /// The same certificate with an arbitrary SAN — how a test mints the
+    /// entry an attacker would: this zone's key, somebody else's name, or a
+    /// string that is not a name at all.
+    ///
+    /// The SAN is written **verbatim**. Nothing is trimmed or normalized on
+    /// the way in, because the shapes worth testing here are exactly the ones
+    /// normalization would erase: `"x.."` has to reach the certificate as
+    /// `"x.."` or the test proves nothing.
     pub fn certificate_for(&self, apex: &str, extensions: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
         let spki = self.spki();
         let serial = rekor::sha256(&spki);
         SelfSigned {
             common_name: "synchronicity zone key",
-            dns_name: apex.trim_end_matches('.'),
+            dns_name: apex,
             spki: &spki,
             serial: &serial[..20],
             not_before: x509::x509_time(1_700_000_000),
@@ -407,6 +460,91 @@ impl SimZone {
             );
         }
         set
+    }
+}
+
+/// A synthetic delegation ladder: root → TLD → apex, each with its own key.
+///
+/// Why this exists is worth stating, because its absence hid two real bugs.
+/// [`SimZone::dnssec_chain`] only ever emits the degenerate **one-link,
+/// self-anchored** shape — the zone is its own trust anchor, which is what
+/// `--dnssec-anchor` deployments and every sim test used. So the suites that
+/// assert the client↔monitor invariant "over every shape the two sides could
+/// disagree about" were, in fact, exercising a single branch of
+/// [`crate::chain::validate`], and never the multi-link ladder production
+/// actually emits. A divergence that only appears once a chain has a parent
+/// to climb to was invisible.
+///
+/// This is that ladder, small enough to build in a test and real enough to
+/// walk: three zones, three keys, DS records signed by actual parents, and a
+/// root whose DNSKEY is the only thing a reader has to be told to trust.
+#[doc(hidden)]
+#[allow(missing_debug_implementations)]
+pub struct SimDelegation {
+    /// The root zone. Its DNSKEY is the trust anchor.
+    pub root: SimZone,
+    /// The intermediate zone, e.g. `example.`.
+    pub tld: SimZone,
+    /// The zone the entry is about, e.g. `cluster.example.`.
+    pub apex: SimZone,
+}
+
+impl SimDelegation {
+    /// A ladder terminating at `apex`, which must have exactly two labels
+    /// (`cluster.example`) so the middle zone is unambiguous.
+    pub fn new(apex: &str, txt: Vec<String>) -> SimDelegation {
+        let apex_name = Name::from_utf8(format!("{apex}.")).expect("apex name");
+        assert_eq!(
+            apex_name.num_labels(),
+            2,
+            "a sim delegation is root → TLD → apex"
+        );
+        SimDelegation {
+            root: SimZone::for_name(Name::root(), Vec::new()),
+            tld: SimZone::for_name(apex_name.base_name(), Vec::new()),
+            apex: SimZone::for_name(apex_name, txt),
+        }
+    }
+
+    /// The chain an entry for this apex carries: apex DS, then the TLD's own
+    /// DNSKEY and DS, then the root's DNSKEY — apex first, root last, exactly
+    /// as [`crate::chain`] walks it.
+    pub fn chain(&self) -> DnssecChain {
+        self.chain_at(time::OffsetDateTime::now_utc() - time::Duration::hours(1))
+    }
+
+    /// The same, with every RRSIG's inception moved.
+    pub fn chain_at(&self, inception: time::OffsetDateTime) -> DnssecChain {
+        let link = |zone: &SimZone, records: Vec<Record>| ChainLink {
+            zone: zone.apex(),
+            rrs: chain::encode_rrs(&records).expect("encode chain link"),
+        };
+        let mut tld_records = self.tld.dnskey_records(inception);
+        tld_records.extend(self.root.ds_records_for(&self.tld, inception));
+        DnssecChain {
+            links: vec![
+                link(&self.apex, self.tld.ds_records_for(&self.apex, inception)),
+                link(&self.tld, tld_records),
+                link(&self.root, self.root.dnskey_records(inception)),
+            ],
+        }
+    }
+
+    /// The trust-anchor line a reader of this ladder installs: the *root's*
+    /// key, not the apex's. This is the shape a real ICANN-rooted deployment
+    /// has, and the one the self-anchored sim chain cannot express.
+    pub fn anchor_record(&self) -> String {
+        self.root.anchor_record()
+    }
+
+    /// The certificate an entry for this apex carries, with the ladder as its
+    /// chain extension.
+    pub fn certificate(&self, succession: Option<&Succession>) -> Vec<u8> {
+        let mut extensions = vec![(OID_DNSSEC_CHAIN.to_vec(), self.chain().encode())];
+        if let Some(succession) = succession {
+            extensions.push((OID_SUCCESSION.to_vec(), succession.encode()));
+        }
+        self.apex.certificate(&extensions)
     }
 }
 

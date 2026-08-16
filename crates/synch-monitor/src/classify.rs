@@ -7,12 +7,11 @@
 //! in it, so a monitor that asked DNS what the zone's key is would be asking
 //! the attacker.
 
-use hickory_resolver::proto::dnssec::TrustAnchors;
+use hickory_resolver::proto::{dnssec::TrustAnchors, rr::Name};
 use ring::signature;
 use synch_net::{
     chain,
-    rekor::{p256_spki, sha256, HashedRekordBody, ZONE_KEY_ALGORITHM, ZONE_KEY_FLAGS},
-    x509::same_dns_name,
+    rekor::{sha256, HashedRekordBody},
     zonecert::Succession,
 };
 
@@ -61,17 +60,22 @@ pub struct KnownKeys {
 
 impl KnownKeys {
     /// Whether this SPKI is one the monitor already trusts for `apex`.
-    pub fn contains(&self, apex: &str, spki: &[u8]) -> bool {
+    ///
+    /// Names are compared **parsed**, never trimmed: an operator's state file
+    /// says `sync.example.dev` and a certificate says `sync.example.dev.`,
+    /// and those are one zone — but `sync.example.dev..` is not a name at all
+    /// and must match nothing.
+    pub fn contains(&self, apex: &Name, spki: &[u8]) -> bool {
         let digest = hex::encode(sha256(spki));
         self.keys
             .iter()
-            .filter(|(known, _)| same_dns_name(known, apex))
+            .filter(|(known, _)| chain::parse_name(known).is_ok_and(|known| known == *apex))
             .any(|(_, digests)| digests.iter().any(|d| d.eq_ignore_ascii_case(&digest)))
     }
 
     /// Records a key as known for `apex`.
-    pub fn insert(&mut self, apex: &str, spki: &[u8]) {
-        let key = apex.trim_end_matches('.').to_ascii_lowercase();
+    pub fn insert(&mut self, apex: &Name, spki: &[u8]) {
+        let key = apex.to_string();
         let digest = hex::encode(sha256(spki));
         let entry = self.keys.entry(key).or_default();
         if !entry.iter().any(|d| d.eq_ignore_ascii_case(&digest)) {
@@ -79,9 +83,13 @@ impl KnownKeys {
         }
     }
 
-    /// The apexes this monitor has an opinion about.
-    pub fn apexes(&self) -> impl Iterator<Item = &str> {
-        self.keys.keys().map(String::as_str)
+    /// The apexes this monitor has an opinion about, parsed. An entry that is
+    /// not a DNS name watches nothing — it cannot match a certificate's SAN,
+    /// which is parsed too.
+    pub fn apexes(&self) -> impl Iterator<Item = Name> + '_ {
+        self.keys
+            .keys()
+            .filter_map(|apex| chain::parse_name(apex).ok())
     }
 }
 
@@ -138,33 +146,33 @@ pub fn classify(
     known: &KnownKeys,
     anchors: &TrustAnchors,
 ) -> Option<Finding> {
-    let apex = body.certificate.single_dns_name().ok()?.to_string();
+    // Everything about the zone and the key comes out of `chain::authorize`,
+    // the same call the client makes — the apex parsed once from the SAN, the
+    // key derived from the SPKI, the chain walked against exactly those. The
+    // monitor may not compose this itself: doing so is how the two sides once
+    // disagreed about whether `victim.example..` was a zone (see
+    // `chain::authorize`), which put a client-accepted entry in the silent bin.
+    let apex = body.certificate.single_dns_name().ok()?;
     // Only the P-256 keys this design logs are classifiable at all; anything
     // else in the certificate is somebody else's entry that happens to have
     // a SAN, and saying nothing about it is the honest answer.
-    let point = zone_key_point(&body.certificate.spki)?;
-    let dnskey_rdata = dnskey_rdata(point);
-    let key_tag = chain::key_tag(&dnskey_rdata);
-    let ds = chain::ds_fields(&apex, &dnskey_rdata).unwrap_or_else(|_| "?".into());
+    let dnskey_rdata = chain::zone_key_rdata(&body.certificate.spki)?;
     let mut finding = Finding {
         log_index,
-        apex: apex.clone(),
-        key_tag,
+        apex: apex.to_string(),
+        key_tag: chain::key_tag(&dnskey_rdata),
         spki_sha256: hex::encode(sha256(&body.certificate.spki)),
-        ds,
+        ds: chain::ds_fields(&apex, &dnskey_rdata),
         tier: Tier::C,
         reasons: Vec::new(),
         predecessor_key_tag: None,
     };
 
-    let valid = match body
-        .dnssec_chain()
-        .and_then(|chain| chain::validate(&chain, &apex, &dnskey_rdata, anchors))
-    {
-        Ok(valid) => valid,
+    let authorized = match chain::authorize(&body.certificate, anchors) {
+        Ok(authorized) => authorized,
         Err(why) => {
             // No client would have accepted this either — the client runs
-            // this same validator and refuses what it rejects — so an entry
+            // this same composition and refuses what it rejects — so an entry
             // here is an unauthorized claim nobody could have been served.
             finding.reasons.push(format!("unauthorized claim: {why}"));
             return Some(finding);
@@ -172,7 +180,7 @@ pub fn classify(
     };
     finding.reasons.push(format!(
         "DNSSEC chain valid to {} ({} link(s))",
-        valid.anchor_zone, valid.links
+        authorized.chain.anchor_zone, authorized.chain.links
     ));
 
     // The chain holds. The only remaining question is whether the operator's
@@ -210,7 +218,7 @@ pub fn classify(
 /// and the key tag inside the payload matches the one being claimed.
 fn check_succession(
     succession: &Succession,
-    apex: &str,
+    apex: &Name,
     successor_spki: &[u8],
     known: &KnownKeys,
 ) -> Result<(), String> {
@@ -220,16 +228,21 @@ fn check_succession(
             succession.predecessor_key_tag
         ));
     }
-    let point = zone_key_point(&succession.predecessor_spki)
+    let rdata = chain::zone_key_rdata(&succession.predecessor_spki)
         .ok_or_else(|| "the predecessor key is not a P-256 SubjectPublicKeyInfo".to_string())?;
-    if chain::key_tag(&dnskey_rdata(point)) != succession.predecessor_key_tag {
+    if chain::key_tag(&rdata) != succession.predecessor_key_tag {
         return Err(format!(
             "the countersignature claims key tag {} but its key's tag is {}",
             succession.predecessor_key_tag,
-            chain::key_tag(&dnskey_rdata(point))
+            chain::key_tag(&rdata)
         ));
     }
-    let signed = Succession::signed_bytes(apex, succession.predecessor_key_tag, successor_spki);
+    let point = &rdata[4..];
+    let signed = Succession::signed_bytes(
+        &apex.to_string(),
+        succession.predecessor_key_tag,
+        successor_spki,
+    );
     let mut uncompressed = Vec::with_capacity(65);
     uncompressed.push(0x04);
     uncompressed.extend_from_slice(point);
@@ -238,45 +251,46 @@ fn check_succession(
         .map_err(|_| "the succession countersignature does not verify".to_string())
 }
 
-/// The 64-byte P-256 point inside a DER SubjectPublicKeyInfo, if that is what
-/// this is.
-fn zone_key_point(spki: &[u8]) -> Option<&[u8]> {
-    let rebuilt = |point: &[u8]| p256_spki(point) == spki;
-    let point = spki.get(27..)?;
-    (point.len() == 64 && rebuilt(point)).then_some(point)
-}
-
-/// The DNSKEY rdata a zone key implies: the CSK convention this design logs.
-fn dnskey_rdata(point: &[u8]) -> Vec<u8> {
-    let mut rdata = Vec::with_capacity(4 + 64);
-    rdata.extend_from_slice(&ZONE_KEY_FLAGS.to_be_bytes());
-    rdata.push(3);
-    rdata.push(ZONE_KEY_ALGORITHM);
-    rdata.extend_from_slice(point);
-    rdata
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn name(text: &str) -> Name {
+        chain::parse_name(text).expect("a test name")
+    }
+
     #[test]
     fn known_keys_compare_names_the_way_dns_does() {
         let mut known = KnownKeys::default();
-        known.insert("Sync.Example.Dev.", b"a key");
-        assert!(known.contains("sync.example.dev", b"a key"));
-        assert!(known.contains("SYNC.EXAMPLE.DEV.", b"a key"));
-        assert!(!known.contains("other.example.dev", b"a key"));
-        assert!(!known.contains("sync.example.dev", b"another key"));
+        known.insert(&name("Sync.Example.Dev."), b"a key");
+        assert!(known.contains(&name("sync.example.dev"), b"a key"));
+        assert!(known.contains(&name("SYNC.EXAMPLE.DEV."), b"a key"));
+        assert!(!known.contains(&name("other.example.dev"), b"a key"));
+        assert!(!known.contains(&name("sync.example.dev"), b"another key"));
         // Inserting twice does not double the entry.
-        known.insert("sync.example.dev", b"a key");
-        assert_eq!(known.keys["sync.example.dev"].len(), 1);
+        known.insert(&name("sync.example.dev"), b"a key");
+        assert_eq!(known.keys["sync.example.dev."].len(), 1);
+    }
+
+    /// A watch entry that is not a DNS name watches nothing.
+    ///
+    /// The state file is hand-edited, so it can contain anything. What it
+    /// must never do is match a certificate by some looser rule than the one
+    /// the chain walk uses — that mismatch is what put a client-accepted
+    /// entry in the silent bin.
+    #[test]
+    fn an_unparseable_watch_entry_matches_nothing() {
+        let mut known = KnownKeys::default();
+        known.keys.insert("sync.example.dev..".into(), vec![]);
+        assert_eq!(known.apexes().count(), 0);
+        assert!(!known.contains(&name("sync.example.dev"), b"a key"));
     }
 
     #[test]
     fn a_spki_that_is_not_a_p256_key_is_not_classifiable() {
-        assert!(zone_key_point(&[0u8; 91]).is_none());
-        assert!(zone_key_point(&p256_spki(&[7u8; 64])).is_some());
-        assert!(zone_key_point(&p256_spki(&[7u8; 64])[..90]).is_none());
+        assert!(chain::zone_key_rdata(&[0u8; 91]).is_none());
+        let spki = synch_net::rekor::p256_spki(&[7u8; 64]);
+        assert!(chain::zone_key_rdata(&spki).is_some());
+        assert!(chain::zone_key_rdata(&spki[..90]).is_none());
     }
 }

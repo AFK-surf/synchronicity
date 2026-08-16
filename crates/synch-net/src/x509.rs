@@ -26,6 +26,8 @@
 
 use std::fmt;
 
+use hickory_resolver::proto::rr::Name;
+
 /// Why a certificate could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("certificate: {0}")]
@@ -147,19 +149,40 @@ impl Certificate {
             .map(|e| e.value.as_slice())
     }
 
-    /// The single `dNSName` a zone-key certificate must carry.
+    /// The single `dNSName` a zone-key certificate must carry, **parsed**.
     ///
     /// Exactly one: a certificate with two names is a certificate that means
     /// two things to a monitor indexing by name, and this design has no use
     /// for that ambiguity.
-    pub fn single_dns_name(&self) -> Result<&str, X509Error> {
-        match self.dns_names.as_slice() {
-            [one] => Ok(one),
-            names => Err(X509Error::new(format!(
-                "a zone-key certificate carries exactly one dNSName SAN, not {}",
-                names.len()
-            ))),
+    ///
+    /// Parsed, and returned parsed, because a `dNSName` that is not a DNS
+    /// name is not a SAN this design can act on — and because handing callers
+    /// a raw string is how the client and the monitor once ended up disagreeing
+    /// about whether `victim.example..` named the same zone as
+    /// `victim.example.` (see [`crate::chain::authorize`]). A name that does
+    /// not parse is refused here, once, for everybody.
+    pub fn single_dns_name(&self) -> Result<Name, X509Error> {
+        let text = match self.dns_names.as_slice() {
+            [one] => one,
+            names => {
+                return Err(X509Error::new(format!(
+                    "a zone-key certificate carries exactly one dNSName SAN, not {}",
+                    names.len()
+                )))
+            }
+        };
+        let mut name = Name::from_utf8(text)
+            .map_err(|e| X509Error::new(format!("the dNSName SAN {text:?} is not a name: {e}")))?;
+        name.set_fqdn(true);
+        if name.is_root() {
+            // An empty SAN parses as the DNS root, which is a name but never
+            // a zone this design mints a key for. Refusing it here keeps `""`
+            // from becoming a value that compares equal to something.
+            return Err(X509Error::new(
+                "the dNSName SAN is the DNS root, which is not a zone this design logs",
+            ));
         }
+        Ok(name.to_lowercase())
     }
 }
 
@@ -182,17 +205,6 @@ fn parse_san(value: &[u8]) -> Result<Vec<String>, X509Error> {
         }
     }
     Ok(names)
-}
-
-/// Two DNS names, compared the way DNS compares them: case-insensitively,
-/// with the root dot optional on either side.
-///
-/// This is the rule the client applies between a certificate's SAN and the
-/// apex its DNSSEC chain named, and the rule a monitor applies when indexing
-/// leaves by watched apex. Both halves must agree, so it lives once.
-pub fn same_dns_name(a: &str, b: &str) -> bool {
-    a.trim_end_matches('.')
-        .eq_ignore_ascii_case(b.trim_end_matches('.'))
 }
 
 // ---------------------------------------------------------------- building
@@ -542,7 +554,10 @@ mod tests {
         let cert = Certificate::parse(&der).expect("the certificate must parse");
         assert_eq!(cert.spki, spki());
         assert_eq!(cert.dns_names, vec!["sync.example.dev".to_string()]);
-        assert_eq!(cert.single_dns_name().unwrap(), "sync.example.dev");
+        assert_eq!(
+            cert.single_dns_name().unwrap().to_string(),
+            "sync.example.dev."
+        );
         assert_eq!(cert.extension(&[0x41, 0x01]), Some(&b"payload"[..]));
         assert_eq!(cert.extension(&[0x41, 0x02]), None);
         // The standard three are present, and the two that must be critical
@@ -589,15 +604,38 @@ mod tests {
         assert!(Certificate::parse(&[0x30, 0x80, 0x00, 0x00]).is_err());
     }
 
+    /// A SAN that is not a DNS name is refused here, not normalized away.
+    ///
+    /// `"x.."` used to reach callers as a string and compare equal to `"x."`
+    /// under a trailing-dot trim, which is how a client-accepted entry ended
+    /// up in a monitor's silent bin (see `crate::chain::authorize`). Parsing
+    /// at the boundary means no caller ever sees the ambiguous form.
     #[test]
-    fn names_compare_the_way_dns_does() {
-        assert!(same_dns_name("Sync.Example.Dev.", "sync.example.dev"));
-        assert!(same_dns_name("sync.example.dev", "SYNC.EXAMPLE.DEV."));
-        assert!(same_dns_name("sync.example.dev.", "sync.example.dev."));
-        assert!(!same_dns_name("sync.example.dev", "other.example.dev"));
+    fn a_san_that_is_not_a_name_is_refused() {
+        let with = |san: &str| Certificate {
+            spki: spki(),
+            dns_names: vec![san.to_string()],
+            extensions: Vec::new(),
+        };
+        for bad in [
+            "sync.example.dev..",
+            "sync.example.dev...",
+            "sync..example",
+            "",
+        ] {
+            assert!(
+                with(bad).single_dns_name().is_err(),
+                "{bad:?} must not be a usable SAN"
+            );
+        }
+        // Spellings that *are* one name normalize to one value.
+        let canonical = with("sync.example.dev.").single_dns_name().unwrap();
+        for same in ["sync.example.dev", "SYNC.EXAMPLE.DEV.", "Sync.Example.Dev"] {
+            assert_eq!(with(same).single_dns_name().unwrap(), canonical, "{same}");
+        }
         // Not a suffix match: a certificate for the parent is not a
         // certificate for the child, however tempting the substring is.
-        assert!(!same_dns_name("example.dev", "sync.example.dev"));
+        assert_ne!(with("example.dev").single_dns_name().unwrap(), canonical);
     }
 
     #[test]

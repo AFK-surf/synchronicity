@@ -82,8 +82,8 @@ fn the_leaf_names_the_zone_where_a_monitor_can_see_it() {
     let (zone, _log, proof) = logged_zone();
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
     assert_eq!(
-        body.certificate.single_dns_name().unwrap(),
-        zone.apex().trim_end_matches('.')
+        body.certificate.single_dns_name().unwrap().to_string(),
+        zone.apex()
     );
     let text = String::from_utf8_lossy(&proof.canonicalized_body);
     assert!(text.contains("x509Certificate"), "{text}");
@@ -342,7 +342,7 @@ fn an_expired_chain_still_verifies_because_no_clock_is_consulted() {
     let carried = body.dnssec_chain().unwrap();
     chain::validate(
         &carried,
-        &zone.apex(),
+        &chain::parse_name(&zone.apex()).unwrap(),
         &zone.dnskey_rdata(),
         &anchors(&zone),
     )
@@ -687,8 +687,8 @@ fn the_shared_fixture_decodes_and_verifies() {
     assert_eq!(body.certificate_der, fixture("certificate.der"));
     let apex = fixture_field("apex");
     assert_eq!(
-        body.certificate.single_dns_name().unwrap(),
-        apex.trim_end_matches('.')
+        body.certificate.single_dns_name().unwrap().to_string(),
+        apex
     );
     let chain = body.dnssec_chain().expect("the fixture carries a chain");
     assert_eq!(chain.encode(), fixture("dnssec-chain.der"));
@@ -764,7 +764,10 @@ fn the_gleam_certificate_encoders_agree_with_this_one() {
     // And a whole certificate the Gleam side built, read here.
     let der = fixture("crossval/certificate.der");
     let certificate = Certificate::parse(&der).expect("a Gleam-built certificate must parse");
-    assert_eq!(certificate.single_dns_name().unwrap(), "sync.test");
+    assert_eq!(
+        certificate.single_dns_name().unwrap().to_string(),
+        "sync.test."
+    );
     assert_eq!(certificate.spki.len(), 91);
     assert_eq!(
         certificate.extension(OID_DNSSEC_CHAIN),
@@ -1077,7 +1080,10 @@ mod real_rekor_v3 {
         let body = HashedRekordBody::parse(&v3("canonicalized_body.json"))
             .expect("a real entry body must parse");
         assert_eq!(body.certificate_der, v3("certificate.der"));
-        assert_eq!(body.certificate.single_dns_name().unwrap(), APEX);
+        assert_eq!(
+            body.certificate.single_dns_name().unwrap().to_string(),
+            format!("{APEX}.")
+        );
 
         // The apex is literally inside the bytes the Merkle leaf commits to —
         // the property a monitor's SAN index depends on.
