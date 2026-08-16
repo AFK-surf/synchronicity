@@ -28,14 +28,11 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   monitor tell a rotation from a substitution offline. `rekor-publish`
   collects the chain over DoH, mints the certificate, POSTs a
   `hashedrekord` v0.0.2 `CreateEntryRequest` to `CP_REKOR_URL`, then
-  verifies the returned entry locally — with the *client's own verifier*,
-  reached through the `rekorport/` port program: canonicalized body,
-  inclusion, checkpoint, possession, the certificate's key and name
-  bindings, and the DNSSEC chain walk. A row means a client would accept
-  this proof; if the port program is missing or refuses, the publish
-  fails rather than storing something unverified. **Run it after the DS
-  is live in the parent** — there is no chain to collect before then. A
-  self-hosted, Rekor-v2-compatible log works via `CP_REKOR_KEY`.
+  verifies the returned entry locally (canonicalized body, inclusion,
+  checkpoint, possession, the certificate's key and name bindings) before
+  storing it. **Run it after the DS is live in the parent** — there is no
+  chain to collect before then. A self-hosted, Rekor-v2-compatible log
+  works via `CP_REKOR_KEY`.
   See [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md) §2, §3, §5.
 - The zone also **relays Sigstore's TUF metadata** verbatim at
   `_synchronicity-tuf.<apex>` (`controlplane tuf-refresh`, and the hourly
@@ -66,14 +63,6 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   it to stdio and the database's own directory. Zones are pre-signed at
   mutation time and served straight from SQLite through a pool of
   reset-on-checkout workers (one read transaction per answer).
-  The Rekor wire formats sit behind a second port program of the same
-  shape, `rekorport/` — built from `crates/synch-rekor-port` over the
-  client's own `crates/synch-net`, so the bytes this service publishes
-  and the bytes every client verifies come from one implementation
-  rather than two that can drift. It is what mints the certificate,
-  signs the Statement, verifies the entry the log returns and encodes
-  the proof record; the zone CSK is handed to it as a **path**, never in
-  argv and never streamed.
 - **Frontend**: Vite + React + TypeScript + Tailwind (`web/`).
 - **Replication**: primary + read-only DNS replicas fed by external,
   operator-owned tooling (e.g. litestream). See `ops/RUNBOOK.md`.
@@ -86,7 +75,6 @@ asdf install            # erlang + gleam per .tool-versions
                         #   curl -fsSL -o ~/bin/rebar3 https://s3.amazonaws.com/rebar3/rebar3 && chmod +x ~/bin/rebar3
                         # CI gets it from setup-beam's rebar3-version input
 make -C csqlite         # needs libsqlite3-dev
-make -C rekorport       # needs a Rust toolchain (builds crates/synch-rekor-port)
 gleam test              # backend suite
 just dev                # backend :8080 + vite dev server
 just e2e                # delv + the real synchronicity resolver validate
@@ -134,7 +122,6 @@ listen address.
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev (Ed25519) snapshot. Set it for a self-hosted log. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
-| `CP_DNSSEC_ANCHOR` | primary | Optional trust anchor file, in `--dnssec-anchor` syntax, that a collected chain is validated against before it is logged and when the returned entry is verified. Unset means the IANA root — what a public zone is delegated under, and what every monitor uses. Set it only for a privately rooted deployment: an override is a different universe. |
 | `CP_TUF_URL` | primary | Sigstore TUF repository this zone relays, so clients' log pins follow it. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched by `controlplane tuf-refresh` and by the hourly job within three days of the stored timestamp's expiry. |
 
 Day-2 operations (replicas, key ceremony, backups) live in

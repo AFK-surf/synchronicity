@@ -139,10 +139,8 @@ pub const ZONE_KEY_FLAGS: u16 = 257;
 /// reads like a misconfigured pin set rather than the mix-up it is. The
 /// trusted root shows the same split: it agrees with us for the P-256 log and
 /// disagrees for the Ed25519 one. What a proof's `log_id` must match is this
-/// convention. (Found the hard way while driving a live submission. Both
-/// sides of the system read `log_id` out of this one derivation now — the
-/// control plane pins its log through the `synch-rekor` port program, which
-/// is this code — so the mix-up has nowhere left to happen.)
+/// convention. (Found the hard way while driving a live submission; the
+/// control plane's `rekor/proof.log_id` was right all along.)
 pub const EMBEDDED_LOG_KEYS: &str = "\
 # Sigstore production transparency logs, snapshotted from the TUF
 # repository's trusted_root.json. See EMBEDDED_LOG_KEYS in rekor.rs.
@@ -419,43 +417,6 @@ pub fn verify(
     logs: &LogKeys,
     anchors: &TrustAnchors,
 ) -> Result<VerifiedRecord, ProofError> {
-    verify_demanding(proof, key, logs, anchors, Demand::Authorization)
-}
-
-/// What a reader demands of an entry beyond its soundness.
-///
-/// Soundness — inclusion, the log's signature, possession, every binding — is
-/// not negotiable and is not in here. This is only the question of what the
-/// entry is *for*, and there are exactly two answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Demand {
-    /// The client's rule, and the only one [`verify`] offers: the entry must
-    /// **authorize** the key. A `create` or `rollover` action, and a DNSSEC
-    /// chain that establishes the delegation to someone reading the log and
-    /// nothing else.
-    Authorization,
-    /// The publisher's rule for a `retire` breadcrumb: the action must *be*
-    /// `retire`, and a chain is optional, because a zone being retired may
-    /// have no DS left in its parent to build one from.
-    ///
-    /// **This is not a weaker check of the same entries — it is a check of
-    /// different ones.** The two demands partition the actions between them,
-    /// so nothing a client would accept can be verified this way, and the
-    /// control plane cannot store an authorizing entry through a softer path
-    /// than the one its clients will run. A client never constructs this.
-    Breadcrumb,
-}
-
-/// [`verify`], with the demand spelled out — the entry point the control
-/// plane's port program uses so that it can also verify the `retire`
-/// breadcrumbs it publishes and no client accepts.
-pub fn verify_demanding(
-    proof: &RekorProof,
-    key: &ZoneKey<'_>,
-    logs: &LogKeys,
-    anchors: &TrustAnchors,
-    demand: Demand,
-) -> Result<VerifiedRecord, ProofError> {
     if proof.key_tag != key.key_tag {
         return Err(ProofError::Binding(format!(
             "proof is for key tag {}, the answer was signed by {}",
@@ -535,14 +496,8 @@ pub fn verify_demanding(
     // prevent. Enforced for the monitors' sake, not the client's (see the doc
     // comment above): a client that accepted a chainless entry would hand an
     // attacker a key that works and rings no bell.
-    //
-    // A breadcrumb carries no such claim and is allowed to carry no chain;
-    // `check_binds` is what holds it to being a `retire`, so the exemption
-    // cannot be borrowed by an entry that authorizes anything.
-    if demand == Demand::Authorization {
-        let authorized = chain::authorize(&body.certificate, anchors).map_err(chain_error)?;
-        debug_assert_eq!(authorized.apex, claimed.apex);
-    }
+    let authorized = chain::authorize(&body.certificate, anchors).map_err(chain_error)?;
+    debug_assert_eq!(authorized.apex, claimed.apex);
 
     // Possession: the entry signature is the zone key's own. Rekor signs the
     // hashedrekord's `data.digest` as a prehash — which, because that digest
@@ -564,7 +519,7 @@ pub fn verify_demanding(
 
     // Statement binding: the Statement describes the key and zone observed.
     let statement = ZoneKeyStatement::parse(&proof.statement)?;
-    statement.check_binds(key, demand)?;
+    statement.check_binds(key)?;
 
     Ok(VerifiedRecord {
         log_index: proof.log_index,
@@ -828,7 +783,7 @@ impl ZoneKeyStatement {
     /// The apex check is what stops a key logged for one zone being replayed
     /// into another; the digest check is what stops a Statement being reused
     /// for a different key under the same name.
-    fn check_binds(&self, key: &ZoneKey<'_>, demand: Demand) -> Result<(), ProofError> {
+    fn check_binds(&self, key: &ZoneKey<'_>) -> Result<(), ProofError> {
         let digest = hex_lower(&sha256(key.dnskey_rdata));
         if !self.subject_sha256.eq_ignore_ascii_case(&digest) {
             return Err(ProofError::Binding(
@@ -865,20 +820,10 @@ impl ZoneKeyStatement {
         // client that accepted one would accept an entry carrying no proof
         // of delegation at all — the exact evasion the chain requirement
         // exists to close.
-        //
-        // The publisher verifies its own breadcrumbs, and this is where the
-        // two demands stop overlapping: `Breadcrumb` accepts a `retire` and
-        // nothing else, so the chain exemption it carries can never be
-        // reached by an entry that claims to authorize a key.
-        let allowed: &[&str] = match demand {
-            Demand::Authorization => &["create", "rollover"],
-            Demand::Breadcrumb => &["retire"],
-        };
-        if !allowed.contains(&self.action.as_str()) {
+        if !matches!(self.action.as_str(), "create" | "rollover") {
             return Err(ProofError::Binding(format!(
-                "the entry's action is {}, and only {} is accepted here",
-                self.action,
-                allowed.join(" or ")
+                "the entry's action is {}, and only create or rollover authorizes a key",
+                self.action
             )));
         }
         Ok(())
@@ -1019,19 +964,9 @@ pub struct LogKey {
     algorithm: LogKeyAlgorithm,
     /// The raw public key: an uncompressed P-256 point, or 32 Ed25519 bytes.
     point: Vec<u8>,
-    /// The DER SubjectPublicKeyInfo exactly as parsed — kept because `id` is
-    /// a digest of it and a caller that has to name this key to somebody else
-    /// (the control plane pins one log and passes it on) would otherwise have
-    /// to re-read and re-parse the file to get the bytes back.
-    spki: Vec<u8>,
 }
 
 impl LogKey {
-    /// The DER SubjectPublicKeyInfo this key was parsed from, byte for byte.
-    pub fn spki(&self) -> &[u8] {
-        &self.spki
-    }
-
     fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), ProofError> {
         let algorithm: &dyn signature::VerificationAlgorithm = match self.algorithm {
             LogKeyAlgorithm::EcdsaP256Sha256 => &signature::ECDSA_P256_SHA256_FIXED,
@@ -1057,16 +992,6 @@ impl LogKeys {
     /// The keys compiled into this build (see [`EMBEDDED_LOG_KEYS`]).
     pub fn embedded() -> LogKeys {
         LogKeys::parse(EMBEDDED_LOG_KEYS).unwrap_or_default()
-    }
-
-    /// A pin set holding exactly these keys.
-    ///
-    /// For a caller that already resolved its pins by some other route than a
-    /// file — the control plane's port program pins the single log it submits
-    /// to, and passes that key back in on the verification request rather than
-    /// re-reading a file whose contents could have changed in between.
-    pub fn from_keys(keys: Vec<LogKey>) -> LogKeys {
-        LogKeys { keys }
     }
 
     /// Reads a key file: PEM `PUBLIC KEY` blocks, or one base64
@@ -1156,7 +1081,6 @@ impl LogKey {
                     id,
                     algorithm: LogKeyAlgorithm::EcdsaP256Sha256,
                     point: uncompressed,
-                    spki: der.to_vec(),
                 });
             }
         }
@@ -1166,7 +1090,6 @@ impl LogKey {
                     id,
                     algorithm: LogKeyAlgorithm::Ed25519,
                     point: point.to_vec(),
-                    spki: der.to_vec(),
                 });
             }
         }
@@ -1476,48 +1399,6 @@ mod tests {
         assert_eq!(&bytes[35..43], &1_234_567u64.to_be_bytes());
         // The statement blob's u16 length prefix, then its bytes.
         assert_eq!(&bytes[43..45], &13u16.to_be_bytes());
-    }
-
-    /// A record that does not fit the format is refused, not mangled.
-    ///
-    /// This encoder used to clamp the 16-bit length and truncate the blob;
-    /// the Gleam one, which no longer exists, wrapped it modulo 65536. Two
-    /// different wrong answers, in a format whose whole purpose is that a
-    /// publisher and a client agree byte for byte. There is one encoder now,
-    /// and what it does with an unrepresentable record is a refusal — which
-    /// is the only answer that cannot be silently wrong.
-    #[test]
-    fn an_oversized_record_is_refused_rather_than_mangled() {
-        let base = proof();
-        for oversized in [
-            RekorProof {
-                statement: vec![0; 65_536],
-                ..base.clone()
-            },
-            RekorProof {
-                canonicalized_body: vec![0; 65_536],
-                ..base.clone()
-            },
-            RekorProof {
-                checkpoint: vec![0; 65_536],
-                ..base.clone()
-            },
-            RekorProof {
-                inclusion_path: vec![[0u8; 32]; 256],
-                ..base.clone()
-            },
-        ] {
-            assert!(oversized.encode().is_none());
-            assert!(oversized.to_txt().is_none());
-        }
-        // 65535 bytes and 255 hops are the last that fit.
-        assert!(RekorProof {
-            statement: vec![0; 65_535],
-            inclusion_path: vec![[0u8; 32]; 255],
-            ..base
-        }
-        .encode()
-        .is_some());
     }
 
     #[test]

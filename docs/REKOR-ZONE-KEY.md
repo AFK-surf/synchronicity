@@ -122,9 +122,9 @@ Certificate (self-signed, ECDSA P-256/SHA-256)
 
 We hold no IANA Private Enterprise Number, and inventing an arc under
 somebody else's is how OID collisions happen. `2.25` is the UUID arc, which
-needs no registration. Both OIDs are hardcoded as named constants in exactly one place,
-`crates/synch-net/src/zonecert.rs` — the module that both mints and reads
-these extensions.
+needs no registration. Both OIDs are hardcoded as named constants on both
+sides (`crates/synch-net/src/zonecert.rs`,
+`control-plane/src/rekor/cert.gleam`) and pinned by the crossval fixtures.
 
 | OID | DER content bytes | Carries |
 |---|---|---|
@@ -142,8 +142,8 @@ This design originally used full 128-bit UUID arcs
 (`2.25.293397732029928475482264626946701631422` and
 `2.25.90191032005037091005377665797806520834`) and **they are unusable**. The
 failure was found by live submission and could not have been found any other
-way: OpenSSL and Erlang's `public_key` — then the encoder that built these
-certificates, and the tool that read them back — both parse a 128-bit arc
+way: OpenSSL and Erlang's `public_key` — the encoder that builds these
+certificates and the tool that reads them back — both parse a 128-bit arc
 happily, so every test on both sides of this repo passed against a
 certificate the log would refuse. Bisected against
 `log2025-1.rekor.sigstore.dev`, where a rejected submission is not logged and
@@ -206,12 +206,9 @@ was wrong. A reader anchors the chain by finding a key it trusts in the
 such key — so the flag's only effect was to emit entries that every client
 and every monitor refuses, while `rekor-publish` reported success. A switch
 whose sole outcome is unverifiable output is not a size trade-off, so it is
-gone. The collected chain is now **validated cryptographically before the
-certificate is built** — by `chain::validate`, the same walk every client and
-monitor runs, against the same trust anchor — so a chain that stops short, or
-that does not cover the key, fails at the ceremony with an operator watching
-rather than at every client afterwards. That replaced a structural check that
-could only see whether the ladder reached the root.
+gone. `rekor/chain.check_shape` now walks the ladder before anything is
+published, so a chain that stops short fails at the ceremony rather than at
+every client afterwards.
 
 A real chain to the root measures ~1.9 KB of DER (root DNSKEY 1.1 KB, `com`
 DNSKEY+DS 0.6 KB, the leaf DS 0.2 KB); about 480 B per extra delegation level.
@@ -234,7 +231,7 @@ DSSEv1 45 application/vnd.synchronicity.succession+json <len> {"apex":"<apex>","
 ```
 
 Byte-exact, no whitespace, fixed field order. `apex` is written **without its
-root dot**, so a signer and a verifier cannot disagree about a character
+root dot** so the two implementations cannot disagree about a character
 nobody can see. The successor is named by the SHA-256 of its DER
 SubjectPublicKeyInfo rather than by its key tag, so the signature commits to
 the exact key bytes and not to a 16-bit checksum of them. The predecessor is
@@ -497,22 +494,9 @@ belongs.
 | `CP_REKOR_URL` | primary | Rekor v2 write endpoint (`POST /api/v2/log/entries`). Default `https://log2025-1.rekor.sigstore.dev`. |
 | `CP_REKOR_KEY` | primary | Optional file pinning a self-hosted log's verification key; absent means the embedded Sigstore production key. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
-| `CP_DNSSEC_ANCHOR` | primary | Optional trust anchor file (`--dnssec-anchor` syntax) the collected chain is validated against before the certificate is built, and again when the returned entry is verified. Absent means the IANA root, which is what a public zone is delegated under and what every monitor will use; an override is a different universe, for a privately rooted deployment. |
 
 Replicas need nothing: the proof is public data in the database and rides the
-existing operator-owned replication — including the encoded proof record
-itself, so a replica serves it without a port program or any wire-format code.
-
-**The wire formats live in one place.** Everything in this section that
-touches bytes — minting the certificate and its two extensions, rendering and
-signing the Statement, building the `hashedrekord` submission, verifying what
-the log returns, encoding the `RekorProof` — happens in
-`crates/synch-rekor-port`, a port program over `crates/synch-net`, which is
-the client's and the monitor's own code. The control plane speaks to it over
-a length-framed stdio protocol, the same mechanism it already uses for SQLite
-(`csqlite/`), and holds the zone CSK as a **path** it hands over rather than
-as material it streams. There is deliberately no second implementation to
-drift: three shipped bugs came out of the one that used to be here.
+existing operator-owned replication.
 
 ### 5.2 Ceremony and publication — the order is inverted
 
@@ -586,11 +570,9 @@ from the RRSIG it just validated — but selection is not identity. A zone may
 now serve two proof records under one tag, and the client tries each until
 one verifies.
 
-There is no client rule this side cannot re-run, because it runs the client's
-verifier: `rekor::verify`, over the log's own bytes, in the `synch-rekor` port
-program. A row in `rekor_records` means a client would accept this proof. If
-the port program is missing or fails, the publish fails — verification is
-never skipped, which is the property the whole step exists for.
+The one client rule this side cannot re-run is the cryptographic chain walk —
+that lives in the Rust verifier, and the e2e crossval is what keeps this side
+honest about it.
 
 Re-running is a **refresh**: the entry signature *and the certificate* both
 live inside the stored `canonicalized_body`, and both are reused verbatim
@@ -961,20 +943,13 @@ interoperation but cannot be made to misbehave on demand.
   real canonical-form RRSIGs. It keeps verifying after its signatures expire,
   which is the archival property. Regenerate with the collector recorded in
   its PROVENANCE.txt.
-- `control-plane/test/fixtures/rekor` — a whole simulated entry (proof,
-  Statement, body, certificate, checkpoint, audit path, log key, anchor),
-  written by `regenerate_the_shared_fixture` and read by two suites: the Rust
-  one directly, and the control plane's through the port program. It is what
-  proves the publishing path's framing, key pinning, anchors, verification
-  and encoding line up end to end — the control-plane suite verifies these
-  bytes and must re-encode them to the same `proof.bin`.
-
-  It replaced a set of crossval fixtures that existed to keep two DER
-  encoders — a hand-rolled Rust one and OTP's ASN.1 module on the Gleam side
-  — from agreeing with themselves rather than with each other. Those did
-  their job (they caught the Rust OID constants encoding `2.25` as 40×1+25),
-  and then the duplication they policed was removed instead: there is one
-  encoder now, so there is nothing left for a crossval to compare.
+- `control-plane/test/fixtures/rekor/crossval` — deterministic DER written by
+  the Gleam encoders (`gleam run -m tools/gen_crossval`) and asserted by both
+  suites: the chain extension, the succession extension, the countersigned
+  payload, and a whole Gleam-built certificate the Rust parser reads. This is
+  what keeps a hand-rolled DER reader and OTP's ASN.1 encoder from agreeing
+  with themselves rather than with each other. It caught a real bug on its
+  first run — the Rust OID constants encoded `2.25` as 40×1+25.
 
 **What no fixture can catch.** The `int32` OID constraint in §2.2 was invisible
 to every test here, and would have been invisible to any test built the same
@@ -995,9 +970,8 @@ other, and substituting one for the other yields a proof that matches no pin
 and fails as "unknown log" — which reads like a misconfigured client. The
 production code was always right (it derives the id from the *pinned* key,
 never from anything the server said); only the submission driver was wrong.
-`rekor::EMBEDDED_LOG_KEYS` says so where somebody would look — and there is
-now one derivation of `log_id` in the system rather than two, so the mix-up
-has one place left to be got wrong instead of two.
+Both `rekor::EMBEDDED_LOG_KEYS` and `rekor/proof.log_id` now say so where
+somebody would look.
 
 **Both chain shapes, always.** `SimDelegation` builds a synthetic
 root → TLD → apex ladder with real DS records and its own anchor, beside the
@@ -1046,11 +1020,9 @@ and the real classifier rather than restatements of either:
 > `client_accepts(p)` ⟹ `monitor_tier(p) ∈ {A, B}`, and `tier(p) = C` ⟹
 > `¬client_accepts(p)`.
 
-**The control-plane suite** drives the publisher against a simulated log with
-a real self-anchored chain, and its stored proof is the string the port
-program produced from the entry the client verifier had just accepted — the
-same load-bearing pattern as the existing delv + resolver e2e, with the
-verifier reached over a pipe rather than reimplemented.
+**The control-plane e2e** extends its crossval: the Gleam publisher's stored
+proof and served TXT record must verify under the real Rust client verifier —
+the same load-bearing pattern as the existing delv + resolver e2e.
 
 **Driving a real submission.** Nothing in the suite ever POSTs. To exercise
 the real path against the public log:

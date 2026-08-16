@@ -3908,23 +3908,12 @@ dependencies = [
  "serde_json",
  "synch-core",
  "synch-mpt",
- "synch-net",
  "synch-store",
  "tempfile",
  "thiserror 2.0.20",
  "time",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "synch-rekor-port"
-version = "0.1.0"
-dependencies = [
- "base64",
- "hickory-resolver",
- "ring",
- "synch-net",
 ]
 
 [[package]]

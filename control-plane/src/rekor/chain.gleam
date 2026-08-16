@@ -23,14 +23,11 @@
 ////                                             IANA trust anchor a reader
 ////                                             already holds
 ////
-//// Nothing here validates anything, and nothing here encodes anything. The
-//// resolver's answers are handed to the `synch-rekor` port program as they
-//// arrived, and it walks them — the same cryptographic walk every client and
-//// every monitor runs, against the same trust anchor — *before* it builds a
-//// certificate around them. So a lying resolver produces a publish that
-//// fails at the terminal rather than an entry nobody can anchor: this used
-//// to be a shape check that could only see whether the ladder reached the
-//// root, and a chain that stopped at the TLD once got past it into the log.
+//// Nothing here validates anything. The resolver's answers are copied into
+//// the certificate verbatim and every reader — client and monitor alike —
+//// checks the signatures itself. A lying resolver therefore produces an
+//// entry that fails validation everywhere, which is a publish that gets
+//// refused, not a proof anybody accepts.
 
 import dns/name.{type Name}
 import dns/rdata
@@ -44,7 +41,6 @@ import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
-import rekor/port
 
 /// DS is not among the types the serving path emits, so it is not in
 /// `dns/wire`'s list; the chain is the one place this service reads one.
@@ -61,18 +57,6 @@ pub fn resolver_url() -> String {
   |> result.unwrap("https://cloudflare-dns.com/dns-query")
 }
 
-/// The trust anchor a collected chain is walked against
-/// (`CP_DNSSEC_ANCHOR`), or `""` for the IANA root.
-///
-/// The root is what a public zone is delegated under and therefore what every
-/// monitor will use, so overriding it is a claim that your readers live in a
-/// different universe — the same semantics, and the same file syntax, as the
-/// client's `--dnssec-anchor`. It exists for a privately rooted deployment
-/// and for tests; a zone under the real DNS wants it unset.
-pub fn anchor_file() -> String {
-  envoy.get("CP_DNSSEC_ANCHOR") |> result.unwrap("")
-}
-
 /// A resolver, as the one operation this needs: ask for `<name> <type>`
 /// with DNSSEC records, get the answer section's RRs back.
 ///
@@ -83,20 +67,89 @@ pub type Resolver {
   Resolver(query: fn(Name, Int) -> Result(List(wire.Rr), String))
 }
 
+/// One link of the chain, ready for `rekor/cert`.
+pub type Link {
+  Link(zone: String, rrs: BitArray)
+}
+
 /// Collects the chain for `apex`, from its own DS up to the root.
 ///
 /// Fails rather than returning a short chain: an entry with half a chain is
 /// an entry every reader rejects, and finding that out at publish time —
 /// where an operator is standing there reading the error — is worth much
 /// more than finding it out later from a client that will not resolve.
-pub fn collect(
-  resolver: Resolver,
-  apex: Name,
-) -> Result(List(port.ChainLink), String) {
+pub fn collect(resolver: Resolver, apex: Name) -> Result(List(Link), String) {
   let labels = name.to_string(apex) |> string.split(".") |> drop_empty
   use apex_link <- result.try(ds_link(resolver, apex))
   use ancestors <- result.try(ancestor_links(resolver, labels, []))
   Ok([apex_link, ..ancestors])
+}
+
+/// Walks a chain's *shape*, the way a reader will walk its signatures.
+///
+/// This service cannot check the cryptography — the RRSIG walk lives in
+/// crates/synch-net/src/chain.rs and every client and monitor runs it — but
+/// it can check the thing that is cheap to get wrong and impossible to notice
+/// afterwards: that the links form an unbroken ladder from the apex to the
+/// **root**, and that each carries the RRsets its position requires.
+///
+/// It exists because a configuration knob once let this service publish a
+/// chain that stopped at the TLD. Nothing here refused it — the code checked
+/// only that the extension was *present* — so `rekor-publish` reported
+/// success and then every client failed closed against an entry no reader
+/// could anchor. A publish that cannot be verified is a publish that must
+/// fail here, loudly, while an operator is still watching.
+pub fn check_shape(links: List(Link), apex: Name) -> Result(Nil, String) {
+  case links {
+    [] -> Error("the chain has no links")
+    [first, ..] ->
+      case first.zone == name.to_string(apex) {
+        False ->
+          Error(
+            "the chain starts at " <> first.zone <> ", not the apex " <> name.to_string(apex),
+          )
+        True -> check_ladder(links, apex)
+      }
+  }
+}
+
+fn check_ladder(links: List(Link), below: Name) -> Result(Nil, String) {
+  case links {
+    [] -> Error("the chain has no links")
+    // The top of a well-formed chain is the root, whose DNSKEY the IANA
+    // trust anchor terminates. Anything else is a chain that anchors nowhere.
+    [last] ->
+      case last.zone == "." {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "the chain stops at "
+            <> last.zone
+            <> " instead of the root, so no reader can anchor it",
+          )
+      }
+    [_, next, ..rest] -> {
+      let parent = parent_of(below)
+      case next.zone == name.to_string(parent) {
+        False ->
+          Error(
+            "the chain jumps from "
+            <> name.to_string(below)
+            <> " to "
+            <> next.zone
+            <> ", which is not its parent",
+          )
+        True -> check_ladder([next, ..rest], parent)
+      }
+    }
+  }
+}
+
+fn parent_of(zone: Name) -> Name {
+  case zone {
+    [] -> []
+    [_, ..rest] -> rest
+  }
 }
 
 /// The apex's own link: its DS RRset and the parent's signature over it.
@@ -104,16 +157,16 @@ pub fn collect(
 /// No DNSKEY: a reader derives the key it is asking about from the
 /// certificate's own SubjectPublicKeyInfo, so a copy of the DNSKEY here
 /// would be a copy of something nobody is willing to believe.
-fn ds_link(resolver: Resolver, apex: Name) -> Result(port.ChainLink, String) {
+fn ds_link(resolver: Resolver, apex: Name) -> Result(Link, String) {
   use rrs <- result.try(rrset(resolver, apex, type_ds))
-  Ok(port.ChainLink(name.to_string(apex), rrs))
+  Ok(Link(name.to_string(apex), rrs))
 }
 
 fn ancestor_links(
   resolver: Resolver,
   labels: List(String),
-  acc: List(port.ChainLink),
-) -> Result(List(port.ChainLink), String) {
+  acc: List(Link),
+) -> Result(List(Link), String) {
   case labels {
     [] | [_] -> {
       // The next zone up is the root: DNSKEY only, since the root has no DS.
@@ -123,7 +176,7 @@ fn ancestor_links(
       // switch whose only effect is to break verification is not a trade-off.
       use root <- result.try(name.parse(".") |> replace_error("."))
       use rrs <- result.try(rrset(resolver, root, wire.type_dnskey))
-      Ok(list.reverse([port.ChainLink(".", rrs), ..acc]))
+      Ok(list.reverse([Link(".", rrs), ..acc]))
     }
     [_, ..rest] -> {
       let text = string.join(rest, ".") <> "."
@@ -131,7 +184,7 @@ fn ancestor_links(
       use keys <- result.try(rrset(resolver, zone, wire.type_dnskey))
       use ds <- result.try(rrset(resolver, zone, type_ds))
       ancestor_links(resolver, rest, [
-        port.ChainLink(text, bit_array.concat([keys, ds])),
+        Link(text, bit_array.concat([keys, ds])),
         ..acc
       ])
     }
@@ -224,14 +277,8 @@ fn doh_query(
   let question =
     bit_array.concat([
       // id 0, RD set, one question, one additional (the OPT).
-      <<
-        0:int-size(16),
-        0x0100:int-size(16),
-        1:int-size(16),
-        0:int-size(16),
-        0:int-size(16),
-        1:int-size(16),
-      >>,
+      <<0:int-size(16), 0x0100:int-size(16), 1:int-size(16), 0:int-size(16),
+        0:int-size(16), 1:int-size(16)>>,
       name.encode(zone),
       <<rtype:int-size(16), { wire.class_in }:int-size(16)>>,
       { rdata.opt(4096, True) }.wire,

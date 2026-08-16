@@ -56,10 +56,9 @@
 //! Number and OIDs under `1.3.6.1.4.1.<PEN>` — see docs/REKOR-ZONE-KEY.md
 //! §8.3. Until then, do not widen these arcs: the log will refuse the entry.
 //!
-//! These constants are the only place either arc is written. The control
-//! plane used to carry a second copy of both, with the same warning attached
-//! to it; it now mints its certificates through this module (over the
-//! `synch-rekor` port program), so there is nothing left to drift.
+//! Both are duplicated, deliberately and with the same warning, in
+//! `control-plane/src/rekor/cert.gleam`, and the crossval fixtures pin the
+//! bytes so the two cannot drift.
 
 use crate::x509::{tlv, Der, X509Error};
 

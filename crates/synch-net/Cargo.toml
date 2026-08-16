@@ -30,14 +30,7 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
-[features]
-# Test support (`sim`): a simulated zone, log and TUF repository. Off by
-# default and never on in anything that ships — the suites that need it turn
-# it on through a dev-dependency, including this crate's own below.
-sim = []
-
 [dev-dependencies]
-synch-net = { path = ".", features = ["sim"] }
 hex.workspace = true
 postcard.workspace = true
 time.workspace = true

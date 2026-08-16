@@ -21,8 +21,6 @@ synch-net.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# The tiering suites drive simulated zones and logs (synch-net's `sim`).
-synch-net = { workspace = true, features = ["sim"] }
 tempfile.workspace = true
 time.workspace = true
 

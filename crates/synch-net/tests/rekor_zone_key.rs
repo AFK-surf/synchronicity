@@ -643,13 +643,11 @@ async fn a_garbled_proof_record_is_refused_as_malformed() {
 
 /// The checked-in proof both halves of the system are asserted against.
 ///
-/// Written by `regenerate_the_shared_fixture` below and read by two suites:
-/// this one, directly, and the control plane's, through the `synch-rekor`
-/// port program — which is to say through this crate's verifier, reached over
-/// a pipe. A whole entry nobody can quietly regenerate is what keeps the
-/// publishing path honest about the bytes it will hand a client. It lives
-/// beside the Gleam tests because those can only read files from their own
-/// tree; this side reaches across for it deliberately.
+/// The control plane builds these bytes and this client reads them; a
+/// fixture neither side can quietly regenerate is what keeps the Gleam
+/// encoder and the Rust decoder from drifting apart in opposite directions.
+/// It lives beside the Gleam tests because those can only read files from
+/// their own tree; this side reaches across for it deliberately.
 fn fixture_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../control-plane/test/fixtures/rekor")
 }
@@ -671,9 +669,9 @@ fn fixture_field(name: &str) -> String {
 fn the_shared_fixture_decodes_and_verifies() {
     let proof = RekorProof::decode(&fixture("proof.bin")).expect("the fixture is a v3 proof");
 
-    // Every part the control plane's suite drives the port program with,
-    // asserted here too: if the fixture and this build ever disagree, one of
-    // these fails rather than both suites passing against different bytes.
+    // Every part the Gleam encoder is asserted against, asserted here too:
+    // if the two ever disagree, one of these fails rather than both suites
+    // passing against different bytes.
     assert_eq!(proof.statement, fixture("statement.json"));
     assert_eq!(proof.canonicalized_body, fixture("canonicalized-body.bin"));
     assert_eq!(proof.checkpoint, fixture("checkpoint.txt"));
@@ -688,8 +686,9 @@ fn the_shared_fixture_decodes_and_verifies() {
     // Re-encoding is byte-identical: the format has exactly one rendering.
     assert_eq!(proof.encode().unwrap(), fixture("proof.bin"));
 
-    // The certificate inside the entry: the SAN, the SPKI and the two custom
-    // extensions the whole design turns on.
+    // The certificate the Gleam side built, read by the Rust parser: the two
+    // DER implementations have to agree about the SAN, the SPKI and the two
+    // custom extensions, and this is where that is checked.
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
     assert_eq!(body.certificate_der, fixture("certificate.der"));
     let apex = fixture_field("apex");
@@ -714,18 +713,80 @@ fn the_shared_fixture_decodes_and_verifies() {
     let verified = rekor::verify(&proof, &key, &logs, &anchors).expect("the fixture must verify");
     assert_eq!(verified.action, fixture_field("action"));
     assert_eq!(verified.log_index, proof.log_index);
+}
 
-    // The certificate is a well-formed end-entity certificate, not a
-    // curiosity: the three standard extensions are present with the
-    // criticality RFC 5280 asks for, and both custom extensions are there.
-    // A monitor reading this entry in another toolchain sees the same thing.
-    let certificate = &body.certificate;
-    assert!(certificate.extension(OID_DNSSEC_CHAIN).is_some());
-    assert!(
-        certificate.extension(OID_SUCCESSION).is_none(),
-        "a genesis create has no predecessor"
+/// The certificate encoders, across two implementations of one DER format.
+///
+/// The bytes under `test/fixtures/rekor/crossval` are written by the Gleam
+/// side (`gleam run -m tools/gen_crossval`) and asserted by both suites. It
+/// is the only thing that keeps a hand-rolled DER reader here and OTP's
+/// ASN.1 encoder there from agreeing with themselves and not with each
+/// other — and the certificate in particular is round-tripped, not merely
+/// compared, because its signature is randomized and its *contents* are what
+/// both sides turn on.
+#[test]
+fn the_gleam_certificate_encoders_agree_with_this_one() {
+    use synch_net::{
+        x509::Certificate,
+        zonecert::{ChainLink, DnssecChain, Succession, OID_DNSSEC_CHAIN, OID_SUCCESSION},
+    };
+
+    let chain = DnssecChain {
+        links: vec![
+            ChainLink {
+                zone: "sync.test.".into(),
+                rrs: vec![0xaa, 0xbb, 0xcc],
+            },
+            ChainLink {
+                zone: ".".into(),
+                rrs: vec![0x01, 0x02],
+            },
+        ],
+    };
+    assert_eq!(chain.encode(), fixture("crossval/chain.der"));
+    assert_eq!(
+        DnssecChain::decode(&fixture("crossval/chain.der")).unwrap(),
+        chain
     );
-    let critical = |oid: &[u8]| {
+
+    let succession = Succession {
+        predecessor_key_tag: 34_918,
+        predecessor_spki: vec![0x30, 0x59, 0x11],
+        signature: vec![0x30, 0x44, 0x02],
+    };
+    assert_eq!(succession.encode(), fixture("crossval/succession.der"));
+    assert_eq!(
+        Succession::decode(&fixture("crossval/succession.der")).unwrap(),
+        succession
+    );
+
+    // The bytes the *previous* zone key signs, which two implementations
+    // have to render identically or a rotation reads as a substitution.
+    assert_eq!(
+        Succession::signed_payload("sync.test.", 34_918, b"spki"),
+        fixture("crossval/succession-payload.json")
+    );
+
+    // And a whole certificate the Gleam side built, read here.
+    let der = fixture("crossval/certificate.der");
+    let certificate = Certificate::parse(&der).expect("a Gleam-built certificate must parse");
+    assert_eq!(
+        certificate.single_dns_name().unwrap().to_string(),
+        "sync.test."
+    );
+    assert_eq!(certificate.spki.len(), 91);
+    assert_eq!(
+        certificate.extension(OID_DNSSEC_CHAIN),
+        Some(fixture("crossval/chain.der").as_slice())
+    );
+    assert_eq!(
+        certificate.extension(OID_SUCCESSION),
+        Some(fixture("crossval/succession.der").as_slice())
+    );
+    // The two extensions X.509 requires of an end-entity key envelope are
+    // there and critical, so a certificate this design mints reads correctly
+    // in any toolchain that opens the log entry.
+    let by_oid = |oid: &[u8]| {
         certificate
             .extensions
             .iter()
@@ -733,46 +794,9 @@ fn the_shared_fixture_decodes_and_verifies() {
             .expect("extension")
             .critical
     };
-    assert!(critical(synch_net::x509::OID_BASIC_CONSTRAINTS));
-    assert!(critical(synch_net::x509::OID_KEY_USAGE));
-    assert!(!critical(synch_net::x509::OID_SUBJECT_ALT_NAME));
-}
-
-/// An entry of another kind, or another version of this one, is refused.
-///
-/// Rekor v2 takes exactly one entry type and this design logs exactly one
-/// version of it, so a body claiming anything else is not an entry this
-/// system has ever written — and reading one as though it were would mean
-/// interpreting fields that mean something different. The check used to
-/// exist on one side of a duplicated parser and not the other, which is the
-/// duplication this repository no longer has.
-#[test]
-fn an_entry_of_another_kind_or_version_is_refused() {
-    for (from, to) in [
-        ("\"kind\":\"hashedrekord\"", "\"kind\":\"dsse\""),
-        ("\"apiVersion\":\"0.0.2\"", "\"apiVersion\":\"0.0.1\""),
-    ] {
-        let zone = SimZone::new("cluster.example", member_records());
-        let mut log = SimLog::new("rekor.sim");
-        let statement = zone.zone_key_statement("create", None).to_json();
-        let body = hashedrekord_body(
-            &statement,
-            &zone.sign_dsse(&statement),
-            &zone.zone_key_certificate(None),
-        );
-        let swapped = String::from_utf8(body).unwrap().replace(from, to);
-        assert!(
-            swapped.contains(to),
-            "the fake entry must actually be swapped"
-        );
-        // Logged as-is, so the leaf, the inclusion proof and the checkpoint
-        // are all sound: the entry kind is the only thing wrong with it.
-        let proof = log.log_body(zone.key_tag(), statement, swapped.into_bytes());
-        assert!(
-            matches!(verify(&proof, &zone, &log), Err(ProofError::Binding(_))),
-            "{to} must be refused as a binding failure"
-        );
-    }
+    assert!(by_oid(synch_net::x509::OID_BASIC_CONSTRAINTS));
+    assert!(by_oid(synch_net::x509::OID_KEY_USAGE));
+    assert!(!by_oid(synch_net::x509::OID_SUBJECT_ALT_NAME));
 }
 
 /// Rewrites the shared fixture. Not part of the suite — a zone key and a log
@@ -1104,10 +1128,11 @@ mod real_rekor_v3 {
     /// The real Statement round-trips through this build's canonical form,
     /// byte for byte.
     ///
-    /// These bytes were rendered on a publishing path and the log committed
-    /// to their digest, permanently. "Equivalent JSON" is not equivalent when
-    /// a Merkle leaf commits to a digest, so this pins the Statement half of
-    /// the format against a public record rather than against ourselves.
+    /// The control plane rendered these bytes and the log committed to their
+    /// digest. Two renderers have to agree on them exactly — "equivalent
+    /// JSON" is not equivalent when a Merkle leaf commits to a digest — so
+    /// this is the crossval for the Statement half of the format, against
+    /// bytes the log has permanently recorded.
     #[test]
     fn the_real_statement_round_trips_through_this_builds_canonical_form() {
         let statement = v3("statement.json");

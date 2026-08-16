@@ -62,51 +62,8 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7, v8]
+  [v1, v2, v3, v4, v5, v6, v7]
 }
-
-/// V8: store the served proof record, verified, rather than re-encoding it.
-///
-/// The `RekorProof` v3 encoder now lives in exactly one place — the
-/// `synch-rekor` port program, over crates/synch-net — because the two copies
-/// of it disagreed about what to do with an oversized field, and a format
-/// whose whole purpose is that two implementations agree byte for byte cannot
-/// afford two different wrong answers. The zone builder therefore no longer
-/// encodes anything: it serves the string this column holds, which is the
-/// string the port program produced *from the entry it had just verified*.
-/// The bytes a zone serves are then exactly the bytes that verified, and
-/// building a zone — which happens on every mutation — needs no subprocess.
-///
-/// Existing rows have no such string and it cannot be backfilled in SQL, so
-/// the table is rebuilt and `rekor-publish` repopulates it — the same answer
-/// V6 and V7 gave, and a step the ceremony already has. Re-running it is also
-/// what re-checks each entry under the DNSSEC chain walk this service could
-/// not run before: a row written by an older build was verified by every rule
-/// a client applies *except* the cryptographic chain validation, and clearing
-/// them means no row survives that this build would not write.
-const v8 = "
-DROP TABLE rekor_records;
-CREATE TABLE rekor_records (
-  spki_sha256        BLOB    NOT NULL CHECK (length(spki_sha256) = 32),
-  key_tag            INTEGER NOT NULL,
-  apex               TEXT    NOT NULL,
-  action             TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
-  statement          BLOB    NOT NULL,
-  canonicalized_body BLOB    NOT NULL,
-  log_id             BLOB    NOT NULL CHECK (length(log_id) = 32),
-  log_index          INTEGER NOT NULL,
-  checkpoint         BLOB    NOT NULL,
-  inclusion_path     BLOB    NOT NULL,
-  proof_txt          TEXT    NOT NULL CHECK (length(proof_txt) > 0),
-  chainless          INTEGER NOT NULL DEFAULT 0
-                     CHECK (chainless = 0 OR action = 'retire'),
-  integrated_at      INTEGER NOT NULL,
-  verified_at        INTEGER NOT NULL,
-  PRIMARY KEY (spki_sha256, action)
-);
-CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
-CREATE INDEX rekor_records_by_key_tag ON rekor_records (key_tag);
-"
 
 /// V7: identify a key by its key, not by a checksum of it.
 ///

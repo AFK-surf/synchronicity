@@ -8,7 +8,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 make -C csqlite
-make -C rekorport
 gleam build
 
 WORKDIR=$(mktemp -d)

@@ -24,8 +24,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# The DNSSEC suite drives a simulated zone (synch-net's `sim`).
-synch-net = { workspace = true, features = ["sim"] }
 iroh-base.workspace = true
 synch-store.workspace = true
 tempfile.workspace = true
