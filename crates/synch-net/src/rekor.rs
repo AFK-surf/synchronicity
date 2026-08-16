@@ -108,7 +108,7 @@ pub const HASHEDREKORD_KEY_DETAILS: &str = "PKIX_ECDSA_P256_SHA_256";
 pub const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
 
 /// The predicate type carrying the zone-key claim.
-pub const PREDICATE_TYPE: &str = "https://synchronicity.dev/zone-key/v1";
+pub const PREDICATE_TYPE: &str = "https://synchronicity.sh/zone-key/v1";
 
 /// DNSSEC algorithm 13, ECDSA P-256/SHA-256 — the only zone-key algorithm
 /// this design logs, and the DSSE signing algorithm (§2: no second signing

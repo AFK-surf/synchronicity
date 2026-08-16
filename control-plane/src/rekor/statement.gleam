@@ -26,7 +26,7 @@ import gleam/string
 pub const statement_type = "https://in-toto.io/Statement/v1"
 
 /// The predicate type carrying the zone-key claim.
-pub const predicate_type = "https://synchronicity.dev/zone-key/v1"
+pub const predicate_type = "https://synchronicity.sh/zone-key/v1"
 
 /// The DSSE payload type of an in-toto Statement.
 pub const dsse_payload_type = "application/vnd.in-toto+json"

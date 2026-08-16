@@ -1,8 +1,8 @@
 log2025-1.rekor.sigstore.dev
-67766085
-Z4XALa7MTB7BleHmbSpU4GoiUb1zfC2sY0yJb5DIvCI=
+67966402
+vvkeZWkTMw8X19dnbazSI9kJY6ypj12JdcC1Q/MZfeg=
 
-— log2025-1.rekor.sigstore.dev zxGZFRRcPkQnTcGMY6HO8Vg6oaIrlnvDIVi0xVndUcW/SLJpMFAG9Q5NJumq8cNtSjMBOwlWLt7KW2iRrHZ58DHAGg0=
-— witness.stagemole.eu Z/euoAAAAABqgX3UHlvm4R7XEL+6ozgOmd0g5V237CCnPOKEEjFr9Q7NGLYZ2sKlGQRpkEk0T/Rhdo9M12vnagHvWTHAPbeHSIrHCQ==
-— staging.witness.transparency.goog/ring-any-bells LhqNyQAAAABqgX3UzOnUEWe2IF4uejzw1HoOU0vr7mPhSoVU8erNFQGj9iBFEVk9cJwG6AfpZ6jhHE4PoI4dhUTzi6wWwQaAMYSwAQ==
-— witness.navigli.sunlight.geomys.org o+AP4gAAAABqgX3UYM8pVS81vvYPdHrCZuGNRbwcNC4H5jX85Bk4H2o4C8737h1NmEa34t/kd1t6E5LYMp7zfK42+jOYDWuvOqrjDw==
+— log2025-1.rekor.sigstore.dev zxGZFScdYNMPILiAAziCIpcY8mgoqv6fkcdADYiavzzSRhtySbQMh8PXDI68ykre783NYVNA6TX2QaJ8FIZBTfqN3wU=
+— witness.stagemole.eu Z/euoAAAAABqgbYNUasTsoZynIIr7EsXunxPVL1zX+IdeBfiNMicx9xjGlawlsV+zT9+XNcVBbhn4jlw41+ownF1QTQUTecZwOfLBQ==
+— staging.witness.transparency.goog/ring-any-bells LhqNyQAAAABqgbYNmUVX3FebpvdYaHkqJl7AW8qAXCf2RS4724d/6OgdB9KnzOPRfnWZIxVfKrg8+rMZJco8/1EryQcXA9RI464VCQ==
+— witness.navigli.sunlight.geomys.org o+AP4gAAAABqgbYNDFGKgaoGo2GvJHaAp6Sl80uvdhYEn4+BdKk3NRS8GwMgiN77WHBXgRhN5YYT7dOux54Equ4hGzZPqTH4J+WaBw==

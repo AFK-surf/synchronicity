@@ -895,8 +895,8 @@ mod real_rekor_v3 {
     }
 
     const APEX: &str = "zone-key-transparency.demo.invalid";
-    const LOG_INDEX: u64 = 67_766_084;
-    const KEY_TAG: u16 = 1339;
+    const LOG_INDEX: u64 = 67_966_366;
+    const KEY_TAG: u16 = 27337;
 
     /// The proof exactly as a zone serves it: the checked-in `proof.bin` is
     /// the encoded `RekorProof` v3 record, decoded here through the client's
@@ -994,7 +994,7 @@ mod real_rekor_v3 {
             .expect("a real published entry must verify under the embedded pins");
 
         assert_eq!(record.log_index, LOG_INDEX);
-        assert_eq!(record.tree_size, 67_766_085);
+        assert_eq!(record.tree_size, 67_966_402);
         assert_eq!(record.origin, "log2025-1.rekor.sigstore.dev");
         // A rollover: the statement names the key it replaces, and a client
         // accepts rollover as authorization (retire it would refuse).
@@ -1104,9 +1104,9 @@ mod real_rekor_v3 {
             .any(|w| w == APEX.as_bytes()));
 
         // Both extensions survived the round trip, under the narrowed OIDs.
-        // 944 bytes is the empirical answer to "will Rekor take a
+        // 945 bytes is the empirical answer to "will Rekor take a
         // certificate this size, with arcs like these": it did, HTTP 201.
-        assert_eq!(body.certificate_der.len(), 944);
+        assert_eq!(body.certificate_der.len(), 945);
         let carried = body
             .certificate
             .extension(OID_DNSSEC_CHAIN)
@@ -1119,7 +1119,7 @@ mod real_rekor_v3 {
             .expect("the real certificate carries the succession extension");
         let succession =
             synch_net::zonecert::Succession::decode(succession).expect("and it decodes");
-        assert_eq!(succession.predecessor_key_tag, 56306);
+        assert_eq!(succession.predecessor_key_tag, 17123);
 
         assert_eq!(body.digest.len(), 32);
         assert_eq!(body.certificate.spki.len(), 91);
@@ -1145,7 +1145,7 @@ mod real_rekor_v3 {
         assert_eq!(parsed.apex, format!("{APEX}."));
         assert_eq!(parsed.key_tag, KEY_TAG);
         assert_eq!(parsed.action, "rollover");
-        assert_eq!(parsed.replaces_key_tag, Some(56306));
+        assert_eq!(parsed.replaces_key_tag, Some(17123));
         assert_eq!(parsed.flags, 257);
         assert_eq!(parsed.algorithm, 13);
         assert_eq!(

@@ -26,7 +26,7 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 const APEX: &str = "zone-key-transparency.demo.invalid";
-const LOG_INDEX: u64 = 67_766_084;
+const LOG_INDEX: u64 = 67_966_366;
 
 /// The zone is its own trust anchor: we own no DNSSEC-signed domain, so the
 /// chain in the certificate terminates at the apex rather than at the ICANN
@@ -54,7 +54,7 @@ fn the_real_published_entry_classifies_tier_b() {
     assert_eq!(finding.tier, Tier::B, "{}", finding.line());
     assert_eq!(finding.apex, format!("{APEX}."));
     assert_eq!(finding.log_index, LOG_INDEX);
-    assert_eq!(finding.key_tag, 1339);
+    assert_eq!(finding.key_tag, 27337);
 
     // The chain validated, and the countersignature named a predecessor this
     // monitor has never seen — which is precisely what tier B means.
@@ -63,12 +63,12 @@ fn the_real_published_entry_classifies_tier_b() {
         "{:?}",
         finding.reasons
     );
-    assert_eq!(finding.predecessor_key_tag, Some(56306));
+    assert_eq!(finding.predecessor_key_tag, Some(17123));
     assert!(
         finding
             .reasons
             .iter()
-            .any(|r| r.contains("56306") && r.contains("not one this monitor knows")),
+            .any(|r| r.contains("17123") && r.contains("not one this monitor knows")),
         "{:?}",
         finding.reasons
     );
@@ -78,7 +78,7 @@ fn the_real_published_entry_classifies_tier_b() {
     // has a compromised DNS provider in it. The DS is the line a registrar
     // would show, so an operator can compare without believing the entry.
     assert!(
-        finding.ds.starts_with("1339 13 2 "),
+        finding.ds.starts_with("27337 13 2 "),
         "the derived DS: {}",
         finding.ds
     );
@@ -108,7 +108,7 @@ fn the_same_entry_is_tier_a_once_its_predecessor_is_known() {
 
     let finding = classify(&body, LOG_INDEX, &known, &anchors).expect("classifiable");
     assert_eq!(finding.tier, Tier::A, "{}", finding.line());
-    assert_eq!(finding.predecessor_key_tag, Some(56306));
+    assert_eq!(finding.predecessor_key_tag, Some(17123));
 }
 
 /// And the invariant, at the one point where it touches real bytes: an entry
