@@ -847,6 +847,17 @@ fn now_unix() -> u64 {
 /// How long one DoH exchange may take end to end.
 const DOH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The most of a DoH response body we will buffer.
+///
+/// A DNS message is length-prefixed by 16 bits, so 65535 bytes is the whole
+/// of any legitimate answer — the ~20 KB TUF bundle, the ~3 KB proof and
+/// everything smaller sit well inside it. The transport is untrusted and may
+/// be plaintext, so an endpoint that streams a body without end is a
+/// memory-exhaustion lever; we read up to this bound and refuse the rest
+/// rather than buffer whatever arrives. Denial, which http already concedes,
+/// never escalates to unbounded allocation.
+const MAX_DOH_RESPONSE: usize = 64 * 1024;
+
 /// An RFC 8484 DNS-over-HTTP(S) client.
 ///
 /// This is the only transport: queries are POSTed in wire format over
@@ -894,11 +905,35 @@ impl DohHandle {
                 response.status()
             )));
         }
-        let bytes = response
-            .bytes()
+        // A `Content-Length` past the cap is refused before a byte is read;
+        // but the header is a hint an attacker can omit or lie about, so the
+        // streaming loop below is the real bound — it stops buffering the
+        // instant the body crosses the cap, whatever the header claimed.
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_DOH_RESPONSE as u64)
+        {
+            return Err(std::io::Error::other(format!(
+                "{}: response exceeds the {MAX_DOH_RESPONSE}-byte DoH ceiling",
+                self.url
+            )));
+        }
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| std::io::Error::other(format!("{}: {e}", self.url)))?;
-        Ok(bytes.to_vec())
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", self.url)))?
+        {
+            if bytes.len() + chunk.len() > MAX_DOH_RESPONSE {
+                return Err(std::io::Error::other(format!(
+                    "{}: response exceeds the {MAX_DOH_RESPONSE}-byte DoH ceiling",
+                    self.url
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 }
 

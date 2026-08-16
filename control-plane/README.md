@@ -19,7 +19,12 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   (`controlplane rekor-publish`), with the proof served inside the zone at
   `_synchronicity-rekor.<apex>` so clients verify it offline — a
   substituted DS then has to be a *public* substitution or fail
-  validation. See [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md).
+  validation. v1 uses synchronicity's own log-entry convention (the client
+  pins and verifies real Sigstore *checkpoints* and *keys*, but matching
+  Rekor v2's on-log entry serialization for end-to-end interop against the
+  public Sigstore log is future work, and the submission client is a stub);
+  a self-hosted, convention-compatible log works today. See
+  [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md) §2, §8.
 - The zone also **relays Sigstore's TUF metadata** verbatim at
   `_synchronicity-tuf.<apex>` (`controlplane tuf-refresh`, and the hourly
   job when the stored timestamp nears expiry), so clients' log-key pins

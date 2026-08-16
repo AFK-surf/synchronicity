@@ -81,8 +81,28 @@ The DSSE payload is an in-toto v1 Statement:
 - The DSSE signature is ECDSA P-256/SHA-256 with the zone key — the same
   algorithm 13 material, no second signing identity.
 
-The design targets Rekor v2 (tile-backed) bundles: entry + Merkle inclusion
-proof + signed checkpoint. No reliance on v1 Signed Entry Timestamps.
+The design targets a Rekor v2 (tile-backed) shape: entry + Merkle inclusion
+proof + signed checkpoint, with no reliance on v1 Signed Entry Timestamps.
+
+**Interop scope, stated exactly** (audit finding, do not let this drift): the
+*checkpoint* and *log-key* halves are the real Sigstore article — the client
+verifies a genuine `log2025-1.rekor.sigstore.dev` checkpoint against the
+embedded log key in a conformance test (`rekor.rs`,
+`a_real_sigstore_checkpoint_verifies_under_the_embedded_pin_set`), and the
+embedded pins are Sigstore's production keys. What is *not* yet the real
+article is the Merkle **leaf** convention: the entry a leaf commits to is the
+DSSE envelope rendered as canonical JSON (§3), which is synchronicity's own
+serialization, not the on-log entry format Rekor v2 hashes. End-to-end
+inclusion against a proof minted by the *real* Sigstore therefore does not
+work yet — an inclusion walk under our leaf convention will not reach a root
+Sigstore computed over its own. Two honest consequences follow: v1
+interoperates with a log that adopts this convention (a self-hosted,
+Rekor-compatible deployment), and matching Sigstore v2's entry serialization
+so a real public-good proof verifies end to end is tracked as future work
+(§8). The control plane's Rekor submission client is a stub for the same
+reason (§5.2). None of this weakens the security argument — a mismatch fails
+closed, discarding the answer — but it bounds what "on the public log" can
+mean in a v1 deployment.
 
 ## 3. Proof distribution: in-band, in the zone
 
@@ -343,11 +363,24 @@ Rejected:
 - **Per-network proof records** — duplicates the proof once per network for a
   zone-scoped fact.
 
-Future work: checkpoint witness cosignatures (split-view resistance beyond
-monitors); an in-client TUF root for log-key rotation (designed in §10);
-logging device-key membership *sets* (a much chattier, much larger design,
-only worth it with witnessing in place); `retire`-entry enforcement as soft
-revocation signal.
+Future work: **matching Rekor v2's on-log entry serialization** so a proof
+minted by the real Sigstore verifies end to end (today the leaf commits to
+our own canonical-JSON DSSE entry, and the checkpoint/log-key halves are the
+only parts anchored to real Sigstore — §2); the real Rekor submission client
+(§5.2, stubbed today); checkpoint witness cosignatures (split-view
+resistance beyond monitors — the real checkpoints already carry witness
+lines, which the client parses and ignores); an in-client TUF root for
+log-key rotation (designed in §10); logging device-key membership *sets* (a
+much chattier, much larger design, only worth it with witnessing in place);
+`retire`-entry enforcement as soft revocation signal.
+
+Witnessing note: the conformance-fixture checkpoint from
+`log2025-1.rekor.sigstore.dev` already carries two witness cosignatures
+(`witness.navigli.sunlight.geomys.org`, `witness.stagemole.eu`) beside the
+log's own. The client parses every signature line and needs only the pinned
+log's to verify, so witnesses cost nothing today; requiring *N-of-M* witness
+signatures — the actual split-view defense — is the future-work item above,
+and the pin-set format already carries more than one key.
 
 ## 9. Testing
 

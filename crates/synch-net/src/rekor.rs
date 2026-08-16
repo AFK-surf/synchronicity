@@ -225,6 +225,14 @@ impl RekorProof {
     /// This exact rendering — field order, single signature object, padded
     /// standard base64, no whitespace — is what the leaf hash commits to, so
     /// it is part of the format (see the module docs), not a detail.
+    ///
+    /// Scope (audit finding, docs/REKOR-ZONE-KEY.md §2): this is
+    /// *synchronicity's* entry serialization, which a compatible log adopts —
+    /// it is not the on-log entry format Rekor v2 hashes. The checkpoint and
+    /// log-key halves are anchored to real Sigstore
+    /// (`a_real_sigstore_checkpoint_verifies_under_the_embedded_pin_set`);
+    /// end-to-end inclusion against a proof minted by the real Sigstore needs
+    /// this rendering to match its entry format, which is future work.
     pub fn entry_bytes(&self) -> Vec<u8> {
         let mut out = String::with_capacity(64 + 2 * (self.dsse_payload.len() + 96));
         out.push_str("{\"payloadType\":\"");
@@ -1154,6 +1162,56 @@ mod tests {
                 "{broken:?} must not parse"
             );
         }
+    }
+
+    #[test]
+    fn a_real_sigstore_checkpoint_verifies_under_the_embedded_pin_set() {
+        // The one external reality anchor for the checkpoint half of the
+        // proof path: a genuine signed checkpoint fetched from
+        // log2025-1.rekor.sigstore.dev, verified here against the log key
+        // this build embeds — nothing in this file authored it. It proves
+        // our signed-note parsing and our pinned-key selection accept what
+        // real Sigstore emits: the note framing (origin, tree size, base64
+        // root, blank line, `— name base64(keyhint||sig)`), the em-dash
+        // signature line, the four-byte key-hint prefix, and the Ed25519
+        // signature over the note body up to and including its final
+        // newline. (The witness cosignature lines in the same checkpoint are
+        // parsed and simply not matched by our pin — `verify_signature`
+        // needs only one line to verify, which is the log's own.)
+        //
+        // Scope, stated exactly: this anchors the checkpoint and log-key
+        // machinery to reality. It does NOT anchor the Merkle *leaf*
+        // convention — `entry_bytes` renders the DSSE envelope as canonical
+        // JSON, which is synchronicity's own entry serialization, not
+        // Rekor v2's on-log entry format. End-to-end inclusion against a
+        // real Sigstore proof needs that serialization matched, which is
+        // future work (docs/REKOR-ZONE-KEY.md §2, §8).
+        let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
+        let checkpoint = Checkpoint::parse(note).expect("a real checkpoint must parse");
+        assert_eq!(checkpoint.origin, "log2025-1.rekor.sigstore.dev");
+        assert!(checkpoint.tree_size > 0);
+
+        let embedded = LogKeys::embedded();
+        let verified = embedded
+            .keys()
+            .iter()
+            .any(|key| checkpoint.verify_signature(key).is_ok());
+        assert!(
+            verified,
+            "the real checkpoint must verify under an embedded Sigstore key"
+        );
+
+        // And the anchor has teeth: flip one byte of the signed body and no
+        // embedded key vouches for it any more.
+        let mut tampered = checkpoint.clone();
+        tampered.signed[0] ^= 0x01;
+        assert!(
+            !embedded
+                .keys()
+                .iter()
+                .any(|key| tampered.verify_signature(key).is_ok()),
+            "a tampered checkpoint must not verify"
+        );
     }
 
     #[test]
