@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: vmactions/openbsd-vm@v1
         with:
-          release: "7.7"
+          release: "7.9"
           usesh: true
           # Everything from ports lands under /usr/local (hence the
           # -I/-L via environment, which the Makefile appends to).
