@@ -449,10 +449,12 @@ them fail a refresh: TUF trouble is never worse than not having the record.
   real Rust verifier against what the zone serves. Bad stored material
   costs nothing but zone bytes: clients ignore it and keep their pins.
 - `zone/build` emits the bundle record from `tuf_material`; the hourly job
-  refetches when the stored timestamp is within 3 days of expiry, and
-  `controlplane tuf-refresh` does it on demand (the air-gapped ceremony
-  runs it where there is egress and couriers the database, as with
-  everything else).
+  refetches when the stored timestamp is within 3 days of expiry and, when
+  the fetch changed anything, republishes in the same tick — the zone is
+  presigned, so stored material a client can see only exists after a
+  publish. `controlplane tuf-refresh` does the same on demand (the
+  air-gapped ceremony runs it where there is egress and couriers the
+  database, as with everything else).
 - `/healthz` reports the stored timestamp expiry and root version.
 
 ### 10.4 What this changes about §4.1 and §8

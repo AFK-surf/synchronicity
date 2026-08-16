@@ -117,6 +117,24 @@ pub enum NetError {
         /// Which checkpoint check failed.
         reason: String,
     },
+    /// The relayed TUF material did not verify, so the pin set did not move
+    /// (docs/REKOR-ZONE-KEY.md §10.2).
+    ///
+    /// Never fatal to a refresh, by design: expiry gates updates, never
+    /// operation, and a zone that relays nothing usable leaves the client
+    /// exactly where it was. The variant exists so `synch doctor` can say
+    /// *which* way the chain broke — a threshold failure and a stale
+    /// timestamp are very different news.
+    #[error("tuf pin refresh: {name}: {class}: {reason}")]
+    Tuf {
+        /// The bundle record's owner name.
+        name: String,
+        /// The failure class: chain, threshold, signature, expiry, rollback,
+        /// target-hash, malformed.
+        class: &'static str,
+        /// What failed, in the verifier's own words.
+        reason: String,
+    },
     /// The entry lives in a log this client was never told to trust.
     #[error("zone key transparency: {name}: unknown log: {reason}")]
     RekorUnknownLog {

@@ -36,6 +36,7 @@ async fn a_signed_zone_validates_end_to_end() {
         // suite, and this zone logs nothing.
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
+        rekor_state: None,
     })
     .unwrap();
 
@@ -72,6 +73,7 @@ async fn a_zone_signed_by_an_unanchored_key_is_refused() {
         // suite, and this zone logs nothing.
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
+        rekor_state: None,
     })
     .unwrap();
     resolver
@@ -99,6 +101,7 @@ async fn an_unsigned_zone_is_refused() {
         // suite, and this zone logs nothing.
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
+        rekor_state: None,
     })
     .unwrap();
     resolver

@@ -62,8 +62,37 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3]
+  [v1, v2, v3, v4]
 }
+
+/// V4: the relayed TUF material (docs/REKOR-ZONE-KEY.md §10.3). One row,
+/// because there is one Sigstore repository and one current view of it —
+/// the files verbatim, their versions, and the timestamp expiry the hourly
+/// job watches. This service is a relay, not the verifier: the columns
+/// exist so it can refuse regressions and know when to refetch, and the
+/// cryptographic gate is the client's.
+///
+/// `root_json` holds the root chain as one blob of u32-length-prefixed
+/// files, ascending — the same framing the bundle record uses, so serving
+/// is a copy rather than a re-encode.
+const v4 = "
+CREATE TABLE tuf_material (
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  source            TEXT    NOT NULL,
+  root_json         BLOB    NOT NULL,
+  root_count        INTEGER NOT NULL CHECK (root_count BETWEEN 1 AND 255),
+  root_version      INTEGER NOT NULL,
+  timestamp_json    BLOB    NOT NULL,
+  timestamp_version INTEGER NOT NULL,
+  timestamp_expires INTEGER NOT NULL,
+  snapshot_json     BLOB    NOT NULL,
+  snapshot_version  INTEGER NOT NULL,
+  targets_json      BLOB    NOT NULL,
+  targets_version   INTEGER NOT NULL,
+  trusted_root      BLOB    NOT NULL,
+  fetched_at        INTEGER NOT NULL
+);
+"
 
 /// V3: zone-key transparency (docs/REKOR-ZONE-KEY.md §5.2). One row per
 /// zone-key lifecycle event, holding the entry exactly as it was logged

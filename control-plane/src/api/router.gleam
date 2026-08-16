@@ -19,6 +19,7 @@ import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import store/pool
+import tuf/store as tuf_store
 import wisp.{type Request, type Response}
 import zone/model
 
@@ -182,13 +183,26 @@ fn with_session(
 
 fn healthz(serving: Serving) -> Response {
   let looked =
-    pool.with_connection(serving.pool, fn(conn) { model.health(conn) })
+    pool.with_connection(serving.pool, fn(conn) {
+      #(model.health(conn), tuf_store.get(conn))
+    })
   case looked {
-    Ok(Ok(#(serial, expires))) ->
+    Ok(#(Ok(#(serial, expires)), tuf)) ->
       json.object([
         #("status", json.string("ok")),
         #("soa_serial", json.int(serial)),
         #("sig_expires_at", json.int(expires)),
+        // The relayed TUF material (docs/REKOR-ZONE-KEY.md §10.3): the
+        // stored timestamp expiry and root version, so an operator can see
+        // a relay that has quietly stopped refetching. Absent material is
+        // reported as absent, not as unhealthy — clients keep their pins.
+        ..case tuf {
+          Ok(Ok(material)) -> [
+            #("tuf_root_version", json.int(material.root_version)),
+            #("tuf_timestamp_expires_at", json.int(material.timestamp_expires)),
+          ]
+          _ -> []
+        }
       ])
       |> json.to_string
       |> wisp.json_response(200)

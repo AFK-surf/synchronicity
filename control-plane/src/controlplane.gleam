@@ -8,6 +8,8 @@
 ////   rekor-publish <apex> <file>
 ////                         log the zone key in the transparency log, verify
 ////                         the proof locally, store and serve it
+////   tuf-refresh           refetch Sigstore's TUF metadata and relay it in
+////                         the zone, so clients' log pins follow it
 ////   seed                  create a demo org/network/devices and publish
 ////   seed-admin <email>    first-user bootstrap: print a one-time magic link
 ////   migrate-check         replay the migration chain against a scratch DB
@@ -40,6 +42,7 @@ import store/migrate
 import store/pool
 import store/sqlite
 import tools/seed
+import tuf/fetch as tuf_fetch
 import wisp/wisp_mist
 import zone/model
 import zone/publish
@@ -59,13 +62,14 @@ pub fn main() {
     ["ds", apex, key_file] -> print_key_material(apex, key_file)
     ["rekor-publish", apex, key_file] ->
       run_or_die(fn() { rekor_publish(apex, key_file) })
+    ["tuf-refresh"] -> run_or_die(tuf_refresh)
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(run_seed)
     ["seed-admin", email] -> run_or_die(fn() { seed_admin(email) })
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | seed | seed-admin <email> | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | tuf-refresh | seed | seed-admin <email> | migrate-check",
       )
       halt(2)
     }
@@ -150,6 +154,49 @@ fn rekor_publish(apex_text: String, key_file: String) -> Result(Nil, String) {
     <> case outcome.refreshed {
       True -> " (proof refreshed, no new entry)"
       False -> " (entry added)"
+    },
+  )
+  Ok(Nil)
+}
+
+/// Refetches Sigstore's TUF metadata and republishes, so the bundle record
+/// is served beside the proofs it will be used to check (§10.3).
+///
+/// The air-gapped ceremony runs this where there is egress and couriers the
+/// database, as with everything else. Failing costs nothing: clients keep
+/// the pins they have, which is what a control plane that never ran this at
+/// all leaves them with.
+fn tuf_refresh() -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use csk <- result.try(keys.load(cfg.key_file))
+  use conn <- result.try(open_primary_db(cfg))
+  let now = now_unix()
+  let source = tuf_fetch.url()
+  use outcome <- result.try(tuf_fetch.refresh(
+    conn,
+    tuf_fetch.http(source),
+    source,
+    now,
+  ))
+  use _ <- result.try(
+    publish.publish(conn, csk, now, "system:tuf-refresh")
+    |> result.map_error(fn(e) { "republishing zone: " <> string.inspect(e) }),
+  )
+  sqlite.close(conn)
+  io.println(
+    "tuf: root "
+    <> int.to_string(outcome.root_version)
+    <> ", timestamp "
+    <> int.to_string(outcome.timestamp_version)
+    <> " (expires "
+    <> int.to_string(outcome.timestamp_expires)
+    <> "), snapshot "
+    <> int.to_string(outcome.snapshot_version)
+    <> ", targets "
+    <> int.to_string(outcome.targets_version)
+    <> case outcome.changed {
+      True -> " — relayed"
+      False -> " — unchanged"
     },
   )
   Ok(Nil)

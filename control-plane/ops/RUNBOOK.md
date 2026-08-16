@@ -73,6 +73,7 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_REKOR_URL` | primary | zone-key transparency log, default `https://rekor.sigstore.dev` |
 | `CP_REKOR_KEY` | primary | file pinning the log's verification key; defaults to the embedded rekor.sigstore.dev snapshot |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
+| `CP_TUF_URL` | primary | Sigstore TUF repository relayed in the zone, default `https://tuf-repo-cdn.sigstore.dev` |
 
 > **Why the database gets its own directory.** Each SQLite connection
 > runs in a `csqlite` worker sandboxed (Landlock on Linux, `unveil`/
@@ -114,20 +115,41 @@ secrets.** Protect the replication bucket accordingly.
    checkpoint against a grown tree. Nothing is stored that did not
    verify.
 
-3. Start the primary (systemd unit in `ops/systemd/`). First boot
+3. **Relay Sigstore's TUF metadata** (once there is egress):
+
+   ```sh
+   controlplane tuf-refresh
+   ```
+
+   Walks `CP_TUF_URL` the way TUF consistent snapshots are meant to be
+   walked — timestamp names the snapshot, the snapshot names the targets,
+   the targets name `trusted_root.json` by digest — stores every file
+   verbatim and republishes so the bundle is served at
+   `_synchronicity-tuf.<apex>` (docs/REKOR-ZONE-KEY.md §10). Clients
+   verify that chain offline against a TUF root built into them and adopt
+   the log keys it names, so Sigstore's log rotations stop being a client
+   upgrade. This service checks structure, versions and expiries only —
+   it is a relay, not the verifier — and refuses a fetch that would walk
+   clients backwards. The hourly job refetches on its own once the stored
+   timestamp is within three days of expiring; run this by hand after any
+   long outage, or on an egress host before couriering the database in an
+   air-gapped deployment. Skipping it entirely is fine: clients keep the
+   log keys their build shipped with.
+
+4. Start the primary (systemd unit in `ops/systemd/`). First boot
    migrates the DB, writes zone metadata and publishes the (empty) zone.
 
-4. **First user**: `controlplane seed-admin you@example.com` prints a
+5. **First user**: `controlplane seed-admin you@example.com` prints a
    one-time sign-in link.
 
-5. Start replicas + your replication tooling on the `ns` hosts.
+6. Start replicas + your replication tooling on the `ns` hosts.
 
-6. **Delegate at the parent zone**:
+7. **Delegate at the parent zone**:
    - `NS` records pointing at `ns1.<base>`, `ns2.<base>`;
    - glue `A`/`AAAA` for those names (they match `CP_NS_HOSTS`);
    - the `DS` record from step 1.
 
-7. **Verify from outside** (must print `; fully validated`):
+8. **Verify from outside** (must print `; fully validated`):
 
    ```sh
    delv _synchronicity.<net>.<org>.<base> TXT +rtrace
@@ -169,6 +191,14 @@ control plane itself with
   a verified record. With the gate on, *every* publish path refuses while
   the active key has none, including the hourly re-sign; that is
   deliberate, and `rekor-publish` is how you get out of it.
+- **Log-pin refresh** (docs/REKOR-ZONE-KEY.md §10): `tuf-refresh` relays
+  Sigstore's TUF metadata at `_synchronicity-tuf.<apex>` so clients'
+  transparency-log pins follow Sigstore's rotations. `/healthz` reports
+  `tuf_root_version` and `tuf_timestamp_expires_at`; an expiry that stops
+  moving means the hourly refetch is failing — check egress to
+  `CP_TUF_URL`. It is never urgent: an expired or absent bundle leaves
+  every client on the pins it already has, which is where they were
+  before this existed.
 - **Backups**: the litestream bucket *is* the database backup. The key
   file is backed up offline from the ceremony. Those two artifacts
   restore the whole service.

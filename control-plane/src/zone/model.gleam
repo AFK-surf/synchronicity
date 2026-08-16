@@ -12,6 +12,8 @@ import rekor/publish as rekor_publish
 import rekor/store as rekor_store
 import store/sqlite.{type Connection, Text}
 import thirtytwo
+import tuf/bundle
+import tuf/store as tuf_store
 
 pub type ZoneMeta {
   ZoneMeta(
@@ -48,6 +50,10 @@ pub type ZoneInput {
     /// base64url form one TXT record carries. Empty until `rekor-publish`
     /// has run — phase 0 of the rollout serves a zone without them.
     rekor_proofs: List(String),
+    /// The relayed Sigstore TUF bundle (§10.1), base64url. Empty until
+    /// `tuf-refresh` has run, which is a zone whose clients keep the pins
+    /// they already have — a non-event, not a fault.
+    tuf_bundle: String,
   )
 }
 
@@ -73,7 +79,21 @@ pub fn read(conn: Connection) -> Result(ZoneInput, ModelError) {
   use ns_hosts <- result.try(read_ns(conn, meta.apex))
   use txt_names <- result.try(read_txt_names(conn, meta.apex))
   use rekor_proofs <- result.try(read_rekor_proofs(conn, meta.key_tag))
-  Ok(ZoneInput(meta, ns_hosts, txt_names, rekor_proofs))
+  use tuf_bundle <- result.try(read_tuf_bundle(conn))
+  Ok(ZoneInput(meta, ns_hosts, txt_names, rekor_proofs, tuf_bundle))
+}
+
+/// The relayed TUF bundle, or the empty string when nothing is stored.
+///
+/// A database error here would be an odd way to stop serving a zone over
+/// material the client is free to ignore, so it is reported like any other
+/// read; what is *not* an error is having no material at all.
+fn read_tuf_bundle(conn: Connection) -> Result(String, ModelError) {
+  use stored <- result.try(tuf_store.get(conn) |> result.map_error(Db))
+  case stored {
+    Ok(material) -> Ok(bundle.to_txt(tuf_store.to_bundle(material)))
+    Error(Nil) -> Ok("")
+  }
 }
 
 /// The proof records for the key this zone publishes.

@@ -38,6 +38,7 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
         // suite, and this zone logs nothing.
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
+        rekor_state: None,
     })
     .unwrap();
 

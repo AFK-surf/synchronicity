@@ -77,6 +77,16 @@ fail validation. `--rekor off` (`SYNCH_REKOR`) states the opt-out;
 verification key, with the same different-universe semantics as the trust
 anchor. See [docs/REKOR-ZONE-KEY.md](docs/REKOR-ZONE-KEY.md).
 
+Sigstore rotates those log keys, so the pinned set follows them on its own.
+A zone may also relay Sigstore's TUF metadata, verbatim, at
+`_synchronicity-tuf.<apex>`; the daemon verifies that chain offline against
+a TUF root built into the binary and adopts the resulting log keys,
+persisting them in `<data-dir>/rekor-pins.json`. Nothing about it can fail a
+refresh — an absent, stale or invalid bundle simply leaves the current pins
+standing — and the versions only ever move forward, so a hostile relay can
+withhold an update but never walk one back. `--rekor-key` turns the whole
+mechanism off: a named key file is a static universe in both directions.
+
 Rotate a device key. Every step is an explicit command: a node never polls its
 own domain and never switches signing keys on its own.
 

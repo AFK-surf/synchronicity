@@ -20,6 +20,13 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   `_synchronicity-rekor.<apex>` so clients verify it offline — a
   substituted DS then has to be a *public* substitution or fail
   validation. See [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md).
+- The zone also **relays Sigstore's TUF metadata** verbatim at
+  `_synchronicity-tuf.<apex>` (`controlplane tuf-refresh`, and the hourly
+  job when the stored timestamp nears expiry), so clients' log-key pins
+  follow Sigstore's rotations without an upgrade. This service is a relay,
+  not the verifier: it checks structure, versions and expiries, and the
+  cryptographic gate is the client's, against a TUF root built into it.
+  Relaying nothing costs nothing — clients keep the pins they have.
 - Each org has **networks**; a network is one synchronicity cluster and
   owns one membership name: `_synchronicity.<network>.<org>.<base>`.
 - A **device** is one `id=` label plus its keys. Key rotation follows
@@ -100,6 +107,7 @@ listen address.
 | `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint. Default `https://rekor.sigstore.dev`. |
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key; defaults to the embedded rekor.sigstore.dev snapshot. Set it for a self-hosted log. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
+| `CP_TUF_URL` | primary | Sigstore TUF repository this zone relays, so clients' log pins follow it. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched by `controlplane tuf-refresh` and by the hourly job within three days of the stored timestamp's expiry. |
 
 Day-2 operations (replicas, key ceremony, backups) live in
 `ops/RUNBOOK.md`.

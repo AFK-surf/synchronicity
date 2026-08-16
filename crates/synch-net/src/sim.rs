@@ -25,6 +25,7 @@ use hickory_resolver::proto::{
 use crate::{
     dns::TXT_PREFIX,
     rekor::{self, RekorProof, ZoneKeyStatement},
+    tuf::{self, TufBundle},
 };
 
 /// One signed zone: an origin, its TXT membership records, and the key that
@@ -47,6 +48,10 @@ pub struct SimZone {
     /// base64url as [`RekorProof::to_txt`] renders it. Empty is the
     /// not-yet-upgraded control plane.
     pub rekor_txt: Vec<String>,
+    /// The TUF bundle served at `_synchronicity-tuf.<origin>`, base64url as
+    /// [`TufBundle::to_txt`] renders it. Empty is a control plane that
+    /// relays no TUF material, which is a non-event to a client (§10.2).
+    pub tuf_txt: Vec<String>,
 }
 
 impl SimZone {
@@ -74,6 +79,7 @@ impl SimZone {
             ttl: 300,
             unsigned: false,
             rekor_txt: Vec::new(),
+            tuf_txt: Vec::new(),
         }
     }
 
@@ -136,6 +142,11 @@ impl SimZone {
     /// The name the proof records live under.
     pub fn rekor_name(&self) -> Name {
         Name::from_utf8(format!("{}.{}", rekor::REKOR_TXT_PREFIX, self.origin)).expect("rekor name")
+    }
+
+    /// The name the TUF bundle lives under.
+    pub fn tuf_name(&self) -> Name {
+        Name::from_utf8(format!("{}.{}", tuf::TUF_TXT_PREFIX, self.origin)).expect("tuf name")
     }
 
     /// The trust-anchor line for this zone's key, in the file syntax
@@ -228,22 +239,10 @@ impl SimZone {
                 set
             }
             RecordType::TXT if name == self.rekor_name() && !self.rekor_txt.is_empty() => {
-                let mut set = RecordSet::new(name, RecordType::TXT, 0);
-                for text in &self.rekor_txt {
-                    // A proof is kilobytes; TXT carries it as consecutive
-                    // ≤255-byte character-strings, which the client
-                    // concatenates before decoding (§3).
-                    let chunks = text
-                        .as_bytes()
-                        .chunks(255)
-                        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                        .collect();
-                    set.insert(
-                        Record::from_rdata(self.rekor_name(), 86_400, RData::TXT(TXT::new(chunks))),
-                        0,
-                    );
-                }
-                set
+                self.chunked_txt(self.rekor_name(), &self.rekor_txt)
+            }
+            RecordType::TXT if name == self.tuf_name() && !self.tuf_txt.is_empty() => {
+                self.chunked_txt(self.tuf_name(), &self.tuf_txt)
             }
             RecordType::DNSKEY if name == self.origin => {
                 let mut set = RecordSet::new(name, RecordType::DNSKEY, 0);
@@ -277,6 +276,27 @@ impl SimZone {
     /// The name the membership records live under.
     pub fn txt_name(&self) -> Name {
         Name::from_utf8(format!("{TXT_PREFIX}.{}", self.origin)).expect("txt name")
+    }
+
+    /// One TXT RRset carrying long base64url payloads.
+    ///
+    /// A proof is kilobytes and a TUF bundle is tens of them; TXT carries
+    /// either as consecutive ≤255-byte character-strings, which the client
+    /// concatenates before decoding (§3, §10.1).
+    fn chunked_txt(&self, owner: Name, payloads: &[String]) -> RecordSet {
+        let mut set = RecordSet::new(owner.clone(), RecordType::TXT, 0);
+        for text in payloads {
+            let chunks = text
+                .as_bytes()
+                .chunks(255)
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect();
+            set.insert(
+                Record::from_rdata(owner.clone(), 86_400, RData::TXT(TXT::new(chunks))),
+                0,
+            );
+        }
+        set
     }
 }
 
@@ -342,6 +362,12 @@ impl SimLog {
     /// The log's id: SHA-256 over its DER SubjectPublicKeyInfo.
     pub fn log_id(&self) -> [u8; 32] {
         rekor::sha256(&self.spki)
+    }
+
+    /// The log's DER SubjectPublicKeyInfo — what a `trusted_root.json`
+    /// carries as a tlog's `publicKey.rawBytes`.
+    pub fn spki(&self) -> Vec<u8> {
+        self.spki.clone()
     }
 
     /// Appends one entry, returning its index.
@@ -419,6 +445,385 @@ impl SimLog {
         proof.checkpoint = self.checkpoint();
         proof.inclusion_path = self.inclusion_path(proof.log_index);
     }
+}
+
+/// A synthetic TUF repository with its own root keys (§10.5).
+///
+/// The real chain is checked in as a conformance fixture, because canonical
+/// JSON has to be right against the bytes a real repository serves. This is
+/// for everything the real repository cannot be made to do on demand: root
+/// rotation across several versions, a threshold that is not met, an expired
+/// timestamp, a rolled-back version, a tampered target, and a trusted root
+/// that *drops* a log key — revocation reaching the pin set, which is the
+/// half of §10 that a fixture can never demonstrate.
+///
+/// Roles are signed the way Sigstore signs them: the root role with ECDSA
+/// P-256 and DER signatures, the online roles — timestamp, snapshot, targets
+/// — with a single Ed25519 key, so both schemes and both signature
+/// encodings are exercised by every bundle this produces.
+#[doc(hidden)]
+#[allow(missing_debug_implementations)]
+pub struct SimTuf {
+    /// The root-role keys, and how many of them must sign.
+    root_keys: Vec<SimTufKey>,
+    root_threshold: u64,
+    /// The one key the timestamp, snapshot and targets roles share.
+    online: SimTufKey,
+    /// Every `root.json` this repository has published, ascending.
+    roots: Vec<Vec<u8>>,
+    timestamp_version: u64,
+    snapshot_version: u64,
+    targets_version: u64,
+    trusted_root: Vec<u8>,
+    /// When the online roles expire, seconds since the epoch.
+    pub expires: i64,
+    /// When the root role expires, seconds since the epoch.
+    pub root_expires: i64,
+}
+
+impl SimTuf {
+    /// A repository at root version 1 whose `trusted_root.json` names
+    /// `tlogs` — each a DER SubjectPublicKeyInfo, as [`SimLog::spki`]
+    /// produces.
+    ///
+    /// `now` is the moment the caller intends to verify at; everything
+    /// expires a year later, and every test that wants an expiry failure
+    /// says so by moving one of the two `expires` fields.
+    pub fn new(now: i64, tlogs: &[Vec<u8>]) -> SimTuf {
+        let mut repo = SimTuf {
+            root_keys: (0..3).map(|_| SimTufKey::p256()).collect(),
+            root_threshold: 2,
+            online: SimTufKey::ed25519(),
+            roots: Vec::new(),
+            timestamp_version: 1,
+            snapshot_version: 1,
+            targets_version: 1,
+            trusted_root: Vec::new(),
+            expires: now + 365 * 86_400,
+            root_expires: now + 365 * 86_400,
+        };
+        repo.set_tlogs(tlogs);
+        repo.publish_root(None);
+        repo
+    }
+
+    /// The `root.json` a client of this repository would embed: version 1.
+    pub fn embedded_root(&self) -> Vec<u8> {
+        self.roots.first().cloned().expect("root version 1")
+    }
+
+    /// A [`crate::tuf::PinState`] anchored at that embedded root and nothing
+    /// else — a fresh install.
+    pub fn embedded_state(&self) -> crate::tuf::PinState {
+        let root = self.embedded_root();
+        crate::tuf::PinState {
+            root,
+            root_version: 1,
+            timestamp_version: 0,
+            snapshot_version: 0,
+            targets_version: 0,
+            trusted_root: Vec::new(),
+            updated_at: 0,
+        }
+    }
+
+    /// The current root version.
+    pub fn root_version(&self) -> u64 {
+        self.roots.len() as u64
+    }
+
+    /// Replaces the logs the `trusted_root.json` target names, bumping
+    /// targets, snapshot and timestamp the way a repository publish does.
+    ///
+    /// Passing fewer keys than last time is how a test asks the question
+    /// §10.2 exists to answer: does a key Sigstore removes actually leave
+    /// the client's pin set?
+    pub fn set_tlogs(&mut self, tlogs: &[Vec<u8>]) {
+        self.trusted_root = serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1",
+            "tlogs": tlogs
+                .iter()
+                .map(|spki| {
+                    serde_json::json!({
+                        "baseUrl": "https://rekor.sim",
+                        "hashAlgorithm": "SHA2_256",
+                        "publicKey": { "rawBytes": rekor::base64_encode(spki) },
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes();
+        self.targets_version += 1;
+        self.snapshot_version += 1;
+        self.timestamp_version += 1;
+    }
+
+    /// Publishes a new root version, signed by the old root's keys and its
+    /// own. `rekey` replaces the root-role key set, which is the rotation
+    /// the whole chain walk exists for.
+    pub fn rotate_root(&mut self, rekey: bool) {
+        let previous = rekey.then(|| self.root_keys.clone());
+        if rekey {
+            self.root_keys = (0..3).map(|_| SimTufKey::p256()).collect();
+        }
+        self.publish_root(previous.as_deref());
+    }
+
+    /// The bundle a zone would relay: every root, ascending, then the four
+    /// files the chain authenticates.
+    pub fn bundle(&self) -> TufBundle {
+        self.bundle_from(1)
+    }
+
+    /// The same bundle with the roots below `first` withheld — a relay that
+    /// serves a chain a client embedded lower down cannot reach.
+    pub fn bundle_from(&self, first: u64) -> TufBundle {
+        TufBundle {
+            roots: self
+                .roots
+                .iter()
+                .skip(first.saturating_sub(1) as usize)
+                .cloned()
+                .collect(),
+            timestamp: self.timestamp(),
+            snapshot: self.snapshot(),
+            targets: self.targets(),
+            trusted_root: self.trusted_root.clone(),
+        }
+    }
+
+    fn publish_root(&mut self, previous: Option<&[SimTufKey]>) {
+        let version = self.roots.len() as u64 + 1;
+        let mut keys = serde_json::Map::new();
+        for key in self.root_keys.iter().chain([&self.online]) {
+            keys.insert(key.id(), key.to_json());
+        }
+        let root_ids: Vec<String> = self.root_keys.iter().map(SimTufKey::id).collect();
+        let online = vec![self.online.id()];
+        let signed = serde_json::json!({
+            "_type": "root",
+            "spec_version": "1.0.31",
+            "version": version,
+            "expires": rfc3339(self.root_expires),
+            "consistent_snapshot": true,
+            "keys": keys,
+            "roles": {
+                "root": { "keyids": root_ids, "threshold": self.root_threshold },
+                "timestamp": { "keyids": online.clone(), "threshold": 1 },
+                "snapshot": { "keyids": online.clone(), "threshold": 1 },
+                "targets": { "keyids": online, "threshold": 1 },
+            },
+        });
+        // Both roots sign: the old one says who may succeed it, the new one
+        // proves it holds the keys it claims.
+        let signers = self.root_keys.iter().chain(previous.unwrap_or(&[]));
+        self.roots.push(sign_metadata(&signed, signers));
+    }
+
+    fn timestamp(&self) -> Vec<u8> {
+        let snapshot = self.snapshot();
+        let signed = serde_json::json!({
+            "_type": "timestamp",
+            "spec_version": "1.0.31",
+            "version": self.timestamp_version,
+            "expires": rfc3339(self.expires),
+            "meta": {
+                "snapshot.json": {
+                    "version": self.snapshot_version,
+                    "length": snapshot.len(),
+                    "hashes": { "sha256": hex::encode(rekor::sha256(&snapshot)) },
+                },
+            },
+        });
+        sign_metadata(&signed, [&self.online])
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        let targets = self.targets();
+        let signed = serde_json::json!({
+            "_type": "snapshot",
+            "spec_version": "1.0.31",
+            "version": self.snapshot_version,
+            "expires": rfc3339(self.expires),
+            "meta": {
+                // Sigstore's own snapshot lists targets.json by version
+                // alone; the hashes here make the tampered-target case
+                // reachable at this level too.
+                "targets.json": {
+                    "version": self.targets_version,
+                    "length": targets.len(),
+                    "hashes": { "sha256": hex::encode(rekor::sha256(&targets)) },
+                },
+            },
+        });
+        sign_metadata(&signed, [&self.online])
+    }
+
+    fn targets(&self) -> Vec<u8> {
+        let signed = serde_json::json!({
+            "_type": "targets",
+            "spec_version": "1.0.31",
+            "version": self.targets_version,
+            "expires": rfc3339(self.expires),
+            "targets": {
+                tuf::TRUSTED_ROOT_TARGET: {
+                    "length": self.trusted_root.len(),
+                    "hashes": { "sha256": hex::encode(rekor::sha256(&self.trusted_root)) },
+                },
+            },
+        });
+        sign_metadata(&signed, [&self.online])
+    }
+}
+
+/// One signing key of a synthetic repository.
+#[derive(Clone)]
+struct SimTufKey {
+    pkcs8: Vec<u8>,
+    spki: Vec<u8>,
+    scheme: &'static str,
+}
+
+impl SimTufKey {
+    fn p256() -> SimTufKey {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &rng,
+        )
+        .expect("keygen")
+        .as_ref()
+        .to_vec();
+        let key = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &pkcs8,
+            &rng,
+        )
+        .expect("key load");
+        let point = ring::signature::KeyPair::public_key(&key).as_ref()[1..].to_vec();
+        SimTufKey {
+            pkcs8,
+            spki: p256_spki(&point),
+            scheme: "ecdsa-sha2-nistp256",
+        }
+    }
+
+    fn ed25519() -> SimTufKey {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+            .expect("keygen")
+            .as_ref()
+            .to_vec();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).expect("key load");
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(ring::signature::KeyPair::public_key(&key).as_ref());
+        SimTufKey {
+            pkcs8,
+            spki,
+            scheme: "ed25519",
+        }
+    }
+
+    /// The key object a root's key table holds.
+    fn to_json(&self) -> serde_json::Value {
+        let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+        pem.push_str(&rekor::base64_encode(&self.spki));
+        pem.push_str("\n-----END PUBLIC KEY-----\n");
+        serde_json::json!({
+            "keytype": match self.scheme {
+                "ed25519" => "ed25519",
+                _ => "ecdsa",
+            },
+            "scheme": self.scheme,
+            "keyval": { "public": pem },
+        })
+    }
+
+    /// The TUF key id: SHA-256 over the canonical JSON of the key object.
+    fn id(&self) -> String {
+        crate::tuf::key_id(&self.to_json()).expect("key id")
+    }
+
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        let rng = ring::rand::SystemRandom::new();
+        match self.scheme {
+            "ed25519" => ring::signature::Ed25519KeyPair::from_pkcs8(&self.pkcs8)
+                .expect("key load")
+                .sign(message)
+                .as_ref()
+                .to_vec(),
+            _ => ring::signature::EcdsaKeyPair::from_pkcs8(
+                &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+                &self.pkcs8,
+                &rng,
+            )
+            .expect("key load")
+            .sign(&rng, message)
+            .expect("sign")
+            .as_ref()
+            .to_vec(),
+        }
+    }
+}
+
+/// Renders a `signed` object as a TUF metadata file, signed by each key.
+///
+/// The signatures cover the *canonical* JSON of `signed`, while the file
+/// itself carries the serialization below — exactly the split that makes
+/// canonical JSON load-bearing.
+fn sign_metadata<'a>(
+    signed: &serde_json::Value,
+    keys: impl IntoIterator<Item = &'a SimTufKey>,
+) -> Vec<u8> {
+    let canonical = crate::tuf::canonical_json(signed).expect("canonical json");
+    let signatures: Vec<serde_json::Value> = keys
+        .into_iter()
+        .map(|key| {
+            serde_json::json!({
+                "keyid": key.id(),
+                "sig": hex::encode(key.sign(&canonical)),
+            })
+        })
+        .collect();
+    serde_json::json!({ "signatures": signatures, "signed": signed })
+        .to_string()
+        .into_bytes()
+}
+
+/// A unix timestamp as the RFC 3339 form TUF `expires` fields carry.
+fn rfc3339(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
+/// Howard Hinnant's `civil_from_days`: the inverse of the conversion
+/// crate::tuf uses to read these back.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (year + i64::from(month <= 2), month, day)
 }
 
 /// RFC 6962 §2.1: the Merkle tree hash over a list of leaf hashes.

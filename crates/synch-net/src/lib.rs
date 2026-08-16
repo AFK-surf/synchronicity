@@ -17,6 +17,7 @@ pub mod reconcile;
 pub mod rekor;
 #[doc(hidden)]
 pub mod sim;
+pub mod tuf;
 
 pub use blob::{BlobClient, BlobProtocol, Slice};
 pub use dns::{
@@ -28,3 +29,4 @@ pub use error::{NetError, Result};
 pub use mpt::{HeadExchange, MptClient, MptProtocol, NodesResponse, ValuesResponse};
 pub use reconcile::{FetchOutcome, HeadOutcome, SyncReport, Syncer};
 pub use rekor::{ProofError, RekorProof};
+pub use tuf::{PinState, TufBundle, TufError};
