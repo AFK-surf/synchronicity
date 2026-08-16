@@ -705,6 +705,87 @@ fn the_shared_fixture_decodes_and_verifies() {
     assert_eq!(verified.log_index, proof.log_index);
 }
 
+/// The certificate encoders, across two implementations of one DER format.
+///
+/// The bytes under `test/fixtures/rekor/crossval` are written by the Gleam
+/// side (`gleam run -m tools/gen_crossval`) and asserted by both suites. It
+/// is the only thing that keeps a hand-rolled DER reader here and OTP's
+/// ASN.1 encoder there from agreeing with themselves and not with each
+/// other — and the certificate in particular is round-tripped, not merely
+/// compared, because its signature is randomized and its *contents* are what
+/// both sides turn on.
+#[test]
+fn the_gleam_certificate_encoders_agree_with_this_one() {
+    use synch_net::{
+        x509::Certificate,
+        zonecert::{ChainLink, DnssecChain, Succession, OID_DNSSEC_CHAIN, OID_SUCCESSION},
+    };
+
+    let chain = DnssecChain {
+        links: vec![
+            ChainLink {
+                zone: "sync.test.".into(),
+                rrs: vec![0xaa, 0xbb, 0xcc],
+            },
+            ChainLink {
+                zone: ".".into(),
+                rrs: vec![0x01, 0x02],
+            },
+        ],
+    };
+    assert_eq!(chain.encode(), fixture("crossval/chain.der"));
+    assert_eq!(
+        DnssecChain::decode(&fixture("crossval/chain.der")).unwrap(),
+        chain
+    );
+
+    let succession = Succession {
+        predecessor_key_tag: 34_918,
+        predecessor_spki: vec![0x30, 0x59, 0x11],
+        signature: vec![0x30, 0x44, 0x02],
+    };
+    assert_eq!(succession.encode(), fixture("crossval/succession.der"));
+    assert_eq!(
+        Succession::decode(&fixture("crossval/succession.der")).unwrap(),
+        succession
+    );
+
+    // The bytes the *previous* zone key signs, which two implementations
+    // have to render identically or a rotation reads as a substitution.
+    assert_eq!(
+        Succession::signed_payload("sync.test.", 34_918, b"spki"),
+        fixture("crossval/succession-payload.json")
+    );
+
+    // And a whole certificate the Gleam side built, read here.
+    let der = fixture("crossval/certificate.der");
+    let certificate = Certificate::parse(&der).expect("a Gleam-built certificate must parse");
+    assert_eq!(certificate.single_dns_name().unwrap(), "sync.test");
+    assert_eq!(certificate.spki.len(), 91);
+    assert_eq!(
+        certificate.extension(OID_DNSSEC_CHAIN),
+        Some(fixture("crossval/chain.der").as_slice())
+    );
+    assert_eq!(
+        certificate.extension(OID_SUCCESSION),
+        Some(fixture("crossval/succession.der").as_slice())
+    );
+    // The two extensions X.509 requires of an end-entity key envelope are
+    // there and critical, so a certificate this design mints reads correctly
+    // in any toolchain that opens the log entry.
+    let by_oid = |oid: &[u8]| {
+        certificate
+            .extensions
+            .iter()
+            .find(|e| e.oid == oid)
+            .expect("extension")
+            .critical
+    };
+    assert!(by_oid(synch_net::x509::OID_BASIC_CONSTRAINTS));
+    assert!(by_oid(synch_net::x509::OID_KEY_USAGE));
+    assert!(!by_oid(synch_net::x509::OID_SUBJECT_ALT_NAME));
+}
+
 /// Rewrites the shared fixture. Not part of the suite — a zone key and a log
 /// key are minted here, so running it invalidates every byte downstream of
 /// them; it exists so the fixture can be regenerated when the format

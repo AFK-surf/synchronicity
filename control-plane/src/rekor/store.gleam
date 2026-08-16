@@ -25,6 +25,11 @@ pub type Record {
     log_index: Int,
     checkpoint: BitArray,
     inclusion_path: BitArray,
+    /// Whether this entry carries no DNSSEC chain. Only ever a `retire`: a
+    /// retired zone may have no DS left to build one from, and clients
+    /// refuse a retire as authorization outright, so the exception cannot be
+    /// turned into an evasion (§5.2).
+    chainless: Bool,
     integrated_at: Int,
     verified_at: Int,
   )
@@ -40,8 +45,9 @@ pub fn put(conn: Connection, record: Record) -> Result(Nil, sqlite.Error) {
     conn,
     "INSERT INTO rekor_records
        (key_tag, apex, action, statement, canonicalized_body, log_id,
-        log_index, checkpoint, inclusion_path, integrated_at, verified_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        log_index, checkpoint, inclusion_path, chainless, integrated_at,
+        verified_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (key_tag, action) DO UPDATE SET
        apex = excluded.apex,
        statement = excluded.statement,
@@ -50,6 +56,7 @@ pub fn put(conn: Connection, record: Record) -> Result(Nil, sqlite.Error) {
        log_index = excluded.log_index,
        checkpoint = excluded.checkpoint,
        inclusion_path = excluded.inclusion_path,
+       chainless = excluded.chainless,
        integrated_at = excluded.integrated_at,
        verified_at = excluded.verified_at",
     [
@@ -62,6 +69,10 @@ pub fn put(conn: Connection, record: Record) -> Result(Nil, sqlite.Error) {
       VInt(record.log_index),
       Blob(record.checkpoint),
       Blob(record.inclusion_path),
+      VInt(case record.chainless {
+        True -> 1
+        False -> 0
+      }),
       VInt(record.integrated_at),
       VInt(record.verified_at),
     ],
@@ -76,7 +87,8 @@ pub fn for_key_tag(
 ) -> Result(List(Record), sqlite.Error) {
   let sql =
     "SELECT key_tag, apex, action, statement, canonicalized_body, log_id,
-            log_index, checkpoint, inclusion_path, integrated_at, verified_at
+            log_index, checkpoint, inclusion_path, chainless, integrated_at,
+            verified_at
      FROM rekor_records WHERE key_tag = ?
      ORDER BY verified_at DESC, action"
   use rows <- result.try(sqlite.query(conn, sql, [VInt(key_tag)]))
@@ -137,6 +149,7 @@ fn decode(row: List(sqlite.Value)) -> Result(Record, Nil) {
       VInt(log_index),
       Blob(checkpoint),
       Blob(path),
+      VInt(chainless),
       VInt(integrated_at),
       VInt(verified_at),
     ] ->
@@ -150,6 +163,7 @@ fn decode(row: List(sqlite.Value)) -> Result(Record, Nil) {
         log_index,
         checkpoint,
         path,
+        chainless != 0,
         integrated_at,
         verified_at,
       ))

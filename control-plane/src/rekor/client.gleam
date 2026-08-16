@@ -7,12 +7,13 @@
 //// rather than as a hardwired endpoint. Tests drive it with a fake; the real
 //// HTTP leg below is what `rekor-publish` runs against the public log.
 ////
-//// Rekor v2 has no DSSE entry type (docs/REKOR-ZONE-KEY.md §2): a
+//// Rekor v2 accepts only `hashedrekord` (docs/REKOR-ZONE-KEY.md §2): a
 //// DSSE-signed Statement is logged as a `hashedrekord` v0.0.2 over the DSSE
-//// PAE. The write API is `POST /api/v2/log/entries` with a protojson
-//// `CreateEntryRequest`, and the response is a `TransparencyLogEntry`
-//// carrying the `canonicalizedBody` (the Merkle leaf preimage), the
-//// inclusion proof and the signed checkpoint.
+//// PAE, with a certificate as its verifier. The write API is
+//// `POST /api/v2/log/entries` with a protojson `CreateEntryRequest`, and the
+//// response is a `TransparencyLogEntry` carrying the `canonicalizedBody`
+//// (the Merkle leaf preimage), the inclusion proof and the signed
+//// checkpoint.
 
 import envoy
 import gleam/bit_array
@@ -29,9 +30,13 @@ import rekor/proof
 import simplifile
 
 /// What is submitted for one entry: the SHA-256 of the DSSE PAE, the DER
-/// ECDSA signature over that PAE, and the signer's DER SubjectPublicKeyInfo.
+/// ECDSA signature over that PAE, and the signer's **certificate**.
+///
+/// A certificate rather than a raw key because Rekor copies it verbatim into
+/// the Merkle leaf without validating any of it, which is the only way the
+/// apex gets somewhere a monitor can see it (`rekor/cert`).
 pub type Submission {
-  Submission(digest: BitArray, signature: BitArray, verifier_spki: BitArray)
+  Submission(digest: BitArray, signature: BitArray, certificate: BitArray)
 }
 
 /// Where the log put an entry — the parts of a `TransparencyLogEntry` a proof
@@ -134,9 +139,9 @@ fn submit_http(base: String, sub: Submission) -> Result(Entry, String) {
                 "verifier",
                 json.object([
                   #(
-                    "publicKey",
+                    "x509Certificate",
                     json.object([
-                      #("rawBytes", json.string(b64(sub.verifier_spki))),
+                      #("rawBytes", json.string(b64(sub.certificate))),
                     ]),
                   ),
                   #("keyDetails", json.string("PKIX_ECDSA_P256_SHA_256")),

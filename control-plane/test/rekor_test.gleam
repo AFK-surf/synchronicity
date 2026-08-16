@@ -8,6 +8,7 @@
 //// both of them holds the bytes still — this is that something.
 
 import dns/name
+import dns/rdata
 import dns/wire
 import dnssec/keys
 import envoy
@@ -19,6 +20,8 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import rekor/cert
+import rekor/chain
 import rekor/client
 import rekor/gate
 import rekor/proof.{type Proof, Proof}
@@ -155,7 +158,11 @@ pub fn the_body_binds_to_the_statement_and_key_test() {
       crypto.Sha256,
       statement.pae(statement.dsse_payload_type, fixture("statement.json")),
     )
-  assert verifier == proof.p256_spki(fixture_public())
+  // The verifier is the apex-naming certificate, and the key inside it is
+  // the zone key — the binding the client checks, checked here too.
+  let assert Ok(#(spki, san)) = cert_spki_and_san(verifier)
+  assert spki == proof.p256_spki(fixture_public())
+  assert san == cert.fqdn(meta("apex"))
 }
 
 pub fn proof_encoding_matches_the_fixture_test() {
@@ -234,6 +241,65 @@ pub fn checkpoints_parse_or_are_refused_test() {
 
 // ---------------------------------------------------------------- publishing
 
+/// A resolver that answers with structurally correct but cryptographically
+/// meaningless RRsets.
+///
+/// Deliberate: this side never validates a chain — the cryptographic walk
+/// lives in crates/synch-net/src/chain.rs and is run by every client and
+/// every monitor, and the e2e crossval is what keeps this side honest. What
+/// the publisher owes is *collection*: ask for the right RRsets at the right
+/// names, refuse when one is missing, and carry the bytes verbatim. That is
+/// what this fake exercises.
+fn fake_resolver() -> chain.Resolver {
+  chain.Resolver(query: fn(zone, rtype) {
+    let rdata_of = fn(rtype: Int) {
+      case rtype {
+        48 -> rdata.dnskey(257, 13, <<7:size(512)>>)
+        _ -> <<1234:int-size(16), 13:int-size(8), 2:int-size(8), 9:size(256)>>
+      }
+    }
+    Ok([
+      wire.Rr(zone, rtype, wire.class_in, 3600, rdata_of(rtype)),
+      wire.Rr(
+        zone,
+        wire.type_rrsig,
+        wire.class_in,
+        3600,
+        <<rtype:int-size(16), 13:int-size(8), 2:int-size(8), 0:size(512)>>,
+      ),
+    ])
+  })
+}
+
+/// A resolver with nothing to say — the DS is not live in the parent yet,
+/// which is the one failure the inverted ceremony makes common.
+fn silent_resolver() -> chain.Resolver {
+  chain.Resolver(query: fn(_zone, _rtype) { Ok([]) })
+}
+
+fn publish_run(
+  conn: sqlite.Connection,
+  apex: name.Name,
+  csk: keys.Csk,
+  log: client.Log,
+  log_key: #(BitArray, BitArray),
+  now: Int,
+) {
+  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
+  let assert Ok(action) = rekor_publish.action_for(conn, key_tag)
+  rekor_publish.run(
+    conn,
+    apex,
+    csk,
+    log,
+    log_key,
+    now,
+    fake_resolver(),
+    action,
+    None,
+  )
+}
+
 /// A log a test can hold in its hand: one earlier entry, then ours, with a
 /// checkpoint signed by a key the test also holds. It builds a real
 /// `hashedrekord` body from the submission, exactly as Sigstore returns one,
@@ -244,7 +310,7 @@ fn fake_log(log_csk: keys.Csk) -> #(client.Log, BitArray, BitArray) {
   let neighbour = proof.leaf_hash(<<"an earlier entry":utf8>>)
   let entry_of = fn(sub: client.Submission) {
     let body =
-      proof.hashedrekord_body(sub.digest, sub.signature, sub.verifier_spki)
+      proof.hashedrekord_body(sub.digest, sub.signature, sub.certificate)
     let leaf = proof.leaf_hash(body)
     let root = proof.node_hash(neighbour, leaf)
     let note_body =
@@ -274,7 +340,7 @@ pub fn publish_stores_a_verified_record_test() {
   let #(log, spki, point) = fake_log(keys.generate())
 
   let assert Ok(outcome) =
-    rekor_publish.run(conn, apex, csk, log, #(spki, point), 1000)
+    publish_run(conn, apex, csk, log, #(spki, point), 1000)
   assert outcome.action == "create"
   assert outcome.refreshed == False
   assert outcome.key_tag == keys.key_tag(keys.dnskey_rdata(csk))
@@ -286,7 +352,7 @@ pub fn publish_stores_a_verified_record_test() {
   let assert Ok(stored) = rekor_publish.to_proof(record)
   let assert Ok(_) = proof.verify_against_log(stored, spki, point)
   // Possession: the signature the log indexed is inside the stored body.
-  let assert Ok(#(_digest, signature, _verifier)) =
+  let assert Ok(#(_digest, signature, _certificate)) =
     proof.parse_body(record.canonicalized_body)
   assert statement.verify(csk.public, record.statement, signature)
   sqlite.close(conn)
@@ -299,9 +365,9 @@ pub fn publish_is_idempotent_test() {
   let #(log, spki, point) = fake_log(keys.generate())
 
   let assert Ok(first) =
-    rekor_publish.run(conn, apex, csk, log, #(spki, point), 1000)
+    publish_run(conn, apex, csk, log, #(spki, point), 1000)
   let assert Ok(second) =
-    rekor_publish.run(conn, apex, csk, log, #(spki, point), 2000)
+    publish_run(conn, apex, csk, log, #(spki, point), 2000)
   // The second run reused the signature the log already indexed, so Rekor's
   // content addressing returns the same entry — a refresh, not a new claim.
   assert second.refreshed
@@ -323,7 +389,7 @@ pub fn publish_refuses_an_unverifiable_proof_test() {
 
   // The log's own key is not the key we pin: nothing is stored.
   let assert Error(rekor_publish.Unverified(_)) =
-    rekor_publish.run(conn, apex, csk, log, #(spki, stranger.public), 1000)
+    publish_run(conn, apex, csk, log, #(spki, stranger.public), 1000)
   let assert Ok([]) =
     store.for_key_tag(conn, keys.key_tag(keys.dnskey_rdata(csk)))
   sqlite.close(conn)
@@ -348,7 +414,7 @@ pub fn publish_gate_refuses_an_unlogged_key_test() {
   let assert Ok(apex) = name.parse("sync.test.")
   let #(log, spki, point) = fake_log(keys.generate())
   let assert Ok(_) =
-    rekor_publish.run(conn, apex, csk, log, #(spki, point), 1000)
+    publish_run(conn, apex, csk, log, #(spki, point), 1000)
   let assert Ok(_) = publish.publish(conn, csk, 1000, "test")
   envoy.unset(gate.require_env)
   sqlite.close(conn)
@@ -371,6 +437,7 @@ pub fn a_retire_record_does_not_satisfy_the_gate_test() {
         log_index: 0,
         checkpoint: <<>>,
         inclusion_path: <<>>,
+        chainless: True,
         integrated_at: 1,
         verified_at: 1,
       ),
@@ -463,3 +530,196 @@ fn chunks(rdata: BitArray) -> Result(String, Nil) {
     _ -> Error(Nil)
   }
 }
+
+// ------------------------------------------------- the certificate crossval
+
+/// The certificate encoders, against bytes the Rust side asserts too.
+///
+/// Two implementations of one DER format drift silently. These fixtures are
+/// deterministic — fixed inputs, no signatures — so both suites can hold the
+/// same bytes still: crates/synch-net/tests/rekor_zone_key.rs reads exactly
+/// these files.
+pub fn the_chain_extension_encodes_the_crossval_bytes_test() {
+  let links = [
+    cert.Link("sync.test.", <<0xaa, 0xbb, 0xcc>>),
+    cert.Link(".", <<0x01, 0x02>>),
+  ]
+  assert cert.encode_chain(links) == fixture("crossval/chain.der")
+}
+
+pub fn the_succession_extension_encodes_the_crossval_bytes_test() {
+  let succession =
+    cert.Succession(
+      predecessor_key_tag: 34_918,
+      predecessor_spki: <<0x30, 0x59, 0x11>>,
+      signature: <<0x30, 0x44, 0x02>>,
+    )
+  assert cert.encode_succession(succession) == fixture("crossval/succession.der")
+}
+
+pub fn the_succession_payload_is_the_crossval_bytes_test() {
+  // The bytes the *previous* zone key signs. The apex is written without its
+  // root dot so the two halves cannot disagree about a character nobody can
+  // see, and the successor is named by the SHA-256 of its SubjectPublicKeyInfo
+  // rather than by a 16-bit key tag.
+  let payload = cert.succession_payload("sync.test.", 34_918, <<"spki":utf8>>)
+  assert payload == fixture("crossval/succession-payload.json")
+  assert cert.succession_payload("sync.test", 34_918, <<"spki":utf8>>) == payload
+}
+
+/// A certificate this side builds, read back by this side and — from the
+/// checked-in copy — by the Rust parser.
+pub fn a_built_certificate_carries_its_key_its_name_and_its_extensions_test() {
+  let csk = keys.generate()
+  let links = [cert.Link("sync.test.", <<0xaa, 0xbb>>)]
+  let succession =
+    cert.Succession(
+      predecessor_key_tag: 1234,
+      predecessor_spki: <<0x30, 0x59>>,
+      signature: <<0x30, 0x44>>,
+    )
+  let der =
+    cert.build(
+      "sync.test.",
+      csk.public,
+      csk.private,
+      1_786_866_288,
+      1_786_866_288 + 3_155_760_000,
+      Some(links),
+      Some(succession),
+    )
+  let assert Ok(#(spki, san)) = cert_spki_and_san(der)
+  assert spki == proof.p256_spki(csk.public)
+  // The SAN is the apex without its root dot: a dNSName is a hostname.
+  assert san == "sync.test"
+  let assert Ok(chain_value) = cert_extension(der, cert.oid_dnssec_chain)
+  assert chain_value == cert.encode_chain(links)
+  let assert Ok(succession_value) = cert_extension(der, cert.oid_succession)
+  assert succession_value == cert.encode_succession(succession)
+
+  // A chainless certificate has no chain extension at all — the shape a
+  // `retire` breadcrumb takes, and the shape a client refuses.
+  let bare =
+    cert.build("sync.test.", csk.public, csk.private, 0, 1, None, None)
+  let assert Error(Nil) = cert_extension(bare, cert.oid_dnssec_chain)
+  let assert Error(Nil) = cert_extension(bare, cert.oid_succession)
+}
+
+/// The certificate the Rust suite parses: built here, checked in, read
+/// there. This is the crossval that a hand-rolled DER reader on one side and
+/// OTP's ASN.1 encoder on the other actually agree.
+pub fn the_checked_in_certificate_is_this_encoders_output_test() {
+  let der = fixture("crossval/certificate.der")
+  let assert Ok(#(spki, san)) = cert_spki_and_san(der)
+  assert bit_array.byte_size(spki) == 91
+  assert san == "sync.test"
+  let assert Ok(chain_value) = cert_extension(der, cert.oid_dnssec_chain)
+  assert chain_value == fixture("crossval/chain.der")
+  let assert Ok(succession_value) = cert_extension(der, cert.oid_succession)
+  assert succession_value == fixture("crossval/succession.der")
+}
+
+/// The publisher refuses when the chain cannot be built.
+///
+/// Which is the ordinary failure of the inverted ceremony (§5.2): logging
+/// now happens *after* the DS is live in the parent, so "the DS is not there
+/// yet" is the error an operator meets, and it says so.
+pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
+  let conn = fixtures.fresh_conn()
+  let csk = fixtures.zone_boot(conn)
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = fake_log(keys.generate())
+  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
+
+  let assert Error(rekor_publish.NoChain(why)) =
+    rekor_publish.run(
+      conn,
+      apex,
+      csk,
+      log,
+      #(spki, point),
+      1000,
+      silent_resolver(),
+      "create",
+      None,
+    )
+  assert string.contains(why, "DS")
+  let assert Ok([]) = store.for_key_tag(conn, key_tag)
+  sqlite.close(conn)
+}
+
+/// A retire may be chainless; a create may not.
+pub fn a_retire_may_be_chainless_test() {
+  let conn = fixtures.fresh_conn()
+  let csk = fixtures.zone_boot(conn)
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = fake_log(keys.generate())
+
+  let assert Ok(outcome) =
+    rekor_publish.run(
+      conn,
+      apex,
+      csk,
+      log,
+      #(spki, point),
+      1000,
+      silent_resolver(),
+      "retire",
+      None,
+    )
+  assert outcome.action == "retire"
+  assert outcome.chainless
+  // And it is never served to a client: a retire is a monitor breadcrumb.
+  let assert Ok([]) = store.servable(conn, outcome.key_tag)
+  sqlite.close(conn)
+}
+
+/// Naming the previous key adds the countersignature that separates a
+/// rotation from a substitution in every monitor watching the zone.
+pub fn a_countersigned_publish_names_its_predecessor_test() {
+  let conn = fixtures.fresh_conn()
+  let csk = fixtures.zone_boot(conn)
+  let previous = keys.generate()
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = fake_log(keys.generate())
+
+  let assert Ok(outcome) =
+    rekor_publish.run(
+      conn,
+      apex,
+      csk,
+      log,
+      #(spki, point),
+      1000,
+      fake_resolver(),
+      "create",
+      Some(previous),
+    )
+  assert outcome.countersigned_by
+    == Some(keys.key_tag(keys.dnskey_rdata(previous)))
+  assert !outcome.chainless
+
+  // The countersignature is the previous key's, over the successor's SPKI.
+  let assert Ok([record]) = store.for_key_tag(conn, outcome.key_tag)
+  let assert Ok(#(_digest, _signature, certificate)) =
+    proof.parse_body(record.canonicalized_body)
+  let assert Ok(value) = cert_extension(certificate, cert.oid_succession)
+  let assert Ok(succession) = cert.decode_succession(value)
+  assert succession.predecessor_spki == proof.p256_spki(previous.public)
+  assert statement.verify_bytes(
+    previous.public,
+    cert.succession_signed_bytes(
+      "sync.test.",
+      succession.predecessor_key_tag,
+      proof.p256_spki(csk.public),
+    ),
+    succession.signature,
+  )
+  sqlite.close(conn)
+}
+
+@external(erlang, "cp_crypto_ffi", "cert_spki_and_san")
+fn cert_spki_and_san(der: BitArray) -> Result(#(BitArray, String), Nil)
+
+@external(erlang, "cp_crypto_ffi", "cert_extension")
+fn cert_extension(der: BitArray, oid: #(Int, Int, Int)) -> Result(BitArray, Nil)

@@ -5,9 +5,19 @@
 ////   serve                 run the service (configuration from CP_* env)
 ////   keygen <apex> <file>  generate the zone CSK; print DNSKEY / DS / anchor
 ////   ds <apex> <file>      print DS + anchor material for an existing key
-////   rekor-publish <apex> <file>
+////   rekor-publish <apex> <file> [<previous-key-file>]
 ////                         log the zone key in the transparency log, verify
-////                         the proof locally, store and serve it
+////                         the proof locally, store and serve it. Run this
+////                         *after* the DS is live in the parent — the entry
+////                         carries a DNSSEC chain, and there is no chain to
+////                         build before then (§5.2). Naming the previous key
+////                         file adds the succession countersignature that
+////                         tells a monitor this is a rotation and not a
+////                         substitution.
+////   rekor-retire <apex> <file>
+////                         log a retirement breadcrumb for a key. Allowed to
+////                         be chainless: a retired zone may have no DS left,
+////                         and clients never treat a retire as authorization.
 ////   tuf-refresh           refetch Sigstore's TUF metadata and relay it in
 ////                         the zone, so clients' log pins follow it
 ////   seed                  create a demo org/network/devices and publish
@@ -29,12 +39,13 @@ import email/mailer
 import gleam/erlang/process
 import gleam/int
 import gleam/io
-import gleam/option
+import gleam/option.{None, Some}
 import gleam/otp/static_supervisor as sup
 import gleam/result
 import gleam/string
 import jobs/resign
 import mist
+import rekor/chain
 import rekor/client
 import rekor/publish as rekor
 import store/db
@@ -61,7 +72,11 @@ pub fn main() {
     ["keygen", apex, key_file] -> keygen(apex, key_file)
     ["ds", apex, key_file] -> print_key_material(apex, key_file)
     ["rekor-publish", apex, key_file] ->
-      run_or_die(fn() { rekor_publish(apex, key_file) })
+      run_or_die(fn() { rekor_publish(apex, key_file, None, "") })
+    ["rekor-publish", apex, key_file, previous] ->
+      run_or_die(fn() { rekor_publish(apex, key_file, Some(previous), "") })
+    ["rekor-retire", apex, key_file] ->
+      run_or_die(fn() { rekor_publish(apex, key_file, None, "retire") })
     ["tuf-refresh"] -> run_or_die(tuf_refresh)
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(run_seed)
@@ -69,7 +84,7 @@ pub fn main() {
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | tuf-refresh | seed | seed-admin <email> | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> [<previous-keyfile>] | rekor-retire <apex> <keyfile> | tuf-refresh | seed | seed-admin <email> | migrate-check",
       )
       halt(2)
     }
@@ -126,17 +141,43 @@ fn print_material(apex: name.Name, csk: keys.Csk) -> Nil {
 /// tree without minting a second entry. The zone is republished either way,
 /// which is also how a phase-2 deployment escapes the publish gate after
 /// its first successful logging.
-fn rekor_publish(apex_text: String, key_file: String) -> Result(Nil, String) {
+fn rekor_publish(
+  apex_text: String,
+  key_file: String,
+  previous_file: option.Option(String),
+  forced_action: String,
+) -> Result(Nil, String) {
   use cfg <- result.try(config.load())
   use apex <- result.try(
     name.parse(apex_text) |> result.replace_error("invalid apex domain"),
   )
   use csk <- result.try(keys.load(key_file))
+  use previous <- result.try(case previous_file {
+    None -> Ok(None)
+    Some(path) -> keys.load(path) |> result.map(Some)
+  })
   use log_key <- result.try(client.log_key())
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
+  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
+  use action <- result.try(case forced_action {
+    "" ->
+      rekor.action_for(conn, key_tag)
+      |> result.map_error(fn(e) { "reading stored records: " <> string.inspect(e) })
+    forced -> Ok(forced)
+  })
   use outcome <- result.try(
-    rekor.run(conn, apex, csk, client.http(client.url()), log_key, now)
+    rekor.run(
+      conn,
+      apex,
+      csk,
+      client.http(client.url()),
+      log_key,
+      now,
+      chain.doh(chain.resolver_url()),
+      action,
+      previous,
+    )
     |> result.map_error(fn(e) { "logging the zone key: " <> string.inspect(e) }),
   )
   use _ <- result.try(
@@ -154,6 +195,17 @@ fn rekor_publish(apex_text: String, key_file: String) -> Result(Nil, String) {
     <> case outcome.refreshed {
       True -> " (proof refreshed, no new entry)"
       False -> " (entry added)"
+    }
+    <> case outcome.chainless {
+      True -> ", no DNSSEC chain (retire breadcrumb)"
+      False -> ", DNSSEC chain carried"
+    }
+    <> case outcome.countersigned_by {
+      Some(tag) ->
+        ", countersigned by key tag " <> int.to_string(tag) <> " (monitors see tier A)"
+      // Genesis and disaster recovery both land here, and both are expected
+      // — but a monitor watching this zone will alert on it, so say so.
+      None -> ", NOT countersigned: monitors will alert (tier B)"
     },
   )
   Ok(Nil)

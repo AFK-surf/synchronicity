@@ -62,8 +62,49 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5]
+  [v1, v2, v3, v4, v5, v6]
 }
+
+/// V6: proof v3 — the certificate verifier (docs/REKOR-ZONE-KEY.md §2, §3).
+///
+/// Every row written under v5 holds a `canonicalizedBody` whose verifier is a
+/// raw public key. Such an entry names no zone anywhere in its Merkle leaf,
+/// which is the apex-anonymous shape v3 abolished: no client will accept one
+/// and no monitor could ever have seen it. Carrying those rows forward would
+/// mean serving proofs every upgraded client refuses, so the table is rebuilt
+/// empty and the operator re-runs `rekor-publish`.
+///
+/// The columns are unchanged — the certificate lives inside
+/// `canonicalized_body`, where the log put it, and this service stores what
+/// the log serialized rather than a decomposition of it. The one addition is
+/// `chainless`, recording whether an entry carries a DNSSEC chain: only a
+/// `retire` may, and being able to say so without re-parsing DER is what lets
+/// `/healthz` and the dashboard tell an operator what monitors will see.
+///
+/// One ordering consequence rides along, and it is the reason a rebuild is
+/// tolerable: an entry now has to carry a DNSSEC chain, which cannot be built
+/// until the **DS is live in the parent**, so re-running `rekor-publish` is a
+/// step that happens after the DS is in place anyway (§5.2).
+const v6 = "
+DROP TABLE rekor_records;
+CREATE TABLE rekor_records (
+  key_tag            INTEGER NOT NULL,
+  apex               TEXT    NOT NULL,
+  action             TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
+  statement          BLOB    NOT NULL,
+  canonicalized_body BLOB    NOT NULL,
+  log_id             BLOB    NOT NULL CHECK (length(log_id) = 32),
+  log_index          INTEGER NOT NULL,
+  checkpoint         BLOB    NOT NULL,
+  inclusion_path     BLOB    NOT NULL,
+  chainless          INTEGER NOT NULL DEFAULT 0
+                     CHECK (chainless = 0 OR action = 'retire'),
+  integrated_at      INTEGER NOT NULL,
+  verified_at        INTEGER NOT NULL,
+  PRIMARY KEY (key_tag, action)
+);
+CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
+"
 
 /// V5: the Rekor v2 rework (docs/REKOR-ZONE-KEY.md §2, §3). The record now
 /// carries the log's own `canonicalizedBody` (the Merkle leaf preimage,

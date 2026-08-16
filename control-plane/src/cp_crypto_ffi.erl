@@ -4,7 +4,9 @@
 -module(cp_crypto_ffi).
 -export([ec_generate/0, ecdsa_sign_raw/2, ecdsa_verify_raw/3,
          ecdsa_sign_der/2, ecdsa_verify_der/3, ed25519_verify/3,
-         ed25519_generate_public/0]).
+         ed25519_generate_public/0, self_signed_cert/7, cert_spki_and_san/1, cert_extension/2]).
+
+-include_lib("public_key/include/public_key.hrl").
 
 %% A fresh Ed25519 public key (32 bytes) — device keys are Ed25519 iroh
 %% NodeIds, and seeded demo/test zones need real curve points because the
@@ -81,4 +83,122 @@ der_int(B) ->
     case strip_zeros(B) of
         <<H, _/binary>> = S when H >= 128 -> <<0, S/binary>>;
         S -> S
+    end.
+
+%% ------------------------------------------------------------------------
+%% The zone-key certificate (docs/REKOR-ZONE-KEY.md §2).
+%%
+%% Rekor v2's verifier is a oneof — a raw public key or an X.509 certificate
+%% — and it validates the certificate not at all: it parses it, takes the
+%% public key, and copies the DER verbatim into the canonicalized body the
+%% Merkle leaf commits to. That is the only door in a log with one entry type
+%% and no room for a payload, so this is how the apex gets into the leaf
+%% where a monitor can index it.
+%%
+%% What comes out is therefore a **key envelope, not a trust assertion**.
+%% Nothing anywhere verifies its signature, its issuer or its validity
+%% window; the three things that matter are the SubjectPublicKeyInfo, the
+%% single dNSName SAN, and the two custom extensions carried through.
+%%
+%% Built with OTP's own public_key records rather than hand-rolled DER: the
+%% ASN.1 module is the reference encoder, and a certificate an external tool
+%% cannot read would defeat the point of putting it in a public log.
+self_signed_cert(CommonName, DnsName, Pub64, Priv32, NotBefore, NotAfter,
+                 Extra) ->
+    Point = <<4, Pub64/binary>>,
+    Name = {rdnSequence,
+            [[#'AttributeTypeAndValue'{type = ?'id-at-commonName',
+                                       value = {utf8String, CommonName}}]]},
+    %% The serial is derived from the key, not drawn at random: re-running
+    %% the ceremony for the same key must produce the same certificate, or
+    %% every republish would mint a fresh Merkle leaf for one claim.
+    <<Serial:128, _/binary>> = crypto:hash(sha256, Point),
+    Extensions =
+        [#'Extension'{extnID = ?'id-ce-basicConstraints', critical = true,
+                      extnValue = #'BasicConstraints'{cA = false}},
+         #'Extension'{extnID = ?'id-ce-keyUsage', critical = true,
+                      extnValue = [digitalSignature]},
+         %% Non-critical: criticality is an instruction to validators, and
+         %% nothing validates this certificate.
+         #'Extension'{extnID = ?'id-ce-subjectAltName', critical = false,
+                      extnValue = [{dNSName, binary_to_list(DnsName)}]}]
+        ++ [#'Extension'{extnID = Oid, critical = false, extnValue = Value}
+            || {Oid, Value} <- Extra],
+    Tbs = #'OTPTBSCertificate'{
+             version = v3,
+             serialNumber = Serial,
+             signature = #'SignatureAlgorithm'{
+                            algorithm = ?'ecdsa-with-SHA256',
+                            parameters = asn1_NOVALUE},
+             issuer = Name,
+             validity = #'Validity'{notBefore = x509_time(NotBefore),
+                                    notAfter = x509_time(NotAfter)},
+             subject = Name,
+             subjectPublicKeyInfo =
+                 #'OTPSubjectPublicKeyInfo'{
+                    algorithm = #'PublicKeyAlgorithm'{
+                                   algorithm = ?'id-ecPublicKey',
+                                   parameters = {namedCurve, ?'secp256r1'}},
+                    subjectPublicKey = #'ECPoint'{point = Point}},
+             extensions = Extensions},
+    Key = #'ECPrivateKey'{version = 1, privateKey = Priv32,
+                          parameters = {namedCurve, ?'secp256r1'},
+                          publicKey = Point},
+    public_key:pkix_sign(Tbs, Key).
+
+%% RFC 5280 draws the line at 2050: UTCTime below it, GeneralizedTime above.
+x509_time(Unix) ->
+    {{Y, M, D}, {H, Mi, S}} =
+        calendar:gregorian_seconds_to_datetime(Unix + 62167219200),
+    case Y >= 1950 andalso Y =< 2049 of
+        true ->
+            {utcTime, lists:flatten(io_lib:format("~2..0B~2..0B~2..0B~2..0B~2..0B~2..0BZ",
+                                                  [Y rem 100, M, D, H, Mi, S]))};
+        false ->
+            {generalTime, lists:flatten(io_lib:format("~4..0B~2..0B~2..0B~2..0B~2..0B~2..0BZ",
+                                                      [Y, M, D, H, Mi, S]))}
+    end.
+
+%% The two things a reader turns on inside a zone-key certificate: the DER
+%% SubjectPublicKeyInfo and the single dNSName SAN. Decoded with OTP's own
+%% ASN.1 module, so this service reads its own certificates with the same
+%% code that wrote them — and a certificate it cannot read is one it refuses
+%% to store, rather than one it discovers a client rejecting later.
+cert_spki_and_san(Der) ->
+    try
+        #'OTPCertificate'{tbsCertificate = Tbs} =
+            public_key:pkix_decode_cert(Der, otp),
+        #'Certificate'{tbsCertificate = Plain} =
+            public_key:der_decode('Certificate', Der),
+        Spki = public_key:der_encode(
+                 'SubjectPublicKeyInfo',
+                 Plain#'TBSCertificate'.subjectPublicKeyInfo),
+        Extensions = Tbs#'OTPTBSCertificate'.extensions,
+        case [Names || #'Extension'{extnID = ?'id-ce-subjectAltName',
+                                    extnValue = Names} <- Extensions] of
+            [Names] ->
+                case [list_to_binary(N) || {dNSName, N} <- Names] of
+                    [Name] -> {ok, {Spki, Name}};
+                    _ -> {error, nil}
+                end;
+            _ -> {error, nil}
+        end
+    catch
+        _:_ -> {error, nil}
+    end.
+
+%% One extension's DER value, by OID. Used to read back what was just
+%% written — a certificate that lost its chain on the way through the
+%% encoder would otherwise be discovered by a client, weeks later.
+cert_extension(Der, Oid) ->
+    try
+        #'OTPCertificate'{tbsCertificate = Tbs} =
+            public_key:pkix_decode_cert(Der, otp),
+        case [Value || #'Extension'{extnID = O, extnValue = Value}
+                           <- Tbs#'OTPTBSCertificate'.extensions, O =:= Oid] of
+            [Value] when is_binary(Value) -> {ok, Value};
+            _ -> {error, nil}
+        end
+    catch
+        _:_ -> {error, nil}
     end.

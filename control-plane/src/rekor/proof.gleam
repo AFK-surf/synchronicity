@@ -1,4 +1,4 @@
-//// The `RekorProof` v2 record: the compact binary blob that travels in the
+//// The `RekorProof` v3 record: the compact binary blob that travels in the
 //// zone at `_synchronicity-rekor.<apex>`, and the local verification of it.
 ////
 //// This is the mirror of crates/synch-net/src/rekor.rs. Every client that
@@ -8,7 +8,7 @@
 //// other's good intentions:
 ////
 //// ```text
-//// u8       version            = 2
+//// u8       version            = 3
 //// u16      key_tag
 //// u8[32]   log_id               SHA-256 of the log's DER SubjectPublicKeyInfo
 //// u64      log_index
@@ -18,15 +18,25 @@
 //// u8+[32]* inclusion_path       Merkle audit path, leaf to root
 //// ```
 ////
-//// v2 is the *real* Rekor v2 entry, not a synchronicity convention: Rekor
-//// has no DSSE entry type, so a DSSE-signed Statement is logged as a
-//// `hashedrekord` v0.0.2 over the DSSE PAE — `data.digest = SHA-256(PAE)`,
-//// `signature.content` the DER ECDSA over the PAE, `verifier.publicKey.
-//// rawBytes` the DER SubjectPublicKeyInfo. The log returns those bytes as
-//// `canonicalizedBody`; this record carries them **verbatim** and the Merkle
-//// leaf is `SHA-256(0x00 || canonicalized_body)`, with interior nodes
+//// The entry is the *real* Rekor v2 serialization, not a synchronicity
+//// convention: Rekor accepts only `hashedrekord`, so a DSSE-signed Statement
+//// is logged as a `hashedrekord` v0.0.2 over the DSSE PAE —
+//// `data.digest = SHA-256(PAE)`, `signature.content` the DER ECDSA over that
+//// digest. The log returns those bytes as `canonicalizedBody`; this record
+//// carries them **verbatim** and the Merkle leaf is
+//// `SHA-256(0x00 || canonicalized_body)`, with interior nodes
 //// `SHA-256(0x01 || left || right)` — RFC 6962 §2.1. The Statement rides
 //// alongside because the body commits only to its PAE *digest*.
+////
+//// What makes this v3 rather than v2 is the **verifier**: an
+//// `x509Certificate`, never a raw public key. A raw-key entry names no zone
+//// anywhere in its leaf, so nobody can monitor a zone for newly published
+//// keys — and the threat model has a compromised DNS provider in it, so DNS
+//// cannot be the monitoring channel. Rekor validates the certificate not at
+//// all and copies its DER into the body verbatim, so the apex in its
+//// `dNSName` SAN lands inside the Merkle leaf where a monitor sees it
+//// (`rekor/cert`). There is no v2 path left anywhere: a v2 record is a
+//// malformed version and a `publicKey` verifier is a refusal.
 
 import gleam/bit_array
 import gleam/crypto
@@ -38,7 +48,7 @@ import gleam/result
 import gleam/string
 
 /// The version this build writes and accepts.
-pub const version = 2
+pub const version = 3
 
 /// The `hashedrekord` v0.0.2 digest algorithm and P-256 key-details tags a
 /// body must declare.
@@ -119,23 +129,27 @@ pub fn to_txt(proof: Proof) -> String {
 pub fn hashedrekord_body(
   digest: BitArray,
   signature: BitArray,
-  verifier_spki: BitArray,
+  certificate: BitArray,
 ) -> BitArray {
   <<
     "{\"apiVersion\":\"0.0.2\",\"kind\":\"hashedrekord\",\"spec\":{\"hashedRekordV002\":{\"data\":{\"algorithm\":\"SHA2_256\",\"digest\":\"":utf8,
     bit_array.base64_encode(digest, True):utf8,
     "\"},\"signature\":{\"content\":\"":utf8,
     bit_array.base64_encode(signature, True):utf8,
-    "\",\"verifier\":{\"keyDetails\":\"PKIX_ECDSA_P256_SHA_256\",\"publicKey\":{\"rawBytes\":\"":utf8,
-    bit_array.base64_encode(verifier_spki, True):utf8,
+    "\",\"verifier\":{\"keyDetails\":\"PKIX_ECDSA_P256_SHA_256\",\"x509Certificate\":{\"rawBytes\":\"":utf8,
+    bit_array.base64_encode(certificate, True):utf8,
     "\"}}}}}}":utf8,
   >>
 }
 
-/// The digest, DER signature and DER SubjectPublicKeyInfo a `hashedrekord`
+/// The digest, DER signature and verifier certificate a `hashedrekord`
 /// v0.0.2 body carries. The service reads these back out of the log's own
 /// `canonicalizedBody` to re-check possession and the verifier binding
 /// before storing — re-deriving nothing the log already serialized.
+///
+/// The `publicKey` arm of Rekor's verifier oneof is not handled: an entry
+/// whose verifier is a bare key names no apex in its leaf, which is the
+/// unmonitorable shape v3 abolished. There is no branch to reach.
 pub fn parse_body(
   bytes: BitArray,
 ) -> Result(#(BitArray, BitArray, BitArray), ProofError) {
@@ -162,7 +176,7 @@ pub fn parse_body(
     )
     use raw_bytes <- decode.subfield(
       [
-        "spec", "hashedRekordV002", "signature", "verifier", "publicKey",
+        "spec", "hashedRekordV002", "signature", "verifier", "x509Certificate",
         "rawBytes",
       ],
       decode.string,
@@ -171,7 +185,9 @@ pub fn parse_body(
   }
   use #(algorithm, digest, content, details, raw_bytes) <- result.try(
     json.parse(text, decoder)
-    |> result.replace_error(bad("not a hashedrekord v0.0.2 entry")),
+    |> result.replace_error(bad(
+      "not a hashedrekord v0.0.2 entry with an x509Certificate verifier",
+    )),
   )
   use Nil <- result.try(case algorithm == digest_algorithm {
     True -> Ok(Nil)
@@ -191,7 +207,9 @@ pub fn parse_body(
   )
   use raw_bytes <- result.try(
     bit_array.base64_decode(raw_bytes)
-    |> result.replace_error(bad("verifier.publicKey.rawBytes is not base64")),
+    |> result.replace_error(bad(
+      "verifier.x509Certificate.rawBytes is not base64",
+    )),
   )
   Ok(#(digest, content, raw_bytes))
 }
