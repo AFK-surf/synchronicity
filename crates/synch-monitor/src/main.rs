@@ -3,7 +3,16 @@
 //! One run: fetch the checkpoint, verify it under the pinned log keys, check
 //! that it extends the tree this monitor saw last time, then walk every entry
 //! bundle from the last-seen index, pull the certificate out of each leaf, and
-//! classify the ones naming a watched apex (docs/REKOR-ZONE-KEY.md §5.5).
+//! classify the ones naming a zone the watch list covers
+//! (docs/REKOR-ZONE-KEY.md §5.5).
+//!
+//! **Covers, not names.** A watch on `cp.example.com` also covers the zones
+//! above and below it, because a DNS cut can be created or removed at any
+//! label boundary and clients follow whichever one exists: `example.com` can
+//! withdraw the delegation and sign `cp.example.com`'s names itself, and
+//! `org.cp.example.com` can be delegated away and sign the names inside it.
+//! Both authorize a key clients accept for the watched operator's names.
+//! See [`synch_monitor::KnownKeys::watches`].
 //!
 //! **The product is the list of newly authorized keys.** A tier A entry whose
 //! key this monitor has not recorded for that apex is a new authorization: it
@@ -21,10 +30,10 @@
 //! Exit codes are the interface a cron job or an alerting rule reads:
 //!
 //! ```text
-//!  0  nothing new for a watched apex
-//! 10  unauthorized claims only — tier B naming a watched apex, no alarm
-//! 20  new authorizations seen — a key was authorized for a watched apex
-//!     that this monitor had not recorded: check it against what you published
+//!  0  nothing new for a watched zone
+//! 10  unauthorized claims only — tier B naming a watched zone, no alarm
+//! 20  new authorizations seen — a key was authorized for a watched zone, or
+//!     for one above or below it: check it against what you published
 //!  2  the run could not finish (transport, checkpoint, state)
 //! ```
 //!
@@ -34,8 +43,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use hickory_resolver::proto::dnssec::TrustAnchors;
+use hickory_resolver::proto::rr::Name;
 use synch_monitor::{
-    classify::{classify, Finding, Tier},
+    classify::{classify, Finding, Tier, Watched},
     state::MonitorState,
     tiles::{HttpTiles, Tree},
     MonitorError,
@@ -58,12 +68,22 @@ use synch_net::rekor::{Checkpoint, HashedRekordBody, LogKeys};
     name = "synch-monitor",
     version,
     about,
-    after_long_help = "EXIT CODES:
-   0  nothing new for a watched apex
-  10  unauthorized claims only — entries naming a watched apex whose chain
+    after_long_help = "WHAT A WATCH LIST COVERS:
+  Listing an apex also watches the zones above and below it. A DNS cut can be
+  created or removed at any label boundary, and a client validates against
+  whichever zone ends up signing the name: example.com can withdraw the
+  delegation and sign cp.example.com's names itself, and org.cp.example.com
+  can be delegated away and sign the names inside it. Either key would be
+  accepted by clients, so either entry is reported — labelled with the
+  relation, so a key that is not yours does not read as a rotation you forgot.
+
+EXIT CODES:
+   0  nothing new for a watched zone
+  10  unauthorized claims only — entries naming a watched zone whose chain
       does not verify. No client would have accepted one; recorded, no alarm.
-  20  new authorizations seen — a key was authorized for a watched apex that
-      this monitor had not recorded. Check it against what you published.
+  20  new authorizations seen — a key was authorized for a watched zone, or
+      for one above or below it, and this monitor had not recorded it.
+      Check it against what you published.
    2  the run could not finish (transport, checkpoint, state)"
 )]
 struct Args {
@@ -142,7 +162,9 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
         return Err(MonitorError::State(format!(
             "{} names no apex to watch — seed it with the zones you want \
              reported on, and (optionally) the keys you have already accounted \
-             for, e.g. {{\"known\":{{\"keys\":{{\"sync.example\":[]}}}}}}",
+             for, e.g. {{\"known\":{{\"keys\":{{\"sync.example\":[]}}}}}}. \
+             List the zones you operate; the zones above and below each one are \
+             covered without being named",
             args.state.display()
         )));
     }
@@ -233,9 +255,14 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
             let Ok(name) = parsed.certificate.single_dns_name() else {
                 continue;
             };
-            if !state.known.apexes().any(|apex| apex == name) {
+            // Comparable with a watched zone, not equal to one: a zone above a
+            // watched apex can serve its names by withdrawing the delegation,
+            // and a zone below it takes names out of it by existing. Both
+            // authorize a key that clients accept for a watched operator's
+            // names (see `KnownKeys::watches`).
+            let Some(watched) = state.known.watches(&name) else {
                 continue;
-            }
+            };
             // A watched apex: prove the leaf really is this entry before
             // reading anything out of it, then classify.
             if !tree.leaf_matches(index, &body)? {
@@ -253,7 +280,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
             )
             .map_err(|e| MonitorError::Tile(e.to_string()))?;
             if let Some(finding) = classify(&parsed, index, &anchors) {
-                findings.push((finding, parsed.certificate.spki.clone()));
+                findings.push((finding, parsed.certificate.spki.clone(), watched));
             }
         }
         at = ((at / 256) + 1) * 256;
@@ -268,7 +295,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     let mut new_authorizations = Vec::new();
     let mut already_known = 0usize;
     let mut claims = Vec::new();
-    for (finding, spki) in &findings {
+    for (finding, spki, watched) in &findings {
         match finding.tier {
             Tier::A => {
                 let apex = synch_net::chain::parse_name(&finding.apex);
@@ -277,29 +304,36 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
                 // than as known is the safe direction anyway — it reports.
                 match apex.map(|apex| state.known.contains(&apex, spki)) {
                     Ok(true) => already_known += 1,
-                    _ => new_authorizations.push((finding, spki)),
+                    _ => new_authorizations.push((finding, spki, watched)),
                 }
             }
-            Tier::B => claims.push(finding),
+            Tier::B => claims.push((finding, watched)),
         }
     }
 
     // stdout is the report: newly authorized keys, and nothing else.
-    for (finding, _) in &new_authorizations {
-        println!("{}", render(finding, args.json));
+    for (finding, _, watched) in &new_authorizations {
+        println!("{}", render(finding, watched, args.json));
     }
     // Tier B on stderr. It is not an alarm — no client would have taken these
     // — but an operator who sees the exit code needs to be able to see *what*
     // was claimed without re-running with different flags.
-    for finding in &claims {
-        eprintln!("{}", render(finding, args.json));
+    for (finding, watched) in &claims {
+        eprintln!("{}", render(finding, watched, args.json));
     }
 
     // Record what was reported, so the next run stays quiet about it. Tier B
     // is deliberately never recorded: the same key arriving later with a
     // chain that *does* verify is a genuine new authorization, and a tier B
     // sighting must not have quietly consumed it.
-    for (finding, spki) in &new_authorizations {
+    //
+    // Recording is under the entry's *own* apex, not under the watched zone it
+    // was matched through: the key belongs to that zone, and a neighbour's key
+    // must never be filed as one the operator's zone has authorized. It also
+    // means an ancestor or descendant zone joins the watch list once reported,
+    // which widens nothing — everything comparable with it was already
+    // comparable with the watched zone that surfaced it.
+    for (finding, spki, _) in &new_authorizations {
         if let Ok(apex) = synch_net::chain::parse_name(&finding.apex) {
             state.known.insert(&apex, spki);
         }
@@ -312,11 +346,22 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
         state.save(&args.state)?;
     }
 
+    // A neighbouring zone in the report is worth calling out in the summary:
+    // it is the case an operator has not thought about, and reading it as
+    // "my zone rotated a key" would be exactly the wrong conclusion.
+    let neighbours = new_authorizations
+        .iter()
+        .filter(|(_, _, watched)| watched.zone().is_some())
+        .count();
     eprintln!(
-        "synch-monitor: {} entries read to index {end}; {} new authorization(s), \
+        "synch-monitor: {} entries read to index {end}; {} new authorization(s){}, \
          {already_known} already recorded, {} unauthorized claim(s)",
         end.saturating_sub(started_at),
         new_authorizations.len(),
+        match neighbours {
+            0 => String::new(),
+            n => format!(" ({n} in a zone above or below a watched one)"),
+        },
         claims.len()
     );
     Ok(match (new_authorizations.is_empty(), claims.is_empty()) {
@@ -327,9 +372,94 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
 }
 
 /// One finding, as a line — JSON when asked, human otherwise.
-fn render(finding: &Finding, json: bool) -> String {
+///
+/// The watch relation rides along rather than living in the [`Finding`],
+/// deliberately: what an entry *is* comes from the certificate and the trust
+/// anchors alone, and *why it is being shown to you* is a fact about this
+/// operator's watch list. Keeping the second out of `classify` is what stops
+/// the monitor's own configuration from steering its verdicts.
+fn render(finding: &Finding, watched: &Watched, json: bool) -> String {
     match json {
-        true => serde_json::to_string(finding).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}")),
-        false => finding.line(),
+        true => serde_json::to_string(&Report {
+            finding,
+            relation: watched.relation(),
+            watched: watched.zone().map(Name::to_string),
+        })
+        .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}")),
+        false => match watched.note() {
+            None => finding.line(),
+            Some(note) => format!("{} [{note}]", finding.line()),
+        },
+    }
+}
+
+/// A finding as reported: the verdict, plus why this operator is seeing it.
+#[derive(Debug, serde::Serialize)]
+struct Report<'a> {
+    #[serde(flatten)]
+    finding: &'a Finding,
+    /// `direct`, `ancestor` or `descendant` — always present, so a filter can
+    /// select on it without testing for a missing field.
+    relation: &'static str,
+    /// The watched zone this entry concerns; absent when the entry names a
+    /// watched apex itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watched: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synch_monitor::classify::Tier;
+
+    fn finding() -> Finding {
+        Finding {
+            log_index: 68_018_370,
+            apex: "example.com.".into(),
+            key_tag: 34918,
+            spki_sha256: "ab".repeat(32),
+            ds: "34918 13 2 beef".into(),
+            tier: Tier::A,
+            reasons: vec!["DNSSEC chain valid to .".into()],
+        }
+    }
+
+    /// A key that is not yours must not read as a rotation you forgot.
+    ///
+    /// The relation is the whole difference between "your zone authorized a
+    /// key" and "the zone above yours did, and it can serve your names" — an
+    /// operator comparing the report against their own records has to be able
+    /// to see which of the two they are looking at.
+    #[test]
+    fn a_neighbouring_zone_says_so_in_the_line() {
+        let watched = synch_net::chain::parse_name("cp.example.com").unwrap();
+        let direct = render(&finding(), &Watched::Directly, false);
+        let above = render(&finding(), &Watched::Ancestor(watched), false);
+
+        assert!(direct.starts_with("[A] index 68018370 apex example.com."));
+        assert!(!direct.contains("watched"));
+        assert!(above.starts_with(&direct));
+        assert!(above.contains("above watched cp.example.com."));
+    }
+
+    /// The JSON line is the finding's own fields plus the relation, flat.
+    ///
+    /// Flattening is load-bearing for anyone already filtering these lines:
+    /// the finding's keys stay where they were, and `relation` is always
+    /// present so a filter can select on it without testing for absence.
+    #[test]
+    fn the_json_line_carries_the_relation_alongside_the_finding() {
+        let watched = synch_net::chain::parse_name("cp.example.com").unwrap();
+        let below: serde_json::Value =
+            serde_json::from_str(&render(&finding(), &Watched::Descendant(watched), true)).unwrap();
+        assert_eq!(below["apex"], "example.com.");
+        assert_eq!(below["log_index"], 68_018_370);
+        assert_eq!(below["relation"], "descendant");
+        assert_eq!(below["watched"], "cp.example.com.");
+
+        let direct: serde_json::Value =
+            serde_json::from_str(&render(&finding(), &Watched::Directly, true)).unwrap();
+        assert_eq!(direct["relation"], "direct");
+        assert!(direct.get("watched").is_none());
     }
 }

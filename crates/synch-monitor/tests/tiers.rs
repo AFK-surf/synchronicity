@@ -266,6 +266,13 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
         ("malformed san (triple dot)", "cluster.example..."),
         ("malformed san (upper double dot)", "CLUSTER.EXAMPLE.."),
         ("malformed san (empty)", ""),
+        // The root, spelled out. It is the one zone that can take over any
+        // name in the tree by withdrawing a delegation, so it is worth
+        // pinning that an entry naming it is refused by *both* halves rather
+        // than accepted by one: a root takeover fails a client closed instead
+        // of admitting devices, which is why the watch list does not cover
+        // the root (`KnownKeys::watches`).
+        ("malformed san (root)", "."),
     ] {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");

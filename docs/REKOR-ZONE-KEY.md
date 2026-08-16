@@ -18,6 +18,14 @@ against *broken* chains, not *substituted* ones — admits attacker devices
 into the cluster with full read/write membership (§3.2 of DESIGN.md: trust
 admits a node in full).
 
+Substituting the DS is not even the cheapest form of it. A parent that can
+rewrite the delegation can also **move the cut**: withdraw it and serve the
+child's names from its own zone, or push it deeper and delegate
+`org.cp.example.com` to a zone of its choosing. Either way the names resolve,
+the answers validate, and the key a client ends up demanding a log entry for
+belongs to a zone that is not the one the operator thinks of as theirs. §5.5
+is where that lands, because it decides what a monitor has to watch.
+
 The attack is quiet. It can be served to one resolver path, one client, one
 network. Nothing in DNSSEC makes it visible to the zone's real operator.
 
@@ -723,12 +731,63 @@ through the client's own RFC 6962 walk.
 
 **SAN indexing.** Every leaf that parses as a `hashedrekord` with a
 certificate verifier is indexed by the single `dNSName` SAN inside it. For a
-watched apex the monitor then derives, **from the certificate's
+covered apex (below) the monitor then derives, **from the certificate's
 SubjectPublicKeyInfo alone**, the DNSKEY rdata (flags 257, protocol 3,
 algorithm 13), the RFC 4034 key tag, and the DS the registrar would have to
 show. No DNS query anywhere: the threat model has a compromised DNS provider
 in it, so a monitor that asked DNS what the zone's key is would be asking the
 attacker.
+
+**What a watch list covers, which is not what it names.** An operator lists
+the zones they run. What they are protecting is a *name* —
+`_synchronicity.<network>.<org>.<apex>`, the record a client resolves — and
+**which zone signs that name is not a property of the name**. A cut can be
+created or removed at any label boundary along it, by whoever holds the zone
+above that boundary, and §4.2 takes the apex from the RRSIG signer field:
+whatever cut exists is the zone the client demands an entry for. An operator
+watching `cp.example.com` therefore has two blind spots if the watch list is
+matched by equality, in opposite directions along one name:
+
+- **From above.** `example.com` withdraws the `cp` delegation and serves
+  `_synchronicity.network.org.cp.example.com` out of its own zone. The signer
+  becomes `example.com`, so the entry the attacker must publish names
+  `example.com`. It is a perfectly ordinary tier A entry — for a zone the
+  operator never listed.
+- **From below.** `example.com` (or `cp.example.com` itself, if that is what
+  was taken) delegates `org.cp.example.com` away. The signer becomes
+  `org.cp.example.com`, the entry names that, and every membership name
+  underneath it has left the watched key's control.
+
+Both are accepted by clients and classified tier A. So the filter matches
+every zone **comparable with** a watched one in the DNS tree — the name
+itself, every ancestor, every descendant — and the report says which:
+
+```
+[A] index 68018370 apex example.com keyTag 34918 DS … spki … — DNSSEC chain
+    valid to . (3 link(s)): this key is authorized for example.com
+    [above watched cp.example.com — this zone can serve cp.example.com's names
+     by withdrawing its delegation, and its key would be the one clients
+     validate]
+```
+
+That labelling is not decoration. A neighbour's key must not read as a
+rotation the operator forgot performing, and it is recorded in the state file
+under **its own** zone rather than the watched one it matched through, so
+"which keys have been authorized for my zone?" keeps its answer. Ancestors run
+the whole way up — `com` really can withdraw `example.com`'s delegation — and
+that costs nothing, because a TLD publishing a synchronicity zone-key entry is
+an event worth reading either way.
+
+**The DNS root is the one exclusion**, and for a reason rather than as a
+cutoff. A root takeover is real, but the entry it needs cannot exist: a
+certificate whose SAN is the root is refused by `single_dns_name` on both
+sides, so a client served a root-signed membership answer **fails closed**
+instead of accepting a key nobody watched. There is no silent case left to
+catch, and leaving the root out keeps a stray `""` in a hand-edited state file
+— which parses as the root, comparable with every name there is — from turning
+one watch into a report on the whole log. The client-side refusal is pinned in
+`crates/synch-monitor/tests/tiers.rs` so it cannot quietly become an
+acceptance.
 
 **Offline chain validation.** The carried chain is validated against the IANA
 root trust anchor with `synch_net::chain` — the same validator the client
@@ -787,7 +846,10 @@ then recorded so the next run stays quiet. A tier A entry for a key already
 recorded is silent. The apexes are also the watch list: an apex with an empty
 key list says "tell me about this zone, I have accounted for nothing yet",
 and an operator seeding a zone whose history predates the monitor lists the
-keys they already know about. `--no-save` classifies and reports without
+keys they already know about. List the zones you operate and nothing else —
+the ladder above and below each one is covered without being named, so an
+operator cannot be caught out by having failed to think of a zone that does
+not exist yet. `--no-save` classifies and reports without
 writing anything, so the same news arrives again next run — a dry run rather
 than a run that silently consumed the report.
 
@@ -837,9 +899,9 @@ the events that need a human.
 
 | Code | Meaning |
 |---|---|
-| `0` | nothing new for a watched apex |
-| `10` | unauthorized claims only — tier B naming a watched apex; no client would have accepted one |
-| `20` | new authorizations — a key was authorized for a watched apex that this monitor had not recorded: check it against what you published |
+| `0` | nothing new for a covered zone |
+| `10` | unauthorized claims only — tier B naming a covered zone; no client would have accepted one |
+| `20` | new authorizations — a key was authorized for a watched zone, or for one above or below it, and this monitor had not recorded it: check it against what you published |
 | `2` | the run could not finish (transport, checkpoint, state) |
 
 They are **ordered by severity**, so an alerting rule testing `>=` reads

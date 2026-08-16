@@ -36,6 +36,49 @@
 //! zone whose owner never reads the reports is no better watched than one
 //! nobody monitors.
 //!
+//! # What a watch list covers
+//!
+//! An operator writes down zones, but the thing they are protecting is a
+//! *name*: `_synchronicity.<network>.<org>.<apex>`, the record a client
+//! resolves. Which zone signs that name is not a fixed property of it — a cut
+//! can be created or removed at any label boundary along it, and whoever holds
+//! the zone above the boundary decides. The client follows whatever cut exists
+//! and demands a log entry for the key at *that* signer (§4.2), so an entry
+//! naming an unexpected zone is accepted by clients and has to be seen here.
+//!
+//! So a watch on `cp.example.com` covers every zone comparable with it in the
+//! DNS tree — the whole ladder above it and everything below it, not merely
+//! that spelling:
+//!
+//! ```text
+//!   .                    excluded, and only this one — see below
+//!   com                  a TLD can withdraw example.com's delegation
+//!   example.com          can withdraw cp's, and serve cp's names itself
+//!   cp.example.com       the zone the operator wrote down
+//!   org.cp.example.com   a new cut, taking the names under it out of cp's key
+//!   …and anything deeper
+//! ```
+//!
+//! Every one of those keys can authorize itself over
+//! `_synchronicity.network.org.cp.example.com`, every one produces an entry a
+//! client accepts, and matching the watch list by equality reported only the
+//! middle line. The ancestors are not a slippery slope to be trimmed: `com`
+//! really can take the name, and an entry naming `com` is one no client would
+//! ever refuse. It costs nothing to watch, because a TLD publishing a
+//! synchronicity zone-key entry is an event that should be read either way.
+//!
+//! **The root is the exception, and it is not an oversight.** A root takeover
+//! is real — the root can withdraw `com` — but the entry it would need cannot
+//! exist: a certificate whose SAN is the DNS root is refused by
+//! [`synch_net::x509::Certificate::single_dns_name`], on both sides. So a
+//! client served a root-signed membership answer **fails closed** rather than
+//! accepting a key nobody watched, and there is no silent case left for a
+//! monitor to catch. Excluding it also keeps a stray `""` in a hand-edited
+//! state file — which parses as the root, and is comparable with every name in
+//! existence — from turning one watch into a report on the entire log.
+//! `tests/tiers.rs` pins the refusal so it cannot quietly become an
+//! acceptance. See [`KnownKeys::watches`].
+//!
 //! # Reporting once, not forever
 //!
 //! [`KnownKeys`] is the memory that makes this usable: a key already recorded
@@ -68,7 +111,7 @@ pub mod classify;
 pub mod state;
 pub mod tiles;
 
-pub use classify::{classify, Finding, KnownKeys, Tier};
+pub use classify::{classify, Finding, KnownKeys, Tier, Watched};
 pub use state::MonitorState;
 
 /// Why a monitor run could not finish.

@@ -82,7 +82,12 @@ published entry is checked in as a conformance fixture, so an entry minted by
 other half: it walks the log's tiles, indexes every leaf by the name in its
 certificate, and reports every newly authorized key for the zones you watch —
 the CT-monitor posture, where the log tells you a key exists and your own
-record of what you published tells you whether to worry.
+record of what you published tells you whether to worry. Listing a zone also
+covers the zones above and below it: a DNS cut can be created or removed at
+any label boundary, so `example.com` can serve `cp.example.com`'s names by
+withdrawing the delegation and `org.cp.example.com` can be delegated away to
+take those names out of your key — both produce a key clients accept, and
+neither shows up in your own zone's key history.
 `--rekor off` (`SYNCH_REKOR`) states the opt-out;
 `--rekor-key <file>` (`SYNCH_REKOR_KEY`) points at a self-hosted log's
 verification key, with the same different-universe semantics as the trust
@@ -218,7 +223,7 @@ about that shape.
 | `synch-engine` | the embeddable node: scanner, publisher, anti-entropy, fetcher, mirrors |
 | `synch-cli` | the `synch` binary: the daemon, the control socket, and the CLI client |
 | `synch-s3` | the `synch-s3` binary and the gateway library |
-| `synch-monitor` | the `synch-monitor` binary: walks the transparency log's tiles and classifies every entry that names a watched zone |
+| `synch-monitor` | the `synch-monitor` binary: walks the transparency log's tiles and classifies every entry naming a watched zone, or one above or below it |
 
 All logic lives in the library crates, so any Rust application can embed a full
 node by depending on `synch-engine`.
