@@ -654,3 +654,123 @@ async fn a_poisoned_origin_does_not_hold_up_the_others() {
         node.net.shutdown().await.unwrap();
     }
 }
+
+/// A small edit to a large object moves the edit, not the object
+/// (`docs/DELTA-SYNC.md` §1, §3.3).
+///
+/// The follower already holds the previous version, so the new root's tree is
+/// the only thing it is missing. It asks for that tree — hashes, no payload —
+/// compares it against the object it has, promotes every span that turns out to
+/// be byte-identical, and fetches the one group that changed. What crosses the
+/// wire is the proof plus one 16 KiB group, for an object of a megabyte; before
+/// this, the same edit cost a megabyte.
+#[tokio::test]
+async fn a_small_edit_to_a_large_object_transfers_the_edit() {
+    let publisher = Node::spawn("nas").await;
+    let follower = Node::spawn("laptop").await;
+    trust_each_other(&[&publisher, &follower]);
+
+    const GROUP: usize = 16 * 1024;
+    let old: Vec<u8> = (0..64 * GROUP).map(|i| (i * 17 + 3) as u8).collect();
+    let mut new = old.clone();
+    new[40 * GROUP + 77] ^= 0xff;
+    let old_root = follower.store.ingest_bytes(&old, now_ns()).unwrap();
+    publisher.publish(1, &[("disk.img", new.as_slice())]);
+    let new_root = publisher
+        .store
+        .list_entries(Some(&publisher.origin), "media", "", None, None)
+        .unwrap()[0]
+        .content
+        .unwrap();
+    let size = new.len() as u64;
+    let groups = synch_core::group_count(size);
+    let all = ChunkRanges::single(0, groups);
+
+    let blob = follower
+        .net
+        .connect_blob(publisher.net.direct_addr())
+        .await
+        .unwrap();
+
+    // Round one: the tree at span granularity — here spans of 16 groups, the
+    // scaled-down stand-in for the 16 MiB ad span a real object would use.
+    let round_one = blob.get_proof(new_root, &all, 4).await.unwrap();
+    assert_eq!(round_one.served, all);
+    assert!(
+        round_one.encoded.len() < GROUP,
+        "a span proof of a 1 MiB object is a few hundred bytes, not {}",
+        round_one.encoded.len()
+    );
+    let spans = follower
+        .store
+        .write_proof(&new_root, size, &round_one.served, 4, &round_one.encoded, 0)
+        .unwrap();
+    assert_eq!(spans.len(), 4, "four spans of sixteen groups");
+
+    // The donor agrees about every span but the one holding the edit.
+    let asked: Vec<(u64, u64)> = spans.iter().map(|s| (s.start, s.groups)).collect();
+    let donor_cvs = follower.store.subtree_cvs(&old_root, &asked).unwrap();
+    let equal: Vec<&synch_store::ProvenSubtree> = spans
+        .iter()
+        .zip(&donor_cvs)
+        .filter(|(span, cv)| **cv == Some(span.cv))
+        .map(|(span, _)| span)
+        .collect();
+    assert_eq!(equal.len(), 3, "only the edited span differs");
+    let mut promoted = follower
+        .store
+        .promote(
+            &new_root,
+            size,
+            &synch_store::Donor::Object(old_root),
+            &equal.into_iter().copied().collect::<Vec<_>>(),
+            0,
+        )
+        .unwrap();
+    assert_eq!(promoted.count(), 48);
+
+    // Round two: leaf chaining values, inside the one span that differs.
+    let differing = all.difference(&promoted);
+    let round_two = blob.get_proof(new_root, &differing, 0).await.unwrap();
+    let leaves = follower
+        .store
+        .write_proof(&new_root, size, &round_two.served, 0, &round_two.encoded, 0)
+        .unwrap();
+    promoted = promoted.union(
+        &follower
+            .store
+            .promote(
+                &new_root,
+                size,
+                &synch_store::Donor::Object(old_root),
+                &leaves,
+                0,
+            )
+            .unwrap(),
+    );
+    assert_eq!(promoted.count(), groups - 1, "everything but the edit");
+
+    // And the delta itself: one group, fetched the ordinary way.
+    let missing = all.difference(&promoted);
+    assert_eq!(missing, ChunkRanges::single(40, 41));
+    let slice = blob.get_slice(new_root, &missing).await.unwrap();
+    let payload_bytes = round_one.encoded.len() + round_two.encoded.len() + slice.encoded.len();
+    assert!(
+        payload_bytes < 4 * GROUP,
+        "a one-group edit to a 64-group object cost {payload_bytes} bytes"
+    );
+    follower
+        .store
+        .write_slice(&new_root, size, &slice.served, &slice.encoded, 0)
+        .unwrap();
+
+    // The object is whole, verified against the root the publisher signed, and
+    // servable onward: the tree came with the proofs.
+    assert!(follower.store.blob(&new_root).unwrap().unwrap().complete);
+    assert_eq!(follower.store.read_all(&new_root).unwrap(), new);
+    let (encoded, served) = follower.store.encode_slice(&new_root, &all).unwrap();
+    assert!(!encoded.is_empty() && !served.is_empty());
+
+    publisher.net.shutdown().await.unwrap();
+    follower.net.shutdown().await.unwrap();
+}

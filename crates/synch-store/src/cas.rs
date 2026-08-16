@@ -42,7 +42,7 @@ static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Flushes a file's contents to stable storage. A blob row is only ever written
 /// after this returns, so a crash cannot leave a `complete=1` index row whose
 /// bytes never reached the disk (§6.2 durability).
-fn fsync_file(file: &File) -> Result<()> {
+pub(crate) fn fsync_file(file: &File) -> Result<()> {
     file.sync_all()?;
     Ok(())
 }
@@ -144,7 +144,7 @@ fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
     ChunkRanges::from_ranges(ranges)
 }
 
-fn ranges_to_bitmap(ranges: &ChunkRanges, groups: u64) -> Vec<u8> {
+pub(crate) fn ranges_to_bitmap(ranges: &ChunkRanges, groups: u64) -> Vec<u8> {
     let mut bits = vec![0u8; bitmap_len(groups)];
     for r in &ranges.ranges {
         for group in r.start..r.end.min(groups) {
@@ -179,7 +179,7 @@ impl Store {
         path
     }
 
-    fn tree(size: u64) -> BaoTree {
+    pub(crate) fn tree(size: u64) -> BaoTree {
         BaoTree::new(size, BLOCK_SIZE)
     }
 
@@ -268,7 +268,7 @@ impl Store {
         Ok(())
     }
 
-    fn write_blob_row(
+    pub(crate) fn write_blob_row(
         &self,
         root: &Hash,
         size: u64,
@@ -700,7 +700,7 @@ impl Store {
 /// `positioned-io` gives `File` the random-access reads and writes bao needs;
 /// this newtype exists only so the trait bounds resolve on both platforms
 /// without importing `positioned-io` directly.
-struct DataFile(File);
+pub(crate) struct DataFile(pub(crate) File);
 
 impl bao_tree::io::sync::ReadAt for DataFile {
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {

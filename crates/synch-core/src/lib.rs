@@ -12,7 +12,7 @@ pub mod path;
 pub mod record;
 pub mod wire;
 
-pub use hash::{hash_reader, Hash, HashParseError};
+pub use hash::{group_cv, hash_reader, join_cvs, join_root, Cv, Hash, HashParseError};
 pub use head::{head_signing_input, HeadError, HeadSummary, SignedHead, HEAD_SIGNING_DOMAIN};
 pub use origin::{NodeId, OriginId, OriginParseError};
 pub use path::{normalize_native_path, normalize_path, PathError, MAX_KEY_LEN};
@@ -23,7 +23,7 @@ pub use record::{
 };
 pub use wire::{
     BlobMessage, ChunkRanges, GroupRange, MptMessage, ALPN_BLOB, ALPN_MPT, MAX_BATCH,
-    MAX_FRAME_LEN, MAX_RANGES, MAX_SLICE_GROUPS, PROTO_VERSION,
+    MAX_FRAME_LEN, MAX_PROOF_NODES, MAX_RANGES, MAX_SLICE_GROUPS, PROOF_NODE_LEN, PROTO_VERSION,
 };
 
 /// The software identification string published in [`NodeManifest::software`].
@@ -34,6 +34,16 @@ pub const CHUNK_GROUP_SIZE: u64 = 16 * 1024;
 
 /// log2 of the chunk group size in BLAKE3 chunks (§6.1).
 pub const CHUNK_GROUP_LOG2: u8 = 4;
+
+/// The descent level whose subtrees are exactly one ad span across.
+///
+/// Delta sync's first proof round asks for the tree at this level and no
+/// deeper: one chaining value per 16 MiB, which is 32 bytes per span and about
+/// 200 KB for a 100 GB object (`docs/DELTA-SYNC.md` §3.3). The ad span is the
+/// unit deliberately — a span proven equal to a donor's is promoted whole, and
+/// the same boundary is what `BlobAd` summarizes possession at (§6.3), so a
+/// node that promotes a span can advertise it without any further arithmetic.
+pub const AD_SPAN_LEVEL: u8 = (AD_SPAN_GRANULARITY / CHUNK_GROUP_SIZE).trailing_zeros() as u8;
 
 /// Blobs at or below this size are inlined in SQLite rather than written to the
 /// filesystem CAS (§6.2).

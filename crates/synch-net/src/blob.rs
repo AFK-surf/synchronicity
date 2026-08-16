@@ -1,9 +1,15 @@
-//! The `sync/blob/1` ALPN: verified bao slice transfer (§6.4).
+//! The `sync/blob/1` ALPN: verified bao slice transfer (§6.4) and the tree
+//! proofs delta sync descends with (`docs/DELTA-SYNC.md` §3.1).
 //!
-//! The blob ALPN carries nothing but `GetSlice`/`SliceEnd` and the slice bytes
-//! themselves. `SliceEnd` reports what the provider actually had, which is how
-//! the fetcher learns exact availability — span summaries in `BlobAd` are hints,
-//! not promises.
+//! The blob ALPN carries nothing but `GetSlice`/`SliceEnd`, `GetProof`/
+//! `ProofEnd`, and the slice and proof bytes themselves. Both `End` messages
+//! report what the provider actually had, which is how the fetcher learns exact
+//! availability — span summaries in `BlobAd` are hints, not promises.
+//!
+//! A proof is the same exchange as a slice with the payload left out, and it is
+//! deliberately not a protocol of its own: a provider that can serve a group can
+//! prove it, because the bao slice it would have sent already carries every
+//! hash on that group's path to the root.
 
 use std::sync::Arc;
 
@@ -12,7 +18,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use synch_core::{now_ns, BlobMessage, ChunkRanges, Hash, MAX_RANGES, MAX_SLICE_GROUPS};
-use synch_store::Store;
+use synch_store::{ProvenSubtree, Store};
 
 use crate::{
     error::NetError,
@@ -123,9 +129,43 @@ impl BlobProtocol {
                 write_frame(send, &BlobMessage::SliceEnd { served }).await?;
                 Ok(())
             }
-            BlobMessage::SliceEnd { .. } => Err(NetError::Unexpected(
-                "SliceEnd is a response, not a request".into(),
-            )),
+            BlobMessage::GetProof {
+                root,
+                ranges,
+                level,
+            } => {
+                // Bounded before anything reads it, for the same reason a slice
+                // request is: the set operations under it are quadratic in the
+                // number of ranges (§12).
+                if ranges.range_count() > MAX_RANGES {
+                    return Err(NetError::Unexpected(format!(
+                        "proof request of {} ranges exceeds the {MAX_RANGES} limit",
+                        ranges.range_count()
+                    )));
+                }
+                let ranges = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
+                // Cheaper than a slice — a proof of a 16 MiB span is 32 bytes —
+                // but it still walks a tree and reads an outboard off disk, and
+                // the leaf-level round over a large edit walks a lot of one. It
+                // goes to the blocking pool with everything else (§10).
+                let store = self.store.clone();
+                let (encoded, served) = crate::blocking::offload(move || {
+                    match store.encode_proof(&root, &ranges, level) {
+                        Ok(pair) => Ok(pair),
+                        Err(synch_store::StoreError::MissingBlob(_)) => {
+                            Ok((Vec::new(), ChunkRanges::empty()))
+                        }
+                        Err(e) => Err(e.into()),
+                    }
+                })
+                .await?;
+                write_bytes(send, &encoded).await?;
+                write_frame(send, &BlobMessage::ProofEnd { served }).await?;
+                Ok(())
+            }
+            BlobMessage::SliceEnd { .. } | BlobMessage::ProofEnd { .. } => Err(
+                NetError::Unexpected("an End message is a response, not a request".into()),
+            ),
         }
     }
 }
@@ -142,6 +182,25 @@ pub struct Slice {
     /// The bao-encoded slice bytes.
     pub encoded: Vec<u8>,
     /// The ranges the provider had, which is what the encoding covers.
+    pub served: ChunkRanges,
+}
+
+/// A received proof, together with what the provider actually served.
+#[derive(Debug, Clone)]
+pub struct Proof {
+    /// The pre-order node pairs.
+    pub encoded: Vec<u8>,
+    /// The ranges the proof covers.
+    pub served: ChunkRanges,
+}
+
+/// What a run of proof exchanges established (`docs/DELTA-SYNC.md` §3.3).
+#[derive(Debug, Clone, Default)]
+pub struct ProofOutcome {
+    /// The subtrees whose chaining values are now proven against the root, in
+    /// tree order — one per group at level 0, one per span higher up.
+    pub proven: Vec<ProvenSubtree>,
+    /// The ranges they cover, which is what the requester can stop asking for.
     pub served: ChunkRanges,
 }
 
@@ -172,11 +231,96 @@ impl BlobClient {
         let encoded = read_bytes(&mut recv).await?;
         let served = match read_frame::<BlobMessage>(&mut recv).await? {
             BlobMessage::SliceEnd { served } => served,
-            BlobMessage::GetSlice { .. } => {
-                return Err(NetError::Unexpected("expected SliceEnd".into()))
-            }
+            _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
         };
         Ok(Slice { encoded, served })
+    }
+
+    /// Requests the tree over a range, without its bytes.
+    pub async fn get_proof(
+        &self,
+        root: Hash,
+        ranges: &ChunkRanges,
+        level: u8,
+    ) -> Result<Proof, NetError> {
+        let (mut send, mut recv) = self.connection.open_bi().await?;
+        write_frame(
+            &mut send,
+            &BlobMessage::GetProof {
+                root,
+                ranges: ranges.clone(),
+                level,
+            },
+        )
+        .await?;
+        let _ = send.finish();
+
+        let encoded = read_bytes(&mut recv).await?;
+        let served = match read_frame::<BlobMessage>(&mut recv).await? {
+            BlobMessage::ProofEnd { served } => served,
+            _ => return Err(NetError::Unexpected("expected ProofEnd".into())),
+        };
+        Ok(Proof { encoded, served })
+    }
+
+    /// Requests the tree over a range and commits it to the local CAS,
+    /// verifying every node against the object root before anything is stored.
+    ///
+    /// The counterpart of [`BlobClient::fetch_into`] for the descent that comes
+    /// *before* a fetch (`docs/DELTA-SYNC.md` §3.3): it answers "what does this
+    /// object's tree look like here?", and the answer is what lets the caller
+    /// discover that most of the object is already on this disk under another
+    /// name. A provider serves one window of nodes per exchange, so a large
+    /// range is walked window by window; each is verified and committed as it
+    /// arrives, so an interrupted descent keeps what it proved.
+    ///
+    /// Returns the proven subtrees and the ranges they cover — which may be
+    /// less than was asked for, when the provider holds less than that.
+    pub async fn fetch_proof_into(
+        &self,
+        store: &Arc<Store>,
+        root: Hash,
+        size: u64,
+        ranges: &ChunkRanges,
+        level: u8,
+    ) -> Result<ProofOutcome, NetError> {
+        let mut remaining = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
+        let mut out = ProofOutcome::default();
+        let mut barren = 0u32;
+        while !remaining.is_empty() {
+            // The window is the provider's to choose — it is counted in tree
+            // nodes, not groups, and only the provider knows how the tree falls
+            // — so the whole remainder is offered and `ProofEnd` says how much
+            // of it came back. Only the range *count* is clamped here, because
+            // that is the one part of the request the provider must not be made
+            // to pay for (§12).
+            let window =
+                ChunkRanges::from_ranges(remaining.ranges.iter().take(MAX_RANGES).copied());
+            let proof = self.get_proof(root, &window, level).await?;
+            let served = proof.served.intersect(&window);
+            if served.is_empty() {
+                barren += 1;
+                if barren >= MAX_BARREN_WINDOWS {
+                    break;
+                }
+                // Nothing came back for this window, and asking again would
+                // only repeat the round trip.
+                remaining = remaining.difference(&window);
+                continue;
+            }
+            barren = 0;
+            let store = store.clone();
+            let encoded = proof.encoded;
+            let for_store = served.clone();
+            let proven = crate::blocking::offload(move || {
+                Ok(store.write_proof(&root, size, &for_store, level, &encoded, now_ns())?)
+            })
+            .await?;
+            remaining = remaining.difference(&served);
+            out.served = out.served.union(&served);
+            out.proven.extend(proven);
+        }
+        Ok(out)
     }
 
     /// Requests a slice and commits it to the local CAS, verifying every group
