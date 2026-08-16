@@ -3,11 +3,16 @@
 //// anything that changes what the service *is*.
 
 import envoy
+import gleam/bool
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+
+/// The database's directory, used to keep it disjoint from the key file.
+@external(erlang, "filename", "dirname")
+fn dirname(path: String) -> String
 
 pub type Role {
   Primary
@@ -59,6 +64,7 @@ pub fn load() -> Result(Config, String) {
         Error(Nil) -> Ok("")
       }
   })
+  use _ <- result.try(validate_db_path(db_path, key_file))
   use _ <- result.try(removed("CP_HTTP_PORT", "CP_HTTP_LISTEN"))
   use _ <- result.try(removed("CP_DNS_PORT", "CP_DNS_LISTEN"))
   use http_listen <- result.try(listen_from("CP_HTTP_LISTEN", "0.0.0.0:8080"))
@@ -122,6 +128,32 @@ fn credential_pair(
 
 fn required(key: String) -> Result(String, String) {
   envoy.get(key) |> result.replace_error(key <> " is required")
+}
+
+/// The csqlite sandbox grants read+write over the *directory* of the
+/// database (Landlock/unveil cannot name a single file), so two things
+/// must hold: the path is absolute — a relative one would resolve
+/// against the service's working directory and grant the release tree —
+/// and the signing key lives in a different directory, or a compromised
+/// worker's directory grant would cover it. `key_file` is "" on replicas
+/// (no key), which trivially satisfies the second check.
+fn validate_db_path(db_path: String, key_file: String) -> Result(Nil, String) {
+  use <- bool.guard(
+    !string.starts_with(db_path, "/"),
+    Error("CP_DB_PATH must be an absolute path, got: " <> db_path),
+  )
+  case key_file == "" || dirname(db_path) != dirname(key_file) {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        "CP_DB_PATH and CP_KEY_FILE must not share a directory: the csqlite "
+        <> "sandbox grants the database's directory, so the signing key must "
+        <> "sit elsewhere. Put the database in its own subdirectory, e.g. "
+        <> dirname(db_path)
+        <> "/db/"
+        <> ".",
+      )
+  }
 }
 
 @external(erlang, "cp_udp_ffi", "valid_listen")

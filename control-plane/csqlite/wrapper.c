@@ -65,6 +65,7 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <stddef.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #if defined(__has_include)
@@ -105,24 +106,29 @@ _Static_assert(sizeof(size_t) >= 8, "csqlite assumes a 64-bit size_t");
 
 /* Filesystem: Landlock (5.13+), unprivileged. The ruleset handles every
  * access kind this kernel's ABI knows so anything unlisted is denied,
- * then grants the database directory just what SQLite needs for the db
- * and its -wal/-shm/journal companions. Temp spill files are not
- * granted anywhere: open_hardened() forces temp_store=MEMORY. */
+ * then grants the database directory just what SQLite needs for the db,
+ * its -wal/-shm/journal companions, and temp spill files (main() points
+ * the VFS temp path here). The grant is the *database's* directory, which
+ * is why the operator keeps the signing key elsewhere: Landlock cannot
+ * express a filename, only a directory. */
 #ifdef CSQLITE_HAVE_LANDLOCK
-static void grant_path(int rfd, const char *path, uint64_t access) {
+/* Returns 1 if the rule was added, 0 on any failure (already warned). */
+static int grant_path(int rfd, const char *path, uint64_t access) {
   struct landlock_path_beneath_attr pb = {0};
   pb.parent_fd = open(path, O_PATH | O_CLOEXEC);
   if (pb.parent_fd < 0) {
     fprintf(stderr, "csqlite: landlock: cannot open %s: %s\n", path,
             strerror(errno));
-    return;
+    return 0;
   }
   pb.allowed_access = access;
-  if (syscall(__NR_landlock_add_rule, rfd, LANDLOCK_RULE_PATH_BENEATH, &pb,
-              0) != 0)
+  int ok = syscall(__NR_landlock_add_rule, rfd, LANDLOCK_RULE_PATH_BENEATH,
+                   &pb, 0) == 0;
+  if (!ok)
     fprintf(stderr, "csqlite: landlock: add rule for %s: %s\n", path,
             strerror(errno));
   close(pb.parent_fd);
+  return ok;
 }
 
 static void confine_fs(const char *datadir) {
@@ -163,9 +169,18 @@ static void confine_fs(const char *datadir) {
             strerror(errno));
     return;
   }
-  grant_path(rfd, datadir, dir_access);
-  /* SQLite's VFS seeds randomness from /dev/urandom; if the node lacks
-   * it SQLite falls back to time+pid, so a failed grant is not fatal. */
+  /* If the database directory itself could not be granted, sealing the
+   * ruleset would deny every OPEN — a worker that is confined but cannot
+   * serve. Warn-and-continue policy: leave the filesystem unconfined and
+   * loud rather than sealed and dead. (/dev/urandom is best-effort: a
+   * failed grant only costs SQLite its preferred randomness source.) */
+  if (!grant_path(rfd, datadir, dir_access)) {
+    fputs("csqlite: landlock: database directory not granted; leaving "
+          "filesystem unconfined\n",
+          stderr);
+    close(rfd);
+    return;
+  }
   grant_path(rfd, "/dev/urandom", LANDLOCK_ACCESS_FS_READ_FILE);
   if (syscall(__NR_landlock_restrict_self, rfd, 0) != 0)
     fprintf(stderr, "csqlite: landlock: restrict self: %s\n",
@@ -260,6 +275,14 @@ static void confine_syscalls(void) {
 #ifdef __NR_flock
       __NR_flock,
 #endif
+  /* unixDeviceCharacteristics() probes the fs on the commit path; a
+   * libsqlite3 built with SQLITE_ENABLE_BATCH_ATOMIC_WRITE issues an
+   * ioctl there. The distro build linked here does not, but the Makefile
+   * does not pin the build, so allow it rather than SIGSYS on first write
+   * against a differently-configured SQLite. */
+#ifdef __NR_ioctl
+      __NR_ioctl,
+#endif
   /* journal/WAL files are fchmod'd to match the database */
 #ifdef __NR_fchmod
       __NR_fchmod,
@@ -301,18 +324,16 @@ static void confine_syscalls(void) {
 #ifdef __NR_getcwd
       __NR_getcwd,
 #endif
-  /* memory: malloc, SQLite page cache, WAL -shm mapping */
-#ifdef __NR_mmap
-      __NR_mmap,
-#endif
+  /* memory: malloc, SQLite page cache, WAL -shm mapping. mmap and
+   * mprotect are handled separately below, with a PROT_EXEC check — this
+   * is a C process with no JIT, so nothing legitimately maps writable-
+   * then-executable, and denying it removes the last step of the usual
+   * "corrupt a page, run it" chain against a hostile database file. */
 #ifdef __NR_munmap
       __NR_munmap,
 #endif
 #ifdef __NR_mremap
       __NR_mremap,
-#endif
-#ifdef __NR_mprotect
-      __NR_mprotect,
 #endif
 #ifdef __NR_madvise
       __NR_madvise,
@@ -380,8 +401,10 @@ static void confine_syscalls(void) {
   };
   enum { NALLOWED = sizeof(allowed) / sizeof(allowed[0]) };
 
-  /* 4 prologue + 2 (x32 check, x86_64 only) + 2 per syscall + final. */
-  struct sock_filter prog[7 + 2 * NALLOWED];
+  /* Upper bound (x86_64, every guard live): 4 prologue + 2 x32 check
+   * + 5 mmap + 5 mprotect + 2 per allowlisted syscall + 1 final. Other
+   * arches emit fewer; over-sizing is a few unused stack slots. */
+  struct sock_filter prog[17 + 2 * NALLOWED];
   size_t n = 0;
   prog[n++] = (struct sock_filter)BPF_STMT(
       BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
@@ -397,6 +420,34 @@ static void confine_syscalls(void) {
                                            0x40000000u, 0, 1);
   prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
                                            SECCOMP_RET_KILL_PROCESS);
+#endif
+  /* W^X: mmap/mprotect are allowed only without PROT_EXEC. Each block is
+   * "if nr==call, load args[2] (prot, low word — every mapped arch here
+   * is little-endian), kill on PROT_EXEC else allow; if nr!=call skip the
+   * four-instruction body with the accumulator still holding nr". Both
+   * interior arms return, so a taken block never falls through and the
+   * allowlist below always sees nr, never a stale prot value. */
+#if defined(__NR_mmap) || defined(__NR_mprotect)
+  static const int prot_calls[] = {
+#ifdef __NR_mmap
+      __NR_mmap,
+#endif
+#ifdef __NR_mprotect
+      __NR_mprotect,
+#endif
+  };
+  for (size_t i = 0; i < sizeof(prot_calls) / sizeof(prot_calls[0]); i++) {
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                             (uint32_t)prot_calls[i], 0, 4);
+    prog[n++] = (struct sock_filter)BPF_STMT(
+        BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[2]));
+    prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K,
+                                             (uint32_t)PROT_EXEC, 0, 1);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                                             SECCOMP_RET_KILL_PROCESS);
+    prog[n++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K,
+                                             SECCOMP_RET_ALLOW);
+  }
 #endif
   for (size_t i = 0; i < NALLOWED; i++) {
     prog[n++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
@@ -419,7 +470,8 @@ static void sandbox(const char *datadir) {
   struct rlimit no_core = {0, 0};
   if (setrlimit(RLIMIT_CORE, &no_core) != 0)
     fprintf(stderr, "csqlite: RLIMIT_CORE: %s\n", strerror(errno));
-  prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+  if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0)
+    fprintf(stderr, "csqlite: PR_SET_DUMPABLE: %s\n", strerror(errno));
   /* db + wal + shm + journal + dir fsync handles + urandom: 64 is
    * generous for one connection and starves nothing legitimate. */
   struct rlimit few_files = {64, 64};
@@ -892,13 +944,36 @@ static void handle_exec(sqlite3 *db, Cur *c) {
 
 /* ---- main loop --------------------------------------------------------- */
 
+/* No SQL statement may name a second file. ATTACH is the obvious way SQL
+ * opens a path other than the OPENed one; VACUUM INTO reaches the VFS
+ * through the same SQLITE_ATTACH authorization. Nothing the control plane
+ * runs needs either, and denying them keeps a compromised query from
+ * touching the signing key (or anything else) that shares the granted
+ * directory — a distinction the kernel confinement cannot draw, and the
+ * one layer that still holds on a host without Landlock. */
+static int deny_second_file(void *unused, int action, const char *a,
+                            const char *b, const char *c, const char *d) {
+  (void)unused;
+  (void)a;
+  (void)b;
+  (void)c;
+  (void)d;
+  if (action == SQLITE_ATTACH || action == SQLITE_DETACH) return SQLITE_DENY;
+  return SQLITE_OK;
+}
+
 /* Opens `zpath` with the mode's flags and the full hostile-file hardening
  * applied. On failure the handle is closed and *out is NULL. */
 static int open_hardened(const char *zpath, uint8_t mode, sqlite3 **out) {
-  int flags = mode == 0   ? SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW
+  /* NOFOLLOW in every mode: the database is opened by absolute path and
+   * the replica refresh contract is an atomic rename, never a symlink, so
+   * a symlinked target is always someone redirecting the open — and for a
+   * writable mode it would land the db (and its -wal/-shm) outside the
+   * granted directory. */
+  int flags = mode == 0   ? SQLITE_OPEN_READONLY
               : mode == 1 ? SQLITE_OPEN_READWRITE
                           : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-  flags |= SQLITE_OPEN_EXRESCODE;
+  flags |= SQLITE_OPEN_EXRESCODE | SQLITE_OPEN_NOFOLLOW;
   sqlite3 *db = NULL;
   int rc = sqlite3_open_v2(zpath, &db, flags, NULL);
   if (rc != SQLITE_OK) {
@@ -918,10 +993,10 @@ static int open_hardened(const char *zpath, uint8_t mode, sqlite3 **out) {
   sqlite3_limit(db, SQLITE_LIMIT_VDBE_OP, 250000);
   sqlite3_busy_timeout(db, 5000);
   sqlite3_exec(db, "PRAGMA cell_size_check=ON", NULL, NULL, NULL);
-  /* The sandbox grants no temp directory, so sorts and statement
-   * journals must never spill to disk. In-memory is fine at our scale:
-   * responses are capped at MAX_RESP anyway. */
-  sqlite3_exec(db, "PRAGMA temp_store=MEMORY", NULL, NULL, NULL);
+  /* ATTACH / VACUUM INTO / DETACH are refused (see deny_second_file):
+   * the sandbox grants one directory, so SQL must not be able to name a
+   * file in it beyond the database. */
+  sqlite3_set_authorizer(db, deny_second_file, NULL);
   *out = db;
   return SQLITE_OK;
 }
@@ -935,7 +1010,19 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   /* Seal before the first frame: everything after this point handles
    * untrusted input with the kernel surface already reduced. */
-  sandbox(argc > 1 ? argv[1] : NULL);
+  const char *datadir = argc > 1 ? argv[1] : NULL;
+  sandbox(datadir);
+
+  /* Sorts and statement journals spill into the granted directory rather
+   * than an ungranted /tmp: temp_store stays at its FILE default and the
+   * VFS temp path points at the database's own directory. (temp_store=
+   * MEMORY, the obvious alternative, turns a disk-bounded sort into an
+   * unbounded heap allocation — a fleet-wide ORDER BY would then size the
+   * worker's RSS instead of spilling.) The hard heap limit is a backstop
+   * for the paths that still allocate: a runaway query gets SQLITE_NOMEM,
+   * not the cgroup's OOM killer. */
+  if (datadir) sqlite3_temp_directory = sqlite3_mprintf("%s", datadir);
+  sqlite3_hard_heap_limit64(256 * 1024 * 1024);
 
   sqlite3 *db = NULL;
   char *saved_path = NULL;

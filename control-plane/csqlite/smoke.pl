@@ -77,6 +77,23 @@ sub exec_frame {
     return "\x02" . pack("N", length $sql) . $sql . pack("n", 0);
 }
 
+# Wait for a worker and fail on abnormal exit. Death-by-signal is the
+# case that matters: a SIGSYS from the seccomp filter (the whole reason
+# the filter is tested) leaves `$? >> 8` at 0, so it must be caught via
+# `$? & 127` or it passes silently.
+sub reap {
+    my ($pid, $label) = @_;
+    waitpid($pid, 0);
+    if ($? & 127) {
+        printf "FAIL %-40s worker killed by signal %d\n", $label, $? & 127;
+        $failures++;
+    }
+    elsif (my $code = $? >> 8) {
+        printf "FAIL %-40s worker exited %d\n", $label, $code;
+        $failures++;
+    }
+}
+
 # --- 1. Full life-cycle inside the granted directory. WAL + ORDER BY +
 # RESET + CLOSE cover the syscalls the sandbox must keep allowing:
 # shm mmap, journal fchmod, sort, reopen, unlink.
@@ -116,15 +133,50 @@ expect("EXEC select after RESET",
     rpc($in, $out, exec_frame("SELECT a FROM t")), 0x83);
 expect("CLOSE", rpc($in, $out, "\x03"), 0x81);
 close $in;
-waitpid($pid, 0);
-if (my $code = $? >> 8) {
-    print "FAIL worker exited $code after CLOSE\n";
-    $failures++;
-}
+reap($pid, "life-cycle");
 
-# --- 2. The kernel must refuse an OPEN outside the granted directory.
+# --- 2. SQL must not be able to name a second file. The authorizer
+# denies ATTACH/DETACH (and VACUUM INTO, routed through the same
+# SQLITE_ATTACH authorization), and OPEN sets NOFOLLOW. These are
+# userland, active on every platform independent of kernel confinement,
+# so they are hard checks even where Landlock is absent.
 
 my $outside = tempdir(CLEANUP => 1);
+($pid, $in, $out) = spawn_worker($datadir);
+expect("OPEN for escape probes",
+    rpc($in, $out, "\x01\x02$datadir/probe.db"), 0x81);
+expect("ATTACH a second file refused",
+    rpc($in, $out, "\x04ATTACH '$outside/att.db' AS e"), 0x84);
+expect("VACUUM INTO a second file refused",
+    rpc($in, $out, "\x04VACUUM INTO '$outside/vac.db'"), 0x84);
+for my $f ("$outside/att.db", "$outside/vac.db") {
+    next unless -e $f;
+    print "FAIL SQL created $f outside the granted directory\n";
+    $failures++;
+    unlink $f;
+}
+close $in;
+reap($pid, "escape-probe");
+
+# NOFOLLOW must refuse an OPEN through a symlink, in every mode, so a
+# planted symlink cannot land the database (and its -wal/-shm) outside
+# the granted directory.
+symlink("$outside/target.db", "$datadir/link.db")
+    or die "smoke: cannot create test symlink: $!\n";
+($pid, $in, $out) = spawn_worker($datadir);
+expect("symlinked OPEN refused (NOFOLLOW)",
+    rpc($in, $out, "\x01\x02$datadir/link.db"), 0x84);
+if (-e "$outside/target.db") {
+    print "FAIL symlinked OPEN created a file outside the granted dir\n";
+    $failures++;
+    unlink "$outside/target.db";
+}
+close $in;
+reap($pid, "symlink");
+unlink "$datadir/link.db";
+
+# --- 3. The kernel must refuse an OPEN outside the granted directory.
+
 ($pid, $in, $out) = spawn_worker($datadir);
 my $resp = rpc($in, $out, "\x01\x02$outside/escape.db");
 if (unpack("C", $resp) == 0x84 && !-e "$outside/escape.db") {
@@ -141,7 +193,7 @@ else {
 }
 unlink "$outside/escape.db";
 close $in;
-waitpid($pid, 0);
+reap($pid, "out-of-dir");
 
 die "smoke: $failures check(s) failed\n" if $failures;
 print "smoke: all checks passed\n";

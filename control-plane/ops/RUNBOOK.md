@@ -36,7 +36,7 @@ Primary, `litestream replicate`:
 
 ```yaml
 dbs:
-  - path: /var/lib/synch-controlplane/cp.db
+  - path: /var/lib/synch-controlplane/db/cp.db
     replicas:
       - type: s3
         bucket: cp-litestream
@@ -47,8 +47,8 @@ dbs:
 Replica restore loop (cron/systemd timer, ~60s):
 
 ```sh
-litestream restore -o /var/lib/synch-controlplane/cp.db.new "$REPLICA_URL" \
-  && mv -f /var/lib/synch-controlplane/cp.db.new /var/lib/synch-controlplane/cp.db
+litestream restore -o /var/lib/synch-controlplane/db/cp.db.new "$REPLICA_URL" \
+  && mv -f /var/lib/synch-controlplane/db/cp.db.new /var/lib/synch-controlplane/db/cp.db
 ```
 
 **The database contains OAuth client secrets and per-org OIDC client
@@ -60,8 +60,8 @@ secrets.** Protect the replication bucket accordingly.
 |---|---|---|
 | `CP_ROLE` | both | `primary` or `replica` |
 | `CP_BASE_DOMAIN` | both | zone apex, e.g. `sync.example.dev` |
-| `CP_DB_PATH` | both | SQLite file |
-| `CP_KEY_FILE` | primary | zone key file; **must be unset on replicas** |
+| `CP_DB_PATH` | both | SQLite file; **absolute, in its own directory** (see below) |
+| `CP_KEY_FILE` | primary | zone key file; **not in the database's directory**; unset on replicas |
 | `CP_HTTP_LISTEN` | both | `address:port`, default `0.0.0.0:8080` |
 | `CP_DNS_LISTEN` | both | `address:port`, default `0.0.0.0:53` |
 | `CP_NS_HOSTS` | primary | `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53` |
@@ -70,6 +70,16 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link mail (absent = log-only) |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |
+
+> **Why the database gets its own directory.** Each SQLite connection
+> runs in a `csqlite` worker sandboxed (Landlock on Linux, `unveil`/
+> `pledge` on OpenBSD) to exactly the *directory* holding `CP_DB_PATH` —
+> the kernel primitives grant a directory, not a single file. So the
+> zone signing key (`CP_KEY_FILE`) must live **outside** that directory,
+> or a compromised worker's grant would cover it. Put the database in a
+> dedicated subdirectory — `/var/lib/synch-controlplane/db/cp.db` with
+> the key at `/var/lib/synch-controlplane/csk.key` — and the service
+> refuses to start if the two share a directory or the path is relative.
 
 ## First-time setup
 
