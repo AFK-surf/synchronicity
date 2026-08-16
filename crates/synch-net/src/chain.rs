@@ -7,8 +7,11 @@
 //! - the **monitor** runs it on every leaf it classifies.
 //!
 //! The invariant that couples them is: *anything a client accepts must be
-//! classified at least tier B by a monitor* — never tier C, which is the
-//! silent bin. If the monitor's chain rule were stricter than the client's,
+//! classified tier A by a monitor* — never tier C, which is the silent bin.
+//! (It once read "at least tier B", when a middle tier existed; with two
+//! tiers there is exactly one bin a client-accepted entry may land in, which
+//! makes the invariant stronger rather than weaker.)
+//! If the monitor's chain rule were stricter than the client's,
 //! an attacker could publish an entry with a chain the client waves through
 //! and the monitor files as noise: usable against victims and inaudible to
 //! the operator, which is strictly worse than not logging at all. So neither

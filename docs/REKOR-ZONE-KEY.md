@@ -44,10 +44,17 @@ covert.
   one zone cannot, and neither can a monitor detect a history shown to
   *somebody else*. Cross-witnessing would have covered that second case and
   this design does not implement it (§8.2).
-- Theft of the *previous* key as well as the current one. Succession
-  countersignatures are what separate a rotation from a substitution (§2.2);
-  an attacker holding both key generations produces a tier A entry, and at
-  that point transparency was never going to be the defence.
+- Telling a rotation apart from a substitution, automatically. An attacker
+  who has taken the registrar holds the DS, so they can assemble a delegation
+  chain exactly as valid as the operator's own; the entry they publish is
+  indistinguishable, byte for byte, from the entry a routine rollover
+  publishes. The design carried a **succession countersignature** for a while
+  — the previous zone key signing "this key follows me", which a DS
+  substitution alone could not forge — and it is gone (§2.2, §5.5). What is
+  left is what transparency actually provides: the key is *public*, and the
+  operator's own record of which keys they minted is what says whether a
+  reported key is theirs. That is a real transfer of work onto the operator,
+  and it is stated here rather than buried in §5.5.
 
 ## 2. What gets logged
 
@@ -94,11 +101,14 @@ where anyone walking the log's tiles can index it.
 
 This is confirmed live, not inferred: such an entry was published to
 `log2025-1.rekor.sigstore.dev` (HTTP 201 Created, `logIndex 67966366`, SAN
-`DNS:zone-key-transparency.demo.invalid`), carrying both custom extensions
-below in a 945-byte certificate. Its leaf was read back out of the static
-tiles and the whole record — inclusion, checkpoint, possession, bindings,
-chain — verifies offline through the real client verifier. It is checked in
-as `crates/synch-net/tests/fixtures/rekor_v3`.
+`DNS:zone-key-transparency.demo.invalid`), in a 945-byte certificate carrying
+the two custom extensions this design had at the time — the DNSSEC chain, and
+the succession countersignature since removed (§2.2). Its leaf was read back
+out of the static tiles and the whole record — inclusion, checkpoint,
+possession, bindings, chain — verifies offline through the real client
+verifier, exactly as it did before that removal, because nothing reads the
+extension it still carries. It is checked in as
+`crates/synch-net/tests/fixtures/rekor_v3`.
 
 An earlier entry at `logIndex 67766084` was the same shape under the old
 `synchronicity.dev` predicate type. A Statement reaches the log only as the
@@ -124,23 +134,26 @@ Certificate (self-signed, ECDSA P-256/SHA-256)
   keyUsage           digitalSignature    critical
   subjectAltName     dNSName = <apex>    non-critical
   2.25.1555716359    the DNSSEC chain
-  2.25.1138370866    the succession countersignature
 ```
 
-### 2.2 The two custom extensions
+### 2.2 The custom extension
+
+One custom extension, and there used to be two — the second is retired below,
+because a reader of an older draft needs to know where it went rather than to
+find it silently absent.
 
 We hold no IANA Private Enterprise Number, and inventing an arc under
 somebody else's is how OID collisions happen. `2.25` is the UUID arc, which
-needs no registration. Both OIDs are hardcoded as named constants on both
+needs no registration. The OID is hardcoded as a named constant on both
 sides (`crates/synch-net/src/zonecert.rs`,
 `control-plane/src/rekor/cert.gleam`) and pinned by the crossval fixtures.
 
 | OID | DER content bytes | Carries |
 |---|---|---|
 | `2.25.1555716359` | `69 85 e5 e9 b2 07` | the DNSSEC chain |
-| `2.25.1138370866` | `69 84 9e e8 d2 32` | the succession countersignature |
+| `2.25.1138370866` | `69 84 9e e8 d2 32` | *retired* — the succession countersignature. **Burned, never to be reallocated.** |
 
-**The arcs must stay inside 31 bits, and this is not a style preference.**
+**The arc must stay inside 31 bits, and this is not a style preference.**
 Rekor is Go, its certificate parser is `crypto/x509`, and Go's
 `encoding/asn1` `parseBase128Int` rejects any OID component that overflows
 `int32`. A wider arc therefore fails inside `x509.ParseCertificate` *before*
@@ -156,14 +169,18 @@ certificates and the tool that reads them back — both parse a 128-bit arc
 happily, so every test on both sides of this repo passed against a
 certificate the log would refuse. Bisected against
 `log2025-1.rekor.sigstore.dev`, where a rejected submission is not logged and
-so costs nothing:
+so costs nothing. **The bisect is historical in one respect and current in
+every other**: it was run while the succession extension still existed, so two
+of its rows describe certificates this build no longer mints. The evidence it
+carries is about *OID arc width*, which has not changed, so the table is kept
+as measured rather than rewritten to match today's certificate:
 
 | Certificate | Size | Result |
 |---|---|---|
 | bare (no custom extensions) | 410 B | `201` |
 | chain extension only | 771 B | `400 invalid hashedrekord request` |
-| succession extension only | 616 B | `400 invalid hashedrekord request` |
-| both | 973 B | `400 invalid hashedrekord request` |
+| succession extension only *(the retired extension; historical)* | 616 B | `400 invalid hashedrekord request` |
+| both *(historical)* | 973 B | `400 invalid hashedrekord request` |
 
 and then, with the extension *bytes held byte-identical* and only the OID
 changed:
@@ -173,19 +190,20 @@ changed:
 | `2.25.<128-bit uuid arc>` | `400 invalid hashedrekord request` |
 | `1.3.6.1.4.1.99999.1` | `201` |
 
-The extension structure was never the problem. The arcs in use now are the
-first four bytes of the original UUIDs masked into 31 bits — `0xdcba5907` and
-`0x43da2932` — so they stay inside `int32` while remaining syntactically
-UUID-arc OIDs. Both sides assert the `int32` bound in a unit test, so
-widening one fails locally instead of in production.
+The extension structure was never the problem. The arcs chosen instead are the
+first four bytes of the original UUIDs masked into 31 bits — `0xdcba5907` for
+the chain and `0x43da2932` for what was then the countersignature — so they
+stay inside `int32` while remaining syntactically UUID-arc OIDs. Both sides
+assert the `int32` bound on the surviving arc in a unit test, so widening it
+fails locally instead of in production.
 
-**These OIDs are provisional.** `2.25.<31-bit>` is a syntactically valid
+**This OID is provisional.** `2.25.<31-bit>` is a syntactically valid
 UUID-arc OID but semantically a UUID with 97 leading zero bits, which carries
 a small collision risk against anyone else doing the same trick. The right
-long-term fix is an IANA Private Enterprise Number and OIDs under
+long-term fix is an IANA Private Enterprise Number and an OID under
 `1.3.6.1.4.1.<PEN>` — recorded as follow-up in §8.3.
 
-**Extension A — the DNSSEC chain.** Non-critical.
+**The DNSSEC chain extension.** Non-critical.
 
 ```asn1
 DnssecChain ::= SEQUENCE OF Link
@@ -222,34 +240,46 @@ every client afterwards.
 A real chain to the root measures ~1.9 KB of DER (root DNSKEY 1.1 KB, `com`
 DNSKEY+DS 0.6 KB, the leaf DS 0.2 KB); about 480 B per extra delegation level.
 
-**Extension B — the succession countersignature.** Non-critical.
+**The extension that was removed — the succession countersignature.** It
+lived at `2.25.1138370866` and carried a signature by the **previous** zone
+key over "this key follows me": the predecessor's key tag, its DER
+SubjectPublicKeyInfo, and an ECDSA P-256/SHA-256 signature over the DSSE PAE
+of a canonical-JSON payload under the payload type
+`application/vnd.synchronicity.succession+json`. Its purpose was to draw the
+one line a chain cannot: an attacker who has taken the registrar holds the DS
+and can therefore always build a valid chain, but not the old key's private
+half. A monitor used it to separate a routine rotation from a substitution.
 
-```asn1
-Succession ::= SEQUENCE {
-  predecessorKeyTag  INTEGER,          -- RFC 4034 key tag of the old key
-  predecessorSpki    OCTET STRING,     -- its DER SubjectPublicKeyInfo
-  signature          OCTET STRING }    -- ECDSA P-256/SHA-256, DER
-```
+It is gone, mechanism and monitor tier together, and §5.5 is where the full
+argument lives — both what was lost and what was gained. The short version is
+that no countersignature can exist for two legitimate, unavoidable events (a
+zone's genesis key has no predecessor; disaster recovery happens precisely
+because the predecessor's private key is gone), so the loud tier fired on
+routine events, while a correctly countersigned rotation was
+*silent* — meaning an attacker holding both key generations went unremarked.
+The monitor now reports every authorization and stops attempting a judgement
+it was making badly.
 
-The signature is made by the **previous zone key** over the DSSE PAE of a
-canonical-JSON payload under payload type
-`application/vnd.synchronicity.succession+json`:
+Two facts about the removal are worth recording here, because both are
+permanent:
 
-```
-DSSEv1 45 application/vnd.synchronicity.succession+json <len> {"apex":"<apex>","predecessorKeyTag":<int>,"successorSpkiSha256":"<hex>"}
-```
-
-Byte-exact, no whitespace, fixed field order. `apex` is written **without its
-root dot** so the two implementations cannot disagree about a character
-nobody can see. The successor is named by the SHA-256 of its DER
-SubjectPublicKeyInfo rather than by its key tag, so the signature commits to
-the exact key bytes and not to a 16-bit checksum of them. The predecessor is
-named by its full SPKI as well as its tag, for the same reason.
-
-The extension is **absent** for a zone's genesis key (there is no
-predecessor) and for disaster-recovery rotations (the predecessor's private
-key is exactly what was lost). Both land in a monitor's tier B, which is
-expected — see §5.5.
+- **The arc `2.25.1138370866` is burned.** A genuine, published, immutable
+  Merkle leaf carries it — the conformance entry at log index 67966366, which
+  is checked in as `crates/synch-net/tests/fixtures/rekor_v3` — so
+  reallocating that arc to a new meaning would make that entry, and any other
+  published in that window, decode as whatever the new meaning is. Never
+  reuse it; the fixture's `PROVENANCE.txt` says the same thing where the
+  bytes are.
+- **Removing the mechanism required no new log entry.** The extension is
+  still in those bytes and always will be; nothing reads it. The certificate
+  parser collects extensions and looks them up by OID, and refuses nothing
+  for carrying one it has no name for (`crates/synch-net/src/x509.rs`), so
+  the entry verifies exactly as it did before and the extension is simply
+  vestigial. That is asserted over the real bytes rather than assumed, on
+  both sides — `crates/synch-monitor/tests/real_entry.rs` and
+  `crates/synch-net/tests/rekor_zone_key.rs` — and a synthetic unknown
+  extension is exercised beside it in `tiers.rs`, so the property keeps its
+  meaning after the fixture is eventually replaced.
 
 ### 2.3 The Statement
 
@@ -454,13 +484,18 @@ to its own anchor, before reaching any of this. It verifies the carried chain
 > A client must enforce whatever property makes an entry *discoverable*, or
 > an attacker simply omits it.
 
-An entry with no chain, or a broken one, is tier C to a monitor — the bin a
-monitor records and does **not** alert on (§5.5). If a client accepted such
-an entry, an attacker would hold a key that works against victims *and* rings
-no bell, which is strictly worse than not logging at all. So the invariant
-both halves preserve is:
+An entry with no chain, or a broken one, or one covering some other key, is
+tier C to a monitor — the bin a monitor records and does **not** report on
+(§5.5). If a client accepted such an entry, an attacker would hold a key that
+works against victims *and* rings no bell, which is strictly worse than not
+logging at all. So the invariant both halves preserve is:
 
-> **Anything a client accepts is classified at least tier B.** Never tier C.
+> **Anything a client accepts is classified tier A.** Never tier C.
+
+That is *stronger* than the rule this document carried while there were three
+tiers, which permitted a client-accepted entry into either of two bins.
+With tier B gone there is exactly one bin it may land in, and the assertion in
+`crates/synch-monitor/tests/tiers.rs` tightened accordingly.
 
 There is exactly one chain validator in the tree
 (`crates/synch-net/src/chain.rs`), run by both sides, so the two rules cannot
@@ -478,13 +513,17 @@ chain is bound to the key *by content*, so replaying somebody else's old
 chain gains an attacker nothing (it does not cover their key), and the client
 independently requires a live DS through native DNSSEC validation anyway.
 
-The **succession countersignature is the mirror image, and is not checked by
-the client.** Its absence *alarms* a monitor (tier B) rather than silencing
-one, so omitting it makes an attacker louder, not quieter; forging it needs
-the predecessor's private key, which is a compromise transparency was never
-going to survive; and requiring it would break a zone's genesis key and every
-disaster recovery. Chain absence silences, countersignature absence alarms —
-which is exactly why one is enforced and the other is not.
+**The asymmetry this section used to draw had a second half, and only the
+first half survives.** The rule above — enforce whatever makes an entry
+discoverable — was stated against its mirror image: the succession
+countersignature, whose *absence* alarmed a monitor rather than silencing one,
+so omitting it made an attacker louder and there was nothing for a client to
+enforce. That half is gone with the mechanism (§2.2, §5.5). The chain half is
+untouched and is still the entire reason a client pays for a chain walk whose
+answer it already knows: chain absence silences a monitor, and a client that
+tolerated it would be handing an attacker an inaudible key. Nothing else the
+certificate carries has that property, so nothing else is enforced on a
+monitor's behalf.
 
 Under an explicit `--dnssec-anchor` the chain is validated to *that* anchor,
 not the ICANN root: an override is a different universe in both directions, or
@@ -541,9 +580,17 @@ existing operator-owned replication.
 Publication is a separate, explicit, idempotent step:
 
 ```
-controlplane rekor-publish <apex> <keyfile> [<previous-keyfile>]
+controlplane rekor-publish <apex> <keyfile>
 controlplane rekor-retire  <apex> <keyfile>
 ```
+
+`rekor-publish` took an optional `[<previous-keyfile>]` while the succession
+countersignature existed; it does not any more, and a stale invocation that
+still passes one is a usage error rather than a silently ignored argument.
+Nothing was lost from the command line with it: whether an entry is a `create`
+or a `rollover` — and which key tag it names as replaced — is derived from the
+records already stored for the apex (`rekor.action_for`), never from an
+operator naming a file correctly.
 
 **Run it after the DS is live in the parent.** This reverses the original
 ceremony, and the reason is §2.2: a `create` or `rollover` entry carries a
@@ -553,19 +600,19 @@ the DNSKEY in the zone → get the DS into the parent → **then** log. The
 existing two-key rollover window covers the gap; the old key keeps signing
 until the new one is logged, which is exactly what that window is for.
 
-Naming `<previous-keyfile>` adds the succession countersignature (§2.2) — the
-one thing an attacker holding a substituted DS cannot produce. The command
-says out loud when it did not:
+The command says out loud what publishing now means, because there is no
+longer any way to publish quietly:
 
 ```
-zone key 34918 rollover: log index 67673584 (entry added), DNSSEC chain carried,
-countersigned by key tag 12345 (monitors see tier A)
+zone key 34918 rollover: log index 67673584 (entry added),
+DNSSEC chain carried (monitors will report this key)
 ```
 
-```
-zone key 34918 create: log index 67673585 (entry added), DNSSEC chain carried,
-NOT countersigned: monitors will alert (tier B)
-```
+That sentence is a warning, not a status line. Every monitor watching the apex
+reports this key the first time it sees it (§5.5), and nothing in the command
+suppresses that — so tell whoever watches the monitor *before* running it, and
+write the key tag down. A retire, which carries no chain, says so instead:
+`no DNSSEC chain (retire breadcrumb)`.
 
 The step builds the Statement, collects the chain over DoH, mints the
 certificate, computes `digest = SHA-256(PAE)`, signs with the CSK as **DER
@@ -627,10 +674,10 @@ content-addressed by leaf, so re-submitting byte-identical bytes returns the
 same `logIndex` with a fresh checkpoint and proof.
 
 **There is no chainless-create escape hatch.** With logging after the DS,
-even a zone's genesis key has a chain; what it lacks is a countersignature,
-which is fine and which monitors are supposed to notice. A publish that
-cannot build a chain fails, with the error an operator actually needs: *no DS
-RRset at `<apex>` — is the DS live in the parent yet?*
+every `create` and `rollover` has a chain — a zone's genesis key included,
+which is what makes genesis an ordinary case here rather than a special one.
+A publish that cannot build a chain fails, with the error an operator actually
+needs: *no DS RRset at `<apex>` — is the DS live in the parent yet?*
 
 ### 5.3 Serving and enforcement
 
@@ -682,12 +729,14 @@ step moved **after** the parent DS, for the reason in §5.2:
 1. `keygen` the new key.
 2. Publish both DNSKEYs in the zone.
 3. Add the second DS at the parent, and wait for it to be live.
-4. `rekor-publish <apex> <newkey> <oldkey>` — action `rollover`, naming the
-   old tag, carrying the chain that the new DS makes buildable and the
-   countersignature the old key still exists to make. **Name the old key
-   file.** Skipping it produces a tier B alert in every monitor watching the
-   zone, and a rotation that alarms is a rotation that trains people to
-   ignore alarms.
+4. `rekor-publish <apex> <newkey>` — action `rollover`, naming the old tag,
+   carrying the chain that the new DS makes buildable. The action and the
+   replaced tag come from the records already stored for the apex; there is
+   no old key file to name, and the step that used to say "name the old key
+   file" is gone with the countersignature (§2.2). **Expect every monitor
+   watching the zone to report the new key** — that is what publishing now
+   means, there is nothing to suppress it with, and it is the reason step 0
+   of this runbook is telling whoever watches the monitor.
 5. Publish the new proof record (the command republishes the zone for you).
 6. Switch signing to the new key.
 7. Retire: `rekor-retire <apex> <oldkey>`, then drop the old DNSKEY, DS and
@@ -702,10 +751,14 @@ is about the *active* key rather than about the order of a rollover. Steps 1–7
 are a runbook, and they are a runbook because a zone-key rollover is rare,
 manual and human-supervised on purpose.
 
-Key *loss* recovery follows the same order without step 4's
-old key file: there is no old private key to countersign with, so the entry
-is tier B and a human is meant to look — which is exactly right, because a
-key loss is an event.
+Key *loss* recovery follows the same steps, and is **no longer a special
+case**. It used to be one: with no old private key there was nothing to
+countersign with, so the recovery entry landed in the loud tier and a human
+was meant to look at an event they had themselves just performed. Now it is
+an ordinary `rekor-publish` producing an ordinary reported authorization,
+indistinguishable from any other — which is the honest shape, since the
+operator already knows a recovery happened and everyone else only learns that
+a new key was authorized.
 
 **Chainless retires.** A retire is published after the DS may already be gone,
 so it is allowed to carry no chain, and the row records `chainless`. Nothing
@@ -767,36 +820,88 @@ this morning — asserted directly, reasons and all. What is lost is forensic
 detail ("this chain had already expired when the world last saw this tree"),
 not security: neither side ever consulted a clock to reach a verdict.
 
-**Three tiers.**
+**Two tiers, lettered A and C.**
 
 | Tier | Condition | Response |
 |---|---|---|
-| **A** | valid chain **and** a valid countersignature from a key this monitor already knew | routine rotation; log it |
-| **B** | valid chain, no valid countersignature | **alert loudly** |
-| **C** | no valid chain | record; do not alert |
+| **A** | the chain verifies to the anchor in force **and** covers this key | an **authorization**: report it the first time, then record it |
+| **C** | no chain, an invalid chain, or a chain covering a different key | an unauthorized claim: note it, never record it |
 
-Tier B is the compromise signature, and it is loud on purpose. An attacker who
-has taken the registrar can produce tier A's first half — they hold the DS, so
-they can assemble a real chain naming their key. They cannot produce the
-second: countersigning needs the **previous zone key's private half**, which a
-DS substitution does not give them. If they had that key, transparency was
-never the defence; the operator's problem is theft, and theft has a different
-runbook.
+**The gap where B was is deliberate.** Tier B used to mean "valid chain, no
+countersignature", and removing the countersignature removed the only thing
+that separated it from tier A. Re-lettering the survivors as A and B would
+have silently reinterpreted every rule and every runbook written against the
+old letters; leaving the hole means a reader of an older runbook can see that
+a tier was removed rather than that a tier was redefined under them. The
+letters are the vocabulary the reported lines, the exit codes and this
+document share, so they are held still on purpose.
 
-Two legitimate events land in tier B and must be documented rather than tuned
-away: a zone's **genesis** key has no predecessor, and **disaster recovery**
-happens precisely because the predecessor's private key is gone. Tier B means
-*a human looks*, not *an attack happened*.
+Classification is now a **pure function of the certificate and the trust
+anchors**. `classify()` no longer takes the monitor's known keys — it takes no
+state at all — so nothing the monitor has seen before can steer what it
+concludes about an entry. That separation is the point: what an entry *is* and
+whether it is *news* are different questions, and only the second one consults
+memory.
 
-Tier C is silent because anybody may write anything into a public log — but
+**What tier A costs, honestly.** An attacker who has taken the registrar holds
+the DS and can therefore always assemble a chain as valid as the operator's.
+So a routine rotation and a registrar-compromised substitution produce
+*identical* tier A entries, and nothing in the log distinguishes them.
+Detection did not disappear, but it moved: from the monitor making that
+judgement to the operator comparing reports against their own record of what
+they published. That is exactly how Certificate Transparency monitoring works
+— a CT monitor tells you a certificate exists for your name and leaves "did
+you ask for it?" to you — and it is nonetheless a shift of work onto the
+operator, who now has to *keep* such a record for it to be worth anything.
+`crates/synch-monitor/tests/tiers.rs` keeps the rotation and the substitution
+as two separate cases precisely because they are byte-for-byte
+indistinguishable to a monitor; collapsing them into one would let that fact
+quietly stop being tested.
+
+**What it gains, and it is not nothing.** A correctly countersigned rotation
+used to be *silent*, so an attacker who held both key generations produced a
+tier A entry and no monitor said a word; now every authorization is reported,
+whoever made it. And the old scheme raised a loud tier on exactly two
+legitimate, unavoidable events — a zone's **genesis** key (no predecessor
+exists) and **disaster recovery** (the predecessor's private key is what was
+lost) — training operators to ignore the one alarm that was supposed to matter.
+Both of those are gone. The exchange is a weaker automated verdict for a signal
+that is honest about its own limits and fires on every event rather than on the
+events the mechanism happened to be worst at.
+
+**Reporting once, not forever.** `KnownKeys` is the monitor's memory, and its
+meaning changed with the tiering: it used to be "predecessor keys this monitor
+trusts" and is now "keys already reported for this apex". A tier A entry whose
+key is not recorded for that apex is a **new authorization** — it goes to
+stdout with the apex, key tag, expected DS, SPKI digest and log index, and is
+then recorded so the next run stays quiet. A tier A entry for a key already
+recorded is silent. The apexes are also the watch list: an apex with an empty
+key list says "tell me about this zone, I have accounted for nothing yet",
+and an operator seeding a zone whose history predates the monitor lists the
+keys they already know about. `--no-save` classifies and reports without
+writing anything, so the same news arrives again next run — a dry run rather
+than a run that silently consumed the report.
+
+It is **bookkeeping, not a trust store**, and the distinction is load-bearing.
+An attacker's substituted key is recorded the moment it is reported, exactly
+like the operator's, because the monitor draws no distinction and does not
+pretend to. Nothing about being recorded makes a later entry look more routine
+— which is precisely the foothold the old "trusted predecessor" state could
+have handed over, where a first substituted key became the known predecessor
+that made the second one look like a rotation.
+
+**Tier C is noted, never recorded.** It goes to stderr as a running
+commentary — an operator who sees the exit code has to be able to see what was
+claimed without re-running with different flags — and it is deliberately kept
+out of the state file. Recording it would suppress the real report if that same
+key later reappeared with a chain that *does* verify, which is the one thing a
+silent bin must never do.
+
+Tier C is quiet because anybody may write anything into a public log — but
 that is only safe because **no client would have accepted a tier C entry
 either**. The client enforces the chain for exactly this reason (§4.2.1), and
-the invariant is asserted directly in the test suite over every shape the two
-sides could disagree about.
-
-Only **tier A** findings become trusted predecessors in the monitor's state.
-Promoting tier B would hand an attacker a foothold: their first substituted
-key would become the known predecessor that makes their second look routine.
+the invariant — anything a client accepts is tier A — is asserted directly in
+the test suite over every shape the two sides could disagree about.
 
 **Split-view resistance, and its exact limit.** The monitor persists the last
 checkpoint it accepted and requires every later tree to be **consistent** with
@@ -817,9 +922,24 @@ public, so anyone can run a monitor. An operator who wants independence runs a
 second one, differently homed, and compares. That is a procedure rather than a
 protocol, and it is stated as one.
 
-Exit codes are the interface an alerting rule reads: `0` nothing new, `10`
-tier A only, `20` tier C present, `30` tier B present, `2` the run could not
-finish.
+**Streams and exit codes** are the interface a cron job or an alerting rule
+reads. stdout is the report and nothing else — newly authorized keys, one line
+each — and stderr is everything else, so a job that mails stdout mails exactly
+the events that need a human.
+
+| Code | Meaning |
+|---|---|
+| `0` | nothing new for a watched apex |
+| `10` | unauthorized claims only — tier C naming a watched apex; no client would have accepted one |
+| `20` | new authorizations — a key was authorized for a watched apex that this monitor had not recorded: check it against what you published |
+| `2` | the run could not finish (transport, checkpoint, state) |
+
+These numbers changed when tier B was removed, and they were **renumbered by
+severity rather than kept for compatibility**. The old scheme was `10` tier A
+only, `20` tier C present, `30` tier B present. A rule matching the old `30`
+now matches nothing, which fails loudly; the alternative — leaving `20` to mean
+tier C while `10` became the loudest outcome — would have silently inverted
+every rule that tested `>=`.
 
 ## 6. Costs, stated plainly
 
@@ -860,8 +980,17 @@ finish.
   artifact with the same update-story obligations as the ICANN anchor, and
   one that a root-level Sigstore incident still turns into a client upgrade.
   The obligation did not go away; it moved up a level and got rarer.
-- **A monitor is now infrastructure.** Tier B alerts are the product; nobody
-  running one is done at "it publishes".
+- **A monitor is now infrastructure.** Reported authorizations are the
+  product; nobody running one is done at "it publishes".
+- **And the operator now owns the judgement the monitor used to attempt.** A
+  reported key means *a key was authorized for your zone*, not *something is
+  wrong* — the monitor cannot tell a rotation you performed from a
+  substitution by whoever took your registrar, and does not try (§5.5). The
+  discriminator is your own record of every key you minted: its key tag and
+  SPKI digest, written down at the ceremony, kept where an incident can reach
+  it. That record is a new operational obligation created by this design, it
+  is cheap only if it is kept as a habit, and without it the reports are
+  strictly less useful than they look.
 
 ## 7. Rollout
 
@@ -937,9 +1066,16 @@ reach.
   trustworthy clock in the input (`integratedTime` is outside the Merkle
   commitment) and RRSIGs expire in weeks while entries are read for years
   (§4.2.1).
-- **Client-side enforcement of the succession countersignature** — would
-  break every genesis key and every disaster recovery, and buys nothing:
-  omitting it already makes an attacker *louder* (§4.2.1).
+- **The succession countersignature, in any form** — shipped once, removed,
+  and not deferred work. It was the previous zone key signing "this key
+  follows me", and it was the whole of the old tier A/B distinction. The
+  rejection is now of the mechanism rather than of client-side enforcement of
+  it: it could not be produced for a genesis key or a disaster recovery, so it
+  alarmed on two unavoidable events, and it was silent on the case it was
+  meant to catch whenever the attacker held both key generations. §2.2 records
+  what it was and §5.5 what replaced it. Reviving the idea means answering
+  those two failures first, and it must use a **fresh OID** — `2.25.1138370866`
+  is burned by a published entry that still carries it (§2.2).
 - **Logging every zone publish** — high write volume, no trust gained: zone
   contents are already signed by the (logged) key.
 - **Per-network proof records** — duplicates the proof once per network for a
@@ -951,7 +1087,7 @@ reach.
   timestamps as an attested clock for chain-staleness notes. Both are gone.
   Counting lines is not verification — this design pins no witness keys, so
   the count was structural and a log free to invent lines could satisfy it.
-  And the staleness note it fed was forensic detail on a tier B finding that
+  And the staleness note it fed was forensic detail on a finding that
   never changed a verdict, so it bought a whole clock-handling surface for
   something no decision depended on. Doing this *properly* means pinning
   witness keys, verifying their signatures, and defining an N-of-M policy —
@@ -964,15 +1100,17 @@ reach.
 
 ### 8.3 Future work
 
-**Register an IANA Private Enterprise Number and move both extension OIDs
-under `1.3.6.1.4.1.<PEN>`.** The current `2.25.<31-bit>` arcs are provisional:
-they are UUID-arc OIDs whose UUID has 97 leading zero bits, chosen because a
-full-width UUID arc is unusable against a Go certificate parser (§2.2). They
-are almost certainly unique in practice and they are cheap to change — one
+**Register an IANA Private Enterprise Number and move the extension OID
+under `1.3.6.1.4.1.<PEN>`.** The current `2.25.<31-bit>` arc is provisional:
+a UUID-arc OID whose UUID has 97 leading zero bits, chosen because a
+full-width UUID arc is unusable against a Go certificate parser (§2.2). It is
+almost certainly unique in practice and it is cheap to change — one
 constant on each side and a fixture regeneration — but "almost certainly
 unique" is not what an allocation is for. Doing this is a format change and
 should ride a proof-version bump, so it is worth batching with any other
-breaking change rather than done alone.
+breaking change rather than done alone. Note that moving the chain OID does
+*not* un-burn `2.25.1138370866`: that arc names a meaning inside a permanent
+public entry and is retired wherever the live extension ends up.
 
 Still open: logging device-key membership *sets* (a much chattier, much
 larger design); `retire`-entry enforcement as a soft revocation signal; and a
@@ -1014,16 +1152,30 @@ interoperation but cannot be made to misbehave on demand.
   certificate naming a domain we do not control would be squatting a name in
   a permanent public log, so the apex is its own trust anchor and a monitor
   rooted at ICANN files this entry tier C, correctly; ICANN-rooted validation
-  is the `dnssec_chain` fixture's job. And it is a `rollover` (key tag 27337,
-  predecessor 17123) whose predecessor private key was not retained, so it
-  classifies tier B, with the tier A path exercised by seeding the
-  predecessor's SPKI out of the extension itself — which proves the
-  countersignature genuinely verifies rather than merely parses.
+  is the `dnssec_chain` fixture's job. Under the anchor it *is* published
+  under — the one shipped beside it, which is what a `--dnssec-anchor`
+  operator's own monitor would hold — it is tier A, and the monitor tests
+  assert both that it is reported the first time and that it is silent once
+  recorded.
+
+  **The entry predates the removal of the succession countersignature**, and
+  that is now something it proves rather than a wart. Its certificate still
+  carries `2.25.1138370866` and always will; nothing reads it; the entry
+  verifies and classifies exactly as before. Two tests name the retired OID
+  directly and assert the extension is still present and still irrelevant —
+  one on the monitor side, one on the client side — so the claim that the
+  removal needed no republish rests on the real bytes rather than on
+  reasoning. A regenerated fixture would not carry the extension, so those two
+  tests are to be **deleted rather than updated** if that ever happens: they
+  exist to prove a one-time property.
 
   It also settles empirically what §2.2's bisect opened: the certificate
-  carries **both** extensions under the narrowed OIDs at **945 bytes** and the
-  log accepted it. Size was the open question after the OID fix, and it is
-  now answered by a `201` rather than by an estimate.
+  carries **both** of the then-current extensions under the narrowed OIDs at
+  **945 bytes** and the log accepted it. Size was the open question after the
+  OID fix, and it is now answered by a `201` rather than by an estimate. It is
+  still 945 bytes for the same reason it still carries the retired extension:
+  shrinking it would mean minting a second leaf for a claim already in the
+  log.
 
   **Regenerating it costs a permanent public write** (§2.1), so the pinned
   constants that move with it are listed in PROVENANCE.txt: `LOG_INDEX`,
@@ -1038,8 +1190,8 @@ interoperation but cannot be made to misbehave on demand.
   its PROVENANCE.txt.
 - `control-plane/test/fixtures/rekor/crossval` — deterministic DER written by
   the Gleam encoders (`gleam run -m tools/gen_crossval`) and asserted by both
-  suites: the chain extension, the succession extension, the countersigned
-  payload, and a whole Gleam-built certificate the Rust parser reads. This is
+  suites: the chain extension and a whole Gleam-built certificate the Rust
+  parser reads — two files now that succession is gone. This is
   what keeps a hand-rolled DER reader and OTP's ASN.1 encoder from agreeing
   with themselves rather than with each other. It caught a real bug on its
   first run — the Rust OID constants encoded `2.25` as 40×1+25.
@@ -1088,7 +1240,7 @@ quietly collapse back.
   test asserts the window really is in the past so it cannot pass vacuously.
 - `synch-monitor` tests the tile arithmetic against an independent reference
   Merkle implementation at ten tree sizes that straddle every tile boundary,
-  and the three-tier classification over every entry shape below.
+  and the two-tier classification over every entry shape below.
 
 **One composition, not two.** The client and the monitor reach the chain
 walk through a single function, `chain::authorize`, which extracts the SAN,
@@ -1104,23 +1256,31 @@ monitor alerts: precisely the evasion the tiering exists to prevent. Sharing
 a primitive is not sharing a decision.
 
 **The invariant, tested directly.** `crates/synch-monitor/tests/tiers.rs`
-generates a genesis key, a routine rotation, a substitution, a forged
-countersignature, a chainless entry, a broken chain, a chain for another
-key, an expired chain, four unparseable SANs (a trailing double dot, a
-triple dot, an upper-case double dot, and the empty string) and a
-well-formed SAN naming another zone — **each in both
-chain shapes**, self-anchored and root-anchored, so thirteen constructions
-become twenty-six — and asserts over every one of them, using the real
-verifier and the real classifier rather than restatements of either:
+generates a genesis key, a routine rotation, a substitution, a chainless
+entry, a broken chain, a chain for another key, an expired chain, four
+unparseable SANs (a trailing double dot, a triple dot, an upper-case double
+dot, and the empty string) and a well-formed SAN naming another zone — **each
+in both chain shapes**, self-anchored and root-anchored, so twelve
+constructions become twenty-four — and asserts over every one of them, using
+the real verifier and the real classifier rather than restatements of either:
 
-> `client_accepts(p)` ⟹ `monitor_tier(p) ∈ {A, B}`, and `tier(p) = C` ⟹
+> `client_accepts(p)` ⟹ `monitor_tier(p) = A`, and `tier(p) = C` ⟹
 > `¬client_accepts(p)`.
 
 The invariant is satisfied vacuously by a client that accepts nothing, so the
 same test also pins what acceptance *is*, shape by shape — including that the
-substitution and the forged countersignature are accepted, because those are
-meant to be loud rather than refused. A predecessor the monitor has never
-heard of not reaching tier A is a separate test beside it.
+substitution is accepted, because it is meant to be reported rather than
+refused. **The rotation and the substitution are kept as two cases** although
+they are built identically and expected to classify identically: that is the
+assertion, and the day the two stop being indistinguishable to a monitor is a
+day this test should have to be edited.
+
+Three properties sit beside it, each a separate test: that classification is
+unchanged by anything the monitor has recorded (there is no argument left to
+pass it, which is the strong form of "state cannot steer a verdict"); that a
+key is news until recorded and not afterwards; and that an extension nothing
+reads — a synthetic OID, so the assertion outlives anyone's memory of
+`2.25.1138370866` — changes neither the tier nor the reasons.
 
 **What the control-plane e2e does and does not do.** It runs the real client
 resolver against a real served zone, and its zone-key leg is a *negative*

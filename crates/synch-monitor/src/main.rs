@@ -197,7 +197,22 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
         }
     }
 
+    // A from-index *ahead* of where this monitor stopped leaves a range that
+    // will never be classified: the run writes `next_index = end` back, so
+    // the gap is skipped permanently and silently. Bounded first runs want
+    // this; a resuming monitor almost never does, so say so out loud.
+    if let Some(from) = args.from_index {
+        if from > state.next_index {
+            eprintln!(
+                "synch-monitor: starting at {from}, past the recorded {}: \
+                 entries {}..{from} will never be classified",
+                state.next_index, state.next_index
+            );
+        }
+    }
     let mut at = args.from_index.unwrap_or(state.next_index);
+    // `at` advances as the scan runs; the summary needs where it began.
+    let started_at = at;
     let end = match args.max_entries {
         // Saturating: `--from-index` and `--max-entries` are both operator
         // input, and their sum is not bounded by anything but the CLI.
@@ -304,7 +319,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     eprintln!(
         "synch-monitor: {} entries read to index {end}; {} new authorization(s), \
          {already_known} already recorded, {} unauthorized claim(s)",
-        end.saturating_sub(args.from_index.unwrap_or(0)),
+        end.saturating_sub(started_at),
         new_authorizations.len(),
         claims.len()
     );
