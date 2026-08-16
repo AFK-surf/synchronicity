@@ -57,8 +57,8 @@
 //!    not raw). The log returns these bytes as `canonicalizedBody` and this
 //!    record carries them **verbatim** — nothing here re-canonicalizes JSON,
 //!    because the log already did and the leaf commits to its output.
-//! 2. **The verifier is an `x509Certificate`, never a raw public key.** This
-//!    is the whole of v3. A raw-key entry is *apex-anonymous*: its leaf holds
+//! 2. **The verifier is an `x509Certificate`, never a raw public key.**
+//!    A raw-key entry is *apex-anonymous*: its leaf holds
 //!    a digest, a signature and 91 bytes of SubjectPublicKeyInfo, and nothing
 //!    that names a zone. Nobody could monitor a zone for newly published
 //!    keys, which makes the transparency claim hollow — the threat model has
@@ -89,13 +89,10 @@ use crate::{
     zonecert::{self, DnssecChain},
 };
 
-/// The only `RekorProof` version this build accepts.
-///
-/// v4 is the key-set format: the entry authorizes the apex DNSKEY RRset its
-/// chain proves, the entry signature is attribution by the certificate's own
-/// key, and the wire carries no key-tag selector. No earlier version is
-/// readable — v3's possession semantics are not this claim, and accepting a
-/// v2 raw-key entry would be accepting the unmonitorable shape v3 abolished.
+/// The only `RekorProof` version this build accepts: the entry authorizes
+/// the apex DNSKEY RRset its chain proves, the entry signature is
+/// attribution by the certificate's own key, and the wire carries no
+/// key-tag selector. Any other version byte is refused as malformed.
 pub const PROOF_VERSION: u8 = 4;
 
 /// The label the proof records live under, one below the zone apex.
@@ -227,7 +224,7 @@ pub struct RekorProof {
 }
 
 impl RekorProof {
-    /// Encodes the record in the v3 wire format.
+    /// Encodes the record in the wire format above.
     ///
     /// `None` for a record that does not fit it — a blob past 65535 bytes or
     /// an audit path past 255 hops. Refusing beats emitting *something*: this
@@ -538,8 +535,8 @@ impl HashedRekordBody {
     ///
     /// The `publicKey` arm of Rekor's verifier oneof is **not** handled, at
     /// all: an entry whose verifier is a bare key names no apex anywhere in
-    /// its leaf, which is exactly the unmonitorable shape v3 abolishes. There
-    /// is no branch to reach, no legacy path and no fallback.
+    /// its leaf, so no monitor could ever have seen it. There is no branch
+    /// to reach and no fallback.
     pub fn parse(bytes: &[u8]) -> Result<HashedRekordBody, ProofError> {
         let bad = |why: String| ProofError::Malformed(format!("entry body: {why}"));
         let value: serde_json::Value =

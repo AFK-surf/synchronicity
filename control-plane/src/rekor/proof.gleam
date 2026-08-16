@@ -1,4 +1,4 @@
-//// The `RekorProof` v3 record: the compact binary blob that travels in the
+//// The `RekorProof` record: the compact binary blob that travels in the
 //// zone at `_synchronicity-rekor.<apex>`, and the local verification of it.
 ////
 //// This is the mirror of crates/synch-net/src/rekor.rs. Every client that
@@ -27,15 +27,15 @@
 //// `SHA-256(0x01 || left || right)` — RFC 6962 §2.1. The Statement rides
 //// alongside because the body commits only to its PAE *digest*.
 ////
-//// What makes this shape right is the **verifier**: an
-//// `x509Certificate`, never a raw public key. A raw-key entry names no zone
-//// anywhere in its leaf, so nobody can monitor a zone for newly published
-//// keys — and the threat model has a compromised DNS provider in it, so DNS
-//// cannot be the monitoring channel. Rekor validates the certificate not at
-//// all and copies its DER into the body verbatim, so the apex in its
-//// `dNSName` SAN lands inside the Merkle leaf where a monitor sees it
-//// (`rekor/cert`). There is no v2 path left anywhere: a v2 record is a
-//// malformed version and a `publicKey` verifier is a refusal.
+//// The **verifier is an `x509Certificate`, never a raw public key**: a
+//// raw-key entry names no zone anywhere in its leaf, so nobody can monitor
+//// a zone for newly published keys — and the threat model has a
+//// compromised DNS provider in it, so DNS cannot be the monitoring
+//// channel. Rekor validates the certificate not at all and copies its DER
+//// into the body verbatim, so the apex in its `dNSName` SAN lands inside
+//// the Merkle leaf where a monitor sees it (`rekor/cert`). Any other
+//// version byte is a malformed record and a `publicKey` verifier is a
+//// refusal.
 
 import gleam/bit_array
 import gleam/crypto
@@ -178,8 +178,8 @@ pub fn hashedrekord_body(
 /// before storing — re-deriving nothing the log already serialized.
 ///
 /// The `publicKey` arm of Rekor's verifier oneof is not handled: an entry
-/// whose verifier is a bare key names no apex in its leaf, which is the
-/// unmonitorable shape v3 abolished. There is no branch to reach.
+/// whose verifier is a bare key names no apex in its leaf, so no monitor
+/// could ever have seen it. There is no branch to reach.
 pub fn parse_body(
   bytes: BitArray,
 ) -> Result(#(BitArray, BitArray, BitArray), ProofError) {

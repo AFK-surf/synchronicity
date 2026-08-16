@@ -5,21 +5,6 @@ ship. Scope: the control plane's zone CSK and the clients that validate zones
 signed by it. Device keys are out of scope — they already ride inside the
 signed zone this design protects.
 
-> **Amended by docs/EXTERNAL-DNS-PROVIDER.md.** The claim this document
-> describes was reworked for provider-hosted zones, and the rework shipped
-> with no legacy path: the statement's subject is now the **key set** the
-> entry's chain proves (the apex DNSKEY RRset — predicate
-> `…/zone-key/v2`), the entry signature is **attribution** by the
-> certificate's own key rather than possession by the zone key, the chain's
-> apex link carries the apex DNSKEY RRset and the walk proves the set
-> (DS → covered key → RRset, with membership deciding), and the served
-> proof record is wire v4 with no key-tag selector. Where this document
-> says the entry is signed by the zone key itself, or that the certificate's
-> SubjectPublicKeyInfo is the zone key, read it as the v1 design it was;
-> §2.1 of the external-DNS document explains why possession never carried
-> the authorization. Everything else here — the leaf shape, the
-> monitorability argument, the chain requirement, the log conventions, the
-> ceremonies — stands.
 
 ## 1. Problem and threat model
 
@@ -72,11 +57,14 @@ covert.
 
 ## 2. What gets logged
 
-One Rekor entry per zone-key lifecycle event, over a DSSE statement signed
-by the zone key itself. Self-signing is deliberate: possession of the CSK is
-exactly the authority being made transparent, the client already holds the
-public key from the validated DNSKEY RRset, and it keeps Fulcio/OIDC out of a
-key ceremony that is designed to run offline.
+One Rekor entry per zone-key lifecycle event, over a DSSE statement whose
+**subject is the apex DNSKEY RRset the entry's chain proves** — the
+authorized key set — and whose signer is an ephemeral key minted for the
+entry and discarded. The signature is attribution, never authorization
+(docs/EXTERNAL-DNS-PROVIDER.md §2.1): authorization is carried entirely by
+the embedded DNSSEC chain, which is also what lets a zone whose keys a
+managed provider holds be logged at all. Keeping Fulcio/OIDC out keeps the
+ceremony runnable offline.
 
 ### 2.1 Why the entry looks the way it does
 
@@ -117,9 +105,9 @@ This is confirmed live, not inferred: such an entry was published to
 `log2025-1.rekor.sigstore.dev` (HTTP 201 Created, `logIndex 68018370`, SAN
 `DNS:zone-key-transparency.demo.invalid`), in a 757-byte certificate carrying
 the custom extension this design defines. Its leaf was read back out of the
-static tiles and the whole record — inclusion, checkpoint, possession,
-bindings, chain — verifies offline through the real client verifier. It is
-checked in as
+static tiles, and the log-owned half of the record — inclusion, the
+checkpoint with its witness cosignatures, the certificate interop —
+verifies offline. It is checked in as
 `crates/synch-net/tests/fixtures/rekor_v3`.
 
 A Statement reaches the log only as the SHA-256 of its DSSE PAE, so nothing
@@ -246,34 +234,37 @@ entry in the proof record (§3) because the leaf commits only to its digest:
 ```json
 {
   "_type": "https://in-toto.io/Statement/v1",
-  "subject": [{
-    "name": "sync.example.",
-    "digest": { "sha256": "<hex sha256 of the DNSKEY rdata>" }
-  }],
-  "predicateType": "https://synchronicity.sh/zone-key/v1",
+  "subject": [
+    { "name": "sync.example.",
+      "digest": { "sha256": "<hex sha256 of one DNSKEY rdata>" } }
+  ],
+  "predicateType": "https://synchronicity.sh/zone-key/v2",
   "predicate": {
     "apex": "sync.example.",
-    "keyTag": 34918,
-    "algorithm": 13,
-    "flags": 257,
-    "ds": "34918 13 2 <hex sha256 digest>",
-    "action": "create",
-    "replacesKeyTag": null
+    "keys": [
+      { "keyTag": 34918, "algorithm": 13, "flags": 257,
+        "sha256": "<the same hex digest>" }
+    ],
+    "action": "create"
   }
 }
 ```
 
-- `subject.digest` binds the entry to exact key bytes (the DNSKEY rdata:
-  flags, protocol, algorithm, public key).
+- The subject is the **key set** — one entry per key of the apex DNSKEY
+  RRset the chain proves, in one canonical order (ascending tag, ties by
+  digest), each digest over exact key bytes (the DNSKEY rdata: flags,
+  protocol, algorithm, public key). The predicate repeats the set with the
+  tag, algorithm and flags an operator wants at a glance, and the two
+  lists must agree entry for entry.
 - `predicate.apex` binds it to one zone; the certificate's SAN says the same
   thing where a monitor can see it without the Statement.
-- `action` is `create`, `rollover` (with `replacesKeyTag`), or `retire`.
-  Clients accept **only** `create` and `rollover` as authorization: a retire
-  is a monitor breadcrumb and may be published chainless (§5.4), so treating
-  one as authorization would accept an entry carrying no proof of delegation
-  at all.
-- The DSSE signature is ECDSA P-256/SHA-256 with the zone key — the same
-  algorithm 13 material, no second signing identity.
+- `action` is `create`, `rollover`, or `retire`. Clients accept **only**
+  `create` and `rollover` as authorization: a retire is a monitor
+  breadcrumb and may be published chainless (§5.4), so treating one as
+  authorization would accept an entry carrying no proof of delegation at
+  all.
+- The DSSE signature is ECDSA P-256/SHA-256 by the entry's ephemeral
+  signer, named by the certificate.
 
 **Interop scope, stated exactly.** All three halves are the real Sigstore
 article. The checkpoint and log-key halves verify a genuine
@@ -293,15 +284,14 @@ The proof travels **inside the zone itself**, as a TXT record at
 _synchronicity-rekor.<apex>   86400  IN  TXT  ( "<b64url chunk>" "<b64url chunk>" ... )
 ```
 
-one record per DNSKEY the zone currently publishes (two during a zone-key
-rollover window), each carrying a compact binary `RekorProof`. The layout is
-unchanged from v2 — what changed is what the body must contain, and a v2
-record is refused as a malformed version and nothing more:
+one record per current claim (a retirement breadcrumb may sit beside the
+live one), each carrying a compact binary `RekorProof`. There is no
+selector field: a record's subject is a key set, so a client tries each
+served record and membership in a verified set decides:
 
 ```
-RekorProof v3
-  u8       version            = 3
-  u16      key_tag              selects the record during rollover
+RekorProof v4
+  u8       version            = 4
   u8[32]   log_id               SHA-256 of the log's DER SPKI; selects the pinned key
   u64      log_index
   u16+[]   statement            the in-toto Statement, byte-exact (DSSE PAE preimage)
@@ -414,19 +404,19 @@ Then, in process, no network:
 - **apex binding**: the certificate has exactly one `dNSName` SAN and it
   equals the apex being resolved (ASCII case-insensitive, trailing dot
   optional on either side);
-- **key binding**: the certificate's DER SubjectPublicKeyInfo equals this
-  DNSKEY's;
-- **possession**: `signature.content` verifies under that SPKI over the
-  entry's digest as a prehash — equivalently, ECDSA-SHA256 over the DSSE PAE,
-  which is how ring is asked (ASN.1/DER, not the raw `r‖s` of DNSSEC);
-- `data.digest` = SHA-256 of the DSSE PAE of the carried Statement;
-- **statement binding**: `subject.digest` = SHA-256(DNSKEY rdata),
-  `predicate.apex` = RRSIG signer, key tag, flags 257, algorithm 13, and
-  `action` ∈ {`create`, `rollover`};
 - **the DNSSEC chain**: the chain extension is present and validates
   cryptographically — every RRSIG verifies, the links form an unbroken
-  delegation ladder to the trust anchor *this resolver holds*, and the apex
-  DS covers this key.
+  delegation ladder to the trust anchor *this resolver holds*, and what the
+  walk proves is the apex DNSKEY RRset: the **authorized key set**;
+- **attribution**: `signature.content` verifies under the certificate's own
+  SubjectPublicKeyInfo over the entry's digest as a prehash — equivalently,
+  ECDSA-SHA256 over the DSSE PAE, which is how ring is asked (ASN.1/DER,
+  not the raw `r‖s` of DNSSEC);
+- `data.digest` = SHA-256 of the DSSE PAE of the carried Statement;
+- **statement and key binding**: the Statement's claimed set is exactly the
+  chain-proven set — digest for digest, tag for tag, canonical order — the
+  key that signed the answer is a **member** of it, `predicate.apex` = the
+  RRSIG signer, and `action` ∈ {`create`, `rollover`};
 
 Steps 2, 3 and 4 are cacheable on their own TTLs (the proof and bundle
 records carry a 24 h TTL; the zone key changes rarely) — the steady-state
@@ -490,7 +480,7 @@ key was authorized.
 Identical posture to a bogus DNSSEC chain: the answer is **discarded
 entirely and the previously cached member set is retained until its own
 expiry**. Fail closed, degrade toward static-only trust. New `NetError`
-variants distinguish: proof record absent, proof malformed, possession/
+variants distinguish: proof record absent, proof malformed, attribution/
 binding/inclusion/checkpoint/chain failure, unknown log. `synch doctor` explains
 each (an absent record on a not-yet-upgraded control plane reads differently
 from a binding mismatch, which is an alarm).
@@ -537,10 +527,12 @@ controlplane rekor-publish <apex> <keyfile>
 controlplane rekor-retire  <apex> <keyfile>
 ```
 
-Whether an entry is a `create` or a `rollover` — and which key tag it names as
-replaced — is derived from the records already stored for the apex
-(`rekor.action_for`), never from an operator naming a file correctly. A third
-argument is a usage error rather than a silently ignored one.
+Whether an entry is a `create` or a `rollover` is derived from the records
+already stored for the apex — a set already logged keeps its action and
+re-running is a refresh; a new set is a `create` when the zone has no
+record yet and a `rollover` after that — never from an operator naming a
+file correctly. A third argument is a usage error rather than a silently
+ignored one.
 
 **Run it after the DS is live in the parent.** This reverses the original
 ceremony, and the reason is §2.2: a `create` or `rollover` entry carries a
@@ -554,7 +546,7 @@ The command says out loud what publishing now means, because there is no
 longer any way to publish quietly:
 
 ```
-zone key 34918 rollover: log index 67673584 (entry added),
+zone key set 34918 rollover: log index 67673584 (entry added),
 DNSSEC chain carried (monitors will report this key)
 ```
 
@@ -564,19 +556,21 @@ suppresses that — so tell whoever watches the monitor *before* running it, and
 write the key tag down. A retire, which carries no chain, says so instead:
 `no DNSSEC chain (retire breadcrumb)`.
 
-The step builds the Statement, collects the chain over DoH, mints the
-certificate, computes `digest = SHA-256(PAE)`, signs with the CSK as **DER
-ECDSA**, POSTs a protojson `hashedRekordRequestV002` `CreateEntryRequest` to
+The step collects the chain over DoH — the apex DNSKEY RRset it observes
+there *is* the claimed set, so the claim and its proof cannot disagree —
+builds the Statement, mints an ephemeral signer and its certificate,
+computes `digest = SHA-256(PAE)`, signs as **DER ECDSA** and discards the
+signer, POSTs a protojson `hashedRekordRequestV002` `CreateEntryRequest` to
 `CP_REKOR_URL`, parses the returned `TransparencyLogEntry` (its
 `canonicalizedBody`, inclusion proof and signed checkpoint), **verifies that
 returned proof locally with the same rules as the client** — the body's
-digest against the PAE, possession, the certificate's key and name bindings,
-inclusion, and the checkpoint signature — and only then stores it:
+digest against the PAE, attribution against the entry's own certificate,
+the name binding, inclusion, and the checkpoint signature — and only then
+stores it:
 
 ```sql
 CREATE TABLE rekor_records (
-  spki_sha256        BLOB    NOT NULL,   -- the key's identity
-  key_tag            INTEGER NOT NULL,   -- how a client selects, indexed
+  keyset_sha256      BLOB    NOT NULL,   -- the claimed set's identity
   apex               TEXT    NOT NULL,
   action             TEXT    NOT NULL,   -- create | rollover | retire
   statement          BLOB    NOT NULL,   -- the in-toto Statement (PAE preimage)
@@ -589,29 +583,24 @@ CREATE TABLE rekor_records (
                      DEFAULT 0,
   integrated_at      INTEGER NOT NULL,
   verified_at        INTEGER NOT NULL,
-  PRIMARY KEY (spki_sha256, action)
+  PRIMARY KEY (keyset_sha256, action)   -- claimed keys: rekor_record_keys
 );
 ```
 
 It arrives whole, in the control plane's migration **v3** — the same step that
-adds `tuf_material` for §10.3. The chain is `[v1, v2, v3]` and there is no
+adds `tuf_material` for §10.3. There is no
 intermediate shape of this table in any database that exists: the work landed
 over several migrations while it was being written, and those were squashed
 into one before release. So there is no "before" to migrate from, and nothing
 here describes schema arriving in stages.
 
-**A key is identified by its key, not by a checksum of it.** The table is
-keyed on `(spki_sha256, action)` rather than on the key tag. An RFC 4034 key
-tag is a 16-bit checksum over the DNSKEY rdata, so two distinct keys collide
-with odds around 1/65536 per rollover, and keying on it would let one key's
-row silently *replace* another's, taking its proof out of the served zone
-with no error anywhere. Rare and silent is the bad combination: it would
-surface as a cluster that stopped resolving for reasons nobody can
-reconstruct. The tag remains as
-an indexed column because that is what a client selects on — it reads the tag
-from the RRSIG it just validated — but selection is not identity. A zone may
-now serve two proof records under one tag, and the client tries each until
-one verifies.
+**A claim is identified by its key set, not by a checksum of it.** The
+table is keyed on `(keyset_sha256, action)` — the SHA-256 over the claimed
+set's canonical rdata digests — with one `rekor_record_keys` row per
+claimed key. An RFC 4034 key tag is a 16-bit checksum over the DNSKEY
+rdata, so two distinct keys collide with odds around 1/65536 per rollover;
+tags are display data beside the digests, never identity, and never
+selection: the client tries each served record and membership decides.
 
 The one client rule this side cannot re-run is the cryptographic chain walk —
 that lives in the Rust verifier, and the e2e crossval is what keeps this side
@@ -635,9 +624,9 @@ needs: *no DS RRset at `<apex>` — is the DS live in the parent yet?*
 - `zone/build` emits the `_synchronicity-rekor.<apex>` TXT record(s) from
   `rekor_records` for every DNSKEY the zone publishes; they are signed like
   any RRset and re-signed on every publish.
-- `publish_in_tx` gains a gate: if the active CSK (by key tag) has no
-  verified `rekor_records` row, publish **refuses** with a new
-  `PublishError::NoRekorRecord` — the same stance as the existing §3.2
+- `publish_in_tx` gains a gate: if the active CSK (by rdata digest) is
+  claimed by no verified, servable `rekor_records` row, publish **refuses**
+  with `PublishError::NoRekorRecord` — the same stance as the existing §3.2
   build-time checks: the service refuses to publish rather than emit a zone
   clients will reject. (Phase-gated; see §7.)
 - The same `zone/build` pass emits `_synchronicity-tuf.<apex>` from
@@ -975,9 +964,11 @@ describe a property the entry does not have.
   zone endpoint the control plane serves, and the air-gapped path is a
   database courier rather than a second way to fetch a proof (§5.3).
 - **Fulcio/OIDC signing identity** — drags an interactive identity provider
-  into an offline ceremony; CSK possession is precisely the authority at
-  stake. (Note that the certificate this design mints is *not* a step toward
-  Fulcio: nothing issues it and nothing validates it.)
+  into an offline ceremony to attest a signer identity that carries no
+  authority: the signature is attribution, the chain is the authorization,
+  and the signer is an ephemeral key by design. (Note that the certificate
+  this design mints is *not* a step toward Fulcio: nothing issues it and
+  nothing validates it.)
 - **Client-side RRSIG window checks on the carried chain** — there is no
   trustworthy clock in the input (`integratedTime` is outside the Merkle
   commitment) and RRSIGs expire in weeks while entries are read for years
@@ -1034,18 +1025,16 @@ interoperation but cannot be made to misbehave on demand.
 **Real bytes, checked in.**
 
 - `crates/synch-net/tests/fixtures/rekor_v3` — a published entry
-  (`logIndex 68018370`, HTTP 201), read back out of the log's own tiles, and
-  **total**: the real `rekor::verify` runs to a successful `VerifiedRecord`
-  over it. The leaf, the RFC 6962 inclusion walk through a real tree of
-  68.0 M entries, the checkpoint under the *embedded* Sigstore key (found
-  among the four signature lines that note carries), the body's `kind`,
-  `apiVersion`, digest algorithm and key-details tags, the certificate, its
-  single SAN, possession, the statement-digest link, the
-  Statement's byte-exact round trip through this build's renderer, and the
-  carried DNSSEC chain. With teeth: the same proof offered for a different
-  key, or a different apex, is refused. `crates/synch-monitor/tests/
-  real_entry.rs` classifies the same bytes, so one fixture covers both halves
-  of the invariant.
+  (`logIndex 68018370`, HTTP 201), read back out of the log's own tiles.
+  What it proves is everything the *log* is responsible for: the leaf, the
+  RFC 6962 inclusion walk through a real tree of 68.0 M entries, the
+  checkpoint under the *embedded* Sigstore key (found among the four
+  signature lines that note carries), the digest↔PAE link, and that the
+  log accepted a 757-byte certificate carrying the chain extension under
+  the narrowed OID — the interop no local test can establish. A fresh
+  fully-verifying fixture costs a permanent public write and is minted with
+  the next real publication. `crates/synch-monitor/tests/real_entry.rs`
+  classifies the same bytes, so the fixture also covers the monitor half.
 
   Two limits, stated in its PROVENANCE.txt rather than glossed. The chain is
   **self-anchored** — we own no DNSSEC-signed domain, and minting a
@@ -1117,11 +1106,13 @@ quietly collapse back.
 **Synthetic material, for the failures reality will not perform.**
 
 - `synch-net::sim` grows a deterministic in-memory tile log and a signed
-  zone: every verification failure is provoked one at a time — possession,
-  the apex binding, the key binding, statement binding, an absent chain, a
-  broken chain, a chain for another key, a raw-public-key entry, a retire
-  presented as authorization, inclusion, checkpoint, unknown log, absent
-  record — through the unit path *and* through the whole resolver.
+  zone: every verification failure is provoked one at a time — a
+  misattributed signature, the apex binding, an observed key outside the
+  proven set, a statement describing keys its chain never proved, an
+  absent chain, a broken chain, a chain for another zone, a
+  raw-public-key entry, a retire presented as authorization, inclusion,
+  checkpoint, unknown log, absent record — through the unit path *and*
+  through the whole resolver.
 - An expired-but-valid-at-logging-time chain verifies, on both sides, and the
   test asserts the window really has lapsed so it cannot pass vacuously.
 - `synch-monitor` tests the tile arithmetic against an independent reference
@@ -1130,8 +1121,9 @@ quietly collapse back.
 
 **One composition, not two.** The client and the monitor reach the chain
 walk through a single function, `chain::authorize`, which extracts the SAN,
-**parses it once**, derives the key from the certificate's SPKI, and validates
-against exactly those. Neither side can supply its own apex. This is
+**parses it once**, walks the chain against exactly that name, and returns
+the proven key set the chain itself carries. Neither side can supply its
+own apex, and neither believes any key the chain did not prove. This is
 structural rather than stylistic. Were the two to share `chain::validate` and
 compose the call themselves, they could feed it different things — the client
 the well-formed apex from DNS, the monitor the raw SAN string — and a

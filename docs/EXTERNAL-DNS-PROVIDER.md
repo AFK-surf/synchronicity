@@ -1,10 +1,10 @@
 # External DNS providers — publishing the zone through Cloudflare or Bunny
 
-Status: **implemented.** The claim change (predicate v2, proof wire v4,
-the key-set chain walk) ships in `crates/synch-net` / `crates/synch-monitor`
-and `control-plane/src/rekor`; external mode ships as `CP_DNS_MODE=external`
-with the Cloudflare and Bunny legs under `control-plane/src/provider`. This
-document remains the rationale and the operational guide.
+Status: **implemented.** The claim lives in `crates/synch-net` /
+`crates/synch-monitor` and `control-plane/src/rekor`; external mode is
+`CP_DNS_MODE=external`, with the Cloudflare and Bunny legs under
+`control-plane/src/provider`. This document is the rationale and the
+operational guide.
 
 This document designs a control-plane mode in which the membership zone is
 hosted by an external managed DNS provider instead of being served by the
@@ -15,8 +15,8 @@ and states plainly what the trade is.
 Contents:
 
 1. [Problem and motivation](#1-problem-and-motivation)
-2. [What the client actually enforces today](#2-what-the-client-actually-enforces-today)
-3. [Zone-key claim v2 — transparency without possession](#3-zone-key-claim-v2--transparency-without-possession)
+2. [What the client enforces](#2-what-the-client-enforces)
+3. [The zone-key claim](#3-the-zone-key-claim)
 4. [Control plane: `CP_DNS_MODE=external`](#4-control-plane-cp_dns_modeexternal)
 5. [The provider abstraction](#5-the-provider-abstraction)
 6. [Provider notes: Cloudflare, Bunny](#6-provider-notes-cloudflare-bunny)
@@ -52,120 +52,108 @@ records to a provider-hosted zone via the provider's API, the provider
 serves and DNSSEC-signs them, and the control plane runs no DNS listeners
 at all.
 
-The obstacle is not record publishing — that is a small reconciler. The
-obstacle is that the client's verification model was built around a zone
-key the control plane possesses, and a managed provider will not hand over
-its private keys. Section 2 examines what the client actually checks, and
-section 3 restates the transparency claim so that it survives a
-provider-held key.
+The interesting part is not record publishing — that is a small
+reconciler. It is that a managed provider will not hand over its private
+keys, so the client's verification model must hold for a zone key nobody
+on our side can sign with. Section 2 lays out the model that makes that
+possible; section 3 gives the claim's exact shape.
 
-## 2. What the client actually enforces today
+## 2. What the client enforces
 
 A client answer is accepted only after two gates:
 
 **DNSSEC validation.** `crates/synch-net/src/dns.rs` validates in-process
 (hickory over DoH) against the ICANN root anchor (or a `--dnssec-anchor`
-override). This gate is provider-neutral already: a zone signed by
-Cloudflare's keys with a correct DS in the parent validates exactly as ours
-does. Nothing in this design touches it.
+override). This gate is provider-neutral: a zone signed by Cloudflare's
+keys with a correct DS in the parent validates exactly as a self-served
+zone does.
 
-**Zone-key transparency.** By default (`RekorPolicy::Require`,
-`dns.rs:463`), a validated answer is discarded unless the key that signed
-it carries a verified Rekor log record. The proof check
-(`crates/synch-net/src/rekor.rs:420-522`) is four distinct verifications:
+**Zone-key transparency.** By default (`RekorPolicy::Require`), a
+validated answer is discarded unless the key that signed it is covered by
+a verified Rekor log record. The proof check
+(`crates/synch-net/src/rekor.rs`) is four verifications:
 
 1. **Log inclusion** — the checkpoint carries the pinned log key's
    signature; the entry's Merkle inclusion path hashes up to it.
-2. **Binding** — the logged certificate's SubjectPublicKeyInfo equals,
-   byte-for-byte, the DNSKEY that signed the answer. The signing key is
-   identified from the answer's RRSIG key tag (`dns.rs:852`), then fetched
-   and DNSSEC-validated.
+2. **Apex binding** — the logged certificate's single `dNSName` SAN names
+   the zone whose RRSIG signed the answer.
 3. **Authorization** — the certificate's embedded DNSSEC chain
-   (`zonecert.rs`, the `OID_DNSSEC_CHAIN` extension: raw signed RRsets from
-   the apex's DS up to the root DNSKEY) is cryptographically verified
-   against the trust anchors by `chain::authorize`. The client verifies
-   this chain even though it just validated the live one, because an entry
-   whose chain is absent or broken would be invisible to a monitor
-   (rekor.rs's "why the client verifies a chain it does not need").
-4. **Possession** — the entry signature over the DSSE PAE verifies against
-   the zone key itself. `rekor/statement.gleam`: "possession of the CSK is
-   exactly the authority being made transparent."
+   (`zonecert.rs`, the `OID_DNSSEC_CHAIN` extension: raw signed RRsets
+   from the apex up to the root) is cryptographically verified against the
+   trust anchors by `chain::authorize`, and what it proves is the apex
+   DNSKEY RRset — the **authorized key set**. The key that signed the
+   answer must be a member. The client verifies this chain even though it
+   just validated the live one, because an entry whose chain is absent or
+   broken would be invisible to a monitor (rekor.rs's "why the client
+   verifies a chain it does not need").
+4. **Attribution** — the entry signature over the DSSE PAE verifies under
+   the certificate's own key: the entry is what its signer made, whoever
+   that is.
 
-### 2.1 Possession is not load-bearing
+### 2.1 Why there is no possession check
 
-Check 4 is the one a provider-held key can never satisfy — and it is also
-the one that carries no security the other three don't already provide.
+The entry signature deliberately does **not** have to come from a zone
+key, and requiring that would add no security.
 
 Walk the threat. An attacker who wants a client to accept a rogue zone key
-must present a proof passing all four checks for *that* key. Checks 1 and 2
-are about the log and the wire. Check 3 is the hard one: the entry must
-embed a DNSSEC chain in which the parent's signed DS covers the rogue key —
-which requires the attacker to have compromised the parent zone or the
-registrar. And an attacker who minted the rogue key holds its private half,
-so signing the possession statement (check 4) costs them nothing. In every
-scenario where checks 1–3 pass for a hostile key, check 4 passes too.
-Possession therefore adds *attribution* — the entry was made by the key's
-holder, not a bystander — never *authorization*. Authorization is the
-chain, and only the chain.
+must present a proof passing the checks above for *that* key.
+Authorization is the hard one: the entry must embed a DNSSEC chain in
+which the parent's signed DS covers a key that signs the rogue key into
+the apex RRset — which requires the attacker to have compromised the
+parent zone or the registrar. And an attacker who minted a rogue key holds
+its private half, so any possession requirement would cost them nothing.
+Possession could only ever add *attribution* — the entry was made by the
+key's holder, not a bystander — never *authorization*. Authorization is
+the chain, and only the chain.
 
-Transparency's actual protection is unchanged either way: it is
-*detectability*, not prevention. A rogue-but-chained key is accepted by
-clients and simultaneously exposed in the public log, where the monitor
-(`crates/synch-monitor`) files it as evidence. That property needs log
-inclusion (1) and the chain (3); it never needed the entry signature to
-come from the zone key.
+Transparency's protection is *detectability*, not prevention. A
+rogue-but-chained key is accepted by clients and simultaneously exposed in
+the public log, where the monitor (`crates/synch-monitor`) files it as
+evidence. That property needs log inclusion and the chain; it never needs
+the entry signature to come from any particular key. This is exactly what
+lets a provider-held zone key — one nobody but the provider can sign with
+— be logged and enforced like any other.
 
-Dropping the possession requirement is what makes provider-held keys
-compatible with transparency, and it is a deliberate weakening of nothing
-— but it is a **format change**, because the statement bytes and the
-verifier both currently insist on it. Hence claim v2.
-
-## 3. Zone-key claim v2 — transparency without possession
+## 3. The zone-key claim
 
 ### 3.1 The statement
 
-The v1 statement's subject is the zone CSK and its DSSE signer is the same
-key. V2 decouples them:
-
-- **Subject**: the *provider's* apex DNSKEY material — the SPKI of each
-  zone-signing key observed signing answers for the apex (see §3.3 on key
-  sets), plus apex and key tag, as today.
+- **Subject**: the apex DNSKEY RRset the entry's chain proves — the
+  **key set** (see §3.3), one in-toto subject per key, each named by the
+  apex and identified by the SHA-256 of its DNSKEY rdata. The predicate
+  (`https://synchronicity.sh/zone-key/v2`) repeats the set with each
+  key's tag, algorithm and flags.
 - **Signer**: an **ephemeral ECDSA P-256 key, minted per entry and
   immediately discarded**. The signature is attribution and nothing more —
-  the entry is what its signer made — and authorization is carried entirely
-  by the chain, so a signer that exists for one signature is the honest
-  expression of the model: no key file to store, protect, or rotate, and
-  no false suggestion that the signing identity means anything. It signs
-  the DSSE envelope; the Rekor `hashedrekord` verifier certificate names
-  it, and on a refresh the stored entry's own certificate is what the
-  signature verifies against.
-- **Versioning**: a new predicate type string
-  (`https://synchronicity.sh/zone-key/v2`) so both client and monitor
-  dispatch on it. The v1 rendering rules carry over: byte-exact, fixed
-  field order, no whitespace — the DSSE signature and the Merkle leaf both
-  commit to the bytes.
+  the entry is what its signer made — and authorization is carried
+  entirely by the chain, so a signer that exists for one signature is the
+  honest expression of the model: no key file to store, protect, or
+  rotate, and no false suggestion that the signing identity means
+  anything. It signs the DSSE envelope; the Rekor `hashedrekord` verifier
+  certificate names it, and on a refresh the stored entry's own
+  certificate is what the signature verifies against.
+- **Rendering**: byte-exact, fixed field order, no whitespace, one
+  canonical key order (ascending tag, ties by digest) — the DSSE
+  signature and the Merkle leaf both commit to the bytes, and both the
+  Gleam and Rust renderers produce them identically.
 
 ### 3.2 The certificate and the chain walk
 
-The `OID_DNSSEC_CHAIN` extension format (`SEQUENCE OF { zone, rrs }`,
-apex-first) needs no structural change — each link already carries raw
-signed RRsets. Two behavioral deltas:
+The certificate is a key envelope, not a trust assertion: its SAN carries
+the apex into the Merkle leaf where a monitor can index it, and its
+`OID_DNSSEC_CHAIN` extension (`SEQUENCE OF { zone, rrs }`, apex-first)
+carries the evidence. Every link — the apex included — holds its own
+DNSKEY RRset with the RRSIGs the walk needs, plus the DS RRset its parent
+signed.
 
-- **The apex link gains the apex DNSKEY RRset + its RRSIG.** V1 omits it
-  deliberately: the monitor derives the apex DNSKEY from the certificate's
-  own SPKI, because subject and signer are one key and the DS covers it
-  directly. Under a provider's KSK/ZSK split that derivation breaks — the
-  DS covers the KSK (SEP bit set), while answers are signed by the ZSK.
-  The apex DNSKEY RRset, signed by the KSK, is the missing middle of the
-  walk.
-- **`chain::authorize` extends from "DS covers the subject" to the
-  standard three-step walk**: the parent's signed DS covers a SEP key in
-  the apex DNSKEY RRset; that RRset's RRSIG verifies under the covered
-  key; the statement's subject SPKI is a member of the RRset. A CSK zone
-  (ours, in serve mode) is the degenerate case — the covered key and the
-  subject are the same record — so one walk serves both formats. The v1
-  error at `chain.rs:78` ("the chain's DS records do not cover this zone
-  key") splits into the three corresponding refusals.
+`chain::authorize` runs the standard delegation walk: the top link's
+DNSKEY RRset verifies under a trust-anchored key, each link below proves
+its DNSKEY RRset with a DS its parent signed, and what the walk returns is
+the **proven apex key set**. A split-key zone is the reason for the shape
+— the DS covers the KSK (SEP bit set) while answers are signed by the
+ZSK, and DS → KSK → RRset is how DNSSEC itself authorizes the signing
+key. A CSK zone is simply the degenerate case where the covered key and
+the signing key are the same record; one walk serves both.
 
 ### 3.3 Provider key rotation and the key-set subject
 
@@ -176,36 +164,19 @@ plane noticed and re-logged.
 
 Two mitigations, both part of this design:
 
-- **The v2 subject is the observed signing-key set**, not one key: every
-  DNSKEY in the apex RRset that could sign answers (in practice one or two
-  during a provider's rotation overlap). The client accepts a proof whose
-  subject set contains the answer's signing key. A provider pre-publishing
-  its next ZSK — the standard rotation dance — is therefore covered by the
-  *existing* entry before the new key signs anything.
+- **The subject is the observed signing-key set**, not one key: every
+  DNSKEY in the apex RRset (in practice one or two during a provider's
+  rotation overlap). The client accepts a proof whose subject set contains
+  the answer's signing key. A provider pre-publishing its next ZSK — the
+  standard rotation dance — is therefore covered by the *existing* entry
+  before the new key signs anything.
 - **The control plane watches** (§4.4): it re-observes the apex DNSKEY
-  RRset on a short cadence and logs a fresh v2 entry whenever the set
+  RRset on a short cadence and logs a fresh entry whenever the set
   changes, updating the served `_synchronicity-rekor` TXT alongside.
 
 The residual gap — a provider that cuts to a never-pre-published key
 faster than the watch cadence — fails closed for the propagation window.
 That is the correct failure direction, and §8 prices it.
-
-### 3.4 Client changes and migration
-
-`rekor.rs` keeps checks 1–3 (with the §3.2 walk) and, for v2 entries,
-replaces check 4 with: the entry signature verifies against the
-certificate's own SPKI — whatever key that is. The binding check becomes
-membership: the answer's signing DNSKEY appears in the subject set.
-`zonecert.rs` learns the apex-link DNSKEY RRset; the monitor learns the v2
-predicate and applies the same chain walk (its evidence standard is
-unchanged — a chained rogue key is exactly as visible in v2 as in v1).
-
-Migration is naturally coupled to hosting: a v1-only client aimed at a
-provider-hosted zone fails closed regardless of entry format, because no
-v1 entry can exist for the provider's key. So the client upgrade ships
-before or with a deployment's cutover, and serve-mode deployments — whose
-CSK entries remain v1 — are untouched. The monitor accepts both formats
-indefinitely; published leaves are read for years.
 
 ## 4. Control plane: `CP_DNS_MODE=external`
 
@@ -372,7 +343,7 @@ CREATE TABLE provider_sync_state (
 );
 
 -- The provider signing keys last observed on the wire, and when each was
--- covered by a logged v2 entry. The watcher's memory.
+-- covered by a logged entry. The watcher's memory.
 CREATE TABLE observed_zone_keys (
   spki_sha256 BLOB    NOT NULL CHECK (length(spki_sha256) = 32),
   key_tag     INTEGER NOT NULL,
@@ -494,39 +465,32 @@ Migrating a live serve-mode deployment; a green-field external deployment
 runs the same steps minus the decommissioning.
 
 1. **Prepare.** Create/verify the provider zone for the apex; enable
-   DNSSEC on it (the provider's own toggle and ceremony). Upgrade
-   client fleets to a claim-v2-capable build (§3.4) — this can lead the
-   cutover by any amount; v2-capable clients still verify v1 zones.
+   DNSSEC on it (the provider's own toggle and ceremony).
 2. **Dual-run.** Flip the control plane to `external` with the provider
    configured but the registrar still pointing at our NS. The reconciler
    populates the provider zone; the watcher observes the provider's keys
-   and logs the v2 entry (the provider zone answers its own DNSKEY even
+   and logs the claim (the provider zone answers its own DNSKEY even
    before delegation). Our listeners keep serving the live zone.
-   Verify: provider zone contains exactly the rendered set; v2 entry
+   Verify: provider zone contains exactly the rendered set; the entry
    verified in the log; `healthz` `in_sync=true`.
 3. **Cut.** At the registrar: replace NS with the provider's, replace the
    DS with the provider's KSK DS. The parent's TTL governs the window;
    during it both zones answer, both validly signed, both carrying proof
-   records for their respective keys — v1 for ours, v2 for the
-   provider's, distributed in-band by whichever zone answers.
+   records for their respective key sets, distributed in-band by
+   whichever zone answers.
 4. **Verify.** `delv @1.1.1.1 _synchronicity.<net>.<org>.<apex> TXT`
-   fully validates via the provider; a v2 client resolves and accepts the
-   member set end-to-end; the monitor sees the v2 entry.
-5. **Decommission.** Retire the CSK (`rekor-retire` files the v1
+   fully validates via the provider; a client resolves and accepts the
+   member set end-to-end; the monitor sees the entry.
+5. **Decommission.** Retire the CSK (`rekor-retire` files the retirement
    breadcrumb), stop the old listeners, drop replicas. Rollback before
    this step is symmetric: restore NS+DS at the registrar — the serve-mode
    zone never stopped being correct.
 
 ## 8. Costs, stated plainly
 
-- **A protocol change on both sides.** Claim v2 touches the statement
-  renderer, the certificate builder, the client verifier, and the monitor,
-  and the client change must reach fleets before their deployment cuts
-  over. Serve-mode deployments are untouched, but the verifier carries two
-  formats from then on.
-- **Possession attribution is gone for external zones.** Anyone can log a
-  v2 entry about any zone (they always could log *something*; now the
-  client accepts chained third-party entries too). No signer identity
+- **Anyone can log an entry about any zone** (they always could log
+  *something*; the client accepts chained third-party entries too). No
+  signer identity
   distinguishes operator entries from anyone else's — deliberately: the
   signature is per-entry ephemeral, and
   authorization rests entirely on the chain — which §2.1 argues is where
@@ -567,12 +531,12 @@ runs the same steps minus the decommissioning.
   `run_once_with(db_path, resolver, log, now)` ladders exactly like
   `resign.run_once_with`, driven with in-memory fakes; asserted:
   convergence, second-run no-op, conflict refusal leaves the provider
-  untouched, failure → stale state → recovery, key-set change → new v2
+  untouched, failure → stale state → recovery, key-set change → new
   entry → rekor TXT poke.
-- **Claim v2 cross-validation**: the Gleam statement/cert renderer's
-  output verified by the Rust client's verifier in
-  `e2e/tests/crossval.rs`, as v1 is today; chain-walk cases (CSK
-  degenerate, KSK/ZSK split, subject-not-in-RRset refusal) on both sides.
+- **Claim cross-validation**: the Gleam statement/cert renderer's output
+  verified by the Rust client's verifier in `e2e/tests/crossval.rs`;
+  chain-walk cases (CSK degenerate, KSK/ZSK split, subject-not-in-RRset
+  refusal) on both sides.
 - **e2e**: a Cloudflare-shaped HTTP stub in `e2e/run.sh` (the harness
   already stands up servers and curls them); `CP_CLOUDFLARE_API_URL`
   points at it; assert the stub converges to exactly the rendered set
@@ -580,16 +544,10 @@ runs the same steps minus the decommissioning.
   waiting for the sweep. Full wire-serving e2e against a real provider
   needs a real account — a manual pre-GA checklist item, not CI.
 
-## 10. Phasing
+## 10. Remaining work
 
-1. **Claim v2** — statement/cert/chain on both sides plus monitor,
-   cross-validated. Ships independently; v2-capable clients are a no-op
-   against v1 zones. Everything else depends on it.
-2. **External mode core + Cloudflare** — config/mode wiring, renderer,
-   migration v4, reconciler, watcher, `provider/provider.gleam`,
-   Cloudflare leg, healthz, e2e stub.
-3. **Bunny** — DNSSEC verification against a real account gates GA.
-4. **Polish** — dashboard sync-state surfacing, post-apply DoH
+1. **Bunny** — DNSSEC verification against a real account gates GA.
+2. **Polish** — dashboard sync-state surfacing, post-apply DoH
    verification probe (the reconciler confirming the edge actually
    serves what it pushed), runbook hardening from a real cutover.
 

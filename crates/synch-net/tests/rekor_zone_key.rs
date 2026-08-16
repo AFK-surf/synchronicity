@@ -76,9 +76,10 @@ fn a_logged_zone_key_verifies_offline() {
 
 #[test]
 fn the_leaf_names_the_zone_where_a_monitor_can_see_it() {
-    // The whole reason v3 exists: the apex is inside the Merkle leaf, in the
-    // clear, with no DNS lookup and no cooperation from the zone required to
-    // find it. Assert it of the bytes the log committed to, not of a struct.
+    // The whole reason the verifier is a certificate: the apex is inside
+    // the Merkle leaf, in the clear, with no DNS lookup and no cooperation
+    // from the zone required to find it. Assert it of the bytes the log
+    // committed to, not of a struct.
     let (zone, _log, proof) = logged_zone();
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
     assert_eq!(
@@ -97,8 +98,8 @@ fn the_leaf_names_the_zone_where_a_monitor_can_see_it() {
 
 #[test]
 fn a_raw_public_key_entry_is_refused_outright() {
-    // A v2-shaped entry: perfectly valid Rekor, apex-anonymous, and therefore
-    // exactly what this design abolished. There is no branch to reach.
+    // Perfectly valid Rekor, apex-anonymous — no monitor could ever have
+    // seen it, so there is no branch that accepts it.
     let (zone, mut log, _) = logged_zone();
     let statement = zone.zone_key_statement("create");
     let payload = statement.to_json();
@@ -123,7 +124,7 @@ fn a_raw_public_key_entry_is_refused_outright() {
 }
 
 #[test]
-fn a_v2_proof_record_is_a_malformed_version_and_nothing_more() {
+fn a_wrong_version_byte_is_a_malformed_record_and_nothing_more() {
     let (_, _, proof) = logged_zone();
     let mut bytes = proof.encode().expect("a sim proof encodes");
     bytes[0] = 2;
@@ -158,19 +159,19 @@ fn a_misattributed_entry_signature_is_refused() {
 #[test]
 fn a_signer_other_than_the_zone_key_is_fine() {
     // The decoupling this claim exists for: the entry is signed by a key
-    // that is *not* in the zone at all — a control-plane operational key —
-    // and verifies, because the certificate names that key as the signer and
-    // the chain, not the signature, is what authorizes the zone's key set.
-    // This is what makes a provider-held zone key loggable.
+    // that is *not* in the zone at all — the ephemeral signer the publisher
+    // mints — and verifies, because the certificate names that key as the
+    // signer and the chain, not the signature, is what authorizes the
+    // zone's key set. This is what makes a provider-held zone key loggable.
     let zone = SimZone::new("cluster.example", member_records());
-    let operational = SimZone::new("cluster.example", Vec::new());
+    let ephemeral = SimZone::new("cluster.example", Vec::new());
     let mut log = SimLog::new("rekor.sim");
     let statement = zone.zone_key_statement("create").to_json();
-    // The certificate is built around the *operational* key (its SPKI, its
+    // The certificate is built around the *ephemeral* key (its SPKI, its
     // self-signature) but names the zone's apex and carries the zone's chain.
     let certificate =
-        operational.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), zone.dnssec_chain().encode())]);
-    let body = hashedrekord_body(&statement, &operational.sign_dsse(&statement), &certificate);
+        ephemeral.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), zone.dnssec_chain().encode())]);
+    let body = hashedrekord_body(&statement, &ephemeral.sign_dsse(&statement), &certificate);
     let proof = log.log_body(statement, body);
     verify(&proof, &zone, &log)
         .expect("an entry attributed to its real signer authorizes the chain-proven set");
@@ -889,17 +890,15 @@ fn regenerate_the_shared_fixture() {
 /// it — and it accepted a 757-byte certificate carrying the chain extension
 /// under the narrowed OID, which no local test can establish.
 ///
-/// The entry was published under the retired possession-format claim, so the
-/// full client verifier no longer runs over it: its `proof.bin` is the old
-/// v3 wire layout and its Statement the old v1 predicate, and this build
-/// reads neither — deliberately, there is no legacy path. What the fixture
-/// still proves is everything the *log* is responsible for: the leaf shape,
-/// the checkpoint with its witness cosignatures, inclusion in the real tree,
-/// and the certificate interop. A fresh total fixture requires a new public
-/// write (§2.1 of docs/REKOR-ZONE-KEY.md) and is minted the next time an
-/// entry is published for real. The chain inside the certificate is
-/// self-anchored at the apex (we own no DNSSEC-signed domain); real
-/// ICANN-rooted chain validation is anchored separately by
+/// The entry's `proof.bin` and Statement predate this build's formats and
+/// do not decode through it, so the full client verifier does not run over
+/// the fixture. What it proves is everything the *log* is responsible for:
+/// the leaf shape, the checkpoint with its witness cosignatures, inclusion
+/// in the real tree, and the certificate interop. A fully-verifying fixture
+/// requires a public write (§2.1 of docs/REKOR-ZONE-KEY.md) and is minted
+/// the next time an entry is published for real. The chain inside the
+/// certificate is self-anchored at the apex (we own no DNSSEC-signed
+/// domain); real ICANN-rooted chain validation is anchored separately by
 /// `tests/fixtures/dnssec_chain` (a live `cloudflare.com` delegation).
 mod real_rekor_v3 {
     use super::*;
@@ -914,13 +913,13 @@ mod real_rekor_v3 {
     const APEX: &str = "zone-key-transparency.demo.invalid";
     const LOG_INDEX: u64 = 68_018_370;
 
-    /// The legacy v3 wire record's log-facing fields, read with a local
-    /// throwaway parser: this build's decoder refuses the version on
-    /// purpose, but the *log's* half of the fixture — index, checkpoint,
-    /// audit path — is format-independent and stays load-bearing.
+    /// The fixture's log-facing fields, read with a local throwaway parser
+    /// for the wire layout it was recorded in: the *log's* half — index,
+    /// checkpoint, audit path — is format-independent and stays
+    /// load-bearing.
     fn legacy_log_fields() -> (u64, Vec<u8>, Vec<[u8; 32]>) {
         let bytes = v3("proof.bin");
-        assert_eq!(bytes[0], 3, "the fixture is the legacy v3 layout");
+        assert_eq!(bytes[0], 3, "the fixture's recorded wire layout");
         // version u8, key_tag u16, log_id [32], log_index u64, then three
         // u16-prefixed blobs (statement, body, checkpoint), then the path.
         let mut at = 1 + 2 + 32;
@@ -1031,19 +1030,19 @@ mod real_rekor_v3 {
         assert_eq!(body.certificate.spki.len(), 91);
     }
 
-    /// The legacy Statement is refused by this build's parser — there is no
-    /// quiet path by which a possession-format claim reads as a key-set one
-    /// — while the leaf's digest↔PAE link, which is the log's business and
-    /// not the claim's, still holds over the real bytes.
+    /// The fixture's Statement is a foreign predicate to this build's
+    /// parser and is refused — while the leaf's digest↔PAE link, which is
+    /// the log's business and not the claim's, still holds over the real
+    /// bytes.
     #[test]
-    fn the_legacy_statement_is_refused_and_the_pae_link_still_holds() {
+    fn a_foreign_statement_is_refused_and_the_pae_link_still_holds() {
         let statement = v3("statement.json");
         assert!(
             matches!(
                 rekor::ZoneKeyStatement::parse(&statement),
                 Err(ProofError::Binding(_))
             ),
-            "the v1 predicate type must be refused, not reinterpreted"
+            "a foreign predicate type must be refused, not reinterpreted"
         );
 
         // The leaf's digest is that Statement's DSSE PAE — the link between
