@@ -705,27 +705,21 @@ async fn a_small_edit_to_a_large_object_transfers_the_edit() {
         .store
         .write_proof(&new_root, size, &round_one.served, 4, &round_one.encoded, 0)
         .unwrap();
-    assert_eq!(spans.len(), 4, "four spans of sixteen groups");
+    assert_eq!(spans.subtrees.len(), 4, "four spans of sixteen groups");
 
     // The donor agrees about every span but the one holding the edit.
-    let asked: Vec<(u64, u64)> = spans.iter().map(|s| (s.start, s.groups)).collect();
+    let asked: Vec<(u64, u64)> = spans.subtrees.iter().map(|s| (s.start, s.groups)).collect();
     let donor_cvs = follower.store.subtree_cvs(&old_root, &asked).unwrap();
-    let equal: Vec<&synch_store::ProvenSubtree> = spans
+    let equal = spans
+        .subtrees
         .iter()
         .zip(&donor_cvs)
         .filter(|(span, cv)| **cv == Some(span.cv))
-        .map(|(span, _)| span)
-        .collect();
-    assert_eq!(equal.len(), 3, "only the edited span differs");
+        .count();
+    assert_eq!(equal, 3, "only the edited span differs");
     let mut promoted = follower
         .store
-        .promote(
-            &new_root,
-            size,
-            &synch_store::Donor::Object(old_root),
-            &equal.into_iter().copied().collect::<Vec<_>>(),
-            0,
-        )
+        .promote(&new_root, size, &synch_store::Donor(old_root), &spans, 0)
         .unwrap();
     assert_eq!(promoted.count(), 48);
 
@@ -739,13 +733,7 @@ async fn a_small_edit_to_a_large_object_transfers_the_edit() {
     promoted = promoted.union(
         &follower
             .store
-            .promote(
-                &new_root,
-                size,
-                &synch_store::Donor::Object(old_root),
-                &leaves,
-                0,
-            )
+            .promote(&new_root, size, &synch_store::Donor(old_root), &leaves, 0)
             .unwrap(),
     );
     assert_eq!(promoted.count(), groups - 1, "everything but the edit");

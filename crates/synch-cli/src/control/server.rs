@@ -1033,12 +1033,16 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                     report.skipped.len()
                 ))
                 .await?;
-                if report.reused_bytes > 0 {
+                if report.reused_bytes > 0 || report.reflinked > 0 {
                     // Only when there is something to say: a pass that reused
-                    // nothing is the ordinary case and needs no extra line.
+                    // nothing and shared nothing is the ordinary case and needs
+                    // no extra line.
                     out.line(format!(
-                        "{}  reused {} B · fetched {} B",
-                        mirror.local_path, report.reused_bytes, report.fetched_bytes
+                        "{}  reused {} B · fetched {} B · reflinked {}",
+                        mirror.local_path,
+                        report.reused_bytes,
+                        report.fetched_bytes,
+                        report.reflinked
                     ))
                     .await?;
                 }

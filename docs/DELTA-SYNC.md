@@ -2,28 +2,27 @@
 
 Status: **implemented**. `synch-core` carries the messages and the chaining-value
 helpers, `synch-store::proof` the proof walk and donor promotion, `synch-net` the
-exchange, `synch-engine` the descent and the mirror's patching write. Section 8
-is the order it landed in; where the built thing differs from what was proposed,
-this document has been corrected to describe the built thing.
+exchange, `synch-engine` the descent and the mirror's write. Section 8 is the
+order it landed in; where the built thing differs from what was proposed, this
+document has been corrected to describe the built thing.
 
 ## 1. Problem
 
 A mirror pass treats content as all-or-nothing per object. `plan_pass`
 (`crates/synch-engine/src/mirror.rs`) decides "current or wanted" by comparing
 the on-disk file's whole-content hash against the selected entry's root; when
-they differ, phase 2 runs `fetch_all` for the *new* root and
-`write_blob_to_blocking` rewrites the whole file through a staging rename.
+they differ, phase 2 fetches the *new* root and materializes it.
 
 The fetch already skips groups verified locally — but only groups verified
 **under the same root** (`fetch_groups` subtracts `local_groups(root)`). A
 changed file has a new root, so its local-groups set starts empty even when
-99% of its bytes are identical to the previous version sitting in the CAS and
-on disk. The result, for the workloads mirrors exist for (§14: VM images,
-databases, media libraries, append-heavy logs):
+99% of its bytes are identical to the previous version sitting in the CAS. The
+result, for the workloads mirrors exist for (§14: VM images, databases, media
+libraries, append-heavy logs):
 
 - **Network**: a 100 GB image with 50 MB changed in place costs a 100 GB fetch.
-- **Disk**: the staging copy rewrites 100 GB even though the mirror already
-  holds a file that is 99.95% correct.
+- **Disk**: the CAS writes 100 GB of payload it already holds a near-copy of,
+  and the mirror then writes 100 GB more.
 - **Swarm**: until the fetch completes past an ad milestone, this node
   advertises nothing of the new root, so other mirrors cannot lean on it.
 
@@ -51,20 +50,51 @@ out of the existing design rather than fight it:
    tail, escape this equivalence.
 
 So "which parts of the new version do I already have?" reduces to comparing
-subtree CVs of the new object's bao tree against CVs this node can compute
-locally — and every reused byte can still be *verified against the new root*
-before it is committed, keeping the §5.1 rule that no byte is trusted because
-of who supplied it.
+subtree CVs of the new object's bao tree against CVs this node can read out of
+the trees it already holds — and every CV the comparison is made against was
+*proved against the new root*, keeping the §5.1 rule that nothing is believed
+because of who supplied it.
 
 The one thing the node is missing is the new object's tree. That is the only
 new thing the protocol has to move.
 
+## 2.1 Where verification happens
+
+Delta sync does not change the verification posture; it is worth stating it
+plainly, because the shape of the code follows from it.
+
+**Verify at the boundary. Trust the filesystem at rest.** Bytes are checked when
+they *enter* the CAS — a slice decoded off the network, a proof recomputed to
+the root, a file being ingested — and a chaining value proved against a root is
+checked before any byte it vouches for is written. Bytes already committed under
+a verified bitmap are then trusted as they sit, exactly as the rest of the design
+trusts the filesystem it runs on (§6.2, §10).
+
+The alternative was tried and removed. Re-reading a donor's payload to re-hash
+what was hashed when it was written, or scrubbing a whole payload before
+materializing it, makes **every update cost the size of the object** — which is
+precisely the cost delta sync exists to remove, paid locally instead of over the
+network. It also duplicates, badly and partially, what a checksumming filesystem
+does properly and continuously.
+
+What still verifies, and always will:
+
+| Boundary | Check |
+| --- | --- |
+| Slice off the network | bao decode against the root, per 16 KiB group |
+| Proof off the network | every pair recomputed up to the root the entry named |
+| Promotion | donor CV (from its tree) equals a CV proved against the new root, **before** any byte is written |
+| A promoted subtree's interior nodes | recombined on the way up to the proved CV, so a rotted donor *tree* cannot poison a tree this node will serve |
+| Re-ingest of a mirrored file | `ingest_file` hashes by construction |
+| A range read | `read_range` is a bao decode against the root |
+| Serving a slice | `encode_ranges_validated` |
+| The mirror's currency check | the target file is user-mutable, so its root is recomputed every pass — drift detection, not CAS scrubbing |
+
 ## 3. Design overview
 
-Delta sync is a fetch-side optimization plus a write-side optimization, joined
-by one new wire exchange. No schema migration, no trie or record changes, no
-new subsystem: the partial-object machinery (bitmaps, sparse payload and
-outboard files, `write_slice`, milestone ads) already does the bookkeeping.
+Delta sync builds the **new CAS blob** out of the old CAS blob plus the groups
+that changed. It is a fetch-side optimization joined by one new wire exchange;
+the write side is downstream of it and has no delta logic of its own.
 
 ```
         ┌───────────────────────────── new root R', size S' ──┐
@@ -72,10 +102,10 @@ outboard files, `write_slice`, milestone ads) already does the bookkeeping.
   1. GetProof(R', spans)      hash-only bao traversal         │  provider
   2. compare span CVs         against donor outboards         │  (any holder
   3. GetProof(R', leaves)     only inside differing spans     │   of R')
-  4. promote equal groups     donor bytes → CAS, re-verified  │
+  4. promote equal runs       old CAS blob → new CAS blob     │
   5. GetSlice(R', changed)    existing fetch path, fanout     │
         │                                                     │
-        └── mirror write: reflink old file, patch changed groups, rename
+        └── mirror write: clone the finished CAS blob, rename
 ```
 
 ### 3.1 Wire: `GetProof` on `sync/blob/1`
@@ -103,7 +133,10 @@ ProofEnd  { served: ChunkRanges }
   from there (§6.4 shape). When the budget cuts a walk short the provider
   re-walks the ranges that fit and sends exactly those, so both sides agree on
   the answer node for node rather than the requester having to guess which
-  prefix it received.
+  prefix it received. The *number* of windows one exchange may take is capped
+  too: a provider serving one group per window is not barren — it is making
+  progress, an RTT at a time — and without a ceiling it could hold a descent
+  open for one round trip per group of the object.
 - **Who can serve**: any holder of the verified groups in question — a bao
   slice already carries its root-path hashes, so a partial holder's outboard
   has every node the proof for *its* groups needs. Provider selection reuses
@@ -113,11 +146,17 @@ ProofEnd  { served: ChunkRanges }
   existing `GetSlice`/`SliceEnd` encoding is untouched. Nobody is running this
   protocol yet, so a second ALPN would have bought version negotiation and a
   fallback path for a population of zero. No flag day, no manifest change.
+- **A proof carries its root.** `write_proof` returns a `Proven { root,
+  subtrees }`, not a bare list. Two objects of the same size have the same tree
+  *shape*, so every positional check a promotion makes would pass for the wrong
+  object's proof just as readily as the right one's — and what would come out is
+  an object filled with a stranger's bytes and marked complete. `promote`
+  refuses a proof whose root is not the root it was asked to fill.
 
-### 3.2 Donors: where local bytes come from
+### 3.2 Donors: CAS objects, and only CAS objects
 
-A *donor* is any local source of candidate bytes for the new object. In
-priority order:
+A *donor* is another object in this node's CAS that may carry bytes of the new
+one. In priority order:
 
 1. **The new root itself** — groups already in the bitmap (today's behavior,
    unchanged; a resumed fetch stays free).
@@ -127,22 +166,26 @@ priority order:
 3. **Other versions of the same path** in its `VersionSet` — divergent
    origins' roots, and the losing versions under `newest`. Same mechanics as
    `prev`, just more candidates for the span comparison.
-4. **The mirror's on-disk file.** The phase-1 currency check already streams
-   the whole file through BLAKE3 whenever its size matches the wanted version;
-   its output *is* the file's content root, so returning that (instead of a
-   bare bool) tells the plan exactly which object is on the disk for free. The
-   file is offered as a donor whatever its size, though — an append is the case
-   delta serves best, and there the old file is by definition the wrong length
-   — and it is offered last, because it is the only donor whose every span has
-   to be hashed to be compared at all. If the CAS has dropped every version,
-   the disk file is the whole of the descent: CAS-less, bytes-only.
 
-CAS donors contribute both bytes and an outboard (so span-level CVs are read,
-not recomputed). A disk-file donor contributes bytes only; its group CVs are
-computed at promotion time, 16 KiB at a time, with the right chunk counter.
+There is deliberately no fourth kind. An earlier shape of this had the mirror's
+on-disk file as a donor of its own, which meant promotion had to cope with a
+donor that has no tree, no bitmap and no row — every comparison it could not
+make cheaply falling back to hashing bytes — and it meant the mirror had to
+reason about which promoted groups were "the file's own" to decide what its
+write could keep. Both are gone.
 
-Donors are hints, never authority: every promoted group is re-verified against
-the new root (§3.4). A malicious or stale donor costs CPU, not correctness.
+The one capability that donor bought is kept, and paid for where it belongs.
+When the lineage names versions this node holds **none** of — the collector took
+the old object — and the file at the mirror's own destination turns out to *be*
+one of those versions, the mirror `ingest_file`s it and the ordinary CAS-to-CAS
+delta proceeds. The check is a hash of a file the mirror was about to rewrite
+anyway; the ingest after it buys an update that costs the change rather than the
+object. It runs only above `delta_min_size`, only when no CAS donor exists, and
+only when the file really is a named version.
+
+Donors are hints, never authority: nothing is promoted except where the donor's
+own tree gives the run the chaining value a proof chained to the new root
+(§3.4). A stale donor matches nothing.
 
 ### 3.3 The descent: two proof rounds, not a full outboard
 
@@ -155,109 +198,166 @@ Instead the fetcher descends, the same way `mptsync` walks trie diffs (§5):
   §6.3). Cost: 32 bytes per 16 MiB plus path overhead — ~200 KB for 100 GB.
   Compare each complete aligned subtree CV against the donor's CV at the same
   position (read straight out of the donor's outboard). Equal ⇒ the whole
-  span is byte-identical; promote it wholesale. Unequal or incomparable (tail
-  spans, spans past either object's end) ⇒ descend.
-- **Round 2 — leaf level.** `GetProof(level = 0)` restricted to the differing
-  spans. Cost: 64 bytes per 16 KiB *of changed region only*. Compare leaf CVs
-  group by group; equal groups are promoted, unequal groups are the delta.
+  span is byte-identical; promote it wholesale.
+- **Round 2 — leaf level.** `GetProof(level = 0)` restricted to the spans round
+  one found **comparable and unequal**: a donor had a chaining value at that
+  position and it differed, which is a span whose bytes moved and whose groups
+  are worth comparing one at a time. A span *no* donor can speak to — past the
+  end of every one of them, held by none — has nothing to be compared against,
+  and descending into it would buy a leaf proof of the whole object to learn
+  what round one already said. It goes straight to the fetch. The object's right
+  edge is the exception and is bounded to one span: a subtree cut short by the
+  end of the object is not comparable as a subtree at all, so the absence of a
+  donor value there means nothing, and its groups descend.
+
+Round two runs in batches of `LEAF_ROUND_BATCH` groups (128 MiB of object), so
+the list of proven subtrees stays a few hundred kilobytes however much of the
+object turns out to have changed.
+
+The level of round one is clamped: `span_level = min(AD_SPAN_LEVEL, top - 1)`
+where `top` is the height of the object's tree. An object that *is* one span has
+no subtree below its root to compare — the root carries BLAKE3's root flag and
+equals no chaining value anywhere (§2) — so one level below the top is the
+deepest cut that still says something. In practice this means objects of one to
+two spans are compared at a finer granularity than large ones, and an object of
+a single span skips round one entirely and goes to the leaf level.
 
 Whatever remains after round 2 goes to the ordinary `fetch_groups` machinery
 untouched: fanout split, `SliceEnd` re-planning, per-group verification,
-bitmap commits. `FetchReport` grows a `promoted: ChunkRanges` field, and a
+bitmap commits. `FetchReport` carries `promoted: ChunkRanges` and a
 `reused: Vec<(Donor, ChunkRanges)>` breakdown of which donor supplied what, so
 callers (and `synch mirror sync` progress lines over the control socket's
-`Progress` frames) can say "reused 98.9 GB, fetched 1.1 GB" — and so the mirror
-write in §3.5 knows which groups of the file at its destination are already
-right.
+`Progress` frames) can say "reused 98.9 GB, fetched 1.1 GB".
 
 If round 1 shows nothing in common — an encrypted container re-keyed, a
-compressed archive rebuilt — the entire delta attempt has cost one ~200 KB
-exchange, and the fetch proceeds exactly as today. That failure mode is cheap
-enough that no similarity heuristic is needed in front of it.
+compressed archive rebuilt — and no donor covers the object, the entire delta
+attempt has cost one ~200 KB exchange and the fetch proceeds exactly as today.
+That failure mode is cheap enough that no similarity heuristic is needed in
+front of it.
 
-### 3.4 Promotion: local bytes into the new object, verified
+**Ranged reads.** `prepare_range` descends for whole-object reads always, and
+for a partial range only when the range is at least one span. Promotion works a
+span at a time and the proof rounds come before the first byte, so a one-byte
+cold `synch cat --range` would otherwise pay two round trips and promote 16 MiB
+to answer with one byte.
 
-For each group whose new-tree leaf CV is proven (chained to `R'` by a proof
-round) and equal to a donor CV:
+### 3.4 Promotion: old CAS blob into new CAS blob
 
-1. Read the donor's 16 KiB at that offset — a positional read of the CAS
-   payload, or of the disk file. (Not `copy_file_range`: step 2 has to see the
-   bytes, so a kernel-side copy that never brings them into user space would
-   only mean reading them twice.)
-2. Recompute the group CV with the offset's chunk counter and compare with the
-   proven CV. This closes the gap between "the donor's outboard said so" and
-   "the bytes on disk still say so" — a donor whose payload rotted under a
-   correct outboard fails here and the group falls through to the network
-   fetch.
-3. Write into the new object's sparse payload, set the bitmap bit — the same
-   commit discipline as `write_slice`, so progress survives restarts and a
-   torn pass resumes instead of restarting.
+For each proven subtree, in the new object's tree:
 
-Interior tree nodes come along too: nodes delivered by proof rounds are
-written into the new object's sparse `.obao` at their positions, and the nodes
-*beneath* a span-level CV fall out of the re-hash in step 2 for free — hashing a
-span group by group produces every interior CV under it on the way up, so they
-are recorded as the span is verified rather than copied out of the donor's
-outboard. (Recomputing is also the stricter of the two: the nodes written are
-the ones the bytes on this disk imply, not the ones the donor's tree claimed.)
-That matters for the swarm: it is what lets this node serve slices of the
-promoted spans, not merely hold them. Promoted groups flow through
-`on_content_progress` like fetched ones, so the node advertises partial
-possession of `R'` within one milestone interval — mirrors of the same space
-then delta from *each other*, and the origin uploads the changed bytes
-roughly once (§6.3's O(N) swarm property, now for updates too).
+1. Read the chaining value the **donor's own outboard** holds at the same
+   position (`cv_at`, the machinery behind `subtree_cvs`). `None` means the
+   donor cannot speak to it — its tree is shaped differently there, or the run
+   is the whole of it. Two positional reads for a 16 MiB span.
+2. Compare with the chaining value the proof chained to the new root. Unequal
+   ⇒ the bytes differ; nothing is written.
+3. Only then, copy the byte run from the old payload into the new object's
+   sparse payload with `copy_file_range`. Both files are in the CAS directory
+   and therefore on one filesystem, which is the condition under which Linux
+   routes the call through the filesystem's own remap: on btrfs, XFS and
+   bcachefs an aligned run becomes a **reflink**, so the bytes are shared rather
+   than moved and the new object costs no space where it agrees with the old
+   one. A run of whole 16 KiB groups at 16 KiB offsets satisfies any block size
+   a filesystem is likely to have; the short tail group does not, and the kernel
+   copies that instead of sharing it. Where the syscall is unavailable or
+   refuses, positional reads and writes finish the job.
+4. Copy the interior tree nodes under the run out of the donor's outboard,
+   recombining each pair on the way up and checking that it arrives at the
+   proved chaining value. The new object needs those nodes or the groups it
+   just gained could be held and not *served* — and the recombination is what
+   keeps the copy honest, at one 64-byte hash per group rather than a pass over
+   the bytes.
+5. Set the bitmap bits, after payload and tree are fsynced — the same commit
+   discipline as `write_slice`, so a torn pass resumes instead of restarting.
 
-### 3.5 Mirror write path: patch, don't rewrite
+**Compare strictly before writing.** An earlier shape of this absorbed the
+donor's bytes into the new payload and judged the chaining value afterwards. A
+concurrent `write_slice` on the same root could commit a group's bitmap bit and
+then have promotion's not-yet-judged bytes land on top of it: a bit that lies,
+a group advertised and unreadable, and no path back. Every write below step 2
+is a write of bytes already known to belong there, which also makes two racing
+writers of one root idempotent rather than merely lucky.
 
-Today phase 2 copies the whole object out of the CAS into a staging file and
-renames (`write_blob_to_blocking`) — the atomicity invariant being that a
-reader of the target sees old bytes or new bytes, never a truncation. Delta
-keeps the invariant and drops the cost:
+Two shapes of subtree are promotable, and between them they cover everything the
+descent produces: a **whole** subtree, whose chaining value is comparable across
+objects at all (§2), and a **single group**, comparable whenever both objects run
+the same distance past its start. A multi-group subtree cut short by the end of
+the object is neither, and the leaf round settles it. One reuse is given up by
+comparing trees rather than hashing bytes: a new object whose tail group is
+*shorter* than the donor's group at that index — a truncation — cannot match,
+because the donor's tree has no value for "the first k bytes of that group". It
+is one group, and it goes to the network.
 
-- When the plan knows the on-disk file's root equals a donor root (§3.2.4 —
-  known for free from the phase-1 hash whenever the sizes match, and computed
-  deliberately when they do not and the file is at least `delta_min_size`), the
-  staging file starts as a
-  **reflink clone** of the on-disk file (`FICLONE` on btrfs/XFS/bcachefs,
-  `clonefile` on APFS): O(1) and no data copy. The differing groups — exactly
-  the promoted-unequal plus network-fetched set — are then `pwrite`n into the
-  staging clone from the CAS, fsync, rename. Old-or-new is preserved; write
-  cost is proportional to the change.
-- Where reflink is unsupported (ext4, NTFS, cross-device), fall back to
-  `std::fs::copy` — which is itself a kernel-side `copy_file_range` on Linux,
-  with no user-space bounce — and then patch; the network savings are untouched
-  and the write cost matches today's worst case.
+Promoted groups flow through `on_content_progress` like fetched ones, so the
+node advertises partial possession of `R'` within one milestone interval —
+mirrors of the same space then delta from *each other*, and the origin uploads
+the changed bytes roughly once (§6.3's O(N) swarm property, now for updates too).
 
-  Which groups are "the differing ones" is read off `FetchReport::reused`, which
-  records what each donor supplied. Bytes promoted from the file at the target
-  are trivially bytes that file has right; so are bytes promoted from the CAS
-  object the file *is* a copy of, which is the case that carries the ordinary
-  mirror update — the previous version is usually in both places, and the CAS is
-  the cheaper of the two to compare against, so it wins the donor race every
-  time. Everything else is written out of the CAS.
-- In-place patching of the live target (no staging at all) is **rejected**: a
-  crash mid-patch leaves a franken-file wearing a complete file's name, which
-  is exactly what the staging rename exists to prevent (§7.2's conservatism).
-  The next pass would catch it — `already_current` hashes content — but
-  readers in between would not.
+### 3.5 Materialization: one path onto the filesystem
 
-The s3 gateway (§9.4) and `synch take`/`get` inherit the fetch-side savings
-automatically, since they ride the same fetch path; the reflink trick is
-mirror-only, because only a mirror knows a same-lineage old file is sitting at
-the destination.
+`materialize_blob` is the only way an object becomes a file. The mirror pass
+(§7.2), `synch take`/`adopt_from` (§8) and the gateway's fetch-to-file all go
+through it, and all get the same guarantees: the target is old-or-new and never
+half, no staging residue is left on any path, and the object is never held in
+memory.
+
+The object must already be held whole and locally — materialization refuses
+what it does not have rather than leaving a truncated file wearing a complete
+file's name. Then:
+
+- The CAS payload is **cloned** into a staging file beside the target with
+  `FICLONE`. On btrfs, XFS or bcachefs that shares the payload's extents: O(1),
+  no data moved, and no second copy of the object on the disk until one of the
+  two is written to.
+- Where the ioctl cannot apply — the mirror is on a different filesystem from
+  the CAS, ext4, a platform without it — the fallback is `std::fs::copy`, itself
+  a kernel-side `copy_file_range` on Linux with no bounce through user space.
+- Objects small enough to live in the index (§6.2) have no payload file and are
+  written straight out of it.
+- The staging file is fsynced, renamed over the target, and the parent directory
+  is fsynced too: "old file or new file" is a claim about crashes, and without
+  the directory flush the contents can survive a power cut while the name they
+  arrived under does not. Every failure path unlinks the staging file — the name
+  it uses is one the scanner's built-in ignore rules skip, so a stranded one
+  would sit beside the target unnoticed forever.
+
+`MirrorReport::reflinked` counts the files that cost no data movement.
+
+**The trade-off, stated plainly.** A mirror on a *different filesystem from the
+CAS* keeps the whole network win — the delta happens in the CAS, before the
+mirror is involved at all — but pays a full local copy of the object on every
+update, because `FICLONE` cannot cross filesystems. An earlier design avoided
+that by patching the mirror's existing file in a clone of *itself*, keeping the
+groups a donor had proved it already held. That path is deliberately gone:
+
+- **One path.** Two ways to write a file meant two sets of atomicity, residue
+  and metadata behavior to keep correct, and the patching one was only ever
+  exercised by one caller.
+- **No TOCTOU keep-set.** Deciding what to keep meant deciding which promoted
+  groups were "the file's own" — a fact about a user-mutable file, established
+  before a network fetch and acted on after it. Nothing stopped the file
+  changing in between, and the pass would have kept groups that were no longer
+  there.
+- **Extent sharing where it counts.** When the mirror *does* share a filesystem
+  with the CAS — the ordinary single-disk deployment — the clone is O(1) and the
+  mirrored file and the CAS object are the same extents, which is strictly
+  better than patching a private copy.
+
+Put the mirror on the CAS's filesystem and the whole update, network and disk,
+costs the size of the change.
 
 ## 4. Policy and configuration
 
 - `delta_min_size` (default **16 MiB**): objects smaller than one ad span skip
   proof rounds entirely — the round-trips cost more than the bytes. Inline
-  blobs (≤ 16 KiB) never delta.
-- `mirror_delta_write`: `reflink` (default: reflink, then copy) | `copy` |
-  `off`. `off` reproduces the pre-delta full staging write for operators who
-  want bit-identical write behavior.
+  blobs (≤ 16 KiB) never delta. Setting it to `u64::MAX` turns the descent off
+  for a node. Like `fetch_fanout`, this is **code-level configuration**: no
+  shipped binary reads it from a file today, and this document does not promise
+  a knob an operator can reach.
 - Delta fetch itself needs no switch: with no donor, no provider that answers,
   or no matching span, it *is* the old fetch plus at most one small exchange.
-  The escape hatch for diagnosis is `delta_min_size`, which set to `u64::MAX`
-  turns the descent off for a node without touching anything else.
+- There is no write-side switch. Reflink is probed per materialization by
+  attempting it, which costs one failing ioctl on a filesystem that cannot.
 
 ## 5. What this deliberately does not do
 
@@ -272,15 +372,14 @@ the destination.
   workloads mirrors carry at scale (images, databases, media, logs) mutate in
   place or append, which fixed offsets serve well. An rsync-style rolling-hash
   recovery layer over the existing addresses is possible future work; it fits
-  *behind* `GetProof` (the receiver may match donor groups at shifted offsets
-  it discovers itself — promotion in §3.4 never assumed offsets matched, only
-  CVs) without any further wire change.
+  *behind* `GetProof` without any further wire change.
 - **No per-chunk availability records.** Ads stay one coarse record per
   (object, holder) — §4.2 already litigated this; delta discovers exactness
   from `ProofEnd`/`SliceEnd`, the same way fetch discovers it today.
 - **No persistent delta state.** No stored diffs, no generation chains beyond
   the existing 1-step `prev`. Every pass rediscovers reuse from hashes it can
   verify; nothing new can go stale or lie.
+- **No scrubbing.** See §2.1.
 
 ## 6. Failure modes
 
@@ -288,53 +387,60 @@ the destination.
 | --- | --- |
 | No provider answers a proof request | Full fetch, as before. |
 | Proof verification fails | Provider dropped for the exchange (as with a bad slice); next candidate tried; delta abandoned for this object if none remain. |
-| Donor bytes fail re-verification | Group falls through to network fetch; donor kept for other groups (rot is per-extent). |
-| Crash mid-promotion | Bitmap has only verified groups; next pass resumes. |
-| Crash mid-patch | Staging file abandoned; target untouched (rename never happened). |
-| Sizes equal, roots differ, content unrelated | Round 1 finds no equal spans; cost ≈ 200 KB per 100 GB, then full fetch. |
+| A proof offered for the wrong object | Refused at `promote`: the root travels with the proof (§3.1). |
+| An entry overstates a root's size | The row records the claim, and the next writer with a different one replaces it — a size is only settled once the final group is held, because no earlier group's chaining value depends on it. |
+| Donor's tree disagrees under a matched span | Span refused and left to the network; the spans around it are unaffected. |
+| Donor object collected mid-promotion | The payload and outboard handles are opened once and held for the run, so an unlinked inode stays readable to the end; a donor already gone before the open simply supplies nothing. |
+| Crash mid-promotion | Bitmap has only committed groups; next pass resumes. |
+| Two writers filling one root at once | Bitmap commits are read-union-write inside one transaction, so neither loses the other's groups; promoted bytes are correct by construction, so overlapping writes are idempotent. |
+| Crash mid-materialization | Staging file abandoned and unlinked; target untouched (rename never happened). |
+| Sizes equal, roots differ, content unrelated | Round 1 finds no equal spans; the leaf round runs over the object and the fetch follows. Cost is the leaf proof, in 128 MiB batches. |
 
 ## 7. Cost model (worked example)
 
-100 GB VM image, 1 GB modified in place across 64 spans, previous version on
-disk and in the CAS:
+100 GB VM image, 1 GB modified in place across 64 spans, previous version in the
+CAS and mirrored on the same filesystem:
 
 | | today | with delta |
 | --- | --- | --- |
 | proof rounds | — | ~200 KB + 64 spans × 32 KB ≈ 2.2 MB |
 | network payload | 100 GB | ~1 GB (+ slice path hashes) |
-| CAS write | 100 GB payload + 400 MB outboard | ~1 GB + copied/received tree nodes |
-| mirror write | 100 GB staging copy | reflink + ~1 GB patch |
+| CAS write | 100 GB payload + 400 MB outboard | ~1 GB + 390 MB of tree; the other 99 GB is shared extents |
+| mirror write | 100 GB staging copy | reflink of the finished object: O(1) |
 | time to first ad of `R'` | after ≥ first milestone of a 100 GB fetch | one milestone after promotion — seconds |
+
+On a filesystem without reflink the CAS write becomes ~100 GB of local copy and
+the mirror write another 100 GB; the network column is unchanged.
 
 Append-only case (log grows 100 MB on 50 GB): round 1 proves every old
 complete span equal; only tail spans reach round 2; network cost ≈ the
 appended bytes.
 
-## 8. Implementation sketch
-
-Ordered so each step lands testable on its own:
+## 8. Implementation map
 
 1. `synch-core`: `GetProof`/`ProofEnd` messages on the existing `sync/blob/1`
    `BlobMessage`, proof-window bound; chaining-value helpers (`group_cv`,
    `join_cvs`, `join_root`) in `hash.rs`.
 2. `synch-store`: `encode_proof` (positional outboard reads, mirror of
-   `encode_slice_inner`), `write_proof` (verify, then sparse `.obao` commits),
-   `subtree_cvs` (the donor-side comparison), and
-   `promote(root, size, donor, proven)` with the §3.4 verification.
+   `encode_slice_inner`), `write_proof` (verify, then sparse `.obao` commits)
+   returning `Proven`, `subtree_cvs` (the donor-side comparison), and
+   `promote(root, size, donor, proven)` with the §3.4 compare-then-clone;
+   `commit_groups` for the transactional bitmap union.
 3. `synch-net`: serve `GetProof`; client `get_proof` and `fetch_proof_into`.
-4. `synch-engine`: donor resolution (`prev`, version set, the disk file, whose
-   root is surfaced from what used to be `already_current`); the two-round
-   descent in front of `fetch_groups`; `FetchReport::promoted` and
-   `FetchReport::reused`.
-5. `synch-engine/mirror.rs`: thread the disk root through `plan_pass`;
-   reflink/patch staging in phase 2 behind `mirror_delta_write`.
+4. `synch-engine`: donor resolution (`donor_roots`, `donors_for`); the
+   two-round descent in front of `fetch_groups`, with round two restricted to
+   comparable-and-unequal spans; `FetchReport::promoted` and `reused`.
+5. `synch-engine`: `materialize_blob`, the one write path (§3.5), and the
+   mirror's re-ingest recovery (§3.2).
 6. Tests: store-level round trips (equal spans across unequal sizes, tail
-   groups, tampered proofs, rotted donors), and the tree arithmetic checked
-   node for node against the outboard bao itself writes — everything else
-   stands on that being right; a two-node `tests/two_nodes.rs` case asserting
-   what a one-group edit to a 64-group object costs on the wire; mirror passes
-   asserting reuse, patching, an appended file, and the atomicity invariant
-   under a torn patch.
+   groups, tampered proofs, rotted donor trees, a proof spent on the wrong
+   object, an overstated size), the tree arithmetic checked node for node
+   against the outboard bao itself writes, a two-node `tests/two_nodes.rs` case
+   asserting what a one-group edit to a 64-group object costs on the wire, and
+   mirror passes asserting reuse, an appended file, donor recovery by re-ingest,
+   and the atomicity invariant under a torn materialization.
 
-Steps 1–4 deliver the network win for every fetch path; step 5 is the
-mirror-specific write win and is independently shippable.
+Nothing in the reflink and extent-sharing paths is asserted *as* a reflink in
+the tests: whether extents are shared depends on the filesystem the tests run
+on, and the point of every fallback here is that the bytes, the reports and the
+atomicity are the same either way.

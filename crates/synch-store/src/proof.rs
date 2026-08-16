@@ -9,18 +9,25 @@
 //! the previous version of a file can compare the answer against bytes it has
 //! and discover that almost none of the new version needs to cross the network.
 //!
-//! Nothing here trusts anyone. A proof is verified by recomputation from the
-//! root the caller already trusts (§5.1's rule that no byte is believed because
-//! of who supplied it, applied to hashes), and a *donor* — a local object or
-//! file whose bytes look like they belong in the new object — is verified the
-//! same way, by hashing what is actually on the disk right now and checking it
-//! against a chaining value the proof established. A stale or hostile donor
-//! costs CPU; it cannot cost correctness.
+//! Nothing here trusts anyone *else*. A proof is verified by recomputation from
+//! the root the caller already trusts (§5.1's rule that no byte is believed
+//! because of who supplied it, applied to hashes), and a *donor* — another
+//! object in this node's CAS whose bytes may belong in the new one — supplies a
+//! run only where its own tree agrees, chaining value for chaining value, with
+//! what the proof established. Equal chaining values are equal bytes; a stale
+//! donor simply matches nothing.
+//!
+//! What this deliberately does not do is read a donor's payload back to check
+//! it again. Verification happens at the trust boundary — a slice off the
+//! network, a proof, a file being ingested — and bytes already committed under
+//! a verified bitmap are trusted at rest, which is the posture the rest of the
+//! design takes towards the filesystem it sits on (§6.2, §10). Re-hashing
+//! 100 GB of local payload to reconfirm what was confirmed when it was written
+//! would make every delta update cost the size of the object rather than the
+//! size of the change, which is the whole of what delta sync exists to avoid —
+//! and it would duplicate, badly, what a checksumming filesystem already does.
 
-use std::{
-    fs::{File, OpenOptions},
-    path::PathBuf,
-};
+use std::fs::{File, OpenOptions};
 
 use bao_tree::{
     io::{
@@ -30,12 +37,12 @@ use bao_tree::{
     BaoTree, TreeNode,
 };
 use synch_core::{
-    group_count, group_cv, join_cvs, join_root, ChunkRanges, Cv, GroupRange, Hash,
-    CHUNK_GROUP_SIZE, INLINE_BLOB_MAX, MAX_PROOF_NODES, PROOF_NODE_LEN,
+    group_count, join_cvs, join_root, ChunkRanges, Cv, GroupRange, Hash, CHUNK_GROUP_SIZE,
+    INLINE_BLOB_MAX, MAX_PROOF_NODES, PROOF_NODE_LEN,
 };
 
 use crate::{
-    cas::{fsync_file, ranges_to_bitmap, DataFile},
+    cas::{fsync_file, DataFile},
     db::Store,
     error::{Result, StoreError},
 };
@@ -76,32 +83,79 @@ impl ProvenSubtree {
     }
 }
 
-/// A local source of candidate bytes for an object (§3.2).
+/// What proof rounds established about one object.
 ///
-/// Donors are hints about where bytes might be found, never authority about
-/// what they are: every group a donor supplies is hashed and checked against a
-/// proven chaining value before it is committed.
+/// The root travels with the subtrees, and that is the whole reason this type
+/// exists. A chaining value means nothing except against the tree it was proved
+/// in, and two objects of the same size have the same tree *shape* — so a bare
+/// list of subtrees carries nothing that would stop it being handed to a
+/// promotion for the wrong object, which would fill that object with another's
+/// bytes and mark it complete. [`Store::promote`] checks the root it was given
+/// against the root the proof was verified under; without the root in the type
+/// there is nothing there to check.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Donor {
-    /// Another object in this node's CAS, read from its payload at the same
-    /// byte offsets — typically the entry's `prev` root, or another version of
-    /// the same path (§4.2, §8).
-    Object(Hash),
-    /// An ordinary file on disk, read at the same byte offsets.
-    ///
-    /// A mirror's materialized copy of the previous version is the case this
-    /// exists for: the bytes are right there even when the CAS has long since
-    /// collected the object they came from (§3.2.4).
-    File(PathBuf),
+pub struct Proven {
+    /// The object root every subtree here was chained back to.
+    pub root: Hash,
+    /// The subtrees, in tree order — one per group at level 0, one per span
+    /// higher up.
+    pub subtrees: Vec<ProvenSubtree>,
 }
 
-impl Donor {
-    /// The object root a donor supplies bytes for, when it has one.
-    pub fn root(&self) -> Option<Hash> {
-        match self {
-            Donor::Object(root) => Some(*root),
-            Donor::File(_) => None,
+impl Proven {
+    /// An empty result for an object.
+    pub fn none(root: Hash) -> Proven {
+        Proven {
+            root,
+            subtrees: Vec::new(),
         }
+    }
+
+    /// True if no subtree was proven.
+    pub fn is_empty(&self) -> bool {
+        self.subtrees.is_empty()
+    }
+
+    /// Folds another round's subtrees over the same root into this one.
+    ///
+    /// Refuses to mix roots: the two would be indistinguishable afterwards,
+    /// which is exactly what carrying the root is meant to prevent.
+    pub fn absorb(&mut self, other: Proven) -> Result<()> {
+        if other.root != self.root {
+            return Err(StoreError::Verification {
+                root: self.root,
+                reason: format!(
+                    "a proof of {} cannot join a proof of this object",
+                    other.root
+                ),
+            });
+        }
+        self.subtrees.extend(other.subtrees);
+        Ok(())
+    }
+}
+
+/// A local source of candidate bytes for an object (§3.2).
+///
+/// Always another object in this node's CAS, read from its payload at the same
+/// byte offsets — typically the entry's `prev` root, or another version of the
+/// same path (§4.2, §8). Donors are hints about where bytes might be found,
+/// never authority about what they are: a run is promoted only where the
+/// donor's own tree gives it the chaining value a proof chained to the new
+/// object's root.
+///
+/// One shape of donor, deliberately. A mirror whose file on disk *is* a version
+/// the CAS has since collected re-ingests that file rather than being offered
+/// here as a second kind of donor: the capability is preserved, the rare path
+/// pays for it, and nothing inside this module has to know that a donor might
+/// have no tree (`docs/DELTA-SYNC.md` §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Donor(pub Hash);
+
+impl Donor {
+    /// The object root the donor supplies bytes for.
+    pub fn root(&self) -> Hash {
+        self.0
     }
 }
 
@@ -413,42 +467,21 @@ fn cv_at<R: ReadAt>(
     }
 }
 
-/// A donor's bytes, however they are stored.
-enum DonorBytes {
-    /// A blob small enough to live in the index (§6.2).
-    Inline(Vec<u8>),
-    /// A payload or an ordinary file, read positionally.
-    OnDisk(File),
-}
-
-impl DonorBytes {
-    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        match self {
-            DonorBytes::Inline(data) => {
-                let start = offset.min(data.len() as u64) as usize;
-                let end = start + buf.len();
-                if end > data.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "donor is shorter than the range asked of it",
-                    ));
-                }
-                buf.copy_from_slice(&data[start..end]);
-                Ok(())
-            }
-            DonorBytes::OnDisk(file) => file.read_exact_at(offset, buf),
-        }
-    }
-}
-
-/// A donor opened for reading, with the groups it can actually supply.
+/// A donor opened for reading: its payload, its tree, and what it holds.
 struct OpenDonor {
-    bytes: DonorBytes,
-    /// The groups the donor is known to hold, in the object's own grid — the
-    /// bitmap for a CAS object, everything up to the end for a plain file.
+    /// The donor object's root, for the errors its tree can raise.
+    root: Hash,
+    /// Its payload, read positionally and cloned range by range.
+    payload: File,
+    /// Its tree, which is what makes a donor cheap to ask about: a 16 MiB span
+    /// costs two positional reads to compare rather than 16 MiB of hashing.
+    outboard: PreOrderOutboard<DataFile>,
+    /// The groups the donor is known to hold, out of its bitmap.
     held: ChunkRanges,
     /// How long the donor is, which bounds what can be read out of it.
     size: u64,
+    /// Its group count, which fixes the shape of its tree.
+    groups: u64,
 }
 
 impl Store {
@@ -552,11 +585,11 @@ impl Store {
         level: u8,
         encoded: &[u8],
         now: i64,
-    ) -> Result<Vec<ProvenSubtree>> {
+    ) -> Result<Proven> {
         let groups = group_count(size);
         let served = served.intersect(&ChunkRanges::single(0, groups));
         if let Some(row) = self.blob(root)? {
-            if row.size != size {
+            if row.size != size && row.size_is_attested() {
                 return Err(StoreError::Verification {
                     root: *root,
                     reason: format!("size mismatch: have {}, offered {}", row.size, size),
@@ -606,11 +639,14 @@ impl Store {
 
         if !proof.nodes.is_empty() {
             let tree = Self::tree(size);
-            let (_, outboard_file) = self.open_sparse(root, size, tree)?;
+            // The outboard only. A proof commits no bytes, so it has no
+            // business creating a payload file the size of an object this node
+            // holds nothing of — that file is the business of whatever first
+            // puts a byte in it.
             let mut outboard = PreOrderOutboard {
                 root: blake3::Hash::from_bytes(root.0),
                 tree,
-                data: DataFile(outboard_file),
+                data: DataFile(self.open_sparse_outboard(root, tree)?),
             };
             for (node, pair) in &proof.nodes {
                 let left = blake3::Hash::from_bytes(pair[..32].try_into().expect("32 of 64"));
@@ -621,13 +657,22 @@ impl Store {
             let _ = fsync_file(&outboard.data.0);
             // The row is what later passes read the object's size and bitmap
             // out of. A proof commits no bytes, so an object first met this way
-            // is recorded as held-nothing rather than not held at all.
-            if self.blob(root)?.is_none() {
-                let empty = ranges_to_bitmap(&ChunkRanges::empty(), groups);
-                self.write_blob_row(root, size, false, Some(empty), None, now)?;
-            }
+            // is recorded as held-nothing rather than not held at all — and the
+            // recording is a union of nothing, so a fetch that raced this proof
+            // into the same root does not have its groups erased by it.
+            //
+            // The size in that row is a claim off an entry, not something this
+            // proof established: an object's tree is the same shape for every
+            // size inside its last 1 KiB chunk, so a peer can overstate a root
+            // by a few bytes and have the proof verify anyway. Nothing durable
+            // may rest on it, which is what [`BlobRow::size_is_attested`] is
+            // for — until the final group is held, the next writer's size wins.
+            self.commit_groups(root, size, &ChunkRanges::empty(), None, now)?;
         }
-        Ok(proof.proven)
+        Ok(Proven {
+            root: *root,
+            subtrees: proof.proven,
+        })
     }
 
     /// The chaining values this object's tree holds at the given spans.
@@ -672,21 +717,29 @@ impl Store {
 
     // ---- promotion --------------------------------------------------------
 
-    /// Commits the donor's bytes for every proven subtree they turn out to
-    /// match (§3.4).
+    /// Commits the donor's bytes for every proven subtree its tree turns out to
+    /// agree with (§3.4).
     ///
-    /// For each subtree, the donor's bytes at the same offsets are read, hashed
-    /// at their place in the *new* object's tree, and compared with the
-    /// chaining value a proof established. Only on a match are the bytes
-    /// committed: payload, interior tree nodes, and the bitmap bit, in that
-    /// order and fsynced before the bitmap advances — the same discipline as
-    /// [`Store::write_slice`](crate::Store::write_slice), so a torn pass
-    /// resumes instead of restarting.
+    /// For each subtree, the chaining value the donor's own outboard holds at
+    /// the same position is compared with the chaining value a proof chained to
+    /// the new object's root. Equal chaining values are equal bytes, so on a
+    /// match the run is copied straight across — payload, interior tree nodes,
+    /// and the bitmap bit, in that order and fsynced before the bitmap advances,
+    /// the same discipline as [`Store::write_slice`](crate::Store::write_slice)
+    /// so a torn pass resumes instead of restarting.
     ///
-    /// The re-hash is not ceremony. It closes the gap between "the donor's
-    /// outboard said these bytes were right" and "the bytes on the disk still
-    /// are": a donor whose payload rotted under a correct outboard fails here,
-    /// and its groups fall through to the network fetch.
+    /// Two positional reads per span, and a copy the kernel may not even have to
+    /// perform: this is what makes an update cost the size of its change rather
+    /// than the size of the object. The donor's bytes are not read back and
+    /// re-hashed — they were verified when they entered the CAS, and the module
+    /// header says why that is where the checking belongs.
+    ///
+    /// Two shapes of subtree are promotable, and between them they cover
+    /// everything the descent produces: a whole subtree, whose chaining value is
+    /// comparable across objects at all (§3.3), and a single group, which is
+    /// comparable whenever both objects run the same distance past its start.
+    /// A multi-group subtree cut short by the end of the object is neither, and
+    /// is left to the leaf-level round that follows it.
     ///
     /// Returns the groups newly committed.
     pub fn promote(
@@ -694,9 +747,19 @@ impl Store {
         root: &Hash,
         size: u64,
         donor: &Donor,
-        proven: &[ProvenSubtree],
+        proven: &Proven,
         now: i64,
     ) -> Result<ChunkRanges> {
+        // A proof of one object is not a proof of another, however alike their
+        // trees. Two objects of a size share a shape, so every positional check
+        // below would pass for the wrong proof and the promotion would fill
+        // this object with a stranger's bytes and mark it complete (§5.1).
+        if proven.root != *root {
+            return Err(StoreError::Verification {
+                root: *root,
+                reason: format!("a proof of {} is not a proof of this object", proven.root),
+            });
+        }
         let groups = group_count(size);
         // Inline blobs never delta (§4): one group is smaller than the round
         // trip that would discover it could be reused.
@@ -705,7 +768,7 @@ impl Store {
         }
         let existing = self.blob(root)?;
         if let Some(row) = &existing {
-            if row.size != size {
+            if row.size != size && row.size_is_attested() {
                 return Err(StoreError::Verification {
                     root: *root,
                     reason: format!("size mismatch: have {}, offered {}", row.size, size),
@@ -733,7 +796,7 @@ impl Store {
         };
 
         let mut promoted = ChunkRanges::empty();
-        for subtree in proven {
+        for subtree in &proven.subtrees {
             let Some(node) = Subtree::locate(&tree, groups, subtree.start, subtree.groups) else {
                 // Not a subtree of this object: a caller mixing up two objects'
                 // proofs, which is a bug rather than an attack, but either way
@@ -741,27 +804,61 @@ impl Store {
                 continue;
             };
             // A subtree that overlaps groups this node has already verified is
-            // left alone entirely. Writing donor bytes over a verified group to
-            // find out whether they were right would risk the one thing the
-            // bitmap promises, and the groups around it come back around at the
-            // leaf level anyway.
+            // left alone entirely. Copying donor bytes over a verified group
+            // would risk the one thing the bitmap promises, and the groups
+            // around it come back around at the leaf level anyway.
             if held.overlaps(subtree.start, subtree.end()) {
                 continue;
             }
-            let (_, end_byte) = node.byte_range(size);
+            if node.groups > 1 && !node.is_whole(size) {
+                continue;
+            }
+            let (start_byte, end_byte) = node.byte_range(size);
             if end_byte > donor.size || !donor.held.covers(subtree.start, subtree.end()) {
                 continue;
             }
-
-            let mut nodes = Vec::new();
-            let cv = match self.absorb_subtree(&donor, &mut payload, size, node, &mut nodes) {
-                Ok(cv) => cv,
-                // A donor that cannot be read where it said it could is not an
-                // error in the fetch, just a donor with nothing to give here.
-                Err(StoreError::Io(_)) => continue,
-                Err(e) => return Err(e),
+            // The donor's own word for this run, out of the tree it was given
+            // when its bytes were verified into the CAS. `None` means it cannot
+            // speak to the position at all — its tree is shaped differently
+            // there, or the run is the whole of it and so has no chaining value
+            // (§2); a value that differs means the bytes differ.
+            let donor_cv = match cv_at(
+                &donor.root,
+                &donor.outboard,
+                donor.groups,
+                node.start,
+                node.span,
+            ) {
+                Ok(Some(cv)) => cv,
+                Ok(None) => continue,
+                // A donor whose tree cannot be read where it said it could is
+                // not an error in the fetch, just a donor with nothing to give.
+                Err(e) => {
+                    tracing::debug!(donor = %donor.root, error = %e, "donor tree unreadable");
+                    continue;
+                }
             };
-            if cv != subtree.cv {
+            if donor_cv != subtree.cv {
+                continue;
+            }
+
+            // Everything from here on writes, and everything that decides
+            // *whether* to write is above: the comparison happens strictly
+            // before a byte of this run lands in the payload. Judging after
+            // writing — as an earlier shape of this did — means a run that
+            // turns out not to match has already overwritten whatever was at
+            // those offsets, and a group another writer had just verified into
+            // the bitmap becomes a bit that lies (§6.2).
+
+            // The nodes *under* the run come across as well, or the groups this
+            // pass gains could be held and not served (§3.4, §6.3).
+            let mut nodes = Vec::new();
+            if let Err(e) = copy_subtree_nodes(&donor, node, subtree.cv, &mut nodes) {
+                tracing::debug!(donor = %donor.root, error = %e, "donor tree not copied");
+                continue;
+            }
+            if let Err(e) = copy_run(&donor.payload, &mut payload, start_byte, end_byte) {
+                tracing::debug!(donor = %donor.root, error = %e, "donor payload not copied");
                 continue;
             }
             for (node, pair) in nodes {
@@ -782,92 +879,48 @@ impl Store {
         outboard.sync()?;
         let _ = fsync_file(&payload.0);
         let _ = fsync_file(&outboard.data.0);
-        let verified = held.union(&promoted);
-        let complete = verified.count() >= groups;
-        self.write_blob_row(
-            root,
-            size,
-            complete,
-            (!complete).then(|| ranges_to_bitmap(&verified, groups)),
-            None,
-            now,
-        )?;
+        self.commit_groups(root, size, &promoted, None, now)?;
         Ok(promoted)
     }
 
-    /// Reads one subtree out of a donor, writing it into the object's payload
-    /// and computing its chaining value and interior nodes on the way.
-    ///
-    /// Group by group, so a 16 MiB span costs 16 KiB of memory; depth-first, so
-    /// the interior nodes come out in the order the outboard wants them. The
-    /// nodes are handed back rather than saved because none of this is trusted
-    /// until the chaining value at the top of it matches.
-    fn absorb_subtree(
-        &self,
-        donor: &OpenDonor,
-        payload: &mut DataFile,
-        size: u64,
-        node: Subtree,
-        nodes: &mut Vec<(TreeNode, [u8; PROOF_NODE_LEN])>,
-    ) -> Result<Cv> {
-        if node.groups == 1 {
-            let (start, end) = node.byte_range(size);
-            let mut buffer = vec![0u8; (end - start) as usize];
-            donor.bytes.read_exact_at(start, &mut buffer)?;
-            payload.write_all_at(start, &buffer)?;
-            return Ok(group_cv(start, &buffer));
-        }
-        let (left, right) = node
-            .children()
-            .ok_or_else(|| StoreError::invalid("a multi-group subtree has no children"))?;
-        let left_cv = self.absorb_subtree(donor, payload, size, left, nodes)?;
-        let right_cv = self.absorb_subtree(donor, payload, size, right, nodes)?;
-        let mut pair = [0u8; PROOF_NODE_LEN];
-        pair[..32].copy_from_slice(left_cv.as_bytes());
-        pair[32..].copy_from_slice(right_cv.as_bytes());
-        nodes.push((node.node, pair));
-        Ok(join_cvs(&left_cv, &right_cv))
-    }
-
     /// Opens a donor for reading, or reports that it has nothing to offer.
+    ///
+    /// An inline blob is turned away here rather than special-cased later: a
+    /// blob that fits in the index is a single chunk group, and a single group's
+    /// only hash is its object's root, which carries BLAKE3's root flag and can
+    /// therefore equal no chaining value of anything (§2). It could never match,
+    /// so it is never opened.
     fn open_donor(&self, donor: &Donor) -> Result<Option<OpenDonor>> {
-        match donor {
-            Donor::Object(root) => {
-                let Some(row) = self.blob(root)? else {
-                    return Ok(None);
-                };
-                let held = row.verified_groups();
-                if held.is_empty() {
-                    return Ok(None);
-                }
-                let bytes = match &row.inline {
-                    Some(data) => DonorBytes::Inline(data.clone()),
-                    None => match File::open(self.blob_path(root)) {
-                        Ok(file) => DonorBytes::OnDisk(file),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                        Err(e) => return Err(e.into()),
-                    },
-                };
-                Ok(Some(OpenDonor {
-                    bytes,
-                    held,
-                    size: row.size,
-                }))
-            }
-            Donor::File(path) => {
-                let file = match File::open(path) {
-                    Ok(file) => file,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                    Err(e) => return Err(e.into()),
-                };
-                let size = file.metadata()?.len();
-                Ok(Some(OpenDonor {
-                    bytes: DonorBytes::OnDisk(file),
-                    held: ChunkRanges::single(0, group_count(size)),
-                    size,
-                }))
-            }
+        let root = donor.root();
+        let Some(row) = self.blob(&root)? else {
+            return Ok(None);
+        };
+        let held = row.verified_groups();
+        let groups = group_count(row.size);
+        if held.is_empty() || row.inline.is_some() || groups <= 1 {
+            return Ok(None);
         }
+        let (payload, outboard) = match (
+            File::open(self.blob_path(&root)),
+            File::open(self.outboard_path(&root)),
+        ) {
+            (Ok(payload), Ok(outboard)) => (payload, outboard),
+            // A donor the GC took between the plan and the promotion is a donor
+            // with nothing to give, not a failure of the fetch.
+            _ => return Ok(None),
+        };
+        Ok(Some(OpenDonor {
+            root,
+            payload,
+            outboard: PreOrderOutboard {
+                root: blake3::Hash::from_bytes(root.0),
+                tree: Self::tree(row.size),
+                data: DataFile(outboard),
+            },
+            held,
+            size: row.size,
+            groups,
+        }))
     }
 
     /// Opens (creating if need be) the sparse payload and outboard of an object
@@ -884,20 +937,127 @@ impl Store {
             .truncate(false)
             .open(&payload_path)?;
         payload.set_len(size)?;
+        Ok((payload, self.open_sparse_outboard(root, tree)?))
+    }
+
+    /// Opens (creating if need be) just the sparse outboard, for a proof that
+    /// has a tree to record and no bytes to put under it.
+    fn open_sparse_outboard(&self, root: &Hash, tree: BaoTree) -> Result<File> {
+        let path = self.outboard_path(root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let outboard = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.outboard_path(root))?;
+            .open(&path)?;
         outboard.set_len(tree.outboard_size())?;
-        Ok((payload, outboard))
+        Ok(outboard)
     }
+}
+
+/// Copies a whole subtree's interior nodes out of a donor's tree, checking on
+/// the way up that they are the tree the proof proved.
+///
+/// The new object needs them: a span promoted without the nodes beneath it is a
+/// span this node holds and cannot serve, which is the worse half of advertising
+/// it (§3.4, §6.3). They are copied rather than recomputed from the payload
+/// because a pair is 64 bytes per 16 KiB group — 1/256 of the bytes it describes
+/// — so reading the tree is cheap where reading the object is not.
+///
+/// The recombination on the way back up is what keeps the copy honest: each pair
+/// has to hash to the value its parent already committed to, up to the chaining
+/// value the proof chained to the new object's root. A donor whose *outboard*
+/// rotted therefore cannot poison a tree this node will go on to serve, and the
+/// check costs one 64-byte hash per group rather than a pass over the bytes.
+///
+/// Only ever called for a whole subtree, whose shape — a full binary tree of
+/// `span` groups at a fixed position — is the same in every object that contains
+/// it, which is why the donor's nodes land at the same [`TreeNode`] here.
+fn copy_subtree_nodes(
+    donor: &OpenDonor,
+    node: Subtree,
+    expected: Cv,
+    out: &mut Vec<(TreeNode, [u8; PROOF_NODE_LEN])>,
+) -> Result<()> {
+    if node.groups <= 1 {
+        // A single group has no interior, and its chaining value came from the
+        // pair its parent already contributed.
+        return Ok(());
+    }
+    let pair = load_from_outboard(&donor.outboard, &donor.root, &node.node)?;
+    let left = Cv(pair[..32].try_into().expect("32 of 64 bytes"));
+    let right = Cv(pair[32..].try_into().expect("32 of 64 bytes"));
+    if join_cvs(&left, &right) != expected {
+        return Err(StoreError::Verification {
+            root: donor.root,
+            reason: format!(
+                "the donor's tree at group {} does not hash to the value above it",
+                node.start
+            ),
+        });
+    }
+    out.push((node.node, pair));
+    let (left_child, right_child) = node
+        .children()
+        .ok_or_else(|| StoreError::invalid("a multi-group subtree has no children"))?;
+    copy_subtree_nodes(donor, left_child, left, out)?;
+    copy_subtree_nodes(donor, right_child, right, out)
+}
+
+/// How much of a run is held in memory when the kernel will not move it.
+const COPY_RUN_CHUNK: u64 = 256 * 1024;
+
+/// Copies a byte run from a donor's payload into an object's sparse payload.
+///
+/// `copy_file_range` first. Both files are in the CAS directory and therefore on
+/// one filesystem, which is the condition under which Linux routes the call
+/// through the filesystem's own remap: on btrfs, XFS and bcachefs an aligned run
+/// becomes a **reflink**, so the bytes are shared rather than moved and the new
+/// object costs no space wherever it agrees with the old one. A run of whole
+/// 16 KiB groups at 16 KiB offsets satisfies any block size a filesystem is
+/// likely to have; the short tail group of an object does not, and the kernel
+/// quietly copies that instead of sharing it. Everywhere else — ext4, an old
+/// kernel, a platform without the syscall — the call copies without a bounce
+/// through user space, or refuses, and the loop below finishes the job by hand.
+///
+/// Either way the caller has already established that these bytes belong here:
+/// the run's chaining value, in the donor's tree, is one a proof chained to the
+/// new object's root.
+fn copy_run(donor: &File, payload: &mut DataFile, start: u64, end: u64) -> std::io::Result<()> {
+    let mut offset = start;
+    #[cfg(target_os = "linux")]
+    while offset < end {
+        let mut from = offset;
+        let mut to = offset;
+        let len = usize::try_from(end - offset).unwrap_or(usize::MAX);
+        match rustix::fs::copy_file_range(donor, Some(&mut from), &payload.0, Some(&mut to), len) {
+            // A copy of nothing means the donor ended early: the fallback will
+            // read it and report the real error.
+            Ok(0) => break,
+            Ok(moved) => offset += moved as u64,
+            Err(_) => break,
+        }
+    }
+    if offset < end {
+        let mut buffer = vec![0u8; COPY_RUN_CHUNK.min(end - offset) as usize];
+        while offset < end {
+            let take = COPY_RUN_CHUNK.min(end - offset) as usize;
+            let piece = &mut buffer[..take];
+            donor.read_exact_at(offset, piece)?;
+            payload.write_all_at(offset, piece)?;
+            offset += take as u64;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synch_core::group_cv;
 
     /// One chunk group, the unit everything here is counted in.
     const GROUP: usize = CHUNK_GROUP_SIZE as usize;
@@ -1006,8 +1166,8 @@ mod tests {
             .write_proof(&root, size, &served, 0, &encoded, 0)
             .unwrap();
 
-        assert_eq!(proven.len(), group_count(size) as usize);
-        for subtree in &proven {
+        assert_eq!(proven.subtrees.len(), group_count(size) as usize);
+        for subtree in &proven.subtrees {
             assert_eq!(subtree.groups, 1);
             let start = subtree.start as usize * GROUP;
             let end = (start + GROUP).min(bytes.len());
@@ -1051,8 +1211,8 @@ mod tests {
         let proven = fetcher
             .write_proof(&root, size, &served, 2, &encoded, 0)
             .unwrap();
-        assert_eq!(proven.len(), 5);
-        for (index, subtree) in proven.iter().enumerate() {
+        assert_eq!(proven.subtrees.len(), 5);
+        for (index, subtree) in proven.subtrees.iter().enumerate() {
             assert_eq!(subtree.start, index as u64 * 4);
             assert_eq!(subtree.groups, 4);
             assert!(subtree.whole);
@@ -1082,9 +1242,14 @@ mod tests {
             .write_proof(&new_root, size, &served, 2, &encoded, 0)
             .unwrap();
 
-        let spans: Vec<(u64, u64)> = proven.iter().map(|s| (s.start, s.groups)).collect();
+        let spans: Vec<(u64, u64)> = proven
+            .subtrees
+            .iter()
+            .map(|s| (s.start, s.groups))
+            .collect();
         let donor_cvs = store.subtree_cvs(&old_root, &spans).unwrap();
         let equal: Vec<u64> = proven
+            .subtrees
             .iter()
             .zip(&donor_cvs)
             .filter(|(subtree, cv)| **cv == Some(subtree.cv))
@@ -1120,7 +1285,7 @@ mod tests {
             .write_proof(&new_root, size, &served, 0, &encoded, 0)
             .unwrap();
         let promoted = fetcher
-            .promote(&new_root, size, &Donor::Object(old_root), &proven, 0)
+            .promote(&new_root, size, &Donor(old_root), &proven, 0)
             .unwrap();
 
         assert_eq!(promoted, all.difference(&ChunkRanges::single(5, 6)));
@@ -1174,9 +1339,9 @@ mod tests {
         let spans = fetcher
             .write_proof(&new_root, size, &served, 4, &encoded, 0)
             .unwrap();
-        assert_eq!(spans.len(), 4);
+        assert_eq!(spans.subtrees.len(), 4);
         let promoted = fetcher
-            .promote(&new_root, size, &Donor::Object(old_root), &spans, 0)
+            .promote(&new_root, size, &Donor(old_root), &spans, 0)
             .unwrap();
         assert_eq!(promoted.count(), 48, "three whole spans: {promoted:?}");
 
@@ -1216,10 +1381,13 @@ mod tests {
         let proven = fetcher
             .write_proof(&new_root, size, &served, 0, &encoded, 0)
             .unwrap();
-        assert!(!proven.last().unwrap().whole, "the tail group is short");
+        assert!(
+            !proven.subtrees.last().unwrap().whole,
+            "the tail group is short"
+        );
 
         let promoted = fetcher
-            .promote(&new_root, size, &Donor::Object(old_root), &proven, 0)
+            .promote(&new_root, size, &Donor(old_root), &proven, 0)
             .unwrap();
         assert!(
             promoted.contains(6),
@@ -1228,83 +1396,235 @@ mod tests {
         assert!(!promoted.contains(0), "the changed group is not");
     }
 
-    /// A file on disk is a donor too, with no CAS row and no outboard behind
-    /// it — the case a mirror meets when the object it materialized has since
-    /// been collected (§3.2.4).
-    #[test]
-    fn a_plain_file_can_be_the_donor() {
-        let (dir, provider) = store();
-        let (_d2, fetcher) = store();
-        let old = data(10 * GROUP);
-        let mut new = old.clone();
-        new[3 * GROUP..4 * GROUP].fill(0x5a);
-        let path = dir.path().join("previous.bin");
-        std::fs::write(&path, &old).unwrap();
-        let new_root = provider.ingest_bytes(&new, 0).unwrap();
-        let size = new.len() as u64;
-
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider.encode_proof(&new_root, &all, 0).unwrap();
-        let proven = fetcher
-            .write_proof(&new_root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        let promoted = fetcher
-            .promote(&new_root, size, &Donor::File(path), &proven, 0)
-            .unwrap();
-        assert_eq!(promoted, all.difference(&ChunkRanges::single(3, 4)));
-    }
-
-    /// A donor whose payload rotted under a correct outboard is caught by the
-    /// re-hash at promotion time, and only the rotted groups are lost.
+    /// A matched run is copied across whole — the aligned middle of an object
+    /// and the short group on the end of it alike — and what comes out reads
+    /// back as the new version, byte for byte.
     ///
-    /// This is the difference between believing a donor's tree and believing
-    /// its bytes. The donor's outboard is perfectly consistent — it was written
-    /// by an honest ingest — and the group it describes is no longer what is on
-    /// the disk. Nothing but hashing the bytes again would notice.
+    /// The copy is `copy_file_range` where the kernel will take it, which on a
+    /// filesystem that shares extents moves no data at all. Nothing here asserts
+    /// which of those happened: the point of the fallback chain is that the
+    /// object is the same either way, so what is asserted is the object.
     #[test]
-    fn rotted_donor_bytes_are_refused_and_left_to_the_fetch() {
+    fn a_matched_run_is_copied_across_whole_including_the_tail_group() {
         let (_d1, provider) = store();
         let (_d2, fetcher) = store();
-        let old = data(8 * GROUP);
+        // A size with a short last group, and more than one span's worth of
+        // whole ones in front of it.
+        let old = data(20 * GROUP + 777);
         let mut new = old.clone();
-        new[7 * GROUP..].fill(0x11);
+        new[9 * GROUP..10 * GROUP].fill(0x5a);
         let old_root = fetcher.ingest_bytes(&old, 0).unwrap();
         let new_root = provider.ingest_bytes(&new, 0).unwrap();
         let size = new.len() as u64;
-
-        // A bit flips in the donor's payload, behind the store's back.
-        let mut raw = std::fs::read(fetcher.blob_path(&old_root)).unwrap();
-        raw[2 * GROUP + 9] ^= 0xff;
-        std::fs::write(fetcher.blob_path(&old_root), &raw).unwrap();
-
         let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider.encode_proof(&new_root, &all, 0).unwrap();
-        let proven = fetcher
-            .write_proof(&new_root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        let promoted = fetcher
-            .promote(&new_root, size, &Donor::Object(old_root), &proven, 0)
-            .unwrap();
 
-        assert!(!promoted.contains(2), "the rotted group is refused");
-        assert!(
-            !promoted.contains(7),
-            "the changed group has nothing to give"
+        // The descent as the fetcher runs it: spans first, then leaves in what
+        // the spans did not settle.
+        let mut promoted = ChunkRanges::empty();
+        for level in [2u8, 0] {
+            let want = all.difference(&promoted);
+            let (encoded, served) = provider.encode_proof(&new_root, &want, level).unwrap();
+            let proven = fetcher
+                .write_proof(&new_root, size, &served, level, &encoded, 0)
+                .unwrap();
+            let got = fetcher
+                .promote(&new_root, size, &Donor(old_root), &proven, 0)
+                .unwrap();
+            promoted = promoted.union(&got);
+        }
+        assert_eq!(
+            promoted,
+            all.difference(&ChunkRanges::single(9, 10)),
+            "every group but the edited one, the short tail included"
+        );
+        assert!(promoted.contains(20), "the short tail group came across");
+
+        // The bytes that came across are the new version's bytes, and they
+        // verify: a read is a bao decode against the root.
+        assert_eq!(
+            fetcher.read_range(&new_root, 0, 8 * GROUP as u64).unwrap(),
+            &new[..8 * GROUP]
         );
         assert_eq!(
-            promoted.count(),
-            6,
-            "the other six are promoted: {promoted:?}"
+            fetcher
+                .read_range(&new_root, 20 * GROUP as u64, 777)
+                .unwrap(),
+            &new[20 * GROUP..]
         );
-        // Rot is per-extent: the donor keeps supplying the groups it still has
-        // right, and what it lost goes back to the network.
-        assert_eq!(fetcher.read_range(&new_root, 0, 10).unwrap(), &new[..10]);
+        // And the one group that changed finishes it off.
+        let missing = all.difference(&promoted);
+        let (encoded, served) = provider.encode_slice(&new_root, &missing).unwrap();
+        fetcher
+            .write_slice(&new_root, size, &served, &encoded, 0)
+            .unwrap();
+        assert!(fetcher.blob(&new_root).unwrap().unwrap().complete);
+        assert_eq!(fetcher.read_all(&new_root).unwrap(), new);
+    }
+
+    /// A donor whose *tree* rotted cannot poison the tree being built.
+    ///
+    /// Promotion believes a donor's bytes on the strength of its outboard, so
+    /// the outboard is the thing that has to be self-consistent: the nodes
+    /// copied out from under a matched span are recombined on the way up and
+    /// have to arrive at the chaining value the proof proved. A flipped bit
+    /// below the span survives the span's own comparison — that value is read
+    /// from the pair *above* it — and is caught here. The span is left to the
+    /// network, and the spans either side of it are unaffected.
+    #[test]
+    fn a_rotted_donor_tree_is_refused_and_left_to_the_fetch() {
+        let (_d1, provider) = store();
+        let (_d2, fetcher) = store();
+        let old = data(16 * GROUP);
+        let mut new = old.clone();
+        new[15 * GROUP..].fill(0x11);
+        let old_root = fetcher.ingest_bytes(&old, 0).unwrap();
+        let new_root = provider.ingest_bytes(&new, 0).unwrap();
+        let size = new.len() as u64;
+        let all = ChunkRanges::single(0, group_count(size));
+
+        // Spans of four groups. A bit flips inside the donor's outboard, under
+        // the span covering groups 4..8, behind the store's back.
+        let (encoded, served) = provider.encode_proof(&new_root, &all, 2).unwrap();
+        let proven = fetcher
+            .write_proof(&new_root, size, &served, 2, &encoded, 0)
+            .unwrap();
+        let span = proven.subtrees.iter().find(|s| s.start == 4).unwrap();
+        // The node one level under that span, which its own comparison cannot
+        // see: the span's value comes out of the pair above it.
+        let inner = Subtree::locate(&Store::tree(size), 16, 4, 2).unwrap().node;
+        let outboard = outboard_of(&fetcher, &old_root, size);
+        let offset = outboard.tree.pre_order_offset(inner).unwrap() * PROOF_NODE_LEN as u64;
+        let mut raw = std::fs::read(fetcher.outboard_path(&old_root)).unwrap();
+        raw[offset as usize + 8 + 3] ^= 0xff;
+        std::fs::write(fetcher.outboard_path(&old_root), &raw).unwrap();
+
+        let promoted = fetcher
+            .promote(&new_root, size, &Donor(old_root), &proven, 0)
+            .unwrap();
+        assert!(
+            !promoted.overlaps(span.start, span.end()),
+            "the span over the rotted tree is refused: {promoted:?}"
+        );
+        assert!(
+            promoted.contains(0) && promoted.contains(8),
+            "the spans either side of it are not: {promoted:?}"
+        );
+        // What was refused goes back to the network, and the object completes.
         let missing = all.difference(&promoted);
         let (encoded, served) = provider.encode_slice(&new_root, &missing).unwrap();
         fetcher
             .write_slice(&new_root, size, &served, &encoded, 0)
             .unwrap();
         assert_eq!(fetcher.read_all(&new_root).unwrap(), new);
+    }
+
+    /// A proof of one object cannot be spent on another.
+    ///
+    /// Two objects of a size have the same tree, so every positional check
+    /// promotion makes — does this subtree exist here, is it whole, does the
+    /// donor reach that far — passes for the wrong proof just as readily as for
+    /// the right one. What would come out is an object filled with a stranger's
+    /// bytes and marked complete: advertised, and unreadable by anyone who
+    /// asked for it. The root travelling with the subtrees is what makes the
+    /// refusal possible.
+    #[test]
+    fn a_proof_of_another_object_is_refused() {
+        let (_d1, provider) = store();
+        let (_d2, fetcher) = store();
+        let mine = data(8 * GROUP);
+        let mut theirs = mine.clone();
+        theirs[0] ^= 0xff;
+        let size = mine.len() as u64;
+        let my_root = provider.ingest_bytes(&mine, 0).unwrap();
+        let their_root = provider.ingest_bytes(&theirs, 0).unwrap();
+        let donor = fetcher.ingest_bytes(&mine, 0).unwrap();
+
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = provider.encode_proof(&my_root, &all, 0).unwrap();
+        let proven = fetcher
+            .write_proof(&my_root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert!(matches!(
+            fetcher.promote(&their_root, size, &Donor(donor), &proven, 0),
+            Err(StoreError::Verification { .. })
+        ));
+        assert!(
+            fetcher.blob(&their_root).unwrap().is_none(),
+            "nothing was written for the object the proof was not about"
+        );
+    }
+
+    /// A size a peer merely claimed does not brick a root.
+    ///
+    /// An object's tree is the same shape for every size inside its last 1 KiB
+    /// chunk, so an entry that overstates an honest root by a hundred bytes
+    /// yields a proof that verifies against that root perfectly well. The row
+    /// it leaves behind used to record the lie, and every honest writer of the
+    /// same root afterwards — from any origin, on any node that touched the
+    /// path — was refused with "size mismatch" for good, with nothing to
+    /// collect the row because the honest entry still named it.
+    #[test]
+    fn an_overstated_size_does_not_brick_a_root() {
+        let (_d1, provider) = store();
+        let (_d2, victim) = store();
+        let bytes = data(8 * GROUP + 500);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        // A hundred bytes further on, inside the same chunk: the same tree.
+        let lie = size + 100;
+        assert_eq!(group_count(lie), group_count(size));
+
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = provider.encode_proof(&root, &all, 0).unwrap();
+        victim
+            .write_proof(&root, lie, &served, 0, &encoded, 0)
+            .expect("the proof verifies: the lie is invisible in the tree");
+        assert_eq!(victim.blob(&root).unwrap().unwrap().size, lie);
+
+        // The honest fetch that follows replaces the claim rather than being
+        // refused by it, and the object completes.
+        let (encoded, served) = provider.encode_slice(&root, &all).unwrap();
+        victim
+            .write_slice(&root, size, &served, &encoded, 0)
+            .unwrap();
+        let row = victim.blob(&root).unwrap().unwrap();
+        assert!(row.complete);
+        assert_eq!(row.size, size);
+        assert_eq!(victim.read_all(&root).unwrap(), bytes);
+
+        // And once the last group is held, the size *is* attested: a later
+        // claim of a different one is refused, as it always was.
+        assert!(matches!(
+            victim.write_slice(&root, lie, &served, &encoded, 0),
+            Err(StoreError::Verification { .. })
+        ));
+    }
+
+    /// An inline donor has nothing to say and is not consulted.
+    ///
+    /// A blob that fits in the index is one chunk group, and a single group's
+    /// only hash is its object's root — root-flagged, and so equal to no
+    /// chaining value anywhere (§2). Offering one is not an error; it simply
+    /// promotes nothing.
+    #[test]
+    fn an_inline_donor_promotes_nothing() {
+        let (_d1, provider) = store();
+        let (_d2, fetcher) = store();
+        let new = data(8 * GROUP);
+        let tiny = fetcher.ingest_bytes(&data(100), 0).unwrap();
+        assert!(fetcher.blob(&tiny).unwrap().unwrap().inline.is_some());
+        let new_root = provider.ingest_bytes(&new, 0).unwrap();
+        let size = new.len() as u64;
+
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = provider.encode_proof(&new_root, &all, 0).unwrap();
+        let proven = fetcher
+            .write_proof(&new_root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        let promoted = fetcher
+            .promote(&new_root, size, &Donor(tiny), &proven, 0)
+            .unwrap();
+        assert!(promoted.is_empty(), "{promoted:?}");
     }
 
     /// A tampered proof is rejected whole, and commits nothing.
@@ -1402,7 +1722,7 @@ mod tests {
         let proven = fetcher
             .write_proof(&root, size, &served, 0, &encoded, 0)
             .unwrap();
-        assert_eq!(proven.len(), 8);
+        assert_eq!(proven.subtrees.len(), 8);
     }
 
     /// Objects too small to have a tree have nothing to prove, and say so
@@ -1420,7 +1740,13 @@ mod tests {
             // And promoting into one is a no-op rather than an error: inline
             // blobs never delta (§4).
             let promoted = store
-                .promote(&root, bytes.len() as u64, &Donor::Object(root), &[], 0)
+                .promote(
+                    &root,
+                    bytes.len() as u64,
+                    &Donor(root),
+                    &Proven::none(root),
+                    0,
+                )
                 .unwrap();
             assert!(promoted.is_empty());
         }

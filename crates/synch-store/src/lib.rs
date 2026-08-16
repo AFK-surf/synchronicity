@@ -19,7 +19,7 @@ pub use db::{DeviceKey, KeyState, Store, Txn, CAS_DIR, DB_FILE};
 pub use error::{Result, StoreError};
 pub use gc::{GcStats, TrieStats};
 pub use heads::{Equivocation, Slot, StoredHead};
-pub use proof::{Donor, ProvenSubtree};
+pub use proof::{Donor, Proven, ProvenSubtree};
 pub use recovery::ObservedHead;
 pub use schema::SCHEMA_VERSION;
 pub use unified::{Selection, Version, VersionPolicy, VersionSet};

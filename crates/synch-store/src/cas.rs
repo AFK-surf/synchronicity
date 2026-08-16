@@ -99,6 +99,30 @@ impl BlobRow {
         }
     }
 
+    /// True if bytes on this disk actually attest to the size this row records.
+    ///
+    /// Only the last group can. Every other group's chaining value is the same
+    /// whatever the object's total length, so holding the first half of an
+    /// object says a great deal about its content and nothing at all about
+    /// where it ends; the final group is short by exactly the amount the size
+    /// determines, and is the one place a wrong size cannot survive.
+    ///
+    /// This is what keeps a peer from bricking a root. An object's tree has the
+    /// same shape for every size inside its last 1 KiB chunk, so an entry that
+    /// overstates an honest root by a few bytes yields a proof that verifies —
+    /// and the row it creates would then refuse every honest writer of that
+    /// root forever with "size mismatch", on every node that ever touched the
+    /// poisoned path, with nothing to collect the row because the honest entry
+    /// still references it. A size no group attests to is a claim, not a fact,
+    /// and the next writer's claim replaces it (§5.1, §6.2).
+    pub(crate) fn size_is_attested(&self) -> bool {
+        if self.complete {
+            return true;
+        }
+        let last = group_count(self.size) - 1;
+        self.verified_groups().contains(last)
+    }
+
     /// The advertisement this holder should publish for the object (§6.3).
     pub fn to_ad(&self) -> BlobAd {
         if self.complete {
@@ -142,6 +166,53 @@ fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
         ranges.push(GroupRange::new(s, groups));
     }
     ChunkRanges::from_ranges(ranges)
+}
+
+/// Writes an object's index row, creating it or replacing what it claimed.
+fn upsert_blob_row(
+    conn: &rusqlite::Connection,
+    root: &Hash,
+    size: u64,
+    complete: bool,
+    bitmap: Option<Vec<u8>>,
+    inline: Option<Vec<u8>>,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO blobs (root, size, complete, bitmap, inline, pinned, last_access)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+         ON CONFLICT(root) DO UPDATE SET
+           size = excluded.size,
+           complete = excluded.complete,
+           bitmap = excluded.bitmap,
+           inline = COALESCE(excluded.inline, blobs.inline),
+           last_access = excluded.last_access",
+        params![
+            root.as_bytes().to_vec(),
+            size as i64,
+            complete as i64,
+            bitmap,
+            inline,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+/// The groups an object's row currently claims, read on a given connection.
+fn held_groups(conn: &rusqlite::Connection, root: &Hash, total: u64) -> Result<ChunkRanges> {
+    let row: Option<(i64, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT complete, bitmap FROM blobs WHERE root = ?1",
+            params![root.as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((complete, _)) if complete != 0 => ChunkRanges::single(0, total),
+        Some((_, Some(bits))) => bitmap_to_ranges(&bits, total),
+        _ => ChunkRanges::empty(),
+    })
 }
 
 pub(crate) fn ranges_to_bitmap(ranges: &ChunkRanges, groups: u64) -> Vec<u8> {
@@ -277,25 +348,47 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO blobs (root, size, complete, bitmap, inline, pinned, last_access)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
-             ON CONFLICT(root) DO UPDATE SET
-               size = excluded.size,
-               complete = excluded.complete,
-               bitmap = excluded.bitmap,
-               inline = COALESCE(excluded.inline, blobs.inline),
-               last_access = excluded.last_access",
-            params![
-                root.as_bytes().to_vec(),
-                size as i64,
-                complete as i64,
-                bitmap,
+        upsert_blob_row(&self.conn(), root, size, complete, bitmap, inline, now)
+    }
+
+    /// Folds newly verified groups into an object's row, atomically (§10).
+    ///
+    /// Two writers of one root is the ordinary case rather than an exotic one:
+    /// a mirror pass, a `synch cat` and the gateway's range read all resolve to
+    /// the same content, and a promotion commits a whole span in a single step.
+    /// Reading the bitmap, unioning, and writing it back as three separate
+    /// statements loses one of two interleaved writers' progress every time —
+    /// harmlessly, because bits only ever grow and the bytes are already on the
+    /// disk, but the groups it dropped are then fetched all over again, and a
+    /// promotion's share of that loss is a whole span rather than a slice.
+    ///
+    /// So the read, the union and the write happen inside one transaction on
+    /// the store's single connection. The expensive part — decoding, hashing,
+    /// copying, fsyncing — stays outside it, as it must: this is a row update,
+    /// not a lock over the file IO that earned it.
+    pub(crate) fn commit_groups(
+        &self,
+        root: &Hash,
+        size: u64,
+        groups: &ChunkRanges,
+        inline: Option<Vec<u8>>,
+        now: i64,
+    ) -> Result<()> {
+        let total = group_count(size);
+        self.with_tx(|tx| {
+            let held = held_groups(tx, root, total)?;
+            let verified = held.union(groups);
+            let complete = verified.count() >= total;
+            upsert_blob_row(
+                tx,
+                root,
+                size,
+                complete,
+                (!complete).then(|| ranges_to_bitmap(&verified, total)),
                 inline,
-                now
-            ],
-        )?;
-        Ok(())
+                now,
+            )
+        })
     }
 
     // ---- index reads ------------------------------------------------------
@@ -585,7 +678,9 @@ impl Store {
 
         let existing = self.blob(root)?;
         if let Some(row) = &existing {
-            if row.size != size {
+            // A size no group attests to is a peer's claim rather than a fact,
+            // and yields to this writer's ([`BlobRow::size_is_attested`]).
+            if row.size != size && row.size_is_attested() {
                 return Err(StoreError::Verification {
                     root: *root,
                     reason: format!("size mismatch: have {}, offered {}", row.size, size),
@@ -619,19 +714,7 @@ impl Store {
                 root: *root,
                 reason: e.to_string(),
             })?;
-            let verified = existing
-                .map(|r| r.verified_groups())
-                .unwrap_or_else(ChunkRanges::empty)
-                .union(&served);
-            let complete = verified.count() >= groups;
-            self.write_blob_row(
-                root,
-                size,
-                complete,
-                (!complete).then(|| ranges_to_bitmap(&verified, groups)),
-                Some(buffer),
-                now,
-            )?;
+            self.commit_groups(root, size, &served, Some(buffer), now)?;
             return Ok(served);
         }
 
@@ -680,19 +763,7 @@ impl Store {
             let _ = fsync_file(&ob);
         }
 
-        let verified = existing
-            .map(|r| r.verified_groups())
-            .unwrap_or_else(ChunkRanges::empty)
-            .union(&served);
-        let complete = verified.count() >= groups;
-        self.write_blob_row(
-            root,
-            size,
-            complete,
-            (!complete).then(|| ranges_to_bitmap(&verified, groups)),
-            None,
-            now,
-        )?;
+        self.commit_groups(root, size, &served, None, now)?;
         Ok(served)
     }
 }
@@ -1058,6 +1129,39 @@ mod tests {
             store.read_all(&root),
             Err(StoreError::MissingBlob(_))
         ));
+    }
+
+    /// Two writers filling one object keep both halves of what they wrote.
+    ///
+    /// The same content root is reached by more than one path at once as a
+    /// matter of course — a mirror pass, a `synch cat`, the gateway's range
+    /// read — and each commits the groups it verified. Read the bitmap, union,
+    /// write it back as three separate statements and the later write erases
+    /// the earlier one's bits: harmless, since the bytes are on the disk either
+    /// way and bits only ever grow, but the groups it dropped are fetched all
+    /// over again, and a promotion's share of that loss is a whole span.
+    #[test]
+    fn concurrent_commits_of_disjoint_groups_keep_both() {
+        let (_d, store) = store();
+        let size = 64 * CHUNK_GROUP_SIZE;
+        let all = ChunkRanges::single(0, 64);
+
+        // Two halves, committed by two threads over the one connection, a few
+        // objects over so an interleaving is actually met.
+        for round in 0..16u8 {
+            let root = Hash::new(&[round]);
+            std::thread::scope(|scope| {
+                for half in [ChunkRanges::single(0, 32), ChunkRanges::single(32, 64)] {
+                    let (store, root) = (&store, &root);
+                    scope.spawn(move || store.commit_groups(root, size, &half, None, 0).unwrap());
+                }
+            });
+            assert_eq!(
+                store.blob(&root).unwrap().unwrap().verified_groups(),
+                all,
+                "round {round}: one writer's groups were lost"
+            );
+        }
     }
 
     #[test]

@@ -1033,20 +1033,19 @@ async fn adopting_a_deletion_refuses_a_path_outside_a_space() {
 /// One chunk group, so the delta tests can talk in the units the tree does.
 const GROUP: usize = 16 * 1024;
 
-/// An edit to a mirrored file moves the edit, and the mirror patches the copy
-/// it already has rather than rewriting it (`docs/DELTA-SYNC.md` §1, §3.5).
+/// An edit to a mirrored file moves the edit, and nothing else
+/// (`docs/DELTA-SYNC.md` §1, §3.4).
 ///
-/// The mirror holds the previous version twice over — in its CAS, because that
-/// is what the last pass fetched into, and on the disk, because that is what
-/// the last pass wrote. Both are donors. What has to cross the network is the
-/// new version's tree over the region that changed, and the group that changed;
-/// what has to be written is that group, into a clone of the file already
-/// there.
+/// The mirror holds the previous version in its CAS, because that is what the
+/// last pass fetched into, so the new version is *built* there out of the old
+/// one plus the group that changed — and what crosses the network is the new
+/// version's tree over the region that changed, and that group. The file then
+/// comes off the CAS object it was built in.
 ///
 /// The node is configured with a small `delta_min_size` so the test can work in
 /// megabytes rather than the 16 MiB an unconfigured node would insist on.
 #[tokio::test]
-async fn a_mirror_reuses_local_bytes_and_patches_the_file_it_already_has() {
+async fn a_mirror_reuses_local_bytes_when_a_file_it_holds_changes() {
     let nas = spawn("nas").await;
     let vps = spawn_with("vps", |config| config.delta_min_size = 32 * 1024).await;
     introduce(&[&nas, &vps]);
@@ -1065,8 +1064,10 @@ async fn a_mirror_reuses_local_bytes_and_patches_the_file_it_already_has() {
         .unwrap();
     let report = vps.node.sync_mirror(target.path()).await.unwrap();
     assert_eq!(report.written, 1, "{report:?}");
-    assert_eq!(report.patched, 0, "nothing was here to patch: {report:?}");
-    assert_eq!(report.reused_bytes, 0, "{report:?}");
+    assert_eq!(
+        report.reused_bytes, 0,
+        "nothing was here to reuse: {report:?}"
+    );
     assert_eq!(report.fetched_bytes, v1.len() as u64, "{report:?}");
     assert_eq!(std::fs::read(&mirrored).unwrap(), v1);
 
@@ -1080,10 +1081,6 @@ async fn a_mirror_reuses_local_bytes_and_patches_the_file_it_already_has() {
     let report = vps.node.sync_mirror(target.path()).await.unwrap();
     assert_eq!(report.written, 1, "{report:?}");
     assert_eq!(
-        report.patched, 1,
-        "the file on disk was patched: {report:?}"
-    );
-    assert_eq!(
         report.fetched_bytes, GROUP as u64,
         "only the edited group crossed the network: {report:?}"
     );
@@ -1094,8 +1091,7 @@ async fn a_mirror_reuses_local_bytes_and_patches_the_file_it_already_has() {
     );
     assert_eq!(std::fs::read(&mirrored).unwrap(), v2);
 
-    // The staging file is gone: a patched write leaves no more residue than a
-    // whole one does (§9.4).
+    // The staging file is gone (§9.4).
     let left: Vec<String> = std::fs::read_dir(target.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1105,7 +1101,7 @@ async fn a_mirror_reuses_local_bytes_and_patches_the_file_it_already_has() {
     // And the pass after it has nothing to do at all.
     let report = vps.node.sync_mirror(target.path()).await.unwrap();
     assert_eq!(report.current, 1, "{report:?}");
-    assert_eq!(report.written + report.patched, 0, "{report:?}");
+    assert_eq!(report.written, 0, "{report:?}");
 
     nas.node.shutdown().await.unwrap();
     vps.node.shutdown().await.unwrap();
@@ -1150,6 +1146,65 @@ async fn an_appended_file_transfers_only_what_was_appended() {
     );
     assert_eq!(report.reused_bytes, v1.len() as u64, "{report:?}");
     assert_eq!(std::fs::read(target.path().join("app.log")).unwrap(), v2);
+
+    nas.node.shutdown().await.unwrap();
+    vps.node.shutdown().await.unwrap();
+}
+
+/// The mirror's own copy stands in for a donor the CAS has thrown away
+/// (`docs/DELTA-SYNC.md` §3.2).
+///
+/// Donors are CAS objects, so a collector that took the previous version would
+/// ordinarily end delta for that path — even though the bytes of that version
+/// are sitting at the mirror's own destination, which is where the last pass
+/// put them. The pass notices that the file on the disk *is* the version the
+/// lineage named, ingests it back, and the update is CAS-to-CAS delta again.
+#[tokio::test]
+async fn a_mirror_re_ingests_its_own_copy_when_the_cas_has_dropped_it() {
+    let nas = spawn("nas").await;
+    let vps = spawn_with("vps", |config| config.delta_min_size = 32 * 1024).await;
+    introduce(&[&nas, &vps]);
+
+    nas.node.add_space("media", nas.space.path()).unwrap();
+    let v1 = big_payload(64 * GROUP);
+    let source = nas.space.path().join("disk.img");
+    std::fs::write(&source, &v1).unwrap();
+    nas.node.scan_publish_push().await.unwrap();
+    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
+
+    let target = tempfile::tempdir().unwrap();
+    let mirrored = target.path().join("disk.img");
+    vps.node
+        .add_mirror("media", target.path(), &VersionPolicy::Newest)
+        .unwrap();
+    vps.node.sync_mirror(target.path()).await.unwrap();
+    assert_eq!(std::fs::read(&mirrored).unwrap(), v1);
+
+    // The collector takes the version the mirror is sitting on. Nothing of it
+    // is left in the CAS, and the only copy of those bytes on this node is the
+    // mirrored file itself.
+    let old_root = synch_core::Hash::new(&v1);
+    vps.node.store().delete_blob(&old_root).unwrap();
+    assert!(vps.node.store().blob(&old_root).unwrap().is_none());
+
+    // One group changes.
+    let mut v2 = v1.clone();
+    v2[40 * GROUP + 5] ^= 0xff;
+    std::fs::write(&source, &v2).unwrap();
+    nas.node.scan_publish_push().await.unwrap();
+    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
+
+    let report = vps.node.sync_mirror(target.path()).await.unwrap();
+    assert_eq!(report.written, 1, "{report:?}");
+    assert_eq!(
+        report.fetched_bytes, GROUP as u64,
+        "the re-ingested copy carried everything but the edit: {report:?}"
+    );
+    assert_eq!(report.reused_bytes, (v2.len() - GROUP) as u64, "{report:?}");
+    assert_eq!(std::fs::read(&mirrored).unwrap(), v2);
+    // The old version is back in the CAS under its own root, which is what
+    // made it a donor.
+    assert!(vps.node.store().blob(&old_root).unwrap().is_some());
 
     nas.node.shutdown().await.unwrap();
     vps.node.shutdown().await.unwrap();

@@ -47,10 +47,10 @@ pub struct MirrorReport {
     /// Files removed: the selected version is a tombstone, or the path has
     /// left the unified tree entirely.
     pub removed: usize,
-    /// Files written by patching a clone of the copy already at the target,
-    /// rather than by copying the whole object out of the CAS
-    /// (`docs/DELTA-SYNC.md` §3.5). A subset of `written`.
-    pub patched: usize,
+    /// Files whose bytes were not copied at all: the mirror shares a filesystem
+    /// with the CAS, so the file and the object it came from are the same
+    /// extents (`docs/DELTA-SYNC.md` §3.5). A subset of `written`.
+    pub reflinked: usize,
     /// Bytes that crossed the network to write the files this pass wrote.
     pub fetched_bytes: u64,
     /// Bytes that did not, because a local donor already held them and the new
@@ -168,8 +168,9 @@ impl Node {
             wanted,
         } = plan;
 
-        // Phase 2: fetch what phase 1 could not satisfy locally, and copy each
-        // object out of the CAS as it lands.
+        // Phase 2: fetch what phase 1 could not satisfy locally — building each
+        // new object in the CAS out of the old one where it can — and
+        // materialize it as it lands.
         for want in wanted {
             let fetched = self
                 .fetch_all_from(&want.content, want.size, &want.donors)
@@ -180,33 +181,6 @@ impl Node {
                     .push((want.path, "no provider could serve the content".into()));
                 continue;
             }
-            // The groups the file already at the destination was *proven* to
-            // hold correctly, which the write may then leave alone. Not every
-            // promoted group qualifies: bytes promoted out of some other
-            // object in the CAS are right in the CAS, and say nothing about
-            // what is on the disk at this path (`docs/DELTA-SYNC.md` §3.5).
-            let keep = match (self.config().mirror_delta_write, &want.on_disk) {
-                (crate::config::MirrorDeltaWrite::Off, _) | (_, None) => ChunkRanges::empty(),
-                (_, Some(on_disk)) => fetched
-                    .reused
-                    .iter()
-                    .filter(|(donor, _)| match donor {
-                        // Bytes taken out of the file itself are, trivially,
-                        // bytes the file has right.
-                        synch_store::Donor::File(path) => path == &want.target,
-                        // And so are bytes taken out of the CAS object the file
-                        // *is* a copy of: same object, same offsets, same
-                        // bytes. This is the case that carries the common
-                        // mirror update, because the previous version is
-                        // usually in both places and the CAS is the cheaper of
-                        // the two to compare against, so it wins the donor race
-                        // every time.
-                        synch_store::Donor::Object(root) => on_disk.root == Some(*root),
-                    })
-                    .fold(ChunkRanges::empty(), |all, (_, groups)| all.union(groups)),
-            };
-            let reflink =
-                self.config().mirror_delta_write == crate::config::MirrorDeltaWrite::Reflink;
             // Counted in bytes rather than groups, and clamped to the object,
             // so the tail group of a 100-byte file does not report 16 KiB.
             let bytes_of = |groups: &ChunkRanges| {
@@ -224,10 +198,10 @@ impl Node {
             };
             report.fetched_bytes += bytes_of(&fetched.fetched);
             report.reused_bytes += bytes_of(&fetched.promoted);
-            // Copied out of the CAS a piece at a time and renamed into place: a
-            // mirror of multi-gigabyte objects must not hold one in memory, and
-            // a pass interrupted halfway must not leave a truncated file
-            // wearing a complete file's name.
+            // Cloned out of the CAS and renamed into place: a mirror of
+            // multi-gigabyte objects must not hold one in memory, and a pass
+            // interrupted halfway must not leave a truncated file wearing a
+            // complete file's name (§7.2, §9.4).
             //
             // The escape guard is taken again here, in the same blocking step
             // as the write it protects. Phase 1 checked this path too, but a
@@ -236,39 +210,36 @@ impl Node {
             let node = self.clone();
             let root = root_dir.clone();
             let path = want.path.clone();
-            let patching = !keep.is_empty();
             let outcome = crate::blocking::offload(move || {
                 if escapes_via_symlink(&root, &path) {
                     return Ok(Written::Escaped);
                 }
-                if patching {
-                    node.patch_blob_to_blocking(
-                        &want.content,
-                        want.size,
-                        &want.target,
-                        &keep,
-                        reflink,
-                    )?;
-                } else {
-                    node.write_blob_to_blocking(&want.content, want.size, &want.target)?;
-                }
+                // A materialization that fails takes its path down with it and
+                // nothing else: the target is untouched, and the next pass
+                // tries again.
+                let kind =
+                    match node.materialize_blob_blocking(&want.content, want.size, &want.target) {
+                        Ok(kind) => kind,
+                        Err(e) => return Ok(Written::Failed(e.to_string())),
+                    };
                 // The bytes are the file; its metadata is stamped on right
                 // after, and a filesystem that refuses the stamp — a mount
                 // that will not take the mode, a foreign owner — is reported
                 // rather than allowed to fail the whole pass.
                 Ok(match apply_metadata(&want.target, want.meta) {
-                    Ok(()) => Written::Fully,
-                    Err(e) => Written::WithoutMetadata(e.to_string()),
+                    Ok(()) => Written::Fully(kind),
+                    Err(e) => Written::WithoutMetadata(kind, e.to_string()),
                 })
             })
             .await?;
-            if patching && !matches!(outcome, Written::Escaped) {
-                report.patched += 1;
-            }
             match outcome {
-                Written::Fully => report.written += 1,
-                Written::WithoutMetadata(why) => {
+                Written::Fully(kind) => {
                     report.written += 1;
+                    report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
+                }
+                Written::WithoutMetadata(kind, why) => {
+                    report.written += 1;
+                    report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
                     report.skipped.push((
                         want.path,
                         format!("content written, but its metadata could not be reproduced: {why}"),
@@ -278,6 +249,9 @@ impl Node {
                     want.path,
                     "path resolves through a symlink; refusing to write outside the mirror".into(),
                 )),
+                Written::Failed(why) => report
+                    .skipped
+                    .push((want.path, format!("content could not be written: {why}"))),
             }
         }
 
@@ -320,21 +294,19 @@ struct WantedContent {
     /// Where the bytes might already be, in §3.2 priority order
     /// (`docs/DELTA-SYNC.md`).
     donors: Vec<synch_store::Donor>,
-    /// What is already at the target, when anything is: the file the write may
-    /// be able to patch a clone of rather than copy the object out whole
-    /// (§3.5).
-    on_disk: Option<OnDisk>,
 }
 
 /// How one write in phase 2 ended.
 #[derive(Debug)]
 enum Written {
-    /// Bytes and metadata both.
-    Fully,
+    /// Bytes and metadata both, and how the bytes got there.
+    Fully(crate::CloneKind),
     /// The bytes landed; the filesystem refused the metadata.
-    WithoutMetadata(String),
+    WithoutMetadata(crate::CloneKind, String),
     /// Refused by the symlink-escape guard: nothing was written.
     Escaped,
+    /// The object could not be materialized. The target is as it was.
+    Failed(String),
 }
 
 /// What one pass settled before any content was fetched.
@@ -462,8 +434,13 @@ fn plan_pass(
                 continue;
             };
             let meta = Metadata::of(&selected);
-            let on_disk = on_disk(&target, selected.size, node.config().delta_min_size);
-            if on_disk.as_ref().and_then(|f| f.root) == Some(content) {
+            // The currency check: whenever the file on the disk is the right
+            // length it is hashed, because that hash *is* the answer to "is
+            // this already the selected version?". A file of the wrong length
+            // is not hashed here — it cannot be current — and may still be
+            // hashed below, if delta turns out to want to know what it is.
+            let on_disk = same_size_root(&target, selected.size);
+            if on_disk == Some(content) {
                 // Right bytes, and possibly the wrong mode or mtime: a local
                 // `chmod`, a file this mirror wrote before it stamped metadata
                 // at all, or a mode the origin has since changed without
@@ -485,16 +462,22 @@ fn plan_pass(
                 continue;
             }
 
-            // Where the bytes of this version might already be, in the order
-            // §3.2 wants them tried: the CAS first, because a donor with an
-            // outboard is compared span by span for the price of a few reads,
-            // and only then the file at the destination, whose every span has
-            // to be hashed to be compared at all. That file is offered whatever
-            // its size — an append is the case delta serves best, and there the
-            // old file is by definition the wrong length.
+            // Where the bytes of this version might already be (§3.2). Donors
+            // are CAS objects and nothing else, so that the descent has one
+            // shape of thing to reason about — but the capability a file donor
+            // used to buy is kept, and this is where it is paid for.
+            //
+            // The case is a real one: the CAS collected the version this mirror
+            // is sitting on, so the lineage names a root nothing here holds,
+            // while the bytes of that root are right there in the target file.
+            // Rather than teach promotion about files, the file is ingested and
+            // becomes the ordinary CAS donor it is a copy of — one pass over a
+            // file this node was about to rewrite anyway. Only when delta would
+            // use it: below `delta_min_size` there is no descent to feed.
             let mut donors = node.donors_for(&selected, set)?;
-            if on_disk.is_some() {
-                donors.push(synch_store::Donor::File(target.clone()));
+            if donors.is_empty() && selected.size >= node.config().delta_min_size {
+                let recovered = reingest_the_copy_on_disk(node, &selected, set, &target, on_disk)?;
+                donors.extend(recovered.map(synch_store::Donor));
             }
             wanted.push(WantedContent {
                 path: set.path.clone(),
@@ -503,7 +486,6 @@ fn plan_pass(
                 size: selected.size,
                 meta,
                 donors,
-                on_disk,
             });
         }
     }
@@ -685,47 +667,85 @@ fn system_time(ns: i64) -> SystemTime {
     }
 }
 
-/// What a pass found at a mirror's target path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OnDisk {
-    /// The file's length.
-    size: u64,
-    /// Its content root, when the pass had reason to compute one.
-    root: Option<synch_core::Hash>,
+/// The content root of the file at `target`, if it is the right length to be
+/// the version being materialized.
+///
+/// This is the currency check, and the hash is the whole of it: an object is
+/// its bytes, so "is the file already this version?" is "does it hash to this
+/// root?". Size first, because it settles almost every case for the price of a
+/// `stat` — and a file of the wrong length is not hashed here at all, because
+/// no hash of it could answer yes.
+///
+/// Streamed, because a mirror carries objects far larger than memory and this
+/// question is asked of every path on every pass. Anything unreadable answers
+/// `None`, and the pass rewrites it.
+///
+/// The root rather than a bare "current?": naming the object that is on the
+/// disk is also what tells the pass whether the file is a version the descent
+/// wanted and could not find (`docs/DELTA-SYNC.md` §3.2).
+fn same_size_root(target: &Path, wanted_size: u64) -> Option<synch_core::Hash> {
+    let metadata = std::fs::metadata(target).ok().filter(|m| m.is_file())?;
+    if metadata.len() != wanted_size {
+        return None;
+    }
+    hash_file(target)
 }
 
-/// Looks at the file already at `target`, hashing it when that will pay.
-///
-/// Size first, because it settles almost every case for the price of a `stat`;
-/// the hash only then, and streamed, because a mirror carries objects far
-/// larger than memory and this question is asked of every path on every pass.
-/// Anything unreadable answers `None`, and the pass rewrites it.
-///
-/// The root rather than a bare "is this current?": naming the object that is
-/// actually on the disk is what lets the write be a patch. If the file turns
-/// out to be a version the descent also has in the CAS, then every group the
-/// CAS donor supplies is, by definition, already correct at the same offset in
-/// the file — and the staging clone can keep it (`docs/DELTA-SYNC.md` §3.2.4,
-/// §3.5).
-///
-/// Two reasons to hash, then. When the size matches the wanted version the hash
-/// is the current-check and costs nothing extra. When it does not — an appended
-/// log, a truncated image — the file is going to be rewritten either way, and
-/// hashing it first is only worth it if what that might save is worth saving:
-/// hence the [`NodeConfig::delta_min_size`](crate::NodeConfig) floor, the same
-/// one the fetch descent uses.
-fn on_disk(target: &Path, wanted_size: u64, delta_min_size: u64) -> Option<OnDisk> {
-    let size = std::fs::metadata(target)
+/// Streams a file through BLAKE3 for its content root.
+fn hash_file(target: &Path) -> Option<synch_core::Hash> {
+    std::fs::File::open(target)
         .ok()
-        .filter(|m| m.is_file())?
-        .len();
-    if size != wanted_size && size < delta_min_size {
-        return Some(OnDisk { size, root: None });
+        .and_then(|file| synch_core::hash_reader(std::io::BufReader::new(file)).ok())
+}
+
+/// Recovers a donor the CAS has lost but the mirror is still sitting on
+/// (`docs/DELTA-SYNC.md` §3.2).
+///
+/// Delta donors are CAS objects, which leaves one capability to account for:
+/// the mirror materialized the previous version, the CAS then collected the
+/// object it came from, and the bytes of that version are now only on the disk.
+/// Rather than a second kind of donor threaded through the descent, the file is
+/// ingested and *becomes* the object it is a copy of — after which everything
+/// downstream is ordinary CAS-to-CAS delta.
+///
+/// Deliberately narrow. It runs only when the lineage named other versions and
+/// this node holds none of them, only above `delta_min_size` where a descent
+/// will actually happen, and only when the file turns out to *be* one of the
+/// versions named. That last check is a pass over a file the mirror is about to
+/// rewrite anyway; the ingest after it is a second one, and buys a rewrite that
+/// costs the change rather than the object.
+///
+/// `known` is the file's root where the currency check already computed it.
+fn reingest_the_copy_on_disk(
+    node: &Node,
+    selected: &EntryRow,
+    versions: &synch_store::VersionSet,
+    target: &Path,
+    known: Option<synch_core::Hash>,
+) -> Result<Option<synch_core::Hash>> {
+    let wanted = node.donor_roots(selected, versions);
+    if wanted.is_empty() || !target.is_file() {
+        return Ok(None);
     }
-    let root = std::fs::File::open(target)
-        .ok()
-        .and_then(|file| synch_core::hash_reader(std::io::BufReader::new(file)).ok());
-    Some(OnDisk { size, root })
+    let Some(on_disk) = known.or_else(|| hash_file(target)) else {
+        return Ok(None);
+    };
+    if !wanted.contains(&on_disk) {
+        return Ok(None);
+    }
+    let (root, _) = node.store().ingest_file(target, synch_core::now_ns())?;
+    // A file rewritten under the ingest is not the version that was wanted, and
+    // whatever did land in the CAS is some other object the collector will deal
+    // with in its own time.
+    if root != on_disk {
+        return Ok(None);
+    }
+    tracing::debug!(
+        target = %target.display(),
+        root = %root,
+        "re-ingested a mirrored file the CAS had collected"
+    );
+    Ok(Some(root))
 }
 
 /// Returns true if any ancestor of `rel` under `root` is a symlink, so that
@@ -1381,12 +1401,16 @@ mod tests {
         assert!(!metadata_matches(&path, published));
     }
 
-    /// A patch writes the groups that differ and leaves the rest of the file
-    /// alone — including, on a filesystem with reflink, leaving them
-    /// physically shared with the copy that was already there
-    /// (`docs/DELTA-SYNC.md` §3.5).
+    /// Materializing an object produces the object, over whatever was there
+    /// before, and leaves nothing beside it.
+    ///
+    /// Nothing here asserts that a reflink happened: whether the extents are
+    /// shared depends on the filesystem the test runs on, and the point of the
+    /// fallback is that the file is the same either way. What is asserted is
+    /// the file, the absence of residue, and that the clone reports one of the
+    /// two ways it can have happened.
     #[tokio::test]
-    async fn a_patch_rewrites_only_the_groups_that_differ() {
+    async fn materializing_an_object_replaces_the_file_and_leaves_no_residue() {
         let (_d, node) = node().await;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("disk.img");
@@ -1398,70 +1422,86 @@ mod tests {
         std::fs::write(&target, &old).unwrap();
         let root = node.store().ingest_bytes(&new, now_ns()).unwrap();
 
-        // Everything but group three is already right on the disk.
-        let keep = ChunkRanges::single(0, 8).difference(&ChunkRanges::single(3, 4));
-        node.patch_blob_to_blocking(&root, new.len() as u64, &target, &keep, true)
+        let kind = node
+            .materialize_blob_blocking(&root, new.len() as u64, &target)
             .unwrap();
+        assert!(matches!(
+            kind,
+            crate::CloneKind::Reflink | crate::CloneKind::Copy
+        ));
         assert_eq!(std::fs::read(&target).unwrap(), new);
-        let left: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            left,
-            vec!["disk.img".to_string()],
-            "no staging file remains"
-        );
+        assert_eq!(left_in(dir.path()), vec!["disk.img".to_string()]);
 
-        // A file the new version is longer than is extended, not appended to
-        // twice: the clone is cut to size before anything is patched.
+        // A version of a different length replaces it exactly, rather than
+        // being written over the top of the longer file it found.
         let mut longer = new.clone();
         longer.extend(vec![3u8; 2 * GROUP]);
         let root = node.store().ingest_bytes(&longer, now_ns()).unwrap();
-        node.patch_blob_to_blocking(&root, longer.len() as u64, &target, &keep, false)
+        node.materialize_blob_blocking(&root, longer.len() as u64, &target)
             .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), longer);
+
+        // And an object small enough to live in the index comes out of it.
+        let root = node.store().ingest_bytes(b"tiny", now_ns()).unwrap();
+        node.materialize_blob_blocking(&root, 4, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"tiny");
+        assert_eq!(left_in(dir.path()), vec!["disk.img".to_string()]);
         node.shutdown().await.unwrap();
     }
 
-    /// A patch that dies partway leaves the target exactly as it was.
+    /// A materialization that dies partway leaves the target exactly as it was.
     ///
-    /// The invariant §7.2 exists for, restated for the write that does not copy
-    /// everything: bytes go into a staging clone, the target only changes at
-    /// the rename, and a staging file that never got committed is removed
-    /// rather than left lying beside the file it was going to replace.
+    /// The invariant §7.2 exists for: bytes go into a staging file beside the
+    /// target, the target only changes at the rename, and a staging file that
+    /// never got committed is removed rather than left lying beside the file it
+    /// was going to replace — under a name the scanner's built-in ignore rules
+    /// skip, which is what would make a stranded one permanent.
     #[tokio::test]
-    async fn a_torn_patch_leaves_the_target_untouched() {
+    async fn a_torn_materialization_leaves_the_target_untouched() {
         let (_d, node) = node().await;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("disk.img");
         let old: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
         std::fs::write(&target, &old).unwrap();
 
-        // An object this node does not hold: the patch clones the target, then
-        // fails on the first read it needs out of the CAS — which is as close
-        // to a crash mid-patch as a test can arrange without one.
+        // An object this node does not hold at all.
         let absent = Hash::new(b"nobody has this");
         let err = node
-            .patch_blob_to_blocking(&absent, 100_000, &target, &ChunkRanges::single(0, 2), true)
+            .materialize_blob_blocking(&absent, 100_000, &target)
             .unwrap_err();
-        assert!(err.to_string().contains("not in the local store"), "{err}");
+        assert!(err.to_string().contains("not held whole"), "{err}");
+
+        // And one the index claims but whose payload has gone from under it,
+        // which is as close to a crash mid-write as a test can arrange: the
+        // staging file is created and the clone of the payload then fails.
+        let new: Vec<u8> = (0..100_000).map(|i| (i % 13) as u8).collect();
+        let root = node.store().ingest_bytes(&new, now_ns()).unwrap();
+        std::fs::remove_file(node.store().blob_path(&root)).unwrap();
+        assert!(node
+            .materialize_blob_blocking(&root, new.len() as u64, &target)
+            .is_err());
 
         assert_eq!(
             std::fs::read(&target).unwrap(),
             old,
             "the target must be exactly what it was"
         );
-        let left: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
         assert_eq!(
-            left,
+            left_in(dir.path()),
             vec!["disk.img".to_string()],
             "the abandoned staging file went with the failure"
         );
         node.shutdown().await.unwrap();
+    }
+
+    /// What is in a directory, by name, in order.
+    fn left_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]

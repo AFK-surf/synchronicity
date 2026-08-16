@@ -3952,6 +3952,7 @@ dependencies = [
  "proptest",
  "range-collections",
  "rusqlite",
+ "rustix",
  "serde",
  "synch-core",
  "synch-mpt",

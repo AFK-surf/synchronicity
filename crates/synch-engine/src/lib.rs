@@ -27,7 +27,7 @@ pub mod watcher;
 
 pub use aae::RoundReport;
 pub use compare::{CompareChange, CompareReport, CompareStatus};
-pub use config::{default_data_dir, MirrorDeltaWrite, NodeConfig};
+pub use config::{default_data_dir, NodeConfig};
 pub use error::{EngineError, Result};
 pub use fetcher::{FetchReport, PreparedRange, Provider};
 pub use ignore::IgnoreSet;

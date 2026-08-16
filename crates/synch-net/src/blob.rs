@@ -18,7 +18,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use synch_core::{now_ns, BlobMessage, ChunkRanges, Hash, MAX_RANGES, MAX_SLICE_GROUPS};
-use synch_store::{ProvenSubtree, Store};
+use synch_store::{Proven, Store};
 
 use crate::{
     error::NetError,
@@ -195,11 +195,12 @@ pub struct Proof {
 }
 
 /// What a run of proof exchanges established (`docs/DELTA-SYNC.md` §3.3).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProofOutcome {
     /// The subtrees whose chaining values are now proven against the root, in
-    /// tree order — one per group at level 0, one per span higher up.
-    pub proven: Vec<ProvenSubtree>,
+    /// tree order — one per group at level 0, one per span higher up, with the
+    /// root they were chained to.
+    pub proven: Proven,
     /// The ranges they cover, which is what the requester can stop asking for.
     pub served: ChunkRanges,
 }
@@ -285,9 +286,25 @@ impl BlobClient {
         level: u8,
     ) -> Result<ProofOutcome, NetError> {
         let mut remaining = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
-        let mut out = ProofOutcome::default();
+        let mut out = ProofOutcome {
+            proven: Proven::none(root),
+            served: ChunkRanges::empty(),
+        };
         let mut barren = 0u32;
+        // A ceiling on the exchange as a whole, not just on the empty answers.
+        // A provider that serves one group per window is not barren — it is
+        // making progress, a round trip at a time — and without a bound it can
+        // hold this descent open for one RTT per group of the object. An
+        // honest provider needs a window per [`MAX_PROOF_NODES`] worth of tree,
+        // so a few per range plus a floor is generous and still finite; the
+        // ranges it did not reach simply go to the ordinary fetch (§6.4).
+        let mut windows = 8 + remaining.count().saturating_mul(2);
         while !remaining.is_empty() {
+            if windows == 0 {
+                tracing::debug!(root = %root, "proof exchange cut off: too many windows");
+                break;
+            }
+            windows -= 1;
             // The window is the provider's to choose — it is counted in tree
             // nodes, not groups, and only the provider knows how the tree falls
             // — so the whole remainder is offered and `ProofEnd` says how much
@@ -318,7 +335,7 @@ impl BlobClient {
             .await?;
             remaining = remaining.difference(&served);
             out.served = out.served.union(&served);
-            out.proven.extend(proven);
+            out.proven.absorb(proven)?;
         }
         Ok(out)
     }

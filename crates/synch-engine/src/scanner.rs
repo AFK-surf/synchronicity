@@ -486,7 +486,7 @@ impl Node {
         // is refused before anything is fetched.
         let target = self.adoption_target(space_id, path)?;
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
-        self.write_blob_to(&range.root, range.size, target.clone())
+        self.materialize_blob(&range.root, range.size, target.clone())
             .await?;
         Ok(target)
     }
@@ -604,73 +604,67 @@ impl Adoption {
         })
     }
 
-    /// Stages a write that starts out as a copy of a file already on disk
+    /// Stages a write that starts out as a clone of a file already on disk
     /// (`docs/DELTA-SYNC.md` §3.5).
     ///
-    /// The atomicity invariant is unchanged — the bytes still land in a staging
-    /// file that is renamed over the target, so a reader sees the old file or
-    /// the new one — but the staging file no longer starts empty. A mirror
-    /// rewriting a 100 GB image whose previous version is sitting right there
-    /// clones it and patches the megabyte that changed, instead of copying
-    /// 100 GB out of the CAS to reproduce bytes that are already on the disk.
+    /// The atomicity invariant is unchanged — the bytes land in a staging file
+    /// that is renamed over the target, so a reader sees the old file or the
+    /// new one — but the staging file arrives already full. This is how an
+    /// object becomes a mirrored file: the source is the CAS payload, and a
+    /// 100 GB image is materialized without moving 100 GB.
     ///
-    /// With `reflink`, the clone is attempted with `FICLONE` first: on btrfs,
-    /// XFS and bcachefs that shares the source's extents copy-on-write, so it
-    /// is O(1) and consumes no space until the patch writes. Everywhere else —
-    /// ext4, a different device, a kernel without the ioctl — it falls back to
-    /// [`std::fs::copy`], which on Linux is itself a kernel-side
-    /// `copy_file_range` rather than a bounce through user space. Either way
-    /// the network savings that got us here are untouched; only the local write
-    /// is more or less clever.
-    pub fn cloning(
-        target: impl Into<PathBuf>,
-        source: &Path,
-        reflink: bool,
-    ) -> Result<(Adoption, CloneKind)> {
+    /// `FICLONE` first. On btrfs, XFS and bcachefs it shares the source's
+    /// extents copy-on-write, so the write is O(1) and consumes no space until
+    /// one of the two files is written to. Everywhere else — a target on a
+    /// different filesystem from the source, ext4, a kernel or platform without
+    /// the ioctl — it falls back to [`std::fs::copy`], which on Linux is itself
+    /// a kernel-side `copy_file_range` rather than a bounce through user space.
+    ///
+    /// Every failure path unlinks the staging file before returning. The
+    /// obvious way to write the fallback leaves one behind when the copy fails
+    /// *and* the handle cannot be reopened — ENOSPC, EMFILE — and the file it
+    /// strands wears a name the scanner's built-in ignore rules skip, so it
+    /// would sit beside the target unnoticed and uncollected forever.
+    pub fn cloning(target: impl Into<PathBuf>, source: &Path) -> Result<(Adoption, CloneKind)> {
         let mut adoption = Adoption::open(target.into())?;
-        let file = adoption
+        match adoption.clone_from(source) {
+            Ok(kind) => Ok((adoption, kind)),
+            Err(e) => {
+                // `Drop` only unlinks while the handle is live, and the copy
+                // fallback below has to let go of it.
+                let _ = std::fs::remove_file(&adoption.staging);
+                adoption.file = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// Fills the staging file from `source`, sharing its extents if it can.
+    fn clone_from(&mut self, source: &Path) -> Result<CloneKind> {
+        let file = self
             .file
             .as_ref()
             .ok_or_else(|| EngineError::invalid("a fresh staging file has no handle"))?;
-        if reflink {
-            match std::fs::File::open(source).and_then(|src| reflink_file(&src, file)) {
-                Ok(()) => return Ok((adoption, CloneKind::Reflink)),
-                Err(e) => {
-                    tracing::debug!(source = %source.display(), error = %e, "reflink unavailable");
-                }
+        match std::fs::File::open(source).and_then(|src| reflink_file(&src, file)) {
+            Ok(()) => return Ok(CloneKind::Reflink),
+            Err(e) => {
+                tracing::debug!(source = %source.display(), error = %e, "reflink unavailable");
             }
         }
         // The staging file exists and is empty; `fs::copy` wants to create its
         // own, so the handle is dropped for the duration and reopened after.
-        adoption.file = None;
-        let copied = std::fs::copy(source, &adoption.staging);
-        adoption.file = Some(
+        self.file = None;
+        let copied = std::fs::copy(source, &self.staging);
+        self.file = Some(
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(&adoption.staging)?,
+                .open(&self.staging)?,
         );
         copied?;
-        Ok((adoption, CloneKind::Copy))
-    }
-
-    /// Writes one piece of the payload at a fixed offset.
-    ///
-    /// The patching counterpart of [`Adoption::write`], for a staging file that
-    /// already has contents: only the pieces that differ from what
-    /// [`Adoption::cloning`] started with are written.
-    pub fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
-        use std::io::{Seek, SeekFrom, Write};
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(bytes)?;
-        self.written += bytes.len() as u64;
-        Ok(())
+        Ok(CloneKind::Copy)
     }
 
     /// Sets the staging file's length, for a clone of a file whose size the new
@@ -704,7 +698,11 @@ impl Adoption {
     /// Flushes the payload and moves it into place, returning the target.
     ///
     /// The rename is what makes the write atomic from the scanner's point of
-    /// view: it sees the old file or the new one, never a partial one.
+    /// view: it sees the old file or the new one, never a partial one. That is
+    /// a claim about crashes, so the directory entry the rename created is
+    /// flushed too — otherwise the contents survive a power cut and the name
+    /// they arrived under does not, which is the old file or *no* file rather
+    /// than the old file or the new one.
     pub fn commit(mut self) -> Result<PathBuf> {
         let file = self
             .file
@@ -713,7 +711,20 @@ impl Adoption {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&self.staging, &self.target)?;
+        fsync_parent(&self.target);
         Ok(self.target.clone())
+    }
+}
+
+/// Flushes a directory entry — a rename or a create — to stable storage.
+///
+/// Best effort: a platform that cannot open a directory as a file simply does
+/// not get the guarantee, which is the same posture the CAS takes (§6.2).
+fn fsync_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
     }
 }
 
