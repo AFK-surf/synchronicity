@@ -174,12 +174,19 @@ fn nothing_a_client_accepts_lands_in_the_silent_bin() {
             !accepted || tier != Tier::C,
             "{name}: the client accepted an entry the monitor files as noise"
         );
-        // And the converse half that makes tier C safe to be quiet about: an
-        // entry the monitor calls noise is one no client would take.
-        assert!(
-            tier != Tier::C || !accepted,
-            "{name}: tier C must mean unusable"
-        );
+        // The invariant above is satisfied trivially by a client that accepts
+        // nothing, so pin what acceptance actually is. These are the shapes a
+        // resolver must take — including the two that alarm a monitor, because
+        // the substitution *is* usable and the whole point is that it is loud
+        // rather than refused here — and the three it must refuse, which are
+        // exactly the tier C bin.
+        let must_accept = match name {
+            "genesis" | "rotation" | "substitution" | "forged countersignature"
+            | "expired chain" => true,
+            "chainless" | "broken chain" | "wrong-key chain" => false,
+            other => panic!("unclassified shape {other}: say whether a client takes it"),
+        };
+        assert_eq!(accepted, must_accept, "{name}: client acceptance");
     }
 }
 
