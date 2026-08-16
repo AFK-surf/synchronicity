@@ -54,6 +54,12 @@ pub const version = 3
 /// body must declare.
 const digest_algorithm = "SHA2_256"
 
+/// The only entry kind Rekor v2 accepts, and the only one this design logs.
+const entry_kind = "hashedrekord"
+
+/// The entry API version a body must declare.
+const entry_api_version = "0.0.2"
+
 const key_details = "PKIX_ECDSA_P256_SHA_256"
 
 pub type Proof {
@@ -94,18 +100,40 @@ pub type Checkpoint {
   )
 }
 
-/// Encodes the record.
-pub fn encode(proof: Proof) -> BitArray {
-  bit_array.concat([
-    <<version:int-size(8), proof.key_tag:int-size(16)>>,
-    proof.log_id,
-    <<proof.log_index:int-size(64)>>,
-    blob16(proof.statement),
-    blob16(proof.canonicalized_body),
-    blob16(proof.checkpoint),
-    <<list.length(proof.inclusion_path):int-size(8)>>,
-    bit_array.concat(proof.inclusion_path),
-  ])
+/// Encodes the record, or refuses a record that does not fit the format.
+///
+/// `Error` for a blob past 65535 bytes or an audit path past 255 hops.
+/// Refusing beats emitting *something*: the format exists so two
+/// implementations agree byte for byte, and the two used to disagree about
+/// the failure itself — this side wrapped the length modulo 65536 while the
+/// Rust side clamped it and truncated the blob. Two different wrong answers
+/// in a format whose whole point is agreement is worse than no answer.
+pub fn encode(proof: Proof) -> Result(BitArray, String) {
+  use Nil <- result.try(
+    [proof.statement, proof.canonicalized_body, proof.checkpoint]
+    |> list.try_each(fn(blob) {
+      case bit_array.byte_size(blob) <= 65_535 {
+        True -> Ok(Nil)
+        False -> Error("a proof field is longer than the format's 16-bit length")
+      }
+    }),
+  )
+  use Nil <- result.try(case list.length(proof.inclusion_path) <= 255 {
+    True -> Ok(Nil)
+    False -> Error("the audit path is longer than the format's 255 hops")
+  })
+  Ok(
+    bit_array.concat([
+      <<version:int-size(8), proof.key_tag:int-size(16)>>,
+      proof.log_id,
+      <<proof.log_index:int-size(64)>>,
+      blob16(proof.statement),
+      blob16(proof.canonicalized_body),
+      blob16(proof.checkpoint),
+      <<list.length(proof.inclusion_path):int-size(8)>>,
+      bit_array.concat(proof.inclusion_path),
+    ]),
+  )
 }
 
 fn blob16(bytes: BitArray) -> BitArray {
@@ -114,8 +142,9 @@ fn blob16(bytes: BitArray) -> BitArray {
 
 /// The base64url form one TXT record carries. `zone/build` splits it into
 /// ≤255-byte character-strings; the client concatenates before decoding.
-pub fn to_txt(proof: Proof) -> String {
-  bit_array.base64_url_encode(encode(proof), False)
+pub fn to_txt(proof: Proof) -> Result(String, String) {
+  encode(proof)
+  |> result.map(bit_array.base64_url_encode(_, False))
 }
 
 /// A real `hashedrekord` v0.0.2 body over a Statement's DSSE PAE.
@@ -158,6 +187,8 @@ pub fn parse_body(
     bit_array.to_string(bytes) |> result.replace_error(bad("not UTF-8")),
   )
   let decoder = {
+    use kind <- decode.field("kind", decode.string)
+    use api_version <- decode.field("apiVersion", decode.string)
     use algorithm <- decode.subfield(
       ["spec", "hashedRekordV002", "data", "algorithm"],
       decode.string,
@@ -181,14 +212,30 @@ pub fn parse_body(
       ],
       decode.string,
     )
-    decode.success(#(algorithm, digest, content, details, raw_bytes))
+    decode.success(#(
+      kind,
+      api_version,
+      algorithm,
+      digest,
+      content,
+      details,
+      raw_bytes,
+    ))
   }
-  use #(algorithm, digest, content, details, raw_bytes) <- result.try(
+  use #(kind, api_version, algorithm, digest, content, details, raw_bytes) <- result.try(
     json.parse(text, decoder)
     |> result.replace_error(bad(
       "not a hashedrekord v0.0.2 entry with an x509Certificate verifier",
     )),
   )
+  // Asserted here as well as in the client (crates/synch-net/src/rekor.rs),
+  // because this module's stated job is to refuse anything the client would:
+  // a body this side stores and the client rejects is the failure the
+  // verify-before-store step exists to prevent.
+  use Nil <- result.try(case kind == entry_kind && api_version == entry_api_version {
+    True -> Ok(Nil)
+    False -> Error(Binding("the entry is " <> kind <> " " <> api_version))
+  })
   use Nil <- result.try(case algorithm == digest_algorithm {
     True -> Ok(Nil)
     False -> Error(Binding("entry digest algorithm " <> algorithm))

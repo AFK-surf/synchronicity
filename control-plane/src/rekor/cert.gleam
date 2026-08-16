@@ -144,7 +144,7 @@ pub fn build(
     |> list.reverse
   ffi_self_signed_cert(
     <<common_name:utf8>>,
-    <<{ fqdn(apex) }:utf8>>,
+    <<{ san_name(apex) }:utf8>>,
     public,
     private,
     not_before,
@@ -164,10 +164,15 @@ fn prepend_option(
   }
 }
 
-/// The SAN spelling: no trailing dot. A `dNSName` is a hostname, and the
-/// client compares it case-insensitively with the dot optional either way —
-/// but writing it one way keeps the fixture stable.
-pub fn fqdn(apex: String) -> String {
+/// The SAN spelling for an apex: **no trailing dot**.
+///
+/// A `dNSName` is a hostname, and readers parse it into a name before
+/// comparing anything — so the dot is presentation, not identity. Writing it
+/// one way keeps the fixtures stable.
+///
+/// Named `san_name` and not `fqdn` because it produces the opposite of an
+/// FQDN, and the old name said so backwards.
+pub fn san_name(apex: String) -> String {
   case string.ends_with(apex, ".") {
     True -> string.drop_end(apex, 1)
     False -> apex
@@ -223,7 +228,7 @@ pub fn succession_payload(
     ))
   <<
     "{\"apex\":\"":utf8,
-    { fqdn(apex) }:utf8,
+    { san_name(apex) }:utf8,
     "\",\"predecessorKeyTag\":":utf8,
     { int.to_string(predecessor_key_tag) }:utf8,
     ",\"successorSpkiSha256\":\"":utf8,

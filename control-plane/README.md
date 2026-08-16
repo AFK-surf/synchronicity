@@ -122,7 +122,6 @@ listen address.
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev (Ed25519) snapshot. Set it for a self-hosted log. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
-| `CP_DNSSEC_CHAIN_ROOT_DNSKEY` | primary | `false` omits the root DNSKEY link from that chain (~1.1 KB smaller). Default `true`, so an entry carries its whole chain and stays verifiable from the IANA anchor alone. |
 | `CP_TUF_URL` | primary | Sigstore TUF repository this zone relays, so clients' log pins follow it. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched by `controlplane tuf-refresh` and by the hourly job within three days of the stored timestamp's expiry. |
 
 Day-2 operations (replicas, key ceremony, backups) live in

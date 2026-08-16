@@ -699,30 +699,74 @@ impl DnssecResolver {
             Err(e) => return Err(e),
         };
 
-        let mut proof = None;
+        // One unreadable record must not sink a readable one. During a
+        // rollover the set holds a record per key, and a control plane
+        // mid-upgrade can leave an old-format record beside a current one —
+        // refusing the whole set then strands a client that had exactly the
+        // proof it needed sitting next to the one it did not. The set is
+        // DNSSEC-validated, so a record here is one the zone published;
+        // skipping the ones this build cannot read is a compatibility rule,
+        // not an injection risk.
+        //
+        // A malformed record is still reported when *nothing* matched, so
+        // "the zone published gibberish" stays distinguishable from "the zone
+        // published nothing for this key" — the two read very differently in
+        // `synch doctor`.
+        let mut candidates = Vec::new();
+        let mut malformed = None;
         for record in &records {
             match RekorProof::from_txt(record) {
                 // Other key tags belong to the other half of a rollover
                 // window; they are not this answer's business.
-                Ok(candidate) if candidate.key_tag == key_tag => proof = Some(candidate),
+                Ok(candidate) if candidate.key_tag == key_tag => candidates.push(candidate),
                 Ok(_) => {}
-                Err(e) => {
-                    return Err(NetError::RekorMalformed {
-                        name: name.clone(),
-                        reason: e.to_string(),
-                    })
-                }
+                Err(e) => malformed = Some(e),
             }
         }
-        let proof = proof.ok_or_else(absent)?;
+        if candidates.is_empty() {
+            // One unreadable record must not sink a readable one. During a
+            // rollover the set holds a record per key, and a control plane
+            // mid-upgrade can leave an old-format record beside a current
+            // one — refusing the whole set then strands a client that had
+            // exactly the proof it needed sitting next to the one it did
+            // not. The set is DNSSEC-validated, so a record here is one the
+            // zone published; skipping what this build cannot read is a
+            // compatibility rule, not an injection risk.
+            //
+            // A malformed record is still reported when *nothing* matched, so
+            // "the zone published gibberish" stays distinguishable from "the
+            // zone published nothing for this key" — the two read very
+            // differently in `synch doctor`.
+            return Err(match malformed {
+                Some(e) => NetError::RekorMalformed {
+                    name: name.clone(),
+                    reason: e.to_string(),
+                },
+                None => absent(),
+            });
+        }
 
         let key = ZoneKey {
             apex: &apex_text,
             key_tag,
             dnskey_rdata: &dnskey_rdata,
         };
-        rekor::verify(&proof, &key, &self.log_keys(), &self.anchors)
-            .map_err(|e| rekor_error(&name, e))
+        // Every candidate, not just the last. A key tag is a 16-bit checksum
+        // over the DNSKEY rdata, so two keys can share one and a zone can
+        // legitimately serve two records under it — the tag selects, the
+        // verification decides. Trying one and giving up would make a
+        // collision look like a bad proof.
+        let mut last = None;
+        for candidate in &candidates {
+            match rekor::verify(candidate, &key, &self.log_keys(), &self.anchors) {
+                Ok(verified) => return Ok(verified),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(rekor_error(
+            &name,
+            last.expect("a non-empty candidate list yields an error"),
+        ))
     }
 
     /// The validated DNSKEY rdata for one key tag at `apex` (§4.2 step 2).

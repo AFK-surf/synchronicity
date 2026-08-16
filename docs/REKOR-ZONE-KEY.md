@@ -198,10 +198,17 @@ records *owned by* `zone`:
 - link n — the root: its `DNSKEY` RRset + `RRSIG`, terminated by the IANA
   trust anchor every reader already holds.
 
-Root-DNSKEY inclusion is configurable (`CP_DNSSEC_CHAIN_ROOT_DNSKEY`, default
-true). It is ~1.1 KB and every monitor holds the anchor already, but an entry
-that carries its whole chain is one an archivist can verify in twenty years
-with nothing but the IANA anchor.
+The root link is **always included, and this is not configurable**. It was,
+briefly: `CP_DNSSEC_CHAIN_ROOT_DNSKEY=false` omitted it to save ~1.1 KB, on
+the reasoning that every monitor holds the IANA anchor already. The reasoning
+was wrong. A reader anchors the chain by finding a key it trusts in the
+**top link's DNSKEY RRset**, and a chain topped by a TLD's DNSKEY contains no
+such key — so the flag's only effect was to emit entries that every client
+and every monitor refuses, while `rekor-publish` reported success. A switch
+whose sole outcome is unverifiable output is not a size trade-off, so it is
+gone. `rekor/chain.check_shape` now walks the ladder before anything is
+published, so a chain that stops short fails at the ceremony rather than at
+every client afterwards.
 
 A real chain to the root measures ~1.9 KB of DER (root DNSKEY 1.1 KB, `com`
 DNSKEY+DS 0.6 KB, the leaf DS 0.2 KB); about 480 B per extra delegation level.
@@ -487,7 +494,6 @@ belongs.
 | `CP_REKOR_URL` | primary | Rekor v2 write endpoint (`POST /api/v2/log/entries`). Default `https://log2025-1.rekor.sigstore.dev`. |
 | `CP_REKOR_KEY` | primary | Optional file pinning a self-hosted log's verification key; absent means the embedded Sigstore production key. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
-| `CP_DNSSEC_CHAIN_ROOT_DNSKEY` | primary | `false` omits the root DNSKEY link (~1.1 KB). Default `true`: an entry that carries its whole chain is one an archivist can verify with nothing but the IANA anchor. |
 
 Replicas need nothing: the proof is public data in the database and rides the
 existing operator-owned replication.
@@ -535,7 +541,8 @@ inclusion, and the checkpoint signature — and only then stores it:
 
 ```sql
 CREATE TABLE rekor_records (
-  key_tag            INTEGER NOT NULL,
+  spki_sha256        BLOB    NOT NULL,   -- the key's identity
+  key_tag            INTEGER NOT NULL,   -- how a client selects, indexed
   apex               TEXT    NOT NULL,
   action             TEXT    NOT NULL,   -- create | rollover | retire
   statement          BLOB    NOT NULL,   -- the in-toto Statement (PAE preimage)
@@ -547,9 +554,21 @@ CREATE TABLE rekor_records (
   chainless          INTEGER NOT NULL,   -- only ever a retire
   integrated_at      INTEGER NOT NULL,
   verified_at        INTEGER NOT NULL,
-  PRIMARY KEY (key_tag, action)
+  PRIMARY KEY (spki_sha256, action)
 );
 ```
+
+**A key is identified by its key, not by a checksum of it.** The primary key
+was `(key_tag, action)` until migration v7. An RFC 4034 key tag is a 16-bit
+checksum over the DNSKEY rdata, so two distinct keys collide with odds around
+1/65536 per rollover — and a collision meant one key's row silently
+*replaced* another's, taking its proof out of the served zone with no error
+anywhere. Rare and silent is the bad combination: it surfaces as a cluster
+that stopped resolving for reasons nobody can reconstruct. The tag remains as
+an indexed column because that is what a client selects on — it reads the tag
+from the RRSIG it just validated — but selection is not identity. A zone may
+now serve two proof records under one tag, and the client tries each until
+one verifies.
 
 The one client rule this side cannot re-run is the cryptographic chain walk —
 that lives in the Rust verifier, and the e2e crossval is what keeps this side
@@ -578,13 +597,31 @@ RRset at `<apex>` — is the DS live in the parent yet?*
   `PublishError::NoRekorRecord` — the same stance as the existing §3.2
   build-time checks: the service refuses to publish rather than emit a zone
   clients will reject. (Phase-gated; see §7.)
-- The hourly resign job additionally refreshes stored proofs against a fresh
-  checkpoint when the stored one is older than 7 days. This keeps the served
-  view young for monitors; clients do not require it (§4.4).
-- `/healthz` reports `rekor_verified_at` and the log index alongside
-  `sig_expires_at`.
-- Air-gapped/direct mode: `/api/zone/rekor` serves the proof next to the
-  existing `/api/zone/anchor`.
+**Three things this section used to claim, which do not exist.** They are
+recorded as gaps rather than deleted quietly, because each was load-bearing
+in somebody's mental model:
+
+- *"The hourly resign job refreshes stored proofs older than 7 days."* It does
+  not — `jobs/resign.gleam` re-signs RRsets and refetches TUF material, and
+  never touches `rekor_records`. **The served checkpoint therefore ages
+  indefinitely**: a zone publishes the checkpoint that was current when
+  `rekor-publish` last ran, and nothing moves it afterwards. This costs
+  clients nothing, because §4.4 is explicit that inclusion is checked and
+  freshness is not, and the stored proof stays valid for as long as the tree
+  it names is a prefix of the current one — which is forever, in an
+  append-only log. It costs *monitors* a little: a stale checkpoint is a
+  weaker cross-check than a fresh one when comparing what a zone serves
+  against what the log holds. Re-running `rekor-publish` refreshes it, and is
+  idempotent by design; automating that on a timer is the obvious fix and is
+  not written.
+- *"`/healthz` reports `rekor_verified_at` and the log index."* It does not.
+  `/healthz` reports the SOA serial and the soonest RRSIG expiry. An operator
+  checks transparency state with `rekor-publish` (which prints it) or by
+  reading `rekor_records`.
+- *"`/api/zone/rekor` serves the proof for air-gapped mode."* It does not;
+  `/api/zone/anchor` is the only zone endpoint. The proof is served in the
+  zone itself, which is the design's whole point, and the air-gapped path is
+  the database courier the rest of §5 already describes.
 
 ### 5.4 Rollover and retirement (runbook deltas)
 
@@ -936,6 +973,16 @@ never from anything the server said); only the submission driver was wrong.
 Both `rekor::EMBEDDED_LOG_KEYS` and `rekor/proof.log_id` now say so where
 somebody would look.
 
+**Both chain shapes, always.** `SimDelegation` builds a synthetic
+root → TLD → apex ladder with real DS records and its own anchor, beside the
+degenerate self-anchored chain a `--dnssec-anchor` deployment produces. Until
+it existed, every sim test ran on the one-link shape — so the suites asserting
+the invariant "over every shape the two sides could disagree about" were
+exercising a single branch of the validator, and a divergence that only
+appears once a chain has a parent to climb to was invisible. A test asserts
+both shapes are present and structurally different, so the coverage cannot
+quietly collapse back.
+
 **Synthetic material, for the failures reality will not perform.**
 
 - `synch-net::sim` grows a deterministic in-memory tile log and a signed
@@ -950,11 +997,25 @@ somebody would look.
   Merkle implementation at ten tree sizes that straddle every tile boundary,
   and the three-tier classification over eight entry shapes.
 
+**One composition, not two.** The client and the monitor reach the chain
+walk through a single function, `chain::authorize`, which extracts the SAN,
+**parses it once**, derives the key from the certificate's SPKI, and validates
+against exactly those. Neither side can supply its own apex. This is
+structural rather than stylistic: the two used to share `chain::validate` and
+compose the call themselves, and they diverged on what to feed it — the
+client passed the well-formed apex from DNS, the monitor the raw SAN string.
+A certificate whose SAN was `victim.example..` then satisfied the client's
+trailing-dot-trimming comparison *and* validated, while the monitor could not
+parse the SAN at all and filed the entry tier C. Every client accepts, no
+monitor alerts: precisely the evasion the tiering exists to prevent. Sharing
+a primitive is not sharing a decision.
+
 **The invariant, tested directly.** `crates/synch-monitor/tests/tiers.rs`
 generates valid, chainless, broken-chain, wrong-key-chain, expired-chain,
-countersigned, forged-countersignature and unknown-predecessor proofs, and
-asserts over every one of them, using the real verifier and the real
-classifier rather than restatements of either:
+countersigned, forged-countersignature, unknown-predecessor, malformed-SAN
+and wrong-zone-SAN proofs — **each in both chain shapes**, self-anchored and
+root-anchored — and asserts over every one of them, using the real verifier
+and the real classifier rather than restatements of either:
 
 > `client_accepts(p)` ⟹ `monitor_tier(p) ∈ {A, B}`, and `tier(p) = C` ⟹
 > `¬client_accepts(p)`.

@@ -162,18 +162,43 @@ pub fn the_body_binds_to_the_statement_and_key_test() {
   // the zone key — the binding the client checks, checked here too.
   let assert Ok(#(spki, san)) = cert_spki_and_san(verifier)
   assert spki == proof.p256_spki(fixture_public())
-  assert san == cert.fqdn(meta("apex"))
+  assert san == cert.san_name(meta("apex"))
 }
 
 pub fn proof_encoding_matches_the_fixture_test() {
-  assert proof.encode(fixture_proof()) == fixture("proof.bin")
+  assert proof.encode(fixture_proof()) == Ok(fixture("proof.bin"))
 }
 
 pub fn proof_txt_is_base64url_test() {
-  let text = proof.to_txt(fixture_proof())
+  let assert Ok(text) = proof.to_txt(fixture_proof())
   let assert Ok(decoded) = bit_array.base64_url_decode(text)
   assert decoded == fixture("proof.bin")
   assert !string.contains(text, "=")
+}
+
+/// A record that does not fit the format is refused, not mangled.
+///
+/// Both sides refuse now. They used to fail *differently* — this side
+/// wrapped the 16-bit length modulo 65536, the Rust side clamped it and
+/// truncated the blob — which in a format whose whole purpose is that two
+/// implementations agree byte for byte is worse than not encoding at all.
+pub fn an_oversized_proof_is_refused_rather_than_mangled_test() {
+  let base = fixture_proof()
+  let assert Error(_) =
+    proof.encode(Proof(..base, statement: <<0:size(524_288)>>))
+  let assert Error(_) =
+    proof.encode(Proof(..base, checkpoint: <<0:size(524_288)>>))
+  let assert Error(_) =
+    proof.to_txt(Proof(..base, canonicalized_body: <<0:size(524_288)>>))
+  let assert Error(_) =
+    proof.encode(
+      Proof(..base, inclusion_path: list.repeat(<<0:size(256)>>, 256)),
+    )
+  // 255 hops is the last that fits.
+  let assert Ok(_) =
+    proof.encode(
+      Proof(..base, inclusion_path: list.repeat(<<0:size(256)>>, 255)),
+    )
 }
 
 pub fn the_fixture_verifies_against_its_log_test() {
@@ -428,6 +453,7 @@ pub fn a_retire_record_does_not_satisfy_the_gate_test() {
     store.put(
       conn,
       store.Record(
+        spki_sha256: crypto.hash(crypto.Sha256, proof.p256_spki(csk.public)),
         key_tag: key_tag,
         apex: "sync.test.",
         action: "retire",
@@ -458,7 +484,7 @@ pub fn the_zone_serves_the_proof_record_test() {
   let assert Ok(ns1) = name.parse("ns1.sync.test.")
   let assert Ok(owner) = name.parse("_synchronicity.prod.acme.sync.test.")
   let csk = keys.generate()
-  let text = proof.to_txt(fixture_proof())
+  let assert Ok(text) = proof.to_txt(fixture_proof())
   let input =
     ZoneInput(
       ZoneMeta(
@@ -775,4 +801,100 @@ fn scan_for(
         False -> scan_for(haystack, needle, size, at - 1)
       }
   }
+}
+
+/// Re-running with the predecessor keyfile you forgot the first time is not
+/// a no-op.
+///
+/// The §5.4 recovery for "you published without naming the old key, and every
+/// monitor is now alerting" is to re-run with it. The Statement bytes are
+/// identical either way — the predecessor lives in the certificate, not the
+/// Statement — so a reuse rule keyed on the Statement alone silently threw
+/// the countersignature away and reported success, leaving the zone tier B
+/// forever with no way out short of editing the database.
+pub fn republishing_with_a_predecessor_adds_the_countersignature_test() {
+  let conn = fixtures.fresh_conn()
+  let csk = fixtures.zone_boot(conn)
+  let previous = keys.generate()
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = fake_log(keys.generate())
+
+  // First publish: the operator forgets the predecessor. Tier B everywhere.
+  let assert Ok(first) =
+    rekor_publish.run(
+      conn, apex, csk, log, #(spki, point), 1000, fake_resolver(), "create",
+      None,
+    )
+  assert first.countersigned_by == None
+
+  // Re-run naming it. The Statement is byte-identical, so the old rule would
+  // have reused the stored certificate and reported success unchanged.
+  let assert Ok(second) =
+    rekor_publish.run(
+      conn, apex, csk, log, #(spki, point), 2000, fake_resolver(), "create",
+      Some(previous),
+    )
+  assert second.countersigned_by
+    == Some(keys.key_tag(keys.dnskey_rdata(previous)))
+  assert second.refreshed == False
+
+  // And what is stored now carries it, verifiably.
+  let assert Ok([record]) = store.for_key_tag(conn, second.key_tag)
+  let assert Ok(#(_digest, _signature, certificate)) =
+    proof.parse_body(record.canonicalized_body)
+  let assert Ok(value) = cert_extension(certificate, cert.oid_succession)
+  let assert Ok(succession) = cert.decode_succession(value)
+  assert succession.predecessor_spki == proof.p256_spki(previous.public)
+
+  // A third run naming the *same* predecessor changes nothing: the stored
+  // entry already says what this run would say, so it stays one claim.
+  let assert Ok(third) =
+    rekor_publish.run(
+      conn, apex, csk, log, #(spki, point), 3000, fake_resolver(), "create",
+      Some(previous),
+    )
+  assert third.refreshed
+  sqlite.close(conn)
+}
+
+/// A body whose kind or apiVersion is not the one entry type Rekor v2 takes
+/// is refused here, as it is by the client.
+pub fn parse_body_refuses_a_foreign_entry_kind_test() {
+  let good = fixture("canonicalized-body.bin")
+  let assert Ok(_) = proof.parse_body(good)
+  let assert Ok(text) = bit_array.to_string(good)
+
+  let swapped =
+    string.replace(text, "\"kind\":\"hashedrekord\"", "\"kind\":\"dsse\"")
+  let assert Error(proof.Binding(_)) = proof.parse_body(<<swapped:utf8>>)
+
+  let older =
+    string.replace(text, "\"apiVersion\":\"0.0.2\"", "\"apiVersion\":\"0.0.1\"")
+  let assert Error(proof.Binding(_)) = proof.parse_body(<<older:utf8>>)
+}
+
+/// A chain that stops below the root is refused before it is ever published.
+pub fn a_chain_that_does_not_reach_the_root_is_refused_test() {
+  let assert Ok(apex) = name.parse("sync.test.")
+  let full = [
+    chain.Link("sync.test.", <<1>>),
+    chain.Link("test.", <<2>>),
+    chain.Link(".", <<3>>),
+  ]
+  let assert Ok(Nil) = chain.check_shape(full, apex)
+
+  // The shape CP_DNSSEC_CHAIN_ROOT_DNSKEY=false used to emit: a TLD DNSKEY on
+  // top, anchoring against nothing any reader holds.
+  let rootless = [chain.Link("sync.test.", <<1>>), chain.Link("test.", <<2>>)]
+  let assert Error(why) = chain.check_shape(rootless, apex)
+  assert string.contains(why, "root")
+
+  // A ladder with a rung missing.
+  let spliced = [chain.Link("sync.test.", <<1>>), chain.Link(".", <<3>>)]
+  let assert Error(_) = chain.check_shape(spliced, apex)
+
+  // A chain that is not about this apex at all.
+  let assert Error(_) =
+    chain.check_shape([chain.Link("other.test.", <<1>>), chain.Link(".", <<3>>)], apex)
+  let assert Error(_) = chain.check_shape([], apex)
 }

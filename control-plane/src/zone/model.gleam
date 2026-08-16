@@ -111,9 +111,13 @@ fn read_rekor_proofs(
   Ok(
     records
     |> list.filter_map(fn(record) {
-      rekor_publish.to_proof(record)
-      |> result.map(proof.to_txt)
-      |> result.replace_error(Nil)
+      // A row that will not encode is dropped for the same reason a
+      // malformed one is: serving it would make every client refuse the
+      // whole zone, which is worse than the gap the row was meant to close.
+      case rekor_publish.to_proof(record) {
+        Ok(built) -> proof.to_txt(built) |> result.replace_error(Nil)
+        Error(_) -> Error(Nil)
+      }
     }),
   )
 }

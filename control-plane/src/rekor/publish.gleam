@@ -102,6 +102,8 @@ pub fn run(
   predecessor: Option(Csk),
 ) -> Result(Outcome, PublishError) {
   let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
+  let spki_sha256 =
+    crypto.hash(crypto.Sha256, proof.p256_spki(csk.public))
   use replaces <- result.try(previous_key_tag(conn, key_tag))
   let statement_bytes =
     statement.to_json(statement.for_key(apex, csk.public, action, replaces))
@@ -112,10 +114,10 @@ pub fn run(
   // leaf for one claim — Rekor is content-addressed, so reusing them is what
   // makes a republish a refresh.
   use stored <- result.try(
-    store.get(conn, key_tag, action) |> result.map_error(Db),
+    store.get(conn, spki_sha256, key_tag, action) |> result.map_error(Db),
   )
   use #(signature, certificate, refreshed) <- result.try(case
-    reusable(stored, statement_bytes)
+    reusable(stored, statement_bytes, predecessor)
   {
     Ok(#(signature, certificate)) -> Ok(#(signature, certificate, True))
     Error(Nil) -> {
@@ -178,6 +180,7 @@ pub fn run(
     store.put(
       conn,
       store.Record(
+        spki_sha256: spki_sha256,
         key_tag: key_tag,
         apex: name.to_string(apex),
         action: action,
@@ -215,19 +218,51 @@ pub fn action_for(conn: Connection, key_tag: Int) -> Result(String, PublishError
 }
 
 /// The signature and certificate a prior run logged, when the Statement is
-/// unchanged and the stored body still parses.
+/// unchanged, the stored body still parses, **and** the stored certificate
+/// already carries the countersignature this run was asked for.
+///
+/// That last condition is the whole reason this is not a one-liner. The §5.4
+/// recovery for "you forgot the predecessor keyfile" is to re-run with it,
+/// and the Statement bytes are identical either way — the predecessor's key
+/// tag lives in the certificate, not the Statement. Reusing on Statement
+/// equality alone therefore threw the new `Succession` away and reported
+/// success, leaving the zone tier B in every monitor forever, with no way to
+/// fix it short of hand-editing the database. Minting a fresh certificate is
+/// the right answer: it is a new leaf, but it is the leaf the operator asked
+/// for, and the old one stays in the log as the history it is.
 fn reusable(
   stored: Result(store.Record, Nil),
   statement_bytes: BitArray,
+  predecessor: Option(Csk),
 ) -> Result(#(BitArray, BitArray), Nil) {
-  case stored {
-    Ok(record) if record.statement == statement_bytes ->
-      case proof.parse_body(record.canonicalized_body) {
-        Ok(#(_digest, signature, certificate)) -> Ok(#(signature, certificate))
-        Error(_) -> Error(Nil)
-      }
+  use record <- result.try(case stored {
+    Ok(record) if record.statement == statement_bytes -> Ok(record)
     _ -> Error(Nil)
-  }
+  })
+  use #(_digest, signature, certificate) <- result.try(
+    proof.parse_body(record.canonicalized_body) |> result.replace_error(Nil),
+  )
+  use Nil <- result.try(case predecessor {
+    // Nothing new to add: whatever was logged stands.
+    None -> Ok(Nil)
+    // A predecessor was named. Reuse only if the logged certificate already
+    // countersigns with *that* key; otherwise this run has something to say
+    // that the stored entry does not.
+    Some(old) ->
+      case cert_extension(certificate, cert.oid_succession) {
+        Error(Nil) -> Error(Nil)
+        Ok(value) ->
+          case cert.decode_succession(value) {
+            Ok(succession) ->
+              case succession.predecessor_spki == proof.p256_spki(old.public) {
+                True -> Ok(Nil)
+                False -> Error(Nil)
+              }
+            Error(Nil) -> Error(Nil)
+          }
+      }
+  })
+  Ok(#(signature, certificate))
 }
 
 /// Builds the certificate a fresh entry carries.
@@ -254,10 +289,18 @@ fn mint_certificate(
     // into an evasion — it is a breadcrumb for monitors and nothing else.
     "retire" -> Ok(None)
     _ ->
-      case chain.collect(resolver, apex, chain.include_root_dnskey()) {
-        Ok(links) ->
-          Ok(Some(list.map(links, fn(link) { cert.Link(link.zone, link.rrs) })))
+      case chain.collect(resolver, apex) {
         Error(why) -> Error(NoChain(why))
+        Ok(links) ->
+          // Walk what was just collected before it goes anywhere. This side
+          // cannot check the signatures — that is the client's and the
+          // monitor's job — but it can check the chain reaches the root, and
+          // a chain that does not is one every reader refuses.
+          case chain.check_shape(links, apex) {
+            Error(why) -> Error(NoChain(why))
+            Ok(Nil) ->
+              Ok(Some(list.map(links, fn(link) { cert.Link(link.zone, link.rrs) })))
+          }
       }
   })
   let succession =
@@ -333,7 +376,7 @@ fn verify_entry(
         "the logged certificate's key is not this zone's DNSKEY",
       ))
   })
-  use Nil <- result.try(case san == cert.fqdn(name.to_string(apex)) {
+  use Nil <- result.try(case san == cert.san_name(name.to_string(apex)) {
     True -> Ok(Nil)
     False ->
       Error(proof.Binding("the logged certificate names " <> san <> ", not this apex"))

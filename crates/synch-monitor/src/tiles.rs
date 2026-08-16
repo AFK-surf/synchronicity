@@ -44,6 +44,16 @@ use synch_net::rekor::{leaf_hash, node_hash, sha256};
 
 use crate::MonitorError;
 
+/// The largest tile this reader will accept.
+///
+/// A full hash tile is 256 × 32 = 8 KiB. An entry bundle is 256 bodies, each
+/// a `hashedrekord` with at most Rekor's own 4 MiB request limit behind it,
+/// but in practice kilobytes — 16 MiB is far above anything the format can
+/// legitimately produce and far below what would hurt. The point is that
+/// *some* bound exists: the log is the party this monitor is auditing, so it
+/// is precisely the party whose response size must not be taken on trust.
+const MAX_TILE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Where tiles come from.
 #[allow(missing_debug_implementations)]
 pub trait TileSource {
@@ -100,12 +110,24 @@ impl TileSource for HttpTiles {
             .send()
             .map_err(|e| MonitorError::Transport(format!("{url}: {e}")))?;
         let body = match response.status().as_u16() {
-            200 => Some(
-                response
+            200 => {
+                // Capped, because a monitor reads from a log it does not
+                // trust: an 8 KiB hash tile and a 256-entry bundle are both
+                // bounded by the format, so anything past the cap is a server
+                // trying to exhaust the reader rather than a tile. The
+                // client's DoH path has had this bound since the audit that
+                // asked for it; this path had not.
+                let body = response
                     .bytes()
-                    .map_err(|e| MonitorError::Transport(format!("{url}: {e}")))?
-                    .to_vec(),
-            ),
+                    .map_err(|e| MonitorError::Transport(format!("{url}: {e}")))?;
+                if body.len() > MAX_TILE_BYTES {
+                    return Err(MonitorError::Transport(format!(
+                        "{url}: {} bytes, over the {MAX_TILE_BYTES}-byte cap",
+                        body.len()
+                    )));
+                }
+                Some(body.to_vec())
+            }
             404 => None,
             status => {
                 return Err(MonitorError::Transport(format!(
@@ -131,11 +153,6 @@ impl<'a> Tree<'a> {
     /// The tree of `size` leaves a checkpoint commits to.
     pub fn new(source: &'a dyn TileSource, size: u64) -> Tree<'a> {
         Tree { source, size }
-    }
-
-    /// The number of leaves.
-    pub fn size(&self) -> u64 {
-        self.size
     }
 
     /// The path of a tile, in the tlog-tiles naming scheme.
@@ -182,7 +199,12 @@ impl<'a> Tree<'a> {
     fn stored_hash(&self, level: u32, index: u64) -> Result<[u8; 32], MonitorError> {
         let tile_level = level / 8;
         let within = level % 8;
-        let tile_index = (index << within) >> 8;
+        // `index << within` overflows for a level/index pair a hostile log
+        // can name; refuse rather than wrap into a different node.
+        let shifted = index.checked_shl(within).ok_or_else(|| {
+            MonitorError::Tile(format!("node ({level},{index}) is not addressable"))
+        })?;
+        let tile_index = shifted >> 8;
         let offset = index - ((tile_index << 8) >> within);
         let data = self.hash_tile(tile_level, tile_index)?;
         let start = (offset << within) as usize * 32;
@@ -324,18 +346,26 @@ fn fold(data: &[u8]) -> [u8; 32] {
 }
 
 /// The largest power of two strictly less than `n` — RFC 6962's split.
+///
+/// Checked for the same reason as [`max_pow2_le`]: the bound comes from the
+/// log.
 fn max_pow2_lt(n: u64) -> u64 {
-    let mut k = 1;
-    while k * 2 < n {
+    let mut k = 1u64;
+    while k.checked_mul(2).is_some_and(|next| next < n) {
         k *= 2;
     }
     k
 }
 
 /// The largest power of two at most `n`.
+///
+/// The doubling is checked: `n` reaches this function from a tree size the
+/// *log* chose, and an unchecked `k * 2` overflows and panics (debug) or
+/// wraps to zero and spins (release) for sizes near `u64::MAX`. A monitor
+/// must not be crashable by the thing it is auditing.
 fn max_pow2_le(n: u64) -> u64 {
-    let mut k = 1;
-    while k * 2 <= n {
+    let mut k = 1u64;
+    while k.checked_mul(2).is_some_and(|next| next <= n) {
         k *= 2;
     }
     k

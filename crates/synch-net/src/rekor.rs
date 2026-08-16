@@ -214,8 +214,25 @@ pub struct RekorProof {
 }
 
 impl RekorProof {
-    /// Encodes the record in the v2 wire format.
-    pub fn encode(&self) -> Vec<u8> {
+    /// Encodes the record in the v3 wire format.
+    ///
+    /// `None` for a record that does not fit it — a blob past 65535 bytes or
+    /// an audit path past 255 hops. Refusing beats emitting *something*: this
+    /// format exists so two implementations agree byte for byte, and the two
+    /// used to disagree about the failure itself (this side clamped the
+    /// length and truncated the blob; the Gleam side wrapped it modulo
+    /// 65536). Two different wrong answers in a format whose whole point is
+    /// agreement is worse than no answer, so both sides now refuse.
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        for blob in [&self.statement, &self.canonicalized_body, &self.checkpoint] {
+            u16::try_from(blob.len()).ok()?;
+        }
+        u8::try_from(self.inclusion_path.len()).ok()?;
+        Some(self.encode_unchecked())
+    }
+
+    /// The encoder proper, for a record already known to fit.
+    fn encode_unchecked(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             45 + self.statement.len()
                 + self.canonicalized_body.len()
@@ -227,22 +244,18 @@ impl RekorProof {
         out.extend_from_slice(&self.log_id);
         out.extend_from_slice(&self.log_index.to_be_bytes());
         for blob in [&self.statement, &self.canonicalized_body, &self.checkpoint] {
-            // A field that cannot be length-prefixed cannot be encoded; the
-            // control plane never produces one, and truncating silently
-            // would produce a record that fails verification much later.
-            let len = u16::try_from(blob.len()).unwrap_or(u16::MAX);
+            let len = u16::try_from(blob.len()).expect("checked by encode");
             out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(&blob[..usize::from(len)]);
+            out.extend_from_slice(blob);
         }
-        let hops = u8::try_from(self.inclusion_path.len()).unwrap_or(u8::MAX);
-        out.push(hops);
-        for hash in self.inclusion_path.iter().take(usize::from(hops)) {
+        out.push(u8::try_from(self.inclusion_path.len()).expect("checked by encode"));
+        for hash in &self.inclusion_path {
             out.extend_from_slice(hash);
         }
         out
     }
 
-    /// Decodes a v2 record, refusing anything with bytes left over — a
+    /// Decodes a v3 record, refusing anything with bytes left over — a
     /// record that decodes two ways is a record an attacker can steer.
     pub fn decode(bytes: &[u8]) -> Result<RekorProof, ProofError> {
         let mut reader = Reader::new(bytes);
@@ -282,14 +295,15 @@ impl RekorProof {
         RekorProof::decode(&base64url_decode(text)?)
     }
 
-    /// Renders the record as one base64url TXT payload.
-    pub fn to_txt(&self) -> String {
-        base64url_encode(&self.encode())
+    /// Renders the record as one base64url TXT payload, or `None` for a
+    /// record too large for the format (see [`RekorProof::encode`]).
+    pub fn to_txt(&self) -> Option<String> {
+        Some(base64url_encode(&self.encode()?))
     }
 
     /// The RFC 6962 leaf hash of this entry: over the log's own body bytes.
     ///
-    /// This is the whole point of v2 — the leaf commits to the exact
+    /// This is the whole point of the format — the leaf commits to the exact
     /// `canonicalizedBody` the log returned, so an inclusion walk under this
     /// hash reaches a root the real Sigstore computed over the same bytes.
     pub fn leaf_hash(&self) -> [u8; 32] {
@@ -1366,16 +1380,19 @@ mod tests {
     #[test]
     fn proofs_round_trip() {
         let original = proof();
-        let bytes = original.encode();
+        let bytes = original.encode().expect("a small record encodes");
         assert_eq!(RekorProof::decode(&bytes).unwrap(), original);
-        assert_eq!(RekorProof::from_txt(&original.to_txt()).unwrap(), original);
+        assert_eq!(
+            RekorProof::from_txt(&original.to_txt().expect("encodes")).unwrap(),
+            original
+        );
     }
 
     #[test]
     fn the_wire_layout_is_pinned() {
         // Field offsets are load-bearing across two implementations; assert
         // them rather than trusting the encoder to agree with itself.
-        let bytes = proof().encode();
+        let bytes = proof().encode().expect("a small record encodes");
         assert_eq!(bytes[0], PROOF_VERSION);
         assert_eq!(&bytes[1..3], &34_918u16.to_be_bytes());
         assert_eq!(&bytes[3..35], &[7u8; 32]);
@@ -1386,7 +1403,7 @@ mod tests {
 
     #[test]
     fn a_truncated_or_padded_record_is_malformed() {
-        let bytes = proof().encode();
+        let bytes = proof().encode().expect("a small record encodes");
         for cut in [0, 1, 10, 44, bytes.len() - 1] {
             assert!(matches!(
                 RekorProof::decode(&bytes[..cut]),

@@ -74,7 +74,6 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_REKOR_KEY` | primary | file pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev snapshot |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query` |
-| `CP_DNSSEC_CHAIN_ROOT_DNSKEY` | primary | `false` omits the root DNSKEY link from that chain; default `true` |
 | `CP_TUF_URL` | primary | Sigstore TUF repository relayed in the zone, default `https://tuf-repo-cdn.sigstore.dev` |
 
 > **Why the database gets its own directory.** Each SQLite connection

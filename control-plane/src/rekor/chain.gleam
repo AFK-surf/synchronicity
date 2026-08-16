@@ -57,22 +57,6 @@ pub fn resolver_url() -> String {
   |> result.unwrap("https://cloudflare-dns.com/dns-query")
 }
 
-/// Whether to include the root DNSKEY RRset as the chain's last link
-/// (`CP_DNSSEC_CHAIN_ROOT_DNSKEY`, default true).
-///
-/// It costs about 1.1 KB and every monitor already holds the root trust
-/// anchor, so omitting it is defensible on size. It is on by default anyway,
-/// because an entry that carries its whole chain is one an archivist can
-/// verify in twenty years with nothing but the IANA anchor — and because a
-/// monitor that has to supply the root itself is a monitor with a
-/// configuration step that can be got wrong.
-pub fn include_root_dnskey() -> Bool {
-  case envoy.get("CP_DNSSEC_CHAIN_ROOT_DNSKEY") {
-    Ok("false") -> False
-    _ -> True
-  }
-}
-
 /// A resolver, as the one operation this needs: ask for `<name> <type>`
 /// with DNSSEC records, get the answer section's RRs back.
 ///
@@ -94,15 +78,78 @@ pub type Link {
 /// an entry every reader rejects, and finding that out at publish time —
 /// where an operator is standing there reading the error — is worth much
 /// more than finding it out later from a client that will not resolve.
-pub fn collect(
-  resolver: Resolver,
-  apex: Name,
-  include_root: Bool,
-) -> Result(List(Link), String) {
+pub fn collect(resolver: Resolver, apex: Name) -> Result(List(Link), String) {
   let labels = name.to_string(apex) |> string.split(".") |> drop_empty
   use apex_link <- result.try(ds_link(resolver, apex))
-  use ancestors <- result.try(ancestor_links(resolver, labels, include_root, []))
+  use ancestors <- result.try(ancestor_links(resolver, labels, []))
   Ok([apex_link, ..ancestors])
+}
+
+/// Walks a chain's *shape*, the way a reader will walk its signatures.
+///
+/// This service cannot check the cryptography — the RRSIG walk lives in
+/// crates/synch-net/src/chain.rs and every client and monitor runs it — but
+/// it can check the thing that is cheap to get wrong and impossible to notice
+/// afterwards: that the links form an unbroken ladder from the apex to the
+/// **root**, and that each carries the RRsets its position requires.
+///
+/// It exists because a configuration knob once let this service publish a
+/// chain that stopped at the TLD. Nothing here refused it — the code checked
+/// only that the extension was *present* — so `rekor-publish` reported
+/// success and then every client failed closed against an entry no reader
+/// could anchor. A publish that cannot be verified is a publish that must
+/// fail here, loudly, while an operator is still watching.
+pub fn check_shape(links: List(Link), apex: Name) -> Result(Nil, String) {
+  case links {
+    [] -> Error("the chain has no links")
+    [first, ..] ->
+      case first.zone == name.to_string(apex) {
+        False ->
+          Error(
+            "the chain starts at " <> first.zone <> ", not the apex " <> name.to_string(apex),
+          )
+        True -> check_ladder(links, apex)
+      }
+  }
+}
+
+fn check_ladder(links: List(Link), below: Name) -> Result(Nil, String) {
+  case links {
+    [] -> Error("the chain has no links")
+    // The top of a well-formed chain is the root, whose DNSKEY the IANA
+    // trust anchor terminates. Anything else is a chain that anchors nowhere.
+    [last] ->
+      case last.zone == "." {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "the chain stops at "
+            <> last.zone
+            <> " instead of the root, so no reader can anchor it",
+          )
+      }
+    [_, next, ..rest] -> {
+      let parent = parent_of(below)
+      case next.zone == name.to_string(parent) {
+        False ->
+          Error(
+            "the chain jumps from "
+            <> name.to_string(below)
+            <> " to "
+            <> next.zone
+            <> ", which is not its parent",
+          )
+        True -> check_ladder([next, ..rest], parent)
+      }
+    }
+  }
+}
+
+fn parent_of(zone: Name) -> Name {
+  case zone {
+    [] -> []
+    [_, ..rest] -> rest
+  }
 }
 
 /// The apex's own link: its DS RRset and the parent's signature over it.
@@ -118,26 +165,25 @@ fn ds_link(resolver: Resolver, apex: Name) -> Result(Link, String) {
 fn ancestor_links(
   resolver: Resolver,
   labels: List(String),
-  include_root: Bool,
   acc: List(Link),
 ) -> Result(List(Link), String) {
   case labels {
-    [] | [_] ->
+    [] | [_] -> {
       // The next zone up is the root: DNSKEY only, since the root has no DS.
-      case include_root {
-        False -> Ok(list.reverse(acc))
-        True -> {
-          use root <- result.try(name.parse(".") |> replace_error("."))
-          use rrs <- result.try(rrset(resolver, root, wire.type_dnskey))
-          Ok(list.reverse([Link(".", rrs), ..acc]))
-        }
-      }
+      // Always included. An earlier version made this optional to save ~1.1 KB
+      // and the saving was illusory: a chain that stops below the root anchors
+      // against nothing a reader holds, so every client refuses the entry. A
+      // switch whose only effect is to break verification is not a trade-off.
+      use root <- result.try(name.parse(".") |> replace_error("."))
+      use rrs <- result.try(rrset(resolver, root, wire.type_dnskey))
+      Ok(list.reverse([Link(".", rrs), ..acc]))
+    }
     [_, ..rest] -> {
       let text = string.join(rest, ".") <> "."
       use zone <- result.try(name.parse(text) |> replace_error(text))
       use keys <- result.try(rrset(resolver, zone, wire.type_dnskey))
       use ds <- result.try(rrset(resolver, zone, type_ds))
-      ancestor_links(resolver, rest, include_root, [
+      ancestor_links(resolver, rest, [
         Link(text, bit_array.concat([keys, ds])),
         ..acc
       ])

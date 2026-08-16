@@ -69,7 +69,7 @@ fn a_logged_zone_key_verifies_offline() {
 
     // And it survives the round trip through a TXT record, which is how it
     // actually reaches a client.
-    let decoded = RekorProof::from_txt(&proof.to_txt()).unwrap();
+    let decoded = RekorProof::from_txt(&proof.to_txt().expect("encodes")).unwrap();
     assert_eq!(decoded, proof);
     verify(&decoded, &zone, &log).unwrap();
 }
@@ -125,7 +125,7 @@ fn a_raw_public_key_entry_is_refused_outright() {
 #[test]
 fn a_v2_proof_record_is_a_malformed_version_and_nothing_more() {
     let (_, _, proof) = logged_zone();
-    let mut bytes = proof.encode();
+    let mut bytes = proof.encode().expect("a sim proof encodes");
     bytes[0] = 2;
     assert!(matches!(
         RekorProof::decode(&bytes),
@@ -489,7 +489,10 @@ async fn a_zone_that_publishes_its_proof_resolves_under_require() {
     let mut other_log = SimLog::new("rekor.sim");
     let stranger = SimZone::new("cluster.example", member_records());
     let other = other_log.publish(&stranger, "rollover", Some(zone.key_tag()));
-    zone.rekor_txt = vec![other.to_txt(), proof.to_txt()];
+    zone.rekor_txt = vec![
+        other.to_txt().expect("encodes"),
+        proof.to_txt().expect("encodes"),
+    ];
 
     let anchor = write(&zone.anchor_record());
     let log_key = write(&log.key_pem());
@@ -558,7 +561,10 @@ async fn a_proof_record_for_another_key_reads_as_absent() {
     let mut zone = SimZone::new("cluster.example", member_records());
     let stranger = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    zone.rekor_txt = vec![log.publish(&stranger, "create", None).to_txt()];
+    zone.rekor_txt = vec![log
+        .publish(&stranger, "create", None)
+        .to_txt()
+        .expect("encodes")];
 
     let anchor = write(&zone.anchor_record());
     let log_key = write(&log.key_pem());
@@ -589,7 +595,7 @@ async fn a_chainless_entry_is_refused_through_the_whole_resolver_path() {
     let statement = zone.zone_key_statement("create", None);
     let certificate = zone.certificate(&[]);
     let proof = log.log_certified(&zone, &statement, &certificate);
-    zone.rekor_txt = vec![proof.to_txt()];
+    zone.rekor_txt = vec![proof.to_txt().expect("encodes")];
 
     let anchor = write(&zone.anchor_record());
     let log_key = write(&log.key_pem());
@@ -678,7 +684,7 @@ fn the_shared_fixture_decodes_and_verifies() {
     assert_eq!(proof.key_tag.to_string(), fixture_field("key_tag"));
     assert_eq!(proof.log_index.to_string(), fixture_field("log_index"));
     // Re-encoding is byte-identical: the format has exactly one rendering.
-    assert_eq!(proof.encode(), fixture("proof.bin"));
+    assert_eq!(proof.encode().unwrap(), fixture("proof.bin"));
 
     // The certificate the Gleam side built, read by the Rust parser: the two
     // DER implementations have to agree about the SAN, the SPKI and the two
@@ -822,7 +828,7 @@ fn regenerate_the_shared_fixture() {
     let dir = fixture_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let write_file = |name: &str, bytes: &[u8]| std::fs::write(dir.join(name), bytes).unwrap();
-    write_file("proof.bin", &proof.encode());
+    write_file("proof.bin", &proof.encode().expect("the fixture encodes"));
     write_file("statement.json", &proof.statement);
     write_file("canonicalized-body.bin", &proof.canonicalized_body);
     write_file("certificate.der", &body.certificate_der);

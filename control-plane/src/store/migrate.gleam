@@ -62,8 +62,53 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6]
+  [v1, v2, v3, v4, v5, v6, v7]
 }
+
+/// V7: identify a key by its key, not by a checksum of it.
+///
+/// V6's primary key was `(key_tag, action)`. An RFC 4034 key tag is a 16-bit
+/// checksum over the DNSKEY rdata, so two distinct keys collide with odds
+/// around 1/65536 per rollover — and a collision meant one key's row silently
+/// *replaced* another's, taking its proof out of the served zone with no
+/// error anywhere. Rare and silent is the bad combination: it would surface
+/// as a cluster that stopped resolving for reasons nobody could reconstruct.
+///
+/// The identity is now `(spki_sha256, action)` — the SHA-256 of the key's DER
+/// SubjectPublicKeyInfo, which is what identifies a key everywhere else in
+/// this design (the succession extension names a predecessor by SPKI for the
+/// same reason, and a monitor's known-keys file is keyed by this digest).
+/// `key_tag` stays as an indexed column because that is what a client selects
+/// on — it reads the tag from the RRSIG it just validated — but selection is
+/// no longer identity: a lookup may now return two rows for one tag, and the
+/// client tries each until one verifies.
+///
+/// Existing rows carry no SPKI column to backfill from, and the certificate
+/// inside `canonicalized_body` would have to be parsed in SQL to get one, so
+/// the table is rebuilt. `rekor-publish` repopulates it, which is a step the
+/// ceremony already has.
+const v7 = "
+DROP TABLE rekor_records;
+CREATE TABLE rekor_records (
+  spki_sha256        BLOB    NOT NULL CHECK (length(spki_sha256) = 32),
+  key_tag            INTEGER NOT NULL,
+  apex               TEXT    NOT NULL,
+  action             TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
+  statement          BLOB    NOT NULL,
+  canonicalized_body BLOB    NOT NULL,
+  log_id             BLOB    NOT NULL CHECK (length(log_id) = 32),
+  log_index          INTEGER NOT NULL,
+  checkpoint         BLOB    NOT NULL,
+  inclusion_path     BLOB    NOT NULL,
+  chainless          INTEGER NOT NULL DEFAULT 0
+                     CHECK (chainless = 0 OR action = 'retire'),
+  integrated_at      INTEGER NOT NULL,
+  verified_at        INTEGER NOT NULL,
+  PRIMARY KEY (spki_sha256, action)
+);
+CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
+CREATE INDEX rekor_records_by_key_tag ON rekor_records (key_tag);
+"
 
 /// V6: proof v3 — the certificate verifier (docs/REKOR-ZONE-KEY.md §2, §3).
 ///

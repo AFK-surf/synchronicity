@@ -156,7 +156,9 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
 
     let mut at = args.from_index.unwrap_or(state.next_index);
     let end = match args.max_entries {
-        Some(max) => checkpoint.tree_size.min(at + max),
+        // Saturating: `--from-index` and `--max-entries` are both operator
+        // input, and their sum is not bounded by anything but the CLI.
+        Some(max) => checkpoint.tree_size.min(at.saturating_add(max)),
         None => checkpoint.tree_size,
     };
     let mut findings = Vec::new();

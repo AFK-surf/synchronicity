@@ -140,9 +140,15 @@ impl DnssecChain {
         let mut links = Vec::new();
         while !list.is_empty() {
             let mut link = list.sequence("Link")?;
-            let zone = std::str::from_utf8(link.tagged(0x16, "Link.zone")?)
-                .map_err(|_| X509Error::from("Link.zone is not ASCII"))?
-                .to_string();
+            // `zone` is an IA5String, which is ASCII — so check ASCII rather
+            // than UTF-8 and then claim ASCII in the error. A DNS name that
+            // needs more than ASCII is punycode by the time it reaches here.
+            let bytes = link.tagged(0x16, "Link.zone")?;
+            if !bytes.is_ascii() {
+                return Err(X509Error::from("Link.zone is not ASCII"));
+            }
+            let zone = String::from_utf8(bytes.to_vec())
+                .map_err(|_| X509Error::from("Link.zone is not ASCII"))?;
             let rrs = link.tagged(0x04, "Link.rrs")?.to_vec();
             if !link.is_empty() {
                 return Err(X509Error::from("Link: unexpected trailing member"));

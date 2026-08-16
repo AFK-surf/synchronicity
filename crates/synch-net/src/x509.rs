@@ -130,9 +130,20 @@ impl Certificate {
             }
         }
 
-        let dns_names = match extensions.iter().find(|e| e.oid == OID_SUBJECT_ALT_NAME) {
-            Some(san) => parse_san(&san.value)?,
-            None => Vec::new(),
+        // Exactly one subjectAltName, or none. RFC 5280 says an extension
+        // appears at most once, and taking the *first* of two would let a
+        // certificate mean one thing to this parser and another to any reader
+        // that took the last — which, for the extension that carries the zone
+        // name, is the whole game.
+        let mut sans = extensions.iter().filter(|e| e.oid == OID_SUBJECT_ALT_NAME);
+        let dns_names = match (sans.next(), sans.next()) {
+            (Some(san), None) => parse_san(&san.value)?,
+            (None, _) => Vec::new(),
+            (Some(_), Some(_)) => {
+                return Err(X509Error::new(
+                    "the certificate carries more than one subjectAltName extension",
+                ))
+            }
         };
         Ok(Certificate {
             spki,
@@ -208,6 +219,25 @@ fn parse_san(value: &[u8]) -> Result<Vec<String>, X509Error> {
 }
 
 // ---------------------------------------------------------------- building
+//
+// **Everything below this line is the cross-validation encoder, not the
+// production one.** Certificates that reach the public log are built by
+// `control-plane/src/cp_crypto_ffi.erl` with OTP's `public_key` — the ASN.1
+// module is the reference encoder, and a certificate an external tool cannot
+// read would defeat the point of putting it in a public log. This half is
+// reachable only from `crate::sim` and the test suites.
+//
+// It earns its place by being a *second, independent* encoder: the shared
+// fixtures under `control-plane/test/fixtures/rekor/crossval` are written by
+// the Gleam side and read by the parser above, and this builder lets the
+// tests mint certificate shapes the control plane will not produce on demand
+// — a SAN that is not a name, two SAN extensions, a chain for the wrong zone.
+// Two implementations of one DER format drift silently unless something
+// outside both of them holds the bytes still; this is one of the two.
+//
+// It is not feature-gated because `sim` is not either, and a `cfg` that hid
+// it would also hide it from the crossval. What it needs instead is this
+// note, so a reader does not assume `x509::SelfSigned` ships.
 
 /// The one certificate shape this design mints.
 ///
