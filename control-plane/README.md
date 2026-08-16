@@ -22,10 +22,10 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   validation. The entry's verifier is a **self-signed certificate naming
   the apex in a `dNSName` SAN**: Rekor validates certificates not at all
   and copies the DER verbatim into the Merkle leaf, so the zone name lands
-  where anyone reading the log can index it. Inside it ride two custom
-  extensions — the DNSSEC chain from the apex's DS up to the root, and the
-  previous zone key's succession countersignature — which are what let a
-  monitor tell a rotation from a substitution offline. `rekor-publish`
+  where anyone reading the log can index it. Inside it rides one custom
+  extension — the DNSSEC chain from the apex's DS up to the root — which is
+  what lets a monitor confirm offline that the key really is authorized for
+  the zone the entry names. `rekor-publish`
   collects the chain over DoH, mints the certificate, POSTs a
   `hashedrekord` v0.0.2 `CreateEntryRequest` to `CP_REKOR_URL`, then
   verifies the returned entry locally (canonicalized body, inclusion,
@@ -101,7 +101,7 @@ listen address.
 | Variable | Role | Meaning |
 |---|---|---|
 | `CP_ROLE` | both | Required. `primary` or `replica`. |
-| `CP_BASE_DOMAIN` | both | Required. Zone apex, no trailing dot (`sync.example.dev`). |
+| `CP_BASE_DOMAIN` | both | Required. Zone apex, no trailing dot (`sync.example`). |
 | `CP_DB_PATH` | both | Required. SQLite file, absolute path, in its own directory (the sandbox grants that directory — keep the key out of it). |
 | `CP_KEY_FILE` | primary | Required on the primary (zone CSK). Must live outside the database's directory. **Must be unset on replicas.** |
 | `CP_HTTP_LISTEN` | both | HTTP / DoH bind as `address:port`. Default `0.0.0.0:8080`. |

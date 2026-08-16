@@ -5,25 +5,41 @@
 //! bundle from the last-seen index, pull the certificate out of each leaf, and
 //! classify the ones naming a watched apex (docs/REKOR-ZONE-KEY.md §5.5).
 //!
+//! **The product is the list of newly authorized keys.** A tier A entry whose
+//! key this monitor has not recorded for that apex is a new authorization: it
+//! goes to stdout, and is then recorded so the next run does not repeat it. A
+//! tier A entry for a key already recorded has been reported before and is
+//! not reported again. Tier C — an unauthorized claim no client would have
+//! accepted — goes to stderr as a note and is never recorded, because
+//! recording it would suppress the report if the same key later showed up
+//! with a chain that does verify.
+//!
+//! stdout is therefore the report and nothing else; stderr is the running
+//! commentary. A cron job that mails stdout mails exactly the events that
+//! need a human.
+//!
 //! Exit codes are the interface a cron job or an alerting rule reads:
 //!
 //! ```text
 //!  0  nothing new for a watched apex
-//! 10  new tier A entries only — routine rotations, already countersigned
-//! 20  tier C present — unauthorized claims naming a watched apex, no alarm
-//! 30  tier B present — a chain-valid key nobody countersigned: LOOK
+//! 10  unauthorized claims only — tier C naming a watched apex, no alarm
+//! 20  new authorizations seen — a key was authorized for a watched apex
+//!     that this monitor had not recorded: check it against what you published
 //!  2  the run could not finish (transport, checkpoint, state)
 //! ```
 //!
-//! Tier B outranks tier C in that ordering because a run that found both is a
-//! run that found tier B.
+//! These numbers changed when tier B was removed, and they were renumbered by
+//! severity rather than kept for compatibility: an alerting rule matching the
+//! old `30` would now match nothing, which is a loud failure, whereas leaving
+//! `20` meaning "tier C" while `10` meant the new loudest outcome would have
+//! silently inverted every rule that tested `>=`.
 
 use std::path::PathBuf;
 
 use clap::Parser;
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::{
-    classify::{classify, Tier},
+    classify::{classify, Finding, Tier},
     state::MonitorState,
     tiles::{HttpTiles, Tree},
     MonitorError,
@@ -31,8 +47,29 @@ use synch_monitor::{
 use synch_net::rekor::{Checkpoint, HashedRekordBody, LogKeys};
 
 /// Watch a Rekor v2 transparency log for zone-key entries.
+///
+/// Reports every newly authorized zone key for a watched apex: an entry whose
+/// DNSSEC chain verifies and covers its own key authorizes that key, and the
+/// first time this monitor sees one it says so. It cannot tell a rotation you
+/// performed from a substitution by somebody who took your registrar — an
+/// attacker with the DS builds the same chain — so it reports the
+/// authorization and leaves the judgement to your own record of what you
+/// published.
+///
+/// New authorizations go to stdout, one line each; everything else to stderr.
 #[derive(Debug, Parser)]
-#[command(name = "synch-monitor", version, about)]
+#[command(
+    name = "synch-monitor",
+    version,
+    about,
+    after_long_help = "EXIT CODES:
+   0  nothing new for a watched apex
+  10  unauthorized claims only — entries naming a watched apex whose chain
+      does not verify. No client would have accepted one; recorded, no alarm.
+  20  new authorizations seen — a key was authorized for a watched apex that
+      this monitor had not recorded. Check it against what you published.
+   2  the run could not finish (transport, checkpoint, state)"
+)]
 struct Args {
     /// The log's base URL.
     #[arg(
@@ -42,7 +79,8 @@ struct Args {
     )]
     log: String,
 
-    /// Where to persist the last checkpoint, the last index and known keys.
+    /// Where to persist the last checkpoint, the last index, the apexes to
+    /// watch and the keys already reported for each.
     #[arg(long, env = "SYNCH_MONITOR_STATE")]
     state: PathBuf,
 
@@ -71,7 +109,11 @@ struct Args {
     #[arg(long)]
     json: bool,
 
-    /// Classify but do not persist: the dry run an operator does first.
+    /// Classify but do not record: the dry run an operator does first.
+    ///
+    /// Nothing is written to the state file, so the same new authorizations
+    /// are reported again on the next run — which is what makes it a dry run
+    /// rather than a run that silently consumed the news.
     #[arg(long)]
     no_save: bool,
 }
@@ -102,8 +144,9 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     let mut state = MonitorState::load(&args.state)?;
     if state.known.keys.is_empty() {
         return Err(MonitorError::State(format!(
-            "{} names no apex to watch — seed it with the zones and keys you \
-             already know, e.g. {{\"known\":{{\"keys\":{{\"sync.example.dev\":[]}}}}}}",
+            "{} names no apex to watch — seed it with the zones you want \
+             reported on, and (optionally) the keys you have already accounted \
+             for, e.g. {{\"known\":{{\"keys\":{{\"sync.example\":[]}}}}}}",
             args.state.display()
         )));
     }
@@ -198,31 +241,56 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
                 checkpoint.root_hash,
             )
             .map_err(|e| MonitorError::Tile(e.to_string()))?;
-            if let Some(finding) = classify(&parsed, index, &state.known, &anchors) {
+            if let Some(finding) = classify(&parsed, index, &anchors) {
                 findings.push((finding, parsed.certificate.spki.clone()));
             }
         }
         at = ((at / 256) + 1) * 256;
     }
 
-    for (finding, _) in &findings {
-        match args.json {
-            true => println!(
-                "{}",
-                serde_json::to_string(finding).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
-            ),
-            false => println!("{}", finding.line()),
+    // Sort the classified entries into the three things a run can have found.
+    //
+    // The "already reported" test runs against the state as it was *loaded*,
+    // and recording happens after the whole batch is decided — so two entries
+    // in one run that authorize the same key report once, and an entry does
+    // not suppress itself.
+    let mut new_authorizations = Vec::new();
+    let mut already_known = 0usize;
+    let mut claims = Vec::new();
+    for (finding, spki) in &findings {
+        match finding.tier {
+            Tier::A => {
+                let apex = synch_net::chain::parse_name(&finding.apex);
+                // A tier A finding always came from a parsed SAN, so this
+                // cannot fail; treating an unparseable one as *new* rather
+                // than as known is the safe direction anyway — it reports.
+                match apex.map(|apex| state.known.contains(&apex, spki)) {
+                    Ok(true) => already_known += 1,
+                    _ => new_authorizations.push((finding, spki)),
+                }
+            }
+            Tier::C => claims.push(finding),
         }
     }
 
-    // Only a tier A key becomes a trusted predecessor. Promoting tier B would
-    // hand an attacker a foothold: their first substituted key would become
-    // the known predecessor that makes their second one look routine.
-    for (finding, spki) in &findings {
-        if finding.tier == Tier::A {
-            if let Ok(apex) = synch_net::chain::parse_name(&finding.apex) {
-                state.known.insert(&apex, spki);
-            }
+    // stdout is the report: newly authorized keys, and nothing else.
+    for (finding, _) in &new_authorizations {
+        println!("{}", render(finding, args.json));
+    }
+    // Tier C on stderr. It is not an alarm — no client would have taken these
+    // — but an operator who sees the exit code needs to be able to see *what*
+    // was claimed without re-running with different flags.
+    for finding in &claims {
+        eprintln!("{}", render(finding, args.json));
+    }
+
+    // Record what was reported, so the next run stays quiet about it. Tier C
+    // is deliberately never recorded: the same key arriving later with a
+    // chain that *does* verify is a genuine new authorization, and a tier C
+    // sighting must not have quietly consumed it.
+    for (finding, spki) in &new_authorizations {
+        if let Ok(apex) = synch_net::chain::parse_name(&finding.apex) {
+            state.known.insert(&apex, spki);
         }
     }
     state.origin = checkpoint.origin.clone();
@@ -233,16 +301,24 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
         state.save(&args.state)?;
     }
 
-    let worst = findings.iter().map(|(f, _)| f.tier).max();
     eprintln!(
-        "synch-monitor: {} entries read to index {end}, {} finding(s)",
+        "synch-monitor: {} entries read to index {end}; {} new authorization(s), \
+         {already_known} already recorded, {} unauthorized claim(s)",
         end.saturating_sub(args.from_index.unwrap_or(0)),
-        findings.len()
+        new_authorizations.len(),
+        claims.len()
     );
-    Ok(match worst {
-        None => 0,
-        Some(Tier::A) => 10,
-        Some(Tier::C) => 20,
-        Some(Tier::B) => 30,
+    Ok(match (new_authorizations.is_empty(), claims.is_empty()) {
+        (false, _) => 20,
+        (true, false) => 10,
+        (true, true) => 0,
     })
+}
+
+/// One finding, as a line — JSON when asked, human otherwise.
+fn render(finding: &Finding, json: bool) -> String {
+    match json {
+        true => serde_json::to_string(finding).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}")),
+        false => finding.line(),
+    }
 }

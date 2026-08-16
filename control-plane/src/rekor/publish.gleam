@@ -77,9 +77,6 @@ pub type Outcome {
     refreshed: Bool,
     /// True when this entry carries no DNSSEC chain — only ever a `retire`.
     chainless: Bool,
-    /// The predecessor key tag this entry's succession countersignature
-    /// names, if it carries one.
-    countersigned_by: Option(Int),
   )
 }
 
@@ -87,9 +84,9 @@ pub type Outcome {
 ///
 /// The action follows the ceremony (§5.4): the first key logged for a zone
 /// is a `create`; a key logged while another already has a record is a
-/// `rollover` naming the tag it replaces. `predecessor` is the *previous*
-/// zone key's material, present only when the operator still holds it —
-/// which is what turns a monitor's tier B into a tier A.
+/// `rollover` naming the tag it replaces. `replacesKeyTag` in the Statement
+/// is rollover *metadata* — it says which key this one supersedes — and it
+/// is not evidence of anything: nothing signs it but the new key itself.
 pub fn run(
   conn: Connection,
   apex: Name,
@@ -99,7 +96,6 @@ pub fn run(
   now: Int,
   resolver: chain.Resolver,
   action: String,
-  predecessor: Option(Csk),
 ) -> Result(Outcome, PublishError) {
   let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
   let spki_sha256 = crypto.hash(crypto.Sha256, proof.p256_spki(csk.public))
@@ -116,7 +112,7 @@ pub fn run(
     store.get(conn, spki_sha256, key_tag, action) |> result.map_error(Db),
   )
   use #(signature, certificate, refreshed) <- result.try(
-    case reusable(stored, statement_bytes, predecessor) {
+    case reusable(stored, statement_bytes) {
       Ok(#(signature, certificate)) -> Ok(#(signature, certificate, True))
       Error(Nil) -> {
         use certificate <- result.try(mint_certificate(
@@ -125,7 +121,6 @@ pub fn run(
           action,
           now,
           resolver,
-          predecessor,
         ))
         Ok(#(statement.sign(csk, statement_bytes), certificate, False))
       }
@@ -196,14 +191,7 @@ pub fn run(
     )
     |> result.map_error(Db),
   )
-  Ok(Outcome(
-    key_tag,
-    action,
-    logged.log_index,
-    refreshed,
-    verified.chainless,
-    verified.countersigned_by,
-  ))
+  Ok(Outcome(key_tag, action, logged.log_index, refreshed, verified.chainless))
 }
 
 /// The action for a fresh publish: a zone's first logged key is a `create`,
@@ -220,22 +208,22 @@ pub fn action_for(
 }
 
 /// The signature and certificate a prior run logged, when the Statement is
-/// unchanged, the stored body still parses, **and** the stored certificate
-/// already carries the countersignature this run was asked for.
+/// unchanged and the stored body still parses.
 ///
-/// That last condition is the whole reason this is not a one-liner. The §5.4
-/// recovery for "you forgot the predecessor keyfile" is to re-run with it,
-/// and the Statement bytes are identical either way — the predecessor's key
-/// tag lives in the certificate, not the Statement. Reusing on Statement
-/// equality alone therefore threw the new `Succession` away and reported
-/// success, leaving the zone tier B in every monitor forever, with no way to
-/// fix it short of hand-editing the database. Minting a fresh certificate is
-/// the right answer: it is a new leaf, but it is the leaf the operator asked
-/// for, and the old one stays in the log as the history it is.
+/// Reuse is what makes a republish a *refresh*. ECDSA signing is randomized
+/// and a freshly collected chain carries fresh RRSIGs, so rebuilding either
+/// would mint a second Merkle leaf for one claim — two public claims about
+/// one key, where the operator asked for one.
+///
+/// The Statement is now the whole test. It did not used to be: a run that
+/// named a predecessor keyfile had something to add that lived in the
+/// *certificate* rather than the Statement, so Statement equality alone
+/// would have thrown the new countersignature away and reported success.
+/// With the countersignature gone the certificate carries nothing the
+/// Statement does not imply, and the extra condition went with it.
 fn reusable(
   stored: Result(store.Record, Nil),
   statement_bytes: BitArray,
-  predecessor: Option(Csk),
 ) -> Result(#(BitArray, BitArray), Nil) {
   use record <- result.try(case stored {
     Ok(record) if record.statement == statement_bytes -> Ok(record)
@@ -244,26 +232,6 @@ fn reusable(
   use #(_digest, signature, certificate) <- result.try(
     proof.parse_body(record.canonicalized_body) |> result.replace_error(Nil),
   )
-  use Nil <- result.try(case predecessor {
-    // Nothing new to add: whatever was logged stands.
-    None -> Ok(Nil)
-    // A predecessor was named. Reuse only if the logged certificate already
-    // countersigns with *that* key; otherwise this run has something to say
-    // that the stored entry does not.
-    Some(old) ->
-      case cert_extension(certificate, cert.oid_succession) {
-        Error(Nil) -> Error(Nil)
-        Ok(value) ->
-          case cert.decode_succession(value) {
-            Ok(succession) ->
-              case succession.predecessor_spki == proof.p256_spki(old.public) {
-                True -> Ok(Nil)
-                False -> Error(Nil)
-              }
-            Error(Nil) -> Error(Nil)
-          }
-      }
-  })
   Ok(#(signature, certificate))
 }
 
@@ -274,15 +242,14 @@ fn reusable(
 /// with an operator standing at the terminal reading "is the DS live in the
 /// parent yet?" — beats discovering it later from a cluster that will not
 /// resolve. There is deliberately no escape hatch: with logging moved to
-/// after the DS is live, even a zone's genesis key has a chain. What a
-/// genesis key lacks is a *countersignature*, which is fine and expected.
+/// after the DS is live, every key this service logs has one — a zone's
+/// genesis key included.
 fn mint_certificate(
   apex: Name,
   csk: Csk,
   action: String,
   now: Int,
   resolver: chain.Resolver,
-  predecessor: Option(Csk),
 ) -> Result(BitArray, PublishError) {
   let apex_text = name.to_string(apex)
   use links <- result.try(case action {
@@ -309,22 +276,6 @@ fn mint_certificate(
           }
       }
   })
-  let succession =
-    option.map(predecessor, fn(old) {
-      let old_tag = keys.key_tag(keys.dnskey_rdata(old))
-      cert.Succession(
-        predecessor_key_tag: old_tag,
-        predecessor_spki: proof.p256_spki(old.public),
-        signature: statement.sign_bytes(
-          old,
-          cert.succession_signed_bytes(
-            apex_text,
-            old_tag,
-            proof.p256_spki(csk.public),
-          ),
-        ),
-      )
-    })
   Ok(cert.build(
     apex_text,
     csk.public,
@@ -332,13 +283,12 @@ fn mint_certificate(
     now,
     now + certificate_lifetime_seconds,
     links,
-    succession,
   ))
 }
 
 /// What verifying a returned entry established, beyond "it is sound".
 type Verified {
-  Verified(chainless: Bool, countersigned_by: Option(Int))
+  Verified(chainless: Bool)
 }
 
 @external(erlang, "cp_crypto_ffi", "cert_spki_and_san")
@@ -398,7 +348,6 @@ fn verify_entry(
   )
   Ok(Verified(
     chainless: !cert_has_extension(certificate, cert.oid_dnssec_chain),
-    countersigned_by: countersigned_by(certificate),
   ))
 }
 
@@ -409,17 +358,6 @@ fn cert_has_extension(der: BitArray, oid: #(Int, Int, Int)) -> Bool {
   case cert_extension(der, oid) {
     Ok(_) -> True
     Error(Nil) -> False
-  }
-}
-
-/// The predecessor key tag the succession extension names, for the operator's
-/// benefit: a publish that quietly lost its countersignature would otherwise
-/// look exactly like one that never had one, and the difference is a tier B
-/// alert in every monitor watching this zone.
-fn countersigned_by(der: BitArray) -> Option(Int) {
-  case cert_extension(der, cert.oid_succession) {
-    Error(Nil) -> None
-    Ok(value) -> option.from_result(cert.succession_key_tag(value))
   }
 }
 

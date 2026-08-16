@@ -5,14 +5,20 @@
 //! `tests/fixtures/rekor_v3` holds a genuine `hashedrekord` entry from
 //! `log2025-1.rekor.sigstore.dev` (see its PROVENANCE.txt); over there the
 //! client verifier accepts it end to end, and here the monitor classifies the
-//! very same bytes. A client-accepted entry must land in tier A or B and
-//! never in the silent bin — that property is exercised exhaustively over
-//! synthetic shapes in `tiers.rs`, and pinned to reality here.
+//! very same bytes. A client-accepted entry must land in tier A and never in
+//! the silent bin — that property is exercised exhaustively over synthetic
+//! shapes in `tiers.rs`, and pinned to reality here.
 //!
-//! It lands in **tier B**, and that is the correct answer twice over: the
-//! entry is a `rollover` whose predecessor key was not retained, so nobody
-//! could have seeded it as known, and an uncountersigned rotation is exactly
-//! the shape a monitor is supposed to make noise about.
+//! It lands in **tier A**: the chain in its certificate verifies to the
+//! anchor that zone is under, and covers the key the certificate carries. It
+//! is therefore an authorization, and a monitor watching that apex reports it
+//! the first time it sees it.
+//!
+//! The entry **predates the removal of the succession countersignature** and
+//! still carries that extension. Nothing reads it any more, and these tests
+//! are part of the evidence that nothing has to: the fixture's bytes are
+//! immutable, and they classify correctly with no code left that knows what
+//! `2.25.1138370866` was.
 
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::classify::{classify, KnownKeys, Tier};
@@ -43,32 +49,22 @@ fn anchors() -> (tempfile::TempDir, TrustAnchors) {
 }
 
 #[test]
-fn the_real_published_entry_classifies_tier_b() {
+fn the_real_published_entry_classifies_tier_a() {
     let body = HashedRekordBody::parse(&fixture("canonicalized_body.json"))
         .expect("a real entry body must parse");
     let (_dir, anchors) = anchors();
 
-    let finding = classify(&body, LOG_INDEX, &KnownKeys::default(), &anchors)
+    let finding = classify(&body, LOG_INDEX, &anchors)
         .expect("an entry with a P-256 key and a SAN is classifiable");
 
-    assert_eq!(finding.tier, Tier::B, "{}", finding.line());
+    assert_eq!(finding.tier, Tier::A, "{}", finding.line());
     assert_eq!(finding.apex, format!("{APEX}."));
     assert_eq!(finding.log_index, LOG_INDEX);
     assert_eq!(finding.key_tag, 27337);
 
-    // The chain validated, and the countersignature named a predecessor this
-    // monitor has never seen — which is precisely what tier B means.
+    // The chain validated and covers this key, which is the whole verdict.
     assert!(
         finding.reasons.iter().any(|r| r.contains("chain valid")),
-        "{:?}",
-        finding.reasons
-    );
-    assert_eq!(finding.predecessor_key_tag, Some(17123));
-    assert!(
-        finding
-            .reasons
-            .iter()
-            .any(|r| r.contains("17123") && r.contains("not one this monitor knows")),
         "{:?}",
         finding.reasons
     );
@@ -85,30 +81,60 @@ fn the_real_published_entry_classifies_tier_b() {
     assert_eq!(finding.spki_sha256.len(), 64);
 }
 
-/// With the predecessor seeded, the same bytes are a routine rotation.
+/// The vestigial extension, asserted rather than assumed.
 ///
-/// This is the tier the operator of that zone would have seen, and it is the
-/// half of the classifier that reality cannot demonstrate on its own: the
-/// published entry's predecessor key was thrown away, so only a test can put
-/// it back. The countersignature it verifies is real.
+/// This entry's certificate carries `2.25.1138370866`, the succession
+/// countersignature extension, and those bytes are in a public append-only
+/// log forever. The claim that its removal needed no republish rests on one
+/// property — the certificate parser looks extensions up by OID and never
+/// refuses a certificate for carrying one it does not know — so that property
+/// is checked here against the real bytes rather than reasoned about.
+///
+/// The extension is still *there*: if a future edit ever makes an unknown
+/// extension fatal, this test names the entry it would break.
 #[test]
-fn the_same_entry_is_tier_a_once_its_predecessor_is_known() {
-    let body = HashedRekordBody::parse(&fixture("canonicalized_body.json")).unwrap();
-    let (_dir, anchors) = anchors();
+fn the_retired_extension_is_still_in_the_certificate_and_still_ignored() {
+    let body = HashedRekordBody::parse(&fixture("canonicalized_body.json"))
+        .expect("the certificate parses despite carrying an extension nothing reads");
 
-    let succession = body
-        .succession()
-        .expect("the real certificate carries a succession extension")
-        .expect("and it decodes");
-    let mut known = KnownKeys::default();
-    known.insert(
-        &synch_net::chain::parse_name(APEX).unwrap(),
-        &succession.predecessor_spki,
+    // 2.25.1138370866, in DER content-byte form: 0x69 is 2.25 packed into the
+    // first byte, then the arc in base-128 continuation form.
+    const RETIRED_OID: &[u8] = &[0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32];
+    assert!(
+        body.certificate
+            .extensions
+            .iter()
+            .any(|e| e.oid == RETIRED_OID),
+        "the fixture is supposed to be the pre-removal entry; if this fails \
+         the fixture was replaced and this test has nothing to prove"
     );
 
-    let finding = classify(&body, LOG_INDEX, &known, &anchors).expect("classifiable");
-    assert_eq!(finding.tier, Tier::A, "{}", finding.line());
-    assert_eq!(finding.predecessor_key_tag, Some(17123));
+    // And it changes nothing: the same anchors, the same verdict as any
+    // other well-formed entry for this zone.
+    let (_dir, anchors) = anchors();
+    let finding = classify(&body, LOG_INDEX, &anchors).expect("classifiable");
+    assert_eq!(finding.tier, Tier::A);
+}
+
+/// Reporting, over real bytes: news once, then not again.
+#[test]
+fn the_real_entry_is_a_new_authorization_until_it_is_recorded() {
+    let body = HashedRekordBody::parse(&fixture("canonicalized_body.json")).unwrap();
+    let (_dir, anchors) = anchors();
+    let finding = classify(&body, LOG_INDEX, &anchors).unwrap();
+    assert_eq!(finding.tier, Tier::A);
+
+    let apex = synch_net::chain::parse_name(APEX).unwrap();
+    let mut known = KnownKeys::default();
+    assert!(
+        !known.contains(&apex, &body.certificate.spki),
+        "a monitor that has never seen this key must report it"
+    );
+    known.insert(&apex, &body.certificate.spki);
+    assert!(
+        known.contains(&apex, &body.certificate.spki),
+        "and must not report it a second time"
+    );
 }
 
 /// And the invariant, at the one point where it touches real bytes: an entry
@@ -117,7 +143,7 @@ fn the_same_entry_is_tier_a_once_its_predecessor_is_known() {
 fn the_real_entry_is_never_in_the_silent_bin() {
     let body = HashedRekordBody::parse(&fixture("canonicalized_body.json")).unwrap();
     let (_dir, anchors) = anchors();
-    let finding = classify(&body, LOG_INDEX, &KnownKeys::default(), &anchors).unwrap();
+    let finding = classify(&body, LOG_INDEX, &anchors).unwrap();
     assert_ne!(
         finding.tier,
         Tier::C,

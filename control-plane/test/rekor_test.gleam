@@ -311,17 +311,7 @@ fn publish_run(
 ) {
   let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
   let assert Ok(action) = rekor_publish.action_for(conn, key_tag)
-  rekor_publish.run(
-    conn,
-    apex,
-    csk,
-    log,
-    log_key,
-    now,
-    fake_resolver(),
-    action,
-    None,
-  )
+  rekor_publish.run(conn, apex, csk, log, log_key, now, fake_resolver(), action)
 }
 
 /// A log a test can hold in its hand: one earlier entry, then ours, with a
@@ -570,39 +560,11 @@ pub fn the_chain_extension_encodes_the_crossval_bytes_test() {
   assert cert.encode_chain(links) == fixture("crossval/chain.der")
 }
 
-pub fn the_succession_extension_encodes_the_crossval_bytes_test() {
-  let succession =
-    cert.Succession(
-      predecessor_key_tag: 34_918,
-      predecessor_spki: <<0x30, 0x59, 0x11>>,
-      signature: <<0x30, 0x44, 0x02>>,
-    )
-  assert cert.encode_succession(succession)
-    == fixture("crossval/succession.der")
-}
-
-pub fn the_succession_payload_is_the_crossval_bytes_test() {
-  // The bytes the *previous* zone key signs. The apex is written without its
-  // root dot so the two halves cannot disagree about a character nobody can
-  // see, and the successor is named by the SHA-256 of its SubjectPublicKeyInfo
-  // rather than by a 16-bit key tag.
-  let payload = cert.succession_payload("sync.test.", 34_918, <<"spki":utf8>>)
-  assert payload == fixture("crossval/succession-payload.json")
-  assert cert.succession_payload("sync.test", 34_918, <<"spki":utf8>>)
-    == payload
-}
-
 /// A certificate this side builds, read back by this side and — from the
 /// checked-in copy — by the Rust parser.
 pub fn a_built_certificate_carries_its_key_its_name_and_its_extensions_test() {
   let csk = keys.generate()
   let links = [cert.Link("sync.test.", <<0xaa, 0xbb>>)]
-  let succession =
-    cert.Succession(
-      predecessor_key_tag: 1234,
-      predecessor_spki: <<0x30, 0x59>>,
-      signature: <<0x30, 0x44>>,
-    )
   let der =
     cert.build(
       "sync.test.",
@@ -611,7 +573,6 @@ pub fn a_built_certificate_carries_its_key_its_name_and_its_extensions_test() {
       1_786_866_288,
       1_786_866_288 + 3_155_760_000,
       Some(links),
-      Some(succession),
     )
   let assert Ok(#(spki, san)) = cert_spki_and_san(der)
   assert spki == proof.p256_spki(csk.public)
@@ -619,14 +580,11 @@ pub fn a_built_certificate_carries_its_key_its_name_and_its_extensions_test() {
   assert san == "sync.test"
   let assert Ok(chain_value) = cert_extension(der, cert.oid_dnssec_chain)
   assert chain_value == cert.encode_chain(links)
-  let assert Ok(succession_value) = cert_extension(der, cert.oid_succession)
-  assert succession_value == cert.encode_succession(succession)
 
   // A chainless certificate has no chain extension at all — the shape a
   // `retire` breadcrumb takes, and the shape a client refuses.
-  let bare = cert.build("sync.test.", csk.public, csk.private, 0, 1, None, None)
+  let bare = cert.build("sync.test.", csk.public, csk.private, 0, 1, None)
   let assert Error(Nil) = cert_extension(bare, cert.oid_dnssec_chain)
-  let assert Error(Nil) = cert_extension(bare, cert.oid_succession)
 }
 
 /// The certificate the Rust suite parses: built here, checked in, read
@@ -639,8 +597,6 @@ pub fn the_checked_in_certificate_is_this_encoders_output_test() {
   assert san == "sync.test"
   let assert Ok(chain_value) = cert_extension(der, cert.oid_dnssec_chain)
   assert chain_value == fixture("crossval/chain.der")
-  let assert Ok(succession_value) = cert_extension(der, cert.oid_succession)
-  assert succession_value == fixture("crossval/succession.der")
 }
 
 /// The publisher refuses when the chain cannot be built.
@@ -665,7 +621,6 @@ pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
       1000,
       silent_resolver(),
       "create",
-      None,
     )
   assert string.contains(why, "DS")
   let assert Ok([]) = store.for_key_tag(conn, key_tag)
@@ -689,56 +644,11 @@ pub fn a_retire_may_be_chainless_test() {
       1000,
       silent_resolver(),
       "retire",
-      None,
     )
   assert outcome.action == "retire"
   assert outcome.chainless
   // And it is never served to a client: a retire is a monitor breadcrumb.
   let assert Ok([]) = store.servable(conn, outcome.key_tag)
-  sqlite.close(conn)
-}
-
-/// Naming the previous key adds the countersignature that separates a
-/// rotation from a substitution in every monitor watching the zone.
-pub fn a_countersigned_publish_names_its_predecessor_test() {
-  let conn = fixtures.fresh_conn()
-  let csk = fixtures.zone_boot(conn)
-  let previous = keys.generate()
-  let assert Ok(apex) = name.parse("sync.test.")
-  let #(log, spki, point) = fake_log(keys.generate())
-
-  let assert Ok(outcome) =
-    rekor_publish.run(
-      conn,
-      apex,
-      csk,
-      log,
-      #(spki, point),
-      1000,
-      fake_resolver(),
-      "create",
-      Some(previous),
-    )
-  assert outcome.countersigned_by
-    == Some(keys.key_tag(keys.dnskey_rdata(previous)))
-  assert !outcome.chainless
-
-  // The countersignature is the previous key's, over the successor's SPKI.
-  let assert Ok([record]) = store.for_key_tag(conn, outcome.key_tag)
-  let assert Ok(#(_digest, _signature, certificate)) =
-    proof.parse_body(record.canonicalized_body)
-  let assert Ok(value) = cert_extension(certificate, cert.oid_succession)
-  let assert Ok(succession) = cert.decode_succession(value)
-  assert succession.predecessor_spki == proof.p256_spki(previous.public)
-  assert statement.verify_bytes(
-    previous.public,
-    cert.succession_signed_bytes(
-      "sync.test.",
-      succession.predecessor_key_tag,
-      proof.p256_spki(csk.public),
-    ),
-    succession.signature,
-  )
   sqlite.close(conn)
 }
 
@@ -762,19 +672,16 @@ fn cert_extension(der: BitArray, oid: #(Int, Int, Int)) -> Result(BitArray, Nil)
 pub fn the_oid_arcs_stay_inside_an_int32_test() {
   let int32_max = 2_147_483_647
   assert oid_arc(cert.oid_dnssec_chain) <= int32_max
-  assert oid_arc(cert.oid_succession) <= int32_max
 
   // The DER an OID gets: tag 0x06, length 6, then 0x69 (= 40 × 2 + 25) and
   // the arc in base-128. Byte-identical to crates/synch-net/src/zonecert.rs.
   let der = fixture("crossval/certificate.der")
   assert contains(der, <<0x06, 0x06, 0x69, 0x85, 0xe5, 0xe9, 0xb2, 0x07>>)
-  assert contains(der, <<0x06, 0x06, 0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32>>)
 
-  // And each arc is the first four bytes of its UUID masked to 31 bits, so a
+  // And the arc is the first four bytes of its UUID masked to 31 bits, so a
   // future edit cannot pick a new number and keep the explanation.
   assert oid_arc(cert.oid_dnssec_chain)
     == int.bitwise_and(0xdcba5907, int32_max)
-  assert oid_arc(cert.oid_succession) == int.bitwise_and(0x43da2932, int32_max)
 }
 
 fn oid_arc(oid: #(Int, Int, Int)) -> Int {
@@ -795,81 +702,6 @@ fn scan_for(haystack: BitArray, needle: BitArray, size: Int, at: Int) -> Bool {
         False -> scan_for(haystack, needle, size, at - 1)
       }
   }
-}
-
-/// Re-running with the predecessor keyfile you forgot the first time is not
-/// a no-op.
-///
-/// The §5.4 recovery for "you published without naming the old key, and every
-/// monitor is now alerting" is to re-run with it. The Statement bytes are
-/// identical either way — the predecessor lives in the certificate, not the
-/// Statement — so a reuse rule keyed on the Statement alone silently threw
-/// the countersignature away and reported success, leaving the zone tier B
-/// forever with no way out short of editing the database.
-pub fn republishing_with_a_predecessor_adds_the_countersignature_test() {
-  let conn = fixtures.fresh_conn()
-  let csk = fixtures.zone_boot(conn)
-  let previous = keys.generate()
-  let assert Ok(apex) = name.parse("sync.test.")
-  let #(log, spki, point) = fake_log(keys.generate())
-
-  // First publish: the operator forgets the predecessor. Tier B everywhere.
-  let assert Ok(first) =
-    rekor_publish.run(
-      conn,
-      apex,
-      csk,
-      log,
-      #(spki, point),
-      1000,
-      fake_resolver(),
-      "create",
-      None,
-    )
-  assert first.countersigned_by == None
-
-  // Re-run naming it. The Statement is byte-identical, so the old rule would
-  // have reused the stored certificate and reported success unchanged.
-  let assert Ok(second) =
-    rekor_publish.run(
-      conn,
-      apex,
-      csk,
-      log,
-      #(spki, point),
-      2000,
-      fake_resolver(),
-      "create",
-      Some(previous),
-    )
-  assert second.countersigned_by
-    == Some(keys.key_tag(keys.dnskey_rdata(previous)))
-  assert second.refreshed == False
-
-  // And what is stored now carries it, verifiably.
-  let assert Ok([record]) = store.for_key_tag(conn, second.key_tag)
-  let assert Ok(#(_digest, _signature, certificate)) =
-    proof.parse_body(record.canonicalized_body)
-  let assert Ok(value) = cert_extension(certificate, cert.oid_succession)
-  let assert Ok(succession) = cert.decode_succession(value)
-  assert succession.predecessor_spki == proof.p256_spki(previous.public)
-
-  // A third run naming the *same* predecessor changes nothing: the stored
-  // entry already says what this run would say, so it stays one claim.
-  let assert Ok(third) =
-    rekor_publish.run(
-      conn,
-      apex,
-      csk,
-      log,
-      #(spki, point),
-      3000,
-      fake_resolver(),
-      "create",
-      Some(previous),
-    )
-  assert third.refreshed
-  sqlite.close(conn)
 }
 
 /// A body whose kind or apiVersion is not the one entry type Rekor v2 takes

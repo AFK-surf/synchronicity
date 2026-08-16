@@ -75,7 +75,7 @@ use ring::{digest, signature};
 use crate::{
     chain::{self, ChainError},
     x509::Certificate,
-    zonecert::{self, DnssecChain, Succession},
+    zonecert::{self, DnssecChain},
 };
 
 /// The only `RekorProof` version this build accepts.
@@ -118,14 +118,22 @@ pub const ZONE_KEY_ALGORITHM: u8 = 13;
 /// ZONE + SEP: the single-key (CSK) convention the control plane publishes.
 pub const ZONE_KEY_FLAGS: u16 = 257;
 
-/// The log verification keys compiled into this build.
+/// The log verification keys compiled into this build — the **bootstrap**
+/// set, not the last word.
 ///
 /// A snapshot of Sigstore's production transparency logs, taken from the
 /// TUF repository's `trusted_root.json` (consistent-snapshot target
 /// `6494e21e…`, its SHA-256 checked against the signed `targets.json`;
-/// fetched 2026-08-15 from `tuf-repo-cdn.sigstore.dev`). A full in-client
-/// TUF workflow is out of v1 (§8) — rotating these keys is a new build, the
-/// same way rotating the ICANN trust anchor is.
+/// fetched 2026-08-15 from `tuf-repo-cdn.sigstore.dev`).
+///
+/// These are what a client runs on until it learns better. The in-client TUF
+/// workflow ships (§10, [`crate::tuf`]): a client that accepts a TUF bundle
+/// relayed by a zone runs on the tlogs that bundle's `trusted_root.json`
+/// names instead, persisted in `<data-dir>/rekor-pins.json` and **replacing**
+/// this set rather than unioning with it. So the resolution order is
+/// `--rekor-key` if given, else the last TUF-verified pin set, else this.
+/// Rotating a Sigstore log key is therefore not a new build any more; only a
+/// TUF-*root*-level incident is.
 ///
 /// Note that this format's `log_id` is always SHA-256 over the DER
 /// SubjectPublicKeyInfo, computed here from the key bytes themselves.
@@ -383,29 +391,28 @@ pub struct VerifiedRecord {
 /// (statement binding). Any single failure refuses the whole record — there
 /// is no partial credit.
 ///
-/// # The two custom extensions, and why exactly one of them is enforced
+/// # The chain extension, and why the client verifies a chain it does not need
 ///
-/// The client learns nothing from either: it validated this zone's delegation
-/// natively, all the way to its trust anchor, before reaching this function,
-/// and it has no use for a claim about which key came before. But *the client
-/// enforces whatever property makes an entry discoverable, or an attacker
-/// simply omits it* — so the asymmetry between the two is not symmetry:
+/// The client learns nothing from it: it validated this zone's delegation
+/// natively, all the way to its trust anchor, before reaching this function.
+/// But *the client enforces whatever property makes an entry discoverable, or
+/// an attacker simply omits it* — and the chain is that property.
 ///
-/// - **The DNSSEC chain is required, and verified cryptographically.** Its
-///   absence would *silence* a monitor: a chainless or broken-chain entry is
-///   tier C, the bin a monitor records and does not alert on. An attacker who
-///   could get such an entry accepted would hold a key that works against
-///   victims and rings no bell — strictly worse than no log at all. So the
-///   client refuses it, which makes "client-accepted" imply "at least tier B"
-///   (docs/REKOR-ZONE-KEY.md §5.5). RRSIG validity *windows* are deliberately
-///   not checked here; see [`crate::chain`] for the two reasons.
-/// - **The succession countersignature is not required.** Its absence
-///   *alarms* — tier B, the loud bin — so omitting it makes an attacker more
-///   visible, not less, and forging it needs the predecessor's private key,
-///   which is a compromise transparency was never going to survive anyway.
-///   Requiring it here would instead break the two legitimate cases that
-///   cannot have one: a zone's genesis key, and disaster recovery after the
-///   old private key is gone.
+/// **The DNSSEC chain is required, and verified cryptographically.** Its
+/// absence would *silence* a monitor: a chainless or broken-chain entry is
+/// tier C, the bin a monitor records and does not report. An attacker who
+/// could get such an entry accepted would hold a key that works against
+/// victims and rings no bell — strictly worse than no log at all. So the
+/// client refuses it, which makes "client-accepted" imply "tier A"
+/// (docs/REKOR-ZONE-KEY.md §5.5). RRSIG validity *windows* are deliberately
+/// not checked here; see [`crate::chain`] for the two reasons.
+///
+/// **Unknown extensions are ignored, and that is load-bearing.**
+/// [`Certificate::parse`] collects every extension verbatim and looks them up
+/// by OID; nothing here refuses a certificate for carrying one this build has
+/// no name for. That is what let the succession countersignature extension be
+/// deleted from the code without republishing the conformance entry that
+/// still carries it — its bytes are simply never asked for now.
 ///
 /// A `retire` entry is refused outright rather than chain-checked: retirement
 /// is a monitor breadcrumb (§2), never authorization, and a chainless retire
@@ -638,17 +645,6 @@ impl HashedRekordBody {
                 DnssecChain::decode(value).map_err(|e| ChainError::Malformed(e.to_string()))
             }
         }
-    }
-
-    /// The succession countersignature, if the certificate carries one.
-    ///
-    /// Only a monitor reads this (§5.5): its *absence* escalates to tier B
-    /// rather than demoting to tier C, so there is nothing here for a client
-    /// to enforce and nothing an attacker gains by omitting it.
-    pub fn succession(&self) -> Option<Result<Succession, crate::x509::X509Error>> {
-        self.certificate
-            .extension(zonecert::OID_SUCCESSION)
-            .map(Succession::decode)
     }
 }
 
@@ -1436,9 +1432,9 @@ mod tests {
     #[test]
     fn statements_round_trip_through_their_canonical_form() {
         let statement = ZoneKeyStatement {
-            subject_name: "sync.example.dev.".into(),
+            subject_name: "sync.example.".into(),
             subject_sha256: "ab".repeat(32),
-            apex: "sync.example.dev.".into(),
+            apex: "sync.example.".into(),
             key_tag: 34_918,
             algorithm: 13,
             flags: 257,
@@ -1636,7 +1632,7 @@ mod tests {
 
     #[test]
     fn names_compare_the_way_dns_does() {
-        assert!(same_name("Sync.Example.Dev.", "sync.example.dev"));
-        assert!(!same_name("sync.example.dev", "other.example.dev"));
+        assert!(same_name("Sync.Example.", "sync.example"));
+        assert!(!same_name("sync.example", "other.example"));
     }
 }

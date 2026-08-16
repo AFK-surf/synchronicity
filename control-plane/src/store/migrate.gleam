@@ -76,8 +76,8 @@ fn migrations() -> List(String) {
 ///
 /// Identity is `(spki_sha256, action)`: the SHA-256 of the key's DER
 /// SubjectPublicKeyInfo, which is what names a key everywhere else in this
-/// design — the succession extension names a predecessor by SPKI, and a
-/// monitor's known-keys file is keyed by the same digest. An RFC 4034 key
+/// design — a monitor's record of the keys it has reported for a zone is
+/// keyed by the same digest. An RFC 4034 key
 /// tag is only a 16-bit checksum over the DNSKEY rdata, so two distinct keys
 /// collide with odds near 1/65536 per rollover; keying rows on it would let
 /// one key's row silently replace another's, taking its proof out of the

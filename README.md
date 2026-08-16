@@ -76,12 +76,13 @@ see it, or fail validation. The zone key is logged as a genuine
 `hashedrekord` entry whose verifier is a **self-signed certificate naming the
 apex** — Rekor validates certificates not at all and copies the DER into the
 Merkle leaf verbatim, which is what puts a monitorable zone name inside the
-log — carrying the zone's DNSSEC chain and the previous key's succession
-countersignature as custom extensions. A real published entry is checked in as
-a conformance fixture, so an entry minted by `log2025-1.rekor.sigstore.dev`
-verifies end to end. `synch-monitor` is the other half: it walks the log's
-tiles, indexes every leaf by the name in its certificate, and alerts on a
-chain-valid key that no previous key countersigned — the compromise signature.
+log — carrying the zone's DNSSEC chain as a custom extension. A real
+published entry is checked in as a conformance fixture, so an entry minted by
+`log2025-1.rekor.sigstore.dev` verifies end to end. `synch-monitor` is the
+other half: it walks the log's tiles, indexes every leaf by the name in its
+certificate, and reports every newly authorized key for the zones you watch —
+the CT-monitor posture, where the log tells you a key exists and your own
+record of what you published tells you whether to worry.
 `--rekor off` (`SYNCH_REKOR`) states the opt-out;
 `--rekor-key <file>` (`SYNCH_REKOR_KEY`) points at a self-hosted log's
 verification key, with the same different-universe semantics as the trust

@@ -4,31 +4,67 @@
 //! it reads the log's static tiles from end to end, pulls the certificate out
 //! of every `hashedrekord` leaf, indexes it by the `dNSName` SAN inside, and
 //! for the apexes an operator cares about decides — offline, from the leaf
-//! alone — which of three things it is looking at
+//! alone — which of two things it is looking at
 //! (docs/REKOR-ZONE-KEY.md §5.5).
 //!
 //! ```text
-//!  tier A   valid chain + valid succession countersignature   routine
-//!  tier B   valid chain, no valid countersignature            ALERT
-//!  tier C   no valid chain                                    noise
+//!  tier A   the chain verifies and covers this key   an authorization: REPORT
+//!  tier C   no valid chain, or a chain for another   noise
 //! ```
 //!
-//! # Why tier B is the alarm, and tier A is unreachable to an attacker
+//! # What this crate reports, and what it deliberately does not decide
 //!
-//! An attacker who has taken over the registrar can produce tier A's first
-//! half: they hold the DS, so they can assemble a real DNSSEC chain naming
-//! their key. What they cannot produce is the second half. The
-//! countersignature is made by the **previous zone key's private half** —
-//! the one thing a DS substitution does not give them. If they had that key,
-//! transparency was never going to help; the operator's problem is theft, not
-//! substitution, and the runbook for theft is different.
+//! **A fully verified DNSSEC chain is enough.** An entry whose chain walks to
+//! the anchor in force and covers the certificate's own key is an entry that
+//! *authorizes* that key for that apex — and the monitor's job is to surface
+//! every such authorization for a watched zone, the first time it sees it.
 //!
-//! So tier B is not "something odd" — it is the compromise signature, and it
-//! is loud on purpose. Two legitimate events land there too, and both must be
-//! documented rather than tuned away: a zone's **genesis** key has no
-//! predecessor to countersign it, and **disaster recovery** happens precisely
-//! because the predecessor's private key is gone. Tier B means *a human
-//! looks*, not *an attack happened*.
+//! It does not try to say whether the authorization was *legitimate*, and
+//! that is a deliberate retreat from what this crate used to claim. There was
+//! a third tier here, and a **succession countersignature**: the previous
+//! zone key signing "this key follows me", carried in a second certificate
+//! extension. A chain-plus-countersignature entry was tier A (routine
+//! rotation, quiet); a chain without one was tier B (the compromise
+//! signature, loud).
+//!
+//! It has been removed, mechanism and tier together. The reasoning that
+//! killed it is short: an attacker who has taken the registrar holds the DS,
+//! so their entry *always* produced a valid chain and always could. The
+//! countersignature was the one thing separating their key from a rotation
+//! the operator performed — so with it gone, the monitor cannot make that
+//! judgement at all. Rather than make it badly, it stops making it. Every
+//! authorization event for a watched zone is reported, and **the operator's
+//! own record of what they published is the discriminator**: they know which
+//! keys they minted, and nothing in a public log can tell them that.
+//!
+//! This is how Certificate Transparency monitoring actually works — a CT
+//! monitor tells you a certificate exists for your name and leaves "did you
+//! ask for it?" to you — and it costs less than it looks like it costs. What
+//! is lost is a mechanism that produced false alarms on exactly the events it
+//! was worst at: a zone's **genesis** key has no predecessor, and **disaster
+//! recovery** happens precisely because the predecessor's private key is
+//! gone. Both were tier B — indistinguishable from a compromise — so the
+//! "loud" tier fired on routine, expected, unavoidable events and trained
+//! people to ignore it. What is gained is that a rotation is now reported
+//! too, where before a correctly countersigned rotation was silent: an
+//! attacker who *did* hold both key generations produced a tier A entry and
+//! this crate said nothing at all. Now it says something either way.
+//!
+//! Be clear about the residual: the loud/quiet split is gone, so a
+//! substitution and a rotation arrive looking identical, and only the
+//! operator can tell them apart. That is a real reduction in what automation
+//! can conclude, in exchange for a signal that is honest about its own
+//! limits.
+//!
+//! # Reporting once, not forever
+//!
+//! [`KnownKeys`] is the memory that makes this usable: a key already recorded
+//! for an apex has been reported, and is not reported again. It is not a
+//! trust store and must never be read as one — an attacker's key is recorded
+//! the moment it is reported, exactly like the operator's, because the
+//! monitor draws no distinction. Nothing about being *recorded* makes a later
+//! entry look more routine, which is precisely the foothold the old
+//! "trusted predecessor" state could have handed over.
 //!
 //! # Why tier C is silent, and why that is only safe because clients agree
 //!
@@ -43,9 +79,12 @@
 //! [`synch_net::chain`] — the same validator this crate calls, deliberately
 //! the same code — and the invariant to preserve on both sides is:
 //!
-//! > **anything a client accepts is classified at least tier B.**
+//! > **anything a client accepts is classified tier A.**
 //!
-//! Never tighten this crate's chain rule without tightening the client's.
+//! Removing tier B tightened this rather than weakened it: the invariant used
+//! to permit a client-accepted entry to land in either of two bins, and now
+//! there is only one it may land in. Never tighten this crate's chain rule
+//! without tightening the client's.
 
 #![deny(missing_docs)]
 

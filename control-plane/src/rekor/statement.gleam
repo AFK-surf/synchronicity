@@ -147,15 +147,6 @@ pub fn sign(csk: Csk, payload: BitArray) -> BitArray {
   ecdsa_sign_der(pae(dsse_payload_type, payload), csk.private)
 }
 
-/// Signs arbitrary already-framed bytes with a zone key, DER/ASN.1.
-///
-/// The succession countersignature is made over its own PAE under its own
-/// payload type (`rekor/cert`), so it cannot be reinterpreted as an in-toto
-/// Statement; this is the primitive that signs it, with the *previous* key.
-pub fn sign_bytes(csk: Csk, message: BitArray) -> BitArray {
-  ecdsa_sign_der(message, csk.private)
-}
-
 /// Verifies a DER DSSE-PAE signature against a DNSKEY public key — the same
 /// possession check the client performs, run here before anything is stored.
 pub fn verify(
@@ -164,14 +155,4 @@ pub fn verify(
   signature: BitArray,
 ) -> Bool {
   ecdsa_verify_der(pae(dsse_payload_type, payload), signature, public)
-}
-
-/// Verifies a DER signature over already-framed bytes — the counterpart of
-/// [`sign_bytes`], for checking a succession countersignature.
-pub fn verify_bytes(
-  public: BitArray,
-  message: BitArray,
-  signature: BitArray,
-) -> Bool {
-  ecdsa_verify_der(message, signature, public)
 }

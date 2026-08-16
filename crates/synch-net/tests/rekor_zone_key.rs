@@ -14,7 +14,7 @@ use synch_net::{
     error::NetError,
     rekor::{self, HashedRekordBody, LogKeys, ProofError, RekorProof, ZoneKey},
     sim::{hashedrekord_body, SimLog, SimZone},
-    zonecert::{OID_DNSSEC_CHAIN, OID_SUCCESSION},
+    zonecert::OID_DNSSEC_CHAIN,
 };
 
 fn write(contents: &str) -> tempfile::NamedTempFile {
@@ -146,7 +146,7 @@ fn a_forged_entry_signature_fails_possession() {
     let body = hashedrekord_body(
         &statement,
         &stranger.sign_dsse(&statement),
-        &zone.zone_key_certificate(None),
+        &zone.zone_key_certificate(),
     );
     let proof = log.log_body(zone.key_tag(), statement, body);
     assert!(matches!(
@@ -167,7 +167,7 @@ fn a_certificate_holding_another_key_fails_binding() {
     let body = hashedrekord_body(
         &statement,
         &zone.sign_dsse(&statement),
-        &stranger.zone_key_certificate(None),
+        &stranger.zone_key_certificate(),
     );
     let proof = log.log_body(zone.key_tag(), statement, body);
     assert!(matches!(
@@ -356,43 +356,50 @@ fn an_expired_chain_still_verifies_because_no_clock_is_consulted() {
     assert!(expirations.iter().all(|&e| e < now));
 }
 
-/// The countersignature is the one thing a client does *not* check.
+/// A certificate extension this build has no name for changes nothing.
 ///
-/// The asymmetry is the point: chain absence silences a monitor, so the
-/// client enforces it; countersignature absence alarms a monitor, so the
-/// client must not — requiring it would break a zone's genesis key and every
-/// disaster recovery, and omitting it only makes an attacker louder.
+/// The client turns on exactly one custom extension — the DNSSEC chain — and
+/// reaches it by OID. Anything else in the certificate is carried into the
+/// leaf and never asked for, which is why a real published entry keeps
+/// verifying after the code that wrote one of its extensions is deleted: the
+/// succession countersignature under `2.25.1138370866` is exactly that case,
+/// and the conformance fixture still carries it.
+///
+/// The negative half matters as much: an unknown extension must not become a
+/// *reason to accept* either. The entry with junk in it is accepted because
+/// its chain is good, and the entry with junk and no chain is still refused.
 #[test]
-fn the_succession_countersignature_is_not_a_client_concern() {
+fn an_extension_the_client_does_not_know_is_carried_and_ignored() {
     let zone = SimZone::new("cluster.example", member_records());
-    let old = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let statement = zone.zone_key_statement("rollover", Some(old.key_tag()));
-
-    // Present and valid: accepted.
-    let succession = old.countersign(&zone.apex(), &zone.spki());
-    let proof = log.log_certified(
-        &zone,
-        &statement,
-        &zone.zone_key_certificate(Some(&succession)),
+    let statement = zone.zone_key_statement("create", None);
+    // The arc the countersignature used to occupy, holding bytes that are not
+    // a valid anything.
+    let retired = (
+        vec![0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32],
+        b"vestigial".to_vec(),
     );
+
+    // Chain plus an unknown extension: accepted, exactly as chain alone is.
+    let certificate = zone.certificate(&[
+        (OID_DNSSEC_CHAIN.to_vec(), zone.dnssec_chain().encode()),
+        retired.clone(),
+    ]);
+    let proof = log.log_certified(&zone, &statement, &certificate);
     verify(&proof, &zone, &log).unwrap();
 
-    // Absent: accepted just the same. This is a genesis key or a recovery.
-    let proof = log.log_certified(&zone, &statement, &zone.zone_key_certificate(None));
-    verify(&proof, &zone, &log).unwrap();
-
-    // Present and forged: still accepted by the *client*, because the client
-    // never looks. A monitor is what refuses this, loudly, as tier B.
-    let mut forged = succession.clone();
-    forged.signature[10] ^= 0x01;
-    let proof = log.log_certified(&zone, &statement, &zone.zone_key_certificate(Some(&forged)));
-    verify(&proof, &zone, &log).unwrap();
-
-    // And the extension is really there, so the assertions above are not
-    // passing because nothing was written.
+    // And it is really in there, so the assertion above is not passing
+    // because nothing was written.
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-    assert!(body.certificate.extension(OID_SUCCESSION).is_some());
+    assert!(body.certificate.extension(&retired.0).is_some());
+
+    // The unknown extension buys nothing: without a chain the entry is
+    // refused just as it would be with no extensions at all.
+    let proof = log.log_certified(&zone, &statement, &zone.certificate(&[retired]));
+    assert!(matches!(
+        verify(&proof, &zone, &log),
+        Err(ProofError::Chain(_))
+    ));
 }
 
 // -------------------------------------------------------- log-level checks
@@ -728,7 +735,7 @@ fn the_shared_fixture_decodes_and_verifies() {
 fn the_gleam_certificate_encoders_agree_with_this_one() {
     use synch_net::{
         x509::Certificate,
-        zonecert::{ChainLink, DnssecChain, Succession, OID_DNSSEC_CHAIN, OID_SUCCESSION},
+        zonecert::{ChainLink, DnssecChain, OID_DNSSEC_CHAIN},
     };
 
     let chain = DnssecChain {
@@ -749,24 +756,6 @@ fn the_gleam_certificate_encoders_agree_with_this_one() {
         chain
     );
 
-    let succession = Succession {
-        predecessor_key_tag: 34_918,
-        predecessor_spki: vec![0x30, 0x59, 0x11],
-        signature: vec![0x30, 0x44, 0x02],
-    };
-    assert_eq!(succession.encode(), fixture("crossval/succession.der"));
-    assert_eq!(
-        Succession::decode(&fixture("crossval/succession.der")).unwrap(),
-        succession
-    );
-
-    // The bytes the *previous* zone key signs, which two implementations
-    // have to render identically or a rotation reads as a substitution.
-    assert_eq!(
-        Succession::signed_payload("sync.test.", 34_918, b"spki"),
-        fixture("crossval/succession-payload.json")
-    );
-
     // And a whole certificate the Gleam side built, read here.
     let der = fixture("crossval/certificate.der");
     let certificate = Certificate::parse(&der).expect("a Gleam-built certificate must parse");
@@ -779,11 +768,7 @@ fn the_gleam_certificate_encoders_agree_with_this_one() {
         certificate.extension(OID_DNSSEC_CHAIN),
         Some(fixture("crossval/chain.der").as_slice())
     );
-    assert_eq!(
-        certificate.extension(OID_SUCCESSION),
-        Some(fixture("crossval/succession.der").as_slice())
-    );
-    // The two extensions X.509 requires of an end-entity key envelope are
+    // The three extensions X.509 requires of an end-entity key envelope are
     // there and critical, so a certificate this design mints reads correctly
     // in any toolchain that opens the log entry.
     let by_oid = |oid: &[u8]| {
@@ -864,11 +849,12 @@ fn regenerate_the_shared_fixture() {
 /// The bytes in `tests/fixtures/rekor_v3` are a genuine `hashedrekord` v0.0.2
 /// entry published to `log2025-1.rekor.sigstore.dev` (see PROVENANCE.txt) and
 /// read back out of the log's own static tiles; nothing in this repository
-/// authored the log's half of any of it. The certificate carries **both**
-/// custom extensions under the narrowed OIDs, at 944 bytes — which is the
-/// empirical answer to two questions a local test cannot settle: whether
-/// Rekor accepts a certificate this size, and whether it accepts these
-/// extensions at all.
+/// authored the log's half of any of it. The certificate carries the chain
+/// extension under its narrowed OID at 945 bytes — which is the empirical
+/// answer to two questions a local test cannot settle: whether Rekor accepts
+/// a certificate this size, and whether it accepts these extensions at all.
+/// It also carries a second, now-retired extension, which nothing in this
+/// build reads; see PROVENANCE.txt.
 ///
 /// It proves the claim the whole of v3 rests on: Rekor performs no
 /// certificate validation, so an apex written into a `dNSName` SAN lands, in
@@ -1080,9 +1066,14 @@ mod real_rekor_v3 {
     }
 
     /// The certificate really does carry the apex into the leaf, and really
-    /// does carry both extensions at a size the log accepted.
+    /// does carry its chain at a size the log accepted.
+    ///
+    /// It carries a second extension too — the retired succession
+    /// countersignature — because it was published before that mechanism was
+    /// removed and a Merkle leaf cannot be edited. That is asserted here as
+    /// what it is: bytes this build parses past and never reads.
     #[test]
-    fn the_real_entrys_certificate_carries_its_apex_and_both_extensions() {
+    fn the_real_entrys_certificate_carries_its_apex_and_its_chain() {
         let body = HashedRekordBody::parse(&v3("canonicalized_body.json"))
             .expect("a real entry body must parse");
         assert_eq!(body.certificate_der, v3("certificate.der"));
@@ -1103,9 +1094,12 @@ mod real_rekor_v3 {
             .windows(APEX.len())
             .any(|w| w == APEX.as_bytes()));
 
-        // Both extensions survived the round trip, under the narrowed OIDs.
-        // 945 bytes is the empirical answer to "will Rekor take a
-        // certificate this size, with arcs like these": it did, HTTP 201.
+        // The chain survived the round trip under the narrowed OID. 945 bytes
+        // is the empirical answer to "will Rekor take a certificate this
+        // size, with arcs like these": it did, HTTP 201. Note the size still
+        // includes the retired extension below — no republish was needed to
+        // stop reading it, and shrinking the certificate would mean minting a
+        // new leaf for a claim that is already in the log.
         assert_eq!(body.certificate_der.len(), 945);
         let carried = body
             .certificate
@@ -1113,13 +1107,16 @@ mod real_rekor_v3 {
             .expect("the real certificate carries the chain extension");
         let carried = synch_net::zonecert::DnssecChain::decode(carried).expect("and it decodes");
         assert_eq!(carried.links.first().unwrap().zone, format!("{APEX}."));
-        let succession = body
+
+        // 2.25.1138370866, the succession countersignature this entry
+        // predates the removal of. Still present, never asked for by anything
+        // outside this assertion — which is the whole reason the entry did
+        // not have to be republished.
+        assert!(body
             .certificate
-            .extension(OID_SUCCESSION)
-            .expect("the real certificate carries the succession extension");
-        let succession =
-            synch_net::zonecert::Succession::decode(succession).expect("and it decodes");
-        assert_eq!(succession.predecessor_key_tag, 17123);
+            .extensions
+            .iter()
+            .any(|e| e.oid == [0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32]));
 
         assert_eq!(body.digest.len(), 32);
         assert_eq!(body.certificate.spki.len(), 91);

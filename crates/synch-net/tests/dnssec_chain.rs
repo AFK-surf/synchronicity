@@ -3,9 +3,9 @@
 //! `synch_net::chain` is the one piece of this design that both halves of the
 //! system run: the client refuses a proof whose chain does not validate, and
 //! the monitor files an entry as noise for exactly the same reason. The
-//! invariant that couples them — *client-accepted implies at least tier B* —
-//! only holds because there is one implementation, so this suite tests it as
-//! the shared thing it is rather than through either caller.
+//! invariant that couples them — *client-accepted implies tier A* — only
+//! holds because there is one implementation, so this suite tests it as the
+//! shared thing it is rather than through either caller.
 
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_net::{

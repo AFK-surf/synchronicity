@@ -8,9 +8,11 @@
 //! showed a **different** monitor a different history is invisible from here;
 //! catching that needs either cross-witnessing, which this design does not
 //! implement, or a second monitor run somewhere else and compared by hand.
-//! The **known keys** are what separate tier A from tier B — without a record
-//! of which keys the operator has already accepted, every rotation looks like
-//! a first sighting.
+//! The **known keys** are what make reporting bearable: without a record of
+//! which keys have already been surfaced for an apex, every run would report
+//! every key the zone has ever authorized, and an alert that fires every hour
+//! about the same key is an alert nobody reads. They are bookkeeping, not
+//! trust — see [`crate::classify::KnownKeys`].
 //!
 //! The file is plain JSON on purpose: an operator has to be able to read it,
 //! seed it by hand for a zone whose history predates the monitor, and check it
@@ -36,7 +38,8 @@ pub struct MonitorState {
     /// The next entry index to read. Entries below it have been classified.
     #[serde(default)]
     pub next_index: u64,
-    /// The keys this monitor accepts as predecessors, per apex.
+    /// The apexes this monitor watches, and the keys it has already reported
+    /// as authorized for each.
     #[serde(default)]
     pub known: KnownKeys,
 }
@@ -88,7 +91,7 @@ mod tests {
             known: KnownKeys::default(),
         };
         state.known.insert(
-            &synch_net::chain::parse_name("sync.example.dev").unwrap(),
+            &synch_net::chain::parse_name("sync.example").unwrap(),
             b"a key",
         );
         state.save(&path).unwrap();

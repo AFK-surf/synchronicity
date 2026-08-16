@@ -28,7 +28,7 @@ use crate::{
     rekor::{self, RekorProof, ZoneKeyStatement},
     tuf::{self, TufBundle},
     x509::{self, SelfSigned},
-    zonecert::{ChainLink, DnssecChain, Succession, OID_DNSSEC_CHAIN, OID_SUCCESSION},
+    zonecert::{ChainLink, DnssecChain, OID_DNSSEC_CHAIN},
 };
 
 /// One signed zone: an origin, its TXT membership records, and the key that
@@ -262,28 +262,9 @@ impl SimZone {
     }
 
     /// The certificate an ordinary `create` or `rollover` entry carries: the
-    /// chain, and a countersignature when there is a predecessor to make one.
-    pub fn zone_key_certificate(&self, succession: Option<&Succession>) -> Vec<u8> {
-        let mut extensions = vec![(OID_DNSSEC_CHAIN.to_vec(), self.dnssec_chain().encode())];
-        if let Some(succession) = succession {
-            extensions.push((OID_SUCCESSION.to_vec(), succession.encode()));
-        }
-        self.certificate(&extensions)
-    }
-
-    /// This zone key countersigning its successor: what an operator's
-    /// *previous* key does during a planned rollover, and the one thing an
-    /// attacker holding only a substituted DS cannot produce.
-    pub fn countersign(&self, apex: &str, successor_spki: &[u8]) -> Succession {
-        let key_tag = self.key_tag();
-        Succession {
-            predecessor_key_tag: key_tag,
-            predecessor_spki: self.spki(),
-            signature: sign_p256_der(
-                &self.pkcs8,
-                &Succession::signed_bytes(apex, key_tag, successor_spki),
-            ),
-        }
+    /// chain, and nothing else the design reads.
+    pub fn zone_key_certificate(&self) -> Vec<u8> {
+        self.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), self.dnssec_chain().encode())])
     }
 
     /// The Statement this zone's control plane would publish for its key.
@@ -539,12 +520,9 @@ impl SimDelegation {
 
     /// The certificate an entry for this apex carries, with the ladder as its
     /// chain extension.
-    pub fn certificate(&self, succession: Option<&Succession>) -> Vec<u8> {
-        let mut extensions = vec![(OID_DNSSEC_CHAIN.to_vec(), self.chain().encode())];
-        if let Some(succession) = succession {
-            extensions.push((OID_SUCCESSION.to_vec(), succession.encode()));
-        }
-        self.apex.certificate(&extensions)
+    pub fn certificate(&self) -> Vec<u8> {
+        self.apex
+            .certificate(&[(OID_DNSSEC_CHAIN.to_vec(), self.chain().encode())])
     }
 }
 
@@ -666,7 +644,7 @@ impl SimLog {
     /// `hashedrekord` v0.0.2 body over the Statement's DSSE PAE, with the
     /// zone's apex-naming certificate as its verifier.
     pub fn log_statement(&mut self, zone: &SimZone, statement: &ZoneKeyStatement) -> RekorProof {
-        self.log_certified(zone, statement, &zone.zone_key_certificate(None))
+        self.log_certified(zone, statement, &zone.zone_key_certificate())
     }
 
     /// The same, with a certificate the caller chose — how a test logs an

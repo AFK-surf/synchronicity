@@ -1,30 +1,45 @@
-//! The two custom certificate extensions a zone-key entry carries, and the
-//! OIDs that name them (docs/REKOR-ZONE-KEY.md §2).
+//! The custom certificate extension a zone-key entry carries, and the OID
+//! that names it (docs/REKOR-ZONE-KEY.md §2).
 //!
 //! The certificate in a Rekor leaf gets the apex into the log's Merkle tree
-//! (see [`crate::x509`]). These two extensions get *evidence* in beside it,
-//! so that a monitor consuming the log can decide, from the leaf alone and
-//! with no DNS query at all, whether the key it just saw was authorized:
+//! (see [`crate::x509`]). The extension gets *evidence* in beside it, so that
+//! a monitor consuming the log can decide, from the leaf alone and with no
+//! DNS query at all, whether the key it just saw is authorized for that zone:
 //!
 //! - **The DNSSEC chain** (`OID_DNSSEC_CHAIN`) — the delegation from the
 //!   apex's DS up to the root DNSKEY, as raw signed RRsets. A monitor
-//!   validates it offline against the IANA root trust anchor and demands
-//!   only that the RRSIGs were valid *at the log's integration time*, never
-//!   that they are valid now: an entry from 2029 must still verify in 2039.
-//! - **The succession countersignature** (`OID_SUCCESSION`) — the previous
-//!   zone key's signature over "this key follows me". It is what separates a
-//!   routine rotation an operator performed from a substitution an attacker
-//!   performed with a compromised registrar: the attacker has the DS, so
-//!   they can produce the chain, but they do not have the old *private* key.
+//!   validates it offline against the IANA root trust anchor and asks
+//!   **nothing at all about time**: RRSIG validity windows are not checked on
+//!   either side, because a Merkle leaf carries no trustworthy clock
+//!   (`integratedTime` is outside the commitment) and because RRSIGs expire
+//!   in weeks while entries are read for years. An entry from 2029 verifies
+//!   in 2039 exactly as it did the day it was logged. See `crate::chain`.
 //!
-//! Neither is read by the client. The client validates DNSSEC natively and
-//! already holds the DNSKEY it is asking about, so re-deriving authorization
-//! from a copy of the chain inside the entry would be a slower way to learn
-//! the same fact; and succession is a claim about history, which a client
-//! resolving *now* has no use for. Both are monitor food — the client parses
-//! past them and does not care (see `rekor::verify`).
+//! The client does not read it either. The client validates DNSSEC natively
+//! and already holds the DNSKEY it is asking about, so re-deriving
+//! authorization from a copy of the chain inside the entry would be a slower
+//! way to learn the same fact. It is monitor food, and the client enforces
+//! its presence only because an entry without one would be invisible to a
+//! monitor (see `rekor::verify`).
 //!
-//! # Why the OIDs look the way they do
+//! # There used to be a second extension, and there is a hole where it was
+//!
+//! `2.25.1138370866` carried a **succession countersignature**: the previous
+//! zone key's signature over "this key follows me". The idea was that an
+//! attacker holding a compromised registrar has the DS — so they can build a
+//! real chain — but not the old key's private half, so the countersignature
+//! was the one thing separating a rotation from a substitution.
+//!
+//! It is gone, and the monitor no longer tries to make that distinction at
+//! all; it reports every newly authorized key for a watched apex instead and
+//! leaves the operator's own record of what they published to be the
+//! discriminator. The reasons are in `synch-monitor`'s crate docs. What
+//! matters *here* is that **the arc `2.25.1138370866` is burned**: a genuine,
+//! permanent, public log entry carries it (the conformance fixture under
+//! `tests/fixtures/rekor_v3`), so reusing it for anything else would make
+//! that entry decode as whatever the new meaning is. Pick a fresh arc.
+//!
+//! # Why the OID looks the way it does
 //!
 //! We hold no IANA Private Enterprise Number, and inventing an arc under
 //! someone else's is how OID collisions happen. `2.25` is the UUID arc:
@@ -47,16 +62,16 @@
 //! OID changed, `1.3.6.1.4.1.99999.1` `201`. The extension *structure* was
 //! never the problem.
 //!
-//! So both arcs are the first four bytes of the original UUID masked into 31
+//! So the arc is the first four bytes of the original UUID masked into 31
 //! bits — inside `int32`, still syntactically a UUID-arc OID.
 //!
-//! **These OIDs are provisional.** `2.25.<31-bit>` is a UUID with 97 leading
+//! **This OID is provisional.** `2.25.<31-bit>` is a UUID with 97 leading
 //! zero bits, which is a real if small collision risk against anyone else
 //! doing the same trick. The long-term fix is an IANA Private Enterprise
-//! Number and OIDs under `1.3.6.1.4.1.<PEN>` — see docs/REKOR-ZONE-KEY.md
-//! §8.3. Until then, do not widen these arcs: the log will refuse the entry.
+//! Number and an OID under `1.3.6.1.4.1.<PEN>` — see docs/REKOR-ZONE-KEY.md
+//! §8.3. Until then, do not widen this arc: the log will refuse the entry.
 //!
-//! Both are duplicated, deliberately and with the same warning, in
+//! It is duplicated, deliberately and with the same warning, in
 //! `control-plane/src/rekor/cert.gleam`, and the crossval fixtures pin the
 //! bytes so the two cannot drift.
 
@@ -76,16 +91,6 @@ use crate::x509::{tlv, Der, X509Error};
 /// first byte (40 × 2 + 25 = 105), and the rest is the arc in base-128
 /// continuation form.
 pub const OID_DNSSEC_CHAIN: &[u8] = &[0x69, 0x85, 0xe5, 0xe9, 0xb2, 0x07];
-
-/// The succession countersignature extension: `2.25.1138370866`.
-///
-/// `1138370866` is `0x43da2932` — the first four bytes of UUID
-/// `43da2932-67ac-4e03-bcbe-c8c9fee67a02` — which already fits in 31 bits.
-/// The same `int32` constraint applies; see [`OID_DNSSEC_CHAIN`].
-pub const OID_SUCCESSION: &[u8] = &[0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32];
-
-/// The DSSE payload type a succession countersignature is made over.
-pub const SUCCESSION_PAYLOAD_TYPE: &str = "application/vnd.synchronicity.succession+json";
 
 // ------------------------------------------------------------ DNSSEC chain
 
@@ -159,102 +164,6 @@ impl DnssecChain {
     }
 }
 
-// -------------------------------------------------------------- succession
-
-/// The previous zone key's countersignature over this one.
-///
-/// Absent for a zone's genesis key — there is no predecessor — and for
-/// disaster recovery, where the predecessor's private key is exactly what
-/// was lost. Both land in a monitor's tier B alongside a real compromise,
-/// which is correct and has to be said out loud: tier B means *a human looks*,
-/// not *an attack happened*.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Succession {
-    /// The RFC 4034 key tag of the predecessor key.
-    pub predecessor_key_tag: u16,
-    /// The predecessor's DER SubjectPublicKeyInfo — named explicitly rather
-    /// than left to be looked up, because a key tag is a 16-bit checksum and
-    /// two keys can share one.
-    pub predecessor_spki: Vec<u8>,
-    /// ECDSA P-256/SHA-256, DER, by the predecessor key, over
-    /// [`Succession::signed_payload`]'s DSSE PAE.
-    pub signature: Vec<u8>,
-}
-
-impl Succession {
-    /// The extension value:
-    /// `SEQUENCE { predecessorKeyTag INTEGER, predecessorSpki OCTET STRING,
-    /// signature OCTET STRING }`.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut body = crate::x509::integer(&self.predecessor_key_tag.to_be_bytes());
-        body.extend_from_slice(&tlv(0x04, &self.predecessor_spki));
-        body.extend_from_slice(&tlv(0x04, &self.signature));
-        tlv(0x30, &body)
-    }
-
-    /// Parses an extension value, refusing trailing bytes.
-    pub fn decode(bytes: &[u8]) -> Result<Succession, X509Error> {
-        let mut outer = Der::new(bytes);
-        let mut fields = outer.sequence("Succession")?;
-        if !outer.is_empty() {
-            return Err(X509Error::from("Succession: bytes after the sequence"));
-        }
-        let tag = fields.tagged(0x02, "predecessorKeyTag")?;
-        // A key tag is 16 bits; DER drops leading zeros and adds one back for
-        // a set high bit, so anything up to three bytes can be legitimate.
-        if tag.is_empty() || tag.len() > 3 {
-            return Err(X509Error::from("predecessorKeyTag is out of range"));
-        }
-        let value = tag.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b));
-        let predecessor_key_tag = u16::try_from(value)
-            .map_err(|_| X509Error::from("predecessorKeyTag is out of range"))?;
-        let predecessor_spki = fields.tagged(0x04, "predecessorSpki")?.to_vec();
-        let signature = fields.tagged(0x04, "signature")?.to_vec();
-        if !fields.is_empty() {
-            return Err(X509Error::from("Succession: unexpected trailing member"));
-        }
-        Ok(Succession {
-            predecessor_key_tag,
-            predecessor_spki,
-            signature,
-        })
-    }
-
-    /// The canonical JSON payload the countersignature is made over.
-    ///
-    /// Byte-exact and with no equivalent form, for the same reason the
-    /// Statement is: two implementations sign and check these bytes, so
-    /// field order and the absence of whitespace are part of the format.
-    ///
-    /// ```text
-    /// {"apex":"<fqdn>","predecessorKeyTag":<int>,"successorSpkiSha256":"<hex>"}
-    /// ```
-    ///
-    /// The successor is named by the SHA-256 of its DER SubjectPublicKeyInfo
-    /// rather than by its key tag, so a countersignature commits to the exact
-    /// key bytes and not to a 16-bit checksum of them.
-    pub fn signed_payload(apex: &str, predecessor_key_tag: u16, successor_spki: &[u8]) -> Vec<u8> {
-        let digest = hex::encode(crate::rekor::sha256(successor_spki));
-        format!(
-            "{{\"apex\":\"{}\",\"predecessorKeyTag\":{},\"successorSpkiSha256\":\"{}\"}}",
-            apex.trim_end_matches('.'),
-            predecessor_key_tag,
-            digest
-        )
-        .into_bytes()
-    }
-
-    /// The exact bytes signed: the DSSE PAE of [`Succession::signed_payload`]
-    /// under [`SUCCESSION_PAYLOAD_TYPE`], so a succession statement can never
-    /// be reinterpreted as an in-toto Statement or the other way round.
-    pub fn signed_bytes(apex: &str, predecessor_key_tag: u16, successor_spki: &[u8]) -> Vec<u8> {
-        crate::rekor::pae(
-            SUCCESSION_PAYLOAD_TYPE,
-            &Succession::signed_payload(apex, predecessor_key_tag, successor_spki),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,11 +173,11 @@ mod tests {
         let chain = DnssecChain {
             links: vec![
                 ChainLink {
-                    zone: "sync.example.dev.".into(),
+                    zone: "sync.example.".into(),
                     rrs: vec![0xaa; 200],
                 },
                 ChainLink {
-                    zone: "example.dev.".into(),
+                    zone: "example.".into(),
                     rrs: vec![0xbb; 400],
                 },
                 ChainLink {
@@ -282,7 +191,7 @@ mod tests {
         // The apex comes first and the root last; a decoder that sorted or
         // reversed would still round-trip a one-link chain, so assert three.
         let back = DnssecChain::decode(&der).unwrap();
-        assert_eq!(back.links[0].zone, "sync.example.dev.");
+        assert_eq!(back.links[0].zone, "sync.example.");
         assert_eq!(back.links[2].zone, ".");
 
         // Trailing bytes are a second encoding of the same value, which is
@@ -300,53 +209,7 @@ mod tests {
         assert_eq!(DnssecChain::decode(&empty.encode()).unwrap(), empty);
     }
 
-    #[test]
-    fn a_succession_round_trips_across_the_key_tag_range() {
-        for tag in [0u16, 1, 127, 128, 255, 256, 34_918, 65_535] {
-            let succession = Succession {
-                predecessor_key_tag: tag,
-                predecessor_spki: vec![0x30, 0x59, 0x11],
-                signature: vec![0x30, 0x44, 0x02],
-            };
-            let der = succession.encode();
-            assert_eq!(Succession::decode(&der).unwrap(), succession, "tag {tag}");
-        }
-        let der = Succession {
-            predecessor_key_tag: 7,
-            predecessor_spki: vec![1, 2, 3],
-            signature: vec![4, 5, 6],
-        }
-        .encode();
-        let mut extra = der.clone();
-        extra.push(0);
-        assert!(Succession::decode(&extra).is_err());
-        assert!(Succession::decode(&der[..3]).is_err());
-    }
-
-    #[test]
-    fn the_countersigned_payload_is_byte_exact() {
-        let payload = Succession::signed_payload("sync.example.dev.", 34_918, b"spki bytes");
-        assert_eq!(
-            String::from_utf8(payload).unwrap(),
-            format!(
-                "{{\"apex\":\"sync.example.dev\",\"predecessorKeyTag\":34918,\
-                 \"successorSpkiSha256\":\"{}\"}}",
-                hex::encode(crate::rekor::sha256(b"spki bytes"))
-            )
-        );
-        // The apex is written without its root dot, so the two halves cannot
-        // disagree about a trailing character nobody can see.
-        assert_eq!(
-            Succession::signed_payload("sync.example.dev", 1, b"k"),
-            Succession::signed_payload("sync.example.dev.", 1, b"k")
-        );
-        // And the signed bytes are the PAE of that payload under the
-        // succession type, never the in-toto one.
-        let bytes = Succession::signed_bytes("sync.example.dev", 1, b"k");
-        assert!(bytes.starts_with(b"DSSEv1 45 application/vnd.synchronicity.succession+json "));
-    }
-
-    /// Both OID arcs must stay inside `int32`, forever.
+    /// The OID arc must stay inside `int32`, forever.
     ///
     /// Go's `encoding/asn1` — and therefore Rekor's `x509.ParseCertificate`,
     /// and therefore Rekor — rejects any OID component that overflows
@@ -360,7 +223,7 @@ mod tests {
     /// comment. If this test fails, the fix is a *narrower* arc, never a
     /// wider parser.
     #[test]
-    fn the_oid_arcs_fit_in_an_int32_because_go_rejects_anything_larger() {
+    fn the_oid_arc_fits_in_an_int32_because_go_rejects_anything_larger() {
         /// Decodes `2.<second> [.<arc>]*` from an OID's DER content bytes.
         fn arcs(oid: &[u8]) -> Vec<u128> {
             let (first, rest) = oid.split_first().expect("a non-empty OID");
@@ -377,30 +240,33 @@ mod tests {
             out
         }
 
-        for (name, oid, expected) in [
-            ("DNSSEC chain", OID_DNSSEC_CHAIN, 1_555_716_359_u128),
-            ("succession", OID_SUCCESSION, 1_138_370_866),
-        ] {
-            let arcs = arcs(oid);
-            assert_eq!(arcs[0], 2, "{name}: not under the UUID arc");
-            assert_eq!(arcs[1], 25, "{name}: not under the UUID arc");
-            assert_eq!(arcs.len(), 3, "{name}: expected exactly one arc under 2.25");
-            assert_eq!(arcs[2], expected, "{name}: the arc changed");
-            assert!(
-                arcs[2] <= i32::MAX as u128,
-                "{name}: arc {} overflows int32 — Rekor's Go parser will \
-                 refuse the certificate and the log will reject the entry",
-                arcs[2]
-            );
-        }
+        // One OID now that succession is gone, so this reads as a check on a
+        // constant rather than a loop over a family. Restore the loop if a
+        // second extension is ever added — the rule is about every arc, not
+        // about this one.
+        let arcs = arcs(OID_DNSSEC_CHAIN);
+        assert_eq!(arcs[0], 2, "DNSSEC chain: not under the UUID arc");
+        assert_eq!(arcs[1], 25, "DNSSEC chain: not under the UUID arc");
+        assert_eq!(arcs.len(), 3, "expected exactly one arc under 2.25");
+        assert_eq!(arcs[2], 1_555_716_359, "the DNSSEC chain arc changed");
+        assert!(
+            arcs[2] <= i32::MAX as u128,
+            "arc {} overflows int32 — Rekor's Go parser will refuse the \
+             certificate and the log will reject the entry",
+            arcs[2]
+        );
 
-        // Each arc really is the first four bytes of its UUID, masked to 31
+        // The arc really is the first four bytes of its UUID, masked to 31
         // bits — the derivation, so a future edit cannot quietly pick a new
         // number and keep the comment.
         assert_eq!(
             u128::from(u32::from_be_bytes([0xdc, 0xba, 0x59, 0x07]) & 0x7fff_ffff),
             1_555_716_359
         );
+        // The retired succession arc, asserted only so that the number in the
+        // module docs stays checkable. Nothing encodes or decodes it any
+        // more, but a published entry carries it forever, so it must not be
+        // handed out again for a different meaning.
         assert_eq!(
             u128::from(u32::from_be_bytes([0x43, 0xda, 0x29, 0x32]) & 0x7fff_ffff),
             1_138_370_866

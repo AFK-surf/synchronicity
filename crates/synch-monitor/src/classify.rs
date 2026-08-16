@@ -1,4 +1,4 @@
-//! Deciding what a leaf is: routine rotation, compromise signature, or noise.
+//! Deciding what a leaf is: an authorization for a zone, or noise.
 //!
 //! Everything here works from the certificate inside the leaf and nothing
 //! else. In particular the DNSKEY, its key tag and the DS a parent would have
@@ -6,30 +6,40 @@
 //! never looked up: the threat model has a compromised upstream DNS provider
 //! in it, so a monitor that asked DNS what the zone's key is would be asking
 //! the attacker.
+//!
+//! Note what is *not* here: any attempt to tell a rotation from a
+//! substitution. Classification is a pure function of the certificate and the
+//! trust anchors — it takes no state, and it cannot be steered by what the
+//! monitor happens to have seen before. Whether a tier A entry is *news* is a
+//! separate question, answered against the monitor's own state file by the
+//! caller; see the crate docs for why the two were pulled apart.
 
 use hickory_resolver::proto::{dnssec::TrustAnchors, rr::Name};
-use ring::signature;
 use synch_net::{
     chain,
     rekor::{sha256, HashedRekordBody},
-    zonecert::Succession,
 };
 
 /// What a leaf turned out to be.
+///
+/// Two values, lettered **A** and **C**. The gap where B was is not an
+/// oversight: tier B used to mean "valid chain, nobody countersigned it", and
+/// removing the countersignature removed the only thing that distinguished it
+/// from tier A. The letters are kept because they are the vocabulary
+/// everything else — the runbook, the exit codes, the design document — is
+/// written in, and renaming them would silently reinterpret every existing
+/// alerting rule rather than break it loudly.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub enum Tier {
-    /// No valid chain: an unauthorized claim naming this apex. Recorded, not
-    /// alerted on — and safe to be quiet about only because no client would
-    /// have accepted it either (see the crate docs).
+    /// No valid chain, or a chain covering some other key: an unauthorized
+    /// claim naming this apex. Recorded, not reported — and safe to be quiet
+    /// about only because no client would have accepted it either (see the
+    /// crate docs).
     C,
-    /// A valid chain and no valid countersignature from a known predecessor.
-    /// The compromise signature; also where a genesis key and a disaster
-    /// recovery legitimately land.
-    B,
-    /// A valid chain *and* a valid countersignature by a key this monitor
-    /// already knew: a rotation the operator performed.
+    /// A chain that verifies to the anchor in force and covers this key. The
+    /// entry **authorizes** this key for this apex — whoever published it.
     A,
 }
 
@@ -38,32 +48,42 @@ impl Tier {
     pub fn letter(&self) -> char {
         match self {
             Tier::A => 'A',
-            Tier::B => 'B',
             Tier::C => 'C',
         }
     }
 }
 
-/// What a monitor already believes about an apex's keys.
+/// The keys this monitor has already seen authorized, per apex.
 ///
-/// Seeded from the operator's own record of their zone keys, then grown by
-/// **tier A findings only**. Growing it from tier B would be a gift to an
-/// attacker: their first substituted key would become a trusted predecessor,
-/// and every key after it would be classified as a routine rotation.
+/// This is the monitor's memory, and it does exactly one job: stop a key from
+/// being reported on every pass forever. A tier A entry whose key is not in
+/// here is a **new authorization** — the event an operator is running a
+/// monitor to hear about — and once reported it is recorded so the next run
+/// stays quiet.
+///
+/// It is emphatically **not** a trust store. An attacker's substituted key
+/// gets recorded here the moment it is reported, exactly like the operator's
+/// own, because the monitor has no way to tell them apart and does not
+/// pretend to. Recording is bookkeeping about what has been *said*, not a
+/// judgement about what is *legitimate*; the judgement is the operator's,
+/// made against their own record of what they published.
+///
+/// The apexes are also the watch list: an apex with an empty key list is how
+/// an operator says "tell me about this zone, I have seen nothing yet".
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KnownKeys {
-    /// `apex (lowercase, no trailing dot)` → the SHA-256 hex of each known
-    /// key's DER SubjectPublicKeyInfo.
+    /// `apex` → the SHA-256 hex of each already-reported key's DER
+    /// SubjectPublicKeyInfo.
     #[serde(default)]
     pub keys: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl KnownKeys {
-    /// Whether this SPKI is one the monitor already trusts for `apex`.
+    /// Whether this SPKI has already been seen for `apex`.
     ///
     /// Names are compared **parsed**, never trimmed: an operator's state file
-    /// says `sync.example.dev` and a certificate says `sync.example.dev.`,
-    /// and those are one zone — but `sync.example.dev..` is not a name at all
+    /// says `sync.example` and a certificate says `sync.example.`,
+    /// and those are one zone — but `sync.example..` is not a name at all
     /// and must match nothing.
     pub fn contains(&self, apex: &Name, spki: &[u8]) -> bool {
         let digest = hex::encode(sha256(spki));
@@ -73,7 +93,7 @@ impl KnownKeys {
             .any(|(_, digests)| digests.iter().any(|d| d.eq_ignore_ascii_case(&digest)))
     }
 
-    /// Records a key as known for `apex`.
+    /// Records a key as seen for `apex`.
     pub fn insert(&mut self, apex: &Name, spki: &[u8]) {
         let key = apex.to_string();
         let digest = hex::encode(sha256(spki));
@@ -83,9 +103,9 @@ impl KnownKeys {
         }
     }
 
-    /// The apexes this monitor has an opinion about, parsed. An entry that is
-    /// not a DNS name watches nothing — it cannot match a certificate's SAN,
-    /// which is parsed too.
+    /// The apexes this monitor watches, parsed. An entry that is not a DNS
+    /// name watches nothing — it cannot match a certificate's SAN, which is
+    /// parsed too.
     pub fn apexes(&self) -> impl Iterator<Item = Name> + '_ {
         self.keys
             .keys()
@@ -94,6 +114,10 @@ impl KnownKeys {
 }
 
 /// One classified leaf.
+///
+/// Everything an operator needs to act without believing anything the entry
+/// says: the zone, the key tag and DS their registrar should be showing, the
+/// exact key bytes by digest, and where in the log to look.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Finding {
     /// Where the entry sits in the log.
@@ -112,20 +136,24 @@ pub struct Finding {
     pub tier: Tier,
     /// Why, in the order the checks ran. Always non-empty.
     pub reasons: Vec<String>,
-    /// The predecessor the countersignature named, when there was one.
-    pub predecessor_key_tag: Option<u16>,
 }
 
 impl Finding {
     /// A one-line rendering for a terminal or a log.
+    ///
+    /// The DS is in it deliberately, and it is the longest field: the
+    /// operator's first move on a new authorization is to compare this line
+    /// against what their registrar is publishing, and a line they have to
+    /// re-run a tool to complete is a line they will not act on.
     pub fn line(&self) -> String {
         format!(
-            "[{}] index {} apex {} keyTag {} spki {}… — {}",
+            "[{}] index {} apex {} keyTag {} DS {} spki {} — {}",
             self.tier.letter(),
             self.log_index,
             self.apex,
             self.key_tag,
-            &self.spki_sha256[..16],
+            self.ds,
+            self.spki_sha256,
             self.reasons.join("; ")
         )
     }
@@ -143,7 +171,6 @@ impl Finding {
 pub fn classify(
     body: &HashedRekordBody,
     log_index: u64,
-    known: &KnownKeys,
     anchors: &TrustAnchors,
 ) -> Option<Finding> {
     // Everything about the zone and the key comes out of `chain::authorize`,
@@ -165,90 +192,28 @@ pub fn classify(
         ds: chain::ds_fields(&apex, &dnskey_rdata),
         tier: Tier::C,
         reasons: Vec::new(),
-        predecessor_key_tag: None,
     };
 
-    let authorized = match chain::authorize(&body.certificate, anchors) {
-        Ok(authorized) => authorized,
+    match chain::authorize(&body.certificate, anchors) {
+        Ok(authorized) => {
+            // The chain verifies and covers this key, so a resolver holding
+            // this anchor would take the entry. That is the whole of the
+            // verdict: this key is authorized for this apex, and the monitor
+            // does not — cannot — say by whom.
+            finding.tier = Tier::A;
+            finding.reasons.push(format!(
+                "DNSSEC chain valid to {} ({} link(s)): this key is authorized for {apex}",
+                authorized.chain.anchor_zone, authorized.chain.links
+            ));
+        }
         Err(why) => {
             // No client would have accepted this either — the client runs
             // this same composition and refuses what it rejects — so an entry
             // here is an unauthorized claim nobody could have been served.
             finding.reasons.push(format!("unauthorized claim: {why}"));
-            return Some(finding);
-        }
-    };
-    finding.reasons.push(format!(
-        "DNSSEC chain valid to {} ({} link(s))",
-        authorized.chain.anchor_zone, authorized.chain.links
-    ));
-
-    // The chain holds. The only remaining question is whether the operator's
-    // previous key vouched for this one.
-    finding.tier = Tier::B;
-    match body.succession() {
-        None => finding.reasons.push(
-            "no succession countersignature: genesis, disaster recovery, or a substitution".into(),
-        ),
-        Some(Err(why)) => finding
-            .reasons
-            .push(format!("succession extension does not decode: {why}")),
-        Some(Ok(succession)) => {
-            finding.predecessor_key_tag = Some(succession.predecessor_key_tag);
-            match check_succession(&succession, &apex, &body.certificate.spki, known) {
-                Ok(()) => {
-                    finding.tier = Tier::A;
-                    finding.reasons.push(format!(
-                        "countersigned by known predecessor key tag {}",
-                        succession.predecessor_key_tag
-                    ));
-                }
-                Err(why) => finding.reasons.push(why),
-            }
         }
     }
     Some(finding)
-}
-
-/// Whether a succession countersignature is one this monitor believes.
-///
-/// Three conditions, and all of them matter: the predecessor is a key the
-/// monitor *already knew* for this apex (not merely one that appeared in the
-/// log), the signature is over this exact successor's SubjectPublicKeyInfo,
-/// and the key tag inside the payload matches the one being claimed.
-fn check_succession(
-    succession: &Succession,
-    apex: &Name,
-    successor_spki: &[u8],
-    known: &KnownKeys,
-) -> Result<(), String> {
-    if !known.contains(apex, &succession.predecessor_spki) {
-        return Err(format!(
-            "the countersigning key (tag {}) is not one this monitor knows for {apex}",
-            succession.predecessor_key_tag
-        ));
-    }
-    let rdata = chain::zone_key_rdata(&succession.predecessor_spki)
-        .ok_or_else(|| "the predecessor key is not a P-256 SubjectPublicKeyInfo".to_string())?;
-    if chain::key_tag(&rdata) != succession.predecessor_key_tag {
-        return Err(format!(
-            "the countersignature claims key tag {} but its key's tag is {}",
-            succession.predecessor_key_tag,
-            chain::key_tag(&rdata)
-        ));
-    }
-    let point = &rdata[4..];
-    let signed = Succession::signed_bytes(
-        &apex.to_string(),
-        succession.predecessor_key_tag,
-        successor_spki,
-    );
-    let mut uncompressed = Vec::with_capacity(65);
-    uncompressed.push(0x04);
-    uncompressed.extend_from_slice(point);
-    signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, &uncompressed)
-        .verify(&signed, &succession.signature)
-        .map_err(|_| "the succession countersignature does not verify".to_string())
 }
 
 #[cfg(test)]
@@ -262,14 +227,15 @@ mod tests {
     #[test]
     fn known_keys_compare_names_the_way_dns_does() {
         let mut known = KnownKeys::default();
-        known.insert(&name("Sync.Example.Dev."), b"a key");
-        assert!(known.contains(&name("sync.example.dev"), b"a key"));
-        assert!(known.contains(&name("SYNC.EXAMPLE.DEV."), b"a key"));
-        assert!(!known.contains(&name("other.example.dev"), b"a key"));
-        assert!(!known.contains(&name("sync.example.dev"), b"another key"));
-        // Inserting twice does not double the entry.
-        known.insert(&name("sync.example.dev"), b"a key");
-        assert_eq!(known.keys["sync.example.dev."].len(), 1);
+        known.insert(&name("Sync.Example."), b"a key");
+        assert!(known.contains(&name("sync.example"), b"a key"));
+        assert!(known.contains(&name("SYNC.EXAMPLE."), b"a key"));
+        assert!(!known.contains(&name("other.example"), b"a key"));
+        assert!(!known.contains(&name("sync.example"), b"another key"));
+        // Inserting twice does not double the entry — which is what stops a
+        // key being re-reported once it has been recorded.
+        known.insert(&name("sync.example"), b"a key");
+        assert_eq!(known.keys["sync.example."].len(), 1);
     }
 
     /// A watch entry that is not a DNS name watches nothing.
@@ -281,9 +247,9 @@ mod tests {
     #[test]
     fn an_unparseable_watch_entry_matches_nothing() {
         let mut known = KnownKeys::default();
-        known.keys.insert("sync.example.dev..".into(), vec![]);
+        known.keys.insert("sync.example..".into(), vec![]);
         assert_eq!(known.apexes().count(), 0);
-        assert!(!known.contains(&name("sync.example.dev"), b"a key"));
+        assert!(!known.contains(&name("sync.example"), b"a key"));
     }
 
     #[test]

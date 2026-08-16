@@ -59,7 +59,7 @@ secrets.** Protect the replication bucket accordingly.
 | Variable | Role | Meaning |
 |---|---|---|
 | `CP_ROLE` | both | `primary` or `replica` |
-| `CP_BASE_DOMAIN` | both | zone apex, e.g. `sync.example.dev` |
+| `CP_BASE_DOMAIN` | both | zone apex, e.g. `sync.example` |
 | `CP_DB_PATH` | both | SQLite file; **absolute, in its own directory** (see below) |
 | `CP_KEY_FILE` | primary | zone key file; **not in the database's directory**; unset on replicas |
 | `CP_HTTP_LISTEN` | both | `address:port`, default `0.0.0.0:8080` |
@@ -91,7 +91,7 @@ secrets.** Protect the replication bucket accordingly.
 1. **Key ceremony** (on the primary host):
 
    ```sh
-   controlplane keygen sync.example.dev /var/lib/synch-controlplane/csk.key
+   controlplane keygen sync.example /var/lib/synch-controlplane/csk.key
    ```
 
    Prints the key tag, the **DS record** for the parent zone, and the
@@ -108,9 +108,8 @@ secrets.** Protect the replication bucket accordingly.
    clients require the record by default):
 
    ```sh
-   controlplane rekor-publish sync.example.dev \
-     /var/lib/synch-controlplane/csk.key \
-     [/path/to/previous-csk.key]
+   controlplane rekor-publish sync.example \
+     /var/lib/synch-controlplane/csk.key
    ```
 
    Puts the key on a public transparency log, verifies the returned
@@ -129,24 +128,24 @@ secrets.** Protect the replication bucket accordingly.
    there yet the command says so:
 
    ```
-   no DS RRset at sync.example.dev. — is the DS live in the parent yet?
+   no DS RRset at sync.example. — is the DS live in the parent yet?
    ```
 
-   **Name the previous key file when you have one.** That adds the
-   succession countersignature — the one thing an attacker holding a
-   substituted DS cannot produce — and it is the difference between a
-   monitor logging a routine rotation and a monitor paging somebody. The
-   command tells you which you got:
+   **Expect every monitor watching this apex to report the key.** That is
+   what publishing to a transparency log now means, and there is nothing to
+   suppress it with: a monitor cannot tell your rotation from a
+   substitution, because an attacker holding your registrar can build the
+   same chain you just did. It reports the authorization and leaves the
+   judgement to you. The command says so:
 
    ```
    zone key 34918 rollover: log index 67673584 (entry added),
-   DNSSEC chain carried, countersigned by key tag 12345 (monitors see tier A)
+   DNSSEC chain carried (monitors will report this key)
    ```
 
-   A first key, or a recovery where the old private key is gone, has no
-   predecessor and legitimately reads `NOT countersigned: monitors will
-   alert (tier B)`. That is expected, and it is why somebody should be
-   told before you do it.
+   So tell whoever watches the monitor **before** you run it, and write the
+   key tag down. Your own record of what you published is the only thing
+   that distinguishes a report you caused from one you did not.
 
 4. **Relay Sigstore's TUF metadata** (once there is egress):
 
@@ -217,11 +216,12 @@ control plane itself with
   DS records present during the window; v1 keeps this manual and rare.
   With transparency enabled the order is: `keygen`, publish both DNSKEYs,
   **add the DS at the parent and wait**, then `rekor-publish <apex>
-  <newkey> <oldkey>`, then switch signing, then `rekor-retire <apex>
-  <oldkey>`. Logging comes after the DS because the entry carries the
-  DNSSEC chain that the DS makes buildable; the two-key window is what
-  covers the gap, since the old key keeps signing until the new one is
-  logged.
+  <newkey>`, then switch signing, then `rekor-retire <apex> <oldkey>`.
+  Logging comes after the DS because the entry carries the DNSSEC chain
+  that the DS makes buildable; the two-key window is what covers the gap,
+  since the old key keeps signing until the new one is logged. Every
+  monitor watching the apex will report the new key — tell them first,
+  and record the key tag.
 - **Zone key transparency** (docs/REKOR-ZONE-KEY.md): `rekor-publish`
   puts the zone key on a public log and the zone serves the proof at
   `_synchronicity-rekor.<apex>`. Rollout is phased — publish first
@@ -230,22 +230,38 @@ control plane itself with
   the active key has none, including the hourly re-sign; that is
   deliberate, and `rekor-publish` is how you get out of it.
 - **Watch the log** (docs/REKOR-ZONE-KEY.md §5.5). A required log with no
-  watcher is a formality. `synch-monitor` reads the whole log's tiles,
-  finds every entry naming your apex, and classifies it:
+  watcher is a formality. `synch-monitor` reads the whole log's tiles and
+  reports **every newly authorized key** for the apexes you watch:
 
   ```sh
-  echo '{"known":{"keys":{"sync.example.dev":[]}}}' > /var/lib/synch-monitor/state.json
+  echo '{"known":{"keys":{"sync.example":[]}}}' > /var/lib/synch-monitor/state.json
   synch-monitor --state /var/lib/synch-monitor/state.json
   ```
 
-  Exit codes: `0` nothing new, `10` routine countersigned rotations only,
-  `20` unauthorized claims naming your apex (recorded, no alarm — no
-  client would have accepted one), `30` **a chain-valid key nobody
-  countersigned: look now**, `2` the run could not finish. Run it from
-  somewhere that is not the control plane's network; the independence is
-  the point. Seed the state file with the keys you already know, and note
-  that it only ever learns new predecessors from tier A findings —
-  deliberately, so an attacker's first key cannot bootstrap their second.
+  Exit codes: `0` nothing new, `10` unauthorized claims naming your apex
+  (recorded, no alarm — no client would have accepted one), `20` **a key
+  was authorized for your apex that this monitor had not seen: check it
+  against what you published**, `2` the run could not finish. These
+  numbers changed when the tiering was reduced to two; a rule written
+  against the old `30` now matches nothing, which is the intended way to
+  find out.
+
+  New authorizations go to **stdout**, one line each with the apex, key
+  tag, the DS your registrar should be showing, the SPKI digest and the
+  log index. Everything else goes to stderr. A cron job that mails stdout
+  mails exactly the events that need a human.
+
+  **The monitor cannot tell your rotation from a substitution**, and does
+  not try: an attacker who has taken your registrar holds the DS, so
+  their entry carries a valid chain exactly like yours. It tells you a
+  key was authorized; *you* decide whether you authorized it. So keep a
+  record of every key you publish — that record is the discriminator, and
+  nothing in the log can replace it. Run the monitor from somewhere that
+  is not the control plane's network; the independence is the point. Seed
+  the state file with the keys you have already accounted for, so the
+  first run reports only what you did not know. The keys it records are
+  bookkeeping about what it has already told you, **not** a trust list:
+  an attacker's key is recorded once reported, the same as yours.
 - **Log-pin refresh** (docs/REKOR-ZONE-KEY.md §10): `tuf-refresh` relays
   Sigstore's TUF metadata at `_synchronicity-tuf.<apex>` so clients'
   transparency-log pins follow Sigstore's rotations. `/healthz` reports

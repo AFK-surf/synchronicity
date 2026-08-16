@@ -1,11 +1,15 @@
 //! Classification, and the invariant that couples it to the client.
 //!
-//! The three tiers are only useful if tier C — the silent bin — is exactly
-//! "an entry no client would have accepted either". If a client ever accepted
+//! The two tiers are only useful if tier C — the silent bin — is exactly "an
+//! entry no client would have accepted either". If a client ever accepted
 //! something a monitor filed as tier C, an attacker would hold a key that
 //! works against victims and rings no bell, which is strictly worse than not
 //! logging at all. That invariant is asserted here directly, over every shape
 //! of entry the two sides can disagree about.
+//!
+//! With tier B gone the invariant is *stronger*, not weaker: a client-accepted
+//! entry used to be allowed into either of two bins, and now there is exactly
+//! one bin it may land in.
 
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::{
@@ -16,7 +20,7 @@ use synch_monitor::{
 use synch_net::{
     rekor::{self, HashedRekordBody, LogKeys, RekorProof, ZoneKey},
     sim::{SimDelegation, SimLog, SimZone},
-    zonecert::{Succession, OID_DNSSEC_CHAIN, OID_SUCCESSION},
+    zonecert::OID_DNSSEC_CHAIN,
 };
 
 fn members() -> Vec<String> {
@@ -41,7 +45,6 @@ struct Shape {
     zone: SimZone,
     log: SimLog,
     proof: RekorProof,
-    known: KnownKeys,
     /// The trust anchor a reader of this entry holds, in `--dnssec-anchor`
     /// syntax.
     anchor: String,
@@ -71,12 +74,7 @@ fn client_accepts(shape: &Shape) -> bool {
 fn monitor_tier(shape: &Shape) -> Tier {
     let body =
         HashedRekordBody::parse(&shape.proof.canonicalized_body).expect("a well-formed body");
-    match classify(
-        &body,
-        shape.proof.log_index,
-        &shape.known,
-        &anchors(&shape.anchor),
-    ) {
+    match classify(&body, shape.proof.log_index, &anchors(&shape.anchor)) {
         Some(finding) => finding.tier,
         // A certificate the classifier declines to judge at all — an
         // unparseable SAN, a key that is not ours — is not in *any* tier, and
@@ -157,111 +155,89 @@ fn shapes() -> Vec<Shape> {
 fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     let mut out = Vec::new();
     let leak = |name: &str| -> &'static str { Box::leak(name.to_string().into_boxed_str()) };
-    let mut push = |name: &str,
-                    g: Ground,
-                    log: SimLog,
-                    proof: RekorProof,
-                    known: KnownKeys,
-                    observed: Option<String>| {
-        let observed_apex = observed.unwrap_or_else(|| g.zone.apex());
-        out.push(Shape {
-            name: leak(&format!("{name} ({})", rooted.label())),
-            zone: g.zone,
-            log,
-            proof,
-            known,
-            anchor: g.anchor,
-            observed_apex,
-        });
-    };
-    let certificate = |g: &Ground, succession: Option<&Succession>| {
-        let mut extensions = vec![(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())];
-        if let Some(succession) = succession {
-            extensions.push((OID_SUCCESSION.to_vec(), succession.encode()));
-        }
-        g.zone.certificate(&extensions)
+    let mut push =
+        |name: &str, g: Ground, log: SimLog, proof: RekorProof, observed: Option<String>| {
+            let observed_apex = observed.unwrap_or_else(|| g.zone.apex());
+            out.push(Shape {
+                name: leak(&format!("{name} ({})", rooted.label())),
+                zone: g.zone,
+                log,
+                proof,
+                anchor: g.anchor,
+                observed_apex,
+            });
+        };
+    let certificate = |g: &Ground| {
+        g.zone
+            .certificate(&[(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())])
     };
 
-    // 1. The honest genesis key: valid chain, no predecessor to countersign.
+    // 1. The honest genesis key: a zone's first, with a valid chain.
     {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
         let statement = g.zone.zone_key_statement("create", None);
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g, None));
-        push("genesis", g, log, proof, KnownKeys::default(), None);
+        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        push("genesis", g, log, proof, None);
     }
 
-    // 2. A routine rotation: valid chain, countersigned by a known key.
+    // 2. A routine rotation the operator performed.
     {
         let g = ground(rooted);
         let old = SimZone::new("cluster.example", members());
         let mut log = SimLog::new("rekor.sim");
         let statement = g.zone.zone_key_statement("rollover", Some(old.key_tag()));
-        let succession = old.countersign(&g.zone.apex(), &g.zone.spki());
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g, Some(&succession)));
-        let mut known = KnownKeys::default();
-        known.insert(&apex_name(&g.zone), &old.spki());
-        push("rotation", g, log, proof, known, None);
+        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        push("rotation", g, log, proof, None);
     }
 
-    // 3. A substitution: the attacker holds the DS, so the chain is real —
-    //    and cannot countersign, because that needs the old private key.
+    // 3. A substitution: the attacker holds the DS, so the chain is real.
+    //
+    //    This shape and shape 2 are byte-for-byte indistinguishable in every
+    //    respect a monitor can see, which is the point — both are tier A,
+    //    both get reported, and which of them actually happened is a question
+    //    only the operator's own records answer. Keeping both here, rather
+    //    than collapsing them into one, is what stops that fact from
+    //    quietly ceasing to be tested.
     {
         let g = ground(rooted);
-        let old = SimZone::new("cluster.example", members());
         let mut log = SimLog::new("rekor.sim");
         let statement = g.zone.zone_key_statement("create", None);
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g, None));
-        let mut known = KnownKeys::default();
-        known.insert(&apex_name(&g.zone), &old.spki());
-        push("substitution", g, log, proof, known, None);
+        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        push("substitution", g, log, proof, None);
     }
 
-    // 4. A forged countersignature: the attacker guesses at succession.
-    {
-        let g = ground(rooted);
-        let old = SimZone::new("cluster.example", members());
-        let mut log = SimLog::new("rekor.sim");
-        let mut forged = old.countersign(&g.zone.apex(), &g.zone.spki());
-        forged.signature[12] ^= 0x01;
-        let statement = g.zone.zone_key_statement("rollover", Some(old.key_tag()));
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g, Some(&forged)));
-        let mut known = KnownKeys::default();
-        known.insert(&apex_name(&g.zone), &old.spki());
-        push("forged countersignature", g, log, proof, known, None);
-    }
-
-    // 5. No chain at all.
+    // 4. No chain at all.
     {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
         let statement = g.zone.zone_key_statement("create", None);
         let proof = log.log_certified(&g.zone, &statement, &g.zone.certificate(&[]));
-        push("chainless", g, log, proof, KnownKeys::default(), None);
+        push("chainless", g, log, proof, None);
     }
 
-    // 6. A chain whose signature does not verify.
+    // 5. A chain whose signature does not verify.
     {
         let mut g = ground(rooted);
         let at = g.chain.links[0].rrs.len() - 3;
         g.chain.links[0].rrs[at] ^= 0x01;
         let mut log = SimLog::new("rekor.sim");
         let statement = g.zone.zone_key_statement("create", None);
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g, None));
-        push("broken chain", g, log, proof, KnownKeys::default(), None);
+        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        push("broken chain", g, log, proof, None);
     }
 
-    // 7. A chain that is valid — for a different zone's key.
+    // 6. A chain that is valid — for a different zone's key.
     {
         let mut g = ground(rooted);
         g.chain = ground(rooted).chain;
         let mut log = SimLog::new("rekor.sim");
         let statement = g.zone.zone_key_statement("create", None);
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g, None));
-        push("wrong-key chain", g, log, proof, KnownKeys::default(), None);
+        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        push("wrong-key chain", g, log, proof, None);
     }
 
-    // 8. A chain that was valid long ago and has expired since. Archival, and
+    // 7. A chain that was valid long ago and has expired since. Archival, and
     //    therefore still perfectly good — neither side consults a clock.
     {
         let mut g = ground(rooted);
@@ -280,11 +256,11 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
         };
         let mut log = SimLog::new("rekor.sim");
         let statement = g.zone.zone_key_statement("create", None);
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g, None));
-        push("expired chain", g, log, proof, KnownKeys::default(), None);
+        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        push("expired chain", g, log, proof, None);
     }
 
-    // 9-12. SANs that are not names, or name somebody else. This is the
+    // 8-11. SANs that are not names, or name somebody else. This is the
     //       family that broke the invariant in production code: the client
     //       compared SANs by trimming trailing dots while the monitor parsed
     //       them, so `cluster.example..` satisfied the client *and* failed to
@@ -302,10 +278,10 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
             .zone
             .certificate_for(san, &[(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())]);
         let proof = log.log_certified(&g.zone, &statement, &certificate);
-        push(label, g, log, proof, KnownKeys::default(), None);
+        push(label, g, log, proof, None);
     }
 
-    // 13. A well-formed SAN naming a zone that is not the one the Statement
+    // 12. A well-formed SAN naming a zone that is not the one the Statement
     //     and the resolver are about.
     {
         let g = ground(rooted);
@@ -316,14 +292,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
             &[(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())],
         );
         let proof = log.log_certified(&g.zone, &statement, &certificate);
-        push(
-            "san names another zone",
-            g,
-            log,
-            proof,
-            KnownKeys::default(),
-            None,
-        );
+        push("san names another zone", g, log, proof, None);
     }
 
     out
@@ -331,14 +300,9 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
 
 /// The tier of a proof about `zone`, anchored at that zone's own key — the
 /// shorthand the single-purpose tests below use.
-fn tier_of(proof: &RekorProof, zone: &SimZone, known: &KnownKeys) -> Tier {
+fn tier_of(proof: &RekorProof, zone: &SimZone) -> Tier {
     let body = HashedRekordBody::parse(&proof.canonicalized_body).expect("a well-formed body");
-    match classify(
-        &body,
-        proof.log_index,
-        known,
-        &anchors(&zone.anchor_record()),
-    ) {
+    match classify(&body, proof.log_index, &anchors(&zone.anchor_record())) {
         Some(finding) => finding.tier,
         None => Tier::C,
     }
@@ -349,7 +313,7 @@ fn apex_name(zone: &SimZone) -> hickory_resolver::proto::rr::Name {
     synch_net::chain::parse_name(&zone.apex()).expect("a sim apex is a name")
 }
 
-/// **The invariant.** Anything a client accepts is at least tier B.
+/// **The invariant.** Anything a client accepts is tier A.
 #[test]
 fn nothing_a_client_accepts_lands_in_the_silent_bin() {
     for shape in shapes() {
@@ -357,21 +321,17 @@ fn nothing_a_client_accepts_lands_in_the_silent_bin() {
         let accepted = client_accepts(&shape);
         let tier = monitor_tier(&shape);
         assert!(
-            !accepted || tier != Tier::C,
+            !accepted || tier == Tier::A,
             "{name}: the client accepted an entry the monitor files as noise"
         );
         // The invariant above is satisfied trivially by a client that accepts
         // nothing, so pin what acceptance actually is. These are the shapes a
-        // resolver must take — including the two that alarm a monitor, because
-        // the substitution *is* usable and the whole point is that it is loud
-        // rather than refused here — and the three it must refuse, which are
-        // exactly the tier C bin.
+        // resolver must take — including the substitution, because it *is*
+        // usable and the whole point is that it is reported rather than
+        // refused here — and the ones it must refuse, which are exactly the
+        // tier C bin.
         let must_accept = match name.split(" (").next().expect("a shape name") {
-            "genesis"
-            | "rotation"
-            | "substitution"
-            | "forged countersignature"
-            | "expired chain" => true,
+            "genesis" | "rotation" | "substitution" | "expired chain" => true,
             "chainless"
             | "broken chain"
             | "wrong-key chain"
@@ -416,14 +376,17 @@ fn the_suite_covers_both_a_self_anchored_chain_and_a_real_ladder() {
 #[test]
 fn each_shape_lands_where_the_design_says_it_should() {
     let expected = [
-        ("genesis", Tier::B),
+        ("genesis", Tier::A),
         ("rotation", Tier::A),
-        ("substitution", Tier::B),
-        ("forged countersignature", Tier::B),
+        // The attacker's entry classifies exactly like the operator's. Stated
+        // as an expectation rather than left implicit, because it is the
+        // whole shape of what this monitor now claims: a verified chain is an
+        // authorization, and nothing here says who was entitled to make it.
+        ("substitution", Tier::A),
         ("chainless", Tier::C),
         ("broken chain", Tier::C),
         ("wrong-key chain", Tier::C),
-        ("expired chain", Tier::B),
+        ("expired chain", Tier::A),
         // A SAN that is not a name names no zone: nothing to classify, and
         // nothing a client takes either.
         ("malformed san", Tier::C),
@@ -444,50 +407,62 @@ fn each_shape_lands_where_the_design_says_it_should() {
     }
 }
 
-/// A predecessor the monitor has never heard of does not make tier A.
+/// Classification takes no state, so nothing a monitor has seen can steer it.
 ///
-/// Otherwise an attacker's first substituted key would be a valid predecessor
-/// for their second, and every key after the first would look routine.
+/// The old classifier consulted its known-keys set to decide between two
+/// tiers, which meant the verdict on an entry depended on the monitor's
+/// history. It no longer does: the same bytes classify the same way against
+/// an empty state and against one holding every key involved. The
+/// already-seen test still exists, but it decides whether to *report*, never
+/// what an entry *is* — and that separation is what keeps a recorded
+/// attacker key from making the next one look ordinary.
 #[test]
-fn an_unknown_predecessor_cannot_manufacture_tier_a() {
-    let old = SimZone::new("cluster.example", members());
+fn what_the_monitor_has_seen_does_not_change_what_an_entry_is() {
     let zone = SimZone::new("cluster.example", members());
     let mut log = SimLog::new("rekor.sim");
-    let succession = old.countersign(&zone.apex(), &zone.spki());
-    let statement = zone.zone_key_statement("rollover", Some(old.key_tag()));
-    let proof = log.log_certified(
-        &zone,
-        &statement,
-        &zone.zone_key_certificate(Some(&succession)),
-    );
+    let proof = log.publish(&zone, "create", None);
+    let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
 
-    // Signature perfectly valid, key unknown: tier B.
-    assert_eq!(tier_of(&proof, &zone, &KnownKeys::default()), Tier::B);
-    // The same entry, once the operator has told the monitor about the old
-    // key: tier A.
+    let anchors = anchors(&zone.anchor_record());
+    let first = classify(&body, proof.log_index, &anchors).unwrap();
+
+    // Whatever a monitor records about this key, the classification of the
+    // entry is unchanged — there is no argument left to pass it.
     let mut known = KnownKeys::default();
-    known.insert(&apex_name(&zone), &old.spki());
-    assert_eq!(tier_of(&proof, &zone, &known), Tier::A);
+    known.insert(&apex_name(&zone), &zone.spki());
+    assert!(known.contains(&apex_name(&zone), &zone.spki()));
+
+    let again = classify(&body, proof.log_index, &anchors).unwrap();
+    assert_eq!(first, again);
+    assert_eq!(first.tier, Tier::A);
 }
 
-/// A countersignature over a *different* successor does not transfer.
+/// Reporting once: a recorded key is not news, an unrecorded one is.
+///
+/// This is the whole of the state machine `main` runs, asserted against the
+/// types rather than against the binary — the binary's part is which stream
+/// each half goes to.
 #[test]
-fn a_countersignature_is_bound_to_the_key_it_names() {
-    let old = SimZone::new("cluster.example", members());
+fn a_key_is_news_until_it_has_been_recorded() {
     let zone = SimZone::new("cluster.example", members());
-    let stranger = SimZone::new("cluster.example", members());
     let mut log = SimLog::new("rekor.sim");
-    // A genuine countersignature — for somebody else's key, replayed here.
-    let elsewhere = old.countersign(&zone.apex(), &stranger.spki());
-    let statement = zone.zone_key_statement("rollover", Some(old.key_tag()));
-    let proof = log.log_certified(
-        &zone,
-        &statement,
-        &zone.zone_key_certificate(Some(&elsewhere)),
-    );
+    let proof = log.publish(&zone, "create", None);
+    let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
+    let finding = classify(&body, proof.log_index, &anchors(&zone.anchor_record())).unwrap();
+    assert_eq!(finding.tier, Tier::A);
+
+    let apex = apex_name(&zone);
     let mut known = KnownKeys::default();
-    known.insert(&apex_name(&zone), &old.spki());
-    assert_eq!(tier_of(&proof, &zone, &known), Tier::B);
+    // Nothing recorded: a new authorization.
+    assert!(!known.contains(&apex, &zone.spki()));
+    known.insert(&apex, &zone.spki());
+    // Recorded: reported once, and not again.
+    assert!(known.contains(&apex, &zone.spki()));
+
+    // A different key for the same apex is still news — recording one key
+    // must not vouch for the zone as a whole.
+    let next = SimZone::new("cluster.example", members());
+    assert!(!known.contains(&apex, &next.spki()));
 }
 
 /// What a monitor derives, it derives from the certificate alone.
@@ -497,13 +472,7 @@ fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
     let mut log = SimLog::new("rekor.sim");
     let proof = log.publish(&zone, "create", None);
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-    let finding = classify(
-        &body,
-        7,
-        &KnownKeys::default(),
-        &anchors(&zone.anchor_record()),
-    )
-    .unwrap();
+    let finding = classify(&body, 7, &anchors(&zone.anchor_record())).unwrap();
 
     // The same key tag and DS the zone itself would publish, arrived at with
     // no DNS query — which is the only reason a compromised provider cannot
@@ -514,19 +483,26 @@ fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
     // carries its root dot however the certificate happened to spell it.
     assert_eq!(finding.apex, zone.apex());
     assert_eq!(finding.log_index, 7);
-    assert!(finding
-        .line()
-        .starts_with("[B] index 7 apex cluster.example"));
+
+    // The reported line carries everything an operator acts on: the zone, the
+    // key tag, the DS to compare against the registrar, the full SPKI digest
+    // and the index to look the entry up by.
+    let line = finding.line();
+    assert!(
+        line.starts_with("[A] index 7 apex cluster.example"),
+        "{line}"
+    );
+    assert!(line.contains(&zone.ds_field()), "{line}");
+    assert!(line.contains(&finding.spki_sha256), "{line}");
 }
 
 /// A long-expired chain classifies exactly like a fresh one.
 ///
-/// This is what is left of the old staleness note, and it is the half worth
-/// keeping: the monitor consults **no clock at all** now, so an entry whose
-/// RRSIGs expired years ago lands in the same tier as one signed this
-/// morning. It has to. The client does not check windows either (there is no
-/// attested time anywhere near a leaf, and archival entries are read for
-/// years), so a monitor that quietly demoted an expired chain would put a
+/// The monitor consults **no clock at all**, so an entry whose RRSIGs expired
+/// years ago lands in the same tier as one signed this morning. It has to.
+/// The client does not check windows either (there is no attested time
+/// anywhere near a leaf, and archival entries are read for years), so a
+/// monitor that quietly demoted an expired chain would put a
 /// client-acceptable entry in the silent bin — the exact evasion the
 /// invariant forbids.
 #[test]
@@ -539,20 +515,14 @@ fn a_long_expired_chain_classifies_the_same_as_a_fresh_one() {
         let certificate = zone.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), chain)]);
         let proof = log.log_certified(&zone, &statement, &certificate);
         let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-        classify(
-            &body,
-            0,
-            &KnownKeys::default(),
-            &anchors(&zone.anchor_record()),
-        )
-        .unwrap()
+        classify(&body, 0, &anchors(&zone.anchor_record())).unwrap()
     };
 
     let ancient = time::OffsetDateTime::now_utc() - time::Duration::days(900);
     let expired = classify_chain(zone.dnssec_chain_at(ancient).encode());
     let fresh = classify_chain(zone.dnssec_chain().encode());
 
-    assert_eq!(expired.tier, Tier::B);
+    assert_eq!(expired.tier, Tier::A);
     assert_eq!(expired.tier, fresh.tier);
     // Not merely the same tier — the same reasons, because nothing in the
     // classifier looks at time at all.
@@ -564,34 +534,42 @@ fn a_long_expired_chain_classifies_the_same_as_a_fresh_one() {
     );
 }
 
-/// A succession extension the certificate carries but that does not decode
-/// is tier B, not a crash and not tier C.
+/// An extension this build has never heard of changes nothing.
+///
+/// This is the property that let the succession extension be deleted from the
+/// code without republishing the conformance entry that still carries it: the
+/// certificate parser collects extensions and looks them up by OID, and an
+/// unrecognised one is simply never asked for. Asserted with a synthetic OID
+/// rather than the retired one, so the assertion keeps its meaning after
+/// nobody remembers what `2.25.1138370866` was.
 #[test]
-fn an_undecodable_succession_extension_is_still_only_tier_b() {
+fn an_extension_nothing_reads_does_not_disturb_the_verdict() {
     let zone = SimZone::new("cluster.example", members());
-    let mut log = SimLog::new("rekor.sim");
     let statement = zone.zone_key_statement("create", None);
-    let certificate = zone.certificate(&[
-        (OID_DNSSEC_CHAIN.to_vec(), zone.dnssec_chain().encode()),
-        (OID_SUCCESSION.to_vec(), b"not der".to_vec()),
-    ]);
-    let proof = log.log_certified(&zone, &statement, &certificate);
-    assert_eq!(tier_of(&proof, &zone, &KnownKeys::default()), Tier::B);
-}
+    let chain = zone.dnssec_chain().encode();
 
-/// The succession payload is the one both halves sign; assert its bytes here
-/// too, where a Gleam signer and a Rust verifier have to meet.
-#[test]
-fn the_succession_payload_is_the_bytes_both_halves_agree_on() {
-    let payload = Succession::signed_payload("cluster.example.", 4242, b"spki");
-    assert_eq!(
-        String::from_utf8(payload).unwrap(),
-        format!(
-            "{{\"apex\":\"cluster.example\",\"predecessorKeyTag\":4242,\
-             \"successorSpkiSha256\":\"{}\"}}",
-            hex::encode(rekor::sha256(b"spki"))
-        )
-    );
+    let classify_cert = |certificate: Vec<u8>| {
+        let mut log = SimLog::new("rekor.sim");
+        let proof = log.log_certified(&zone, &statement, &certificate);
+        let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
+        classify(&body, 0, &anchors(&zone.anchor_record())).unwrap()
+    };
+
+    let plain = classify_cert(zone.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), chain.clone())]));
+    let with_junk = classify_cert(zone.certificate(&[
+        (OID_DNSSEC_CHAIN.to_vec(), chain),
+        // 2.25.1138370866, the arc the countersignature used to live under,
+        // carrying bytes that decode as nothing at all.
+        (
+            vec![0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32],
+            b"vestigial".to_vec(),
+        ),
+    ]));
+
+    assert_eq!(plain.tier, Tier::A);
+    assert_eq!(plain.tier, with_junk.tier);
+    assert_eq!(plain.reasons, with_junk.reasons);
+    assert_eq!(plain.spki_sha256, with_junk.spki_sha256);
 }
 
 /// A monitor reads leaves out of tiles; assert it against a whole simulated
@@ -632,4 +610,6 @@ fn a_monitor_finds_a_zones_entry_by_walking_bundles() {
         ));
     }
     assert_eq!(found, vec![(1, "cluster.example.".to_string())]);
+    // And the entry it found is an authorization, not noise.
+    assert_eq!(tier_of(&proof, &zone), Tier::A);
 }
