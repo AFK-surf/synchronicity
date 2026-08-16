@@ -62,33 +62,45 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7]
+  [v1, v2, v3]
 }
 
-/// V7: identify a key by its key, not by a checksum of it.
+/// V3: zone-key transparency and the relayed TUF material
+/// (docs/REKOR-ZONE-KEY.md §5.2, §10.3).
 ///
-/// V6's primary key was `(key_tag, action)`. An RFC 4034 key tag is a 16-bit
-/// checksum over the DNSKEY rdata, so two distinct keys collide with odds
-/// around 1/65536 per rollover — and a collision meant one key's row silently
-/// *replaced* another's, taking its proof out of the served zone with no
-/// error anywhere. Rare and silent is the bad combination: it would surface
-/// as a cluster that stopped resolving for reasons nobody could reconstruct.
+/// `rekor_records` holds one row per zone-key lifecycle event: the entry
+/// exactly as the log serialized it, beside the checkpoint and audit path
+/// that prove it is in the tree. What is stored is what the log returned,
+/// not a decomposition of it — so the certificate naming the zone stays
+/// inside `canonicalized_body`, where Rekor put it.
 ///
-/// The identity is now `(spki_sha256, action)` — the SHA-256 of the key's DER
-/// SubjectPublicKeyInfo, which is what identifies a key everywhere else in
-/// this design (the succession extension names a predecessor by SPKI for the
-/// same reason, and a monitor's known-keys file is keyed by this digest).
-/// `key_tag` stays as an indexed column because that is what a client selects
-/// on — it reads the tag from the RRSIG it just validated — but selection is
-/// no longer identity: a lookup may now return two rows for one tag, and the
-/// client tries each until one verifies.
+/// Identity is `(spki_sha256, action)`: the SHA-256 of the key's DER
+/// SubjectPublicKeyInfo, which is what names a key everywhere else in this
+/// design — the succession extension names a predecessor by SPKI, and a
+/// monitor's known-keys file is keyed by the same digest. An RFC 4034 key
+/// tag is only a 16-bit checksum over the DNSKEY rdata, so two distinct keys
+/// collide with odds near 1/65536 per rollover; keying rows on it would let
+/// one key's row silently replace another's, taking its proof out of the
+/// served zone with no error anywhere. `key_tag` remains an indexed column
+/// because it is what a client selects on — it reads the tag from the RRSIG
+/// it just validated — but selection is not identity: a lookup may return two
+/// rows for one tag, and the client tries each until one verifies.
 ///
-/// Existing rows carry no SPKI column to backfill from, and the certificate
-/// inside `canonicalized_body` would have to be parsed in SQL to get one, so
-/// the table is rebuilt. `rekor-publish` repopulates it, which is a step the
-/// ceremony already has.
-const v7 = "
-DROP TABLE rekor_records;
+/// `chainless` records whether an entry carries a DNSSEC chain, and the CHECK
+/// confines that to `retire`: a zone being retired may have no DS left in its
+/// parent to build a chain from, while anything a client treats as
+/// authorization must carry one. Recording it saves re-parsing DER to tell an
+/// operator what monitors will make of a key.
+///
+/// `tuf_material` is a single row, because there is one Sigstore repository
+/// and one current view of it — the files verbatim, their versions, and the
+/// timestamp expiry the hourly job watches. This service is a relay, not the
+/// verifier: these columns exist so it can refuse regressions and know when to
+/// refetch, and the cryptographic gate is the client's. `root_json` holds the
+/// root chain as one blob of u32-length-prefixed files, ascending — the same
+/// framing the bundle record uses, so serving is a copy rather than a
+/// re-encode.
+const v3 = "
 CREATE TABLE rekor_records (
   spki_sha256        BLOB    NOT NULL CHECK (length(spki_sha256) = 32),
   key_tag            INTEGER NOT NULL,
@@ -108,89 +120,6 @@ CREATE TABLE rekor_records (
 );
 CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
 CREATE INDEX rekor_records_by_key_tag ON rekor_records (key_tag);
-"
-
-/// V6: proof v3 — the certificate verifier (docs/REKOR-ZONE-KEY.md §2, §3).
-///
-/// Every row written under v5 holds a `canonicalizedBody` whose verifier is a
-/// raw public key. Such an entry names no zone anywhere in its Merkle leaf,
-/// which is the apex-anonymous shape v3 abolished: no client will accept one
-/// and no monitor could ever have seen it. Carrying those rows forward would
-/// mean serving proofs every upgraded client refuses, so the table is rebuilt
-/// empty and the operator re-runs `rekor-publish`.
-///
-/// The columns are unchanged — the certificate lives inside
-/// `canonicalized_body`, where the log put it, and this service stores what
-/// the log serialized rather than a decomposition of it. The one addition is
-/// `chainless`, recording whether an entry carries a DNSSEC chain: only a
-/// `retire` may, and being able to say so without re-parsing DER is what lets
-/// `/healthz` and the dashboard tell an operator what monitors will see.
-///
-/// One ordering consequence rides along, and it is the reason a rebuild is
-/// tolerable: an entry now has to carry a DNSSEC chain, which cannot be built
-/// until the **DS is live in the parent**, so re-running `rekor-publish` is a
-/// step that happens after the DS is in place anyway (§5.2).
-const v6 = "
-DROP TABLE rekor_records;
-CREATE TABLE rekor_records (
-  key_tag            INTEGER NOT NULL,
-  apex               TEXT    NOT NULL,
-  action             TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
-  statement          BLOB    NOT NULL,
-  canonicalized_body BLOB    NOT NULL,
-  log_id             BLOB    NOT NULL CHECK (length(log_id) = 32),
-  log_index          INTEGER NOT NULL,
-  checkpoint         BLOB    NOT NULL,
-  inclusion_path     BLOB    NOT NULL,
-  chainless          INTEGER NOT NULL DEFAULT 0
-                     CHECK (chainless = 0 OR action = 'retire'),
-  integrated_at      INTEGER NOT NULL,
-  verified_at        INTEGER NOT NULL,
-  PRIMARY KEY (key_tag, action)
-);
-CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
-"
-
-/// V5: the Rekor v2 rework (docs/REKOR-ZONE-KEY.md §2, §3). The record now
-/// carries the log's own `canonicalizedBody` (the Merkle leaf preimage,
-/// a real `hashedrekord` v0.0.2 entry over the DSSE PAE) beside the
-/// Statement, replacing the v1 leaf convention that hashed a
-/// synchronicity-canonical DSSE envelope. Any row written under v3/v4 is a
-/// proof under the old leaf convention that no v2 client will accept, so the
-/// table is rebuilt empty rather than carried forward with mislabelled
-/// columns: `dsse_signature` bytes are not a `canonicalizedBody`. An operator
-/// re-runs `rekor-publish` to repopulate it, which the ceremony already
-/// budgets for.
-const v5 = "
-DROP TABLE rekor_records;
-CREATE TABLE rekor_records (
-  key_tag            INTEGER NOT NULL,
-  apex               TEXT    NOT NULL,
-  action             TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
-  statement          BLOB    NOT NULL,
-  canonicalized_body BLOB    NOT NULL,
-  log_id             BLOB    NOT NULL CHECK (length(log_id) = 32),
-  log_index          INTEGER NOT NULL,
-  checkpoint         BLOB    NOT NULL,
-  inclusion_path     BLOB    NOT NULL,
-  integrated_at      INTEGER NOT NULL,
-  verified_at        INTEGER NOT NULL,
-  PRIMARY KEY (key_tag, action)
-);
-CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
-"
-
-/// V4: the relayed TUF material (docs/REKOR-ZONE-KEY.md §10.3). One row,
-/// because there is one Sigstore repository and one current view of it —
-/// the files verbatim, their versions, and the timestamp expiry the hourly
-/// job watches. This service is a relay, not the verifier: the columns
-/// exist so it can refuse regressions and know when to refetch, and the
-/// cryptographic gate is the client's.
-///
-/// `root_json` holds the root chain as one blob of u32-length-prefixed
-/// files, ascending — the same framing the bundle record uses, so serving
-/// is a copy rather than a re-encode.
-const v4 = "
 CREATE TABLE tuf_material (
   id                INTEGER PRIMARY KEY CHECK (id = 1),
   source            TEXT    NOT NULL,
@@ -207,30 +136,6 @@ CREATE TABLE tuf_material (
   trusted_root      BLOB    NOT NULL,
   fetched_at        INTEGER NOT NULL
 );
-"
-
-/// V3: zone-key transparency (docs/REKOR-ZONE-KEY.md §5.2). One row per
-/// zone-key lifecycle event, holding the entry exactly as it was logged
-/// plus the checkpoint and audit path that prove it is in the tree. The
-/// primary key is (key_tag, action) because a key is created once, rolled
-/// over once and retired once; re-publishing refreshes the row rather than
-/// minting a second entry for the same claim.
-const v3 = "
-CREATE TABLE rekor_records (
-  key_tag         INTEGER NOT NULL,
-  apex            TEXT    NOT NULL,
-  action          TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
-  dsse_payload    BLOB    NOT NULL,
-  dsse_signature  BLOB    NOT NULL,
-  log_id          BLOB    NOT NULL CHECK (length(log_id) = 32),
-  log_index       INTEGER NOT NULL,
-  checkpoint      BLOB    NOT NULL,
-  inclusion_path  BLOB    NOT NULL,
-  integrated_at   INTEGER NOT NULL,
-  verified_at     INTEGER NOT NULL,
-  PRIMARY KEY (key_tag, action)
-);
-CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
 "
 
 /// V2: DNS answers query SQLite directly (no in-memory snapshot), so

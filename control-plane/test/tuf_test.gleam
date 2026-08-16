@@ -298,7 +298,9 @@ pub fn the_migration_chain_reaches_the_tuf_table_test() {
   let assert Ok(conn) = sqlite.open(":memory:", sqlite.ReadWrite)
   let assert Ok(version) = migrate.migrate(conn)
   assert version == migrate.build_version()
-  assert version >= 4
+  // That the chain *reaches* the table is proven by the put below, not by a
+  // version number: which migration introduced it is an implementation
+  // detail, and pinning it here only breaks when the chain is squashed.
   // The single-row constraint is the schema's, not the application's.
   let assert Ok(Nil) =
     tuf_store.put(
