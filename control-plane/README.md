@@ -19,13 +19,20 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   (`controlplane rekor-publish`), with the proof served inside the zone at
   `_synchronicity-rekor.<apex>` so clients verify it offline — a
   substituted DS then has to be a *public* substitution or fail
-  validation. The submission is genuine: `rekor-publish` builds the DSSE
-  PAE, signs it as DER ECDSA with the CSK, POSTs a `hashedrekord` v0.0.2
-  `CreateEntryRequest` to `CP_REKOR_URL`, then verifies the returned entry
-  locally (canonicalized body, inclusion, checkpoint, possession, binding)
-  before storing it. A real published entry is a checked-in conformance
-  fixture, so a proof from `log2025-1.rekor.sigstore.dev` verifies end to
-  end; a self-hosted, Rekor-v2-compatible log works too via `CP_REKOR_KEY`.
+  validation. The entry's verifier is a **self-signed certificate naming
+  the apex in a `dNSName` SAN**: Rekor validates certificates not at all
+  and copies the DER verbatim into the Merkle leaf, so the zone name lands
+  where anyone reading the log can index it. Inside it ride two custom
+  extensions — the DNSSEC chain from the apex's DS up to the root, and the
+  previous zone key's succession countersignature — which are what let a
+  monitor tell a rotation from a substitution offline. `rekor-publish`
+  collects the chain over DoH, mints the certificate, POSTs a
+  `hashedrekord` v0.0.2 `CreateEntryRequest` to `CP_REKOR_URL`, then
+  verifies the returned entry locally (canonicalized body, inclusion,
+  checkpoint, possession, the certificate's key and name bindings) before
+  storing it. **Run it after the DS is live in the parent** — there is no
+  chain to collect before then. A self-hosted, Rekor-v2-compatible log
+  works via `CP_REKOR_KEY`.
   See [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md) §2, §3, §5.
 - The zone also **relays Sigstore's TUF metadata** verbatim at
   `_synchronicity-tuf.<apex>` (`controlplane tuf-refresh`, and the hourly
@@ -114,6 +121,8 @@ listen address.
 | `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Default `https://log2025-1.rekor.sigstore.dev`. |
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev (Ed25519) snapshot. Set it for a self-hosted log. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
+| `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
+| `CP_DNSSEC_CHAIN_ROOT_DNSKEY` | primary | `false` omits the root DNSKEY link from that chain (~1.1 KB smaller). Default `true`, so an entry carries its whole chain and stays verifiable from the IANA anchor alone. |
 | `CP_TUF_URL` | primary | Sigstore TUF repository this zone relays, so clients' log pins follow it. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched by `controlplane tuf-refresh` and by the hourly job within three days of the stored timestamp's expiry. |
 
 Day-2 operations (replicas, key ceremony, backups) live in

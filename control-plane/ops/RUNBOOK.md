@@ -70,9 +70,11 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link mail (absent = log-only) |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |
-| `CP_REKOR_URL` | primary | zone-key transparency log, default `https://rekor.sigstore.dev` |
-| `CP_REKOR_KEY` | primary | file pinning the log's verification key; defaults to the embedded rekor.sigstore.dev snapshot |
+| `CP_REKOR_URL` | primary | zone-key transparency log, default `https://log2025-1.rekor.sigstore.dev` |
+| `CP_REKOR_KEY` | primary | file pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev snapshot |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
+| `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query` |
+| `CP_DNSSEC_CHAIN_ROOT_DNSKEY` | primary | `false` omits the root DNSKEY link from that chain; default `true` |
 | `CP_TUF_URL` | primary | Sigstore TUF repository relayed in the zone, default `https://tuf-repo-cdn.sigstore.dev` |
 
 > **Why the database gets its own directory.** Each SQLite connection
@@ -98,12 +100,18 @@ secrets.** Protect the replication bucket accordingly.
    key file offline; `keygen` refuses to overwrite an existing file.
    (`controlplane ds <apex> <keyfile>` reprints all of it.)
 
-2. **Log the zone key** (before any client resolves the zone —
+2. **Put the DS at the parent registrar and wait for it to be live.**
+   `dig +dnssec <apex> DS` against a public resolver until it answers.
+   This step now comes *before* logging, which reverses the earlier
+   order — see step 3 for why.
+
+3. **Log the zone key** (before any client resolves the zone —
    clients require the record by default):
 
    ```sh
    controlplane rekor-publish sync.example.dev \
-     /var/lib/synch-controlplane/csk.key
+     /var/lib/synch-controlplane/csk.key \
+     [/path/to/previous-csk.key]
    ```
 
    Puts the key on a public transparency log, verifies the returned
@@ -115,7 +123,33 @@ secrets.** Protect the replication bucket accordingly.
    checkpoint against a grown tree. Nothing is stored that did not
    verify.
 
-3. **Relay Sigstore's TUF metadata** (once there is egress):
+   **It needs the DS to be live first.** The entry carries the DNSSEC
+   chain from the apex's DS up to the root, which is what lets a monitor
+   decide offline whether this key was ever delegated — and there is
+   nothing to collect until the parent publishes the DS. If it is not
+   there yet the command says so:
+
+   ```
+   no DS RRset at sync.example.dev. — is the DS live in the parent yet?
+   ```
+
+   **Name the previous key file when you have one.** That adds the
+   succession countersignature — the one thing an attacker holding a
+   substituted DS cannot produce — and it is the difference between a
+   monitor logging a routine rotation and a monitor paging somebody. The
+   command tells you which you got:
+
+   ```
+   zone key 34918 rollover: log index 67673584 (entry added),
+   DNSSEC chain carried, countersigned by key tag 12345 (monitors see tier A)
+   ```
+
+   A first key, or a recovery where the old private key is gone, has no
+   predecessor and legitimately reads `NOT countersigned: monitors will
+   alert (tier B)`. That is expected, and it is why somebody should be
+   told before you do it.
+
+4. **Relay Sigstore's TUF metadata** (once there is egress):
 
    ```sh
    controlplane tuf-refresh
@@ -182,8 +216,13 @@ control plane itself with
   this is a planned outage of new-validation, existing caches keep
   working. **Zone key rollover** (proactive) is the same dance with both
   DS records present during the window; v1 keeps this manual and rare.
-  With transparency enabled, the new key is logged *before* it signs
-  anything: `keygen`, then `rekor-publish`, then the DS steps.
+  With transparency enabled the order is: `keygen`, publish both DNSKEYs,
+  **add the DS at the parent and wait**, then `rekor-publish <apex>
+  <newkey> <oldkey>`, then switch signing, then `rekor-retire <apex>
+  <oldkey>`. Logging comes after the DS because the entry carries the
+  DNSSEC chain that the DS makes buildable; the two-key window is what
+  covers the gap, since the old key keeps signing until the new one is
+  logged.
 - **Zone key transparency** (docs/REKOR-ZONE-KEY.md): `rekor-publish`
   puts the zone key on a public log and the zone serves the proof at
   `_synchronicity-rekor.<apex>`. Rollout is phased — publish first
@@ -191,6 +230,23 @@ control plane itself with
   a verified record. With the gate on, *every* publish path refuses while
   the active key has none, including the hourly re-sign; that is
   deliberate, and `rekor-publish` is how you get out of it.
+- **Watch the log** (docs/REKOR-ZONE-KEY.md §5.5). A required log with no
+  watcher is a formality. `synch-monitor` reads the whole log's tiles,
+  finds every entry naming your apex, and classifies it:
+
+  ```sh
+  echo '{"known":{"keys":{"sync.example.dev":[]}}}' > /var/lib/synch-monitor/state.json
+  synch-monitor --state /var/lib/synch-monitor/state.json --min-witnesses 1
+  ```
+
+  Exit codes: `0` nothing new, `10` routine countersigned rotations only,
+  `20` unauthorized claims naming your apex (recorded, no alarm — no
+  client would have accepted one), `30` **a chain-valid key nobody
+  countersigned: look now**, `2` the run could not finish. Run it from
+  somewhere that is not the control plane's network; the independence is
+  the point. Seed the state file with the keys you already know, and note
+  that it only ever learns new predecessors from tier A findings —
+  deliberately, so an attacker's first key cannot bootstrap their second.
 - **Log-pin refresh** (docs/REKOR-ZONE-KEY.md §10): `tuf-refresh` relays
   Sigstore's TUF metadata at `_synchronicity-tuf.<apex>` so clients'
   transparency-log pins follow Sigstore's rotations. `/healthz` reports

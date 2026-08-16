@@ -330,8 +330,8 @@ impl ZoneKey<'_> {
     }
 
     /// The DER SubjectPublicKeyInfo of this key: what the logged entry's
-    /// `verifier.publicKey.rawBytes` must equal, so that the key the log
-    /// vouches for is the key the DNSSEC chain observed.
+    /// certificate must carry, so that the key the log vouches for is the
+    /// key the DNSSEC chain observed.
     fn der_spki(&self) -> Result<Vec<u8>, ProofError> {
         Ok(p256_spki(self.public_key()?))
     }
@@ -1515,9 +1515,9 @@ mod tests {
         // needs only one line to verify, which is the log's own.)
         //
         // This anchors the checkpoint and log-key machinery to reality; the
-        // Merkle *leaf* convention is anchored separately and end to end by
-        // `the_real_rekor_v2_entry_verifies` in the integration suite, over a
-        // genuine published `hashedrekord` entry (tests/fixtures/rekor_v2).
+        // Merkle *leaf* convention is anchored separately by the
+        // `real_rekor_v3` suite, over a genuine published `hashedrekord`
+        // entry whose verifier is a certificate (tests/fixtures/rekor_v3).
         let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
         let checkpoint = Checkpoint::parse(note).expect("a real checkpoint must parse");
         assert_eq!(checkpoint.origin, "log2025-1.rekor.sigstore.dev");
@@ -1586,14 +1586,14 @@ mod tests {
                 .unwrap()
                 .try_into()
                 .unwrap();
-        let rekor_v2: [u8; 32] =
+        let log2025_1: [u8; 32] =
             hex::decode("b54813cb63d8859870a5e78500cc6adcfdf59723edae93ee8d25faf2475a0690")
                 .unwrap()
                 .try_into()
                 .unwrap();
         assert!(keys.find(&rekor_v1).is_some(), "rekor.sigstore.dev");
         assert!(
-            keys.find(&rekor_v2).is_some(),
+            keys.find(&log2025_1).is_some(),
             "log2025-1.rekor.sigstore.dev"
         );
     }
