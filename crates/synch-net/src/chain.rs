@@ -33,12 +33,11 @@
 //! their key), and a client independently requires a live DS through native
 //! DNSSEC validation before it ever reaches this code.
 //!
-//! The windows are not reported either. An earlier version handed them to the
-//! monitor so it could note "this chain had already expired when the log's
-//! witnesses timestamped the entry", but that reading needed a signed clock
-//! and this design no longer interprets one, so the record had no consumer
-//! left. Inception and expiration are still *verified as part of the RRSIG*
-//! by hickory, exactly as before — what is gone is only the bookkeeping.
+//! The windows are not reported either. Handing them to a caller would only
+//! be useful for a note like "this chain had already expired when the world
+//! last saw this tree", and that reading needs a signed clock, which nothing
+//! near a leaf provides. Inception and expiration are still *verified as part
+//! of the RRSIG* by hickory; what is absent is only the bookkeeping.
 
 use hickory_resolver::proto::{
     dnssec::{
@@ -115,11 +114,11 @@ pub struct Authorized {
 ///
 /// **Both the client and the monitor must reach the chain through here, and
 /// neither may supply its own apex.** That constraint is not stylistic; it is
-/// the fix for a real break. The two sides used to share `validate` but
-/// compose the call themselves, and they diverged on what to feed it: the
-/// client passed the well-formed apex it had from DNS, the monitor passed the
-/// raw SAN string. A certificate whose SAN was `victim.example..` then
-/// satisfied the client's trailing-dot-trimming comparison *and* validated —
+/// what closes a real evasion. Were the two to share `validate` but compose
+/// the call themselves, they could feed it different things: the client the
+/// well-formed apex it has from DNS, the monitor the raw SAN string. A
+/// certificate whose SAN is `victim.example..` would then satisfy a
+/// trailing-dot-trimming comparison on the client *and* validate —
 /// because the client fed the chain a different, well-formed name — while the
 /// monitor's chain walk failed to parse the SAN at all and filed the entry
 /// tier B, the silent bin. Every client accepts, no monitor alerts: exactly

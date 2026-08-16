@@ -6,10 +6,6 @@
 //! works against victims and rings no bell, which is strictly worse than not
 //! logging at all. That invariant is asserted here directly, over every shape
 //! of entry the two sides can disagree about.
-//!
-//! With tier B gone the invariant is *stronger*, not weaker: a client-accepted
-//! entry used to be allowed into either of two bins, and now there is exactly
-//! one bin it may land in.
 
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::{

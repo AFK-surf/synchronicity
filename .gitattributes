@@ -1,0 +1,20 @@
+# Fixtures are bytes, not text.
+#
+# Almost everything under a fixtures/ directory is a byte-exact input to a
+# signature or digest check: a Rekor checkpoint is a signed note, TUF metadata
+# is hashed by the target that names it, a proof record is compared verbatim
+# against what a zone serves. Git's end-of-line translation rewrites those
+# bytes on a CRLF checkout, and every one of those checks then fails — which
+# is exactly what happened on Windows CI, where a checkpoint arrived with a
+# 0x0D before each 0x0A and `trusted_root.json` was 126 bytes longer than the
+# metadata said it should be.
+#
+# `-text` disables that translation in both directions, so these files are
+# checked out byte-identical on every platform.
+**/tests/fixtures/** -text
+**/test/fixtures/** -text
+
+# Embedded at compile time and checked the same way: the TUF root the client
+# pins is parsed into canonical JSON and its signatures verified over those
+# exact bytes.
+crates/synch-net/src/sigstore_tuf_root.json -text

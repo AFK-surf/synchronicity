@@ -259,7 +259,8 @@ pub struct SelfSigned<'a> {
     /// zero is inserted if the high bit is set).
     pub serial: &'a [u8],
     /// `notBefore` and `notAfter` as `YYMMDDHHMMSSZ` / `YYYYMMDDHHMMSSZ`,
-    /// already chosen by the caller (see [`utc_time`], [`generalized_time`]).
+    /// already chosen by the caller (see [`x509_time`], which picks the
+    /// encoding RFC 5280 requires for the year in question).
     pub not_before: Time,
     /// See `not_before`.
     pub not_after: Time,

@@ -106,14 +106,12 @@ bindings, chain — verifies offline through the real client verifier. It is
 checked in as
 `crates/synch-net/tests/fixtures/rekor_v3`.
 
-An earlier entry at `logIndex 67766084` was the same shape under the old
-`synchronicity.dev` predicate type. A Statement reaches the log only as the
-SHA-256 of its DSSE PAE, so a predicate type cannot be edited after the
-fact and moving it meant publishing again. That is the standing cost of this
-fixture, and it is worth naming: **regenerating it is a permanent, public,
-irreversible write**, so the certificate's shape should not be changed
-casually. The old entry is still in the log and still valid on its own
-terms; it simply no longer matches what this build renders.
+A Statement reaches the log only as the SHA-256 of its DSSE PAE, so nothing
+inside it — the predicate type included — can be edited after the fact:
+changing any of it means publishing again. That is the standing cost of this
+fixture and it is worth naming, because **regenerating it is a permanent,
+public, irreversible write**. The certificate's shape should not be changed
+casually.
 
 The certificate is therefore a **key envelope, not a trust assertion**.
 Nothing anywhere — not Rekor, not the client, not the monitor — verifies its
@@ -151,8 +149,8 @@ Rekor is Go, its certificate parser is `crypto/x509`, and Go's
 Rekor looks at the extension at all, and the submission comes back
 `400 invalid hashedrekord request` naming no field.
 
-This design originally used a full 128-bit UUID arc
-(`2.25.293397732029928475482264626946701631422`) and **it is unusable**. The
+A full 128-bit UUID arc such as
+`2.25.293397732029928475482264626946701631422` is **unusable**. The
 failure was found by live submission and could not have been found any other
 way: OpenSSL and Erlang's `public_key` — the encoder that builds these
 certificates and the tool that reads them back — both parse a 128-bit arc
@@ -586,13 +584,14 @@ over several migrations while it was being written, and those were squashed
 into one before release. So there is no "before" to migrate from, and nothing
 here describes schema arriving in stages.
 
-**A key is identified by its key, not by a checksum of it.** An earlier draft
-keyed the table on `(key_tag, action)`. An RFC 4034 key tag is a 16-bit
-checksum over the DNSKEY rdata, so two distinct keys collide with odds around
-1/65536 per rollover — and a collision meant one key's row silently
-*replaced* another's, taking its proof out of the served zone with no error
-anywhere. Rare and silent is the bad combination: it surfaces as a cluster
-that stopped resolving for reasons nobody can reconstruct. The tag remains as
+**A key is identified by its key, not by a checksum of it.** The table is
+keyed on `(spki_sha256, action)` rather than on the key tag. An RFC 4034 key
+tag is a 16-bit checksum over the DNSKEY rdata, so two distinct keys collide
+with odds around 1/65536 per rollover, and keying on it would let one key's
+row silently *replace* another's, taking its proof out of the served zone
+with no error anywhere. Rare and silent is the bad combination: it would
+surface as a cluster that stopped resolving for reasons nobody can
+reconstruct. The tag remains as
 an indexed column because that is what a client selects on — it reads the tag
 from the RRSIG it just validated — but selection is not identity. A zone may
 now serve two proof records under one tag, and the client tries each until
@@ -629,9 +628,8 @@ needs: *no DS RRset at `<apex>` — is the DS live in the parent yet?*
   `tuf_material`, when there is any. It is not gated on anything and its
   absence is not an error — §10.3.
 
-**Three things this section used to claim, which do not exist.** They are
-recorded as gaps rather than deleted quietly, because each was load-bearing
-in somebody's mental model:
+**Three things this section does not do.** They are named rather than left
+unsaid, because each is the kind of thing a reader may assume is present:
 
 - *"The hourly resign job refreshes stored proofs older than 7 days."* It does
   not — `jobs/resign.gleam` re-signs RRsets and refetches TUF material, and
@@ -677,10 +675,10 @@ step moved **after** the parent DS, for the reason in §5.2:
 7. Retire: `rekor-retire <apex> <oldkey>`, then drop the old DNSKEY, DS and
    proof record.
 
-**Nothing enforces that ordering but the operator.** An earlier draft had the
-dashboard refuse the signing-switch step while the new key lacked a verified
-record; there is no such check, and the dashboard says nothing about zone keys
-at all — it manages orgs, networks and devices. The only automatic enforcement
+**Nothing enforces that ordering but the operator.** In particular the
+dashboard does not refuse the signing-switch step while the new key lacks a
+verified record: it says nothing about zone keys at all, and manages orgs,
+networks and devices. The only automatic enforcement
 anywhere on this side is the publish gate of §5.3, which is off by default and
 is about the *active* key rather than about the order of a rollover. Steps 1–7
 are a runbook, and they are a runbook because a zone-key rollover is rare,
@@ -745,8 +743,8 @@ one or the file it was handed, and a Sigstore log rotation is an upgrade or a
 Signature *windows* are not enforced
 (§4.2.1), and the monitor has **no clock at all** to enforce them against: an
 entry's `integratedTime` sits outside the Merkle commitment and is therefore
-attacker-supplied, so the only signed time anywhere near a leaf was the
-checkpoint's witness cosignatures, and this design no longer interprets those.
+attacker-supplied, and the only other signed time near a leaf is in the
+checkpoint's witness cosignatures, which nothing here interprets.
 An entry whose RRSIGs expired years ago classifies exactly like one signed
 this morning — asserted directly, reasons and all. What is lost is forensic
 detail ("this chain had already expired when the world last saw this tree"),
@@ -849,8 +847,7 @@ correctly rather than inverting on the outcome that matters most.
 
 ## 6. Costs, stated plainly
 
-- **The apex is disclosed, and the log becomes enumerable.** This reverses
-  what an earlier draft of this document claimed. Under v3 the zone name is
+- **The apex is disclosed, and the log becomes enumerable.** The zone name is
   written *in the clear* inside the Merkle leaf — that is the entire
   mechanism, not a side effect — so anyone who consumes the log can list
   every zone using synchronicity, and watch each one's key history. There is
@@ -888,7 +885,7 @@ correctly rather than inverting on the outcome that matters most.
   The obligation did not go away; it moved up a level and got rarer.
 - **A monitor is now infrastructure.** Reported authorizations are the
   product; nobody running one is done at "it publishes".
-- **And the operator now owns the judgement the monitor used to attempt.** A
+- **And the operator owns the judgement, not the monitor.** A
   reported key means *a key was authorized for your zone*, not *something is
   wrong* — the monitor cannot tell a rotation you performed from a
   substitution by whoever took your registrar, and does not try (§5.5). The
@@ -948,13 +945,10 @@ leaf. Only one exists today.
   indexed by anyone reading the log (§2.1). The cost is the disclosure in §6
   and about 4 KB per proof record.
 
-**Resolving a contradiction in an earlier draft.** This section previously
-rejected "`hashedrekord` over raw key bytes — no apex binding, no monitorable
-name", and then the system shipped exactly that. The rejection was right and
-the implementation was wrong: the v2 entry *was* apex-anonymous, and the
-monitoring story in §5.5 described a property it did not have. v3 is the fix,
-and the raw-key form is now refused outright by the client with no branch to
-reach.
+**`hashedrekord` over raw key bytes** — rejected, and refused outright by the
+client with no branch to reach. Such an entry is apex-anonymous: nothing in
+its leaf names a zone, so no monitor can index it and the whole of §5.5 would
+describe a property the entry does not have.
 
 ### 8.2 Still rejected
 
@@ -978,11 +972,11 @@ reach.
   zone-scoped fact.
 - **Interpreting the checkpoint's witness cosignatures** — a deliberate
   non-goal, not deferred hardening. Sigstore's checkpoints carry cosignature
-  lines from independent witnesses, and an earlier build read them for two
-  things: counting attestations (`--min-witnesses`) and taking their
-  timestamps as an attested clock for chain-staleness notes. Both are gone.
-  Counting lines is not verification — this design pins no witness keys, so
-  the count was structural and a log free to invent lines could satisfy it.
+  lines from independent witnesses, which could be read for two things:
+  counting attestations, and taking their timestamps as an attested clock.
+  Neither is done. Counting lines is not verification — this design pins no
+  witness keys, so a count would be structural and a log free to invent lines
+  could satisfy it.
   And the staleness note it fed was forensic detail on a finding that
   never changed a verdict, so it bought a whole clock-handling surface for
   something no decision depended on. Doing this *properly* means pinning
@@ -1011,10 +1005,6 @@ larger design); `retire`-entry enforcement as a soft revocation signal; and a
 monitor that also fetches the zone's *served* proof records and diffs them
 against what the log holds, which would catch a control plane serving a proof
 it never logged.
-
-An in-client TUF root for log-key rotation used to head that list. It ships —
-§10 is the design and the code is `crates/synch-net/src/tuf.rs` and
-`control-plane/src/tuf/`.
 
 Witness cosignatures are **not** on this list. See §8.2 — they are a
 non-goal, not deferred work.
@@ -1117,7 +1107,7 @@ quietly collapse back.
   presented as authorization, inclusion, checkpoint, unknown log, absent
   record — through the unit path *and* through the whole resolver.
 - An expired-but-valid-at-logging-time chain verifies, on both sides, and the
-  test asserts the window really is in the past so it cannot pass vacuously.
+  test asserts the window really has lapsed so it cannot pass vacuously.
 - `synch-monitor` tests the tile arithmetic against an independent reference
   Merkle implementation at ten tree sizes that straddle every tile boundary,
   and the two-tier classification over every entry shape below.
@@ -1126,13 +1116,14 @@ quietly collapse back.
 walk through a single function, `chain::authorize`, which extracts the SAN,
 **parses it once**, derives the key from the certificate's SPKI, and validates
 against exactly those. Neither side can supply its own apex. This is
-structural rather than stylistic: the two used to share `chain::validate` and
-compose the call themselves, and they diverged on what to feed it — the
-client passed the well-formed apex from DNS, the monitor the raw SAN string.
-A certificate whose SAN was `victim.example..` then satisfied the client's
-trailing-dot-trimming comparison *and* validated, while the monitor could not
-parse the SAN at all and filed the entry tier B. Every client accepts, no
-monitor alerts: precisely the evasion the tiering exists to prevent. Sharing
+structural rather than stylistic. Were the two to share `chain::validate` and
+compose the call themselves, they could feed it different things — the client
+the well-formed apex from DNS, the monitor the raw SAN string — and a
+certificate whose SAN is `victim.example..` would then satisfy a
+trailing-dot-trimming comparison on the client *and* validate, while the
+monitor failed to parse the SAN at all and filed the entry tier B. Every
+client accepts, no monitor alerts: precisely the evasion the tiering exists
+to prevent. Sharing
 a primitive is not sharing a decision.
 
 **The invariant, tested directly.** `crates/synch-monitor/tests/tiers.rs`
@@ -1167,7 +1158,7 @@ resolver against a real served zone, and its zone-key leg is a *negative*
 one: the e2e zone logs nothing, and the test asserts that under the default
 policy it therefore fails closed while the plain TXT lookup still works. It
 does **not** verify a stored proof or a relayed TUF bundle under the Rust
-verifier, and an earlier draft of this section said it did. It cannot without
+verifier. It cannot without
 either POSTing throwaway keys to the public log on every CI run or standing
 up a Rekor v2 server, and neither is worth it. What stands in for it is the
 fixtures: `rekor_v3` pins what a real published proof verifies to, and the

@@ -127,7 +127,7 @@ pub fn get(
 ///
 /// Its one caller is `rekor/publish`, which asks whether the key it is about
 /// to publish already has a record. Neither the dashboard nor `/healthz`
-/// reads it, despite what an earlier version of this comment claimed.
+/// reads it.
 pub fn verified_key_tags(conn: Connection) -> Result(List(Int), sqlite.Error) {
   use rows <- result.try(
     sqlite.query(

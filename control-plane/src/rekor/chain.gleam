@@ -173,10 +173,10 @@ fn ancestor_links(
   case labels {
     [] | [_] -> {
       // The next zone up is the root: DNSKEY only, since the root has no DS.
-      // Always included. An earlier version made this optional to save ~1.1 KB
-      // and the saving was illusory: a chain that stops below the root anchors
-      // against nothing a reader holds, so every client refuses the entry. A
-      // switch whose only effect is to break verification is not a trade-off.
+      // Always included, and not worth making optional to save its ~1.1 KB:
+      // a chain that stops below the root anchors against nothing a reader
+      // holds, so every client would refuse the entry. A switch whose only
+      // effect is to break verification is not a trade-off.
       use root <- result.try(name.parse(".") |> replace_error("."))
       use rrs <- result.try(rrset(resolver, root, wire.type_dnskey))
       Ok(list.reverse([Link(".", rrs), ..acc]))
