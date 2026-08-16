@@ -588,7 +588,14 @@ async fn an_absent_proof_record_refuses_under_require_and_resolves_under_off() {
 }
 
 #[tokio::test]
-async fn a_proof_record_for_another_key_reads_as_absent() {
+async fn a_proof_record_covering_only_someone_elses_keys_is_refused() {
+    // Under the key-set claim there is no selector to filter on: every
+    // served record is a candidate, so a record whose proven set does not
+    // contain the key that signed the answer is *refused* — here as a chain
+    // failure, since the stranger's set anchors under a key this resolver
+    // never trusted — rather than filtered into looking absent. `synch
+    // doctor` reads the two very differently, and this zone did publish
+    // something; it published the wrong thing.
     let mut zone = SimZone::new("cluster.example", member_records());
     let stranger = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
@@ -608,8 +615,8 @@ async fn a_proof_record_for_another_key_reads_as_absent() {
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
     assert!(
-        matches!(error, NetError::RekorAbsent { .. }),
-        "a record for another key tag is no record for this one: {error}"
+        matches!(error, NetError::RekorChain { .. }),
+        "a record proving someone else's keys authorizes nothing here: {error}"
     );
     server.abort();
 }
