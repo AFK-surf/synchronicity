@@ -716,7 +716,7 @@ impl ZoneKeyStatement {
             out.push_str(&key.flags.to_string());
             out.push_str(",\"sha256\":");
             json_string(&mut out, &key.sha256);
-            out.push_str("}");
+            out.push('}');
         }
         out.push_str("],\"action\":");
         json_string(&mut out, &self.action);
