@@ -207,6 +207,32 @@ impl Store {
         Ok(out)
     }
 
+    /// Runs `f` in a transaction that takes SQLite's write lock up front.
+    ///
+    /// [`Store::with_tx`] begins deferred, which acquires the read lock first
+    /// and upgrades it on the first write. That is right for a transaction that
+    /// only writes, and wrong for one that *reads and then writes what it read*:
+    /// under multi-process WAL, another process committing in between makes the
+    /// upgrade fail with `SQLITE_BUSY_SNAPSHOT` rather than wait, because the
+    /// snapshot the read saw is no longer the tip. Nothing is corrupted, but the
+    /// work the transaction was about to record is lost and the caller has to
+    /// find out and repeat it.
+    ///
+    /// `BEGIN IMMEDIATE` takes the write lock at the start instead, so the
+    /// contention is handled by `busy_timeout` like any other — a wait rather
+    /// than a failure. The read-union-write bitmap commit
+    /// ([`Store::commit_groups`](crate::Store)) is the path that needs it.
+    pub(crate) fn with_immediate_tx<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// Runs `f` inside a single SQLite transaction, committing on `Ok` and
     /// rolling the whole thing back on `Err`.
     ///

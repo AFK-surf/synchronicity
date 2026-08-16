@@ -38,8 +38,11 @@ pub const CHUNK_GROUP_LOG2: u8 = 4;
 /// The descent level whose subtrees are exactly one ad span across.
 ///
 /// Delta sync's first proof round asks for the tree at this level and no
-/// deeper: one chaining value per 16 MiB, which is 32 bytes per span and about
-/// 200 KB for a 100 GB object (`docs/DELTA-SYNC.md` §3.3). The ad span is the
+/// deeper: one chaining value per 16 MiB. What travels is the *interior* of the
+/// tree above those spans — a 64-byte pair per node, one node per span less one
+/// — so a 100 GB object costs about 381 KB, not the 32 bytes per span the
+/// chaining values alone would suggest (`docs/DELTA-SYNC.md` §3.3, §7). The ad
+/// span is the
 /// unit deliberately — a span proven equal to a donor's is promoted whole, and
 /// the same boundary is what `BlobAd` summarizes possession at (§6.3), so a
 /// node that promotes a span can advertise it without any further arithmetic.

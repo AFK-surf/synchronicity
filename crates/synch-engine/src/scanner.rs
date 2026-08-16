@@ -703,7 +703,25 @@ impl Adoption {
     /// flushed too — otherwise the contents survive a power cut and the name
     /// they arrived under does not, which is the old file or *no* file rather
     /// than the old file or the new one.
+    /// The rename itself can fail — the target is a directory, the filesystem
+    /// filled up under the fsync — and when it does, this is the only chance to
+    /// unlink the staging file: [`Drop`] only cleans up while the handle is
+    /// live, and committing has to let go of it to flush and rename it. Leaving
+    /// it stranded would leave a full-size copy of the object beside the target
+    /// under a name the scanner's built-in ignore rules skip, unnoticed and
+    /// uncollected forever, on a path that is reached precisely when the disk is
+    /// already in trouble.
     pub fn commit(mut self) -> Result<PathBuf> {
+        match self.commit_inner() {
+            Ok(()) => Ok(self.target.clone()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&self.staging);
+                Err(e)
+            }
+        }
+    }
+
+    fn commit_inner(&mut self) -> Result<()> {
         let file = self
             .file
             .take()
@@ -712,7 +730,7 @@ impl Adoption {
         drop(file);
         std::fs::rename(&self.staging, &self.target)?;
         fsync_parent(&self.target);
-        Ok(self.target.clone())
+        Ok(())
     }
 }
 
@@ -1146,6 +1164,34 @@ mod tests {
         assert_eq!(entry.content, Some(Hash::new(b"theirs")));
         assert_eq!(entry.prev, Some(Hash::new(b"mine")));
         node.shutdown().await.unwrap();
+    }
+
+    /// A commit that cannot finish takes its staging file with it.
+    ///
+    /// `commit` has to take the handle out of the `Adoption` to flush and close
+    /// it before the rename, which is exactly what `Drop`'s cleanup keys on — so
+    /// once the sync or the rename fails, `Drop` sees nothing to remove and the
+    /// staging file is stranded. It wears a name the scanner's built-in ignore
+    /// rules skip, so nothing would ever have found it again: a full-size copy
+    /// of the object sitting beside the target forever, on a path reached
+    /// precisely when the disk is already in trouble (ENOSPC — or, as here, a
+    /// target that is a directory).
+    #[test]
+    fn a_commit_that_cannot_finish_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("occupied");
+        std::fs::create_dir(&target).unwrap();
+
+        let mut out = Adoption::at(&target).unwrap();
+        out.write(b"the new version").unwrap();
+        assert!(out.commit().is_err(), "a directory cannot be renamed over");
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["occupied".to_string()], "residue: {left:?}");
     }
 
     /// The streamed form of adoption: the object goes from the CAS into the

@@ -85,18 +85,32 @@ impl ProvenSubtree {
 
 /// What proof rounds established about one object.
 ///
-/// The root travels with the subtrees, and that is the whole reason this type
-/// exists. A chaining value means nothing except against the tree it was proved
-/// in, and two objects of the same size have the same tree *shape* — so a bare
-/// list of subtrees carries nothing that would stop it being handed to a
-/// promotion for the wrong object, which would fill that object with another's
-/// bytes and mark it complete. [`Store::promote`] checks the root it was given
-/// against the root the proof was verified under; without the root in the type
-/// there is nothing there to check.
+/// The root and the size travel with the subtrees, and that is the whole reason
+/// this type exists. A chaining value means nothing except against the tree it
+/// was proved in, and a bare list of subtrees carries nothing that would stop it
+/// being spent on the wrong tree:
+///
+/// - **The root.** Two objects of the same size have the same tree *shape*, so
+///   every positional check a promotion makes would pass for another object's
+///   proof just as readily as for the right one's — and what would come out is
+///   an object filled with a stranger's bytes and marked complete.
+/// - **The size.** One object has the same tree shape at every size inside its
+///   last chunk group, and a *shorter* size makes a subtree that is really cut
+///   short by the end of the object look whole. A legitimate proof of a 20-span
+///   object, taken under a size four spans short of it, names sixteen spans this
+///   object does not end after — promote them and the row is complete at 80% of
+///   its length: unreadable, and refusing every honest writer of the rest.
+///
+/// [`Store::promote`] checks both against what it was asked to fill; without
+/// them in the type there is nothing there to check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proven {
     /// The object root every subtree here was chained back to.
     pub root: Hash,
+    /// The object size the tree was walked under. Two different sizes give two
+    /// different answers to "is this subtree whole?", so a proof is only
+    /// spendable on an object of the length it was proved for.
+    pub size: u64,
     /// The subtrees, in tree order — one per group at level 0, one per span
     /// higher up.
     pub subtrees: Vec<ProvenSubtree>,
@@ -104,9 +118,10 @@ pub struct Proven {
 
 impl Proven {
     /// An empty result for an object.
-    pub fn none(root: Hash) -> Proven {
+    pub fn none(root: Hash, size: u64) -> Proven {
         Proven {
             root,
+            size,
             subtrees: Vec::new(),
         }
     }
@@ -116,17 +131,17 @@ impl Proven {
         self.subtrees.is_empty()
     }
 
-    /// Folds another round's subtrees over the same root into this one.
+    /// Folds another round's subtrees over the same object into this one.
     ///
-    /// Refuses to mix roots: the two would be indistinguishable afterwards,
-    /// which is exactly what carrying the root is meant to prevent.
+    /// Refuses to mix roots or sizes: the two would be indistinguishable
+    /// afterwards, which is exactly what carrying them is meant to prevent.
     pub fn absorb(&mut self, other: Proven) -> Result<()> {
-        if other.root != self.root {
+        if other.root != self.root || other.size != self.size {
             return Err(StoreError::Verification {
                 root: self.root,
                 reason: format!(
-                    "a proof of {} cannot join a proof of this object",
-                    other.root
+                    "a proof of {} at {} bytes cannot join a proof of this object at {} bytes",
+                    other.root, other.size, self.size
                 ),
             });
         }
@@ -589,12 +604,10 @@ impl Store {
         let groups = group_count(size);
         let served = served.intersect(&ChunkRanges::single(0, groups));
         if let Some(row) = self.blob(root)? {
-            if row.size != size && row.size_is_attested() {
-                return Err(StoreError::Verification {
-                    root: *root,
-                    reason: format!("size mismatch: have {}, offered {}", row.size, size),
-                });
-            }
+            // The cheap refusal; `commit_groups` makes the same decision again
+            // inside the transaction that records it (`settle_size`).
+            let held = row.verified_groups();
+            crate::cas::settle_size(root, Some((row.size, row.complete, &held)), size)?;
         }
         if !encoded.len().is_multiple_of(PROOF_NODE_LEN) {
             return Err(StoreError::Verification {
@@ -663,14 +676,17 @@ impl Store {
             //
             // The size in that row is a claim off an entry, not something this
             // proof established: an object's tree is the same shape for every
-            // size inside its last 1 KiB chunk, so a peer can overstate a root
-            // by a few bytes and have the proof verify anyway. Nothing durable
-            // may rest on it, which is what [`BlobRow::size_is_attested`] is
-            // for — until the final group is held, the next writer's size wins.
+            // size inside its last 16 KiB chunk group, so a peer can overstate a
+            // root by a few bytes and have the proof verify anyway. Nothing
+            // durable may rest on it, which is what `settle_size` is for — until
+            // the final group is held, the next writer's size wins, and the
+            // decision is made inside the transaction that records it so that
+            // two writers cannot each decide it on a stale snapshot.
             self.commit_groups(root, size, &ChunkRanges::empty(), None, now)?;
         }
         Ok(Proven {
             root: *root,
+            size,
             subtrees: proof.proven,
         })
     }
@@ -760,6 +776,21 @@ impl Store {
                 reason: format!("a proof of {} is not a proof of this object", proven.root),
             });
         }
+        // And a proof of this object at some other length is not a proof of it
+        // either. "Whole" — the property that makes a subtree comparable across
+        // objects at all — is a fact about where the object ends, so a proof
+        // taken under a short size hands out whole-looking subtrees that this
+        // object does not end after, and promoting them completes the row at a
+        // fraction of its length (see [`Proven`]).
+        if proven.size != size {
+            return Err(StoreError::Verification {
+                root: *root,
+                reason: format!(
+                    "a proof taken at {} bytes is not a proof of this object at {size} bytes",
+                    proven.size
+                ),
+            });
+        }
         let groups = group_count(size);
         // Inline blobs never delta (§4): one group is smaller than the round
         // trip that would discover it could be reused.
@@ -767,33 +798,28 @@ impl Store {
             return Ok(ChunkRanges::empty());
         }
         let existing = self.blob(root)?;
+        let mut held = ChunkRanges::empty();
         if let Some(row) = &existing {
-            if row.size != size && row.size_is_attested() {
-                return Err(StoreError::Verification {
-                    root: *root,
-                    reason: format!("size mismatch: have {}, offered {}", row.size, size),
-                });
-            }
+            held = row.verified_groups();
+            // The cheap refusal; `commit_groups` decides again inside the
+            // transaction that records the result (`settle_size`).
+            crate::cas::settle_size(root, Some((row.size, row.complete, &held)), size)?;
             if row.complete {
                 return Ok(ChunkRanges::empty());
             }
         }
-        let held = existing
-            .as_ref()
-            .map(|row| row.verified_groups())
-            .unwrap_or_else(ChunkRanges::empty);
         let Some(donor) = self.open_donor(donor)? else {
             return Ok(ChunkRanges::empty());
         };
 
         let tree = Self::tree(size);
-        let (payload, outboard_file) = self.open_sparse(root, size, tree)?;
-        let mut payload = DataFile(payload);
-        let mut outboard = PreOrderOutboard {
-            root: blake3::Hash::from_bytes(root.0),
-            tree,
-            data: DataFile(outboard_file),
-        };
+        // The payload and the outboard are opened on the first run that matches,
+        // and not before. A donor with nothing to give is the common case — the
+        // descent offers every version of the path in turn and most of them
+        // agree about nothing — and opening up front left each of them a
+        // full-size sparse payload behind: no data, but an inode and a length,
+        // for an object this node may never fetch a byte of.
+        let mut sink: Option<Sink> = None;
 
         let mut promoted = ChunkRanges::empty();
         for subtree in &proven.subtrees {
@@ -857,29 +883,35 @@ impl Store {
                 tracing::debug!(donor = %donor.root, error = %e, "donor tree not copied");
                 continue;
             }
-            if let Err(e) = copy_run(&donor.payload, &mut payload, start_byte, end_byte) {
+            let sink = match &mut sink {
+                Some(sink) => sink,
+                slot => slot.insert(self.open_sink(root, size, tree)?),
+            };
+            if let Err(e) = copy_run(&donor.payload, &mut sink.payload, start_byte, end_byte) {
                 tracing::debug!(donor = %donor.root, error = %e, "donor payload not copied");
                 continue;
             }
             for (node, pair) in nodes {
                 let left = blake3::Hash::from_bytes(pair[..32].try_into().expect("32 of 64"));
                 let right = blake3::Hash::from_bytes(pair[32..].try_into().expect("32 of 64"));
-                outboard.save(node, &(left, right))?;
+                sink.outboard.save(node, &(left, right))?;
             }
             promoted = promoted.union(&ChunkRanges::from_ranges([subtree.range()]));
         }
 
-        if promoted.is_empty() {
-            return Ok(promoted);
-        }
+        let Some(mut sink) = sink.filter(|_| !promoted.is_empty()) else {
+            return Ok(ChunkRanges::empty());
+        };
         // Bytes and tree to stable storage first, the claim that they are there
         // second: a crash between the two costs a re-promotion, the other order
         // would cost an index that lies (§6.2).
-        payload.flush()?;
-        outboard.sync()?;
-        let _ = fsync_file(&payload.0);
-        let _ = fsync_file(&outboard.data.0);
-        self.commit_groups(root, size, &promoted, None, now)?;
+        sink.payload.flush()?;
+        sink.outboard.sync()?;
+        let _ = fsync_file(&sink.payload.0);
+        let _ = fsync_file(&sink.outboard.data.0);
+        let commit = self.commit_groups(root, size, &promoted, None, now)?;
+        drop(sink);
+        self.trim_to_size(root, commit);
         Ok(promoted)
     }
 
@@ -925,7 +957,11 @@ impl Store {
 
     /// Opens (creating if need be) the sparse payload and outboard of an object
     /// this node is accumulating.
-    fn open_sparse(&self, root: &Hash, size: u64, tree: BaoTree) -> Result<(File, File)> {
+    ///
+    /// `size` is still a claim here, so the files are only ever grown to fit it
+    /// ([`Store::trim_to_size`] is the one place either is made smaller, after a
+    /// commit that settled the length).
+    fn open_sink(&self, root: &Hash, size: u64, tree: BaoTree) -> Result<Sink> {
         let payload_path = self.blob_path(root);
         if let Some(parent) = payload_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -936,8 +972,15 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&payload_path)?;
-        payload.set_len(size)?;
-        Ok((payload, self.open_sparse_outboard(root, tree)?))
+        crate::cas::grow_to(&payload, size)?;
+        Ok(Sink {
+            payload: DataFile(payload),
+            outboard: PreOrderOutboard {
+                root: blake3::Hash::from_bytes(root.0),
+                tree,
+                data: DataFile(self.open_sparse_outboard(root, tree)?),
+            },
+        })
     }
 
     /// Opens (creating if need be) just the sparse outboard, for a proof that
@@ -953,9 +996,16 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        outboard.set_len(tree.outboard_size())?;
+        crate::cas::grow_to(&outboard, tree.outboard_size())?;
         Ok(outboard)
     }
+}
+
+/// The files a promotion writes into: the object's sparse payload and its
+/// sparse outboard, opened together on the first run that matched.
+struct Sink {
+    payload: DataFile,
+    outboard: PreOrderOutboard<DataFile>,
 }
 
 /// Copies a whole subtree's interior nodes out of a donor's tree, checking on
@@ -1554,10 +1604,123 @@ mod tests {
         );
     }
 
+    /// A proof of the right object at the wrong length is refused.
+    ///
+    /// The root travelling with a proof settles *which* object it describes;
+    /// this settles how long that object is, and the two holes are the same
+    /// shape. "Whole" — the property that makes a subtree comparable across
+    /// objects at all — is a fact about where the object ends, so a proof spent
+    /// under a size shorter than the one it was taken at hands out whole-looking
+    /// subtrees that the object does not end after. A group-aligned
+    /// understatement of a twenty-group object by four groups would promote
+    /// sixteen of them and leave the row complete at eighty percent of its
+    /// length: unreadable, and refusing every honest writer of the rest for
+    /// good, exactly as an unattested size claim once did.
+    #[test]
+    fn a_proof_spent_at_the_wrong_length_is_refused() {
+        let (_d1, provider) = store();
+        let (_d2, fetcher) = store();
+        let bytes = data(20 * GROUP);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        // A donor sharing every group but the last: a real reuse, so what the
+        // refusal costs is visible next to what it would have allowed.
+        let mut donor_bytes = bytes.clone();
+        donor_bytes[19 * GROUP] ^= 0xff;
+        let donor = fetcher.ingest_bytes(&donor_bytes, 0).unwrap();
+
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = provider.encode_proof(&root, &all, 0).unwrap();
+        let proven = fetcher
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert_eq!(
+            proven.size, size,
+            "a proof carries the size it was taken at"
+        );
+
+        let short = 16 * GROUP as u64;
+        assert!(matches!(
+            fetcher.promote(&root, short, &Donor(donor), &proven, 0),
+            Err(StoreError::Verification { .. })
+        ));
+        let row = fetcher.blob(&root).unwrap().unwrap();
+        assert!(
+            !row.complete,
+            "nothing was promoted into a truncated object"
+        );
+        assert!(row.verified_groups().is_empty());
+        assert_eq!(row.size, size);
+
+        // At the length it was taken at, the same proof spends perfectly well.
+        let promoted = fetcher
+            .promote(&root, size, &Donor(donor), &proven, 0)
+            .unwrap();
+        assert_eq!(promoted.count(), 19, "every group but the changed one");
+    }
+
+    /// A size claim racing a write that completes the object cannot brick it.
+    ///
+    /// Both committers used to decide whether a claimed size could stand by
+    /// reading the row *before* doing their work: an honest `write_slice`
+    /// finishing an object and a `write_proof` carrying an entry's overstatement
+    /// of it could each look, each see a row no group attested to yet, and each
+    /// go ahead. Whichever committed second wrote its size over the other's, and
+    /// when that was the liar the row ended `complete` under a length no byte on
+    /// the disk supports — attested from then on, so every honest writer was
+    /// refused "size mismatch" for good, `read_all` failed, and the entry that
+    /// named the root kept the collector off it. The decision now happens inside
+    /// the same transaction as the bitmap union, so one of the two loses and it
+    /// is always the claim.
+    ///
+    /// A bounded loop rather than a stress test: the interleaving is rare enough
+    /// that the original took dozens of rounds to hit, and what is asserted is
+    /// the invariant, which has to hold on every one of them.
+    #[test]
+    fn a_size_claim_racing_a_completing_write_never_wins() {
+        let (_d1, provider) = store();
+        let (_d2, victim) = store();
+        for round in 0..64usize {
+            // A fresh object per round, so each race starts from no row at all.
+            let bytes = data(4 * GROUP + 500 + round);
+            let size = bytes.len() as u64;
+            let root = provider.ingest_bytes(&bytes, 0).unwrap();
+            // A hundred bytes further on, inside the same chunk group: the same
+            // tree, so the proof under the lie verifies against the same root.
+            let lie = size + 100;
+            assert_eq!(group_count(lie), group_count(size));
+
+            let all = ChunkRanges::single(0, group_count(size));
+            let (slice, slice_served) = provider.encode_slice(&root, &all).unwrap();
+            let (proof, proof_served) = provider.encode_proof(&root, &all, 0).unwrap();
+
+            std::thread::scope(|scope| {
+                let (victim, root) = (&victim, &root);
+                let (slice, slice_served) = (&slice, &slice_served);
+                let (proof, proof_served) = (&proof, &proof_served);
+                scope.spawn(move || {
+                    victim
+                        .write_slice(root, size, slice_served, slice, 0)
+                        .expect("the honest writer is never refused")
+                });
+                scope.spawn(move || {
+                    // Refused or absorbed, either is fine — what it must not do
+                    // is leave its size on a completed row.
+                    let _ = victim.write_proof(root, lie, proof_served, 0, proof, 0);
+                });
+            });
+
+            let row = victim.blob(&root).unwrap().unwrap();
+            assert_eq!(row.size, size, "round {round}: the claim won");
+            assert!(row.complete, "round {round}");
+            assert_eq!(victim.read_all(&root).unwrap(), bytes, "round {round}");
+        }
+    }
+
     /// A size a peer merely claimed does not brick a root.
     ///
-    /// An object's tree is the same shape for every size inside its last 1 KiB
-    /// chunk, so an entry that overstates an honest root by a hundred bytes
+    /// An object's tree is the same shape for every size inside its last 16 KiB
+    /// chunk group, so an entry that overstates an honest root by a hundred bytes
     /// yields a proof that verifies against that root perfectly well. The row
     /// it leaves behind used to record the lie, and every honest writer of the
     /// same root afterwards — from any origin, on any node that touched the
@@ -1744,7 +1907,7 @@ mod tests {
                     &root,
                     bytes.len() as u64,
                     &Donor(root),
-                    &Proven::none(root),
+                    &Proven::none(root, bytes.len() as u64),
                     0,
                 )
                 .unwrap();

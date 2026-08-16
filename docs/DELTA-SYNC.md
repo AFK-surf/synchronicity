@@ -146,12 +146,18 @@ ProofEnd  { served: ChunkRanges }
   existing `GetSlice`/`SliceEnd` encoding is untouched. Nobody is running this
   protocol yet, so a second ALPN would have bought version negotiation and a
   fallback path for a population of zero. No flag day, no manifest change.
-- **A proof carries its root.** `write_proof` returns a `Proven { root,
-  subtrees }`, not a bare list. Two objects of the same size have the same tree
-  *shape*, so every positional check a promotion makes would pass for the wrong
-  object's proof just as readily as the right one's — and what would come out is
-  an object filled with a stranger's bytes and marked complete. `promote`
-  refuses a proof whose root is not the root it was asked to fill.
+- **A proof carries its root and its size.** `write_proof` returns a
+  `Proven { root, size, subtrees }`, not a bare list. Two objects of the same
+  size have the same tree *shape*, so every positional check a promotion makes
+  would pass for the wrong object's proof just as readily as the right one's —
+  and what would come out is an object filled with a stranger's bytes and marked
+  complete. The size closes the same hole for the object's *length*: "whole" is
+  the property that makes a subtree comparable across objects at all (§2), and
+  it is a fact about where the object ends, so a proof spent under a shorter
+  size hands out whole-looking subtrees the object does not end after — promote
+  them and the row is complete at a fraction of its length, unreadable and
+  refusing every honest writer of the rest. `promote` refuses a proof whose root
+  or size is not the one it was asked to fill.
 
 ### 3.2 Donors: CAS objects, and only CAS objects
 
@@ -178,10 +184,18 @@ The one capability that donor bought is kept, and paid for where it belongs.
 When the lineage names versions this node holds **none** of — the collector took
 the old object — and the file at the mirror's own destination turns out to *be*
 one of those versions, the mirror `ingest_file`s it and the ordinary CAS-to-CAS
-delta proceeds. The check is a hash of a file the mirror was about to rewrite
-anyway; the ingest after it buys an update that costs the change rather than the
-object. It runs only above `delta_min_size`, only when no CAS donor exists, and
-only when the file really is a named version.
+delta proceeds. It runs only above `delta_min_size`, only when no CAS donor
+exists, and only when the file really is a named version.
+
+What it costs is worth separating into the two currencies, because they do not
+move together. **On the network** it buys an update that costs the change rather
+than the object, which is the whole point. **Locally** it costs a full read of
+the file to identify it (the currency check's hash, when the file happens to be
+the length of the version being written, and a second read otherwise), plus
+`ingest_file`: another full read and a **full-size write into the CAS**. So
+recovering a 100 GB donor is two passes over 100 GB and 100 GB of new payload,
+to save 100 GB of transfer and end with the delta. Worth it on any link slower
+than the disk, and not free.
 
 Donors are hints, never authority: nothing is promoted except where the donor's
 own tree gives the run the chaining value a proof chained to the new root
@@ -195,32 +209,60 @@ Instead the fetcher descends, the same way `mptsync` walks trie diffs (§5):
 
 - **Round 1 — span level.** One `GetProof` at the level whose subtrees cover
   `AD_SPAN_GRANULARITY` (16 MiB, 1024 groups — deliberately the ad-span unit,
-  §6.3). Cost: 32 bytes per 16 MiB plus path overhead — ~200 KB for 100 GB.
+  §6.3). What travels is the *interior* of the tree above the spans: a 64-byte
+  node **pair** each, one node per span less one, not a bare 32-byte CV per
+  span. A 100 GB object is 5961 spans, so 5960 pairs — **~381 KB**.
   Compare each complete aligned subtree CV against the donor's CV at the same
   position (read straight out of the donor's outboard). Equal ⇒ the whole
   span is byte-identical; promote it wholesale.
 - **Round 2 — leaf level.** `GetProof(level = 0)` restricted to the spans round
   one found **comparable and unequal**: a donor had a chaining value at that
   position and it differed, which is a span whose bytes moved and whose groups
-  are worth comparing one at a time. A span *no* donor can speak to — past the
+  are worth comparing one at a time. Cost is the interior below one span: 1023
+  pairs, ~65 KB per 16 MiB span. A span *no* donor can speak to — past the
   end of every one of them, held by none — has nothing to be compared against,
   and descending into it would buy a leaf proof of the whole object to learn
   what round one already said. It goes straight to the fetch. The object's right
   edge is the exception and is bounded to one span: a subtree cut short by the
   end of the object is not comparable as a subtree at all, so the absence of a
   donor value there means nothing, and its groups descend.
+- **The zero-match early exit.** If round one finds **no** span in common with
+  any donor, round two is skipped entirely and everything goes to the fetch. A
+  same-size donor with unrelated content — a container re-keyed, an archive
+  rebuilt — passes every cheap test the descent has and then matches nothing,
+  and the leaf round over 100 GB is ~391 MB of tree in ~746 round trips. What
+  that spend could still find is agreement *inside* spans whose span-level CVs
+  all differed, which for fixed-offset groups means a run that happens to align
+  on a group boundary within an otherwise-changed span. Real, and far too rare
+  to be worth 391 MB every time it is absent. One span in common is enough to
+  say the donor is a relative of this object and the leaf round is worth
+  running; zero says it is not.
 
 Round two runs in batches of `LEAF_ROUND_BATCH` groups (128 MiB of object), so
 the list of proven subtrees stays a few hundred kilobytes however much of the
 object turns out to have changed.
 
 The level of round one is clamped: `span_level = min(AD_SPAN_LEVEL, top - 1)`
-where `top` is the height of the object's tree. An object that *is* one span has
-no subtree below its root to compare — the root carries BLAKE3's root flag and
-equals no chaining value anywhere (§2) — so one level below the top is the
-deepest cut that still says something. In practice this means objects of one to
-two spans are compared at a finer granularity than large ones, and an object of
-a single span skips round one entirely and goes to the leaf level.
+where `top = log2(next_power_of_two(group_count))` is the height of the object's
+tree. An object that *is* one span has no subtree below its root to compare —
+the root carries BLAKE3's root flag and equals no chaining value anywhere (§2) —
+so one level below the top is the deepest cut that still says something. The
+clamp only ever bites for objects of two spans or fewer: a 1024-group object has
+`top = 10` and is compared at level 9, in half-span units of 512 groups; a
+2048-group object is compared at level 10, which is the span level itself. Only
+an object of **two groups or fewer** has round one land on the leaf level, and
+one of a single group has no interior tree to prove at all.
+
+**What "the changed region and nothing else" is worth, stated carefully.** For
+the workloads this exists for — a VM image written in place, a database file, an
+appended log — round one settles almost everything and round two looks only
+inside the spans that moved, so the leaf proof is proportional to the edit. Two
+cases are not that. A donor of the *same size* whose content is unrelated
+matches no span at all, and the early exit above is what keeps that from costing
+a full leaf proof. And a byte inserted at offset 0 shifts every subsequent group,
+so every span is comparable-and-unequal and round two runs over the whole object:
+~391 MB of tree for a 100 GB file, after which the fetch is full anyway. Fixed
+offsets buy their cheapness by being exactly this brittle to shifts (§5).
 
 Whatever remains after round 2 goes to the ordinary `fetch_groups` machinery
 untouched: fanout split, `SliceEnd` re-planning, per-group verification,
@@ -230,10 +272,10 @@ callers (and `synch mirror sync` progress lines over the control socket's
 `Progress` frames) can say "reused 98.9 GB, fetched 1.1 GB".
 
 If round 1 shows nothing in common — an encrypted container re-keyed, a
-compressed archive rebuilt — and no donor covers the object, the entire delta
-attempt has cost one ~200 KB exchange and the fetch proceeds exactly as today.
-That failure mode is cheap enough that no similarity heuristic is needed in
-front of it.
+compressed archive rebuilt — the entire delta attempt has cost one ~381 KB
+exchange, because the zero-match exit above stops there and the fetch proceeds
+exactly as today. That failure mode is cheap enough that no similarity heuristic
+is needed in front of it.
 
 **Ranged reads.** `prepare_range` descends for whole-object reads always, and
 for a partial range only when the range is at least one span. Promotion works a
@@ -317,11 +359,40 @@ file's name. Then:
 - The staging file is fsynced, renamed over the target, and the parent directory
   is fsynced too: "old file or new file" is a claim about crashes, and without
   the directory flush the contents can survive a power cut while the name they
-  arrived under does not. Every failure path unlinks the staging file — the name
-  it uses is one the scanner's built-in ignore rules skip, so a stranded one
-  would sit beside the target unnoticed forever.
+  arrived under does not. Every failure path unlinks the staging file — the
+  clone's, the copy fallback's, and the commit's own, which is the one that
+  matters most because it runs after the handle has been given up to be flushed
+  and renamed. The name a staging file uses is one the scanner's built-in ignore
+  rules skip, so a stranded one would sit beside the target unnoticed forever,
+  full-size, on a path reached exactly when the disk is already in trouble.
 
 `MirrorReport::reflinked` counts the files that cost no data movement.
+
+**Non-convergence, and the one loop the currency check cannot break.** A mirror
+pass decides "already current?" by hashing the file on disk (§7.2), and rewrites
+it when the hash is wrong. That converges on every ordinary cause of a wrong
+hash — a torn write, a local edit, a version this pass supersedes. It does not
+converge when the *CAS payload* is the thing that is wrong: the row calls the
+object complete, the fetch finds every group held, materialization clones the
+payload without re-reading it (§2.1), and the next pass hashes the same file,
+finds the same wrong answer, and writes the same bytes again. `written`
+increments forever and `skipped` stays empty, which is a mirror reporting
+progress while making none.
+
+So a pass remembers, per target, what content root it wrote there and the length
+and mtime of the payload it wrote it from. When the next pass is about to write
+the *same* root from the *same* payload over a file that still does not hash to
+it, the payload is named as the suspect in `skipped` and the file is left alone.
+The bytes are still never re-verified — the memory is a stat, not a hash.
+
+Two limits, both deliberate. It lives in memory, per process: a restart forgets
+it and costs one more rewrite before the loop is noticed again, which is cheaper
+than a durable "suspect object" record nothing could ever clear. And it
+identifies the payload by length and mtime, which is enough to notice a payload
+that has been *replaced* — by `synch blob rm` and a refetch, by a restore, by the
+filesystem's own repair — so the mirror converges on the very next pass after a
+repair; a payload rewritten with the same length and the same mtime is
+indistinguishable here and stays suspect until the daemon restarts.
 
 **The trade-off, stated plainly.** A mirror on a *different filesystem from the
 CAS* keeps the whole network win — the delta happens in the CAS, before the
@@ -364,7 +435,9 @@ costs the size of the change.
 - **No content-defined chunking.** CDC would survive insertions and deletions
   that shift the tail of the file, which fixed-offset groups do not — one byte
   inserted at offset 0 defeats reuse entirely (the proof rounds report "all
-  spans differ" and the fetch degrades gracefully to full, plus ~200 KB).
+  spans differ" and the fetch degrades gracefully to full, plus ~381 KB — or
+  plus the leaf round over the object, ~391 MB, where a donor still matched a
+  span somewhere and the early exit therefore did not fire).
   But CDC chunk boundaries would have to become part of the object's identity,
   and the object address is *plain* `blake3(file)` — checkable by any BLAKE3
   tool, servable by bao, deduplicated across peers (§6.1). Changing the
@@ -387,14 +460,17 @@ costs the size of the change.
 | --- | --- |
 | No provider answers a proof request | Full fetch, as before. |
 | Proof verification fails | Provider dropped for the exchange (as with a bad slice); next candidate tried; delta abandoned for this object if none remain. |
-| A proof offered for the wrong object | Refused at `promote`: the root travels with the proof (§3.1). |
-| An entry overstates a root's size | The row records the claim, and the next writer with a different one replaces it — a size is only settled once the final group is held, because no earlier group's chaining value depends on it. |
+| A proof offered for the wrong object, or at the wrong length | Refused at `promote`: the root *and* the size travel with the proof (§3.1). |
+| An entry overstates a root's size | The row records the claim, and the next writer with a different one replaces it — a size is only settled once the final group is held, because no earlier group's chaining value depends on it. The claim can only ever be wrong within the last 16 KiB group: anything that changes the object's group count changes the shape of its tree, so no proof or slice for it would verify. |
+| An entry **under**states a root's size | Refused before anything is written. Nothing is resized on the strength of an unproved length — the payload and outboard only ever grow until a commit settles the size — so a claim short enough to contradict groups already in the bitmap is rejected, and the bytes, the bitmap and the row are exactly as they were. |
+| A size claim racing a write that completes the object | The claim loses. Whether a claimed size may stand is decided inside the same transaction as the bitmap read-union-write, so the two writers serialize: the honest one either finds the claim and replaces it, or lands first and has the claim refused against the size its final group now attests to. Before that the decision was made on a snapshot taken before the work, and the second committer overwrote the first's size — leaving the row `complete` under a length no byte on the disk supported: unreadable, refusing every honest writer for good, and pinned against the collector by the entry that named it. |
 | Donor's tree disagrees under a matched span | Span refused and left to the network; the spans around it are unaffected. |
+| Donor's **payload** rotted, its outboard intact | Not detected, and by design. Promotion compares tree chaining values, never bytes — re-reading the donor is the scrubbing §2.1 refuses — so the rotted run is copied into the new object and its bitmap bit set. The new object then fails its own `read_range` there, and serving it fails at `encode_ranges_validated` rather than sending bad bytes, so the damage does not propagate to peers. It does propagate *locally*, into every derived object promotion touches. This is the accepted cost of trusting the filesystem at rest; the answer to it is a checksumming filesystem, and the mirror's non-convergence guard (§3.5) is what surfaces it to an operator. |
 | Donor object collected mid-promotion | The payload and outboard handles are opened once and held for the run, so an unlinked inode stays readable to the end; a donor already gone before the open simply supplies nothing. |
 | Crash mid-promotion | Bitmap has only committed groups; next pass resumes. |
 | Two writers filling one root at once | Bitmap commits are read-union-write inside one transaction, so neither loses the other's groups; promoted bytes are correct by construction, so overlapping writes are idempotent. |
 | Crash mid-materialization | Staging file abandoned and unlinked; target untouched (rename never happened). |
-| Sizes equal, roots differ, content unrelated | Round 1 finds no equal spans; the leaf round runs over the object and the fetch follows. Cost is the leaf proof, in 128 MiB batches. |
+| Sizes equal, roots differ, content unrelated | Round 1 finds no equal spans and the leaf round is skipped entirely (§3.3); the fetch follows. Cost is the one span-level exchange, ~381 KB for 100 GB. |
 
 ## 7. Cost model (worked example)
 
@@ -403,7 +479,7 @@ CAS and mirrored on the same filesystem:
 
 | | today | with delta |
 | --- | --- | --- |
-| proof rounds | — | ~200 KB + 64 spans × 32 KB ≈ 2.2 MB |
+| proof rounds | — | ~381 KB + 64 spans × ~65 KB ≈ 4.6 MB |
 | network payload | 100 GB | ~1 GB (+ slice path hashes) |
 | CAS write | 100 GB payload + 400 MB outboard | ~1 GB + 390 MB of tree; the other 99 GB is shared extents |
 | mirror write | 100 GB staging copy | reflink of the finished object: O(1) |
@@ -434,11 +510,16 @@ appended bytes.
    mirror's re-ingest recovery (§3.2).
 6. Tests: store-level round trips (equal spans across unequal sizes, tail
    groups, tampered proofs, rotted donor trees, a proof spent on the wrong
-   object, an overstated size), the tree arithmetic checked node for node
-   against the outboard bao itself writes, a two-node `tests/two_nodes.rs` case
-   asserting what a one-group edit to a 64-group object costs on the wire, and
-   mirror passes asserting reuse, an appended file, donor recovery by re-ingest,
-   and the atomicity invariant under a torn materialization.
+   object or at the wrong length, an overstated size, an understated one that
+   must not truncate what is held, and a size claim racing a completing write),
+   the tree arithmetic checked node for node against the outboard bao itself
+   writes, a two-node `tests/two_nodes.rs` case asserting what a one-group edit
+   to a 64-group object costs on the wire, the leaf round's restriction to spans
+   a donor can speak to, the proof window ceiling's arithmetic, a staging file
+   unlinked on a commit that cannot finish, and mirror passes asserting reuse, an
+   appended file, donor recovery by re-ingest, the atomicity invariant under a
+   torn materialization, and non-convergence on a rotted payload being reported
+   rather than rewritten.
 
 Nothing in the reflink and extent-sharing paths is asserted *as* a reflink in
 the tests: whether extents are shared depends on the filesystem the tests run

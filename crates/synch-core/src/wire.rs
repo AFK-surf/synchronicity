@@ -49,7 +49,7 @@ pub const MAX_SLICE_GROUPS: u64 = 512;
 /// slice, though, a proof cannot be bounded by group count alone — the whole
 /// point of the span-level round is that one exchange describes a very large
 /// range very cheaply, and clamping it to [`MAX_SLICE_GROUPS`] groups would
-/// turn the 200 KB descent of a 100 GB object into twelve thousand round trips
+/// turn the 381 KB descent of a 100 GB object into twelve thousand round trips
 /// (`docs/DELTA-SYNC.md` §3.3). Nodes are what a proof costs, so nodes are what
 /// it is counted in: this ceiling covers a 100 GB object's span-level round in
 /// a single exchange, and `ProofEnd` reports where anything larger stopped.

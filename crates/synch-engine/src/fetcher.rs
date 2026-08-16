@@ -496,13 +496,12 @@ impl Node {
     /// Discovers how much of an object this node can supply itself, in two
     /// rounds of proof (`docs/DELTA-SYNC.md` §3.3).
     ///
-    /// Round one asks for the tree at span granularity — 32 bytes per 16 MiB,
-    /// about 200 KB for a 100 GB object — and promotes every span a donor
-    /// turns out to agree with, whole. Round two asks for leaf chaining values
-    /// inside the spans a donor could speak to and *disagreed* with, which is
-    /// the changed region and nothing else, and promotes group by group. What
-    /// survives both rounds is the delta, and it is all the caller has to
-    /// fetch.
+    /// Round one asks for the tree at span granularity — a 64-byte node pair per
+    /// interior node above the spans, so about 381 KB for a 100 GB object — and
+    /// promotes every span a donor turns out to agree with, whole. Round two
+    /// asks for leaf chaining values inside the spans a donor could speak to and
+    /// *disagreed* with, and promotes group by group. What survives both rounds
+    /// is the delta, and it is all the caller has to fetch.
     ///
     /// Nothing here can fail the fetch. A provider that will not answer, a
     /// donor the collector took, a file rewritten end to end — each just leaves
@@ -519,10 +518,11 @@ impl Node {
         // The whole tree is only as tall as the object: descending "to the span
         // level" of an object that *is* one span would ask for nothing at all,
         // because the root's own hash is not a chaining value anything can be
-        // compared against (§2). One level below the top is the deepest cut
-        // that still says something — so an object of one or two spans is
-        // compared at a finer granularity than a large one, and an object of a
-        // single span goes straight to the leaf level.
+        // compared against (§2). One level below the top is the deepest cut that
+        // still says something, so the level is clamped to `top - 1` — an object
+        // of one span is compared at half-span granularity, one of two spans at
+        // span granularity, and only an object of two groups or fewer has round
+        // one land on the leaf level itself.
         let top = group_count(size)
             .next_power_of_two()
             .trailing_zeros()
@@ -540,6 +540,26 @@ impl Node {
             .promote_round(root, size, donors, round, report)
             .await?;
         if span_level == 0 {
+            return Ok(());
+        }
+        // Nothing in common at all, across every donor: stop here rather than
+        // buy the leaf round. A same-size donor with unrelated content — a
+        // re-keyed container, a rebuilt archive — passes every cheap test the
+        // descent has and then matches nothing, and the leaf round over a
+        // 100 GB object is ~391 MB of tree and ~750 round trips. What that
+        // spend could still find is bytes that agree *inside* spans whose
+        // span-level chaining values all differed, which for fixed-offset
+        // groups means a run that happens to align on a group boundary within
+        // an otherwise-changed span: real, but rare enough that paying 391 MB
+        // for the chance is the wrong trade every time it is not found
+        // (`docs/DELTA-SYNC.md` §3.3). One span in common is enough to
+        // establish the donor is a relative of this object and the round is
+        // worth running; zero says it is not.
+        if report.promoted.is_empty() {
+            tracing::debug!(
+                root = %root,
+                "no span in common with any donor: skipping the leaf round"
+            );
             return Ok(());
         }
 
@@ -648,7 +668,7 @@ impl Node {
             providers = self.ask_peers_for_providers(root, size).await?;
         }
         let mut remaining = ranges.clone();
-        let mut proven = Proven::none(*root);
+        let mut proven = Proven::none(*root, size);
         for provider in providers {
             if remaining.is_empty() {
                 break;
@@ -1364,6 +1384,66 @@ mod tests {
             !donors.contains(&Donor(new_root)),
             "the object being fetched is never its own donor"
         );
+        node.shutdown().await.unwrap();
+    }
+
+    /// Round two looks inside the spans a donor can speak to, and nowhere else
+    /// (`docs/DELTA-SYNC.md` §3.3).
+    ///
+    /// This is the F3 restriction, stated as the ranges round two would ask for.
+    /// A span past the end of every donor — or held by none of them — has
+    /// nothing for a leaf comparison to compare against, so descending into it
+    /// would buy a leaf proof of the whole object to learn what round one
+    /// already said. Getting this wrong is invisible in the result (the object
+    /// still completes) and costs 1/256 of the object on the wire, which is
+    /// precisely the thing delta sync exists to not spend.
+    #[tokio::test]
+    async fn the_leaf_round_descends_only_where_a_donor_can_answer() {
+        let (_d, node) = node().await;
+        const GROUP: usize = 16 * 1024;
+        // A donor of eight groups. The new version is nineteen groups and a bit,
+        // so spans 0..4 and 4..8 are inside the donor, spans 8..12 and 12..16
+        // are past its end, and the span on the right edge is cut short by the
+        // end of the object and is not a whole subtree at all.
+        let donor_bytes: Vec<u8> = (0..8 * GROUP).map(|i| (i * 13 % 251) as u8).collect();
+        let donor = node.store().ingest_bytes(&donor_bytes, now_ns()).unwrap();
+        let new_root = Hash::new(b"the version being fetched");
+        let size = (19 * GROUP + 700) as u64;
+
+        let span = |start: u64, groups: u64, whole: bool| ProvenSubtree {
+            start,
+            groups,
+            cv: synch_core::Cv([0u8; 32]),
+            whole,
+        };
+        let round_one = Proven {
+            root: new_root,
+            size,
+            subtrees: vec![
+                span(0, 4, true),
+                span(4, 4, true),
+                span(8, 4, true),
+                span(12, 4, true),
+                // The right edge: cut short by the end of the object, so the
+                // donor's silence there says nothing and the groups descend.
+                span(16, 4, false),
+            ],
+        };
+
+        let unsettled = node.unsettled_spans(&[Donor(donor)], &round_one).unwrap();
+        assert_eq!(
+            unsettled,
+            ChunkRanges::from_ranges([
+                synch_core::GroupRange::new(0, 8),
+                synch_core::GroupRange::new(16, 20),
+            ]),
+            "only the spans the donor reaches, plus the object's right edge"
+        );
+
+        // With no donor at all, round two has nothing to look inside but that
+        // right edge — the whole of the rest goes straight to the fetch.
+        let unsettled = node.unsettled_spans(&[], &round_one).unwrap();
+        assert_eq!(unsettled, ChunkRanges::single(16, 20));
         node.shutdown().await.unwrap();
     }
 

@@ -210,6 +210,8 @@ impl Node {
             let node = self.clone();
             let root = root_dir.clone();
             let path = want.path.clone();
+            let written_target = want.target.clone();
+            let written_content = want.content;
             let outcome = crate::blocking::offload(move || {
                 if escapes_via_symlink(&root, &path) {
                     return Ok(Written::Escaped);
@@ -232,6 +234,19 @@ impl Node {
                 })
             })
             .await?;
+            // Remembered whenever the bytes landed, so the pass after this one
+            // can tell a file it wrote and got wrong from one it has not tried
+            // yet (`Node::note_mirror_write`).
+            if matches!(outcome, Written::Fully(_) | Written::WithoutMetadata(_, _)) {
+                let payload = payload_fingerprint(self, &written_content);
+                self.note_mirror_write(
+                    &written_target,
+                    crate::node::MirrorWrite {
+                        content: written_content,
+                        payload,
+                    },
+                );
+            }
             match outcome {
                 Written::Fully(kind) => {
                     report.written += 1;
@@ -447,6 +462,9 @@ fn plan_pass(
                 // touching the content. Repairing it is a `stat` and a syscall
                 // or two — refetching the object to fix a permission bit is
                 // not.
+                // Whatever this pass or an earlier one wrote here landed: the
+                // suspicion the guard below carries is discharged.
+                node.forget_mirror_write(&target);
                 if metadata_matches(&target, meta) {
                     report.current += 1;
                 } else if let Err(e) = apply_metadata(&target, meta) {
@@ -459,6 +477,45 @@ fn plan_pass(
                 } else {
                     report.retouched += 1;
                 }
+                continue;
+            }
+
+            // The file is not the selected version — and the previous pass
+            // wrote the selected version here. Writing it again would produce
+            // the same bytes from the same payload and leave the file exactly as
+            // wrong as it is now: the mirror would report `written` on every
+            // pass, forever, and never converge. What that pattern means is a
+            // CAS payload that rotted at rest under a row that still calls the
+            // object complete — the one wrong-hash cause the currency check
+            // cannot fix, because nothing upstream of it doubts the object
+            // (`docs/DELTA-SYNC.md` §2.1, §6).
+            //
+            // So the payload is named as the suspect and the path is left as it
+            // is. Deleting the object is not this pass's call to make — it may
+            // be pinned, it may be another mirror's current version, and the
+            // operator is the one who can say whether the disk under it is
+            // failing — but reporting it is, and `synch blob rm` followed by a
+            // pass will refetch it from a provider.
+            //
+            // A file that is not *there* proves nothing and is not guarded: it
+            // may never have been written, or a pass in between may have removed
+            // it for a tombstone the policy has since stopped selecting.
+            if on_disk.is_none() {
+                node.forget_mirror_write(&target);
+            } else if node.mirror_write_was(&target)
+                == Some(crate::node::MirrorWrite {
+                    content,
+                    payload: payload_fingerprint(node, &content),
+                })
+            {
+                report.skipped.push((
+                    set.path.clone(),
+                    format!(
+                        "written from {content} on the previous pass and the file still does \
+                         not hash to it: the CAS payload for that object is suspect, so this \
+                         pass is not writing it again"
+                    ),
+                ));
                 continue;
             }
 
@@ -689,6 +746,19 @@ fn same_size_root(target: &Path, wanted_size: u64) -> Option<synch_core::Hash> {
         return None;
     }
     hash_file(target)
+}
+
+/// A cheap identity for the CAS payload behind an object: its length and its
+/// modification time.
+///
+/// Emphatically not a hash. Re-reading an object to identify it is the
+/// scrubbing §2.1 refuses, and what this is for does not need one: it only has
+/// to notice that a payload has been *replaced*, so the rot guard in
+/// [`Node::note_mirror_write`] lets go when the operator repairs the object.
+/// `None` for an inline object, which has no payload file.
+fn payload_fingerprint(node: &Node, content: &synch_core::Hash) -> Option<(u64, i64)> {
+    let meta = std::fs::metadata(node.store().blob_path(content)).ok()?;
+    Some((meta.len(), crate::scanner::mtime_nanos(&meta)))
 }
 
 /// Streams a file through BLAKE3 for its content root.
@@ -951,6 +1021,81 @@ mod tests {
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.current, 1);
         assert_eq!(report.written, 0);
+        node.shutdown().await.unwrap();
+    }
+
+    /// A rotted CAS payload stops the pass instead of being rewritten forever.
+    ///
+    /// The one wrong-hash cause the currency check cannot fix. Nothing upstream
+    /// of the mirror doubts the object — the row calls it complete, the fetch
+    /// finds every group held, and materialization clones the payload without
+    /// re-reading it, which is the settled at-rest trust posture (§2.1) — so the
+    /// pass writes the rot to disk, the pass after it hashes the file, finds the
+    /// same wrong answer, and writes the same bytes again. `written` climbs on
+    /// every pass and the mirror never converges.
+    ///
+    /// The bytes are still not re-verified here: what changed is that a pass
+    /// knows what the last one wrote, and a path it wrote from a root that still
+    /// does not hash to that root is reported with the payload named, not
+    /// rewritten.
+    #[tokio::test]
+    async fn a_rotted_payload_is_reported_rather_than_rewritten_forever() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        // Large enough to have a payload file rather than living in the index.
+        let payload: Vec<u8> = (0..80_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        publish_entry(&node, &peer(), "disk.img", &payload, 1);
+        let content = node.versions("media", "disk.img").unwrap().entries[0]
+            .content
+            .unwrap();
+
+        // The payload rots at rest, behind the store's back and without
+        // changing its length — a flipped bit on a disk nobody is checksumming.
+        let path = node.store().blob_path(&content);
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[40_000] ^= 0xff;
+        std::fs::write(&path, &raw).unwrap();
+
+        // The first pass writes it: nothing has told the mirror otherwise.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let file = target.path().join("disk.img");
+        assert_ne!(
+            std::fs::read(&file).unwrap(),
+            payload,
+            "the rot came across"
+        );
+
+        // The second pass recognizes the loop rather than joining it.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 0, "{report:?}");
+        assert_eq!(report.current, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        let (path_reported, why) = &report.skipped[0];
+        assert_eq!(path_reported, "disk.img");
+        assert!(
+            why.contains("payload") && why.contains(&content.to_string()),
+            "the report names the object at fault: {why}"
+        );
+        // And it stays that way rather than alternating.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+
+        // Repairing the payload — `synch blob rm` and a refetch, a restore, the
+        // filesystem's own repair — lets the very next pass converge. The guard
+        // notices by the payload's length and mtime, never by reading it back.
+        raw[40_000] ^= 0xff;
+        std::fs::write(&path, &raw).unwrap();
+        set_modified(&path, STAMP).unwrap();
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(std::fs::read(&file).unwrap(), payload);
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.current, 1, "{report:?}");
         node.shutdown().await.unwrap();
     }
 

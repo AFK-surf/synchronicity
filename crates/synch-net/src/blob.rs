@@ -29,6 +29,45 @@ use crate::{
 /// fetch gives up on it and lets the caller try someone else.
 const MAX_BARREN_WINDOWS: u32 = 4;
 
+/// How many windows one proof exchange may take before the requester walks away.
+///
+/// A ceiling on the exchange as a whole, not just on the empty answers. A
+/// provider that serves one node per window is not barren — it is making
+/// progress, a round trip at a time — and without a bound it can hold a descent
+/// open for one RTT per node of the object's tree.
+///
+/// So the ceiling is based on what an *honest* answer costs. A proof stopping at
+/// `level` names one subtree per `2^level` groups, and a walk that names `n`
+/// subtrees emits fewer than `2n` interior nodes above them, plus at most one
+/// path from the root per disjoint range asked about — a path being no deeper
+/// than the 64 levels a `u64` group index can address. Divide by the window
+/// ([`MAX_PROOF_NODES`](synch_core::MAX_PROOF_NODES)) for the number of windows
+/// the honest answer takes, then
+/// allow a small multiple of it and a floor, so a provider that splits its
+/// answer differently than expected is not cut off for it. The ranges the
+/// exchange did not reach simply go to the ordinary fetch (§6.4).
+///
+/// The count that used to stand here was `8 + groups * 2`, which reads as
+/// generous and is not a bound at all: a span-level round over 100 GB names
+/// about six thousand subtrees and needs one window, and that formula would have
+/// allowed twelve million.
+fn proof_window_ceiling(ranges: &ChunkRanges, level: u8) -> u64 {
+    /// Windows allowed per window an honest answer needs.
+    const SLACK: u64 = 4;
+    /// The smallest ceiling, so a one-node proof still gets a few tries.
+    const FLOOR: u64 = 8;
+    /// The deepest a root-to-range path can be for a `u64` group index.
+    const MAX_PATH: u64 = 64;
+
+    let per_subtree = 1u64 << level.min(63);
+    let subtrees = ranges.count().div_ceil(per_subtree);
+    let nodes = subtrees
+        .saturating_mul(2)
+        .saturating_add((ranges.range_count() as u64).saturating_mul(MAX_PATH));
+    let honest = nodes.div_ceil(synch_core::MAX_PROOF_NODES).max(1);
+    honest.saturating_mul(SLACK).saturating_add(FLOOR)
+}
+
 /// The `sync/blob/1` protocol handler.
 #[derive(Debug, Clone)]
 pub struct BlobProtocol {
@@ -287,18 +326,11 @@ impl BlobClient {
     ) -> Result<ProofOutcome, NetError> {
         let mut remaining = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
         let mut out = ProofOutcome {
-            proven: Proven::none(root),
+            proven: Proven::none(root, size),
             served: ChunkRanges::empty(),
         };
         let mut barren = 0u32;
-        // A ceiling on the exchange as a whole, not just on the empty answers.
-        // A provider that serves one group per window is not barren — it is
-        // making progress, a round trip at a time — and without a bound it can
-        // hold this descent open for one RTT per group of the object. An
-        // honest provider needs a window per [`MAX_PROOF_NODES`] worth of tree,
-        // so a few per range plus a floor is generous and still finite; the
-        // ranges it did not reach simply go to the ordinary fetch (§6.4).
-        let mut windows = 8 + remaining.count().saturating_mul(2);
+        let mut windows = proof_window_ceiling(&remaining, level);
         while !remaining.is_empty() {
             if windows == 0 {
                 tracing::debug!(root = %root, "proof exchange cut off: too many windows");
@@ -390,5 +422,51 @@ impl BlobClient {
             got = got.union(&written);
         }
         Ok(got)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synch_core::{GroupRange, AD_SPAN_LEVEL, CHUNK_GROUP_SIZE, MAX_PROOF_NODES};
+
+    /// The window ceiling tracks what an honest answer costs, not how much of
+    /// the object was named.
+    ///
+    /// Counting groups made the ceiling scale with the thing the proof exists to
+    /// avoid touching group by group: a span round over 100 GB names six
+    /// thousand subtrees and one honest window, and the old `8 + groups * 2`
+    /// granted twelve million round trips against it — a bound in name only.
+    #[test]
+    fn the_window_ceiling_is_based_on_windows_not_groups() {
+        let groups_in = |bytes: u64| bytes / CHUNK_GROUP_SIZE;
+        let hundred_gb = ChunkRanges::single(0, groups_in(100_000_000_000));
+
+        // The span-level round of a 100 GB object: one honest window, so a
+        // ceiling in the tens rather than the millions.
+        let span_round = proof_window_ceiling(&hundred_gb, AD_SPAN_LEVEL);
+        assert!(
+            (1..64).contains(&span_round),
+            "a span round over 100 GB should cost a handful of windows, not {span_round}"
+        );
+
+        // The leaf round of the same object is genuinely large, and the ceiling
+        // grows with it — proportionally to the tree it has to move, which is
+        // what "a few per window" means.
+        let leaf_round = proof_window_ceiling(&hundred_gb, 0);
+        let honest = hundred_gb.count() * 2 / MAX_PROOF_NODES;
+        assert!(leaf_round > honest, "{leaf_round} vs {honest}");
+        assert!(leaf_round < honest * 8, "{leaf_round} vs {honest}");
+
+        // Fragmentation costs a root path per range and no more, so a request
+        // split into many small ranges is bounded too.
+        let scattered =
+            ChunkRanges::from_ranges((0..1000u64).map(|i| GroupRange::new(i * 1024, i * 1024 + 1)));
+        assert!(proof_window_ceiling(&scattered, 0) < 64);
+
+        // And the floor holds for the degenerate cases rather than yielding a
+        // ceiling of zero, which would refuse the first window outright.
+        assert!(proof_window_ceiling(&ChunkRanges::empty(), 0) >= 8);
+        assert!(proof_window_ceiling(&ChunkRanges::single(0, 1), 63) >= 8);
     }
 }
