@@ -260,12 +260,12 @@ entry in the proof record (§3) because the leaf commits only to its digest:
 {
   "_type": "https://in-toto.io/Statement/v1",
   "subject": [{
-    "name": "sync.example.dev.",
+    "name": "sync.example.",
     "digest": { "sha256": "<hex sha256 of the DNSKEY rdata>" }
   }],
   "predicateType": "https://synchronicity.sh/zone-key/v1",
   "predicate": {
-    "apex": "sync.example.dev.",
+    "apex": "sync.example.",
     "keyTag": 34918,
     "algorithm": 13,
     "flags": 257,
@@ -1144,9 +1144,9 @@ the real path against the public log:
 export CP_REKOR_URL=https://log2025-1.rekor.sigstore.dev
 export CP_DNSSEC_CHAIN_RESOLVER=https://cloudflare-dns.com/dns-query
 # ...after the DS is live in the parent:
-gleam run -- rekor-publish sync.example.dev /etc/synchronicity/csk.key
+gleam run -- rekor-publish sync.example /etc/synchronicity/csk.key
 # then watch it arrive, from the other side:
-echo '{"known":{"keys":{"sync.example.dev":[]}}}' > monitor.json
+echo '{"known":{"keys":{"sync.example":[]}}}' > monitor.json
 cargo run -p synch-monitor -- --state monitor.json --from-index <n> --max-entries 512
 ```
 

@@ -76,7 +76,7 @@ pub enum NetError {
         /// The key tag the answer's RRSIG named.
         key_tag: u16,
     },
-    /// A proof record exists but is not a v1 `RekorProof`.
+    /// A proof record exists but is not a v3 `RekorProof`.
     #[error("zone key transparency: malformed proof at {name}: {reason}")]
     RekorMalformed {
         /// The proof record's owner name.

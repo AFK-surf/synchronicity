@@ -27,7 +27,7 @@ pub type Listen {
 pub type Config {
   Config(
     role: Role,
-    /// The zone apex, e.g. "sync.example.dev" (no trailing dot).
+    /// The zone apex, e.g. "sync.example" (no trailing dot).
     base_domain: String,
     db_path: String,
     /// Primary only; replicas must not have key material.

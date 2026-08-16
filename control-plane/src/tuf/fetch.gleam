@@ -7,8 +7,10 @@
 //// targets name the target's digest — and checks structure, versions,
 //// expiries and the one digest the chain hands it. It checks no
 //// signatures: the cryptographic gate is the client's, in
-//// crates/synch-net/src/tuf.rs, and the e2e keeps this side honest by
-//// running that verifier against what the zone serves.
+//// crates/synch-net/src/tuf.rs. Nothing in CI carries what this side
+//// stores through that verifier — the e2e's zone-key leg is negative
+//// only — so the agreement rests on the shared fixtures both sides read,
+//// which is a weaker guarantee than an end-to-end run and worth knowing.
 ////
 //// Bad stored material therefore costs nothing but zone bytes — clients
 //// ignore it and keep their pins — while a *regression* is refused here,

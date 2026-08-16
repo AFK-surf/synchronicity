@@ -571,7 +571,7 @@ mod tests {
         let extra = vec![(vec![0x41, 0x01], b"payload".to_vec())];
         let spec = SelfSigned {
             common_name: "synchronicity zone key",
-            dns_name: "sync.example.dev",
+            dns_name: "sync.example",
             spki: &spki(),
             serial: &[0x01, 0x02, 0x03],
             not_before: x509_time(1_760_000_000),
@@ -583,10 +583,10 @@ mod tests {
         let der = spec.build(|_| vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]);
         let cert = Certificate::parse(&der).expect("the certificate must parse");
         assert_eq!(cert.spki, spki());
-        assert_eq!(cert.dns_names, vec!["sync.example.dev".to_string()]);
+        assert_eq!(cert.dns_names, vec!["sync.example".to_string()]);
         assert_eq!(
             cert.single_dns_name().unwrap().to_string(),
-            "sync.example.dev."
+            "sync.example."
         );
         assert_eq!(cert.extension(&[0x41, 0x01]), Some(&b"payload"[..]));
         assert_eq!(cert.extension(&[0x41, 0x02]), None);
@@ -619,7 +619,7 @@ mod tests {
     fn truncated_and_malformed_der_is_refused_rather_than_panicking() {
         let spec = SelfSigned {
             common_name: "cn",
-            dns_name: "sync.example.dev",
+            dns_name: "sync.example",
             spki: &spki(),
             serial: &[0x01],
             not_before: x509_time(1_760_000_000),
@@ -648,8 +648,8 @@ mod tests {
             extensions: Vec::new(),
         };
         for bad in [
-            "sync.example.dev..",
-            "sync.example.dev...",
+            "sync.example..",
+            "sync.example...",
             "sync..example",
             "",
         ] {
@@ -659,8 +659,8 @@ mod tests {
             );
         }
         // Spellings that *are* one name normalize to one value.
-        let canonical = with("sync.example.dev.").single_dns_name().unwrap();
-        for same in ["sync.example.dev", "SYNC.EXAMPLE.DEV.", "Sync.Example.Dev"] {
+        let canonical = with("sync.example.").single_dns_name().unwrap();
+        for same in ["sync.example", "SYNC.EXAMPLE.DEV.", "Sync.Example.Dev"] {
             assert_eq!(with(same).single_dns_name().unwrap(), canonical, "{same}");
         }
         // Not a suffix match: a certificate for the parent is not a

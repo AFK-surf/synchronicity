@@ -610,7 +610,7 @@ mod tests {
         let anchors = TrustAnchors::default();
         let error = validate(
             &DnssecChain::default(),
-            &parse_name("sync.example.dev.").unwrap(),
+            &parse_name("sync.example.").unwrap(),
             &[0; 68],
             &anchors,
         )
