@@ -3188,6 +3188,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -3856,6 +3857,24 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "synch-monitor"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "hex",
+ "hickory-resolver",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "synch-net",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
 ]
 
 [[package]]

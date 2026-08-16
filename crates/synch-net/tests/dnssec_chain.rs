@@ -30,7 +30,8 @@ fn fixture(name: &str) -> Vec<u8> {
 /// hand-written validator quietly gets wrong.
 #[test]
 fn a_real_delegation_validates_against_the_icann_anchor() {
-    let chain = DnssecChain::decode(&fixture("cloudflare-com.der")).expect("the fixture is a chain");
+    let chain =
+        DnssecChain::decode(&fixture("cloudflare-com.der")).expect("the fixture is a chain");
     assert_eq!(chain.links.len(), 3);
     assert_eq!(chain.links[0].zone, "cloudflare.com.");
     assert_eq!(chain.links[2].zone, ".");
@@ -79,7 +80,12 @@ fn a_real_delegation_does_not_cover_a_key_it_never_named() {
 
     // And it says nothing about a different zone, however well it validates.
     assert!(matches!(
-        chain::validate(&chain, "example.com.", &fixture("cloudflare-com-dnskey.bin"), &anchors),
+        chain::validate(
+            &chain,
+            "example.com.",
+            &fixture("cloudflare-com-dnskey.bin"),
+            &anchors
+        ),
         Err(ChainError::Structure(_))
     ));
 }
@@ -95,7 +101,12 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     // separates "this control plane has not upgraded" from "somebody
     // stripped the evidence out".
     assert_eq!(
-        chain::validate(&DnssecChain::default(), "cloudflare.com.", &dnskey, &anchors),
+        chain::validate(
+            &DnssecChain::default(),
+            "cloudflare.com.",
+            &dnskey,
+            &anchors
+        ),
         Err(ChainError::Absent)
     );
 
@@ -140,7 +151,12 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     // An empty trust-anchor set trusts nothing, and says so as an anchor
     // failure rather than quietly succeeding.
     assert!(matches!(
-        chain::validate(&original, "cloudflare.com.", &dnskey, &TrustAnchors::empty()),
+        chain::validate(
+            &original,
+            "cloudflare.com.",
+            &dnskey,
+            &TrustAnchors::empty()
+        ),
         Err(ChainError::Anchor(_))
     ));
 }

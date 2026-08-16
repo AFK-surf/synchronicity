@@ -40,7 +40,7 @@
 
 use hickory_resolver::proto::{
     dnssec::{
-        rdata::{DNSKEY, DNSSECRData, RRSIG},
+        rdata::{DNSSECRData, DNSKEY, RRSIG},
         DigestType, TrustAnchors, Verifier,
     },
     rr::{DNSClass, Name, RData, Record, RecordType},
@@ -135,7 +135,10 @@ pub fn validate(
         return Err(ChainError::Absent);
     }
     let apex_name = name(apex)?;
-    let parsed: Vec<ParsedLink> = links.iter().map(ParsedLink::parse).collect::<Result<_, _>>()?;
+    let parsed: Vec<ParsedLink> = links
+        .iter()
+        .map(ParsedLink::parse)
+        .collect::<Result<_, _>>()?;
     if parsed[0].zone != apex_name {
         return Err(ChainError::Structure(format!(
             "the first link is for {}, not the apex {apex_name}",
@@ -165,9 +168,9 @@ pub fn validate(
     // its parent signed, until the apex, whose DS must cover the key at hand.
     for index in (0..parsed.len() - 1).rev() {
         let link = &parsed[index];
-        let ds = verify_ds_set(link, index, &trusted, &mut windows)?;
+        let ds = verify_ds_set(link, index, trusted, &mut windows)?;
         if index == 0 {
-            return match covers(&ds, &link.zone, dnskey_rdata) {
+            return match covers(ds, &link.zone, dnskey_rdata) {
                 true => Ok(ValidChain {
                     anchor_zone,
                     windows,
@@ -180,7 +183,7 @@ pub fn validate(
                 ))),
             };
         }
-        trusted = verify_dnskey_set_under(link, index, &ds, &mut windows)?;
+        trusted = verify_dnskey_set_under(link, index, ds, &mut windows)?;
     }
 
     // A one-link chain: the apex *is* the anchored zone. Only reachable under
@@ -531,11 +534,7 @@ mod tests {
         // The DS a real registrar published for cloudflare.com, checked
         // against the key tag computed from its own DNSKEY rdata — the
         // arithmetic is one-byte-off-able and silently so.
-        let rdata = [
-            &[0x01u8, 0x01, 0x03, 0x0d][..],
-            &[0xab; 64][..],
-        ]
-        .concat();
+        let rdata = [&[0x01u8, 0x01, 0x03, 0x0d][..], &[0xab; 64][..]].concat();
         assert_eq!(key_tag(&rdata), key_tag(&rdata));
         // A one-bit change moves the tag: the checksum is over every byte.
         let mut other = rdata.clone();
@@ -568,8 +567,13 @@ mod tests {
     #[test]
     fn an_empty_chain_is_absent_not_malformed() {
         let anchors = TrustAnchors::default();
-        let error = validate(&DnssecChain::default(), "sync.example.dev.", &[0; 68], &anchors)
-            .unwrap_err();
+        let error = validate(
+            &DnssecChain::default(),
+            "sync.example.dev.",
+            &[0; 68],
+            &anchors,
+        )
+        .unwrap_err();
         assert_eq!(error, ChainError::Absent);
     }
 }

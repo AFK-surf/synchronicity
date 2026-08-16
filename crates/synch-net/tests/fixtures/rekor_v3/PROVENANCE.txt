@@ -1,0 +1,52 @@
+A genuine Rekor v2 entry whose verifier is a certificate — the v3 shape.
+
+Published 2026-08-16 to https://log2025-1.rekor.sigstore.dev (HTTP 201,
+logIndex 67673583) and read back out of the log's own static tiles on the
+same day. Nothing in this repository authored the log's half of any of it.
+
+  canonicalized_body.json  the Merkle leaf preimage, verbatim, as it came out
+                           of the entry bundle at api/v2/tile/entries/x264/349
+                           (offset 239, uint16-BE length framing).
+  certificate.der          the same certificate, extracted from
+                           spec.hashedRekordV002.signature.verifier
+                             .x509Certificate.rawBytes.
+  checkpoint.txt           api/v2/checkpoint at tree size 67 686 055, with the
+                           log's Ed25519 signature and three witness
+                           cosignatures (witness.stagemole.eu,
+                           witness.navigli.sunlight.geomys.org,
+                           staging.witness.transparency.goog).
+  inclusion_path.bin       18 audit-path hashes, derived from the log's hash
+                           tiles by recomputing complete-subtree hashes — not
+                           taken from any server-supplied proof.
+  log_index.txt            67673583.
+
+The certificate is exactly the shape §2 specifies: self-signed P-256,
+CN "synchronicity zone key", basicConstraints CA:FALSE critical, keyUsage
+digitalSignature critical, and one dNSName SAN —
+`zone-key-transparency.demo.invalid`. It proves the load-bearing claim the
+whole of v3 rests on: **Rekor performs no certificate validation**, so an
+apex written into a SAN lands, in the clear, inside the log's Merkle leaf.
+
+What this fixture can prove, and does, in
+tests/rekor_zone_key.rs::real_rekor_v3:
+  - the leaf is SHA-256(0x00 || canonicalized_body) and the RFC 6962 walk
+    over the audit path reaches the checkpoint's root, in a real tree of
+    67.7 million entries;
+  - the checkpoint verifies under the *embedded* Sigstore log key;
+  - the body parses as hashedrekord 0.0.2 with an x509Certificate verifier;
+  - the certificate parses, and its single dNSName SAN is the apex;
+  - signature.content verifies under the certificate's own key with the
+    entry's data.digest as the prehashed message. (Confirmed independently:
+    `openssl pkeyutl -verify -pubin -inkey pub.pem -sigfile sig.der
+     -in digest.bin -pkeyopt digest:sha256` → Signature Verified Successfully.
+    Because that digest *is* SHA-256(PAE), the same signature verifies as
+    ECDSA-SHA256 over the PAE, which is how ring is asked the question.)
+
+What it cannot prove, stated plainly: the in-toto Statement behind the digest
+was not preserved by whoever published this demo entry, and a hashedrekord
+leaf commits only to the digest — which is precisely why §3's record carries
+the Statement bytes alongside the body. So the fixture cannot exercise the
+statement-digest, statement-binding or chain checks, and the test asserts
+that a full `rekor::verify` over it fails at exactly that step and no
+earlier one. The synthetic suite covers the rest, and the DNSSEC chain half
+is anchored to reality separately by tests/fixtures/dnssec_chain.

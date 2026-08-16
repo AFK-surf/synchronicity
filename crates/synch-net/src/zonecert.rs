@@ -170,8 +170,8 @@ impl Succession {
             return Err(X509Error::from("predecessorKeyTag is out of range"));
         }
         let value = tag.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b));
-        let predecessor_key_tag =
-            u16::try_from(value).map_err(|_| X509Error::from("predecessorKeyTag is out of range"))?;
+        let predecessor_key_tag = u16::try_from(value)
+            .map_err(|_| X509Error::from("predecessorKeyTag is out of range"))?;
         let predecessor_spki = fields.tagged(0x04, "predecessorSpki")?.to_vec();
         let signature = fields.tagged(0x04, "signature")?.to_vec();
         if !fields.is_empty() {

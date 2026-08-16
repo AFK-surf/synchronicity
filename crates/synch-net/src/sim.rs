@@ -151,8 +151,8 @@ impl SimZone {
             ),
             0,
         );
-        let rrsig =
-            RRSIG::from_rrset(&set, DNSClass::IN, inception, &self.signer).expect("sign dnskey set");
+        let rrsig = RRSIG::from_rrset(&set, DNSClass::IN, inception, &self.signer)
+            .expect("sign dnskey set");
         set.insert_rrsig(Record::from_rdata(
             self.origin.clone(),
             self.ttl,
@@ -211,10 +211,7 @@ impl SimZone {
     /// The certificate an ordinary `create` or `rollover` entry carries: the
     /// chain, and a countersignature when there is a predecessor to make one.
     pub fn zone_key_certificate(&self, succession: Option<&Succession>) -> Vec<u8> {
-        let mut extensions = vec![(
-            OID_DNSSEC_CHAIN.to_vec(),
-            self.dnssec_chain().encode(),
-        )];
+        let mut extensions = vec![(OID_DNSSEC_CHAIN.to_vec(), self.dnssec_chain().encode())];
         if let Some(succession) = succession {
             extensions.push((OID_SUCCESSION.to_vec(), succession.encode()));
         }

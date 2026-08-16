@@ -390,7 +390,10 @@ pub fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
         out.push(len as u8);
     } else {
         let bytes = len.to_be_bytes();
-        let first = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len() - 1);
+        let first = bytes
+            .iter()
+            .position(|b| *b != 0)
+            .unwrap_or(bytes.len() - 1);
         out.push(0x80 | (bytes.len() - first) as u8);
         out.extend_from_slice(&bytes[first..]);
     }
@@ -447,7 +450,9 @@ impl<'a> Der<'a> {
                     return Err(bad("a non-minimal length is not DER"));
                 }
                 (
-                    slice.iter().fold(0usize, |acc, b| (acc << 8) | usize::from(*b)),
+                    slice
+                        .iter()
+                        .fold(0usize, |acc, b| (acc << 8) | usize::from(*b)),
                     2 + count,
                 )
             }

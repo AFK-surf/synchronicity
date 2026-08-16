@@ -578,8 +578,7 @@ impl HashedRekordBody {
                 ))
             }
         };
-        let certificate =
-            Certificate::parse(&certificate_der).map_err(|e| bad(e.to_string()))?;
+        let certificate = Certificate::parse(&certificate_der).map_err(|e| bad(e.to_string()))?;
         Ok(HashedRekordBody {
             digest: b64(&data["digest"], "data.digest")?,
             signature: b64(&signature["content"], "signature.content")?,
@@ -862,6 +861,50 @@ impl Checkpoint {
         })
     }
 
+    /// Verifies that some pinned key signed this checkpoint.
+    ///
+    /// The public entry point a monitor uses: a client reaches the same check
+    /// through [`verify`], but a monitor holds a checkpoint on its own and
+    /// must be able to ask the question directly.
+    pub fn verify_under(&self, logs: &LogKeys) -> Result<(), ProofError> {
+        match logs
+            .keys()
+            .iter()
+            .any(|key| self.verify_signature(key).is_ok())
+        {
+            true => Ok(()),
+            false => Err(ProofError::Checkpoint(format!(
+                "no signature on the checkpoint from {} verifies under a pinned log key",
+                self.origin
+            ))),
+        }
+    }
+
+    /// The witness cosignatures beside the log's own signature.
+    ///
+    /// C2SP `cosignature/v1` blobs are `4-byte key hint || 8-byte big-endian
+    /// unix timestamp || 64-byte Ed25519 signature`; the hint is stripped at
+    /// parse, so a cosignature line is the 72-byte remainder and the log's
+    /// own line is 64 bytes. The timestamps are the only *attested* clock
+    /// anywhere near a log entry — `integratedTime` sits outside the Merkle
+    /// commitment entirely — which is why a monitor's forensics use these and
+    /// nothing else (docs/REKOR-ZONE-KEY.md §5.5).
+    ///
+    /// The signatures themselves are not verified here: this build pins no
+    /// witness keys. A cosignature therefore evidences *who else was looking*
+    /// and roughly *when*, and is never on its own a reason to trust or
+    /// distrust an entry.
+    pub fn cosignatures(&self) -> Vec<Cosignature> {
+        self.signatures
+            .iter()
+            .filter(|(_, blob)| blob.len() == 72)
+            .map(|(name, blob)| Cosignature {
+                name: name.clone(),
+                timestamp: u64::from_be_bytes(blob[..8].try_into().expect("eight bytes")),
+            })
+            .collect()
+    }
+
     /// Verifies that the pinned log key signed this checkpoint.
     fn verify_signature(&self, key: &LogKey) -> Result<(), ProofError> {
         let signed = self
@@ -876,6 +919,15 @@ impl Checkpoint {
             ))),
         }
     }
+}
+
+/// One witness cosignature line on a checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cosignature {
+    /// The witness's name, as its signature line spells it.
+    pub name: String,
+    /// The moment the witness says it saw this tree, seconds since the epoch.
+    pub timestamp: u64,
 }
 
 /// The signature algorithm a pinned log key uses.
