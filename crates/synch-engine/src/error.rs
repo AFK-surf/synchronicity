@@ -22,7 +22,7 @@ pub enum EngineError {
     ///
     /// Blocking work — scanning, hashing, publishing, CAS reads and writes —
     /// runs on tokio's blocking pool rather than on a runtime worker
-    /// ([`crate::blocking`]), and the pool reports only two failures: the
+    /// (the `blocking` module), and the pool reports only two failures: the
     /// closure panicked, or the runtime is shutting down under it. Neither
     /// says anything about the state the operation was midway through, which
     /// is why it is surfaced rather than treated as a no-op.
