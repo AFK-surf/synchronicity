@@ -30,3 +30,8 @@ e2e: csqlite
 # Verify the migration chain replays from scratch.
 migrate-check: csqlite
     gleam run -- migrate-check
+
+# Build the container image CI publishes to ghcr.io (this directory is
+# the build context; nothing here is used from the host).
+image tag="controlplane:dev":
+    docker build -t {{tag}} .

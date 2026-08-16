@@ -87,6 +87,77 @@ for positive, NODATA and NXDOMAIN answers over UDP and TCP, and the
 actual client resolver (`crates/synch-net`) must validate and parse the
 member set over DoH — rotation windows, revocations and all.
 
+## Container image
+
+`ghcr.io/afk-surf/synchronicity/control-plane`, built from
+[`Dockerfile`](Dockerfile) by
+[`.github/workflows/control-plane-image.yml`](../.github/workflows/control-plane-image.yml)
+for `linux/amd64` and `linux/arm64`. `latest` follows `main`; tagged
+releases get `X.Y.Z` and `X.Y`; every build is also tagged
+`sha-<commit>` and carries signed build provenance
+(`gh attestation verify oci://…` / `cosign verify-attestation`).
+
+The image contains what the systemd deployment does — the Erlang
+shipment, `priv/csqlite`, and the built SPA in `priv/web` — and runs the
+primary and the replica alike: `CP_ROLE` picks, and every other setting
+is the same `CP_*` environment described below. It runs as uid/gid
+10001, and the entrypoint takes the service's subcommands, so `keygen`,
+`ds`, `rekor-publish`, `tuf-refresh`, `seed-admin` and `migrate-check`
+work the same way `serve` does.
+
+```sh
+# The zone key, generated once and kept outside the database's directory
+# (the csqlite sandbox grants that directory — see Configuration).
+docker run --rm -v cp-keys:/etc/synch-controlplane \
+  ghcr.io/afk-surf/synchronicity/control-plane \
+  keygen sync.example /etc/synch-controlplane/csk.key
+
+docker run -d --name cp \
+  -e CP_ROLE=primary \
+  -e CP_BASE_DOMAIN=sync.example \
+  -e CP_KEY_FILE=/etc/synch-controlplane/csk.key \
+  -e CP_SESSION_SECRET="$(openssl rand -hex 32)" \
+  -e CP_NS_HOSTS='ns1=192.0.2.1;ns2=192.0.2.53' \
+  -e CP_PUBLIC_URL=https://sync.example \
+  -v cp-keys:/etc/synch-controlplane \
+  -v cp-data:/var/lib/synch-controlplane \
+  -p 8080:8080 -p 53:53/udp -p 53:53/tcp \
+  ghcr.io/afk-surf/synchronicity/control-plane
+```
+
+- **Volumes.** `/var/lib/synch-controlplane` holds the database at
+  `/var/lib/synch-controlplane/db/cp.db` — the image's only default,
+  `CP_DB_PATH`, and a path rather than a policy. The zone key belongs on
+  a *separate* mount (`/etc/synch-controlplane` above): a csqlite worker
+  sandboxes itself to the database's own directory, so anything else
+  living there is inside the sandbox. Replicas mount the database
+  read-write (SQLite needs it) and must leave `CP_KEY_FILE` unset —
+  they hold no key material. Replication stays external and
+  operator-owned; the atomic-rename contract in `ops/RUNBOOK.md` is
+  unchanged by containers, and litestream sees the same file.
+- **Ports.** 8080/tcp (dashboard, API, DoH) and 53 on UDP and TCP.
+  Binding 53 as a non-root user works under Docker, which sets
+  `net.ipv4.ip_unprivileged_port_start=0` in the container's network
+  namespace. On a runtime that does not (Kubernetes), either set that
+  sysctl or move `CP_DNS_LISTEN` to a high port and map 53 to it.
+- **The sandbox needs the host's cooperation.** Each csqlite worker
+  still applies its seccomp allowlist and rlimits, but Landlock needs a
+  kernel that has it enabled and a container seccomp profile that
+  permits the `landlock_*` syscalls (Docker's default profile does).
+  Where it is missing the worker warns on stderr —
+  `csqlite: landlock unsupported here; filesystem unconfined` — and
+  keeps serving; treat that line as a deployment defect, not noise.
+- **Health.** `HEALTHCHECK` polls `/healthz`, which reports the served
+  SOA serial and signature expiry — on a replica that is how a stalled
+  restore loop shows up. It probes port 8080; if `CP_HTTP_LISTEN` moves,
+  set `CP_HEALTHCHECK_PORT` to match.
+
+To build it locally, from the repository root:
+
+```sh
+docker build -t controlplane control-plane
+```
+
 ## Configuration
 
 The service reads only `CP_*` environment variables. Missing required

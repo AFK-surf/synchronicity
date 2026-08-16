@@ -1,0 +1,91 @@
+name: control-plane image
+
+# Builds control-plane/Dockerfile and publishes it to GHCR as
+# ghcr.io/<owner>/synchronicity/control-plane. Pull requests build both
+# architectures but push nothing — the Dockerfile is validated on the PR
+# that changes it, and only main and tags produce images.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - 'control-plane/**'
+      - '.github/workflows/control-plane-image.yml'
+  pull_request:
+    paths:
+      - 'control-plane/**'
+      - '.github/workflows/control-plane-image.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/control-plane
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # Signed build provenance for the pushed image.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 is emulated, but the expensive stages (npm, the Gleam
+      # compile) are pinned to the build platform in the Dockerfile, so
+      # only the csqlite C build and the runtime apt install run under
+      # QEMU.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=synchronicity control plane
+            org.opencontainers.image.description=Authoritative DNSSEC-signed membership zones + dashboard for synchronicity
+            org.opencontainers.image.licenses=MIT
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: control-plane
+          file: control-plane/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

@@ -1,0 +1,13 @@
+# Everything the image builds for itself, plus what it never needs.
+build/
+priv/
+web/node_modules/
+web/dist/
+e2e/
+test/
+ops/
+Dockerfile
+.dockerignore
+.git/
+erl_crash.dump
+*.md
