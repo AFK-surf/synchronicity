@@ -10,7 +10,7 @@
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use ring::signature;
 use synch_net::{
-    chain::{self, SigWindow},
+    chain,
     rekor::{p256_spki, sha256, HashedRekordBody, ZONE_KEY_ALGORITHM, ZONE_KEY_FLAGS},
     x509::same_dns_name,
     zonecert::Succession,
@@ -125,18 +125,18 @@ impl Finding {
 
 /// Classifies one entry body.
 ///
-/// `witness_time` is the moment the checkpoint's witnesses attested to, when
-/// there is one. It is used for exactly one thing: noting that a chain's
-/// signatures were already outside their validity window when the world last
-/// saw this tree. That is a **sub-reason on a tier B finding**, never a
-/// demotion to tier C — the monitor's chain rule has to stay no stricter than
-/// the client's, or the silent bin becomes an evasion (see the crate docs).
+/// No clock is consulted, and none is available to consult: `integratedTime`
+/// sits outside the Merkle commitment and is therefore attacker-supplied, and
+/// nothing else near an entry carries an attested time. So a chain is judged
+/// purely on whether it validates, never on when it was signed — which is the
+/// same rule the client applies, and has to be: the monitor's chain rule can
+/// never be stricter than the client's, or the silent bin becomes an evasion
+/// (see the crate docs).
 pub fn classify(
     body: &HashedRekordBody,
     log_index: u64,
     known: &KnownKeys,
     anchors: &TrustAnchors,
-    witness_time: Option<u64>,
 ) -> Option<Finding> {
     let apex = body.certificate.single_dns_name().ok()?.to_string();
     // Only the P-256 keys this design logs are classifiable at all; anything
@@ -171,13 +171,9 @@ pub fn classify(
         }
     };
     finding.reasons.push(format!(
-        "DNSSEC chain valid to {} ({} signatures)",
-        valid.anchor_zone,
-        valid.windows.len()
+        "DNSSEC chain valid to {} ({} link(s))",
+        valid.anchor_zone, valid.links
     ));
-    if let Some(note) = stale_at(&valid.windows, witness_time) {
-        finding.reasons.push(note);
-    }
 
     // The chain holds. The only remaining question is whether the operator's
     // previous key vouched for this one.
@@ -242,21 +238,6 @@ fn check_succession(
         .map_err(|_| "the succession countersignature does not verify".to_string())
 }
 
-/// A note when the chain's signatures did not cover the moment the log's
-/// witnesses last attested to. Informational, and deliberately so.
-fn stale_at(windows: &[SigWindow], witness_time: Option<u64>) -> Option<String> {
-    let at = witness_time?;
-    let stale = windows.iter().filter(|w| !w.covers(at)).count();
-    match stale {
-        0 => None,
-        n => Some(format!(
-            "{n} of {} chain signature(s) were outside their validity window at the \
-             witnesses' timestamp — expected for an archival entry, worth a look for a fresh one",
-            windows.len()
-        )),
-    }
-}
-
 /// The 64-byte P-256 point inside a DER SubjectPublicKeyInfo, if that is what
 /// this is.
 fn zone_key_point(spki: &[u8]) -> Option<&[u8]> {
@@ -297,19 +278,5 @@ mod tests {
         assert!(zone_key_point(&[0u8; 91]).is_none());
         assert!(zone_key_point(&p256_spki(&[7u8; 64])).is_some());
         assert!(zone_key_point(&p256_spki(&[7u8; 64])[..90]).is_none());
-    }
-
-    #[test]
-    fn a_stale_chain_is_a_note_and_never_a_verdict() {
-        let window = SigWindow {
-            zone_index: 0,
-            type_covered: hickory_resolver::proto::rr::RecordType::DS,
-            inception: 100,
-            expiration: 200,
-        };
-        assert!(stale_at(&[window], Some(150)).is_none());
-        assert!(stale_at(&[window], Some(500)).is_some());
-        // With no witness timestamp there is no clock, so there is no note.
-        assert!(stale_at(&[window], None).is_none());
     }
 }

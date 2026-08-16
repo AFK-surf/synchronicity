@@ -39,9 +39,11 @@ covert.
   statement of validity; which key is *currently* authorized remains the DS's
   job. We deliberately attach no client-side checkpoint-freshness rule (§4.4).
 - A log that equivocates (split view) toward a client that never gossips.
-  A monitor detects it — it recomputes the prefix root of every checkpoint it
-  has seen (§5.5) — but a client that only ever reads one zone cannot.
-  Cryptographic witness verification is future hardening (§8.3).
+  A monitor detects the version of this it can see — a log that shows *this
+  monitor* two histories over time (§5.5) — but a client that only ever reads
+  one zone cannot, and neither can a monitor detect a history shown to
+  *somebody else*. Cross-witnessing would have covered that second case and
+  this design does not implement it (§8.2).
 - Theft of the *previous* key as well as the current one. Succession
   countersignatures are what separate a rotation from a substitution (§2.2);
   an attacker holding both key generations produces a tier A entry, and at
@@ -649,14 +651,17 @@ show. No DNS query anywhere: the threat model has a compromised DNS provider
 in it, so a monitor that asked DNS what the zone's key is would be asking the
 attacker.
 
-**Offline chain validation, at logging time.** The carried chain is validated
-against the IANA root trust anchor with `synch_net::chain` — the same
-validator the client runs, deliberately the same code. Signature *windows*
-are not enforced (§4.2.1); instead the monitor reads the only attested clock
-anywhere near the entry, the **witness cosignature timestamps** on the
-checkpoint (C2SP `cosignature/v1`: `4-byte key hint ‖ 8-byte big-endian unix
-time ‖ 64-byte Ed25519 signature`), and notes when a chain's signatures did
-not cover that moment. That is a flag on a finding, never a verdict.
+**Offline chain validation.** The carried chain is validated against the IANA
+root trust anchor with `synch_net::chain` — the same validator the client
+runs, deliberately the same code. Signature *windows* are not enforced
+(§4.2.1), and the monitor has **no clock at all** to enforce them against: an
+entry's `integratedTime` sits outside the Merkle commitment and is therefore
+attacker-supplied, so the only signed time anywhere near a leaf was the
+checkpoint's witness cosignatures, and this design no longer interprets those.
+An entry whose RRSIGs expired years ago classifies exactly like one signed
+this morning — asserted directly, reasons and all. What is lost is forensic
+detail ("this chain had already expired when the world last saw this tree"),
+not security: neither side ever consulted a clock to reach a verdict.
 
 **Three tiers.**
 
@@ -689,14 +694,24 @@ Only **tier A** findings become trusted predecessors in the monitor's state.
 Promoting tier B would hand an attacker a foothold: their first substituted
 key would become the known predecessor that makes their second look routine.
 
-**Split-view resistance.** The persisted checkpoint plus the recomputed prefix
-root catches a log that shows this monitor two histories. `--min-witnesses`
-additionally refuses to proceed unless the checkpoint carries at least *N*
-witness cosignatures; this build pins no witness keys, so that count is
-structural rather than cryptographic, and the honest strength of it is stated
-in the code. The real independence comes from the operator running a second,
-differently-homed monitor — which anybody can do, because entries name the
-apex in public.
+**Split-view resistance, and its exact limit.** The monitor persists the last
+checkpoint it accepted and requires every later tree to be **consistent** with
+it: the old root is recomputed from the new tree's tiles, which is precisely
+what an RFC 6962 consistency proof asserts, obtained directly instead of asked
+for. That catches a log which shows *this monitor* two histories over time,
+and it is the strongest thing a single monitor can do alone.
+
+It does **not** catch a log that has shown a *different* monitor a different
+history. Detecting that needs the views compared across parties —
+cross-witnessing, which this design does not implement (§8.2) and which the
+checkpoint's own witness cosignature lines would have been the raw material
+for. The parser tolerates those lines because real checkpoints carry them;
+nothing reads them.
+
+What is left in their place is cheap and real: entries name the apex in
+public, so anyone can run a monitor. An operator who wants independence runs a
+second one, differently homed, and compares. That is a procedure rather than a
+protocol, and it is stated as one.
 
 Exit codes are the interface an alerting rule reads: `0` nothing new, `10`
 tier A only, `20` tier C present, `30` tier B present, `2` the run could not
@@ -812,6 +827,23 @@ reach.
   contents are already signed by the (logged) key.
 - **Per-network proof records** — duplicates the proof once per network for a
   zone-scoped fact.
+- **Interpreting the checkpoint's witness cosignatures** — a deliberate
+  non-goal, not deferred hardening. Sigstore's checkpoints carry cosignature
+  lines from independent witnesses, and an earlier build read them for two
+  things: counting attestations (`--min-witnesses`) and taking their
+  timestamps as an attested clock for chain-staleness notes. Both are gone.
+  Counting lines is not verification — this design pins no witness keys, so
+  the count was structural and a log free to invent lines could satisfy it.
+  And the staleness note it fed was forensic detail on a tier B finding that
+  never changed a verdict, so it bought a whole clock-handling surface for
+  something no decision depended on. Doing this *properly* means pinning
+  witness keys, verifying their signatures, and defining an N-of-M policy —
+  a real feature with a real trust-distribution question behind it, not a
+  refinement of what was here. Until someone does that, the honest position
+  is that this design has no third-party attestation and says so (§5.5).
+  **The checkpoint parser still tolerates the lines**, because a real
+  checkpoint carries four signatures and rejecting them would reject every
+  checkpoint the production log serves.
 
 ### 8.3 Future work
 
@@ -825,14 +857,15 @@ unique" is not what an allocation is for. Doing this is a format change and
 should ride a proof-version bump, so it is worth batching with any other
 breaking change rather than done alone.
 
-Cryptographic witness verification (this build counts cosignature lines and
-reads their timestamps but pins no witness keys, so `--min-witnesses` is a
-structural check); an in-client TUF root for log-key rotation (designed in
-§10, and now shipped); logging device-key membership *sets* (a much chattier,
-much larger design); `retire`-entry enforcement as a soft revocation signal;
-and a monitor that also fetches the zone's *served* proof records and diffs
-them against what the log holds, which would catch a control plane serving a
-proof it never logged.
+An in-client TUF root for log-key rotation (designed in §10, and now
+shipped); logging device-key membership *sets* (a much chattier, much larger
+design); `retire`-entry enforcement as a soft revocation signal; and a monitor
+that also fetches the zone's *served* proof records and diffs them against
+what the log holds, which would catch a control plane serving a proof it never
+logged.
+
+Witness cosignatures are **not** on this list. See §8.2 — they are a
+non-goal, not deferred work.
 
 ## 9. Testing
 
@@ -847,7 +880,7 @@ interoperation but cannot be made to misbehave on demand.
   **total**: the real `rekor::verify` runs to a successful `VerifiedRecord`
   over it. The leaf, the RFC 6962 inclusion walk through a real tree of
   67.7 M entries, the checkpoint under the *embedded* Sigstore key, three
-  witness cosignatures with decodable timestamps, the body's tags, the
+  the body's tags, the
   certificate, its single SAN, possession, the statement-digest link, the
   Statement's byte-exact round trip through this build's renderer, and the
   carried DNSSEC chain. With teeth: the same proof offered for a different

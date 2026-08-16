@@ -22,21 +22,23 @@
 //! and the apex's DS actually covers the key being validated.
 //!
 //! **Not checked: RRSIG validity windows.** Two independent reasons, and both
-//! matter. First, there is no trustworthy clock in the input — a Rekor leaf
-//! commits to `data` and `signature` and nothing else, so `integratedTime` is
-//! attacker-supplied metadata outside the Merkle commitment and can never be
-//! a security input. Second, RRSIGs expire in weeks while log entries are
-//! read for years; a window check would reject legitimate archival entries
-//! and force a republish on every zone re-sign. Nothing is lost: the chain is
-//! bound to the key *by content*, so replaying somebody else's old chain
-//! gains an attacker nothing (it does not cover their key), and a client
-//! independently requires a live DS through native DNSSEC validation before
-//! it ever reaches this code.
+//! matter. First, there is no trustworthy clock in the input at all — a Rekor
+//! leaf commits to `data` and `signature` and nothing else, so
+//! `integratedTime` is attacker-supplied metadata outside the Merkle
+//! commitment and can never be a security input. Second, RRSIGs expire in
+//! weeks while log entries are read for years; a window check would reject
+//! legitimate archival entries and force a republish on every zone re-sign.
+//! Nothing is lost: the chain is bound to the key *by content*, so replaying
+//! somebody else's old chain gains an attacker nothing (it does not cover
+//! their key), and a client independently requires a live DS through native
+//! DNSSEC validation before it ever reaches this code.
 //!
-//! The windows are still *reported*, in [`ValidChain::windows`], because a
-//! monitor doing forensics wants to say "this chain was already expired when
-//! the log's witnesses timestamped the entry". That is a flag on a tier B
-//! finding, never a demotion to tier C.
+//! The windows are not reported either. An earlier version handed them to the
+//! monitor so it could note "this chain had already expired when the log's
+//! witnesses timestamped the entry", but that reading needed a signed clock
+//! and this design no longer interprets one, so the record had no consumer
+//! left. Inception and expiration are still *verified as part of the RRSIG*
+//! by hickory, exactly as before — what is gone is only the bookkeeping.
 
 use hickory_resolver::proto::{
     dnssec::{
@@ -75,41 +77,14 @@ pub enum ChainError {
     KeyNotCovered(String),
 }
 
-/// One RRSIG's validity window, kept for a monitor's forensics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SigWindow {
-    /// The RRset's owner zone.
-    pub zone_index: usize,
-    /// The type the signature covers.
-    pub type_covered: RecordType,
-    /// `sig_inception`, seconds since the epoch.
-    pub inception: u32,
-    /// `sig_expiration`, seconds since the epoch.
-    pub expiration: u32,
-}
-
-impl SigWindow {
-    /// Whether `at` falls inside the window, with the wrap-around arithmetic
-    /// RFC 4034 §3.1.5 specifies for 32-bit DNSSEC times.
-    pub fn covers(&self, at: u64) -> bool {
-        let now = at as u32;
-        serial_le(self.inception, now) && serial_le(now, self.expiration)
-    }
-}
-
-/// Serial-number ordering (RFC 1982): `a <= b` in the 32-bit circle.
-fn serial_le(a: u32, b: u32) -> bool {
-    b.wrapping_sub(a) < 0x8000_0000
-}
-
 /// What a valid chain establishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidChain {
     /// The zone the chain terminated at — the trust anchor it reached.
     pub anchor_zone: String,
-    /// Every RRSIG window the walk verified, in walk order. Purely
-    /// informational: nothing in this module compares them to a clock.
-    pub windows: Vec<SigWindow>,
+    /// How many links the walk verified, apex first. Descriptive only:
+    /// a caller reporting a finding wants to say how far the chain reached.
+    pub links: usize,
     /// Whether the apex link proved the key with a DS from its parent (the
     /// ordinary case) or the key *is* the anchored key (only reachable under
     /// an explicit trust-anchor override, where the apex is the anchor).
@@ -157,23 +132,23 @@ pub fn validate(
         }
     }
 
-    let mut windows = Vec::new();
+    let links = parsed.len();
     let top = parsed.last().expect("non-empty");
     // The top link anchors the chain: one of its DNSKEYs is a key this
     // reader already trusts, and that key signed the DNSKEY RRset it is in.
-    let mut trusted = verify_dnskey_set(top, parsed.len() - 1, anchors, &mut windows)?;
+    let mut trusted = verify_dnskey_set(top, anchors)?;
     let anchor_zone = top.zone.to_string();
 
     // Descend: every link below the top proves its own DNSKEY set with a DS
     // its parent signed, until the apex, whose DS must cover the key at hand.
     for index in (0..parsed.len() - 1).rev() {
         let link = &parsed[index];
-        let ds = verify_ds_set(link, index, trusted, &mut windows)?;
+        let ds = verify_ds_set(link, trusted)?;
         if index == 0 {
             return match covers(ds, &link.zone, dnskey_rdata) {
                 true => Ok(ValidChain {
                     anchor_zone,
-                    windows,
+                    links,
                     anchored_directly: false,
                 }),
                 false => Err(ChainError::KeyNotCovered(format!(
@@ -183,7 +158,7 @@ pub fn validate(
                 ))),
             };
         }
-        trusted = verify_dnskey_set_under(link, index, ds, &mut windows)?;
+        trusted = verify_dnskey_set_under(link, ds)?;
     }
 
     // A one-link chain: the apex *is* the anchored zone. Only reachable under
@@ -195,7 +170,7 @@ pub fn validate(
     match trusted.iter().any(|key| rdata_of(key) == dnskey_rdata) {
         true => Ok(ValidChain {
             anchor_zone,
-            windows,
+            links,
             anchored_directly: true,
         }),
         false => Err(ChainError::KeyNotCovered(format!(
@@ -285,9 +260,7 @@ pub fn dnskey_rdata(key: &DNSKEY) -> Vec<u8> {
 /// The top link: a DNSKEY RRset self-signed by a key the reader anchors.
 fn verify_dnskey_set<'a>(
     link: &'a ParsedLink,
-    index: usize,
     anchors: &TrustAnchors,
-    windows: &mut Vec<SigWindow>,
 ) -> Result<&'a [Record], ChainError> {
     if link.dnskeys.is_empty() {
         return Err(ChainError::Anchor(format!(
@@ -311,12 +284,10 @@ fn verify_dnskey_set<'a>(
     }
     verify_rrset(
         link,
-        index,
         RecordType::DNSKEY,
         &link.dnskeys,
         &link.dnskey_sigs,
         anchored.into_iter().cloned().collect::<Vec<_>>().as_slice(),
-        windows,
     )?;
     Ok(&link.dnskeys)
 }
@@ -324,9 +295,7 @@ fn verify_dnskey_set<'a>(
 /// A descendant link's DNSKEY RRset, proved by a DS its parent signed.
 fn verify_dnskey_set_under<'a>(
     link: &'a ParsedLink,
-    index: usize,
     ds: &[Record],
-    windows: &mut Vec<SigWindow>,
 ) -> Result<&'a [Record], ChainError> {
     let matching: Vec<Record> = link
         .dnskeys
@@ -342,12 +311,10 @@ fn verify_dnskey_set_under<'a>(
     }
     verify_rrset(
         link,
-        index,
         RecordType::DNSKEY,
         &link.dnskeys,
         &link.dnskey_sigs,
         &matching,
-        windows,
     )?;
     Ok(&link.dnskeys)
 }
@@ -355,9 +322,7 @@ fn verify_dnskey_set_under<'a>(
 /// A link's DS RRset, proved by the already-trusted parent DNSKEY set.
 fn verify_ds_set<'a>(
     link: &'a ParsedLink,
-    index: usize,
     parent_keys: &[Record],
-    windows: &mut Vec<SigWindow>,
 ) -> Result<&'a [Record], ChainError> {
     if link.ds.is_empty() {
         return Err(ChainError::Structure(format!(
@@ -365,15 +330,7 @@ fn verify_ds_set<'a>(
             link.zone
         )));
     }
-    verify_rrset(
-        link,
-        index,
-        RecordType::DS,
-        &link.ds,
-        &link.ds_sigs,
-        parent_keys,
-        windows,
-    )?;
+    verify_rrset(link, RecordType::DS, &link.ds, &link.ds_sigs, parent_keys)?;
     Ok(&link.ds)
 }
 
@@ -387,12 +344,10 @@ fn verify_ds_set<'a>(
 /// repository for the two to disagree about.
 fn verify_rrset(
     link: &ParsedLink,
-    index: usize,
     type_covered: RecordType,
     rrset: &[Record],
     sigs: &[RRSIG],
     keys: &[Record],
-    windows: &mut Vec<SigWindow>,
 ) -> Result<(), ChainError> {
     for sig in sigs {
         if sig.input().type_covered != type_covered {
@@ -409,12 +364,6 @@ fn verify_rrset(
                 .verify_rrsig(&link.zone, DNSClass::IN, sig, rrset.iter())
                 .is_ok()
             {
-                windows.push(SigWindow {
-                    zone_index: index,
-                    type_covered,
-                    inception: sig.input().sig_inception.get(),
-                    expiration: sig.input().sig_expiration.get(),
-                });
                 return Ok(());
             }
         }
@@ -540,28 +489,6 @@ mod tests {
         let mut other = rdata.clone();
         other[10] ^= 0x01;
         assert_ne!(key_tag(&rdata), key_tag(&other));
-    }
-
-    #[test]
-    fn signature_windows_use_serial_arithmetic() {
-        let window = SigWindow {
-            zone_index: 0,
-            type_covered: RecordType::DS,
-            inception: 1_000,
-            expiration: 2_000,
-        };
-        assert!(window.covers(1_500));
-        assert!(!window.covers(999));
-        assert!(!window.covers(2_001));
-        // A window that straddles the 2106 wrap is still a window.
-        let wrapped = SigWindow {
-            inception: u32::MAX - 10,
-            expiration: 10,
-            ..window
-        };
-        assert!(wrapped.covers(u64::from(u32::MAX)));
-        assert!(wrapped.covers(5));
-        assert!(!wrapped.covers(1_000));
     }
 
     #[test]

@@ -44,21 +44,17 @@ fn a_real_delegation_validates_against_the_icann_anchor() {
         .expect("a real delegation must validate");
     assert_eq!(valid.anchor_zone, ".");
     assert!(!valid.anchored_directly);
-    // One RRSIG per RRset the walk needed: root DNSKEY, com DS, com DNSKEY,
+    // Four links' worth of walk: root DNSKEY, com DS, com DNSKEY,
     // cloudflare.com DS.
-    assert_eq!(valid.windows.len(), 4);
+    assert_eq!(valid.links, 3);
     // The archival property, asserted without depending on how old the
-    // fixture happens to be today: at a moment outside every window this
-    // chain still validates, because the validator never consults a clock.
-    // (The windows are reported, for a monitor's forensics, and that is all.)
-    let long_after = valid
-        .windows
-        .iter()
-        .map(|w| u64::from(w.expiration))
-        .max()
-        .expect("windows")
-        + 365 * 86_400;
-    assert!(valid.windows.iter().all(|w| !w.covers(long_after)));
+    // fixture happens to be today: every RRSIG in it has an expiration, and
+    // the chain validates just the same at a moment past all of them, because
+    // the validator never consults a clock.
+    let expirations = rrsig_expirations(&chain);
+    assert_eq!(expirations.len(), 4);
+    let long_after = expirations.iter().max().expect("expirations") + 365 * 86_400;
+    assert!(expirations.iter().all(|&e| e < long_after));
     chain::validate(&chain, "cloudflare.com.", &dnskey, &anchors)
         .expect("an expired chain still validates: that is the point");
 
@@ -179,4 +175,31 @@ fn a_link_cannot_smuggle_another_zones_records() {
         chain::validate(&relabelled, "cloudflare.com.", &dnskey, &anchors),
         Err(ChainError::Structure(_))
     ));
+}
+
+/// Every RRSIG expiration in a chain, decoded here rather than reported by
+/// the validator.
+///
+/// The validator deliberately keeps no record of validity windows — it has no
+/// clock to compare them against, and nothing consumes them (see
+/// `chain`'s module docs). But a test claiming "this chain is expired and
+/// still validates" has to prove the first half, or it passes vacuously. So
+/// the test decodes the windows itself, out of the same bytes.
+fn rrsig_expirations(chain: &DnssecChain) -> Vec<u64> {
+    use hickory_resolver::proto::{
+        dnssec::rdata::DNSSECRData,
+        rr::{RData, Record},
+        serialize::binary::{BinDecodable, BinDecoder},
+    };
+    let mut out = Vec::new();
+    for link in &chain.links {
+        let mut decoder = BinDecoder::new(&link.rrs);
+        while decoder.peek().is_some() {
+            let record = Record::read(&mut decoder).expect("a well-formed link");
+            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = record.data {
+                out.push(u64::from(sig.input().sig_expiration.get()));
+            }
+        }
+    }
+    out
 }

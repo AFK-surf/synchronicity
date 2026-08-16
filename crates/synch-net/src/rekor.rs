@@ -817,6 +817,14 @@ pub struct Checkpoint {
     signed: Vec<u8>,
     /// `(name, signature)` per signature line; the four-byte key hint is a
     /// selector, never a credential, so it is dropped here.
+    ///
+    /// **This is a list, and it must stay one.** A real Sigstore checkpoint
+    /// carries the log's own signature *plus* a line per witness that
+    /// cosigned the tree — the checked-in fixtures have four. This design
+    /// does not interpret those lines in any way, but it has to tolerate
+    /// them: narrowing the parser to a single signature would reject every
+    /// checkpoint the production log actually serves. Verification scans the
+    /// list for one that a pinned key signed and ignores the rest.
     signatures: Vec<(String, Vec<u8>)>,
 }
 
@@ -889,32 +897,11 @@ impl Checkpoint {
         }
     }
 
-    /// The witness cosignatures beside the log's own signature.
-    ///
-    /// C2SP `cosignature/v1` blobs are `4-byte key hint || 8-byte big-endian
-    /// unix timestamp || 64-byte Ed25519 signature`; the hint is stripped at
-    /// parse, so a cosignature line is the 72-byte remainder and the log's
-    /// own line is 64 bytes. The timestamps are the only *attested* clock
-    /// anywhere near a log entry — `integratedTime` sits outside the Merkle
-    /// commitment entirely — which is why a monitor's forensics use these and
-    /// nothing else (docs/REKOR-ZONE-KEY.md §5.5).
-    ///
-    /// The signatures themselves are not verified here: this build pins no
-    /// witness keys. A cosignature therefore evidences *who else was looking*
-    /// and roughly *when*, and is never on its own a reason to trust or
-    /// distrust an entry.
-    pub fn cosignatures(&self) -> Vec<Cosignature> {
-        self.signatures
-            .iter()
-            .filter(|(_, blob)| blob.len() == 72)
-            .map(|(name, blob)| Cosignature {
-                name: name.clone(),
-                timestamp: u64::from_be_bytes(blob[..8].try_into().expect("eight bytes")),
-            })
-            .collect()
-    }
-
     /// Verifies that the pinned log key signed this checkpoint.
+    ///
+    /// Scans every signature line, because the log's own is one among
+    /// several: witnesses cosign the same note and their lines sit beside it.
+    /// A line that verifies under no pinned key is simply not ours.
     fn verify_signature(&self, key: &LogKey) -> Result<(), ProofError> {
         let signed = self
             .signatures
@@ -928,15 +915,6 @@ impl Checkpoint {
             ))),
         }
     }
-}
-
-/// One witness cosignature line on a checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cosignature {
-    /// The witness's name, as its signature line spells it.
-    pub name: String,
-    /// The moment the witness says it saw this tree, seconds since the epoch.
-    pub timestamp: u64,
 }
 
 /// The signature algorithm a pinned log key uses.
@@ -1519,9 +1497,14 @@ mod tests {
         // root, blank line, `— name base64(keyhint||sig)`), the em-dash
         // signature line, the four-byte key-hint prefix, and the Ed25519
         // signature over the note body up to and including its final
-        // newline. (The witness cosignature lines in the same checkpoint are
-        // parsed and simply not matched by our pin — `verify_signature`
-        // needs only one line to verify, which is the log's own.)
+        // newline.
+        //
+        // It is also the regression test for the *shape* of that parse: a
+        // real checkpoint carries four signature lines, the log's own plus
+        // three witness cosignatures. This design interprets cosignatures not
+        // at all (§8.2), but narrowing the parser to a single signature would
+        // reject every checkpoint the production log serves. `verify_signature`
+        // scans the list and needs exactly one line to match a pinned key.
         //
         // This anchors the checkpoint and log-key machinery to reality; the
         // Merkle *leaf* convention is anchored separately by the
@@ -1531,6 +1514,12 @@ mod tests {
         let checkpoint = Checkpoint::parse(note).expect("a real checkpoint must parse");
         assert_eq!(checkpoint.origin, "log2025-1.rekor.sigstore.dev");
         assert!(checkpoint.tree_size > 0);
+        assert_eq!(
+            checkpoint.signatures.len(),
+            4,
+            "a real checkpoint carries the log's signature and three witness \
+             cosignatures; a parser that tolerates only one would reject it"
+        );
 
         let embedded = LogKeys::embedded();
         let verified = embedded

@@ -50,7 +50,7 @@ fn client_accepts(proof: &RekorProof, zone: &SimZone, log: &SimLog) -> bool {
 /// What would a monitor call it? The real classifier, no re-implementation.
 fn monitor_tier(proof: &RekorProof, zone: &SimZone, known: &KnownKeys) -> Tier {
     let body = HashedRekordBody::parse(&proof.canonicalized_body).expect("a well-formed body");
-    classify(&body, proof.log_index, known, &anchors(zone), None)
+    classify(&body, proof.log_index, known, &anchors(zone))
         .expect("a zone-key certificate is classifiable")
         .tier
 }
@@ -269,7 +269,7 @@ fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
     let mut log = SimLog::new("rekor.sim");
     let proof = log.publish(&zone, "create", None);
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-    let finding = classify(&body, 7, &KnownKeys::default(), &anchors(&zone), None).unwrap();
+    let finding = classify(&body, 7, &KnownKeys::default(), &anchors(&zone)).unwrap();
 
     // The same key tag and DS the zone itself would publish, arrived at with
     // no DNS query — which is the only reason a compromised provider cannot
@@ -283,40 +283,43 @@ fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
         .starts_with("[B] index 7 apex cluster.example"));
 }
 
-/// The witness clock is a note on a finding, never a verdict.
+/// A long-expired chain classifies exactly like a fresh one.
+///
+/// This is what is left of the old staleness note, and it is the half worth
+/// keeping: the monitor consults **no clock at all** now, so an entry whose
+/// RRSIGs expired years ago lands in the same tier as one signed this
+/// morning. It has to. The client does not check windows either (there is no
+/// attested time anywhere near a leaf, and archival entries are read for
+/// years), so a monitor that quietly demoted an expired chain would put a
+/// client-acceptable entry in the silent bin — the exact evasion the
+/// invariant forbids.
 #[test]
-fn a_stale_chain_is_flagged_without_changing_the_tier() {
+fn a_long_expired_chain_classifies_the_same_as_a_fresh_one() {
     let zone = SimZone::new("cluster.example", members());
-    let mut log = SimLog::new("rekor.sim");
-    let ancient = time::OffsetDateTime::now_utc() - time::Duration::days(900);
     let statement = zone.zone_key_statement("create", None);
-    let certificate = zone.certificate(&[(
-        OID_DNSSEC_CHAIN.to_vec(),
-        zone.dnssec_chain_at(ancient).encode(),
-    )]);
-    let proof = log.log_certified(&zone, &statement, &certificate);
-    let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let flagged = classify(&body, 0, &KnownKeys::default(), &anchors(&zone), Some(now)).unwrap();
-    assert_eq!(flagged.tier, Tier::B);
+    let classify_chain = |chain: Vec<u8>| {
+        let mut log = SimLog::new("rekor.sim");
+        let certificate = zone.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), chain)]);
+        let proof = log.log_certified(&zone, &statement, &certificate);
+        let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
+        classify(&body, 0, &KnownKeys::default(), &anchors(&zone)).unwrap()
+    };
+
+    let ancient = time::OffsetDateTime::now_utc() - time::Duration::days(900);
+    let expired = classify_chain(zone.dnssec_chain_at(ancient).encode());
+    let fresh = classify_chain(zone.dnssec_chain().encode());
+
+    assert_eq!(expired.tier, Tier::B);
+    assert_eq!(expired.tier, fresh.tier);
+    // Not merely the same tier — the same reasons, because nothing in the
+    // classifier looks at time at all.
+    assert_eq!(expired.reasons, fresh.reasons);
     assert!(
-        flagged
-            .reasons
-            .iter()
-            .any(|r| r.contains("outside their validity window")),
+        expired.reasons.iter().any(|r| r.contains("chain valid")),
         "{:?}",
-        flagged.reasons
+        expired.reasons
     );
-
-    // With no witness timestamp there is no clock, so there is no note — and
-    // the tier is the same either way, which is the property that matters.
-    let unflagged = classify(&body, 0, &KnownKeys::default(), &anchors(&zone), None).unwrap();
-    assert_eq!(unflagged.tier, flagged.tier);
-    assert_eq!(unflagged.reasons.len(), flagged.reasons.len() - 1);
 }
 
 /// A succession extension the certificate carries but that does not decode

@@ -48,7 +48,7 @@ fn the_real_published_entry_classifies_tier_b() {
         .expect("a real entry body must parse");
     let (_dir, anchors) = anchors();
 
-    let finding = classify(&body, LOG_INDEX, &KnownKeys::default(), &anchors, None)
+    let finding = classify(&body, LOG_INDEX, &KnownKeys::default(), &anchors)
         .expect("an entry with a P-256 key and a SAN is classifiable");
 
     assert_eq!(finding.tier, Tier::B, "{}", finding.line());
@@ -103,7 +103,7 @@ fn the_same_entry_is_tier_a_once_its_predecessor_is_known() {
     let mut known = KnownKeys::default();
     known.insert(APEX, &succession.predecessor_spki);
 
-    let finding = classify(&body, LOG_INDEX, &known, &anchors, None).expect("classifiable");
+    let finding = classify(&body, LOG_INDEX, &known, &anchors).expect("classifiable");
     assert_eq!(finding.tier, Tier::A, "{}", finding.line());
     assert_eq!(finding.predecessor_key_tag, Some(56306));
 }
@@ -114,7 +114,7 @@ fn the_same_entry_is_tier_a_once_its_predecessor_is_known() {
 fn the_real_entry_is_never_in_the_silent_bin() {
     let body = HashedRekordBody::parse(&fixture("canonicalized_body.json")).unwrap();
     let (_dir, anchors) = anchors();
-    let finding = classify(&body, LOG_INDEX, &KnownKeys::default(), &anchors, None).unwrap();
+    let finding = classify(&body, LOG_INDEX, &KnownKeys::default(), &anchors).unwrap();
     assert_ne!(
         finding.tier,
         Tier::C,

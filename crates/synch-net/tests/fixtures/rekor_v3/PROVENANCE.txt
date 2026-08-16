@@ -4,8 +4,8 @@ complete, and verifiable end to end.
 Published 2026-08-16 to https://log2025-1.rekor.sigstore.dev (HTTP 201
 Created, logIndex 67766084) and read back out of the log's own static tiles
 on the same day. Nothing in this repository authored the log's half of any of
-it: not the checkpoint, not the witness cosignatures, not the tree the audit
-path walks.
+it: not the checkpoint, not its signature lines, not the tree the audit path
+walks.
 
   statement.json           470 B  the in-toto Statement, byte-exact — the
                                   DSSE PAE preimage the leaf's digest commits
@@ -16,11 +16,15 @@ path walks.
                                     .x509Certificate.rawBytes.
   canonicalized_body.json 1631 B  the Merkle leaf preimage, verbatim, as the
                                   log returned it.
-  checkpoint.txt           643 B  the signed note at tree size 67 766 085,
-                                  with the log's Ed25519 signature and three
-                                  witness cosignatures (witness.stagemole.eu,
-                                  witness.navigli.sunlight.geomys.org,
-                                  staging.witness.transparency.goog).
+  checkpoint.txt           643 B  the signed note at tree size 67 766 085.
+                                  It carries FOUR signature lines: the log's
+                                  own Ed25519 signature plus three witness
+                                  cosignatures. This design does not interpret
+                                  cosignatures at all, but the parser has to
+                                  tolerate them — narrowing it to a single
+                                  signature would reject every checkpoint the
+                                  production log serves, and this file is the
+                                  regression test for that.
   proof.bin               3050 B  the encoded RekorProof v3 record — the
                                   exact bytes a zone serves at
                                   _synchronicity-rekor.<apex>, carrying 8
@@ -56,8 +60,8 @@ double — runs to a successful VerifiedRecord over these bytes:
 
   - the served proof record decodes through the client's wire reader;
   - the log id matches a key in the *embedded* Sigstore pin set;
-  - the checkpoint verifies under that key, and its three witness
-    cosignatures decode as C2SP cosignature/v1 blobs with sane timestamps;
+  - the checkpoint verifies under that key, with the log's own signature
+    found among the four lines the note carries;
   - the leaf is SHA-256(0x00 || canonicalized_body) and the RFC 6962 walk
     over 8 audit-path hashes reaches the checkpoint's root, in a real tree of
     67.7 million entries;

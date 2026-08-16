@@ -336,10 +336,12 @@ fn an_expired_chain_still_verifies_because_no_clock_is_consulted() {
     verify(&proof, &zone, &log).expect("an entry does not rot");
 
     // The window is genuinely in the past — the test would pass vacuously
-    // otherwise.
+    // otherwise. Decoded here, because the validator keeps no record of
+    // validity windows: it has no clock to compare them against.
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-    let valid = chain::validate(
-        &body.dnssec_chain().unwrap(),
+    let carried = body.dnssec_chain().unwrap();
+    chain::validate(
+        &carried,
         &zone.apex(),
         &zone.dnskey_rdata(),
         &anchors(&zone),
@@ -349,7 +351,9 @@ fn an_expired_chain_still_verifies_because_no_clock_is_consulted() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    assert!(valid.windows.iter().all(|w| !w.covers(now)));
+    let expirations = rrsig_expirations(&carried);
+    assert!(!expirations.is_empty());
+    assert!(expirations.iter().all(|&e| e < now));
 }
 
 /// The countersignature is the one thing a client does *not* check.
@@ -1033,12 +1037,17 @@ mod real_rekor_v3 {
         checkpoint
             .verify_under(&LogKeys::embedded())
             .expect("a real checkpoint verifies under the embedded pin set");
-        // Three witnesses cosigned it, and their timestamps decode as the
-        // C2SP cosignature/v1 blobs a monitor reads its clock from.
-        let cosignatures = checkpoint.cosignatures();
-        assert_eq!(cosignatures.len(), 3, "{cosignatures:?}");
-        assert!(cosignatures.iter().all(|c| c.timestamp > 1_700_000_000));
-
+        // It verifies *among* four signature lines — the log's own plus three
+        // witness cosignatures. Nothing here interprets cosignatures (§8.2),
+        // but the parser must keep tolerating them or every real checkpoint
+        // becomes unparseable.
+        assert_eq!(
+            String::from_utf8_lossy(&v3("checkpoint.txt"))
+                .lines()
+                .filter(|line| line.starts_with('\u{2014}'))
+                .count(),
+            4
+        );
         rekor::verify_inclusion(
             proof.log_index,
             checkpoint.tree_size,
@@ -1171,4 +1180,31 @@ fn the_policy_default_is_require_everywhere() {
         .rekor_policy(),
         RekorPolicy::Off
     );
+}
+
+/// Every RRSIG expiration in a chain, decoded here rather than reported by
+/// the validator.
+///
+/// The validator deliberately keeps no record of validity windows — it has no
+/// clock to compare them against, and nothing consumes them (see
+/// `chain`'s module docs). But a test claiming "this chain is expired and
+/// still validates" has to prove the first half, or it passes vacuously. So
+/// the test decodes the windows itself, out of the same bytes.
+fn rrsig_expirations(chain: &synch_net::zonecert::DnssecChain) -> Vec<u64> {
+    use hickory_resolver::proto::{
+        dnssec::rdata::DNSSECRData,
+        rr::{RData, Record},
+        serialize::binary::{BinDecodable, BinDecoder},
+    };
+    let mut out = Vec::new();
+    for link in &chain.links {
+        let mut decoder = BinDecoder::new(&link.rrs);
+        while decoder.peek().is_some() {
+            let record = Record::read(&mut decoder).expect("a well-formed link");
+            if let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = record.data {
+                out.push(u64::from(sig.input().sig_expiration.get()));
+            }
+        }
+    }
+    out
 }

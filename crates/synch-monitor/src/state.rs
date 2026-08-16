@@ -4,9 +4,13 @@
 //! checkpoint** is what makes split-view detection possible at all: a log that
 //! shows this monitor a tree which does not extend the one it showed last time
 //! has equivocated, and that is the single strongest thing a monitor can
-//! notice. The **known keys** are what separate tier A from tier B — without a
-//! record of which keys the operator has already accepted, every rotation
-//! looks like a first sighting.
+//! notice on its own. Note the scope — *this* monitor, over time. A log that
+//! showed a **different** monitor a different history is invisible from here;
+//! catching that needs either cross-witnessing, which this design does not
+//! implement, or a second monitor run somewhere else and compared by hand.
+//! The **known keys** are what separate tier A from tier B — without a record
+//! of which keys the operator has already accepted, every rotation looks like
+//! a first sighting.
 //!
 //! The file is plain JSON on purpose: an operator has to be able to read it,
 //! seed it by hand for a zone whose history predates the monitor, and check it

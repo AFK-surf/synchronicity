@@ -58,12 +58,6 @@ struct Args {
     #[arg(long)]
     dnssec_anchor: Option<PathBuf>,
 
-    /// Refuse to proceed unless the checkpoint carries at least this many
-    /// witness cosignatures. Structural, not cryptographic: this build pins
-    /// no witness keys, so it counts attestations rather than verifying them.
-    #[arg(long, default_value_t = 0)]
-    min_witnesses: usize,
-
     /// Start here instead of at the persisted index. A fresh monitor for a
     /// log with 10⁸ entries in it wants a starting point that is not zero.
     #[arg(long)]
@@ -120,18 +114,6 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     checkpoint
         .verify_under(&logs)
         .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
-
-    // Witness cosignatures: counted here, and used below as the only clock
-    // anywhere near this entry that anybody attested to.
-    let cosignatures = checkpoint.cosignatures();
-    if cosignatures.len() < args.min_witnesses {
-        return Err(MonitorError::Checkpoint(format!(
-            "{} witness cosignature(s), fewer than the {} required",
-            cosignatures.len(),
-            args.min_witnesses
-        )));
-    }
-    let witness_time = median_timestamp(&cosignatures);
 
     let tree = Tree::new(&source, checkpoint.tree_size);
     if tree
@@ -214,7 +196,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
                 checkpoint.root_hash,
             )
             .map_err(|e| MonitorError::Tile(e.to_string()))?;
-            if let Some(finding) = classify(&parsed, index, &state.known, &anchors, witness_time) {
+            if let Some(finding) = classify(&parsed, index, &state.known, &anchors) {
                 findings.push((finding, parsed.certificate.spki.clone()));
             }
         }
@@ -249,10 +231,9 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
 
     let worst = findings.iter().map(|(f, _)| f.tier).max();
     eprintln!(
-        "synch-monitor: {} entries read to index {end}, {} finding(s), {} witness cosignature(s)",
+        "synch-monitor: {} entries read to index {end}, {} finding(s)",
         end.saturating_sub(args.from_index.unwrap_or(0)),
-        findings.len(),
-        cosignatures.len()
+        findings.len()
     );
     Ok(match worst {
         None => 0,
@@ -260,14 +241,4 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
         Some(Tier::C) => 20,
         Some(Tier::B) => 30,
     })
-}
-
-/// The middle witness timestamp, or nothing when no witness spoke.
-///
-/// The median rather than the newest: one witness with a wrong clock should
-/// not move the monitor's idea of when the world saw this tree.
-fn median_timestamp(cosignatures: &[synch_net::rekor::Cosignature]) -> Option<u64> {
-    let mut times: Vec<u64> = cosignatures.iter().map(|c| c.timestamp).collect();
-    times.sort_unstable();
-    times.get(times.len() / 2).copied()
 }

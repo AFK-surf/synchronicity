@@ -236,7 +236,7 @@ control plane itself with
 
   ```sh
   echo '{"known":{"keys":{"sync.example.dev":[]}}}' > /var/lib/synch-monitor/state.json
-  synch-monitor --state /var/lib/synch-monitor/state.json --min-witnesses 1
+  synch-monitor --state /var/lib/synch-monitor/state.json
   ```
 
   Exit codes: `0` nothing new, `10` routine countersigned rotations only,
