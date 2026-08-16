@@ -114,7 +114,8 @@ pub fn encode(proof: Proof) -> Result(BitArray, String) {
     |> list.try_each(fn(blob) {
       case bit_array.byte_size(blob) <= 65_535 {
         True -> Ok(Nil)
-        False -> Error("a proof field is longer than the format's 16-bit length")
+        False ->
+          Error("a proof field is longer than the format's 16-bit length")
       }
     }),
   )
@@ -232,10 +233,12 @@ pub fn parse_body(
   // because this module's stated job is to refuse anything the client would:
   // a body this side stores and the client rejects is the failure the
   // verify-before-store step exists to prevent.
-  use Nil <- result.try(case kind == entry_kind && api_version == entry_api_version {
-    True -> Ok(Nil)
-    False -> Error(Binding("the entry is " <> kind <> " " <> api_version))
-  })
+  use Nil <- result.try(
+    case kind == entry_kind && api_version == entry_api_version {
+      True -> Ok(Nil)
+      False -> Error(Binding("the entry is " <> kind <> " " <> api_version))
+    },
+  )
   use Nil <- result.try(case algorithm == digest_algorithm {
     True -> Ok(Nil)
     False -> Error(Binding("entry digest algorithm " <> algorithm))

@@ -285,13 +285,12 @@ fn fake_resolver() -> chain.Resolver {
     }
     Ok([
       wire.Rr(zone, rtype, wire.class_in, 3600, rdata_of(rtype)),
-      wire.Rr(
-        zone,
-        wire.type_rrsig,
-        wire.class_in,
-        3600,
-        <<rtype:int-size(16), 13:int-size(8), 2:int-size(8), 0:size(512)>>,
-      ),
+      wire.Rr(zone, wire.type_rrsig, wire.class_in, 3600, <<
+        rtype:int-size(16),
+        13:int-size(8),
+        2:int-size(8),
+        0:size(512),
+      >>),
     ])
   })
 }
@@ -389,8 +388,7 @@ pub fn publish_is_idempotent_test() {
   let assert Ok(apex) = name.parse("sync.test.")
   let #(log, spki, point) = fake_log(keys.generate())
 
-  let assert Ok(first) =
-    publish_run(conn, apex, csk, log, #(spki, point), 1000)
+  let assert Ok(first) = publish_run(conn, apex, csk, log, #(spki, point), 1000)
   let assert Ok(second) =
     publish_run(conn, apex, csk, log, #(spki, point), 2000)
   // The second run reused the signature the log already indexed, so Rekor's
@@ -438,8 +436,7 @@ pub fn publish_gate_refuses_an_unlogged_key_test() {
   // With a record in hand the same publish goes through.
   let assert Ok(apex) = name.parse("sync.test.")
   let #(log, spki, point) = fake_log(keys.generate())
-  let assert Ok(_) =
-    publish_run(conn, apex, csk, log, #(spki, point), 1000)
+  let assert Ok(_) = publish_run(conn, apex, csk, log, #(spki, point), 1000)
   let assert Ok(_) = publish.publish(conn, csk, 1000, "test")
   envoy.unset(gate.require_env)
   sqlite.close(conn)
@@ -580,7 +577,8 @@ pub fn the_succession_extension_encodes_the_crossval_bytes_test() {
       predecessor_spki: <<0x30, 0x59, 0x11>>,
       signature: <<0x30, 0x44, 0x02>>,
     )
-  assert cert.encode_succession(succession) == fixture("crossval/succession.der")
+  assert cert.encode_succession(succession)
+    == fixture("crossval/succession.der")
 }
 
 pub fn the_succession_payload_is_the_crossval_bytes_test() {
@@ -590,7 +588,8 @@ pub fn the_succession_payload_is_the_crossval_bytes_test() {
   // rather than by a 16-bit key tag.
   let payload = cert.succession_payload("sync.test.", 34_918, <<"spki":utf8>>)
   assert payload == fixture("crossval/succession-payload.json")
-  assert cert.succession_payload("sync.test", 34_918, <<"spki":utf8>>) == payload
+  assert cert.succession_payload("sync.test", 34_918, <<"spki":utf8>>)
+    == payload
 }
 
 /// A certificate this side builds, read back by this side and — from the
@@ -625,8 +624,7 @@ pub fn a_built_certificate_carries_its_key_its_name_and_its_extensions_test() {
 
   // A chainless certificate has no chain extension at all — the shape a
   // `retire` breadcrumb takes, and the shape a client refuses.
-  let bare =
-    cert.build("sync.test.", csk.public, csk.private, 0, 1, None, None)
+  let bare = cert.build("sync.test.", csk.public, csk.private, 0, 1, None, None)
   let assert Error(Nil) = cert_extension(bare, cert.oid_dnssec_chain)
   let assert Error(Nil) = cert_extension(bare, cert.oid_succession)
 }
@@ -774,7 +772,8 @@ pub fn the_oid_arcs_stay_inside_an_int32_test() {
 
   // And each arc is the first four bytes of its UUID masked to 31 bits, so a
   // future edit cannot pick a new number and keep the explanation.
-  assert oid_arc(cert.oid_dnssec_chain) == int.bitwise_and(0xdcba5907, int32_max)
+  assert oid_arc(cert.oid_dnssec_chain)
+    == int.bitwise_and(0xdcba5907, int32_max)
   assert oid_arc(cert.oid_succession) == int.bitwise_and(0x43da2932, int32_max)
 }
 
@@ -787,12 +786,7 @@ fn contains(haystack: BitArray, needle: BitArray) -> Bool {
   scan_for(haystack, needle, size, bit_array.byte_size(haystack) - size)
 }
 
-fn scan_for(
-  haystack: BitArray,
-  needle: BitArray,
-  size: Int,
-  at: Int,
-) -> Bool {
+fn scan_for(haystack: BitArray, needle: BitArray, size: Int, at: Int) -> Bool {
   case at < 0 {
     True -> False
     False ->
@@ -822,7 +816,14 @@ pub fn republishing_with_a_predecessor_adds_the_countersignature_test() {
   // First publish: the operator forgets the predecessor. Tier B everywhere.
   let assert Ok(first) =
     rekor_publish.run(
-      conn, apex, csk, log, #(spki, point), 1000, fake_resolver(), "create",
+      conn,
+      apex,
+      csk,
+      log,
+      #(spki, point),
+      1000,
+      fake_resolver(),
+      "create",
       None,
     )
   assert first.countersigned_by == None
@@ -831,7 +832,14 @@ pub fn republishing_with_a_predecessor_adds_the_countersignature_test() {
   // have reused the stored certificate and reported success unchanged.
   let assert Ok(second) =
     rekor_publish.run(
-      conn, apex, csk, log, #(spki, point), 2000, fake_resolver(), "create",
+      conn,
+      apex,
+      csk,
+      log,
+      #(spki, point),
+      2000,
+      fake_resolver(),
+      "create",
       Some(previous),
     )
   assert second.countersigned_by
@@ -850,7 +858,14 @@ pub fn republishing_with_a_predecessor_adds_the_countersignature_test() {
   // entry already says what this run would say, so it stays one claim.
   let assert Ok(third) =
     rekor_publish.run(
-      conn, apex, csk, log, #(spki, point), 3000, fake_resolver(), "create",
+      conn,
+      apex,
+      csk,
+      log,
+      #(spki, point),
+      3000,
+      fake_resolver(),
+      "create",
       Some(previous),
     )
   assert third.refreshed
@@ -895,6 +910,9 @@ pub fn a_chain_that_does_not_reach_the_root_is_refused_test() {
 
   // A chain that is not about this apex at all.
   let assert Error(_) =
-    chain.check_shape([chain.Link("other.test.", <<1>>), chain.Link(".", <<3>>)], apex)
+    chain.check_shape(
+      [chain.Link("other.test.", <<1>>), chain.Link(".", <<3>>)],
+      apex,
+    )
   let assert Error(_) = chain.check_shape([], apex)
 }

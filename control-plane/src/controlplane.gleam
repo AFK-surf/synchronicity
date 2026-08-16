@@ -163,7 +163,9 @@ fn rekor_publish(
   use action <- result.try(case forced_action {
     "" ->
       rekor.action_for(conn, key_tag)
-      |> result.map_error(fn(e) { "reading stored records: " <> string.inspect(e) })
+      |> result.map_error(fn(e) {
+        "reading stored records: " <> string.inspect(e)
+      })
     forced -> Ok(forced)
   })
   use outcome <- result.try(
@@ -202,7 +204,9 @@ fn rekor_publish(
     }
     <> case outcome.countersigned_by {
       Some(tag) ->
-        ", countersigned by key tag " <> int.to_string(tag) <> " (monitors see tier A)"
+        ", countersigned by key tag "
+        <> int.to_string(tag)
+        <> " (monitors see tier A)"
       // Genesis and disaster recovery both land here, and both are expected
       // — but a monitor watching this zone will alert on it, so say so.
       None -> ", NOT countersigned: monitors will alert (tier B)"

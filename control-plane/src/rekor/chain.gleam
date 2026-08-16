@@ -106,7 +106,10 @@ pub fn check_shape(links: List(Link), apex: Name) -> Result(Nil, String) {
       case first.zone == name.to_string(apex) {
         False ->
           Error(
-            "the chain starts at " <> first.zone <> ", not the apex " <> name.to_string(apex),
+            "the chain starts at "
+            <> first.zone
+            <> ", not the apex "
+            <> name.to_string(apex),
           )
         True -> check_ladder(links, apex)
       }
@@ -277,8 +280,14 @@ fn doh_query(
   let question =
     bit_array.concat([
       // id 0, RD set, one question, one additional (the OPT).
-      <<0:int-size(16), 0x0100:int-size(16), 1:int-size(16), 0:int-size(16),
-        0:int-size(16), 1:int-size(16)>>,
+      <<
+        0:int-size(16),
+        0x0100:int-size(16),
+        1:int-size(16),
+        0:int-size(16),
+        0:int-size(16),
+        1:int-size(16),
+      >>,
       name.encode(zone),
       <<rtype:int-size(16), { wire.class_in }:int-size(16)>>,
       { rdata.opt(4096, True) }.wire,

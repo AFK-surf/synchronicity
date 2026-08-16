@@ -102,8 +102,7 @@ pub fn run(
   predecessor: Option(Csk),
 ) -> Result(Outcome, PublishError) {
   let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
-  let spki_sha256 =
-    crypto.hash(crypto.Sha256, proof.p256_spki(csk.public))
+  let spki_sha256 = crypto.hash(crypto.Sha256, proof.p256_spki(csk.public))
   use replaces <- result.try(previous_key_tag(conn, key_tag))
   let statement_bytes =
     statement.to_json(statement.for_key(apex, csk.public, action, replaces))
@@ -116,22 +115,22 @@ pub fn run(
   use stored <- result.try(
     store.get(conn, spki_sha256, key_tag, action) |> result.map_error(Db),
   )
-  use #(signature, certificate, refreshed) <- result.try(case
-    reusable(stored, statement_bytes, predecessor)
-  {
-    Ok(#(signature, certificate)) -> Ok(#(signature, certificate, True))
-    Error(Nil) -> {
-      use certificate <- result.try(mint_certificate(
-        apex,
-        csk,
-        action,
-        now,
-        resolver,
-        predecessor,
-      ))
-      Ok(#(statement.sign(csk, statement_bytes), certificate, False))
-    }
-  })
+  use #(signature, certificate, refreshed) <- result.try(
+    case reusable(stored, statement_bytes, predecessor) {
+      Ok(#(signature, certificate)) -> Ok(#(signature, certificate, True))
+      Error(Nil) -> {
+        use certificate <- result.try(mint_certificate(
+          apex,
+          csk,
+          action,
+          now,
+          resolver,
+          predecessor,
+        ))
+        Ok(#(statement.sign(csk, statement_bytes), certificate, False))
+      }
+    },
+  )
 
   use Nil <- result.try(
     case statement.verify(csk.public, statement_bytes, signature) {
@@ -209,7 +208,10 @@ pub fn run(
 
 /// The action for a fresh publish: a zone's first logged key is a `create`,
 /// any later one is a `rollover` naming the tag it replaces.
-pub fn action_for(conn: Connection, key_tag: Int) -> Result(String, PublishError) {
+pub fn action_for(
+  conn: Connection,
+  key_tag: Int,
+) -> Result(String, PublishError) {
   use replaces <- result.try(previous_key_tag(conn, key_tag))
   Ok(case replaces {
     Some(_) -> "rollover"
@@ -299,7 +301,11 @@ fn mint_certificate(
           case chain.check_shape(links, apex) {
             Error(why) -> Error(NoChain(why))
             Ok(Nil) ->
-              Ok(Some(list.map(links, fn(link) { cert.Link(link.zone, link.rrs) })))
+              Ok(
+                Some(
+                  list.map(links, fn(link) { cert.Link(link.zone, link.rrs) }),
+                ),
+              )
           }
       }
   })
@@ -379,7 +385,9 @@ fn verify_entry(
   use Nil <- result.try(case san == cert.san_name(name.to_string(apex)) {
     True -> Ok(Nil)
     False ->
-      Error(proof.Binding("the logged certificate names " <> san <> ", not this apex"))
+      Error(proof.Binding(
+        "the logged certificate names " <> san <> ", not this apex",
+      ))
   })
   use Nil <- result.try(
     case statement.verify(csk.public, record.statement, signature) {

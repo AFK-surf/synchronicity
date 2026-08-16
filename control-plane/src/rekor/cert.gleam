@@ -153,11 +153,7 @@ pub fn build(
   )
 }
 
-fn prepend_option(
-  acc: List(b),
-  value: Option(a),
-  make: fn(a) -> b,
-) -> List(b) {
+fn prepend_option(acc: List(b), value: Option(a), make: fn(a) -> b) -> List(b) {
   case value {
     Some(value) -> [make(value), ..acc]
     None -> acc
@@ -186,10 +182,13 @@ pub fn san_name(apex: String) -> String {
 pub fn encode_chain(links: List(Link)) -> BitArray {
   links
   |> list.map(fn(link) {
-    der(0x30, bit_array.concat([
-      der(0x16, <<{ link.zone }:utf8>>),
-      der(0x04, link.rrs),
-    ]))
+    der(
+      0x30,
+      bit_array.concat([
+        der(0x16, <<{ link.zone }:utf8>>),
+        der(0x04, link.rrs),
+      ]),
+    )
   })
   |> bit_array.concat
   |> der(0x30, _)
@@ -223,9 +222,9 @@ pub fn succession_payload(
   successor_spki: BitArray,
 ) -> BitArray {
   let digest =
-    string.lowercase(bit_array.base16_encode(
-      crypto.hash(crypto.Sha256, successor_spki),
-    ))
+    string.lowercase(
+      bit_array.base16_encode(crypto.hash(crypto.Sha256, successor_spki)),
+    )
   <<
     "{\"apex\":\"":utf8,
     { san_name(apex) }:utf8,
@@ -271,7 +270,11 @@ fn pae(payload_type: String, payload: BitArray) -> BitArray {
 
 /// A DER tag-length-value, definite length, minimal encoding.
 pub fn der(tag: Int, body: BitArray) -> BitArray {
-  bit_array.concat([<<tag:int-size(8)>>, der_length(bit_array.byte_size(body)), body])
+  bit_array.concat([
+    <<tag:int-size(8)>>,
+    der_length(bit_array.byte_size(body)),
+    body,
+  ])
 }
 
 fn der_length(size: Int) -> BitArray {
@@ -290,10 +293,11 @@ fn der_length(size: Int) -> BitArray {
 fn big_endian(value: Int, acc: List(Int)) -> List(Int) {
   case value {
     0 -> acc
-    _ -> big_endian(int.bitwise_shift_right(value, 8), [
-      int.bitwise_and(value, 0xff),
-      ..acc
-    ])
+    _ ->
+      big_endian(int.bitwise_shift_right(value, 8), [
+        int.bitwise_and(value, 0xff),
+        ..acc
+      ])
   }
 }
 
@@ -332,7 +336,10 @@ pub fn succession_key_tag(value: BitArray) -> Result(Int, Nil) {
 }
 
 /// One element's contents and whatever follows it.
-fn der_element(bytes: BitArray, tag: Int) -> Result(#(BitArray, BitArray), Nil) {
+fn der_element(
+  bytes: BitArray,
+  tag: Int,
+) -> Result(#(BitArray, BitArray), Nil) {
   use #(header, size) <- result.try(case bytes {
     <<actual:int-size(8), size:int-size(8), _:bits>>
       if actual == tag && size < 0x80
