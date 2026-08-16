@@ -40,7 +40,7 @@ jobs:
   # that is too narrow or an unveil that does not stick fails fast),
   # then the full gleam test suite, which drives the pool and store
   # through real pledged workers.
-  csqlite-openbsd:
+  openbsd:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
