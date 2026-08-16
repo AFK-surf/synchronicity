@@ -35,7 +35,11 @@ fi
 
 export CP_ROLE=primary
 export CP_BASE_DOMAIN=sync.test
-export CP_DB_PATH="$WORKDIR/cp.db"
+# The database gets its own directory so the csqlite sandbox's directory
+# grant never covers the sibling signing key (config refuses to start
+# otherwise). The replica below has no key, so its db can sit anywhere.
+mkdir -p "$WORKDIR/db"
+export CP_DB_PATH="$WORKDIR/db/cp.db"
 export CP_KEY_FILE="$WORKDIR/csk.key"
 export CP_HTTP_LISTEN=127.0.0.1:$HTTP_PORT
 export CP_DNS_LISTEN=127.0.0.1:$DNS_PORT
