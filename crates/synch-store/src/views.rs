@@ -31,6 +31,12 @@ pub struct EntryRow {
     pub size: u64,
     /// The origin's observed mtime, in unix nanoseconds.
     pub mtime_ns: i64,
+    /// The origin's advisory unix mode (§4.2), when it published one.
+    ///
+    /// `None` where the origin's platform has no mode to report, and on rows
+    /// materialized before the column existed — a mirror reproduces what it is
+    /// given and leaves the rest alone.
+    pub unix_mode: Option<u32>,
     /// The object root, for files.
     pub content: Option<Hash>,
     /// The origin trie seq at which this version was published.
@@ -264,7 +270,7 @@ impl Store {
     ) -> Result<Vec<EntryRow>> {
         let conn = self.conn();
         let sql = format!(
-            "SELECT origin_id, space, path, kind, size, mtime_ns, content, seq, prev,
+            "SELECT origin_id, space, path, kind, size, mtime_ns, unix_mode, content, seq, prev,
                     symlink_target
              FROM entries {filter}"
         );
@@ -277,16 +283,28 @@ impl Store {
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
-                row.get::<_, Option<Vec<u8>>>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, Option<Vec<u8>>>(8)?,
-                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<Vec<u8>>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (origin, space, path, kind, size, mtime_ns, content, seq, prev, symlink_target) =
-                row?;
+            let (
+                origin,
+                space,
+                path,
+                kind,
+                size,
+                mtime_ns,
+                unix_mode,
+                content,
+                seq,
+                prev,
+                symlink_target,
+            ) = row?;
             out.push(EntryRow {
                 origin: origin_column(origin, "entries.origin_id")?,
                 space,
@@ -294,6 +312,7 @@ impl Store {
                 kind: kind_from_int(kind)?,
                 size: size as u64,
                 mtime_ns,
+                unix_mode: unix_mode.map(|m| m as u32),
                 content: content
                     .map(|b| hash_column(b, "entries.content"))
                     .transpose()?,
@@ -833,13 +852,13 @@ fn put_entry_in(
     entry: &FileEntry,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, content, seq, prev,
-                              symlink_target)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, unix_mode, content,
+                              seq, prev, symlink_target)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(origin_id, space, path) DO UPDATE SET
            kind = excluded.kind, size = excluded.size, mtime_ns = excluded.mtime_ns,
-           content = excluded.content, seq = excluded.seq, prev = excluded.prev,
-           symlink_target = excluded.symlink_target",
+           unix_mode = excluded.unix_mode, content = excluded.content, seq = excluded.seq,
+           prev = excluded.prev, symlink_target = excluded.symlink_target",
         params![
             origin.canonical(),
             space,
@@ -847,6 +866,7 @@ fn put_entry_in(
             kind_to_int(entry.kind),
             entry.size as i64,
             entry.mtime_ns,
+            entry.unix_mode.map(|m| m as i64),
             entry.content.map(|h| h.as_bytes().to_vec()),
             entry.seq as i64,
             entry.prev.map(|h| h.as_bytes().to_vec()),
@@ -916,6 +936,65 @@ mod tests {
 
         store.delete_entry(&o, "media", "a/b.txt").unwrap();
         assert!(store.entry(&o, "media", "a/b.txt").unwrap().is_none());
+    }
+
+    /// The advisory mode is metadata a mirror materializes (§7.2), so it has to
+    /// survive the trip through this view rather than being dropped at it.
+    #[test]
+    fn entries_carry_the_advisory_unix_mode() {
+        let (_d, store) = store();
+        let o = origin("nas");
+        let mut e = FileEntry::file(10, 5, Hash::new(b"c"), 3);
+        e.unix_mode = Some(0o100_640);
+        store.put_entry(&o, "media", "a.txt", &e).unwrap();
+        assert_eq!(
+            store
+                .entry(&o, "media", "a.txt")
+                .unwrap()
+                .unwrap()
+                .unix_mode,
+            Some(0o100_640)
+        );
+
+        // An origin with no mode to report publishes none, and that is not the
+        // same as reporting zero.
+        store
+            .put_entry(
+                &o,
+                "media",
+                "b.txt",
+                &FileEntry::file(1, 0, Hash::new(b"d"), 1),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .entry(&o, "media", "b.txt")
+                .unwrap()
+                .unwrap()
+                .unix_mode,
+            None
+        );
+
+        // And it survives the path every peer's entry actually takes: decoded
+        // from a trie leaf into the view.
+        let trie = Trie::new(&store);
+        let root = trie
+            .insert(
+                Hash::EMPTY,
+                &file_key("media", "c.txt").unwrap(),
+                &postcard::to_stdvec(&e).unwrap(),
+            )
+            .unwrap();
+        let peer = origin("laptop");
+        store.materialize_diff(&peer, Hash::EMPTY, root).unwrap();
+        assert_eq!(
+            store
+                .entry(&peer, "media", "c.txt")
+                .unwrap()
+                .unwrap()
+                .unix_mode,
+            Some(0o100_640)
+        );
     }
 
     #[test]

@@ -404,6 +404,25 @@ async fn a_mirror_materializes_the_unified_tree() {
     std::fs::create_dir_all(nas.space.path().join("sub")).unwrap();
     std::fs::write(nas.space.path().join("a.txt"), b"alpha").unwrap();
     std::fs::write(nas.space.path().join("sub/b.bin"), big_payload(80_000)).unwrap();
+
+    // Metadata the mirror has to reproduce (§7.2), set before the scan so it
+    // travels the whole path: scanner, trie, anti-entropy, materialization.
+    // A stamp years in the past, so "the mirror kept it" cannot be confused
+    // with "the copy happened to land now".
+    let source = nas.space.path().join("a.txt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o750)).unwrap();
+    }
+    let observed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(observed))
+        .unwrap();
+
     nas.node.scan_publish_push().await.unwrap();
     vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
 
@@ -422,6 +441,28 @@ async fn a_mirror_materializes_the_unified_tree() {
         std::fs::read(target.path().join("sub/b.bin")).unwrap(),
         big_payload(80_000)
     );
+
+    // The mirrored file is the published file, metadata included: it carries
+    // the mtime the NAS observed rather than the moment the copy landed, and
+    // the permission bits the NAS published.
+    let mirrored = target.path().join("a.txt");
+    assert_eq!(
+        std::fs::metadata(&mirrored).unwrap().modified().unwrap(),
+        std::fs::metadata(&source).unwrap().modified().unwrap(),
+        "the mirror must carry the origin's mtime"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&mirrored).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
+    // Nothing about that makes the next pass think there is work to do.
+    let report = vps.node.sync_mirror(target.path()).await.unwrap();
+    assert_eq!(report.current, 2, "{report:?}");
+    assert_eq!(report.written + report.retouched, 0, "{report:?}");
 
     // A deletion on the origin removes the mirrored file.
     std::fs::remove_file(nas.space.path().join("a.txt")).unwrap();

@@ -63,6 +63,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V6_ENTRY_SYMLINK_TARGET),
     Migration::Sql(V7_OBSERVED_CLAIMED_BY),
     Migration::Sql(V8_S3_CONFIG_NAMESPACE),
+    Migration::Sql(V9_ENTRY_UNIX_MODE),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -299,6 +300,48 @@ UPDATE config SET key = 's3.buckets' WHERE key = 's3_buckets';
 UPDATE config SET key = 's3.keys'    WHERE key = 's3_access_keys';
 "#;
 
+/// v9 — a file's advisory unix mode (§4.2) is metadata a mirror has to
+/// reproduce (§7.2), and `entries` is what every materializing surface reads.
+/// The scanner has always published the mode in its `f:` records; this view
+/// dropped it on the way in, so no reader could ever see it and every mirrored
+/// file came out with whatever mode the copy happened to create.
+///
+/// The column is nullable because the mode genuinely is optional: a Windows
+/// origin publishes none. Existing rows are carried forward as NULL rather than
+/// backfilled — the authoritative value is in each origin's trie, not here, and
+/// re-deriving it means re-materializing every leaf of every trie inside a
+/// migration transaction. Rows refresh as their origins republish, and
+/// `synch doctor --rebuild` repopulates all of them at once.
+///
+/// Rebuilt rather than `ALTER ... ADD COLUMN` for the same reason as v6 and v7:
+/// the stored DDL should read in declaration order.
+const V9_ENTRY_UNIX_MODE: &str = r#"
+DROP INDEX entries_by_path;
+DROP INDEX entries_by_content;
+ALTER TABLE entries RENAME TO entries_v8;
+CREATE TABLE entries (
+  origin_id   TEXT NOT NULL,
+  space       TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  kind        INTEGER NOT NULL,
+  size        INTEGER NOT NULL,
+  mtime_ns    INTEGER NOT NULL,
+  unix_mode   INTEGER,
+  content     BLOB,
+  seq         INTEGER NOT NULL,
+  prev        BLOB,
+  symlink_target TEXT,
+  PRIMARY KEY (origin_id, space, path)
+);
+INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, unix_mode, content, seq,
+                     prev, symlink_target)
+  SELECT origin_id, space, path, kind, size, mtime_ns, NULL, content, seq, prev, symlink_target
+  FROM entries_v8;
+DROP TABLE entries_v8;
+CREATE INDEX entries_by_path    ON entries (space, path);
+CREATE INDEX entries_by_content ON entries (content);
+"#;
+
 /// The §10 schema as the design document states it — the shape replaying the
 /// whole chain must produce.
 ///
@@ -353,6 +396,7 @@ CREATE TABLE entries (
   kind        INTEGER NOT NULL,
   size        INTEGER NOT NULL,
   mtime_ns    INTEGER NOT NULL,
+  unix_mode   INTEGER,
   content     BLOB,
   seq         INTEGER NOT NULL,
   prev        BLOB,

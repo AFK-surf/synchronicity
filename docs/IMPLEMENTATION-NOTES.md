@@ -149,6 +149,48 @@ publishes no version of the path) removes the file too, since the path is not
 in the pinned view; and a path a `strict` mirror skipped is left exactly as it
 is — skipping is a refusal to act, not a decision to delete.
 
+### §7.2 — the metadata a mirrored file carries
+
+A mirrored file is the published file, which is more than its bytes: it carries
+the mtime its origin observed and the permission bits of the advisory
+`unix_mode` §4.2 records. Without that a mirror is a directory of `0644` files
+all modified the moment the copy ran — every executable stripped of its `+x`,
+every incremental `rsync` out of the mirror copying everything, every
+"newest first" listing sorted by fetch order.
+
+Four choices worth naming:
+
+- **`entries` had to learn the mode.** The scanner has always published it in
+  its `f:` records, but the derived view every materializing surface reads
+  dropped it on the way in, so no reader could see it. Schema step 8 adds the
+  column; rows materialized before it read as "no mode published", which means
+  *leave the file's mode alone* rather than *reset it*, and refresh as their
+  origins republish or all at once under `synch doctor --rebuild`.
+- **Only the permission bits.** setuid, setgid and the sticky bit are masked
+  off. A mirror writes bytes a peer chose under a name that peer chose, and the
+  daemon may be running as root; reproducing a setuid bit would turn "publish a
+  file" into "plant a setuid binary in someone else's tree". §4.2 already calls
+  the mode advisory, so declining the three bits that grant authority costs
+  nothing materialization promised.
+- **Times before mode, with owner-write borrowed.** Setting a file's times
+  needs a writable descriptor. Applying the mode first would leave a mirror
+  unable to re-stamp exactly the files whose mode it had got right — `0444` is
+  an ordinary mode for published media — so the stamp goes on first, with the
+  write bit lent for the duration and put back either way.
+- **Drift is repaired, not refetched.** A file whose bytes are current but
+  whose mode or mtime has moved is stamped in place and reported as
+  `retouched`; refetching an object to fix a permission bit would be absurd.
+  Stored timestamps that sit within two seconds *below* the published one count
+  as matching, because filesystems coarsen stamps downward (ext4 keeps
+  nanoseconds, HFS+ whole seconds, FAT two) and demanding exact equality would
+  have every pass re-touch every file it had just stamped, forever.
+
+Symlinks are the exception: a link's own timestamps cannot be set without
+`utimensat(AT_SYMLINK_NOFOLLOW)`, which `std` does not expose, and following
+the link to stamp it would stamp whatever it points at — possibly outside the
+mirror, which is what the escape guard exists to prevent. A link's target is
+its version (§8), and that is what the mirror reproduces.
+
 ### §7.1 — reconciling `local_files` on open
 
 Batching introduces a failure the synchronous publisher did not have.
@@ -524,6 +566,8 @@ The chain to date:
 | 4 | 4 | 5 | reshape the `synch-s3` bucket map (§9.4) |
 | 5 | 5 | 6 | `entries.symlink_target`, for §8 version identity |
 | 6 | 6 | 7 | `observed_heads.claimed_by`, for §3.4 attribution |
+| 7 | 7 | 8 | move the gateway's config rows under the `s3.` namespace (§9.4) |
+| 8 | 8 | 9 | `entries.unix_mode`, so a mirror can reproduce it (§7.2) |
 
 Steps 0–2 reproduce the history that shipped before the chain existed: a
 database stamped 1, 2, or 3 by an older build lands on exactly the version the
