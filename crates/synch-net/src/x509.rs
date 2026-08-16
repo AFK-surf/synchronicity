@@ -584,10 +584,7 @@ mod tests {
         let cert = Certificate::parse(&der).expect("the certificate must parse");
         assert_eq!(cert.spki, spki());
         assert_eq!(cert.dns_names, vec!["sync.example".to_string()]);
-        assert_eq!(
-            cert.single_dns_name().unwrap().to_string(),
-            "sync.example."
-        );
+        assert_eq!(cert.single_dns_name().unwrap().to_string(), "sync.example.");
         assert_eq!(cert.extension(&[0x41, 0x01]), Some(&b"payload"[..]));
         assert_eq!(cert.extension(&[0x41, 0x02]), None);
         // The standard three are present, and the two that must be critical
@@ -647,12 +644,7 @@ mod tests {
             dns_names: vec![san.to_string()],
             extensions: Vec::new(),
         };
-        for bad in [
-            "sync.example..",
-            "sync.example...",
-            "sync..example",
-            "",
-        ] {
+        for bad in ["sync.example..", "sync.example...", "sync..example", ""] {
             assert!(
                 with(bad).single_dns_name().is_err(),
                 "{bad:?} must not be a usable SAN"
@@ -660,12 +652,12 @@ mod tests {
         }
         // Spellings that *are* one name normalize to one value.
         let canonical = with("sync.example.").single_dns_name().unwrap();
-        for same in ["sync.example", "SYNC.EXAMPLE.DEV.", "Sync.Example.Dev"] {
+        for same in ["sync.example", "SYNC.EXAMPLE.", "Sync.Example"] {
             assert_eq!(with(same).single_dns_name().unwrap(), canonical, "{same}");
         }
         // Not a suffix match: a certificate for the parent is not a
         // certificate for the child, however tempting the substring is.
-        assert_ne!(with("example.dev").single_dns_name().unwrap(), canonical);
+        assert_ne!(with("example.").single_dns_name().unwrap(), canonical);
     }
 
     #[test]
