@@ -716,10 +716,7 @@ impl DnssecResolver {
         let mut malformed = None;
         for record in &records {
             match RekorProof::from_txt(record) {
-                // Other key tags belong to the other half of a rollover
-                // window; they are not this answer's business.
-                Ok(candidate) if candidate.key_tag == key_tag => candidates.push(candidate),
-                Ok(_) => {}
+                Ok(candidate) => candidates.push(candidate),
                 Err(e) => malformed = Some(e),
             }
         }
@@ -751,11 +748,10 @@ impl DnssecResolver {
             key_tag,
             dnskey_rdata: &dnskey_rdata,
         };
-        // Every candidate, not just the last. A key tag is a 16-bit checksum
-        // over the DNSKEY rdata, so two keys can share one and a zone can
-        // legitimately serve two records under it — the tag selects, the
-        // verification decides. Trying one and giving up would make a
-        // collision look like a bad proof.
+        // Every candidate, not just the last. A record's subject is a key
+        // set, so there is no selector on the wire — a zone can legitimately
+        // serve more than one record (a retirement breadcrumb beside the
+        // live claim), and membership in a verified set is what decides.
         let mut last = None;
         for candidate in &candidates {
             match rekor::verify(candidate, &key, &self.log_keys(), &self.anchors) {
@@ -861,7 +857,7 @@ fn rekor_error(name: &str, error: ProofError) -> NetError {
     let name = name.to_string();
     match error {
         ProofError::Malformed(reason) => NetError::RekorMalformed { name, reason },
-        ProofError::Possession(reason) => NetError::RekorPossession { name, reason },
+        ProofError::Attribution(reason) => NetError::RekorAttribution { name, reason },
         ProofError::Binding(reason) => NetError::RekorBinding { name, reason },
         ProofError::Inclusion(reason) => NetError::RekorInclusion { name, reason },
         ProofError::Checkpoint(reason) => NetError::RekorCheckpoint { name, reason },

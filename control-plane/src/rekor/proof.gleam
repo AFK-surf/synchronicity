@@ -8,8 +8,7 @@
 //// other's good intentions:
 ////
 //// ```text
-//// u8       version            = 3
-//// u16      key_tag
+//// u8       version            = 4
 //// u8[32]   log_id               SHA-256 of the log's DER SubjectPublicKeyInfo
 //// u64      log_index
 //// u16+[]   statement            the in-toto Statement, byte-exact (PAE preimage)
@@ -28,7 +27,7 @@
 //// `SHA-256(0x01 || left || right)` — RFC 6962 §2.1. The Statement rides
 //// alongside because the body commits only to its PAE *digest*.
 ////
-//// What makes this v3 rather than v2 is the **verifier**: an
+//// What makes this shape right is the **verifier**: an
 //// `x509Certificate`, never a raw public key. A raw-key entry names no zone
 //// anywhere in its leaf, so nobody can monitor a zone for newly published
 //// keys — and the threat model has a compromised DNS provider in it, so DNS
@@ -47,8 +46,10 @@ import gleam/list
 import gleam/result
 import gleam/string
 
-/// The version this build writes and accepts.
-pub const version = 3
+/// The version this build writes and accepts. v4 is the key-set format:
+/// no key-tag selector on the wire — a record's subject is a set, and a
+/// client tries each record the zone serves.
+pub const version = 4
 
 /// The `hashedrekord` v0.0.2 digest algorithm and P-256 key-details tags a
 /// body must declare.
@@ -64,7 +65,6 @@ const key_details = "PKIX_ECDSA_P256_SHA_256"
 
 pub type Proof {
   Proof(
-    key_tag: Int,
     log_id: BitArray,
     log_index: Int,
     statement: BitArray,
@@ -79,7 +79,7 @@ pub type Proof {
 /// this whole verify-before-store step exists to prevent.
 pub type ProofError {
   Malformed(String)
-  Possession(String)
+  Attribution(String)
   Binding(String)
   Inclusion(String)
   CheckpointFailed(String)
@@ -125,7 +125,7 @@ pub fn encode(proof: Proof) -> Result(BitArray, String) {
   })
   Ok(
     bit_array.concat([
-      <<version:int-size(8), proof.key_tag:int-size(16)>>,
+      <<version:int-size(8)>>,
       proof.log_id,
       <<proof.log_index:int-size(64)>>,
       blob16(proof.statement),
@@ -174,7 +174,7 @@ pub fn hashedrekord_body(
 
 /// The digest, DER signature and verifier certificate a `hashedrekord`
 /// v0.0.2 body carries. The service reads these back out of the log's own
-/// `canonicalizedBody` to re-check possession and the verifier binding
+/// `canonicalizedBody` to re-check attribution and the verifier binding
 /// before storing — re-deriving nothing the log already serialized.
 ///
 /// The `publicKey` arm of Rekor's verifier oneof is not handled: an entry
@@ -517,8 +517,8 @@ pub fn parse_log_key(
 /// `canonicalizedBody` is in the tree the checkpoint commits to, and the log
 /// signed that checkpoint.
 ///
-/// Possession and the verifier binding are checked in `rekor/publish`, where
-/// the zone key and the Statement being logged are both in hand.
+/// Attribution and the verifier binding are checked in `rekor/publish`,
+/// where the signer key and the Statement being logged are both in hand.
 pub fn verify_against_log(
   proof: Proof,
   log_spki: BitArray,

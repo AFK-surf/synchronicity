@@ -1,11 +1,11 @@
 //! Zone-key transparency end to end (docs/REKOR-ZONE-KEY.md §9).
 //!
 //! One simulated zone, one simulated log, and the real verifier. The positive
-//! case proves a correctly logged key is accepted through the whole path —
+//! case proves a correctly logged key set is accepted through the whole path —
 //! validated TXT, apex DNSKEY, proof record, offline verification. Every other
 //! case takes that same proof and breaks exactly one thing, so a passing
-//! verification can never be an accident of the harness: possession, apex
-//! binding, key binding, statement binding, the DNSSEC chain, inclusion,
+//! verification can never be an accident of the harness: attribution, apex
+//! binding, key-set binding, statement binding, the DNSSEC chain, inclusion,
 //! checkpoint, unknown log, absent record.
 
 use synch_net::{
@@ -41,7 +41,7 @@ fn anchors(zone: &SimZone) -> hickory_resolver::proto::dnssec::TrustAnchors {
 fn logged_zone() -> (SimZone, SimLog, RekorProof) {
     let zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let proof = log.publish(&zone, "create", None);
+    let proof = log.publish(&zone, "create");
     (zone, log, proof)
 }
 
@@ -100,7 +100,7 @@ fn a_raw_public_key_entry_is_refused_outright() {
     // A v2-shaped entry: perfectly valid Rekor, apex-anonymous, and therefore
     // exactly what this design abolished. There is no branch to reach.
     let (zone, mut log, _) = logged_zone();
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
     let payload = statement.to_json();
     let signature = zone.sign_dsse(&payload);
     let body = format!(
@@ -115,7 +115,7 @@ fn a_raw_public_key_entry_is_refused_outright() {
         rekor::base64_encode(&signature),
         rekor::base64_encode(&zone.spki()),
     );
-    let proof = log.log_body(zone.key_tag(), payload, body.into_bytes());
+    let proof = log.log_body(payload, body.into_bytes());
     assert!(matches!(
         verify(&proof, &zone, &log),
         Err(ProofError::Binding(_))
@@ -134,44 +134,71 @@ fn a_v2_proof_record_is_a_malformed_version_and_nothing_more() {
 }
 
 #[test]
-fn a_forged_entry_signature_fails_possession() {
+fn a_misattributed_entry_signature_is_refused() {
     // A body that is genuinely in the tree (leaf, inclusion and checkpoint
     // all sound) and whose digest matches the Statement's PAE — but whose
-    // signature was made by a stranger, not this zone's key. Possession is
-    // the only check that can tell that apart, and it must.
+    // signature was made by a key that is not the certificate's. The entry
+    // lies about who built it, so nothing it says can be believed.
     let zone = SimZone::new("cluster.example", member_records());
     let stranger = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let statement = zone.zone_key_statement("create", None).to_json();
+    let statement = zone.zone_key_statement("create").to_json();
     let body = hashedrekord_body(
         &statement,
         &stranger.sign_dsse(&statement),
         &zone.zone_key_certificate(),
     );
-    let proof = log.log_body(zone.key_tag(), statement, body);
+    let proof = log.log_body(statement, body);
     assert!(matches!(
         verify(&proof, &zone, &log),
-        Err(ProofError::Possession(_))
+        Err(ProofError::Attribution(_))
     ));
 }
 
 #[test]
-fn a_certificate_holding_another_key_fails_binding() {
-    // The zone signs the entry itself, so possession would pass — but the
-    // certificate records a *stranger's* key. To a monitor watching the apex
-    // that entry is about the stranger's key; the client must refuse it.
+fn a_signer_other_than_the_zone_key_is_fine() {
+    // The decoupling this claim exists for: the entry is signed by a key
+    // that is *not* in the zone at all — a control-plane operational key —
+    // and verifies, because the certificate names that key as the signer and
+    // the chain, not the signature, is what authorizes the zone's key set.
+    // This is what makes a provider-held zone key loggable.
+    let zone = SimZone::new("cluster.example", member_records());
+    let operational = SimZone::new("cluster.example", Vec::new());
+    let mut log = SimLog::new("rekor.sim");
+    let statement = zone.zone_key_statement("create").to_json();
+    // The certificate is built around the *operational* key (its SPKI, its
+    // self-signature) but names the zone's apex and carries the zone's chain.
+    let certificate =
+        operational.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), zone.dnssec_chain().encode())]);
+    let body = hashedrekord_body(&statement, &operational.sign_dsse(&statement), &certificate);
+    let proof = log.log_body(statement, body);
+    verify(&proof, &zone, &log)
+        .expect("an entry attributed to its real signer authorizes the chain-proven set");
+}
+
+#[test]
+fn an_observed_key_outside_the_proven_set_fails_binding() {
+    // A perfectly sound entry for this zone's real key set — but the answer
+    // was signed by some other key. Membership in the proven set is the key
+    // binding, and it must refuse.
     let zone = SimZone::new("cluster.example", member_records());
     let stranger = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let statement = zone.zone_key_statement("create", None).to_json();
-    let body = hashedrekord_body(
-        &statement,
-        &zone.sign_dsse(&statement),
-        &stranger.zone_key_certificate(),
-    );
-    let proof = log.log_body(zone.key_tag(), statement, body);
+    let proof = log.publish(&zone, "create");
+    let apex = zone.apex();
+    let rdata = stranger.dnskey_rdata();
+    let key = ZoneKey {
+        apex: &apex,
+        key_tag: stranger.key_tag(),
+        dnskey_rdata: &rdata,
+    };
     assert!(matches!(
-        verify(&proof, &zone, &log),
+        rekor::verify(
+            &proof,
+            &key,
+            &LogKeys::parse(&log.key_pem()).unwrap(),
+            &anchors(&zone),
+        ),
         Err(ProofError::Binding(_))
     ));
 }
@@ -183,7 +210,7 @@ fn a_certificate_naming_another_apex_fails_binding() {
     // this zone — so the operator's monitor never looks at it.
     let zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
     let certificate = zone.certificate_for(
         "somewhere.else",
         &[(OID_DNSSEC_CHAIN.to_vec(), zone.dnssec_chain().encode())],
@@ -199,9 +226,8 @@ fn a_certificate_naming_another_apex_fails_binding() {
 fn a_key_logged_for_another_apex_fails_binding() {
     let zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let mut statement = zone.zone_key_statement("create", None);
+    let mut statement = zone.zone_key_statement("create");
     statement.apex = "other.example.".into();
-    statement.subject_name = "other.example.".into();
     let proof = log.log_statement(&zone, &statement);
     assert!(matches!(
         verify(&proof, &zone, &log),
@@ -210,24 +236,24 @@ fn a_key_logged_for_another_apex_fails_binding() {
 }
 
 #[test]
-fn a_statement_over_another_key_fails_binding() {
+fn a_statement_describing_keys_its_chain_never_proved_fails_binding() {
     let zone = SimZone::new("cluster.example", member_records());
     let stranger = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    // Right apex, right key tag, wrong key bytes: the subject digest is the
-    // only thing that can tell these apart, and it must.
-    let mut statement = zone.zone_key_statement("create", None);
-    statement.subject_sha256 = hex::encode(rekor::sha256(&stranger.dnskey_rdata()));
+    // Right apex, wrong key bytes: the claimed set must be exactly the set
+    // the chain proves, digest for digest.
+    let mut statement = zone.zone_key_statement("create");
+    statement.keys[0].sha256 = hex::encode(rekor::sha256(&stranger.dnskey_rdata()));
     let proof = log.log_statement(&zone, &statement);
     assert!(matches!(
         verify(&proof, &zone, &log),
         Err(ProofError::Binding(_))
     ));
 
-    // A record for the other half of a rollover window is refused here too;
-    // selecting the right one by key tag is the caller's job.
-    let mut statement = zone.zone_key_statement("rollover", Some(1));
-    statement.key_tag = zone.key_tag().wrapping_add(1);
+    // And metadata for metadata: a statement lying about a key's tag is a
+    // statement describing a set its chain never proved.
+    let mut statement = zone.zone_key_statement("rollover");
+    statement.keys[0].key_tag = zone.key_tag().wrapping_add(1);
     let proof = log.log_statement(&zone, &statement);
     assert!(matches!(
         verify(&proof, &zone, &log),
@@ -242,7 +268,7 @@ fn a_retire_entry_is_never_authorization() {
     // that accepts an entry carrying no proof of delegation at all.
     let zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let proof = log.publish(&zone, "retire", None);
+    let proof = log.publish(&zone, "retire");
     assert!(matches!(
         verify(&proof, &zone, &log),
         Err(ProofError::Binding(_))
@@ -263,7 +289,7 @@ fn a_retire_entry_is_never_authorization() {
 fn an_entry_with_no_chain_is_refused_on_the_monitors_behalf() {
     let zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
     let proof = log.log_certified(&zone, &statement, &zone.certificate(&[]));
     let error = verify(&proof, &zone, &log).unwrap_err();
     assert!(
@@ -277,7 +303,7 @@ fn a_broken_or_irrelevant_chain_is_refused_the_same_way() {
     let zone = SimZone::new("cluster.example", member_records());
     let stranger = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
 
     // A chain whose signature has been tampered with.
     let mut broken = zone.dnssec_chain();
@@ -327,7 +353,7 @@ fn an_expired_chain_still_verifies_because_no_clock_is_consulted() {
     let zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
     let ancient = time::OffsetDateTime::now_utc() - time::Duration::days(900);
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
     let certificate = zone.certificate(&[(
         OID_DNSSEC_CHAIN.to_vec(),
         zone.dnssec_chain_at(ancient).encode(),
@@ -343,7 +369,6 @@ fn an_expired_chain_still_verifies_because_no_clock_is_consulted() {
     chain::validate(
         &carried,
         &chain::parse_name(&zone.apex()).unwrap(),
-        &zone.dnskey_rdata(),
         &anchors(&zone),
     )
     .unwrap();
@@ -371,7 +396,7 @@ fn an_expired_chain_still_verifies_because_no_clock_is_consulted() {
 fn an_extension_the_client_does_not_know_is_carried_and_ignored() {
     let zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
     // An arc this build has no name for, holding bytes that decode as
     // nothing at all.
     let unknown = (
@@ -410,7 +435,7 @@ fn a_broken_audit_path_fails_inclusion() {
     let zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
     log.append(b"an earlier entry");
-    let mut proof = log.publish(&zone, "create", None);
+    let mut proof = log.publish(&zone, "create");
     log.append(b"a later entry");
     log.refresh(&mut proof);
     verify(&proof, &zone, &log).expect("the proof is sound before it is broken");
@@ -494,7 +519,7 @@ async fn a_zone_that_publishes_its_proof_resolves_under_require() {
     // and must not be confused by the other one.
     let mut other_log = SimLog::new("rekor.sim");
     let stranger = SimZone::new("cluster.example", member_records());
-    let other = other_log.publish(&stranger, "rollover", Some(zone.key_tag()));
+    let other = other_log.publish(&stranger, "rollover");
     zone.rekor_txt = vec![
         other.to_txt().expect("encodes"),
         proof.to_txt().expect("encodes"),
@@ -567,10 +592,7 @@ async fn a_proof_record_for_another_key_reads_as_absent() {
     let mut zone = SimZone::new("cluster.example", member_records());
     let stranger = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    zone.rekor_txt = vec![log
-        .publish(&stranger, "create", None)
-        .to_txt()
-        .expect("encodes")];
+    zone.rekor_txt = vec![log.publish(&stranger, "create").to_txt().expect("encodes")];
 
     let anchor = write(&zone.anchor_record());
     let log_key = write(&log.key_pem());
@@ -598,7 +620,7 @@ async fn a_chainless_entry_is_refused_through_the_whole_resolver_path() {
     // reaches it, and surfaced as the error class `synch doctor` explains.
     let mut zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
     let certificate = zone.certificate(&[]);
     let proof = log.log_certified(&zone, &statement, &certificate);
     zone.rekor_txt = vec![proof.to_txt().expect("encodes")];
@@ -673,7 +695,7 @@ fn fixture_field(name: &str) -> String {
 
 #[test]
 fn the_shared_fixture_decodes_and_verifies() {
-    let proof = RekorProof::decode(&fixture("proof.bin")).expect("the fixture is a v3 proof");
+    let proof = RekorProof::decode(&fixture("proof.bin")).expect("the fixture is a v4 proof");
 
     // Every part the Gleam encoder is asserted against, asserted here too:
     // if the two ever disagree, one of these fails rather than both suites
@@ -687,7 +709,6 @@ fn the_shared_fixture_decodes_and_verifies() {
         fixture("inclusion-path.bin"),
         "the audit path is a flat run of 32-byte hashes"
     );
-    assert_eq!(proof.key_tag.to_string(), fixture_field("key_tag"));
     assert_eq!(proof.log_index.to_string(), fixture_field("log_index"));
     // Re-encoding is byte-identical: the format has exactly one rendering.
     assert_eq!(proof.encode().unwrap(), fixture("proof.bin"));
@@ -706,10 +727,13 @@ fn the_shared_fixture_decodes_and_verifies() {
     assert_eq!(chain.encode(), fixture("dnssec-chain.der"));
 
     let dnskey_rdata = fixture("dnskey.bin");
+    // The sim signs with the zone key, so the certificate's key is that key
+    // too — allowed, not required: the signer and the subject set are
+    // independent under this claim.
     assert_eq!(body.certificate.spki, rekor::p256_spki(&dnskey_rdata[4..]));
     let key = ZoneKey {
         apex: &apex,
-        key_tag: proof.key_tag,
+        key_tag: fixture_field("key_tag").parse().expect("a key tag"),
         dnskey_rdata: &dnskey_rdata,
     };
     let logs = LogKeys::parse(&String::from_utf8(fixture("log-key.pem")).unwrap()).unwrap();
@@ -802,7 +826,7 @@ fn regenerate_the_shared_fixture() {
     let mut log = SimLog::new("rekor.sim");
     // Neighbours, so the audit path is a real path and not an empty list.
     log.append(b"an entry logged before this zone's key");
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
     let mut proof = log.log_statement(&zone, &statement);
     log.append(b"an entry logged after it");
     log.refresh(&mut proof);
@@ -829,12 +853,11 @@ fn regenerate_the_shared_fixture() {
     write_file(
         "meta.txt",
         format!(
-            "apex={}\nkey_tag={}\nlog_index={}\naction={}\nds={}\n",
+            "apex={}\nkey_tag={}\nlog_index={}\naction={}\n",
             zone.apex(),
-            proof.key_tag,
+            zone.key_tag(),
             proof.log_index,
             statement.action,
-            statement.ds,
         )
         .as_bytes(),
     );
@@ -853,20 +876,24 @@ fn regenerate_the_shared_fixture() {
 /// answer to two questions a local test cannot settle: whether Rekor accepts
 /// a certificate this size, and whether it accepts these extensions at all.
 ///
-/// It proves the claim the whole of v3 rests on: Rekor performs no
-/// certificate validation, so an apex written into a `dNSName` SAN lands, in
-/// the clear, inside the Merkle leaf where a monitor can index it.
+/// It proves the claim the whole certificate-verifier design rests on: Rekor
+/// performs no certificate validation, so an apex written into a `dNSName`
+/// SAN lands, in the clear, inside the Merkle leaf where a monitor can index
+/// it — and it accepted a 757-byte certificate carrying the chain extension
+/// under the narrowed OID, which no local test can establish.
 ///
-/// This fixture is **total** — the Statement was preserved this time, so the
-/// real client verifier runs to completion over real bytes rather than
-/// stopping at the first check it cannot answer. The one thing it is not is
-/// ICANN-rooted: we own no DNSSEC-signed domain, so the chain inside the
-/// certificate is self-anchored at the apex, and the test supplies that apex
-/// as the trust anchor exactly as a `--dnssec-anchor` deployment would. A
-/// public monitor rooted at ICANN files this entry tier B, correctly.
-/// Real-world ICANN-rooted chain validation is anchored separately by
-/// `tests/fixtures/dnssec_chain` (a live `cloudflare.com` delegation); this
-/// fixture is about interoperating with the log.
+/// The entry was published under the retired possession-format claim, so the
+/// full client verifier no longer runs over it: its `proof.bin` is the old
+/// v3 wire layout and its Statement the old v1 predicate, and this build
+/// reads neither — deliberately, there is no legacy path. What the fixture
+/// still proves is everything the *log* is responsible for: the leaf shape,
+/// the checkpoint with its witness cosignatures, inclusion in the real tree,
+/// and the certificate interop. A fresh total fixture requires a new public
+/// write (§2.1 of docs/REKOR-ZONE-KEY.md) and is minted the next time an
+/// entry is published for real. The chain inside the certificate is
+/// self-anchored at the apex (we own no DNSSEC-signed domain); real
+/// ICANN-rooted chain validation is anchored separately by
+/// `tests/fixtures/dnssec_chain` (a live `cloudflare.com` delegation).
 mod real_rekor_v3 {
     use super::*;
 
@@ -879,152 +906,47 @@ mod real_rekor_v3 {
 
     const APEX: &str = "zone-key-transparency.demo.invalid";
     const LOG_INDEX: u64 = 68_018_370;
-    const KEY_TAG: u16 = 31460;
 
-    /// The proof exactly as a zone serves it: the checked-in `proof.bin` is
-    /// the encoded `RekorProof` v3 record, decoded here through the client's
-    /// own wire decoder. Reassembling it field by field would test the
-    /// fixture against itself; decoding it tests the format.
-    fn proof_from_fixture() -> RekorProof {
-        let proof = RekorProof::decode(&v3("proof.bin"))
-            .expect("the served proof record must decode through the client's own reader");
-        // The loose files are the same bytes, so a reader of this directory
-        // can inspect each piece without a decoder.
-        assert_eq!(proof.statement, v3("statement.json"));
-        assert_eq!(proof.canonicalized_body, v3("canonicalized_body.json"));
-        assert_eq!(proof.checkpoint, v3("checkpoint.txt"));
-        assert_eq!(proof.log_index, LOG_INDEX);
-        assert_eq!(proof.key_tag, KEY_TAG);
-        proof
-    }
-
-    /// The zone's DNSKEY rdata, derived from the certificate's own
-    /// SubjectPublicKeyInfo — the way a monitor derives it, with no DNS
-    /// query, because the threat model has a compromised DNS provider in it.
-    ///
-    /// The shipped anchor file is asserted to be about the same key, so the
-    /// fixture cannot drift into being two keys wearing one name.
-    fn zone_dnskey_rdata() -> Vec<u8> {
-        let body = HashedRekordBody::parse(&v3("canonicalized_body.json")).unwrap();
-        let public = &body.certificate.spki[27..]; // the uncompressed point, sans 0x04
-        let mut rdata = vec![0x01, 0x01, 0x03, 0x0d]; // flags 257, protocol 3, alg 13
-        rdata.extend_from_slice(public);
-        assert_eq!(
-            chain::key_tag(&rdata),
-            KEY_TAG,
-            "the certificate's key must be the key the entry names"
-        );
-        let anchor = String::from_utf8(v3("anchor.txt")).expect("the anchor is text");
-        assert!(
-            anchor.contains(&rekor::base64_encode(public)),
-            "the shipped anchor must be this same key, or the fixture is about two keys"
-        );
-        rdata
-    }
-
-    /// The anchor as the resolver holds it. Written to a temp file because
-    /// `TrustAnchors::from_file` is the only public constructor, and using
-    /// the real parser is the point — the fixture ships the anchor in the
-    /// syntax an operator actually types.
-    fn anchors() -> (
-        tempfile::TempDir,
-        hickory_resolver::proto::dnssec::TrustAnchors,
-    ) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("anchor.key");
-        std::fs::write(&path, v3("anchor.txt")).expect("write anchor");
-        let anchors = hickory_resolver::proto::dnssec::TrustAnchors::from_file(&path)
-            .expect("the shipped anchor must parse");
-        (dir, anchors)
-    }
-
-    /// The embedded id of `log2025-1.rekor.sigstore.dev`.
-    ///
-    /// Note which id this is. Rekor's own `entry.logId.keyId` in the same
-    /// JSON response is the **C2SP note key id** —
-    /// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)` — a different, equally
-    /// 32-byte, entirely plausible-looking value. Copying that one instead
-    /// produces a proof that fails to match any pin. Ours is
-    /// `SHA-256(DER SPKI)` throughout, and `rekor::log_id` is the only place
-    /// that decision is made.
-    fn embedded_log2025_1_id() -> [u8; 32] {
-        let expected: [u8; 32] =
-            hex::decode("b54813cb63d8859870a5e78500cc6adcfdf59723edae93ee8d25faf2475a0690")
-                .unwrap()
-                .try_into()
-                .unwrap();
-        assert!(
-            LogKeys::embedded().find(&expected).is_some(),
-            "the embedded pin set must carry log2025-1"
-        );
-        expected
-    }
-
-    /// The whole client verifier, over real bytes, to a successful result.
-    #[test]
-    fn the_real_entry_verifies_end_to_end() {
-        let proof = proof_from_fixture();
-        assert_eq!(proof.log_id, embedded_log2025_1_id());
-        let rdata = zone_dnskey_rdata();
-        let key = ZoneKey {
-            apex: APEX,
-            key_tag: KEY_TAG,
-            dnskey_rdata: &rdata,
+    /// The legacy v3 wire record's log-facing fields, read with a local
+    /// throwaway parser: this build's decoder refuses the version on
+    /// purpose, but the *log's* half of the fixture — index, checkpoint,
+    /// audit path — is format-independent and stays load-bearing.
+    fn legacy_log_fields() -> (u64, Vec<u8>, Vec<[u8; 32]>) {
+        let bytes = v3("proof.bin");
+        assert_eq!(bytes[0], 3, "the fixture is the legacy v3 layout");
+        // version u8, key_tag u16, log_id [32], log_index u64, then three
+        // u16-prefixed blobs (statement, body, checkpoint), then the path.
+        let mut at = 1 + 2 + 32;
+        let log_index = u64::from_be_bytes(bytes[at..at + 8].try_into().unwrap());
+        at += 8;
+        let mut blob = || {
+            let len = u16::from_be_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+            let out = bytes[at + 2..at + 2 + len].to_vec();
+            at += 2 + len;
+            out
         };
-        let (_dir, anchors) = anchors();
-
-        let record = rekor::verify(&proof, &key, &LogKeys::embedded(), &anchors)
-            .expect("a real published entry must verify under the embedded pins");
-
-        assert_eq!(record.log_index, LOG_INDEX);
-        assert_eq!(record.tree_size, 68_018_432);
-        assert_eq!(record.origin, "log2025-1.rekor.sigstore.dev");
-        // A rollover: the statement names the key it replaces, and a client
-        // accepts rollover as authorization (retire it would refuse).
-        assert_eq!(record.action, "rollover");
-    }
-
-    /// The same bytes, offered as proof for a *different* key: refused.
-    ///
-    /// The binding this breaks is the one that matters — an attacker who can
-    /// read the log can copy any published proof, so a proof that verified
-    /// for a key it does not name would authorize every key in existence.
-    #[test]
-    fn the_real_entry_is_refused_for_a_different_key() {
-        let proof = proof_from_fixture();
-        let (_dir, anchors) = anchors();
-        let mut rdata = zone_dnskey_rdata();
-        rdata[8] ^= 0x40; // a different P-256 point, same shape
-        let stranger = ZoneKey {
-            apex: APEX,
-            key_tag: KEY_TAG,
-            dnskey_rdata: &rdata,
-        };
-        let error = rekor::verify(&proof, &stranger, &LogKeys::embedded(), &anchors)
-            .expect_err("a real proof must not authorize a key it does not name");
-        assert!(
-            matches!(&error, ProofError::Binding(_)),
-            "the certificate names another key: {error}"
-        );
-
-        // And offered for a different apex, with the right key.
-        let rdata = zone_dnskey_rdata();
-        let elsewhere = ZoneKey {
-            apex: "somewhere.else.invalid",
-            key_tag: KEY_TAG,
-            dnskey_rdata: &rdata,
-        };
-        assert!(matches!(
-            rekor::verify(&proof, &elsewhere, &LogKeys::embedded(), &anchors).unwrap_err(),
-            ProofError::Binding(_)
-        ));
+        let statement = blob();
+        let body = blob();
+        let checkpoint = blob();
+        assert_eq!(statement, v3("statement.json"));
+        assert_eq!(body, v3("canonicalized_body.json"));
+        let hops = bytes[at] as usize;
+        at += 1;
+        let mut path = Vec::with_capacity(hops);
+        for _ in 0..hops {
+            path.push(bytes[at..at + 32].try_into().unwrap());
+            at += 32;
+        }
+        assert_eq!(at, bytes.len());
+        (log_index, checkpoint, path)
     }
 
     /// Inclusion in the real tree, with teeth.
     #[test]
     fn the_real_entry_is_included_in_the_real_tree() {
-        let proof = proof_from_fixture();
-        let checkpoint = rekor::Checkpoint::parse(&proof.checkpoint).unwrap();
+        let (log_index, checkpoint_bytes, inclusion_path) = legacy_log_fields();
+        assert_eq!(log_index, LOG_INDEX);
+        let checkpoint = rekor::Checkpoint::parse(&checkpoint_bytes).unwrap();
         assert_eq!(checkpoint.origin, "log2025-1.rekor.sigstore.dev");
         checkpoint
             .verify_under(&LogKeys::embedded())
@@ -1041,22 +963,22 @@ mod real_rekor_v3 {
             4
         );
         rekor::verify_inclusion(
-            proof.log_index,
+            log_index,
             checkpoint.tree_size,
-            proof.leaf_hash(),
-            &proof.inclusion_path,
+            rekor::leaf_hash(&v3("canonicalized_body.json")),
+            &inclusion_path,
             checkpoint.root_hash,
         )
         .expect("the audit path must reach the real root");
 
         // One byte off the body and the leaf is not in the tree.
-        let mut tampered = proof;
-        tampered.canonicalized_body[0] ^= 0x01;
+        let mut tampered = v3("canonicalized_body.json");
+        tampered[0] ^= 0x01;
         assert!(rekor::verify_inclusion(
-            tampered.log_index,
+            log_index,
             checkpoint.tree_size,
-            tampered.leaf_hash(),
-            &tampered.inclusion_path,
+            rekor::leaf_hash(&tampered),
+            &inclusion_path,
             checkpoint.root_hash,
         )
         .is_err());
@@ -1102,36 +1024,23 @@ mod real_rekor_v3 {
         assert_eq!(body.certificate.spki.len(), 91);
     }
 
-    /// The real Statement round-trips through this build's canonical form,
-    /// byte for byte.
-    ///
-    /// The control plane rendered these bytes and the log committed to their
-    /// digest. Two renderers have to agree on them exactly — "equivalent
-    /// JSON" is not equivalent when a Merkle leaf commits to a digest — so
-    /// this is the crossval for the Statement half of the format, against
-    /// bytes the log has permanently recorded.
+    /// The legacy Statement is refused by this build's parser — there is no
+    /// quiet path by which a possession-format claim reads as a key-set one
+    /// — while the leaf's digest↔PAE link, which is the log's business and
+    /// not the claim's, still holds over the real bytes.
     #[test]
-    fn the_real_statement_round_trips_through_this_builds_canonical_form() {
+    fn the_legacy_statement_is_refused_and_the_pae_link_still_holds() {
         let statement = v3("statement.json");
-        let parsed = rekor::ZoneKeyStatement::parse(&statement).expect("a real Statement parses");
-        assert_eq!(
-            String::from_utf8_lossy(&parsed.to_json()),
-            String::from_utf8_lossy(&statement),
-            "this build must re-render the logged Statement byte for byte"
-        );
-        assert_eq!(parsed.apex, format!("{APEX}."));
-        assert_eq!(parsed.key_tag, KEY_TAG);
-        assert_eq!(parsed.action, "rollover");
-        assert_eq!(parsed.replaces_key_tag, Some(23100));
-        assert_eq!(parsed.flags, 257);
-        assert_eq!(parsed.algorithm, 13);
-        assert_eq!(
-            parsed.subject_sha256,
-            hex::encode(rekor::sha256(&zone_dnskey_rdata()))
+        assert!(
+            matches!(
+                rekor::ZoneKeyStatement::parse(&statement),
+                Err(ProofError::Binding(_))
+            ),
+            "the v1 predicate type must be refused, not reinterpreted"
         );
 
-        // And the leaf's digest is that Statement's DSSE PAE — the link
-        // between the log's commitment and the bytes served beside it.
+        // The leaf's digest is that Statement's DSSE PAE — the link between
+        // the log's commitment and the bytes served beside it.
         let body = HashedRekordBody::parse(&v3("canonicalized_body.json")).unwrap();
         assert_eq!(
             body.digest,

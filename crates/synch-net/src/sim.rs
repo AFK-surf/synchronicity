@@ -114,8 +114,8 @@ impl SimZone {
         self.dnskey.calculate_key_tag().expect("key tag")
     }
 
-    /// The DS field the Statement carries: `<tag> <alg> 2 <sha256 hex>` over
-    /// the owner name and the DNSKEY rdata (RFC 4034 §5.1.4).
+    /// The DS field an operator hands a registrar: `<tag> <alg> 2 <sha256
+    /// hex>` over the owner name and the DNSKEY rdata (RFC 4034 §5.1.4).
     pub fn ds_field(&self) -> String {
         let rdata = self.dnskey_rdata();
         let mut input = name_wire(&self.origin);
@@ -123,17 +123,20 @@ impl SimZone {
         format!(
             "{} {} 2 {}",
             self.key_tag(),
-            rekor::ZONE_KEY_ALGORITHM,
+            u8::from(self.dnskey.public_key().algorithm()),
             hex::encode(rekor::sha256(&input))
         )
     }
 
-    /// Signs a DSSE payload's PAE with the zone key itself — §2's whole
-    /// point: possession of the CSK is the authority being made transparent.
+    /// Signs a DSSE payload's PAE with the zone key — which doubles as the
+    /// sim's entry *signer*: the certificate's SubjectPublicKeyInfo is this
+    /// key, so attribution verifies. Nothing requires the signer to be the
+    /// zone key; tests that want a distinct signer mint their own
+    /// certificate around another key.
     ///
     /// DER/ASN.1, the encoding a Rekor entry's `signature.content` carries
-    /// (and what the client's possession check verifies), not the raw `r||s`
-    /// of a DNSSEC signature.
+    /// (and what the client's attribution check verifies), not the raw
+    /// `r||s` of a DNSSEC signature.
     pub fn sign_dsse(&self, payload: &[u8]) -> Vec<u8> {
         sign_p256_der(&self.pkcs8, &rekor::pae(rekor::DSSE_PAYLOAD_TYPE, payload))
     }
@@ -267,20 +270,10 @@ impl SimZone {
         self.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), self.dnssec_chain().encode())])
     }
 
-    /// The Statement this zone's control plane would publish for its key.
-    pub fn zone_key_statement(&self, action: &str, replaces: Option<u16>) -> ZoneKeyStatement {
-        let rdata = self.dnskey_rdata();
-        ZoneKeyStatement {
-            subject_name: self.apex(),
-            subject_sha256: hex::encode(rekor::sha256(&rdata)),
-            apex: self.apex(),
-            key_tag: self.key_tag(),
-            algorithm: rekor::ZONE_KEY_ALGORITHM,
-            flags: rekor::ZONE_KEY_FLAGS,
-            ds: self.ds_field(),
-            action: action.to_string(),
-            replaces_key_tag: replaces,
-        }
+    /// The Statement this zone's control plane would publish for its key
+    /// set — here the one-key degenerate case, a CSK zone.
+    pub fn zone_key_statement(&self, action: &str) -> ZoneKeyStatement {
+        ZoneKeyStatement::for_keys(&self.apex(), &[self.dnskey_rdata()], action)
     }
 
     /// The name the proof records live under.
@@ -500,11 +493,16 @@ impl SimDelegation {
             zone: zone.apex(),
             rrs: chain::encode_rrs(&records).expect("encode chain link"),
         };
+        // The apex link carries its own DNSKEY RRset beside the DS: the walk
+        // proves the RRset — the authorized key set — and the DS need only
+        // cover the key that signed it, never every key in it.
+        let mut apex_records = self.apex.dnskey_records(inception);
+        apex_records.extend(self.tld.ds_records_for(&self.apex, inception));
         let mut tld_records = self.tld.dnskey_records(inception);
         tld_records.extend(self.root.ds_records_for(&self.tld, inception));
         DnssecChain {
             links: vec![
-                link(&self.apex, self.tld.ds_records_for(&self.apex, inception)),
+                link(&self.apex, apex_records),
                 link(&self.tld, tld_records),
                 link(&self.root, self.root.dnskey_records(inception)),
             ],
@@ -658,16 +656,15 @@ impl SimLog {
         let payload = statement.to_json();
         let signature = zone.sign_dsse(&payload);
         let body = hashedrekord_body(&payload, &signature, certificate);
-        self.log_body(statement.key_tag, payload, body)
+        self.log_body(payload, body)
     }
 
     /// Appends a prebuilt entry body and returns the whole proof. The
     /// primitive `log_statement` builds on, and the seam a test uses to log a
     /// body that is well formed but wrong — a signature by a stranger, a
-    /// verifier that is not the zone's key — one flaw at a time.
-    pub fn log_body(&mut self, key_tag: u16, statement: Vec<u8>, body: Vec<u8>) -> RekorProof {
+    /// verifier that is not the signer's key — one flaw at a time.
+    pub fn log_body(&mut self, statement: Vec<u8>, body: Vec<u8>) -> RekorProof {
         let mut proof = RekorProof {
-            key_tag,
             log_id: self.log_id(),
             log_index: 0,
             statement,
@@ -681,9 +678,9 @@ impl SimLog {
         proof
     }
 
-    /// Logs a zone's current key with the standard Statement.
-    pub fn publish(&mut self, zone: &SimZone, action: &str, replaces: Option<u16>) -> RekorProof {
-        let statement = zone.zone_key_statement(action, replaces);
+    /// Logs a zone's current key set with the standard Statement.
+    pub fn publish(&mut self, zone: &SimZone, action: &str) -> RekorProof {
+        let statement = zone.zone_key_statement(action);
         self.log_statement(zone, &statement)
     }
 

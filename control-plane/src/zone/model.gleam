@@ -78,7 +78,7 @@ pub fn read(conn: Connection) -> Result(ZoneInput, ModelError) {
   use meta <- result.try(read_meta(conn))
   use ns_hosts <- result.try(read_ns(conn, meta.apex))
   use txt_names <- result.try(read_txt_names(conn, meta.apex))
-  use rekor_proofs <- result.try(read_rekor_proofs(conn, meta.key_tag))
+  use rekor_proofs <- result.try(read_rekor_proofs(conn))
   use tuf_bundle <- result.try(read_tuf_bundle(conn))
   Ok(ZoneInput(meta, ns_hosts, txt_names, rekor_proofs, tuf_bundle))
 }
@@ -96,18 +96,14 @@ fn read_tuf_bundle(conn: Connection) -> Result(String, ModelError) {
   }
 }
 
-/// The proof records for the key this zone publishes.
+/// The proof records this zone serves — every verified non-retire record;
+/// with key-set claims there is no per-tag selection, a client tries each.
 ///
 /// A stored row that cannot be turned back into a proof is dropped rather
 /// than served: a malformed record would make every client refuse the whole
 /// zone, which is a worse outcome than the one the row was meant to fix.
-fn read_rekor_proofs(
-  conn: Connection,
-  key_tag: Int,
-) -> Result(List(String), ModelError) {
-  use records <- result.try(
-    rekor_store.servable(conn, key_tag) |> result.map_error(Db),
-  )
+fn read_rekor_proofs(conn: Connection) -> Result(List(String), ModelError) {
+  use records <- result.try(rekor_store.servable(conn) |> result.map_error(Db))
   Ok(
     records
     |> list.filter_map(fn(record) {

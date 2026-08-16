@@ -36,6 +36,7 @@ import email/mailer
 import gleam/erlang/process
 import gleam/int
 import gleam/io
+import gleam/list
 import gleam/option
 import gleam/otp/static_supervisor as sup
 import gleam/result
@@ -149,15 +150,12 @@ fn rekor_publish(
   use log_key <- result.try(client.log_key())
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
-  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
-  use action <- result.try(case forced_action {
-    "" ->
-      rekor.action_for(conn, key_tag)
-      |> result.map_error(fn(e) {
-        "reading stored records: " <> string.inspect(e)
-      })
-    forced -> Ok(forced)
-  })
+  let claim = case forced_action {
+    // The retiring subject is the CSK being taken out of service — the one
+    // key this deployment ever put in the zone.
+    "retire" -> rekor.Retire([keys.dnskey_rdata(csk)])
+    _ -> rekor.Current
+  }
   use outcome <- result.try(
     rekor.run(
       conn,
@@ -167,7 +165,7 @@ fn rekor_publish(
       log_key,
       now,
       chain.doh(chain.resolver_url()),
-      action,
+      claim,
     )
     |> result.map_error(fn(e) { "logging the zone key: " <> string.inspect(e) }),
   )
@@ -177,8 +175,8 @@ fn rekor_publish(
   )
   sqlite.close(conn)
   io.println(
-    "zone key "
-    <> int.to_string(outcome.key_tag)
+    "zone key set "
+    <> string.join(list.map(outcome.key_tags, int.to_string), ",")
     <> " "
     <> outcome.action
     <> ": log index "

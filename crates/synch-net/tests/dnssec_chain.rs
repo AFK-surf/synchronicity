@@ -47,48 +47,47 @@ fn a_real_delegation_validates_against_the_icann_anchor() {
     assert_eq!(chain::key_tag(&dnskey), 2371);
 
     let anchors = TrustAnchors::default();
-    let valid = chain::validate(&chain, &apex("cloudflare.com."), &dnskey, &anchors)
+    let (proven, valid) = chain::validate(&chain, &apex("cloudflare.com."), &anchors)
         .expect("a real delegation must validate");
     assert_eq!(valid.anchor_zone, ".");
     assert!(!valid.anchored_directly);
-    // Four links' worth of walk: root DNSKEY, com DS, com DNSKEY,
-    // cloudflare.com DS.
     assert_eq!(valid.links, 3);
+    // The proven set is the apex DNSKEY RRset — a real split-key zone, so
+    // the DS-covered KSK is in it and it is not alone: the ZSKs that
+    // actually sign answers are the point of proving the whole RRset.
+    assert!(proven.contains(&dnskey), "the KSK the DS covers is proven");
+    assert!(proven.len() > 1, "a split-key zone proves its ZSKs too");
     // The archival property, asserted without depending on how old the
     // fixture happens to be today: every RRSIG in it has an expiration, and
     // the chain validates just the same at a moment past all of them, because
     // the validator never consults a clock.
     let expirations = rrsig_expirations(&chain);
-    assert_eq!(expirations.len(), 4);
+    assert_eq!(expirations.len(), 5);
     let long_after = expirations.iter().max().expect("expirations") + 365 * 86_400;
     assert!(expirations.iter().all(|&e| e < long_after));
-    chain::validate(&chain, &apex("cloudflare.com."), &dnskey, &anchors)
+    chain::validate(&chain, &apex("cloudflare.com."), &anchors)
         .expect("an expired chain still validates: that is the point");
 
     // Case and the trailing dot are DNS spelling, not identity.
-    chain::validate(&chain, &apex("CloudFlare.com"), &dnskey, &anchors).unwrap();
+    chain::validate(&chain, &apex("CloudFlare.com"), &anchors).unwrap();
 }
 
-/// The same chain, asked about a key it says nothing about.
+/// The proven set is closed: a key the chain never proved is not in it.
 #[test]
 fn a_real_delegation_does_not_cover_a_key_it_never_named() {
     let chain = DnssecChain::decode(&fixture("cloudflare-com.der")).unwrap();
     let anchors = TrustAnchors::default();
+    let (proven, _) = chain::validate(&chain, &apex("cloudflare.com."), &anchors).unwrap();
     let mut other = fixture("cloudflare-com-dnskey.bin");
     other[20] ^= 0x01;
-    assert!(matches!(
-        chain::validate(&chain, &apex("cloudflare.com."), &other, &anchors),
-        Err(ChainError::KeyNotCovered(_))
-    ));
+    assert!(
+        !proven.contains(&other),
+        "membership is byte-exact — a one-bit key variant proves nothing"
+    );
 
     // And it says nothing about a different zone, however well it validates.
     assert!(matches!(
-        chain::validate(
-            &chain,
-            &apex("example.com."),
-            &fixture("cloudflare-com-dnskey.bin"),
-            &anchors
-        ),
+        chain::validate(&chain, &apex("example.com."), &anchors),
         Err(ChainError::Structure(_))
     ));
 }
@@ -97,19 +96,13 @@ fn a_real_delegation_does_not_cover_a_key_it_never_named() {
 #[test]
 fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     let anchors = TrustAnchors::default();
-    let dnskey = fixture("cloudflare-com-dnskey.bin");
     let original = DnssecChain::decode(&fixture("cloudflare-com.der")).unwrap();
 
     // No links at all: absent, not malformed — the distinction is what
     // separates "this control plane has not upgraded" from "somebody
     // stripped the evidence out".
     assert_eq!(
-        chain::validate(
-            &DnssecChain::default(),
-            &apex("cloudflare.com."),
-            &dnskey,
-            &anchors
-        ),
+        chain::validate(&DnssecChain::default(), &apex("cloudflare.com."), &anchors),
         Err(ChainError::Absent)
     );
 
@@ -120,7 +113,7 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     let at = broken.links[last].rrs.len() - 20;
     broken.links[last].rrs[at] ^= 0x01;
     assert!(matches!(
-        chain::validate(&broken, &apex("cloudflare.com."), &dnskey, &anchors),
+        chain::validate(&broken, &apex("cloudflare.com."), &anchors),
         Err(ChainError::Signature(_))
     ));
 
@@ -129,7 +122,7 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     let mut headless = original.clone();
     headless.links.pop();
     assert!(matches!(
-        chain::validate(&headless, &apex("cloudflare.com."), &dnskey, &anchors),
+        chain::validate(&headless, &apex("cloudflare.com."), &anchors),
         Err(ChainError::Anchor(_))
     ));
 
@@ -139,7 +132,7 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     let mut spliced = original.clone();
     spliced.links.remove(1);
     assert!(matches!(
-        chain::validate(&spliced, &apex("cloudflare.com."), &dnskey, &anchors),
+        chain::validate(&spliced, &apex("cloudflare.com."), &anchors),
         Err(ChainError::Structure(_))
     ));
 
@@ -147,19 +140,14 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
     let mut garbled = original.clone();
     garbled.links[0].rrs = b"not a resource record".to_vec();
     assert!(matches!(
-        chain::validate(&garbled, &apex("cloudflare.com."), &dnskey, &anchors),
+        chain::validate(&garbled, &apex("cloudflare.com."), &anchors),
         Err(ChainError::Malformed(_)) | Err(ChainError::Structure(_))
     ));
 
     // An empty trust-anchor set trusts nothing, and says so as an anchor
     // failure rather than quietly succeeding.
     assert!(matches!(
-        chain::validate(
-            &original,
-            &apex("cloudflare.com."),
-            &dnskey,
-            &TrustAnchors::empty()
-        ),
+        chain::validate(&original, &apex("cloudflare.com."), &TrustAnchors::empty()),
         Err(ChainError::Anchor(_))
     ));
 }
@@ -171,7 +159,6 @@ fn a_tampered_chain_is_refused_at_the_link_that_was_touched() {
 #[test]
 fn a_link_cannot_smuggle_another_zones_records() {
     let anchors = TrustAnchors::default();
-    let dnskey = fixture("cloudflare-com-dnskey.bin");
     let original = DnssecChain::decode(&fixture("cloudflare-com.der")).unwrap();
     let mut relabelled = original.clone();
     relabelled.links[1] = ChainLink {
@@ -179,7 +166,7 @@ fn a_link_cannot_smuggle_another_zones_records() {
         rrs: original.links[1].rrs.clone(),
     };
     assert!(matches!(
-        chain::validate(&relabelled, &apex("cloudflare.com."), &dnskey, &anchors),
+        chain::validate(&relabelled, &apex("cloudflare.com."), &anchors),
         Err(ChainError::Structure(_))
     ));
 }

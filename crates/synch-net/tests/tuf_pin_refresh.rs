@@ -490,7 +490,7 @@ fn state_is_monotonic_across_two_zones_sharing_one_file() {
 async fn zone_learning_a_new_shard() -> (SimZone, SimLog, tempfile::NamedTempFile) {
     let mut zone = SimZone::new("cluster.example", member_records());
     let mut new_shard = SimLog::new("log2099-1.rekor.sim");
-    let proof = new_shard.publish(&zone, "create", None);
+    let proof = new_shard.publish(&zone, "create");
     zone.rekor_txt = vec![proof.to_txt().expect("encodes")];
 
     let now = std::time::SystemTime::now()
@@ -601,10 +601,7 @@ async fn an_invalid_bundle_leaves_the_pins_alone_and_never_fails_a_refresh() {
     // proof from a log the client already pins — the refresh must succeed.
     let mut zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    zone.rekor_txt = vec![log
-        .publish(&zone, "create", None)
-        .to_txt()
-        .expect("encodes")];
+    zone.rekor_txt = vec![log.publish(&zone, "create").to_txt().expect("encodes")];
     zone.tuf_txt = vec!["this is not a bundle".to_string()];
 
     let anchor = write(&zone.anchor_record());
@@ -659,10 +656,7 @@ async fn an_invalid_bundle_leaves_the_pins_alone_and_never_fails_a_refresh() {
 async fn a_zone_that_relays_nothing_is_a_non_event() {
     let mut zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    zone.rekor_txt = vec![log
-        .publish(&zone, "create", None)
-        .to_txt()
-        .expect("encodes")];
+    zone.rekor_txt = vec![log.publish(&zone, "create").to_txt().expect("encodes")];
     let anchor = write(&zone.anchor_record());
     let log_key = write(&log.key_pem());
     let (url, server) = zone.serve().await;

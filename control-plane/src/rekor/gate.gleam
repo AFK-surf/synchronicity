@@ -13,7 +13,6 @@
 //// accidentally publish ungated.
 
 import envoy
-import gleam/list
 import gleam/result
 import rekor/store
 import store/sqlite.{type Connection}
@@ -22,7 +21,7 @@ import store/sqlite.{type Connection}
 pub const require_env = "CP_REKOR_REQUIRE"
 
 pub type GateError {
-  /// The active key has no verified log record.
+  /// The active key is claimed by no verified log record.
   NoRecord(key_tag: Int)
   Db(sqlite.Error)
 }
@@ -35,18 +34,24 @@ pub fn required() -> Bool {
   }
 }
 
-/// Refuses when the gate is armed and the active key tag has no verified,
-/// servable record. Passes silently when it is not armed.
-pub fn check(conn: Connection, key_tag: Int) -> Result(Nil, GateError) {
+/// Refuses when the gate is armed and the active key — named by the SHA-256
+/// of its DNSKEY rdata, with the tag along for the error message — is not
+/// claimed by any verified, servable record. Passes silently when the gate
+/// is not armed.
+pub fn check(
+  conn: Connection,
+  key_tag: Int,
+  key_sha256: BitArray,
+) -> Result(Nil, GateError) {
   case required() {
     False -> Ok(Nil)
     True -> {
-      use records <- result.try(
-        store.servable(conn, key_tag) |> result.map_error(Db),
+      use covered <- result.try(
+        store.covered(conn, key_sha256) |> result.map_error(Db),
       )
-      case list.is_empty(records) {
-        False -> Ok(Nil)
-        True -> Error(NoRecord(key_tag))
+      case covered {
+        True -> Ok(Nil)
+        False -> Error(NoRecord(key_tag))
       }
     }
   }

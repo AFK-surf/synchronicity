@@ -172,7 +172,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create", None);
+        let statement = g.zone.zone_key_statement("create");
         let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
         push("genesis", g, log, proof, None);
     }
@@ -180,9 +180,8 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     // 2. A routine rotation the operator performed.
     {
         let g = ground(rooted);
-        let old = SimZone::new("cluster.example", members());
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("rollover", Some(old.key_tag()));
+        let statement = g.zone.zone_key_statement("rollover");
         let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
         push("rotation", g, log, proof, None);
     }
@@ -198,7 +197,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create", None);
+        let statement = g.zone.zone_key_statement("create");
         let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
         push("substitution", g, log, proof, None);
     }
@@ -207,7 +206,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create", None);
+        let statement = g.zone.zone_key_statement("create");
         let proof = log.log_certified(&g.zone, &statement, &g.zone.certificate(&[]));
         push("chainless", g, log, proof, None);
     }
@@ -218,7 +217,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
         let at = g.chain.links[0].rrs.len() - 3;
         g.chain.links[0].rrs[at] ^= 0x01;
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create", None);
+        let statement = g.zone.zone_key_statement("create");
         let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
         push("broken chain", g, log, proof, None);
     }
@@ -228,7 +227,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
         let mut g = ground(rooted);
         g.chain = ground(rooted).chain;
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create", None);
+        let statement = g.zone.zone_key_statement("create");
         let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
         push("wrong-key chain", g, log, proof, None);
     }
@@ -251,7 +250,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
             }
         };
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create", None);
+        let statement = g.zone.zone_key_statement("create");
         let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
         push("expired chain", g, log, proof, None);
     }
@@ -269,7 +268,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     ] {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create", None);
+        let statement = g.zone.zone_key_statement("create");
         let certificate = g
             .zone
             .certificate_for(san, &[(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())]);
@@ -282,7 +281,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create", None);
+        let statement = g.zone.zone_key_statement("create");
         let certificate = g.zone.certificate_for(
             "somewhere.else",
             &[(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())],
@@ -416,7 +415,7 @@ fn each_shape_lands_where_the_design_says_it_should() {
 fn what_the_monitor_has_seen_does_not_change_what_an_entry_is() {
     let zone = SimZone::new("cluster.example", members());
     let mut log = SimLog::new("rekor.sim");
-    let proof = log.publish(&zone, "create", None);
+    let proof = log.publish(&zone, "create");
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
 
     let anchors = anchors(&zone.anchor_record());
@@ -442,7 +441,7 @@ fn what_the_monitor_has_seen_does_not_change_what_an_entry_is() {
 fn a_key_is_news_until_it_has_been_recorded() {
     let zone = SimZone::new("cluster.example", members());
     let mut log = SimLog::new("rekor.sim");
-    let proof = log.publish(&zone, "create", None);
+    let proof = log.publish(&zone, "create");
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
     let finding = classify(&body, proof.log_index, &anchors(&zone.anchor_record())).unwrap();
     assert_eq!(finding.tier, Tier::A);
@@ -466,22 +465,25 @@ fn a_key_is_news_until_it_has_been_recorded() {
 fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
     let zone = SimZone::new("cluster.example", members());
     let mut log = SimLog::new("rekor.sim");
-    let proof = log.publish(&zone, "create", None);
+    let proof = log.publish(&zone, "create");
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
     let finding = classify(&body, 7, &anchors(&zone.anchor_record())).unwrap();
 
     // The same key tag and DS the zone itself would publish, arrived at with
-    // no DNS query — which is the only reason a compromised provider cannot
-    // steer what the monitor concludes.
-    assert_eq!(finding.key_tag, zone.key_tag());
-    assert_eq!(finding.ds, zone.ds_field());
+    // no DNS query — read out of the chain-proven RRset, which is the only
+    // reason a compromised provider cannot steer what the monitor concludes.
+    let [key] = finding.keys.as_slice() else {
+        panic!("a one-key zone proves one key: {:?}", finding.keys);
+    };
+    assert_eq!(key.key_tag, zone.key_tag());
+    assert_eq!(key.ds, zone.ds_field());
     // The apex is reported in canonical form — parsed from the SAN, so it
     // carries its root dot however the certificate happened to spell it.
     assert_eq!(finding.apex, zone.apex());
     assert_eq!(finding.log_index, 7);
 
     // The reported line carries everything an operator acts on: the zone, the
-    // key tag, the DS to compare against the registrar, the full SPKI digest
+    // key tag, the DS to compare against the registrar, the full rdata digest
     // and the index to look the entry up by.
     let line = finding.line();
     assert!(
@@ -489,7 +491,7 @@ fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
         "{line}"
     );
     assert!(line.contains(&zone.ds_field()), "{line}");
-    assert!(line.contains(&finding.spki_sha256), "{line}");
+    assert!(line.contains(&key.sha256), "{line}");
 }
 
 /// A long-expired chain classifies exactly like a fresh one.
@@ -504,7 +506,7 @@ fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
 #[test]
 fn a_long_expired_chain_classifies_the_same_as_a_fresh_one() {
     let zone = SimZone::new("cluster.example", members());
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
 
     let classify_chain = |chain: Vec<u8>| {
         let mut log = SimLog::new("rekor.sim");
@@ -539,7 +541,7 @@ fn a_long_expired_chain_classifies_the_same_as_a_fresh_one() {
 #[test]
 fn an_extension_nothing_reads_does_not_disturb_the_verdict() {
     let zone = SimZone::new("cluster.example", members());
-    let statement = zone.zone_key_statement("create", None);
+    let statement = zone.zone_key_statement("create");
     let chain = zone.dnssec_chain().encode();
 
     let classify_cert = |certificate: Vec<u8>| {
@@ -563,7 +565,7 @@ fn an_extension_nothing_reads_does_not_disturb_the_verdict() {
     assert_eq!(plain.tier, Tier::A);
     assert_eq!(plain.tier, with_junk.tier);
     assert_eq!(plain.reasons, with_junk.reasons);
-    assert_eq!(plain.spki_sha256, with_junk.spki_sha256);
+    assert_eq!(plain.keys, with_junk.keys);
 }
 
 /// A monitor reads leaves out of tiles; assert it against a whole simulated
@@ -586,7 +588,7 @@ fn a_monitor_finds_a_zones_entry_by_walking_bundles() {
     let zone = SimZone::new("cluster.example", members());
     let mut log = SimLog::new("rekor.sim");
     log.append(b"somebody else's entry");
-    let proof = log.publish(&zone, "create", None);
+    let proof = log.publish(&zone, "create");
     let bundles = Bundles(vec![
         b"somebody else's entry".to_vec(),
         proof.canonicalized_body.clone(),

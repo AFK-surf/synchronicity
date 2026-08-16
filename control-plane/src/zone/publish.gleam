@@ -9,6 +9,7 @@ import dns/rdata
 import dnssec/keys.{type Csk}
 import dnssec/sign
 import gleam/bit_array
+import gleam/crypto
 import gleam/int
 import gleam/list
 import gleam/result
@@ -103,7 +104,11 @@ pub fn publish_in_tx(
     False -> Error(KeyMismatch)
   })
   use Nil <- result.try(
-    gate.check(conn, meta.key_tag)
+    gate.check(
+      conn,
+      meta.key_tag,
+      crypto.hash(crypto.Sha256, keys.dnskey_rdata(csk)),
+    )
     |> result.map_error(fn(e) {
       case e {
         gate.NoRecord(key_tag) -> NoRekorRecord(key_tag)

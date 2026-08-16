@@ -60,10 +60,8 @@ fn meta(field: String) -> String {
 
 fn fixture_proof() -> Proof {
   let assert Ok(path) = proof.split_path(fixture("inclusion-path.bin"))
-  let assert Ok(key_tag) = int.parse(meta("key_tag"))
   let assert Ok(log_index) = int.parse(meta("log_index"))
   Proof(
-    key_tag: key_tag,
     log_id: fixture("log-id.bin"),
     log_index: log_index,
     statement: fixture("statement.json"),
@@ -84,42 +82,45 @@ fn fixture_public() -> BitArray {
 pub fn statement_bytes_match_the_fixture_test() {
   let assert Ok(apex) = name.parse(meta("apex"))
   let built =
-    statement.to_json(statement.for_key(
+    statement.to_json(statement.for_keys(
       apex,
-      fixture_public(),
+      [fixture("dnskey.bin")],
       meta("action"),
-      None,
     ))
   // Byte-exact: the signature and the Merkle leaf both commit to these
   // bytes, so "equivalent JSON" is not equivalent.
   assert built == fixture("statement.json")
 }
 
-pub fn statement_fields_are_the_observed_key_test() {
+pub fn statement_fields_are_the_observed_key_set_test() {
   let assert Ok(apex) = name.parse(meta("apex"))
-  let built = statement.for_key(apex, fixture_public(), "create", None)
-  assert built.key_tag == keys.key_tag(fixture("dnskey.bin"))
-  assert built.algorithm == 13
-  assert built.flags == 257
-  assert built.ds == meta("ds")
-  assert built.subject_sha256
+  let built = statement.for_keys(apex, [fixture("dnskey.bin")], "create")
+  let assert [key] = built.keys
+  assert key.key_tag == keys.key_tag(fixture("dnskey.bin"))
+  assert key.algorithm == 13
+  assert key.flags == 257
+  assert key.sha256
     == string.lowercase(
       bit_array.base16_encode(crypto.hash(crypto.Sha256, fixture("dnskey.bin"))),
     )
 }
 
-pub fn statement_renders_a_rollover_test() {
+pub fn a_key_set_has_one_canonical_rendering_test() {
+  // Two keys supplied in either order render to the same bytes: ascending
+  // key tag, ties broken by digest. One set, one rendering — the same rule
+  // the Rust renderer applies.
   let assert Ok(apex) = name.parse("sync.test.")
-  let text =
-    statement.to_json(statement.for_key(
-      apex,
-      fixture_public(),
-      "rollover",
-      Some(1234),
-    ))
-  let assert Ok(json) = bit_array.to_string(text)
+  let ksk = rdata.dnskey(257, 13, <<7:size(512)>>)
+  let zsk = rdata.dnskey(256, 13, <<9:size(512)>>)
+  let one = statement.to_json(statement.for_keys(apex, [ksk, zsk], "rollover"))
+  let two = statement.to_json(statement.for_keys(apex, [zsk, ksk], "rollover"))
+  assert one == two
+  let assert Ok(json) = bit_array.to_string(one)
   assert string.contains(json, "\"action\":\"rollover\"")
-  assert string.ends_with(json, "\"replacesKeyTag\":1234}}")
+  assert string.contains(
+    json,
+    "\"predicateType\":\"https://synchronicity.sh/zone-key/v2\"",
+  )
 }
 
 pub fn dsse_pae_is_the_dsse_pae_test() {
@@ -138,7 +139,7 @@ pub fn the_fixture_signature_verifies_test() {
     fixture("statement.json"),
     signature,
   )
-  // One flipped bit and possession fails — the check is doing work.
+  // One flipped bit and attribution fails — the check is doing work.
   let assert Ok(<<first:int-size(8), rest:bits>>) = Ok(signature)
   let tampered = <<int.bitwise_exclusive_or(first, 1):int-size(8), rest:bits>>
   assert !statement.verify(
@@ -275,11 +276,11 @@ pub fn checkpoints_parse_or_are_refused_test() {
 /// the publisher owes is *collection*: ask for the right RRsets at the right
 /// names, refuse when one is missing, and carry the bytes verbatim. That is
 /// what this fake exercises.
-fn fake_resolver() -> chain.Resolver {
+fn fake_resolver(dnskey_rd: BitArray) -> chain.Resolver {
   chain.Resolver(query: fn(zone, rtype) {
     let rdata_of = fn(rtype: Int) {
       case rtype {
-        48 -> rdata.dnskey(257, 13, <<7:size(512)>>)
+        48 -> dnskey_rd
         _ -> <<1234:int-size(16), 13:int-size(8), 2:int-size(8), 9:size(256)>>
       }
     }
@@ -309,9 +310,16 @@ fn publish_run(
   log_key: #(BitArray, BitArray),
   now: Int,
 ) {
-  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
-  let assert Ok(action) = rekor_publish.action_for(conn, key_tag)
-  rekor_publish.run(conn, apex, csk, log, log_key, now, fake_resolver(), action)
+  rekor_publish.run(
+    conn,
+    apex,
+    csk,
+    log,
+    log_key,
+    now,
+    fake_resolver(keys.dnskey_rdata(csk)),
+    rekor_publish.Current,
+  )
 }
 
 /// A log a test can hold in its hand: one earlier entry, then ours, with a
@@ -357,15 +365,22 @@ pub fn publish_stores_a_verified_record_test() {
     publish_run(conn, apex, csk, log, #(spki, point), 1000)
   assert outcome.action == "create"
   assert outcome.refreshed == False
-  assert outcome.key_tag == keys.key_tag(keys.dnskey_rdata(csk))
+  // The claimed set is what the resolver's apex DNSKEY RRset holds — the
+  // CSK, observed on the (fake) wire rather than named from memory.
+  let csk_rdata = keys.dnskey_rdata(csk)
+  assert outcome.key_tags == [keys.key_tag(csk_rdata)]
 
-  let assert Ok([record]) = store.for_key_tag(conn, outcome.key_tag)
+  let assert Ok([record]) = store.servable(conn)
   assert record.apex == "sync.test."
   assert record.verified_at == 1000
+  let assert [#(key_sha256, key_tag)] = record.keys
+  assert key_sha256 == crypto.hash(crypto.Sha256, csk_rdata)
+  assert key_tag == keys.key_tag(csk_rdata)
   // What was stored is what a client will be handed, and it verifies.
   let assert Ok(stored) = rekor_publish.to_proof(record)
   let assert Ok(_) = proof.verify_against_log(stored, spki, point)
-  // Possession: the signature the log indexed is inside the stored body.
+  // Attribution: the signature the log indexed is inside the stored body,
+  // and it is the signer\'s.
   let assert Ok(#(_digest, signature, _certificate)) =
     proof.parse_body(record.canonicalized_body)
   assert statement.verify(csk.public, record.statement, signature)
@@ -386,7 +401,8 @@ pub fn publish_is_idempotent_test() {
   assert second.refreshed
   assert second.log_index == first.log_index
 
-  let assert Ok(records) = store.for_key_tag(conn, first.key_tag)
+  let _ = first
+  let assert Ok(records) = store.servable(conn)
   assert list.length(records) == 1
   let assert [record] = records
   assert record.verified_at == 2000
@@ -403,8 +419,7 @@ pub fn publish_refuses_an_unverifiable_proof_test() {
   // The log's own key is not the key we pin: nothing is stored.
   let assert Error(rekor_publish.Unverified(_)) =
     publish_run(conn, apex, csk, log, #(spki, stranger.public), 1000)
-  let assert Ok([]) =
-    store.for_key_tag(conn, keys.key_tag(keys.dnskey_rdata(csk)))
+  let assert Ok([]) = store.servable(conn)
   sqlite.close(conn)
 }
 
@@ -435,13 +450,12 @@ pub fn publish_gate_refuses_an_unlogged_key_test() {
 pub fn a_retire_record_does_not_satisfy_the_gate_test() {
   let conn = fixtures.fresh_conn()
   let csk = fixtures.zone_boot(conn)
-  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
+  let csk_rdata = keys.dnskey_rdata(csk)
   let assert Ok(Nil) =
     store.put(
       conn,
       store.Record(
-        spki_sha256: crypto.hash(crypto.Sha256, proof.p256_spki(csk.public)),
-        key_tag: key_tag,
+        keyset_sha256: crypto.hash(crypto.Sha256, csk_rdata),
         apex: "sync.test.",
         action: "retire",
         statement: <<"{}":utf8>>,
@@ -453,10 +467,15 @@ pub fn a_retire_record_does_not_satisfy_the_gate_test() {
         chainless: True,
         integrated_at: 1,
         verified_at: 1,
+        keys: [
+          #(crypto.hash(crypto.Sha256, csk_rdata), keys.key_tag(csk_rdata)),
+        ],
       ),
     )
-  // A retirement is a monitor breadcrumb, never a licence to serve (§2).
-  assert store.servable(conn, key_tag) == Ok([])
+  // A retirement is a monitor breadcrumb, never a licence to serve (§2) —
+  // and never a licence for the gate either: the key is claimed only by a
+  // retire, which covers nothing.
+  assert store.servable(conn) == Ok([])
   envoy.set(gate.require_env, "true")
   let assert Error(publish.NoRekorRecord(_)) =
     publish.publish(conn, csk, 1000, "test")
@@ -609,7 +628,6 @@ pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
   let csk = fixtures.zone_boot(conn)
   let assert Ok(apex) = name.parse("sync.test.")
   let #(log, spki, point) = fake_log(keys.generate())
-  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
 
   let assert Error(rekor_publish.NoChain(why)) =
     rekor_publish.run(
@@ -620,10 +638,10 @@ pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
       #(spki, point),
       1000,
       silent_resolver(),
-      "create",
+      rekor_publish.Current,
     )
-  assert string.contains(why, "DS")
-  let assert Ok([]) = store.for_key_tag(conn, key_tag)
+  assert string.contains(why, "DS") || string.contains(why, "DNSKEY")
+  let assert Ok([]) = store.servable(conn)
   sqlite.close(conn)
 }
 
@@ -643,12 +661,13 @@ pub fn a_retire_may_be_chainless_test() {
       #(spki, point),
       1000,
       silent_resolver(),
-      "retire",
+      rekor_publish.Retire([keys.dnskey_rdata(csk)]),
     )
   assert outcome.action == "retire"
   assert outcome.chainless
+  assert outcome.key_tags == [keys.key_tag(keys.dnskey_rdata(csk))]
   // And it is never served to a client: a retire is a monitor breadcrumb.
-  let assert Ok([]) = store.servable(conn, outcome.key_tag)
+  let assert Ok([]) = store.servable(conn)
   sqlite.close(conn)
 }
 

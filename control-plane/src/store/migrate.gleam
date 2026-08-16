@@ -74,17 +74,14 @@ fn migrations() -> List(String) {
 /// not a decomposition of it — so the certificate naming the zone stays
 /// inside `canonicalized_body`, where Rekor put it.
 ///
-/// Identity is `(spki_sha256, action)`: the SHA-256 of the key's DER
-/// SubjectPublicKeyInfo, which is what names a key everywhere else in this
-/// design — a monitor's record of the keys it has reported for a zone is
-/// keyed by the same digest. An RFC 4034 key
-/// tag is only a 16-bit checksum over the DNSKEY rdata, so two distinct keys
-/// collide with odds near 1/65536 per rollover; keying rows on it would let
-/// one key's row silently replace another's, taking its proof out of the
-/// served zone with no error anywhere. `key_tag` remains an indexed column
-/// because it is what a client selects on — it reads the tag from the RRSIG
-/// it just validated — but selection is not identity: a lookup may return two
-/// rows for one tag, and the client tries each until one verifies.
+/// Identity is `(keyset_sha256, action)`: an entry claims a key *set* — the
+/// apex DNSKEY RRset its chain proves — and the identity is the SHA-256 over
+/// that set's canonical rdata digests. The keys themselves are one row each
+/// in `rekor_record_keys`, keyed by the SHA-256 of the DNSKEY rdata (the
+/// digest a monitor's memory uses too), with the RFC 4034 key tag beside it
+/// for operators. A tag is only a 16-bit checksum two keys can share, so it
+/// is display data, never identity; the publish gate's question — is this
+/// key claimed by a verified record — is a join on the rdata digest.
 ///
 /// `chainless` records whether an entry carries a DNSSEC chain, and the CHECK
 /// confines that to `retire`: a zone being retired may have no DS left in its
@@ -102,8 +99,7 @@ fn migrations() -> List(String) {
 /// re-encode.
 const v3 = "
 CREATE TABLE rekor_records (
-  spki_sha256        BLOB    NOT NULL CHECK (length(spki_sha256) = 32),
-  key_tag            INTEGER NOT NULL,
+  keyset_sha256      BLOB    NOT NULL CHECK (length(keyset_sha256) = 32),
   apex               TEXT    NOT NULL,
   action             TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
   statement          BLOB    NOT NULL,
@@ -116,10 +112,19 @@ CREATE TABLE rekor_records (
                      CHECK (chainless = 0 OR action = 'retire'),
   integrated_at      INTEGER NOT NULL,
   verified_at        INTEGER NOT NULL,
-  PRIMARY KEY (spki_sha256, action)
+  PRIMARY KEY (keyset_sha256, action)
 );
 CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
-CREATE INDEX rekor_records_by_key_tag ON rekor_records (key_tag);
+CREATE TABLE rekor_record_keys (
+  keyset_sha256 BLOB    NOT NULL CHECK (length(keyset_sha256) = 32),
+  action        TEXT    NOT NULL,
+  key_sha256    BLOB    NOT NULL CHECK (length(key_sha256) = 32),
+  key_tag       INTEGER NOT NULL,
+  PRIMARY KEY (keyset_sha256, action, key_sha256),
+  FOREIGN KEY (keyset_sha256, action)
+    REFERENCES rekor_records (keyset_sha256, action) ON DELETE CASCADE
+);
+CREATE INDEX rekor_record_keys_by_key ON rekor_record_keys (key_sha256);
 CREATE TABLE tuf_material (
   id                INTEGER PRIMARY KEY CHECK (id = 1),
   source            TEXT    NOT NULL,

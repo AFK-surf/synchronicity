@@ -19,7 +19,12 @@
 //!
 //! Checked, cryptographically: every RRSIG in the chain verifies, the links
 //! form an unbroken delegation ladder from the trust anchor down to the apex,
-//! and the apex's DS actually covers the key being validated.
+//! and the apex's DNSKEY RRset is proved by a DS its parent signed. What the
+//! walk *establishes* is that RRset — the authorized key set — and the caller
+//! decides membership against it. The zone's signing keys need not be covered
+//! by the DS directly: a provider-managed zone signs answers with a ZSK the
+//! DS never names, and the DS→KSK→DNSKEY-RRset walk is exactly how DNSSEC
+//! itself authorizes that key.
 //!
 //! **Not checked: RRSIG validity windows.** Two independent reasons, and both
 //! matter. First, there is no trustworthy clock in the input at all — a Rekor
@@ -74,9 +79,6 @@ pub enum ChainError {
     /// The top of the chain is not a zone this reader's trust anchor names.
     #[error("chain anchor: {0}")]
     Anchor(String),
-    /// The chain is sound but says nothing about the key in the certificate.
-    #[error("the chain's DS records do not cover this zone key: {0}")]
-    KeyNotCovered(String),
 }
 
 /// What a valid chain establishes.
@@ -87,9 +89,10 @@ pub struct ValidChain {
     /// How many links the walk verified, apex first. Descriptive only:
     /// a caller reporting a finding wants to say how far the chain reached.
     pub links: usize,
-    /// Whether the apex link proved the key with a DS from its parent (the
-    /// ordinary case) or the key *is* the anchored key (only reachable under
-    /// an explicit trust-anchor override, where the apex is the anchor).
+    /// Whether the apex link proved its DNSKEY RRset with a DS from its
+    /// parent (the ordinary case) or the RRset *is* the anchored set (only
+    /// reachable under an explicit trust-anchor override, where the apex is
+    /// the anchor).
     pub anchored_directly: bool,
 }
 
@@ -103,9 +106,12 @@ pub struct Authorized {
     /// The apex, parsed and normalized from the certificate's single
     /// `dNSName` SAN.
     pub apex: Name,
-    /// The DNSKEY rdata implied by the certificate's SubjectPublicKeyInfo —
-    /// derived, never looked up.
-    pub dnskey_rdata: Vec<u8>,
+    /// The DNSKEY rdatas of the apex RRset the chain proved — the authorized
+    /// key set. Read out of the chain's own apex link, never looked up, and
+    /// never derived from the certificate's key: the certificate's
+    /// SubjectPublicKeyInfo is the entry *signer*, which attributes the entry
+    /// and authorizes nothing.
+    pub proven_keys: Vec<Vec<u8>>,
     /// What the carried chain established.
     pub chain: ValidChain,
 }
@@ -133,67 +139,33 @@ pub fn authorize(
     certificate: &Certificate,
     anchors: &TrustAnchors,
 ) -> Result<Authorized, ChainError> {
-    let Identity { apex, dnskey_rdata } = identify(certificate)?;
+    let apex = identify(certificate)?;
     let carried = match certificate.extension(zonecert::OID_DNSSEC_CHAIN) {
         None => return Err(ChainError::Absent),
         Some(value) => {
             DnssecChain::decode(value).map_err(|e| ChainError::Malformed(e.to_string()))?
         }
     };
-    let chain = validate(&carried, &apex, &dnskey_rdata, anchors)?;
+    let (proven_keys, chain) = validate(&carried, &apex, anchors)?;
     Ok(Authorized {
         apex,
-        dnskey_rdata,
+        proven_keys,
         chain,
     })
 }
 
-/// Who a certificate says it is about, before any signature is checked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Identity {
-    /// The apex, parsed and normalized from the single `dNSName` SAN.
-    pub apex: Name,
-    /// The DNSKEY rdata implied by the SubjectPublicKeyInfo.
-    pub dnskey_rdata: Vec<u8>,
-}
-
-/// The cheap half of [`authorize`]: the name and the key, no crypto.
+/// The cheap half of [`authorize`]: the apex a certificate names, no crypto.
 ///
-/// Exposed so a caller can compare a certificate's claims against what it
+/// Exposed so a caller can compare a certificate's claim against what it
 /// observed *before* paying for a chain walk, and so a mismatch reports as
 /// the binding failure it is rather than as a confusing chain error. It
 /// cannot be used to route around [`authorize`]: that calls this itself and
 /// walks the chain against what *it* returns, never against a caller's
 /// string.
-pub fn identify(certificate: &Certificate) -> Result<Identity, ChainError> {
-    let apex = certificate
+pub fn identify(certificate: &Certificate) -> Result<Name, ChainError> {
+    certificate
         .single_dns_name()
-        .map_err(|e| ChainError::Structure(e.to_string()))?;
-    let dnskey_rdata = zone_key_rdata(&certificate.spki).ok_or_else(|| {
-        ChainError::Structure(
-            "the certificate's key is not the P-256 SubjectPublicKeyInfo this design logs".into(),
-        )
-    })?;
-    Ok(Identity { apex, dnskey_rdata })
-}
-
-/// The DNSKEY rdata a certificate's public key implies: the CSK convention
-/// this design logs (flags 257, protocol 3, algorithm 13).
-///
-/// `None` for anything that is not the 91-byte P-256 SubjectPublicKeyInfo —
-/// somebody else's certificate that happens to carry a SAN, about which the
-/// honest answer is to say nothing.
-pub fn zone_key_rdata(spki: &[u8]) -> Option<Vec<u8>> {
-    let point = spki.get(27..)?;
-    if point.len() != 64 || crate::rekor::p256_spki(point) != spki {
-        return None;
-    }
-    let mut rdata = Vec::with_capacity(4 + 64);
-    rdata.extend_from_slice(&crate::rekor::ZONE_KEY_FLAGS.to_be_bytes());
-    rdata.push(3);
-    rdata.push(crate::rekor::ZONE_KEY_ALGORITHM);
-    rdata.extend_from_slice(point);
-    Some(rdata)
+        .map_err(|e| ChainError::Structure(e.to_string()))
 }
 
 /// Parses a DNS name the way every comparison in this design must.
@@ -205,20 +177,20 @@ pub fn parse_name(text: &str) -> Result<Name, ChainError> {
     name(text)
 }
 
-/// Validates a carried chain against `anchors`, for `apex` and the exact
-/// DNSKEY rdata the certificate's public key implies.
+/// Validates a carried chain against `anchors`, for `apex`, and returns the
+/// apex DNSKEY rdatas the chain proved — the authorized key set.
 ///
-/// `dnskey_rdata` is the four-byte DNSKEY header plus the public key — the
-/// bytes the DS digest is taken over. A client passes the rdata it observed
-/// in DNS; a monitor *derives* it from the certificate's SubjectPublicKeyInfo
-/// alone, precisely so that a compromised DNS provider has no influence over
-/// what the monitor concludes.
+/// Every link, the apex included, carries its own DNSKEY RRset; each RRset
+/// below the top is proved by a DS its parent signed, and the top's by a key
+/// the reader anchors. The proven set is read out of the chain itself: a
+/// monitor believes nothing but these bytes, and a client checks the key
+/// that signed its answer for membership rather than asking the DS to name
+/// it directly — a KSK/ZSK split zone's DS never names the signing key.
 pub fn validate(
     chain: &DnssecChain,
     apex: &Name,
-    dnskey_rdata: &[u8],
     anchors: &TrustAnchors,
-) -> Result<ValidChain, ChainError> {
+) -> Result<(Vec<Vec<u8>>, ValidChain), ChainError> {
     let links = chain.links.as_slice();
     if links.is_empty() {
         return Err(ChainError::Absent);
@@ -253,45 +225,29 @@ pub fn validate(
     let mut trusted = verify_dnskey_set(top, anchors)?;
     let anchor_zone = top.zone.to_string();
 
-    // Descend: every link below the top proves its own DNSKEY set with a DS
-    // its parent signed, until the apex, whose DS must cover the key at hand.
+    // Descend: every link below the top — the apex included — proves its own
+    // DNSKEY RRset with a DS its parent signed. A one-link chain skips the
+    // loop: the apex *is* the anchored zone, only reachable under an explicit
+    // `--dnssec-anchor` override, where there is no parent to hold a DS. A
+    // public monitor anchored at the ICANN root classifies such an entry
+    // tier B, which is the honest answer: nothing outside that private
+    // universe can tell whether the keys were authorized.
     for index in (0..parsed.len() - 1).rev() {
         let link = &parsed[index];
         let ds = verify_ds_set(link, trusted)?;
-        if index == 0 {
-            return match covers(ds, &link.zone, dnskey_rdata) {
-                true => Ok(ValidChain {
-                    anchor_zone,
-                    links,
-                    anchored_directly: false,
-                }),
-                false => Err(ChainError::KeyNotCovered(format!(
-                    "{} has {} DS record(s), none over this key",
-                    link.zone,
-                    ds.len()
-                ))),
-            };
-        }
         trusted = verify_dnskey_set_under(link, ds)?;
     }
 
-    // A one-link chain: the apex *is* the anchored zone. Only reachable under
-    // an explicit `--dnssec-anchor` override — "an override is a different
-    // universe" — where there is no parent to hold a DS and the anchor names
-    // the zone key directly. A public monitor anchored at the ICANN root
-    // classifies such an entry tier B, which is the honest answer: nothing
-    // outside that private universe can tell whether the key was authorized.
-    match trusted.iter().any(|key| rdata_of(key) == dnskey_rdata) {
-        true => Ok(ValidChain {
+    let proven: Vec<Vec<u8>> = trusted.iter().map(rdata_of).collect();
+    debug_assert!(!proven.is_empty(), "a verified DNSKEY set is non-empty");
+    Ok((
+        proven,
+        ValidChain {
             anchor_zone,
             links,
-            anchored_directly: true,
-        }),
-        false => Err(ChainError::KeyNotCovered(format!(
-            "the anchored DNSKEY set at {} does not contain this key",
-            top.zone
-        ))),
-    }
+            anchored_directly: links == 1,
+        },
+    ))
 }
 
 /// One link, decoded into records grouped the way validation needs them.
@@ -610,7 +566,6 @@ mod tests {
         let error = validate(
             &DnssecChain::default(),
             &parse_name("sync.example.").unwrap(),
-            &[0; 68],
             &anchors,
         )
         .unwrap_err();
