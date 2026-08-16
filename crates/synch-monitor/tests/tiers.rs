@@ -1,8 +1,8 @@
 //! Classification, and the invariant that couples it to the client.
 //!
-//! The two tiers are only useful if tier C — the silent bin — is exactly "an
+//! The two tiers are only useful if tier B — the silent bin — is exactly "an
 //! entry no client would have accepted either". If a client ever accepted
-//! something a monitor filed as tier C, an attacker would hold a key that
+//! something a monitor filed as tier B, an attacker would hold a key that
 //! works against victims and rings no bell, which is strictly worse than not
 //! logging at all. That invariant is asserted here directly, over every shape
 //! of entry the two sides can disagree about.
@@ -78,9 +78,9 @@ fn monitor_tier(shape: &Shape) -> Tier {
         Some(finding) => finding.tier,
         // A certificate the classifier declines to judge at all — an
         // unparseable SAN, a key that is not ours — is not in *any* tier, and
-        // for the invariant that is strictly worse than tier C: the entry is
+        // for the invariant that is strictly worse than tier B: the entry is
         // not even recorded. Treat it as C so the assertion below has teeth.
-        None => Tier::C,
+        None => Tier::B,
     }
 }
 
@@ -90,7 +90,7 @@ fn monitor_tier(shape: &Shape) -> Tier {
 /// Both, always. Every shape below is generated twice, because until this
 /// suite ran over a multi-link chain it was exercising exactly one branch of
 /// the validator — and the divergence that let a client-accepted entry be
-/// filed tier C only appears once a chain has a parent to climb to.
+/// filed tier B only appears once a chain has a parent to climb to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Rooted {
     /// The apex is its own trust anchor (`--dnssec-anchor` deployments).
@@ -304,7 +304,7 @@ fn tier_of(proof: &RekorProof, zone: &SimZone) -> Tier {
     let body = HashedRekordBody::parse(&proof.canonicalized_body).expect("a well-formed body");
     match classify(&body, proof.log_index, &anchors(&zone.anchor_record())) {
         Some(finding) => finding.tier,
-        None => Tier::C,
+        None => Tier::B,
     }
 }
 
@@ -329,7 +329,7 @@ fn nothing_a_client_accepts_lands_in_the_silent_bin() {
         // resolver must take — including the substitution, because it *is*
         // usable and the whole point is that it is reported rather than
         // refused here — and the ones it must refuse, which are exactly the
-        // tier C bin.
+        // tier B bin.
         let must_accept = match name.split(" (").next().expect("a shape name") {
             "genesis" | "rotation" | "substitution" | "expired chain" => true,
             "chainless"
@@ -383,18 +383,18 @@ fn each_shape_lands_where_the_design_says_it_should() {
         // whole shape of what this monitor now claims: a verified chain is an
         // authorization, and nothing here says who was entitled to make it.
         ("substitution", Tier::A),
-        ("chainless", Tier::C),
-        ("broken chain", Tier::C),
-        ("wrong-key chain", Tier::C),
+        ("chainless", Tier::B),
+        ("broken chain", Tier::B),
+        ("wrong-key chain", Tier::B),
         ("expired chain", Tier::A),
         // A SAN that is not a name names no zone: nothing to classify, and
         // nothing a client takes either.
-        ("malformed san", Tier::C),
+        ("malformed san", Tier::B),
         // A well-formed SAN with a chain for a *different* zone is an
-        // unauthorized claim about the zone it names — tier C, and refused by
+        // unauthorized claim about the zone it names — tier B, and refused by
         // every client. A monitor watching the zone whose chain it stole
         // never sees it at all, because the SAN does not match.
-        ("san names another zone", Tier::C),
+        ("san names another zone", Tier::B),
     ];
     for shape in shapes() {
         let base = shape.name.split(" (").next().expect("a shape name");
@@ -536,12 +536,10 @@ fn a_long_expired_chain_classifies_the_same_as_a_fresh_one() {
 
 /// An extension this build has never heard of changes nothing.
 ///
-/// This is the property that let the succession extension be deleted from the
-/// code without republishing the conformance entry that still carries it: the
-/// certificate parser collects extensions and looks them up by OID, and an
-/// unrecognised one is simply never asked for. Asserted with a synthetic OID
-/// rather than the retired one, so the assertion keeps its meaning after
-/// nobody remembers what `2.25.1138370866` was.
+/// The certificate parser collects extensions and looks them up by OID, so an
+/// unrecognised one is simply never asked for. A certificate may therefore
+/// carry things this build says nothing about without that changing what the
+/// entry *is*.
 #[test]
 fn an_extension_nothing_reads_does_not_disturb_the_verdict() {
     let zone = SimZone::new("cluster.example", members());
@@ -558,11 +556,11 @@ fn an_extension_nothing_reads_does_not_disturb_the_verdict() {
     let plain = classify_cert(zone.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), chain.clone())]));
     let with_junk = classify_cert(zone.certificate(&[
         (OID_DNSSEC_CHAIN.to_vec(), chain),
-        // 2.25.1138370866, the arc the countersignature used to live under,
-        // carrying bytes that decode as nothing at all.
+        // An arc this build has no name for, carrying bytes that decode as
+        // nothing at all.
         (
-            vec![0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32],
-            b"vestigial".to_vec(),
+            vec![0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x01],
+            b"opaque".to_vec(),
         ),
     ]));
 

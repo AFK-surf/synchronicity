@@ -257,7 +257,7 @@ fn a_retire_entry_is_never_authorization() {
 /// This is the evasion the requirement closes, and it is worth stating in
 /// full: the client does not need the chain — it validated this zone's
 /// delegation natively before it ever got here. A monitor does. An entry with
-/// no chain is tier C, the *silent* bin, so a client that accepted one would
+/// no chain is tier B, the *silent* bin, so a client that accepted one would
 /// hand an attacker a key that works against victims and rings no bell.
 #[test]
 fn an_entry_with_no_chain_is_refused_on_the_monitors_behalf() {
@@ -360,10 +360,9 @@ fn an_expired_chain_still_verifies_because_no_clock_is_consulted() {
 ///
 /// The client turns on exactly one custom extension — the DNSSEC chain — and
 /// reaches it by OID. Anything else in the certificate is carried into the
-/// leaf and never asked for, which is why a real published entry keeps
-/// verifying after the code that wrote one of its extensions is deleted: the
-/// succession countersignature under `2.25.1138370866` is exactly that case,
-/// and the conformance fixture still carries it.
+/// leaf and never asked for, which is why an entry carrying an extension this
+/// build has no name for still verifies — the conformance fixture is exactly
+/// that case.
 ///
 /// The negative half matters as much: an unknown extension must not become a
 /// *reason to accept* either. The entry with junk in it is accepted because
@@ -373,17 +372,17 @@ fn an_extension_the_client_does_not_know_is_carried_and_ignored() {
     let zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
     let statement = zone.zone_key_statement("create", None);
-    // The arc the countersignature used to occupy, holding bytes that are not
-    // a valid anything.
-    let retired = (
-        vec![0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32],
-        b"vestigial".to_vec(),
+    // An arc this build has no name for, holding bytes that decode as
+    // nothing at all.
+    let unknown = (
+        vec![0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x01],
+        b"opaque".to_vec(),
     );
 
     // Chain plus an unknown extension: accepted, exactly as chain alone is.
     let certificate = zone.certificate(&[
         (OID_DNSSEC_CHAIN.to_vec(), zone.dnssec_chain().encode()),
-        retired.clone(),
+        unknown.clone(),
     ]);
     let proof = log.log_certified(&zone, &statement, &certificate);
     verify(&proof, &zone, &log).unwrap();
@@ -391,11 +390,11 @@ fn an_extension_the_client_does_not_know_is_carried_and_ignored() {
     // And it is really in there, so the assertion above is not passing
     // because nothing was written.
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-    assert!(body.certificate.extension(&retired.0).is_some());
+    assert!(body.certificate.extension(&unknown.0).is_some());
 
     // The unknown extension buys nothing: without a chain the entry is
     // refused just as it would be with no extensions at all.
-    let proof = log.log_certified(&zone, &statement, &zone.certificate(&[retired]));
+    let proof = log.log_certified(&zone, &statement, &zone.certificate(&[unknown]));
     assert!(matches!(
         verify(&proof, &zone, &log),
         Err(ProofError::Chain(_))
@@ -850,11 +849,9 @@ fn regenerate_the_shared_fixture() {
 /// entry published to `log2025-1.rekor.sigstore.dev` (see PROVENANCE.txt) and
 /// read back out of the log's own static tiles; nothing in this repository
 /// authored the log's half of any of it. The certificate carries the chain
-/// extension under its narrowed OID at 945 bytes — which is the empirical
+/// extension under its narrowed OID at 757 bytes — which is the empirical
 /// answer to two questions a local test cannot settle: whether Rekor accepts
 /// a certificate this size, and whether it accepts these extensions at all.
-/// It also carries a second, now-retired extension, which nothing in this
-/// build reads; see PROVENANCE.txt.
 ///
 /// It proves the claim the whole of v3 rests on: Rekor performs no
 /// certificate validation, so an apex written into a `dNSName` SAN lands, in
@@ -866,7 +863,7 @@ fn regenerate_the_shared_fixture() {
 /// ICANN-rooted: we own no DNSSEC-signed domain, so the chain inside the
 /// certificate is self-anchored at the apex, and the test supplies that apex
 /// as the trust anchor exactly as a `--dnssec-anchor` deployment would. A
-/// public monitor rooted at ICANN files this entry tier C, correctly.
+/// public monitor rooted at ICANN files this entry tier B, correctly.
 /// Real-world ICANN-rooted chain validation is anchored separately by
 /// `tests/fixtures/dnssec_chain` (a live `cloudflare.com` delegation); this
 /// fixture is about interoperating with the log.
@@ -881,8 +878,8 @@ mod real_rekor_v3 {
     }
 
     const APEX: &str = "zone-key-transparency.demo.invalid";
-    const LOG_INDEX: u64 = 67_966_366;
-    const KEY_TAG: u16 = 27337;
+    const LOG_INDEX: u64 = 68_018_370;
+    const KEY_TAG: u16 = 31460;
 
     /// The proof exactly as a zone serves it: the checked-in `proof.bin` is
     /// the encoded `RekorProof` v3 record, decoded here through the client's
@@ -980,7 +977,7 @@ mod real_rekor_v3 {
             .expect("a real published entry must verify under the embedded pins");
 
         assert_eq!(record.log_index, LOG_INDEX);
-        assert_eq!(record.tree_size, 67_966_402);
+        assert_eq!(record.tree_size, 68_018_432);
         assert_eq!(record.origin, "log2025-1.rekor.sigstore.dev");
         // A rollover: the statement names the key it replaces, and a client
         // accepts rollover as authorization (retire it would refuse).
@@ -1068,10 +1065,6 @@ mod real_rekor_v3 {
     /// The certificate really does carry the apex into the leaf, and really
     /// does carry its chain at a size the log accepted.
     ///
-    /// It carries a second extension too — the retired succession
-    /// countersignature — because it was published before that mechanism was
-    /// removed and a Merkle leaf cannot be edited. That is asserted here as
-    /// what it is: bytes this build parses past and never reads.
     #[test]
     fn the_real_entrys_certificate_carries_its_apex_and_its_chain() {
         let body = HashedRekordBody::parse(&v3("canonicalized_body.json"))
@@ -1094,29 +1087,16 @@ mod real_rekor_v3 {
             .windows(APEX.len())
             .any(|w| w == APEX.as_bytes()));
 
-        // The chain survived the round trip under the narrowed OID. 945 bytes
+        // The chain survived the round trip under the narrowed OID. 757 bytes
         // is the empirical answer to "will Rekor take a certificate this
-        // size, with arcs like these": it did, HTTP 201. Note the size still
-        // includes the retired extension below — no republish was needed to
-        // stop reading it, and shrinking the certificate would mean minting a
-        // new leaf for a claim that is already in the log.
-        assert_eq!(body.certificate_der.len(), 945);
+        // size, with an arc like this": it did, HTTP 201.
+        assert_eq!(body.certificate_der.len(), 757);
         let carried = body
             .certificate
             .extension(OID_DNSSEC_CHAIN)
             .expect("the real certificate carries the chain extension");
         let carried = synch_net::zonecert::DnssecChain::decode(carried).expect("and it decodes");
         assert_eq!(carried.links.first().unwrap().zone, format!("{APEX}."));
-
-        // 2.25.1138370866, the succession countersignature this entry
-        // predates the removal of. Still present, never asked for by anything
-        // outside this assertion — which is the whole reason the entry did
-        // not have to be republished.
-        assert!(body
-            .certificate
-            .extensions
-            .iter()
-            .any(|e| e.oid == [0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32]));
 
         assert_eq!(body.digest.len(), 32);
         assert_eq!(body.certificate.spki.len(), 91);
@@ -1142,7 +1122,7 @@ mod real_rekor_v3 {
         assert_eq!(parsed.apex, format!("{APEX}."));
         assert_eq!(parsed.key_tag, KEY_TAG);
         assert_eq!(parsed.action, "rollover");
-        assert_eq!(parsed.replaces_key_tag, Some(17123));
+        assert_eq!(parsed.replaces_key_tag, Some(23100));
         assert_eq!(parsed.flags, 257);
         assert_eq!(parsed.algorithm, 13);
         assert_eq!(

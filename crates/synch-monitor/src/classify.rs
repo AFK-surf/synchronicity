@@ -7,12 +7,11 @@
 //! in it, so a monitor that asked DNS what the zone's key is would be asking
 //! the attacker.
 //!
-//! Note what is *not* here: any attempt to tell a rotation from a
-//! substitution. Classification is a pure function of the certificate and the
-//! trust anchors — it takes no state, and it cannot be steered by what the
-//! monitor happens to have seen before. Whether a tier A entry is *news* is a
+//! Classification is a pure function of the certificate and the trust
+//! anchors: it takes no state, and it cannot be steered by what the monitor
+//! happens to have seen before. Whether a tier A entry is *news* is a
 //! separate question, answered against the monitor's own state file by the
-//! caller; see the crate docs for why the two were pulled apart.
+//! caller; see the crate docs for why the two are kept apart.
 
 use hickory_resolver::proto::{dnssec::TrustAnchors, rr::Name};
 use synch_net::{
@@ -21,14 +20,6 @@ use synch_net::{
 };
 
 /// What a leaf turned out to be.
-///
-/// Two values, lettered **A** and **C**. The gap where B was is not an
-/// oversight: tier B used to mean "valid chain, nobody countersigned it", and
-/// removing the countersignature removed the only thing that distinguished it
-/// from tier A. The letters are kept because they are the vocabulary
-/// everything else — the runbook, the exit codes, the design document — is
-/// written in, and renaming them would silently reinterpret every existing
-/// alerting rule rather than break it loudly.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -37,7 +28,7 @@ pub enum Tier {
     /// claim naming this apex. Recorded, not reported — and safe to be quiet
     /// about only because no client would have accepted it either (see the
     /// crate docs).
-    C,
+    B,
     /// A chain that verifies to the anchor in force and covers this key. The
     /// entry **authorizes** this key for this apex — whoever published it.
     A,
@@ -48,7 +39,7 @@ impl Tier {
     pub fn letter(&self) -> char {
         match self {
             Tier::A => 'A',
-            Tier::C => 'C',
+            Tier::B => 'B',
         }
     }
 }
@@ -190,7 +181,7 @@ pub fn classify(
         key_tag: chain::key_tag(&dnskey_rdata),
         spki_sha256: hex::encode(sha256(&body.certificate.spki)),
         ds: chain::ds_fields(&apex, &dnskey_rdata),
-        tier: Tier::C,
+        tier: Tier::B,
         reasons: Vec::new(),
     };
 

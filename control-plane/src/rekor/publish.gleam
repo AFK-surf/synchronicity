@@ -215,12 +215,11 @@ pub fn action_for(
 /// would mint a second Merkle leaf for one claim — two public claims about
 /// one key, where the operator asked for one.
 ///
-/// The Statement is now the whole test. It did not used to be: a run that
-/// named a predecessor keyfile had something to add that lived in the
-/// *certificate* rather than the Statement, so Statement equality alone
-/// would have thrown the new countersignature away and reported success.
-/// With the countersignature gone the certificate carries nothing the
-/// Statement does not imply, and the extra condition went with it.
+/// The Statement is the whole test, and that is sound only because the
+/// certificate carries nothing the Statement does not already imply: same
+/// key, same apex, same action means same certificate. Anything added to the
+/// certificate that is *not* implied by the Statement has to be compared
+/// here too, or a rerun would silently reuse a stale one.
 fn reusable(
   stored: Result(store.Record, Nil),
   statement_bytes: BitArray,

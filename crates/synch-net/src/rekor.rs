@@ -400,7 +400,7 @@ pub struct VerifiedRecord {
 ///
 /// **The DNSSEC chain is required, and verified cryptographically.** Its
 /// absence would *silence* a monitor: a chainless or broken-chain entry is
-/// tier C, the bin a monitor records and does not report. An attacker who
+/// tier B, the bin a monitor records and does not report. An attacker who
 /// could get such an entry accepted would hold a key that works against
 /// victims and rings no bell — strictly worse than no log at all. So the
 /// client refuses it, which makes "client-accepted" imply "tier A"
@@ -410,9 +410,8 @@ pub struct VerifiedRecord {
 /// **Unknown extensions are ignored, and that is load-bearing.**
 /// [`Certificate::parse`] collects every extension verbatim and looks them up
 /// by OID; nothing here refuses a certificate for carrying one this build has
-/// no name for. That is what let the succession countersignature extension be
-/// deleted from the code without republishing the conformance entry that
-/// still carries it — its bytes are simply never asked for now.
+/// no name for. An entry may therefore carry extensions this design says
+/// nothing about — the conformance fixture does — and still verify.
 ///
 /// A `retire` entry is refused outright rather than chain-checked: retirement
 /// is a monitor breadcrumb (§2), never authorization, and a chainless retire

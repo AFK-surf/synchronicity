@@ -13,12 +13,6 @@
 //! anchor that zone is under, and covers the key the certificate carries. It
 //! is therefore an authorization, and a monitor watching that apex reports it
 //! the first time it sees it.
-//!
-//! The entry **predates the removal of the succession countersignature** and
-//! still carries that extension. Nothing reads it any more, and these tests
-//! are part of the evidence that nothing has to: the fixture's bytes are
-//! immutable, and they classify correctly with no code left that knows what
-//! `2.25.1138370866` was.
 
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::classify::{classify, KnownKeys, Tier};
@@ -32,11 +26,11 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 const APEX: &str = "zone-key-transparency.demo.invalid";
-const LOG_INDEX: u64 = 67_966_366;
+const LOG_INDEX: u64 = 68_018_370;
 
 /// The zone is its own trust anchor: we own no DNSSEC-signed domain, so the
 /// chain in the certificate terminates at the apex rather than at the ICANN
-/// root. A public monitor rooted at ICANN would file this entry tier C — the
+/// root. A public monitor rooted at ICANN would file this entry tier B — the
 /// honest verdict, since nothing outside that private universe can tell
 /// whether the key was delegated. Supplying the apex as the anchor is what a
 /// `--dnssec-anchor` operator's own monitor would do.
@@ -60,7 +54,7 @@ fn the_real_published_entry_classifies_tier_a() {
     assert_eq!(finding.tier, Tier::A, "{}", finding.line());
     assert_eq!(finding.apex, format!("{APEX}."));
     assert_eq!(finding.log_index, LOG_INDEX);
-    assert_eq!(finding.key_tag, 27337);
+    assert_eq!(finding.key_tag, 31460);
 
     // The chain validated and covers this key, which is the whole verdict.
     assert!(
@@ -74,46 +68,11 @@ fn the_real_published_entry_classifies_tier_a() {
     // has a compromised DNS provider in it. The DS is the line a registrar
     // would show, so an operator can compare without believing the entry.
     assert!(
-        finding.ds.starts_with("27337 13 2 "),
+        finding.ds.starts_with("31460 13 2 "),
         "the derived DS: {}",
         finding.ds
     );
     assert_eq!(finding.spki_sha256.len(), 64);
-}
-
-/// The vestigial extension, asserted rather than assumed.
-///
-/// This entry's certificate carries `2.25.1138370866`, the succession
-/// countersignature extension, and those bytes are in a public append-only
-/// log forever. The claim that its removal needed no republish rests on one
-/// property — the certificate parser looks extensions up by OID and never
-/// refuses a certificate for carrying one it does not know — so that property
-/// is checked here against the real bytes rather than reasoned about.
-///
-/// The extension is still *there*: if a future edit ever makes an unknown
-/// extension fatal, this test names the entry it would break.
-#[test]
-fn the_retired_extension_is_still_in_the_certificate_and_still_ignored() {
-    let body = HashedRekordBody::parse(&fixture("canonicalized_body.json"))
-        .expect("the certificate parses despite carrying an extension nothing reads");
-
-    // 2.25.1138370866, in DER content-byte form: 0x69 is 2.25 packed into the
-    // first byte, then the arc in base-128 continuation form.
-    const RETIRED_OID: &[u8] = &[0x69, 0x84, 0x9e, 0xe8, 0xd2, 0x32];
-    assert!(
-        body.certificate
-            .extensions
-            .iter()
-            .any(|e| e.oid == RETIRED_OID),
-        "the fixture is supposed to be the pre-removal entry; if this fails \
-         the fixture was replaced and this test has nothing to prove"
-    );
-
-    // And it changes nothing: the same anchors, the same verdict as any
-    // other well-formed entry for this zone.
-    let (_dir, anchors) = anchors();
-    let finding = classify(&body, LOG_INDEX, &anchors).expect("classifiable");
-    assert_eq!(finding.tier, Tier::A);
 }
 
 /// Reporting, over real bytes: news once, then not again.
@@ -146,8 +105,8 @@ fn the_real_entry_is_never_in_the_silent_bin() {
     let finding = classify(&body, LOG_INDEX, &anchors).unwrap();
     assert_ne!(
         finding.tier,
-        Tier::C,
+        Tier::B,
         "synch-net's suite verifies this same entry end to end, so classifying it \
-         tier C would mean a key that works against clients and rings no bell"
+         tier B would mean a key that works against clients and rings no bell"
     );
 }

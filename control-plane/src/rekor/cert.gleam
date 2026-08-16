@@ -25,14 +25,6 @@
 ////     against the RRSIG signer and a monitor indexes by;
 ////   - one custom extension — the DNSSEC chain, below.
 ////
-//// There used to be a second extension here, `2.25.1138370866`, carrying a
-//// succession countersignature: the previous zone key signing "this key
-//// follows me". It is gone. A monitor cannot use it to tell a rotation from
-//// a substitution — an attacker with the registrar holds the DS and so can
-//// always build the chain — so the monitor stopped trying and now reports
-//// every newly authorized key instead. **Do not reuse that arc**: a
-//// permanently logged entry still carries it.
-////
 //// The mirror of this module is crates/synch-net/src/{x509,zonecert}.rs.
 //// Both sides carry the same OID and the same DER, and the shared fixture
 //// (test/fixtures/rekor) is what keeps them from drifting.

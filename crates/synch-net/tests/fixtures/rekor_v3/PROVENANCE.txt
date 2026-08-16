@@ -2,81 +2,46 @@ A genuine Rekor v2 entry whose verifier is a certificate — the v3 shape,
 complete, and verifiable end to end.
 
 Published 2026-08-16 to https://log2025-1.rekor.sigstore.dev (HTTP 201
-Created, logIndex 67966366). Nothing in this repository authored the log's
+Created, logIndex 68018370). Nothing in this repository authored the log's
 half of any of it: not the checkpoint, not its signature lines, not the tree
 the audit path walks.
-
-This entry replaces an earlier one (logIndex 67766084) that was identical in
-shape but carried the old `https://synchronicity.dev/zone-key/v1` predicate
-type. A Statement is committed to the log by digest, so a predicate type
-cannot be edited after the fact — changing it meant publishing again. The old
-entry is still in the log and still valid on its own terms; it simply no
-longer matches what this build produces.
 
   statement.json           471 B  the in-toto Statement, byte-exact — the
                                   DSSE PAE preimage the leaf's digest commits
                                   to. Keeping it is what makes this fixture
                                   total (see "what this proves").
-  certificate.der          945 B  the entry's verifier, extracted from
+  certificate.der          757 B  the entry's verifier, extracted from
                                   spec.hashedRekordV002.signature.verifier
                                     .x509Certificate.rawBytes.
-  canonicalized_body.json 1631 B  the Merkle leaf preimage, verbatim, as the
+  canonicalized_body.json 1383 B  the Merkle leaf preimage, verbatim, as the
                                   log returned it.
-  checkpoint.txt           643 B  the signed note at tree size 67 966 402.
+  checkpoint.txt           643 B  the signed note at tree size 68 018 432.
                                   It carries FOUR signature lines: the log's
                                   own Ed25519 signature plus three witness
-                                  cosignatures. This design does not interpret
-                                  cosignatures at all, but the parser has to
-                                  tolerate them — narrowing it to a single
+                                  cosignatures. Nothing here interprets a
+                                  cosignature, but the parser has to tolerate
+                                  them — narrowing it to a single
                                   signature would reject every checkpoint the
                                   production log serves, and this file is the
                                   regression test for that.
-  proof.bin               3275 B  the encoded RekorProof v3 record — the
+  proof.bin               3027 B  the encoded RekorProof v3 record — the
                                   exact bytes a zone serves at
                                   _synchronicity-rekor.<apex>, carrying 15
                                   audit-path hops.
   anchor.txt               144 B  the DNSSEC trust anchor this zone is under.
-  log_index.txt                   67966366.
+  log_index.txt                   68018370.
 
 The entry is a `rollover` for zone-key-transparency.demo.invalid, key tag
-27337. Its chain verifies and covers that key, so a monitor holding the anchor
+31460. Its chain verifies and covers that key, so a monitor holding the anchor
 below classifies it tier A — an authorization — and reports it the first time
 it sees it. That is what crates/synch-monitor/tests/real_entry.rs asserts.
-
-THIS ENTRY PREDATES THE REMOVAL OF THE SUCCESSION COUNTERSIGNATURE
-
-When these bytes were published the design had a second custom extension,
-2.25.1138370866, carrying a countersignature by the previous zone key (here,
-key tag 17123) — and a three-tier monitor that used it to separate a rotation
-from a substitution. Both are gone: an attacker who has taken the registrar
-holds the DS and can always build a valid chain, so the countersignature was
-doing the whole job of that distinction, and without it the monitor stopped
-attempting the distinction rather than attempting it badly. It now reports
-every newly authorized key and leaves the operator's own records to say which
-ones they caused.
-
-**This did not require a new log entry, and must not be given one.** A Merkle
-leaf is immutable, so the extension is still in these bytes and always will
-be. Nothing reads it. The certificate parser collects extensions and looks
-them up by OID, and refuses nothing for carrying one it has no name for
-(crates/synch-net/src/x509.rs), so the entry verifies exactly as it did
-before — the extension is simply vestigial. That is asserted rather than
-assumed, in two places that name the OID directly: the extension's continued
-presence and irrelevance in crates/synch-monitor/tests/real_entry.rs, and the
-same over the client verifier in crates/synch-net/tests/rekor_zone_key.rs.
-The certificate is still 945 bytes for the same reason: shrinking it would
-mean minting a second leaf for a claim already in the log.
-
-The arc 2.25.1138370866 is therefore **burned**. Do not reuse it for a new
-meaning — this entry, and any other published in that window, would decode
-under the new one.
 
 WHAT THIS PROVES, AND WHAT IT DOES NOT
 
 It proves interoperability with the real log: that Rekor v2 accepts a
 self-signed certificate as a hashedrekord verifier with no chain validation of
-any kind, that a 945-byte certificate carrying custom extensions under the
-narrowed 2.25 arcs is accepted, that the returned inclusion proof and
+any kind, that a 757-byte certificate carrying a custom extension under the
+narrowed 2.25 arc is accepted, that the returned inclusion proof and
 checkpoint verify under the log key this build embeds, and that the whole
 record round-trips through the wire form a zone actually serves.
 
@@ -85,7 +50,7 @@ certificate is SELF-ANCHORED: the apex is its own trust anchor, because no
 DNSSEC-signed domain was available to publish under, and minting a certificate
 naming a domain we do not control would be squatting a name in a permanent
 public log. A monitor anchored at the ICANN root therefore classifies this
-entry tier C, correctly — it cannot tell whether the key was authorized.
+entry tier B, correctly — it cannot tell whether the key was authorized.
 ICANN-rooted validation is the job of the separate fixture in
 ../dnssec_chain/, captured from live DNS for cloudflare.com, which exercises
 RSASHA256 at the root and ECDSAP256SHA256 below it.
@@ -97,7 +62,4 @@ entry format changes in a way that invalidates these bytes, and keep the SAN
 under .invalid so no real name is claimed. Afterwards the pinned constants in
 crates/synch-net/tests/rekor_zone_key.rs (LOG_INDEX, KEY_TAG, tree size,
 certificate length) and crates/synch-monitor/tests/real_entry.rs (LOG_INDEX,
-key tag, DS prefix) all have to move with it. A regenerated entry will NOT
-carry 2.25.1138370866, so the two tests that assert the vestigial extension is
-present should be deleted rather than updated — they exist to prove the
-removal needed no republish, and a republished fixture has nothing to prove.
+key tag, DS prefix) all have to move with it.

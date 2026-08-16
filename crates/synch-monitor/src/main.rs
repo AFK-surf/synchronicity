@@ -9,7 +9,7 @@
 //! key this monitor has not recorded for that apex is a new authorization: it
 //! goes to stdout, and is then recorded so the next run does not repeat it. A
 //! tier A entry for a key already recorded has been reported before and is
-//! not reported again. Tier C — an unauthorized claim no client would have
+//! not reported again. Tier B — an unauthorized claim no client would have
 //! accepted — goes to stderr as a note and is never recorded, because
 //! recording it would suppress the report if the same key later showed up
 //! with a chain that does verify.
@@ -22,17 +22,13 @@
 //!
 //! ```text
 //!  0  nothing new for a watched apex
-//! 10  unauthorized claims only — tier C naming a watched apex, no alarm
+//! 10  unauthorized claims only — tier B naming a watched apex, no alarm
 //! 20  new authorizations seen — a key was authorized for a watched apex
 //!     that this monitor had not recorded: check it against what you published
 //!  2  the run could not finish (transport, checkpoint, state)
 //! ```
 //!
-//! These numbers changed when tier B was removed, and they were renumbered by
-//! severity rather than kept for compatibility: an alerting rule matching the
-//! old `30` would now match nothing, which is a loud failure, whereas leaving
-//! `20` meaning "tier C" while `10` meant the new loudest outcome would have
-//! silently inverted every rule that tested `>=`.
+//! They are ordered by severity, so a rule testing `>=` reads correctly.
 
 use std::path::PathBuf;
 
@@ -92,7 +88,7 @@ struct Args {
 
     /// A DNSSEC trust anchor file, replacing the ICANN root. Only for a
     /// deployment whose zones are anchored somewhere else; a chain that does
-    /// not reach the anchor in force is tier C.
+    /// not reach the anchor in force is tier B.
     #[arg(long)]
     dnssec_anchor: Option<PathBuf>,
 
@@ -284,7 +280,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
                     _ => new_authorizations.push((finding, spki)),
                 }
             }
-            Tier::C => claims.push(finding),
+            Tier::B => claims.push(finding),
         }
     }
 
@@ -292,16 +288,16 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     for (finding, _) in &new_authorizations {
         println!("{}", render(finding, args.json));
     }
-    // Tier C on stderr. It is not an alarm — no client would have taken these
+    // Tier B on stderr. It is not an alarm — no client would have taken these
     // — but an operator who sees the exit code needs to be able to see *what*
     // was claimed without re-running with different flags.
     for finding in &claims {
         eprintln!("{}", render(finding, args.json));
     }
 
-    // Record what was reported, so the next run stays quiet about it. Tier C
+    // Record what was reported, so the next run stays quiet about it. Tier B
     // is deliberately never recorded: the same key arriving later with a
-    // chain that *does* verify is a genuine new authorization, and a tier C
+    // chain that *does* verify is a genuine new authorization, and a tier B
     // sighting must not have quietly consumed it.
     for (finding, spki) in &new_authorizations {
         if let Ok(apex) = synch_net::chain::parse_name(&finding.apex) {

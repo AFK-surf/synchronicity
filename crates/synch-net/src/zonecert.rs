@@ -21,59 +21,6 @@
 //! way to learn the same fact. It is monitor food, and the client enforces
 //! its presence only because an entry without one would be invisible to a
 //! monitor (see `rekor::verify`).
-//!
-//! # There used to be a second extension, and there is a hole where it was
-//!
-//! `2.25.1138370866` carried a **succession countersignature**: the previous
-//! zone key's signature over "this key follows me". The idea was that an
-//! attacker holding a compromised registrar has the DS — so they can build a
-//! real chain — but not the old key's private half, so the countersignature
-//! was the one thing separating a rotation from a substitution.
-//!
-//! It is gone, and the monitor no longer tries to make that distinction at
-//! all; it reports every newly authorized key for a watched apex instead and
-//! leaves the operator's own record of what they published to be the
-//! discriminator. The reasons are in `synch-monitor`'s crate docs. What
-//! matters *here* is that **the arc `2.25.1138370866` is burned**: a genuine,
-//! permanent, public log entry carries it (the conformance fixture under
-//! `tests/fixtures/rekor_v3`), so reusing it for anything else would make
-//! that entry decode as whatever the new meaning is. Pick a fresh arc.
-//!
-//! # Why the OID looks the way it does
-//!
-//! We hold no IANA Private Enterprise Number, and inventing an arc under
-//! someone else's is how OID collisions happen. `2.25` is the UUID arc:
-//! `2.25.<uuid>` is allocated by generating a UUID, needs no registration,
-//! and — at full 128-bit width — can collide with nothing.
-//!
-//! **The full width is unusable here.** Rekor is Go, its certificate parser
-//! is `crypto/x509`, and Go's `encoding/asn1` `parseBase128Int` rejects any
-//! OID component that overflows `int32`. A 128-bit arc therefore fails inside
-//! `x509.ParseCertificate`, *before* Rekor ever looks at the extension — the
-//! submission comes back `400 invalid hashedrekord request` with nothing to
-//! say which field was at fault.
-//!
-//! This was found by live submission, not by any local test, and could not
-//! have been found any other way: OpenSSL and Erlang's `public_key` both parse
-//! a 128-bit arc happily, so every test on both sides of this repo passed
-//! against a certificate the log would refuse. Bisected by submitting
-//! variants — bare certificate `201`, same certificate plus either extension
-//! `400`, and then, with the extension bytes held byte-identical and only the
-//! OID changed, `1.3.6.1.4.1.99999.1` `201`. The extension *structure* was
-//! never the problem.
-//!
-//! So the arc is the first four bytes of the original UUID masked into 31
-//! bits — inside `int32`, still syntactically a UUID-arc OID.
-//!
-//! **This OID is provisional.** `2.25.<31-bit>` is a UUID with 97 leading
-//! zero bits, which is a real if small collision risk against anyone else
-//! doing the same trick. The long-term fix is an IANA Private Enterprise
-//! Number and an OID under `1.3.6.1.4.1.<PEN>` — see docs/REKOR-ZONE-KEY.md
-//! §8.3. Until then, do not widen this arc: the log will refuse the entry.
-//!
-//! It is duplicated, deliberately and with the same warning, in
-//! `control-plane/src/rekor/cert.gleam`, and the crossval fixtures pin the
-//! bytes so the two cannot drift.
 
 use crate::x509::{tlv, Der, X509Error};
 
@@ -240,10 +187,9 @@ mod tests {
             out
         }
 
-        // One OID now that succession is gone, so this reads as a check on a
-        // constant rather than a loop over a family. Restore the loop if a
-        // second extension is ever added — the rule is about every arc, not
-        // about this one.
+        // One extension, so this reads as a check on a constant rather than
+        // a loop over a family. Make it a loop if a second is ever added —
+        // the rule is about every arc, not about this one.
         let arcs = arcs(OID_DNSSEC_CHAIN);
         assert_eq!(arcs[0], 2, "DNSSEC chain: not under the UUID arc");
         assert_eq!(arcs[1], 25, "DNSSEC chain: not under the UUID arc");
@@ -263,10 +209,10 @@ mod tests {
             u128::from(u32::from_be_bytes([0xdc, 0xba, 0x59, 0x07]) & 0x7fff_ffff),
             1_555_716_359
         );
-        // The retired succession arc, asserted only so that the number in the
-        // module docs stays checkable. Nothing encodes or decodes it any
-        // more, but a published entry carries it forever, so it must not be
-        // handed out again for a different meaning.
+        // The reserved arc, asserted only so that the number in the module
+        // docs stays checkable. Nothing encodes or decodes it, but a
+        // published entry carries it forever, so it must never be handed out
+        // for a meaning of its own.
         assert_eq!(
             u128::from(u32::from_be_bytes([0x43, 0xda, 0x29, 0x32]) & 0x7fff_ffff),
             1_138_370_866

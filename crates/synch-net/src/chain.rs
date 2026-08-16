@@ -7,10 +7,7 @@
 //! - the **monitor** runs it on every leaf it classifies.
 //!
 //! The invariant that couples them is: *anything a client accepts must be
-//! classified tier A by a monitor* — never tier C, which is the silent bin.
-//! (It once read "at least tier B", when a middle tier existed; with two
-//! tiers there is exactly one bin a client-accepted entry may land in, which
-//! makes the invariant stronger rather than weaker.)
+//! classified tier A by a monitor* — never tier B, which is the silent bin.
 //! If the monitor's chain rule were stricter than the client's,
 //! an attacker could publish an entry with a chain the client waves through
 //! and the monitor files as noise: usable against victims and inaudible to
@@ -125,7 +122,7 @@ pub struct Authorized {
 /// satisfied the client's trailing-dot-trimming comparison *and* validated —
 /// because the client fed the chain a different, well-formed name — while the
 /// monitor's chain walk failed to parse the SAN at all and filed the entry
-/// tier C, the silent bin. Every client accepts, no monitor alerts: exactly
+/// tier B, the silent bin. Every client accepts, no monitor alerts: exactly
 /// the evasion the tiering exists to prevent.
 ///
 /// Sharing a primitive is not sharing a decision. The sequence — extract the
@@ -283,7 +280,7 @@ pub fn validate(
     // an explicit `--dnssec-anchor` override — "an override is a different
     // universe" — where there is no parent to hold a DS and the anchor names
     // the zone key directly. A public monitor anchored at the ICANN root
-    // classifies such an entry tier C, which is the honest answer: nothing
+    // classifies such an entry tier B, which is the honest answer: nothing
     // outside that private universe can tell whether the key was authorized.
     match trusted.iter().any(|key| rdata_of(key) == dnskey_rdata) {
         true => Ok(ValidChain {
