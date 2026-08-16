@@ -61,10 +61,14 @@ jobs:
             export PATH="/usr/local/lib/erlang28/bin:$PATH"
             # The ports gleam shells out to a version-suffixed
             # `rebar3-28` (to bind rebar3 to its OTP) and no such
-            # package exists, so install the official escript under
-            # exactly that name; 3.25.x supports OTP 28. It runs under
-            # whichever escript is first on PATH, i.e. erlang28's.
-            ftp -o /usr/local/bin/rebar3-28 https://github.com/erlang/rebar3/releases/download/3.25.1/rebar3
+            # package exists. Install the official escript (3.25.x
+            # supports OTP 28) as `rebar3` — escript derives its entry
+            # module from the script's basename, so the file must be
+            # named `rebar3` for `rebar3:main/1` to resolve — then make
+            # `rebar3-28` a shim that execs it under that basename.
+            ftp -o /usr/local/bin/rebar3 https://github.com/erlang/rebar3/releases/download/3.25.1/rebar3
+            chmod +x /usr/local/bin/rebar3
+            printf '#!/bin/sh\nexec /usr/local/bin/rebar3 "$@"\n' > /usr/local/bin/rebar3-28
             chmod +x /usr/local/bin/rebar3-28
             cd control-plane
             env CFLAGS="-O2 -I/usr/local/include" LDFLAGS="-L/usr/local/lib" gmake -C csqlite
