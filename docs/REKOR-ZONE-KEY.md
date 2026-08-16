@@ -344,9 +344,10 @@ Rejected:
   zone-scoped fact.
 
 Future work: checkpoint witness cosignatures (split-view resistance beyond
-monitors); an in-client TUF root for log-key rotation; logging device-key
-membership *sets* (a much chattier, much larger design, only worth it with
-witnessing in place); `retire`-entry enforcement as soft revocation signal.
+monitors); an in-client TUF root for log-key rotation (designed in §10);
+logging device-key membership *sets* (a much chattier, much larger design,
+only worth it with witnessing in place); `retire`-entry enforcement as soft
+revocation signal.
 
 ## 9. Testing
 
@@ -357,3 +358,123 @@ witnessing in place); `retire`-entry enforcement as soft revocation signal.
   proof and served TXT record must verify under the real Rust client
   verifier — same load-bearing pattern as the existing delv + resolver e2e.
 - Rollover e2e: both keys, both records, both orders of retirement.
+
+## 10. TUF-driven pin refresh, in-band
+
+Sigstore rotates its tiled logs regularly — a new shard, a new key, roughly
+yearly — and eventually removes compromised keys from its trust root. A
+build-time snapshot alone turns each of those events into a client upgrade.
+This section makes the pin set follow Sigstore's TUF repository
+automatically, without any new transport and without any new liveness
+coupling: **the zone relays Sigstore's TUF metadata, and the client verifies
+it offline against an embedded TUF root.**
+
+The principle is the one the proof records already run on: the zone may
+carry anything that verifies against something the client pins. TUF metadata
+is self-authenticating — every byte chains to the TUF root role — so the
+zone never becomes an authority over the pin set; it is a relay, and a
+tampering relay produces material that simply fails verification and is
+ignored.
+
+### 10.1 What travels: the TUF bundle record
+
+```
+_synchronicity-tuf.<apex>   86400  IN  TXT  ( "<b64url chunk>" ... )
+
+TufBundle v1 (binary, base64url, chunked like RekorProof)
+  u8       version        = 1
+  u8       root_count       root.json versions, ascending, so a client
+  u32+[]   root_json[..]    embedded at version N can chain to current
+  u32+[]   timestamp_json   all files verbatim, exactly as the TUF
+  u32+[]   snapshot_json    repository serves them — signatures cover
+  u32+[]   targets_json     these bytes
+  u32+[]   trusted_root     the target the chain authenticates
+```
+
+Roughly 15–20 KB before base64 — chunky, but it rides a 24 h TTL and the
+DoH/TCP message limit comfortably. The root chain starts one past the
+oldest root version any supported build embeds, a floor stated per release.
+
+### 10.2 Client rules
+
+The client embeds two artifacts: the Sigstore **TUF root role**
+(`root.json`, version N — the ultimate pin) and the current
+**bootstrap log-key snapshot** (`EMBEDDED_LOG_KEYS`, unchanged). Pin
+resolution order: an explicit `--rekor-key` file (a static, different
+universe — TUF refresh disabled entirely); else the last TUF-verified pin
+set persisted in the daemon's data directory; else the embedded bootstrap.
+
+On a `require` refresh the client also resolves the TUF record (cached on
+its own TTL, one extra query a day) and attempts an update before verifying
+the proof:
+
+1. decode the bundle; walk the `root.json` chain from the persisted (else
+   embedded) root version — each step signed by the thresholds of both the
+   old root and the new;
+2. verify `timestamp → snapshot → targets → trusted_root` — signatures over
+   canonical JSON of each file's `signed` object, hashes and versions
+   matching, every expiry in the future;
+3. accept only if every version is ≥ the persisted one (monotonic, global
+   across domains: one state file, `<data-dir>/rekor-pins.json`, 0600);
+4. on acceptance, the pin set becomes the tlogs of the new `trusted_root` —
+   **replacing** the previous set, never unioning with it, so a key
+   Sigstore removes is a key clients drop.
+
+Two rules preserve the availability posture, and they are load-bearing:
+
+- **Expiry gates updates, never operation.** An absent, stale, or invalid
+  bundle is ignored and the current pins stand. To change pins the chain
+  must be valid and unexpired; to keep working, nothing is required. A
+  control plane that stops fetching degrades to a frozen pin set — today's
+  behavior — not to a failed cluster.
+- **Monotonicity bounds hostile relays.** A zone can serve old-but-valid
+  material, but it cannot roll a client's persisted versions back, and a
+  freeze holds only until the served timestamp expires. The residual window
+  — a fresh install fed an unexpired stale chain — is bounded by the
+  timestamp expiry, the standard TUF client guarantee.
+
+Failure classes get their own errors and `synch doctor` copy, but none of
+them fail a refresh: TUF trouble is never worse than not having the record.
+
+### 10.3 Control plane: fetch, store, serve
+
+- `CP_TUF_URL` (default `https://tuf-repo-cdn.sigstore.dev`) names the
+  repository; the primary fetches the metadata files verbatim — walking
+  timestamp → snapshot → targets to the consistent-snapshot target names —
+  and stores them in a `tuf_material` table with their versions and the
+  timestamp expiry.
+- The CP is a **relay, not the verifier**: it checks structure, versions and
+  expiries (refusing obvious garbage and regressions) but the cryptographic
+  gate is the client's, and the e2e keeps the relay honest by running the
+  real Rust verifier against what the zone serves. Bad stored material
+  costs nothing but zone bytes: clients ignore it and keep their pins.
+- `zone/build` emits the bundle record from `tuf_material`; the hourly job
+  refetches when the stored timestamp is within 3 days of expiry, and
+  `controlplane tuf-refresh` does it on demand (the air-gapped ceremony
+  runs it where there is egress and couriers the database, as with
+  everything else).
+- `/healthz` reports the stored timestamp expiry and root version.
+
+### 10.4 What this changes about §4.1 and §8
+
+Pin refresh becomes automatic where §8 deferred it as operator-driven. The
+stance is deliberate: membership itself already refreshes automatically
+from DNS, and the ethos line this system draws is that a node never changes
+*its own* keys unprompted — accepting third-party material that verifies
+against a pinned root is the same texture as DNSSEC validation. The
+"new build required" events shrink to TUF-root-level incidents: root
+compromise, or a root chain the embedded floor can no longer reach.
+
+### 10.5 Testing
+
+- Conformance fixtures: the real TUF chain, checked in verbatim, verified
+  by the Rust client; canonical-JSON serialization exercised against the
+  actual repository bytes, where TUF implementations historically break.
+- A synthetic TUF repository builder in `sim` (own root keys) exercising
+  behaviors the real repo cannot: root rotation across multiple versions,
+  threshold failures, expired timestamps, version rollback, a tampered
+  target, a trusted_root that drops a shard key (revocation reaches the
+  pin set).
+- e2e: the zone serves a bundle; the Rust verifier accepts it and a
+  mutated copy is refused; the crossval asserts the Gleam encoder and the
+  Rust decoder agree on the bundle framing, fixture-pinned like the proof.
