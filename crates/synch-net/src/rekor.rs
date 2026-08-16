@@ -18,33 +18,42 @@
 //!
 //! # Wire format
 //!
-//! `RekorProof` v1, big-endian throughout:
+//! `RekorProof` v2, big-endian throughout:
 //!
 //! ```text
-//! u8       version        = 1
-//! u16      key_tag          selects the record during a rollover window
-//! u8[32]   log_id           SHA-256 of the log's DER SubjectPublicKeyInfo
+//! u8       version            = 2
+//! u16      key_tag              selects the record during a rollover window
+//! u8[32]   log_id               SHA-256 of the log's DER SubjectPublicKeyInfo
 //! u64      log_index
-//! u16+[]   dsse_payload     the in-toto Statement, byte-exact
-//! u16+[]   dsse_signature   ECDSA P-256 over DSSE PAE(payload)
-//! u16+[]   checkpoint       signed note: origin, tree size, root hash, sigs
-//! u8+[32]* inclusion_path   Merkle audit path, leaf to root
+//! u16+[]   statement            the in-toto Statement, byte-exact (PAE preimage)
+//! u16+[]   canonicalized_body   the Rekor entry body, verbatim (leaf preimage)
+//! u16+[]   checkpoint           signed note: origin, tree size, root hash, sigs
+//! u8+[32]* inclusion_path       Merkle audit path, leaf to root
 //! ```
 //!
-//! # The two conventions this format pins
+//! # What this format pins — and why it is the *real* Rekor v2 entry
 //!
 //! A proof is only checkable if both halves agree byte for byte on what was
-//! hashed. Two conventions are therefore part of the format, not of the
-//! implementation, and the control plane mirrors them exactly:
+//! hashed. Where v1 invented its own leaf convention, v2 carries the exact
+//! two byte strings the public log itself commits to, so a proof minted by
+//! `log2025-1.rekor.sigstore.dev` verifies end to end (the conformance
+//! fixture `tests/fixtures/rekor_v2` is a real published entry):
 //!
-//! 1. **The log entry** is the DSSE envelope rendered as canonical JSON —
-//!    field order `payloadType`, `payload`, `signatures`, one signature
-//!    object with a single `sig` member, standard padded base64 for both
-//!    blobs, no whitespace anywhere. See [`RekorProof::entry_bytes`].
-//! 2. **The Merkle leaf** is `SHA-256(0x00 || entry_bytes)`, and an interior
-//!    node is `SHA-256(0x01 || left || right)` — RFC 6962 §2.1.
+//! 1. **The log entry** is a `hashedrekord` v0.0.2 body — Rekor v2 has no
+//!    DSSE entry type, so a DSSE-signed Statement is logged as a
+//!    `hashedrekord` over the DSSE **PAE**: `data.digest = SHA-256(PAE)`,
+//!    `signature.content` = the ECDSA-P256 signature over the PAE (DER, not
+//!    raw), `signature.verifier.publicKey.rawBytes` = the signer's DER
+//!    SubjectPublicKeyInfo. The log returns these bytes as `canonicalizedBody`
+//!    and this record carries them **verbatim** — nothing here re-canonicalizes
+//!    JSON, because the log already did and the leaf commits to its output.
+//! 2. **The Merkle leaf** is `SHA-256(0x00 || canonicalized_body)`, and an
+//!    interior node is `SHA-256(0x01 || left || right)` — RFC 6962 §2.1.
 //!
-//! Neither is negotiable per deployment: a v2 of the record format is how
+//! The Statement travels alongside the body (not inside it) because the body
+//! commits only to the PAE *digest*; the client re-derives that digest from
+//! the Statement bytes and refuses the proof if they disagree. Neither
+//! convention is negotiable per deployment: a v3 of the record format is how
 //! either changes.
 
 use std::path::Path;
@@ -52,13 +61,19 @@ use std::path::Path;
 use ring::{digest, signature};
 
 /// The only `RekorProof` version this build accepts.
-pub const PROOF_VERSION: u8 = 1;
+pub const PROOF_VERSION: u8 = 2;
 
 /// The label the proof records live under, one below the zone apex.
 pub const REKOR_TXT_PREFIX: &str = "_synchronicity-rekor";
 
 /// The DSSE payload type of an in-toto Statement.
 pub const DSSE_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
+
+/// The `hashedrekord` v0.0.2 digest algorithm name the body carries.
+pub const HASHEDREKORD_DIGEST_ALGORITHM: &str = "SHA2_256";
+
+/// The `hashedrekord` v0.0.2 verifier key-details tag for a P-256 key.
+pub const HASHEDREKORD_KEY_DETAILS: &str = "PKIX_ECDSA_P256_SHA_256";
 
 /// The in-toto Statement type the entry must declare.
 pub const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
@@ -104,10 +119,10 @@ MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=
 /// binding mismatch, which is an alarm.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProofError {
-    /// The record could not be decoded as a v1 `RekorProof`.
+    /// The record could not be decoded as a v2 `RekorProof`.
     #[error("malformed proof: {0}")]
     Malformed(String),
-    /// The DSSE signature is not the zone key's: whoever built the entry did
+    /// The entry signature is not the zone key's: whoever built the entry did
     /// not hold the key it claims to log.
     #[error("possession: {0}")]
     Possession(String),
@@ -136,10 +151,13 @@ pub struct RekorProof {
     pub log_id: [u8; 32],
     /// The entry's index in the log, needed to walk the audit path.
     pub log_index: u64,
-    /// The in-toto Statement, byte-exact — hashing requires the exact bytes.
-    pub dsse_payload: Vec<u8>,
-    /// ECDSA P-256 signature over DSSE PAE(payload), raw `r || s`.
-    pub dsse_signature: Vec<u8>,
+    /// The in-toto Statement, byte-exact — the DSSE PAE preimage the entry's
+    /// digest commits to.
+    pub statement: Vec<u8>,
+    /// The Rekor `hashedrekord` entry body, exactly as the log returned it in
+    /// `canonicalizedBody` — the Merkle leaf preimage. The entry signature
+    /// and the signer's public key live inside these bytes.
+    pub canonicalized_body: Vec<u8>,
     /// The signed note the log published, verbatim.
     pub checkpoint: Vec<u8>,
     /// The Merkle audit path, leaf to root.
@@ -147,11 +165,11 @@ pub struct RekorProof {
 }
 
 impl RekorProof {
-    /// Encodes the record in the v1 wire format.
+    /// Encodes the record in the v2 wire format.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
-            45 + self.dsse_payload.len()
-                + self.dsse_signature.len()
+            45 + self.statement.len()
+                + self.canonicalized_body.len()
                 + self.checkpoint.len()
                 + 32 * self.inclusion_path.len(),
         );
@@ -159,7 +177,7 @@ impl RekorProof {
         out.extend_from_slice(&self.key_tag.to_be_bytes());
         out.extend_from_slice(&self.log_id);
         out.extend_from_slice(&self.log_index.to_be_bytes());
-        for blob in [&self.dsse_payload, &self.dsse_signature, &self.checkpoint] {
+        for blob in [&self.statement, &self.canonicalized_body, &self.checkpoint] {
             // A field that cannot be length-prefixed cannot be encoded; the
             // control plane never produces one, and truncating silently
             // would produce a record that fails verification much later.
@@ -175,7 +193,7 @@ impl RekorProof {
         out
     }
 
-    /// Decodes a v1 record, refusing anything with bytes left over — a
+    /// Decodes a v2 record, refusing anything with bytes left over — a
     /// record that decodes two ways is a record an attacker can steer.
     pub fn decode(bytes: &[u8]) -> Result<RekorProof, ProofError> {
         let mut reader = Reader::new(bytes);
@@ -188,8 +206,8 @@ impl RekorProof {
         let key_tag = reader.u16("key tag")?;
         let log_id = reader.array32("log id")?;
         let log_index = reader.u64("log index")?;
-        let dsse_payload = reader.blob16("dsse payload")?.to_vec();
-        let dsse_signature = reader.blob16("dsse signature")?.to_vec();
+        let statement = reader.blob16("statement")?.to_vec();
+        let canonicalized_body = reader.blob16("canonicalized body")?.to_vec();
         let checkpoint = reader.blob16("checkpoint")?.to_vec();
         let hops = reader.u8("inclusion path length")?;
         let mut inclusion_path = Vec::with_capacity(usize::from(hops));
@@ -201,8 +219,8 @@ impl RekorProof {
             key_tag,
             log_id,
             log_index,
-            dsse_payload,
-            dsse_signature,
+            statement,
+            canonicalized_body,
             checkpoint,
             inclusion_path,
         })
@@ -220,34 +238,13 @@ impl RekorProof {
         base64url_encode(&self.encode())
     }
 
-    /// The log entry bytes: the DSSE envelope as canonical JSON.
+    /// The RFC 6962 leaf hash of this entry: over the log's own body bytes.
     ///
-    /// This exact rendering — field order, single signature object, padded
-    /// standard base64, no whitespace — is what the leaf hash commits to, so
-    /// it is part of the format (see the module docs), not a detail.
-    ///
-    /// Scope (audit finding, docs/REKOR-ZONE-KEY.md §2): this is
-    /// *synchronicity's* entry serialization, which a compatible log adopts —
-    /// it is not the on-log entry format Rekor v2 hashes. The checkpoint and
-    /// log-key halves are anchored to real Sigstore
-    /// (`a_real_sigstore_checkpoint_verifies_under_the_embedded_pin_set`);
-    /// end-to-end inclusion against a proof minted by the real Sigstore needs
-    /// this rendering to match its entry format, which is future work.
-    pub fn entry_bytes(&self) -> Vec<u8> {
-        let mut out = String::with_capacity(64 + 2 * (self.dsse_payload.len() + 96));
-        out.push_str("{\"payloadType\":\"");
-        out.push_str(DSSE_PAYLOAD_TYPE);
-        out.push_str("\",\"payload\":\"");
-        out.push_str(&base64_encode(&self.dsse_payload));
-        out.push_str("\",\"signatures\":[{\"sig\":\"");
-        out.push_str(&base64_encode(&self.dsse_signature));
-        out.push_str("\"}]}");
-        out.into_bytes()
-    }
-
-    /// The RFC 6962 leaf hash of this entry.
+    /// This is the whole point of v2 — the leaf commits to the exact
+    /// `canonicalizedBody` the log returned, so an inclusion walk under this
+    /// hash reaches a root the real Sigstore computed over the same bytes.
     pub fn leaf_hash(&self) -> [u8; 32] {
-        leaf_hash(&self.entry_bytes())
+        leaf_hash(&self.canonicalized_body)
     }
 }
 
@@ -291,6 +288,13 @@ impl ZoneKey<'_> {
         }
         Ok(&rdata[4..])
     }
+
+    /// The DER SubjectPublicKeyInfo of this key: what the logged entry's
+    /// `verifier.publicKey.rawBytes` must equal, so that the key the log
+    /// vouches for is the key the DNSSEC chain observed.
+    fn der_spki(&self) -> Result<Vec<u8>, ProofError> {
+        Ok(p256_spki(self.public_key()?))
+    }
 }
 
 /// What a verified record establishes, for logs and `synch doctor`.
@@ -308,10 +312,12 @@ pub struct VerifiedRecord {
 
 /// Verifies a proof completely, offline (§4.2).
 ///
-/// The order is the order of the argument: the log vouches for an entry
-/// (checkpoint, inclusion) that the zone key itself signed (possession) and
-/// that names this exact key and zone (binding). Any single failure refuses
-/// the whole record — there is no partial credit.
+/// The chain, in the order the validated algorithm runs it: the log vouches
+/// for a leaf (checkpoint, inclusion) whose body commits to the DSSE PAE of
+/// this Statement (digest), which the zone key itself signed (possession)
+/// with the key the log names (key binding), and the Statement names this
+/// exact key and zone (statement binding). Any single failure refuses the
+/// whole record — there is no partial credit.
 pub fn verify(
     proof: &RekorProof,
     key: &ZoneKey<'_>,
@@ -335,20 +341,9 @@ pub fn verify(
     })?;
     let checkpoint = Checkpoint::parse(&proof.checkpoint)?;
 
-    // Possession: the DSSE signature is the zone key's own.
-    let public = key.public_key()?;
-    verify_ecdsa_p256(
-        public,
-        &pae(DSSE_PAYLOAD_TYPE, &proof.dsse_payload),
-        &proof.dsse_signature,
-    )
-    .map_err(|_| ProofError::Possession("the DSSE signature is not this zone key's".into()))?;
-
-    // Binding: the Statement describes the key and zone actually observed.
-    let statement = ZoneKeyStatement::parse(&proof.dsse_payload)?;
-    statement.check_binds(key)?;
-
-    // Inclusion: the entry is in the tree the checkpoint commits to.
+    // Inclusion: the entry's body is a leaf of the tree the checkpoint
+    // commits to. The leaf is over the log's own `canonicalizedBody`, so
+    // this walk reaches a root the log computed over the same bytes.
     verify_inclusion(
         proof.log_index,
         checkpoint.tree_size,
@@ -360,12 +355,108 @@ pub fn verify(
     // The log vouches: the checkpoint carries the pinned key's signature.
     checkpoint.verify_signature(log_key)?;
 
+    // The body the leaf committed to: a hashedrekord over a PAE digest,
+    // carrying the entry signature and the key that made it.
+    let body = HashedRekordBody::parse(&proof.canonicalized_body)?;
+
+    // The entry commits to the DSSE PAE of *this* Statement — the body holds
+    // only its digest, so the Statement bytes cannot be swapped under it.
+    let pae = pae(DSSE_PAYLOAD_TYPE, &proof.statement);
+    if body.digest != sha256(&pae) {
+        return Err(ProofError::Binding(
+            "the logged entry's digest is not this statement's DSSE PAE".into(),
+        ));
+    }
+
+    // Possession: the entry signature over the PAE is the zone key's own.
+    // Rekor entry signatures are ASN.1/DER, not the raw r||s of DNSSEC.
+    let public = key.public_key()?;
+    verify_ecdsa_p256_asn1(public, &pae, &body.signature)
+        .map_err(|_| ProofError::Possession("the entry signature is not this zone key's".into()))?;
+
+    // Key binding: the verifier the log recorded is exactly this DNSKEY. A
+    // possession check alone would pass a signature by the observed key under
+    // an entry that names a *different* key to a monitor.
+    if body.verifier_spki != key.der_spki()? {
+        return Err(ProofError::Binding(
+            "the logged verifier key is not this zone's DNSKEY".into(),
+        ));
+    }
+
+    // Statement binding: the Statement describes the key and zone observed.
+    let statement = ZoneKeyStatement::parse(&proof.statement)?;
+    statement.check_binds(key)?;
+
     Ok(VerifiedRecord {
         log_index: proof.log_index,
         tree_size: checkpoint.tree_size,
         origin: checkpoint.origin,
         action: statement.action,
     })
+}
+
+/// The fields a `hashedrekord` v0.0.2 body carries that a proof turns on.
+///
+/// Rekor v2 has no DSSE entry type; a DSSE-signed Statement is logged as a
+/// `hashedrekord` over the DSSE PAE (docs/REKOR-ZONE-KEY.md §2). The body is
+/// the log's own `canonicalizedBody`, verified here by re-deriving nothing —
+/// the digest, signature and verifier are read out and checked against what
+/// the DNSSEC chain independently observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HashedRekordBody {
+    /// The SHA-256 the entry commits to — must equal `SHA-256(PAE)`.
+    digest: Vec<u8>,
+    /// The entry signature, DER/ASN.1 ECDSA over the PAE.
+    signature: Vec<u8>,
+    /// The signer's DER SubjectPublicKeyInfo.
+    verifier_spki: Vec<u8>,
+}
+
+impl HashedRekordBody {
+    /// Parses the body, refusing anything whose known members are the wrong
+    /// shape and asserting the algorithm and key-details tags this design
+    /// logs. Unknown members are tolerated so the entry format can grow.
+    fn parse(bytes: &[u8]) -> Result<HashedRekordBody, ProofError> {
+        let bad = |why: String| ProofError::Malformed(format!("entry body: {why}"));
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| bad(e.to_string()))?;
+        let spec = &value["spec"]["hashedRekordV002"];
+        if spec.is_null() {
+            return Err(bad("not a hashedrekord v0.0.2 entry".into()));
+        }
+        let text = |v: &serde_json::Value, what: &str| -> Result<String, ProofError> {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| bad(format!("{what} is not a string")))
+        };
+        let b64 = |v: &serde_json::Value, what: &str| -> Result<Vec<u8>, ProofError> {
+            base64_decode(&text(v, what)?).map_err(|_| bad(format!("{what} is not base64")))
+        };
+
+        let data = &spec["data"];
+        let algorithm = text(&data["algorithm"], "data.algorithm")?;
+        if algorithm != HASHEDREKORD_DIGEST_ALGORITHM {
+            return Err(ProofError::Binding(format!(
+                "entry digest algorithm {algorithm} is not {HASHEDREKORD_DIGEST_ALGORITHM}"
+            )));
+        }
+        let signature = &spec["signature"];
+        let verifier = &signature["verifier"];
+        let key_details = text(&verifier["keyDetails"], "verifier.keyDetails")?;
+        if key_details != HASHEDREKORD_KEY_DETAILS {
+            return Err(ProofError::Binding(format!(
+                "entry key details {key_details} are not {HASHEDREKORD_KEY_DETAILS}"
+            )));
+        }
+        Ok(HashedRekordBody {
+            digest: b64(&data["digest"], "data.digest")?,
+            signature: b64(&signature["content"], "signature.content")?,
+            verifier_spki: b64(
+                &verifier["publicKey"]["rawBytes"],
+                "verifier.publicKey.rawBytes",
+            )?,
+        })
+    }
 }
 
 /// The in-toto Statement a zone-key entry carries (§2).
@@ -787,15 +878,39 @@ pub fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Verifies an ECDSA P-256/SHA-256 signature in raw `r || s` form against a
+/// Verifies an ECDSA P-256/SHA-256 signature in ASN.1/DER form against a
 /// DNSSEC algorithm 13 public key (64 bytes of coordinates).
-fn verify_ecdsa_p256(public: &[u8], message: &[u8], signature: &[u8]) -> Result<(), ProofError> {
+///
+/// DER, not the raw `r || s` of DNSSEC: a Rekor entry's `signature.content`
+/// is what the log indexed, and Rekor indexes DER. ring hashes the message
+/// (the DSSE PAE) internally.
+fn verify_ecdsa_p256_asn1(
+    public: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), ProofError> {
     let mut uncompressed = Vec::with_capacity(65);
     uncompressed.push(0x04);
     uncompressed.extend_from_slice(public);
-    signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, &uncompressed)
+    signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, &uncompressed)
         .verify(message, signature)
         .map_err(|_| ProofError::Possession("signature does not verify".into()))
+}
+
+/// Wraps a raw 64-byte uncompressed P-256 point in a DER SubjectPublicKeyInfo.
+///
+/// The prefix is the fixed algorithm identifier for `id-ecPublicKey` over
+/// `prime256v1` plus the bit-string header and the `0x04` uncompressed-point
+/// tag — the same 27 bytes [`LogKey::from_spki`] strips back off.
+pub fn p256_spki(point: &[u8]) -> Vec<u8> {
+    const P256_SPKI_PREFIX: &[u8] = &[
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+    ];
+    let mut der = Vec::with_capacity(P256_SPKI_PREFIX.len() + point.len());
+    der.extend_from_slice(P256_SPKI_PREFIX);
+    der.extend_from_slice(point);
+    der
 }
 
 /// Walks an RFC 6962 §2.1.1 audit path from a leaf to a root.
@@ -1012,8 +1127,8 @@ mod tests {
             key_tag: 34_918,
             log_id: [7u8; 32],
             log_index: 1_234_567,
-            dsse_payload: b"{\"_type\":\"x\"}".to_vec(),
-            dsse_signature: vec![9u8; 64],
+            statement: b"{\"_type\":\"x\"}".to_vec(),
+            canonicalized_body: b"{\"kind\":\"hashedrekord\"}".to_vec(),
             checkpoint: "log.example\n4\nAAAA\n\n\u{2014} log.example AAAAAAAA\n"
                 .as_bytes()
                 .to_vec(),
@@ -1038,6 +1153,7 @@ mod tests {
         assert_eq!(&bytes[1..3], &34_918u16.to_be_bytes());
         assert_eq!(&bytes[3..35], &[7u8; 32]);
         assert_eq!(&bytes[35..43], &1_234_567u64.to_be_bytes());
+        // The statement blob's u16 length prefix, then its bytes.
         assert_eq!(&bytes[43..45], &13u16.to_be_bytes());
     }
 
@@ -1057,7 +1173,7 @@ mod tests {
             Err(ProofError::Malformed(_))
         ));
         let mut wrong_version = bytes;
-        wrong_version[0] = 2;
+        wrong_version[0] = 1;
         assert!(matches!(
             RekorProof::decode(&wrong_version),
             Err(ProofError::Malformed(_))
@@ -1179,13 +1295,10 @@ mod tests {
         // parsed and simply not matched by our pin — `verify_signature`
         // needs only one line to verify, which is the log's own.)
         //
-        // Scope, stated exactly: this anchors the checkpoint and log-key
-        // machinery to reality. It does NOT anchor the Merkle *leaf*
-        // convention — `entry_bytes` renders the DSSE envelope as canonical
-        // JSON, which is synchronicity's own entry serialization, not
-        // Rekor v2's on-log entry format. End-to-end inclusion against a
-        // real Sigstore proof needs that serialization matched, which is
-        // future work (docs/REKOR-ZONE-KEY.md §2, §8).
+        // This anchors the checkpoint and log-key machinery to reality; the
+        // Merkle *leaf* convention is anchored separately and end to end by
+        // `the_real_rekor_v2_entry_verifies` in the integration suite, over a
+        // genuine published `hashedrekord` entry (tests/fixtures/rekor_v2).
         let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
         let checkpoint = Checkpoint::parse(note).expect("a real checkpoint must parse");
         assert_eq!(checkpoint.origin, "log2025-1.rekor.sigstore.dev");

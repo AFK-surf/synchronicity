@@ -68,11 +68,15 @@ addition.
 
 DNSSEC answers *is this key authorized for this zone?* by delegation, and a
 compromised or coerced parent can substitute the key quietly. By default the
-zone key that signed an answer must additionally appear in a public
-transparency log — the Sigstore production log keys are built in — with the
-proof carried inside the zone and verified offline: a substituted key then
-has to be a *public* substitution, where the zone's operator can see it, or
-fail validation. `--rekor off` (`SYNCH_REKOR`) states the opt-out;
+zone key that signed an answer must additionally appear in the public
+Sigstore Rekor v2 transparency log — the production log keys are built in —
+with the proof carried inside the zone and verified offline: a substituted
+key then has to be a *public* substitution, where the zone's operator can
+see it, or fail validation. The zone key is logged as a genuine
+`hashedrekord` entry over its DSSE statement, the Merkle leaf commits to the
+log's own canonicalized body, and a real published entry is checked in as a
+conformance fixture, so a proof minted by `log2025-1.rekor.sigstore.dev`
+verifies end to end. `--rekor off` (`SYNCH_REKOR`) states the opt-out;
 `--rekor-key <file>` (`SYNCH_REKOR_KEY`) points at a self-hosted log's
 verification key, with the same different-universe semantics as the trust
 anchor. See [docs/REKOR-ZONE-KEY.md](docs/REKOR-ZONE-KEY.md).

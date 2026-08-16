@@ -1,4 +1,4 @@
-//// The `RekorProof` v1 record: the compact binary blob that travels in the
+//// The `RekorProof` v2 record: the compact binary blob that travels in the
 //// zone at `_synchronicity-rekor.<apex>`, and the local verification of it.
 ////
 //// This is the mirror of crates/synch-net/src/rekor.rs. Every client that
@@ -8,40 +8,51 @@
 //// other's good intentions:
 ////
 //// ```text
-//// u8       version        = 1
+//// u8       version            = 2
 //// u16      key_tag
-//// u8[32]   log_id           SHA-256 of the log's DER SubjectPublicKeyInfo
+//// u8[32]   log_id               SHA-256 of the log's DER SubjectPublicKeyInfo
 //// u64      log_index
-//// u16+[]   dsse_payload     the in-toto Statement, byte-exact
-//// u16+[]   dsse_signature   ECDSA P-256 over DSSE PAE(payload)
-//// u16+[]   checkpoint       signed note: origin, tree size, root hash, sigs
-//// u8+[32]* inclusion_path   Merkle audit path, leaf to root
+//// u16+[]   statement            the in-toto Statement, byte-exact (PAE preimage)
+//// u16+[]   canonicalized_body   the Rekor entry body, verbatim (leaf preimage)
+//// u16+[]   checkpoint           signed note: origin, tree size, root hash, sigs
+//// u8+[32]* inclusion_path       Merkle audit path, leaf to root
 //// ```
 ////
-//// Two conventions are part of the format and not of either implementation:
-//// the log entry is the DSSE envelope as canonical JSON (`payloadType`,
-//// `payload`, `signatures` with a single `sig`, padded base64, no
-//// whitespace), and the Merkle leaf is `SHA-256(0x00 || entry)` with
-//// interior nodes `SHA-256(0x01 || left || right)` — RFC 6962 §2.1.
+//// v2 is the *real* Rekor v2 entry, not a synchronicity convention: Rekor
+//// has no DSSE entry type, so a DSSE-signed Statement is logged as a
+//// `hashedrekord` v0.0.2 over the DSSE PAE — `data.digest = SHA-256(PAE)`,
+//// `signature.content` the DER ECDSA over the PAE, `verifier.publicKey.
+//// rawBytes` the DER SubjectPublicKeyInfo. The log returns those bytes as
+//// `canonicalizedBody`; this record carries them **verbatim** and the Merkle
+//// leaf is `SHA-256(0x00 || canonicalized_body)`, with interior nodes
+//// `SHA-256(0x01 || left || right)` — RFC 6962 §2.1. The Statement rides
+//// alongside because the body commits only to its PAE *digest*.
 
 import gleam/bit_array
 import gleam/crypto
+import gleam/dynamic/decode
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/result
 import gleam/string
-import rekor/statement
 
 /// The version this build writes and accepts.
-pub const version = 1
+pub const version = 2
+
+/// The `hashedrekord` v0.0.2 digest algorithm and P-256 key-details tags a
+/// body must declare.
+const digest_algorithm = "SHA2_256"
+
+const key_details = "PKIX_ECDSA_P256_SHA_256"
 
 pub type Proof {
   Proof(
     key_tag: Int,
     log_id: BitArray,
     log_index: Int,
-    dsse_payload: BitArray,
-    dsse_signature: BitArray,
+    statement: BitArray,
+    canonicalized_body: BitArray,
     checkpoint: BitArray,
     inclusion_path: List(BitArray),
   )
@@ -79,8 +90,8 @@ pub fn encode(proof: Proof) -> BitArray {
     <<version:int-size(8), proof.key_tag:int-size(16)>>,
     proof.log_id,
     <<proof.log_index:int-size(64)>>,
-    blob16(proof.dsse_payload),
-    blob16(proof.dsse_signature),
+    blob16(proof.statement),
+    blob16(proof.canonicalized_body),
     blob16(proof.checkpoint),
     <<list.length(proof.inclusion_path):int-size(8)>>,
     bit_array.concat(proof.inclusion_path),
@@ -97,20 +108,95 @@ pub fn to_txt(proof: Proof) -> String {
   bit_array.base64_url_encode(encode(proof), False)
 }
 
-/// The log entry bytes: the DSSE envelope as canonical JSON.
-pub fn entry_bytes(proof: Proof) -> BitArray {
+/// A real `hashedrekord` v0.0.2 body over a Statement's DSSE PAE.
+///
+/// The field order is the live log's, byte for byte — but nothing on the
+/// serving path builds a body: the log returns `canonicalizedBody` and the
+/// service carries it verbatim. This exists so a test log can mint a body
+/// the way Sigstore does, mirroring `hashedrekord_body` on the client's sim
+/// side (crates/synch-net/src/sim.rs). `digest` is the caller's; the fake
+/// makes it the SHA-256 of the PAE it is logging.
+pub fn hashedrekord_body(
+  digest: BitArray,
+  signature: BitArray,
+  verifier_spki: BitArray,
+) -> BitArray {
   <<
-    "{\"payloadType\":\"":utf8,
-    statement.dsse_payload_type:utf8,
-    "\",\"payload\":\"":utf8,
-    bit_array.base64_encode(proof.dsse_payload, True):utf8,
-    "\",\"signatures\":[{\"sig\":\"":utf8,
-    bit_array.base64_encode(proof.dsse_signature, True):utf8,
-    "\"}]}":utf8,
+    "{\"apiVersion\":\"0.0.2\",\"kind\":\"hashedrekord\",\"spec\":{\"hashedRekordV002\":{\"data\":{\"algorithm\":\"SHA2_256\",\"digest\":\"":utf8,
+    bit_array.base64_encode(digest, True):utf8,
+    "\"},\"signature\":{\"content\":\"":utf8,
+    bit_array.base64_encode(signature, True):utf8,
+    "\",\"verifier\":{\"keyDetails\":\"PKIX_ECDSA_P256_SHA_256\",\"publicKey\":{\"rawBytes\":\"":utf8,
+    bit_array.base64_encode(verifier_spki, True):utf8,
+    "\"}}}}}}":utf8,
   >>
 }
 
-/// The RFC 6962 leaf hash of an entry.
+/// The digest, DER signature and DER SubjectPublicKeyInfo a `hashedrekord`
+/// v0.0.2 body carries. The service reads these back out of the log's own
+/// `canonicalizedBody` to re-check possession and the verifier binding
+/// before storing — re-deriving nothing the log already serialized.
+pub fn parse_body(
+  bytes: BitArray,
+) -> Result(#(BitArray, BitArray, BitArray), ProofError) {
+  let bad = fn(why: String) { Malformed("entry body: " <> why) }
+  use text <- result.try(
+    bit_array.to_string(bytes) |> result.replace_error(bad("not UTF-8")),
+  )
+  let decoder = {
+    use algorithm <- decode.subfield(
+      ["spec", "hashedRekordV002", "data", "algorithm"],
+      decode.string,
+    )
+    use digest <- decode.subfield(
+      ["spec", "hashedRekordV002", "data", "digest"],
+      decode.string,
+    )
+    use content <- decode.subfield(
+      ["spec", "hashedRekordV002", "signature", "content"],
+      decode.string,
+    )
+    use details <- decode.subfield(
+      ["spec", "hashedRekordV002", "signature", "verifier", "keyDetails"],
+      decode.string,
+    )
+    use raw_bytes <- decode.subfield(
+      [
+        "spec", "hashedRekordV002", "signature", "verifier", "publicKey",
+        "rawBytes",
+      ],
+      decode.string,
+    )
+    decode.success(#(algorithm, digest, content, details, raw_bytes))
+  }
+  use #(algorithm, digest, content, details, raw_bytes) <- result.try(
+    json.parse(text, decoder)
+    |> result.replace_error(bad("not a hashedrekord v0.0.2 entry")),
+  )
+  use Nil <- result.try(case algorithm == digest_algorithm {
+    True -> Ok(Nil)
+    False -> Error(Binding("entry digest algorithm " <> algorithm))
+  })
+  use Nil <- result.try(case details == key_details {
+    True -> Ok(Nil)
+    False -> Error(Binding("entry key details " <> details))
+  })
+  use digest <- result.try(
+    bit_array.base64_decode(digest)
+    |> result.replace_error(bad("data.digest is not base64")),
+  )
+  use content <- result.try(
+    bit_array.base64_decode(content)
+    |> result.replace_error(bad("signature.content is not base64")),
+  )
+  use raw_bytes <- result.try(
+    bit_array.base64_decode(raw_bytes)
+    |> result.replace_error(bad("verifier.publicKey.rawBytes is not base64")),
+  )
+  Ok(#(digest, content, raw_bytes))
+}
+
+/// The RFC 6962 leaf hash of an entry body.
 pub fn leaf_hash(entry: BitArray) -> BitArray {
   crypto.hash(crypto.Sha256, bit_array.concat([<<0>>, entry]))
 }
@@ -247,18 +333,32 @@ fn ecdsa_verify_raw(
   public: BitArray,
 ) -> Bool
 
+@external(erlang, "cp_crypto_ffi", "ed25519_verify")
+fn ed25519_verify(
+  message: BitArray,
+  signature: BitArray,
+  public: BitArray,
+) -> Bool
+
 /// Verifies that the pinned log key signed this checkpoint.
 ///
-/// ECDSA P-256 only: that is what Rekor's checkpoints and this service's
-/// own verification use. The client additionally accepts Ed25519 log keys,
-/// which no path here produces.
+/// The algorithm follows the key: a 64-byte point is an uncompressed P-256
+/// key whose checkpoint signatures are raw `r||s` (rekor.sigstore.dev and a
+/// self-hosted or simulated log); a 32-byte point is Ed25519
+/// (log2025-1.rekor.sigstore.dev, the default public log). One matching
+/// signature line is enough — the witness cosignatures beside it are parsed
+/// and simply not our key.
 pub fn verify_checkpoint(
   checkpoint: Checkpoint,
   log_public: BitArray,
 ) -> Result(Nil, ProofError) {
   let signed =
     list.any(checkpoint.signatures, fn(pair) {
-      ecdsa_verify_raw(checkpoint.signed, pair.1, log_public)
+      case bit_array.byte_size(log_public) {
+        64 -> ecdsa_verify_raw(checkpoint.signed, pair.1, log_public)
+        32 -> ed25519_verify(checkpoint.signed, pair.1, log_public)
+        _ -> False
+      }
     })
   case signed {
     True -> Ok(Nil)
@@ -278,6 +378,11 @@ const p256_spki_prefix = <<
   0x04,
 >>
 
+/// The DER SubjectPublicKeyInfo prefix of an Ed25519 key.
+const ed25519_spki_prefix = <<
+  0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+>>
+
 /// Wraps a raw 64-byte P-256 point in a DER SubjectPublicKeyInfo.
 pub fn p256_spki(point: BitArray) -> BitArray {
   bit_array.concat([p256_spki_prefix, point])
@@ -291,7 +396,8 @@ pub fn log_id(spki: BitArray) -> BitArray {
 /// Reads a pinned log key file: PEM `PUBLIC KEY` blocks or one base64
 /// SubjectPublicKeyInfo per line, `#` starting a comment. Returns the DER
 /// and the raw point, since verification needs one and the log id the
-/// other.
+/// other. Both an ECDSA P-256 (64-byte point) and an Ed25519 (32-byte
+/// point) key are recognized; everything else is refused.
 pub fn parse_log_key(
   text: String,
 ) -> Result(#(BitArray, BitArray), ProofError) {
@@ -319,16 +425,22 @@ pub fn parse_log_key(
     <<prefix:bytes-size(27), point:bytes-size(64)>>
       if prefix == p256_spki_prefix
     -> Ok(#(der, point))
+    <<prefix:bytes-size(12), point:bytes-size(32)>>
+      if prefix == ed25519_spki_prefix
+    -> Ok(#(der, point))
     _ ->
-      Error(UnknownLog("the log key is not an ECDSA P-256 SubjectPublicKeyInfo"))
+      Error(UnknownLog(
+        "the log key is neither an ECDSA P-256 nor an Ed25519 SubjectPublicKeyInfo",
+      ))
   }
 }
 
-/// Verifies a proof the way the client will: the entry is in the tree the
-/// checkpoint commits to, and the log signed that checkpoint.
+/// Verifies a proof the way the client will: the leaf over the log's own
+/// `canonicalizedBody` is in the tree the checkpoint commits to, and the log
+/// signed that checkpoint.
 ///
-/// Possession and binding are checked in `rekor/publish`, where the key and
-/// the statement being logged are both in hand.
+/// Possession and the verifier binding are checked in `rekor/publish`, where
+/// the zone key and the Statement being logged are both in hand.
 pub fn verify_against_log(
   proof: Proof,
   log_spki: BitArray,
@@ -345,7 +457,7 @@ pub fn verify_against_log(
   use Nil <- result.try(verify_inclusion(
     proof.log_index,
     checkpoint.tree_size,
-    leaf_hash(entry_bytes(proof)),
+    leaf_hash(proof.canonicalized_body),
     proof.inclusion_path,
     checkpoint.root_hash,
   ))

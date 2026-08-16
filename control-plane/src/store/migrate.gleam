@@ -62,8 +62,37 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4]
+  [v1, v2, v3, v4, v5]
 }
+
+/// V5: the Rekor v2 rework (docs/REKOR-ZONE-KEY.md §2, §3). The record now
+/// carries the log's own `canonicalizedBody` (the Merkle leaf preimage,
+/// a real `hashedrekord` v0.0.2 entry over the DSSE PAE) beside the
+/// Statement, replacing the v1 leaf convention that hashed a
+/// synchronicity-canonical DSSE envelope. Any row written under v3/v4 is a
+/// proof under the old leaf convention that no v2 client will accept, so the
+/// table is rebuilt empty rather than carried forward with mislabelled
+/// columns: `dsse_signature` bytes are not a `canonicalizedBody`. An operator
+/// re-runs `rekor-publish` to repopulate it, which the ceremony already
+/// budgets for.
+const v5 = "
+DROP TABLE rekor_records;
+CREATE TABLE rekor_records (
+  key_tag            INTEGER NOT NULL,
+  apex               TEXT    NOT NULL,
+  action             TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
+  statement          BLOB    NOT NULL,
+  canonicalized_body BLOB    NOT NULL,
+  log_id             BLOB    NOT NULL CHECK (length(log_id) = 32),
+  log_index          INTEGER NOT NULL,
+  checkpoint         BLOB    NOT NULL,
+  inclusion_path     BLOB    NOT NULL,
+  integrated_at      INTEGER NOT NULL,
+  verified_at        INTEGER NOT NULL,
+  PRIMARY KEY (key_tag, action)
+);
+CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
+"
 
 /// V4: the relayed TUF material (docs/REKOR-ZONE-KEY.md §10.3). One row,
 /// because there is one Sigstore repository and one current view of it —

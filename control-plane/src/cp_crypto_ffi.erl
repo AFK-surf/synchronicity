@@ -3,6 +3,7 @@
 %% RFC 6605 §4) — the conversion lives here, next to the calls that need it.
 -module(cp_crypto_ffi).
 -export([ec_generate/0, ecdsa_sign_raw/2, ecdsa_verify_raw/3,
+         ecdsa_sign_der/2, ecdsa_verify_der/3, ed25519_verify/3,
          ed25519_generate_public/0]).
 
 %% A fresh Ed25519 public key (32 bytes) — device keys are Ed25519 iroh
@@ -31,6 +32,22 @@ ecdsa_verify_raw(Msg, RawSig, Pub64) ->
             crypto:verify(ecdsa, sha256, Msg, Der,
                           [<<4, Pub64/binary>>, prime256v1])
     end.
+
+%% DER/ASN.1 ECDSA — what a Rekor entry's signature.content carries, and
+%% what the client's possession check verifies (crates/synch-net/src/rekor.rs
+%% uses ECDSA_P256_SHA256_ASN1). :crypto signs and verifies DER natively, so
+%% no r||s conversion here.
+ecdsa_sign_der(Msg, Priv32) ->
+    crypto:sign(ecdsa, sha256, Msg, [Priv32, prime256v1]).
+
+ecdsa_verify_der(Msg, Der, Pub64) ->
+    crypto:verify(ecdsa, sha256, Msg, Der,
+                  [<<4, Pub64/binary>>, prime256v1]).
+
+%% Ed25519 over a raw message — the signature scheme log2025-1's checkpoints
+%% use. EdDSA hashes internally, so the algorithm digest is `none`.
+ed25519_verify(Msg, Sig, Pub32) ->
+    crypto:verify(eddsa, none, Msg, Sig, [Pub32, ed25519]).
 
 pad32(Bin) when byte_size(Bin) =:= 32 -> Bin;
 pad32(Bin) when byte_size(Bin) < 32 ->

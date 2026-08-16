@@ -15,16 +15,18 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
 
 - **Organizations** have **users** (owner / admin / member roles, via
   invites) and **devices**.
-- The zone key can be put on a public transparency log
+- The zone key can be put on the public Sigstore Rekor v2 transparency log
   (`controlplane rekor-publish`), with the proof served inside the zone at
   `_synchronicity-rekor.<apex>` so clients verify it offline — a
   substituted DS then has to be a *public* substitution or fail
-  validation. v1 uses synchronicity's own log-entry convention (the client
-  pins and verifies real Sigstore *checkpoints* and *keys*, but matching
-  Rekor v2's on-log entry serialization for end-to-end interop against the
-  public Sigstore log is future work, and the submission client is a stub);
-  a self-hosted, convention-compatible log works today. See
-  [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md) §2, §8.
+  validation. The submission is genuine: `rekor-publish` builds the DSSE
+  PAE, signs it as DER ECDSA with the CSK, POSTs a `hashedrekord` v0.0.2
+  `CreateEntryRequest` to `CP_REKOR_URL`, then verifies the returned entry
+  locally (canonicalized body, inclusion, checkpoint, possession, binding)
+  before storing it. A real published entry is a checked-in conformance
+  fixture, so a proof from `log2025-1.rekor.sigstore.dev` verifies end to
+  end; a self-hosted, Rekor-v2-compatible log works too via `CP_REKOR_KEY`.
+  See [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md) §2, §3, §5.
 - The zone also **relays Sigstore's TUF metadata** verbatim at
   `_synchronicity-tuf.<apex>` (`controlplane tuf-refresh`, and the hourly
   job when the stored timestamp nears expiry), so clients' log-key pins
@@ -109,8 +111,8 @@ listen address.
 | `CP_GOOGLE_CLIENT_SECRET` | primary | Google OAuth client secret. |
 | `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in. |
 | `CP_GITHUB_CLIENT_SECRET` | primary | GitHub OAuth client secret. |
-| `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint. Default `https://rekor.sigstore.dev`. |
-| `CP_REKOR_KEY` | primary | File pinning the log's verification key; defaults to the embedded rekor.sigstore.dev snapshot. Set it for a self-hosted log. |
+| `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Default `https://log2025-1.rekor.sigstore.dev`. |
+| `CP_REKOR_KEY` | primary | File pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev (Ed25519) snapshot. Set it for a self-hosted log. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 | `CP_TUF_URL` | primary | Sigstore TUF repository this zone relays, so clients' log pins follow it. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched by `controlplane tuf-refresh` and by the hourly job within three days of the stored timestamp's expiry. |
 

@@ -117,10 +117,20 @@ impl SimZone {
         )
     }
 
-    /// Signs a DSSE payload with the zone key itself — §2's whole point:
-    /// possession of the CSK is the authority being made transparent.
+    /// Signs a DSSE payload's PAE with the zone key itself — §2's whole
+    /// point: possession of the CSK is the authority being made transparent.
+    ///
+    /// DER/ASN.1, the encoding a Rekor entry's `signature.content` carries
+    /// (and what the client's possession check verifies), not the raw `r||s`
+    /// of a DNSSEC signature.
     pub fn sign_dsse(&self, payload: &[u8]) -> Vec<u8> {
-        sign_p256(&self.pkcs8, &rekor::pae(rekor::DSSE_PAYLOAD_TYPE, payload))
+        sign_p256_der(&self.pkcs8, &rekor::pae(rekor::DSSE_PAYLOAD_TYPE, payload))
+    }
+
+    /// The zone key's DER SubjectPublicKeyInfo — what a logged entry records
+    /// as its `verifier.publicKey.rawBytes`.
+    pub fn spki(&self) -> Vec<u8> {
+        rekor::p256_spki(self.dnskey.public_key().public_bytes())
     }
 
     /// The Statement this zone's control plane would publish for its key.
@@ -414,20 +424,30 @@ impl SimLog {
     }
 
     /// Logs a Statement the zone key signs, and returns the whole proof —
-    /// what `controlplane rekor-publish` ends up storing.
+    /// what `controlplane rekor-publish` ends up storing. The entry is a real
+    /// `hashedrekord` v0.0.2 body over the Statement's DSSE PAE.
     pub fn log_statement(&mut self, zone: &SimZone, statement: &ZoneKeyStatement) -> RekorProof {
-        let dsse_payload = statement.to_json();
-        let dsse_signature = zone.sign_dsse(&dsse_payload);
+        let payload = statement.to_json();
+        let signature = zone.sign_dsse(&payload);
+        let body = hashedrekord_body(&payload, &signature, &zone.spki());
+        self.log_body(statement.key_tag, payload, body)
+    }
+
+    /// Appends a prebuilt entry body and returns the whole proof. The
+    /// primitive `log_statement` builds on, and the seam a test uses to log a
+    /// body that is well formed but wrong — a signature by a stranger, a
+    /// verifier that is not the zone's key — one flaw at a time.
+    pub fn log_body(&mut self, key_tag: u16, statement: Vec<u8>, body: Vec<u8>) -> RekorProof {
         let mut proof = RekorProof {
-            key_tag: statement.key_tag,
+            key_tag,
             log_id: self.log_id(),
             log_index: 0,
-            dsse_payload,
-            dsse_signature,
+            statement,
+            canonicalized_body: body,
             checkpoint: Vec::new(),
             inclusion_path: Vec::new(),
         };
-        proof.log_index = self.append(&proof.entry_bytes());
+        proof.log_index = self.append(&proof.canonicalized_body);
         proof.checkpoint = self.checkpoint();
         proof.inclusion_path = self.inclusion_path(proof.log_index);
         proof
@@ -867,12 +887,49 @@ fn split_point(n: usize) -> usize {
     k
 }
 
-/// Signs with ECDSA P-256/SHA-256, producing the raw `r || s` form DNSSEC
-/// and this design's DSSE signatures both use.
+/// A real `hashedrekord` v0.0.2 body over a Statement's DSSE PAE.
+///
+/// The field order is the live log's, byte for byte (`apiVersion`, `kind`,
+/// `spec` → `hashedRekordV002` → `data{algorithm,digest}`,
+/// `signature{content, verifier{keyDetails, publicKey{rawBytes}}}`), because
+/// the Merkle leaf commits to these exact bytes. `digest` is always the
+/// SHA-256 of the PAE of `statement`, so a test that logs a mangled statement
+/// still produces an internally consistent entry — the flaw it is probing
+/// surfaces at the check it means to, not at a digest mismatch.
+#[doc(hidden)]
+pub fn hashedrekord_body(statement: &[u8], signature_der: &[u8], verifier_spki: &[u8]) -> Vec<u8> {
+    let digest = rekor::sha256(&rekor::pae(rekor::DSSE_PAYLOAD_TYPE, statement));
+    let mut out = String::new();
+    out.push_str("{\"apiVersion\":\"0.0.2\",\"kind\":\"hashedrekord\",\"spec\":{\"hashedRekordV002\":{\"data\":{\"algorithm\":\"SHA2_256\",\"digest\":\"");
+    out.push_str(&rekor::base64_encode(&digest));
+    out.push_str("\"},\"signature\":{\"content\":\"");
+    out.push_str(&rekor::base64_encode(signature_der));
+    out.push_str("\",\"verifier\":{\"keyDetails\":\"PKIX_ECDSA_P256_SHA_256\",\"publicKey\":{\"rawBytes\":\"");
+    out.push_str(&rekor::base64_encode(verifier_spki));
+    out.push_str("\"}}}}}}");
+    out.into_bytes()
+}
+
+/// Signs with ECDSA P-256/SHA-256, producing the raw `r || s` form a DNSSEC
+/// signature and a signed-note (checkpoint) signature both use.
 fn sign_p256(pkcs8: &[u8], message: &[u8]) -> Vec<u8> {
     let rng = ring::rand::SystemRandom::new();
     let key = ring::signature::EcdsaKeyPair::from_pkcs8(
         &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        pkcs8,
+        &rng,
+    )
+    .expect("key load");
+    key.sign(&rng, message).expect("sign").as_ref().to_vec()
+}
+
+/// Signs with ECDSA P-256/SHA-256, producing the ASN.1/DER form a Rekor
+/// entry signature carries. The zone key's PKCS#8 was minted for FIXED
+/// signing, but ring lets the same key material load under either encoding.
+fn sign_p256_der(pkcs8: &[u8], message: &[u8]) -> Vec<u8> {
+    let rng = ring::rand::SystemRandom::new();
+    let key = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
         pkcs8,
         &rng,
     )

@@ -128,27 +128,31 @@ pub fn pae(payload_type: String, payload: BitArray) -> BitArray {
   ])
 }
 
-@external(erlang, "cp_crypto_ffi", "ecdsa_sign_raw")
-fn ecdsa_sign_raw(message: BitArray, private: BitArray) -> BitArray
+@external(erlang, "cp_crypto_ffi", "ecdsa_sign_der")
+fn ecdsa_sign_der(message: BitArray, private: BitArray) -> BitArray
 
-@external(erlang, "cp_crypto_ffi", "ecdsa_verify_raw")
-fn ecdsa_verify_raw(
+@external(erlang, "cp_crypto_ffi", "ecdsa_verify_der")
+fn ecdsa_verify_der(
   message: BitArray,
   signature: BitArray,
   public: BitArray,
 ) -> Bool
 
-/// Signs a DSSE payload with the zone key.
+/// Signs a Statement's DSSE PAE with the zone key, DER/ASN.1 encoded.
+///
+/// DER, not the raw `r||s` of a DNSSEC signature: this is the byte string a
+/// Rekor entry's `signature.content` carries and the client's possession
+/// check (crates/synch-net/src/rekor.rs) verifies as ASN.1.
 pub fn sign(csk: Csk, payload: BitArray) -> BitArray {
-  ecdsa_sign_raw(pae(dsse_payload_type, payload), csk.private)
+  ecdsa_sign_der(pae(dsse_payload_type, payload), csk.private)
 }
 
-/// Verifies a DSSE signature against a DNSKEY public key — the same check
-/// the client performs, run here before anything is stored.
+/// Verifies a DER DSSE-PAE signature against a DNSKEY public key — the same
+/// possession check the client performs, run here before anything is stored.
 pub fn verify(
   public: BitArray,
   payload: BitArray,
   signature: BitArray,
 ) -> Bool {
-  ecdsa_verify_raw(pae(dsse_payload_type, payload), signature, public)
+  ecdsa_verify_der(pae(dsse_payload_type, payload), signature, public)
 }

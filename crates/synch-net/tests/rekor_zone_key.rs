@@ -11,7 +11,7 @@ use synch_net::{
     dns::{DnssecResolver, RekorPolicy, ResolverOptions},
     error::NetError,
     rekor::{self, LogKeys, ProofError, RekorProof, ZoneKey},
-    sim::{SimLog, SimZone},
+    sim::{hashedrekord_body, SimLog, SimZone},
 };
 
 fn write(contents: &str) -> tempfile::NamedTempFile {
@@ -59,18 +59,37 @@ fn a_logged_zone_key_verifies_offline() {
 }
 
 #[test]
-fn a_forged_dsse_signature_fails_possession() {
-    let (zone, _, mut proof) = logged_zone();
-    proof.dsse_signature[0] ^= 0x01;
-    // The entry no longer hashes to the leaf that was logged, so re-log it:
-    // otherwise inclusion would fail first and possession would go untested.
+fn a_forged_entry_signature_fails_possession() {
+    // A body that is genuinely in the tree (leaf, inclusion and checkpoint
+    // all sound) and whose digest matches the Statement's PAE — but whose
+    // signature was made by a stranger, not this zone's key. Possession is
+    // the only check that can tell that apart, and it must.
+    let zone = SimZone::new("cluster.example", member_records());
+    let stranger = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    proof.log_id = log.log_id();
-    proof.log_index = log.append(&proof.entry_bytes());
-    log.refresh(&mut proof);
+    let statement = zone.zone_key_statement("create", None).to_json();
+    let body = hashedrekord_body(&statement, &stranger.sign_dsse(&statement), &zone.spki());
+    let proof = log.log_body(zone.key_tag(), statement, body);
     assert!(matches!(
         verify(&proof, &zone, &log),
         Err(ProofError::Possession(_))
+    ));
+}
+
+#[test]
+fn a_verifier_that_is_not_the_dnskey_fails_binding() {
+    // The zone signs the entry itself, so possession passes — but the entry
+    // records a *stranger's* key as its verifier. To a monitor watching the
+    // apex that entry is about the stranger's key; the client must refuse it.
+    let zone = SimZone::new("cluster.example", member_records());
+    let stranger = SimZone::new("cluster.example", member_records());
+    let mut log = SimLog::new("rekor.sim");
+    let statement = zone.zone_key_statement("create", None).to_json();
+    let body = hashedrekord_body(&statement, &zone.sign_dsse(&statement), &stranger.spki());
+    let proof = log.log_body(zone.key_tag(), statement, body);
+    assert!(matches!(
+        verify(&proof, &zone, &log),
+        Err(ProofError::Binding(_))
     ));
 }
 
@@ -348,13 +367,13 @@ fn fixture_field(name: &str) -> String {
 
 #[test]
 fn the_shared_fixture_decodes_and_verifies() {
-    let proof = RekorProof::decode(&fixture("proof.bin")).expect("the fixture is a v1 proof");
+    let proof = RekorProof::decode(&fixture("proof.bin")).expect("the fixture is a v2 proof");
 
     // Every part the Gleam encoder is asserted against, asserted here too:
     // if the two ever disagree, one of these fails rather than both suites
     // passing against different bytes.
-    assert_eq!(proof.dsse_payload, fixture("statement.json"));
-    assert_eq!(proof.dsse_signature, fixture("dsse-signature.bin"));
+    assert_eq!(proof.statement, fixture("statement.json"));
+    assert_eq!(proof.canonicalized_body, fixture("canonicalized-body.bin"));
     assert_eq!(proof.checkpoint, fixture("checkpoint.txt"));
     assert_eq!(proof.log_id.to_vec(), fixture("log-id.bin"));
     assert_eq!(
@@ -409,8 +428,8 @@ fn regenerate_the_shared_fixture() {
     std::fs::create_dir_all(&dir).unwrap();
     let write = |name: &str, bytes: &[u8]| std::fs::write(dir.join(name), bytes).unwrap();
     write("proof.bin", &proof.encode());
-    write("statement.json", &proof.dsse_payload);
-    write("dsse-signature.bin", &proof.dsse_signature);
+    write("statement.json", &proof.statement);
+    write("canonicalized-body.bin", &proof.canonicalized_body);
     write("checkpoint.txt", &proof.checkpoint);
     write("log-id.bin", &proof.log_id);
     write("inclusion-path.bin", &proof.inclusion_path.concat());
@@ -428,6 +447,157 @@ fn regenerate_the_shared_fixture() {
         )
         .as_bytes(),
     );
+}
+
+// ---------------------------------------------- real Sigstore conformance
+
+/// A real published Rekor v2 entry, verified end to end and offline.
+///
+/// This is the crown jewel the whole v2 rework exists for: the bytes in
+/// `tests/fixtures/rekor_v2` are a genuine `hashedrekord` v0.0.2 entry
+/// published to `log2025-1.rekor.sigstore.dev` (see its PROVENANCE.txt),
+/// nothing in this repository authored the log's half. Building a
+/// [`RekorProof`] from the verbatim server response and running the real
+/// verifier over it — leaf over the canonicalized body, RFC 6962 inclusion
+/// to the checkpoint root, the log's Ed25519 signature on the checkpoint
+/// under the *embedded* pin set, the entry digest against the Statement's
+/// DSSE PAE, possession by the fixture's P-256 zone key, and the verifier
+/// binding — proves the system genuinely interoperates with the public log.
+///
+/// One wrinkle of the real fixture, stated exactly (see the report): its
+/// Statement declares `keyTag 12345`, which is a chosen value and not the
+/// RFC 4034 tag of the key bytes (that is 58281). The verifier never
+/// recomputes the tag from rdata — it trusts the tag the RRSIG selected and
+/// checks the Statement and proof agree with it — so the `ZoneKey` here
+/// carries the tag the publishing zone used, exactly as a resolver of that
+/// zone would have observed it.
+mod real_rekor_v2 {
+    use super::*;
+    use base64::Engine;
+
+    fn v2(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rekor_v2")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()))
+    }
+
+    fn b64(text: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(text.trim())
+            .expect("fixture base64")
+    }
+
+    /// The DNSKEY rdata for the fixture's P-256 zone key: flags 257, protocol
+    /// 3, algorithm 13, then the 64-byte point of its DER SubjectPublicKeyInfo.
+    fn zone_dnskey_rdata() -> Vec<u8> {
+        let pem = String::from_utf8(v2("zonekey.pub.pem")).unwrap();
+        let der = b64(&pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<String>());
+        let point = &der[27..];
+        assert_eq!(point.len(), 64, "an alg-13 point is 64 bytes");
+        let mut rdata = Vec::with_capacity(4 + 64);
+        rdata.extend_from_slice(&257u16.to_be_bytes());
+        rdata.extend_from_slice(&[3, 13]);
+        rdata.extend_from_slice(point);
+        rdata
+    }
+
+    /// The proof, assembled from the verbatim server response — the same
+    /// carriage a control plane performs before storing a fetched entry.
+    fn proof_from_entry() -> RekorProof {
+        let entry: serde_json::Value = serde_json::from_slice(&v2("log_entry.json")).unwrap();
+        let inclusion = &entry["inclusionProof"];
+        let hashes = inclusion["hashes"].as_array().unwrap();
+        let inclusion_path = hashes
+            .iter()
+            .map(|h| {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b64(h.as_str().unwrap()));
+                a
+            })
+            .collect();
+        let statement: serde_json::Value = serde_json::from_slice(&v2("statement.json")).unwrap();
+        // Our log_id convention is SHA-256 of the DER SubjectPublicKeyInfo;
+        // the fixture's own logId.keyId is derived differently, so the proof
+        // carries the id the embedded pin set uses for this log.
+        let log_id = embedded_log2025_1_id();
+        RekorProof {
+            key_tag: u16::try_from(statement["predicate"]["keyTag"].as_u64().unwrap()).unwrap(),
+            log_id,
+            log_index: inclusion["logIndex"].as_str().unwrap().parse().unwrap(),
+            statement: v2("statement.json"),
+            canonicalized_body: b64(entry["canonicalizedBody"].as_str().unwrap()),
+            checkpoint: inclusion["checkpoint"]["envelope"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+            inclusion_path,
+        }
+    }
+
+    /// The embedded id of `log2025-1.rekor.sigstore.dev`: the one Ed25519 key
+    /// among the embedded pins, by our SHA-256(SPKI) convention.
+    fn embedded_log2025_1_id() -> [u8; 32] {
+        let expected: [u8; 32] =
+            hex::decode("b54813cb63d8859870a5e78500cc6adcfdf59723edae93ee8d25faf2475a0690")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert!(
+            LogKeys::embedded().find(&expected).is_some(),
+            "the embedded pin set must carry log2025-1"
+        );
+        expected
+    }
+
+    #[test]
+    fn the_real_rekor_v2_entry_verifies() {
+        let proof = proof_from_entry();
+        let rdata = zone_dnskey_rdata();
+        let statement: serde_json::Value = serde_json::from_slice(&v2("statement.json")).unwrap();
+        let apex = statement["predicate"]["apex"].as_str().unwrap().to_string();
+        let key = ZoneKey {
+            apex: &apex,
+            key_tag: proof.key_tag,
+            dnskey_rdata: &rdata,
+        };
+        // The subject digest binds to these exact key bytes; assert the
+        // fixture is internally consistent before leaning on it.
+        assert_eq!(
+            hex::encode(rekor::sha256(&rdata)),
+            statement["subject"][0]["digest"]["sha256"]
+                .as_str()
+                .unwrap()
+        );
+
+        let verified = rekor::verify(&proof, &key, &LogKeys::embedded())
+            .expect("a genuine published Rekor v2 entry must verify");
+        assert_eq!(verified.origin, "log2025-1.rekor.sigstore.dev");
+        assert_eq!(verified.action, "create");
+        assert_eq!(verified.log_index, proof.log_index);
+
+        // And it has teeth: one byte off the logged body no longer hashes to
+        // a leaf of the tree the checkpoint commits to.
+        let mut tampered = proof.clone();
+        tampered.canonicalized_body[0] ^= 0x01;
+        assert!(matches!(
+            rekor::verify(&tampered, &key, &LogKeys::embedded()),
+            Err(ProofError::Inclusion(_))
+        ));
+
+        // One byte off the Statement and its DSSE PAE no longer matches the
+        // digest the entry committed to.
+        let mut restated = proof;
+        restated.statement[20] ^= 0x01;
+        assert!(matches!(
+            rekor::verify(&restated, &key, &LogKeys::embedded()),
+            Err(ProofError::Binding(_))
+        ));
+    }
 }
 
 #[test]

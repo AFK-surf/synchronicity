@@ -63,8 +63,8 @@ fn fixture_proof() -> Proof {
     key_tag: key_tag,
     log_id: fixture("log-id.bin"),
     log_index: log_index,
-    dsse_payload: fixture("statement.json"),
-    dsse_signature: fixture("dsse-signature.bin"),
+    statement: fixture("statement.json"),
+    canonicalized_body: fixture("canonicalized-body.bin"),
     checkpoint: fixture("checkpoint.txt"),
     inclusion_path: path,
   )
@@ -126,20 +126,36 @@ pub fn dsse_pae_is_the_dsse_pae_test() {
 }
 
 pub fn the_fixture_signature_verifies_test() {
+  // The entry signature now lives inside the canonicalized body; read it out
+  // and verify it as the client does — DER over the DSSE PAE.
+  let assert Ok(#(_digest, signature, _verifier)) =
+    proof.parse_body(fixture("canonicalized-body.bin"))
   assert statement.verify(
     fixture_public(),
     fixture("statement.json"),
-    fixture("dsse-signature.bin"),
+    signature,
   )
   // One flipped bit and possession fails — the check is doing work.
-  let assert Ok(<<first:int-size(8), rest:bits>>) =
-    Ok(fixture("dsse-signature.bin"))
+  let assert Ok(<<first:int-size(8), rest:bits>>) = Ok(signature)
   let tampered = <<int.bitwise_exclusive_or(first, 1):int-size(8), rest:bits>>
   assert !statement.verify(
     fixture_public(),
     fixture("statement.json"),
     tampered,
   )
+}
+
+pub fn the_body_binds_to_the_statement_and_key_test() {
+  // The body's digest is the SHA-256 of the Statement's PAE, and its
+  // verifier is the zone key's DER SubjectPublicKeyInfo.
+  let assert Ok(#(digest, _signature, verifier)) =
+    proof.parse_body(fixture("canonicalized-body.bin"))
+  assert digest
+    == crypto.hash(
+      crypto.Sha256,
+      statement.pae(statement.dsse_payload_type, fixture("statement.json")),
+    )
+  assert verifier == proof.p256_spki(fixture_public())
 }
 
 pub fn proof_encoding_matches_the_fixture_test() {
@@ -219,49 +235,36 @@ pub fn checkpoints_parse_or_are_refused_test() {
 // ---------------------------------------------------------------- publishing
 
 /// A log a test can hold in its hand: one earlier entry, then ours, with a
-/// checkpoint signed by a key the test also holds. The shapes are exactly
-/// the ones `rekor/proof` parses, which is the point — the publisher is
-/// exercised against the format, not against a mock of itself.
+/// checkpoint signed by a key the test also holds. It builds a real
+/// `hashedrekord` body from the submission, exactly as Sigstore returns one,
+/// so the publisher is exercised against the format, not against a mock of
+/// itself.
 fn fake_log(log_csk: keys.Csk) -> #(client.Log, BitArray, BitArray) {
   let spki = proof.p256_spki(log_csk.public)
   let neighbour = proof.leaf_hash(<<"an earlier entry":utf8>>)
-  let entry_of = fn(entry: BitArray) {
-    let leaf = proof.leaf_hash(entry)
+  let entry_of = fn(sub: client.Submission) {
+    let body =
+      proof.hashedrekord_body(sub.digest, sub.signature, sub.verifier_spki)
+    let leaf = proof.leaf_hash(body)
     let root = proof.node_hash(neighbour, leaf)
-    let body = "rekor.test\n2\n" <> bit_array.base64_encode(root, True) <> "\n"
-    let signature = ecdsa_sign_raw(<<body:utf8>>, log_csk.private)
+    let note_body =
+      "rekor.test\n2\n" <> bit_array.base64_encode(root, True) <> "\n"
+    let signature = ecdsa_sign_raw(<<note_body:utf8>>, log_csk.private)
     let assert Ok(hint) = bit_array.slice(proof.log_id(spki), 0, 4)
     let note =
-      body
+      note_body
       <> "\n\u{2014} rekor.test "
       <> bit_array.base64_encode(bit_array.concat([hint, signature]), True)
       <> "\n"
     client.Entry(
-      log_id: proof.log_id(spki),
       log_index: 1,
+      canonicalized_body: body,
       checkpoint: <<note:utf8>>,
       inclusion_path: [neighbour],
       integrated_at: 1000,
     )
   }
-  #(
-    client.Log(lookup: fn(_entry) { Ok(None) }, submit: fn(entry) {
-      Ok(entry_of(entry))
-    }),
-    spki,
-    log_csk.public,
-  )
-}
-
-/// A log that has already seen every entry: the republish path.
-fn seen_log(log_csk: keys.Csk) -> client.Log {
-  let #(log, _, _) = fake_log(log_csk)
-  client.Log(
-    lookup: fn(entry) { result.map(log.submit(entry), Some) },
-    submit: fn(_entry) {
-      Error("the entry was already logged; submitting again would duplicate it")
-    },
-  )
+  #(client.Log(submit: fn(sub) { Ok(entry_of(sub)) }), spki, log_csk.public)
 }
 
 pub fn publish_stores_a_verified_record_test() {
@@ -282,11 +285,10 @@ pub fn publish_stores_a_verified_record_test() {
   // What was stored is what a client will be handed, and it verifies.
   let assert Ok(stored) = rekor_publish.to_proof(record)
   let assert Ok(_) = proof.verify_against_log(stored, spki, point)
-  assert statement.verify(
-    csk.public,
-    record.dsse_payload,
-    record.dsse_signature,
-  )
+  // Possession: the signature the log indexed is inside the stored body.
+  let assert Ok(#(_digest, signature, _verifier)) =
+    proof.parse_body(record.canonicalized_body)
+  assert statement.verify(csk.public, record.statement, signature)
   sqlite.close(conn)
 }
 
@@ -294,15 +296,14 @@ pub fn publish_is_idempotent_test() {
   let conn = fixtures.fresh_conn()
   let csk = fixtures.zone_boot(conn)
   let assert Ok(apex) = name.parse("sync.test.")
-  let log_csk = keys.generate()
-  let #(log, spki, point) = fake_log(log_csk)
+  let #(log, spki, point) = fake_log(keys.generate())
 
   let assert Ok(first) =
     rekor_publish.run(conn, apex, csk, log, #(spki, point), 1000)
   let assert Ok(second) =
-    rekor_publish.run(conn, apex, csk, seen_log(log_csk), #(spki, point), 2000)
-  // The second run found the entry already logged and refreshed the proof;
-  // a log that refuses duplicate submissions proves nothing was minted.
+    rekor_publish.run(conn, apex, csk, log, #(spki, point), 2000)
+  // The second run reused the signature the log already indexed, so Rekor's
+  // content addressing returns the same entry — a refresh, not a new claim.
   assert second.refreshed
   assert second.log_index == first.log_index
 
@@ -364,8 +365,8 @@ pub fn a_retire_record_does_not_satisfy_the_gate_test() {
         key_tag: key_tag,
         apex: "sync.test.",
         action: "retire",
-        dsse_payload: <<"{}":utf8>>,
-        dsse_signature: <<0:size(512)>>,
+        statement: <<"{}":utf8>>,
+        canonicalized_body: <<0:size(512)>>,
         log_id: <<0:size(256)>>,
         log_index: 0,
         checkpoint: <<>>,

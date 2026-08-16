@@ -16,8 +16,11 @@ pub type Record {
     key_tag: Int,
     apex: String,
     action: String,
-    dsse_payload: BitArray,
-    dsse_signature: BitArray,
+    /// The in-toto Statement, byte-exact — the DSSE PAE preimage.
+    statement: BitArray,
+    /// The log's `canonicalizedBody`, verbatim — the Merkle leaf preimage,
+    /// carrying the entry signature and the signer's key.
+    canonicalized_body: BitArray,
     log_id: BitArray,
     log_index: Int,
     checkpoint: BitArray,
@@ -36,13 +39,13 @@ pub fn put(conn: Connection, record: Record) -> Result(Nil, sqlite.Error) {
   sqlite.exec(
     conn,
     "INSERT INTO rekor_records
-       (key_tag, apex, action, dsse_payload, dsse_signature, log_id,
+       (key_tag, apex, action, statement, canonicalized_body, log_id,
         log_index, checkpoint, inclusion_path, integrated_at, verified_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (key_tag, action) DO UPDATE SET
        apex = excluded.apex,
-       dsse_payload = excluded.dsse_payload,
-       dsse_signature = excluded.dsse_signature,
+       statement = excluded.statement,
+       canonicalized_body = excluded.canonicalized_body,
        log_id = excluded.log_id,
        log_index = excluded.log_index,
        checkpoint = excluded.checkpoint,
@@ -53,8 +56,8 @@ pub fn put(conn: Connection, record: Record) -> Result(Nil, sqlite.Error) {
       VInt(record.key_tag),
       Text(record.apex),
       Text(record.action),
-      Blob(record.dsse_payload),
-      Blob(record.dsse_signature),
+      Blob(record.statement),
+      Blob(record.canonicalized_body),
       Blob(record.log_id),
       VInt(record.log_index),
       Blob(record.checkpoint),
@@ -72,7 +75,7 @@ pub fn for_key_tag(
   key_tag: Int,
 ) -> Result(List(Record), sqlite.Error) {
   let sql =
-    "SELECT key_tag, apex, action, dsse_payload, dsse_signature, log_id,
+    "SELECT key_tag, apex, action, statement, canonicalized_body, log_id,
             log_index, checkpoint, inclusion_path, integrated_at, verified_at
      FROM rekor_records WHERE key_tag = ?
      ORDER BY verified_at DESC, action"
@@ -128,8 +131,8 @@ fn decode(row: List(sqlite.Value)) -> Result(Record, Nil) {
       VInt(key_tag),
       Text(apex),
       Text(action),
-      Blob(payload),
-      Blob(signature),
+      Blob(statement),
+      Blob(canonicalized_body),
       Blob(log_id),
       VInt(log_index),
       Blob(checkpoint),
@@ -141,8 +144,8 @@ fn decode(row: List(sqlite.Value)) -> Result(Record, Nil) {
         key_tag,
         apex,
         action,
-        payload,
-        signature,
+        statement,
+        canonicalized_body,
         log_id,
         log_index,
         checkpoint,

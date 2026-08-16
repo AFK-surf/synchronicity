@@ -43,11 +43,20 @@ covert.
 
 ## 2. What gets logged
 
-One Rekor **DSSE** entry per zone-key lifecycle event, signed by the zone key
-itself. Self-signing is deliberate: possession of the CSK is exactly the
-authority being made transparent, the client already holds the public key
-from the validated DNSKEY RRset, and it keeps Fulcio/OIDC out of a key
-ceremony that is designed to run offline.
+One Rekor entry per zone-key lifecycle event, over a DSSE statement signed by
+the zone key itself. Self-signing is deliberate: possession of the CSK is
+exactly the authority being made transparent, the client already holds the
+public key from the validated DNSKEY RRset, and it keeps Fulcio/OIDC out of a
+key ceremony that is designed to run offline.
+
+Rekor v2 has **no DSSE entry type**, so the DSSE-signed statement is logged as
+a **`hashedrekord` v0.0.2** entry over the DSSE **PAE**
+(Pre-Authentication Encoding): the entry's `data.digest` is `SHA-256(PAE)`,
+its `signature.content` is the ECDSA P-256 signature over that PAE (DER, the
+encoding Rekor indexes — not the raw `r‖s` of a DNSSEC signature), and its
+`signature.verifier.publicKey.rawBytes` is the zone key's DER
+SubjectPublicKeyInfo. This is the real on-log entry the public Sigstore log
+serializes; the client hashes the log's own `canonicalizedBody` for the leaf.
 
 The DSSE payload is an in-toto v1 Statement:
 
@@ -81,28 +90,28 @@ The DSSE payload is an in-toto v1 Statement:
 - The DSSE signature is ECDSA P-256/SHA-256 with the zone key — the same
   algorithm 13 material, no second signing identity.
 
-The design targets a Rekor v2 (tile-backed) shape: entry + Merkle inclusion
-proof + signed checkpoint, with no reliance on v1 Signed Entry Timestamps.
+The design is a Rekor v2 (tile-backed) shape: `hashedrekord` entry + Merkle
+inclusion proof + signed checkpoint, with no reliance on v1 Signed Entry
+Timestamps.
 
-**Interop scope, stated exactly** (audit finding, do not let this drift): the
-*checkpoint* and *log-key* halves are the real Sigstore article — the client
-verifies a genuine `log2025-1.rekor.sigstore.dev` checkpoint against the
-embedded log key in a conformance test (`rekor.rs`,
-`a_real_sigstore_checkpoint_verifies_under_the_embedded_pin_set`), and the
-embedded pins are Sigstore's production keys. What is *not* yet the real
-article is the Merkle **leaf** convention: the entry a leaf commits to is the
-DSSE envelope rendered as canonical JSON (§3), which is synchronicity's own
-serialization, not the on-log entry format Rekor v2 hashes. End-to-end
-inclusion against a proof minted by the *real* Sigstore therefore does not
-work yet — an inclusion walk under our leaf convention will not reach a root
-Sigstore computed over its own. Two honest consequences follow: v1
-interoperates with a log that adopts this convention (a self-hosted,
-Rekor-compatible deployment), and matching Sigstore v2's entry serialization
-so a real public-good proof verifies end to end is tracked as future work
-(§8). The control plane's Rekor submission client is a stub for the same
-reason (§5.2). None of this weakens the security argument — a mismatch fails
-closed, discarding the answer — but it bounds what "on the public log" can
-mean in a v1 deployment.
+**Interop scope, stated exactly** (this reverses an earlier scoping — the
+system now genuinely interoperates with the public log). All three halves are
+the real Sigstore article. The *checkpoint* and *log-key* halves were always
+real — the client verifies a genuine `log2025-1.rekor.sigstore.dev`
+checkpoint against the embedded log key
+(`rekor.rs::a_real_sigstore_checkpoint_verifies_under_the_embedded_pin_set`),
+and the embedded pins are Sigstore's production keys. The Merkle **leaf** is
+now real too: a proof carries the log's own `canonicalizedBody` verbatim and
+the leaf is `SHA-256(0x00 ‖ canonicalizedBody)`, so an inclusion walk reaches
+the root the real Sigstore computed over the same bytes. A **real published
+entry** (`crates/synch-net/tests/fixtures/rekor_v2`, logIndex 67589472 on
+`log2025-1.rekor.sigstore.dev`) is a checked-in conformance fixture that the
+client verifies end to end offline
+(`rekor_zone_key.rs::the_real_rekor_v2_entry_verifies`). The control plane's
+submission client is a real `POST /api/v2/log/entries` call (§5.2), no longer
+a stub. A self-hosted, Rekor-v2-compatible log still works via
+`--rekor-key`/`CP_REKOR_KEY`. Nothing here weakens the security argument — a
+mismatch still fails closed, discarding the answer.
 
 ## 3. Proof distribution: in-band, in the zone
 
@@ -116,20 +125,27 @@ one record per DNSKEY the zone currently publishes (two during a zone-key
 rollover window), each carrying a compact binary `RekorProof`:
 
 ```
-RekorProof v1
-  u8       version        = 1
-  u16      key_tag          selects the record during rollover
-  u8[32]   log_id           SHA-256 of the log's public key; selects the pinned key
+RekorProof v2
+  u8       version            = 2
+  u16      key_tag              selects the record during rollover
+  u8[32]   log_id               SHA-256 of the log's DER SPKI; selects the pinned key
   u64      log_index
-  u16+[]   dsse_payload     the Statement, byte-exact (hashing requires it)
-  u16+[]   dsse_signature   ECDSA P-256 over DSSE PAE(payload)
-  u16+[]   checkpoint       signed note: origin, tree size, root hash, log sig
-  u8+[32]* inclusion_path   Merkle audit path, leaf to root
+  u16+[]   statement            the in-toto Statement, byte-exact (DSSE PAE preimage)
+  u16+[]   canonicalized_body   the log's hashedrekord body, verbatim (leaf preimage)
+  u16+[]   checkpoint           signed note: origin, tree size, root hash, log sig
+  u8+[32]* inclusion_path       Merkle audit path, leaf to root
 ```
 
-Roughly 2.3 KB for a log of 10⁸ entries (~27 path hashes); base64url ≈ 3.1 KB
-across 13 TXT character-strings — comfortably inside the DoH/TCP message
-limit, and clamped to the client's existing 24 h TTL ceiling.
+The leaf is `SHA-256(0x00 ‖ canonicalized_body)` and an interior node is
+`SHA-256(0x01 ‖ left ‖ right)` (RFC 6962 §2.1). The `canonicalized_body` is
+carried verbatim precisely because the log computed it — nothing on either
+side re-canonicalizes JSON. The Statement rides alongside because the body
+commits only to its DSSE PAE *digest*; the client re-derives that digest from
+the Statement bytes (`data.digest == SHA-256(PAE)`), reads the entry signature
+and verifier out of the body, and refuses any disagreement. Roughly 2.3 KB
+for a log of 10⁸ entries (~27 path hashes); base64url ≈ 3.1 KB across TXT
+character-strings — comfortably inside the DoH/TCP message limit, and clamped
+to the client's existing 24 h TTL ceiling.
 
 Why in-band rather than an HTTPS side-channel or a live Rekor query:
 
@@ -185,14 +201,16 @@ the one DoH transport, then verifies entirely offline:
 Then, in process, no network:
 
 - decode `RekorProof`; check `log_id` names a pinned log key;
-- verify the DSSE signature over the payload with the DNSKEY public key
-  (possession);
-- check the Statement binds what was observed: `subject.digest` =
-  SHA-256(DNSKEY rdata), `predicate.apex` = RRSIG signer, key tag, flags 257,
-  algorithm 13 (binding);
-- hash the DSSE entry to its Merkle leaf, walk `inclusion_path` to the
-  checkpoint's root hash (inclusion);
-- verify the checkpoint signature with the pinned log key (the log vouches).
+- hash the log's `canonicalized_body` to its Merkle leaf, walk
+  `inclusion_path` to the checkpoint's root hash (inclusion);
+- verify the checkpoint signature with the pinned log key (the log vouches);
+- parse the `hashedrekord` body; check its `data.digest` = SHA-256 of the
+  DSSE PAE of the carried Statement, and verify the body's `signature.content`
+  over that PAE with the DNSKEY public key (possession, ASN.1/DER);
+- check the body's `verifier.publicKey.rawBytes` is this DNSKEY's DER SPKI
+  (key binding), and that the Statement binds what was observed:
+  `subject.digest` = SHA-256(DNSKEY rdata), `predicate.apex` = RRSIG signer,
+  key tag, flags 257, algorithm 13 (statement binding).
 
 Steps 2 and 3 are cacheable on their own TTLs (the proof record's TTL is
 long; the zone key changes rarely) — the steady-state refresh cost stays one
@@ -224,7 +242,7 @@ belongs.
 
 | Variable | Role | Meaning |
 |---|---|---|
-| `CP_REKOR_URL` | primary | Rekor write endpoint. Default `https://rekor.sigstore.dev`. |
+| `CP_REKOR_URL` | primary | Rekor v2 write endpoint (`POST /api/v2/log/entries`). Default `https://log2025-1.rekor.sigstore.dev`. |
 | `CP_REKOR_KEY` | primary | Optional file pinning a self-hosted log's verification key; absent means the embedded Sigstore production key. |
 
 Replicas need nothing: the proof is public data in the database and rides the
@@ -239,30 +257,37 @@ Publication is a separate, explicit, idempotent step:
 controlplane rekor-publish <apex> <keyfile>
 ```
 
-which builds the Statement, signs it with the CSK, submits the DSSE entry,
-waits for integration, fetches checkpoint + inclusion proof, **verifies the
-proof locally with the same rules as the client** (cross-validated against
-the Rust verifier in e2e), and stores it in a new table:
+which builds the Statement, computes `digest = SHA-256(PAE)`, signs the PAE
+with the CSK as **DER ECDSA**, POSTs a protojson `hashedRekordRequestV002`
+`CreateEntryRequest` to `CP_REKOR_URL`, parses the returned
+`TransparencyLogEntry` (its `canonicalizedBody`, inclusion proof and signed
+checkpoint), **verifies that returned proof locally with the same rules as
+the client** — the body's digest against the PAE, the entry signature
+(possession), the verifier binding, inclusion, and the checkpoint signature
+(cross-validated against the Rust verifier in e2e) — and only then stores it:
 
 ```sql
 CREATE TABLE rekor_records (
-  key_tag         INTEGER NOT NULL,
-  apex            TEXT    NOT NULL,
-  action          TEXT    NOT NULL,      -- create | rollover | retire
-  dsse_payload    BLOB    NOT NULL,
-  dsse_signature  BLOB    NOT NULL,
-  log_id          BLOB    NOT NULL,
-  log_index       INTEGER NOT NULL,
-  checkpoint      BLOB    NOT NULL,
-  inclusion_path  BLOB    NOT NULL,
-  integrated_at   INTEGER NOT NULL,
-  verified_at     INTEGER NOT NULL,
+  key_tag            INTEGER NOT NULL,
+  apex               TEXT    NOT NULL,
+  action             TEXT    NOT NULL,   -- create | rollover | retire
+  statement          BLOB    NOT NULL,   -- the in-toto Statement (PAE preimage)
+  canonicalized_body BLOB    NOT NULL,   -- the log's hashedrekord body (leaf preimage)
+  log_id             BLOB    NOT NULL,
+  log_index          INTEGER NOT NULL,
+  checkpoint         BLOB    NOT NULL,
+  inclusion_path     BLOB    NOT NULL,
+  integrated_at      INTEGER NOT NULL,
+  verified_at        INTEGER NOT NULL,
   PRIMARY KEY (key_tag, action)
 );
 ```
 
-Re-running searches the log by entry hash first — it refreshes the stored
-checkpoint/proof (the tree has grown) without minting duplicate entries.
+The entry signature lives inside `canonicalized_body`, so re-running reuses
+the exact signature a prior run logged (ECDSA is randomized, and a fresh
+signature would be a fresh leaf): Rekor v2 is content-addressed by leaf, so
+re-submitting the byte-identical entry returns the same `logIndex` with a
+fresh checkpoint/proof — a refresh, without minting a duplicate entry.
 
 ### 5.3 Serving and enforcement
 
@@ -363,16 +388,19 @@ Rejected:
 - **Per-network proof records** — duplicates the proof once per network for a
   zone-scoped fact.
 
-Future work: **matching Rekor v2's on-log entry serialization** so a proof
-minted by the real Sigstore verifies end to end (today the leaf commits to
-our own canonical-JSON DSSE entry, and the checkpoint/log-key halves are the
-only parts anchored to real Sigstore — §2); the real Rekor submission client
-(§5.2, stubbed today); checkpoint witness cosignatures (split-view
-resistance beyond monitors — the real checkpoints already carry witness
-lines, which the client parses and ignores); an in-client TUF root for
-log-key rotation (designed in §10); logging device-key membership *sets* (a
-much chattier, much larger design, only worth it with witnessing in place);
-`retire`-entry enforcement as soft revocation signal.
+Done since this design was first written (kept here to mark the reversal):
+the entry is now the **real Rekor v2 on-log serialization** — a `hashedrekord`
+over the DSSE PAE, leaf over the log's own `canonicalizedBody` — so a proof
+minted by the real Sigstore verifies end to end (§2, §3), anchored by a
+checked-in published-entry fixture; and the control plane's submission client
+is a real `POST /api/v2/log/entries` call (§5.2), no longer a stub.
+
+Future work: checkpoint witness cosignatures (split-view resistance beyond
+monitors — the real checkpoints already carry witness lines, which the client
+parses and ignores); an in-client TUF root for log-key rotation (designed in
+§10); logging device-key membership *sets* (a much chattier, much larger
+design, only worth it with witnessing in place); `retire`-entry enforcement
+as soft revocation signal.
 
 Witnessing note: the conformance-fixture checkpoint from
 `log2025-1.rekor.sigstore.dev` already carries two witness cosignatures

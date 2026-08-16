@@ -14,9 +14,10 @@
 
 import dns/name.{type Name}
 import dnssec/keys.{type Csk}
+import gleam/crypto
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import rekor/client.{type Log}
+import rekor/client.{type Log, Submission}
 import rekor/proof.{type Proof, Proof}
 import rekor/statement
 import rekor/store
@@ -28,8 +29,8 @@ pub type PublishError {
   LogUnavailable(String)
   /// The proof did not verify locally — never stored.
   Unverified(proof.ProofError)
-  /// The DSSE signature is not this key's, which can only mean the key
-  /// file and the statement disagree about who is signing.
+  /// The entry the log returned does not carry this key's signature, which
+  /// can only mean the key file and the statement disagree about who signs.
   NotOurSignature
 }
 
@@ -63,51 +64,59 @@ pub fn run(
     Some(_) -> "rollover"
     None -> "create"
   }
-  let payload =
+  let statement_bytes =
     statement.to_json(statement.for_key(apex, csk.public, action, replaces))
 
-  // Reuse the stored entry when it is byte-identical: the signature is what
-  // the log indexed, so re-signing would mint a new entry for the same
-  // claim.
+  // Reuse the exact signature a prior run already logged when the Statement
+  // is byte-identical: ECDSA signing is randomized, so a fresh signature is
+  // a fresh entry, and one key deserves one claim. The signature lives inside
+  // the stored `canonicalizedBody`, so a republish reads it back out.
   use stored <- result.try(
     store.get(conn, key_tag, action) |> result.map_error(Db),
   )
-  let signature = case stored {
-    Ok(record) if record.dsse_payload == payload -> record.dsse_signature
-    _ -> statement.sign(csk, payload)
+  let refreshed = case stored {
+    Ok(_) -> True
+    Error(Nil) -> False
   }
-  use Nil <- result.try(case statement.verify(csk.public, payload, signature) {
-    True -> Ok(Nil)
-    False -> Error(NotOurSignature)
-  })
+  let signature = reusable_signature(stored, statement_bytes, csk)
+  use Nil <- result.try(
+    case statement.verify(csk.public, statement_bytes, signature) {
+      True -> Ok(Nil)
+      False -> Error(NotOurSignature)
+    },
+  )
 
-  let entry =
-    proof.entry_bytes(
-      Proof(
-        key_tag: key_tag,
-        log_id: <<>>,
-        log_index: 0,
-        dsse_payload: payload,
-        dsse_signature: signature,
-        checkpoint: <<>>,
-        inclusion_path: [],
-      ),
+  // The submission is a hashedrekord over the DSSE PAE: its digest, the DER
+  // signature, and this key's DER SubjectPublicKeyInfo as the verifier.
+  let digest =
+    crypto.hash(
+      crypto.Sha256,
+      statement.pae(statement.dsse_payload_type, statement_bytes),
     )
-  use #(logged, refreshed) <- result.try(fetch_or_submit(log, entry))
+  let submission = Submission(digest, signature, proof.p256_spki(csk.public))
+  use logged <- result.try(
+    log.submit(submission) |> result.map_error(LogUnavailable),
+  )
 
   let record =
     Proof(
       key_tag: key_tag,
-      log_id: logged.log_id,
+      // Our log-id convention is SHA-256 of the DER SPKI; the server's own
+      // keyId is derived differently, so name the log by our pinned key.
+      log_id: proof.log_id(log_key.0),
       log_index: logged.log_index,
-      dsse_payload: payload,
-      dsse_signature: signature,
+      statement: statement_bytes,
+      canonicalized_body: logged.canonicalized_body,
       checkpoint: logged.checkpoint,
       inclusion_path: logged.inclusion_path,
     )
+
+  // Verify the returned proof by the same rules the client applies, before a
+  // row exists: the body's digest is this Statement's PAE, the entry
+  // signature is this key's, the verifier the log recorded is this key, and
+  // the entry is in the tree the checkpoint commits to.
   use _ <- result.try(
-    proof.verify_against_log(record, log_key.0, log_key.1)
-    |> result.map_error(Unverified),
+    verify_entry(record, csk, log_key) |> result.map_error(Unverified),
   )
   use Nil <- result.try(
     store.put(
@@ -116,9 +125,9 @@ pub fn run(
         key_tag: key_tag,
         apex: name.to_string(apex),
         action: action,
-        dsse_payload: payload,
-        dsse_signature: signature,
-        log_id: logged.log_id,
+        statement: statement_bytes,
+        canonicalized_body: logged.canonicalized_body,
+        log_id: record.log_id,
         log_index: logged.log_index,
         checkpoint: logged.checkpoint,
         inclusion_path: proof.join_path(logged.inclusion_path),
@@ -129,6 +138,72 @@ pub fn run(
     |> result.map_error(Db),
   )
   Ok(Outcome(key_tag, action, logged.log_index, refreshed))
+}
+
+/// The signature to submit: a prior run's, reused verbatim when the Statement
+/// has not changed, else a fresh DER signature over the PAE.
+fn reusable_signature(
+  stored: Result(store.Record, Nil),
+  statement_bytes: BitArray,
+  csk: Csk,
+) -> BitArray {
+  case stored {
+    Ok(record) if record.statement == statement_bytes ->
+      case proof.parse_body(record.canonicalized_body) {
+        Ok(#(_digest, signature, _verifier)) -> signature
+        Error(_) -> statement.sign(csk, statement_bytes)
+      }
+    _ -> statement.sign(csk, statement_bytes)
+  }
+}
+
+/// The client's whole verification, run before storing: possession, the
+/// verifier binding, and inclusion under the log's signed checkpoint.
+fn verify_entry(
+  record: Proof,
+  csk: Csk,
+  log_key: #(BitArray, BitArray),
+) -> Result(Nil, proof.ProofError) {
+  use #(digest, signature, verifier) <- result.try(proof.parse_body(
+    record.canonicalized_body,
+  ))
+  use Nil <- result.try(
+    case
+      digest
+      == crypto.hash(
+        crypto.Sha256,
+        statement.pae(statement.dsse_payload_type, record.statement),
+      )
+    {
+      True -> Ok(Nil)
+      False ->
+        Error(proof.Binding(
+          "the logged entry's digest is not this statement's DSSE PAE",
+        ))
+    },
+  )
+  use Nil <- result.try(case verifier == proof.p256_spki(csk.public) {
+    True -> Ok(Nil)
+    False ->
+      Error(proof.Binding("the logged verifier key is not this zone's DNSKEY"))
+  })
+  use Nil <- result.try(
+    case statement.verify(csk.public, record.statement, signature) {
+      True -> Ok(Nil)
+      False ->
+        Error(proof.Possession("the entry signature is not this zone key's"))
+    },
+  )
+  use _ <- result.try(verify_against_log_wrap(record, log_key))
+  Ok(Nil)
+}
+
+fn verify_against_log_wrap(
+  record: Proof,
+  log_key: #(BitArray, BitArray),
+) -> Result(Nil, proof.ProofError) {
+  proof.verify_against_log(record, log_key.0, log_key.1)
+  |> result.map(fn(_) { Nil })
 }
 
 /// The already-logged key this one replaces, if any.
@@ -154,22 +229,6 @@ fn list_first_other(tags: List(Int), key_tag: Int) -> Result(Int, Nil) {
   }
 }
 
-/// Search the log before writing to it, so a republish costs a lookup and
-/// not a duplicate entry.
-fn fetch_or_submit(
-  log: Log,
-  entry: BitArray,
-) -> Result(#(client.Entry, Bool), PublishError) {
-  case log.lookup(entry) {
-    Ok(Some(found)) -> Ok(#(found, True))
-    Ok(None) ->
-      log.submit(entry)
-      |> result.map(fn(added) { #(added, False) })
-      |> result.map_error(LogUnavailable)
-    Error(why) -> Error(LogUnavailable(why))
-  }
-}
-
 /// The proof a served TXT record carries, rebuilt from a stored row.
 pub fn to_proof(record: store.Record) -> Result(Proof, proof.ProofError) {
   use path <- result.try(proof.split_path(record.inclusion_path))
@@ -177,8 +236,8 @@ pub fn to_proof(record: store.Record) -> Result(Proof, proof.ProofError) {
     key_tag: record.key_tag,
     log_id: record.log_id,
     log_index: record.log_index,
-    dsse_payload: record.dsse_payload,
-    dsse_signature: record.dsse_signature,
+    statement: record.statement,
+    canonicalized_body: record.canonicalized_body,
     checkpoint: record.checkpoint,
     inclusion_path: path,
   ))
