@@ -1359,11 +1359,12 @@ mod tests {
         let report = node.scan_and_stage_off_runtime().await.unwrap();
         let after = ticks.load(Ordering::Relaxed);
 
-        // A free current-thread runtime spins this ticker millions of times
-        // per second, so the bar is set far above what a single `Pending`
-        // return can account for and far below what the machine has to manage
-        // to clear it.
-        const FREE_RUNTIME_TICKS: usize = 10_000;
+        // Calibrated to the failure modes, not to machine speed: a thread
+        // that hashes inline ticks at most a handful of times per file
+        // (one per `Pending` return — under a hundred for 32 files), while
+        // a free thread has been measured at ~9,000 even on the slowest
+        // shared CI runners. 1,000 sits an order of magnitude from both.
+        const FREE_RUNTIME_TICKS: usize = 1_000;
 
         assert_eq!(report.hashed, 32);
         assert!(
