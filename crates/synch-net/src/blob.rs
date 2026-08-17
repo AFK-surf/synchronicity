@@ -33,20 +33,6 @@ use crate::{
 /// fetch gives up on it and lets the caller try someone else.
 const MAX_BARREN_WINDOWS: u32 = 4;
 
-/// How many requests one connection may have in flight at once.
-///
-/// The bound that the old handle-one-stream-at-a-time loop looked like but was
-/// not: that serialized a peer's requests without limiting what a peer could
-/// cost us, since nothing capped connections.
-const MAX_CONCURRENT_STREAMS: usize = 8;
-
-/// How long one request may take, start to finish.
-///
-/// Covers the read as well as the work: without it a peer that opens a stream
-/// and sends nothing holds a task indefinitely. Generous, because one window of
-/// a large object is real disk work on the blocking pool.
-const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
 /// The largest prefix of `remaining` whose proof fits one exchange.
 ///
 /// Sized by [`proof_nodes_upper_bound`], so a provider holding everything asked
@@ -151,64 +137,23 @@ impl BlobProtocol {
 
 impl ProtocolHandler for BlobProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let remote = connection.remote_id();
-        match self.store.is_trusted_key(&remote, now_ns()) {
-            Ok(true) => {}
-            _ => {
-                if let Some(wake) = &self.on_unknown_key {
-                    wake.notify_waiters();
+        let handler = self.clone();
+        crate::serve::serve_connection(
+            &self.store.clone(),
+            connection,
+            self.on_unknown_key.as_ref(),
+            |_| {},
+            move |_peer, mut send, mut recv| {
+                let handler = handler.clone();
+                async move {
+                    if let Err(e) = handler.handle_stream(&mut send, &mut recv).await {
+                        tracing::debug!(error = %e, "blob stream ended");
+                    }
+                    let _ = send.finish();
                 }
-                connection.close(0u32.into(), b"untrusted");
-                return Err(AcceptError::from_err(std::io::Error::other(
-                    "peer has no live binding",
-                )));
-            }
-        }
-
-        // One task per stream, bounded by a semaphore.
-        //
-        // Handling streams one at a time to completion was not a concurrency
-        // bound — it bounded nothing, since a peer can open more connections —
-        // but it did bound *throughput*: because the encode runs on the
-        // blocking pool via `.await`, the connection could not accept another
-        // stream while one window was being built, so §6.3's "swarm behaviour
-        // falls out naturally" did not survive any client that pipelines. The
-        // semaphore is the real bound, and it is per connection.
-        let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
-        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-            // §3.2 enforcement is per message, not just per connection: a
-            // binding revoked or expired mid-connection must cut off further
-            // requests, not linger for the life of the QUIC session.
-            if !matches!(self.store.is_trusted_key(&remote, now_ns()), Ok(true)) {
-                tracing::debug!(peer = %remote.fmt_short(), "closing connection: binding lapsed");
-                connection.close(0u32.into(), b"untrusted");
-                break;
-            }
-            let Ok(permit) = limit.clone().acquire_owned().await else {
-                break;
-            };
-            let handler = self.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                // A read timeout, because there was none anywhere in the blob
-                // path: a trusted-key peer could open a stream, send nothing,
-                // and hold the task forever with nothing to reap it — which
-                // also defeated the per-message binding re-check above, since
-                // the loop never came back round.
-                let served = tokio::time::timeout(
-                    STREAM_TIMEOUT,
-                    handler.handle_stream(&mut send, &mut recv),
-                )
-                .await;
-                match served {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::debug!(error = %e, "blob stream ended"),
-                    Err(_) => tracing::debug!("blob stream timed out"),
-                }
-                let _ = send.finish();
-            });
-        }
-        Ok(())
+            },
+        )
+        .await
     }
 }
 

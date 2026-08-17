@@ -89,58 +89,48 @@ impl MptProtocol {
 
 impl ProtocolHandler for MptProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let remote = connection.remote_id();
-        let now = now_ns();
-        // Enforcement at connection-accept time (§3.2): connections from device
-        // keys with no live binding are closed immediately after the handshake.
-        match self.store().is_trusted_key(&remote, now) {
-            Ok(true) => {}
-            _ => {
-                tracing::debug!(peer = %remote.fmt_short(), "refusing connection: no live binding");
-                if let Some(wake) = &self.on_unknown_key {
-                    wake.notify_waiters();
-                }
-                connection.close(0u32.into(), b"untrusted");
-                return Err(AcceptError::from_err(std::io::Error::other(
-                    "peer has no live binding",
-                )));
-            }
-        }
-        let _ = self.store().record_peer_seen(&remote, None, now);
-
         // A session outlives the request that opened it, so "last seen" cannot
         // be recorded only at accept: a peer that has been syncing steadily
         // over one connection for an hour would read as an hour absent in
         // `synch peers`. Refreshed as requests arrive, but at most once an
         // interval — the sighting is for an operator's eyes, not worth a write
         // per stream.
-        let mut refreshed = std::time::Instant::now();
-        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-            // §3.2 enforcement is per message, not just per connection: a
-            // binding revoked or expired mid-connection must cut off further
-            // requests, not linger for the life of the QUIC session.
-            if !matches!(self.store().is_trusted_key(&remote, now_ns()), Ok(true)) {
-                tracing::debug!(peer = %remote.fmt_short(), "closing connection: binding lapsed");
-                connection.close(0u32.into(), b"untrusted");
-                break;
+        let store = self.store().clone();
+        let mut refreshed: Option<std::time::Instant> = None;
+        let sighting = move |peer: NodeId| {
+            if refreshed.is_some_and(|at| at.elapsed() < PEER_SEEN_REFRESH) {
+                return;
             }
-            if refreshed.elapsed() >= PEER_SEEN_REFRESH {
-                let _ = self.store().record_peer_seen(&remote, None, now_ns());
-                refreshed = std::time::Instant::now();
-            }
-            if let Err(e) = self.handle_stream(remote, &mut send, &mut recv).await {
-                tracing::debug!(peer = %remote.fmt_short(), error = %e, "mpt stream ended");
-                let _ = write_frame(
-                    &mut send,
-                    &MptMessage::Error {
-                        reason: e.to_string(),
-                    },
-                )
-                .await;
-            }
-            let _ = send.finish();
-        }
-        Ok(())
+            let _ = store.record_peer_seen(&peer, None, now_ns());
+            refreshed = Some(std::time::Instant::now());
+        };
+
+        let handler = self.clone();
+        crate::serve::serve_connection(
+            &self.store.clone(),
+            connection,
+            self.on_unknown_key.as_ref(),
+            sighting,
+            move |peer, mut send, mut recv| {
+                let handler = handler.clone();
+                async move {
+                    if let Err(e) = handler.handle_stream(peer, &mut send, &mut recv).await {
+                        tracing::debug!(peer = %peer.fmt_short(), error = %e, "mpt stream ended");
+                        // The peer is told what went wrong rather than left to
+                        // read a closed stream.
+                        let _ = write_frame(
+                            &mut send,
+                            &MptMessage::Error {
+                                reason: e.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    let _ = send.finish();
+                }
+            },
+        )
+        .await
     }
 }
 
@@ -815,6 +805,42 @@ mod tests {
             vec![servable],
             "and the want list is still answered"
         );
+
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    /// A stream that stalls mid-message does not stop the connection serving
+    /// the next request.
+    ///
+    /// The work behind a request runs on the blocking pool, so a connection
+    /// that handles its streams one at a time cannot accept the next one while
+    /// a window is being built — and a peer that opens a stream and then says
+    /// nothing parks it indefinitely. One task per stream under a semaphore and
+    /// a deadline is what keeps the session usable either way.
+    #[tokio::test]
+    async fn a_stalled_stream_does_not_hold_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let (server, client, _client_dir) =
+            trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
+        let mpt = client.connect_mpt(server.direct_addr()).await.unwrap();
+
+        // A frame header promising bytes that never arrive: the responder has
+        // accepted the stream and is waiting on the body.
+        let (mut stalled, _recv) = mpt.connection().open_bi().await.unwrap();
+        stalled.write_all(&64u32.to_le_bytes()).await.unwrap();
+
+        // The next request on the same connection is answered regardless.
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        let keys = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            mpt.get_bindings(&origin),
+        )
+        .await
+        .expect("a stalled stream must not hold the connection")
+        .unwrap();
+        assert!(keys.is_empty());
 
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
