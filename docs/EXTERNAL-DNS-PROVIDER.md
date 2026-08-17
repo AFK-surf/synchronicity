@@ -207,9 +207,6 @@ CP_CLOUDFLARE_API_TOKEN=...           # zone-scoped token
 CP_CLOUDFLARE_ZONE_ID=...             # optional; discovered via GET /zones?name= if absent
 CP_CLOUDFLARE_API_URL=...             # test/e2e override, like CP_REKOR_URL
 
-CP_ROUTE53_ACCESS_KEY_ID + CP_ROUTE53_SECRET_ACCESS_KEY   # credential_pair
-CP_ROUTE53_ZONE_ID=...                # required (no discovery; names are ambiguous)
-
 CP_BUNNY_API_KEY=...
 CP_BUNNY_ZONE_ID=...                  # optional; discovered if absent
 ```
@@ -319,7 +316,8 @@ not fatal — the same stance `healthz` takes on absent TUF material.
 `jobs/zonekey_watch.gleam`, a second actor on the same template, closing
 the §3.3 loop:
 
-1. On a short cadence (default 15 minutes; `CP_ZONEKEY_WATCH_SECONDS`),
+1. On a fixed fifteen-minute cadence (`watch_interval_ms` — a constant,
+   not a knob),
    resolve and DNSSEC-validate the apex DNSKEY RRset over DoH — the
    existing `rekor/chain.gleam` collection machinery, which already speaks
    validating DoH for chain assembly.

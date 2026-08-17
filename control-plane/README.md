@@ -190,15 +190,35 @@ IPv6 listen addresses are written in brackets: `[::1]:53`.
 `CP_HTTP_PORT` and `CP_DNS_PORT` are gone; the port lives in the
 listen address.
 
+Two DNS modes. `CP_DNS_MODE=serve` (the default) makes this service the
+authoritative nameserver: it signs the zone with its own CSK and answers
+on `CP_DNS_LISTEN`. `CP_DNS_MODE=external` instead publishes the
+membership records into a zone a managed provider hosts and signs
+(Cloudflare or Bunny), running no DNS listeners and holding no zone key
+— the provider's fleet is the redundancy, so the mode is primary-only
+and `CP_KEY_FILE`, `CP_DNS_LISTEN` and `CP_NS_HOSTS` must be unset.
+Provider configuration present while the mode is `serve` refuses to
+start: a credential that quietly does nothing is a lie. See
+[docs/EXTERNAL-DNS-PROVIDER.md](../docs/EXTERNAL-DNS-PROVIDER.md).
+
 | Variable | Role | Meaning |
 |---|---|---|
 | `CP_ROLE` | both | Required. `primary` or `replica`. |
 | `CP_BASE_DOMAIN` | both | Required. Zone apex, no trailing dot (`sync.example`). |
 | `CP_DB_PATH` | both | Required. SQLite file, absolute path, in its own directory (the sandbox grants that directory — keep the key out of it). |
-| `CP_KEY_FILE` | primary | Required on the primary (zone CSK). Must live outside the database's directory. **Must be unset on replicas.** |
+| `CP_KEY_FILE` | primary | Required on the primary in serve mode (zone CSK). Must live outside the database's directory. **Must be unset on replicas** and with `CP_DNS_MODE=external` — there is no zone CSK to hold. |
 | `CP_HTTP_LISTEN` | both | HTTP / DoH bind as `address:port`. Default `0.0.0.0:8080`. |
-| `CP_DNS_LISTEN` | both | Authoritative DNS (UDP + TCP) bind as `address:port`. Default `0.0.0.0:53`. |
-| `CP_NS_HOSTS` | primary | Semicolon-separated `host=ipv4[,ipv6]` NS glue, e.g. `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53`. Hostnames without dots are relative to the apex. |
+| `CP_DNS_LISTEN` | both | Authoritative DNS (UDP + TCP) bind as `address:port`. Default `0.0.0.0:53`. Must be unset with `CP_DNS_MODE=external` — the provider answers. |
+| `CP_NS_HOSTS` | primary | Semicolon-separated `host=ipv4[,ipv6]` NS glue, e.g. `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53`. Hostnames without dots are relative to the apex. Must be unset with `CP_DNS_MODE=external`. |
+| `CP_DNS_MODE` | both | `serve` (default) or `external`; `external` is primary-only. See "Two DNS modes" above. |
+| `CP_DNS_PROVIDER` | primary | Required with `CP_DNS_MODE=external`: `cloudflare`, `bunny` or `log-only` (no credentials — prints the change set instead of applying it). |
+| `CP_SIGNING_ZONE` | primary | External mode only. The zone the provider actually hosts, when it is not the apex — e.g. a control plane at `sync.example.com` living inside the `example.com` zone, with no delegation of its own. Must contain the apex; default is the apex. |
+| `CP_CLOUDFLARE_API_TOKEN` | primary | Required when the provider is `cloudflare`. Zone-scoped API token. |
+| `CP_CLOUDFLARE_ZONE_ID` | primary | Cloudflare zone id. Default empty: discovered by zone name at boot. |
+| `CP_CLOUDFLARE_API_URL` | primary | Cloudflare API base URL override; default empty means the real endpoint. A test/e2e hook, like `CP_REKOR_URL`. |
+| `CP_BUNNY_API_KEY` | primary | Required when the provider is `bunny`. |
+| `CP_BUNNY_ZONE_ID` | primary | Bunny DNS zone id. Default empty: discovered by zone name at boot. |
+| `CP_BUNNY_API_URL` | primary | Bunny API base URL override; default empty means the real endpoint. |
 | `CP_PUBLIC_URL` | primary | External base URL for links and OAuth callbacks. Default `http://127.0.0.1:<http-port>`. |
 | `CP_SESSION_SECRET` | primary | Required on the primary, ≥32 characters. Signs session cookies. |
 | `CP_SMTP_HOST` | primary | SMTP hostname. Absent means log-only magic-link mail. |
