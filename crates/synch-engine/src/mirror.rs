@@ -442,6 +442,18 @@ fn plan_pass(
     {
         for set in listing {
             known.insert(set.path.clone());
+            // Before the target path is built, because building it is already
+            // the damage: on Windows `Path::join` reads a backslash as a
+            // separator and a drive-prefixed argument as a root, so a published
+            // `..\..\Users\x` or `C:\Windows\x` names a file outside the
+            // mirror root — and the branches below remove what they are given.
+            // Both bytes are ordinary in a Unix filename, so they stay legal
+            // where entries are published and are refused here, at the boundary
+            // where they mean something.
+            if let Some(reason) = unsafe_name(&set.path) {
+                report.skipped.push((set.path.clone(), reason));
+                continue;
+            }
             let target = root_dir.join(&set.path);
             // Defense in depth against a peer that plants a symlink and a file
             // beneath it (`sub` -> `/etc`, then `sub/passwd`): materialized in
@@ -503,10 +515,6 @@ fn plan_pass(
                 continue;
             }
             if selected.kind == EntryKind::Dir {
-                continue;
-            }
-            if let Some(reason) = unsafe_name(&set.path) {
-                report.skipped.push((set.path.clone(), reason));
                 continue;
             }
             if selected.kind == EntryKind::Symlink {
@@ -1392,6 +1400,64 @@ mod tests {
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.written, 1);
         assert_eq!(report.skipped.len(), 2);
+        node.shutdown().await.unwrap();
+    }
+
+    /// A name this platform must not be asked to open is refused before the
+    /// mirror does anything with it — removals included.
+    ///
+    /// `Path::join` on Windows reads a backslash as a separator and a
+    /// drive-prefixed argument as a root, so a published `..\..\Users\x` or
+    /// `C:\Windows\x` names a file outside the mirror root, and all three
+    /// branches that select nothing to write reach for the target and remove
+    /// it. Both bytes are ordinary in a Unix filename and stay legal where
+    /// entries are published, so the refusal belongs here.
+    #[tokio::test]
+    async fn a_name_this_platform_cannot_open_is_refused_before_any_removal() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+
+        let tombstoned = r"sub\..\..\escape.txt";
+        let divergent = r"C:\Windows\hosts";
+        let unpinned = r"D:\other\thing";
+        for name in [tombstoned, divergent, unpinned] {
+            std::fs::write(target.path().join(name), b"not the mirror's to touch").unwrap();
+        }
+
+        // The three selections that remove: a tombstone, a strict mirror's
+        // divergence, and a path the pinned origin does not publish.
+        node.store()
+            .put_entry(
+                &peer(),
+                "media",
+                tombstoned,
+                &FileEntry::tombstone(500, 2, None),
+            )
+            .unwrap();
+        publish_entry(&node, &peer(), divergent, b"mine", 1);
+        publish_entry(&node, &other(), divergent, b"theirs", 2);
+        publish_entry(&node, &other(), unpinned, b"theirs", 1);
+
+        for policy in [
+            VersionPolicy::Newest,
+            VersionPolicy::Strict,
+            VersionPolicy::Origin(peer()),
+        ] {
+            node.add_mirror("media", target.path(), &policy).unwrap();
+            let report = node.sync_mirror(target.path()).await.unwrap();
+            assert_eq!(report.removed, 0, "{policy:?}: {report:?}");
+            assert_eq!(report.written, 0, "{policy:?}: {report:?}");
+            assert_eq!(report.skipped.len(), 3, "{policy:?}: {report:?}");
+            for (_, reason) in &report.skipped {
+                assert!(reason.contains("reserved character"), "{reason}");
+            }
+            for name in [tombstoned, divergent, unpinned] {
+                assert!(
+                    target.path().join(name).exists(),
+                    "{policy:?} removed {name}"
+                );
+            }
+        }
         node.shutdown().await.unwrap();
     }
 
