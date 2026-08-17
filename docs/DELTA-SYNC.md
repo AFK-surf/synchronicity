@@ -238,9 +238,10 @@ Instead the fetcher descends, the same way `mptsync` walks trie diffs (§5):
   say the donor is a relative of this object and the leaf round is worth
   running; zero says it is not.
 
-Round two runs in batches of `LEAF_ROUND_BATCH` groups (128 MiB of object), so
-the list of proven subtrees stays a few hundred kilobytes however much of the
-object turns out to have changed.
+Round two runs one exchange's worth at a time, cut by the same `proof_window`
+the transfer side sizes its windows with, so the list of proven subtrees stays a
+few hundred kilobytes however much of the object turns out to have changed — and
+the requester's idea of how much fits in a round is the provider's.
 
 The level of round one is clamped: `span_level = min(AD_SPAN_LEVEL, top - 1)`
 where `top = log2(next_power_of_two(group_count))` is the height of the object's

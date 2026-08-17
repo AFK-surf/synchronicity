@@ -625,12 +625,14 @@ impl Node {
         };
         let mut left = unsettled;
         while !left.is_empty() {
-            // A batch at a time, because the proven subtrees of a leaf-level
-            // round are one per 16 KiB group and a re-keyed 100 GB container
-            // makes every span unsettled at once: held whole, that list is
-            // hundreds of megabytes of a node's memory to say something about
-            // bytes it is about to fetch anyway.
-            let batch = left.take(LEAF_ROUND_BATCH);
+            // One exchange's worth at a time, because the proven subtrees of a
+            // leaf-level round are one per 16 KiB group and a re-keyed 100 GB
+            // container makes every span unsettled at once: held whole, that
+            // list is hundreds of megabytes of a node's memory to say something
+            // about bytes it is about to fetch anyway. The size of an exchange
+            // is the provider's window sizer's answer, asked here rather than
+            // guessed, so the two cannot disagree about where a round ends.
+            let batch = synch_net::proof_window(&left, 0);
             left = left.difference(&batch);
             let round = self.fetch_proofs(root, size, &batch, 0, report).await?;
             if round.is_empty() {
@@ -1183,15 +1185,6 @@ impl Node {
         Ok(kind)
     }
 }
-
-/// How much of an object one leaf-level proof round covers at a time.
-///
-/// A leaf round proves one subtree per 16 KiB group, so the list it produces is
-/// proportional to the region it covers — and the region can be the whole object
-/// when every span changed. 8192 groups is 128 MiB of object per round: enough
-/// that the round trips disappear against the work, small enough that the list
-/// stays a few hundred kilobytes whatever the object.
-const LEAF_ROUND_BATCH: u64 = 8192;
 
 /// The smallest range a cold read runs the delta descent for
 /// (`docs/DELTA-SYNC.md` §4).

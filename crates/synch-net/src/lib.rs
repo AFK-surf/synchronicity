@@ -28,7 +28,7 @@ pub mod tuf;
 pub mod x509;
 pub mod zonecert;
 
-pub use blob::{BlobClient, BlobProtocol, Proof, ProofOutcome, Slice};
+pub use blob::{proof_window, BlobClient, BlobProtocol, Proof, ProofOutcome, Slice};
 pub use dns::{
     DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError, RekorPolicy,
     ResolverOptions,

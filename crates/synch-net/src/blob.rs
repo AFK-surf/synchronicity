@@ -54,7 +54,13 @@ const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// taken whole where they fit and split where they do not, and the count is
 /// clamped to [`MAX_RANGES`] so the set operations under it stay cheap on both
 /// sides (§12).
-fn proof_window(remaining: &ChunkRanges, level: u8) -> ChunkRanges {
+///
+/// Public because a caller walking a large region in rounds has to cut it the
+/// same way: what fits depends on the level and on how fragmented the ranges
+/// are — a contiguous run costs one node per subtree plus a root path, a
+/// scattered set costs a root path each — so any second answer to "how much per
+/// round?" would disagree with this one.
+pub fn proof_window(remaining: &ChunkRanges, level: u8) -> ChunkRanges {
     let mut taken: Vec<synch_core::GroupRange> = Vec::new();
     for range in remaining.ranges.iter().take(MAX_RANGES) {
         let candidate = ChunkRanges::from_ranges(taken.iter().copied().chain([*range]));
