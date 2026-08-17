@@ -1707,3 +1707,102 @@ async fn take_adopts_a_peers_deletion_over_the_socket() {
 
     daemon.shutdown().await;
 }
+
+/// A daemon stops while its startup work is stalled on a peer.
+///
+/// The initial scan publishes and pushes, which reaches out to every peer this
+/// node knows. A peer that completes the handshake and then answers nothing
+/// holds that push for the whole request deadline, and the stop signal has to be
+/// heard during it: an operator asking a daemon to stop must not be told to wait
+/// on a stranger.
+#[tokio::test]
+async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = space_with(&[("notes.txt", b"hello")]);
+
+    // A peer that accepts the session and answers nothing.
+    let silent = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(SecretKey::generate())
+        .relay_mode(iroh::endpoint::RelayMode::Disabled)
+        .clear_address_lookup()
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .alpns(vec![synch_core::ALPN_MPT.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let silent_addr = iroh::EndpointAddr::from_parts(
+        silent.id(),
+        silent
+            .bound_sockets()
+            .into_iter()
+            .map(iroh::TransportAddr::Ip),
+    );
+    let listening = silent.clone();
+    let accepting = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Some(incoming) = listening.accept().await {
+            if let Ok(connection) = incoming.await {
+                held.push(connection);
+            }
+        }
+    });
+
+    // A space with something to publish, and the silent peer trusted and
+    // addressed, so the initial scan produces a head and pushes it there.
+    Node::init(
+        dir.path(),
+        Some(OriginId::named("nas", "cluster.example").unwrap()),
+    )
+    .unwrap();
+    {
+        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
+        node.add_space("s", space.path()).unwrap();
+        node.store()
+            .put_binding(&synch_store::Binding {
+                origin: OriginId::named("silent", "cluster.example").unwrap(),
+                node_id: silent.id(),
+                source: synch_store::BindingSource::Static,
+                domain: None,
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+        node.store()
+            .record_peer_seen(
+                &silent.id(),
+                Some(&synch_engine::node::encode_addr(&silent_addr)),
+                synch_core::now_ns(),
+            )
+            .unwrap();
+        node.shutdown().await.unwrap();
+    }
+
+    // Long enough that only the initial scan pushes anything during the test.
+    let mut config = NodeConfig::loopback(dir.path());
+    config.publish_quiesce = std::time::Duration::from_secs(300);
+    let running = tokio::spawn(synch_cli::daemon::run(config));
+
+    // Wait for the control socket, then ask the daemon to stop.
+    let mut client = loop {
+        match Client::connect(dir.path()).await {
+            Ok(client) => break client,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    };
+    client.send(&Request::DaemonStop).await.unwrap();
+    while let Ok(Some(_)) = client.next().await {}
+    // The daemon sends the stop once the client has hung up.
+    drop(client);
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), running)
+        .await
+        .expect("the daemon must stop while its initial scan is stalled")
+        .expect("the daemon task did not panic")
+        .unwrap();
+
+    accepting.abort();
+    silent.close().await;
+}

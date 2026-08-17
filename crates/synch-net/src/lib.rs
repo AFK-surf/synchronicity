@@ -22,6 +22,8 @@ pub mod rekor;
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub mod sim;
+#[cfg(test)]
+mod testing;
 pub mod tuf;
 pub mod x509;
 pub mod zonecert;
@@ -31,7 +33,7 @@ pub use dns::{
     DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError, RekorPolicy,
     ResolverOptions,
 };
-pub use endpoint::{Net, NetOptions};
+pub use endpoint::{Net, NetOptions, DIAL_TIMEOUT, REQUEST_TIMEOUT};
 pub use error::{NetError, Result};
 pub use mpt::{HeadExchange, HeadSink, MptClient, MptProtocol, NodesResponse, ValuesResponse};
 pub use rekor::{ProofError, RekorProof};

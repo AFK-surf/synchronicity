@@ -28,6 +28,37 @@ use crate::{
 /// long, silently.
 pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long one request may wait for its answer before the peer is treated as
+/// failed.
+///
+/// [`DIAL_TIMEOUT`] bounds the handshake and nothing after it, so every exchange
+/// carries its own deadline: a peer that keeps a QUIC session alive while
+/// answering nothing would otherwise hold a caller for as long as it liked, and
+/// a stalled sync, fetch or head push has no other way to end. It matches the
+/// budget the serve side gives one stream, so an honest provider doing real disk
+/// work for a window is never cut off by it, and it is applied per exchange —
+/// a windowed fetch gets the deadline once per window, not once for the walk.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Runs one client exchange under a deadline, naming what stalled.
+///
+/// The failure is a [`NetError`] like any other transport failure, which is what
+/// puts a stalled peer on the same footing as an unreachable one: the caller
+/// drops it and tries the next candidate.
+pub(crate) async fn under_deadline<T>(
+    deadline: std::time::Duration,
+    what: &str,
+    exchange: impl std::future::Future<Output = Result<T, NetError>>,
+) -> Result<T, NetError> {
+    match tokio::time::timeout(deadline, exchange).await {
+        Ok(answered) => answered,
+        Err(_) => Err(NetError::Endpoint(format!(
+            "{what} went unanswered for {}s",
+            deadline.as_secs_f64()
+        ))),
+    }
+}
+
 /// How the endpoint should be bound.
 #[derive(Debug, Clone, Default)]
 pub struct NetOptions {

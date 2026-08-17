@@ -24,6 +24,7 @@ use synch_core::{
 use synch_store::{Proven, Store};
 
 use crate::{
+    endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
     frame::{read_bytes, read_frame, write_bytes, write_frame},
 };
@@ -293,6 +294,8 @@ impl BlobProtocol {
 #[derive(Debug, Clone)]
 pub struct BlobClient {
     connection: Connection,
+    /// How long any one exchange on this connection may wait for its answer.
+    deadline: std::time::Duration,
 }
 
 /// A received slice, together with what the provider actually served.
@@ -327,7 +330,18 @@ pub struct ProofOutcome {
 impl BlobClient {
     /// Wraps an established `sync/blob/1` connection.
     pub fn new(connection: Connection) -> Self {
-        BlobClient { connection }
+        BlobClient {
+            connection,
+            deadline: REQUEST_TIMEOUT,
+        }
+    }
+
+    /// The same client under a deadline of the caller's choosing, for tests
+    /// that need a stall to be reported in milliseconds rather than minutes.
+    #[cfg(test)]
+    pub(crate) fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// The peer's device key.
@@ -337,23 +351,26 @@ impl BlobClient {
 
     /// Requests a verified slice.
     pub async fn get_slice(&self, root: Hash, ranges: &ChunkRanges) -> Result<Slice, NetError> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(
-            &mut send,
-            &BlobMessage::GetSlice {
-                root,
-                ranges: ranges.clone(),
-            },
-        )
-        .await?;
-        let _ = send.finish();
+        under_deadline(self.deadline, "a slice request", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(
+                &mut send,
+                &BlobMessage::GetSlice {
+                    root,
+                    ranges: ranges.clone(),
+                },
+            )
+            .await?;
+            let _ = send.finish();
 
-        let encoded = read_bytes(&mut recv).await?;
-        let served = match read_frame::<BlobMessage>(&mut recv).await? {
-            BlobMessage::SliceEnd { served } => check_served(served, ranges)?,
-            _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
-        };
-        Ok(Slice { encoded, served })
+            let encoded = read_bytes(&mut recv).await?;
+            let served = match read_frame::<BlobMessage>(&mut recv).await? {
+                BlobMessage::SliceEnd { served } => check_served(served, ranges)?,
+                _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
+            };
+            Ok(Slice { encoded, served })
+        })
+        .await
     }
 
     /// Requests the tree over a range, without its bytes.
@@ -363,24 +380,27 @@ impl BlobClient {
         ranges: &ChunkRanges,
         level: u8,
     ) -> Result<Proof, NetError> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(
-            &mut send,
-            &BlobMessage::GetProof {
-                root,
-                ranges: ranges.clone(),
-                level,
-            },
-        )
-        .await?;
-        let _ = send.finish();
+        under_deadline(self.deadline, "a proof request", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(
+                &mut send,
+                &BlobMessage::GetProof {
+                    root,
+                    ranges: ranges.clone(),
+                    level,
+                },
+            )
+            .await?;
+            let _ = send.finish();
 
-        let encoded = read_bytes(&mut recv).await?;
-        let served = match read_frame::<BlobMessage>(&mut recv).await? {
-            BlobMessage::ProofEnd { served } => check_served(served, ranges)?,
-            _ => return Err(NetError::Unexpected("expected ProofEnd".into())),
-        };
-        Ok(Proof { encoded, served })
+            let encoded = read_bytes(&mut recv).await?;
+            let served = match read_frame::<BlobMessage>(&mut recv).await? {
+                BlobMessage::ProofEnd { served } => check_served(served, ranges)?,
+                _ => return Err(NetError::Unexpected("expected ProofEnd".into())),
+            };
+            Ok(Proof { encoded, served })
+        })
+        .await
     }
 
     /// Requests the tree over a range and commits it to the local CAS,
@@ -512,7 +532,41 @@ impl BlobClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synch_core::{GroupRange, AD_SPAN_LEVEL, CHUNK_GROUP_SIZE, MAX_PROOF_NODES};
+    use crate::testing::{bare_endpoint, StalledPeer};
+    use synch_core::{GroupRange, AD_SPAN_LEVEL, ALPN_BLOB, CHUNK_GROUP_SIZE, MAX_PROOF_NODES};
+
+    /// A peer that keeps the session open and answers nothing fails the
+    /// request instead of holding the fetch forever.
+    ///
+    /// `STREAM_TIMEOUT` bounds what this node does for a peer; the deadline
+    /// here bounds what a peer can do to this node, and the windowed fetches
+    /// above apply it once per window so a long walk is never cut short for
+    /// making steady progress.
+    #[tokio::test]
+    async fn a_peer_that_answers_nothing_fails_a_slice_and_a_proof() {
+        let peer = StalledPeer::bind(ALPN_BLOB).await;
+        let dialer = bare_endpoint(ALPN_BLOB).await;
+        let connection = dialer.connect(peer.addr.clone(), ALPN_BLOB).await.unwrap();
+        let client =
+            BlobClient::new(connection).with_deadline(std::time::Duration::from_millis(100));
+        let patience = std::time::Duration::from_secs(10);
+        let root = Hash::new(b"object");
+        let ranges = ChunkRanges::single(0, 4);
+
+        let slice = tokio::time::timeout(patience, client.get_slice(root, &ranges))
+            .await
+            .expect("a slice request must not hang")
+            .expect_err("a stalled peer serves no slice");
+        assert!(slice.to_string().contains("went unanswered"), "{slice}");
+        let proof = tokio::time::timeout(patience, client.get_proof(root, &ranges, 0))
+            .await
+            .expect("a proof request must not hang")
+            .expect_err("a stalled peer serves no proof");
+        assert!(proof.to_string().contains("went unanswered"), "{proof}");
+
+        dialer.close().await;
+        peer.shutdown().await;
+    }
 
     /// The requester sizes each window so the provider never truncates.
     ///

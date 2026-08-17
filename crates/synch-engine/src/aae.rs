@@ -87,25 +87,38 @@ impl Node {
     }
 
     /// Pushes a head to every reachable peer (§5.3, reactive path).
+    ///
+    /// All of them at once. Each push is bounded by a dial timeout and a request
+    /// deadline, so a peer that has gone dark costs seconds — but sequentially
+    /// those seconds add up across the membership and a publish waits for all of
+    /// them before it returns. Run together, one slow peer costs one deadline
+    /// rather than delaying every peer behind it.
     pub async fn push_head(&self, head: &SignedHead) -> Result<usize> {
-        let mut pushed = 0;
-        for peer in self.dialable_peers()? {
+        let peers = self.dialable_peers()?;
+        let mut targets = Vec::with_capacity(peers.len());
+        for peer in peers {
             let addr = self
                 .peer_addr(&peer)?
                 .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
+            targets.push((peer, addr));
+        }
+        let results = crate::join::futures_join(targets.into_iter().map(|(peer, addr)| async move {
             match self.net().connect_mpt(addr).await {
                 Ok(client) => match client.push_head(head).await {
-                    Ok(()) => pushed += 1,
+                    Ok(()) => true,
                     Err(e) => {
-                        tracing::debug!(peer = %peer.fmt_short(), error = %e, "head push failed")
+                        tracing::debug!(peer = %peer.fmt_short(), error = %e, "head push failed");
+                        false
                     }
                 },
                 Err(e) => {
-                    tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable")
+                    tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
+                    false
                 }
             }
-        }
-        Ok(pushed)
+        }))
+        .await;
+        Ok(results.into_iter().filter(|pushed| *pushed).count())
     }
 
     /// Scans, publishes, and pushes the resulting head in one step.

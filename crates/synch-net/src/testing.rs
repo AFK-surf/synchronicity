@@ -1,0 +1,76 @@
+//! Fixtures for this crate's own tests.
+
+use iroh::{
+    endpoint::{presets, RelayMode},
+    Endpoint, EndpointAddr, TransportAddr,
+};
+use iroh_base::SecretKey;
+
+/// A loopback-only endpoint speaking one ALPN, with no relay and no discovery.
+pub(crate) async fn bare_endpoint(alpn: &'static [u8]) -> Endpoint {
+    Endpoint::builder(presets::N0)
+        .secret_key(SecretKey::generate())
+        .relay_mode(RelayMode::Disabled)
+        .clear_address_lookup()
+        .clear_ip_transports()
+        .bind_addr(
+            "127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .expect("valid loopback address"),
+        )
+        .expect("a loopback bind address")
+        .alpns(vec![alpn.to_vec()])
+        .bind()
+        .await
+        .expect("a loopback endpoint binds")
+}
+
+/// The directly bound address of an endpoint, which is all a loopback dial
+/// needs.
+pub(crate) fn direct_addr(endpoint: &Endpoint) -> EndpointAddr {
+    EndpointAddr::from_parts(
+        endpoint.id(),
+        endpoint.bound_sockets().into_iter().map(TransportAddr::Ip),
+    )
+}
+
+/// A peer that completes the handshake and then answers nothing.
+///
+/// The shape a client deadline exists for: the session stays open, the streams
+/// stay open, and no frame ever comes back. Its connections are held for as long
+/// as the task lives so nothing on the wire closes and hands the client an error
+/// the deadline was not responsible for.
+pub(crate) struct StalledPeer {
+    /// Where to dial it.
+    pub(crate) addr: EndpointAddr,
+    endpoint: Endpoint,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StalledPeer {
+    /// Binds one and starts accepting.
+    pub(crate) async fn bind(alpn: &'static [u8]) -> StalledPeer {
+        let endpoint = bare_endpoint(alpn).await;
+        let addr = direct_addr(&endpoint);
+        let listening = endpoint.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(incoming) = listening.accept().await {
+                if let Ok(connection) = incoming.await {
+                    held.push(connection);
+                }
+            }
+        });
+        StalledPeer {
+            addr,
+            endpoint,
+            task,
+        }
+    }
+
+    /// Stops accepting and closes the endpoint.
+    pub(crate) async fn shutdown(self) {
+        self.task.abort();
+        self.endpoint.close().await;
+    }
+}

@@ -1,13 +1,12 @@
 //! Content fetching: provider resolution, ranking, and verified range reads
 //! (§6.3, §6.4).
 
-use std::future::Future;
-
 use synch_core::{group_count, groups_for_byte_range, now_ns, ChunkRanges, Hash, OriginId};
 use synch_store::{Donor, EntryRow, Proven, ProvenSubtree, VersionPolicy, VersionSet};
 
 use crate::{
     error::{EngineError, Result},
+    join::futures_join,
     node::Node,
     scanner::CloneKind,
 };
@@ -170,34 +169,6 @@ fn split_ranges(ranges: &ChunkRanges, parts: usize) -> Vec<ChunkRanges> {
         out.push(ChunkRanges::from_ranges(share));
     }
     out
-}
-
-/// Runs several futures to completion together, collecting their outputs.
-///
-/// A hand-rolled join rather than a `futures` dependency: this is the only
-/// place in the workspace that needs one, and it needs the simplest possible
-/// shape — no cancellation, no early return, every branch polled to the end.
-async fn futures_join<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
-    let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
-    let mut out = Vec::with_capacity(pending.len());
-    std::future::poll_fn(move |cx| {
-        let mut index = 0;
-        while index < pending.len() {
-            match pending[index].as_mut().poll(cx) {
-                std::task::Poll::Ready(value) => {
-                    out.push(value);
-                    pending.remove(index);
-                }
-                std::task::Poll::Pending => index += 1,
-            }
-        }
-        if pending.is_empty() {
-            std::task::Poll::Ready(std::mem::take(&mut out))
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await
 }
 
 impl Node {

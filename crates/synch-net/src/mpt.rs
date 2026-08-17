@@ -20,6 +20,7 @@ use synch_mpt::NodeStore;
 use synch_store::{Slot, Store};
 
 use crate::{
+    endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
     frame::{read_frame, write_frame},
 };
@@ -381,12 +382,25 @@ pub struct HeadExchange {
 #[derive(Debug, Clone)]
 pub struct MptClient {
     connection: Connection,
+    /// How long any one exchange on this connection may wait for its answer.
+    deadline: std::time::Duration,
 }
 
 impl MptClient {
     /// Wraps an established `sync/mpt/1` connection.
     pub fn new(connection: Connection) -> Self {
-        MptClient { connection }
+        MptClient {
+            connection,
+            deadline: REQUEST_TIMEOUT,
+        }
+    }
+
+    /// The same client under a deadline of the caller's choosing, for tests
+    /// that need a stall to be reported in milliseconds rather than minutes.
+    #[cfg(test)]
+    pub(crate) fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// The underlying connection.
@@ -411,83 +425,95 @@ impl MptClient {
     where
         F: FnOnce(&[HeadSummary]) -> (Vec<SignedHead>, Vec<OriginId>),
     {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(
-            &mut send,
-            &MptMessage::Hello {
-                proto: PROTO_VERSION,
-                heads: ours,
-            },
-        )
-        .await?;
+        under_deadline(self.deadline, "a head exchange", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(
+                &mut send,
+                &MptMessage::Hello {
+                    proto: PROTO_VERSION,
+                    heads: ours,
+                },
+            )
+            .await?;
 
-        let summaries = match read_frame::<MptMessage>(&mut recv).await? {
-            MptMessage::Hello { proto, heads } => {
-                if proto != PROTO_VERSION {
-                    return Err(NetError::Unexpected(format!(
-                        "unsupported protocol version {proto}"
-                    )));
+            let summaries = match read_frame::<MptMessage>(&mut recv).await? {
+                MptMessage::Hello { proto, heads } => {
+                    if proto != PROTO_VERSION {
+                        return Err(NetError::Unexpected(format!(
+                            "unsupported protocol version {proto}"
+                        )));
+                    }
+                    check_heads(heads.len(), "a Hello summary list")?;
+                    heads
                 }
-                check_heads(heads.len(), "a Hello summary list")?;
-                heads
-            }
-            other => return Err(unexpected("Hello", &other)),
-        };
+                other => return Err(unexpected("Hello", &other)),
+            };
 
-        let (push, want) = decide(&summaries);
-        let pushed = push.len();
-        write_frame(&mut send, &MptMessage::Heads { heads: push }).await?;
-        write_frame(&mut send, &MptMessage::HeadsWant { origins: want }).await?;
+            let (push, want) = decide(&summaries);
+            let pushed = push.len();
+            write_frame(&mut send, &MptMessage::Heads { heads: push }).await?;
+            write_frame(&mut send, &MptMessage::HeadsWant { origins: want }).await?;
 
-        let received = match read_frame::<MptMessage>(&mut recv).await? {
-            MptMessage::Heads { heads } => heads,
-            MptMessage::Error { reason } => return Err(NetError::Unexpected(reason)),
-            other => return Err(unexpected("Heads", &other)),
-        };
-        let _ = send.finish();
-        Ok(HeadExchange {
-            summaries,
-            pushed,
-            received,
+            let received = match read_frame::<MptMessage>(&mut recv).await? {
+                MptMessage::Heads { heads } => heads,
+                MptMessage::Error { reason } => return Err(NetError::Unexpected(reason)),
+                other => return Err(unexpected("Heads", &other)),
+            };
+            let _ = send.finish();
+            Ok(HeadExchange {
+                summaries,
+                pushed,
+                received,
+            })
         })
+        .await
     }
 
     /// Pushes a head reactively (§5.3).
     pub async fn push_head(&self, head: &SignedHead) -> Result<(), NetError> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(&mut send, &MptMessage::HeadPush { head: head.clone() }).await?;
-        let _ = send.finish();
-        match read_frame::<MptMessage>(&mut recv).await? {
-            MptMessage::Heads { .. } => Ok(()),
-            MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
-            other => Err(unexpected("an acknowledgement", &other)),
-        }
+        under_deadline(self.deadline, "a head push", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(&mut send, &MptMessage::HeadPush { head: head.clone() }).await?;
+            let _ = send.finish();
+            match read_frame::<MptMessage>(&mut recv).await? {
+                MptMessage::Heads { .. } => Ok(()),
+                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
+                other => Err(unexpected("an acknowledgement", &other)),
+            }
+        })
+        .await
     }
 
     /// Fetches trie nodes by hash.
     pub async fn get_nodes(&self, hashes: &[Hash]) -> Result<NodesResponse, NetError> {
-        let batch: Vec<Hash> = hashes.iter().take(MAX_BATCH).copied().collect();
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(&mut send, &MptMessage::GetNodes { hashes: batch }).await?;
-        let _ = send.finish();
-        match read_frame::<MptMessage>(&mut recv).await? {
-            MptMessage::Nodes { nodes, missing } => Ok(NodesResponse { nodes, missing }),
-            MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
-            other => Err(unexpected("Nodes", &other)),
-        }
+        let batch: Vec<Hash> = hashes.to_vec();
+        under_deadline(self.deadline, "a trie node request", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(&mut send, &MptMessage::GetNodes { hashes: batch }).await?;
+            let _ = send.finish();
+            match read_frame::<MptMessage>(&mut recv).await? {
+                MptMessage::Nodes { nodes, missing } => Ok(NodesResponse { nodes, missing }),
+                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
+                other => Err(unexpected("Nodes", &other)),
+            }
+        })
+        .await
     }
 
     /// Fetches out-of-line trie values by hash.
     pub async fn get_values(&self, hashes: &[Hash]) -> Result<ValuesResponse, NetError> {
-        let batch: Vec<Hash> = hashes.iter().take(MAX_BATCH).copied().collect();
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(&mut send, &MptMessage::GetValues { hashes: batch }).await?;
-        let _ = send.finish();
-        match read_frame::<MptMessage>(&mut recv).await? {
-            MptMessage::Values { values, missing } => Ok(ValuesResponse { values, missing }),
-            MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
-            other => Err(unexpected("Values", &other)),
-        }
+        let batch: Vec<Hash> = hashes.to_vec();
+        under_deadline(self.deadline, "a trie value request", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(&mut send, &MptMessage::GetValues { hashes: batch }).await?;
+            let _ = send.finish();
+            match read_frame::<MptMessage>(&mut recv).await? {
+                MptMessage::Values { values, missing } => Ok(ValuesResponse { values, missing }),
+                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
+                other => Err(unexpected("Values", &other)),
+            }
+        })
+        .await
     }
 
     /// Asks a peer who advertises an object, for bootstrapping a cold cache
@@ -496,14 +522,17 @@ impl MptClient {
         &self,
         object_root: Hash,
     ) -> Result<Vec<(OriginId, BlobAd)>, NetError> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(&mut send, &MptMessage::FindProviders { object_root }).await?;
-        let _ = send.finish();
-        match read_frame::<MptMessage>(&mut recv).await? {
-            MptMessage::Providers { ads } => Ok(ads),
-            MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
-            other => Err(unexpected("Providers", &other)),
-        }
+        under_deadline(self.deadline, "a provider hint request", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(&mut send, &MptMessage::FindProviders { object_root }).await?;
+            let _ = send.finish();
+            match read_frame::<MptMessage>(&mut recv).await? {
+                MptMessage::Providers { ads } => Ok(ads),
+                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
+                other => Err(unexpected("Providers", &other)),
+            }
+        })
+        .await
     }
 
     /// Asks the peer which device keys it currently holds bound for an origin
@@ -513,27 +542,105 @@ impl MptClient {
     /// binding yet?" — the judgement §3.4 says a rotation's switch-over needs
     /// and that a node cannot make from its own view of DNS.
     pub async fn get_bindings(&self, origin: &OriginId) -> Result<Vec<NodeId>, NetError> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(
-            &mut send,
-            &MptMessage::GetBindings {
-                origin: origin.clone(),
-            },
-        )
-        .await?;
-        let _ = send.finish();
-        match read_frame::<MptMessage>(&mut recv).await? {
-            MptMessage::BindingsFor {
-                origin: answered,
-                keys,
-            } if &answered == origin => Ok(keys),
-            MptMessage::BindingsFor {
-                origin: answered, ..
-            } => Err(NetError::Unexpected(format!(
-                "asked about {origin}, answered about {answered}"
-            ))),
-            MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
-            other => Err(unexpected("BindingsFor", &other)),
+        under_deadline(self.deadline, "a binding request", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(
+                &mut send,
+                &MptMessage::GetBindings {
+                    origin: origin.clone(),
+                },
+            )
+            .await?;
+            let _ = send.finish();
+            match read_frame::<MptMessage>(&mut recv).await? {
+                MptMessage::BindingsFor {
+                    origin: answered,
+                    keys,
+                } if &answered == origin => Ok(keys),
+                MptMessage::BindingsFor {
+                    origin: answered, ..
+                } => Err(NetError::Unexpected(format!(
+                    "asked about {origin}, answered about {answered}"
+                ))),
+                MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
+                other => Err(unexpected("BindingsFor", &other)),
+            }
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{bare_endpoint, StalledPeer};
+    use synch_core::ALPN_MPT;
+
+    /// How long a test waits before calling a request hung rather than slow.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A peer that keeps the session open and answers nothing fails the
+    /// request instead of holding the caller forever.
+    ///
+    /// Every client method reads a frame the peer is under no obligation to
+    /// send, so each carries its own deadline: what comes back is an ordinary
+    /// transport error, which is what puts a stalled peer on the same footing
+    /// as an unreachable one — dropped, and the next candidate tried.
+    #[tokio::test]
+    async fn a_peer_that_answers_nothing_fails_every_request() {
+        let peer = StalledPeer::bind(ALPN_MPT).await;
+        let dialer = bare_endpoint(ALPN_MPT).await;
+        let connection = dialer.connect(peer.addr.clone(), ALPN_MPT).await.unwrap();
+        let client =
+            MptClient::new(connection).with_deadline(std::time::Duration::from_millis(100));
+
+        let origin = OriginId::named("stalled", "x.example").unwrap();
+        let stalled: Vec<(&str, Result<(), NetError>)> = vec![
+            (
+                "get_nodes",
+                tokio::time::timeout(PATIENCE, client.get_nodes(&[Hash::new(b"n")]))
+                    .await
+                    .expect("get_nodes must not hang")
+                    .map(|_| ()),
+            ),
+            (
+                "get_values",
+                tokio::time::timeout(PATIENCE, client.get_values(&[Hash::new(b"v")]))
+                    .await
+                    .expect("get_values must not hang")
+                    .map(|_| ()),
+            ),
+            (
+                "find_providers",
+                tokio::time::timeout(PATIENCE, client.find_providers(Hash::new(b"o")))
+                    .await
+                    .expect("find_providers must not hang")
+                    .map(|_| ()),
+            ),
+            (
+                "get_bindings",
+                tokio::time::timeout(PATIENCE, client.get_bindings(&origin))
+                    .await
+                    .expect("get_bindings must not hang")
+                    .map(|_| ()),
+            ),
+            (
+                "head_exchange",
+                tokio::time::timeout(
+                    PATIENCE,
+                    client.head_exchange(Vec::new(), |_| (Vec::new(), Vec::new())),
+                )
+                .await
+                .expect("head_exchange must not hang")
+                .map(|_| ()),
+            ),
+        ];
+        for (what, outcome) in stalled {
+            let err = outcome.expect_err(what);
+            assert!(err.to_string().contains("went unanswered"), "{what}: {err}");
         }
+
+        dialer.close().await;
+        peer.shutdown().await;
     }
 }
