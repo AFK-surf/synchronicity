@@ -1342,9 +1342,7 @@ mod tests {
             .unwrap();
         let ad = fetcher.local_ad(&root).unwrap().unwrap();
         assert!(!ad.is_complete());
-        match ad.state {
-            synch_core::AdState { ref spans } => assert_eq!(spans, &vec![(0, g)]),
-        }
+        assert_eq!(ad.state.spans, vec![(0, g)]);
         assert!(ad.intersects(0, 10));
         assert!(!ad.intersects(2 * g, 3 * g));
     }

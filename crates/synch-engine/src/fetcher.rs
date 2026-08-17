@@ -617,9 +617,7 @@ impl Node {
         if round.is_empty() {
             return Ok(());
         }
-        let leftover = self
-            .promote_round(root, size, donors, round, report)
-            .await?;
+        let leftover = self.promote_round(root, donors, round, report).await?;
         if span_level == 0 {
             return Ok(());
         }
@@ -667,8 +665,7 @@ impl Node {
             if round.is_empty() {
                 continue;
             }
-            self.promote_round(root, size, donors, round, report)
-                .await?;
+            self.promote_round(root, donors, round, report).await?;
         }
         Ok(())
     }
@@ -815,7 +812,6 @@ impl Node {
     async fn promote_round(
         &self,
         root: &Hash,
-        size: u64,
         donors: &[Donor],
         proven: Proven,
         report: &mut FetchReport,
@@ -825,7 +821,7 @@ impl Node {
         let donors = donors.to_vec();
         let (leftover, supplied) = crate::blocking::offload(move || {
             let mut proven = proven;
-            let supplied = node.promote_blocking(&root, size, &donors, &mut proven)?;
+            let supplied = node.promote_blocking(&root, &donors, &mut proven)?;
             Ok((proven, supplied))
         })
         .await?;
@@ -843,7 +839,6 @@ impl Node {
     fn promote_blocking(
         &self,
         root: &Hash,
-        size: u64,
         donors: &[Donor],
         proven: &mut Proven,
     ) -> Result<Vec<(Donor, ChunkRanges)>> {
