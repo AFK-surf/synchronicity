@@ -51,6 +51,11 @@ pub struct SimZone {
     /// base64url as [`RekorProof::to_txt`] renders it. Empty is the
     /// not-yet-upgraded control plane.
     pub rekor_txt: Vec<String>,
+    /// Extra DNSKEYs served at the apex after the zone's own key.
+    extra_dnskeys: Vec<DNSKEY>,
+    /// If set, membership (and impersonated) TXT is signed by this instead of
+    /// the zone CSK. Other RRsets stay under `signer`.
+    txt_signer: Option<DnssecSigner>,
     /// A TXT RRset this zone serves at a name it **does not own**, signed by
     /// its own key.
     ///
@@ -97,6 +102,8 @@ impl SimZone {
             ttl: 300,
             unsigned: false,
             rekor_txt: Vec::new(),
+            extra_dnskeys: Vec::new(),
+            txt_signer: None,
             impersonate: None,
         }
     }
@@ -119,6 +126,42 @@ impl SimZone {
     /// The zone key's tag, as an RRSIG names it.
     pub fn key_tag(&self) -> u16 {
         self.dnskey.calculate_key_tag().expect("key tag")
+    }
+
+    /// A second P-256 DNSKEY with the same RFC 4034 key tag, plus a signer
+    /// that will sign as this zone. Caps the search so a flaky RNG cannot
+    /// hang the suite.
+    pub fn colliding_key(&self) -> (DNSKEY, DnssecSigner) {
+        let algorithm = Algorithm::ECDSAP256SHA256;
+        let want = self.key_tag();
+        for _ in 0..1_000_000 {
+            let pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).expect("keygen");
+            let key = EcdsaSigningKey::from_pkcs8(&pkcs8, algorithm).expect("key load");
+            let public = key.to_public_key().expect("public key");
+            let dnskey = DNSKEY::from_key(&public);
+            if dnskey.calculate_key_tag().ok() != Some(want) {
+                continue;
+            }
+            let signer = DnssecSigner::new(
+                dnskey.clone(),
+                Box::new(key),
+                self.origin.clone(),
+                std::time::Duration::from_secs(86_400),
+            );
+            return (dnskey, signer);
+        }
+        panic!("no P-256 key with tag {want} in 1_000_000 draws");
+    }
+
+    /// Serves `dnskey` at the apex after the zone's own key.
+    pub fn add_dnskey(&mut self, dnskey: DNSKEY) {
+        self.extra_dnskeys.push(dnskey);
+    }
+
+    /// Signs membership (and impersonated) TXT with `signer` instead of the
+    /// zone CSK.
+    pub fn sign_txt_with(&mut self, signer: DnssecSigner) {
+        self.txt_signer = Some(signer);
     }
 
     /// The DS field an operator hands a registrar: `<tag> <alg> 2 <sha256
@@ -358,11 +401,23 @@ impl SimZone {
     /// `--dnssec-anchor` reads. Whoever anchors this line trusts this zone —
     /// and nothing signed under the real root.
     pub fn anchor_record(&self) -> String {
-        format!(
+        let mut out = format!(
             "{} IN DNSKEY 257 3 13 {}\n",
             self.origin,
             base64(self.dnskey.public_key().public_bytes())
-        )
+        );
+        // Extra apex keys belong in the same universe: leaving them out
+        // sends hickory looking for a DS this zone does not serve.
+        for dnskey in &self.extra_dnskeys {
+            out.push_str(&format!(
+                "{} IN DNSKEY {} 3 {} {}\n",
+                self.origin,
+                dnskey.flags(),
+                u8::from(dnskey.public_key().algorithm()),
+                base64(dnskey.public_key().public_bytes())
+            ));
+        }
+        out
     }
 
     /// Serves the zone over plaintext RFC 8484 DoH on a loopback port,
@@ -510,6 +565,19 @@ impl SimZone {
                     ),
                     0,
                 );
+                // Extra keys come *after* the zone CSK so a first-match
+                // tag lookup still sees the logged key first — the
+                // colliding-tag attack the client's signer check closes.
+                for dnskey in &self.extra_dnskeys {
+                    set.insert(
+                        Record::from_rdata(
+                            self.origin.clone(),
+                            self.ttl,
+                            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+                        ),
+                        0,
+                    );
+                }
                 set
             }
             _ => return response,
@@ -517,8 +585,20 @@ impl SimZone {
         if !self.unsigned {
             // Inception an hour ago: RRSIG validity has to bracket "now".
             let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+            let qname = query.name();
+            let membership_txt = query.query_type() == RecordType::TXT
+                && (*qname == self.txt_name()
+                    || self
+                        .impersonate
+                        .as_ref()
+                        .is_some_and(|(owner, _)| owner == qname));
+            let signer = if membership_txt {
+                self.txt_signer.as_ref().unwrap_or(&self.signer)
+            } else {
+                &self.signer
+            };
             let rrsig =
-                RRSIG::from_rrset(&set, DNSClass::IN, inception, &self.signer).expect("sign rrset");
+                RRSIG::from_rrset(&set, DNSClass::IN, inception, signer).expect("sign rrset");
             set.insert_rrsig(Record::from_rdata(
                 set.name().clone(),
                 self.ttl,

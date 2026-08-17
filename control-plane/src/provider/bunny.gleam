@@ -5,8 +5,10 @@
 //// record id. Two impedance points this leg absorbs:
 ////
 ////   - names are **relative** to the zone in Bunny's model (`""` for the
-////     apex itself), so the leg converts against the apex both ways and
-////     the rest of the reconciler only ever sees fully qualified names;
+////     hosted signing zone), so the leg converts against the signing
+////     zone both ways and the rest of the reconciler only ever sees
+////     fully qualified names. Listing still keeps only names strictly
+////     below the apex this deployment owns;
 ////   - record types are numeric — TXT is 3 — and this leg lists nothing
 ////     else, so a record of another type below the apex never reaches the
 ////     diff. That is the scope rule working structurally: this leg cannot
@@ -43,18 +45,21 @@ pub fn connect(
   zone_id: String,
   api_url: String,
   apex: String,
+  signing_zone: String,
 ) -> Result(Provider, String) {
   let base = case api_url {
     "" -> real_api
     url -> strip_slash(url)
   }
   use zone_id <- result.try(case zone_id {
-    "" -> discover_zone(base, api_key, apex)
+    "" -> discover_zone(base, api_key, signing_zone)
     id -> Ok(id)
   })
   Ok(Provider(
-    list: fn() { list_records(base, api_key, zone_id, apex) },
-    apply: fn(changes) { apply_changes(base, api_key, zone_id, apex, changes) },
+    list: fn() { list_records(base, api_key, zone_id, apex, signing_zone) },
+    apply: fn(changes) {
+      apply_changes(base, api_key, zone_id, signing_zone, changes)
+    },
     describe: "bunny zone " <> zone_id,
   ))
 }
@@ -62,7 +67,7 @@ pub fn connect(
 fn discover_zone(
   base: String,
   key: String,
-  apex: String,
+  signing_zone: String,
 ) -> Result(String, String) {
   let decoder = {
     use items <- decode.subfield(
@@ -76,14 +81,14 @@ fn discover_zone(
     decode.success(items)
   }
   use items <- result.try(get_json(
-    base <> "/dnszone?search=" <> apex,
+    base <> "/dnszone?search=" <> signing_zone,
     key,
     decoder,
   ))
-  case list.filter(items, fn(item) { item.1 == apex }) {
+  case list.filter(items, fn(item) { item.1 == signing_zone }) {
     [#(id, _)] -> Ok(int.to_string(id))
-    [] -> Error("bunny has no zone named " <> apex)
-    _ -> Error("bunny has more than one zone named " <> apex)
+    [] -> Error("bunny has no zone named " <> signing_zone)
+    _ -> Error("bunny has more than one zone named " <> signing_zone)
   }
 }
 
@@ -92,6 +97,7 @@ fn list_records(
   key: String,
   zone_id: String,
   apex: String,
+  signing_zone: String,
 ) -> Result(List(Existing), String) {
   let decoder = {
     use records <- decode.subfield(
@@ -114,7 +120,7 @@ fn list_records(
     let #(id, _, name, value, ttl) = row
     Existing(
       int.to_string(id),
-      Record(qualify(name, apex), provider.Txt, ttl, value),
+      Record(qualify(name, signing_zone), provider.Txt, ttl, value),
     )
   })
   // The whole zone came back; scope discipline is enforced here, so the
@@ -130,7 +136,7 @@ fn apply_changes(
   base: String,
   key: String,
   zone_id: String,
-  apex: String,
+  signing_zone: String,
   changes: provider.Changes,
 ) -> Result(provider.Applied, String) {
   let records = base <> "/dnszone/" <> zone_id <> "/records"
@@ -139,7 +145,7 @@ fn apply_changes(
     |> list.map(fn(record) {
       #(
         record.name,
-        send_json(http.Put, records, key, record_body(record, apex)),
+        send_json(http.Put, records, key, record_body(record, signing_zone)),
       )
     })
   let replaced =
@@ -152,7 +158,7 @@ fn apply_changes(
           http.Post,
           records <> "/" <> existing.id,
           key,
-          record_body(record, apex),
+          record_body(record, signing_zone),
         ),
       )
     })
@@ -167,34 +173,37 @@ fn apply_changes(
   Ok(provider.tally(list.flatten([created, replaced, deleted])))
 }
 
-fn record_body(record: provider.Record, apex: String) -> String {
+fn record_body(record: provider.Record, signing_zone: String) -> String {
   json.to_string(
     json.object([
       #("Type", json.int(txt_type)),
-      #("Name", json.string(relativize(record.name, apex))),
+      #("Name", json.string(relativize(record.name, signing_zone))),
       #("Value", json.string(record.value)),
       #("Ttl", json.int(record.ttl)),
     ]),
   )
 }
 
-/// Bunny's relative name for a fully qualified one: `""` at the apex.
-pub fn relativize(name: String, apex: String) -> String {
-  case name == apex {
+/// Bunny's relative name for a fully qualified one: `""` at the signing
+/// zone. A record under a deeper apex
+/// (`_synchronicity-rekor.sync.example.com` against `example.com`) keeps
+/// the labels between them.
+pub fn relativize(name: String, signing_zone: String) -> String {
+  case name == signing_zone {
     True -> ""
     False ->
-      case string.ends_with(name, "." <> apex) {
-        True -> string.drop_end(name, string.length(apex) + 1)
+      case string.ends_with(name, "." <> signing_zone) {
+        True -> string.drop_end(name, string.length(signing_zone) + 1)
         False -> name
       }
   }
 }
 
-/// And back.
-pub fn qualify(name: String, apex: String) -> String {
+/// And back: qualify(relativize(fqdn, signing_zone), signing_zone) is fqdn.
+pub fn qualify(name: String, signing_zone: String) -> String {
   case name {
-    "" -> apex
-    _ -> name <> "." <> apex
+    "" -> signing_zone
+    _ -> name <> "." <> signing_zone
   }
 }
 

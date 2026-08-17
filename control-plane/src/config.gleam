@@ -32,9 +32,10 @@ pub type DnsMode {
   /// `signing_zone` is the DNS zone the provider actually hosts, which need
   /// not be the apex: a control plane at `sync.example.com` may live
   /// entirely inside the `example.com` zone, with no delegation of its own.
-  /// The zone's own keys sign every record under it, so that zone — not the
-  /// apex — is where the proof records go and where a chain's ladder starts.
-  /// Equal to the apex unless `CP_SIGNING_ZONE` says otherwise.
+  /// That zone — not the apex — is where DNSKEY and RRSIGs live, and where
+  /// a chain's ladder starts. Proof records still live at the apex (the
+  /// membership `apex=` field). Equal to the apex unless `CP_SIGNING_ZONE`
+  /// says otherwise.
   External(provider: ProviderConfig, signing_zone: String)
 }
 

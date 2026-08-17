@@ -285,10 +285,28 @@ pub fn record_observed(
   })
 }
 
-/// Stamps every currently observed key as covered by a logged claim.
-pub fn record_logged(conn: Connection, now: Int) -> Result(Nil, sqlite.Error) {
-  sqlite.exec(conn, "UPDATE observed_zone_keys SET logged_at = ?", [VInt(now)])
-  |> result.replace(Nil)
+/// Stamps only the observed keys whose rdata digest is in `key_sha256s`.
+/// Extra keys stay unlogged so the next watch tick retries them.
+pub fn record_logged(
+  conn: Connection,
+  key_sha256s: List(BitArray),
+  now: Int,
+) -> Result(Nil, sqlite.Error) {
+  case key_sha256s {
+    [] -> Ok(Nil)
+    _ -> {
+      let placeholders =
+        key_sha256s |> list.map(fn(_) { "?" }) |> string_join(",")
+      sqlite.exec(
+        conn,
+        "UPDATE observed_zone_keys SET logged_at = ? WHERE key_sha256 IN ("
+          <> placeholders
+          <> ")",
+        [VInt(now), ..list.map(key_sha256s, Blob)],
+      )
+      |> result.replace(Nil)
+    }
+  }
 }
 
 fn optional_int(value: sqlite.Value) -> Option(Int) {

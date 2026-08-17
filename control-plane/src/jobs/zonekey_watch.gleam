@@ -45,6 +45,7 @@ import provider/state
 import rekor/chain
 import rekor/client.{type Log}
 import rekor/publish as rekor
+import rekor/store as rekor_store
 import store/db
 import store/sqlite.{type Connection}
 
@@ -56,8 +57,24 @@ fn now_unix() -> Int
 /// silently widen the window a rotation can strand clients for.
 const watch_interval_ms = 300_000
 
+/// How soon to look again when the declaration is not on the wire yet.
+/// The reconciler and this watcher both start at boot; five minutes is
+/// the wrong wait for a record the other half publishes in seconds.
+const declaration_retry_ms = 30_000
+
 pub type Msg {
   Tick
+}
+
+/// What one look at the wire decided, so `handle` can pick the next wait
+/// and whether to poke the reconciler.
+pub type WatchResult {
+  /// A new claim was logged.
+  Logged
+  /// The declaration is not published yet — try again soon.
+  WaitingForDeclaration
+  /// Nothing to do, or a failure already logged.
+  Quiet
 }
 
 type State {
@@ -102,8 +119,11 @@ pub fn supervised(
 
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   let Tick = msg
-  case db.open_primary(state.db_path) {
-    Error(_) -> io.println_error("zonekey-watch: database unavailable")
+  let result = case db.open_primary(state.db_path) {
+    Error(_) -> {
+      io.println_error("zonekey-watch: database unavailable")
+      Quiet
+    }
     Ok(conn) -> {
       let now = now_unix()
       // The log is resolved on every tick rather than captured at boot: this
@@ -111,10 +131,10 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // shard should cost a TUF refresh, not a restart. Failing to resolve
       // is a log line like every other failure here — the claim already in
       // the zone keeps verifying while it is unresolvable.
-      let poked = case client.discover(conn, now) {
+      let result = case client.discover(conn, now) {
         Error(why) -> {
           io.println_error("zonekey-watch: no transparency log: " <> why)
-          False
+          Quiet
         }
         Ok(target) ->
           run_once_with(
@@ -128,18 +148,22 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           )
       }
       sqlite.close(conn)
-      case poked {
-        True -> provider_sync.poke(state.reconciler)
-        False -> Nil
-      }
+      result
     }
   }
-  let _ = process.send_after(state.subject, watch_interval_ms, Tick)
+  case result {
+    Logged -> provider_sync.poke(state.reconciler)
+    WaitingForDeclaration | Quiet -> Nil
+  }
+  let next_ms = case result {
+    WaitingForDeclaration -> declaration_retry_ms
+    Logged | Quiet -> watch_interval_ms
+  }
+  let _ = process.send_after(state.subject, next_ms, Tick)
   actor.continue(state)
 }
 
-/// One look at the wire; exposed for tests and the CLI. Returns whether a
-/// new claim was logged — the caller's cue to poke the reconciler.
+/// One look at the wire; exposed for tests and the CLI.
 pub fn run_once_with(
   conn: Connection,
   apex: dns_name.Name,
@@ -148,7 +172,7 @@ pub fn run_once_with(
   log: Log,
   log_key: #(BitArray, BitArray),
   now: Int,
-) -> Bool {
+) -> WatchResult {
   // The chain's bottom link is the declaration, and the reconciler is what
   // puts it in the provider zone. Both actors start at boot, so on a first
   // boot this one can reach the log before that record exists — and then
@@ -164,11 +188,11 @@ pub fn run_once_with(
         <> dns_name.to_string([rdata.transparency_label, ..apex])
         <> " to be published",
       )
-      False
+      WaitingForDeclaration
     }
     Error(why) -> {
       io.println_error("zonekey-watch: declaration lookup failed: " <> why)
-      False
+      Quiet
     }
   }
 }
@@ -200,11 +224,11 @@ fn log_if_new(
   log: Log,
   log_key: #(BitArray, BitArray),
   now: Int,
-) -> Bool {
+) -> WatchResult {
   case observe(resolver, signing_zone) {
     Error(why) -> {
       io.println_error("zonekey-watch: " <> why)
-      False
+      Quiet
     }
     Ok(observed) -> {
       let covered = case state.observed_keys(conn) {
@@ -215,7 +239,7 @@ fn log_if_new(
       }
       let _ = state.record_observed(conn, observed, now)
       case covered {
-        True -> False
+        True -> Quiet
         False ->
           case
             rekor.run(
@@ -230,7 +254,7 @@ fn log_if_new(
             )
           {
             Ok(outcome) -> {
-              let _ = state.record_logged(conn, now)
+              let _ = stamp_covered(conn, now)
               io.println(
                 "zonekey-watch: logged key set "
                 <> string.join(list.map(outcome.key_tags, int.to_string), ",")
@@ -240,18 +264,33 @@ fn log_if_new(
                 <> int.to_string(outcome.log_index)
                 <> ")",
               )
-              True
+              Logged
             }
             Error(e) -> {
               io.println_error(
                 "zonekey-watch: logging failed: " <> string.inspect(e),
               )
-              False
+              Quiet
             }
           }
       }
     }
   }
+}
+
+/// Stamps only keys a verified non-retire row actually covers. Observe and
+/// collect are two DNSKEY queries; extra keys the first saw stay unlogged
+/// so the next tick retries.
+fn stamp_covered(conn: Connection, now: Int) -> Result(Nil, sqlite.Error) {
+  use observed <- result.try(state.observed_keys(conn))
+  let digests =
+    list.filter_map(observed, fn(key) {
+      case rekor_store.covered(conn, key.key_sha256) {
+        Ok(True) -> Ok(key.key_sha256)
+        _ -> Error(Nil)
+      }
+    })
+  state.record_logged(conn, digests, now)
 }
 
 /// The apex DNSKEY RRset as `#(sha256, tag, rdata)` per key, or why not.

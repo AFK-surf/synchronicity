@@ -162,7 +162,7 @@ in honestly rather than cleverly.
 ```
 Certificate (self-signed, ECDSA P-256/SHA-256)
   subject = issuer   CN = synchronicity zone key
-  SPKI               the zone CSK
+  SPKI               the ephemeral entry signer
   basicConstraints   CA:FALSE            critical
   keyUsage           digitalSignature    critical
   subjectAltName     dNSName = <apex>    non-critical
@@ -627,9 +627,9 @@ belongs.
 | `CP_REKOR_URL` | primary | Rekor v2 write endpoint (`POST /api/v2/log/entries`). No default: absent, the shard in service is read from the stored `trusted_root.json` (§10.6). |
 | `CP_REKOR_KEY` | primary | Optional file pinning a self-hosted log's verification key. Absent, the key is the one the trusted root names beside the endpoint — one key, not the client's whole pinned set, because this side submits to exactly one log and verifies what that log returns. Redirecting `CP_REKOR_URL` to a log the trusted root does not name, without naming the matching key here, is refused up front rather than storing something clients would reject. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
-| `CP_REKOR_REQUIRE` | primary | `true` arms the publish gate of §5.3. Off by default, because the rollout publishes before it enforces (§7). |
+| `CP_REKOR_REQUIRE` | primary | `true` arms the publish gate of §5.3. Off by default, because the rollout publishes before it enforces (§7). Serve mode refuses the zone; external mode still publishes the declaration, owner marker and proofs so the watcher can log, and omits membership TXT until a verified record exists. |
 | `CP_TUF_URL` | primary | The Sigstore TUF repository this service follows to find the log shard in service (§10.3). Default `https://tuf-repo-cdn.sigstore.dev`. |
-| `CP_SIGNING_ZONE` | primary, external only | The DNS zone the provider actually hosts, when it is not the apex — a control plane at `sync.example.com` served out of `example.com` sets it to `example.com`. Defaults to `CP_BASE_DOMAIN`, and must be a name that *contains* it; boot refuses anything else, and refuses the variable outright in serve mode, where this service is the authoritative nameserver for its own apex and the two are the same by construction. It decides where the proof records go and where a chain's ladder starts (§2). |
+| `CP_SIGNING_ZONE` | primary, external only | The DNS zone the provider actually hosts, when it is not the apex — a control plane at `sync.example.com` served out of `example.com` sets it to `example.com`. Defaults to `CP_BASE_DOMAIN`, and must be a name that *contains* it; boot refuses anything else, and refuses the variable outright in serve mode, where this service is the authoritative nameserver for its own apex and the two are the same by construction. It decides where a chain's ladder starts; proof records still live at the apex (§2). |
 
 Every one of these is read at its use site rather than through boot
 configuration, so `rekor-publish` sees the same values a
@@ -869,12 +869,14 @@ to the leaf the tiles already commit to, confirmed again by an audit path run
 through the client's own RFC 6962 walk.
 
 **SAN indexing.** Every leaf that parses as a `hashedrekord` with a
-certificate verifier is indexed by the single `dNSName` SAN inside it. For a
-watched apex the monitor then derives, **from the certificate's
-SubjectPublicKeyInfo alone**, the DNSKEY rdata (flags 257, protocol 3,
-algorithm 13), the RFC 4034 key tag, and the DS the registrar would have to
-show. No DNS query anywhere: the threat model has a compromised DNS provider
-in it, so a monitor that asked DNS what the zone's key is would be asking the
+certificate verifier is indexed by the single `dNSName` SAN inside it.
+`classify` then runs `chain::authorize` against the certificate's embedded
+chain and the trust anchors in force, and takes the **proven DNSKEY RRset**
+as the authorized keys — their tags and the DS a parent would show are
+derived from those rdatas, never from the certificate's
+SubjectPublicKeyInfo (that key is the ephemeral entry signer). No DNS
+query anywhere: the threat model has a compromised DNS provider in it, so
+a monitor that asked DNS what the zone's key is would be asking the
 attacker.
 
 **Offline chain validation.** The carried chain is validated against the IANA
@@ -943,7 +945,7 @@ quietly stop being tested.
 **Reporting once, not forever.** `KnownKeys` is the monitor's memory: the keys
 already reported for an apex. A tier A entry whose
 key is not recorded for that apex is a **new authorization** — it goes to
-stdout with the apex, key tag, expected DS, SPKI digest and log index, and is
+stdout with the apex, key tag, expected DS, key digest and log index, and is
 then recorded so the next run stays quiet. A tier A entry for a key already
 recorded is silent. The apexes are also the watch list: an apex with an empty
 key list says "tell me about this zone, I have accounted for nothing yet",

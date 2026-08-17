@@ -284,8 +284,8 @@ fn serve() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
   case cfg.role, cfg.dns_mode {
     Primary, config.Serve -> serve_primary(cfg)
-    Primary, config.External(provider_cfg, _) ->
-      serve_external(cfg, provider_cfg)
+    Primary, config.External(provider_cfg, signing_zone) ->
+      serve_external(cfg, provider_cfg, signing_zone)
     // config.load refuses external on a replica, so this arm is serve mode.
     Replica, _ -> serve_replica(cfg)
   }
@@ -474,6 +474,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
 fn serve_external(
   cfg: Config,
   provider_cfg: config.ProviderConfig,
+  signing_zone_name: String,
 ) -> Result(Nil, String) {
   use apex <- result.try(
     name.parse(cfg.base_domain) |> result.replace_error("bad base domain"),
@@ -492,6 +493,7 @@ fn serve_external(
   use #(prov, provider_name, zone_id) <- result.try(connect_provider(
     provider_cfg,
     cfg.base_domain,
+    signing_zone_name,
   ))
   io.println("dns provider: " <> prov.describe)
 
@@ -565,19 +567,33 @@ fn serve_external(
   Ok(Nil)
 }
 
-/// Builds the configured provider leg, discovering the zone id where the
-/// configuration left it to be discovered.
+/// Builds the configured provider leg. Discovery and Bunny's relative
+/// names use the **signing zone** — the provider-hosted zone. Listing
+/// still scopes to names strictly below the apex this deployment owns.
 fn connect_provider(
   provider_cfg: config.ProviderConfig,
   apex: String,
+  signing_zone: String,
 ) -> Result(#(provider.Provider, String, String), String) {
   case provider_cfg {
     config.Cloudflare(token, zone_id, api_url) -> {
-      use prov <- result.try(cloudflare.connect(token, zone_id, api_url, apex))
+      use prov <- result.try(cloudflare.connect(
+        token,
+        zone_id,
+        api_url,
+        apex,
+        signing_zone,
+      ))
       Ok(#(prov, "cloudflare", describe_zone(prov.describe)))
     }
     config.Bunny(key, zone_id, api_url) -> {
-      use prov <- result.try(bunny.connect(key, zone_id, api_url, apex))
+      use prov <- result.try(bunny.connect(
+        key,
+        zone_id,
+        api_url,
+        apex,
+        signing_zone,
+      ))
       Ok(#(prov, "bunny", describe_zone(prov.describe)))
     }
     config.LogOnly -> Ok(#(provider.log_only(), "log-only", ""))
@@ -596,13 +612,15 @@ fn describe_zone(describe: String) -> String {
 /// What an operator runs at cutover instead of waiting for the sweep.
 fn provider_sync_once() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
-  use provider_cfg <- result.try(case cfg.dns_mode {
-    config.External(provider_cfg, _) -> Ok(provider_cfg)
+  use #(provider_cfg, signing_zone) <- result.try(case cfg.dns_mode {
+    config.External(provider_cfg, signing_zone) ->
+      Ok(#(provider_cfg, signing_zone))
     config.Serve -> Error("provider-sync needs CP_DNS_MODE=external")
   })
   use #(prov, provider_name, zone_id) <- result.try(connect_provider(
     provider_cfg,
     cfg.base_domain,
+    signing_zone,
   ))
   io.println("dns provider: " <> prov.describe)
   provider_sync.run_once(cfg.db_path, prov, provider_name, zone_id)
