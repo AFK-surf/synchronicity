@@ -41,6 +41,23 @@ pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 /// one group at a time.
 pub const MAX_SLICE_GROUPS: u64 = 512;
 
+/// The most interior tree nodes one proof exchange carries — 512 KiB of hashes.
+///
+/// A proof is a slice with the payload left out, and it is bounded for the same
+/// reason (§12): it is built in memory and travels in one frame, so the size of
+/// the provider's allocation must not be the requester's to choose. Unlike a
+/// slice, though, a proof cannot be bounded by group count alone — the whole
+/// point of the span-level round is that one exchange describes a very large
+/// range very cheaply, and clamping it to [`MAX_SLICE_GROUPS`] groups would
+/// turn the 381 KB descent of a 100 GB object into twelve thousand round trips
+/// (`docs/DELTA-SYNC.md` §3.3). Nodes are what a proof costs, so nodes are what
+/// it is counted in: this ceiling covers a 100 GB object's span-level round in
+/// a single exchange, and `ProofEnd` reports where anything larger stopped.
+pub const MAX_PROOF_NODES: u64 = 8192;
+
+/// The wire size of one proof node: a pair of 32-byte chaining values.
+pub const PROOF_NODE_LEN: usize = 64;
+
 /// The most ranges one [`ChunkRanges`] may carry across the wire.
 ///
 /// Set operations are quadratic in the number of ranges, so a request built
@@ -221,6 +238,34 @@ impl ChunkRanges {
             .any(|r| r.start <= group && group < r.end)
     }
 
+    /// True if any part of `[start, end)` is covered.
+    ///
+    /// The question a tree descent asks at every node it considers, which is
+    /// why it is answered by a binary search over the (sorted, disjoint) ranges
+    /// rather than by building an intersection: a proof walk visits thousands
+    /// of nodes and a set that may carry thousands of ranges, and the quadratic
+    /// version of that is a denial of service with extra steps (§12).
+    pub fn overlaps(&self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+        // The first range that could reach `start` is the first whose end is
+        // past it; everything before that lies entirely to the left.
+        let index = self.ranges.partition_point(|r| r.end <= start);
+        self.ranges.get(index).is_some_and(|r| r.start < end)
+    }
+
+    /// True if the whole of `[start, end)` is covered.
+    pub fn covers(&self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return true;
+        }
+        let index = self.ranges.partition_point(|r| r.end <= start);
+        self.ranges
+            .get(index)
+            .is_some_and(|r| r.start <= start && end <= r.end)
+    }
+
     /// The intersection of two sets.
     pub fn intersect(&self, other: &ChunkRanges) -> ChunkRanges {
         let mut out = Vec::new();
@@ -302,8 +347,8 @@ impl ChunkRanges {
 
 /// A message on the `sync/blob/1` ALPN (§6.4).
 ///
-/// The blob ALPN carries nothing but these two messages plus the raw bao slice
-/// bytes (§5.3).
+/// The blob ALPN carries nothing but these messages plus the raw bao slice and
+/// proof bytes (§5.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobMessage {
     /// Request a verified bao slice.
@@ -316,6 +361,40 @@ pub enum BlobMessage {
     /// Terminates a slice response with what the provider actually had.
     SliceEnd {
         /// The ranges actually served.
+        served: ChunkRanges,
+    },
+    /// Request the tree over a range without its bytes
+    /// (`docs/DELTA-SYNC.md` §3.1).
+    ///
+    /// The response is the interior hash pairs on the paths from the root to
+    /// `ranges`, in pre-order, descending no deeper than `level` — which is
+    /// exactly a bao slice with the payload left out. It is what lets a
+    /// requester ask "what does the new version's tree look like here?" without
+    /// paying for the bytes it may well already have: the answer is 64 bytes
+    /// per node rather than 16 KiB per group.
+    ///
+    /// `level` is in chunk-group units: `level = n` stops at subtrees of `2^n`
+    /// groups, so `level = 0` yields the chaining value of every leaf group and
+    /// [`AD_SPAN_LEVEL`](crate::AD_SPAN_LEVEL) yields one per ad span.
+    ///
+    /// Appended after [`BlobMessage::SliceEnd`] rather than beside `GetSlice`:
+    /// postcard numbers variants by position, so a new variant may only ever go
+    /// on the end.
+    GetProof {
+        /// The object root.
+        root: Hash,
+        /// The ranges whose tree is wanted, in 16 KiB group units.
+        ranges: ChunkRanges,
+        /// How deep to descend, in group units.
+        level: u8,
+    },
+    /// Terminates a proof response with the ranges it actually covers.
+    ///
+    /// A proof for a large range can run past [`MAX_PROOF_NODES`]; `served` is
+    /// how the requester learns where the answer stopped, and where its next
+    /// request starts — the same shape as [`BlobMessage::SliceEnd`] (§6.4).
+    ProofEnd {
+        /// The ranges the proof covers.
         served: ChunkRanges,
     },
 }
@@ -390,6 +469,14 @@ mod tests {
             BlobMessage::SliceEnd {
                 served: ChunkRanges::single(0, 2),
             },
+            BlobMessage::GetProof {
+                root: Hash::new(b"o"),
+                ranges: ChunkRanges::single(0, 4096),
+                level: 10,
+            },
+            BlobMessage::ProofEnd {
+                served: ChunkRanges::single(0, 1024),
+            },
         ] {
             let bytes = postcard::to_stdvec(&m).unwrap();
             assert_eq!(postcard::from_bytes::<BlobMessage>(&bytes).unwrap(), m);
@@ -440,5 +527,26 @@ mod tests {
         assert_eq!(a.union(&b).ranges, vec![GroupRange::new(0, 20)]);
         assert!(a.difference(&a).is_empty());
         assert!(ChunkRanges::empty().is_empty());
+    }
+
+    #[test]
+    fn overlap_and_coverage_answer_without_building_a_set() {
+        let r = ChunkRanges::from_ranges([GroupRange::new(2, 5), GroupRange::new(10, 20)]);
+        assert!(r.overlaps(0, 3));
+        assert!(
+            r.overlaps(4, 12),
+            "a window spanning the gap still overlaps"
+        );
+        assert!(r.overlaps(19, 100));
+        assert!(!r.overlaps(5, 10), "the gap itself does not");
+        assert!(!r.overlaps(20, 21));
+        assert!(!r.overlaps(7, 7), "an empty window overlaps nothing");
+
+        assert!(r.covers(2, 5));
+        assert!(r.covers(11, 12));
+        assert!(!r.covers(4, 11), "coverage is not satisfied across a gap");
+        assert!(!r.covers(0, 3));
+        assert!(r.covers(9, 9), "an empty window is covered by anything");
+        assert!(!ChunkRanges::empty().overlaps(0, u64::MAX));
     }
 }

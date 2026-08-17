@@ -51,6 +51,10 @@ struct NodeInner {
     /// The batch between staging and one signed root (§7.1).
     publisher: Publisher,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
+    /// What the last mirror pass wrote at each target path, so a pass can tell
+    /// "this file is not current" from "this file is not current *and I am the
+    /// one who just wrote it*" (`docs/DELTA-SYNC.md` §3.5, §6).
+    mirror_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, MirrorWrite>>,
     /// When each configured membership domain is next due for re-resolution,
     /// and when it was last attempted (§3.2, §3.4).
     dns: std::sync::Mutex<std::collections::HashMap<String, crate::membership::DomainSchedule>>,
@@ -60,6 +64,20 @@ struct NodeInner {
     /// Rung when a space is added or removed, so the watcher re-registers
     /// without waiting for the next filesystem hint (§7.1).
     spaces_changed: Arc<tokio::sync::Notify>,
+}
+
+/// What one mirror pass materialized at one target, and out of what.
+///
+/// See [`Node::note_mirror_write`] for why a pass remembers this at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MirrorWrite {
+    /// The content root that was written.
+    pub(crate) content: Hash,
+    /// The CAS payload's length and modification time when it was written — a
+    /// cheap identity for "the same bytes as last time", never a hash of them.
+    /// `None` for an object small enough to live in the index (§6.2), which has
+    /// no payload file to stat.
+    pub(crate) payload: Option<(u64, i64)>,
 }
 
 /// What `init` created.
@@ -214,6 +232,7 @@ impl Node {
                 config,
                 publisher,
                 ad_clock: std::sync::Mutex::new(Default::default()),
+                mirror_writes: std::sync::Mutex::new(Default::default()),
                 dns: std::sync::Mutex::new(Default::default()),
                 dns_wake,
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
@@ -660,6 +679,64 @@ impl Node {
         };
         let bytes = postcard::to_stdvec(&ad).map_err(|e| EngineError::Record(e.to_string()))?;
         Ok(Some((blob_key(root), Some(bytes))))
+    }
+
+    /// Records what a mirror pass materialized at `target`
+    /// (`docs/DELTA-SYNC.md` §3.5).
+    ///
+    /// The mirror's currency check hashes the file it finds and rewrites it when
+    /// the hash is wrong, which converges on every ordinary cause of a wrong
+    /// hash — a truncated write, a user's edit, a version this pass replaced.
+    /// It does not converge on one: a CAS payload that rotted at rest. The
+    /// object is complete and verified as far as the index is concerned, so
+    /// nothing refetches it; materialization clones it without re-reading it,
+    /// which is the settled trust posture (§2.1); and the pass after this one
+    /// hashes the file, finds the same wrong answer, and writes the same wrong
+    /// bytes again, reporting `written` forever.
+    ///
+    /// So a pass remembers what it wrote where, and which payload it wrote it
+    /// from. When the next one is about to write the *same* content root, from
+    /// the *same* payload, over a file that still does not hash to it, the
+    /// payload — not the file — is the thing at fault, and the path is reported
+    /// instead of rewritten ([`Node::mirror_write_was`]).
+    ///
+    /// Two limits, both deliberate:
+    ///
+    /// - **In memory, per process.** This is a hint about the immediately
+    ///   preceding pass, not a durable quarantine. A restart forgets it and the
+    ///   next pass writes once more before noticing again, which costs one
+    ///   rewrite and keeps the store free of a "suspect object" record that
+    ///   nothing would ever be able to clear.
+    /// - **The payload is identified by length and mtime, not by hash.** Reading
+    ///   the object back to identify it is exactly the scrubbing §2.1 refuses.
+    ///   A stat is enough for the job it has: noticing that the payload has been
+    ///   *replaced* — by `synch blob rm` and a refetch, a restore, a filesystem
+    ///   repair — so that the suspicion clears and the mirror converges on the
+    ///   very next pass. A payload rewritten with the same length and the same
+    ///   mtime is indistinguishable from the old one here, and stays suspect
+    ///   until the daemon restarts.
+    pub(crate) fn note_mirror_write(&self, target: &Path, write: MirrorWrite) {
+        self.mirror_writes().insert(target.to_path_buf(), write);
+    }
+
+    /// What the previous pass wrote at `target`, if this process wrote anything.
+    pub(crate) fn mirror_write_was(&self, target: &Path) -> Option<MirrorWrite> {
+        self.mirror_writes().get(target).copied()
+    }
+
+    /// Forgets what was written at `target` — called when the file turns out to
+    /// be current, which is the evidence that whatever was written landed.
+    pub(crate) fn forget_mirror_write(&self, target: &Path) {
+        self.mirror_writes().remove(target);
+    }
+
+    fn mirror_writes(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<PathBuf, MirrorWrite>> {
+        self.inner
+            .mirror_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether an object's advertisement is due for a milestone update (§6.3).

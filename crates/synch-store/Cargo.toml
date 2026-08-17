@@ -22,6 +22,11 @@ synch-mpt.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# `copy_file_range`, which shares extents rather than copying them wherever the
+# CAS lives on a filesystem that can (`docs/DELTA-SYNC.md` §3.4).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true

@@ -42,7 +42,7 @@ static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Flushes a file's contents to stable storage. A blob row is only ever written
 /// after this returns, so a crash cannot leave a `complete=1` index row whose
 /// bytes never reached the disk (§6.2 durability).
-fn fsync_file(file: &File) -> Result<()> {
+pub(crate) fn fsync_file(file: &File) -> Result<()> {
     file.sync_all()?;
     Ok(())
 }
@@ -119,6 +119,117 @@ impl BlobRow {
     }
 }
 
+/// True if the groups on this disk actually attest to a recorded size.
+///
+/// Only the last group can. Every other group's chaining value is the same
+/// whatever the object's total length, so holding the first half of an object
+/// says a great deal about its content and nothing at all about where it ends;
+/// the final group is short by exactly the amount the size determines, and is
+/// the one place a wrong size cannot survive.
+///
+/// This is what keeps a peer from bricking a root. An object's tree has the same
+/// shape for every size inside its last 16 KiB **group** — the group is this
+/// store's leaf, and nothing above it moves while the group count stays put — so
+/// an entry that overstates an honest root by a few bytes yields a proof that
+/// verifies, and the row it creates would then refuse every honest writer of
+/// that root forever with "size mismatch", on every node that ever touched the
+/// poisoned path, with nothing to collect the row because the honest entry still
+/// references it. A size no group attests to is a claim, not a fact, and the
+/// next writer's claim replaces it (§5.1, §6.2).
+///
+/// Taken as three loose values rather than off a [`BlobRow`] so that the commit
+/// path can ask the question of a row it read *inside* its own transaction.
+fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
+    complete || held.contains(group_count(size) - 1)
+}
+
+/// Decides the size an object's row should record when a writer arrives
+/// claiming `claimed`, or refuses the writer.
+///
+/// Three answers, and the order matters:
+///
+/// 1. A size the disk attests to ([`size_is_attested`]) is a fact, and a writer
+///    offering a different one is offering bytes for some other object: refused.
+/// 2. A size no group attests to is a peer's claim off an entry, and yields to
+///    this writer's — that is what keeps an overstated entry from bricking an
+///    honest root forever (§5.1, §6.2).
+/// 3. But it yields only as far as the last group. A size that changes the
+///    object's *group count* changes the shape of its tree, and every bit
+///    already in the bitmap was set by a write that verified against this root
+///    under the shape it had. Adopting a count those bits do not fit would
+///    leave the row advertising groups whose bytes are somewhere else — or,
+///    worse, let the payload be truncated to fit a length nobody has proved.
+///    A row holding nothing has no bits to contradict, so it takes any claim.
+///
+/// The decision belongs inside the transaction that writes the row. Read
+/// outside it, rule 1 is a check against a snapshot: an honest writer finishing
+/// an object could see "not attested yet", and a claim of a different size
+/// could land between the look and the commit, leaving the row complete under a
+/// size no byte on the disk supports — attested from then on, unreadable, and
+/// refusing every honest writer for good (`docs/DELTA-SYNC.md` §6).
+pub(crate) fn settle_size(
+    root: &Hash,
+    existing: Option<(u64, bool, &ChunkRanges)>,
+    claimed: u64,
+) -> Result<u64> {
+    let Some((recorded, complete, held)) = existing else {
+        return Ok(claimed);
+    };
+    if recorded == claimed {
+        return Ok(recorded);
+    }
+    let refuse = |reason: String| StoreError::Verification {
+        root: *root,
+        reason,
+    };
+    if size_is_attested(recorded, complete, held) {
+        return Err(refuse(format!(
+            "size mismatch: have {recorded}, offered {claimed}"
+        )));
+    }
+    if held.is_empty() || group_count(claimed) == group_count(recorded) {
+        return Ok(claimed);
+    }
+    Err(refuse(format!(
+        "size mismatch: {claimed} bytes is {} chunk groups, and {} groups of this \
+         object are already held under a {}-group tree",
+        group_count(claimed),
+        held.count(),
+        group_count(recorded)
+    )))
+}
+
+/// What a bitmap commit settled.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Commit {
+    /// The size the row records now the claim has met what was there.
+    pub(crate) size: u64,
+    /// True if every group of the object is present.
+    pub(crate) complete: bool,
+}
+
+/// What an object's row already claims, as the commit path needs it.
+struct RowClaim {
+    size: u64,
+    complete: bool,
+    held: ChunkRanges,
+}
+
+/// Extends a file to at least `len`, and never shortens it.
+///
+/// A `set_len` down is destructive, and until a decode has run the size a
+/// writer arrived with is a peer's claim rather than a fact: an understated one
+/// would truncate away groups this node had already verified, whose bitmap bits
+/// would survive to advertise bytes that are gone (`docs/DELTA-SYNC.md` §6).
+/// Shortening waits for [`Store::trim_to_size`], after the commit that settled
+/// the size.
+pub(crate) fn grow_to(file: &File, len: u64) -> Result<()> {
+    if file.metadata()?.len() < len {
+        file.set_len(len)?;
+    }
+    Ok(())
+}
+
 fn bitmap_len(groups: u64) -> usize {
     groups.div_ceil(8) as usize
 }
@@ -144,7 +255,67 @@ fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
     ChunkRanges::from_ranges(ranges)
 }
 
-fn ranges_to_bitmap(ranges: &ChunkRanges, groups: u64) -> Vec<u8> {
+/// Writes an object's index row, creating it or replacing what it claimed.
+fn upsert_blob_row(
+    conn: &rusqlite::Connection,
+    root: &Hash,
+    size: u64,
+    complete: bool,
+    bitmap: Option<Vec<u8>>,
+    inline: Option<Vec<u8>>,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO blobs (root, size, complete, bitmap, inline, pinned, last_access)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+         ON CONFLICT(root) DO UPDATE SET
+           size = excluded.size,
+           complete = excluded.complete,
+           bitmap = excluded.bitmap,
+           inline = COALESCE(excluded.inline, blobs.inline),
+           last_access = excluded.last_access",
+        params![
+            root.as_bytes().to_vec(),
+            size as i64,
+            complete as i64,
+            bitmap,
+            inline,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+/// What an object's row currently claims, read on a given connection.
+///
+/// The bitmap is read against the row's *own* size, not the caller's: the two
+/// can differ, and that difference is the whole subject of [`settle_size`].
+fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClaim>> {
+    let row: Option<(i64, i64, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT size, complete, bitmap FROM blobs WHERE root = ?1",
+            params![root.as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(size, complete, bitmap)| {
+        let size = size as u64;
+        let total = group_count(size);
+        let complete = complete != 0;
+        let held = match (complete, &bitmap) {
+            (true, _) => ChunkRanges::single(0, total),
+            (false, Some(bits)) => bitmap_to_ranges(bits, total),
+            (false, None) => ChunkRanges::empty(),
+        };
+        RowClaim {
+            size,
+            complete,
+            held,
+        }
+    }))
+}
+
+pub(crate) fn ranges_to_bitmap(ranges: &ChunkRanges, groups: u64) -> Vec<u8> {
     let mut bits = vec![0u8; bitmap_len(groups)];
     for r in &ranges.ranges {
         for group in r.start..r.end.min(groups) {
@@ -179,7 +350,7 @@ impl Store {
         path
     }
 
-    fn tree(size: u64) -> BaoTree {
+    pub(crate) fn tree(size: u64) -> BaoTree {
         BaoTree::new(size, BLOCK_SIZE)
     }
 
@@ -268,7 +439,7 @@ impl Store {
         Ok(())
     }
 
-    fn write_blob_row(
+    pub(crate) fn write_blob_row(
         &self,
         root: &Hash,
         size: u64,
@@ -277,25 +448,94 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO blobs (root, size, complete, bitmap, inline, pinned, last_access)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
-             ON CONFLICT(root) DO UPDATE SET
-               size = excluded.size,
-               complete = excluded.complete,
-               bitmap = excluded.bitmap,
-               inline = COALESCE(excluded.inline, blobs.inline),
-               last_access = excluded.last_access",
-            params![
-                root.as_bytes().to_vec(),
-                size as i64,
-                complete as i64,
-                bitmap,
+        upsert_blob_row(&self.conn(), root, size, complete, bitmap, inline, now)
+    }
+
+    /// Folds newly verified groups into an object's row, atomically (§10).
+    ///
+    /// Two writers of one root is the ordinary case rather than an exotic one:
+    /// a mirror pass, a `synch cat` and the gateway's range read all resolve to
+    /// the same content, and a promotion commits a whole span in a single step.
+    /// Reading the bitmap, unioning, and writing it back as three separate
+    /// statements loses one of two interleaved writers' progress every time —
+    /// harmlessly, because bits only ever grow and the bytes are already on the
+    /// disk, but the groups it dropped are then fetched all over again, and a
+    /// promotion's share of that loss is a whole span rather than a slice.
+    ///
+    /// So the read, the union and the write happen inside one transaction on
+    /// the store's single connection. The expensive part — decoding, hashing,
+    /// copying, fsyncing — stays outside it, as it must: this is a row update,
+    /// not a lock over the file IO that earned it.
+    ///
+    /// The **size** decision is made in here too, and for the same reason
+    /// ([`settle_size`]). Deciding whether a writer's claimed length may stand
+    /// is a read of the row followed by a write of it, and every committer used
+    /// to make that decision on its own snapshot before doing the work: two
+    /// writers of one root — the honest one finishing the object, the other
+    /// carrying a size a hundred bytes long off a peer's entry — could each see
+    /// an unattested row and each go ahead, and whichever committed second left
+    /// the row complete under a size no byte on the disk supports. Attested from
+    /// then on, unreadable, refusing every honest writer, and pinned against the
+    /// collector by the entry that named it. One decision, one transaction.
+    pub(crate) fn commit_groups(
+        &self,
+        root: &Hash,
+        size: u64,
+        groups: &ChunkRanges,
+        inline: Option<Vec<u8>>,
+        now: i64,
+    ) -> Result<Commit> {
+        self.with_immediate_tx(|tx| {
+            let claim = read_claim(tx, root)?;
+            let size = settle_size(
+                root,
+                claim.as_ref().map(|c| (c.size, c.complete, &c.held)),
+                size,
+            )?;
+            let total = group_count(size);
+            let held = claim.map(|c| c.held).unwrap_or_else(ChunkRanges::empty);
+            let verified = held.union(groups).intersect(&ChunkRanges::single(0, total));
+            let complete = verified.count() >= total;
+            upsert_blob_row(
+                tx,
+                root,
+                size,
+                complete,
+                (!complete).then(|| ranges_to_bitmap(&verified, total)),
                 inline,
-                now
-            ],
-        )?;
-        Ok(())
+                now,
+            )?;
+            Ok(Commit { size, complete })
+        })
+    }
+
+    /// Shortens an object's payload and outboard to the size a commit settled.
+    ///
+    /// The one place a file in the CAS is ever made smaller, and it runs only
+    /// after a commit that *completed* the object — at which point the final
+    /// group is held and the size is a fact rather than a claim
+    /// ([`size_is_attested`]). What it cleans up is the overstatement
+    /// case: an entry claimed a few bytes more than the object has, the sparse
+    /// payload was grown to fit the claim, and the honest writer that finished
+    /// the object replaced it. Best effort — a payload left long costs disk,
+    /// not correctness, because every read is bounded by the tree.
+    pub(crate) fn trim_to_size(&self, root: &Hash, commit: Commit) {
+        if !commit.complete {
+            return;
+        }
+        for (path, len) in [
+            (self.blob_path(root), commit.size),
+            (
+                self.outboard_path(root),
+                Self::tree(commit.size).outboard_size(),
+            ),
+        ] {
+            if let Ok(file) = OpenOptions::new().write(true).open(&path) {
+                if file.metadata().is_ok_and(|m| m.len() > len) {
+                    let _ = file.set_len(len);
+                }
+            }
+        }
     }
 
     // ---- index reads ------------------------------------------------------
@@ -585,12 +825,11 @@ impl Store {
 
         let existing = self.blob(root)?;
         if let Some(row) = &existing {
-            if row.size != size {
-                return Err(StoreError::Verification {
-                    root: *root,
-                    reason: format!("size mismatch: have {}, offered {}", row.size, size),
-                });
-            }
+            // The cheap refusal. [`settle_size`] decides again, transactionally,
+            // at the commit — this one is here so a claim that cannot possibly
+            // stand never reaches the disk at all.
+            let held = row.verified_groups();
+            settle_size(root, Some((row.size, row.complete, &held)), size)?;
             if row.complete {
                 return Ok(ChunkRanges::empty());
             }
@@ -619,19 +858,7 @@ impl Store {
                 root: *root,
                 reason: e.to_string(),
             })?;
-            let verified = existing
-                .map(|r| r.verified_groups())
-                .unwrap_or_else(ChunkRanges::empty)
-                .union(&served);
-            let complete = verified.count() >= groups;
-            self.write_blob_row(
-                root,
-                size,
-                complete,
-                (!complete).then(|| ranges_to_bitmap(&verified, groups)),
-                Some(buffer),
-                now,
-            )?;
+            self.commit_groups(root, size, &served, Some(buffer), now)?;
             return Ok(served);
         }
 
@@ -645,14 +872,20 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&payload_path)?;
-        payload.set_len(size)?;
+        // Grown to fit, never shrunk: `size` is still this peer's claim, and
+        // `decode_ranges` below is what turns it into a fact. Sizing the file
+        // *down* on the strength of the claim is how an understated entry used
+        // to destroy verified groups — bytes gone, bitmap bits intact, the node
+        // advertising a group it could no longer serve and no way back short of
+        // deleting the object ([`grow_to`], `docs/DELTA-SYNC.md` §6).
+        grow_to(&payload, size)?;
         let outboard_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(self.outboard_path(root))?;
-        outboard_file.set_len(tree.outboard_size())?;
+        grow_to(&outboard_file, tree.outboard_size())?;
         let outboard = PreOrderOutboard {
             root: root_hash,
             tree,
@@ -680,19 +913,8 @@ impl Store {
             let _ = fsync_file(&ob);
         }
 
-        let verified = existing
-            .map(|r| r.verified_groups())
-            .unwrap_or_else(ChunkRanges::empty)
-            .union(&served);
-        let complete = verified.count() >= groups;
-        self.write_blob_row(
-            root,
-            size,
-            complete,
-            (!complete).then(|| ranges_to_bitmap(&verified, groups)),
-            None,
-            now,
-        )?;
+        let commit = self.commit_groups(root, size, &served, None, now)?;
+        self.trim_to_size(root, commit);
         Ok(served)
     }
 }
@@ -700,7 +922,7 @@ impl Store {
 /// `positioned-io` gives `File` the random-access reads and writes bao needs;
 /// this newtype exists only so the trait bounds resolve on both platforms
 /// without importing `positioned-io` directly.
-struct DataFile(File);
+pub(crate) struct DataFile(pub(crate) File);
 
 impl bao_tree::io::sync::ReadAt for DataFile {
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -1058,6 +1280,154 @@ mod tests {
             store.read_all(&root),
             Err(StoreError::MissingBlob(_))
         ));
+    }
+
+    /// Two writers filling one object keep both halves of what they wrote.
+    ///
+    /// The same content root is reached by more than one path at once as a
+    /// matter of course — a mirror pass, a `synch cat`, the gateway's range
+    /// read — and each commits the groups it verified. Read the bitmap, union,
+    /// write it back as three separate statements and the later write erases
+    /// the earlier one's bits: harmless, since the bytes are on the disk either
+    /// way and bits only ever grow, but the groups it dropped are fetched all
+    /// over again, and a promotion's share of that loss is a whole span.
+    #[test]
+    fn concurrent_commits_of_disjoint_groups_keep_both() {
+        let (_d, store) = store();
+        let size = 64 * CHUNK_GROUP_SIZE;
+        let all = ChunkRanges::single(0, 64);
+
+        // Two halves, committed by two threads over the one connection, a few
+        // objects over so an interleaving is actually met.
+        for round in 0..16u8 {
+            let root = Hash::new(&[round]);
+            std::thread::scope(|scope| {
+                for half in [ChunkRanges::single(0, 32), ChunkRanges::single(32, 64)] {
+                    let (store, root) = (&store, &root);
+                    scope.spawn(move || store.commit_groups(root, size, &half, None, 0).unwrap());
+                }
+            });
+            assert_eq!(
+                store.blob(&root).unwrap().unwrap().verified_groups(),
+                all,
+                "round {round}: one writer's groups were lost"
+            );
+        }
+    }
+
+    /// A size claim racing a commit that completes the object never wins.
+    ///
+    /// Whether a claimed length may stand is a read of the row followed by a
+    /// write of it, and every committer used to make that decision on a snapshot
+    /// taken before it did its work. Two writers of one root — the honest one
+    /// finishing the object, the other carrying an entry's overstatement of it —
+    /// could each look, each see a row no group attested to yet, and each go
+    /// ahead; whichever committed second wrote its size over the other's. When
+    /// that was the claim, the row ended `complete` under a length no byte on
+    /// the disk supports: attested from then on, so `read_all` failed, every
+    /// honest writer was refused "size mismatch" for good, and the entry that
+    /// named the root kept the collector off it. Now the decision is made inside
+    /// the transaction that records it, so the loser is always the claim.
+    #[test]
+    fn a_size_claim_racing_a_completing_commit_never_wins() {
+        let (_d, store) = store();
+        let size = 4 * CHUNK_GROUP_SIZE + 500;
+        // A hundred bytes on, inside the same chunk group: the same tree, so
+        // this is exactly the lie a verifying proof can carry (§6.2).
+        let lie = size + 100;
+        assert_eq!(group_count(lie), group_count(size));
+        let all = ChunkRanges::single(0, group_count(size));
+
+        for round in 0..64u16 {
+            let root = Hash::new(&round.to_le_bytes());
+            std::thread::scope(|scope| {
+                let (store, root, all) = (&store, &root, &all);
+                scope.spawn(move || {
+                    store
+                        .commit_groups(root, size, all, None, 0)
+                        .expect("the honest writer is never refused")
+                });
+                scope.spawn(move || {
+                    // Refused or absorbed, either is fine — what it must not do
+                    // is leave its size on a completed row.
+                    let _ = store.commit_groups(root, lie, &ChunkRanges::empty(), None, 0);
+                });
+            });
+            let row = store.blob(&root).unwrap().unwrap();
+            assert_eq!(row.size, size, "round {round}: the claim won");
+            assert!(row.complete, "round {round}");
+            // And an honest writer arriving afterwards is still let in.
+            store.commit_groups(&root, size, &all, None, 0).unwrap();
+        }
+    }
+
+    /// A peer that understates an object's size cannot destroy bytes this node
+    /// has already verified.
+    ///
+    /// The claim arrives before the decode that would disprove it, and the
+    /// payload used to be `set_len` to it on the way past: a node holding group
+    /// 5 of a nine-group object, met by an entry claiming three groups, had
+    /// group 5's bytes truncated away while its bitmap bit survived. The row
+    /// then advertised a group the node could not serve, every read of it failed
+    /// with an unexpected end of file, every later fetch skipped it as already
+    /// held, and nothing short of deleting the object recovered. Nothing is
+    /// resized on the strength of a size nobody has proved — the file only ever
+    /// grows until a commit settles the length (§6.2, `docs/DELTA-SYNC.md` §6).
+    #[test]
+    fn an_understated_size_cannot_truncate_groups_already_held() {
+        let (_d1, provider) = store();
+        let (_d2, victim) = store();
+        let bytes = data(9 * CHUNK_GROUP_SIZE as usize);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+
+        // The victim holds one group in the middle and nothing else.
+        let held = ChunkRanges::single(5, 6);
+        let (encoded, served) = provider.encode_slice(&root, &held).unwrap();
+        assert_eq!(
+            victim
+                .write_slice(&root, size, &served, &encoded, 0)
+                .unwrap(),
+            held
+        );
+        let payload_len = std::fs::metadata(victim.blob_path(&root)).unwrap().len();
+
+        // A peer offers a slice of the same root under a three-group size. It
+        // could never verify; what matters is that it is refused before
+        // anything is resized, not after.
+        let lie = 3 * CHUNK_GROUP_SIZE;
+        let attack = ChunkRanges::single(0, 1);
+        assert!(matches!(
+            victim.write_slice(&root, lie, &attack, &encoded, 0),
+            Err(StoreError::Verification { .. })
+        ));
+
+        // Payload, outboard, row and bitmap exactly as they were.
+        assert_eq!(
+            std::fs::metadata(victim.blob_path(&root)).unwrap().len(),
+            payload_len
+        );
+        let row = victim.blob(&root).unwrap().unwrap();
+        assert_eq!(row.size, size);
+        assert_eq!(row.verified_groups(), held);
+        // And the group is still readable, and still servable to somebody else.
+        let offset = 5 * CHUNK_GROUP_SIZE;
+        assert_eq!(
+            victim.read_range(&root, offset, 64).unwrap(),
+            &bytes[offset as usize..offset as usize + 64]
+        );
+        let (onward, served) = victim.encode_slice(&root, &held).unwrap();
+        assert_eq!(served, held);
+        assert!(!onward.is_empty());
+
+        // The honest writer that follows is not refused either: the object
+        // completes from where it was left.
+        let rest = ChunkRanges::single(0, 9).difference(&held);
+        let (encoded, served) = provider.encode_slice(&root, &rest).unwrap();
+        victim
+            .write_slice(&root, size, &served, &encoded, 0)
+            .unwrap();
+        assert_eq!(victim.read_all(&root).unwrap(), bytes);
     }
 
     #[test]

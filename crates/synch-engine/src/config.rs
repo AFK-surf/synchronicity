@@ -37,6 +37,16 @@ pub struct NodeConfig {
     pub ad_update_interval: Duration,
     /// How many providers a single range fetch is split across (§6.4).
     pub fetch_fanout: usize,
+    /// The smallest object a fetch will run the delta descent for
+    /// (`docs/DELTA-SYNC.md` §4, default 16 MiB — one ad span).
+    ///
+    /// Below it the proof round trips cost more than the bytes they could
+    /// save, and inline blobs (§6.2) never delta at all. Setting it to
+    /// [`u64::MAX`] turns the descent off for this node, which is the escape
+    /// hatch for diagnosing a fetch that is behaving strangely — code-level,
+    /// like [`NodeConfig::fetch_fanout`]: no shipped binary reads it from a
+    /// file.
+    pub delta_min_size: u64,
     /// How long old roots are retained (§5.4).
     pub root_retention: Duration,
     /// How long this node's own tombstones are kept before a later root drops
@@ -68,6 +78,7 @@ impl NodeConfig {
             publish_batch_max: crate::publisher::DEFAULT_PUBLISH_BATCH_MAX,
             ad_update_interval: Duration::from_secs(60),
             fetch_fanout: 3,
+            delta_min_size: synch_core::AD_SPAN_GRANULARITY,
             root_retention: Duration::from_secs(7 * 24 * 3600),
             tombstone_ttl: Duration::from_secs(90 * 24 * 3600),
             recovery_quiesce: crate::recovery::DEFAULT_RECOVERY_QUIESCE,
@@ -111,6 +122,7 @@ mod tests {
         assert_eq!(config.publish_batch_max, 1_000);
         assert_eq!(config.ad_update_interval, Duration::from_secs(60));
         assert_eq!(config.fetch_fanout, 3);
+        assert_eq!(config.delta_min_size, 16 * 1024 * 1024);
         assert_eq!(config.root_retention, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(config.tombstone_ttl, Duration::from_secs(90 * 24 * 3600));
         assert_eq!(config.recovery_quiesce, Duration::from_secs(3600));

@@ -26,7 +26,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use synch_core::EntryKind;
+use synch_core::{ChunkRanges, EntryKind};
 use synch_store::{EntryRow, MirrorRow, VersionPolicy};
 
 use crate::{
@@ -47,6 +47,19 @@ pub struct MirrorReport {
     /// Files removed: the selected version is a tombstone, or the path has
     /// left the unified tree entirely.
     pub removed: usize,
+    /// Files whose bytes were not copied at all: the mirror shares a filesystem
+    /// with the CAS, so the file and the object it came from are the same
+    /// extents (`docs/DELTA-SYNC.md` §3.5). A subset of `written`.
+    pub reflinked: usize,
+    /// Bytes that crossed the network to write the files this pass wrote.
+    pub fetched_bytes: u64,
+    /// Bytes that did not, because a local donor already held them and the new
+    /// version's own tree proved it (`docs/DELTA-SYNC.md` §3.3).
+    ///
+    /// The pair is what turns "the pass took four seconds" into "it reused
+    /// 98.9 GB and fetched 1.1 GB", which is the difference between a mirror an
+    /// operator trusts and one they watch suspiciously.
+    pub reused_bytes: u64,
     /// Entries skipped, with the reason — including every path a `strict`
     /// mirror refused to guess at, and every path whose bytes landed but whose
     /// metadata the filesystem refused.
@@ -145,7 +158,7 @@ impl Node {
             let policy = mirror.policy.clone();
             crate::blocking::offload(move || {
                 let listing = node.unified_listing(&space, "", None, None)?;
-                plan_pass(&root_dir, &listing, &policy)
+                plan_pass(&node, &root_dir, &listing, &policy)
             })
             .await?
         };
@@ -155,20 +168,40 @@ impl Node {
             wanted,
         } = plan;
 
-        // Phase 2: fetch what phase 1 could not satisfy locally, and copy each
-        // object out of the CAS as it lands.
+        // Phase 2: fetch what phase 1 could not satisfy locally — building each
+        // new object in the CAS out of the old one where it can — and
+        // materialize it as it lands.
         for want in wanted {
-            let fetched = self.fetch_all(&want.content, want.size).await?;
+            let fetched = self
+                .fetch_all_from(&want.content, want.size, &want.donors)
+                .await?;
             if !fetched.complete {
                 report
                     .skipped
                     .push((want.path, "no provider could serve the content".into()));
                 continue;
             }
-            // Copied out of the CAS a piece at a time and renamed into place: a
-            // mirror of multi-gigabyte objects must not hold one in memory, and
-            // a pass interrupted halfway must not leave a truncated file
-            // wearing a complete file's name.
+            // Counted in bytes rather than groups, and clamped to the object,
+            // so the tail group of a 100-byte file does not report 16 KiB.
+            let bytes_of = |groups: &ChunkRanges| {
+                groups
+                    .ranges
+                    .iter()
+                    .map(|r| {
+                        let end = r
+                            .end
+                            .saturating_mul(synch_core::CHUNK_GROUP_SIZE)
+                            .min(want.size);
+                        end.saturating_sub(r.start.saturating_mul(synch_core::CHUNK_GROUP_SIZE))
+                    })
+                    .sum::<u64>()
+            };
+            report.fetched_bytes += bytes_of(&fetched.fetched);
+            report.reused_bytes += bytes_of(&fetched.promoted);
+            // Cloned out of the CAS and renamed into place: a mirror of
+            // multi-gigabyte objects must not hold one in memory, and a pass
+            // interrupted halfway must not leave a truncated file wearing a
+            // complete file's name (§7.2, §9.4).
             //
             // The escape guard is taken again here, in the same blocking step
             // as the write it protects. Phase 1 checked this path too, but a
@@ -177,25 +210,51 @@ impl Node {
             let node = self.clone();
             let root = root_dir.clone();
             let path = want.path.clone();
+            let written_target = want.target.clone();
+            let written_content = want.content;
             let outcome = crate::blocking::offload(move || {
                 if escapes_via_symlink(&root, &path) {
                     return Ok(Written::Escaped);
                 }
-                node.write_blob_to_blocking(&want.content, want.size, &want.target)?;
+                // A materialization that fails takes its path down with it and
+                // nothing else: the target is untouched, and the next pass
+                // tries again.
+                let kind =
+                    match node.materialize_blob_blocking(&want.content, want.size, &want.target) {
+                        Ok(kind) => kind,
+                        Err(e) => return Ok(Written::Failed(e.to_string())),
+                    };
                 // The bytes are the file; its metadata is stamped on right
                 // after, and a filesystem that refuses the stamp — a mount
                 // that will not take the mode, a foreign owner — is reported
                 // rather than allowed to fail the whole pass.
                 Ok(match apply_metadata(&want.target, want.meta) {
-                    Ok(()) => Written::Fully,
-                    Err(e) => Written::WithoutMetadata(e.to_string()),
+                    Ok(()) => Written::Fully(kind),
+                    Err(e) => Written::WithoutMetadata(kind, e.to_string()),
                 })
             })
             .await?;
+            // Remembered whenever the bytes landed, so the pass after this one
+            // can tell a file it wrote and got wrong from one it has not tried
+            // yet (`Node::note_mirror_write`).
+            if matches!(outcome, Written::Fully(_) | Written::WithoutMetadata(_, _)) {
+                let payload = payload_fingerprint(self, &written_content);
+                self.note_mirror_write(
+                    &written_target,
+                    crate::node::MirrorWrite {
+                        content: written_content,
+                        payload,
+                    },
+                );
+            }
             match outcome {
-                Written::Fully => report.written += 1,
-                Written::WithoutMetadata(why) => {
+                Written::Fully(kind) => {
                     report.written += 1;
+                    report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
+                }
+                Written::WithoutMetadata(kind, why) => {
+                    report.written += 1;
+                    report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
                     report.skipped.push((
                         want.path,
                         format!("content written, but its metadata could not be reproduced: {why}"),
@@ -205,6 +264,9 @@ impl Node {
                     want.path,
                     "path resolves through a symlink; refusing to write outside the mirror".into(),
                 )),
+                Written::Failed(why) => report
+                    .skipped
+                    .push((want.path, format!("content could not be written: {why}"))),
             }
         }
 
@@ -244,17 +306,22 @@ struct WantedContent {
     size: u64,
     /// The metadata to stamp on once the bytes are there.
     meta: Metadata,
+    /// Where the bytes might already be, in §3.2 priority order
+    /// (`docs/DELTA-SYNC.md`).
+    donors: Vec<synch_store::Donor>,
 }
 
 /// How one write in phase 2 ended.
 #[derive(Debug)]
 enum Written {
-    /// Bytes and metadata both.
-    Fully,
+    /// Bytes and metadata both, and how the bytes got there.
+    Fully(crate::CloneKind),
     /// The bytes landed; the filesystem refused the metadata.
-    WithoutMetadata(String),
+    WithoutMetadata(crate::CloneKind, String),
     /// Refused by the symlink-escape guard: nothing was written.
     Escaped,
+    /// The object could not be materialized. The target is as it was.
+    Failed(String),
 }
 
 /// What one pass settled before any content was fetched.
@@ -276,6 +343,7 @@ struct MirrorPass {
 /// Blocking from end to end: [`Node::sync_mirror_row`] runs it on the blocking
 /// pool.
 fn plan_pass(
+    node: &Node,
     root_dir: &Path,
     listing: &[synch_store::VersionSet],
     policy: &VersionPolicy,
@@ -381,13 +449,22 @@ fn plan_pass(
                 continue;
             };
             let meta = Metadata::of(&selected);
-            if already_current(&target, selected.size, &content) {
+            // The currency check: whenever the file on the disk is the right
+            // length it is hashed, because that hash *is* the answer to "is
+            // this already the selected version?". A file of the wrong length
+            // is not hashed here — it cannot be current — and may still be
+            // hashed below, if delta turns out to want to know what it is.
+            let on_disk = same_size_root(&target, selected.size);
+            if on_disk == Some(content) {
                 // Right bytes, and possibly the wrong mode or mtime: a local
                 // `chmod`, a file this mirror wrote before it stamped metadata
                 // at all, or a mode the origin has since changed without
                 // touching the content. Repairing it is a `stat` and a syscall
                 // or two — refetching the object to fix a permission bit is
                 // not.
+                // Whatever this pass or an earlier one wrote here landed: the
+                // suspicion the guard below carries is discharged.
+                node.forget_mirror_write(&target);
                 if metadata_matches(&target, meta) {
                     report.current += 1;
                 } else if let Err(e) = apply_metadata(&target, meta) {
@@ -403,12 +480,69 @@ fn plan_pass(
                 continue;
             }
 
+            // The file is not the selected version — and the previous pass
+            // wrote the selected version here. Writing it again would produce
+            // the same bytes from the same payload and leave the file exactly as
+            // wrong as it is now: the mirror would report `written` on every
+            // pass, forever, and never converge. What that pattern means is a
+            // CAS payload that rotted at rest under a row that still calls the
+            // object complete — the one wrong-hash cause the currency check
+            // cannot fix, because nothing upstream of it doubts the object
+            // (`docs/DELTA-SYNC.md` §2.1, §6).
+            //
+            // So the payload is named as the suspect and the path is left as it
+            // is. Deleting the object is not this pass's call to make — it may
+            // be pinned, it may be another mirror's current version, and the
+            // operator is the one who can say whether the disk under it is
+            // failing — but reporting it is, and `synch blob rm` followed by a
+            // pass will refetch it from a provider.
+            //
+            // A file that is not *there* proves nothing and is not guarded: it
+            // may never have been written, or a pass in between may have removed
+            // it for a tombstone the policy has since stopped selecting.
+            if on_disk.is_none() {
+                node.forget_mirror_write(&target);
+            } else if node.mirror_write_was(&target)
+                == Some(crate::node::MirrorWrite {
+                    content,
+                    payload: payload_fingerprint(node, &content),
+                })
+            {
+                report.skipped.push((
+                    set.path.clone(),
+                    format!(
+                        "written from {content} on the previous pass and the file still does \
+                         not hash to it: the CAS payload for that object is suspect, so this \
+                         pass is not writing it again"
+                    ),
+                ));
+                continue;
+            }
+
+            // Where the bytes of this version might already be (§3.2). Donors
+            // are CAS objects and nothing else, so that the descent has one
+            // shape of thing to reason about — but the capability a file donor
+            // used to buy is kept, and this is where it is paid for.
+            //
+            // The case is a real one: the CAS collected the version this mirror
+            // is sitting on, so the lineage names a root nothing here holds,
+            // while the bytes of that root are right there in the target file.
+            // Rather than teach promotion about files, the file is ingested and
+            // becomes the ordinary CAS donor it is a copy of — one pass over a
+            // file this node was about to rewrite anyway. Only when delta would
+            // use it: below `delta_min_size` there is no descent to feed.
+            let mut donors = node.donors_for(&selected, set)?;
+            if donors.is_empty() && selected.size >= node.config().delta_min_size {
+                let recovered = reingest_the_copy_on_disk(node, &selected, set, &target, on_disk)?;
+                donors.extend(recovered.map(synch_store::Donor));
+            }
             wanted.push(WantedContent {
                 path: set.path.clone(),
                 target,
                 content,
                 size: selected.size,
                 meta,
+                donors,
             });
         }
     }
@@ -590,22 +724,98 @@ fn system_time(ns: i64) -> SystemTime {
     }
 }
 
-/// True if `target` already holds exactly the object `content` names.
+/// The content root of the file at `target`, if it is the right length to be
+/// the version being materialized.
 ///
-/// Size first, because it settles almost every case for the price of a `stat`;
-/// the hash only then, and streamed, because a mirror carries objects far
-/// larger than memory and this question is asked of every path on every pass.
-/// Anything unreadable answers "no", and the pass rewrites it.
-fn already_current(target: &Path, size: u64, content: &synch_core::Hash) -> bool {
-    if std::fs::metadata(target).map(|m| m.len()).ok() != Some(size) {
-        return false;
+/// This is the currency check, and the hash is the whole of it: an object is
+/// its bytes, so "is the file already this version?" is "does it hash to this
+/// root?". Size first, because it settles almost every case for the price of a
+/// `stat` — and a file of the wrong length is not hashed here at all, because
+/// no hash of it could answer yes.
+///
+/// Streamed, because a mirror carries objects far larger than memory and this
+/// question is asked of every path on every pass. Anything unreadable answers
+/// `None`, and the pass rewrites it.
+///
+/// The root rather than a bare "current?": naming the object that is on the
+/// disk is also what tells the pass whether the file is a version the descent
+/// wanted and could not find (`docs/DELTA-SYNC.md` §3.2).
+fn same_size_root(target: &Path, wanted_size: u64) -> Option<synch_core::Hash> {
+    let metadata = std::fs::metadata(target).ok().filter(|m| m.is_file())?;
+    if metadata.len() != wanted_size {
+        return None;
     }
-    match std::fs::File::open(target) {
-        Ok(file) => synch_core::hash_reader(std::io::BufReader::new(file))
-            .map(|hash| hash == *content)
-            .unwrap_or(false),
-        Err(_) => false,
+    hash_file(target)
+}
+
+/// A cheap identity for the CAS payload behind an object: its length and its
+/// modification time.
+///
+/// Emphatically not a hash. Re-reading an object to identify it is the
+/// scrubbing §2.1 refuses, and what this is for does not need one: it only has
+/// to notice that a payload has been *replaced*, so the rot guard in
+/// [`Node::note_mirror_write`] lets go when the operator repairs the object.
+/// `None` for an inline object, which has no payload file.
+fn payload_fingerprint(node: &Node, content: &synch_core::Hash) -> Option<(u64, i64)> {
+    let meta = std::fs::metadata(node.store().blob_path(content)).ok()?;
+    Some((meta.len(), crate::scanner::mtime_nanos(&meta)))
+}
+
+/// Streams a file through BLAKE3 for its content root.
+fn hash_file(target: &Path) -> Option<synch_core::Hash> {
+    std::fs::File::open(target)
+        .ok()
+        .and_then(|file| synch_core::hash_reader(std::io::BufReader::new(file)).ok())
+}
+
+/// Recovers a donor the CAS has lost but the mirror is still sitting on
+/// (`docs/DELTA-SYNC.md` §3.2).
+///
+/// Delta donors are CAS objects, which leaves one capability to account for:
+/// the mirror materialized the previous version, the CAS then collected the
+/// object it came from, and the bytes of that version are now only on the disk.
+/// Rather than a second kind of donor threaded through the descent, the file is
+/// ingested and *becomes* the object it is a copy of — after which everything
+/// downstream is ordinary CAS-to-CAS delta.
+///
+/// Deliberately narrow. It runs only when the lineage named other versions and
+/// this node holds none of them, only above `delta_min_size` where a descent
+/// will actually happen, and only when the file turns out to *be* one of the
+/// versions named. That last check is a pass over a file the mirror is about to
+/// rewrite anyway; the ingest after it is a second one, and buys a rewrite that
+/// costs the change rather than the object.
+///
+/// `known` is the file's root where the currency check already computed it.
+fn reingest_the_copy_on_disk(
+    node: &Node,
+    selected: &EntryRow,
+    versions: &synch_store::VersionSet,
+    target: &Path,
+    known: Option<synch_core::Hash>,
+) -> Result<Option<synch_core::Hash>> {
+    let wanted = node.donor_roots(selected, versions);
+    if wanted.is_empty() || !target.is_file() {
+        return Ok(None);
     }
+    let Some(on_disk) = known.or_else(|| hash_file(target)) else {
+        return Ok(None);
+    };
+    if !wanted.contains(&on_disk) {
+        return Ok(None);
+    }
+    let (root, _) = node.store().ingest_file(target, synch_core::now_ns())?;
+    // A file rewritten under the ingest is not the version that was wanted, and
+    // whatever did land in the CAS is some other object the collector will deal
+    // with in its own time.
+    if root != on_disk {
+        return Ok(None);
+    }
+    tracing::debug!(
+        target = %target.display(),
+        root = %root,
+        "re-ingested a mirrored file the CAS had collected"
+    );
+    Ok(Some(root))
 }
 
 /// Returns true if any ancestor of `rel` under `root` is a symlink, so that
@@ -811,6 +1021,81 @@ mod tests {
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.current, 1);
         assert_eq!(report.written, 0);
+        node.shutdown().await.unwrap();
+    }
+
+    /// A rotted CAS payload stops the pass instead of being rewritten forever.
+    ///
+    /// The one wrong-hash cause the currency check cannot fix. Nothing upstream
+    /// of the mirror doubts the object — the row calls it complete, the fetch
+    /// finds every group held, and materialization clones the payload without
+    /// re-reading it, which is the settled at-rest trust posture (§2.1) — so the
+    /// pass writes the rot to disk, the pass after it hashes the file, finds the
+    /// same wrong answer, and writes the same bytes again. `written` climbs on
+    /// every pass and the mirror never converges.
+    ///
+    /// The bytes are still not re-verified here: what changed is that a pass
+    /// knows what the last one wrote, and a path it wrote from a root that still
+    /// does not hash to that root is reported with the payload named, not
+    /// rewritten.
+    #[tokio::test]
+    async fn a_rotted_payload_is_reported_rather_than_rewritten_forever() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        // Large enough to have a payload file rather than living in the index.
+        let payload: Vec<u8> = (0..80_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        publish_entry(&node, &peer(), "disk.img", &payload, 1);
+        let content = node.versions("media", "disk.img").unwrap().entries[0]
+            .content
+            .unwrap();
+
+        // The payload rots at rest, behind the store's back and without
+        // changing its length — a flipped bit on a disk nobody is checksumming.
+        let path = node.store().blob_path(&content);
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[40_000] ^= 0xff;
+        std::fs::write(&path, &raw).unwrap();
+
+        // The first pass writes it: nothing has told the mirror otherwise.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let file = target.path().join("disk.img");
+        assert_ne!(
+            std::fs::read(&file).unwrap(),
+            payload,
+            "the rot came across"
+        );
+
+        // The second pass recognizes the loop rather than joining it.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 0, "{report:?}");
+        assert_eq!(report.current, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        let (path_reported, why) = &report.skipped[0];
+        assert_eq!(path_reported, "disk.img");
+        assert!(
+            why.contains("payload") && why.contains(&content.to_string()),
+            "the report names the object at fault: {why}"
+        );
+        // And it stays that way rather than alternating.
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 0, "{report:?}");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+
+        // Repairing the payload — `synch blob rm` and a refetch, a restore, the
+        // filesystem's own repair — lets the very next pass converge. The guard
+        // notices by the payload's length and mtime, never by reading it back.
+        raw[40_000] ^= 0xff;
+        std::fs::write(&path, &raw).unwrap();
+        set_modified(&path, STAMP).unwrap();
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(std::fs::read(&file).unwrap(), payload);
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.current, 1, "{report:?}");
         node.shutdown().await.unwrap();
     }
 
@@ -1259,6 +1544,109 @@ mod tests {
         assert!(!metadata_matches(&path, published));
         set_modified(&path, STAMP - 10 * 1_000_000_000).unwrap();
         assert!(!metadata_matches(&path, published));
+    }
+
+    /// Materializing an object produces the object, over whatever was there
+    /// before, and leaves nothing beside it.
+    ///
+    /// Nothing here asserts that a reflink happened: whether the extents are
+    /// shared depends on the filesystem the test runs on, and the point of the
+    /// fallback is that the file is the same either way. What is asserted is
+    /// the file, the absence of residue, and that the clone reports one of the
+    /// two ways it can have happened.
+    #[tokio::test]
+    async fn materializing_an_object_replaces_the_file_and_leaves_no_residue() {
+        let (_d, node) = node().await;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("disk.img");
+        const GROUP: usize = 16 * 1024;
+
+        let old: Vec<u8> = (0..8 * GROUP).map(|i| (i * 11 + 1) as u8).collect();
+        let mut new = old.clone();
+        new[3 * GROUP..4 * GROUP].fill(0xa5);
+        std::fs::write(&target, &old).unwrap();
+        let root = node.store().ingest_bytes(&new, now_ns()).unwrap();
+
+        let kind = node
+            .materialize_blob_blocking(&root, new.len() as u64, &target)
+            .unwrap();
+        assert!(matches!(
+            kind,
+            crate::CloneKind::Reflink | crate::CloneKind::Copy
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), new);
+        assert_eq!(left_in(dir.path()), vec!["disk.img".to_string()]);
+
+        // A version of a different length replaces it exactly, rather than
+        // being written over the top of the longer file it found.
+        let mut longer = new.clone();
+        longer.extend(vec![3u8; 2 * GROUP]);
+        let root = node.store().ingest_bytes(&longer, now_ns()).unwrap();
+        node.materialize_blob_blocking(&root, longer.len() as u64, &target)
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), longer);
+
+        // And an object small enough to live in the index comes out of it.
+        let root = node.store().ingest_bytes(b"tiny", now_ns()).unwrap();
+        node.materialize_blob_blocking(&root, 4, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"tiny");
+        assert_eq!(left_in(dir.path()), vec!["disk.img".to_string()]);
+        node.shutdown().await.unwrap();
+    }
+
+    /// A materialization that dies partway leaves the target exactly as it was.
+    ///
+    /// The invariant §7.2 exists for: bytes go into a staging file beside the
+    /// target, the target only changes at the rename, and a staging file that
+    /// never got committed is removed rather than left lying beside the file it
+    /// was going to replace — under a name the scanner's built-in ignore rules
+    /// skip, which is what would make a stranded one permanent.
+    #[tokio::test]
+    async fn a_torn_materialization_leaves_the_target_untouched() {
+        let (_d, node) = node().await;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("disk.img");
+        let old: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&target, &old).unwrap();
+
+        // An object this node does not hold at all.
+        let absent = Hash::new(b"nobody has this");
+        let err = node
+            .materialize_blob_blocking(&absent, 100_000, &target)
+            .unwrap_err();
+        assert!(err.to_string().contains("not held whole"), "{err}");
+
+        // And one the index claims but whose payload has gone from under it,
+        // which is as close to a crash mid-write as a test can arrange: the
+        // staging file is created and the clone of the payload then fails.
+        let new: Vec<u8> = (0..100_000).map(|i| (i % 13) as u8).collect();
+        let root = node.store().ingest_bytes(&new, now_ns()).unwrap();
+        std::fs::remove_file(node.store().blob_path(&root)).unwrap();
+        assert!(node
+            .materialize_blob_blocking(&root, new.len() as u64, &target)
+            .is_err());
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            old,
+            "the target must be exactly what it was"
+        );
+        assert_eq!(
+            left_in(dir.path()),
+            vec!["disk.img".to_string()],
+            "the abandoned staging file went with the failure"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// What is in a directory, by name, in order.
+    fn left_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]

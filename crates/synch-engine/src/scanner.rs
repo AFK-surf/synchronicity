@@ -486,7 +486,7 @@ impl Node {
         // is refused before anything is fetched.
         let target = self.adoption_target(space_id, path)?;
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
-        self.write_blob_to(&range.root, range.size, target.clone())
+        self.materialize_blob(&range.root, range.size, target.clone())
             .await?;
         Ok(target)
     }
@@ -604,6 +604,80 @@ impl Adoption {
         })
     }
 
+    /// Stages a write that starts out as a clone of a file already on disk
+    /// (`docs/DELTA-SYNC.md` §3.5).
+    ///
+    /// The atomicity invariant is unchanged — the bytes land in a staging file
+    /// that is renamed over the target, so a reader sees the old file or the
+    /// new one — but the staging file arrives already full. This is how an
+    /// object becomes a mirrored file: the source is the CAS payload, and a
+    /// 100 GB image is materialized without moving 100 GB.
+    ///
+    /// `FICLONE` first. On btrfs, XFS and bcachefs it shares the source's
+    /// extents copy-on-write, so the write is O(1) and consumes no space until
+    /// one of the two files is written to. Everywhere else — a target on a
+    /// different filesystem from the source, ext4, a kernel or platform without
+    /// the ioctl — it falls back to [`std::fs::copy`], which on Linux is itself
+    /// a kernel-side `copy_file_range` rather than a bounce through user space.
+    ///
+    /// Every failure path unlinks the staging file before returning. The
+    /// obvious way to write the fallback leaves one behind when the copy fails
+    /// *and* the handle cannot be reopened — ENOSPC, EMFILE — and the file it
+    /// strands wears a name the scanner's built-in ignore rules skip, so it
+    /// would sit beside the target unnoticed and uncollected forever.
+    pub fn cloning(target: impl Into<PathBuf>, source: &Path) -> Result<(Adoption, CloneKind)> {
+        let mut adoption = Adoption::open(target.into())?;
+        match adoption.clone_from(source) {
+            Ok(kind) => Ok((adoption, kind)),
+            Err(e) => {
+                // `Drop` only unlinks while the handle is live, and the copy
+                // fallback below has to let go of it.
+                let _ = std::fs::remove_file(&adoption.staging);
+                adoption.file = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// Fills the staging file from `source`, sharing its extents if it can.
+    fn clone_from(&mut self, source: &Path) -> Result<CloneKind> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| EngineError::invalid("a fresh staging file has no handle"))?;
+        match std::fs::File::open(source).and_then(|src| reflink_file(&src, file)) {
+            Ok(()) => return Ok(CloneKind::Reflink),
+            Err(e) => {
+                tracing::debug!(source = %source.display(), error = %e, "reflink unavailable");
+            }
+        }
+        // The staging file exists and is empty; `fs::copy` wants to create its
+        // own, so the handle is dropped for the duration and reopened after.
+        self.file = None;
+        let copied = std::fs::copy(source, &self.staging);
+        self.file = Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&self.staging)?,
+        );
+        copied?;
+        Ok(CloneKind::Copy)
+    }
+
+    /// Sets the staging file's length, for a clone of a file whose size the new
+    /// version does not share.
+    pub fn set_len(&mut self, len: u64) -> Result<()> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.set_len(len)?;
+        Ok(())
+    }
+
     /// Appends one piece of the payload.
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
         use std::io::Write;
@@ -624,8 +698,30 @@ impl Adoption {
     /// Flushes the payload and moves it into place, returning the target.
     ///
     /// The rename is what makes the write atomic from the scanner's point of
-    /// view: it sees the old file or the new one, never a partial one.
+    /// view: it sees the old file or the new one, never a partial one. That is
+    /// a claim about crashes, so the directory entry the rename created is
+    /// flushed too — otherwise the contents survive a power cut and the name
+    /// they arrived under does not, which is the old file or *no* file rather
+    /// than the old file or the new one.
+    /// The rename itself can fail — the target is a directory, the filesystem
+    /// filled up under the fsync — and when it does, this is the only chance to
+    /// unlink the staging file: [`Drop`] only cleans up while the handle is
+    /// live, and committing has to let go of it to flush and rename it. Leaving
+    /// it stranded would leave a full-size copy of the object beside the target
+    /// under a name the scanner's built-in ignore rules skip, unnoticed and
+    /// uncollected forever, on a path that is reached precisely when the disk is
+    /// already in trouble.
     pub fn commit(mut self) -> Result<PathBuf> {
+        match self.commit_inner() {
+            Ok(()) => Ok(self.target.clone()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&self.staging);
+                Err(e)
+            }
+        }
+    }
+
+    fn commit_inner(&mut self) -> Result<()> {
         let file = self
             .file
             .take()
@@ -633,7 +729,55 @@ impl Adoption {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&self.staging, &self.target)?;
-        Ok(self.target.clone())
+        fsync_parent(&self.target);
+        Ok(())
+    }
+}
+
+/// Flushes a directory entry — a rename or a create — to stable storage.
+///
+/// Best effort: a platform that cannot open a directory as a file simply does
+/// not get the guarantee, which is the same posture the CAS takes (§6.2).
+fn fsync_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+/// How [`Adoption::cloning`] managed to give the staging file its head start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneKind {
+    /// Extents shared with the source, copy-on-write: no data was moved.
+    Reflink,
+    /// The source's bytes were copied.
+    Copy,
+}
+
+/// Shares a file's extents with another file, where the filesystem can.
+///
+/// `FICLONE` is Linux's reflink ioctl; every other platform (and every
+/// filesystem that does not implement it) reports it unsupported, which is a
+/// perfectly good answer — the caller copies instead.
+fn reflink_file(source: &std::fs::File, dest: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "sparc", target_arch = "sparc64"))
+    ))]
+    {
+        rustix::fs::ioctl_ficlone(dest, source).map_err(std::io::Error::from)
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        not(any(target_arch = "sparc", target_arch = "sparc64"))
+    )))]
+    {
+        let _ = (source, dest);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "reflink is not available on this platform",
+        ))
     }
 }
 
@@ -1020,6 +1164,34 @@ mod tests {
         assert_eq!(entry.content, Some(Hash::new(b"theirs")));
         assert_eq!(entry.prev, Some(Hash::new(b"mine")));
         node.shutdown().await.unwrap();
+    }
+
+    /// A commit that cannot finish takes its staging file with it.
+    ///
+    /// `commit` has to take the handle out of the `Adoption` to flush and close
+    /// it before the rename, which is exactly what `Drop`'s cleanup keys on — so
+    /// once the sync or the rename fails, `Drop` sees nothing to remove and the
+    /// staging file is stranded. It wears a name the scanner's built-in ignore
+    /// rules skip, so nothing would ever have found it again: a full-size copy
+    /// of the object sitting beside the target forever, on a path reached
+    /// precisely when the disk is already in trouble (ENOSPC — or, as here, a
+    /// target that is a directory).
+    #[test]
+    fn a_commit_that_cannot_finish_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("occupied");
+        std::fs::create_dir(&target).unwrap();
+
+        let mut out = Adoption::at(&target).unwrap();
+        out.write(b"the new version").unwrap();
+        assert!(out.commit().is_err(), "a directory cannot be renamed over");
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["occupied".to_string()], "residue: {left:?}");
     }
 
     /// The streamed form of adoption: the object goes from the CAS into the
