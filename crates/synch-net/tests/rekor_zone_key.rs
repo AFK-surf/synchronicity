@@ -1322,3 +1322,155 @@ fn rrsig_expirations(chain: &synch_net::zonecert::DnssecChain) -> Vec<u64> {
     }
     out
 }
+
+/// A P-256 log's checkpoint verifies whichever ECDSA encoding it used.
+///
+/// ECDSA signatures travel two ways — IEEE P1363's fixed 64-byte `r ‖ s`,
+/// and ASN.1/DER — and the verifier used to accept only the fixed form.
+/// Sigstore signs its notes with DER (the live `rekor.sigstore.dev`
+/// signature is 70 bytes opening `30 44 02 20`), so that log's checkpoints
+/// could never verify. It failed closed, so nothing was wrongly accepted,
+/// but the day Sigstore opens a P-256-keyed v2 shard every client would
+/// refuse every proof from it.
+///
+/// Nothing caught it because `SimLog` signed the fixed form too: the mock
+/// produced exactly the bytes the bug required. It signs DER now, so the
+/// assertion below is about the world rather than about ourselves — and the
+/// first half of the test says so out loud, by reading the encoding off the
+/// wire rather than trusting that the simulator changed.
+#[test]
+fn a_p256_checkpoint_verifies_in_der_which_is_what_sigstore_signs() {
+    let log = SimLog::new("rekor.sim");
+    let checkpoint = log.checkpoint();
+    let keys = LogKeys::parse(&log.key_pem()).expect("the log's own key");
+
+    // The signature really is DER: an ASN.1 SEQUENCE tag, and a length that
+    // is not the fixed form's 64 bytes.
+    let text = String::from_utf8(checkpoint.clone()).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("\u{2014} rekor.sim"))
+        .expect("the log's own signature line");
+    let blob = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(line.rsplit(' ').next().unwrap())
+            .expect("base64")
+    };
+    let signature = &blob[4..]; // drop the four-byte key hint
+    assert_eq!(signature[0], 0x30, "not a DER SEQUENCE: {signature:02x?}");
+    assert_ne!(
+        signature.len(),
+        64,
+        "a 64-byte signature would be the fixed form, and the point is that \
+         this is not it"
+    );
+
+    synch_net::rekor::Checkpoint::parse(&checkpoint)
+        .expect("the note parses")
+        .verify_under(&keys)
+        .expect("a DER checkpoint signature must verify under a P-256 log key");
+}
+
+/// A minimal, well-formed P-256 SubjectPublicKeyInfo — the shape the
+/// certificate builder wants, with a stand-in point.
+fn p256_spki_stub() -> Vec<u8> {
+    synch_net::rekor::p256_spki(&[0x11; 64])
+}
+
+/// A certificate that decodes two ways decodes no ways.
+///
+/// Each of these is a second spelling of a value that already had one, and
+/// for bytes sitting in a public log that is the whole problem: the leaf
+/// must mean the same thing to this reader and to an auditor reading it with
+/// anything else. Go's `crypto/x509` — which Rekor itself calls — refuses
+/// all of them, so the public log would not have taken such a certificate;
+/// relying on that would be keeping this design's invariant in somebody
+/// else's parser.
+#[test]
+fn a_certificate_with_two_readings_is_refused() {
+    use synch_net::x509::{Certificate, SelfSigned, OID_SUBJECT_ALT_NAME};
+
+    let spki = p256_spki_stub();
+    let base = || SelfSigned {
+        common_name: "synchronicity zone key",
+        dns_name: "sync.example",
+        spki: &spki,
+        serial: &[0x01],
+        not_before: synch_net::x509::x509_time(1_760_000_000),
+        not_after: synch_net::x509::x509_time(1_900_000_000),
+        extensions: &[],
+    };
+    let sig = |_: &[u8]| vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+
+    // Baseline: the shape this design mints really does parse.
+    let good = base().build(sig);
+    assert!(Certificate::parse(&good).is_ok(), "the control must parse");
+
+    // Trailing bytes after the outer SEQUENCE.
+    let mut trailing = good.clone();
+    trailing.push(0x00);
+    assert!(
+        Certificate::parse(&trailing).is_err(),
+        "bytes after the certificate must be refused"
+    );
+
+    // Two copies of the chain extension: the lookup used to take the first,
+    // so a reader taking the last would disagree about the evidence that
+    // decides reported-versus-silent.
+    let doubled = vec![
+        (
+            synch_net::zonecert::OID_DNSSEC_CHAIN.to_vec(),
+            b"first".to_vec(),
+        ),
+        (
+            synch_net::zonecert::OID_DNSSEC_CHAIN.to_vec(),
+            b"second".to_vec(),
+        ),
+    ];
+    let mut spec = base();
+    spec.extensions = &doubled;
+    let two_chains = spec.build(sig);
+    let parsed = Certificate::parse(&two_chains).expect("it is still a certificate");
+    assert!(
+        parsed
+            .extension(synch_net::zonecert::OID_DNSSEC_CHAIN)
+            .is_none(),
+        "an extension present twice must resolve to neither copy"
+    );
+    // And the SAN rule it was always supposed to match still holds.
+    assert!(
+        parsed.extension(OID_SUBJECT_ALT_NAME).is_some(),
+        "a single extension is unaffected"
+    );
+}
+
+/// One record cannot turn a refresh into a scan.
+///
+/// The wire format lets a record claim up to 255 parts, and the client
+/// fetches parts 2..=N sequentially with a per-query timeout inside a loop
+/// that walks configured domains one at a time — so `1/255` cost every
+/// resolving client 254 round trips before verifying a byte, and stalled
+/// every *other* domain behind it for long enough that cached bindings
+/// expire. The claim is now capped at what a real proof can need.
+#[test]
+fn a_records_part_count_is_capped_at_what_a_proof_can_need() {
+    use synch_net::rekor::{parts_claimed, MAX_PROOF_PARTS};
+
+    assert_eq!(
+        parts_claimed(&["sync1p aabbccdd 1/255 QUJD".to_string()]),
+        MAX_PROOF_PARTS,
+        "a lying record must not name how much work this client does"
+    );
+    // Honest counts are untouched, including the single-record case.
+    assert_eq!(parts_claimed(&["sync1p aabbccdd 1/3 QUJD".to_string()]), 3);
+    assert_eq!(parts_claimed(&["sync1p aabbccdd 1/1 QUJD".to_string()]), 1);
+    assert_eq!(parts_claimed(&[]), 1);
+    // The cap has to clear a real proof with room to spare: an
+    // ICANN-rooted one is 8202 base64url characters (§3), five records.
+    let real_proof_chars = 8202;
+    assert!(
+        MAX_PROOF_PARTS * synch_net::rekor::PROOF_CHUNK_CHARS > 3 * real_proof_chars,
+        "the cap must admit a real proof several times over"
+    );
+}

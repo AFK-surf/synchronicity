@@ -92,7 +92,16 @@ impl Certificate {
     /// self-signature over a key envelope proves nothing the SPKI does not
     /// already prove, and Rekor did not check it either.
     pub fn parse(der: &[u8]) -> Result<Certificate, X509Error> {
-        let mut outer = Der::new(der).sequence("Certificate")?;
+        // Trailing bytes after the certificate are refused. They are a
+        // second encoding of the same value — the thing a verifier must
+        // never accept — and they are exactly how the bytes in a public log
+        // come to mean one thing here and another to an auditor reading the
+        // same leaf with a stricter parser (Go's rejects them).
+        let mut whole = Der::new(der);
+        let mut outer = whole.sequence("Certificate")?;
+        if !whole.is_empty() {
+            return Err(X509Error::new("bytes after the certificate"));
+        }
         let mut tbs = outer.sequence("tbsCertificate")?;
         // [0] EXPLICIT Version — optional, and always present in a v3
         // certificate, which is the only kind that can carry extensions.
@@ -152,12 +161,27 @@ impl Certificate {
         })
     }
 
-    /// The value of the extension with this OID, if the certificate has it.
+    /// The value of the extension with this OID, if the certificate has
+    /// exactly one.
+    ///
+    /// **Exactly one, for the same reason `subjectAltName` is.** Returning
+    /// the first of two would let a certificate mean one thing to this
+    /// parser and another to any reader that took the last — and the
+    /// extension this is used for carries the DNSSEC chain, the evidence
+    /// that decides whether a monitor reports an entry or files it in the
+    /// silent bin. The SAN path had this rule and spelled out why; the
+    /// extension lookup beside it did not.
+    ///
+    /// Go's `crypto/x509` rejects duplicate extensions outright, so the
+    /// public log would not have accepted such a certificate anyway. That is
+    /// a property of somebody else's parser, which is not where this design
+    /// should be keeping its invariants.
     pub fn extension(&self, oid: &[u8]) -> Option<&[u8]> {
-        self.extensions
-            .iter()
-            .find(|e| e.oid == oid)
-            .map(|e| e.value.as_slice())
+        let mut matching = self.extensions.iter().filter(|e| e.oid == oid);
+        match (matching.next(), matching.next()) {
+            (Some(only), None) => Some(only.value.as_slice()),
+            _ => None,
+        }
     }
 
     /// The single `dNSName` a zone-key certificate must carry, **parsed**.
@@ -491,6 +515,14 @@ impl<'a> Der<'a> {
                     .ok_or_else(|| bad("truncated length"))?;
                 if slice[0] == 0 {
                     return Err(bad("a non-minimal length is not DER"));
+                }
+                // DER requires the *shortest* encoding, so a value under 128
+                // must use the short form. Rejecting only a leading zero
+                // byte let `0x81 0x05` through, which is a second spelling
+                // of a length that already had one — and two spellings of
+                // one value is what a strict reader exists to refuse.
+                if count == 1 && slice[0] < 0x80 {
+                    return Err(bad("a long-form length under 128 is not DER"));
                 }
                 (
                     slice

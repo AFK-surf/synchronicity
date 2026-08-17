@@ -668,17 +668,24 @@ impl SimLog {
     /// A log named `origin` with a fresh key. The key is fixed for the life
     /// of the log, so its id, its PEM and every checkpoint it signs are one
     /// coherent universe a test can pin.
+    ///
+    /// **Signs ASN.1/DER, because Sigstore does.** This used to sign the
+    /// fixed 64-byte `r ‖ s` form, which happened to be the only encoding
+    /// the verifier accepted — so the mock produced exactly the bytes the
+    /// bug required and the whole P-256 path was green while being unusable
+    /// against the real log. A simulator that agrees with the implementation
+    /// rather than with the world tests nothing.
     pub fn new(origin: &str) -> SimLog {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             &rng,
         )
         .expect("keygen")
         .as_ref()
         .to_vec();
         let key = ring::signature::EcdsaKeyPair::from_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             &pkcs8,
             &rng,
         )
@@ -747,7 +754,13 @@ impl SimLog {
             self.origin,
             rekor::base64_encode(&root)
         );
-        let signature = sign_p256(&self.pkcs8, body.as_bytes());
+        // **ASN.1/DER, because that is what Sigstore signs notes with** —
+        // the live `rekor.sigstore.dev` signature is 70 bytes opening
+        // `30 44 02 20`. This used to sign the raw `r ‖ s` form; since
+        // the verifier only accepted that same form, the mock agreed with
+        // the bug and the whole P-256 checkpoint path was green while being
+        // unusable against the real log.
+        let signature = sign_p256_der(&self.pkcs8, body.as_bytes());
         // The four-byte key hint is a selector, never a credential; the
         // verifier tries the pinned key regardless of what it says.
         let mut blob = self.log_id()[..4].to_vec();
@@ -1293,19 +1306,6 @@ pub fn hashedrekord_body(statement: &[u8], signature_der: &[u8], certificate: &[
     out.push_str(&rekor::base64_encode(certificate));
     out.push_str("\"}}}}}}");
     out.into_bytes()
-}
-
-/// Signs with ECDSA P-256/SHA-256, producing the raw `r || s` form a DNSSEC
-/// signature and a signed-note (checkpoint) signature both use.
-fn sign_p256(pkcs8: &[u8], message: &[u8]) -> Vec<u8> {
-    let rng = ring::rand::SystemRandom::new();
-    let key = ring::signature::EcdsaKeyPair::from_pkcs8(
-        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-        pkcs8,
-        &rng,
-    )
-    .expect("key load");
-    key.sign(&rng, message).expect("sign").as_ref().to_vec()
 }
 
 /// Signs with ECDSA P-256/SHA-256, producing the ASN.1/DER form a Rekor
