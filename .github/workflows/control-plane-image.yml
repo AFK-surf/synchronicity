@@ -4,6 +4,12 @@ name: control-plane image
 # ghcr.io/<owner>/synchronicity/control-plane. Pull requests build both
 # architectures but push nothing — the Dockerfile is validated on the PR
 # that changes it, and only main and tags produce images.
+#
+# Nothing is published until the same image has booted: `smoke` builds
+# the amd64 half into the local daemon and runs ops/image-smoke.sh
+# against it, and `image` needs it. A build that compiles clean can
+# still ship a missing SPA, a csqlite for the wrong architecture or a
+# runtime without libsqlite3 — only running the thing catches those.
 
 on:
   push:
@@ -23,7 +29,44 @@ env:
   IMAGE_NAME: ${{ github.repository }}/control-plane
 
 jobs:
+  # Boot the image before anyone can pull it. Single-architecture and
+  # `load: true`, because the docker exporter takes exactly one platform
+  # and the arm64 half is the same Dockerfile — what is being tested here
+  # is packaging, not codegen. Its cache lands in its own scope so the
+  # amd64-only export cannot evict the multi-arch cache `image` reads.
+  smoke:
+    name: smoke test the image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: control-plane
+          file: control-plane/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: controlplane:smoke
+          cache-from: |
+            type=gha,scope=smoke
+            type=gha
+          cache-to: type=gha,mode=max,scope=smoke
+          # The docker exporter `load: true` needs cannot carry
+          # attestations; the published build below makes them.
+          provenance: false
+
+      # dig drives the authoritative DNS checks from outside the container.
+      - run: sudo apt-get update && sudo apt-get install -y bind9-dnsutils
+
+      - run: ./ops/image-smoke.sh controlplane:smoke
+        working-directory: control-plane
+
   image:
+    needs: smoke
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -77,7 +120,11 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+          # The smoke scope first: its amd64 layers are already warm from
+          # the job above, so this build only has arm64 left to do.
+          cache-from: |
+            type=gha,scope=smoke
+            type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true

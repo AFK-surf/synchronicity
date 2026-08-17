@@ -152,10 +152,27 @@ docker run -d --name cp \
   restore loop shows up. It probes port 8080; if `CP_HTTP_LISTEN` moves,
   set `CP_HEALTHCHECK_PORT` to match.
 
+Nothing is published until that exact image has booted:
+[`ops/image-smoke.sh`](ops/image-smoke.sh) runs the built image the way
+this section tells you to run it — `keygen` and `seed` into fresh named
+volumes, then `serve` — and checks what only running it can check. The
+shipped SPA is served with its bundle, `/healthz` reports a loaded zone,
+the authoritative DNS answers over UDP and TCP with signatures, the
+csqlite workers come up sandboxed under the default runtime profile, the
+service is uid 10001, and the image's own `HEALTHCHECK` goes healthy.
+The publish job depends on it, so a green image is one that ran.
+
 To build it locally, from the repository root:
 
 ```sh
 docker build -t controlplane control-plane
+```
+
+Or from `control-plane/`, build and smoke-test it in one step (needs
+`docker`, `curl` and `dig`):
+
+```sh
+just image-smoke
 ```
 
 ## Configuration
