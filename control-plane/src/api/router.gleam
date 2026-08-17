@@ -194,14 +194,30 @@ fn primary_routes(req: Request, auth: AuthContext) -> Response {
   }
 }
 
+/// Resolves the session on a connection borrowed only for that lookup, and
+/// gives it back before the handler runs — the handler checks out its own.
+///
+/// The connection must not still be held here: every handler below opens one
+/// of its own, so holding this one across `next` would put two of a pool of
+/// four in one request's hands. At four concurrent authenticated requests
+/// the pool is then empty with every borrower queued for a second
+/// connection, and none of them can release the first until they get it —
+/// a deadlock broken only by `pool.acquire`'s 10s call timeout killing all
+/// four callers. The bound is the pool size, so no pool is large enough to
+/// avoid it.
 fn with_session(
   req: Request,
   auth: AuthContext,
   next: fn(Session) -> Response,
 ) -> Response {
-  auth_api.with_db(auth, fn(conn) {
-    middleware.require_session(req, conn, next)
-  })
+  // pool.with_connection rather than auth_api.with_db: the latter is
+  // Response-typed, and this needs the session out of the closure so the
+  // connection can be released before `next` runs.
+  case pool.with_connection(auth.pool, middleware.check_session(req, _)) {
+    Ok(Ok(live)) -> next(live)
+    Ok(Error(refusal)) -> refusal
+    Error(_) -> middleware.error_json(500, "internal", "database unavailable")
+  }
 }
 
 fn healthz(serving: Serving) -> Response {

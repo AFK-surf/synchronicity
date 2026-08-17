@@ -27,6 +27,12 @@ type Harness {
 
 /// Fresh database with zone bootstrap and one signed-in user.
 fn harness() -> Harness {
+  harness_sized(2)
+}
+
+/// `harness` with the primary pool's size named, so a test can pin how many
+/// connections one request is allowed to need.
+fn harness_sized(pool_size: Int) -> Harness {
   let db_path = tmp_db()
   let assert Ok(conn) = db.open_primary(db_path)
   let assert Ok(_) = migrate.migrate(conn)
@@ -40,7 +46,7 @@ fn harness() -> Harness {
   let assert Ok(#(token, live)) = session.create(conn, "u-admin", now_unix())
   let assert Ok(_) = publish.publish(conn, csk, now_unix(), "test:boot")
   sqlite.close(conn)
-  let assert Ok(api_pool) = db.start_primary_pool(db_path, 2)
+  let assert Ok(api_pool) = db.start_primary_pool(db_path, pool_size)
   let assert Ok(dns_pool) = db.start_read_pool(db_path, 2)
   let assert Ok(apex) = dns_name.parse("sync.test.")
   let auth =
@@ -551,6 +557,30 @@ pub fn mutation_visible_to_dns_immediately_test() {
   assert msg.flags % 16 == 0
   let assert [rr] = msg.answers
   assert rr.rtype == wire.type_txt
+}
+
+pub fn one_request_needs_one_connection_test() {
+  // A pool of exactly one, and an authenticated request that must complete on
+  // it. Resolving the session on a connection held across the handler would
+  // make every such request need two: with a pool of `size`, `size`
+  // concurrent requests would each hold one and queue for a second, and none
+  // could release the first until it arrived. This asserts the request needs
+  // one connection, which is what makes that unreachable at any pool size.
+  // Not /api/me, which resolves its session on the connection it goes on to
+  // use: this must be a route reached through the router's session wrapper,
+  // where the handler opens its own.
+  let h = harness_sized(1)
+  let resp =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    )
+  assert resp.status == 200
 }
 
 pub fn with_db_discards_conn_on_panic_test() {

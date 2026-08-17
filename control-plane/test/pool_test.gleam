@@ -90,5 +90,39 @@ pub fn dead_borrower_releases_write_lock_test() {
   let assert Ok(_) = outcome
 }
 
+pub fn dead_nested_borrower_releases_write_lock_test() {
+  let path = tmp_db()
+  ready_db(path)
+  // Size 2, so one process can hold two leases at once.
+  let assert Ok(p) = db.start_primary_pool(path, 2)
+  // The borrower takes the write lock on one connection, borrows a second
+  // and gives it back, then dies still holding the first. Retiring leases by
+  // borrower instead of by connection would drop the record of the
+  // write-locked connection when the inner one came back — leaving the
+  // monitor nothing to reclaim, and the write lock held until the pool died.
+  let victim =
+    process.spawn_unlinked(fn() {
+      let assert Ok(_) =
+        pool.with_connection(p, fn(outer) {
+          let assert Ok(_) = sqlite.exec(outer, "BEGIN IMMEDIATE", [])
+          let assert Ok(_) =
+            pool.with_connection(p, fn(inner) {
+              sqlite.query(inner, "SELECT 1", [])
+            })
+          process.sleep(60_000)
+        })
+      Nil
+    })
+  process.sleep(250)
+  process.kill(victim)
+  process.sleep(250)
+  let assert Ok(outcome) =
+    pool.with_connection(p, fn(conn) {
+      let assert Ok(_) = sqlite.exec(conn, "BEGIN IMMEDIATE", [])
+      sqlite.exec(conn, "ROLLBACK", [])
+    })
+  let assert Ok(_) = outcome
+}
+
 @external(erlang, "test_ffi", "rename")
 fn rename(from: String, to: String) -> Nil

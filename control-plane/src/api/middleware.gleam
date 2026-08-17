@@ -26,25 +26,50 @@ pub fn error_json(status: Int, code: String, message: String) -> Response {
 
 /// Resolves the session cookie; mutating methods must echo the session's
 /// CSRF token in an `x-csrf` header (double submit).
+///
+/// Returns the refusal rather than taking a continuation, so a caller may
+/// hand the connection back before running the request's own work. That is
+/// what keeps a request from holding two pooled connections at once: with a
+/// pool of `size`, `size` concurrent requests would each hold one and queue
+/// for a second, and every one of them would sit there until
+/// `pool.acquire`'s call timeout killed it.
+pub fn check_session(
+  req: Request,
+  conn: Connection,
+) -> Result(Session, Response) {
+  case wisp.get_cookie(req, session.cookie_name, wisp.Signed) {
+    Error(Nil) -> Error(error_json(401, "unauthenticated", "sign in first"))
+    Ok(token) ->
+      case session.get(conn, token, now_unix()) {
+        Error(Nil) ->
+          Error(error_json(401, "unauthenticated", "session expired"))
+        Ok(live) ->
+          case req.method {
+            Get | Head | Options -> Ok(live)
+            _ ->
+              case list.key_find(req.headers, "x-csrf") {
+                Ok(header) if header == live.csrf -> Ok(live)
+                _ ->
+                  Error(error_json(
+                    403,
+                    "csrf",
+                    "missing or wrong x-csrf header",
+                  ))
+              }
+          }
+      }
+  }
+}
+
+/// `check_session` for a caller that already holds the connection it wants
+/// to keep using, and so has nothing to hand back first.
 pub fn require_session(
   req: Request,
   conn: Connection,
   next: fn(Session) -> Response,
 ) -> Response {
-  case wisp.get_cookie(req, session.cookie_name, wisp.Signed) {
-    Error(Nil) -> error_json(401, "unauthenticated", "sign in first")
-    Ok(token) ->
-      case session.get(conn, token, now_unix()) {
-        Error(Nil) -> error_json(401, "unauthenticated", "session expired")
-        Ok(live) ->
-          case req.method {
-            Get | Head | Options -> next(live)
-            _ ->
-              case list.key_find(req.headers, "x-csrf") {
-                Ok(header) if header == live.csrf -> next(live)
-                _ -> error_json(403, "csrf", "missing or wrong x-csrf header")
-              }
-          }
-      }
+  case check_session(req, conn) {
+    Ok(live) -> next(live)
+    Error(response) -> response
   }
 }
