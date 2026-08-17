@@ -1,22 +1,23 @@
-//// TUF-driven pin refresh: fetching, framing, serving, and discovering the
-//// log from what was stored (docs/REKOR-ZONE-KEY.md §10).
+//// Fetching Sigstore's TUF metadata, and discovering the log to submit to
+//// from what was stored (docs/REKOR-ZONE-KEY.md §10).
 ////
-//// The load-bearing test here is the shared fixture in test/fixtures/tuf:
-//// real Sigstore metadata, framed into the bundle record, asserted against
-//// the same bytes the Rust client's decoder is asserted against
-//// (crates/synch-net/tests/tuf_pin_refresh.rs). Everything else in this
-//// suite is about what this side owes around that: refuse garbage, refuse
-//// regressions, serve what it has, be absent quietly when it has nothing,
-//// and read the log to submit to out of what it stored.
+//// The material here decides one thing: which transparency log shard this
+//// service writes its zone-key claim to, and which key it checks the
+//// returned proof against. So the suite is about what this side owes around
+//// that — refuse garbage, refuse regressions, refetch before the timestamp
+//// expires, and read the endpoint out of the same signed artifact clients
+//// derive their own pins from.
+////
+//// It runs against the shared fixture in test/fixtures/tuf: real Sigstore
+//// metadata, the same files crates/synch-net/tests/tuf_pin_refresh.rs walks,
+//// so the two implementations cannot drift into pinning one log and writing
+//// to another.
 ////
 //// The cryptographic gate those fetches pass through lives in
 //// tuf_verify_test — every `refresh` below therefore also exercises the real
 //// Sigstore chain through the real verifier, which is why a fixture that
 //// stopped verifying would fail this file too.
 
-import dns/name
-import dns/wire
-import dnssec/keys
 import envoy
 import fixtures
 import gleam/bit_array
@@ -25,20 +26,16 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
-import gleam/result
 import gleam/string
 import rekor/client
 import rekor/proof
 import simplifile
 import store/migrate
 import store/sqlite
-import tuf/bundle.{type Bundle, Bundle}
 import tuf/fetch
 import tuf/meta
 import tuf/store as tuf_store
 import tuf/trusted_root
-import zone/build
-import zone/model.{type ZoneInput, Member, NsHost, TxtName, ZoneInput, ZoneMeta}
 
 const fixture_dir = "test/fixtures/tuf/"
 
@@ -64,54 +61,6 @@ fn field(name: String) -> String {
 fn number(name: String) -> Int {
   let assert Ok(value) = int.parse(field(name))
   value
-}
-
-/// The bundle the control plane relays: the root chain from the floor a
-/// stock client embeds. The fixture also carries the two roots below it,
-/// which the repository serves and the *client's* chain walk uses — which
-/// of them a bundle carries is the relay's choice, and this is that choice.
-fn fixture_bundle() -> Bundle {
-  Bundle(
-    roots: list.map(string.split(field("bundle_roots"), ","), fn(version) {
-      fixture("root-" <> version <> ".json")
-    }),
-    timestamp: fixture("timestamp.json"),
-    snapshot: fixture("snapshot.json"),
-    targets: fixture("targets.json"),
-    trusted_root: fixture("trusted-root.json"),
-  )
-}
-
-// ---------------------------------------------------------------- framing
-
-pub fn bundle_encoding_matches_the_fixture_test() {
-  assert bundle.encode(fixture_bundle()) == fixture("bundle.bin")
-}
-
-pub fn bundle_txt_is_base64url_test() {
-  let text = bundle.to_txt(fixture_bundle())
-  let assert Ok(decoded) = bit_array.base64_url_decode(text)
-  assert decoded == fixture("bundle.bin")
-  assert !string.contains(text, "=")
-}
-
-pub fn the_wire_layout_is_pinned_test() {
-  // Field offsets are load-bearing across two implementations; assert them
-  // rather than trusting the encoder to agree with itself.
-  let assert [first, ..] = fixture_bundle().roots
-  let size = bit_array.byte_size(first)
-  let assert <<version:int-size(8), count:int-size(8), len:int-size(32)>> =
-    bit_array.slice(fixture("bundle.bin"), 0, 6) |> unwrap_bits
-  assert version == bundle.version
-  assert count == list.length(fixture_bundle().roots)
-  assert len == size
-}
-
-pub fn root_chains_round_trip_through_their_stored_form_test() {
-  let roots = fixture_bundle().roots
-  assert bundle.split_roots(bundle.join_roots(roots)) == Ok(roots)
-  assert bundle.split_roots(<<0, 0>>) == Error(Nil)
-  assert bundle.split_roots(<<>>) == Ok([])
 }
 
 // ------------------------------------------------------------ metadata
@@ -218,10 +167,13 @@ pub fn a_refresh_stores_the_walked_chain_test() {
   assert outcome.targets_version == number("targets_version")
   assert outcome.timestamp_expires > now
 
-  // What was stored frames up to exactly the bytes the client decodes.
+  // And what was stored is the fixture's own bytes, verbatim.
   let assert Ok(Ok(material)) = tuf_store.get(conn)
   assert material.source == "https://tuf.test"
-  assert bundle.encode(tuf_store.to_bundle(material)) == fixture("bundle.bin")
+  assert material.timestamp_json == fixture("timestamp.json")
+  assert material.snapshot_json == fixture("snapshot.json")
+  assert material.targets_json == fixture("targets.json")
+  assert material.trusted_root == fixture("trusted-root.json")
 
   // Re-running finds nothing new: the ordinary result of the hourly job.
   let assert Ok(again) =
@@ -254,8 +206,8 @@ pub fn a_refresh_refuses_a_version_regression_test() {
 }
 
 pub fn a_refresh_refuses_expired_material_test() {
-  // A relay that stores already-expired material is relaying something no
-  // client will ever adopt.
+  // Expiry gates ingestion, where refusing costs a retry — not use, where
+  // refusing would leave this service with no log to submit to at all.
   let conn = fixtures.fresh_conn()
   let assert Ok(timestamp) =
     meta.read_role(fixture("timestamp.json"), "timestamp")
@@ -297,8 +249,8 @@ pub fn a_refresh_refuses_a_tampered_target_test() {
 
 pub fn refetching_is_due_only_near_expiry_test() {
   let conn = fixtures.fresh_conn()
-  // No material at all is always due: a zone that relays nothing is a zone
-  // whose clients never refresh their pins.
+  // No material at all is always due: with nothing stored, this service
+  // does not know which log shard to submit to.
   assert fetch.due(conn, number("verify_at"))
   let assert Ok(_) =
     fetch.refresh(conn, fake_repo(), "https://tuf.test", number("verify_at"))
@@ -440,8 +392,7 @@ pub fn a_first_ceremony_fetches_the_directory_it_needs_test() {
   envoy.unset("CP_REKOR_KEY")
 
   // Nothing stored, so resolving fetches: the first `rekor-publish` on a
-  // fresh control plane does not have to be told to run `tuf-refresh` first,
-  // and what it fetches is the same material the zone will relay.
+  // fresh control plane does not have to be told to run `tuf-refresh` first.
   let assert Ok(target) =
     client.resolve(conn, fake_repo(), "https://tuf.test", now)
   let assert Ok(logs) = trusted_root.tlogs(fixture("trusted-root.json"))
@@ -493,7 +444,6 @@ pub fn the_migration_chain_reaches_the_tuf_table_test() {
       conn,
       tuf_store.Material(
         source: "https://tuf.test",
-        roots: [<<"{}":utf8>>],
         root_version: 15,
         timestamp_json: <<"{}":utf8>>,
         timestamp_version: 1,
@@ -509,85 +459,6 @@ pub fn the_migration_chain_reaches_the_tuf_table_test() {
   let assert Ok([[sqlite.Int(1)]]) =
     sqlite.query(conn, "SELECT count(*) FROM tuf_material", [])
   sqlite.close(conn)
-}
-
-// --------------------------------------------------------------- serving
-
-fn zone_input(tuf_bundle: String) -> ZoneInput {
-  let assert Ok(apex) = name.parse("sync.test.")
-  let assert Ok(ns1) = name.parse("ns1.sync.test.")
-  let assert Ok(owner) = name.parse("_synchronicity.prod.acme.sync.test.")
-  let csk = keys.generate()
-  ZoneInput(
-    ZoneMeta(
-      apex,
-      7,
-      csk.public,
-      keys.key_tag(keys.dnskey_rdata(csk)),
-      3600,
-      1_209_600,
-      604_800,
-    ),
-    [NsHost(ns1, "127.0.0.1", "")],
-    [TxtName(owner, [Member("nas", fixtures.nk(), "", "")])],
-    [],
-    tuf_bundle,
-  )
-}
-
-pub fn the_zone_serves_the_tuf_bundle_test() {
-  let text = bundle.to_txt(fixture_bundle())
-  let assert Ok(rrsets) = build.build(zone_input(text))
-  let assert Ok(owner) = name.parse("_synchronicity-tuf.sync.test.")
-  let assert Ok(rrset) =
-    list.find(rrsets, fn(r) { r.owner == owner && r.rtype == wire.type_txt })
-  assert rrset.ttl == build.ttl_rekor
-  let assert [rd] = rrset.rdatas
-  // TXT rdata is a run of ≤255-byte character-strings; the client
-  // concatenates them before decoding.
-  assert chunks(rd) == Ok(text)
-  // And the name is in the NSEC chain like any other owner.
-  assert list.contains(build.owners_in_order(rrsets), owner)
-}
-
-pub fn a_zone_without_tuf_material_has_no_such_name_test() {
-  let assert Ok(rrsets) = build.build(zone_input(""))
-  let assert Ok(owner) = name.parse("_synchronicity-tuf.sync.test.")
-  assert !list.contains(build.owners_in_order(rrsets), owner)
-}
-
-pub fn a_published_zone_carries_what_was_fetched_test() {
-  // The whole relay path in one: fetch into the database, read the zone
-  // back out of it, and get the fixture bytes at the owner name a client
-  // will ask for.
-  let conn = fixtures.fresh_conn()
-  let _csk = fixtures.zone_boot(conn)
-  let assert Ok(_) =
-    fetch.refresh(conn, fake_repo(), "https://tuf.test", number("verify_at"))
-  let assert Ok(input) = model.read(conn)
-  assert input.tuf_bundle == bundle.to_txt(fixture_bundle())
-  let assert Ok(rrsets) = build.build(input)
-  let assert Ok(owner) = name.parse("_synchronicity-tuf.sync.test.")
-  assert list.contains(build.owners_in_order(rrsets), owner)
-  sqlite.close(conn)
-}
-
-/// Re-joins TXT character-strings.
-fn chunks(rdata: BitArray) -> Result(String, Nil) {
-  case rdata {
-    <<>> -> Ok("")
-    <<len:int-size(8), chunk:bytes-size(len), rest:bits>> -> {
-      use head <- result.try(bit_array.to_string(chunk))
-      use tail <- result.try(chunks(rest))
-      Ok(head <> tail)
-    }
-    _ -> Error(Nil)
-  }
-}
-
-fn unwrap_bits(sliced: Result(BitArray, Nil)) -> BitArray {
-  let assert Ok(bits) = sliced
-  bits
 }
 
 // ------------------------------------------------- the redirection attack

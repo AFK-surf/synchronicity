@@ -15,8 +15,8 @@
 ////                         log a retirement breadcrumb for a key. Allowed to
 ////                         be chainless: a retired zone may have no DS left,
 ////                         and clients never treat a retire as authorization.
-////   tuf-refresh           refetch Sigstore's TUF metadata and relay it in
-////                         the zone, so clients' log pins follow it
+////   tuf-refresh           refetch Sigstore's TUF metadata, so this service
+////                         submits to the log shard currently in service
 ////   seed                  create a demo org/network/devices and publish
 ////   seed-admin <email>    first-user bootstrap: print a one-time magic link
 ////   migrate-check         replay the migration chain against a scratch DB
@@ -175,7 +175,7 @@ fn rekor_publish(
   use csk <- result.try(keys.load(key_file))
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
-  // Which shard to submit to comes out of the relayed TUF material, so a
+  // Which shard to submit to comes out of the stored TUF material, so a
   // ceremony run after Sigstore rotates goes to the new log without a
   // release. On a control plane that has never fetched, this fetches.
   let tuf_source = tuf_fetch.url()
@@ -234,16 +234,15 @@ fn rekor_publish(
   Ok(Nil)
 }
 
-/// Refetches Sigstore's TUF metadata and republishes, so the bundle record
-/// is served beside the proofs it will be used to check (§10.3).
+/// Refetches Sigstore's TUF metadata, which is how this service learns which
+/// log shard to submit to (§10.3, §10.6).
 ///
-/// The air-gapped ceremony runs this where there is egress and couriers the
-/// database, as with everything else. Failing costs nothing: clients keep
-/// the pins they have, which is what a control plane that never ran this at
-/// all leaves them with.
+/// Nothing about the zone changes — clients read Sigstore's repository
+/// themselves — so this does not republish. The air-gapped ceremony runs it
+/// where there is egress and couriers the database, as with everything else.
+/// Failing costs nothing beyond staying on the shard already stored.
 fn tuf_refresh() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
-  use csk <- result.try(keys.load(cfg.key_file))
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
   let source = tuf_fetch.url()
@@ -257,10 +256,6 @@ fn tuf_refresh() -> Result(Nil, String) {
     source,
     now,
   ))
-  use _ <- result.try(
-    publish.publish(conn, csk, now, "system:tuf-refresh")
-    |> result.map_error(fn(e) { "republishing zone: " <> string.inspect(e) }),
-  )
   sqlite.close(conn)
   io.println(
     "tuf: verified against "
@@ -276,7 +271,7 @@ fn tuf_refresh() -> Result(Nil, String) {
     <> ", targets "
     <> int.to_string(outcome.targets_version)
     <> case outcome.changed {
-      True -> " — relayed"
+      True -> " — stored"
       False -> " — unchanged"
     },
   )

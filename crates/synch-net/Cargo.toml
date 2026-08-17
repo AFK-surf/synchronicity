@@ -14,7 +14,7 @@ futures-core.workspace = true
 hex.workspace = true
 hickory-resolver.workspace = true
 iroh.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 ring.workspace = true
 iroh-base.workspace = true
 iroh-mainline-address-lookup.workspace = true

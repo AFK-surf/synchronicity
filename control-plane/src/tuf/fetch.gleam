@@ -1,15 +1,12 @@
 //// Fetching Sigstore's TUF metadata, verifying it, and storing it verbatim
 //// (docs/REKOR-ZONE-KEY.md §10.3).
 ////
-//// This service relays the metadata a client verifies, and it **also
-//// verifies it itself** (`tuf/verify`), against the same anchor the client
-//// embeds. The second half used to be absent, on the argument that bad
-//// stored material cost nothing but zone bytes: clients ignore what does not
-//// verify and keep their pins, so a relay could be a relay. That stopped
-//// being the whole story when `rekor/client.discover` began reading the
-//// stored `trusted_root.json` to decide **where this service submits** —
-//// a decision no client ever sees, and so a decision no client can
-//// re-verify (§10.6).
+//// What the stored material is *for* is `rekor/client.discover`, which reads
+//// the `trusted_root.json` out of it to decide **where this service
+//// submits** — a decision no client ever sees, and so a decision no client
+//// can re-verify (§10.6). That is why this side verifies what it stores
+//// (`tuf/verify`), against the same anchor the client embeds, rather than
+//// trusting TLS to a CDN.
 ////
 //// So the walk is a walk — timestamp names the snapshot version, the
 //// snapshot names the targets version, the targets name the target's digest
@@ -23,11 +20,10 @@
 //// module decides is then testable without egress, and the HTTP leg stays
 //// one small function.
 ////
-//// One thing verification does *not* do is gate serving. Stored material
-//// that has since expired keeps being relayed and keeps naming the log, on
-//// §10.2's rule that expiry gates updates and never operation. Expiry is
-//// checked at the moment of ingestion, where refusing costs nothing but a
-//// retry.
+//// One thing verification does *not* do is gate use. Stored material that
+//// has since expired keeps naming the log, on §10.2's rule that expiry gates
+//// updates and never operation. Expiry is checked at the moment of
+//// ingestion, where refusing costs nothing but a retry.
 
 import envoy
 import gleam/http/request
@@ -49,9 +45,9 @@ import tuf/verify
 /// It is not a constant any more but the version of the anchor in
 /// `priv/tuf`, which is byte-identical to the one crates/synch-net embeds
 /// (`EMBEDDED_TUF_ROOT`). Reading it from the file rather than restating it
-/// keeps the walk, the verification and the relayed chain agreeing about
-/// where the bottom is by construction — a floor written down twice is a
-/// floor that eventually disagrees with itself.
+/// keeps the walk and the verification agreeing about where the bottom is by
+/// construction — a floor written down twice is a floor that eventually
+/// disagrees with itself.
 ///
 /// Raising it is a release note: a client older than the floor keeps its
 /// pins rather than following, which is the designed failure.
@@ -88,7 +84,7 @@ pub type Outcome {
   )
 }
 
-/// The repository to relay (`CP_TUF_URL`).
+/// The repository to follow (`CP_TUF_URL`).
 pub fn url() -> String {
   envoy.get("CP_TUF_URL")
   |> result.unwrap("https://tuf-repo-cdn.sigstore.dev")
@@ -101,12 +97,7 @@ pub fn url() -> String {
 /// self-authenticating and gets checked against the anchor in `priv/tuf`
 /// before it is stored, and again by the client against the identical root
 /// it embeds. A hostile transport can deny this fetch; it cannot make it
-/// mean anything.
-///
-/// That sentence used to be a half-truth — nothing on this side checked a
-/// signature, so a hostile transport could make the fetch mean whatever it
-/// liked to *this* process, which mattered once the material started naming
-/// the log to submit to. `tuf/verify` is what makes it true.
+/// mean anything. `tuf/verify` is what makes that true on this side.
 pub fn http(base: String) -> Repo {
   Repo(get: fn(path) {
     let url = strip_slash(base) <> "/" <> path
@@ -238,7 +229,6 @@ pub fn refresh(
   let material =
     Material(
       source: source,
-      roots: list.map(roots, fn(pair) { pair.1 }),
       root_version: root_version,
       timestamp_json: timestamp,
       timestamp_version: timestamp_role.version,
@@ -275,8 +265,8 @@ pub fn refresh(
 
 /// Whether the stored timestamp is close enough to expiry to refetch —
 /// three days, per §10.3, against a Sigstore timestamp that lives about a
-/// week. Absent material is always due: a zone that relays nothing is a
-/// zone whose clients never refresh their pins.
+/// week. Absent material is always due: with nothing stored, this service
+/// does not know which log shard to submit to.
 pub fn due(conn: Connection, now: Int) -> Bool {
   case store.get(conn) {
     Ok(Ok(material)) -> material.timestamp_expires - now <= refetch_window
@@ -329,7 +319,8 @@ fn fetch(repo: Repo, path: String) -> Result(BitArray, String) {
 }
 
 /// A file whose own version disagrees with the version it was fetched as is
-/// a repository contradicting itself; a relay should not smooth that over.
+/// a repository contradicting itself, and nothing here should smooth that
+/// over.
 fn agrees(file: String, declared: Int, expected: Int) -> Result(Nil, String) {
   case declared == expected {
     True -> Ok(Nil)

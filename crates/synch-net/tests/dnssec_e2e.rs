@@ -37,6 +37,10 @@ async fn a_signed_zone_validates_end_to_end() {
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
+        tuf_url: None,
+        // Nothing in this suite exercises pin refresh, and no test run
+        // reaches Sigstore by accident.
+        no_tuf: true,
     })
     .unwrap();
 
@@ -74,6 +78,10 @@ async fn a_zone_signed_by_an_unanchored_key_is_refused() {
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
+        tuf_url: None,
+        // Nothing in this suite exercises pin refresh, and no test run
+        // reaches Sigstore by accident.
+        no_tuf: true,
     })
     .unwrap();
     resolver
@@ -102,6 +110,10 @@ async fn an_unsigned_zone_is_refused() {
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
+        tuf_url: None,
+        // Nothing in this suite exercises pin refresh, and no test run
+        // reaches Sigstore by accident.
+        no_tuf: true,
     })
     .unwrap();
     resolver

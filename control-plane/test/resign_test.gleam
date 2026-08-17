@@ -41,30 +41,20 @@ pub fn resign_republishes_near_expiry_test() {
   sqlite.close(conn)
 }
 
-pub fn a_tuf_refetch_republishes_in_the_same_tick_test() {
+pub fn a_tuf_refetch_stores_without_touching_the_zone_test() {
   let path = tmp_db()
   let assert Ok(conn) = db.open_primary(path)
   let assert Ok(_) = migrate.migrate(conn)
   let csk = fixtures.zone_boot(conn)
   let assert Ok(1) = publish.publish(conn, csk, now_unix(), "test")
 
-  // The zone is presigned: stored TUF material a client can see only
-  // exists after a publish. Signatures are nowhere near their refresh
-  // window, so the serial moving means the refetch itself republished.
+  // Nothing in the zone depends on TUF material — it names the log shard
+  // this service submits to and nothing else — so a refetch that stores a
+  // whole new chain must leave the serial exactly where it was.
   resign.run_once_at(path, csk, tuf_test.fake_repo(), tuf_test.verify_at())
-  let assert Ok([[sqlite.Int(2)]]) =
+  let assert Ok([[sqlite.Int(1)]]) =
     sqlite.query(conn, "SELECT soa_serial FROM zone_meta", [])
   let assert Ok([[sqlite.Int(1)]]) =
-    sqlite.query(
-      conn,
-      "SELECT count(*) FROM presigned_rrsets
-       WHERE name LIKE '_synchronicity-tuf.%' AND rtype = 16",
-      [],
-    )
-
-  // The next tick finds nothing new and leaves the zone alone.
-  resign.run_once_at(path, csk, tuf_test.fake_repo(), tuf_test.verify_at())
-  let assert Ok([[sqlite.Int(2)]]) =
-    sqlite.query(conn, "SELECT soa_serial FROM zone_meta", [])
+    sqlite.query(conn, "SELECT count(*) FROM tuf_material", [])
   sqlite.close(conn)
 }

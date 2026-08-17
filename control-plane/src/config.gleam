@@ -33,9 +33,8 @@ pub type DnsMode {
   /// not be the apex: a control plane at `sync.example.com` may live
   /// entirely inside the `example.com` zone, with no delegation of its own.
   /// The zone's own keys sign every record under it, so that zone — not the
-  /// apex — is where the proof and TUF records go and where a chain's
-  /// ladder starts. Equal to the apex unless `CP_SIGNING_ZONE` says
-  /// otherwise.
+  /// apex — is where the proof records go and where a chain's ladder starts.
+  /// Equal to the apex unless `CP_SIGNING_ZONE` says otherwise.
   External(provider: ProviderConfig, signing_zone: String)
 }
 

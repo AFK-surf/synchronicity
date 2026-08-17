@@ -1,47 +1,33 @@
-//! TUF-driven pin refresh: the offline half (docs/REKOR-ZONE-KEY.md §10).
+//! TUF-driven pin refresh (docs/REKOR-ZONE-KEY.md §10).
 //!
 //! Sigstore rotates its tiled logs — a new shard, a new key, roughly yearly
 //! — and eventually removes compromised keys from its trust root. A
 //! build-time snapshot of the log keys turns each of those events into a
 //! client upgrade. This module makes the pin set follow Sigstore's TUF
-//! repository instead, without a new transport and without a new liveness
-//! coupling: **the zone relays Sigstore's TUF metadata verbatim, and the
-//! client verifies it here against an embedded TUF root.**
+//! repository instead: **the client walks the official repository itself and
+//! verifies what it collected here, against an embedded TUF root.**
 //!
-//! The principle is the proof records': the zone may carry anything that
-//! verifies against something the client pins. TUF metadata is
-//! self-authenticating — every byte chains to the root role — so the zone
-//! never becomes an authority over the pin set. It is a relay, and a
-//! tampering relay produces material that fails verification and is ignored.
-//!
-//! # Wire format
-//!
-//! `TufBundle` v1, big-endian throughout, mirroring [`crate::rekor`]'s
-//! conventions (strict decode, base64url in one TXT record, chunked into
-//! ≤255-byte character-strings by the zone):
-//!
-//! ```text
-//! u8       version        = 1
-//! u8       root_count       root.json versions, ascending, so a client
-//! u32+[]   root_json[..]    embedded at version N can chain to current
-//! u32+[]   timestamp_json   all files verbatim, exactly as the TUF
-//! u32+[]   snapshot_json    repository serves them — signatures cover
-//! u32+[]   targets_json     these bytes
-//! u32+[]   trusted_root     the target the chain authenticates
-//! ```
+//! Going to the source rather than through an intermediary is the simpler
+//! arrangement, and it is available because of what TUF metadata *is*.
+//! Every byte chains to the root role, so nothing between the repository and
+//! this module is trusted with anything: the CDN serving the files, the TLS
+//! that carried them, a caching mirror in front of either. A hostile
+//! transport can deny this fetch; it cannot make it mean anything.
 //!
 //! # The two rules that are load-bearing
 //!
 //! Both come straight from §10.2, and both are about availability, so
 //! neither is a detail an implementation gets to soften:
 //!
-//! 1. **Expiry gates updates, never operation.** An absent, stale or invalid
-//!    bundle is ignored and the current pins stand. To *change* pins the
-//!    chain must be valid and unexpired; to keep working, nothing is
-//!    required. No error out of this module ever fails a membership refresh.
-//! 2. **Monotonicity bounds hostile relays.** A zone can serve old-but-valid
-//!    material, but it cannot roll a client's persisted versions back, and a
-//!    freeze holds only until the served timestamp expires.
+//! 1. **Expiry gates updates, never operation.** An unreachable repository,
+//!    or stale or invalid material from one, is ignored and the current pins
+//!    stand. To *change* pins the chain must be valid and unexpired; to keep
+//!    working, nothing is required. No error out of this module ever fails a
+//!    membership refresh.
+//! 2. **Monotonicity bounds hostile mirrors.** A mirror can serve
+//!    old-but-valid material, but it cannot roll a client's persisted
+//!    versions back, and a freeze holds only until the served timestamp
+//!    expires.
 //!
 //! On acceptance the pin set becomes the tlogs of the new `trusted_root` —
 //! **replacing** the previous set, never unioning with it, so a key Sigstore
@@ -55,12 +41,6 @@ use std::{
 use ring::signature;
 
 use crate::rekor::{base64_encode, sha256, LogKeys};
-
-/// The only `TufBundle` version this build accepts.
-pub const BUNDLE_VERSION: u8 = 1;
-
-/// The label the TUF bundle lives under, one below the zone apex.
-pub const TUF_TXT_PREFIX: &str = "_synchronicity-tuf";
 
 /// The target the chain has to authenticate for any of this to matter.
 pub const TRUSTED_ROOT_TARGET: &str = "trusted_root.json";
@@ -98,7 +78,7 @@ pub const EMBEDDED_TUF_ROOT: &str = include_str!("sigstore_tuf_root.json");
 /// `tuf-repo-cdn.sigstore.dev`. It is the signed artifact itself rather than
 /// keys copied out of it, so which logs exist, where they are served and
 /// which of them is currently in service are all read from one place — here
-/// until a bundle verifies, and from that bundle's trusted root afterwards.
+/// until a walk verifies, and from that walk's trusted root afterwards.
 /// Nothing about a Sigstore log rotation reaches this file: only a root-level
 /// incident does, and that is [`EMBEDDED_TUF_ROOT`]'s business.
 pub const EMBEDDED_TRUSTED_ROOT: &str = include_str!("sigstore_trusted_root.json");
@@ -110,7 +90,7 @@ pub const EMBEDDED_TRUSTED_ROOT: &str = include_str!("sigstore_trusted_root.json
 /// current pins" (§10.2) — so they exist to be *reported*, not to propagate.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TufError {
-    /// The bundle could not be decoded, or a file in it is not the JSON
+    /// The repository could not be read, or a file it served is not the JSON
     /// shape TUF metadata has.
     #[error("malformed: {0}")]
     Malformed(String),
@@ -154,9 +134,13 @@ impl TufError {
     }
 }
 
-/// One decoded TUF bundle: the files, verbatim, in chain order.
+/// One walk of a TUF repository: the files, verbatim, in chain order.
+///
+/// Collected by [`fetch_metadata`] and checked by [`update`] — the split is
+/// deliberate, and the naming follows it: everything here is bytes somebody
+/// else served, held together in the order the verifier reads them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TufBundle {
+pub struct TufMetadata {
     /// `root.json` at ascending versions, so a client embedded at version N
     /// can walk to the current one.
     pub roots: Vec<Vec<u8>>,
@@ -170,88 +154,13 @@ pub struct TufBundle {
     pub trusted_root: Vec<u8>,
 }
 
-impl TufBundle {
-    /// Encodes the bundle in the v1 wire format.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            2 + self.roots.iter().map(|r| r.len() + 4).sum::<usize>()
-                + self.timestamp.len()
-                + self.snapshot.len()
-                + self.targets.len()
-                + self.trusted_root.len()
-                + 16,
-        );
-        out.push(BUNDLE_VERSION);
-        // A chain that cannot be length-prefixed cannot be encoded; the
-        // control plane never produces one, and truncating silently would
-        // produce a bundle that fails verification much later.
-        let roots = u8::try_from(self.roots.len()).unwrap_or(u8::MAX);
-        out.push(roots);
-        for blob in self.roots.iter().take(usize::from(roots)).chain([
-            &self.timestamp,
-            &self.snapshot,
-            &self.targets,
-            &self.trusted_root,
-        ]) {
-            let len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
-            out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(&blob[..len as usize]);
-        }
-        out
-    }
-
-    /// Decodes a v1 bundle, refusing anything with bytes left over — a
-    /// record that decodes two ways is a record an attacker can steer.
-    pub fn decode(bytes: &[u8]) -> Result<TufBundle, TufError> {
-        let mut reader = Reader::new(bytes);
-        let version = reader.u8("version")?;
-        if version != BUNDLE_VERSION {
-            return Err(TufError::Malformed(format!(
-                "version {version} is not {BUNDLE_VERSION}"
-            )));
-        }
-        let root_count = reader.u8("root count")?;
-        if root_count == 0 {
-            return Err(TufError::Malformed(
-                "the bundle carries no root.json".into(),
-            ));
-        }
-        let mut roots = Vec::with_capacity(usize::from(root_count));
-        for _ in 0..root_count {
-            roots.push(reader.blob32("root.json")?.to_vec());
-        }
-        let timestamp = reader.blob32("timestamp.json")?.to_vec();
-        let snapshot = reader.blob32("snapshot.json")?.to_vec();
-        let targets = reader.blob32("targets.json")?.to_vec();
-        let trusted_root = reader.blob32("trusted_root.json")?.to_vec();
-        reader.finish()?;
-        Ok(TufBundle {
-            roots,
-            timestamp,
-            snapshot,
-            targets,
-            trusted_root,
-        })
-    }
-
-    /// Decodes one TXT record: base64url, with or without padding. The
-    /// character-strings are concatenated before this is called — the split
-    /// into ≤255-byte chunks is DNS packaging, not content.
-    pub fn from_txt(text: &str) -> Result<TufBundle, TufError> {
-        TufBundle::decode(&base64url_decode(text)?)
-    }
-
-    /// Renders the bundle as one base64url TXT payload.
-    pub fn to_txt(&self) -> String {
-        base64url_encode(&self.encode())
-    }
-}
-
 /// The pin set a client is running on, and where it came from (§10.2).
 ///
 /// Persisted as one file, global across domains: `<data-dir>/rekor-pins.json`
-/// at mode 0600. Global is the point — a hostile zone must not be able to
-/// roll one client's versions back by being asked about a different domain.
+/// at mode 0600. Global is the point — the pin set is a property of Sigstore
+/// and not of any domain being resolved, so every domain shares one floor
+/// and a hostile mirror gets one client's versions to walk back, not one per
+/// domain it is asked about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinState {
     /// The accepted `root.json`, verbatim — the next update chains from it.
@@ -321,7 +230,7 @@ impl PinState {
     /// unreadable as state.
     ///
     /// Unreadable is not an error worth failing on: the pin set falls back
-    /// to the bootstrap snapshot and the next valid bundle rewrites the
+    /// to the bootstrap snapshot and the next valid walk rewrites the
     /// file. A client that refused to start over a corrupt cache would be
     /// exactly the availability coupling §10.2 forbids.
     pub fn load(path: &Path) -> Option<PinState> {
@@ -394,12 +303,13 @@ pub struct TufUpdate {
     pub state: PinState,
     /// The pin set the new trusted root names — replacing, never unioning.
     pub log_keys: LogKeys,
-    /// Whether anything actually moved. A bundle that re-states what is
+    /// Whether anything actually moved. Material that re-states what is
     /// already accepted is valid and boring; saying so keeps the logs quiet.
     pub changed: bool,
 }
 
-/// Verifies a bundle and, if it is newer, returns the state to adopt (§10.2).
+/// Verifies collected metadata and, if it is newer, returns the state to
+/// adopt (§10.2).
 ///
 /// `now` is seconds since the epoch — supplied rather than read so a
 /// conformance fixture can be verified at the moment it was fetched, which
@@ -408,13 +318,13 @@ pub struct TufUpdate {
 /// The order is TUF's own: chain the roots, then timestamp → snapshot →
 /// targets → the target itself, each step endorsed by the role the *current*
 /// root names and bounded by the version the state already accepted.
-pub fn update(bundle: &TufBundle, state: &PinState, now: u64) -> Result<TufUpdate, TufError> {
+pub fn update(metadata: &TufMetadata, state: &PinState, now: u64) -> Result<TufUpdate, TufError> {
     let mut trusted = Root::parse(&state.root)?;
 
     // 1. Walk the root chain. Each step must be signed by the thresholds of
     //    *both* the old root and the new one: the old root says who may
     //    succeed it, the new one proves it holds the keys it claims.
-    for bytes in &bundle.roots {
+    for bytes in &metadata.roots {
         let candidate = Root::parse(bytes)?;
         if candidate.version <= trusted.version {
             // Material for a root this client already passed. Old-but-valid
@@ -444,32 +354,32 @@ pub fn update(bundle: &TufBundle, state: &PinState, now: u64) -> Result<TufUpdat
 
     // 2. timestamp → snapshot → targets, each signed by the role the
     //    current root names, each no older than what is already accepted.
-    let timestamp = Meta::parse(&bundle.timestamp, TIMESTAMP_ROLE)?;
+    let timestamp = Meta::parse(&metadata.timestamp, TIMESTAMP_ROLE)?;
     trusted.check_role(TIMESTAMP_ROLE, &timestamp)?;
     timestamp.check_expiry(now)?;
     timestamp.check_rollback(state.timestamp_version)?;
 
-    let snapshot = Meta::parse(&bundle.snapshot, SNAPSHOT_ROLE)?;
-    timestamp.check_listed(SNAPSHOT_META, &bundle.snapshot, snapshot.version)?;
+    let snapshot = Meta::parse(&metadata.snapshot, SNAPSHOT_ROLE)?;
+    timestamp.check_listed(SNAPSHOT_META, &metadata.snapshot, snapshot.version)?;
     trusted.check_role(SNAPSHOT_ROLE, &snapshot)?;
     snapshot.check_expiry(now)?;
     snapshot.check_rollback(state.snapshot_version)?;
 
-    let targets = Meta::parse(&bundle.targets, TARGETS_ROLE)?;
-    snapshot.check_listed(TARGETS_META, &bundle.targets, targets.version)?;
+    let targets = Meta::parse(&metadata.targets, TARGETS_ROLE)?;
+    snapshot.check_listed(TARGETS_META, &metadata.targets, targets.version)?;
     trusted.check_role(TARGETS_ROLE, &targets)?;
     targets.check_expiry(now)?;
     targets.check_rollback(state.targets_version)?;
 
     // 3. The target the whole chain exists to authenticate.
-    targets.check_target(TRUSTED_ROOT_TARGET, &bundle.trusted_root)?;
-    let log_keys = tlog_keys(&bundle.trusted_root)?;
+    targets.check_target(TRUSTED_ROOT_TARGET, &metadata.trusted_root)?;
+    let log_keys = tlog_keys(&metadata.trusted_root)?;
 
     let changed = trusted.version != state.root_version
         || timestamp.version != state.timestamp_version
         || snapshot.version != state.snapshot_version
         || targets.version != state.targets_version
-        || bundle.trusted_root != state.trusted_root;
+        || metadata.trusted_root != state.trusted_root;
 
     Ok(TufUpdate {
         state: PinState {
@@ -478,7 +388,7 @@ pub fn update(bundle: &TufBundle, state: &PinState, now: u64) -> Result<TufUpdat
             timestamp_version: timestamp.version,
             snapshot_version: snapshot.version,
             targets_version: targets.version,
-            trusted_root: bundle.trusted_root.clone(),
+            trusted_root: metadata.trusted_root.clone(),
             updated_at: now,
         },
         log_keys,
@@ -570,7 +480,7 @@ pub fn tlogs(trusted_root: &[u8]) -> Result<Vec<Tlog>, TufError> {
     if logs.is_empty() {
         // Adopting an empty pin set would silently refuse every zone from
         // then on. §10.2's whole posture is that TUF trouble is never worse
-        // than not having the record, so this is trouble, not an update.
+        // than not having asked, so this is trouble, not an update.
         return Err(bad("it names no transparency logs".into()));
     }
     Ok(logs)
@@ -610,20 +520,30 @@ fn root_version(bytes: &[u8]) -> Option<u64> {
 
 // ------------------------------------------------------------- fetching
 
-/// The default Sigstore TUF repository, the one `EMBEDDED_TUF_ROOT` anchors.
+/// The official Sigstore TUF repository, the one `EMBEDDED_TUF_ROOT` anchors
+/// — where both the client and the monitor read the pin set from.
 pub const SIGSTORE_TUF_URL: &str = "https://tuf-repo-cdn.sigstore.dev";
 
-/// How many root versions past the one already trusted [`fetch_bundle`] will
+/// How long a client rests between walks of the repository (§10.2).
+///
+/// The pin set moves when Sigstore opens or closes a shard, which is a
+/// yearly event; a day is far more often than that and matches the TTL the
+/// zone's own transparency records ride on. The walk is a handful of HTTPS
+/// GETs and a few hundred KB, so this is the difference between a daemon
+/// that touches a CDN once a day and one that touches it on every membership
+/// refresh — which for a short DNS TTL would be every minute.
+pub const REFRESH_INTERVAL: u64 = 24 * 60 * 60;
+
+/// How many root versions past the one already trusted [`fetch_metadata`] will
 /// probe before giving up. Sigstore rotates roughly yearly; this is decades
 /// of headroom and a bound on a repository that answers 200 to everything.
 const ROOT_CEILING: u64 = 200;
 
 /// A TUF repository, as the one operation walking it needs.
 ///
-/// Injected rather than hardwired, exactly as the control plane's relay does
-/// it: everything [`fetch_bundle`] decides is then testable without egress,
-/// and a caller brings whichever HTTP client it already has (the client's is
-/// async, the monitor's blocking).
+/// Injected rather than hardwired, the same shape the control plane's fetch
+/// uses: everything [`fetch_metadata`] decides is then testable without egress,
+/// and a caller brings whichever HTTP client it already has.
 ///
 /// `Ok(None)` is a file the repository does not have — the end of the root
 /// chain is precisely that answer — and `Err` a repository that could not be
@@ -635,8 +555,8 @@ pub trait Repo {
     fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String>;
 }
 
-/// Walks a TUF repository into a bundle, starting the root chain at
-/// `from_root` — the version the caller already trusts.
+/// Walks a TUF repository, starting the root chain at `from_root` — the
+/// version the caller already trusts.
 ///
 /// **This verifies nothing.** It follows the consistent-snapshot naming so
 /// that the right files are collected — timestamp names the snapshot
@@ -644,9 +564,9 @@ pub trait Repo {
 /// target's digest — and hands the result to [`update`], which is where
 /// every signature, expiry and rollback bound is checked. Fetching over a
 /// hostile transport is therefore not a vulnerability but a denial: the
-/// bytes are self-authenticating, so a tampering mirror produces a bundle
+/// bytes are self-authenticating, so a tampering mirror produces material
 /// that fails verification and leaves the current pins standing.
-pub fn fetch_bundle(repo: &dyn Repo, from_root: u64) -> Result<TufBundle, TufError> {
+pub fn fetch_metadata(repo: &dyn Repo, from_root: u64) -> Result<TufMetadata, TufError> {
     let fetch = |path: &str| -> Result<Vec<u8>, TufError> {
         repo.get(path)
             .map_err(TufError::Malformed)?
@@ -684,7 +604,7 @@ pub fn fetch_bundle(repo: &dyn Repo, from_root: u64) -> Result<TufBundle, TufErr
     let digest = target_digest(&targets, TRUSTED_ROOT_TARGET)?;
     let trusted_root = fetch(&format!("targets/{digest}.{TRUSTED_ROOT_TARGET}"))?;
 
-    Ok(TufBundle {
+    Ok(TufMetadata {
         roots,
         timestamp,
         snapshot,
@@ -835,7 +755,7 @@ impl Meta {
             .ok_or_else(|| TufError::Chain(format!("{}.json does not list {file}", self.role)))?;
         if listed != version {
             return Err(TufError::Rollback(format!(
-                "{}.json names {file} version {listed}, the bundle carries {version}",
+                "{}.json names {file} version {listed}, the walk collected {version}",
                 self.role
             )));
         }
@@ -1279,143 +1199,14 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, ()> {
         .map_err(|_| ())
 }
 
-/// base64url without padding — how a bundle travels in a TXT record.
-fn base64url_encode(bytes: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// Decodes a base64url TXT payload, padding optional.
-fn base64url_decode(text: &str) -> Result<Vec<u8>, TufError> {
-    use base64::Engine;
-    let trimmed: String = text
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .collect();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(&trimmed)
-        .map_err(|e| TufError::Malformed(format!("not base64url: {e}")))
-}
-
 /// Lowercase or uppercase hex, as TUF writes signatures and digests.
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
     hex::decode(text).ok()
 }
 
-/// A bounds-checked reader over the wire format.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Reader<'a> {
-        Reader { bytes, at: 0 }
-    }
-
-    fn take(&mut self, len: usize, what: &str) -> Result<&'a [u8], TufError> {
-        let end = self.at.checked_add(len).ok_or_else(|| {
-            TufError::Malformed(format!("{what}: length {len} overflows the bundle"))
-        })?;
-        if end > self.bytes.len() {
-            return Err(TufError::Malformed(format!(
-                "{what}: wanted {len} bytes, {} remain",
-                self.bytes.len() - self.at
-            )));
-        }
-        let slice = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(slice)
-    }
-
-    fn u8(&mut self, what: &str) -> Result<u8, TufError> {
-        Ok(self.take(1, what)?[0])
-    }
-
-    fn u32(&mut self, what: &str) -> Result<u32, TufError> {
-        let bytes = self.take(4, what)?;
-        let mut array = [0u8; 4];
-        array.copy_from_slice(bytes);
-        Ok(u32::from_be_bytes(array))
-    }
-
-    fn blob32(&mut self, what: &str) -> Result<&'a [u8], TufError> {
-        let len = self.u32(what)?;
-        self.take(len as usize, what)
-    }
-
-    fn finish(&self) -> Result<(), TufError> {
-        match self.bytes.len() - self.at {
-            0 => Ok(()),
-            extra => Err(TufError::Malformed(format!(
-                "{extra} bytes after the end of the bundle"
-            ))),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn bundle() -> TufBundle {
-        TufBundle {
-            roots: vec![b"{\"a\":1}".to_vec(), b"{\"a\":2}".to_vec()],
-            timestamp: b"timestamp".to_vec(),
-            snapshot: b"snapshot".to_vec(),
-            targets: b"targets".to_vec(),
-            trusted_root: b"trusted".to_vec(),
-        }
-    }
-
-    #[test]
-    fn bundles_round_trip() {
-        let original = bundle();
-        assert_eq!(TufBundle::decode(&original.encode()).unwrap(), original);
-        assert_eq!(TufBundle::from_txt(&original.to_txt()).unwrap(), original);
-    }
-
-    #[test]
-    fn the_wire_layout_is_pinned() {
-        // Field offsets are load-bearing across two implementations; assert
-        // them rather than trusting the encoder to agree with itself.
-        let bytes = bundle().encode();
-        assert_eq!(bytes[0], BUNDLE_VERSION);
-        assert_eq!(bytes[1], 2, "root count");
-        assert_eq!(&bytes[2..6], &7u32.to_be_bytes());
-        assert_eq!(&bytes[6..13], b"{\"a\":1}");
-        assert_eq!(&bytes[13..17], &7u32.to_be_bytes());
-    }
-
-    #[test]
-    fn a_truncated_or_padded_bundle_is_malformed() {
-        let bytes = bundle().encode();
-        for cut in [0, 1, 2, 5, bytes.len() - 1] {
-            assert!(matches!(
-                TufBundle::decode(&bytes[..cut]),
-                Err(TufError::Malformed(_))
-            ));
-        }
-        let mut extra = bytes.clone();
-        extra.push(0);
-        assert!(matches!(
-            TufBundle::decode(&extra),
-            Err(TufError::Malformed(_))
-        ));
-        let mut wrong_version = bytes.clone();
-        wrong_version[0] = 2;
-        assert!(matches!(
-            TufBundle::decode(&wrong_version),
-            Err(TufError::Malformed(_))
-        ));
-        // A bundle with no root chains from nothing.
-        let mut rootless = bytes;
-        rootless[1] = 0;
-        assert!(matches!(
-            TufBundle::decode(&rootless),
-            Err(TufError::Malformed(_))
-        ));
-    }
 
     #[test]
     fn canonical_json_is_canonical_json() {

@@ -215,10 +215,11 @@ fn healthz(serving: Serving) -> Response {
         #("status", json.string("ok")),
         #("soa_serial", json.int(serial)),
         #("sig_expires_at", json.int(expires)),
-        // The relayed TUF material (docs/REKOR-ZONE-KEY.md §10.3): the
-        // stored timestamp expiry and root version, so an operator can see
-        // a relay that has quietly stopped refetching. Absent material is
-        // reported as absent, not as unhealthy — clients keep their pins.
+        // The stored TUF material (docs/REKOR-ZONE-KEY.md §10.3): the
+        // timestamp expiry and root version, so an operator can see a
+        // service that has quietly stopped refetching and is heading for a
+        // stale idea of which log shard is in service. Absent material is
+        // reported as absent, not as unhealthy.
         ..case tuf {
           Ok(Ok(material)) -> [
             #("tuf_root_version", json.int(material.root_version)),

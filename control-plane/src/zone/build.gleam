@@ -28,12 +28,6 @@ pub const ttl_rekor = 86_400
 /// The label the zone-key proofs live under, one below the apex.
 pub const rekor_label = "_synchronicity-rekor"
 
-/// The label the relayed TUF bundle lives under, one below the apex
-/// (docs/REKOR-ZONE-KEY.md §10.1). Same 24 h TTL as the proofs, and the
-/// same reasoning: the client caches it separately from the membership
-/// answer, so the steady-state refresh stays one TXT query.
-pub const tuf_label = "_synchronicity-tuf"
-
 pub type Rrset {
   Rrset(owner: Name, rtype: Int, ttl: Int, rdatas: List(BitArray))
 }
@@ -119,7 +113,6 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
       glue,
       txt,
       rekor_rrsets(input, apex),
-      tuf_rrsets(input, apex),
     ])
   Ok(list.append(data, nsec_chain(data)))
 }
@@ -154,21 +147,6 @@ pub fn rekor_part_label(index: Int) -> String {
   case index <= 1 {
     True -> rekor_label
     False -> rekor_label <> "-" <> int.to_string(index)
-  }
-}
-
-/// The relayed TUF bundle (docs/REKOR-ZONE-KEY.md §10.1): one TXT record
-/// at the apex, under `_synchronicity-tuf`, signed like every other RRset.
-///
-/// No material means no owner name — not an error. A zone that relays
-/// nothing is a zone whose clients keep the pins they have, which is the
-/// behavior this design started from and degrades back to.
-fn tuf_rrsets(input: ZoneInput, apex: Name) -> List(Rrset) {
-  case input.tuf_bundle {
-    "" -> []
-    text -> [
-      Rrset([tuf_label, ..apex], wire.type_txt, ttl_rekor, [rdata.txt(text)]),
-    ]
   }
 }
 

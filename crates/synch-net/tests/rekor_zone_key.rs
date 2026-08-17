@@ -542,6 +542,10 @@ async fn a_zone_that_publishes_its_proof_resolves_under_require() {
         rekor: Some(RekorPolicy::Require),
         rekor_key: Some(log_key.path().to_path_buf()),
         rekor_state: None,
+        tuf_url: None,
+        // Nothing in this suite exercises pin refresh, and no test run
+        // reaches Sigstore by accident.
+        no_tuf: true,
     })
     .unwrap();
     let (set, _ttl) = resolver
@@ -573,6 +577,10 @@ async fn an_absent_proof_record_refuses_under_require_and_resolves_under_off() {
         rekor: Some(policy),
         rekor_key: Some(log_key.path().to_path_buf()),
         rekor_state: None,
+        tuf_url: None,
+        // Nothing in this suite exercises pin refresh, and no test run
+        // reaches Sigstore by accident.
+        no_tuf: true,
     };
 
     let strict = DnssecResolver::with_options(&options(RekorPolicy::Require)).unwrap();
@@ -618,6 +626,10 @@ async fn a_proof_record_covering_only_someone_elses_keys_is_refused() {
         rekor: Some(RekorPolicy::Require),
         rekor_key: Some(log_key.path().to_path_buf()),
         rekor_state: None,
+        tuf_url: None,
+        // Nothing in this suite exercises pin refresh, and no test run
+        // reaches Sigstore by accident.
+        no_tuf: true,
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
@@ -649,6 +661,10 @@ async fn a_chainless_entry_is_refused_through_the_whole_resolver_path() {
         rekor: Some(RekorPolicy::Require),
         rekor_key: Some(log_key.path().to_path_buf()),
         rekor_state: None,
+        tuf_url: None,
+        // Nothing in this suite exercises pin refresh, and no test run
+        // reaches Sigstore by accident.
+        no_tuf: true,
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
@@ -671,6 +687,10 @@ async fn a_garbled_proof_record_is_refused_as_malformed() {
         rekor: Some(RekorPolicy::Require),
         rekor_key: Some(log_key.path().to_path_buf()),
         rekor_state: None,
+        tuf_url: None,
+        // Nothing in this suite exercises pin refresh, and no test run
+        // reaches Sigstore by accident.
+        no_tuf: true,
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();

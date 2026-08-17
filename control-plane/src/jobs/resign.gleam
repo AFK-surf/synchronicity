@@ -2,12 +2,13 @@
 //// soonest RRSIG expiry is inside the refresh window (default 7 days of a
 //// 14-day validity). Replicas therefore have days of slack, not minutes.
 ////
-//// The same hour also keeps the relayed TUF material young
+//// The same hour also keeps this service's own TUF material young
 //// (docs/REKOR-ZONE-KEY.md §10.3): when the stored timestamp is within
-//// three days of expiring, refetch it. A failed refetch is logged and
-//// nothing else — clients keep the pins they have, and a control plane
-//// that stops fetching degrades to a frozen pin set rather than a failed
-//// cluster (§10.2).
+//// three days of expiring, refetch it. That material decides which log
+//// shard this control plane submits to, and nothing else — clients read
+//// Sigstore's repository themselves. A failed refetch is logged and nothing
+//// else: a control plane that stops fetching degrades to the shard it last
+//// knew about rather than to a failed cluster (§10.2).
 
 import dnssec/keys.{type Csk}
 import gleam/erlang/process.{type Subject}
@@ -88,9 +89,7 @@ pub fn run_once_at(
   case db.open_primary(db_path) {
     Error(_) -> io.println_error("resign: database unavailable")
     Ok(conn) -> {
-      // Refetch first, so a republish this hour carries the fresher bundle
-      // rather than waiting an hour to serve it.
-      refresh_tuf(conn, csk, repo, now)
+      refresh_tuf(conn, repo, now)
       let due =
         sqlite.query(
           conn,
@@ -120,47 +119,31 @@ pub fn run_once_at(
 }
 
 /// Refetches Sigstore's TUF metadata when the stored timestamp is within
-/// three days of expiring (§10.3), and republishes when it changed — the
-/// zone is presigned, so stored material a client can see only exists after
-/// a publish, and waiting for the next RRSIG-due republish could sit on a
-/// fresher bundle for days.
+/// three days of expiring (§10.3).
 ///
-/// Every failure is a log line and nothing more: the zone keeps relaying
-/// whatever it had, and clients keep the pins they have. A control plane
-/// that stops fetching degrades to a frozen pin set, never to a failed
-/// cluster.
-fn refresh_tuf(
-  conn: sqlite.Connection,
-  csk: Csk,
-  repo: fetch.Repo,
-  now: Int,
-) -> Nil {
+/// Nothing about the zone depends on this any more — clients read Sigstore
+/// themselves — so a refetch never republishes. What it keeps young is this
+/// service's own answer to "which shard do I submit to", which
+/// `rekor/client.discover` reads out of the stored `trusted_root.json` at
+/// the moment of use.
+///
+/// Every failure is a log line and nothing more: the stored material stands,
+/// and a control plane that stops fetching degrades to submitting into the
+/// shard it last knew about, never to a failed cluster.
+fn refresh_tuf(conn: sqlite.Connection, repo: fetch.Repo, now: Int) -> Nil {
   case fetch.due(conn, now) {
     False -> Nil
     True ->
       case fetch.refresh(conn, repo, fetch.url(), now) {
         Ok(outcome) ->
           case outcome.changed {
-            True -> {
+            True ->
               io.println(
                 "resign: tuf refreshed, root "
                 <> int.to_string(outcome.root_version)
                 <> " timestamp "
                 <> int.to_string(outcome.timestamp_version),
               )
-              case publish.publish(conn, csk, now, "system:tuf-refresh") {
-                Ok(serial) ->
-                  io.println(
-                    "resign: republished for tuf, serial "
-                    <> int.to_string(serial),
-                  )
-                Error(e) ->
-                  io.println_error(
-                    "resign: publish after tuf refresh failed: "
-                    <> string.inspect(e),
-                  )
-              }
-            }
             False -> Nil
           }
         Error(why) -> io.println_error("resign: tuf refresh failed: " <> why)

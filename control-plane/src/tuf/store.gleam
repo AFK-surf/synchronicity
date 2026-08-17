@@ -1,22 +1,25 @@
-//// The `tuf_material` table: the Sigstore metadata this zone relays, and
-//// the versions that decide whether a refetch is an update or a regression
-//// (docs/REKOR-ZONE-KEY.md §10.3).
+//// The `tuf_material` table: the Sigstore metadata this service verified,
+//// and the versions that decide whether a refetch is an update or a
+//// regression (docs/REKOR-ZONE-KEY.md §10.3).
 ////
 //// One row, because there is one Sigstore repository and one current view
-//// of it. Replicas need nothing beyond the row: relayed TUF material is
-//// public, self-authenticating data and rides the existing operator-owned
+//// of it. What the row is *for* is `rekor/client.discover`, which reads the
+//// stored `trusted_root.json` to decide which log shard this service submits
+//// to. Replicas need nothing beyond the row: it is public,
+//// self-authenticating data and rides the existing operator-owned
 //// replication like everything else.
 
-import gleam/list
 import gleam/result
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
-import tuf/bundle.{type Bundle, Bundle}
 
 /// The stored material, with everything the refetch decision needs.
+///
+/// The root chain itself is not kept. Every walk starts from the anchor in
+/// `priv/tuf` rather than from anything stored, and nothing downstream reads
+/// a root, so a copy here would be bytes nobody looks at.
 pub type Material {
   Material(
     source: String,
-    roots: List(BitArray),
     root_version: Int,
     timestamp_json: BitArray,
     timestamp_version: Int,
@@ -30,32 +33,19 @@ pub type Material {
   )
 }
 
-/// The bundle this material serves as.
-pub fn to_bundle(material: Material) -> Bundle {
-  Bundle(
-    roots: material.roots,
-    timestamp: material.timestamp_json,
-    snapshot: material.snapshot_json,
-    targets: material.targets_json,
-    trusted_root: material.trusted_root,
-  )
-}
-
 /// Replaces the stored material. The single row is the whole state: a
-/// partial update would leave a chain whose files disagree, which is
-/// exactly the material a client is going to ignore.
+/// partial update would leave a chain whose files disagree, which is exactly
+/// the material nothing should be deciding anything from.
 pub fn put(conn: Connection, material: Material) -> Result(Nil, sqlite.Error) {
   sqlite.exec(
     conn,
     "INSERT INTO tuf_material
-       (id, source, root_json, root_count, root_version, timestamp_json,
+       (id, source, root_version, timestamp_json,
         timestamp_version, timestamp_expires, snapshot_json, snapshot_version,
         targets_json, targets_version, trusted_root, fetched_at)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (id) DO UPDATE SET
        source = excluded.source,
-       root_json = excluded.root_json,
-       root_count = excluded.root_count,
        root_version = excluded.root_version,
        timestamp_json = excluded.timestamp_json,
        timestamp_version = excluded.timestamp_version,
@@ -68,8 +58,6 @@ pub fn put(conn: Connection, material: Material) -> Result(Nil, sqlite.Error) {
        fetched_at = excluded.fetched_at",
     [
       Text(material.source),
-      Blob(bundle.join_roots(material.roots)),
-      VInt(list.length(material.roots)),
       VInt(material.root_version),
       Blob(material.timestamp_json),
       VInt(material.timestamp_version),
@@ -88,7 +76,7 @@ pub fn put(conn: Connection, material: Material) -> Result(Nil, sqlite.Error) {
 /// The stored material, if any has ever been fetched.
 pub fn get(conn: Connection) -> Result(Result(Material, Nil), sqlite.Error) {
   let sql =
-    "SELECT source, root_json, root_version, timestamp_json, timestamp_version,
+    "SELECT source, root_version, timestamp_json, timestamp_version,
             timestamp_expires, snapshot_json, snapshot_version, targets_json,
             targets_version, trusted_root, fetched_at
      FROM tuf_material WHERE id = 1"
@@ -103,7 +91,6 @@ fn decode(row: List(sqlite.Value)) -> Result(Material, Nil) {
   case row {
     [
       Text(source),
-      Blob(roots),
       VInt(root_version),
       Blob(timestamp_json),
       VInt(timestamp_version),
@@ -114,11 +101,9 @@ fn decode(row: List(sqlite.Value)) -> Result(Material, Nil) {
       VInt(targets_version),
       Blob(trusted_root),
       VInt(fetched_at),
-    ] -> {
-      use roots <- result.try(bundle.split_roots(roots))
+    ] ->
       Ok(Material(
         source,
-        roots,
         root_version,
         timestamp_json,
         timestamp_version,
@@ -130,7 +115,6 @@ fn decode(row: List(sqlite.Value)) -> Result(Material, Nil) {
         trusted_root,
         fetched_at,
       ))
-    }
     _ -> Error(Nil)
   }
 }

@@ -32,4 +32,4 @@ pub use error::{NetError, Result};
 pub use mpt::{HeadExchange, MptClient, MptProtocol, NodesResponse, ValuesResponse};
 pub use reconcile::{FetchOutcome, HeadOutcome, SyncReport, Syncer};
 pub use rekor::{ProofError, RekorProof};
-pub use tuf::{PinState, TufBundle, TufError};
+pub use tuf::{PinState, TufError, TufMetadata};

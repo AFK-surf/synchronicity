@@ -2,9 +2,9 @@
 ////
 //// `priv/tuf/sigstore_tuf_root.json`, byte-identical to the root the client
 //// embeds (`EMBEDDED_TUF_ROOT` in crates/synch-net/src/tuf.rs) — the two
-//// sides verify the same repository against the same anchor, which is what
-//// makes "the control plane relays what the client will accept" a checkable
-//// statement rather than a hope.
+//// sides verify the same repository against the same anchor, so a shard
+//// this service picks to submit to is a shard clients' own pins will cover
+//// — a checkable statement rather than a hope.
 ////
 //// It ships in `priv/` rather than compiled in because Gleam has no
 //// include-bytes and a 5 KB JSON document escaped into a source constant is

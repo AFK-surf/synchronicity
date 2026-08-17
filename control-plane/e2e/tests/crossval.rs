@@ -38,14 +38,15 @@ async fn control_plane_zone_validates_and_parses() {
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
+        tuf_url: None,
+        no_tuf: true,
     })
     .expect("resolver construction");
 
-    let (set, ttl) = resolver
-        .member_set(&domain)
-        .await
-        .expect("DNSSEC-validated member set — validation failing here means \
-                 the control plane's signatures or negative proofs are wrong");
+    let (set, ttl) = resolver.member_set(&domain).await.expect(
+        "DNSSEC-validated member set — validation failing here means \
+                 the control plane's signatures or negative proofs are wrong",
+    );
 
     assert!(
         set.rejected.is_empty(),
@@ -134,6 +135,11 @@ async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
         rekor: None,
         rekor_key: None,
         rekor_state: None,
+        tuf_url: None,
+        // The refusal below is about this zone's missing proof record, and
+        // nothing about the pin set can change it — so there is no reason
+        // for an e2e run to reach Sigstore's CDN.
+        no_tuf: true,
     })
     .expect("resolver construction");
 

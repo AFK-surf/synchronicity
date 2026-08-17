@@ -26,7 +26,7 @@ use crate::{
     chain,
     dns::TXT_PREFIX,
     rekor::{self, RekorProof, ZoneKeyStatement},
-    tuf::{self, TufBundle},
+    tuf::{self, TufMetadata},
     x509::{self, SelfSigned},
     zonecert::{ChainLink, DnssecChain, OID_DNSSEC_CHAIN},
 };
@@ -51,10 +51,6 @@ pub struct SimZone {
     /// base64url as [`RekorProof::to_txt`] renders it. Empty is the
     /// not-yet-upgraded control plane.
     pub rekor_txt: Vec<String>,
-    /// The TUF bundle served at `_synchronicity-tuf.<origin>`, base64url as
-    /// [`TufBundle::to_txt`] renders it. Empty is a control plane that
-    /// relays no TUF material, which is a non-event to a client (§10.2).
-    pub tuf_txt: Vec<String>,
 }
 
 impl SimZone {
@@ -90,7 +86,6 @@ impl SimZone {
             ttl: 300,
             unsigned: false,
             rekor_txt: Vec::new(),
-            tuf_txt: Vec::new(),
         }
     }
 
@@ -347,11 +342,6 @@ impl SimZone {
         }
     }
 
-    /// The name the TUF bundle lives under.
-    pub fn tuf_name(&self) -> Name {
-        Name::from_utf8(format!("{}.{}", tuf::TUF_TXT_PREFIX, self.origin)).expect("tuf name")
-    }
-
     /// The trust-anchor line for this zone's key, in the file syntax
     /// `--dnssec-anchor` reads. Whoever anchors this line trusts this zone —
     /// and nothing signed under the real root.
@@ -476,9 +466,6 @@ impl SimZone {
                 }
                 self.chunked_txt(name, &mine)
             }
-            RecordType::TXT if name == self.tuf_name() && !self.tuf_txt.is_empty() => {
-                self.chunked_txt(self.tuf_name(), &self.tuf_txt)
-            }
             RecordType::DNSKEY if name == self.origin => {
                 let mut set = RecordSet::new(name, RecordType::DNSKEY, 0);
                 set.insert(
@@ -515,9 +502,8 @@ impl SimZone {
 
     /// One TXT RRset carrying long base64url payloads.
     ///
-    /// A proof is kilobytes and a TUF bundle is tens of them; TXT carries
-    /// either as consecutive ≤255-byte character-strings, which the client
-    /// concatenates before decoding (§3, §10.1).
+    /// A proof is kilobytes; TXT carries it as consecutive ≤255-byte
+    /// character-strings, which the client concatenates before decoding (§3).
     fn chunked_txt(&self, owner: Name, payloads: &[String]) -> RecordSet {
         let mut set = RecordSet::new(owner.clone(), RecordType::TXT, 0);
         for text in payloads {
@@ -808,7 +794,7 @@ impl SimLog {
 /// Roles are signed the way Sigstore signs them: the root role with ECDSA
 /// P-256 and DER signatures, the online roles — timestamp, snapshot, targets
 /// — with a single Ed25519 key, so both schemes and both signature
-/// encodings are exercised by every bundle this produces.
+/// encodings are exercised by everything this produces.
 #[doc(hidden)]
 #[allow(missing_debug_implementations)]
 pub struct SimTuf {
@@ -918,16 +904,16 @@ impl SimTuf {
         self.publish_root(previous.as_deref());
     }
 
-    /// The bundle a zone would relay: every root, ascending, then the four
-    /// files the chain authenticates.
-    pub fn bundle(&self) -> TufBundle {
-        self.bundle_from(1)
+    /// What a walk of this repository collects: every root, ascending, then
+    /// the four files the chain authenticates.
+    pub fn metadata(&self) -> TufMetadata {
+        self.metadata_from(1)
     }
 
-    /// The same bundle with the roots below `first` withheld — a relay that
-    /// serves a chain a client embedded lower down cannot reach.
-    pub fn bundle_from(&self, first: u64) -> TufBundle {
-        TufBundle {
+    /// The same, with the roots below `first` withheld — a mirror serving a
+    /// chain a client embedded lower down cannot reach.
+    pub fn metadata_from(&self, first: u64) -> TufMetadata {
+        TufMetadata {
             roots: self
                 .roots
                 .iter()
@@ -1022,6 +1008,40 @@ impl SimTuf {
             },
         });
         sign_metadata(&signed, [&self.online])
+    }
+}
+
+/// Served the way a real TUF repository serves it: by consistent-snapshot
+/// path, so a walk that resolved the wrong version — or read a digest out of
+/// the wrong field — finds nothing here rather than quietly assembling
+/// something that happens to verify.
+impl tuf::Repo for SimTuf {
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        if let Some(version) = path
+            .strip_suffix(".root.json")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Ok(self.roots.get(version.saturating_sub(1) as usize).cloned());
+        }
+        Ok(match path {
+            "timestamp.json" => Some(self.timestamp()),
+            _ if path == format!("{}.snapshot.json", self.snapshot_version) => {
+                Some(self.snapshot())
+            }
+            _ if path == format!("{}.targets.json", self.targets_version) => Some(self.targets()),
+            _ if path
+                == format!(
+                    "targets/{}.{}",
+                    hex::encode(rekor::sha256(&self.trusted_root)),
+                    tuf::TRUSTED_ROOT_TARGET
+                ) =>
+            {
+                Some(self.trusted_root.clone())
+            }
+            // Every other path is a file this repository does not have,
+            // which is how the root walk learns where to stop.
+            _ => None,
+        })
     }
 }
 

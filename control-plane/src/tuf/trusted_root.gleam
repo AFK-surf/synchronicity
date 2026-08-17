@@ -18,11 +18,11 @@
 //// beside it — that value is the C2SP note key id, a different 32 bytes that
 //// matches no pin (see `rekor/proof.log_id`).
 ////
-//// Nothing here verifies anything. This service is a TUF relay, not the
-//// verifier (`tuf/fetch`); what it reads out of the stored material decides
-//// where it submits, and a submission that went somewhere unexpected fails
-//// at the next step, when the returned proof is checked against the key
-//// named beside that endpoint.
+//// Nothing here verifies anything — `tuf/fetch` is the gate, and only
+//// verified material is ever stored. What this reads out of that material
+//// decides where the service submits, and a submission that went somewhere
+//// unexpected fails at the next step anyway, when the returned proof is
+//// checked against the key named beside that endpoint.
 
 import gleam/bit_array
 import gleam/dynamic/decode

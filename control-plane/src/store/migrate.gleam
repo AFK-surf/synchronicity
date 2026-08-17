@@ -62,8 +62,40 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4]
+  [v1, v2, v3, v4, v5]
 }
+
+/// V5: `tuf_material` stops keeping the root chain.
+///
+/// The chain was kept to be copied into the zone. Clients read Sigstore's
+/// TUF repository themselves now (docs/REKOR-ZONE-KEY.md §10), and every
+/// walk this service makes starts from the anchor in `priv/tuf`, so nothing
+/// reads those two columns. A rebuild rather than `DROP COLUMN`: the table
+/// is one row, and this way the schema a fresh database gets is the schema a
+/// migrated one gets, on every SQLite the deployment might be running.
+const v5 = "
+CREATE TABLE tuf_material_v5 (
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  source            TEXT    NOT NULL,
+  root_version      INTEGER NOT NULL,
+  timestamp_json    BLOB    NOT NULL,
+  timestamp_version INTEGER NOT NULL,
+  timestamp_expires INTEGER NOT NULL,
+  snapshot_json     BLOB    NOT NULL,
+  snapshot_version  INTEGER NOT NULL,
+  targets_json      BLOB    NOT NULL,
+  targets_version   INTEGER NOT NULL,
+  trusted_root      BLOB    NOT NULL,
+  fetched_at        INTEGER NOT NULL
+);
+INSERT INTO tuf_material_v5
+  SELECT id, source, root_version, timestamp_json, timestamp_version,
+         timestamp_expires, snapshot_json, snapshot_version, targets_json,
+         targets_version, trusted_root, fetched_at
+  FROM tuf_material;
+DROP TABLE tuf_material;
+ALTER TABLE tuf_material_v5 RENAME TO tuf_material;
+"
 
 /// V4: external DNS provider mode (docs/EXTERNAL-DNS-PROVIDER.md).
 ///
@@ -104,7 +136,7 @@ CREATE TABLE observed_zone_keys (
 );
 "
 
-/// V3: zone-key transparency and the relayed TUF material
+/// V3: zone-key transparency and the stored TUF material
 /// (docs/REKOR-ZONE-KEY.md §5.2, §10.3).
 ///
 /// `rekor_records` holds one row per zone-key lifecycle event: the entry
@@ -130,12 +162,9 @@ CREATE TABLE observed_zone_keys (
 ///
 /// `tuf_material` is a single row, because there is one Sigstore repository
 /// and one current view of it — the files verbatim, their versions, and the
-/// timestamp expiry the hourly job watches. This service is a relay, not the
-/// verifier: these columns exist so it can refuse regressions and know when to
-/// refetch, and the cryptographic gate is the client's. `root_json` holds the
-/// root chain as one blob of u32-length-prefixed files, ascending — the same
-/// framing the bundle record uses, so serving is a copy rather than a
-/// re-encode.
+/// timestamp expiry the hourly job watches. The versions are what let a
+/// refetch refuse a regression; the `trusted_root` is what names the log
+/// shard this service submits to. (V5 drops `root_json`/`root_count`.)
 const v3 = "
 CREATE TABLE rekor_records (
   keyset_sha256      BLOB    NOT NULL CHECK (length(keyset_sha256) = 32),

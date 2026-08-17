@@ -15,16 +15,19 @@
 //! trusted root that drops a shard key — revocation reaching the pin set.
 //!
 //! The **resolver** half proves the two load-bearing rules of §10.2 through
-//! the whole DoH path: a zone that relays a bundle teaches a client a log
-//! key its build never knew, in the same refresh that then verifies a proof
-//! from that log; and nothing about the bundle can ever fail a refresh.
+//! the whole refresh path: a walk of Sigstore's repository teaches a client
+//! a log key its build never knew, in the same refresh that then verifies a
+//! proof from that log; nothing about that repository can ever fail a
+//! refresh; and a client walks it once a day, not once per membership
+//! lookup. Every repository here is injected, so no test run reaches
+//! Sigstore.
 
 use synch_net::{
     dns::{DnssecResolver, RekorPolicy, ResolverOptions},
     error::NetError,
     rekor::{self, LogKeys},
     sim::{SimLog, SimTuf, SimZone},
-    tuf::{self, PinState, TufBundle, TufError},
+    tuf::{self, PinState, TufError, TufMetadata},
 };
 
 fn write(contents: &str) -> tempfile::NamedTempFile {
@@ -72,22 +75,22 @@ fn fixture_number(name: &str) -> u64 {
     fixture_field(name).parse().expect("a fixture number")
 }
 
-/// The bundle the control plane actually relays: the root chain from the
-/// floor a stock client embeds — one root today, and one more per Sigstore
-/// rotation until the floor is raised.
-fn fixture_bundle() -> TufBundle {
-    fixture_bundle_from("bundle_roots")
+/// What a stock client collects: the root chain from the version its build
+/// embeds — one root today, and one more per Sigstore rotation until the
+/// embedded root is refreshed.
+fn fixture_metadata() -> TufMetadata {
+    fixture_metadata_from("root_version")
 }
 
 /// The same files with the whole checked-in root history in front, so the
-/// chain walk has real rotations to walk. The repository serves these
-/// versions; which of them a bundle carries is the relay's choice.
-fn fixture_chain_bundle() -> TufBundle {
-    fixture_bundle_from("root_versions")
+/// chain walk has real rotations to walk. The repository serves every one of
+/// these versions; where a client starts is its own root's business.
+fn fixture_chain_metadata() -> TufMetadata {
+    fixture_metadata_from("root_versions")
 }
 
-fn fixture_bundle_from(field: &str) -> TufBundle {
-    TufBundle {
+fn fixture_metadata_from(field: &str) -> TufMetadata {
+    TufMetadata {
         roots: fixture_field(field)
             .split(',')
             .map(|version| fixture(&format!("root-{version}.json")))
@@ -100,23 +103,11 @@ fn fixture_bundle_from(field: &str) -> TufBundle {
 }
 
 #[test]
-fn the_shared_fixture_frames_and_decodes() {
-    // The framing half of the crossval: the Gleam encoder builds these same
-    // bytes from these same files, so a drift in either direction fails one
-    // of the two suites rather than passing both against different bytes.
-    let bundle = fixture_bundle();
-    assert_eq!(bundle.encode(), fixture("bundle.bin"));
-    let decoded = TufBundle::decode(&fixture("bundle.bin")).expect("the fixture is a v1 bundle");
-    assert_eq!(decoded, bundle);
-    assert_eq!(TufBundle::from_txt(&bundle.to_txt()).unwrap(), bundle);
-}
-
-#[test]
 fn the_real_sigstore_chain_verifies_and_yields_the_pin_set() {
     // Everything here is Sigstore's own bytes: if canonical JSON, the key
     // parsing, the DER signatures, the optional `meta` hashes or the RFC
     // 3339 shapes were wrong in any way, this cannot pass.
-    let bundle = fixture_chain_bundle();
+    let metadata = fixture_chain_metadata();
     let floor = fixture_number("chain_floor");
     let state = PinState {
         root: fixture(&format!("root-{floor}.json")),
@@ -130,7 +121,7 @@ fn the_real_sigstore_chain_verifies_and_yields_the_pin_set() {
     // Verified at the moment the fixture was fetched: a checked-in chain
     // expires, and pinning the clock is what keeps it checkable.
     let at = fixture_number("verify_at");
-    let update = tuf::update(&bundle, &state, at).expect("the real chain must verify");
+    let update = tuf::update(&metadata, &state, at).expect("the real chain must verify");
     assert!(update.changed);
     assert_eq!(update.state.root_version, fixture_number("root_version"));
     assert_eq!(
@@ -207,15 +198,14 @@ impl tuf::Repo for FixtureRepo {
 }
 
 #[test]
-fn walking_the_repository_finds_the_chain_the_zone_relays() {
-    // The monitor's half of §10: it has no zone to relay a bundle to it, so
-    // it walks Sigstore's repository itself. What it assembles must be the
-    // same chain the control plane relays and the client verifies — the
-    // fetch is a different path to the same bytes, not a second format.
+fn walking_the_repository_finds_the_whole_chain() {
+    // How every reader of the pin set gets it — the client and the monitor
+    // alike: walk the consistent-snapshot naming, then hand what was
+    // collected to the ordinary verifier.
     let floor = fixture_number("chain_floor");
     let walked =
-        tuf::fetch_bundle(&FixtureRepo, floor).expect("the fixture repository is walkable");
-    assert_eq!(walked, fixture_chain_bundle());
+        tuf::fetch_metadata(&FixtureRepo, floor).expect("the fixture repository is walkable");
+    assert_eq!(walked, fixture_chain_metadata());
 
     // And it goes through the ordinary verifier from there, with no
     // dispensation for having been fetched rather than relayed.
@@ -235,13 +225,13 @@ fn walking_the_repository_finds_the_chain_the_zone_relays() {
     // root collects only that root, and one past the end finds nothing at
     // all rather than inventing a chain.
     let current = fixture_number("root_version");
-    let from_current = tuf::fetch_bundle(&FixtureRepo, current).unwrap();
+    let from_current = tuf::fetch_metadata(&FixtureRepo, current).unwrap();
     assert_eq!(
         from_current.roots,
         vec![fixture(&format!("root-{current}.json"))]
     );
     assert!(matches!(
-        tuf::fetch_bundle(&FixtureRepo, current + 1),
+        tuf::fetch_metadata(&FixtureRepo, current + 1),
         Err(TufError::Chain(_))
     ));
 }
@@ -287,29 +277,33 @@ fn the_real_chain_expires() {
         ..PinState::embedded()
     };
     assert!(matches!(
-        tuf::update(&fixture_chain_bundle(), &state, at),
+        tuf::update(&fixture_chain_metadata(), &state, at),
         Err(TufError::Expiry(_))
     ));
 }
 
 #[test]
 fn the_real_chain_cannot_be_reached_from_below_its_floor() {
-    // The floor §10.1 states per release, seen from a build below it. The
-    // bundle a control plane relays starts at the version a stock client
-    // embeds, so a client two rotations older has nothing to bridge the gap
-    // and keeps its pins rather than guessing. The same files *with* the
-    // intermediates in front verify, which is what makes this a floor and
-    // not a bug.
+    // The floor §10.2 states per release, seen from a build below it. A
+    // client walks from the root version it holds, so material collected
+    // from the current version up has nothing to bridge the gap for a client
+    // two rotations older, and that client keeps its pins rather than
+    // guessing. The same files *with* the intermediates in front verify,
+    // which is what makes this a floor and not a bug.
     let floor = fixture_number("chain_floor");
     let state = PinState {
         root: fixture(&format!("root-{floor}.json")),
         root_version: floor,
         ..PinState::embedded()
     };
-    let error = tuf::update(&fixture_bundle(), &state, fixture_number("verify_at"));
+    let error = tuf::update(&fixture_metadata(), &state, fixture_number("verify_at"));
     assert!(matches!(error, Err(TufError::Chain(_))), "{error:?}");
-    tuf::update(&fixture_chain_bundle(), &state, fixture_number("verify_at"))
-        .expect("the full chain reaches the same head");
+    tuf::update(
+        &fixture_chain_metadata(),
+        &state,
+        fixture_number("verify_at"),
+    )
+    .expect("the full chain reaches the same head");
 }
 
 #[test]
@@ -361,14 +355,14 @@ fn at(now: i64) -> u64 {
 #[test]
 fn a_synthetic_chain_verifies_from_its_embedded_root() {
     let (repo, log) = repo();
-    let update = tuf::update(&repo.bundle(), &repo.embedded_state(), at(NOW))
+    let update = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW))
         .expect("a well-formed chain verifies");
     assert!(update.changed);
     assert_eq!(update.state.root_version, 1);
     assert!(update.log_keys.find(&log.log_id()).is_some());
 
-    // Re-applying the same bundle is valid and boring: accepted, unchanged.
-    let again = tuf::update(&repo.bundle(), &update.state, at(NOW)).unwrap();
+    // Re-applying the same material is valid and boring: accepted, unchanged.
+    let again = tuf::update(&repo.metadata(), &update.state, at(NOW)).unwrap();
     assert!(!again.changed);
     assert_eq!(again.state, update.state);
 }
@@ -383,22 +377,22 @@ fn root_rotation_walks_every_version_in_order() {
     repo.rotate_root(true);
     assert_eq!(repo.root_version(), 4);
 
-    let update = tuf::update(&repo.bundle(), &repo.embedded_state(), at(NOW))
+    let update = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW))
         .expect("a chained rotation verifies");
     assert_eq!(update.state.root_version, 4);
 
     // A chain with a version missing bridges nothing. The relay is free to
     // withhold; it is not free to be believed.
-    let mut gapped = repo.bundle();
+    let mut gapped = repo.metadata();
     gapped.roots.remove(1);
     assert!(matches!(
         tuf::update(&gapped, &repo.embedded_state(), at(NOW)),
         Err(TufError::Chain(_))
     ));
 
-    // And a client already at version 4 accepts a bundle that only carries
+    // And a client already at version 4 accepts a chain that only carries
     // the tail — old material may be withheld once it is passed.
-    let tail = repo.bundle_from(4);
+    let tail = repo.metadata_from(4);
     tuf::update(&tail, &update.state, at(NOW)).expect("the tail alone still verifies");
 }
 
@@ -409,7 +403,7 @@ fn a_root_the_old_root_did_not_sign_is_refused() {
     // A fork: rotate to a root signed only by brand-new keys, the way a
     // relay that had minted its own root would.
     repo.rotate_root(true);
-    let mut forged = repo.bundle();
+    let mut forged = repo.metadata();
     // Strip the predecessor's signatures from root 2, leaving only its own.
     let mut root: serde_json::Value = serde_json::from_slice(&forged.roots[1]).unwrap();
     let keyids: Vec<String> = root["signed"]["roles"]["root"]["keyids"]
@@ -439,7 +433,7 @@ fn a_threshold_that_is_not_met_is_refused() {
     let (mut repo, _log) = repo();
     let state = repo.embedded_state();
     repo.rotate_root(false);
-    let mut thin = repo.bundle();
+    let mut thin = repo.metadata();
     // Root version 2 needs two of its three root keys; leave it one,
     // repeated. Two signature entries, one distinct key — repeating a
     // signature must not satisfy a threshold.
@@ -452,18 +446,18 @@ fn a_threshold_that_is_not_met_is_refused() {
     assert!(matches!(error, Err(TufError::Threshold(_))), "{error:?}");
     // The untouched chain verifies, so the refusal is the signature count
     // and nothing incidental.
-    tuf::update(&repo.bundle(), &state, at(NOW)).unwrap();
+    tuf::update(&repo.metadata(), &state, at(NOW)).unwrap();
 }
 
 #[test]
 fn an_expired_timestamp_is_refused() {
     let (mut repo, _log) = repo();
     repo.expires = NOW - 1;
-    let error = tuf::update(&repo.bundle(), &repo.embedded_state(), at(NOW));
+    let error = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW));
     assert!(matches!(error, Err(TufError::Expiry(_))), "{error:?}");
     // The same material a second before its expiry is fine: expiry is a
     // deadline, not a stigma.
-    tuf::update(&repo.bundle(), &repo.embedded_state(), at(NOW - 2)).unwrap();
+    tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW - 2)).unwrap();
 }
 
 #[test]
@@ -475,31 +469,33 @@ fn an_expired_root_is_refused_but_an_expired_intermediate_is_not() {
     // relies on it — root 14 was already expired when 15 was published.
     repo.root_expires = NOW - 1;
     repo.rotate_root(false);
-    let mut bundle = repo.bundle();
+    let mut metadata = repo.metadata();
     assert!(matches!(
-        tuf::update(&bundle, &state, at(NOW)),
+        tuf::update(&metadata, &state, at(NOW)),
         Err(TufError::Expiry(_))
     ));
 
     // Re-publish the head unexpired, leaving the intermediates as they are.
     repo.root_expires = NOW + 86_400;
     repo.rotate_root(false);
-    bundle = repo.bundle();
-    let update = tuf::update(&bundle, &state, at(NOW)).expect("only the head's expiry gates");
+    metadata = repo.metadata();
+    let update = tuf::update(&metadata, &state, at(NOW)).expect("only the head's expiry gates");
     assert_eq!(update.state.root_version, 3);
 }
 
 #[test]
 fn a_version_rollback_is_refused() {
     let (mut repo, _log) = repo();
-    let first = tuf::update(&repo.bundle(), &repo.embedded_state(), at(NOW))
+    let first = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW))
         .unwrap()
         .state;
-    // The zone keeps serving the old bundle after the repository moved on:
+    // A mirror keeps serving the old chain after the repository moved on:
     // valid material, and refused, because the client has seen newer.
-    let stale = repo.bundle();
+    let stale = repo.metadata();
     repo.set_tlogs(&[SimLog::new("rekor.sim").spki()]);
-    let newer = tuf::update(&repo.bundle(), &first, at(NOW)).unwrap().state;
+    let newer = tuf::update(&repo.metadata(), &first, at(NOW))
+        .unwrap()
+        .state;
     assert!(newer.timestamp_version > first.timestamp_version);
 
     let error = tuf::update(&stale, &newer, at(NOW));
@@ -509,29 +505,29 @@ fn a_version_rollback_is_refused() {
 #[test]
 fn a_tampered_target_is_refused() {
     let (repo, _log) = repo();
-    let mut bundle = repo.bundle();
-    bundle.trusted_root.push(b' ');
-    let error = tuf::update(&bundle, &repo.embedded_state(), at(NOW));
+    let mut metadata = repo.metadata();
+    metadata.trusted_root.push(b' ');
+    let error = tuf::update(&metadata, &repo.embedded_state(), at(NOW));
     assert!(matches!(error, Err(TufError::TargetHash(_))), "{error:?}");
 
     // A tampered *snapshot* fails one level up, where the timestamp's own
     // hash of it is checked.
-    let mut bundle = repo.bundle();
-    bundle.snapshot.push(b' ');
+    let mut metadata = repo.metadata();
+    metadata.snapshot.push(b' ');
     assert!(matches!(
-        tuf::update(&bundle, &repo.embedded_state(), at(NOW)),
+        tuf::update(&metadata, &repo.embedded_state(), at(NOW)),
         // Trailing whitespace does not change the canonical form, so the
         // signature still verifies and the length check is what catches it.
         Err(TufError::TargetHash(_))
     ));
 
     // A snapshot whose *content* changed fails on the signature instead.
-    let mut bundle = repo.bundle();
-    let mut snapshot: serde_json::Value = serde_json::from_slice(&bundle.snapshot).unwrap();
+    let mut metadata = repo.metadata();
+    let mut snapshot: serde_json::Value = serde_json::from_slice(&metadata.snapshot).unwrap();
     snapshot["signed"]["meta"]["targets.json"]["version"] = serde_json::json!(99);
-    bundle.snapshot = snapshot.to_string().into_bytes();
+    metadata.snapshot = snapshot.to_string().into_bytes();
     assert!(matches!(
-        tuf::update(&bundle, &repo.embedded_state(), at(NOW)),
+        tuf::update(&metadata, &repo.embedded_state(), at(NOW)),
         Err(TufError::TargetHash(_) | TufError::Threshold(_))
     ));
 }
@@ -544,12 +540,12 @@ fn a_trusted_root_that_drops_a_shard_drops_it_from_the_pin_set() {
     let old = SimLog::new("rekor.old");
     let new = SimLog::new("rekor.new");
     let mut repo = SimTuf::new(NOW, &[old.spki(), new.spki()]);
-    let both = tuf::update(&repo.bundle(), &repo.embedded_state(), at(NOW)).unwrap();
+    let both = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
     assert!(both.log_keys.find(&old.log_id()).is_some());
     assert!(both.log_keys.find(&new.log_id()).is_some());
 
     repo.set_tlogs(&[new.spki()]);
-    let after = tuf::update(&repo.bundle(), &both.state, at(NOW)).unwrap();
+    let after = tuf::update(&repo.metadata(), &both.state, at(NOW)).unwrap();
     assert_eq!(after.log_keys.keys().len(), 1);
     assert!(
         after.log_keys.find(&old.log_id()).is_none(),
@@ -563,10 +559,10 @@ fn a_trusted_root_naming_no_logs_is_never_adopted() {
     // Adopting an empty pin set would silently refuse every zone from then
     // on — trouble, which §10.2 says must never be worse than no record.
     let mut repo = SimTuf::new(NOW, &[]);
-    let error = tuf::update(&repo.bundle(), &repo.embedded_state(), at(NOW));
+    let error = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW));
     assert!(matches!(error, Err(TufError::Malformed(_))), "{error:?}");
     repo.set_tlogs(&[SimLog::new("rekor.sim").spki()]);
-    tuf::update(&repo.bundle(), &repo.embedded_state(), at(NOW)).unwrap();
+    tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
 }
 
 #[test]
@@ -576,11 +572,11 @@ fn state_is_monotonic_across_two_zones_sharing_one_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rekor-pins.json");
     let (mut repo, _log) = repo();
-    let stale = repo.bundle();
+    let stale = repo.metadata();
     repo.rotate_root(false);
     repo.set_tlogs(&[SimLog::new("rekor.next").spki()]);
 
-    let ahead = tuf::update(&repo.bundle(), &repo.embedded_state(), at(NOW)).unwrap();
+    let ahead = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
     ahead.state.save(&path).unwrap();
     let reloaded = PinState::load(&path).expect("the state persists");
     assert_eq!(reloaded, ahead.state);
@@ -591,12 +587,13 @@ fn state_is_monotonic_across_two_zones_sharing_one_file() {
 
 // --------------------------------------------------------------- resolver
 
-/// A zone that relays a bundle teaching one new log, and a proof from it.
+/// A zone whose proof comes from a log the client's bootstrap pin set has
+/// never heard of, and the TUF repository that teaches it.
 ///
 /// The point of the arrangement: the client's *bootstrap* pin set knows a
-/// different log entirely, so the proof can only verify if the TUF update
-/// ran first and replaced the pins.
-async fn zone_learning_a_new_shard() -> (SimZone, SimLog, tempfile::NamedTempFile) {
+/// different log entirely, so the proof can only verify if the TUF walk ran
+/// first and replaced the pins.
+fn zone_learning_a_new_shard() -> (SimZone, SimLog, SimTuf, tempfile::NamedTempFile) {
     let mut zone = SimZone::new("cluster.example", member_records());
     let mut new_shard = SimLog::new("log2099-1.rekor.sim");
     let proof = new_shard.publish(&zone, "create");
@@ -607,11 +604,77 @@ async fn zone_learning_a_new_shard() -> (SimZone, SimLog, tempfile::NamedTempFil
         .unwrap()
         .as_secs() as i64;
     let repo = SimTuf::new(now, &[new_shard.spki()]);
-    zone.tuf_txt = vec![repo.bundle().to_txt()];
     // The root this client embeds — written to a file only so the test can
     // seed a PinState from it the way a build would.
     let embedded = write(&String::from_utf8(repo.embedded_root()).unwrap());
-    (zone, new_shard, embedded)
+    (zone, new_shard, repo, embedded)
+}
+
+/// A repository that answers, and answers nonsense. The walk collects
+/// something; every check `update` makes then refuses it.
+struct Garbage;
+
+impl tuf::Repo for Garbage {
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        // Whichever root a client trusts, this repository has one for it —
+        // so the walk gets past the chain and the refusal is about the
+        // *content*, not about a file that was missing.
+        let junk = path.ends_with(".root.json") || path == "timestamp.json";
+        Ok(junk.then(|| b"this is not TUF metadata".to_vec()))
+    }
+}
+
+/// A repository that counts what was asked of it, so "walked once" and
+/// "walked on every lookup" are distinguishable facts.
+struct Counting {
+    inner: SimTuf,
+    walks: std::sync::atomic::AtomicUsize,
+}
+
+impl Counting {
+    fn new(inner: SimTuf) -> Counting {
+        Counting {
+            inner,
+            walks: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn walks(&self) -> usize {
+        self.walks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl tuf::Repo for Counting {
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        // `timestamp.json` is fetched exactly once per walk, and only after
+        // the root chain — so counting it counts walks, not files.
+        if path == "timestamp.json" {
+            self.walks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.get(path)
+    }
+}
+
+/// The resolver options a refreshing client runs on: no static key file, the
+/// pin state on disk, and pin refresh on — pointed at an injected repository
+/// by the caller rather than at Sigstore.
+fn refreshing(
+    url: String,
+    anchor: &std::path::Path,
+    state_path: Option<std::path::PathBuf>,
+) -> ResolverOptions {
+    ResolverOptions {
+        doh_url: Some(url),
+        trust_anchor: Some(anchor.to_path_buf()),
+        rekor: Some(RekorPolicy::Require),
+        // No --rekor-key: the pin set is the refreshable one, so it starts
+        // as the embedded Sigstore bootstrap.
+        rekor_key: None,
+        rekor_state: state_path,
+        tuf_url: None,
+        no_tuf: false,
+    }
 }
 
 /// Seeds a state file at the synthetic repository's root version 1, which
@@ -631,24 +694,19 @@ fn seed_state(path: &std::path::Path, embedded_root: &std::path::Path) {
 }
 
 #[tokio::test]
-async fn a_relayed_bundle_teaches_a_log_the_build_never_knew() {
-    let (zone, new_shard, embedded) = zone_learning_a_new_shard().await;
+async fn a_walked_chain_teaches_a_log_the_build_never_knew() {
+    let (zone, new_shard, repo, embedded) = zone_learning_a_new_shard();
     let anchor = write(&zone.anchor_record());
     let dir = tempfile::tempdir().unwrap();
     let state_path = dir.path().join("rekor-pins.json");
     seed_state(&state_path, embedded.path());
     let (url, server) = zone.serve().await;
 
-    let resolver = DnssecResolver::with_options(&ResolverOptions {
-        doh_url: Some(url),
-        trust_anchor: Some(anchor.path().to_path_buf()),
-        rekor: Some(RekorPolicy::Require),
-        // No --rekor-key: the pin set is the refreshable one, so it starts
-        // as the embedded Sigstore bootstrap and knows nothing of this log.
-        rekor_key: None,
-        rekor_state: Some(state_path.clone()),
-    })
-    .unwrap();
+    let counting = std::sync::Arc::new(Counting::new(repo));
+    let resolver =
+        DnssecResolver::with_options(&refreshing(url, anchor.path(), Some(state_path.clone())))
+            .unwrap()
+            .with_tuf_repo(counting.clone());
     assert!(
         resolver.log_keys().find(&new_shard.log_id()).is_none(),
         "the build must not already know this log, or the test proves nothing"
@@ -672,15 +730,22 @@ async fn a_relayed_bundle_teaches_a_log_the_build_never_knew() {
         let mode = std::fs::metadata(&state_path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the pin state is the owner's alone");
     }
+
+    // The rule that makes going to the source affordable: membership may
+    // re-resolve on a one-minute TTL, and the repository still hears from
+    // this client once a day (§10.2).
+    assert_eq!(counting.walks(), 1);
+    resolver.member_set("cluster.example").await.unwrap();
+    assert!(resolver.refresh_tuf().await.unwrap().is_none());
+    assert_eq!(counting.walks(), 1, "a second lookup must not walk again");
     server.abort();
 }
 
 #[tokio::test]
-async fn the_same_zone_without_the_bundle_fails_with_unknown_log() {
-    // The control: everything identical except the relay. If the proof
+async fn the_same_zone_without_the_walk_fails_with_unknown_log() {
+    // The control: everything identical except the refresh. If the proof
     // verified here too, the update above would have proved nothing.
-    let (mut zone, _shard, embedded) = zone_learning_a_new_shard().await;
-    zone.tuf_txt.clear();
+    let (zone, _shard, _repo, embedded) = zone_learning_a_new_shard();
     let anchor = write(&zone.anchor_record());
     let dir = tempfile::tempdir().unwrap();
     let state_path = dir.path().join("rekor-pins.json");
@@ -688,30 +753,27 @@ async fn the_same_zone_without_the_bundle_fails_with_unknown_log() {
     let (url, server) = zone.serve().await;
 
     let resolver = DnssecResolver::with_options(&ResolverOptions {
-        doh_url: Some(url),
-        trust_anchor: Some(anchor.path().to_path_buf()),
-        rekor: Some(RekorPolicy::Require),
-        rekor_key: None,
-        rekor_state: Some(state_path),
+        no_tuf: true,
+        ..refreshing(url, anchor.path(), Some(state_path))
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
     assert!(
         matches!(error, NetError::RekorUnknownLog { .. }),
-        "without the bundle the log stays unknown: {error}"
+        "without the walk the log stays unknown: {error}"
     );
     server.abort();
 }
 
 #[tokio::test]
-async fn an_invalid_bundle_leaves_the_pins_alone_and_never_fails_a_refresh() {
-    // The rule §10.2 calls load-bearing: TUF trouble is never worse than
-    // not having the record. The zone here relays garbage *and* publishes a
-    // proof from a log the client already pins — the refresh must succeed.
+async fn a_repository_serving_nonsense_never_fails_a_refresh() {
+    // The rule §10.2 calls load-bearing: TUF trouble is never worse than not
+    // having asked. The repository here serves garbage while the zone
+    // publishes a proof from a log the client already pins — the refresh
+    // must succeed regardless, and the pins must not move.
     let mut zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
     zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
-    zone.tuf_txt = vec!["this is not a bundle".to_string()];
 
     let anchor = write(&zone.anchor_record());
     let log_key = write(&log.key_pem());
@@ -719,50 +781,54 @@ async fn an_invalid_bundle_leaves_the_pins_alone_and_never_fails_a_refresh() {
     let state_path = dir.path().join("rekor-pins.json");
     let (url, server) = zone.serve().await;
 
-    // A static --rekor-key never even asks for the bundle: a different
-    // universe is static in both directions.
+    // A static --rekor-key never walks anything at all: a different universe
+    // is static in both directions.
     let stat = DnssecResolver::with_options(&ResolverOptions {
-        doh_url: Some(url.clone()),
-        trust_anchor: Some(anchor.path().to_path_buf()),
-        rekor: Some(RekorPolicy::Require),
         rekor_key: Some(log_key.path().to_path_buf()),
-        rekor_state: Some(state_path.clone()),
+        ..refreshing(url.clone(), anchor.path(), Some(state_path.clone()))
     })
-    .unwrap();
+    .unwrap()
+    .with_tuf_repo(std::sync::Arc::new(Garbage));
     let (set, _ttl) = stat
         .member_set("cluster.example")
         .await
-        .expect("a garbled bundle must not fail a refresh");
+        .expect("a broken repository must not fail a refresh");
     assert_eq!(set.bindings.len(), 1);
+    assert!(stat.refresh_tuf().await.unwrap().is_none());
     assert!(
         !state_path.exists(),
         "an explicit key file disables TUF refresh entirely"
     );
 
-    // And the refreshable resolver says which way it broke, without that
-    // ever reaching the refresh.
-    let apex = hickory_resolver::proto::rr::Name::from_utf8("cluster.example.").unwrap();
-    let refreshing = DnssecResolver::with_options(&ResolverOptions {
-        doh_url: Some(url),
-        trust_anchor: Some(anchor.path().to_path_buf()),
-        rekor: Some(RekorPolicy::Require),
-        rekor_key: None,
-        rekor_state: Some(state_path.clone()),
-    })
-    .unwrap();
-    let before = refreshing.log_keys();
-    let error = refreshing.refresh_tuf(&apex).await.unwrap_err();
+    // And the refreshable resolver says *which* way the chain broke — the
+    // whole reason the variant carries a class, for `synch doctor` — without
+    // that ever reaching the refresh, moving a pin, or writing a file.
+    let client =
+        DnssecResolver::with_options(&refreshing(url, anchor.path(), Some(state_path.clone())))
+            .unwrap()
+            .with_tuf_repo(std::sync::Arc::new(Garbage));
+    let before = client.log_keys();
+    let error = client.refresh_tuf().await.unwrap_err();
     assert!(
         matches!(&error, NetError::Tuf { class, .. } if *class == "malformed"),
         "{error}"
     );
-    assert_eq!(refreshing.log_keys(), before, "the pins did not move");
+    assert_eq!(client.log_keys(), before, "the pins did not move");
     assert!(!state_path.exists(), "and nothing was persisted");
     server.abort();
 }
 
 #[tokio::test]
-async fn a_zone_that_relays_nothing_is_a_non_event() {
+async fn a_repository_with_nothing_in_it_is_a_non_event() {
+    // An unreachable mirror and an empty one look the same from here, and
+    // both leave the client exactly where it was.
+    struct Empty;
+    impl tuf::Repo for Empty {
+        fn get(&self, _path: &str) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+    }
+
     let mut zone = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
     zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
@@ -771,19 +837,41 @@ async fn a_zone_that_relays_nothing_is_a_non_event() {
     let (url, server) = zone.serve().await;
 
     let resolver = DnssecResolver::with_options(&ResolverOptions {
-        doh_url: Some(url),
-        trust_anchor: Some(anchor.path().to_path_buf()),
-        rekor: Some(RekorPolicy::Require),
         rekor_key: Some(log_key.path().to_path_buf()),
-        rekor_state: None,
+        ..refreshing(url, anchor.path(), None)
     })
-    .unwrap();
-    let apex = hickory_resolver::proto::rr::Name::from_utf8("cluster.example.").unwrap();
-    assert!(resolver.refresh_tuf(&apex).await.unwrap().is_none());
+    .unwrap()
+    .with_tuf_repo(std::sync::Arc::new(Empty));
+    assert!(resolver.refresh_tuf().await.unwrap().is_none());
     resolver
         .member_set("cluster.example")
         .await
-        .expect("a control plane that relays no TUF material changes nothing");
+        .expect("a repository with nothing to say changes nothing");
+    server.abort();
+}
+
+#[tokio::test]
+async fn no_tuf_walks_nothing_and_is_not_a_failure() {
+    // The knob for a deployment that will not have its daemon reach a CDN.
+    // Off means off — not "a repository that answers nothing", which would
+    // report a broken chain once a day forever.
+    let (zone, _shard, repo, embedded) = zone_learning_a_new_shard();
+    let anchor = write(&zone.anchor_record());
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("rekor-pins.json");
+    seed_state(&state_path, embedded.path());
+    let (url, server) = zone.serve().await;
+
+    let counting = std::sync::Arc::new(Counting::new(repo));
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        no_tuf: true,
+        ..refreshing(url, anchor.path(), Some(state_path))
+    })
+    .unwrap()
+    // Even handed a repository, `--no-tuf` does not walk it.
+    .with_tuf_repo(counting.clone());
+    assert!(resolver.refresh_tuf().await.unwrap().is_none());
+    assert_eq!(counting.walks(), 0);
     server.abort();
 }
 
@@ -862,23 +950,12 @@ async fn regenerate_the_shared_fixture() {
     // rotations to walk.
     let floor = head.saturating_sub(2).max(1);
     let chain: Vec<(u64, Vec<u8>)> = roots.into_iter().filter(|(v, _)| *v >= floor).collect();
-    // The bundle itself carries only the roots at or above the version this
-    // build embeds — which is what the control plane's own floor produces,
-    // and what the crossval fixture therefore has to be.
-    let bundle = TufBundle {
-        roots: chain
-            .iter()
-            .filter(|(version, _)| *version >= head)
-            .map(|(_, bytes)| bytes.clone())
-            .collect(),
+    let walked = TufMetadata {
+        roots: chain.iter().map(|(_, bytes)| bytes.clone()).collect(),
         timestamp: timestamp.clone(),
         snapshot: snapshot.clone(),
         targets: targets.clone(),
         trusted_root: trusted_root.clone(),
-    };
-    let chain_bundle = TufBundle {
-        roots: chain.iter().map(|(_, bytes)| bytes.clone()).collect(),
-        ..bundle.clone()
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -893,7 +970,7 @@ async fn regenerate_the_shared_fixture() {
         trusted_root: Vec::new(),
         updated_at: 0,
     };
-    let update = tuf::update(&chain_bundle, &state, now).expect("the fetched chain must verify");
+    let update = tuf::update(&walked, &state, now).expect("the fetched chain must verify");
 
     let dir = fixture_dir();
     std::fs::create_dir_all(&dir).unwrap();
@@ -908,7 +985,6 @@ async fn regenerate_the_shared_fixture() {
     put("snapshot.json", &snapshot);
     put("targets.json", &targets);
     put("trusted-root.json", &trusted_root);
-    put("bundle.bin", &bundle.encode());
     let log_ids: Vec<String> = update
         .log_keys
         .keys()
@@ -922,7 +998,6 @@ async fn regenerate_the_shared_fixture() {
              fetched_at={now}\n\
              verify_at={now}\n\
              root_versions={}\n\
-             bundle_roots={head}\n\
              chain_floor={floor}\n\
              root_version={head}\n\
              timestamp_version={timestamp_version}\n\

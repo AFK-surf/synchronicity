@@ -39,6 +39,10 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
+        tuf_url: None,
+        // Nothing in this suite exercises pin refresh, and no test run
+        // reaches Sigstore by accident.
+        no_tuf: true,
     })
     .unwrap();
 
