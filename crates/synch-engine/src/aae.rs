@@ -219,11 +219,12 @@ impl Node {
             tracing::info!(pruned, "old roots dropped out of retention");
         }
         let stats = self.store().gc(before)?;
-        if stats.nodes > 0 || stats.values > 0 || stats.blobs > 0 {
+        if stats.nodes > 0 || stats.values > 0 || stats.blobs > 0 || stats.orphans > 0 {
             tracing::info!(
                 nodes = stats.nodes,
                 values = stats.values,
                 blobs = stats.blobs,
+                orphans = stats.orphans,
                 "garbage collected"
             );
         }

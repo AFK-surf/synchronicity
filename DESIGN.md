@@ -654,6 +654,11 @@ roots — pending heads must be in the mark set or GC would eat an in-progress
 bootstrap), sweep unmarked
 `trie_nodes`/`trie_values`. Runs incrementally in the maintenance loop.
 
+The same pass sweeps CAS files that no `blobs` row accounts for — what a fetch
+that failed verification leaves behind — using the content retention horizon as
+the cutoff, so a payload written moments before its row is never mistaken for a
+leftover.
+
 ---
 
 ## 6. Content storage and transfer
