@@ -57,9 +57,18 @@ pub fn render(
         )
       })
     })
+  // Each part at its own name: a provider caps the combined content of one
+  // name and type (Cloudflare at 8192 wire bytes), which a single
+  // ICANN-rooted proof exceeds on its own.
   let rekor =
-    list.map(input.rekor_proofs, fn(text) {
-      Record(build.rekor_label <> "." <> zone, provider.Txt, ttl_rekor, text)
+    list.map(input.rekor_proofs, fn(pair) {
+      let #(index, text) = pair
+      Record(
+        build.rekor_part_label(index) <> "." <> zone,
+        provider.Txt,
+        ttl_rekor,
+        text,
+      )
     })
   let tuf = case input.tuf_bundle {
     "" -> []
@@ -97,11 +106,18 @@ pub fn managed_names(input: ZoneInput, signing_zone: String) -> List(String) {
     })
   [
     diff.owner_label <> "." <> apex,
-    build.rekor_label <> "." <> zone,
     build.tuf_label <> "." <> zone,
-    rdata.transparency_label <> "." <> apex,
-    ..owners
+    ..rekor_part_names(input, zone)
   ]
+  |> list.append([rdata.transparency_label <> "." <> apex, ..owners])
+  |> list.unique
+}
+
+/// Every proof-part name the rendered set can occupy, so a part we stopped
+/// rendering is still found and deleted.
+fn rekor_part_names(input: ZoneInput, zone: String) -> List(String) {
+  input.rekor_proofs
+  |> list.map(fn(pair) { build.rekor_part_label(pair.0) <> "." <> zone })
   |> list.unique
 }
 

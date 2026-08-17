@@ -30,7 +30,7 @@ use hickory_resolver::proto::{
 
 use crate::{
     error::NetError,
-    rekor::{self, LogKeys, ProofError, RekorProof, VerifiedRecord, ZoneKey},
+    rekor::{self, LogKeys, ProofError, VerifiedRecord, ZoneKey},
     tuf::{self, PinState, TufBundle, TufError, TufUpdate},
 };
 
@@ -60,8 +60,25 @@ pub fn query_name(domain: &str) -> String {
 /// One name per zone, at the apex — one zone key, one proof set. The client
 /// learns the apex from the RRSIG signer field it already validates, not
 /// from the membership name it asked about.
-pub fn rekor_query_name(apex: &str) -> String {
-    format!("{}.{}", rekor::REKOR_TXT_PREFIX, apex)
+pub fn rekor_query_name(zone: &str) -> String {
+    format!("{}.{}", rekor::REKOR_TXT_PREFIX, zone)
+}
+
+/// Where part `index` of a proof lives (§3).
+///
+/// A proof is far larger than one TXT record, and larger than what a managed
+/// provider will hold at a single owner name — Cloudflare caps the combined
+/// content of one name and type at 8192 wire-format bytes, which an
+/// ICANN-rooted proof exceeds on its own. So the parts are spread across
+/// names, one part each: part 1 at the base name, which is the only one a
+/// client can compute before it has read anything, and every later part one
+/// label along at `_synchronicity-rekor-<index>`. Part 1 says how many
+/// there are.
+pub fn rekor_part_query_name(zone: &str, index: usize) -> String {
+    match index {
+        0 | 1 => rekor_query_name(zone),
+        n => format!("{}-{n}.{}", rekor::REKOR_TXT_PREFIX, zone),
+    }
 }
 
 /// The query name the zone relays Sigstore's TUF metadata under (§10.1).
@@ -724,10 +741,30 @@ impl DnssecResolver {
         // "the zone published gibberish" stays distinguishable from "the zone
         // published nothing for this key" — the two read very differently in
         // `synch doctor`.
+        // A proof spans several records across several names. Part 1 is the
+        // only name derivable from the answer; it says how many parts there
+        // are, and the rest are fetched by index until the set is whole.
+        // Bounded by what part 1 claims, and by the format's own 255-part
+        // ceiling, so a lying record cannot turn one refresh into a scan.
+        let mut records = records;
+        let wanted = rekor::parts_claimed(&records);
+        for index in 2..=wanted {
+            let part = rekor_part_query_name(zone_text.trim_end_matches('.'), index);
+            // A part that does not resolve leaves the set incomplete, which
+            // `proofs_from_txt` reports as the missing-part refusal it is —
+            // better than a transport error naming a name the operator never
+            // configured.
+            if let Ok(answer) = self.lookup(&part, RecordType::TXT).await {
+                if let Ok(validated) = secure_txt(&part, &answer.answers) {
+                    records.extend(validated.records);
+                }
+            }
+        }
+
         let mut candidates = Vec::new();
-        let mut malformed = None;
-        for record in &records {
-            match RekorProof::from_txt(record) {
+        let mut malformed: Option<rekor::ProofError> = None;
+        for reassembled in rekor::proofs_from_txt(&records) {
+            match reassembled {
                 Ok(candidate) => candidates.push(candidate),
                 Err(e) => malformed = Some(e),
             }

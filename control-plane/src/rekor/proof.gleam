@@ -143,9 +143,87 @@ fn blob16(bytes: BitArray) -> BitArray {
 
 /// The base64url form one TXT record carries. `zone/build` splits it into
 /// ≤255-byte character-strings; the client concatenates before decoding.
-pub fn to_txt(proof: Proof) -> Result(String, String) {
-  encode(proof)
-  |> result.map(bit_array.base64_url_encode(_, False))
+/// The token every chunk of a proof record starts with.
+pub const txt_prefix = "sync1p"
+
+/// The most base64url characters one record carries.
+///
+/// Chosen against the tightest provider limit rather than against DNS:
+/// Cloudflare refuses a TXT record past 4096 **wire-format** bytes, which
+/// counts the one-byte length prefix each 255-byte character-string adds. At
+/// this size a record is ~2 KB of payload plus a ~22-byte header and ~8
+/// prefixes, well inside that ceiling.
+pub const txt_chunk_chars = 2000
+
+/// Renders the proof as the TXT payloads a zone serves for it.
+///
+/// A proof does not fit in one record, so the payload is split across
+/// several at the same owner name, each saying where it belongs:
+///
+///     sync1p <group> <index>/<total> <base64url chunk>
+///
+/// `group` is the first four bytes of the SHA-256 of the encoded proof, in
+/// hex. It ties one proof's chunks together where several proofs share a
+/// name — a rollover serves two — and every reader re-derives it after
+/// reassembly, so chunks of different proofs cannot be spliced into
+/// something that decodes. The client's half of this is
+/// `rekor::proofs_from_txt` (crates/synch-net/src/rekor.rs).
+pub fn to_txt(proof: Proof) -> Result(List(String), String) {
+  use encoded <- result.try(encode(proof))
+  let group =
+    crypto.hash(crypto.Sha256, encoded)
+    |> bit_array.slice(0, 4)
+    |> result.map(fn(b) { string.lowercase(bit_array.base16_encode(b)) })
+    |> result.unwrap("00000000")
+  let chunks =
+    bit_array.base64_url_encode(encoded, False)
+    |> split_every(txt_chunk_chars, [])
+  let total = list.length(chunks)
+  case total > 255 {
+    True -> Error("a proof that needs more than 255 records cannot name them")
+    False ->
+      Ok(
+        list.index_map(chunks, fn(chunk, i) {
+          txt_prefix
+          <> " "
+          <> group
+          <> " "
+          <> int.to_string(i + 1)
+          <> "/"
+          <> int.to_string(total)
+          <> " "
+          <> chunk
+        }),
+      )
+  }
+}
+
+/// Which part a rendered record is — what decides the owner name it goes to.
+/// An unreadable record belongs at the base name, where a client looks first.
+pub fn part_index_of(record: String) -> Int {
+  case string.split(record, " ") {
+    [prefix, _group, counter, _payload] if prefix == txt_prefix ->
+      case string.split_once(counter, "/") {
+        Ok(#(index, _total)) -> int.parse(index) |> result.unwrap(1)
+        Error(Nil) -> 1
+      }
+    _ -> 1
+  }
+}
+
+fn split_every(text: String, size: Int, acc: List(String)) -> List(String) {
+  case string.length(text) <= size {
+    True ->
+      case text {
+        "" -> list.reverse(acc)
+        _ -> list.reverse([text, ..acc])
+      }
+    False ->
+      split_every(string.drop_start(text, size), size, [
+        string.slice(text, 0, size),
+        ..acc
+      ])
+  }
 }
 
 /// A real `hashedrekord` v0.0.2 body over a Statement's DSSE PAE.

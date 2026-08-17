@@ -306,16 +306,37 @@ Rekor-v2-compatible log still works via `--rekor-key`/`CP_REKOR_KEY`.
 
 ## 3. Proof distribution: in-band, in the zone
 
-The proof travels **inside the zone itself**, as a TXT record at
+The proof travels **inside the zone itself**, as TXT records under the
+signing zone. One proof does not fit in one record, or even at one name, so
+it is split into numbered **parts**, one per owner name:
 
 ```
-_synchronicity-rekor.<apex>   86400  IN  TXT  ( "<b64url chunk>" "<b64url chunk>" ... )
+_synchronicity-rekor.<zone>     86400 IN TXT "sync1p <group> 1/5 <b64url>"
+_synchronicity-rekor-2.<zone>   86400 IN TXT "sync1p <group> 2/5 <b64url>"
+...
+_synchronicity-rekor-5.<zone>   86400 IN TXT "sync1p <group> 5/5 <b64url>"
 ```
 
-one record per current claim (a retirement breadcrumb may sit beside the
-live one), each carrying a compact binary `RekorProof`. There is no
-selector field: a record's subject is a key set, so a client tries each
-served record and membership in a verified set decides:
+Part 1 sits at the base name because it is the only one a client can compute
+before it has read anything; it says how many parts there are, and the client
+fetches the rest by index. `group` is the first four bytes of the SHA-256 of
+the encoded proof, in hex: it ties one proof's parts together where two
+proofs are in flight (a rollover serves both), and every reader re-derives it
+after reassembly, so parts of different proofs cannot be spliced into
+something that decodes.
+
+**Why parts, and why across names.** Both limits are the provider's, not
+DNS's. Cloudflare refuses a single TXT record past **4096 wire-format bytes**
+and the *combined* content of one name and type past **8192** — measured, not
+inferred. An ICANN-rooted proof is ~6.1 KB encoded, 8202 base64url
+characters, which clears neither. Splitting into ~2 KB chunks answers the
+first; spreading those chunks across names answers the second, and keeps
+headroom as chains get deeper (~480 B of DER per extra delegation level).
+A zone with several control planes shares only the base name, and only
+~2 KB of it.
+
+There is no selector field: a record's subject is a key set, so a client
+tries each proof it reassembles and membership in a verified set decides:
 
 ```
 RekorProof v4

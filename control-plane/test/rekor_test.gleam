@@ -170,11 +170,35 @@ pub fn proof_encoding_matches_the_fixture_test() {
   assert proof.encode(fixture_proof()) == Ok(fixture("proof.bin"))
 }
 
-pub fn proof_txt_is_base64url_test() {
-  let assert Ok(text) = proof.to_txt(fixture_proof())
-  let assert Ok(decoded) = bit_array.base64_url_decode(text)
+/// A proof is served in self-describing pieces, each inside the tightest
+/// provider limit, and they reassemble to exactly the encoded record.
+pub fn proof_txt_is_chunked_base64url_test() {
+  let assert Ok(records) = proof.to_txt(fixture_proof())
+  // Every record names the same group and its place in it.
+  let assert [first, ..] = records
+  let assert [prefix, group, counter, _payload] = string.split(first, " ")
+  assert prefix == proof.txt_prefix
+  assert string.length(group) == 8
+  assert string.ends_with(counter, "/" <> int.to_string(list.length(records)))
+
+  list.each(records, fn(record) {
+    // Comfortably inside Cloudflare's 4096 wire-format bytes, which is the
+    // limit that decides this size.
+    assert string.length(record) < 4096
+    assert string.starts_with(record, proof.txt_prefix <> " " <> group <> " ")
+  })
+
+  // The payloads, in order, are the base64url of the encoded proof.
+  let payload =
+    records
+    |> list.map(fn(r) {
+      let assert [_, _, _, chunk] = string.split(r, " ")
+      chunk
+    })
+    |> string.join("")
+  let assert Ok(decoded) = bit_array.base64_url_decode(payload)
   assert decoded == fixture("proof.bin")
-  assert !string.contains(text, "=")
+  assert !string.contains(payload, "=")
 }
 
 /// A record that does not fit the format is refused, not mangled.
@@ -509,20 +533,30 @@ pub fn the_zone_serves_the_proof_record_test() {
       ),
       [NsHost(ns1, "127.0.0.1", "")],
       [TxtName(owner, [Member("nas", fixtures.nk(), "", "")])],
-      [text],
+      list.index_map(text, fn(t, i) { #(i + 1, t) }),
       "",
     )
   let assert Ok(rrsets) = build.build(input)
+  // One part per owner name: part 1 at the base, part n one label along.
   let assert Ok(rekor_owner) = name.parse("_synchronicity-rekor.sync.test.")
   let assert Ok(rrset) =
     list.find(rrsets, fn(r) {
       r.owner == rekor_owner && r.rtype == wire.type_txt
     })
   assert rrset.ttl == build.ttl_rekor
+  let assert [first, ..rest] = text
   let assert [rd] = rrset.rdatas
-  // TXT rdata is a run of ≤255-byte character-strings; the client
-  // concatenates them before decoding.
-  assert chunks(rd) == Ok(text)
+  assert chunks(rd) == Ok(first)
+  // Every later part has its own name, and its own place in the NSEC chain.
+  list.index_map(rest, fn(part, i) {
+    let label = build.rekor_part_label(i + 2)
+    let assert Ok(owner) = name.parse(label <> ".sync.test.")
+    let assert Ok(set) =
+      list.find(rrsets, fn(r) { r.owner == owner && r.rtype == wire.type_txt })
+    let assert [one] = set.rdatas
+    assert chunks(one) == Ok(part)
+    assert list.contains(build.owners_in_order(rrsets), owner)
+  })
   // And the name is in the NSEC chain like any other owner.
   assert list.contains(build.owners_in_order(rrsets), rekor_owner)
 }

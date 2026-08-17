@@ -331,9 +331,20 @@ impl SimZone {
         chain::transparency_name(&self.origin).expect("transparency name")
     }
 
-    /// The name the proof records live under.
+    /// The name part 1 of a proof lives under.
     pub fn rekor_name(&self) -> Name {
         Name::from_utf8(format!("{}.{}", rekor::REKOR_TXT_PREFIX, self.origin)).expect("rekor name")
+    }
+
+    /// Which proof part `name` is the owner for, if any.
+    fn rekor_part_index(&self, name: &Name) -> Option<usize> {
+        let text = name.to_string();
+        let origin = self.origin.to_string();
+        let label = text.strip_suffix(&format!(".{origin}"))?;
+        match label.strip_prefix(rekor::REKOR_TXT_PREFIX)? {
+            "" => Some(1),
+            rest => rest.strip_prefix('-')?.parse().ok(),
+        }
     }
 
     /// The name the TUF bundle lives under.
@@ -445,8 +456,25 @@ impl SimZone {
                 );
                 set
             }
-            RecordType::TXT if name == self.rekor_name() && !self.rekor_txt.is_empty() => {
-                self.chunked_txt(self.rekor_name(), &self.rekor_txt)
+            // Proof parts live one per name: part 1 at the base, later parts
+            // one label along. The zone serves whichever the query asks for.
+            RecordType::TXT
+                if !self.rekor_txt.is_empty() && self.rekor_part_index(&name).is_some() =>
+            {
+                let index = self.rekor_part_index(&name).expect("checked");
+                let mine: Vec<String> = self
+                    .rekor_txt
+                    .iter()
+                    // A record with no readable header still belongs
+                    // somewhere: the base name, where a client looks first,
+                    // so "the zone published gibberish" stays reachable.
+                    .filter(|record| crate::rekor::part_index_of(record).unwrap_or(1) == index)
+                    .cloned()
+                    .collect();
+                if mine.is_empty() {
+                    return response;
+                }
+                self.chunked_txt(name, &mine)
             }
             RecordType::TXT if name == self.tuf_name() && !self.tuf_txt.is_empty() => {
                 self.chunked_txt(self.tuf_name(), &self.tuf_txt)

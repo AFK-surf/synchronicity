@@ -42,7 +42,11 @@ import zone/render_external
 @external(erlang, "cp_sys_ffi", "now_unix")
 fn now_unix() -> Int
 
-const sweep_interval_ms = 3_600_000
+/// The repair sweep. Short enough that drift — a record edited by hand at
+/// the provider, a change lost to a failed apply — is corrected in minutes
+/// rather than hours, and cheap when nothing has moved: the hash
+/// short-circuit makes an unchanged pass one SELECT and no provider call.
+const sweep_interval_ms = 300_000
 
 pub type Msg {
   Tick
@@ -80,6 +84,12 @@ pub fn supervised(
   supervision.worker(fn() {
     let builder =
       actor.new_with_initialiser(1000, fn(subject) {
+        // Immediately, not one interval from now: a primary that has just
+        // booted has a provider zone of unknown freshness, and on a *first*
+        // boot it has no records out there at all. Waiting out a sweep
+        // before the first pass would leave the zone unpublished for that
+        // long, which is the one window where nothing else pokes.
+        process.send(subject, Tick)
         let _ = process.send_after(subject, sweep_interval_ms, Tick)
         actor.initialised(State(
           db_path,

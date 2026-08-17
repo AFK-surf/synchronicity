@@ -70,9 +70,13 @@ fn a_logged_zone_key_verifies_offline() {
 
     // And it survives the round trip through a TXT record, which is how it
     // actually reaches a client.
-    let decoded = RekorProof::from_txt(&proof.to_txt().expect("encodes")).unwrap();
-    assert_eq!(decoded, proof);
-    verify(&decoded, &zone, &log).unwrap();
+    let served = proof.to_txt().expect("encodes");
+    let reassembled = rekor::proofs_from_txt(&served);
+    let [Ok(decoded)] = reassembled.as_slice() else {
+        panic!("one proof reassembles to one candidate: {reassembled:?}");
+    };
+    assert_eq!(decoded, &proof);
+    verify(decoded, &zone, &log).unwrap();
 }
 
 #[test]
@@ -524,10 +528,8 @@ async fn a_zone_that_publishes_its_proof_resolves_under_require() {
     let mut other_log = SimLog::new("rekor.sim");
     let stranger = SimZone::new("cluster.example", member_records());
     let other = other_log.publish(&stranger, "rollover");
-    zone.rekor_txt = vec![
-        other.to_txt().expect("encodes"),
-        proof.to_txt().expect("encodes"),
-    ];
+    zone.rekor_txt = other.to_txt().expect("encodes");
+    zone.rekor_txt.extend(proof.to_txt().expect("encodes"));
 
     let anchor = write(&zone.anchor_record());
     let log_key = write(&log.key_pem());
@@ -603,7 +605,7 @@ async fn a_proof_record_covering_only_someone_elses_keys_is_refused() {
     let mut zone = SimZone::new("cluster.example", member_records());
     let stranger = SimZone::new("cluster.example", member_records());
     let mut log = SimLog::new("rekor.sim");
-    zone.rekor_txt = vec![log.publish(&stranger, "create").to_txt().expect("encodes")];
+    zone.rekor_txt = log.publish(&stranger, "create").to_txt().expect("encodes");
 
     let anchor = write(&zone.anchor_record());
     let log_key = write(&log.key_pem());
@@ -634,7 +636,7 @@ async fn a_chainless_entry_is_refused_through_the_whole_resolver_path() {
     let statement = zone.zone_key_statement("create");
     let certificate = zone.certificate(&[]);
     let proof = log.log_certified(&zone, &statement, &certificate);
-    zone.rekor_txt = vec![proof.to_txt().expect("encodes")];
+    zone.rekor_txt = proof.to_txt().expect("encodes");
 
     let anchor = write(&zone.anchor_record());
     let log_key = write(&log.key_pem());

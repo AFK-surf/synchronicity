@@ -95,6 +95,18 @@ use crate::{
 /// key-tag selector. Any other version byte is refused as malformed.
 pub const PROOF_VERSION: u8 = 4;
 
+/// The token every chunk of a proof record starts with.
+pub const PROOF_TXT_PREFIX: &str = "sync1p";
+
+/// The most base64url characters one record carries.
+///
+/// Chosen against the tightest provider limit rather than against DNS:
+/// Cloudflare refuses a TXT record past 4096 **wire-format** bytes, which
+/// counts the one-byte length prefix each ≤255-byte character-string adds.
+/// At this size a record is ~2 KB of payload plus a ~22-byte header and
+/// ~8 prefixes, so it clears that ceiling with room for a header that grows.
+pub const PROOF_CHUNK_CHARS: usize = 2000;
+
 /// The label the proof records live under, one below the zone apex.
 pub const REKOR_TXT_PREFIX: &str = "_synchronicity-rekor";
 
@@ -295,17 +307,46 @@ impl RekorProof {
         })
     }
 
-    /// Decodes one TXT record: base64url, with or without padding. A TXT
-    /// record's character-strings are concatenated before this is called —
-    /// the split into ≤255-byte chunks is DNS packaging, not content.
-    pub fn from_txt(text: &str) -> Result<RekorProof, ProofError> {
-        RekorProof::decode(&base64url_decode(text)?)
-    }
-
-    /// Renders the record as one base64url TXT payload, or `None` for a
-    /// record too large for the format (see [`RekorProof::encode`]).
-    pub fn to_txt(&self) -> Option<String> {
-        Some(base64url_encode(&self.encode()?))
+    /// Renders the record as the TXT payloads a zone serves for it, or
+    /// `None` for a record too large for the wire format itself (see
+    /// [`RekorProof::encode`]).
+    ///
+    /// A proof does not fit in one record. Managed DNS providers cap a TXT
+    /// record well below what a full proof needs — Cloudflare refuses
+    /// anything past 4096 wire-format bytes, and an ICANN-rooted proof is
+    /// about twice that — so the payload is split across several records at
+    /// the same owner name, each carrying a header that says where it
+    /// belongs:
+    ///
+    /// ```text
+    /// sync1p <group> <index>/<total> <base64url chunk>
+    /// ```
+    ///
+    /// `group` is the first four bytes of the SHA-256 of the encoded proof,
+    /// in hex. It ties one proof's chunks together where several proofs
+    /// share a name (a rollover serves two), and it is *checked* after
+    /// reassembly, so chunks of different proofs cannot be spliced into
+    /// something that decodes.
+    pub fn to_txt(&self) -> Option<Vec<String>> {
+        let encoded = self.encode()?;
+        let group = hex_lower(&sha256(&encoded)[..4]);
+        let payload = base64url_encode(&encoded);
+        let chunks: Vec<&str> = payload
+            .as_bytes()
+            .chunks(PROOF_CHUNK_CHARS)
+            .map(|c| std::str::from_utf8(c).expect("base64url is ASCII"))
+            .collect();
+        let total = chunks.len();
+        // The header carries a one-byte index and total, so a proof that
+        // needed more records than that could not name its own pieces.
+        u8::try_from(total).ok()?;
+        Some(
+            chunks
+                .iter()
+                .enumerate()
+                .map(|(i, chunk)| format!("{PROOF_TXT_PREFIX} {group} {}/{total} {chunk}", i + 1))
+                .collect(),
+        )
     }
 
     /// The RFC 6962 leaf hash of this entry: over the log's own body bytes.
@@ -316,6 +357,127 @@ impl RekorProof {
     pub fn leaf_hash(&self) -> [u8; 32] {
         leaf_hash(&self.canonicalized_body)
     }
+}
+
+/// Reassembles every complete proof served at one owner name.
+///
+/// The records at `_synchronicity-rekor.<zone>` are a bag: chunks of one
+/// proof, chunks of another during a rollover, and — because the set is
+/// whatever the zone published — possibly records this build cannot read at
+/// all. Chunks are grouped by their `group` field, and a group yields a
+/// proof only when every index it claims is present, the pieces concatenate
+/// to valid base64url, and the digest of the result is the group it said it
+/// was. Anything else is reported rather than silently dropped, so "the zone
+/// published gibberish" stays distinguishable from "the zone published
+/// nothing".
+///
+/// One malformed record never sinks a readable one: each group is decided on
+/// its own, which is what lets a mid-rollover zone serve a record this build
+/// does not understand beside the one it needs.
+pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>> {
+    use std::collections::BTreeMap;
+
+    // group -> (total, index -> chunk)
+    let mut groups: BTreeMap<String, (usize, BTreeMap<usize, String>)> = BTreeMap::new();
+    let mut junk: Vec<ProofError> = Vec::new();
+    for record in records {
+        match parse_chunk(record) {
+            Ok((group, index, total, chunk)) => {
+                let entry = groups.entry(group).or_insert((total, BTreeMap::new()));
+                // A group whose records disagree about how many there are is
+                // not a group; the mismatch shows up as a missing index.
+                entry.0 = entry.0.max(total);
+                entry.1.insert(index, chunk);
+            }
+            Err(e) => junk.push(e),
+        }
+    }
+
+    let mut out = Vec::new();
+    for (group, (total, chunks)) in groups {
+        if chunks.len() != total || !(1..=total).all(|i| chunks.contains_key(&i)) {
+            out.push(Err(ProofError::Malformed(format!(
+                "proof {group} is served in {total} part(s) and {} arrived",
+                chunks.len()
+            ))));
+            continue;
+        }
+        let payload: String = chunks.into_values().collect();
+        out.push(decode_group(&group, &payload));
+    }
+    // Only worth reporting when nothing reassembled: a zone mid-upgrade may
+    // legitimately serve a record beside the ones that work.
+    if out.is_empty() {
+        out.extend(junk.into_iter().map(Err));
+    }
+    out
+}
+
+/// Which part a record is, for a publisher deciding where to put it.
+pub fn part_index_of(record: &str) -> Option<usize> {
+    parse_chunk(record).ok().map(|(_, index, _, _)| index)
+}
+
+/// The largest part count any record at this name claims, capped at the
+/// format's ceiling.
+///
+/// This is what tells a client how many more names to ask for. It is read
+/// from records that have already been DNSSEC-validated, so it is the zone's
+/// own statement — but it is still only a hint about *work*, never about
+/// truth: a wrong count yields a set that fails to reassemble, which is a
+/// refusal, not an acceptance.
+pub fn parts_claimed(records: &[String]) -> usize {
+    records
+        .iter()
+        .filter_map(|record| parse_chunk(record).ok())
+        .map(|(_, _, total, _)| total)
+        .max()
+        .unwrap_or(1)
+}
+
+/// One record, as `sync1p <group> <index>/<total> <chunk>`.
+fn parse_chunk(record: &str) -> Result<(String, usize, usize, String), ProofError> {
+    let malformed = |why: &str| ProofError::Malformed(format!("proof record: {why}"));
+    let mut fields = record.split_whitespace();
+    match fields.next() {
+        Some(PROOF_TXT_PREFIX) => {}
+        _ => return Err(malformed("not a sync1p record")),
+    }
+    let group = fields.next().ok_or_else(|| malformed("no group"))?;
+    if group.len() != 8 || !group.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(malformed("the group is not eight hex digits"));
+    }
+    let counter = fields.next().ok_or_else(|| malformed("no index"))?;
+    let (index, total) = counter
+        .split_once('/')
+        .ok_or_else(|| malformed("the index is not <index>/<total>"))?;
+    let index: usize = index
+        .parse()
+        .map_err(|_| malformed("the index is not a number"))?;
+    let total: usize = total
+        .parse()
+        .map_err(|_| malformed("the total is not a number"))?;
+    if index == 0 || total == 0 || index > total || total > 255 {
+        return Err(malformed("the index is outside 1..=total"));
+    }
+    let chunk = fields.next().ok_or_else(|| malformed("no payload"))?;
+    if fields.next().is_some() {
+        return Err(malformed("trailing fields"));
+    }
+    Ok((group.to_ascii_lowercase(), index, total, chunk.to_string()))
+}
+
+/// Decodes a reassembled payload and holds it to the group it claimed.
+fn decode_group(group: &str, payload: &str) -> Result<RekorProof, ProofError> {
+    let bytes = base64url_decode(payload)?;
+    let digest = hex_lower(&sha256(&bytes)[..4]);
+    if digest != group {
+        return Err(ProofError::Malformed(format!(
+            "proof {group} reassembled to something whose digest is {digest}: \
+             its parts are not all from one record"
+        )));
+    }
+    RekorProof::decode(&bytes)
 }
 
 /// The zone key an answer was actually signed by: what the proof must bind.
@@ -1448,9 +1610,89 @@ mod tests {
         let original = proof();
         let bytes = original.encode().expect("a small record encodes");
         assert_eq!(RekorProof::decode(&bytes).unwrap(), original);
-        assert_eq!(
-            RekorProof::from_txt(&original.to_txt().expect("encodes")).unwrap(),
-            original
+        let records = original.to_txt().expect("encodes");
+        let reassembled = proofs_from_txt(&records);
+        let [Ok(only)] = reassembled.as_slice() else {
+            panic!("one proof reassembles to one candidate: {reassembled:?}");
+        };
+        assert_eq!(only, &original);
+    }
+
+    /// A proof is served in pieces, and the pieces are self-describing.
+    #[test]
+    fn a_proof_is_chunked_and_reassembles_in_any_order() {
+        // Big enough to need several records: the whole reason the format
+        // has a header at all.
+        let big = RekorProof {
+            statement: vec![b'x'; 3000],
+            canonicalized_body: vec![b'y'; 3000],
+            ..proof()
+        };
+        let mut records = big.to_txt().expect("encodes");
+        assert!(records.len() > 1, "a real proof spans records");
+        for record in &records {
+            assert!(record.starts_with(PROOF_TXT_PREFIX));
+            assert!(
+                record.len() < 4096,
+                "a record has to fit the tightest provider limit: {}",
+                record.len()
+            );
+        }
+
+        // Order is carried in the records, not in the answer: DNS gives no
+        // ordering guarantee across an RRset.
+        records.reverse();
+        let reassembled = proofs_from_txt(&records);
+        let [Ok(got)] = reassembled.as_slice() else {
+            panic!("one proof, one candidate: {reassembled:?}");
+        };
+        assert_eq!(got, &big);
+
+        // A missing piece is a refusal, not a truncated proof.
+        let short = records[1..].to_vec();
+        assert!(proofs_from_txt(&short)[0].is_err());
+
+        // Two proofs at one name — a rollover — stay separate.
+        let other = RekorProof {
+            log_index: big.log_index + 1,
+            ..big.clone()
+        };
+        let mut both = big.to_txt().expect("encodes");
+        both.extend(other.to_txt().expect("encodes"));
+        let reassembled = proofs_from_txt(&both);
+        assert_eq!(reassembled.len(), 2, "two groups, two proofs");
+        let decoded: Vec<&RekorProof> = reassembled.iter().map(|r| r.as_ref().unwrap()).collect();
+        assert!(decoded.contains(&&big) && decoded.contains(&&other));
+    }
+
+    /// Chunks of different proofs cannot be spliced into one that decodes.
+    ///
+    /// The group is the digest of the whole encoded record, so a mixed set
+    /// either fails to reassemble or reassembles to something whose digest
+    /// is not the group it claimed — checked, because base64url of two
+    /// unrelated halves can still decode to *bytes*.
+    #[test]
+    fn chunks_from_two_proofs_do_not_splice() {
+        let a = RekorProof {
+            statement: vec![b'a'; 3000],
+            ..proof()
+        };
+        let b = RekorProof {
+            statement: vec![b'b'; 3000],
+            ..proof()
+        };
+        let (ra, rb) = (a.to_txt().unwrap(), b.to_txt().unwrap());
+        assert!(ra.len() > 1 && rb.len() > 1);
+        // b's first chunk relabelled with a's group and index.
+        let group = ra[0].split_whitespace().nth(1).unwrap().to_string();
+        let payload = rb[0].split_whitespace().nth(3).unwrap();
+        let forged = format!("{PROOF_TXT_PREFIX} {group} 1/{} {payload}", ra.len());
+        let spliced: Vec<String> = std::iter::once(forged)
+            .chain(ra[1..].iter().cloned())
+            .collect();
+        assert!(
+            proofs_from_txt(&spliced).iter().all(|r| r.is_err()),
+            "a spliced set must not yield a proof"
         );
     }
 

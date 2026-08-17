@@ -49,7 +49,10 @@ pub type ZoneInput {
     /// Zone-key transparency proofs for the key the zone publishes, in the
     /// base64url form one TXT record carries. Empty until `rekor-publish`
     /// has run — phase 0 of the rollout serves a zone without them.
-    rekor_proofs: List(String),
+    /// The proof records, each with the part number that decides its owner
+    /// name: part 1 at `_synchronicity-rekor`, part n at
+    /// `_synchronicity-rekor-<n>`.
+    rekor_proofs: List(#(Int, String)),
     /// The relayed Sigstore TUF bundle (§10.1), base64url. Empty until
     /// `tuf-refresh` has run, which is a zone whose clients keep the pins
     /// they already have — a non-event, not a fault.
@@ -102,7 +105,9 @@ fn read_tuf_bundle(conn: Connection) -> Result(String, ModelError) {
 /// A stored row that cannot be turned back into a proof is dropped rather
 /// than served: a malformed record would make every client refuse the whole
 /// zone, which is a worse outcome than the one the row was meant to fix.
-fn read_rekor_proofs(conn: Connection) -> Result(List(String), ModelError) {
+fn read_rekor_proofs(
+  conn: Connection,
+) -> Result(List(#(Int, String)), ModelError) {
   use records <- result.try(rekor_store.servable(conn) |> result.map_error(Db))
   Ok(
     records
@@ -114,7 +119,13 @@ fn read_rekor_proofs(conn: Connection) -> Result(List(String), ModelError) {
         Ok(built) -> proof.to_txt(built) |> result.replace_error(Nil)
         Error(_) -> Error(Nil)
       }
-    }),
+    })
+    // One proof is several records, and they go to *different* owner names:
+    // part 1 at the base, part n one label along. Providers cap the combined
+    // content of a single name — Cloudflare at 8192 wire bytes, which one
+    // ICANN-rooted proof exceeds by itself — so the parts have to spread.
+    |> list.flatten
+    |> list.map(fn(text) { #(proof.part_index_of(text), text) }),
   )
 }
 

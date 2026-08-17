@@ -124,16 +124,30 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
 /// with no proofs simply has no such owner name, which is what phase 0
 /// looks like from a client.
 fn rekor_rrsets(input: ZoneInput, apex: Name) -> List(Rrset) {
-  case input.rekor_proofs {
-    [] -> []
-    proofs -> [
-      Rrset(
-        [rekor_label, ..apex],
-        wire.type_txt,
-        ttl_rekor,
-        list.map(proofs, rdata.txt),
-      ),
-    ]
+  // One RRset per part, at the part's own owner name. A proof is far bigger
+  // than one record, and bigger than what a managed provider will hold at a
+  // single name, so the parts spread out; part 1 sits at the base name
+  // because it is the only one a client can compute before reading anything.
+  input.rekor_proofs
+  |> list.group(fn(pair) { pair.0 })
+  |> dict.to_list
+  |> list.sort(fn(a, b) { int.compare(a.0, b.0) })
+  |> list.map(fn(entry) {
+    let #(index, proofs) = entry
+    Rrset(
+      [rekor_part_label(index), ..apex],
+      wire.type_txt,
+      ttl_rekor,
+      list.map(proofs, fn(pair) { rdata.txt(pair.1) }),
+    )
+  })
+}
+
+/// The label part `index` of a proof lives under.
+pub fn rekor_part_label(index: Int) -> String {
+  case index <= 1 {
+    True -> rekor_label
+    False -> rekor_label <> "-" <> int.to_string(index)
   }
 }
 

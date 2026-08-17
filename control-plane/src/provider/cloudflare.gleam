@@ -226,13 +226,33 @@ fn send_json(
     httpc.send(req)
     |> result.map_error(fn(e) { url <> " unreachable: " <> string.inspect(e) }),
   )
-  check_status(url, resp.status)
+  check_body(url, resp.status, resp.body)
 }
 
 fn check_status(url: String, status: Int) -> Result(Nil, String) {
+  check_body(url, status, "")
+}
+
+/// A refusal carries the provider's own words.
+///
+/// Cloudflare answers a rejected change with a JSON body naming the reason —
+/// a record that is too long, a name outside the zone, a duplicate. Dropping
+/// it left `provider-sync` reporting a bare "answered 400", which says only
+/// that something is wrong and never what, and an operator then has to
+/// reconstruct the request by hand to find out.
+fn check_body(url: String, status: Int, body: String) -> Result(Nil, String) {
   case status >= 200 && status < 300 {
     True -> Ok(Nil)
-    False -> Error(url <> " answered " <> int.to_string(status))
+    False ->
+      Error(
+        url
+        <> " answered "
+        <> int.to_string(status)
+        <> case body {
+          "" -> ""
+          text -> ": " <> string.slice(text, 0, 400)
+        },
+      )
   }
 }
 

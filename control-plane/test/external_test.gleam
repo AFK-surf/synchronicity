@@ -35,7 +35,7 @@ fn input(txt_names: List(model.TxtName)) -> ZoneInput {
     ZoneMeta(apex, 7, <<>>, 0, 3600, 1_209_600, 604_800),
     [],
     txt_names,
-    ["proofblob"],
+    [#(1, "proofblob")],
     "tufblob",
   )
 }
