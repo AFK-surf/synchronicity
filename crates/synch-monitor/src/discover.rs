@@ -92,16 +92,31 @@ impl Repo for HttpRepo {
     }
 }
 
-/// The log a run should read, and the keys its checkpoints must verify under.
+/// The logs a run should read, and the keys their checkpoints must verify
+/// under.
 #[derive(Debug, Clone)]
 pub struct Discovered {
-    /// The log's base URL, no trailing slash.
-    pub base_url: String,
+    /// **Every** log the trusted root names, no trailing slashes.
+    ///
+    /// Not just the one currently in service. The client accepts a proof
+    /// from any log whose key is pinned — `tlog_keys` collects every shard
+    /// the trusted root lists, retired ones included, because "a proof from
+    /// a retired shard is still a proof" — while this used to resolve to a
+    /// single `base_url` via `current_tlog`. So the set of logs a client
+    /// would believe and the set a monitor actually read came out of one
+    /// artifact through two different filters, and nobody reconciled them.
+    ///
+    /// That is a hole in the invariant the whole design rests on: an entry
+    /// in a pinned-but-unwatched shard is client-valid and invisible, which
+    /// is the "accepted by every client, reported by no monitor" case the
+    /// tiering exists to prevent. It opens at the first shard rotation, and
+    /// the name `log2025-1` says a rotation is the plan.
+    pub base_urls: Vec<String>,
     /// Every log the trusted root names, retired shards included: a proof
     /// from a closed shard is still a proof, and a checkpoint has to verify
     /// under the key of whichever shard signed it.
     pub keys: LogKeys,
-    /// How `base_url` was arrived at, for the line the run prints.
+    /// How `base_urls` was arrived at, for the line the run prints.
     pub source: &'static str,
 }
 
@@ -153,30 +168,36 @@ pub fn discover(
             .map_err(|e| MonitorError::Checkpoint(format!("trusted root: {e}")))?,
     };
 
-    let base_url = match log_override {
+    let base_urls = match log_override {
         Some(url) => {
             source = "--log";
-            url.trim_end_matches('/').to_string()
+            vec![url.trim_end_matches('/').to_string()]
         }
         None => {
             let logs = pins
                 .tlogs()
                 .map_err(|e| MonitorError::Checkpoint(format!("trusted root: {e}")))?;
-            tuf::current_tlog(&logs, now)
-                .ok_or_else(|| {
-                    MonitorError::Checkpoint(
-                        "the trusted root in force names no transparency log in service \
-                         right now — pass --log to name one"
-                            .into(),
-                    )
-                })?
-                .base_url
-                .clone()
+            if logs.is_empty() {
+                return Err(MonitorError::Checkpoint(
+                    "the trusted root in force names no transparency log at all — \
+                     pass --log to name one"
+                        .into(),
+                ));
+            }
+            // Every shard, newest first so the busy one is walked before a
+            // long tail of retired ones. Ordering is presentation only: a
+            // run reads all of them.
+            let mut logs = logs;
+            logs.sort_by_key(|log| std::cmp::Reverse(log.valid_from));
+            logs.into_iter()
+                .map(|log| log.base_url.trim_end_matches('/').to_string())
+                .collect()
         }
     };
+    let _ = now;
 
     Ok(Discovered {
-        base_url,
+        base_urls,
         keys,
         source,
     })
@@ -228,13 +249,24 @@ mod tests {
         .unwrap();
         assert!(warnings.is_empty());
         assert_eq!(found.source, "embedded trusted root");
-        assert!(found.base_url.starts_with("https://"));
+        assert!(found.base_urls.iter().all(|u| u.starts_with("https://")));
         assert!(!found.keys.is_empty());
-        // The log in service is one of the logs the root names, and the URL
-        // is whatever that artifact says — asserted as a shape, not as a
-        // hostname, because the hostname is exactly what this must not fix.
+        // *Every* log the root names is read, not just the one in service —
+        // the client accepts a proof from any of them, so a monitor that
+        // skipped the retired shards would leave a client-valid entry
+        // permanently unseen. Asserted as a set, and as a shape rather than
+        // as hostnames, because the hostnames are what this must not fix.
         let logs = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
-        assert!(logs.iter().any(|log| log.base_url == found.base_url));
+        assert_eq!(found.base_urls.len(), logs.len());
+        for log in &logs {
+            assert!(
+                found
+                    .base_urls
+                    .contains(&log.base_url.trim_end_matches('/').to_string()),
+                "{} is pinned but would not be read",
+                log.base_url
+            );
+        }
     }
 
     #[test]
@@ -293,7 +325,7 @@ mod tests {
             &mut |_| {},
         )
         .unwrap();
-        assert_eq!(found.base_url, "https://log.example");
+        assert_eq!(found.base_urls, vec!["https://log.example".to_string()]);
         assert_eq!(found.source, "--log");
     }
 }

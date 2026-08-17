@@ -229,12 +229,7 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
         Some(path) => path.clone(),
         None => discover::pins_beside(&args.state),
     };
-    let (tuf, no_tuf, log, now) = (
-        args.tuf.clone(),
-        args.no_tuf,
-        args.log.clone(),
-        now_unix(),
-    );
+    let (tuf, no_tuf, log, now) = (args.tuf.clone(), args.no_tuf, args.log.clone(), now_unix());
     let found = tokio::task::spawn_blocking(move || {
         let repo = match no_tuf {
             true => None,
@@ -252,16 +247,155 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
     .await
     .map_err(|e| MonitorError::Transport(format!("discovery: {e}")))??;
     eprintln!(
-        "synch-monitor: reading {} (via {})",
-        found.base_url, found.source
+        "synch-monitor: reading {} log(s) (via {}): {}",
+        found.base_urls.len(),
+        found.source,
+        found.base_urls.join(", ")
     );
     let logs = found.keys;
 
-    let source = HttpTiles::new(&found.base_url)?;
+    // The "already reported" test runs against the state as it was *loaded*,
+    // so two entries in one run that authorize the same key report once, an
+    // entry does not suppress itself, and — now that a run reads several
+    // logs — the same key turning up in two shards reports once rather than
+    // once per shard.
+    let known_at_start = state.known.clone();
+
+    // Every log the trusted root names, not just the one in service.
+    let mut findings = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for base_url in &found.base_urls {
+        match walk_log(base_url, &logs, &anchors, &known_at_start, &mut state, args).await {
+            Ok(found_here) => findings.extend(found_here),
+            Err(e) => {
+                // One unreadable shard must not cost the report from the
+                // others: a retired log whose tiles have been taken down is
+                // an ordinary thing to meet, and the busy shard is where the
+                // news usually is. The run still ends incomplete.
+                eprintln!("synch-monitor: {base_url}: {e}");
+                failures.push(base_url.clone());
+            }
+        }
+    }
+
+    // Sort the classified entries into the three things a run can have found.
+    //
+    // The "already reported" test runs against the state as it was *loaded*,
+    // and recording happens after the whole batch is decided — so two entries
+    // in one run that authorize the same key report once, and an entry does
+    // not suppress itself.
+    let mut new_authorizations = Vec::new();
+    let mut already_known = 0usize;
+    let mut claims = Vec::new();
+    for finding in &findings {
+        match finding.tier {
+            Tier::A => {
+                let apex = synch_net::chain::parse_name(&finding.apex);
+                // An entry is news when *any* key its chain proves has not
+                // been reported yet — a rotation that pre-publishes one new
+                // key beside a known one is exactly the event to hear about.
+                // A tier A finding always came from a parsed SAN, so parsing
+                // cannot fail; treating an unparseable one as *new* rather
+                // than as known is the safe direction anyway — it reports.
+                let all_known = apex.is_ok_and(|apex| {
+                    finding
+                        .keys
+                        .iter()
+                        .all(|key| known_at_start.contains_digest(&apex, &key.sha256))
+                });
+                match all_known {
+                    true => already_known += 1,
+                    false => new_authorizations.push(finding),
+                }
+            }
+            Tier::B => claims.push(finding),
+        }
+    }
+
+    // stdout is the report: newly authorized keys, and nothing else.
+    for finding in &new_authorizations {
+        println!("{}", render(finding, args.json));
+    }
+    // Tier B on stderr. It is not an alarm — no client would have taken these
+    // — but an operator who sees the exit code needs to be able to see *what*
+    // was claimed without re-running with different flags.
+    for finding in &claims {
+        eprintln!("{}", render(finding, args.json));
+    }
+
+    // Record what was reported, so the next run stays quiet about it. Tier B
+    // is deliberately never recorded: the same key arriving later with a
+    // chain that *does* verify is a genuine new authorization, and a tier B
+    // sighting must not have quietly consumed it.
+    for finding in &new_authorizations {
+        if let Ok(apex) = synch_net::chain::parse_name(&finding.apex) {
+            for key in &finding.keys {
+                state.known.insert_digest(&apex, &key.sha256);
+            }
+        }
+    }
+    if !args.no_save {
+        // A save failure must not swallow the report either: it is printed
+        // by now, so say so and carry on to the exit code.
+        if let Err(e) = state.save(&args.state) {
+            eprintln!("synch-monitor: could not write the state file: {e}");
+            return Ok(EXIT_INCOMPLETE);
+        }
+    }
+    if !failures.is_empty() {
+        eprintln!(
+            "synch-monitor: {} of {} log(s) could not be read ({}); \
+             {} finding(s) above came from the rest",
+            failures.len(),
+            found.base_urls.len(),
+            failures.join(", "),
+            findings.len()
+        );
+        return Ok(EXIT_INCOMPLETE);
+    }
+
+    eprintln!(
+        "synch-monitor: {} log(s) read; {} new authorization(s), \
+         {already_known} already recorded, {} unauthorized claim(s)",
+        found.base_urls.len(),
+        new_authorizations.len(),
+        claims.len()
+    );
+    Ok(match (new_authorizations.is_empty(), claims.is_empty()) {
+        (false, _) => 20,
+        (true, false) => 10,
+        (true, true) => 0,
+    })
+}
+
+/// Reads one log end to end: checkpoint, consistency, then every entry from
+/// where this monitor last stopped.
+///
+/// Returns what it classified. A failure partway is an error, but whatever
+/// was classified before it is *not* lost — the caller keeps the findings
+/// and the position it wrote, and only the exit code records that the
+/// run was incomplete.
+/// One log, walked end to end.
+///
+/// Extracted per log because a run reads *every* log the trusted root names
+/// (§10): the position, the consistency proof and the resume index are all
+/// per-log, keyed on the checkpoint's origin line.
+async fn walk_log(
+    base_url: &str,
+    logs: &LogKeys,
+    anchors: &TrustAnchors,
+    known: &synch_monitor::classify::KnownKeys,
+    state: &mut MonitorState,
+    args: &Args,
+) -> Result<Vec<Finding>, MonitorError> {
+    let source = HttpTiles::new(base_url)?;
     let checkpoint = Checkpoint::parse(&source.checkpoint().await?)
         .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
+    // Under *any* pinned key: which log signed it is settled by the origin
+    // line the position is then keyed on, and a checkpoint no pinned key
+    // signed is not one this client would have believed either.
     checkpoint
-        .verify_under(&logs)
+        .verify_under(logs)
         .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
 
     let tree = Tree::new(&source, checkpoint.tree_size, args.concurrency.get());
@@ -276,65 +410,60 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
         ));
     }
 
-    // Consistency: the root this monitor persisted, recomputed from the *new*
-    // tree's tiles. A log that cannot reproduce its own past has shown two
-    // histories, and nothing below this line would be worth reading.
-    if !state.is_fresh() {
-        if state.origin != checkpoint.origin {
-            return Err(MonitorError::Checkpoint(format!(
-                "this state is for {}, the log now calls itself {}",
-                state.origin, checkpoint.origin
-            )));
-        }
-        if checkpoint.tree_size < state.tree_size {
+    let position = state.position(&checkpoint.origin).clone();
+
+    // Consistency: the root this monitor persisted for *this* log,
+    // recomputed from the new tree's tiles. A log that cannot reproduce its
+    // own past has shown two histories, and nothing below is worth reading.
+    if !position.is_fresh() {
+        if checkpoint.tree_size < position.tree_size {
             return Err(MonitorError::Checkpoint(format!(
                 "the log shrank from {} to {} entries",
-                state.tree_size, checkpoint.tree_size
+                position.tree_size, checkpoint.tree_size
             )));
         }
         let prefix = tree
-            .subtree_hash(0, state.tree_size)
+            .subtree_hash(0, position.tree_size)
             .await
             .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
-        if hex::encode(prefix) != state.root {
+        if hex::encode(prefix) != position.root {
             return Err(MonitorError::Checkpoint(format!(
                 "the tree of {} entries does not extend the {} this monitor saw: \
                  the log has equivocated",
-                checkpoint.tree_size, state.tree_size
+                checkpoint.tree_size, position.tree_size
             )));
         }
     }
 
     // A from-index *ahead* of where this monitor stopped leaves a range that
-    // will never be classified: the run writes `next_index = end` back, so
-    // the gap is skipped permanently and silently. Bounded first runs want
-    // this; a resuming monitor almost never does, so say so out loud.
+    // will never be classified. Bounded first runs want this; a resuming
+    // monitor almost never does, so say so out loud.
     if let Some(from) = args.from_index {
-        if from > state.next_index {
+        if from > position.next_index {
             eprintln!(
-                "synch-monitor: starting at {from}, past the recorded {}: \
+                "synch-monitor: {base_url}: starting at {from}, past the recorded {}: \
                  entries {}..{from} will never be classified",
-                state.next_index, state.next_index
+                position.next_index, position.next_index
             );
         }
     }
-    let started_at = args.from_index.unwrap_or(state.next_index);
-    // How far the walk actually got. It is the resume point when the walk
-    // fails partway: saving `end` there would step over the entries the run
-    // never classified, and saving `started_at` would re-read work already
-    // reported. Advanced per completed bundle, below.
-    let mut at = started_at;
+    let started_at = args.from_index.unwrap_or(position.next_index);
     let end = match args.max_entries {
         // Saturating: `--from-index` and `--max-entries` are both operator
         // input, and their sum is not bounded by anything but the CLI.
         Some(max) => checkpoint.tree_size.min(started_at.saturating_add(max)),
         None => checkpoint.tree_size,
     };
+    // How far the walk actually got, and the resume point when it fails
+    // partway: saving `end` would step over entries the run never
+    // classified, saving `started_at` would re-read work already reported.
+    let mut at = started_at;
+
     let total = end.saturating_sub(started_at);
     if total > 0 {
         eprintln!(
-            "synch-monitor: reading entries {started_at}..{end} ({total} to classify), \
-             {} fetch(es) in flight",
+            "synch-monitor: {base_url}: reading entries {started_at}..{end} \
+             ({total} to classify), {} fetch(es) in flight",
             args.concurrency
         );
     }
@@ -345,8 +474,8 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
     // entry at index N and then hit a 503 at N+1 used to print nothing at
     // all and exit as a failure — the one outcome that must never be silent
     // was the easiest to silence. Everything classified before the error is
-    // reported and recorded below; the error decides the exit code, not
-    // whether the news gets out.
+    // returned and recorded; the error decides the exit code, not whether
+    // the news gets out.
     let mut findings = Vec::new();
     let outcome: Result<(), MonitorError> = async {
         // Bundles arrive strictly in index order, however far fetching has
@@ -392,7 +521,7 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
                 let Ok(name) = parsed.certificate.single_dns_name() else {
                     continue;
                 };
-                if !state.known.watches(&name) {
+                if !known.watches(&name) {
                     continue;
                 }
                 let path = tree.inclusion_path(index).await?;
@@ -404,7 +533,7 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
                     checkpoint.root_hash,
                 )
                 .map_err(|e| MonitorError::Tile(e.to_string()))?;
-                if let Some(finding) = classify(&parsed, index, &anchors) {
+                if let Some(finding) = classify(&parsed, index, anchors) {
                     findings.push(finding);
                 }
             }
@@ -426,7 +555,9 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
                     true => rough_eta(((total - read) as f64 / rate) as u64),
                     false => "unknown".to_string(),
                 };
-                eprintln!("synch-monitor: {read}/{total} entries ({rate:.0}/s, eta {eta})");
+                eprintln!(
+                    "synch-monitor: {base_url}: {read}/{total} entries ({rate:.0}/s, eta {eta})"
+                );
                 last_progress = Instant::now();
             }
         }
@@ -434,105 +565,23 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
     }
     .await;
 
-    // Sort the classified entries into the three things a run can have found.
-    //
-    // The "already reported" test runs against the state as it was *loaded*,
-    // and recording happens after the whole batch is decided — so two entries
-    // in one run that authorize the same key report once, and an entry does
-    // not suppress itself.
-    let mut new_authorizations = Vec::new();
-    let mut already_known = 0usize;
-    let mut claims = Vec::new();
-    for finding in &findings {
-        match finding.tier {
-            Tier::A => {
-                let apex = synch_net::chain::parse_name(&finding.apex);
-                // An entry is news when *any* key its chain proves has not
-                // been reported yet — a rotation that pre-publishes one new
-                // key beside a known one is exactly the event to hear about.
-                // A tier A finding always came from a parsed SAN, so parsing
-                // cannot fail; treating an unparseable one as *new* rather
-                // than as known is the safe direction anyway — it reports.
-                let all_known = apex.is_ok_and(|apex| {
-                    finding
-                        .keys
-                        .iter()
-                        .all(|key| state.known.contains_digest(&apex, &key.sha256))
-                });
-                match all_known {
-                    true => already_known += 1,
-                    false => new_authorizations.push(finding),
-                }
-            }
-            Tier::B => claims.push(finding),
-        }
-    }
-
-    // stdout is the report: newly authorized keys, and nothing else.
-    for finding in &new_authorizations {
-        println!("{}", render(finding, args.json));
-    }
-    // Tier B on stderr. It is not an alarm — no client would have taken these
-    // — but an operator who sees the exit code needs to be able to see *what*
-    // was claimed without re-running with different flags.
-    for finding in &claims {
-        eprintln!("{}", render(finding, args.json));
-    }
-
-    // Record what was reported, so the next run stays quiet about it. Tier B
-    // is deliberately never recorded: the same key arriving later with a
-    // chain that *does* verify is a genuine new authorization, and a tier B
-    // sighting must not have quietly consumed it.
-    for finding in &new_authorizations {
-        if let Ok(apex) = synch_net::chain::parse_name(&finding.apex) {
-            for key in &finding.keys {
-                state.known.insert_digest(&apex, &key.sha256);
-            }
-        }
-    }
-    state.origin = checkpoint.origin.clone();
-    state.tree_size = checkpoint.tree_size;
-    state.root = hex::encode(checkpoint.root_hash);
-    // How far the walk *actually* got, which is `end` only when it finished.
-    // Recording `end` after a partial walk would step over every entry the
-    // failure prevented us from classifying, and they would never be looked
-    // at again.
-    state.next_index = match outcome {
+    // The position is written whether or not the walk finished, so a run
+    // that dies partway resumes where it stopped instead of re-reading from
+    // the last complete run.
+    let reached = match outcome {
         Ok(()) => end,
         Err(_) => at.min(end),
     };
-    let reached = state.next_index;
-    if !args.no_save {
-        // A save failure must not swallow the report either: it is printed
-        // by now, so say so and carry on to the exit code.
-        if let Err(e) = state.save(&args.state) {
-            eprintln!("synch-monitor: could not write the state file: {e}");
-            return Ok(EXIT_INCOMPLETE);
-        }
-    }
-    if let Err(e) = outcome {
-        eprintln!("synch-monitor: {e}");
-        eprintln!(
-            "synch-monitor: the walk stopped at index {reached}; \
-             {} finding(s) above were classified before it stopped",
-            findings.len()
-        );
-        return Ok(EXIT_INCOMPLETE);
-    }
-
+    let position = state.position(&checkpoint.origin);
+    position.tree_size = checkpoint.tree_size;
+    position.root = hex::encode(checkpoint.root_hash);
+    position.next_index = reached;
     eprintln!(
-        "synch-monitor: {} entries read to index {end} in {:.0}s; {} new authorization(s), \
-         {already_known} already recorded, {} unauthorized claim(s)",
-        end.saturating_sub(started_at),
-        scan_started.elapsed().as_secs_f64(),
-        new_authorizations.len(),
-        claims.len()
+        "synch-monitor: {base_url}: {} entries read to index {reached}",
+        reached.saturating_sub(started_at)
     );
-    Ok(match (new_authorizations.is_empty(), claims.is_empty()) {
-        (false, _) => 20,
-        (true, false) => 10,
-        (true, true) => 0,
-    })
+
+    outcome.map(|()| findings)
 }
 
 /// One finding, as a line — JSON when asked, human otherwise.

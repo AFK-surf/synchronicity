@@ -20,13 +20,9 @@
 
 use crate::{classify::KnownKeys, MonitorError};
 
-/// The monitor's persisted view of one log.
+/// Where a monitor got to in one log.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MonitorState {
-    /// The log's origin line, as its checkpoints spell it. A state file that
-    /// meets a different origin is a state file for a different log.
-    #[serde(default)]
-    pub origin: String,
+pub struct LogPosition {
     /// The tree size of the last verified checkpoint.
     #[serde(default)]
     pub tree_size: u64,
@@ -38,8 +34,39 @@ pub struct MonitorState {
     /// The next entry index to read. Entries below it have been classified.
     #[serde(default)]
     pub next_index: u64,
+}
+
+impl LogPosition {
+    /// Whether this log has ever been read.
+    pub fn is_fresh(&self) -> bool {
+        self.root.is_empty()
+    }
+}
+
+/// The monitor's persisted view of every log it reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MonitorState {
+    /// Position per log, keyed by the origin line its checkpoints carry.
+    ///
+    /// **A map, because the client trusts more than one log.** This used to
+    /// be a single origin/size/root/index, so a monitor could follow exactly
+    /// one shard — and on a rotation it hard-failed on every subsequent run
+    /// ("this state is for X, the log now calls itself Y") until an operator
+    /// hand-edited or deleted the file, which also destroyed the split-view
+    /// baseline and the record of what had already been reported. Meanwhile
+    /// the client kept accepting proofs from the shard nobody was reading.
+    ///
+    /// Keyed by origin rather than by URL: the origin is what the log signs,
+    /// so it is the name that cannot be changed by whoever serves the tiles.
+    #[serde(default)]
+    pub logs: std::collections::BTreeMap<String, LogPosition>,
     /// The apexes this monitor watches, and the keys it has already reported
     /// as authorized for each.
+    ///
+    /// Deliberately *not* per log. A key authorized for an apex is news the
+    /// first time it is seen and not the second, whichever shard it turns up
+    /// in — reporting it again because a different log carried it would be
+    /// noise, and noise is what stops alerts being read.
     #[serde(default)]
     pub known: KnownKeys,
 }
@@ -67,9 +94,19 @@ impl MonitorState {
             .map_err(|e| MonitorError::State(format!("{}: {e}", path.display())))
     }
 
-    /// Whether this state has ever seen a checkpoint.
+    /// Where this monitor got to in the log calling itself `origin`, or a
+    /// fresh position if it has never read that one.
+    ///
+    /// A shard this monitor has not met is not an error — it is the ordinary
+    /// state on the day Sigstore opens one, and the right response is to
+    /// read it from the start rather than to refuse to run.
+    pub fn position(&mut self, origin: &str) -> &mut LogPosition {
+        self.logs.entry(origin.to_string()).or_default()
+    }
+
+    /// Whether this state has ever seen a checkpoint from any log.
     pub fn is_fresh(&self) -> bool {
-        self.root.is_empty()
+        self.logs.values().all(LogPosition::is_fresh)
     }
 }
 
@@ -83,17 +120,26 @@ mod tests {
         let path = dir.path().join("monitor.json");
         assert!(MonitorState::load(&path).unwrap().is_fresh());
 
-        let mut state = MonitorState {
-            origin: "log2025-1.rekor.sigstore.dev".into(),
+        let mut state = MonitorState::default();
+        *state.position("log2025-1.rekor.sigstore.dev") = LogPosition {
             tree_size: 67_686_055,
             root: "bcae".repeat(16),
             next_index: 67_673_584,
-            known: KnownKeys::default(),
+        };
+        // A second shard, tracked beside the first rather than instead of
+        // it: the client accepts proofs from both, so the monitor follows
+        // both, and a rotation is a new key in this map rather than the
+        // hard failure it used to be.
+        *state.position("log2026-1.rekor.sigstore.dev") = LogPosition {
+            tree_size: 12,
+            root: "0f0f".repeat(16),
+            next_index: 12,
         };
         state.known.insert(
             &synch_net::chain::parse_name("sync.example").unwrap(),
             b"a key",
         );
+        assert_eq!(state.logs.len(), 2);
         state.save(&path).unwrap();
         assert_eq!(MonitorState::load(&path).unwrap(), state);
         assert!(!MonitorState::load(&path).unwrap().is_fresh());

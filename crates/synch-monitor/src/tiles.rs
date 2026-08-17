@@ -476,11 +476,10 @@ impl<'a, S: TileSource> Tree<'a, S> {
         stream::iter(firsts)
             .map(move |first| async move {
                 let request = self.bundle_request(first)?;
-                let data = self
-                    .source
-                    .fetch(&request.path)
-                    .await?
-                    .ok_or_else(|| MonitorError::Tile(format!("{} is missing", request.path)))?;
+                let data =
+                    self.source.fetch(&request.path).await?.ok_or_else(|| {
+                        MonitorError::Tile(format!("{} is missing", request.path))
+                    })?;
                 self.bundle_decode(&request, &data)
             })
             .buffered(self.concurrency)
@@ -616,7 +615,10 @@ mod tests {
             "api/v2/tile/entries/x264/349"
         );
         assert_eq!(Tree::<MemoryLog>::path("0", 0, 256), "api/v2/tile/0/000");
-        assert_eq!(Tree::<MemoryLog>::path("1", 7, 13), "api/v2/tile/1/007.p/13");
+        assert_eq!(
+            Tree::<MemoryLog>::path("1", 7, 13),
+            "api/v2/tile/1/007.p/13"
+        );
         assert_eq!(
             Tree::<MemoryLog>::path("0", 1_234_567, 256),
             "api/v2/tile/0/x001/x234/567"
@@ -746,8 +748,8 @@ mod tests {
     }
 
     impl TileSource for TamperedBundles {
-        fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
-            let served = self.honest.fetch(path)?;
+        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+            let served = self.honest.fetch(path).await?;
             if !path.starts_with("api/v2/tile/entries/") {
                 // Hash tiles pass through untouched: the tree stays valid.
                 return Ok(served);
@@ -766,8 +768,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_substituted_entry_body_does_not_match_the_leaf_the_log_committed_to() {
+    #[tokio::test]
+    async fn a_substituted_entry_body_does_not_match_the_leaf_the_log_committed_to() {
         let honest = log(600);
         let tampered = TamperedBundles {
             honest: log(600),
@@ -779,16 +781,16 @@ mod tests {
 
         // The tree is unchanged as far as every hash-based check can tell:
         // same size, same root, same inclusion paths.
-        let honest_tree = Tree::new(&honest, 600);
-        let tampered_tree = Tree::new(&tampered, 600);
+        let honest_tree = Tree::new(&honest, 600, 1);
+        let tampered_tree = Tree::new(&tampered, 600, 1);
         assert_eq!(
-            tampered_tree.subtree_hash(0, 600).unwrap(),
-            honest_tree.subtree_hash(0, 600).unwrap(),
+            tampered_tree.subtree_hash(0, 600).await.unwrap(),
+            honest_tree.subtree_hash(0, 600).await.unwrap(),
             "the hash tiles are honest, which is what makes this attack work"
         );
 
         // The bundle really does serve the substitute...
-        let bundle = tampered_tree.entry_bundle(300).unwrap();
+        let bundle = tampered_tree.entry_bundle(300).await.unwrap();
         let served = &bundle
             .iter()
             .find(|(index, _)| *index == 300)
@@ -798,11 +800,11 @@ mod tests {
 
         // ...and this is the one check that notices.
         assert!(
-            !tampered_tree.leaf_matches(300, served).unwrap(),
+            !tampered_tree.leaf_matches(300, served).await.unwrap(),
             "a body the log did not commit to must not match its leaf"
         );
         assert!(
-            honest_tree.leaf_matches(300, b"entry 300").unwrap(),
+            honest_tree.leaf_matches(300, b"entry 300").await.unwrap(),
             "and the honest body must still match"
         );
     }
