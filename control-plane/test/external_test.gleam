@@ -105,7 +105,7 @@ pub fn the_rotation_window_fits_inside_a_binding_lifetime_test() {
 /// set shed history instead of handing the provider a write it refuses.
 pub fn the_proof_budget_sheds_the_oldest_test() {
   let part = fn(index: Int) {
-    [string.repeat("x", 2000) <> "-" <> int_to_string(index)]
+    [string.repeat("x", 2000) <> "-" <> int.to_string(index)]
   }
   // Three fit at ~2028 wire bytes each.
   let #(kept, shed) = model.proofs_within_budget([part(0), part(1), part(0)])
