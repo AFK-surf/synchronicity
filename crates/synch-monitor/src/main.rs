@@ -4,7 +4,7 @@
 //! under the pinned log keys, check that it extends the tree this monitor
 //! saw last time, then walk every entry bundle from the last-seen index,
 //! pull the certificate out of each leaf, and classify the ones naming a
-//! watched apex (docs/REKOR-ZONE-KEY.md §5.5). Every finding's full entry
+//! watched apex (docs/REKOR-ZONE-KEY.md §5.5). Every report's full entry
 //! body goes into the state file with it, and `entry` is the evidence
 //! drawer: print one of those bodies by index, a local read rather than a
 //! re-fetch from the log under watch.
@@ -13,14 +13,26 @@
 //! key this monitor has not recorded for that apex is a new authorization: it
 //! goes to stdout, and is then recorded so the next run does not repeat it. A
 //! tier A entry for a key already recorded has been reported before and is
-//! not reported again. Tier B — an unauthorized claim no client would have
-//! accepted — goes to stderr as a note and is never recorded, because
-//! recording it would suppress the report if the same key later showed up
-//! with a chain that does verify.
+//! not reported again. Tier B — an unauthorized claim **no client holding
+//! this monitor's anchor set would have accepted** — goes to stderr as a note
+//! and is never recorded, because recording it would suppress the report if
+//! the same key later showed up with a chain that does verify.
 //!
 //! stdout is therefore the report and nothing else; stderr is the running
 //! commentary. A cron job that mails stdout mails exactly the events that
 //! need a human.
+//!
+//! # Which client population a run covers
+//!
+//! **The trust surface**: the DNSSEC anchor set and the log key set the
+//! verdicts are computed under, printed at the start of every run.
+//! `--dnssec-anchor` and `--rekor-key` *replace* the ICANN root and the pinned
+//! logs rather than unioning with them, so one process covers one population:
+//! tier B means "no client holding *these* would have accepted it", and the
+//! same bytes can be tier B here and client-accepted under a different anchor
+//! set. The surface is recorded in the state file and a run that changes it is
+//! refused rather than quietly filing verdicts about a different population
+//! into the same memory.
 //!
 //! Exit codes are the interface a cron job or an alerting rule reads:
 //!
@@ -33,28 +45,28 @@
 //! ```
 //!
 //! They are ordered by severity, so a rule testing `>=` reads correctly —
-//! and **that ordering is why a failed run is 30 and not 2.** A monitor that
+//! and that ordering is why a failed run sorts **above** the success codes. A monitor that
 //! cannot finish is not a monitor with nothing to say: it is the state an
 //! attacker most wants it in, because a wedged run and a quiet run look
-//! identical from the outside. With failure sorted below the success codes,
-//! the `>= 10` rule these docs invite ignored every failed run, which is
-//! exactly backwards.
+//! identical from the outside.
 //!
-//! A run that fails partway still prints and records everything it
-//! classified before the failure, so an alarming entry found at index N is
-//! not lost to a transport error at index N+1.
+//! A run that fails partway prints and records everything it classified
+//! before the failure: the findings leave the walk whatever its outcome, and
+//! the resume position is only ever moved over entries whose findings are in
+//! that returned batch. An alarming entry found at index N is not lost to a
+//! transport error at index N+1, and no future run steps over it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use futures_util::stream::StreamExt;
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::{
-    classify::{classify, Finding, Tier},
+    classify::{classify, Finding, KnownKeys, Tier},
     discover::{self, HttpRepo},
-    state::MonitorState,
-    tiles::{HttpTiles, Tree},
+    state::{MonitorState, TrustSurface},
+    tiles::{HttpTiles, TileSource, Tree},
     MonitorError,
 };
 use synch_net::rekor::{Checkpoint, HashedRekordBody, LogKeys};
@@ -89,7 +101,7 @@ struct Args {
 enum Command {
     /// Watch a Rekor v2 transparency log for zone-key entries.
     ///
-    /// Reports every newly authorized zone key for a watched apex: an entry
+    /// Reports every newly authorized zone key for a watched name: an entry
     /// whose DNSSEC chain verifies and covers its own key authorizes that
     /// key, and the first time this monitor sees one it says so. It cannot
     /// tell a rotation you performed from a substitution by somebody who
@@ -101,16 +113,17 @@ enum Command {
     /// stderr.
     #[command(after_long_help = "EXIT CODES:
    0  nothing new for a watched apex
-  10  unauthorized claims only — entries naming a watched apex whose chain
-      does not verify. No client would have accepted one; recorded, no alarm.
-  20  new authorizations seen — a key was authorized for a watched apex that
+  10  unauthorized claims only — entries naming a watched name whose chain
+      does not verify. No client holding this run's anchor set would have
+      accepted one; no alarm.
+  20  new authorizations seen — a key was authorized for a watched name that
       this monitor had not recorded. Check it against what you published.
   30  the run could not finish (transport, checkpoint, state). Sorts above
       the others on purpose: a wedged monitor is not a quiet one. Anything
       classified before the failure is still reported.")]
     Run(RunArgs),
     /// Print the full body of a log entry the state file holds: the evidence
-    /// behind a finding, by its log index — with --log naming the shard when
+    /// behind a report, by its log index — with --log naming the shard when
     /// more than one holds that index. stdout is the raw entry bytes — the
     /// canonicalized Rekor body, nothing added — so it pipes into jq or a
     /// file byte-exactly.
@@ -122,12 +135,15 @@ enum Command {
 struct RunArgs {
     /// The log's base URL. Discovered from Sigstore's TUF repository when
     /// not given, which is how a monitor survives a shard rotation.
+    ///
+    /// Naming one narrows the pinned key set to that log's key as well, so a
+    /// URL the trusted root does not pin needs --rekor-key with it.
     #[arg(long, env = "SYNCH_MONITOR_LOG")]
     log: Option<String>,
 
     /// Where to persist the last checkpoint, the last index, the apexes to
-    /// watch, the keys already reported for each, and the entry bodies
-    /// behind the reports.
+    /// watch, the keys already reported for each, and the entry bodies behind
+    /// the reports.
     #[arg(long, env = "SYNCH_MONITOR_STATE")]
     state: PathBuf,
 
@@ -154,6 +170,10 @@ struct RunArgs {
     /// A DNSSEC trust anchor file, replacing the ICANN root. Only for a
     /// deployment whose zones are anchored somewhere else; a chain that does
     /// not reach the anchor in force is tier B.
+    ///
+    /// It replaces rather than adds, so a run under it covers only clients
+    /// under the same anchors — which is why the state file remembers which
+    /// anchor set its verdicts were made under.
     #[arg(long)]
     dnssec_anchor: Option<PathBuf>,
 
@@ -161,6 +181,10 @@ struct RunArgs {
     /// log with 10⁸ entries in it wants a starting point that is not zero.
     #[arg(long)]
     from_index: Option<u64>,
+
+    /// Accept a --from-index that leaves a range permanently unclassified.
+    #[arg(long)]
+    allow_gap: bool,
 
     /// Stop after this many entries, so a first run can be bounded.
     #[arg(long)]
@@ -193,9 +217,7 @@ struct RunArgs {
 /// A run that could not finish. **Above** the success codes, not below
 /// them: the codes are documented as severity-ordered so that `>= 10` reads
 /// correctly, and a monitor that cannot complete is not a monitor with
-/// nothing to report — it is the state an attacker most wants it in. At the
-/// old value of 2 it sorted below "nothing new", so the alerting rule the
-/// docs invite ignored precisely the runs that needed a human.
+/// nothing to report — it is the state an attacker most wants it in.
 const EXIT_INCOMPLETE: i32 = 30;
 
 /// `entry`'s arguments.
@@ -279,6 +301,95 @@ fn dump_entry(args: &EntryArgs) -> Result<i32, MonitorError> {
     Ok(0)
 }
 
+/// The DNSSEC anchors this run judges chains against.
+///
+/// An anchor file that parses but holds no DNSKEY is refused, for the reason
+/// the client gives in the same situation: an empty anchor set validates
+/// nothing, forever, quietly. Every chain would fail to reach an anchor,
+/// every entry naming a watched name would be tier B — "no client would have
+/// accepted one" — and a completely blind monitor would exit 10 and report no
+/// alarm. That is the one failure mode a monitor must never present as a
+/// clean result.
+fn anchors_in_force(path: Option<&PathBuf>) -> Result<TrustAnchors, MonitorError> {
+    let Some(path) = path else {
+        return Ok(TrustAnchors::default());
+    };
+    let anchors = TrustAnchors::from_file(path)
+        .map_err(|e| MonitorError::State(format!("trust anchor {}: {e}", path.display())))?;
+    if anchors.is_empty() {
+        return Err(MonitorError::State(format!(
+            "trust anchor {}: no DNSKEY records in the file — an empty anchor set \
+             validates nothing, so every entry would be filed as an unauthorized \
+             claim and the run would report no alarm",
+            path.display()
+        )));
+    }
+    Ok(anchors)
+}
+
+/// The trust surface this run's verdicts belong to: which anchors, which log
+/// keys.
+///
+/// Labels, not material — they exist to be compared with the surface the state
+/// file records. A digest identifies an override file without the state having
+/// to carry its contents.
+fn trust_surface(args: &RunArgs) -> Result<TrustSurface, MonitorError> {
+    let digest = |path: &PathBuf| -> Result<String, MonitorError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| MonitorError::State(format!("{}: {e}", path.display())))?;
+        Ok(format!(
+            "sha256:{}",
+            hex::encode(synch_net::rekor::sha256(&bytes))
+        ))
+    };
+    Ok(TrustSurface {
+        anchors: match &args.dnssec_anchor {
+            None => "icann-root".to_string(),
+            Some(path) => digest(path)?,
+        },
+        log_keys: match &args.rekor_key {
+            None => "tuf".to_string(),
+            Some(path) => digest(path)?,
+        },
+    })
+}
+
+/// Refuses a watch list that watches nothing.
+///
+/// Two ways to hold one, and they close the same hole: a watch list is the
+/// only thing that decides whether an entry is looked at, so a list that
+/// matches nothing produces exit 0 forever. Empty is the first-run mistake.
+/// An entry that is not a DNS name is the quieter one — it cannot match a
+/// certificate's SAN, which is parsed too, so it watches nothing however long
+/// it sits in the file, and checking the list for non-emptiness alone lets a
+/// typo be indistinguishable from good news.
+fn check_watch_list(known: &KnownKeys, state_path: &Path) -> Result<(), MonitorError> {
+    if known.keys.is_empty() {
+        return Err(MonitorError::State(format!(
+            "{} names no apex to watch — seed it with the zones you want \
+             reported on, and (optionally) the keys you have already accounted \
+             for, e.g. {{\"known\":{{\"keys\":{{\"sync.example\":[]}}}}}}",
+            state_path.display()
+        )));
+    }
+    let unwatchable = known.unwatchable();
+    if !unwatchable.is_empty() {
+        return Err(MonitorError::State(format!(
+            "{} watches {} entr{} that are not domain names ({}) — an entry that \
+             does not parse can never match a certificate, so it watches nothing \
+             and this monitor would report no alarm whatever the log held",
+            state_path.display(),
+            unwatchable.len(),
+            match unwatchable.len() {
+                1 => "y",
+                _ => "ies",
+            },
+            unwatchable.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
     let keys_override = match &args.rekor_key {
         Some(path) => Some(
@@ -287,24 +398,48 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
         ),
         None => None,
     };
-    let anchors = match &args.dnssec_anchor {
-        Some(path) => TrustAnchors::from_file(path)
-            .map_err(|e| MonitorError::State(format!("trust anchor {}: {e}", path.display())))?,
-        None => TrustAnchors::default(),
-    };
+    let anchors = anchors_in_force(args.dnssec_anchor.as_ref())?;
+    let surface = trust_surface(args)?;
 
-    // Everything local before anything remote: an unseeded state file is the
+    // Everything local before anything remote: an unseeded watch list is the
     // first-run mistake, and finding out about it after a TUF walk and a
     // checkpoint fetch would be a slower way to learn the same thing.
     let mut state = MonitorState::load(&args.state)?;
-    if state.known.keys.is_empty() {
-        return Err(MonitorError::State(format!(
-            "{} names no apex to watch — seed it with the zones you want \
-             reported on, and (optionally) the keys you have already accounted \
-             for, e.g. {{\"known\":{{\"keys\":{{\"sync.example\":[]}}}}}}",
-            args.state.display()
-        )));
+    check_watch_list(&state.known, &args.state)?;
+
+    // A change of trust surface is refused, not merged. The recorded keys and
+    // the recorded verdicts are statements about a client population, and
+    // anchors replace rather than union — so one state file covers one
+    // population, and two populations want two of them.
+    if let Some(recorded) = &state.surface {
+        if *recorded != surface {
+            return Err(MonitorError::State(format!(
+                "{} holds verdicts made under anchors {} and log keys {}, and this run \
+                 uses anchors {} and log keys {} — tier B means \"no client holding \
+                 these would have accepted it\", so the two are statements about \
+                 different client populations. Use a separate state file for each",
+                args.state.display(),
+                recorded.anchors,
+                recorded.log_keys,
+                surface.anchors,
+                surface.log_keys
+            )));
+        }
     }
+    state.surface = Some(surface.clone());
+    eprintln!(
+        "synch-monitor: watching {} apex(es) ({}) under anchors {} and log keys {}",
+        state.known.keys.len(),
+        state
+            .known
+            .keys
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", "),
+        surface.anchors,
+        surface.log_keys
+    );
 
     // Discovery decides both which log this run reads and which keys its
     // checkpoint must verify under, and the two come from one trusted root —
@@ -351,20 +486,39 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
     // once per shard.
     let known_at_start = state.known.clone();
 
-    // Every log the trusted root names, not just the one in service.
-    let mut findings = Vec::new();
+    // Every log the trusted root names, and a walk that fails partway still
+    // hands back what it classified.
+    let mut classified = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     for base_url in &found.base_urls {
-        match walk_log(base_url, &logs, &anchors, &known_at_start, &mut state, args).await {
-            Ok(found_here) => findings.extend(found_here),
+        let source = match HttpTiles::new(base_url) {
+            Ok(source) => source,
             Err(e) => {
-                // One unreadable shard must not cost the report from the
-                // others: a retired log whose tiles have been taken down is
-                // an ordinary thing to meet, and the busy shard is where the
-                // news usually is. The run still ends incomplete.
                 eprintln!("synch-monitor: {base_url}: {e}");
                 failures.push(base_url.clone());
+                continue;
             }
+        };
+        let walked = walk_log(
+            &source,
+            base_url,
+            &logs,
+            &anchors,
+            &known_at_start,
+            &mut state,
+            args,
+        )
+        .await;
+        // The findings come back whatever the outcome, and the position the
+        // walk recorded never moved past an entry whose finding is not in
+        // this batch. One unreadable shard must not cost the report from the
+        // others either: a retired log whose tiles have been taken down is an
+        // ordinary thing to meet, and the busy shard is where the news
+        // usually is. The run still ends incomplete.
+        classified.extend(walked.classified);
+        if let Some(e) = walked.failure {
+            eprintln!("synch-monitor: {base_url}: {e}");
+            failures.push(base_url.clone());
         }
     }
 
@@ -377,10 +531,10 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
     let mut new_authorizations = Vec::new();
     let mut already_known = 0usize;
     let mut claims = Vec::new();
-    for finding in &findings {
-        match finding.tier {
+    for entry in &classified {
+        match entry.finding.tier {
             Tier::A => {
-                let apex = synch_net::chain::parse_name(&finding.apex);
+                let apex = synch_net::chain::parse_name(&entry.finding.apex);
                 // An entry is news when *any* key its chain proves has not
                 // been reported yet — a rotation that pre-publishes one new
                 // key beside a known one is exactly the event to hear about.
@@ -388,40 +542,52 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
                 // cannot fail; treating an unparseable one as *new* rather
                 // than as known is the safe direction anyway — it reports.
                 let all_known = apex.is_ok_and(|apex| {
-                    finding
+                    entry
+                        .finding
                         .keys
                         .iter()
                         .all(|key| known_at_start.contains_digest(&apex, &key.sha256))
                 });
                 match all_known {
                     true => already_known += 1,
-                    false => new_authorizations.push(finding),
+                    false => new_authorizations.push(entry),
                 }
             }
-            Tier::B => claims.push(finding),
+            Tier::B => claims.push(entry),
         }
     }
 
     // stdout is the report: newly authorized keys, and nothing else.
-    for finding in &new_authorizations {
-        println!("{}", render(finding, args.json));
+    for entry in &new_authorizations {
+        println!("{}", render(&entry.finding, args.json));
     }
-    // Tier B on stderr. It is not an alarm — no client would have taken these
-    // — but an operator who sees the exit code needs to be able to see *what*
-    // was claimed without re-running with different flags.
-    for finding in &claims {
-        eprintln!("{}", render(finding, args.json));
+    // Tier B on stderr. It is not an alarm — no client under this run's
+    // anchor set would have taken these — but an operator who sees the exit
+    // code needs to be able to see *what* was claimed without re-running with
+    // different flags.
+    for entry in &claims {
+        eprintln!("{}", render(&entry.finding, args.json));
     }
-
-    // Record what was reported, so the next run stays quiet about it. Tier B
-    // is deliberately never recorded: the same key arriving later with a
-    // chain that *does* verify is a genuine new authorization, and a tier B
-    // sighting must not have quietly consumed it.
-    for finding in &new_authorizations {
-        if let Ok(apex) = synch_net::chain::parse_name(&finding.apex) {
-            for key in &finding.keys {
+    // Record what was reported, so the next run stays quiet about it — and
+    // the evidence for exactly those reports. Tier B is deliberately never
+    // recorded: the same key arriving later with a chain that *does* verify is
+    // a genuine new authorization, and a tier B sighting must not have quietly
+    // consumed it. Its body is not kept either, because an unauthorized claim
+    // naming a watched apex costs an attacker one self-signed certificate,
+    // and a body per claim is a state file that grows at their choosing.
+    for entry in &new_authorizations {
+        if let Ok(apex) = synch_net::chain::parse_name(&entry.finding.apex) {
+            for key in &entry.finding.keys {
                 state.known.insert_digest(&apex, &key.sha256);
             }
+        }
+        let dropped = state.record_entry(&entry.origin, entry.finding.log_index, &entry.body);
+        for index in dropped {
+            eprintln!(
+                "synch-monitor: the evidence drawer for {} is full — the body of entry \
+                 {index} is no longer held locally",
+                entry.origin
+            );
         }
     }
     if !args.no_save {
@@ -439,7 +605,7 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
             failures.len(),
             found.base_urls.len(),
             failures.join(", "),
-            findings.len()
+            classified.len()
         );
         return Ok(EXIT_INCOMPLETE);
     }
@@ -451,9 +617,9 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
         new_authorizations.len(),
         claims.len()
     );
-    if !findings.is_empty() && !args.no_save {
+    if !new_authorizations.is_empty() && !args.no_save {
         eprintln!(
-            "synch-monitor: the full body of every finding is in the state file — \
+            "synch-monitor: the full body of every report is in the state file — \
              `synch-monitor entry <INDEX>` prints one"
         );
     }
@@ -464,29 +630,55 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
     })
 }
 
-/// Reads one log end to end: checkpoint, consistency, then every entry from
-/// where this monitor last stopped.
+/// One classified leaf, with the bytes it was classified from.
 ///
-/// Returns what it classified. A failure partway is an error, but whatever
-/// was classified before it is *not* lost — the caller keeps the findings
-/// and the position it wrote, and only the exit code records that the
-/// run was incomplete.
-/// One log, walked end to end.
+/// The body travels with the finding so that recording evidence is a decision
+/// the reporting code makes, once it knows which findings became reports —
+/// rather than one the scan makes about every entry it sees.
+#[derive(Debug)]
+struct Classified {
+    /// The log's origin line: the label the evidence is filed under.
+    origin: String,
+    /// The canonicalized entry body, verified against the signed checkpoint.
+    body: Vec<u8>,
+    /// The verdict.
+    finding: Finding,
+}
+
+/// What one shard's walk produced.
 ///
-/// Extracted per log because a run reads *every* log the trusted root names
-/// (§10): the position, the consistency proof and the resume index are all
-/// per-log, keyed on the checkpoint's origin line.
-async fn walk_log(
+/// **The findings are not inside the `Result`.** A walk that fails partway has
+/// still classified everything below the failure, and that is the half a
+/// monitor exists to deliver: dropping it on the way out is how a tier A entry
+/// at index N becomes invisible because index N+1 answered 503 — deterministic
+/// for whoever serves the tiles, and silent, because the position advances
+/// over the bundle that produced it either way.
+#[derive(Debug, Default)]
+struct Walked {
+    /// Everything classified before the walk ended, however it ended.
+    classified: Vec<Classified>,
+    /// Why the walk stopped early, if it did.
+    failure: Option<MonitorError>,
+}
+
+/// The checkpoint a run reads `base_url` under, and the range of entries to
+/// walk: everything that decides whether the tiles are worth reading at all.
+///
+/// A failure here touches no position — nothing was read, so there is nothing
+/// to resume from.
+async fn prepare<S: TileSource>(
+    source: &S,
     base_url: &str,
     logs: &LogKeys,
-    anchors: &TrustAnchors,
-    known: &synch_monitor::classify::KnownKeys,
     state: &mut MonitorState,
     args: &RunArgs,
-) -> Result<Vec<Finding>, MonitorError> {
-    let source = HttpTiles::new(base_url)?;
-    let checkpoint = Checkpoint::parse(&source.checkpoint().await?)
-        .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
+) -> Result<(Checkpoint, u64, u64), MonitorError> {
+    let body = source
+        .fetch("api/v2/checkpoint")
+        .await?
+        .ok_or_else(|| MonitorError::Transport("the log serves no checkpoint".into()))?;
+    let checkpoint =
+        Checkpoint::parse(&body).map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
     // Under *any* pinned key: which log signed it is settled by the origin
     // line the position is then keyed on, and a checkpoint no pinned key
     // signed is not one this client would have believed either.
@@ -494,7 +686,8 @@ async fn walk_log(
         .verify_under(logs)
         .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
 
-    let tree = Tree::new(&source, checkpoint.tree_size, args.concurrency.get());
+    let position = state.position(&checkpoint.origin).clone();
+    let tree = Tree::new(source, checkpoint.tree_size, args.concurrency.get());
     if tree
         .root()
         .await
@@ -506,11 +699,9 @@ async fn walk_log(
         ));
     }
 
-    let position = state.position(&checkpoint.origin).clone();
-
-    // Consistency: the root this monitor persisted for *this* log,
-    // recomputed from the new tree's tiles. A log that cannot reproduce its
-    // own past has shown two histories, and nothing below is worth reading.
+    // Consistency: the root this monitor persisted for *this* log, recomputed
+    // from the new tree's tiles. A log that cannot reproduce its own past has
+    // shown two histories, and nothing below is worth reading.
     if !position.is_fresh() {
         if checkpoint.tree_size < position.tree_size {
             return Err(MonitorError::Checkpoint(format!(
@@ -532,15 +723,25 @@ async fn walk_log(
     }
 
     // A from-index *ahead* of where this monitor stopped leaves a range that
-    // will never be classified. Bounded first runs want this; a resuming
-    // monitor almost never does, so say so out loud.
+    // nothing will ever classify. Bounded first runs want exactly that; a
+    // resuming monitor almost never does. stderr is the commentary channel and
+    // that is not the right weight for "these entries are permanently unread",
+    // so this is refused unless the operator says in the same breath that they
+    // mean it.
     if let Some(from) = args.from_index {
         if from > position.next_index {
-            eprintln!(
-                "synch-monitor: {base_url}: starting at {from}, past the recorded {}: \
-                 entries {}..{from} will never be classified",
-                position.next_index, position.next_index
+            let gap = format!(
+                "starting at {from} skips {}..{from}, which no run will ever classify",
+                position.next_index
             );
+            if !args.allow_gap {
+                return Err(MonitorError::State(format!(
+                    "{base_url}: {gap} — pass --allow-gap to accept that, or drop \
+                     --from-index to resume from {}",
+                    position.next_index
+                )));
+            }
+            eprintln!("synch-monitor: {base_url}: {gap} (--allow-gap)");
         }
     }
     let started_at = args.from_index.unwrap_or(position.next_index);
@@ -550,9 +751,37 @@ async fn walk_log(
         Some(max) => checkpoint.tree_size.min(started_at.saturating_add(max)),
         None => checkpoint.tree_size,
     };
+    Ok((checkpoint, started_at, end))
+}
+
+/// Reads one log end to end: checkpoint, consistency, then every entry from
+/// where this monitor last stopped.
+///
+/// Extracted per log because a run reads *every* log the trusted root names
+/// (§10): the position, the consistency proof and the resume index are all
+/// per-log, keyed on the checkpoint's origin line.
+async fn walk_log<S: TileSource>(
+    source: &S,
+    base_url: &str,
+    logs: &LogKeys,
+    anchors: &TrustAnchors,
+    known: &KnownKeys,
+    state: &mut MonitorState,
+    args: &RunArgs,
+) -> Walked {
+    let mut walked = Walked::default();
+    let (checkpoint, started_at, end) = match prepare(source, base_url, logs, state, args).await {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            walked.failure = Some(e);
+            return walked;
+        }
+    };
+    let tree = Tree::new(source, checkpoint.tree_size, args.concurrency.get());
+
     // How far the walk actually got, and the resume point when it fails
-    // partway: saving `end` would step over entries the run never
-    // classified, saving `started_at` would re-read work already reported.
+    // partway: saving `end` would step over entries the run never classified,
+    // saving `started_at` would re-read work already reported.
     let mut at = started_at;
 
     let total = end.saturating_sub(started_at);
@@ -565,14 +794,10 @@ async fn walk_log(
     }
     let scan_started = Instant::now();
     let mut last_progress = scan_started;
-    // The walk runs inside an async block so that a failure partway through
-    // does not take the findings with it. A monitor that read an alarming
-    // entry at index N and then hit a 503 at N+1 used to print nothing at
-    // all and exit as a failure — the one outcome that must never be silent
-    // was the easiest to silence. Everything classified before the error is
-    // returned and recorded; the error decides the exit code, not whether
-    // the news gets out.
-    let mut findings = Vec::new();
+    // The scan runs inside an async block so that a failure partway through
+    // does not take the findings with it: `walked` is filled as the walk goes
+    // and is returned whatever the block's outcome. The error decides the exit
+    // code, not whether the news gets out.
     let outcome: Result<(), MonitorError> = async {
         // Bundles arrive strictly in index order, however far fetching has
         // run ahead — the findings and the bookkeeping are exactly as a
@@ -586,24 +811,23 @@ async fn walk_log(
                     continue;
                 }
                 // **Before anything is read out of it, and before any
-                // decision to skip it.** The hash tiles are checked against
-                // the signed checkpoint; the entry bundles are a separate
-                // resource served by the same party this monitor exists to
-                // audit, and nothing else binds them to the tree.
+                // decision to skip it**, the body is bound to the signed
+                // checkpoint.
                 //
                 // Deciding to *skip* on unauthenticated bytes is the whole
-                // attack: a log that replaces one body with something that
+                // attack. A log that replaces one body with something that
                 // fails to parse, or that names an unwatched zone, hides the
-                // entry while its hash tiles stay honest — so every root and
-                // consistency check still passes, and the victim's client,
-                // whose proof carries a real path to the real leaf, still
-                // accepts it. Silent monitor, working forgery. Costs one
-                // level-0 hash tile per 256 entries, cached.
-                if !tree.leaf_matches(index, body).await? {
-                    return Err(MonitorError::Tile(format!(
-                        "entry {index} does not hash to the leaf the log stored"
-                    )));
-                }
+                // entry — while the victim's client, whose proof carries a
+                // real path to the real leaf, still accepts it. Silent
+                // monitor, working forgery.
+                //
+                // And "bound" has to mean bound to the *checkpoint*. A
+                // comparison against the level-0 hash tile is a comparison
+                // against another file this same party serves, and the root
+                // recomputation never reads that file — so the tile is folded
+                // up to a node the root did commit to first, one fold per 256
+                // entries (see `Tree::verify_leaf`).
+                tree.verify_leaf(index, body, checkpoint.root_hash).await?;
                 let Ok(parsed) = HashedRekordBody::parse(body) else {
                     // Almost every entry in a public log is somebody else's,
                     // in a shape this design says nothing about. Not an event.
@@ -620,25 +844,12 @@ async fn walk_log(
                 if !known.watches(&name) {
                     continue;
                 }
-                let path = tree.inclusion_path(index).await?;
-                synch_net::rekor::verify_inclusion(
-                    index,
-                    checkpoint.tree_size,
-                    synch_net::rekor::leaf_hash(body),
-                    &path,
-                    checkpoint.root_hash,
-                )
-                .map_err(|e| MonitorError::Tile(e.to_string()))?;
                 if let Some(finding) = classify(&parsed, index, anchors) {
-                    findings.push(finding);
-                    // The evidence goes into the state with the finding:
-                    // the full entry body under this log's origin, so "what
-                    // exactly does the log hold for this report" stays a
-                    // local lookup, never a re-fetch from the log under
-                    // watch. A body here is not the recording tier B is
-                    // denied — that rule is about the known-keys memory,
-                    // and evidence suppresses nothing.
-                    state.record_entry(&checkpoint.origin, index, body);
+                    walked.classified.push(Classified {
+                        origin: checkpoint.origin.clone(),
+                        body: body.clone(),
+                        finding,
+                    });
                 }
             }
             let covered = entries
@@ -646,11 +857,14 @@ async fn walk_log(
                 .map(|(last, _)| last + 1)
                 .unwrap_or(started_at)
                 .min(end);
-            // Only once the whole bundle is through: a failure mid-bundle
-            // leaves `at` at the previous boundary, so the next run re-reads
-            // that bundle rather than stepping over the entries it never
-            // classified. Re-reading is free of double-reports, because
-            // anything already reported is recorded as known.
+            // Only once the whole bundle is through, and only because every
+            // finding it produced is already in `walked`: the position may
+            // never pass an entry whose finding did not leave this function.
+            // A failure mid-bundle leaves `at` at the previous boundary, so
+            // the next run re-reads that bundle rather than stepping over
+            // entries it never classified. Re-reading is free of
+            // double-reports, because anything already reported is recorded as
+            // known.
             at = covered;
             let read = covered.saturating_sub(started_at);
             if last_progress.elapsed() >= Duration::from_secs(10) {
@@ -669,12 +883,16 @@ async fn walk_log(
     }
     .await;
 
-    // The position is written whether or not the walk finished, so a run
-    // that dies partway resumes where it stopped instead of re-reading from
-    // the last complete run.
+    // The position is written whether or not the walk finished, so a run that
+    // dies partway resumes where it stopped instead of re-reading from the
+    // last complete run. That is only sound because the findings go back to
+    // the caller in the same breath — see `Walked`.
     let reached = match outcome {
         Ok(()) => end,
-        Err(_) => at.min(end),
+        Err(e) => {
+            walked.failure = Some(e);
+            at.min(end)
+        }
     };
     let position = state.position(&checkpoint.origin);
     position.tree_size = checkpoint.tree_size;
@@ -685,7 +903,7 @@ async fn walk_log(
         reached.saturating_sub(started_at)
     );
 
-    outcome.map(|()| findings)
+    walked
 }
 
 /// One finding, as a line — JSON when asked, human otherwise.
@@ -693,5 +911,324 @@ fn render(finding: &Finding, json: bool) -> String {
     match json {
         true => serde_json::to_string(finding).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}")),
         false => finding.line(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synch_net::sim::{SimLog, SimZone};
+
+    /// A log served through the tile layout, from a `SimLog`'s leaves, with a
+    /// bundle that can be made to fail.
+    struct Fixture {
+        log: SimLog,
+        leaves: Vec<Vec<u8>>,
+        /// Fetches for the bundle at this first index answer a 503.
+        fail_bundle_at: Option<u64>,
+    }
+
+    impl TileSource for Fixture {
+        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+            if path == "api/v2/checkpoint" {
+                return Ok(Some(self.log.checkpoint()));
+            }
+            let rest = path.strip_prefix("api/v2/tile/").expect("a tile path");
+            let (level, rest) = rest.split_once('/').expect("a level");
+            let (digits, width) = match rest.split_once(".p/") {
+                Some((digits, width)) => (digits, width.parse::<u64>().unwrap()),
+                None => (rest, 256),
+            };
+            let index: u64 = digits.split('/').fold(0u64, |acc, group| {
+                acc * 1000 + group.trim_start_matches('x').parse::<u64>().unwrap()
+            });
+            let tile_level: u32 = match level {
+                "entries" => 0,
+                level => level.parse().unwrap(),
+            };
+            let current = ((self.leaves.len() as u64) >> (8 * tile_level))
+                .saturating_sub(index * 256)
+                .min(256);
+            if width != current {
+                return Ok(None);
+            }
+            if level == "entries" {
+                if self.fail_bundle_at == Some(index * 256) {
+                    return Err(MonitorError::Transport(format!(
+                        "{path}: the log answered 503"
+                    )));
+                }
+                let mut out = Vec::new();
+                for i in 0..width {
+                    let body = &self.leaves[(index * 256 + i) as usize];
+                    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                    out.extend_from_slice(body);
+                }
+                return Ok(Some(out));
+            }
+            let span = 1u64 << (8 * tile_level);
+            let mut out = Vec::new();
+            for i in 0..width {
+                let start = (index * 256 + i) * span;
+                out.extend_from_slice(&subtree(&self.leaves, start, start + span));
+            }
+            Ok(Some(out))
+        }
+
+        async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
+            Ok(Some(self.leaves.len() as u64))
+        }
+    }
+
+    /// RFC 6962 §2.1, so the fixture's tiles are right independently of the
+    /// code that reads them.
+    fn subtree(leaves: &[Vec<u8>], lo: u64, hi: u64) -> [u8; 32] {
+        if lo + 1 == hi {
+            return synch_net::rekor::leaf_hash(&leaves[lo as usize]);
+        }
+        let mut span = 1u64;
+        while span * 2 < hi - lo {
+            span *= 2;
+        }
+        synch_net::rekor::node_hash(
+            &subtree(leaves, lo, lo + span),
+            &subtree(leaves, lo + span, hi),
+        )
+    }
+
+    fn anchors_for(zone: &SimZone) -> TrustAnchors {
+        let file = tempfile::NamedTempFile::new().expect("a temp file");
+        std::fs::write(file.path(), zone.anchor_record()).expect("write the anchor");
+        TrustAnchors::from_file(file.path()).expect("the anchor parses")
+    }
+
+    /// A watch list holding one apex and no keys — how an operator seeds one.
+    fn watching(apex: &str) -> KnownKeys {
+        let mut known = KnownKeys::default();
+        known.keys.insert(
+            synch_net::chain::parse_name(apex)
+                .expect("a test apex")
+                .to_string(),
+            Vec::new(),
+        );
+        known
+    }
+
+    fn run_args(state: &Path) -> RunArgs {
+        RunArgs {
+            log: None,
+            state: state.to_path_buf(),
+            tuf: String::new(),
+            no_tuf: true,
+            rekor_pins: None,
+            rekor_key: None,
+            dnssec_anchor: None,
+            from_index: None,
+            allow_gap: false,
+            max_entries: None,
+            concurrency: std::num::NonZeroUsize::new(4).unwrap(),
+            json: false,
+            no_save: false,
+        }
+    }
+
+    /// A log holding one zone-key entry at `index`, padded to `size` leaves.
+    fn log_with_entry(index: u64, size: u64) -> (Fixture, SimZone) {
+        let zone = SimZone::new(
+            "cluster.example",
+            vec!["v=sync1 id=nas nk=aaaa".to_string()],
+        );
+        let mut log = SimLog::new("log2025-1.rekor.example");
+        for i in 0..index {
+            log.append(format!("somebody else's entry {i}").as_bytes());
+        }
+        let proof = log.publish(&zone, "create");
+        assert_eq!(proof.log_index, index);
+        for i in index + 1..size {
+            log.append(format!("somebody else's entry {i}").as_bytes());
+        }
+        let leaves = (0..size)
+            .map(|i| match i == index {
+                true => proof.canonicalized_body.clone(),
+                false => format!("somebody else's entry {i}").into_bytes(),
+            })
+            .collect();
+        (
+            Fixture {
+                log,
+                leaves,
+                fail_bundle_at: None,
+            },
+            zone,
+        )
+    }
+
+    /// **C3.** A walk that dies after the bundle holding a tier A entry still
+    /// returns that finding, and the position it records does not step over
+    /// it.
+    ///
+    /// The audited party triggers this deliberately: fail one tile request
+    /// once the monitor has crossed the bundle boundary, and a findings vector
+    /// dropped on the error takes the alarm with it while the cursor advances
+    /// past the entry that raised it — never printed, never recorded, never
+    /// re-read.
+    #[tokio::test]
+    async fn a_walk_that_fails_partway_still_returns_what_it_classified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("monitor.json");
+        // The entry is in the first bundle; the second bundle 503s.
+        let (mut fixture, zone) = log_with_entry(100, 400);
+        fixture.fail_bundle_at = Some(256);
+        let keys = LogKeys::parse(&fixture.log.key_pem()).unwrap();
+        let anchors = anchors_for(&zone);
+
+        let mut state = MonitorState::default();
+        let known = watching("cluster.example");
+        let args = run_args(&path);
+        let walked = walk_log(
+            &fixture,
+            "https://log.example",
+            &keys,
+            &anchors,
+            &known,
+            &mut state,
+            &args,
+        )
+        .await;
+
+        assert!(walked.failure.is_some(), "the second bundle must fail");
+        let [found] = walked.classified.as_slice() else {
+            panic!(
+                "the finding must survive the failure: {:?}",
+                walked.classified
+            );
+        };
+        assert_eq!(found.finding.log_index, 100);
+        assert_eq!(found.finding.tier, Tier::A);
+        assert_eq!(found.origin, "log2025-1.rekor.example");
+        assert!(!found.body.is_empty(), "the evidence comes back with it");
+
+        // And the cursor stopped at the boundary of the bundle that
+        // completed, so nothing above it was skipped.
+        assert_eq!(state.position("log2025-1.rekor.example").next_index, 256);
+    }
+
+    /// **M2.** An anchor file with no DNSKEY in it is refused.
+    #[test]
+    fn an_empty_anchor_set_is_refused_rather_than_making_every_entry_tier_b() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anchor.key");
+        // Parses as a trust anchor file, holds no key.
+        std::fs::write(&path, b"; nothing but a comment\n").unwrap();
+        let Err(err) = anchors_in_force(Some(&path)) else {
+            panic!("an anchor file with no DNSKEY in it must be refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("validates nothing"), "{err}");
+        // And the ICANN root is still the default.
+        let Ok(default) = anchors_in_force(None) else {
+            panic!("the ICANN root is the default");
+        };
+        assert!(!default.is_empty());
+    }
+
+    /// **D7.** A watch list that watches nothing is refused, whether it is
+    /// empty or unparseable.
+    ///
+    /// Non-emptiness was the only test, so a mistyped apex — the state file is
+    /// hand-edited — watched nothing forever and every run said "no alarm".
+    #[test]
+    fn a_watch_list_that_watches_nothing_is_refused() {
+        let path = Path::new("/nonexistent/monitor.json");
+        let empty = KnownKeys::default();
+        let Err(err) = check_watch_list(&empty, path) else {
+            panic!("an empty watch list must be refused");
+        };
+        assert!(err.to_string().contains("no apex to watch"), "{err}");
+
+        // An entry that is not a name never matches a parsed SAN, so it
+        // watches nothing however long it sits there.
+        let mut hand_edited = KnownKeys::default();
+        hand_edited
+            .keys
+            .insert("cluster.example..".into(), Vec::new());
+        let Err(err) = check_watch_list(&hand_edited, path) else {
+            panic!("an unparseable watch entry must be refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("cluster.example.."), "{err}");
+        assert!(err.contains("watches nothing"), "{err}");
+
+        // A list of names is accepted.
+        check_watch_list(&watching("cluster.example.com"), path)
+            .expect("a domain name is a watchable apex");
+    }
+
+    /// **D7.** A `--from-index` that leaves a permanent hole is refused, not
+    /// mentioned on the commentary channel.
+    #[tokio::test]
+    async fn a_from_index_that_skips_a_range_forever_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("monitor.json");
+        let (fixture, zone) = log_with_entry(10, 300);
+        let keys = LogKeys::parse(&fixture.log.key_pem()).unwrap();
+        let anchors = anchors_for(&zone);
+        let known = watching("cluster.example");
+
+        let mut args = run_args(&path);
+        args.from_index = Some(100);
+        let mut state = MonitorState::default();
+        let walked = walk_log(
+            &fixture,
+            "https://log.example",
+            &keys,
+            &anchors,
+            &known,
+            &mut state,
+            &args,
+        )
+        .await;
+        let failure = walked.failure.expect("a permanent gap must be refused");
+        assert!(failure.to_string().contains("--allow-gap"), "{failure}");
+        // Nothing was read, so no position moved: the entries 0..100 are still
+        // there to be classified by a run without the flag.
+        assert_eq!(state.position("log2025-1.rekor.example").next_index, 0);
+
+        // Said out loud in the same breath, it proceeds — and the entry above
+        // the gap is still classified.
+        args.allow_gap = true;
+        let walked = walk_log(
+            &fixture,
+            "https://log.example",
+            &keys,
+            &anchors,
+            &known,
+            &mut state,
+            &args,
+        )
+        .await;
+        assert!(walked.failure.is_none(), "{:?}", walked.failure);
+        assert_eq!(
+            state.position("log2025-1.rekor.example").next_index,
+            300,
+            "the run read to the end of the tree"
+        );
+    }
+
+    /// **D6.** One state file, one client population.
+    #[test]
+    fn a_run_that_changes_the_trust_surface_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("anchor.key");
+        std::fs::write(&anchor, b"example. IN DNSKEY 257 3 13 aaaa\n").unwrap();
+        let mut args = run_args(&dir.path().join("monitor.json"));
+        let default = trust_surface(&args).unwrap();
+        assert_eq!(default.anchors, "icann-root");
+        assert_eq!(default.log_keys, "tuf");
+
+        args.dnssec_anchor = Some(anchor);
+        let overridden = trust_surface(&args).unwrap();
+        assert!(overridden.anchors.starts_with("sha256:"), "{overridden:?}");
+        assert_ne!(default, overridden);
     }
 }

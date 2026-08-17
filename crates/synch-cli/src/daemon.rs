@@ -23,6 +23,17 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let node = Node::open(config)
         .await
         .context("could not open the node")?;
+    // Before anything is announced: a daemon that cannot resolve the membership
+    // it is configured for has nothing to serve past the current grace window,
+    // and finding that out at startup is the difference between a fixable
+    // message and a cluster that partitions on a timer.
+    let resolver = match build_resolver(&node) {
+        Ok(resolver) => resolver,
+        Err(e) => {
+            let _ = node.shutdown().await;
+            return Err(e);
+        }
+    };
     let (stop_tx, _) = broadcast::channel::<()>(1);
     // Subscribed before anything can ask us to stop, so a `daemon stop` that
     // arrives during the initial scan is not sent to nobody.
@@ -70,13 +81,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // loop a DNSSEC cluster dissolves one TTL plus grace after the last manual
     // refresh, because `run_maintenance` expires bindings and nothing renews
     // them (§3.2). It also carries the §3.4 unknown-key trigger.
-    let dns = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
-        match synch_net::DnssecResolver::with_options(&node.config().dns) {
-            Ok(resolver) => node.run_dns(&resolver, shutdown).await,
-            Err(e) => {
-                tracing::warn!(error = %e, "no DNSSEC resolver available; membership will not refresh");
-                shutdown.await
-            }
+    let dns_resolver = resolver.clone();
+    let dns = spawn_loop(&node, &stop_tx, move |node, shutdown| async move {
+        match dns_resolver {
+            Some(resolver) => node.run_dns(resolver.as_ref(), shutdown).await,
+            None => shutdown.await,
         }
     });
     // What turns the scanner's and the watcher's staged changes into heads: one
@@ -143,6 +152,53 @@ async fn wait_for_stop(
         _ = stopped.recv() => {}
     }
     Ok(())
+}
+
+/// Builds the one resolver this daemon refreshes membership through, and
+/// installs it on the node so control requests use the same one (§3.2, §10.2).
+///
+/// One per process, not one per request. The resolver holds when it last walked
+/// Sigstore's TUF repository, and that state is only persisted on a *successful*
+/// walk — so a fresh resolver per control request re-attempts the whole walk at
+/// 30 s per file whenever the repository is unreachable, which is exactly what
+/// the pre-stamping in `dns.rs` exists to bound to one attempt a day.
+///
+/// A resolver that cannot be built — a mistyped `--dnssec-anchor` path, an empty
+/// anchor file, a malformed DoH URL — means no membership refresh can happen at
+/// all: bindings ossify and then lapse a grace window later. With membership
+/// domains configured that is a refusal to start, because a daemon that cannot
+/// refresh them is a cluster that will partition on a timer, and the one command
+/// an operator would run afterwards would otherwise report a healthy node. With
+/// none configured there is nothing to refresh, so the daemon runs on static
+/// trust and the reason is recorded where `doctor`, `daemon status` and the next
+/// `domain add` will say it.
+fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::DnssecResolver>>> {
+    match synch_net::DnssecResolver::with_options(&node.config().dns) {
+        Ok(resolver) => {
+            let resolver = std::sync::Arc::new(resolver);
+            node.set_dns_resolver(Ok(resolver.clone()));
+            Ok(Some(resolver))
+        }
+        Err(e) => {
+            node.set_dns_resolver(Err(e.to_string()));
+            let domains = node.domains()?;
+            if !domains.is_empty() {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "no DNSSEC resolver could be built, so the {} configured membership \
+                     domain(s) ({}) would never refresh and their bindings would lapse a \
+                     grace window from now. Fix the resolver options, or \
+                     `synch domain rm` them to run on static trust",
+                    domains.len(),
+                    domains.join(", ")
+                )));
+            }
+            tracing::warn!(
+                error = %e,
+                "no DNSSEC resolver available; running on static trust (see `synch doctor`)"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Spawns one of the engine's standing loops, wired to the stop broadcast.

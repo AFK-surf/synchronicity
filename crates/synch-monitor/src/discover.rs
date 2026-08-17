@@ -75,14 +75,22 @@ impl Repo for HttpRepo {
             .map_err(|e| format!("{url}: {e}"))?;
         match response.status().as_u16() {
             200 => {
-                let body = response.bytes().map_err(|e| format!("{url}: {e}"))?;
+                // Read through a `take`, never `bytes()`. A cap applied to the
+                // result of `bytes()` is a bound on nothing, because the
+                // allocation has already happened — an endless body from a
+                // hostile mirror exhausts the reader before the comparison
+                // runs. One byte past the cap is read so that "exactly at the
+                // cap" and "over it" are distinguishable.
+                use std::io::Read;
+                let mut body = Vec::new();
+                response
+                    .take(MAX_TUF_BYTES as u64 + 1)
+                    .read_to_end(&mut body)
+                    .map_err(|e| format!("{url}: {e}"))?;
                 if body.len() > MAX_TUF_BYTES {
-                    return Err(format!(
-                        "{url}: {} bytes, over the {MAX_TUF_BYTES}-byte cap",
-                        body.len()
-                    ));
+                    return Err(format!("{url}: over the {MAX_TUF_BYTES}-byte cap"));
                 }
-                Ok(Some(body.to_vec()))
+                Ok(Some(body))
             }
             // The end of the root chain is a 404, and Sigstore's CDN answers
             // 403 for an object that is not there.
@@ -94,27 +102,22 @@ impl Repo for HttpRepo {
 
 /// The logs a run should read, and the keys their checkpoints must verify
 /// under.
+///
+/// **Every log the trusted root names, retired shards included**, and their
+/// keys. A client accepts a proof from any shard whose key is pinned, and
+/// `tlog_keys` pins every shard the trusted root lists, because a proof from a
+/// retired shard is still a proof — an archival entry does not stop being
+/// logged when its shard closes. The two halves therefore have to come out of
+/// that one artifact through one filter: an entry in a pinned-but-unread shard
+/// is client-valid and invisible, which is the "accepted by every client,
+/// reported by no monitor" case the tiering exists to prevent, and it opens at
+/// the first shard rotation.
 #[derive(Debug, Clone)]
 pub struct Discovered {
-    /// **Every** log the trusted root names, no trailing slashes.
-    ///
-    /// Not just the one currently in service. The client accepts a proof
-    /// from any log whose key is pinned — `tlog_keys` collects every shard
-    /// the trusted root lists, retired ones included, because "a proof from
-    /// a retired shard is still a proof" — while this used to resolve to a
-    /// single `base_url` via `current_tlog`. So the set of logs a client
-    /// would believe and the set a monitor actually read came out of one
-    /// artifact through two different filters, and nobody reconciled them.
-    ///
-    /// That is a hole in the invariant the whole design rests on: an entry
-    /// in a pinned-but-unwatched shard is client-valid and invisible, which
-    /// is the "accepted by every client, reported by no monitor" case the
-    /// tiering exists to prevent. It opens at the first shard rotation, and
-    /// the name `log2025-1` says a rotation is the plan.
+    /// Every log a checkpoint would be believed from, no trailing slashes.
     pub base_urls: Vec<String>,
-    /// Every log the trusted root names, retired shards included: a proof
-    /// from a closed shard is still a proof, and a checkpoint has to verify
-    /// under the key of whichever shard signed it.
+    /// The keys of those logs. A checkpoint has to verify under the key of
+    /// whichever shard signed it.
     pub keys: LogKeys,
     /// How `base_urls` was arrived at, for the line the run prints.
     pub source: &'static str,
@@ -168,33 +171,51 @@ pub fn discover(
             .map_err(|e| MonitorError::Checkpoint(format!("trusted root: {e}")))?,
     };
 
+    // Every shard the trusted root names, newest first so the busy one is
+    // walked before a long tail of retired ones. Ordering is presentation
+    // only: a run reads all of them.
+    let mut pinned = pins
+        .tlogs()
+        .map_err(|e| MonitorError::Checkpoint(format!("trusted root: {e}")))?;
+    pinned.sort_by_key(|log| std::cmp::Reverse(log.valid_from));
+
     let base_urls = match log_override {
         Some(url) => {
             source = "--log";
-            vec![url.trim_end_matches('/').to_string()]
+            let url = url.trim_end_matches('/').to_string();
+            // The operator's word, taken as given. It is still worth one line:
+            // the pin set is unchanged, so this run believes checkpoints from
+            // shards it is not reading, and an entry in one of those is
+            // client-valid and unseen until a run without --log reads it.
+            let unread: Vec<&str> = pinned
+                .iter()
+                .map(|log| log.base_url.as_str())
+                .filter(|pinned| *pinned != url)
+                .collect();
+            if !unread.is_empty() {
+                warn(format!(
+                    "--log reads {url} only; {} other pinned shard(s) are not read this \
+                     run ({}), and an entry in one of those is client-valid and unseen",
+                    unread.len(),
+                    unread.join(", ")
+                ));
+            }
+            vec![url]
         }
         None => {
-            let logs = pins
-                .tlogs()
-                .map_err(|e| MonitorError::Checkpoint(format!("trusted root: {e}")))?;
-            if logs.is_empty() {
+            if pinned.is_empty() {
                 return Err(MonitorError::Checkpoint(
                     "the trusted root in force names no transparency log at all — \
                      pass --log to name one"
                         .into(),
                 ));
             }
-            // Every shard, newest first so the busy one is walked before a
-            // long tail of retired ones. Ordering is presentation only: a
-            // run reads all of them.
-            let mut logs = logs;
-            logs.sort_by_key(|log| std::cmp::Reverse(log.valid_from));
-            logs.into_iter()
-                .map(|log| log.base_url.trim_end_matches('/').to_string())
-                .collect()
+            pinned
+                .iter()
+                .map(|log| log.base_url.clone())
+                .collect::<Vec<_>>()
         }
     };
-    let _ = now;
 
     Ok(Discovered {
         base_urls,
@@ -214,6 +235,9 @@ fn refresh(repo: &dyn Repo, pins: &PinState, now: u64) -> Result<tuf::TufUpdate,
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A fixed instant inside the embedded trusted root's service windows.
+    const NOW: u64 = 1_786_854_774;
 
     /// A repository that has nothing, which is how an unreachable mirror and
     /// an empty one both end up looking from here.
@@ -243,7 +267,7 @@ mod tests {
             &pins_beside(&dir.path().join("monitor.json")),
             None,
             None,
-            1_786_854_774,
+            NOW,
             &mut |w| warnings.push(w),
         )
         .unwrap();
@@ -251,19 +275,23 @@ mod tests {
         assert_eq!(found.source, "embedded trusted root");
         assert!(found.base_urls.iter().all(|u| u.starts_with("https://")));
         assert!(!found.keys.is_empty());
-        // *Every* log the root names is read, not just the one in service —
-        // the client accepts a proof from any of them, so a monitor that
-        // skipped the retired shards would leave a client-valid entry
-        // permanently unseen. Asserted as a set, and as a shape rather than
-        // as hostnames, because the hostnames are what this must not fix.
-        let logs = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
-        assert_eq!(found.base_urls.len(), logs.len());
-        for log in &logs {
+        // **Every pinned shard is read, and every shard read is pinned.**
+        // Retired ones included: the client accepts a proof from any shard
+        // whose key is pinned, so a monitor that skipped the closed shards
+        // would leave a client-valid entry permanently unseen. Asserted as a
+        // set, and as a shape rather than as hostnames, because the hostnames
+        // are what this must not fix.
+        let pinned = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
+        assert_eq!(found.base_urls.len(), pinned.len());
+        for log in &pinned {
             assert!(
-                found
-                    .base_urls
-                    .contains(&log.base_url.trim_end_matches('/').to_string()),
+                found.base_urls.contains(&log.base_url),
                 "{} is pinned but would not be read",
+                log.base_url
+            );
+            assert!(
+                found.keys.find(&log.log_id).is_some(),
+                "{} would be read but its key is not pinned",
                 log.base_url
             );
         }
@@ -278,7 +306,7 @@ mod tests {
             &pins_beside(&dir.path().join("monitor.json")),
             None,
             None,
-            1_786_854_774,
+            NOW,
             &mut |w| warnings.push(w),
         )
         .unwrap();
@@ -305,7 +333,7 @@ mod tests {
             &pins_beside(&dir.path().join("monitor.json")),
             None,
             None,
-            1_786_854_774,
+            NOW,
             &mut |w| warnings.push(w),
         )
         .unwrap();
@@ -313,19 +341,44 @@ mod tests {
         assert_eq!(found.source, "embedded trusted root");
     }
 
+    /// `--log` is the operator's word and is taken as given — with one line
+    /// saying what the run is therefore not reading.
+    ///
+    /// The pin set is unchanged by it, so this run would believe a checkpoint
+    /// from a shard it never asks for, and an entry there stays unseen until a
+    /// run without the flag reads it. That is a coverage fact worth stating,
+    /// not a reason to refuse an override.
     #[test]
-    fn an_override_is_taken_as_given() {
+    fn naming_one_log_says_which_pinned_shards_go_unread() {
         let dir = tempfile::tempdir().unwrap();
+        let pins = pins_beside(&dir.path().join("monitor.json"));
+        let mut warnings = Vec::new();
         let found = discover(
             None,
-            &pins_beside(&dir.path().join("monitor.json")),
+            &pins,
             Some("https://log.example/"),
             None,
-            1_786_854_774,
-            &mut |_| {},
+            NOW,
+            &mut |w| warnings.push(w),
         )
         .unwrap();
         assert_eq!(found.base_urls, vec!["https://log.example".to_string()]);
         assert_eq!(found.source, "--log");
+        // The keys are still the full pinned set, and the run says so.
+        assert!(!found.keys.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("not read this run"), "{warnings:?}");
+
+        // Naming the one shard a single-log trusted root pins leaves nothing
+        // unread, and says nothing.
+        let pinned = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
+        if let [only] = pinned.as_slice() {
+            let mut quiet = Vec::new();
+            discover(None, &pins, Some(&only.base_url), None, NOW, &mut |w| {
+                quiet.push(w)
+            })
+            .unwrap();
+            assert!(quiet.is_empty(), "{quiet:?}");
+        }
     }
 }

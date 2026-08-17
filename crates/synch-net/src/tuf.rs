@@ -36,6 +36,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    time::{Duration, Instant},
 };
 
 use ring::signature;
@@ -156,10 +157,12 @@ pub struct TufMetadata {
 
 /// The on-disk format of the pin state.
 ///
-/// Bumped to 2 when `root_chain` arrived: a v1 file records a root nothing
-/// re-verified, so it is not readable as v2 state and a client that meets
-/// one starts from the embedded bootstrap and re-learns.
-const STATE_FORMAT_VERSION: u64 = 2;
+/// The version is what makes the file's *contents* a contract rather than a
+/// hint: every field this build reads is re-verified against the binary's own
+/// anchor before it is believed, and a file written to any other format is not
+/// read at all. A client that meets one starts from the embedded bootstrap and
+/// re-learns on its next walk, which costs one refresh and concedes nothing.
+const STATE_FORMAT_VERSION: u64 = 3;
 
 /// The pin set a client is running on, and where it came from (§10.2).
 ///
@@ -182,19 +185,11 @@ pub struct PinState {
     /// Every root accepted *beyond* the embedded one, in ascending version
     /// order. Empty means the embedded root is still what is in force.
     ///
-    /// This exists so the persisted state is verifiable rather than merely
-    /// well-formed. It used to be absent, and `load` checked only that the
-    /// version number inside the stored root equalled the version number
-    /// stored beside it — a self-consistency test that any file satisfies.
-    /// Whatever root the file named became the client's world, and every
-    /// later update chained from it, so anyone who could write one file in
-    /// the data directory chose the transparency-log key set outright. The
-    /// project's own test suite demonstrated it: a helper wrote a wholly
-    /// synthetic root into the pin file and the full resolver ran on it.
-    ///
-    /// Keeping the chain costs a few kilobytes and makes the file
-    /// self-authenticating against the binary — which is what the module
-    /// docs claimed all along.
+    /// This is what makes the persisted root verifiable rather than merely
+    /// well-formed: [`PinState::load_anchored`] re-walks it from the anchor
+    /// **the binary holds**, applying the same dual-threshold rule [`update`]
+    /// applies to a live chain, so a stored root is believed only if the root
+    /// compiled into this build transitively signed it.
     pub root_chain: Vec<Vec<u8>>,
     /// Its version.
     pub root_version: u64,
@@ -204,10 +199,26 @@ pub struct PinState {
     pub snapshot_version: u64,
     /// The accepted `targets.json` version.
     pub targets_version: u64,
+    /// The accepted `targets.json`, verbatim — the role that *names* the
+    /// trusted root, kept beside it so the pair can be re-checked on load.
+    ///
+    /// Without these bytes nothing on disk binds `trusted_root` to the root
+    /// chain: the versions beside it are numbers any writer can type, and the
+    /// pin set — which log keys a client accepts a proof from, and which
+    /// endpoints a monitor reads — is computed from `trusted_root` alone. With
+    /// them, [`PinState::load_anchored`] re-runs the targets-role threshold
+    /// against the walked root and re-checks the target digest, so the file is
+    /// authenticated end to end against the binary and not merely internally
+    /// consistent.
+    pub targets: Vec<u8>,
     /// The accepted `trusted_root.json`, verbatim — the pin set is derived
     /// from it rather than stored beside it, so the two cannot disagree.
     pub trusted_root: Vec<u8>,
     /// When this state was written, seconds since the epoch.
+    ///
+    /// A monotonic floor for the clock the expiry checks read, bounded against
+    /// the real clock by the resolver so a value from the file cannot become
+    /// an unbounded one (see `crate::dns`).
     pub updated_at: u64,
 }
 
@@ -231,6 +242,7 @@ impl PinState {
             timestamp_version: 0,
             snapshot_version: 0,
             targets_version: 0,
+            targets: Vec::new(),
             trusted_root: Vec::new(),
             updated_at: 0,
         }
@@ -288,9 +300,7 @@ impl PinState {
         let value: serde_json::Value = serde_json::from_str(&text).ok()?;
         // A file this build cannot read is not an error: the pin set falls
         // back to the bootstrap snapshot and the next accepted update
-        // rewrites it. That is also how the format version bump lands — a
-        // v1 file, which carried no re-walkable root chain, is simply not
-        // read, which is the safe direction.
+        // rewrites it, which is the safe direction.
         if value["version"].as_u64() != Some(STATE_FORMAT_VERSION) {
             return None;
         }
@@ -308,22 +318,50 @@ impl PinState {
             timestamp_version: number("timestamp_version")?,
             snapshot_version: number("snapshot_version")?,
             targets_version: number("targets_version")?,
+            targets: blob("targets")?,
             trusted_root: blob("trusted_root")?,
             updated_at: number("updated_at").unwrap_or(0),
         };
 
-        // **Re-derive the trusted root from the binary rather than believing
-        // the file.** Walking the stored chain from `EMBEDDED_TUF_ROOT`
+        // **Re-derive everything from the binary rather than believing the
+        // file.** Walking the stored chain from the anchor this build holds
         // re-runs the same dual-threshold check `update` applies to a live
-        // chain, so a stored root is accepted only if the root compiled into
-        // *this build* transitively signed it. Nothing else about the file is
-        // load-bearing: the versions and the trusted root beside it are only
-        // believed once this succeeds.
+        // chain, so a stored root is believed only if the root compiled into
+        // *this build* transitively signed it.
         let (walked, version) = verify_root_chain(anchor, &state.root_chain).ok()?;
         if walked != state.root || version != state.root_version {
             return None;
         }
-        Some(state)
+
+        // The root chain is only half the answer. The pin set is computed from
+        // `trusted_root`, so `trusted_root` is the field that has to chain to
+        // the binary too: the walked root's targets role must have signed the
+        // stored `targets.json`, and that `targets.json` must name this exact
+        // target. Anything less and the versions in the file are the only
+        // thing between a local writer and the log key set.
+        //
+        // Expiry is deliberately not checked, exactly as for the intermediate
+        // roots above: a stored state is expected to age between refreshes,
+        // and refusing to start on stale material is the availability coupling
+        // §10.2 forbids. Freshness is `update`'s business at refresh time.
+        let trusted = Root::parse(&state.root).ok()?;
+        match state.trusted_root.is_empty() {
+            // No update has ever been accepted: the bootstrap snapshot stands
+            // and nothing in the file speaks about the pin set. A file that
+            // carries a targets role anyway is not a state this build wrote.
+            true => state.targets.is_empty().then_some(state),
+            false => {
+                let targets = Meta::parse(&state.targets, TARGETS_ROLE).ok()?;
+                if targets.version != state.targets_version {
+                    return None;
+                }
+                trusted.check_role(TARGETS_ROLE, &targets).ok()?;
+                targets
+                    .check_target(TRUSTED_ROOT_TARGET, &state.trusted_root)
+                    .ok()?;
+                Some(state)
+            }
+        }
     }
 
     /// Writes the state at mode 0600, replacing whatever was there.
@@ -331,6 +369,7 @@ impl PinState {
     /// The pin set is not a secret, but the data directory is the owner's
     /// alone (§9.3) and a file another user can rewrite is a pin set another
     /// user chooses.
+    ///
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let text = serde_json::json!({
             "version": STATE_FORMAT_VERSION,
@@ -344,6 +383,7 @@ impl PinState {
             "timestamp_version": self.timestamp_version,
             "snapshot_version": self.snapshot_version,
             "targets_version": self.targets_version,
+            "targets": base64_encode(&self.targets),
             "trusted_root": base64_encode(&self.trusted_root),
             "updated_at": self.updated_at,
         })
@@ -355,12 +395,16 @@ impl PinState {
         // real file and filling it in. A plain write leaves the state
         // half-formed for as long as it takes, and a reader that catches it
         // there — another process, or this one after a crash — gets a file
-        // that does not parse. `load` answers `None` to that, which the
-        // resolver turns into a silent reset to the bootstrap pins,
-        // discarding every update ever accepted with no log line at all. The
-        // temporary carries the mode before it is in place, so the state is
-        // never briefly world-readable either.
-        let temporary = path.with_extension("json.tmp");
+        // that does not parse, which the resolver reports and treats as no
+        // state at all. The temporary carries the mode before it is in place,
+        // so the state is never briefly world-readable either.
+        //
+        // The temporary's name is unique to this write. A single shared name
+        // is the one shape the rename dance cannot survive: two processes
+        // writing at once fill in one another's bytes and then each renames
+        // whatever is there over the real file, which is precisely the
+        // half-formed state the dance exists to prevent.
+        let temporary = unique_temporary(path);
         // Durability before visibility: a rename that reaches the directory
         // ahead of the bytes leaves a valid name over an empty file.
         //
@@ -398,6 +442,22 @@ impl PinState {
             }
         }
     }
+}
+
+/// A temporary path beside `path`, unique to this write.
+fn unique_temporary(path: &Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    /// Distinguishes two writes by this process within one nanosecond, which
+    /// a coarse clock makes reachable.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{nanos}.{sequence}.tmp", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// Narrows a file to its owner. On platforms without POSIX modes the
@@ -536,6 +596,7 @@ pub fn update(metadata: &TufMetadata, state: &PinState, now: u64) -> Result<TufU
             timestamp_version: timestamp.version,
             snapshot_version: snapshot.version,
             targets_version: targets.version,
+            targets: metadata.targets.clone(),
             trusted_root: metadata.trusted_root.clone(),
             updated_at: now,
         },
@@ -570,9 +631,25 @@ pub struct Tlog {
 
 impl Tlog {
     /// Whether this log was in service at `now`.
+    ///
+    /// `now` is unsigned seconds since the epoch and the window bounds are
+    /// signed, so the comparison is made in the *unsigned* domain and a bound
+    /// that cannot be represented there is resolved by what it means rather
+    /// than by what its bits happen to say: a negative start is a window that
+    /// opened before the epoch, and a negative end is one that closed then.
+    /// A cast in either direction turns `u64::MAX` into `-1` and makes every
+    /// window vacuous, which is the one answer that must never come out of a
+    /// validity check.
     pub fn valid_at(&self, now: u64) -> bool {
-        let now = now as i64;
-        self.valid_from <= now && self.valid_until.is_none_or(|end| now < end)
+        let started = match u64::try_from(self.valid_from) {
+            Ok(start) => start <= now,
+            Err(_) => true,
+        };
+        let open = self.valid_until.is_none_or(|end| match u64::try_from(end) {
+            Ok(end) => now < end,
+            Err(_) => false,
+        });
+        started && open
     }
 }
 
@@ -649,7 +726,12 @@ pub fn current_tlog(logs: &[Tlog], now: u64) -> Option<&Tlog> {
 
 /// The transparency-log keys a Sigstore trusted root names — every log it
 /// lists, retired ones included, because a proof from a retired shard is
-/// still a proof.
+/// still a proof (docs/REKOR-ZONE-KEY.md §10.6).
+///
+/// [`current_tlog`] is the separate question of which shard is in service, and
+/// it is the only place a window decides anything: a shard is read from and
+/// written to while its window is open, and its key stays pinned afterwards so
+/// that the archival proofs already published under it keep verifying.
 pub fn tlog_keys(trusted_root: &[u8]) -> Result<LogKeys, TufError> {
     let bad = |why: String| TufError::Malformed(format!("trusted root: {why}"));
     let mut lines = String::new();
@@ -687,6 +769,24 @@ pub const REFRESH_INTERVAL: u64 = 24 * 60 * 60;
 /// of headroom and a bound on a repository that answers 200 to everything.
 const ROOT_CEILING: u64 = 200;
 
+/// The most bytes one walk may buffer, across every file it collects.
+///
+/// A per-response cap is not a bound on a walk: [`fetch_metadata`] holds every
+/// root it collects until [`update`] can chain them, and a mirror that answers
+/// the whole per-response allowance to all [`ROOT_CEILING`] root probes turns a
+/// daily refresh into more than a gigabyte resident. This is the aggregate, and
+/// it is generous against the real repository: Sigstore's `targets.json` is the
+/// only large file at a few hundred KiB, and its roots are tens of KiB apiece.
+pub const MAX_WALK_BYTES: usize = 8 * 1024 * 1024;
+
+/// The longest one walk may take, end to end.
+///
+/// A per-request timeout is not a bound either: ~204 requests each stalling
+/// just inside it is hours of walk, and the walk is awaited inside a membership
+/// refresh. Whatever is collected by this point is abandoned and the pins in
+/// force stand, which is what §10.2 asks of every other TUF failure.
+pub const MAX_WALK_TIME: Duration = Duration::from_secs(120);
+
 /// A TUF repository, as the one operation walking it needs.
 ///
 /// Injected rather than hardwired, the same shape the control plane's fetch
@@ -715,10 +815,15 @@ pub trait Repo {
 /// bytes are self-authenticating, so a tampering mirror produces material
 /// that fails verification and leaves the current pins standing.
 pub fn fetch_metadata(repo: &dyn Repo, from_root: u64) -> Result<TufMetadata, TufError> {
-    let fetch = |path: &str| -> Result<Vec<u8>, TufError> {
-        repo.get(path)
-            .map_err(TufError::Malformed)?
-            .ok_or_else(|| TufError::Chain(format!("the repository has no {path}")))
+    let mut budget = Budget::new();
+    let get = |budget: &mut Budget, path: &str| -> Result<Option<Vec<u8>>, TufError> {
+        budget.check()?;
+        let bytes = repo.get(path).map_err(TufError::Malformed)?;
+        budget.spend(bytes.as_ref().map_or(0, Vec::len))?;
+        Ok(bytes)
+    };
+    let fetch = |budget: &mut Budget, path: &str| -> Result<Vec<u8>, TufError> {
+        get(budget, path)?.ok_or_else(|| TufError::Chain(format!("the repository has no {path}")))
     };
 
     // The root chain, from the version already trusted up to whatever the
@@ -726,10 +831,7 @@ pub fn fetch_metadata(repo: &dyn Repo, from_root: u64) -> Result<TufMetadata, Tu
     // repository does not have — that is how TUF says "this is current".
     let mut roots = Vec::new();
     for version in from_root..from_root.saturating_add(ROOT_CEILING) {
-        match repo
-            .get(&format!("{version}.root.json"))
-            .map_err(TufError::Malformed)?
-        {
+        match get(&mut budget, &format!("{version}.root.json"))? {
             None => break,
             Some(bytes) => roots.push(bytes),
         }
@@ -740,17 +842,20 @@ pub fn fetch_metadata(repo: &dyn Repo, from_root: u64) -> Result<TufMetadata, Tu
         )));
     }
 
-    let timestamp = fetch("timestamp.json")?;
+    let timestamp = fetch(&mut budget, "timestamp.json")?;
     let snapshot_version = meta_version(&timestamp, SNAPSHOT_META)?;
-    let snapshot = fetch(&format!("{snapshot_version}.{SNAPSHOT_META}"))?;
+    let snapshot = fetch(&mut budget, &format!("{snapshot_version}.{SNAPSHOT_META}"))?;
     let targets_version = meta_version(&snapshot, TARGETS_META)?;
-    let targets = fetch(&format!("{targets_version}.{TARGETS_META}"))?;
+    let targets = fetch(&mut budget, &format!("{targets_version}.{TARGETS_META}"))?;
 
     // The one target the whole chain exists to carry, named by its digest.
     // `update` re-derives that digest from the bytes, so a repository that
     // serves something else here fails verification rather than this fetch.
     let digest = target_digest(&targets, TRUSTED_ROOT_TARGET)?;
-    let trusted_root = fetch(&format!("targets/{digest}.{TRUSTED_ROOT_TARGET}"))?;
+    let trusted_root = fetch(
+        &mut budget,
+        &format!("targets/{digest}.{TRUSTED_ROOT_TARGET}"),
+    )?;
 
     Ok(TufMetadata {
         roots,
@@ -759,6 +864,45 @@ pub fn fetch_metadata(repo: &dyn Repo, from_root: u64) -> Result<TufMetadata, Tu
         targets,
         trusted_root,
     })
+}
+
+/// What one walk of a repository is allowed to spend: bytes buffered and time
+/// elapsed, both across the whole walk rather than per response.
+struct Budget {
+    started: Instant,
+    spent: usize,
+}
+
+impl Budget {
+    fn new() -> Budget {
+        Budget {
+            started: Instant::now(),
+            spent: 0,
+        }
+    }
+
+    /// Whether the walk may make another request.
+    fn check(&self) -> Result<(), TufError> {
+        match self.started.elapsed() > MAX_WALK_TIME {
+            false => Ok(()),
+            true => Err(TufError::Malformed(format!(
+                "the walk took longer than {} seconds; the current pins stand",
+                MAX_WALK_TIME.as_secs()
+            ))),
+        }
+    }
+
+    /// Charges a response against the byte budget.
+    fn spend(&mut self, bytes: usize) -> Result<(), TufError> {
+        self.spent = self.spent.saturating_add(bytes);
+        match self.spent <= MAX_WALK_BYTES {
+            true => Ok(()),
+            false => Err(TufError::Malformed(format!(
+                "the walk served more than the {MAX_WALK_BYTES}-byte ceiling; \
+                 the current pins stand"
+            ))),
+        }
+    }
 }
 
 /// The version a role lists for the file below it, unverified — enough to
@@ -869,8 +1013,16 @@ impl Meta {
         })
     }
 
+    /// Whether this role is still valid at `now`.
+    ///
+    /// `now` is unsigned and `expires` is signed, so the comparison happens in
+    /// the unsigned domain: a timestamp before the epoch is expired, and a
+    /// `now` past `i64::MAX` is not quietly reinterpreted as a negative number
+    /// that every expiry clears. Expiry is the only bound on how old the
+    /// metadata a hostile mirror may serve is, so a comparison that can be
+    /// made vacuous is not a bound at all.
     fn check_expiry(&self, now: u64) -> Result<(), TufError> {
-        match self.expires > now as i64 {
+        match u64::try_from(self.expires).is_ok_and(|expires| expires > now) {
             true => Ok(()),
             false => Err(TufError::Expiry(format!(
                 "{}.json version {} expired at {}",
@@ -1283,7 +1435,16 @@ fn write_canonical_string(text: &str, out: &mut String) {
 /// seconds and numeric offsets both have to parse or old chains stop walking.
 fn parse_rfc3339(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
-    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+    // Every separator is checked, not only the ones in the date: a timestamp
+    // whose punctuation is not RFC 3339's is a string this parser has no
+    // business reading fields out of by offset.
+    if bytes.len() < 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
         return None;
     }
     let number = |from: usize, to: usize| text.get(from..to)?.parse::<i64>().ok();
@@ -1293,7 +1454,13 @@ fn parse_rfc3339(text: &str) -> Option<i64> {
     let hour = number(11, 13)?;
     let minute = number(14, 16)?;
     let second = number(17, 19)?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+    // 60 is a leap second, which RFC 3339 §5.6 admits; 61 is not a time.
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return None;
     }
     // Whatever follows the seconds is a fraction, a zone, or both.
@@ -1420,6 +1587,11 @@ mod tests {
             parse_rfc3339("2021-12-18T13:28:12+02:00"),
             parse_rfc3339("2021-12-18T11:28:12Z")
         );
+        // A leap second is a time RFC 3339 §5.6 admits.
+        assert_eq!(
+            parse_rfc3339("2016-12-31T23:59:60Z"),
+            Some(parse_rfc3339("2016-12-31T23:59:59Z").unwrap() + 1)
+        );
         for broken in [
             "",
             "2026-11-20",
@@ -1427,6 +1599,15 @@ mod tests {
             "2026-13-20T13:58:18Z",
             "2026-11-20T13:58:18+0200",
             "not a time at all",
+            // Every separator is checked, not only the ones in the date: the
+            // fields are read out by offset, so punctuation that is not RFC
+            // 3339's is a string this parser has no business indexing into.
+            "2026-11-20T13.58:18Z",
+            "2026-11-20T13:58.18Z",
+            "2026-11-20T135818ZZZ",
+            // And the seconds are bounded like every other field.
+            "2026-11-20T13:58:61Z",
+            "2026-11-20T13:58:99Z",
         ] {
             assert_eq!(parse_rfc3339(broken), None, "{broken:?} must not parse");
         }
@@ -1436,11 +1617,9 @@ mod tests {
     fn a_state_file_round_trips_and_is_the_owners_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("rekor-pins.json");
+        // The bootstrap state: nothing accepted, so nothing in the file speaks
+        // about the pin set and there is no targets role to re-check.
         let state = PinState {
-            trusted_root: br#"{"tlogs":[]}"#.to_vec(),
-            timestamp_version: 7,
-            snapshot_version: 8,
-            targets_version: 9,
             updated_at: 1_700_000_000,
             ..PinState::embedded()
         };
@@ -1452,6 +1631,26 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        // The temporary is gone, and it never shared a name with anybody
+        // else's: two writers filling in one file and then each renaming it
+        // over the real one is the case the rename dance exists to prevent.
+        let siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(siblings, vec!["rekor-pins.json".to_string()]);
+
+        // A state that *claims* a trusted root has to carry the targets role
+        // that names it, and that role has to check out against the walked
+        // root — so a trusted root with a targets role that says nothing about
+        // it is not state at all.
+        let unbacked = PinState {
+            trusted_root: br#"{"tlogs":[]}"#.to_vec(),
+            targets_version: 9,
+            ..state.clone()
+        };
+        unbacked.save(&path).unwrap();
+        assert_eq!(PinState::load(&path), None);
 
         // Anything unreadable as state reads as no state at all, rather
         // than as an error a client could be stopped by.
@@ -1461,7 +1660,7 @@ mod tests {
         );
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(PinState::load(&path), None);
-        std::fs::write(&path, r#"{"version":2}"#).unwrap();
+        std::fs::write(&path, r#"{"version":3}"#).unwrap();
         assert_eq!(PinState::load(&path), None);
     }
 
@@ -1552,6 +1751,55 @@ mod tests {
         assert_eq!(
             crate::rekor::LogKeys::embedded(),
             tlog_keys(EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap()
+        );
+    }
+
+    /// One walk has an aggregate byte budget, not only a per-response cap.
+    ///
+    /// `fetch_metadata` holds every root it collects until `update` can chain
+    /// them, so a per-response bound is not a bound on the walk: a mirror
+    /// answering the whole per-response allowance to all `ROOT_CEILING` root
+    /// probes turns a daily refresh into more than a gigabyte resident, while
+    /// `update` would have bailed after two roots.
+    #[test]
+    fn a_walk_that_serves_too_many_bytes_is_abandoned() {
+        /// A repository that answers a megabyte of nothing to every request.
+        struct Greedy;
+        impl Repo for Greedy {
+            fn get(&self, _path: &str) -> Result<Option<Vec<u8>>, String> {
+                Ok(Some(vec![b'x'; 1024 * 1024]))
+            }
+        }
+        let error = fetch_metadata(&Greedy, 1).expect_err("a greedy mirror is abandoned");
+        assert!(
+            matches!(&error, TufError::Malformed(why) if why.contains("ceiling")),
+            "{error}"
+        );
+        // Well short of what `ROOT_CEILING` responses would have cost.
+        assert!(MAX_WALK_BYTES < ROOT_CEILING as usize * 1024 * 1024);
+    }
+
+    /// And a total deadline, not only a per-request timeout.
+    ///
+    /// ~204 requests each stalling just inside a per-request timeout is hours of
+    /// walk, and the walk is awaited inside a membership refresh.
+    #[test]
+    fn a_walk_that_takes_too_long_is_abandoned() {
+        let fresh = Budget::new();
+        fresh
+            .check()
+            .expect("a walk that has just started may proceed");
+
+        let overrun = Budget {
+            started: Instant::now()
+                .checked_sub(MAX_WALK_TIME * 2)
+                .expect("a monotonic clock with some history"),
+            spent: 0,
+        };
+        let error = overrun.check().expect_err("a walk past its deadline stops");
+        assert!(
+            matches!(&error, TufError::Malformed(why) if why.contains("longer than")),
+            "{error}"
         );
     }
 

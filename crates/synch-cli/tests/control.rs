@@ -1806,3 +1806,57 @@ async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
     accepting.abort();
     silent.close().await;
 }
+
+#[tokio::test]
+async fn the_trust_configuration_and_the_resolver_state_are_reported() {
+    // Every trust knob is settable by environment variable, so which trust a
+    // daemon enforces is not visible from its command line: `daemon status` and
+    // `doctor` are what distinguish a `require` daemon from a `--rekor off` one.
+    // And a resolver that cannot be built refreshes no membership at all, which
+    // is the state most in need of naming and least visible without it.
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+
+    // No resolver in this process at all: the state is named, not implied.
+    let status = lines(data_dir, Request::DaemonStatus).await;
+    assert!(
+        status.contains("trust: no membership resolver in this process"),
+        "{status}"
+    );
+
+    daemon.node.set_dns_resolver(Err(
+        "trust anchor /nope: no DNSKEY records in the file".into()
+    ));
+    let status = lines(data_dir, Request::DaemonStatus).await;
+    assert!(status.contains("NO RESOLVER"), "{status}");
+    assert!(status.contains("membership cannot refresh"), "{status}");
+    let doctor = lines(data_dir, Request::Doctor { rebuild: false }).await;
+    assert!(doctor.contains("no DNSKEY records"), "{doctor}");
+
+    // A refresh asked for over the socket uses the daemon's resolver and
+    // refuses when there is none, rather than building a fresh one per request.
+    daemon.node.add_domain("cluster.example").unwrap();
+    let code = failure(data_dir, Request::DomainRefresh { domain: None }).await;
+    assert_eq!(code, ErrorCode::Unavailable);
+
+    // With one installed, the whole effective policy is on the page.
+    let resolver = std::sync::Arc::new(synch_net::DnssecResolver::with_defaults().unwrap());
+    daemon.node.set_dns_resolver(Ok(resolver.clone()));
+    let status = lines(data_dir, Request::DaemonStatus).await;
+    assert!(status.contains("rekor require"), "{status}");
+    assert!(status.contains("anchor icann-root"), "{status}");
+    assert!(status.contains("log key(s) pinned"), "{status}");
+    let doctor = lines(data_dir, Request::Doctor { rebuild: false }).await;
+    assert!(doctor.contains("log key "), "{doctor}");
+    assert!(doctor.contains("clock: usable"), "{doctor}");
+
+    // And it is *one* resolver: the TUF walk's "once a day even when the
+    // repository is down" bound lives in the resolver, so a per-request one
+    // would re-walk on every command.
+    assert!(std::sync::Arc::ptr_eq(
+        &resolver,
+        &daemon.node.dns_resolver().unwrap()
+    ));
+    daemon.shutdown().await;
+}

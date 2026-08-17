@@ -996,6 +996,12 @@ mod tests {
 
     #[test]
     fn an_expired_binding_no_longer_admits_heads() {
+        // The instants are real ones: an expiry is compared against a clock,
+        // and a reading below `MIN_TRUSTED_NS` dates nothing, so a binding
+        // offered at "now = 50" is not live at all (§3.2).
+        let before = synch_core::MIN_TRUSTED_NS + 50;
+        let expiry = synch_core::MIN_TRUSTED_NS + 100;
+        let after = synch_core::MIN_TRUSTED_NS + 200;
         let (_d, store, _k, origin) = setup();
         let rotated = SecretKey::generate();
         store
@@ -1006,18 +1012,18 @@ mod tests {
                 domain: Some("x.example".into()),
                 note: None,
                 added_at: 0,
-                expires_at: Some(100),
+                expires_at: Some(expiry),
             })
             .unwrap();
         let syncer = Syncer::new(store.clone());
         let head = SignedHead::sign(&rotated, origin.clone(), 1, Hash::EMPTY, 0);
         assert_eq!(
-            syncer.offer_head(&head, 50).unwrap(),
+            syncer.offer_head(&head, before).unwrap(),
             HeadOutcome::Completed
         );
         let later = SignedHead::sign(&rotated, origin, 2, Hash::new(b"x"), 0);
         assert_eq!(
-            syncer.offer_head(&later, 200).unwrap(),
+            syncer.offer_head(&later, after).unwrap(),
             HeadOutcome::Unbound
         );
     }

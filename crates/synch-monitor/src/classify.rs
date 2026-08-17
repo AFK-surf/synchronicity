@@ -26,9 +26,17 @@ use synch_net::{
 )]
 pub enum Tier {
     /// No valid chain, or a chain covering some other key: an unauthorized
-    /// claim naming this apex. Recorded, not reported — and safe to be quiet
-    /// about only because no client would have accepted it either (see the
-    /// crate docs).
+    /// claim naming this apex. Not reported — and safe to be quiet about only
+    /// because **no client holding this monitor's anchor set would have
+    /// accepted it either**.
+    ///
+    /// That condition is the whole of tier B's meaning and it is not
+    /// unconditional. The verdict is computed against the anchors this process
+    /// was given, and `--dnssec-anchor` *replaces* the ICANN root rather than
+    /// unioning with it, so a run under one anchor set says nothing about a
+    /// client population under another: the same bytes are tier B here and
+    /// client-accepted there. One monitor process covers one trust surface;
+    /// see the crate docs.
     B,
     /// A chain that verifies to the anchor in force and covers this key. The
     /// entry **authorizes** this key for this apex — whoever published it.
@@ -45,7 +53,7 @@ impl Tier {
     }
 }
 
-/// The keys this monitor has already seen authorized, per apex.
+/// The keys this monitor has already reported as authorized, per apex.
 ///
 /// This is the monitor's memory, and it does exactly one job: stop a key from
 /// being reported on every pass forever. A tier A entry proving a key not in
@@ -63,7 +71,9 @@ impl Tier {
 /// The apexes are also the watch list: an apex with an empty key list is how
 /// an operator says "tell me about this zone, I have seen nothing yet". What
 /// is watched is not just that name but its whole **delegation path**, in
-/// both directions — see [`KnownKeys::watches`].
+/// both directions — see [`KnownKeys::watches`]. An entry that is not a DNS
+/// name watches nothing, which is why [`KnownKeys::unwatchable`] exists and
+/// why the binary refuses to run on a list holding one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KnownKeys {
     /// `apex` → the SHA-256 hex of each already-reported key's DNSKEY rdata.
@@ -105,13 +115,27 @@ impl KnownKeys {
         }
     }
 
-    /// The apexes this monitor watches, parsed. An entry that is not a DNS
-    /// name watches nothing — it cannot match a certificate's SAN, which is
-    /// parsed too.
+    /// The apexes this monitor watches, parsed.
     pub fn apexes(&self) -> impl Iterator<Item = Name> + '_ {
         self.keys
             .keys()
             .filter_map(|apex| chain::parse_name(apex).ok())
+    }
+
+    /// The watch-list entries that are not DNS names.
+    ///
+    /// The state file is hand-edited, so it can hold anything, and an entry
+    /// that does not parse cannot match a certificate's SAN — which is parsed
+    /// too. So it watches nothing, for as long as it sits there, and a monitor
+    /// whose whole list is such entries reports "no alarm" forever. Non-empty
+    /// is therefore not the test that matters; the caller refuses to run on
+    /// anything this returns rather than letting it be quiet.
+    pub fn unwatchable(&self) -> Vec<&str> {
+        self.keys
+            .keys()
+            .filter(|apex| chain::parse_name(apex).is_err())
+            .map(String::as_str)
+            .collect()
     }
 
     /// Whether an entry naming `apex` is this monitor's business.
@@ -130,6 +154,15 @@ impl KnownKeys {
     /// Downward for the mirror case: an entry for `sub.cp.example.com` is
     /// somebody standing up a control plane inside the operator's own zone,
     /// which is either a delegation they made or one they need to hear about.
+    ///
+    /// Two directions is also what makes the watch complete rather than
+    /// merely broad. A client bounds a certificate's apex by
+    /// `signing_zone ⊇ claimed_apex ⊇ membership domain`, and the control
+    /// plane publishes membership under the apex — so every apex a client
+    /// would accept is a suffix of the membership domain, suffixes of one
+    /// name are totally ordered, and each of them therefore sits on the
+    /// delegation path of any watched name on that chain, in one direction or
+    /// the other.
     ///
     /// The cost is noise, and it is the right trade. A zone's own operators
     /// are the only people who can say whether `example.com` publishing
@@ -318,22 +351,31 @@ mod tests {
 
         // Not everything, though: a sibling shares no delegation path, and
         // a name that merely ends in the same letters is not a suffix in the
-        // DNS sense.
+        // DNS sense. That is sound rather than a gap, because a client only
+        // accepts an apex that *contains* the membership domain, so every apex
+        // it would accept is on one delegation path with the watched name.
         assert!(!known.watches(&name("other.example.")));
         assert!(!known.watches(&name("notcp.example.")));
     }
 
-    /// A watch entry that is not a DNS name watches nothing.
+    /// A watch entry that is not a DNS name watches nothing, and is reported
+    /// as such rather than sitting there quietly.
     ///
-    /// The state file is hand-edited, so it can contain anything. What it
-    /// must never do is match a certificate by some looser rule than the one
-    /// the chain walk uses — that mismatch is what put a client-accepted
-    /// entry in the silent bin.
+    /// What it must never do is match a certificate by some looser rule than
+    /// the one the chain walk uses — that mismatch is what put a
+    /// client-accepted entry in the silent bin. What it must never do
+    /// *silently* is match nothing at all.
     #[test]
-    fn an_unparseable_watch_entry_matches_nothing() {
+    fn an_unparseable_watch_entry_matches_nothing_and_is_reported() {
         let mut known = KnownKeys::default();
         known.keys.insert("sync.example..".into(), vec![]);
         assert_eq!(known.apexes().count(), 0);
         assert!(!known.contains(&name("sync.example"), b"a key"));
+        assert_eq!(known.unwatchable(), ["sync.example.."]);
+
+        // A list of names is watchable, and says so.
+        let mut good = KnownKeys::default();
+        good.keys.insert("cluster.example.com.".into(), vec![]);
+        assert!(good.unwatchable().is_empty());
     }
 }

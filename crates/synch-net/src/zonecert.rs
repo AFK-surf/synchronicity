@@ -22,7 +22,9 @@
 //! its presence only because an entry without one would be invisible to a
 //! monitor (see `rekor::verify`).
 
-use crate::x509::{tlv, Der, X509Error};
+#[cfg(any(test, feature = "sim"))]
+use crate::x509::tlv;
+use crate::x509::{Der, X509Error};
 
 /// The DNSSEC chain extension: `2.25.1555716359`.
 ///
@@ -50,8 +52,9 @@ pub const OID_DNSSEC_CHAIN: &[u8] = &[0x69, 0x85, 0xe5, 0xe9, 0xb2, 0x07];
 ///
 /// - the bottom link is the **declaration** at
 ///   `_synchronicity-transparency.<apex>`: its `TXT` RRset and the `RRSIG`
-///   the apex made over it, which is what makes the entry the zone's own
-///   statement rather than a transcription of its public records;
+///   the apex made over it, which narrows who can mint an entry about a zone
+///   to zones that have declared themselves control planes (see
+///   [`crate::chain`] for what that does and does not deliver);
 /// - the apex link holds the apex's `DNSKEY` RRset + `RRSIG` — the key set
 ///   the entry claims — and its `DS` RRset + `RRSIG` (signed by the parent);
 /// - every ancestor link holds that zone's `DNSKEY` RRset + `RRSIG` and its
@@ -75,6 +78,11 @@ pub struct DnssecChain {
 
 impl DnssecChain {
     /// The extension value: `SEQUENCE OF SEQUENCE { IA5String, OCTET STRING }`.
+    ///
+    /// Publisher-side. The control plane writes these certificates and a
+    /// resolving client only ever decodes them, so the writer is behind the
+    /// harness gate and no shipped client carries it (see [`crate::sim`]).
+    #[cfg(any(test, feature = "sim"))]
     pub fn encode(&self) -> Vec<u8> {
         let mut body = Vec::new();
         for link in &self.links {
@@ -211,14 +219,6 @@ mod tests {
         assert_eq!(
             u128::from(u32::from_be_bytes([0xdc, 0xba, 0x59, 0x07]) & 0x7fff_ffff),
             1_555_716_359
-        );
-        // The reserved arc, asserted only so that the number in the module
-        // docs stays checkable. Nothing encodes or decodes it, but a
-        // published entry carries it forever, so it must never be handed out
-        // for a meaning of its own.
-        assert_eq!(
-            u128::from(u32::from_be_bytes([0x43, 0xda, 0x29, 0x32]) & 0x7fff_ffff),
-            1_138_370_866
         );
     }
 }

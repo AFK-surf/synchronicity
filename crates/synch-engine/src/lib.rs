@@ -33,7 +33,10 @@ pub use config::{default_data_dir, NodeConfig};
 pub use error::{EngineError, Result};
 pub use fetcher::{FetchReport, PreparedRange, Provider};
 pub use ignore::IgnoreSet;
-pub use membership::{DoctorReport, DomainHealth, DomainOutcome, DomainRefresh, HeadStatus};
+pub use membership::{
+    DoctorReport, DomainHealth, DomainOutcome, DomainRefresh, HeadStatus, ResolverStatus,
+    TrustConfig,
+};
 pub use mirror::MirrorReport;
 pub use node::{AdoptOriginReport, InitReport, Node, StagedChange};
 pub use publisher::{Publisher, DEFAULT_PUBLISH_BATCH_MAX, DEFAULT_PUBLISH_QUIESCE};
@@ -45,6 +48,7 @@ pub use recovery::{
 pub use reference::EntryRef;
 pub use rotation::{Activation, PeerBindings, RotationPlan};
 pub use scanner::{Adoption, CloneKind, ScanReport};
+pub use synch_net::dns::RekorPolicy;
 pub use synch_store::{Donor, ProvenSubtree, Selection, Version, VersionPolicy, VersionSet};
 pub use tree::reference_of;
 pub use watcher::SpaceWatcher;

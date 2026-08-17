@@ -3,6 +3,7 @@
 
 pub mod bindings;
 pub mod cas;
+pub mod clock;
 pub mod db;
 pub mod error;
 pub mod gc;
@@ -15,6 +16,7 @@ pub mod views;
 
 pub use bindings::{Binding, BindingSource};
 pub use cas::{BlobRow, BLOCK_SIZE};
+pub use clock::ClockStatus;
 pub use db::{DeviceKey, KeyState, Store, Txn, CAS_DIR, DB_FILE};
 pub use error::{Result, StoreError};
 pub use gc::{GcStats, TrieStats};

@@ -267,3 +267,168 @@ fn a_wildcard_expansion_is_not_a_declaration() {
         "{error}"
     );
 }
+
+/// A zone cut that spans several labels is a chain a client can walk.
+///
+/// DNS delegations are not one label each: `example.` may publish NS and DS for
+/// `cp.acme.example.` with no zone at all at `acme.example.`. A ladder rule that
+/// required each link to be exactly one label below the next left such a
+/// deployment with **no valid encoding**: a link for the empty non-terminal has
+/// neither a DNSKEY RRset nor a DS to prove one, so including it fails, and
+/// omitting it failed the parent-name check. Every client of it refused every
+/// answer, permanently, with a diagnostic that read like a misbuilt entry.
+///
+/// What holds the ladder together is not the label count. Each link's DS digest
+/// is computed over its own `zone`, each link's records must be owned by that
+/// name, and each RRSIG is verified under it — so the cut's width was never
+/// load-bearing, and requiring a *proper ancestor* gives up nothing.
+#[test]
+fn a_delegation_that_spans_several_labels_still_validates() {
+    let ladder = SimDelegation::spanning("cp.acme.example", "example", Vec::new());
+    let (proven, signing_zone, valid) = chain::validate(
+        &ladder.chain(),
+        &apex("cp.acme.example."),
+        &anchored_at(&ladder.root),
+    )
+    .expect("a zone delegated several labels below its parent must validate");
+    assert_eq!(signing_zone, apex("cp.acme.example."));
+    assert_eq!(valid.anchor_zone, ".");
+    assert_eq!(
+        valid.links, 3,
+        "apex, the zone that delegated it, root — with nothing at acme.example."
+    );
+    assert_eq!(proven, vec![ladder.apex.dnskey_rdata()]);
+}
+
+/// The ladder still has to descend, which is the half of the rule that works.
+#[test]
+fn a_ladder_that_does_not_descend_is_refused() {
+    let ladder = SimDelegation::spanning("cp.acme.example", "example", Vec::new());
+    let mut sideways = ladder.chain();
+    // Swap the two lower ladder links so the "parent" is below its child.
+    sideways.links.swap(1, 2);
+    let error = chain::validate(
+        &sideways,
+        &apex("cp.acme.example."),
+        &anchored_at(&ladder.root),
+    )
+    .expect_err("a ladder that climbs the wrong way authorizes nothing");
+    assert!(
+        matches!(&error, ChainError::Structure(why) if why.contains("is not an ancestor of")),
+        "{error}"
+    );
+}
+
+/// A DNSKEY with no Zone Key flag cannot sign inside a chain (RFC 4034 §2.1.1).
+///
+/// hickory's `impl Verifier for DNSKEY` reads only the algorithm and the key
+/// bytes — it consults neither flag — so nothing under this validator enforces
+/// the rule and it has to be enforced here. A key published with flags `0x0000`
+/// is not a zone key and "MUST NOT be used to verify RRSIGs that cover RRsets".
+#[test]
+fn a_key_that_is_not_a_zone_key_signs_nothing_and_proves_nothing() {
+    let zone = SimZone::with_flags("cluster.example", Vec::new(), false, false);
+    let error = chain::validate(
+        &zone.dnssec_chain(),
+        &apex("cluster.example."),
+        &anchored_at(&zone),
+    )
+    .expect_err("a non-zone-key DNSKEY must not anchor or sign a chain");
+    assert!(
+        matches!(&error, ChainError::Anchor(why) if why.contains("zone key")),
+        "{error}"
+    );
+}
+
+/// An RFC 5011 REVOKE-flagged key is never a valid signer either.
+#[test]
+fn a_revoked_key_signs_nothing_and_proves_nothing() {
+    let zone = SimZone::with_flags("cluster.example", Vec::new(), true, true);
+    let error = chain::validate(
+        &zone.dnssec_chain(),
+        &apex("cluster.example."),
+        &anchored_at(&zone),
+    )
+    .expect_err("a revoked DNSKEY must not anchor or sign a chain");
+    assert!(
+        matches!(&error, ChainError::Anchor(why) if why.contains("unrevoked")),
+        "{error}"
+    );
+}
+
+/// A revoked key sitting *beside* a good one is excluded from the proven set.
+///
+/// This is the case that bites: the DS-covered key's flags are pinned by the DS
+/// digest, so it is the RRset's *other* keys that this decides. Whoever holds
+/// one could otherwise sign a forged child DS and mint a chain that validates
+/// against the ICANN root — forged tier-A findings against the one alarm this
+/// design raises. So such a key is not in the set the chain proves, and a
+/// Statement claiming it does not match.
+#[test]
+fn a_revoked_key_beside_a_good_one_is_not_in_the_proven_set() {
+    let mut zone = SimZone::new("cluster.example", Vec::new());
+    let revoked = SimZone::with_flags("cluster.example", Vec::new(), true, true);
+    zone.add_dnskey(revoked.dnskey());
+    let (proven, _, _) = chain::validate(
+        &zone.dnssec_chain(),
+        &apex("cluster.example."),
+        &anchored_at(&zone),
+    )
+    .expect("the live key still anchors and signs");
+    assert_eq!(
+        proven,
+        vec![zone.dnskey_rdata()],
+        "the revoked key is published, verified as part of the RRset, and not authorized"
+    );
+    assert!(!proven.contains(&revoked.dnskey_rdata()));
+}
+
+/// A chain padded with signatures costs a bounded number of verifications.
+///
+/// Every candidate re-canonicalizes the whole RRset before it hashes anything,
+/// and the input is a certificate an attacker chose, so pairing signatures
+/// against keys is quadratic work on hostile data — bounded otherwise only by
+/// the 64 KB entry frame. A legitimate link needs one verification and an
+/// RFC 6781 rollover two, so a link offering dozens is refused rather than
+/// walked: bounded work, and fail-closed when the bound is reached.
+#[test]
+fn a_chain_padded_with_signatures_is_refused_rather_than_walked() {
+    let zone = SimZone::new("cluster.example", Vec::new());
+    let records = zone.dnskey_records(inception());
+    let rrsig = records
+        .iter()
+        .find(|record| {
+            matches!(
+                record.data,
+                hickory_resolver::proto::rr::RData::DNSSEC(
+                    hickory_resolver::proto::dnssec::rdata::DNSSECRData::RRSIG(_)
+                )
+            )
+        })
+        .expect("the set is signed")
+        .clone();
+
+    // Copies of the real RRSIG with one byte of the signature flipped: the same
+    // owner, the same type, the same key tag — so each one is a pairing the walk
+    // has to actually try — and none of them verifies. The honest records come
+    // last, which is what a padded chain would do.
+    let mut junk = chain::encode_rrs(&[rrsig]).expect("encode the decoy");
+    *junk.last_mut().expect("a signature has bytes") ^= 0x01;
+    let mut rrs = Vec::new();
+    for _ in 0..64 {
+        rrs.extend_from_slice(&junk);
+    }
+    rrs.extend_from_slice(&chain::encode_rrs(&records).expect("encode the honest set"));
+
+    let mut padded = zone.dnssec_chain();
+    padded.links[1] = ChainLink {
+        zone: "cluster.example.".into(),
+        rrs,
+    };
+    let error = chain::validate(&padded, &apex("cluster.example."), &anchored_at(&zone))
+        .expect_err("a padded link must be refused, not walked");
+    assert!(
+        matches!(&error, ChainError::Signature(why) if why.contains("pairings")),
+        "{error}"
+    );
+}
