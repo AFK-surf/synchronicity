@@ -1,9 +1,13 @@
 //! `synch-monitor` — read the log, classify what names your zones.
 //!
-//! One run: fetch the checkpoint, verify it under the pinned log keys, check
-//! that it extends the tree this monitor saw last time, then walk every entry
-//! bundle from the last-seen index, pull the certificate out of each leaf, and
-//! classify the ones naming a watched apex (docs/REKOR-ZONE-KEY.md §5.5).
+//! Two subcommands. `run` is the watcher: fetch the checkpoint, verify it
+//! under the pinned log keys, check that it extends the tree this monitor
+//! saw last time, then walk every entry bundle from the last-seen index,
+//! pull the certificate out of each leaf, and classify the ones naming a
+//! watched apex (docs/REKOR-ZONE-KEY.md §5.5). Every finding's full entry
+//! body goes into the state file with it, and `entry` is the evidence
+//! drawer: print one of those bodies by index, a local read rather than a
+//! re-fetch from the log under watch.
 //!
 //! **The product is the list of newly authorized keys.** A tier A entry whose
 //! key this monitor has not recorded for that apex is a new authorization: it
@@ -74,22 +78,28 @@ fn rough_eta(secs: u64) -> String {
 }
 
 /// Watch a Rekor v2 transparency log for zone-key entries.
-///
-/// Reports every newly authorized zone key for a watched apex: an entry whose
-/// DNSSEC chain verifies and covers its own key authorizes that key, and the
-/// first time this monitor sees one it says so. It cannot tell a rotation you
-/// performed from a substitution by somebody who took your registrar — an
-/// attacker with the DS builds the same chain — so it reports the
-/// authorization and leaves the judgement to your own record of what you
-/// published.
-///
-/// New authorizations go to stdout, one line each; everything else to stderr.
 #[derive(Debug, Parser)]
-#[command(
-    name = "synch-monitor",
-    version,
-    about,
-    after_long_help = "EXIT CODES:
+#[command(name = "synch-monitor", version, about)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Watch a Rekor v2 transparency log for zone-key entries.
+    ///
+    /// Reports every newly authorized zone key for a watched apex: an entry
+    /// whose DNSSEC chain verifies and covers its own key authorizes that
+    /// key, and the first time this monitor sees one it says so. It cannot
+    /// tell a rotation you performed from a substitution by somebody who
+    /// took your registrar — an attacker with the DS builds the same chain —
+    /// so it reports the authorization and leaves the judgement to your own
+    /// record of what you published.
+    ///
+    /// New authorizations go to stdout, one line each; everything else to
+    /// stderr.
+    #[command(after_long_help = "EXIT CODES:
    0  nothing new for a watched apex
   10  unauthorized claims only — entries naming a watched apex whose chain
       does not verify. No client would have accepted one; recorded, no alarm.
@@ -97,16 +107,27 @@ fn rough_eta(secs: u64) -> String {
       this monitor had not recorded. Check it against what you published.
   30  the run could not finish (transport, checkpoint, state). Sorts above
       the others on purpose: a wedged monitor is not a quiet one. Anything
-      classified before the failure is still reported."
-)]
-struct Args {
+      classified before the failure is still reported.")]
+    Run(RunArgs),
+    /// Print the full body of a log entry the state file holds: the evidence
+    /// behind a finding, by its log index — with --log naming the shard when
+    /// more than one holds that index. stdout is the raw entry bytes — the
+    /// canonicalized Rekor body, nothing added — so it pipes into jq or a
+    /// file byte-exactly.
+    Entry(EntryArgs),
+}
+
+/// `run`'s flags.
+#[derive(Debug, clap::Args)]
+struct RunArgs {
     /// The log's base URL. Discovered from Sigstore's TUF repository when
     /// not given, which is how a monitor survives a shard rotation.
     #[arg(long, env = "SYNCH_MONITOR_LOG")]
     log: Option<String>,
 
     /// Where to persist the last checkpoint, the last index, the apexes to
-    /// watch and the keys already reported for each.
+    /// watch, the keys already reported for each, and the entry bodies
+    /// behind the reports.
     #[arg(long, env = "SYNCH_MONITOR_STATE")]
     state: PathBuf,
 
@@ -177,10 +198,30 @@ struct Args {
 /// docs invite ignored precisely the runs that needed a human.
 const EXIT_INCOMPLETE: i32 = 30;
 
+/// `entry`'s arguments.
+#[derive(Debug, clap::Args)]
+struct EntryArgs {
+    /// The log index to print.
+    index: u64,
+
+    /// Where the monitor's state — and its stored entry bodies — live.
+    #[arg(long, env = "SYNCH_MONITOR_STATE")]
+    state: PathBuf,
+
+    /// The log the index belongs to, by origin line (e.g.
+    /// "log2025-1.rekor.sigstore.dev"). Needed only when the state holds
+    /// that index under more than one log — the error says so when it does.
+    #[arg(long)]
+    log: Option<String>,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let args = Args::parse();
-    match run(&args).await {
+    let result = match Args::parse().command {
+        Command::Run(args) => run(&args).await,
+        Command::Entry(args) => dump_entry(&args),
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("synch-monitor: {e}");
@@ -189,7 +230,56 @@ async fn main() {
     }
 }
 
-async fn run(args: &Args) -> Result<i32, MonitorError> {
+/// `entry`: the evidence half of the state file, back out. stdout gets the
+/// raw body and nothing else, so it pipes byte-exactly.
+fn dump_entry(args: &EntryArgs) -> Result<i32, MonitorError> {
+    use std::io::Write;
+    let state = MonitorState::load(&args.state)?;
+    // An index names an entry only with its log: two shards both have an
+    // entry 68,295,246, and they are not the same entry. With --log the
+    // question is direct; without it, an index exactly one log holds is
+    // unambiguous.
+    let origin = match &args.log {
+        Some(origin) => origin.clone(),
+        None => match state.origins_holding(args.index).as_slice() {
+            [only] => only.to_string(),
+            [] => {
+                let held = match state.entries.is_empty() {
+                    true => "it holds none".to_string(),
+                    false => format!(
+                        "it holds bodies under: {}",
+                        state.entries.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ),
+                };
+                return Err(MonitorError::State(format!(
+                    "no entry {} in {} — {held}",
+                    args.index,
+                    args.state.display()
+                )));
+            }
+            several => {
+                return Err(MonitorError::State(format!(
+                    "entry {} is held under several logs ({}) — name one with --log",
+                    args.index,
+                    several.join(", ")
+                )));
+            }
+        },
+    };
+    let body = state.entry(&origin, args.index)?.ok_or_else(|| {
+        MonitorError::State(format!(
+            "no entry {} from {origin} in {}",
+            args.index,
+            args.state.display()
+        ))
+    })?;
+    std::io::stdout()
+        .write_all(&body)
+        .map_err(|e| MonitorError::State(format!("writing stdout: {e}")))?;
+    Ok(0)
+}
+
+async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
     let keys_override = match &args.rekor_key {
         Some(path) => Some(
             LogKeys::from_file(path)
@@ -361,6 +451,12 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
         new_authorizations.len(),
         claims.len()
     );
+    if !findings.is_empty() && !args.no_save {
+        eprintln!(
+            "synch-monitor: the full body of every finding is in the state file — \
+             `synch-monitor entry <INDEX>` prints one"
+        );
+    }
     Ok(match (new_authorizations.is_empty(), claims.is_empty()) {
         (false, _) => 20,
         (true, false) => 10,
@@ -386,7 +482,7 @@ async fn walk_log(
     anchors: &TrustAnchors,
     known: &synch_monitor::classify::KnownKeys,
     state: &mut MonitorState,
-    args: &Args,
+    args: &RunArgs,
 ) -> Result<Vec<Finding>, MonitorError> {
     let source = HttpTiles::new(base_url)?;
     let checkpoint = Checkpoint::parse(&source.checkpoint().await?)
@@ -535,6 +631,14 @@ async fn walk_log(
                 .map_err(|e| MonitorError::Tile(e.to_string()))?;
                 if let Some(finding) = classify(&parsed, index, anchors) {
                     findings.push(finding);
+                    // The evidence goes into the state with the finding:
+                    // the full entry body under this log's origin, so "what
+                    // exactly does the log hold for this report" stays a
+                    // local lookup, never a re-fetch from the log under
+                    // watch. A body here is not the recording tier B is
+                    // denied — that rule is about the known-keys memory,
+                    // and evidence suppresses nothing.
+                    state.record_entry(&checkpoint.origin, index, body);
                 }
             }
             let covered = entries

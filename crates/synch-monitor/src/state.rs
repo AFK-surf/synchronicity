@@ -1,6 +1,6 @@
 //! What a monitor remembers between runs.
 //!
-//! Two things, and each is load-bearing for a different reason. The **last
+//! Three things, and each is load-bearing for a different reason. The **last
 //! checkpoint** is what makes split-view detection possible at all: a log that
 //! shows this monitor a tree which does not extend the one it showed last time
 //! has equivocated, and that is the single strongest thing a monitor can
@@ -12,11 +12,21 @@
 //! which keys have already been surfaced for an apex, every run would report
 //! every key the zone has ever authorized, and an alert that fires every hour
 //! about the same key is an alert nobody reads. They are bookkeeping, not
-//! trust — see [`crate::classify::KnownKeys`].
+//! trust — see [`crate::classify::KnownKeys`]. The **entry bodies** are the
+//! evidence: the full log entry behind every finding, per log and by index,
+//! so "what exactly does the log hold for this report" is a local lookup —
+//! the `entry` subcommand — never a re-fetch from the log under watch.
+//! Recording a body here is not the recording tier B is denied; that rule is
+//! about `known.keys`, the report-suppression memory, and evidence suppresses
+//! nothing.
 //!
 //! The file is plain JSON on purpose: an operator has to be able to read it,
 //! seed it by hand for a zone whose history predates the monitor, and check it
 //! into whatever they keep their runbooks in.
+
+use std::collections::BTreeMap;
+
+use base64::Engine;
 
 use crate::{classify::KnownKeys, MonitorError};
 
@@ -69,9 +79,51 @@ pub struct MonitorState {
     /// noise, and noise is what stops alerts being read.
     #[serde(default)]
     pub known: KnownKeys,
+    /// The full body of every finding: the evidence behind each report,
+    /// `origin → index → base64 body`. Per log for the same reason the
+    /// position is — two shards both have an entry 68,295,246, and they are
+    /// not the same entry. A tier A line says "this key was authorized";
+    /// this is *what said so*, kept locally so inspecting it is a file
+    /// read, not a re-fetch from the log being watched. Base64, because
+    /// the file stays hand-readable JSON. Grows only by entries that named
+    /// a watched apex, so it stays small by construction.
+    #[serde(default)]
+    pub entries: BTreeMap<String, BTreeMap<u64, String>>,
 }
 
 impl MonitorState {
+    /// Records one entry body under its log's origin, base64 — the file
+    /// stays hand-readable JSON.
+    pub fn record_entry(&mut self, origin: &str, index: u64, body: &[u8]) {
+        self.entries
+            .entry(origin.to_string())
+            .or_default()
+            .insert(index, base64::engine::general_purpose::STANDARD.encode(body));
+    }
+
+    /// A recorded body, decoded back out — `Ok(None)` when the state holds
+    /// no entry at `index` from the log `origin`.
+    pub fn entry(&self, origin: &str, index: u64) -> Result<Option<Vec<u8>>, MonitorError> {
+        match self.entries.get(origin).and_then(|bodies| bodies.get(&index)) {
+            None => Ok(None),
+            Some(encoded) => base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map(Some)
+                .map_err(|e| MonitorError::State(format!("entry {index} is not base64: {e}"))),
+        }
+    }
+
+    /// The origins that hold a body for `index`. An index alone names an
+    /// entry only when exactly one log holds it — two shards both have an
+    /// entry 68,295,246, and they are not the same entry.
+    pub fn origins_holding(&self, index: u64) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|(_, bodies)| bodies.contains_key(&index))
+            .map(|(origin, _)| origin.as_str())
+            .collect()
+    }
+
     /// Reads a state file, treating an absent one as a fresh monitor.
     pub fn load(path: &std::path::Path) -> Result<MonitorState, MonitorError> {
         match std::fs::read(path) {
@@ -140,9 +192,32 @@ mod tests {
             b"a key",
         );
         assert_eq!(state.logs.len(), 2);
+        state.record_entry(
+            "log2025-1.rekor.sigstore.dev",
+            67_673_583,
+            b"the full body of the finding's entry",
+        );
         state.save(&path).unwrap();
         assert_eq!(MonitorState::load(&path).unwrap(), state);
         assert!(!MonitorState::load(&path).unwrap().is_fresh());
+        assert_eq!(
+            state
+                .entry("log2025-1.rekor.sigstore.dev", 67_673_583)
+                .unwrap()
+                .as_deref(),
+            Some(b"the full body of the finding's entry".as_slice())
+        );
+        // The same index under the other shard is a different entry, and
+        // this state holds neither.
+        assert_eq!(
+            state.entry("log2026-1.rekor.sigstore.dev", 67_673_583).unwrap(),
+            None
+        );
+        assert_eq!(
+            state.origins_holding(67_673_583),
+            ["log2025-1.rekor.sigstore.dev"]
+        );
+        assert!(state.origins_holding(1).is_empty());
 
         // A file that is not this shape is an error, not a silent reset —
         // a monitor that quietly forgot its last checkpoint would quietly
