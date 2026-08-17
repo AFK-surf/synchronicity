@@ -546,6 +546,7 @@ async fn a_zone_that_publishes_its_proof_resolves_under_require() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     let (set, _ttl) = resolver
@@ -581,6 +582,7 @@ async fn an_absent_proof_record_refuses_under_require_and_resolves_under_off() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     };
 
     let strict = DnssecResolver::with_options(&options(RekorPolicy::Require)).unwrap();
@@ -630,6 +632,7 @@ async fn a_proof_record_covering_only_someone_elses_keys_is_refused() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
@@ -665,6 +668,7 @@ async fn a_chainless_entry_is_refused_through_the_whole_resolver_path() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
@@ -691,6 +695,7 @@ async fn a_garbled_proof_record_is_refused_as_malformed() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();

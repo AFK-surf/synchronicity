@@ -886,6 +886,7 @@ impl SimTuf {
         let root = self.embedded_root();
         crate::tuf::PinState {
             root,
+            root_chain: Vec::new(),
             root_version: 1,
             timestamp_version: 0,
             snapshot_version: 0,

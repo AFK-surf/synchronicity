@@ -41,6 +41,7 @@ async fn a_signed_zone_validates_end_to_end() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
 
@@ -82,6 +83,7 @@ async fn a_zone_signed_by_an_unanchored_key_is_refused() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     resolver
@@ -114,6 +116,7 @@ async fn an_unsigned_zone_is_refused() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     resolver
@@ -171,6 +174,7 @@ async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
         rekor_state: None,
         tuf_url: None,
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
 

@@ -111,6 +111,7 @@ fn the_real_sigstore_chain_verifies_and_yields_the_pin_set() {
     let floor = fixture_number("chain_floor");
     let state = PinState {
         root: fixture(&format!("root-{floor}.json")),
+        root_chain: Vec::new(),
         root_version: floor,
         timestamp_version: 0,
         snapshot_version: 0,
@@ -211,6 +212,7 @@ fn walking_the_repository_finds_the_whole_chain() {
     // dispensation for having been fetched rather than relayed.
     let state = PinState {
         root: fixture(&format!("root-{floor}.json")),
+        root_chain: Vec::new(),
         root_version: floor,
         timestamp_version: 0,
         snapshot_version: 0,
@@ -273,6 +275,7 @@ fn the_real_chain_expires() {
     let floor = fixture_number("chain_floor");
     let state = PinState {
         root: fixture(&format!("root-{floor}.json")),
+        root_chain: Vec::new(),
         root_version: floor,
         ..PinState::embedded()
     };
@@ -293,6 +296,7 @@ fn the_real_chain_cannot_be_reached_from_below_its_floor() {
     let floor = fixture_number("chain_floor");
     let state = PinState {
         root: fixture(&format!("root-{floor}.json")),
+        root_chain: Vec::new(),
         root_version: floor,
         ..PinState::embedded()
     };
@@ -578,7 +582,12 @@ fn state_is_monotonic_across_two_zones_sharing_one_file() {
 
     let ahead = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
     ahead.state.save(&path).unwrap();
-    let reloaded = PinState::load(&path).expect("the state persists");
+    // Re-walked from the root this harness minted, exactly as a client
+    // re-walks from the one its binary embeds: the file is never believed
+    // on its own say-so. `rotate_root` above means the chain is non-empty
+    // here, so this also exercises the walk rather than the trivial case.
+    let reloaded = PinState::load_anchored(&path, &repo.embedded_root())
+        .expect("the state persists and re-walks from the anchor");
     assert_eq!(reloaded, ahead.state);
 
     let error = tuf::update(&stale, &reloaded, at(NOW));
@@ -663,6 +672,7 @@ fn refreshing(
     url: String,
     anchor: &std::path::Path,
     state_path: Option<std::path::PathBuf>,
+    tuf_root: Option<&std::path::Path>,
 ) -> ResolverOptions {
     ResolverOptions {
         doh_url: Some(url),
@@ -674,6 +684,10 @@ fn refreshing(
         rekor_state: state_path,
         tuf_url: None,
         no_tuf: false,
+        // The harness mints its own TUF root, so that is the anchor every
+        // persisted pin state here is re-walked from — the same rule
+        // production applies with the built-in Sigstore root.
+        tuf_root: tuf_root.map(std::path::Path::to_path_buf),
     }
 }
 
@@ -683,6 +697,9 @@ fn seed_state(path: &std::path::Path, embedded_root: &std::path::Path) {
     let root = std::fs::read(embedded_root).unwrap();
     let state = PinState {
         root,
+        // Empty: this root *is* the anchor the resolver is given below, so
+        // there is nothing to walk to reach it.
+        root_chain: Vec::new(),
         root_version: 1,
         timestamp_version: 0,
         snapshot_version: 0,
@@ -703,10 +720,14 @@ async fn a_walked_chain_teaches_a_log_the_build_never_knew() {
     let (url, server) = zone.serve().await;
 
     let counting = std::sync::Arc::new(Counting::new(repo));
-    let resolver =
-        DnssecResolver::with_options(&refreshing(url, anchor.path(), Some(state_path.clone())))
-            .unwrap()
-            .with_tuf_repo(counting.clone());
+    let resolver = DnssecResolver::with_options(&refreshing(
+        url,
+        anchor.path(),
+        Some(state_path.clone()),
+        Some(embedded.path()),
+    ))
+    .unwrap()
+    .with_tuf_repo(counting.clone());
     assert!(
         resolver.log_keys().find(&new_shard.log_id()).is_none(),
         "the build must not already know this log, or the test proves nothing"
@@ -720,7 +741,8 @@ async fn a_walked_chain_teaches_a_log_the_build_never_knew() {
     assert!(resolver.log_keys().find(&new_shard.log_id()).is_some());
 
     // And it was persisted, so the next process starts where this one ended.
-    let persisted = PinState::load(&state_path).expect("the pin state is written");
+    let persisted = PinState::load_anchored(&state_path, &std::fs::read(embedded.path()).unwrap())
+        .expect("the pin state is written and re-walks from the anchor");
     assert_eq!(persisted.root_version, 1);
     assert!(persisted.timestamp_version >= 1);
     assert!(rekor::LogKeys::default() != persisted.log_keys().unwrap());
@@ -754,7 +776,8 @@ async fn the_same_zone_without_the_walk_fails_with_unknown_log() {
 
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         no_tuf: true,
-        ..refreshing(url, anchor.path(), Some(state_path))
+        tuf_root: None,
+        ..refreshing(url, anchor.path(), Some(state_path), Some(embedded.path()))
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
@@ -785,7 +808,7 @@ async fn a_repository_serving_nonsense_never_fails_a_refresh() {
     // is static in both directions.
     let stat = DnssecResolver::with_options(&ResolverOptions {
         rekor_key: Some(log_key.path().to_path_buf()),
-        ..refreshing(url.clone(), anchor.path(), Some(state_path.clone()))
+        ..refreshing(url.clone(), anchor.path(), Some(state_path.clone()), None)
     })
     .unwrap()
     .with_tuf_repo(std::sync::Arc::new(Garbage));
@@ -803,10 +826,14 @@ async fn a_repository_serving_nonsense_never_fails_a_refresh() {
     // And the refreshable resolver says *which* way the chain broke — the
     // whole reason the variant carries a class, for `synch doctor` — without
     // that ever reaching the refresh, moving a pin, or writing a file.
-    let client =
-        DnssecResolver::with_options(&refreshing(url, anchor.path(), Some(state_path.clone())))
-            .unwrap()
-            .with_tuf_repo(std::sync::Arc::new(Garbage));
+    let client = DnssecResolver::with_options(&refreshing(
+        url,
+        anchor.path(),
+        Some(state_path.clone()),
+        None,
+    ))
+    .unwrap()
+    .with_tuf_repo(std::sync::Arc::new(Garbage));
     let before = client.log_keys();
     let error = client.refresh_tuf().await.unwrap_err();
     assert!(
@@ -838,7 +865,7 @@ async fn a_repository_with_nothing_in_it_is_a_non_event() {
 
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         rekor_key: Some(log_key.path().to_path_buf()),
-        ..refreshing(url, anchor.path(), None)
+        ..refreshing(url, anchor.path(), None, None)
     })
     .unwrap()
     .with_tuf_repo(std::sync::Arc::new(Empty));
@@ -865,7 +892,8 @@ async fn no_tuf_walks_nothing_and_is_not_a_failure() {
     let counting = std::sync::Arc::new(Counting::new(repo));
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         no_tuf: true,
-        ..refreshing(url, anchor.path(), Some(state_path))
+        tuf_root: None,
+        ..refreshing(url, anchor.path(), Some(state_path), Some(embedded.path()))
     })
     .unwrap()
     // Even handed a repository, `--no-tuf` does not walk it.
@@ -963,6 +991,7 @@ async fn regenerate_the_shared_fixture() {
         .as_secs();
     let state = PinState {
         root: chain[0].1.clone(),
+        root_chain: Vec::new(),
         root_version: floor,
         timestamp_version: 0,
         snapshot_version: 0,
@@ -1020,4 +1049,110 @@ async fn regenerate_the_shared_fixture() {
         &chain.last().expect("a head root").1,
     )
     .unwrap();
+}
+
+/// A pin file naming a root this build never signed is not state.
+///
+/// The load path used to check exactly one thing — that the version number
+/// inside the stored root equalled the version number stored beside it —
+/// which is a self-consistency test any file passes. Whatever root the file
+/// named became the client's world, and every later update chained from it,
+/// so anyone able to write one file in the data directory chose the
+/// transparency-log key set outright.
+///
+/// The state is now re-walked from the anchor the *binary* holds, so a root
+/// minted by somebody else fails to load and the client falls back to its
+/// bootstrap pins rather than adopting a stranger's universe.
+#[test]
+fn a_pin_file_anchored_somewhere_else_does_not_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rekor-pins.json");
+
+    // The honest client's repository, and a state it legitimately reached.
+    let (mut mine, _log) = repo();
+    mine.rotate_root(false);
+    let honest = tuf::update(&mine.metadata(), &mine.embedded_state(), at(NOW)).unwrap();
+    honest.state.save(&path).unwrap();
+    assert!(
+        PinState::load_anchored(&path, &mine.embedded_root()).is_some(),
+        "the state this client reached must load for this client"
+    );
+
+    // An attacker's repository: entirely their own keys, and bumped past
+    // the honest version so a version comparison would prefer it.
+    let (mut theirs, _their_log) = repo();
+    theirs.rotate_root(true);
+    theirs.rotate_root(true);
+    theirs.set_tlogs(&[SimLog::new("rekor.attacker").spki()]);
+    let forged = tuf::update(&theirs.metadata(), &theirs.embedded_state(), at(NOW)).unwrap();
+    assert!(
+        forged.state.root_version > honest.state.root_version,
+        "the forged state must look newer, or the test proves nothing"
+    );
+    forged.state.save(&path).unwrap();
+
+    assert!(
+        PinState::load_anchored(&path, &mine.embedded_root()).is_none(),
+        "a root this build's anchor never signed must not load"
+    );
+    // And it is not merely the *versions* being refused: the forged state
+    // loads perfectly well for the universe that minted it, which is what
+    // makes the anchor — and not the file — the thing that decides.
+    assert!(
+        PinState::load_anchored(&path, &theirs.embedded_root()).is_some(),
+        "the forged state is well-formed; it is simply not ours"
+    );
+}
+
+/// Four independently-monotone counters need componentwise dominance.
+///
+/// The reconciliation between the state on disk and the state in memory
+/// used to compare `(root, timestamp, snapshot, targets)` as a tuple, whose
+/// ordering is lexicographic: the root version dominated the other three
+/// outright, so a state ahead on `root` and behind on everything else read
+/// as newer. Adopting it dropped the rollback floors for those roles to the
+/// lower numbers, which is the one thing the floors exist to prevent.
+#[test]
+fn a_state_ahead_on_the_root_alone_does_not_outrank_one_ahead_everywhere_else() {
+    let (mut repo, _log) = repo();
+    let base = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
+
+    // Same repository, one root rotation on: the root version moves and
+    // nothing below it does.
+    repo.rotate_root(false);
+    let rotated = tuf::update(&repo.metadata(), &base.state, at(NOW)).unwrap();
+    assert!(rotated.state.root_version > base.state.root_version);
+
+    // Hand-build the state a lexicographic comparison got wrong: newer root,
+    // older everything else.
+    let mut mixed = rotated.state.clone();
+    mixed.timestamp_version = base.state.timestamp_version.saturating_sub(1);
+    mixed.snapshot_version = base.state.snapshot_version.saturating_sub(1);
+    mixed.targets_version = base.state.targets_version.saturating_sub(1);
+
+    // Tuple order would call `mixed` the newer of the two. Dominance does
+    // not, and dominance is the question actually being asked.
+    assert!(
+        (
+            mixed.root_version,
+            mixed.timestamp_version,
+            mixed.snapshot_version,
+            mixed.targets_version
+        ) > (
+            base.state.root_version,
+            base.state.timestamp_version,
+            base.state.snapshot_version,
+            base.state.targets_version
+        ),
+        "the tuple comparison this replaced would have preferred `mixed`"
+    );
+    // Neither dominates the other, so neither may displace the other.
+    let dominates = |a: &PinState, b: &PinState| {
+        a.root_version >= b.root_version
+            && a.timestamp_version >= b.timestamp_version
+            && a.snapshot_version >= b.snapshot_version
+            && a.targets_version >= b.targets_version
+    };
+    assert!(!dominates(&mixed, &base.state));
+    assert!(!dominates(&base.state, &mixed));
 }

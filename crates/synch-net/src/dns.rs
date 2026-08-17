@@ -431,6 +431,11 @@ enum Pins {
         keys: LogKeys,
         state: PinState,
         path: Option<std::path::PathBuf>,
+        /// The `root.json` every persisted state is re-walked from before it
+        /// is believed — [`tuf::EMBEDDED_TUF_ROOT`] unless `--tuf-root`
+        /// replaced it. Held here so a reload cannot silently anchor at
+        /// something the file itself supplied.
+        anchor: Vec<u8>,
         /// When the repository was last walked, successfully or not, so a
         /// membership refresh on a short TTL does not become a request to
         /// Sigstore's CDN every time it fires. Seeded from the persisted
@@ -558,6 +563,16 @@ pub struct ResolverOptions {
     /// is stated in §10.4: the pin set stops following Sigstore, so the day
     /// a shard rotates is the day this client needs a new build.
     pub no_tuf: bool,
+    /// A `root.json` *replacing* [`tuf::EMBEDDED_TUF_ROOT`] as the anchor
+    /// every pin state is verified against.
+    ///
+    /// The same "an override is a different universe" semantics as
+    /// `trust_anchor` and `rekor_key`: with this set, a persisted pin state
+    /// chaining from the built-in Sigstore root no longer loads, and vice
+    /// versa. For a deployment running its own TUF repository — the client
+    /// counterpart of the control plane's `CP_TUF_ROOT` — and for the test
+    /// harness, which anchors at a root it minted.
+    pub tuf_root: Option<std::path::PathBuf>,
 }
 
 /// Whether zone-key transparency is enforced (§4.1).
@@ -622,13 +637,22 @@ impl DnssecResolver {
                 Pins::Static(LogKeys::from_file(path).map_err(|e| NetError::Dns(e.to_string()))?)
             }
             None => {
+                // The anchor is decided here, from the binary or from an
+                // explicit override, and never from the state file — which
+                // is the point of re-walking the chain at all.
+                let anchor = match &options.tuf_root {
+                    None => tuf::EMBEDDED_TUF_ROOT.as_bytes().to_vec(),
+                    Some(path) => std::fs::read(path)
+                        .map_err(|e| NetError::Dns(format!("TUF root {}: {e}", path.display())))?,
+                };
                 let state = options
                     .rekor_state
                     .as_deref()
-                    .and_then(PinState::load)
-                    .unwrap_or_else(PinState::embedded);
+                    .and_then(|path| PinState::load_anchored(path, &anchor))
+                    .unwrap_or_else(|| PinState::anchored(&anchor));
                 Pins::Tuf {
                     keys: state.log_keys().unwrap_or_else(LogKeys::embedded),
+                    anchor,
                     // A walk is due when the last one has aged out, and a
                     // state that was never written is a client that has
                     // never walked — so a fresh install refreshes at once
@@ -782,18 +806,30 @@ impl DnssecResolver {
         let Some(source) = self.tuf.clone() else {
             return Ok(None);
         };
-        let now = now_unix();
         // Two decisions under the lock and nothing else: whether a walk is
         // due, and which root version it starts from. The walk itself is
         // seconds of network, and holding a mutex across it would serialize
         // every membership refresh in the process behind a CDN.
-        let from_root = {
+        let (now, from_root) = {
             let mut pins = self.pins();
             let Pins::Tuf {
                 state, checked_at, ..
             } = &mut *pins
             else {
                 return Ok(None);
+            };
+            // No trustworthy clock, no refresh. Expiry is the only bound on
+            // how old the metadata a mirror may serve is, and the pins
+            // already in force are the safe place to stay.
+            let Some(now) = now_unix(state.updated_at) else {
+                return Err(tuf_error(
+                    &source,
+                    TufError::Expiry(
+                        "the system clock is unreadable, so no expiry could be \
+                         checked; the current pins stand"
+                            .into(),
+                    ),
+                ));
             };
             if now < checked_at.saturating_add(tuf::REFRESH_INTERVAL) {
                 return Ok(None);
@@ -802,7 +838,7 @@ impl DnssecResolver {
             // that is slow or down costs one attempt a day and not one per
             // membership refresh for as long as it stays down.
             *checked_at = now;
-            state.root_version
+            (now, state.root_version)
         };
         let metadata = self.walk_tuf(&source, from_root).await?;
 
@@ -811,7 +847,11 @@ impl DnssecResolver {
         // and monotonicity is a property of the file, not of a process.
         let mut pins = self.pins();
         let Pins::Tuf {
-            keys, state, path, ..
+            keys,
+            state,
+            path,
+            anchor,
+            ..
         } = &mut *pins
         else {
             return Ok(None);
@@ -820,8 +860,14 @@ impl DnssecResolver {
         // coherent set — the root bytes, the trusted-root bytes and the
         // versions that describe them — so taking the newer *state* is
         // right and taking the newer of each field would not be.
-        let current = match path.as_deref().and_then(PinState::load) {
-            Some(stored) if versions(&stored) >= versions(state) => stored,
+        //
+        // Re-walked from this resolver's anchor, exactly as at startup: the
+        // file is shared, so it is no more trusted here than it was there.
+        let current = match path
+            .as_deref()
+            .and_then(|path| PinState::load_anchored(path, anchor))
+        {
+            Some(stored) if dominates(&stored, state) => stored,
             _ => state.clone(),
         };
         let update = tuf::update(&metadata, &current, now).map_err(|e| tuf_error(&source, e))?;
@@ -1062,23 +1108,58 @@ fn tuf_error(source: &TufSource, error: TufError) -> NetError {
     }
 }
 
-/// A pin state's versions, ordered the way TUF orders an update: the root
-/// first, then each role below it.
-fn versions(state: &PinState) -> (u64, u64, u64, u64) {
-    (
+/// A pin state's versions: the root, then each role below it.
+fn versions(state: &PinState) -> [u64; 4] {
+    [
         state.root_version,
         state.timestamp_version,
         state.snapshot_version,
         state.targets_version,
-    )
+    ]
 }
 
-/// Seconds since the epoch, for the expiry checks every TUF role carries.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
+/// Whether `a` is at least as far along as `b` in **every** role.
+///
+/// The four versions are independently-monotone counters, so "further along"
+/// is componentwise dominance and not the lexicographic order a tuple
+/// comparison gives. Comparing tuples let the root version dominate the
+/// other three outright: a state ahead on `root` but behind on
+/// timestamp/snapshot/targets read as newer, and adopting it dropped the
+/// rollback floors for those roles to the lower numbers — which is the whole
+/// thing the floors exist to prevent.
+///
+/// When neither state dominates the other they are not comparable, and the
+/// answer is to keep what is in memory rather than to pick by a tie-break
+/// that means nothing.
+fn dominates(a: &PinState, b: &PinState) -> bool {
+    versions(a)
+        .iter()
+        .zip(versions(b).iter())
+        .all(|(a, b)| a >= b)
+}
+
+/// Seconds since the epoch, for the expiry checks every TUF role carries,
+/// floored by the last state this client accepted.
+///
+/// Two things it must not do, and used to do both.
+///
+/// A clock this code cannot read used to become `0`. Every expiry check is
+/// `expires > now`, so at zero *nothing has ever expired* — root, timestamp,
+/// snapshot and targets all pass. That is the wrong direction: expiry is the
+/// only bound on how old the metadata a mirror serves may be, so a clock
+/// failure removed the bound entirely. It now yields `None`, and a refresh
+/// with no trustworthy clock does not run.
+///
+/// And a clock that has been moved *backwards* — a bad NTP step, a dead RTC
+/// coming up at the epoch — would reopen the same window. `updated_at` is
+/// already persisted with every accepted state and was read back and never
+/// used; it is exactly the monotonic floor for this, so it is the floor now.
+fn now_unix(floor: u64) -> Option<u64> {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .ok()?
+        .as_secs();
+    Some(now.max(floor))
 }
 
 /// How long one file of a TUF walk may take.
@@ -1486,6 +1567,7 @@ mod tests {
                 rekor_state: None,
                 tuf_url: None,
                 no_tuf: true,
+                tuf_root: None,
             })
             .unwrap();
         }
@@ -1500,6 +1582,7 @@ mod tests {
             rekor_state: None,
             tuf_url: None,
             no_tuf: true,
+            tuf_root: None,
         })
         .unwrap_err();
         assert!(err.to_string().contains("trust anchor"), "{err}");
@@ -1513,6 +1596,7 @@ mod tests {
             rekor_state: None,
             tuf_url: None,
             no_tuf: true,
+            tuf_root: None,
         })
         .unwrap_err();
         assert!(err.to_string().contains("no DNSKEY records"), "{err}");
@@ -1533,6 +1617,7 @@ mod tests {
             rekor_state: None,
             tuf_url: None,
             no_tuf: true,
+            tuf_root: None,
         })
         .unwrap();
     }
@@ -1601,6 +1686,7 @@ mod tests {
             rekor_state: None,
             tuf_url: None,
             no_tuf: true,
+            tuf_root: None,
         })
         .unwrap();
         let err = tokio::time::timeout(

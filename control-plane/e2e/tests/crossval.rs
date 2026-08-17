@@ -40,6 +40,7 @@ async fn control_plane_zone_validates_and_parses() {
         rekor_state: None,
         tuf_url: None,
         no_tuf: true,
+        tuf_root: None,
     })
     .expect("resolver construction");
 
@@ -140,6 +141,7 @@ async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
         // nothing about the pin set can change it — so there is no reason
         // for an e2e run to reach Sigstore's CDN.
         no_tuf: true,
+        tuf_root: None,
     })
     .expect("resolver construction");
 
