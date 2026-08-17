@@ -66,7 +66,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
-use synch_net::rekor::{Checkpoint, leaf_hash, node_hash, sha256};
+use synch_net::rekor::{leaf_hash, node_hash, sha256, Checkpoint};
 
 use crate::MonitorError;
 
@@ -387,9 +387,9 @@ impl<'a, S: TileSource> Tree<'a, S> {
             "entries" => {
                 let mut at = 0usize;
                 for _ in 0..width {
-                    let header = data.get(at..at + 2).ok_or_else(|| {
-                        MonitorError::Tile(format!("{path}: truncated length"))
-                    })?;
+                    let header = data
+                        .get(at..at + 2)
+                        .ok_or_else(|| MonitorError::Tile(format!("{path}: truncated length")))?;
                     let length = usize::from(u16::from_be_bytes([header[0], header[1]]));
                     at += 2;
                     if data.get(at..at + length).is_none() {

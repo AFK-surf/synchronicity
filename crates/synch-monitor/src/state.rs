@@ -95,16 +95,20 @@ impl MonitorState {
     /// Records one entry body under its log's origin, base64 — the file
     /// stays hand-readable JSON.
     pub fn record_entry(&mut self, origin: &str, index: u64, body: &[u8]) {
-        self.entries
-            .entry(origin.to_string())
-            .or_default()
-            .insert(index, base64::engine::general_purpose::STANDARD.encode(body));
+        self.entries.entry(origin.to_string()).or_default().insert(
+            index,
+            base64::engine::general_purpose::STANDARD.encode(body),
+        );
     }
 
     /// A recorded body, decoded back out — `Ok(None)` when the state holds
     /// no entry at `index` from the log `origin`.
     pub fn entry(&self, origin: &str, index: u64) -> Result<Option<Vec<u8>>, MonitorError> {
-        match self.entries.get(origin).and_then(|bodies| bodies.get(&index)) {
+        match self
+            .entries
+            .get(origin)
+            .and_then(|bodies| bodies.get(&index))
+        {
             None => Ok(None),
             Some(encoded) => base64::engine::general_purpose::STANDARD
                 .decode(encoded)
@@ -210,7 +214,9 @@ mod tests {
         // The same index under the other shard is a different entry, and
         // this state holds neither.
         assert_eq!(
-            state.entry("log2026-1.rekor.sigstore.dev", 67_673_583).unwrap(),
+            state
+                .entry("log2026-1.rekor.sigstore.dev", 67_673_583)
+                .unwrap(),
             None
         );
         assert_eq!(
