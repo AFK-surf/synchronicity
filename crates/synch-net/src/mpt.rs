@@ -194,7 +194,17 @@ impl MptProtocol {
                         let sink = self.heads.clone();
                         crate::blocking::offload(move || {
                             for head in heads {
-                                sink.offer_head(&head, now_ns())?;
+                                // Per origin, like the dial side: one origin
+                                // publishing something this node cannot apply
+                                // must not stop the exchange, which still owes
+                                // this peer an answer to its `HeadsWant`.
+                                if let Err(e) = sink.offer_head(&head, now_ns()) {
+                                    tracing::warn!(
+                                        origin = %head.origin,
+                                        error = %e,
+                                        "origin left behind: its pushed head could not be applied"
+                                    );
+                                }
                             }
                             Ok(())
                         })
@@ -584,8 +594,41 @@ impl MptClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{bare_endpoint, ScriptedPeer, StalledPeer};
+    use crate::testing::{bare_endpoint, trusting_pair, ScriptedPeer, StalledPeer};
     use synch_core::{BlobAd, ALPN_MPT};
+
+    /// A sink that refuses one origin's heads and takes every other.
+    #[derive(Debug)]
+    struct Picky {
+        refuse: OriginId,
+        offered: std::sync::Mutex<Vec<OriginId>>,
+    }
+
+    impl HeadSink for Picky {
+        fn local_summaries(&self) -> Result<Vec<HeadSummary>, NetError> {
+            Ok(Vec::new())
+        }
+
+        fn observe_summaries_from(
+            &self,
+            _peer: NodeId,
+            _summaries: &[HeadSummary],
+            _now: i64,
+        ) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn offer_head(&self, head: &SignedHead, _now: i64) -> Result<(), NetError> {
+            self.offered
+                .lock()
+                .expect("the lock")
+                .push(head.origin.clone());
+            if head.origin == self.refuse {
+                return Err(NetError::Unexpected("this origin cannot be applied".into()));
+            }
+            Ok(())
+        }
+    }
 
     /// How long a test waits before calling a request hung rather than slow.
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -704,5 +747,61 @@ mod tests {
         dialer.close().await;
         peer.shutdown().await;
         honest.shutdown().await;
+    }
+
+    /// One origin the serve side cannot apply does not end the exchange.
+    ///
+    /// The dial side already contains a failing origin per origin; the same has
+    /// to hold here, or a peer publishing something this node chokes on stops
+    /// it converging with every *other* origin — and the `HeadsWant` the same
+    /// exchange owes an answer to never gets one.
+    #[tokio::test]
+    async fn one_unapplicable_origin_does_not_stop_a_hello_exchange() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let signer = iroh_base::SecretKey::generate();
+        let bad = OriginId::named("bad", "x.example").unwrap();
+        let good = OriginId::named("good", "x.example").unwrap();
+        let served = OriginId::named("served", "x.example").unwrap();
+
+        // A head the server can hand back when the exchange gets that far.
+        let servable = SignedHead::sign(&signer, served.clone(), 3, Hash::new(b"root"), 0);
+        store.put_head(Slot::Complete, &servable, 0, 0).unwrap();
+
+        let sink = std::sync::Arc::new(Picky {
+            refuse: bad.clone(),
+            offered: std::sync::Mutex::new(Vec::new()),
+        });
+        let options = crate::endpoint::NetOptions {
+            heads: Some(sink.clone() as std::sync::Arc<dyn HeadSink>),
+            ..crate::endpoint::NetOptions::loopback()
+        };
+        let (server, client) = trusting_pair(store.clone(), options).await;
+
+        let pushed = vec![
+            SignedHead::sign(&signer, bad.clone(), 1, Hash::new(b"a"), 0),
+            SignedHead::sign(&signer, good.clone(), 1, Hash::new(b"b"), 0),
+        ];
+        let exchange = client
+            .connect_mpt(server.direct_addr())
+            .await
+            .unwrap()
+            .head_exchange(Vec::new(), move |_| (pushed, vec![served.clone()]))
+            .await
+            .expect("the exchange completes");
+
+        assert_eq!(
+            *sink.offered.lock().unwrap(),
+            vec![bad, good],
+            "every offered head reaches the sink"
+        );
+        assert_eq!(
+            exchange.received,
+            vec![servable],
+            "and the want list is still answered"
+        );
+
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
     }
 }
