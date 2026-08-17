@@ -20,6 +20,7 @@
 //// against the last logged set for as long as it keeps signing.
 
 import dns/name as dns_name
+import dns/rdata
 import dns/wire
 import dnssec/keys
 import gleam/bit_array
@@ -125,6 +126,47 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 /// One look at the wire; exposed for tests and the CLI. Returns whether a
 /// new claim was logged — the caller's cue to poke the reconciler.
 pub fn run_once_with(
+  conn: Connection,
+  apex: dns_name.Name,
+  signing_zone: dns_name.Name,
+  resolver: chain.Resolver,
+  log: Log,
+  log_key: #(BitArray, BitArray),
+  now: Int,
+) -> Bool {
+  // The chain's bottom link is the declaration, and the reconciler is what
+  // puts it in the provider zone. Both actors start at boot, so on a first
+  // boot this one can reach the log before that record exists — and then
+  // logs nothing, loudly, every quarter hour until it does. Checking first
+  // turns that into a quiet wait for the other half of the boot.
+  case declaration_live(resolver, apex) {
+    False -> {
+      io.println(
+        "zonekey-watch: waiting for the declaration at "
+        <> dns_name.to_string([rdata.transparency_label, ..apex])
+        <> " to be published",
+      )
+      False
+    }
+    True -> log_if_new(conn, apex, signing_zone, resolver, log, log_key, now)
+  }
+}
+
+/// Whether the apex's declaration resolves yet. Absence is the ordinary
+/// state of a control plane that has booted but not yet reconciled, so it is
+/// a reason to wait rather than a fault to report.
+fn declaration_live(resolver: chain.Resolver, apex: dns_name.Name) -> Bool {
+  let owner = [rdata.transparency_label, ..apex]
+  case resolver.query(owner, wire.type_txt) {
+    Ok(answers) ->
+      list.any(answers, fn(rr) {
+        rr.rtype == wire.type_txt && rr.class == wire.class_in
+      })
+    Error(_) -> False
+  }
+}
+
+fn log_if_new(
   conn: Connection,
   apex: dns_name.Name,
   signing_zone: dns_name.Name,

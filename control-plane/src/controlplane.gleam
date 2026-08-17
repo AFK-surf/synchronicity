@@ -511,12 +511,7 @@ fn serve_external(
     use conn <- result.try(open_primary_db(cfg))
     use Nil <- result.try(publish.ensure_meta_external(conn, cfg.base_domain))
     use _ <- result.try(
-      publish.publish_external(
-        conn,
-        now_unix(),
-        "system:boot",
-        name.to_string(signing_zone),
-      )
+      publish.publish_external(conn, now_unix(), "system:boot")
       |> result.map_error(fn(e) { "publishing zone: " <> string.inspect(e) }),
     )
     sqlite.close(conn)
@@ -544,14 +539,7 @@ fn serve_external(
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
-      fn(conn, now, actor) {
-        publish.publish_external_in_tx(
-          conn,
-          now,
-          actor,
-          name.to_string(signing_zone),
-        )
-      },
+      fn(conn, now, actor) { publish.publish_external_in_tx(conn, now, actor) },
       // After commit: nudge the reconciler, so a mutation reaches the
       // provider in seconds while the hourly sweep stays the safety net.
       fn() { provider_sync.poke(sync_name) },
@@ -581,7 +569,6 @@ fn serve_external(
       prov,
       provider_name,
       zone_id,
-      name.to_string(signing_zone),
     ))
     |> sup.add(zonekey_watch.supervised(
       cfg.db_path,
@@ -647,17 +634,7 @@ fn provider_sync_once() -> Result(Nil, String) {
     cfg.base_domain,
   ))
   io.println("dns provider: " <> prov.describe)
-  use apex <- result.try(
-    name.parse(cfg.base_domain) |> result.replace_error("bad base domain"),
-  )
-  use signing_zone <- result.try(signing_zone_of(cfg, apex))
-  provider_sync.run_once(
-    cfg.db_path,
-    prov,
-    provider_name,
-    zone_id,
-    name.to_string(signing_zone),
-  )
+  provider_sync.run_once(cfg.db_path, prov, provider_name, zone_id)
   Ok(Nil)
 }
 

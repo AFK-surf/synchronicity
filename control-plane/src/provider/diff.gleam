@@ -51,10 +51,21 @@ pub fn diff(
   desired: List(Record),
   existing: List(Existing),
 ) -> Result(Changes, Conflict) {
+  // The marker has to be *ours*. Checking only the leftmost label made any
+  // control plane's marker satisfy every other one's ownership test — so two
+  // sharing a zone would each take the other's records for strays and delete
+  // them, with the refusal rule never firing. The desired set names our
+  // marker; nothing else counts as it.
+  let ours =
+    list.filter_map(desired, fn(d) {
+      case d.value == owner_value && starts_with_label(d.name, owner_label) {
+        True -> Ok(d.name)
+        False -> Error(Nil)
+      }
+    })
   let owned =
     list.any(existing, fn(e) {
-      e.record.value == owner_value
-      && starts_with_label(e.record.name, owner_label)
+      e.record.value == owner_value && list.contains(ours, e.record.name)
     })
 
   // A record is matched by content, not by id: (name, value) — type is

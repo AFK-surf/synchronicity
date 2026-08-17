@@ -32,18 +32,17 @@ pub const ttl_data = 300
 pub const ttl_rekor = 86_400
 
 /// Renders the desired record set, canonically sorted.
-/// `signing_zone` is the DNS zone the provider actually hosts. It is where
-/// the proof and TUF records go, because it is the only name a client can
-/// compute from a membership answer — the apex is a name only the log entry
-/// knows. Equal to the apex whenever the control plane runs a zone of its
-/// own, which is the ordinary case.
-pub fn render(
-  input: ZoneInput,
-  signing_zone: String,
-) -> Result(List(Record), build.BuildError) {
+///
+/// Every name is under the **apex**, never the signing zone. Two control
+/// planes may share one provider-hosted zone, and if they shared a record
+/// name each reconciler would see the other's records as strays at a name it
+/// manages and delete them — forever, on every sweep. Scoping to the apex
+/// makes that collision unrepresentable rather than merely unlikely. The
+/// client finds these names from the `apex=` field of the membership record
+/// it has already validated.
+pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
   use Nil <- result.try(build.validate(input))
   let apex = apex_name(input)
-  let zone = strip_dot(signing_zone)
   let members =
     input.txt_names
     |> list.flat_map(fn(txt_name) {
@@ -53,7 +52,7 @@ pub fn render(
           owner,
           provider.Txt,
           ttl_data,
-          rdata.sync1_text(m.label, m.nk_z32, m.relay, m.addr),
+          rdata.sync1_text(m.label, m.nk_z32, m.relay, m.addr, apex),
         )
       })
     })
@@ -64,7 +63,7 @@ pub fn render(
     list.map(input.rekor_proofs, fn(pair) {
       let #(index, text) = pair
       Record(
-        build.rekor_part_label(index) <> "." <> zone,
+        build.rekor_part_label(index) <> "." <> apex,
         provider.Txt,
         ttl_rekor,
         text,
@@ -73,7 +72,7 @@ pub fn render(
   let tuf = case input.tuf_bundle {
     "" -> []
     text -> [
-      Record(build.tuf_label <> "." <> zone, provider.Txt, ttl_rekor, text),
+      Record(build.tuf_label <> "." <> apex, provider.Txt, ttl_rekor, text),
     ]
   }
   // Unconditional, exactly as in serve mode: the declaration is what makes
@@ -97,17 +96,16 @@ pub fn render(
 /// the provider to list. Includes the empty-set names (`_rekor`, `_tuf`,
 /// each network owner) so records we *stopped* rendering still get found
 /// and deleted.
-pub fn managed_names(input: ZoneInput, signing_zone: String) -> List(String) {
+pub fn managed_names(input: ZoneInput) -> List(String) {
   let apex = apex_name(input)
-  let zone = strip_dot(signing_zone)
   let owners =
     list.map(input.txt_names, fn(txt_name) {
       strip_dot(name.to_string(txt_name.owner))
     })
   [
     diff.owner_label <> "." <> apex,
-    build.tuf_label <> "." <> zone,
-    ..rekor_part_names(input, zone)
+    build.tuf_label <> "." <> apex,
+    ..rekor_part_names(input, apex)
   ]
   |> list.append([rdata.transparency_label <> "." <> apex, ..owners])
   |> list.unique
@@ -115,9 +113,9 @@ pub fn managed_names(input: ZoneInput, signing_zone: String) -> List(String) {
 
 /// Every proof-part name the rendered set can occupy, so a part we stopped
 /// rendering is still found and deleted.
-fn rekor_part_names(input: ZoneInput, zone: String) -> List(String) {
+fn rekor_part_names(input: ZoneInput, apex: String) -> List(String) {
   input.rekor_proofs
-  |> list.map(fn(pair) { build.rekor_part_label(pair.0) <> "." <> zone })
+  |> list.map(fn(pair) { build.rekor_part_label(pair.0) <> "." <> apex })
   |> list.unique
 }
 

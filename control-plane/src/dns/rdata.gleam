@@ -7,6 +7,7 @@ import dns/wire
 import gleam/bit_array
 import gleam/int
 import gleam/list
+import gleam/string
 
 @external(erlang, "cp_udp_ffi", "parse_ip")
 fn parse_ip(text: String) -> Result(BitArray, Nil)
@@ -218,8 +219,16 @@ pub fn sync1_text(
   nk_z32: String,
   relay: String,
   addr: String,
+  apex: String,
 ) -> String {
-  let base = "v=sync1 id=" <> label <> " nk=" <> nk_z32
+  // `apex=` is how a client finds the transparency records for *this*
+  // control plane. It cannot derive the name: the zone that signed the
+  // answer may hold several control planes, and every one of them owns its
+  // own records. The client checks the value at both ends rather than
+  // trusting it — it must contain the domain and sit inside the signing
+  // zone — so it is a pointer, not an authority.
+  let base =
+    "v=sync1 id=" <> label <> " nk=" <> nk_z32 <> " apex=" <> strip_dot(apex)
   let with_relay = case relay {
     "" -> base
     r -> base <> " relay=" <> r
@@ -227,5 +236,12 @@ pub fn sync1_text(
   case addr {
     "" -> with_relay
     a -> with_relay <> " addr=" <> a
+  }
+}
+
+fn strip_dot(text: String) -> String {
+  case string.ends_with(text, ".") {
+    True -> string.drop_end(text, 1)
+    False -> text
   }
 }

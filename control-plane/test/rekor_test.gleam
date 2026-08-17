@@ -662,7 +662,7 @@ pub fn the_checked_in_certificate_is_this_encoders_output_test() {
 /// Which is the ordinary failure of the inverted ceremony (§5.2): logging
 /// now happens *after* the DS is live in the parent, so "the DS is not there
 /// yet" is the error an operator meets, and it says so.
-pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
+pub fn publish_refuses_when_the_chain_cannot_be_collected_test() {
   let conn = fixtures.fresh_conn()
   let _csk = fixtures.zone_boot(conn)
   let assert Ok(apex) = name.parse("sync.test.")
@@ -679,7 +679,10 @@ pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
       silent_resolver(),
       rekor_publish.Current,
     )
-  assert string.contains(why, "DS") || string.contains(why, "DNSKEY")
+  // Against a resolver that answers nothing, the first thing missing is the
+  // chain's bottom link — the declaration — and the refusal names it rather
+  // than reaching for the DS, which is a later link's problem.
+  assert string.contains(why, "_synchronicity-transparency")
   let assert Ok([]) = store.servable(conn)
   sqlite.close(conn)
 }

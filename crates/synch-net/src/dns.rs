@@ -90,6 +90,60 @@ pub fn tuf_query_name(apex: &str) -> String {
     format!("{}.{}", tuf::TUF_TXT_PREFIX, apex)
 }
 
+/// The control-plane apex a validated membership answer names, checked at
+/// both ends.
+///
+/// Every record in the answer must agree — a set that named two apexes would
+/// be pointing a client at two different control planes for one domain — and
+/// the name has to sit between the domain being resolved and the zone that
+/// signed the answer:
+///
+/// ```text
+/// <signing zone>  ⊇  <apex>  ⊇  <membership domain>
+/// ```
+///
+/// The lower bound is what stops a record from redirecting a client to a
+/// control plane for a *sibling* namespace, whose monitor would never be
+/// watching this one. The upper bound is what stops it pointing outside the
+/// zone that actually vouched for the answer.
+fn apex_of(domain: &str, signing_zone: &Name, records: &[String]) -> Result<Name, NetError> {
+    let named: Vec<String> = records
+        .iter()
+        .filter_map(|record| parse_record(record).ok())
+        .filter_map(|record| record.apex)
+        .collect();
+    let Some(first) = named.first() else {
+        return Err(NetError::Dns(format!(
+            "{domain}: no membership record names an apex= to find its \
+             transparency records under"
+        )));
+    };
+    if named.iter().any(|other| other != first) {
+        return Err(NetError::Dns(format!(
+            "{domain}: the membership records name more than one apex"
+        )));
+    }
+    let mut apex =
+        Name::from_utf8(first).map_err(|e| NetError::Dns(format!("apex {first}: {e}")))?;
+    apex.set_fqdn(true);
+    let apex = apex.to_lowercase();
+
+    let mut owner = Name::from_utf8(domain).map_err(|e| NetError::Dns(format!("{domain}: {e}")))?;
+    owner.set_fqdn(true);
+    if !apex.zone_of(&owner.to_lowercase()) {
+        return Err(NetError::Dns(format!(
+            "{domain}: the records name apex {apex}, which does not contain it"
+        )));
+    }
+    if !signing_zone.zone_of(&apex) {
+        return Err(NetError::Dns(format!(
+            "{domain}: the records name apex {apex}, which is outside {signing_zone}, \
+             the zone that signed the answer"
+        )));
+    }
+    Ok(apex)
+}
+
 /// Clamps a TTL into the §3.2 window.
 pub fn clamp_ttl(ttl: Duration) -> Duration {
     ttl.clamp(MIN_TTL, MAX_TTL)
@@ -107,6 +161,16 @@ pub struct MemberRecord {
     pub relay: Option<String>,
     /// An optional direct-address dialing hint (§3.3).
     pub addr: Option<String>,
+    /// The control plane this record's zone belongs to, as the operator
+    /// names it — where the transparency records for it live.
+    ///
+    /// It is a *hint about where to look*, never an authority: the apex it
+    /// names has to contain this membership domain, has to be contained by
+    /// the zone whose RRSIG signed the answer, and has to be what the log
+    /// entry's own certificate names. A wrong value points at a name with no
+    /// usable proof, which fails closed. Its purpose is to let two control
+    /// planes share one signing zone without sharing a single record name.
+    pub apex: Option<String>,
 }
 
 impl MemberRecord {
@@ -154,6 +218,7 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
     let mut node_key = None;
     let mut relay = None;
     let mut addr = None;
+    let mut apex = None;
     for field in fields {
         let Some((key, value)) = field.split_once('=') else {
             continue;
@@ -178,6 +243,7 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
             }
             "relay" => relay = Some(value.to_string()),
             "addr" => addr = Some(value.to_string()),
+            "apex" => apex = Some(value.to_ascii_lowercase()),
             _ => {}
         }
     }
@@ -187,6 +253,7 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
         node_key: node_key.ok_or(RecordError::MissingKey)?,
         relay,
         addr,
+        apex,
     })
 }
 
@@ -594,6 +661,14 @@ impl DnssecResolver {
             // the log entry knows, and it is checked against this one rather
             // than used to find anything.
             let (signing_zone, key_tag) = signing_key_of(&name, &response.answers)?;
+            // Where the control plane's transparency records live. Taken
+            // from the answer this client just DNSSEC-validated, and then
+            // held to both ends: it must contain the domain being resolved
+            // and be contained by the zone that signed it. Two control
+            // planes inside one signing zone would otherwise have to share a
+            // single record name — and, on the publishing side, delete each
+            // other's records forever.
+            let apex = apex_of(&domain, &signing_zone, &validated.records)?;
             // The pin set is refreshed *before* the proof is verified, so a
             // proof from a shard Sigstore added since this build shipped
             // verifies in the same refresh that learned about it (§10.2).
@@ -602,9 +677,9 @@ impl DnssecResolver {
             // or invalid bundle leaves the current pins standing, because a
             // control plane that stops fetching must degrade to a frozen pin
             // set — today's behavior — and never to a failed cluster.
-            match self.refresh_tuf(&signing_zone).await {
+            match self.refresh_tuf(&apex).await {
                 Ok(Some(update)) if update.changed => tracing::info!(
-                    zone = %signing_zone,
+                    apex = %apex,
                     root = update.state.root_version,
                     timestamp = update.state.timestamp_version,
                     logs = update.log_keys.keys().len(),
@@ -612,12 +687,12 @@ impl DnssecResolver {
                 ),
                 Ok(_) => {}
                 Err(e) => tracing::debug!(
-                    zone = %signing_zone,
+                    apex = %apex,
                     error = %e,
                     "the zone's TUF bundle did not update the pin set; the current pins stand"
                 ),
             }
-            self.verify_zone_key(&domain, &signing_zone, key_tag)
+            self.verify_zone_key(&domain, &apex, &signing_zone, key_tag)
                 .await?;
         }
         let set = MemberSet::from_records(&domain, &validated.records)?;
@@ -702,18 +777,19 @@ impl DnssecResolver {
     pub async fn verify_zone_key(
         &self,
         domain: &str,
+        apex: &Name,
         signing_zone: &Name,
         key_tag: u16,
     ) -> Result<VerifiedRecord, NetError> {
         let zone_text = signing_zone.to_string();
+        let apex_text = apex.to_string();
         let dnskey_rdata = self.zone_dnskey(signing_zone, key_tag).await?;
 
-        // The proof records live at the **signing zone**, not at the control
-        // plane's apex. That is not a preference: the apex is a name only the
-        // entry knows, and a client has to be able to compute where to look
-        // from the answer alone. The zone that signed the answer is the one
-        // name it can always derive.
-        let name = rekor_query_name(zone_text.trim_end_matches('.'));
+        // Under the **apex**, which the membership answer named: every
+        // record a control plane owns hangs off its own apex, so two of them
+        // in one signing zone never share a name.
+        let apex_label = apex_text.trim_end_matches('.');
+        let name = rekor_query_name(apex_label);
         let response = self.lookup(&name, RecordType::TXT).await?;
         let absent = || NetError::RekorAbsent {
             name: name.clone(),
@@ -749,7 +825,7 @@ impl DnssecResolver {
         let mut records = records;
         let wanted = rekor::parts_claimed(&records);
         for index in 2..=wanted {
-            let part = rekor_part_query_name(zone_text.trim_end_matches('.'), index);
+            let part = rekor_part_query_name(apex_label, index);
             // A part that does not resolve leaves the set incomplete, which
             // `proofs_from_txt` reports as the missing-part refusal it is —
             // better than a transport error naming a name the operator never

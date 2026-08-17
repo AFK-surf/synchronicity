@@ -292,7 +292,13 @@ fn rrset_of(
         <> type_name(rtype)
         <> " RRset at "
         <> name.to_string(zone)
-        <> " — is the DS live in the parent yet?",
+        <> case rtype {
+          // Each absence has one likely cause, and they are different
+          // enough that a single hint sends an operator the wrong way.
+          t if t == wire.type_txt ->
+            " — has the zone published its declaration yet?"
+          _ -> " — is the DS live in the parent yet?"
+        },
       )
     _, False ->
       Error(
@@ -322,6 +328,7 @@ fn type_name(rtype: Int) -> String {
   case rtype {
     48 -> "DNSKEY"
     43 -> "DS"
+    16 -> "TXT"
     other -> int.to_string(other)
   }
 }

@@ -25,7 +25,7 @@ fn write(contents: &str) -> tempfile::NamedTempFile {
 
 fn member_records() -> Vec<String> {
     vec![format!(
-        "v=sync1 id=nas nk={}",
+        "v=sync1 id=nas nk={} apex=cluster.example",
         iroh_base::SecretKey::generate().public().to_z32()
     )]
 }

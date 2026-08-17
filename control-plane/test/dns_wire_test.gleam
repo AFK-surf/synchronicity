@@ -202,7 +202,14 @@ pub fn address_parse_test() {
 }
 
 pub fn sync1_text_test() {
-  assert rdata.sync1_text("nas", "abc123", "", "") == "v=sync1 id=nas nk=abc123"
-  assert rdata.sync1_text("nas", "abc123", "https://r.example", "1.2.3.4:5")
-    == "v=sync1 id=nas nk=abc123 relay=https://r.example addr=1.2.3.4:5"
+  assert rdata.sync1_text("nas", "abc123", "", "", "sync.test.")
+    == "v=sync1 id=nas nk=abc123 apex=sync.test"
+  assert rdata.sync1_text(
+      "nas",
+      "abc123",
+      "https://r.example",
+      "1.2.3.4:5",
+      "sync.test.",
+    )
+    == "v=sync1 id=nas nk=abc123 apex=sync.test relay=https://r.example addr=1.2.3.4:5"
 }

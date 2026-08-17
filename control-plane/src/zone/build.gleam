@@ -93,7 +93,13 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
         wire.type_txt,
         ttl_data,
         list.map(txt_name.members, fn(m) {
-          rdata.txt(rdata.sync1_text(m.label, m.nk_z32, m.relay, m.addr))
+          rdata.txt(rdata.sync1_text(
+            m.label,
+            m.nk_z32,
+            m.relay,
+            m.addr,
+            name.to_string(apex),
+          ))
         }),
       )
     })
