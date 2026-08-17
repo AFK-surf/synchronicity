@@ -143,6 +143,17 @@ fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
     complete || held.contains(group_count(size) - 1)
 }
 
+/// What a size claim settled to, and what that costs the bits already held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Settlement {
+    /// The size the row should record.
+    pub(crate) size: u64,
+    /// True when the recorded size changed the object's *group count*, so the
+    /// verified-group bitmap describes a tree that is no longer the one being
+    /// written and must be started again.
+    pub(crate) reset_held: bool,
+}
+
 /// Decides the size an object's row should record when a writer arrives
 /// claiming `claimed`, or refuses the writer.
 ///
@@ -153,13 +164,26 @@ fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
 /// 2. A size no group attests to is a peer's claim off an entry, and yields to
 ///    this writer's — that is what keeps an overstated entry from bricking an
 ///    honest root forever (§5.1, §6.2).
-/// 3. But it yields only as far as the last group. A size that changes the
-///    object's *group count* changes the shape of its tree, and every bit
-///    already in the bitmap was set by a write that verified against this root
-///    under the shape it had. Adopting a count those bits do not fit would
-///    leave the row advertising groups whose bytes are somewhere else — or,
-///    worse, let the payload be truncated to fit a length nobody has proved.
-///    A row holding nothing has no bits to contradict, so it takes any claim.
+/// 3. It yields *completely*, including the bits already held.
+///
+/// Rule 3 used to refuse a claim that changed the object's group count while
+/// any group was held, on the reasoning that a changed count changes the shape
+/// of the tree and so no slice for it could have verified. That reasoning is
+/// wrong, and it inverted the rule it was protecting. bao splits at the largest
+/// power of two below the chunk count, so every size in one bracket shares a
+/// left subtree: 20 groups and 24 groups both split at 16, and a slice covering
+/// groups 0..16 verifies identically under either — the right sibling's
+/// chaining value is opaque bytes from the encoder that join to the same root.
+/// An entry overstating the size within its bracket therefore produced a row
+/// that verified, held real bits, and refused every honest writer of that root
+/// for good: exactly the brick rule 2 exists to prevent, reached through rule 3.
+///
+/// So bits set under a size nothing attests to are themselves only a claim. A
+/// writer offering a different size takes the row, and if the group count moves
+/// the bitmap starts again — a re-fetch, which is cheap next to an object no
+/// one can ever complete. Rule 1 is what stops this churning: the first writer
+/// to hold the final group settles the size permanently, because that is the
+/// one group whose chaining value a wrong size cannot survive.
 ///
 /// The decision belongs inside the transaction that writes the row. Read
 /// outside it, rule 1 is a check against a snapshot: an honest writer finishing
@@ -171,32 +195,29 @@ pub(crate) fn settle_size(
     root: &Hash,
     existing: Option<(u64, bool, &ChunkRanges)>,
     claimed: u64,
-) -> Result<u64> {
+) -> Result<Settlement> {
+    let settled = |size| {
+        Ok(Settlement {
+            size,
+            reset_held: false,
+        })
+    };
     let Some((recorded, complete, held)) = existing else {
-        return Ok(claimed);
+        return settled(claimed);
     };
     if recorded == claimed {
-        return Ok(recorded);
+        return settled(recorded);
     }
-    let refuse = |reason: String| StoreError::Verification {
-        root: *root,
-        reason,
-    };
     if size_is_attested(recorded, complete, held) {
-        return Err(refuse(format!(
-            "size mismatch: have {recorded}, offered {claimed}"
-        )));
+        return Err(StoreError::Verification {
+            root: *root,
+            reason: format!("size mismatch: have {recorded}, offered {claimed}"),
+        });
     }
-    if held.is_empty() || group_count(claimed) == group_count(recorded) {
-        return Ok(claimed);
-    }
-    Err(refuse(format!(
-        "size mismatch: {claimed} bytes is {} chunk groups, and {} groups of this \
-         object are already held under a {}-group tree",
-        group_count(claimed),
-        held.count(),
-        group_count(recorded)
-    )))
+    Ok(Settlement {
+        size: claimed,
+        reset_held: group_count(claimed) != group_count(recorded),
+    })
 }
 
 /// What a bitmap commit settled.
@@ -487,13 +508,22 @@ impl Store {
     ) -> Result<Commit> {
         self.with_immediate_tx(|tx| {
             let claim = read_claim(tx, root)?;
-            let size = settle_size(
+            let settlement = settle_size(
                 root,
                 claim.as_ref().map(|c| (c.size, c.complete, &c.held)),
                 size,
             )?;
+            let size = settlement.size;
             let total = group_count(size);
-            let held = claim.map(|c| c.held).unwrap_or_else(ChunkRanges::empty);
+            // A settlement that moved the group count invalidates the bitmap:
+            // those bits were verified against a tree of a different shape, and
+            // the size that gave them that shape was only ever a claim. Start
+            // the bitmap again rather than carry bits describing a tree nobody
+            // is writing any more.
+            let held = match (settlement.reset_held, claim) {
+                (false, Some(claim)) => claim.held,
+                _ => ChunkRanges::empty(),
+            };
             let verified = held.union(groups).intersect(&ChunkRanges::single(0, total));
             let complete = verified.count() >= total;
             upsert_blob_row(

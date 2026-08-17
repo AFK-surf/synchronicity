@@ -120,24 +120,35 @@ impl Syncer {
         }
         // A pending head is advertised too — as strictly not complete — so a
         // peer learns the newer head exists without being told we can serve it.
+        //
+        // It is advertised *alongside* the complete head, never in place of it.
+        // Collapsing the two slots into one summary per origin erased the fact
+        // that we hold the older root whole, and two things read that fact: our
+        // own push decision, which only pushes a head whose order key matches
+        // the summary it just advertised, and every peer's servability filter,
+        // which needs `complete` set to fetch trie nodes from us. A node with
+        // any pending head therefore stopped propagating that origin entirely
+        // and dropped out of the provider set for a root it could serve.
         for stored in self.store.all_heads(Slot::Pending)? {
             let head = stored.head;
-            match out.iter_mut().find(|s| s.origin == head.origin) {
-                Some(existing) if (head.seq, head.root.0) > (existing.seq, existing.root.0) => {
-                    existing.seq = head.seq;
-                    existing.root = head.root;
-                    existing.complete = false;
-                }
-                Some(_) => {}
-                None => out.push(HeadSummary {
-                    origin: head.origin,
-                    seq: head.seq,
-                    root: head.root,
-                    complete: false,
-                }),
+            let already = out
+                .iter()
+                .any(|s| s.origin == head.origin && (s.seq, s.root.0) == (head.seq, head.root.0));
+            if already {
+                continue;
             }
+            out.push(HeadSummary {
+                origin: head.origin,
+                seq: head.seq,
+                root: head.root,
+                complete: false,
+            });
         }
-        out.sort_by(|a, b| a.origin.cmp(&b.origin));
+        out.sort_by(|a, b| {
+            a.origin
+                .cmp(&b.origin)
+                .then(a.order_key().cmp(&b.order_key()))
+        });
         Ok(out)
     }
 
@@ -203,20 +214,34 @@ impl Syncer {
         if !self.store.is_bound(&head.origin, &head.signed_by, now)? {
             return Ok(HeadOutcome::Unbound);
         }
-        // Verified heads are provable history and fork evidence even when they
-        // lose the ordering comparison, so they are retained either way (§4.4).
-        self.store.record_history(head)?;
+        // The ordering check and the write that acts on it are one transaction.
+        // Read-then-write across two lock acquisitions let two concurrent
+        // offers — one per peer connection, all on the blocking pool — both
+        // read the same floor, both decide they supersede it, and both write
+        // the pending slot, so the lower one clobbered the higher and the
+        // higher survived only in `head_history` with nothing to re-drive it.
+        let outcome = self
+            .store
+            .transaction(|txn| -> Result<HeadOutcome, NetError> {
+                // Verified heads are provable history and fork evidence even
+                // when they lose the ordering comparison, so they are retained
+                // either way (§4.4).
+                txn.record_history(head)?;
 
-        // 3. (seq, root) must be strictly greater, lexicographically. Strictly
-        //    greater on seq alone would not converge: two peers receiving
-        //    different same-seq heads in different orders would diverge
-        //    permanently.
-        let floor = self.store.head_floor(&head.origin)?;
-        if !head.supersedes(floor.as_ref()) {
+                // 3. (seq, root) must be strictly greater, lexicographically.
+                //    Strictly greater on seq alone would not converge: two
+                //    peers receiving different same-seq heads in different
+                //    orders would diverge permanently.
+                let floor = txn.head_floor(&head.origin)?;
+                if !head.supersedes(floor.as_ref()) {
+                    return Ok(HeadOutcome::NotNewer);
+                }
+                txn.put_head(Slot::Pending, head, now, now)?;
+                Ok(HeadOutcome::Pending)
+            })?;
+        if outcome == HeadOutcome::NotNewer {
             return Ok(HeadOutcome::NotNewer);
         }
-
-        self.store.put_head(Slot::Pending, head, now, now)?;
         if self.try_promote(&head.origin, now)? {
             Ok(HeadOutcome::Completed)
         } else {
@@ -241,6 +266,27 @@ impl Syncer {
                 return Ok(None);
             }
             let displaced = txn.complete_head(origin)?;
+            // The pending head must actually beat the complete one. This used
+            // to rest on "pending is always greater", an invariant `offer_head`
+            // maintains and two other writers do not: `publish` and the key
+            // rotation in `activate` both derive their seq from the *complete*
+            // slot alone and write it directly, never consulting pending. So a
+            // peer relaying an older head of our own origin — signed by a key
+            // of ours that is still bound, which is exactly the §3.4 recovery
+            // shape — could sit in the pending slot while a local publish moved
+            // the complete slot past it, and this would then install the lesser
+            // head and roll `entries` back to it.
+            let floor = displaced.as_ref().map(|h| (h.seq, h.root));
+            if !pending.head.supersedes(floor.as_ref()) {
+                tracing::debug!(
+                    origin = %origin,
+                    pending = pending.head.seq,
+                    complete = displaced.as_ref().map(|h| h.seq).unwrap_or(0),
+                    "dropping a pending head the complete slot has overtaken"
+                );
+                txn.clear_head(origin, Slot::Pending)?;
+                return Ok(None);
+            }
             let old_root = displaced
                 .as_ref()
                 .map(|h| h.root)
@@ -462,31 +508,41 @@ impl Syncer {
         let mut report = SyncReport::default();
         let theirs = client
             .head_exchange(ours.clone(), |theirs| {
-                // Push: heads we hold that the peer does not.
+                // Both slots may be advertised per origin, so the comparison is
+                // against the best summary either side has for it, never the
+                // first one that happens to match.
+                let best = |set: &[HeadSummary], origin: &OriginId| {
+                    set.iter()
+                        .filter(|s| &s.origin == origin)
+                        .map(|s| s.order_key())
+                        .max()
+                };
+                // Push: the servable head we hold, whenever it beats theirs.
+                // Keyed off the complete slot directly rather than off whichever
+                // summary was advertised: what we can hand over is exactly what
+                // the complete slot holds.
                 let mut push = Vec::new();
+                let mut pushed_for: Vec<OriginId> = Vec::new();
                 for summary in &ours {
-                    let peer = theirs.iter().find(|t| t.origin == summary.origin);
-                    let newer = match peer {
-                        None => true,
-                        Some(peer) => summary.order_key() > peer.order_key(),
+                    if pushed_for.contains(&summary.origin) {
+                        continue;
+                    }
+                    let Ok(Some(head)) = store.complete_head(&summary.origin) else {
+                        continue;
                     };
-                    if newer {
-                        if let Ok(Some(head)) = store.complete_head(&summary.origin) {
-                            if (head.seq, head.root.0) == summary.order_key() {
-                                push.push(head);
-                            }
-                        }
+                    let mine = (head.seq, head.root.0);
+                    if best(theirs, &summary.origin).is_none_or(|peer| mine > peer) {
+                        pushed_for.push(summary.origin.clone());
+                        push.push(head);
                     }
                 }
                 // Pull: origins where the peer is ahead of us.
                 let mut want = Vec::new();
                 for summary in theirs {
-                    let ours_for = ours.iter().find(|o| o.origin == summary.origin);
-                    let newer = match ours_for {
-                        None => true,
-                        Some(mine) => summary.order_key() > mine.order_key(),
-                    };
-                    if newer {
+                    if want.contains(&summary.origin) {
+                        continue;
+                    }
+                    if best(&ours, &summary.origin).is_none_or(|mine| summary.order_key() > mine) {
                         want.push(summary.origin.clone());
                     }
                 }
@@ -872,7 +928,11 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].complete);
 
-        // A pending head for an unknown root shows up as explicitly incomplete.
+        // A pending head for an unknown root shows up as explicitly incomplete
+        // — *alongside* the complete head, not in place of it. Both facts are
+        // load-bearing: the peer needs to know the newer head exists, and it
+        // needs to know we can still serve the older root, or it will neither
+        // pull from us nor count us as a provider for it.
         syncer
             .offer_head(
                 &SignedHead::sign(&key, origin, 2, Hash::new(b"unknown"), 0),
@@ -880,9 +940,14 @@ mod tests {
             )
             .unwrap();
         let summaries = syncer.local_summaries().unwrap();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].seq, 2);
-        assert!(!summaries[0].complete);
+        assert_eq!(summaries.len(), 2);
+        let complete: Vec<_> = summaries.iter().filter(|s| s.complete).collect();
+        assert_eq!(complete.len(), 1, "the servable root is still advertised");
+        assert_eq!(complete[0].seq, 1);
+        assert_eq!(complete[0].root, root);
+        let pending: Vec<_> = summaries.iter().filter(|s| !s.complete).collect();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, 2);
     }
 
     #[test]

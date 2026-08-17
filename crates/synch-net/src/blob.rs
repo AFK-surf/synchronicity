@@ -68,6 +68,31 @@ fn proof_window_ceiling(ranges: &ChunkRanges, level: u8) -> u64 {
     honest.saturating_mul(SLACK).saturating_add(FLOOR)
 }
 
+/// Validates what a provider says it served, before any set operation reads it.
+///
+/// Two bounds, and the request itself supplies both:
+///
+/// - **Range count.** The provider side rejects a request past [`MAX_RANGES`]
+///   because the set operations under it are quadratic in the number of ranges
+///   and the asker would not be paying for them (§12). The same is true in
+///   reverse and was not checked: `served` is decoded from a frame, so a
+///   provider could answer with a million singleton ranges, and the requester
+///   intersects it on a runtime worker.
+/// - **Containment.** A provider can only have served what was asked for.
+///   Anything outside the request is at best noise the requester would union
+///   into its progress, and the slice path fed it straight to `write_slice`
+///   while the proof path already intersected it away — an asymmetry with no
+///   reason behind it.
+fn check_served(served: ChunkRanges, requested: &ChunkRanges) -> Result<ChunkRanges, NetError> {
+    if served.range_count() > MAX_RANGES {
+        return Err(NetError::Unexpected(format!(
+            "provider claims {} served ranges, past the {MAX_RANGES} limit",
+            served.range_count()
+        )));
+    }
+    Ok(served.intersect(requested))
+}
+
 /// The `sync/blob/1` protocol handler.
 #[derive(Debug, Clone)]
 pub struct BlobProtocol {
@@ -270,7 +295,7 @@ impl BlobClient {
 
         let encoded = read_bytes(&mut recv).await?;
         let served = match read_frame::<BlobMessage>(&mut recv).await? {
-            BlobMessage::SliceEnd { served } => served,
+            BlobMessage::SliceEnd { served } => check_served(served, ranges)?,
             _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
         };
         Ok(Slice { encoded, served })
@@ -297,7 +322,7 @@ impl BlobClient {
 
         let encoded = read_bytes(&mut recv).await?;
         let served = match read_frame::<BlobMessage>(&mut recv).await? {
-            BlobMessage::ProofEnd { served } => served,
+            BlobMessage::ProofEnd { served } => check_served(served, ranges)?,
             _ => return Err(NetError::Unexpected("expected ProofEnd".into())),
         };
         Ok(Proof { encoded, served })
@@ -346,7 +371,8 @@ impl BlobClient {
             let window =
                 ChunkRanges::from_ranges(remaining.ranges.iter().take(MAX_RANGES).copied());
             let proof = self.get_proof(root, &window, level).await?;
-            let served = proof.served.intersect(&window);
+            // Already clamped to the window by `check_served`.
+            let served = proof.served.clone();
             if served.is_empty() {
                 barren += 1;
                 if barren >= MAX_BARREN_WINDOWS {

@@ -14,7 +14,7 @@ use iroh::{
 };
 use synch_core::{
     now_ns, BlobAd, Hash, HeadSummary, MptMessage, NodeId, OriginId, SignedHead, MAX_BATCH,
-    PROTO_VERSION,
+    MAX_HEADS_PER_MESSAGE, PROTO_VERSION,
 };
 use synch_mpt::NodeStore;
 use synch_store::{Slot, Store};
@@ -138,6 +138,7 @@ impl MptProtocol {
                         "unsupported protocol version {proto}"
                     )));
                 }
+                check_heads(heads.len(), "a Hello summary list")?;
                 // A dialing peer's summaries are as good an observation as the
                 // ones we collect by dialing out, and a node in recovery is
                 // more likely to be called than to be calling (§3.4).
@@ -164,6 +165,7 @@ impl MptProtocol {
                 // we have that it lacks.
                 match read_frame::<MptMessage>(recv).await? {
                     MptMessage::Heads { heads } => {
+                        check_heads(heads.len(), "a Heads push")?;
                         // Each offer verifies a signature, records history, and
                         // may promote the head — which walks the trie and
                         // re-materializes the changed leaves in one
@@ -181,6 +183,7 @@ impl MptProtocol {
                 }
                 match read_frame::<MptMessage>(recv).await? {
                     MptMessage::HeadsWant { origins } => {
+                        check_heads(origins.len(), "a HeadsWant list")?;
                         let heads = self.heads_for(&origins)?;
                         write_frame(send, &MptMessage::Heads { heads }).await?;
                     }
@@ -275,6 +278,30 @@ fn check_batch(len: usize) -> Result<(), NetError> {
     if len > MAX_BATCH {
         return Err(NetError::Unexpected(format!(
             "batch of {len} exceeds the {MAX_BATCH} limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Bounds a head-carrying message, which `MAX_BATCH` never covered.
+///
+/// `GetNodes`/`GetValues` are capped at [`MAX_BATCH`] hashes because a cheap
+/// request must not buy expensive work (§12). The head messages had no such
+/// cap and are the more expensive of the two: bounded only by `MAX_FRAME_LEN`
+/// (16 MiB), one `Heads` frame carries on the order of 110 000 `SignedHead`s,
+/// and each one costs an Ed25519 verification *and* a `head_history` insert —
+/// the insert running before the ordering check, so heads that lose the
+/// comparison are persisted too. `HeadsWant` is the same shape with a database
+/// query per origin. Seconds of CPU and hundreds of thousands of autocommit
+/// statements, for 16 MB of upload, repeatable per stream.
+///
+/// The bound is generous next to any real cluster: §12 sizes membership at
+/// N ≤ 100 origins, so a legitimate exchange names tens of heads, not
+/// thousands.
+fn check_heads(len: usize, what: &str) -> Result<(), NetError> {
+    if len > MAX_HEADS_PER_MESSAGE {
+        return Err(NetError::Unexpected(format!(
+            "{what} of {len} exceeds the {MAX_HEADS_PER_MESSAGE} limit"
         )));
     }
     Ok(())
@@ -382,6 +409,7 @@ impl MptClient {
                         "unsupported protocol version {proto}"
                     )));
                 }
+                check_heads(heads.len(), "a Hello summary list")?;
                 heads
             }
             other => return Err(unexpected("Hello", &other)),

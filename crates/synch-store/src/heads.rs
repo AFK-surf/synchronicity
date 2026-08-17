@@ -124,11 +124,7 @@ impl Store {
     pub fn head_floor(&self, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
         let complete = self.complete_head(origin)?.map(|h| (h.seq, h.root));
         let pending = self.pending_head(origin)?.map(|h| (h.seq, h.root));
-        Ok(match (complete, pending) {
-            (None, p) => p,
-            (c, None) => c,
-            (Some(c), Some(p)) => Some(if (p.0, p.1 .0) > (c.0, c.1 .0) { p } else { c }),
-        })
+        Ok(best_floor(complete, pending))
     }
 
     /// Every slot for every origin.
@@ -392,6 +388,19 @@ impl Txn<'_> {
         Ok(self.head(origin, Slot::Pending)?.map(|s| s.head))
     }
 
+    /// The `(seq, root)` ordering key currently held, read inside the
+    /// transaction.
+    ///
+    /// The acceptance rule reads this and then writes what it read, so it has
+    /// to see the same snapshot the write lands in: split across two lock
+    /// acquisitions, two concurrent offers both read the same floor, both
+    /// decide they beat it, and the lower one wins the race to the slot.
+    pub fn head_floor(&self, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
+        let complete = self.complete_head(origin)?.map(|h| (h.seq, h.root));
+        let pending = self.pending_head(origin)?.map(|h| (h.seq, h.root));
+        Ok(best_floor(complete, pending))
+    }
+
     /// Writes a head into a slot, inside the transaction.
     ///
     /// The caller must have verified the signature *and* the binding first
@@ -430,6 +439,17 @@ pub struct Equivocation {
     pub seq: u64,
     /// The conflicting heads, retained with their signatures.
     pub heads: Vec<SignedHead>,
+}
+
+/// The greater of the two slots' ordering keys, which is what the §5.2
+/// acceptance rule compares against: a head already being fetched is not
+/// fetched again, and a head older than an in-progress target is not adopted.
+fn best_floor(complete: Option<(u64, Hash)>, pending: Option<(u64, Hash)>) -> Option<(u64, Hash)> {
+    match (complete, pending) {
+        (None, p) => p,
+        (c, None) => c,
+        (Some(c), Some(p)) => Some(if (p.0, p.1 .0) > (c.0, c.1 .0) { p } else { c }),
+    }
 }
 
 fn put_head_in(

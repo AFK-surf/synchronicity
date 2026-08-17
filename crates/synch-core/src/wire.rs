@@ -24,6 +24,19 @@ pub const PROTO_VERSION: u16 = 1;
 /// Maximum number of hashes per `GetNodes`/`GetValues` batch (§5.1).
 pub const MAX_BATCH: usize = 256;
 
+/// How many heads or head summaries one message may carry (§5.1).
+///
+/// The counterpart of [`MAX_BATCH`] for the head-gossip messages, which had no
+/// bound at all and are the costlier of the two: each `SignedHead` in a `Heads`
+/// frame buys an Ed25519 verification and a `head_history` insert, and each
+/// origin in a `HeadsWant` buys a query. Bounded only by the frame, one 16 MiB
+/// message was worth six figures of both.
+///
+/// §12 sizes a cluster at N ≤ 100 origins and one head per origin per slot, so
+/// a legitimate exchange names tens; this leaves two orders of magnitude of
+/// headroom over that and still cuts the amplification to nothing.
+pub const MAX_HEADS_PER_MESSAGE: usize = 4096;
+
 /// Maximum accepted length of a single framed message, in bytes.
 ///
 /// This bounds memory use per stream against a hostile peer (§12, DoS).
@@ -267,29 +280,50 @@ impl ChunkRanges {
     }
 
     /// The intersection of two sets.
+    ///
+    /// A linear merge over both sides, which the sorted-and-disjoint invariant
+    /// permits and the nested loop this replaced did not exploit. The
+    /// difference matters because a range set arrives off the wire: `served` in
+    /// a `SliceEnd`/`ProofEnd` is bounded only by the frame, so a provider
+    /// could answer with a million singleton ranges and make the requester
+    /// spend `n * m` on a set operation the requester runs on a runtime worker.
     pub fn intersect(&self, other: &ChunkRanges) -> ChunkRanges {
         let mut out = Vec::new();
-        for a in &self.ranges {
-            for b in &other.ranges {
-                let start = a.start.max(b.start);
-                let end = a.end.min(b.end);
-                if start < end {
-                    out.push(GroupRange { start, end });
-                }
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < self.ranges.len() && j < other.ranges.len() {
+            let (a, b) = (&self.ranges[i], &other.ranges[j]);
+            let start = a.start.max(b.start);
+            let end = a.end.min(b.end);
+            if start < end {
+                out.push(GroupRange { start, end });
+            }
+            // Retire whichever ends first; the other may still overlap what
+            // comes next on this side.
+            if a.end <= b.end {
+                i += 1;
+            } else {
+                j += 1;
             }
         }
         ChunkRanges::from_ranges(out)
     }
 
     /// The part of `self` not covered by `other`.
+    ///
+    /// Linear, for the same reason as [`ChunkRanges::intersect`].
     pub fn difference(&self, other: &ChunkRanges) -> ChunkRanges {
         let mut out = Vec::new();
+        let mut j = 0usize;
         for a in &self.ranges {
             let mut cursor = a.start;
-            for b in &other.ranges {
-                if b.end <= cursor || b.start >= a.end {
-                    continue;
-                }
+            // Skip anything entirely before this range. `other` is sorted, so
+            // the cursor into it only ever moves forward across the whole loop.
+            while j < other.ranges.len() && other.ranges[j].end <= cursor {
+                j += 1;
+            }
+            let mut k = j;
+            while k < other.ranges.len() && other.ranges[k].start < a.end {
+                let b = &other.ranges[k];
                 if b.start > cursor {
                     out.push(GroupRange {
                         start: cursor,
@@ -300,6 +334,7 @@ impl ChunkRanges {
                 if cursor >= a.end {
                     break;
                 }
+                k += 1;
             }
             if cursor < a.end {
                 out.push(GroupRange {

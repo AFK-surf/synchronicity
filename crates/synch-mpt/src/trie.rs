@@ -25,8 +25,19 @@ use crate::{
 pub(crate) enum Cursor {
     /// Nothing is stored at this position.
     Empty,
-    /// A node (possibly a virtual remainder of a compressed node).
-    At(TrieNode),
+    /// A node, with the hash it was loaded from when the position is a whole
+    /// stored node rather than the virtual remainder of a compressed one.
+    At {
+        /// The stored node's hash, or `None` part-way through a compressed node.
+        ///
+        /// This is a walk's identity for the position. Two positions carrying
+        /// the same hash have the same subtree beneath them, which is what lets
+        /// a walk over a peer's node *graph* — a DAG, not a tree — avoid
+        /// re-descending a subtree it has already covered.
+        hash: Option<Hash>,
+        /// The node itself.
+        node: TrieNode,
+    },
 }
 
 impl Cursor {
@@ -34,10 +45,26 @@ impl Cursor {
         matches!(self, Cursor::Empty)
     }
 
+    /// The identity of this position, for walk memoization, or `None` when the
+    /// position has none.
+    ///
+    /// A cursor part-way through a compressed node is *not* identified: the
+    /// synthetic remainder it carries depends on the path taken into it, so two
+    /// unrelated positions would otherwise collide under one key and a walk
+    /// would prune a subtree it had never visited. Those positions need no
+    /// memo — they are bounded by the node's own nibble run, which
+    /// [`TrieNode::hash_of_encoded`] caps at `MAX_KEY_LEN * 2`.
+    pub(crate) fn identity(&self) -> Option<PositionId> {
+        match self {
+            Cursor::Empty => Some(PositionId::Empty),
+            Cursor::At { hash, .. } => hash.map(PositionId::Node),
+        }
+    }
+
     pub(crate) fn value_ref(&self) -> Option<&ValueRef> {
         match self {
             Cursor::Empty => None,
-            Cursor::At(node) => match node {
+            Cursor::At { node, .. } => match node {
                 TrieNode::Leaf { key_rest, value } if key_rest.is_empty() => Some(value),
                 TrieNode::Leaf { .. } | TrieNode::Ext { .. } => None,
                 TrieNode::Branch { value, .. } => value.as_ref(),
@@ -48,7 +75,7 @@ impl Cursor {
     pub(crate) fn node_ref(&self) -> Option<&TrieNode> {
         match self {
             Cursor::Empty => None,
-            Cursor::At(node) => Some(node),
+            Cursor::At { node, .. } => Some(node),
         }
     }
 }
@@ -60,6 +87,97 @@ impl Cursor {
 /// a peer that built the structure by hand. Walks prune there rather than
 /// following it down.
 pub const MAX_DEPTH_NIBBLES: usize = MAX_KEY_LEN * 2;
+
+/// What identifies a walk position, when anything does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PositionId {
+    /// Nothing is stored here.
+    Empty,
+    /// A stored node.
+    Node(Hash),
+}
+
+/// How many times one distinct stored node may be arrived at.
+///
+/// Structural sharing makes this greater than one for honest data — two keys
+/// whose suffixes and values coincide share a leaf — but only by a small
+/// factor, because sharing requires the subtries to be *identical*. The case
+/// this exists to catch misses by orders of magnitude.
+const WALK_REVISIT_RATIO: usize = 16;
+
+/// A floor below which the ratio is not applied, so small tries are never
+/// refused for being lopsided. Also the bounded worst case: a walk that is
+/// going to be refused does at most this much work first.
+const WALK_REVISIT_FLOOR: usize = 65_536;
+
+/// An absolute ceiling on positions of every kind, as a backstop for the
+/// compressed-node traversal the ratio deliberately does not count.
+const WALK_POSITION_CEILING: usize = 64_000_000;
+
+/// Keeps a structural walk proportional to the trie it is walking.
+///
+/// A walk over trie *structure* descends positions, and a peer's node graph is
+/// a DAG rather than a tree: nothing stops a branch pointing all sixteen
+/// children at one hash. Sixteen such branches stacked are seventeen distinct
+/// nodes — which `MissingWalk` fetches happily, because it dedups on hash, and
+/// which `is_complete` then passes — and 16^16 positions to walk. Depth bounds
+/// do not help; the explosion is in breadth.
+///
+/// Deduping positions by node hash is *not* the fix, and looks like it is:
+/// structural sharing means one leaf node legitimately sits at as many
+/// positions as there are keys with that value, so pruning repeats silently
+/// drops keys from `scan` and changes from `diff`.
+///
+/// What separates the two cases is how often a *stored node* is arrived at. A
+/// walk over an honest trie reaches each stored node about once — sharing makes
+/// it a few times, never many, because sharing requires whole subtries to
+/// coincide. A fan-out DAG holds its node count still while arrivals multiply,
+/// so it blows the ratio immediately.
+///
+/// Only positions that *are* a stored node are counted against it. A cursor
+/// part-way through a compressed node has no hash, and there are legitimately
+/// many of those — one per nibble of the run — so counting them measured depth
+/// rather than fan-out and refused ordinary tries. They are bounded instead by
+/// the per-node nibble cap and by [`WALK_POSITION_CEILING`].
+#[derive(Debug, Default)]
+pub(crate) struct FanoutGuard {
+    /// Positions of every kind, against the absolute ceiling.
+    positions: usize,
+    /// Positions that are a whole stored node, against the ratio.
+    arrivals: usize,
+    nodes: HashSet<Hash>,
+}
+
+impl FanoutGuard {
+    /// Records one visited position, failing if the walk has outrun the trie.
+    pub(crate) fn visit(
+        &mut self,
+        ids: impl IntoIterator<Item = PositionId>,
+    ) -> Result<(), MptError> {
+        self.positions += 1;
+        if self.positions > WALK_POSITION_CEILING {
+            return Err(MptError::NonCanonical(format!(
+                "structural walk exceeded {WALK_POSITION_CEILING} positions"
+            )));
+        }
+        for id in ids {
+            if let PositionId::Node(hash) = id {
+                self.arrivals += 1;
+                self.nodes.insert(hash);
+            }
+        }
+        let allowed = WALK_REVISIT_FLOOR.max(self.nodes.len().saturating_mul(WALK_REVISIT_RATIO));
+        if self.arrivals > allowed {
+            return Err(MptError::NonCanonical(format!(
+                "structural walk arrived at {} node positions over {} distinct nodes, \
+                 which no key set can produce",
+                self.arrivals,
+                self.nodes.len()
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// One level of an explicit walk stack: the cursor at that level, and which
 /// child nibble to visit next.
@@ -208,10 +326,22 @@ impl MissingWalk {
             };
             self.frontier
                 .extend(paired_children(reference_node.as_ref(), &node));
+            // A node whose out-of-line values have not arrived is not done
+            // with. Reporting the value once and moving on made the walk claim
+            // exhaustion over a trie it could not serve: the node loaded, so it
+            // was never deferred, and `seen` kept it from ever being revisited.
+            // The fetch loop then broke out with its unproductive counter at
+            // one, so the §5.2 abandonment clause could never fire for a
+            // value-only failure, and `note_complete` vouched for the root.
+            let mut awaiting_values = false;
             for value_hash in node.value_hashes() {
                 if !trie.has_value_raw(&value_hash)? {
                     missing.values.push(value_hash);
+                    awaiting_values = true;
                 }
+            }
+            if awaiting_values {
+                self.deferred.push((reference, hash));
             }
         }
         Ok(missing)
@@ -324,7 +454,20 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         let nibbles = Nibbles::from_bytes(key);
         let mut rest = nibbles.as_slice();
         let mut current = root_opt(root);
+        // Every iteration consumes at least one nibble except the last, so this
+        // is bounded by the key length — but only once an empty extension
+        // prefix is impossible. `hash_of_encoded` rejects those now; the guard
+        // stays because `get` is the one descent with no stack to bound it, and
+        // a chain of zero-progress nodes would otherwise turn one lookup into
+        // one store read per node.
+        let mut steps = 0usize;
         loop {
+            steps += 1;
+            if steps > MAX_DEPTH_NIBBLES {
+                return Err(MptError::NonCanonical(
+                    "lookup descended further than any valid key is long".into(),
+                ));
+            }
             let Some(hash) = current else { return Ok(None) };
             match self.load(&hash)? {
                 TrieNode::Leaf { key_rest, value } => {
@@ -336,7 +479,10 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
                 }
                 TrieNode::Ext { prefix, child } => {
                     let p = prefix.as_slice();
-                    if !rest.starts_with(p) {
+                    // An empty prefix would make this a dead end for every
+                    // structural walk (`cursor_child` can never match one) and
+                    // a transparent hop here — the two readers must agree.
+                    if p.is_empty() || !rest.starts_with(p) {
                         return Ok(None);
                     }
                     rest = &rest[p.len()..];
@@ -518,6 +664,13 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// canonical form: any two tries holding the same key/value map have the
     /// same root regardless of the operation history that produced them.
     pub fn remove(&self, root: Hash, key: &[u8]) -> Result<Hash, MptError> {
+        // The same §12 bound `insert` applies. A key this long cannot be
+        // present, so the walk is merely wasted — but the asymmetry is the kind
+        // that stops being harmless the moment `remove_at` grows an allocation
+        // keyed on the input.
+        if key.len() > MAX_KEY_LEN {
+            return Err(MptError::KeyTooLong(key.len()));
+        }
         let nibbles = Nibbles::from_bytes(key);
         match root_opt(root) {
             None => Ok(Hash::EMPTY),
@@ -613,12 +766,15 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     pub(crate) fn cursor_at(&self, hash: Option<Hash>) -> Result<Cursor, MptError> {
         match hash {
             None => Ok(Cursor::Empty),
-            Some(h) => Ok(Cursor::At(self.load(&h)?)),
+            Some(h) => Ok(Cursor::At {
+                hash: Some(h),
+                node: self.load(&h)?,
+            }),
         }
     }
 
     pub(crate) fn cursor_child(&self, cursor: &Cursor, nibble: u8) -> Result<Cursor, MptError> {
-        let Cursor::At(node) = cursor else {
+        let Cursor::At { node, .. } = cursor else {
             return Ok(Cursor::Empty);
         };
         match node {
@@ -627,10 +783,11 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
                 if k.first() != Some(&nibble) {
                     return Ok(Cursor::Empty);
                 }
-                Ok(Cursor::At(TrieNode::leaf(
-                    Nibbles::from_nibbles(&k[1..]),
-                    value.clone(),
-                )))
+                // Part-way through a compressed node: no stored hash of its own.
+                Ok(Cursor::At {
+                    hash: None,
+                    node: TrieNode::leaf(Nibbles::from_nibbles(&k[1..]), value.clone()),
+                })
             }
             TrieNode::Ext { prefix, child } => {
                 let p = prefix.as_slice();
@@ -640,10 +797,10 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
                 if p.len() == 1 {
                     self.cursor_at(Some(*child))
                 } else {
-                    Ok(Cursor::At(TrieNode::ext(
-                        Nibbles::from_nibbles(&p[1..]),
-                        *child,
-                    )))
+                    Ok(Cursor::At {
+                        hash: None,
+                        node: TrieNode::ext(Nibbles::from_nibbles(&p[1..]), *child),
+                    })
                 }
             }
             TrieNode::Branch { children, .. } => self.cursor_at(children[nibble as usize]),
@@ -703,6 +860,9 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         let after_bytes = after.map(|a| a.to_bytes().unwrap_or_default());
         let base = path.len();
         let mut stack: Vec<Frame> = Vec::new();
+        // Keeps the scan proportional to the trie, so a fan-out DAG cannot turn
+        // a handful of nodes into an unbounded walk.
+        let mut guard = FanoutGuard::default();
 
         self.take_value(cursor, path, after_bytes.as_deref(), limit, out)?;
         stack.push(Frame {
@@ -734,6 +894,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
                 path.pop();
                 continue;
             }
+            guard.visit(child.identity())?;
             self.take_value(&child, path, after_bytes.as_deref(), limit, out)?;
             stack.push(Frame {
                 cursor: child,

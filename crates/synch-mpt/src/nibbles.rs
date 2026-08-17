@@ -1,14 +1,35 @@
 //! Nibble sequences: the radix-16 alphabet the trie is keyed on (§4.3).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// A sequence of nibbles (4-bit values), high nibble of each byte first.
 ///
 /// Stored one nibble per byte so that the postcard encoding is canonical: two
 /// equal nibble sequences always produce identical bytes, which is what makes
 /// node hashing deterministic.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// Every element is in `0..16`, and that is an invariant of the type rather
+/// than a convention of its constructors: `Deserialize` is written by hand to
+/// enforce it, because the derived one would not. A node arriving from a peer
+/// is decoded, not constructed, and a nibble outside the alphabet reaching
+/// [`Trie::insert`](crate::Trie::insert) indexes a 16-element child array out
+/// of bounds — a panic, which aborts the daemon rather than failing the
+/// exchange. It also breaks [`Nibbles::to_bytes`]'s injectivity, so two
+/// distinct sequences could pack to one key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Nibbles(Vec<u8>);
+
+impl<'de> Deserialize<'de> for Nibbles {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Vec::<u8>::deserialize(deserializer)?;
+        if let Some(bad) = raw.iter().find(|n| **n > 0x0f) {
+            return Err(serde::de::Error::custom(format!(
+                "nibble {bad} is outside the radix-16 alphabet"
+            )));
+        }
+        Ok(Nibbles(raw))
+    }
+}
 
 impl Nibbles {
     /// An empty sequence.

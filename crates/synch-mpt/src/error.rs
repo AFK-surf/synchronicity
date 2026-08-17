@@ -28,6 +28,18 @@ pub enum MptError {
     /// A key exceeded the §12 bound.
     #[error("trie key too long: {0} bytes (max {max})", max = synch_core::MAX_KEY_LEN)]
     KeyTooLong(usize),
+    /// A node was well-formed and correctly hashed but broke one of the
+    /// structural invariants the node kinds document (§4.3).
+    ///
+    /// The write path maintains these by construction; a node arriving from a
+    /// peer is only decoded, so they are checked at the trust boundary
+    /// ([`TrieNode::hash_of_encoded`](crate::TrieNode::hash_of_encoded)).
+    /// Accepting such a node does not corrupt anything on its own, but it puts
+    /// the readers into disagreement — an empty extension prefix is followed by
+    /// `get` and skipped by every structural walk — and it gives one key/value
+    /// map more than one root, which defeats structural sharing.
+    #[error("trie node breaks a structural invariant: {0}")]
+    NonCanonical(String),
     /// The trie contained a value at an odd nibble depth, which no byte-string
     /// key can produce.
     #[error("trie contains a value at an odd nibble depth")]
