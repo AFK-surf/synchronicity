@@ -32,7 +32,6 @@ fn input(txt_names: List(model.TxtName)) -> ZoneInput {
     [],
     txt_names,
     [#(1, "proofblob")],
-    "tufblob",
   )
 }
 
@@ -50,7 +49,6 @@ pub fn the_renderer_emits_data_records_and_the_marker_test() {
   let names = list.map(records, fn(r) { r.name })
   assert list.contains(names, "_synchronicity-owner.sync.test")
   assert list.contains(names, "_synchronicity-rekor.sync.test")
-  assert list.contains(names, "_synchronicity-tuf.sync.test")
   assert list.contains(names, "_synchronicity.prod.acme.sync.test")
   // The member record value is the §3.2 grammar, unchunked.
   let assert Ok(member) =

@@ -534,7 +534,6 @@ pub fn the_zone_serves_the_proof_record_test() {
       [NsHost(ns1, "127.0.0.1", "")],
       [TxtName(owner, [Member("nas", fixtures.nk(), "", "")])],
       list.index_map(text, fn(t, i) { #(i + 1, t) }),
-      "",
     )
   let assert Ok(rrsets) = build.build(input)
   // One part per owner name: part 1 at the base, part n one label along.
@@ -579,7 +578,6 @@ pub fn a_zone_without_a_proof_has_no_such_name_test() {
       [NsHost(ns1, "127.0.0.1", "")],
       [],
       [],
-      "",
     )
   let assert Ok(rrsets) = build.build(input)
   let assert Ok(rekor_owner) = name.parse("_synchronicity-rekor.sync.test.")

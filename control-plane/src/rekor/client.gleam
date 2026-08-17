@@ -17,8 +17,8 @@
 ////
 //// *Which* log that is, and which key its checkpoints are signed with, are
 //// not compiled in: [`discover`] reads both out of the `trusted_root.json`
-//// this service already relays (§10). The endpoint follows Sigstore for the
-//// same reason the pin set does — a shard rotation should cost a TUF
+//// this service fetches from Sigstore (§10). The endpoint follows Sigstore
+//// for the same reason clients' pins do — a shard rotation should cost a TUF
 //// refresh, not a release.
 
 import envoy
@@ -79,11 +79,10 @@ pub type Target {
   Target(url: String, key: #(BitArray, BitArray))
 }
 
-/// Discovers the log to write to from the relayed TUF material (§10).
+/// Discovers the log to write to from the stored TUF material (§10).
 ///
 /// **Nothing about the public log is compiled in.** The `trusted_root.json`
-/// this service already fetches and relays is a directory of transparency
-/// logs — where each is served, its key, and the window it was in service for
+/// this service fetches is a directory of transparency logs — where each is served, its key, and the window it was in service for
 /// — so the shard to submit to is read from the same signed artifact the
 /// client derives its pins from, at the moment of use. Sigstore opening the
 /// next shard is then a TUF refresh on both sides, not a release on either.

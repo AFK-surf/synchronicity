@@ -51,9 +51,11 @@ pub fn node_config(cli: &Cli) -> Result<NodeConfig> {
     config.dns.trust_anchor = cli.dnssec_anchor.clone();
     config.dns.rekor = cli.rekor.map(Into::into);
     config.dns.rekor_key = cli.rekor_key.clone();
+    config.dns.tuf_url = cli.tuf.clone();
+    config.dns.no_tuf = cli.no_tuf;
     // Where the TUF-verified transparency-log pin set lives
     // (docs/REKOR-ZONE-KEY.md §10.2). One file for the whole data directory,
-    // never one per domain: monotonicity is what bounds a hostile relay, and
+    // never one per domain: monotonicity is what bounds a hostile mirror, and
     // it only bounds anything if every domain shares the same floor.
     config.dns.rekor_state = Some(config.data_dir.join(REKOR_PIN_STATE_FILE));
     Ok(config)

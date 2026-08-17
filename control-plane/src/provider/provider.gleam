@@ -13,8 +13,8 @@ import gleam/list
 import gleam/string
 
 /// The record types external mode manages. Only TXT is ever published — the
-/// membership records, the transparency proofs, the TUF relay and the
-/// ownership marker are all TXT — but the type is named so the diff can
+/// membership records, the transparency proofs and the ownership marker are
+/// all TXT — but the type is named so the diff can
 /// refuse foreign types at managed names by name instead of by accident.
 pub type Rtype {
   Txt

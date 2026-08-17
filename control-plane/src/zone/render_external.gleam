@@ -4,8 +4,8 @@
 ////
 //// SOA, NS, DNSKEY, negative proofs and every RRSIG are the provider's
 //// business in external mode; what this deployment owns is the data —
-//// membership TXT, the transparency proofs, the TUF relay — plus the
-//// ownership marker the reconciler's refusal rule turns on. The product
+//// membership TXT and the transparency proofs — plus the ownership marker
+//// the reconciler's refusal rule turns on. The product
 //// invariants are re-checked with `build.validate`, the exact rule set the
 //// serving builder applies: they protect clients, not the wire format, and
 //// they hold in either mode.
@@ -69,12 +69,6 @@ pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
         text,
       )
     })
-  let tuf = case input.tuf_bundle {
-    "" -> []
-    text -> [
-      Record(build.tuf_label <> "." <> apex, provider.Txt, ttl_rekor, text),
-    ]
-  }
   // Unconditional, exactly as in serve mode: the declaration is what makes
   // every logged entry the zone's own statement, so a zone without one has
   // no working transparency at all.
@@ -87,26 +81,21 @@ pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
     )
   Ok(sort(
     [diff.owner_record(apex), transparency, ..members]
-    |> list.append(rekor)
-    |> list.append(tuf),
+    |> list.append(rekor),
   ))
 }
 
 /// Every name the rendered set can ever occupy — what the reconciler asks
-/// the provider to list. Includes the empty-set names (`_rekor`, `_tuf`,
-/// each network owner) so records we *stopped* rendering still get found
-/// and deleted.
+/// the provider to list. Includes the empty-set names (`_rekor`, each
+/// network owner) so records we *stopped* rendering still get found and
+/// deleted.
 pub fn managed_names(input: ZoneInput) -> List(String) {
   let apex = apex_name(input)
   let owners =
     list.map(input.txt_names, fn(txt_name) {
       strip_dot(name.to_string(txt_name.owner))
     })
-  [
-    diff.owner_label <> "." <> apex,
-    build.tuf_label <> "." <> apex,
-    ..rekor_part_names(input, apex)
-  ]
+  [diff.owner_label <> "." <> apex, ..rekor_part_names(input, apex)]
   |> list.append([rdata.transparency_label <> "." <> apex, ..owners])
   |> list.unique
 }

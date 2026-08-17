@@ -25,7 +25,6 @@ fn demo_input(csk: keys.Csk) -> ZoneInput {
       ]),
     ],
     [],
-    "",
   )
 }
 

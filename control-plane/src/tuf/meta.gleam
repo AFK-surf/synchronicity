@@ -28,7 +28,7 @@ pub type Role {
 /// Reads a metadata file and checks it declares the role it was fetched as.
 ///
 /// A snapshot served where the targets belong is the sort of confusion a
-/// relay should refuse to pass on, even though a client would catch it.
+/// this side should refuse to store, rather than leave to a later check.
 pub fn read_role(bytes: BitArray, expected: String) -> Result(Role, String) {
   use text <- result.try(utf8(bytes, expected))
   let decoder = {
@@ -110,7 +110,7 @@ fn utf8(bytes: BitArray, what: String) -> Result(String, String) {
 ///
 /// Narrow, and wider than the current repository needs: Sigstore's roots
 /// have written plain `Z` times, fractional seconds and numeric offsets at
-/// different points in their history, and a relay that refused an old shape
+/// different points in their history, and a reader that refused an old shape
 /// would stop refetching for a reason nobody could see.
 pub fn parse_rfc3339(text: String) -> Result(Int, Nil) {
   use year <- result.try(number(text, 0, 4))

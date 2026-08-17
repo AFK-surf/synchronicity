@@ -1,19 +1,14 @@
 //// The TUF client workflow, on this side of the wire
 //// (docs/REKOR-ZONE-KEY.md §10.3).
 ////
-//// This service used to check no signatures at all, and said so: it was a
-//// relay, the client was the verifier, and material that did not verify cost
-//// nothing but zone bytes because clients ignore it and keep their pins.
-////
-//// That argument stopped covering everything the moment the same material
-//// began deciding **where this service submits** and **which key it checks
-//// the returned proof against** (`rekor/client.discover`, §10.6). That
-//// decision is consumed here and nowhere else — no client ever sees it, so
-//// no client can re-verify it. Left unverified, TLS to the TUF CDN would be
-//// the only thing standing between a hostile mirror and a control plane that
-//// publishes its zone-key claim into a log nobody monitors, believes the
-//// proof it gets back, and satisfies its own `CP_REKOR_REQUIRE` gate while
-//// doing it. So the gate moved here.
+//// The material this gate protects decides **where this service submits**
+//// and **which key it checks the returned proof against**
+//// (`rekor/client.discover`, §10.6). That decision is consumed here and
+//// nowhere else — no client ever sees it, so no client can re-verify it.
+//// Left unverified, TLS to the TUF CDN would be the only thing standing
+//// between a hostile mirror and a control plane that publishes its zone-key
+//// claim into a log nobody monitors, believes the proof it gets back, and
+//// satisfies its own `CP_REKOR_REQUIRE` gate while doing it.
 ////
 //// It is the same workflow the client runs (crates/synch-net/src/tuf.rs),
 //// deliberately: chain the roots, then timestamp → snapshot → targets, each

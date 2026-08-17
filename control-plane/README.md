@@ -34,17 +34,15 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   chain to collect before then. A self-hosted, Rekor-v2-compatible log
   works via `CP_REKOR_KEY`.
   See [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md) §2, §3, §5.
-- The zone also **relays Sigstore's TUF metadata** verbatim at
-  `_synchronicity-tuf.<apex>` (`controlplane tuf-refresh`, and the hourly
-  job when the stored timestamp nears expiry), so clients' log-key pins
-  follow Sigstore's rotations without an upgrade. It **verifies that metadata
-  itself** before storing it — the same workflow the client runs, against the
-  same anchor (`priv/tuf/sigstore_tuf_root.json`) — because the same file
-  also decides which transparency log this service submits to, and that
-  decision is one no client is in a position to re-check. Relaying nothing
-  costs nothing: clients keep the pins they have, and stored material that
-  has expired keeps being served, since expiry gates updates and not
-  operation.
+- It **follows Sigstore's TUF metadata** (`controlplane tuf-refresh`, and the
+  hourly job when the stored timestamp nears expiry) to learn which
+  transparency log shard is in service, so a Sigstore rotation costs a
+  refresh rather than a release. It **verifies that metadata itself** before
+  storing it — the same workflow the client runs, against the same anchor
+  (`priv/tuf/sigstore_tuf_root.json`) — because that decision is one no
+  client is in a position to re-check. Nothing in the zone depends on it:
+  clients read Sigstore's repository themselves for their own pins
+  (docs/REKOR-ZONE-KEY.md §10).
 - Each org has **networks**; a network is one synchronicity cluster and
   owns one membership name: `_synchronicity.<network>.<org>.<base>`.
 - A **device** is one `id=` label plus its keys. Key rotation follows
@@ -210,11 +208,11 @@ listen address.
 | `CP_GOOGLE_CLIENT_SECRET` | primary | Google OAuth client secret. |
 | `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in. |
 | `CP_GITHUB_CLIENT_SECRET` | primary | GitHub OAuth client secret. |
-| `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Unset — the normal case — the shard in service is read from the relayed `trusted_root.json`, so a Sigstore rotation costs a `tuf-refresh` and not a release. |
+| `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Unset — the normal case — the shard in service is read from the stored `trusted_root.json`, so a Sigstore rotation costs a `tuf-refresh` and not a release. |
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
-| `CP_TUF_URL` | primary | Sigstore TUF repository this zone relays, so clients' log pins follow it. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched by `controlplane tuf-refresh` and by the hourly job within three days of the stored timestamp's expiry. |
+| `CP_TUF_URL` | primary | Sigstore TUF repository this service follows to find the transparency-log shard in service. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched by `controlplane tuf-refresh` and by the hourly job within three days of the stored timestamp's expiry. |
 | `CP_TUF_ROOT` | primary | The `root.json` TUF verification anchors on. Defaults to `priv/tuf/sigstore_tuf_root.json`, byte-identical to the root the client embeds. Set it — together with `CP_TUF_URL` — for a deployment running its own TUF repository; a repository whose root this service does not hold is one none of whose files it can check. |
 
 Day-2 operations (replicas, key ceremony, backups) live in

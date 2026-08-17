@@ -1197,8 +1197,8 @@ impl LogKeys {
     /// (see [`crate::tuf::EMBEDDED_TRUSTED_ROOT`]).
     ///
     /// These are what a client runs on until it learns better. A client that
-    /// accepts a TUF bundle relayed by a zone runs on the tlogs *that*
-    /// bundle's trusted root names instead, persisted in
+    /// accepts a chain from Sigstore's TUF repository runs on the tlogs its
+    /// trusted root names instead, persisted in
     /// `<data-dir>/rekor-pins.json` and **replacing** this set rather than
     /// unioning with it (§10, [`crate::tuf`]). So the resolution order is
     /// `--rekor-key` if given, else the last TUF-verified pin set, else this.

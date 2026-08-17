@@ -31,7 +31,7 @@ use hickory_resolver::proto::{
 use crate::{
     error::NetError,
     rekor::{self, LogKeys, ProofError, VerifiedRecord, ZoneKey},
-    tuf::{self, PinState, TufBundle, TufError, TufUpdate},
+    tuf::{self, PinState, Repo, TufError, TufMetadata, TufUpdate},
 };
 
 /// The label the membership TXT records live under.
@@ -79,15 +79,6 @@ pub fn rekor_part_query_name(zone: &str, index: usize) -> String {
         0 | 1 => rekor_query_name(zone),
         n => format!("{}-{n}.{}", rekor::REKOR_TXT_PREFIX, zone),
     }
-}
-
-/// The query name the zone relays Sigstore's TUF metadata under (§10.1).
-///
-/// One name per zone, at the apex, beside the proof records — the same
-/// relay, on the same 24 h TTL, so a steady-state refresh still costs one
-/// TXT query and the pin set follows Sigstore without a second transport.
-pub fn tuf_query_name(apex: &str) -> String {
-    format!("{}.{}", tuf::TUF_TXT_PREFIX, apex)
 }
 
 /// The control-plane apex a validated membership answer names, checked at
@@ -419,6 +410,7 @@ pub struct DnssecResolver {
     anchors: std::sync::Arc<TrustAnchors>,
     rekor: RekorPolicy,
     pins: std::sync::Arc<std::sync::Mutex<Pins>>,
+    tuf: Option<TufSource>,
 }
 
 /// The transparency-log pin set in force, and whether TUF may move it
@@ -426,8 +418,8 @@ pub struct DnssecResolver {
 ///
 /// An explicit `--rekor-key` file is a static, different universe: the pin
 /// set is what the file says and TUF refresh is disabled entirely, so the
-/// resolver never even asks for the bundle record. Otherwise the pins are
-/// the last TUF-verified set, else the embedded bootstrap snapshot.
+/// resolver never walks anything. Otherwise the pins are the last
+/// TUF-verified set, else the embedded bootstrap snapshot.
 #[derive(Debug)]
 enum Pins {
     /// `--rekor-key` named a file. Nothing refreshes this.
@@ -439,6 +431,14 @@ enum Pins {
         keys: LogKeys,
         state: PinState,
         path: Option<std::path::PathBuf>,
+        /// When the repository was last walked, successfully or not, so a
+        /// membership refresh on a short TTL does not become a request to
+        /// Sigstore's CDN every time it fires. Seeded from the persisted
+        /// state's `updated_at`, so a restart does not reset the clock —
+        /// but *not* persisted on failure, so a run that could not reach
+        /// the repository retries on the next start rather than resting a
+        /// full day on nothing.
+        checked_at: u64,
     },
 }
 
@@ -450,6 +450,23 @@ impl Pins {
             Pins::Tuf { keys, .. } => keys.clone(),
         }
     }
+}
+
+/// Where the pin set is refreshed from (§10.2).
+///
+/// Held as an `Option`, and `None` — `--no-tuf`, or an explicit
+/// `--rekor-key` making the whole pin set static — is the reason: refresh
+/// being off is a state with no repository in it at all, rather than a
+/// repository that answers nothing.
+#[derive(Clone)]
+enum TufSource {
+    /// Sigstore's TUF repository, read over HTTPS. The URL is not trusted
+    /// with anything — every byte fetched under it is checked against the
+    /// embedded root — so this is a mirror knob, not a trust knob.
+    Url(String),
+    /// A repository supplied by the caller, so the walk is exercisable
+    /// without egress. Tests use it; nothing else does.
+    Repo(std::sync::Arc<dyn Repo + Send + Sync>),
 }
 
 impl std::fmt::Debug for DnssecResolver {
@@ -516,10 +533,25 @@ pub struct ResolverOptions {
     ///
     /// The daemon passes `<data-dir>/rekor-pins.json`; `None` keeps the
     /// state in memory, which is what a one-shot command or a test wants.
-    /// The file is global across domains and monotonic on purpose — a
-    /// hostile zone must not be able to roll one client's versions back by
-    /// being asked about some other domain.
+    /// The file is global across domains and monotonic on purpose — the pin
+    /// set belongs to Sigstore, not to any domain being resolved, so every
+    /// domain shares one floor.
     pub rekor_state: Option<std::path::PathBuf>,
+    /// The Sigstore TUF repository the pin set follows, [`tuf::SIGSTORE_TUF_URL`]
+    /// when unset (§10.2).
+    ///
+    /// A mirror knob rather than a trust knob: whatever it names, the
+    /// material fetched under it is verified against the embedded TUF root
+    /// before anything moves. A deployment running its *own* Sigstore points
+    /// this at its repository and `rekor_key` at its log.
+    pub tuf_url: Option<String>,
+    /// Turns pin refresh off, leaving the client on the pins it already has
+    /// — the persisted set, else the embedded bootstrap snapshot.
+    ///
+    /// For a deployment that will not have its daemon reach a CDN. The cost
+    /// is stated in §10.4: the pin set stops following Sigstore, so the day
+    /// a shard rotates is the day this client needs a new build.
+    pub no_tuf: bool,
 }
 
 /// Whether zone-key transparency is enforced (§4.1).
@@ -591,10 +623,24 @@ impl DnssecResolver {
                     .unwrap_or_else(PinState::embedded);
                 Pins::Tuf {
                     keys: state.log_keys().unwrap_or_else(LogKeys::embedded),
+                    // A walk is due when the last one has aged out, and a
+                    // state that was never written is a client that has
+                    // never walked — so a fresh install refreshes at once
+                    // and a restarted one does not.
+                    checked_at: state.updated_at,
                     state,
                     path: options.rekor_state.clone(),
                 }
             }
+        };
+        let tuf = match (options.no_tuf, &options.rekor_key) {
+            (true, _) | (_, Some(_)) => None,
+            (false, None) => Some(TufSource::Url(
+                options
+                    .tuf_url
+                    .clone()
+                    .unwrap_or_else(|| tuf::SIGSTORE_TUF_URL.to_string()),
+            )),
         };
         Ok(DnssecResolver {
             handle: hickory_resolver::net::dnssec::DnssecDnsHandle::with_trust_anchor(
@@ -610,7 +656,18 @@ impl DnssecResolver {
             anchors,
             rekor: options.rekor_policy(),
             pins: std::sync::Arc::new(std::sync::Mutex::new(pins)),
+            tuf,
         })
+    }
+
+    /// Refreshes the pin set from `repo` instead of over HTTPS.
+    ///
+    /// The one seam the walk needs to be exercisable without egress, so no
+    /// test run ever reaches Sigstore by accident. Has no effect when the
+    /// pin set is static (`--rekor-key`) or refresh is off.
+    pub fn with_tuf_repo(mut self, repo: std::sync::Arc<dyn Repo + Send + Sync>) -> Self {
+        self.tuf = self.tuf.map(|_| TufSource::Repo(repo));
+        self
     }
 
     /// Whether this resolver requires zone-key transparency (§4.1).
@@ -673,23 +730,24 @@ impl DnssecResolver {
             // proof from a shard Sigstore added since this build shipped
             // verifies in the same refresh that learned about it (§10.2).
             //
-            // And nothing about it can fail this refresh: an absent, stale
-            // or invalid bundle leaves the current pins standing, because a
-            // control plane that stops fetching must degrade to a frozen pin
-            // set — today's behavior — and never to a failed cluster.
-            match self.refresh_tuf(&apex).await {
+            // And nothing about it can fail this refresh: an unreachable,
+            // stale or hostile TUF repository leaves the current pins
+            // standing, because a client that cannot read Sigstore must
+            // degrade to a frozen pin set — the behavior a build-time
+            // snapshot always had — and never to a failed cluster. At most
+            // once a day, too: the pins move on Sigstore's schedule, not on
+            // the zone's TTL.
+            match self.refresh_tuf().await {
                 Ok(Some(update)) if update.changed => tracing::info!(
-                    apex = %apex,
                     root = update.state.root_version,
                     timestamp = update.state.timestamp_version,
                     logs = update.log_keys.keys().len(),
-                    "transparency-log pin set updated from the zone's TUF bundle"
+                    "transparency-log pin set updated from Sigstore's TUF repository"
                 ),
                 Ok(_) => {}
                 Err(e) => tracing::debug!(
-                    apex = %apex,
                     error = %e,
-                    "the zone's TUF bundle did not update the pin set; the current pins stand"
+                    "Sigstore's TUF repository did not update the pin set; the current pins stand"
                 ),
             }
             self.verify_zone_key(&domain, &apex, &signing_zone, key_tag)
@@ -699,31 +757,53 @@ impl DnssecResolver {
         Ok((set, validated.ttl))
     }
 
-    /// Resolves the zone's TUF bundle and adopts it if it is newer (§10.2).
+    /// Walks Sigstore's TUF repository and adopts what it served if it is
+    /// newer (§10.2).
     ///
-    /// `Ok(None)` is the ordinary case for a control plane that relays no
-    /// material — an absent record is a non-event, not a fault, and neither
-    /// is a bundle that merely re-states what is already accepted. An `Err`
-    /// names the class the chain broke in, for `synch doctor`; the refresh
-    /// pipeline logs it and carries on.
+    /// `Ok(None)` is the ordinary case: refresh is off, or the last walk is
+    /// still young. An `Err` names the class the chain broke in, for `synch
+    /// doctor`; the refresh pipeline logs it and carries on, because nothing
+    /// about a TUF repository is allowed to fail a membership refresh.
     ///
-    /// Under an explicit `--rekor-key` this does nothing at all and asks for
-    /// nothing: a static universe is static in both directions.
-    pub async fn refresh_tuf(&self, apex: &Name) -> Result<Option<TufUpdate>, NetError> {
-        if matches!(*self.pins(), Pins::Static(_)) {
+    /// Under an explicit `--rekor-key`, or `--no-tuf`, this does nothing at
+    /// all and fetches nothing: a static universe is static in both
+    /// directions.
+    pub async fn refresh_tuf(&self) -> Result<Option<TufUpdate>, NetError> {
+        let Some(source) = self.tuf.clone() else {
             return Ok(None);
-        }
-        let name = tuf_query_name(apex.to_string().trim_end_matches('.'));
-        let bundle = match self.tuf_bundle(&name).await? {
-            Some(bundle) => bundle,
-            None => return Ok(None),
         };
+        let now = now_unix();
+        // Two decisions under the lock and nothing else: whether a walk is
+        // due, and which root version it starts from. The walk itself is
+        // seconds of network, and holding a mutex across it would serialize
+        // every membership refresh in the process behind a CDN.
+        let from_root = {
+            let mut pins = self.pins();
+            let Pins::Tuf {
+                state, checked_at, ..
+            } = &mut *pins
+            else {
+                return Ok(None);
+            };
+            if now < checked_at.saturating_add(tuf::REFRESH_INTERVAL) {
+                return Ok(None);
+            }
+            // Stamped before the walk rather than after it, so a repository
+            // that is slow or down costs one attempt a day and not one per
+            // membership refresh for as long as it stays down.
+            *checked_at = now;
+            state.root_version
+        };
+        let metadata = self.walk_tuf(&source, from_root).await?;
 
         // The state is re-read from disk under the lock rather than trusted
         // from memory: two resolvers in one data directory share one file,
         // and monotonicity is a property of the file, not of a process.
         let mut pins = self.pins();
-        let Pins::Tuf { keys, state, path } = &mut *pins else {
+        let Pins::Tuf {
+            keys, state, path, ..
+        } = &mut *pins
+        else {
             return Ok(None);
         };
         // Whichever of the two is further along, whole: a state is a
@@ -734,7 +814,7 @@ impl DnssecResolver {
             Some(stored) if versions(&stored) >= versions(state) => stored,
             _ => state.clone(),
         };
-        let update = tuf::update(&bundle, &current, now_unix()).map_err(|e| tuf_error(&name, e))?;
+        let update = tuf::update(&metadata, &current, now).map_err(|e| tuf_error(&source, e))?;
         if let Some(path) = path.as_deref() {
             if let Err(e) = update.state.save(path) {
                 // A pin set that cannot be persisted is still a pin set: it
@@ -747,29 +827,25 @@ impl DnssecResolver {
         Ok(Some(update))
     }
 
-    /// The bundle record at `name`, if the zone publishes one that decodes.
-    async fn tuf_bundle(&self, name: &str) -> Result<Option<TufBundle>, NetError> {
-        let Ok(response) = self.lookup(name, RecordType::TXT).await else {
-            // A name that does not exist, an unproven negative, a transport
-            // hiccup: all the same fact here — no material to adopt.
-            return Ok(None);
-        };
-        let Ok(validated) = secure_txt(name, &response.answers) else {
-            return Ok(None);
-        };
-        let mut last = None;
-        for record in &validated.records {
-            match TufBundle::from_txt(record) {
-                Ok(bundle) => return Ok(Some(bundle)),
-                Err(e) => last = Some(e),
+    /// Collects the metadata chain from the repository, off the reactor.
+    ///
+    /// The walk is a handful of sequential HTTPS GETs ending in a few
+    /// hundred KB of `targets.json`, and [`tuf::fetch_metadata`] is the one
+    /// implementation of it — the monitor runs the same function against the
+    /// same trait. Running it on a blocking thread is what lets that stay
+    /// true without a second, async transcription of a walk whose every step
+    /// is load-bearing.
+    async fn walk_tuf(&self, source: &TufSource, from_root: u64) -> Result<TufMetadata, NetError> {
+        let owned = source.clone();
+        let walked = tokio::task::spawn_blocking(move || match &owned {
+            TufSource::Repo(repo) => tuf::fetch_metadata(&**repo, from_root),
+            TufSource::Url(url) => {
+                tuf::fetch_metadata(&HttpRepo::new(url).map_err(TufError::Malformed)?, from_root)
             }
-        }
-        match last {
-            // A record that exists and does not decode is worth saying out
-            // loud; a name with no TXT record at all is not.
-            Some(e) => Err(tuf_error(name, e)),
-            None => Ok(None),
-        }
+        })
+        .await
+        .map_err(|e| NetError::Dns(format!("the TUF walk did not finish: {e}")))?;
+        walked.map_err(|e| tuf_error(source, e))
     }
 
     /// Verifies that the zone key which signed an answer is on the public
@@ -992,14 +1068,18 @@ fn rekor_error(name: &str, error: ProofError) -> NetError {
     }
 }
 
-/// Lifts a TUF failure into the error class `synch doctor` explains.
+/// Lifts a TUF failure into the error class `synch doctor` explains, naming
+/// the repository it was walking.
 ///
 /// None of these ever reaches a caller of [`DnssecResolver::member_set`]:
-/// §10.2 is explicit that TUF trouble is never worse than not having the
-/// record. They exist so the refresh loop can say which way it broke.
-fn tuf_error(name: &str, error: TufError) -> NetError {
+/// §10.2 is explicit that TUF trouble is never worse than not having asked.
+/// They exist so the refresh can say which way it broke.
+fn tuf_error(source: &TufSource, error: TufError) -> NetError {
     NetError::Tuf {
-        name: name.to_string(),
+        repository: match source {
+            TufSource::Url(url) => url.clone(),
+            TufSource::Repo(_) => "the supplied TUF repository".to_string(),
+        },
         class: error.class(),
         reason: error.to_string(),
     }
@@ -1024,6 +1104,73 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// How long one file of a TUF walk may take.
+const TUF_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most a single TUF file may be.
+///
+/// Sigstore's `targets.json` is the big one at a few hundred KiB. The cap is
+/// here for the same reason the DoH body has one: these are bytes from a
+/// party nothing is trusted about, and a response with no bound is a reader
+/// that can be exhausted rather than a file that can be parsed.
+const MAX_TUF_BYTES: usize = 8 * 1024 * 1024;
+
+/// Sigstore's TUF repository, read over HTTPS.
+///
+/// Built and used entirely inside [`tokio::task::spawn_blocking`], which is
+/// what makes a blocking client the right one: the walk is sequential by
+/// nature — each file names the next — so there is no concurrency to give
+/// up, and running it off the reactor keeps a few hundred KB of JSON parsing
+/// away from the tasks doing the actual syncing.
+///
+/// TLS here is not load-bearing. Every byte fetched is self-authenticating
+/// and is checked against [`tuf::EMBEDDED_TUF_ROOT`] before it moves
+/// anything, so a hostile mirror can deny this walk and cannot make it mean
+/// anything (§10.2).
+struct HttpRepo {
+    base: String,
+    client: reqwest::blocking::Client,
+}
+
+impl HttpRepo {
+    fn new(base: &str) -> Result<HttpRepo, String> {
+        Ok(HttpRepo {
+            base: base.trim_end_matches('/').to_string(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(TUF_TIMEOUT)
+                .build()
+                .map_err(|e| format!("TUF client: {e}"))?,
+        })
+    }
+}
+
+impl Repo for HttpRepo {
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let url = format!("{}/{path}", self.base);
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("{url}: {e}"))?;
+        match response.status().as_u16() {
+            200 => {
+                let body = response.bytes().map_err(|e| format!("{url}: {e}"))?;
+                if body.len() > MAX_TUF_BYTES {
+                    return Err(format!(
+                        "{url}: {} bytes, over the {MAX_TUF_BYTES}-byte cap",
+                        body.len()
+                    ));
+                }
+                Ok(Some(body.to_vec()))
+            }
+            // The end of the root chain is a 404, and Sigstore's CDN answers
+            // 403 for an object that is not there.
+            403 | 404 => Ok(None),
+            status => Err(format!("{url}: the repository answered {status}")),
+        }
+    }
+}
+
 /// How long one plaintext DoH exchange may take end to end.
 /// How long one DoH exchange may take end to end.
 const DOH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1031,8 +1178,8 @@ const DOH_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most of a DoH response body we will buffer.
 ///
 /// A DNS message is length-prefixed by 16 bits, so 65535 bytes is the whole
-/// of any legitimate answer — the ~20 KB TUF bundle, the ~3 KB proof and
-/// everything smaller sit well inside it. The transport is untrusted and may
+/// of any legitimate answer — the ~3 KB proof record and everything smaller
+/// sit well inside it. The transport is untrusted and may
 /// be plaintext, so an endpoint that streams a body without end is a
 /// memory-exhaustion lever; we read up to this bound and refuse the rest
 /// rather than buffer whatever arrives. Denial, which http already concedes,
@@ -1295,6 +1442,8 @@ mod tests {
                 rekor: None,
                 rekor_key: None,
                 rekor_state: None,
+                tuf_url: None,
+                no_tuf: true,
             })
             .unwrap();
         }
@@ -1307,6 +1456,8 @@ mod tests {
             rekor: None,
             rekor_key: None,
             rekor_state: None,
+            tuf_url: None,
+            no_tuf: true,
         })
         .unwrap_err();
         assert!(err.to_string().contains("trust anchor"), "{err}");
@@ -1318,6 +1469,8 @@ mod tests {
             rekor: None,
             rekor_key: None,
             rekor_state: None,
+            tuf_url: None,
+            no_tuf: true,
         })
         .unwrap_err();
         assert!(err.to_string().contains("no DNSKEY records"), "{err}");
@@ -1336,6 +1489,8 @@ mod tests {
             rekor: None,
             rekor_key: None,
             rekor_state: None,
+            tuf_url: None,
+            no_tuf: true,
         })
         .unwrap();
     }
@@ -1402,6 +1557,8 @@ mod tests {
             rekor: None,
             rekor_key: None,
             rekor_state: None,
+            tuf_url: None,
+            no_tuf: true,
         })
         .unwrap();
         let err = tokio::time::timeout(

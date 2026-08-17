@@ -32,7 +32,7 @@ The control plane is today a from-scratch authoritative DNSSEC nameserver:
 `zone/model.gleam` reads the product tables into a `ZoneInput`,
 `zone/build.gleam` renders the full zone (SOA, NS, DNSKEY, glue, membership
 TXT, the `_synchronicity-transparency` declaration, `_synchronicity-rekor`
-and `_synchronicity-tuf` TXT, and the NSEC chain), `zone/publish.gleam` signs every RRset with the zone CSK and writes
+TXT, and the NSEC chain), `zone/publish.gleam` signs every RRset with the zone CSK and writes
 the result into `presigned_rrsets` — all inside the API transaction, so
 commit is publication — and the UDP/TCP/DoH listeners answer straight out
 of SQLite.
@@ -243,10 +243,9 @@ are ours to publish:
 - `_synchronicity-transparency.<apex>` TXT — the declaration (§2.1),
   rendered unconditionally: a zone that stopped publishing it would have
   every entry it ever logged stop verifying;
-- `_synchronicity-rekor.<signing zone>` TXT — the v2 proof records;
-- `_synchronicity-tuf.<signing zone>` TXT — the relayed TUF bundle.
+- `_synchronicity-rekor.<signing zone>` TXT — the v2 proof records.
 
-The last two sit at the **signing zone** rather than the apex. The apex is
+The proof records sit at the **signing zone** rather than the apex. The apex is
 the control plane's name; the signing zone is the zone the provider actually
 hosts, and the two differ when a control plane at `sync.example.com` lives
 inside the `example.com` zone with no delegation of its own

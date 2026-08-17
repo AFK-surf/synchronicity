@@ -52,6 +52,19 @@ pub struct Cli {
     #[arg(long, global = true, env = "SYNCH_REKOR_KEY", value_name = "FILE")]
     pub rekor_key: Option<PathBuf>,
 
+    /// Follow this Sigstore TUF repository instead of the official one, so
+    /// the transparency-log pin set tracks it (docs/REKOR-ZONE-KEY.md §10).
+    /// A mirror knob, not a trust knob: whatever it names, the metadata
+    /// fetched under it is verified against the TUF root this build embeds.
+    #[arg(long, global = true, env = "SYNCH_TUF", value_name = "URL")]
+    pub tuf: Option<String>,
+
+    /// Never contact Sigstore's TUF repository, leaving the pin set frozen
+    /// at whatever this node last verified — or at the built-in snapshot.
+    /// The cost is a new build the day Sigstore rotates a log (§10.4).
+    #[arg(long, global = true, env = "SYNCH_NO_TUF")]
+    pub no_tuf: bool,
+
     /// Dial and listen through this iroh relay server instead of n0's public
     /// relays; repeat for several. A relay forwards encrypted traffic only —
     /// choosing one is an availability decision, not a trust one (§3.3).

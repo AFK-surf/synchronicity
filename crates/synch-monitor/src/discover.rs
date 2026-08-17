@@ -7,12 +7,9 @@
 //! `trusted_root.json` names every transparency log, where each is served,
 //! and the window each was in service for (docs/REKOR-ZONE-KEY.md §10).
 //!
-//! The client learns this from a bundle a zone relays, because a client
-//! resolves DNS and should not be made to depend on a CDN. A monitor has no
-//! such constraint — it is already an HTTP client of a log it does not trust
-//! — so it walks the repository itself and verifies what it gets with the
-//! same [`synch_net::tuf`] code the client runs, against the same embedded
-//! root. Nothing is trusted because it was fetched.
+//! The walk and the verification are the client's, not a second copy of
+//! them: [`synch_net::tuf`] against the same embedded root, persisting the
+//! same `rekor-pins.json`. Nothing is trusted because it was fetched.
 //!
 //! §10.2's posture carries over intact: **TUF trouble is never worse than not
 //! having asked.** A repository that is unreachable, stale, or serving
@@ -25,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use synch_net::{
     rekor::LogKeys,
-    tuf::{self, PinState, Repo, TufBundle},
+    tuf::{self, PinState, Repo, TufMetadata},
 };
 
 use crate::MonitorError;
@@ -187,8 +184,8 @@ pub fn discover(
 
 /// Walks the repository and verifies what it served.
 fn refresh(repo: &dyn Repo, pins: &PinState, now: u64) -> Result<tuf::TufUpdate, String> {
-    let bundle: TufBundle =
-        tuf::fetch_bundle(repo, pins.root_version).map_err(|e| e.to_string())?;
+    let bundle: TufMetadata =
+        tuf::fetch_metadata(repo, pins.root_version).map_err(|e| e.to_string())?;
     tuf::update(&bundle, pins, now).map_err(|e| e.to_string())
 }
 

@@ -2,7 +2,6 @@ source=https://tuf-repo-cdn.sigstore.dev
 fetched_at=1786854774
 verify_at=1786854774
 root_versions=13,14,15
-bundle_roots=15
 chain_floor=13
 root_version=15
 timestamp_version=756
