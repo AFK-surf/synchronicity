@@ -1008,7 +1008,16 @@ impl Store {
             reason: "could not duplicate the payload handle to flush it".into(),
         })?;
         fsync_file(&payload)?;
-        fsync_file(&File::open(self.outboard_path(root))?)?;
+        // Reopened for *write* to flush it. `File::open` hands back a read-only
+        // handle, and Windows refuses `FlushFileBuffers` on one with
+        // ERROR_ACCESS_DENIED — which went unnoticed while the result was
+        // discarded, and became a hard failure the moment these flushes started
+        // being checked. Unix does not care either way.
+        fsync_file(
+            &OpenOptions::new()
+                .write(true)
+                .open(self.outboard_path(root))?,
+        )?;
 
         let commit = self.commit_groups(root, size, &served, None, now)?;
         self.trim_to_size(root, commit);
