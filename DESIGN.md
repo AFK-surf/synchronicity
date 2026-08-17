@@ -1293,15 +1293,30 @@ CI (GitHub Actions):
   namespace for future publishes. Established peers won't accept lower seqs and
   retain signed history as evidence — but that is per-peer protection only (see the
   rollback bullet below); new peers get none, and forward overwrites at higher seq
-  remain possible for any binding holder. **v1 accepts this exposure knowingly**: the
-  protocol makes no attempt to distinguish a legitimate rotation from a domain-level
-  takeover — a cryptographic continuity scheme (old-key cross-signing of rebindings)
-  was considered and deliberately deferred as complexity not yet earned (§13). What
-  v1 does provide: every rebinding is logged and listed by `synch doctor`, plus the
-  base mitigations — validated in-process resolution (no resolver trust),
-  TTL-bounded caching, and `synch doctor` surfacing the full live member set,
-  bindings, and their provenance. Deployments that can't accept domain-controller
-  power use static trust only. The flip side of
+  remain possible for any binding holder. The protocol still makes no attempt to
+  distinguish a legitimate rotation from a domain-level takeover *cryptographically* —
+  a continuity scheme (old-key cross-signing of rebindings) was considered and
+  deliberately deferred (§13).
+
+  What v1 adds instead is **transparency**, which does not prevent the takeover but
+  makes it public: the zone key that signed a membership answer must additionally
+  appear in Sigstore's Rekor log, with an offline-verifiable inclusion proof carried
+  inside the zone. An attacker who has taken the registrar must therefore either log
+  their key under the operator's own apex, where a monitor watching that delegation
+  path reports it, or fail client validation. Covert targeted substitution stops
+  being covert. It is on by default (`--rekor off` states the opt-out), and it is
+  the reason the "knowingly accepted" framing this bullet used to end on no longer
+  describes what ships. **See [docs/REKOR-ZONE-KEY.md](docs/REKOR-ZONE-KEY.md)** for
+  the mechanism, its threat model, and — importantly — what it still does not
+  protect against: key *theft* leaves a valid record, and the monitor cannot tell
+  your rotation from a substitution. It tells you a key was authorized; your own
+  record of what you published is the discriminator.
+
+  Everything else v1 provides is unchanged: every rebinding is logged and listed by
+  `synch doctor`, plus the base mitigations — validated in-process resolution (no
+  resolver trust), TTL-bounded caching, and `synch doctor` surfacing the full live
+  member set, bindings, and their provenance. Deployments that can't accept
+  domain-controller power use static trust only. The flip side of
   failing closed is worth stating: a prolonged DNSSEC outage expires dns bindings
   and shrinks the member set toward static-only — the cluster degrades to a halt
   rather than falling open. Deliberate.
@@ -1354,8 +1369,12 @@ CI (GitHub Actions):
 
 - Read-only membership tier and per-space ACLs.
 - Rotation continuity attestation: cryptographically distinguishing a legitimate key
-  rotation from a domain-level rebinding (e.g. an old-key cross-signed rotation log),
-  closing the DNSSEC over-trust exposure accepted in §12.
+  rotation from a domain-level rebinding (e.g. an old-key cross-signed rotation log).
+  Still not v1. Note that the transparency layer shipped since (§12,
+  [docs/REKOR-ZONE-KEY.md](docs/REKOR-ZONE-KEY.md)) attacks the same exposure from
+  the other side — it makes a substitution *public* rather than making it
+  *distinguishable* — so this remains the thing that would let a client tell the
+  two apart on its own, without a monitor and without an operator's records.
 - Encrypted spaces (per-space content keys; metadata padding).
 - Partial trie replication for very large clusters (the proof machinery in §4.3
   already permits it).

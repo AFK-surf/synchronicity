@@ -262,16 +262,28 @@ control plane itself with
 
   ```sh
   echo '{"known":{"keys":{"sync.example":[]}}}' > /var/lib/synch-monitor/state.json
-  synch-monitor --state /var/lib/synch-monitor/state.json
+  # --from-index is not optional in practice: without it the first run
+  # walks the log from entry 0, and the production shard has ~10^8 entries
+  # in it. Take the current tree size from the checkpoint and subtract
+  # however far back you want to look.
+  size=$(curl -sS https://log2025-1.rekor.sigstore.dev/api/v2/checkpoint | sed -n 2p)
+  synch-monitor --state /var/lib/synch-monitor/state.json \
+                --from-index "$((size - 200000))"
   ```
+
+  Then install the unit and timer beside it — `ops/systemd/
+  synch-monitor.{service,timer}` — which run it hourly from the recorded
+  index. **Run it somewhere that is not the control plane's network**;
+  the independence is the point.
 
   Exit codes: `0` nothing new, `10` unauthorized claims naming your apex
   (recorded, no alarm — no client would have accepted one), `20` **a key
   was authorized for your apex that this monitor had not seen: check it
-  against what you published**, `2` the run could not finish. These
-  numbers changed when the tiering was reduced to two; a rule written
-  against the old `30` now matches nothing, which is the intended way to
-  find out.
+  against what you published**, `30` the run could not finish. They are
+  ordered by severity so a rule testing `>= 10` reads correctly — which
+  is why failure is `30` and not the `2` it used to be, since at `2` it
+  sorted below "nothing new" and that rule silently ignored every failed
+  run. A monitor that cannot finish is not a monitor with nothing to say.
 
   New authorizations go to **stdout**, one line each with the apex, key
   tag, the DS your registrar should be showing, the SPKI digest and the

@@ -87,10 +87,19 @@ delegation and no DNSKEY of its own. Then `example.com` signs everything —
 membership answers, the declaration, all of it — and it is `example.com`'s key
 set the chain proves. So a chain reads as the declaration at the apex, then
 the ladder starting at the **signing zone**, and the rule tying them together
-is that the signing zone must contain the apex. The proof records live at the
-signing zone rather than the apex, because it is the only name a client can
-compute from an answer: the apex is a name only the entry knows.
-`CP_SIGNING_ZONE` names it when it differs (§5.1); it defaults to the apex.
+is that the signing zone must contain the apex. `CP_SIGNING_ZONE` names it
+when it differs (§5.1); it defaults to the apex.
+
+**The proof records live at the apex**, and the membership answer says where
+that apex is (`apex=`, §3). An earlier revision put them at the signing zone,
+on the grounds that it was the only name a client could compute from an
+answer — true before the `apex=` field existed, and the reason that claim
+still appears in older prose. It is wrong now, and it mattered: two control
+planes inside one signing zone would have had to share a single record name,
+and would have deleted each other's records forever. The one name a client
+takes from the answer itself is the **signing zone**, from the RRSIG signer
+field, and it is used to *bound* the apex rather than to find anything:
+`signing zone ⊇ apex ⊇ membership domain`.
 
 ### 2.1 Why the entry looks the way it does
 
@@ -401,8 +410,11 @@ Why in-band rather than an HTTPS side-channel or a live Rekor query:
   sees.
 
 The record sits at the **apex** (one zone key, one proof set), not per
-membership name — the client learns the apex from the RRSIG signer field it
-already validates.
+membership name. The client learns the apex from the `apex=` field of the
+membership answer it just validated, and holds it between two names it
+already knows — it must contain the membership domain, and be contained by
+the signing zone the RRSIG names. A wrong value points at a name with no
+usable proof, which fails closed.
 
 One more record rides the same mechanism at the apex: the **declaration** at
 `_synchronicity-transparency.<apex>`, a fixed 20-byte TXT the zone always
@@ -461,11 +473,14 @@ the one DoH transport, then verifies entirely offline:
 
 1. `_synchronicity.<domain> TXT` — as today (hickory in-process validation,
    secure-proof-only, owner-name check).
-2. `<apex> DNSKEY` — apex taken from the TXT answer's RRSIG signer field;
-   select the DNSKEY whose key tag matches that RRSIG. This yields the exact
-   zone-key rdata bytes the chain must prove.
-3. `_synchronicity-rekor.<apex> TXT` — the proof record matching that key
-   tag.
+2. `<signing zone> DNSKEY` — the signing zone taken from the TXT answer's
+   RRSIG signer field (which is also checked to *contain* the queried name,
+   RFC 4035 §5.3.1); select the DNSKEY whose key tag matches that RRSIG.
+   This yields the exact zone-key rdata bytes the chain must prove.
+3. `_synchronicity-rekor.<apex> TXT` — the proof records, at the apex the
+   membership answer named, which must sit between the signing zone and the
+   domain being resolved. A proof spanning several records continues at
+   `_synchronicity-rekor-<n>.<apex>`, bounded by `MAX_PROOF_PARTS`.
 
 Before step 3, and off the DNS transport entirely, the pin set may be
 refreshed from Sigstore's TUF repository — at most once a day, so this is not

@@ -57,9 +57,10 @@ pub fn query_name(domain: &str) -> String {
 
 /// The query name a zone's key-transparency proofs live under (§3).
 ///
-/// One name per zone, at the apex — one zone key, one proof set. The client
-/// learns the apex from the RRSIG signer field it already validates, not
-/// from the membership name it asked about.
+/// One name per zone, at the apex — one zone key, one proof set. The apex
+/// comes from the `apex=` field of the membership answer, held between the
+/// signing zone the RRSIG names and the domain being resolved (see
+/// [`apex_of`]); the RRSIG signer is the *bound*, not the lookup.
 pub fn rekor_query_name(zone: &str) -> String {
     format!("{}.{}", rekor::REKOR_TXT_PREFIX, zone)
 }
