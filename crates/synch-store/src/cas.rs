@@ -95,7 +95,7 @@ impl BlobRow {
         }
         match &self.bitmap {
             None => ChunkRanges::empty(),
-            Some(bits) => bitmap_to_ranges(bits, group_count(self.size)),
+            Some(bytes) => blob_to_ranges(bytes, group_count(self.size)),
         }
     }
 
@@ -251,11 +251,63 @@ pub(crate) fn grow_to(file: &File, len: u64) -> Result<()> {
     Ok(())
 }
 
+/// The first byte past the last group of `served`, clamped to `size`.
+///
+/// What a window's writes can actually reach, which is the only length a file
+/// may be grown to on the strength of an unverified claim.
+fn window_end_bytes(served: &ChunkRanges, size: u64) -> u64 {
+    served
+        .ranges
+        .last()
+        .map(|r| r.end.saturating_mul(CHUNK_GROUP_SIZE).min(size))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
 fn bitmap_len(groups: u64) -> usize {
     groups.div_ceil(8) as usize
 }
 
-fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
+/// Encodes an object's verified groups for the `blobs.bitmap` column.
+///
+/// Ranges, not a bit per group, despite the column's name. A bitmap costs
+/// `O(group_count)` to read *and* to write, and both happen on every commit:
+/// `write_slice` reads the row, `commit_groups` reads it again inside its
+/// transaction and rewrites the whole blob — per 8 MiB window. For a 100 GB
+/// object that is 6.1M loop iterations and a 763 KB blob rewritten ~12 200
+/// times, so moving 100 GB of payload cost tens of GB of index traffic and
+/// ~10^11 iterations. It is worse remotely: `encode_slice` reads the row before
+/// anything else, so a `GetSlice` for one group of a 1 TB partial object cost
+/// the provider a 7.6 MB read and 61M iterations for a ~50-byte request.
+///
+/// Verified groups are contiguous runs in practice — fetches walk windows in
+/// order — so the range form is a handful of integers where the bitmap was
+/// hundreds of kilobytes, and both directions are `O(runs)`.
+pub(crate) fn ranges_to_blob(ranges: &ChunkRanges) -> Vec<u8> {
+    let pairs: Vec<(u64, u64)> = ranges.ranges.iter().map(|r| (r.start, r.end)).collect();
+    postcard::to_stdvec(&pairs).expect("range encoding is infallible")
+}
+
+/// Decodes the `blobs.bitmap` column, clamped to the object's group count.
+pub(crate) fn blob_to_ranges(bytes: &[u8], groups: u64) -> ChunkRanges {
+    let pairs: Vec<(u64, u64)> = match postcard::from_bytes(bytes) {
+        Ok(pairs) => pairs,
+        // A row this build cannot read is treated as holding nothing, which
+        // costs a re-fetch and never a wrong claim of availability.
+        Err(_) => return ChunkRanges::empty(),
+    };
+    ChunkRanges::from_ranges(
+        pairs
+            .into_iter()
+            .map(|(start, end)| GroupRange::new(start, end.min(groups))),
+    )
+}
+
+/// Decodes the pre-v10 bit-per-group encoding.
+///
+/// Live only inside the v10 migration, which rewrites every partial row into
+/// the range form. Nothing on a running node reads a bitmap any more.
+pub(crate) fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
     let mut ranges = Vec::new();
     let mut start: Option<u64> = None;
     for group in 0..groups {
@@ -325,7 +377,7 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
         let complete = complete != 0;
         let held = match (complete, &bitmap) {
             (true, _) => ChunkRanges::single(0, total),
-            (false, Some(bits)) => bitmap_to_ranges(bits, total),
+            (false, Some(bytes)) => blob_to_ranges(bytes, total),
             (false, None) => ChunkRanges::empty(),
         };
         RowClaim {
@@ -336,6 +388,7 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn ranges_to_bitmap(ranges: &ChunkRanges, groups: u64) -> Vec<u8> {
     let mut bits = vec![0u8; bitmap_len(groups)];
     for r in &ranges.ranges {
@@ -531,7 +584,7 @@ impl Store {
                 root,
                 size,
                 complete,
-                (!complete).then(|| ranges_to_bitmap(&verified, total)),
+                (!complete).then(|| ranges_to_blob(&verified)),
                 inline,
                 now,
             )?;
@@ -900,20 +953,30 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&payload_path)?;
-        // Grown to fit, never shrunk: `size` is still this peer's claim, and
-        // `decode_ranges` below is what turns it into a fact. Sizing the file
-        // *down* on the strength of the claim is how an understated entry used
-        // to destroy verified groups — bytes gone, bitmap bits intact, the node
-        // advertising a group it could no longer serve and no way back short of
-        // deleting the object ([`grow_to`], `docs/DELTA-SYNC.md` §6).
-        grow_to(&payload, size)?;
+        // Grown to fit the *window*, never to the claimed size, and never
+        // shrunk.
+        //
+        // Never shrunk, because sizing a file down on the strength of a claim is
+        // how an understated entry used to destroy verified groups — bytes gone,
+        // bitmap bits intact, the node advertising a group it could no longer
+        // serve ([`grow_to`], `docs/DELTA-SYNC.md` §6).
+        //
+        // Never to the claimed size, because `size` is a peer's assertion off an
+        // entry and this runs *before* `decode_ranges` turns any of it into
+        // fact. An entry claiming 32 TiB for any root made every node that
+        // attempted a fetch create a 32 TiB sparse payload and a 128 GiB sparse
+        // outboard, fail verification, and leave both behind — `trim_to_size`
+        // only runs on a commit that completed the object, so nothing reclaimed
+        // them. Growing to the end of the window bounds the file by what is
+        // about to be verified; `write_at` extends past it as later windows
+        // land, so a real object still fills out normally.
+        grow_to(&payload, window_end_bytes(&served, size))?;
         let outboard_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(self.outboard_path(root))?;
-        grow_to(&outboard_file, tree.outboard_size())?;
         let outboard = PreOrderOutboard {
             root: root_hash,
             tree,

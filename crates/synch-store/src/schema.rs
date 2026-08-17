@@ -64,6 +64,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V7_OBSERVED_CLAIMED_BY),
     Migration::Sql(V8_S3_CONFIG_NAMESPACE),
     Migration::Sql(V9_ENTRY_UNIX_MODE),
+    Migration::Rust {
+        name: "verified groups as ranges",
+        run: v10_groups_as_ranges,
+    },
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -190,7 +194,12 @@ CREATE TABLE mirrors (
   space      TEXT NOT NULL,
   policy     TEXT NOT NULL               -- 'newest' | 'origin=<id>' | 'strict' (§7.2)
 );
-INSERT OR REPLACE INTO mirrors (local_path, space, policy)
+-- Plain INSERT, not INSERT OR REPLACE. The key moves from
+-- (origin_id, space) to local_path, so two v3 mirrors that pointed at one
+-- directory collapse here — and the survivor's sweep then deletes the other
+-- origin's materialized files. Failing loudly is the right outcome for an
+-- ambiguous upgrade: the operator picks which mirror that directory is.
+INSERT INTO mirrors (local_path, space, policy)
   SELECT local_path, space, 'origin=' || origin_id FROM mirrors_v3;
 DROP TABLE mirrors_v3;
 "#;
@@ -341,6 +350,44 @@ DROP TABLE entries_v8;
 CREATE INDEX entries_by_path    ON entries (space, path);
 CREATE INDEX entries_by_content ON entries (content);
 "#;
+
+/// v10 — `blobs.bitmap` holds the verified groups as ranges rather than as a
+/// bit per group.
+///
+/// The column keeps its name and type; only the encoding changes. A bitmap cost
+/// `O(group_count)` to read and to write, and a partial object's row is read and
+/// rewritten on every committed window and read again on every slice served, so
+/// the cost fell on exactly the hot paths — quadratic in the object for a fetch,
+/// and a cheap-request/expensive-work amplification for a provider. Runs of
+/// verified groups are contiguous in practice, so the range form is a few
+/// integers where the bitmap was hundreds of kilobytes.
+///
+/// Only partial rows carry the column at all: a complete object's groups are
+/// implied by its size.
+fn v10_groups_as_ranges(tx: &Transaction<'_>) -> Result<()> {
+    let rows: Vec<(Vec<u8>, i64, Vec<u8>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT root, size, bitmap FROM blobs WHERE complete = 0 AND bitmap IS NOT NULL",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (root, size, bits) in rows {
+        let groups = synch_core::group_count(size as u64);
+        let ranges = crate::cas::bitmap_to_ranges(&bits, groups);
+        tx.execute(
+            "UPDATE blobs SET bitmap = ?2 WHERE root = ?1",
+            rusqlite::params![root, crate::cas::ranges_to_blob(&ranges)],
+        )?;
+    }
+    Ok(())
+}
 
 /// The §10 schema as the design document states it — the shape replaying the
 /// whole chain must produce.

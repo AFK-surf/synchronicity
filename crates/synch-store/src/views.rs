@@ -341,6 +341,24 @@ impl Store {
         Ok(())
     }
 
+    /// Every object root one origin currently advertises a `b:` record for.
+    ///
+    /// Read from the materialized view rather than the trie because that is
+    /// what every other reader uses, and for our own origin the two agree by
+    /// construction.
+    pub fn provider_roots_for_origin(&self, origin: &OriginId) -> Result<Vec<Hash>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT object_root FROM blob_providers WHERE origin_id = ?1 ORDER BY object_root",
+        )?;
+        let rows = stmt.query_map(params![origin.canonical()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(hash_column(row?, "blob_providers.object_root")?);
+        }
+        Ok(out)
+    }
+
     /// Deletes every provider row for an origin.
     pub fn delete_origin_providers(&self, origin: &OriginId) -> Result<usize> {
         Ok(self.conn().execute(

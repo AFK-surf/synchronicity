@@ -225,12 +225,28 @@ impl Store {
     /// Equivocation only harms the equivocator's own published view, but it is
     /// reported loudly (§4.4) with both signed heads retained as proof.
     pub fn equivocations(&self) -> Result<Vec<Equivocation>> {
+        self.equivocations_matching(None)
+    }
+
+    /// The same, for one origin.
+    ///
+    /// `prune_history_before` runs once per origin per maintenance pass and
+    /// needs only that origin's forks; calling the unscoped version there made
+    /// each pass do a full-table group-by *and* an unfiltered per-origin
+    /// history read for every origin in the cluster — an N+1 inside an N+1.
+    pub fn equivocations_for(&self, origin: &OriginId) -> Result<Vec<Equivocation>> {
+        self.equivocations_matching(Some(origin))
+    }
+
+    fn equivocations_matching(&self, only: Option<&OriginId>) -> Result<Vec<Equivocation>> {
         let conn = self.conn();
+        let scope = only.map(|o| o.canonical());
         let mut stmt = conn.prepare(
             "SELECT origin_id, seq, COUNT(DISTINCT root) AS roots FROM head_history
+             WHERE ?1 IS NULL OR origin_id = ?1
              GROUP BY origin_id, seq HAVING roots > 1 ORDER BY origin_id, seq",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![scope], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)? as u64,
@@ -318,9 +334,8 @@ impl Store {
         // A seq with more than one retained root is a fork, and both sides of
         // it are evidence.
         let forked: Vec<u64> = self
-            .equivocations()?
+            .equivocations_for(origin)?
             .into_iter()
-            .filter(|e| &e.origin == origin)
             .map(|e| e.seq)
             .collect();
         let moved_past_forks = current_created < before;

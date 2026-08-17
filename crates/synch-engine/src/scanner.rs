@@ -352,6 +352,52 @@ impl Node {
         Ok(changes)
     }
 
+    /// Stages the removal of `b:` records for objects this node no longer
+    /// holds (§6.3).
+    ///
+    /// Nothing ever retired an availability ad. The scanner stages
+    /// `blob_key(content) -> Some(ad)` on every hash and only `f:` keys were
+    /// ever staged as `None`, so every content root this origin had ever
+    /// published stayed a leaf in its trie for good — replicated to every
+    /// member, pinned against trie GC by the head that reaches it, and
+    /// accumulating one leaf per edit per file forever.
+    ///
+    /// It was also a correctness problem, not only a growth one: `gc_content`
+    /// deletes a local payload once no entry references it, while the ad went
+    /// on telling every peer this node held the object. Peers kept selecting it
+    /// as a provider and kept failing.
+    ///
+    /// Retiring is the same shape as tombstone expiry — staged, so it costs one
+    /// head like any other batch.
+    pub fn retired_ad_changes(&self) -> Result<Vec<StagedChange>> {
+        let mut changes = Vec::new();
+        for root in self.store().provider_roots_for_origin(self.origin())? {
+            // Still held, whole or in part: the ad stands, and a partial
+            // holder's ad is exactly what §6.3 wants advertised.
+            if self.store().blob(&root)?.is_some() {
+                continue;
+            }
+            changes.push((blob_key(&root), None));
+        }
+        Ok(changes)
+    }
+
+    /// Stages the removal of ads for objects this node has dropped.
+    ///
+    /// Returns how many were staged.
+    pub fn retire_ads(&self) -> Result<usize> {
+        let changes = self.retired_ad_changes()?;
+        let retired = changes.len();
+        if retired > 0 {
+            self.stage(changes);
+            tracing::info!(
+                retired,
+                "staging availability ads for objects no longer held"
+            );
+        }
+        Ok(retired)
+    }
+
     /// Stages the removal of this node's aged-out tombstones (§4.2).
     ///
     /// Staged rather than published: expiry flows through the ordinary

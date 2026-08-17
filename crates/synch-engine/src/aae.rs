@@ -181,6 +181,12 @@ impl Node {
             tracing::info!(expired, "dns bindings lapsed");
         }
         self.expire_tombstones()?;
+        // Ads for objects content GC has since dropped. Staged before the
+        // content sweep below rather than after, so a root that goes this pass
+        // is retired next pass rather than lingering an interval — and so the
+        // ad and the payload never disagree in the direction that has peers
+        // dialling us for bytes we no longer have (§6.3).
+        self.retire_ads()?;
 
         let retention = self
             .config()
