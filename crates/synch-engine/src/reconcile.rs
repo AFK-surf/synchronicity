@@ -258,7 +258,7 @@ impl Syncer {
             // Verified heads are provable history and fork evidence even
             // when they lose the ordering comparison, so they are retained
             // either way (§4.4).
-            txn.record_history(head)?;
+            txn.record_history(head, now)?;
 
             // 3. (seq, root) must be strictly greater, lexicographically.
             //    Strictly greater on seq alone would not converge: two

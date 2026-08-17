@@ -645,7 +645,10 @@ sub-second via push.
 ### 5.4 Trie garbage collection
 
 Old roots are kept for `root_retention` (default 7 days) to serve laggard peers cheap
-diffs and to power `synch log` history (§8). GC is mark-and-sweep in SQLite: mark from
+diffs and to power `synch log` history (§8). Age is measured from when this node
+recorded the row, not from the `created_at` the signer chose: the signed time is
+display metadata, and keying retention on it would let an origin make its rows —
+and every trie node reachable from them — permanent on every peer. GC is mark-and-sweep in SQLite: mark from
 all retained heads (each origin's **complete and pending** heads + retained history
 roots — pending heads must be in the mark set or GC would eat an in-progress
 bootstrap), sweep unmarked
@@ -1160,6 +1163,9 @@ CREATE TABLE heads (
 );
 CREATE TABLE head_history  (origin_id TEXT, seq INTEGER, root BLOB, created_at INTEGER,
                             signed_by BLOB, sig BLOB,    -- sig kept: provable fork/equivocation evidence
+                            recorded_at INTEGER NOT NULL,-- when this node received the row: what
+                                                         -- retention keys on, since created_at is
+                                                         -- the signer's own unclamped choice
                             PRIMARY KEY (origin_id, seq, root)); -- same-seq forks both stored;
                                                                  -- for §8 history + §3.4 evidence,
                                                                  -- pruned by retention

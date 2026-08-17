@@ -183,9 +183,12 @@ impl Store {
     }
 
     /// Records a head in `head_history`, keeping its signature.
-    pub fn record_history(&self, head: &SignedHead) -> Result<()> {
+    ///
+    /// `now` is when this node received the head, which is what retention
+    /// measures age from (§5.4).
+    pub fn record_history(&self, head: &SignedHead, now: i64) -> Result<()> {
         let conn = self.conn();
-        record_history_in(&conn, head)
+        record_history_in(&conn, head, now)
     }
 
     /// How many distinct roots an origin has retained at one seq.
@@ -330,17 +333,19 @@ impl Store {
     /// - **Anything newer than `before`**, which is the retention window
     ///   itself.
     ///
-    /// Age is the head's own `created_at`, which is the only time this table
-    /// carries. For this node's own history that is this node's clock; for a
-    /// replicated origin it is the origin's, which is the same member-supplied
-    /// metadata §8 and §12 already accept for `mtime_ns`.
+    /// Age is `recorded_at`: when *this node* took the row. `created_at` is
+    /// signed but is the signer's own unclamped choice, so keying retention on
+    /// it would let an origin date a head at the end of time and make both the
+    /// row and every trie node reachable from its root permanent here (§5.4).
+    /// The same goes for the complete head, whose `received_at` is what says
+    /// whether the cluster has visibly moved past a fork.
     ///
     /// Returns how many rows were dropped.
     pub fn prune_history_before(&self, origin: &OriginId, before: i64) -> Result<usize> {
-        let complete = self.complete_head(origin)?;
+        let complete = self.head(origin, Slot::Complete)?;
         let pending = self.pending_head(origin)?;
-        let current_seq = complete.as_ref().map(|h| h.seq).unwrap_or(0);
-        let current_created = complete.as_ref().map(|h| h.created_at).unwrap_or(i64::MIN);
+        let current_seq = complete.as_ref().map(|h| h.head.seq).unwrap_or(0);
+        let current_recorded = complete.as_ref().map(|h| h.received_at).unwrap_or(i64::MIN);
         // A seq with more than one retained root is a fork, and both sides of
         // it are evidence.
         let forked: Vec<u64> = self
@@ -348,24 +353,24 @@ impl Store {
             .into_iter()
             .map(|e| e.seq)
             .collect();
-        let moved_past_forks = current_created < before;
+        let moved_past_forks = current_recorded < before;
 
         let mut doomed = Vec::new();
-        for head in self.head_history(origin)? {
-            if head.created_at >= before {
+        for (seq, root, recorded_at) in self.history_receipts(origin)? {
+            if recorded_at >= before {
                 continue;
             }
-            let is_current = [complete.as_ref(), pending.as_ref()]
+            let is_current = [complete.as_ref().map(|c| &c.head), pending.as_ref()]
                 .into_iter()
                 .flatten()
-                .any(|h| h.seq == head.seq && h.root == head.root);
+                .any(|h| h.seq == seq && h.root == root);
             if is_current {
                 continue;
             }
-            if forked.contains(&head.seq) && !(current_seq > head.seq && moved_past_forks) {
+            if forked.contains(&seq) && !(current_seq > seq && moved_past_forks) {
                 continue;
             }
-            doomed.push((head.seq, head.root));
+            doomed.push((seq, root));
         }
 
         let pruned = doomed.len();
@@ -379,6 +384,31 @@ impl Store {
             Ok(())
         })?;
         Ok(pruned)
+    }
+
+    /// Every retained row for an origin as `(seq, root, recorded_at)`.
+    ///
+    /// What retention reads: the signature and the signed time are of no
+    /// interest to it, and the time it does need is not on [`SignedHead`].
+    fn history_receipts(&self, origin: &OriginId) -> Result<Vec<(u64, Hash, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, root, recorded_at FROM head_history
+             WHERE origin_id = ?1 ORDER BY seq DESC, root DESC",
+        )?;
+        let rows = stmt.query_map(params![origin.canonical()], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, root, recorded_at) = row?;
+            out.push((seq, hash_column(root, "head_history.root")?, recorded_at));
+        }
+        Ok(out)
     }
 
     /// The roots that GC must mark from: every origin's complete and pending
@@ -454,8 +484,8 @@ impl Txn<'_> {
     }
 
     /// Records a head in `head_history`, inside the transaction.
-    pub fn record_history(&self, head: &SignedHead) -> Result<()> {
-        record_history_in(self.conn(), head)
+    pub fn record_history(&self, head: &SignedHead, now: i64) -> Result<()> {
+        record_history_in(self.conn(), head, now)
     }
 
     /// How many distinct roots this origin has retained at one seq, inside the
@@ -514,7 +544,7 @@ fn put_head_in(
     // has to remember to record history alongside — which is what the old
     // record-on-arrival-and-again-on-displacement pair of rules was doing by
     // hand, redundantly, at seven call sites.
-    record_history_in(conn, head)?;
+    record_history_in(conn, head, received_at)?;
     conn.execute(
         "INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -533,10 +563,15 @@ fn put_head_in(
     Ok(())
 }
 
-fn record_history_in(conn: &rusqlite::Connection, head: &SignedHead) -> Result<()> {
+fn record_history_in(
+    conn: &rusqlite::Connection,
+    head: &SignedHead,
+    recorded_at: i64,
+) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO head_history (origin_id, seq, root, created_at, signed_by, sig)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO head_history
+           (origin_id, seq, root, created_at, signed_by, sig, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             head.origin.canonical(),
             head.seq as i64,
@@ -544,6 +579,7 @@ fn record_history_in(conn: &rusqlite::Connection, head: &SignedHead) -> Result<(
             head.created_at,
             head.signed_by.as_bytes().to_vec(),
             head.sig.to_bytes().to_vec(),
+            recorded_at,
         ],
     )?;
     Ok(())
@@ -610,7 +646,7 @@ mod tests {
         let b = SignedHead::sign(&key, origin(), 7, Hash([2u8; 32]), 0);
         let c = SignedHead::sign(&key, origin(), 8, Hash([3u8; 32]), 0);
         for h in [&a, &b, &c] {
-            store.record_history(h).unwrap();
+            store.record_history(h, 0).unwrap();
         }
         let found = store.equivocations().unwrap();
         assert_eq!(found.len(), 1);
@@ -627,7 +663,7 @@ mod tests {
         let key = SecretKey::generate();
         for seq in 1..=5u64 {
             let h = SignedHead::sign(&key, origin(), seq, Hash([seq as u8; 32]), 0);
-            store.record_history(&h).unwrap();
+            store.record_history(&h, 0).unwrap();
         }
         let head = SignedHead::sign(&key, origin(), 6, Hash([6u8; 32]), 0);
         store.put_head(Slot::Complete, &head, 0, 0).unwrap();

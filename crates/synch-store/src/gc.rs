@@ -314,7 +314,7 @@ mod tests {
         let old = publish(&store, &[("a", 1)]);
         let new = publish(&store, &[("a", 1), ("b", 2)]);
         store
-            .record_history(&SignedHead::sign(&key, origin(), 1, old, 0))
+            .record_history(&SignedHead::sign(&key, origin(), 1, old, 0), 0)
             .unwrap();
         store
             .put_head(
@@ -398,9 +398,12 @@ mod tests {
         let fork_b = SignedHead::sign(&key, origin(), 2, Hash([3u8; 32]), 200);
         let current = SignedHead::sign(&key, origin(), 3, Hash([4u8; 32]), 300);
         for head in [&old, &fork_a, &fork_b, &current] {
-            store.record_history(head).unwrap();
+            // Received here when it was signed, which is what retention reads.
+            store.record_history(head, head.created_at).unwrap();
         }
-        store.put_head(Slot::Complete, &current, 0, 0).unwrap();
+        store
+            .put_head(Slot::Complete, &current, current.created_at, 0)
+            .unwrap();
 
         // A horizon past every row: the plain old root goes, the current head
         // stays because it is current, and both fork rows stay because the
@@ -422,15 +425,43 @@ mod tests {
         assert!(store.equivocations().unwrap().is_empty());
     }
 
+    /// A head dated at the end of time is pruned like any other.
+    ///
+    /// `created_at` is signed but is the signer's own choice and is never
+    /// clamped, so retention that read it would leave a row — and every trie
+    /// node reachable from its root — permanent on every peer that took it.
+    /// What ages a row out is when this node recorded it.
+    #[test]
+    fn a_head_dated_at_the_end_of_time_still_ages_out() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let liar = SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), i64::MAX);
+        let current = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), i64::MAX);
+        store.record_history(&liar, 100).unwrap();
+        store.put_head(Slot::Complete, &current, 200, 0).unwrap();
+
+        // Inside the horizon it stays, like any recently received row.
+        assert_eq!(store.prune_history_before(&origin(), 50).unwrap(), 0);
+        // Past it, the signed date buys nothing.
+        assert_eq!(store.prune_history_before(&origin(), 150).unwrap(), 1);
+        let kept: Vec<u64> = store
+            .head_history(&origin())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.seq)
+            .collect();
+        assert_eq!(kept, vec![2], "only the current head is left");
+    }
+
     #[test]
     fn a_fork_at_the_current_seq_is_never_pruned() {
         let (_d, store) = store();
         let key = SecretKey::generate();
         let a = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), 100);
         let b = SignedHead::sign(&key, origin(), 2, Hash([3u8; 32]), 100);
-        store.record_history(&a).unwrap();
-        store.record_history(&b).unwrap();
-        store.put_head(Slot::Complete, &a, 0, 0).unwrap();
+        store.record_history(&a, a.created_at).unwrap();
+        store.record_history(&b, b.created_at).unwrap();
+        store.put_head(Slot::Complete, &a, a.created_at, 0).unwrap();
 
         // The origin has not published past the forked seq, so no horizon
         // drops the evidence.
@@ -444,7 +475,7 @@ mod tests {
         assert!(store.history_origins().unwrap().is_empty());
         let key = SecretKey::generate();
         store
-            .record_history(&SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0))
+            .record_history(&SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0), 0)
             .unwrap();
         assert_eq!(store.history_origins().unwrap(), vec![origin()]);
     }
