@@ -2114,7 +2114,7 @@ mod tests {
 
         let only_decoy = vec![
             secure_dnskey(&zone, decoy_key.clone()),
-            secure_dnskey_rrsig(&zone, &[decoy_key.clone()], &real_signer),
+            secure_dnskey_rrsig(&zone, std::slice::from_ref(&decoy_key), &real_signer),
         ];
         let err = signing_key_rdata(&zone, &rrsig, &txt_rrset, &only_decoy).unwrap_err();
         assert!(
