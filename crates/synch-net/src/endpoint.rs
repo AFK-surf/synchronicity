@@ -208,11 +208,11 @@ fn dht_address_lookup(
 /// The live outbound connections this endpoint holds, keyed by peer and ALPN.
 type Dialed = std::sync::Mutex<HashMap<(NodeId, &'static [u8]), Connection>>;
 
-/// A [`HeadSink`](crate::HeadSink) that adopts nothing.
+/// A [`HeadSink`](crate::HeadSink) with no head state at all.
 ///
 /// The default when no reconciler is supplied — a bare endpoint that speaks the
-/// protocol but has no head state to speak for. It answers `Hello` with an
-/// empty summary list and refuses pushed heads rather than pretending to have
+/// protocol and has nothing to say through it. It answers with empty summaries
+/// and empty head lists, and refuses pushed heads rather than pretending to have
 /// taken them, which is what tests exercising only transport want and what a
 /// misconfigured node should do rather than silently dropping heads.
 #[derive(Debug)]
@@ -236,6 +236,13 @@ impl crate::HeadSink for RefuseHeads {
         Err(NetError::Unexpected(
             "this endpoint has no reconciler and cannot adopt heads".into(),
         ))
+    }
+
+    fn heads_for(
+        &self,
+        _origins: &[synch_core::OriginId],
+    ) -> Result<Vec<synch_core::SignedHead>, NetError> {
+        Ok(Vec::new())
     }
 }
 

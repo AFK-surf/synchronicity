@@ -219,6 +219,21 @@ impl Syncer {
         Ok(self.store.observed_head(&own)?.map(|o| o.seq))
     }
 
+    /// The full signed heads for the origins a peer asked about (§5.1).
+    ///
+    /// Only complete heads are handed out: what this advertises is a head whose
+    /// trie this node can serve, and the pending slot's is by definition one it
+    /// cannot.
+    pub fn heads_for(&self, origins: &[OriginId]) -> Result<Vec<SignedHead>> {
+        let mut out = Vec::new();
+        for origin in origins {
+            if let Some(head) = self.store.head(origin, Slot::Complete)? {
+                out.push(head.head);
+            }
+        }
+        Ok(out)
+    }
+
     /// Offers a head for adoption, applying the full §5.2 acceptance rule.
     pub fn offer_head(&self, head: &SignedHead, now: i64) -> Result<HeadOutcome> {
         // 1. The signature must verify under the key that claims to have made it.
@@ -723,6 +738,10 @@ impl HeadSink for Syncer {
         Syncer::offer_head(self, head, now)
             .map(|_| ())
             .map_err(to_net)
+    }
+
+    fn heads_for(&self, origins: &[OriginId]) -> std::result::Result<Vec<SignedHead>, NetError> {
+        Syncer::heads_for(self, origins).map_err(to_net)
     }
 }
 

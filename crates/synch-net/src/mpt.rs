@@ -17,7 +17,7 @@ use synch_core::{
     MAX_HEADS_PER_MESSAGE, MAX_PROVIDER_ADS, PROTO_VERSION,
 };
 use synch_mpt::NodeStore;
-use synch_store::{Slot, Store};
+use synch_store::Store;
 
 use crate::{
     endpoint::{under_deadline, REQUEST_TIMEOUT},
@@ -49,6 +49,12 @@ pub trait HeadSink: Send + Sync + std::fmt::Debug + 'static {
 
     /// Offers a head for adoption under the §5.2 acceptance rule.
     fn offer_head(&self, head: &SignedHead, now: i64) -> Result<(), NetError>;
+
+    /// The full signed heads for the origins a peer asked about (§5.1).
+    ///
+    /// Only heads this node can back with a servable trie: what a peer does
+    /// with one is fetch the trie under it from us.
+    fn heads_for(&self, origins: &[OriginId]) -> Result<Vec<SignedHead>, NetError>;
 }
 
 /// How often a live session refreshes the sighting it recorded at accept.
@@ -205,7 +211,11 @@ impl MptProtocol {
                 match read_frame::<MptMessage>(recv).await? {
                     MptMessage::HeadsWant { origins } => {
                         check_heads(origins.len(), "a HeadsWant list")?;
-                        let heads = self.heads_for(&origins)?;
+                        // A database query per origin, so it goes to the
+                        // blocking pool like every other head operation (§5.1).
+                        let sink = self.heads.clone();
+                        let heads =
+                            crate::blocking::offload(move || sink.heads_for(&origins)).await?;
                         write_frame(send, &MptMessage::Heads { heads }).await?;
                     }
                     other => return Err(unexpected("HeadsWant", &other)),
@@ -282,18 +292,6 @@ impl MptProtocol {
             }
             other => Err(unexpected("a request", &other)),
         }
-    }
-
-    fn heads_for(&self, origins: &[OriginId]) -> Result<Vec<SignedHead>, NetError> {
-        let mut out = Vec::new();
-        for origin in origins {
-            // Only complete heads are handed out: we advertise what we can
-            // actually back with a servable trie.
-            if let Some(head) = self.store().head(origin, Slot::Complete)? {
-                out.push(head.head);
-            }
-        }
-        Ok(out)
     }
 }
 
@@ -449,6 +447,10 @@ impl MptClient {
                     check_heads(heads.len(), "a Hello summary list")?;
                     heads
                 }
+                // A responder that refuses says why, and the reason is the
+                // error — reading it as a shape mismatch loses the only account
+                // of what went wrong the peer will ever give.
+                MptMessage::Error { reason } => return Err(NetError::Unexpected(reason)),
                 other => return Err(unexpected("Hello", &other)),
             };
 
@@ -607,6 +609,7 @@ mod tests {
     struct Picky {
         refuse: OriginId,
         offered: std::sync::Mutex<Vec<OriginId>>,
+        serving: std::collections::HashMap<OriginId, SignedHead>,
     }
 
     impl HeadSink for Picky {
@@ -632,6 +635,13 @@ mod tests {
                 return Err(NetError::Unexpected("this origin cannot be applied".into()));
             }
             Ok(())
+        }
+
+        fn heads_for(&self, origins: &[OriginId]) -> Result<Vec<SignedHead>, NetError> {
+            Ok(origins
+                .iter()
+                .filter_map(|origin| self.serving.get(origin).cloned())
+                .collect())
         }
     }
 
@@ -771,11 +781,10 @@ mod tests {
 
         // A head the server can hand back when the exchange gets that far.
         let servable = SignedHead::sign(&signer, served.clone(), 3, Hash::new(b"root"), 0);
-        store.put_head(Slot::Complete, &servable, 0, 0).unwrap();
-
         let sink = std::sync::Arc::new(Picky {
             refuse: bad.clone(),
             offered: std::sync::Mutex::new(Vec::new()),
+            serving: [(served.clone(), servable.clone())].into_iter().collect(),
         });
         let options = crate::endpoint::NetOptions {
             heads: Some(sink.clone() as std::sync::Arc<dyn HeadSink>),

@@ -632,11 +632,11 @@ Properties:
   trusted peer, connect if needed, run a full `Hello` push-pull exchange. This repairs
   anything the reactive path missed (dropped connections, simultaneous partitions) and
   is the mechanism that guarantees convergence.
-- **On-connect**: every peer pairing maintains an mpt session (`sync/mpt/1`), and it
-  begins with a `Hello` exchange. Dialing a peer for a blob fetch opens (or reuses)
-  that mpt session alongside `sync/blob/1` — blob fetches double as sync
-  opportunities. `Hello` exists only on the mpt ALPN; the blob ALPN carries nothing
-  but `GetSlice`/`SliceEnd`.
+- **On-connect**: an mpt session (`sync/mpt/1`) begins with a `Hello` exchange, and
+  each ALPN's session is held open and reused across requests for as long as it is
+  live. The two are independent: `Hello` exists only on the mpt ALPN, and the blob
+  ALPN carries nothing but `GetSlice`/`SliceEnd` and `GetProof`/`ProofEnd`, so a
+  blob fetch neither opens nor needs an mpt session.
 
 Expected staleness with push + pull-gossip is `O(log N)` rounds after any partition
 heals; at N ≤ 100 and 30 s rounds this is well under 5 minutes worst-case, typically

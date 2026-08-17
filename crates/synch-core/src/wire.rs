@@ -19,6 +19,12 @@ pub const ALPN_MPT: &[u8] = b"sync/mpt/1";
 pub const ALPN_BLOB: &[u8] = b"sync/blob/1";
 
 /// Protocol version carried in `Hello`.
+///
+/// postcard numbers enum variants by position, so the shape of the messages
+/// below *is* the protocol: reordering or reshaping one changes the wire and
+/// changes this. The check in `Hello` is the whole of the compatibility story —
+/// a peer on another version is refused rather than negotiated with — so the
+/// messages are free to be defined in whatever order reads best.
 pub const PROTO_VERSION: u16 = 1;
 
 /// Maximum number of hashes per `GetNodes`/`GetValues` batch (§5.1).
