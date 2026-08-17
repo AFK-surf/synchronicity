@@ -9,6 +9,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Only the blocking-pool handoff; no runtime is started here.
+tokio = { workspace = true, features = ["rt"] }
 blake3.workspace = true
 hex.workspace = true
 iroh-base.workspace = true

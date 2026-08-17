@@ -450,7 +450,7 @@ impl Node {
     /// a worker thread it stops that thread from polling for as long as it
     /// takes, which on a multi-gigabyte space is the daemon going quiet: no
     /// peer answered, no control request served, no timer fired on time (§10).
-    pub async fn scan_and_stage_off_runtime(&self) -> Result<ScanReport> {
+    pub(crate) async fn scan_and_stage_off_runtime(&self) -> Result<ScanReport> {
         let node = self.clone();
         crate::blocking::offload(move || node.scan_and_stage()).await
     }

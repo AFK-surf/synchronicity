@@ -1148,7 +1148,7 @@ impl Node {
 
     /// The body of [`Node::materialize_blob`], for callers already off the
     /// runtime.
-    pub fn materialize_blob_blocking(
+    pub(crate) fn materialize_blob_blocking(
         &self,
         root: &Hash,
         size: u64,
