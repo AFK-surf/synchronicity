@@ -19,6 +19,25 @@ import wisp.{type Request, type Response}
 import zone/build
 import zone/model
 
+/// A per-member rule broken by the request itself. The code and the wording
+/// come from `common.build_refusal`, so this refusal and the publish-time one
+/// name the same fault identically; only the status says which of the two
+/// caught it — 400 because the request is malformed, where the publish
+/// answers 409 because the zone it would produce is.
+fn refused(fault: build.BuildError) -> Response {
+  let #(code, message) = common.build_refusal(fault)
+  error_json(400, code, message)
+}
+
+/// Whichever hint is the invalid one, so the refusal quotes the offender
+/// rather than both fields.
+fn bad_hint(relay: String, addr: String) -> build.BuildError {
+  case build.valid_hint(relay) {
+    False -> build.InvalidHint(relay)
+    True -> build.InvalidHint(addr)
+  }
+}
+
 pub fn list_devices(ctx: AuthContext, live: Session, slug: String) -> Response {
   with_db(ctx, fn(conn) {
     use org_id, _ <- require_org(conn, slug, live.user_id, Member)
@@ -71,24 +90,13 @@ pub fn create_device(
     model.validate_nk(nk),
     build.valid_hint(relay) && build.valid_hint(addr)
   {
-    False, _, _ ->
-      error_json(400, "bad_label", "device label must match [a-z0-9-]{1,63}")
-    _, Error(Nil), _ ->
-      error_json(
-        400,
-        "bad_nk",
-        "nk must be the 52-character z-base-32 device key from `synch id`",
-      )
+    False, _, _ -> refused(build.InvalidLabel(label))
+    _, Error(Nil), _ -> refused(build.InvalidNk(nk))
     // Refused here as well as at publish. A membership record is
     // whitespace-separated key=value pairs, so a hint carrying whitespace
     // is extra fields rather than one value — and the client's parser is
     // last-wins for apex=, so it can override a field the operator set.
-    _, _, False ->
-      error_json(
-        400,
-        "bad_hint",
-        "relay and addr must be at most 255 characters with no whitespace or quotes",
-      )
+    _, _, False -> refused(bad_hint(relay, addr))
     True, Ok(nk_bytes), True ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, live.user_id, Member)
@@ -158,12 +166,7 @@ pub fn patch_device(
   use #(relay, addr) <- body_decoder(req, decoder)
   // Refused here as well as at publish: see the create handler above.
   case build.valid_hint(relay) && build.valid_hint(addr) {
-    False ->
-      error_json(
-        400,
-        "bad_hint",
-        "relay and addr must be at most 255 characters with no whitespace or quotes",
-      )
+    False -> refused(bad_hint(relay, addr))
     True ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, live.user_id, Member)
@@ -265,7 +268,7 @@ pub fn add_key(
   }
   use nk <- body_decoder(req, decoder)
   case model.validate_nk(nk) {
-    Error(Nil) -> error_json(400, "bad_nk", "not a z-base-32 device key")
+    Error(Nil) -> refused(build.InvalidNk(nk))
     Ok(nk_bytes) ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, live.user_id, Member)

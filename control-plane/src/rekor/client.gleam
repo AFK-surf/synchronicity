@@ -213,7 +213,10 @@ pub fn http(base: String) -> Log {
 }
 
 fn submit_http(base: String, sub: Submission) -> Result(Entry, String) {
-  let endpoint = strip_slash(base) <> "/api/v2/log/entries"
+  // The same normalization `resolve` applies at the other end (:110), so a
+  // configured URL and a stored one agree: this is the key `for_url` matches
+  // a log's pinned key on, and it strips *every* trailing slash, not one.
+  let endpoint = trusted_root.strip_slash(base) <> "/api/v2/log/entries"
   let body =
     json.object([
       #(
@@ -332,11 +335,4 @@ fn parse_entry(body: String) -> Result(Entry, String) {
 /// Standard padded base64, the encoding a Rekor `CreateEntryRequest` carries.
 fn b64(bytes: BitArray) -> String {
   bit_array.base64_encode(bytes, True)
-}
-
-fn strip_slash(base: String) -> String {
-  case string.ends_with(base, "/") {
-    True -> string.drop_end(base, 1)
-    False -> base
-  }
 }

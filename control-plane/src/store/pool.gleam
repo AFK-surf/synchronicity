@@ -30,8 +30,12 @@ pub opaque type Pool {
 
 pub opaque type Msg {
   Checkout(caller: Pid, reply: Subject(Connection))
-  Checkin(caller: Pid, conn: Connection)
-  Discard(caller: Pid)
+  /// Both carry the connection rather than the borrower: one process may
+  /// hold more than one lease at a time (a request that resolves a session
+  /// on one connection and does its work on another), so returning a
+  /// connection must retire that connection's lease and no other.
+  Checkin(conn: Connection)
+  Discard(conn: Connection)
   BorrowerDown(process.Down)
   PortExit(process.ExitMessage)
 }
@@ -176,7 +180,7 @@ fn acquire(pool: Pool, attempts: Int) -> Result(Connection, sqlite.Error) {
         Error(sqlite.ConnectionClosed) | Error(sqlite.RpcTimeout) -> {
           // Dead worker in the pool: kill, report, try again.
           sqlite.kill(conn)
-          process.send(pool.subject, Discard(self))
+          process.send(pool.subject, Discard(conn))
           acquire(pool, attempts - 1)
         }
         Error(e) -> {
@@ -203,12 +207,12 @@ fn release(pool: Pool, conn: Connection) -> Nil {
     Error(Nil) -> Error(Nil)
   }
   case returned {
-    Ok(Nil) -> process.send(pool.subject, Checkin(process.self(), conn))
+    Ok(Nil) -> process.send(pool.subject, Checkin(conn))
     Error(Nil) -> {
       // Dispatcher gone (mid-restart) or worker dead: this connection is
       // an orphan of the old generation — discard it.
       sqlite.kill(conn)
-      process.send(pool.subject, Discard(process.self()))
+      process.send(pool.subject, Discard(conn))
     }
   }
 }
@@ -216,12 +220,12 @@ fn release(pool: Pool, conn: Connection) -> Nil {
 fn handle_msg(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Checkout(caller, reply) -> actor.continue(lend(state, caller, reply))
-    Checkin(caller, conn) -> {
+    Checkin(conn) -> {
       sqlite.take(conn)
-      let state = drop_lease(state, caller)
+      let state = drop_lease(state, conn)
       actor.continue(place(state, conn))
     }
-    Discard(caller) -> actor.continue(drop_lease(state, caller))
+    Discard(conn) -> actor.continue(drop_lease(state, conn))
     BorrowerDown(process.ProcessDown(monitor: monitor, pid: pid, ..)) -> {
       // The borrower died holding a connection: its worker is unreachable
       // (ports deliver to the dead owner) and may hold the write lock —
@@ -308,8 +312,15 @@ fn place(state: State, conn: Connection) -> State {
   }
 }
 
-fn drop_lease(state: State, pid: Pid) -> State {
-  let #(gone, kept) = list.partition(state.leases, fn(l) { l.pid == pid })
+/// Retires the lease on one connection. Keyed on the connection, never on
+/// the borrower: a process holding two leases returns them one at a time,
+/// and dropping both on the first checkin would lose the pool's record of a
+/// connection still out on loan — undercounting `size` and, worse, leaving
+/// `BorrowerDown` with nothing to kill if that borrower then died holding
+/// the write lock. Monitors are per-lease, so demonitoring this one leaves
+/// any other lease of the same pid still watched.
+fn drop_lease(state: State, conn: Connection) -> State {
+  let #(gone, kept) = list.partition(state.leases, fn(l) { l.conn == conn })
   list.each(gone, fn(l) { process.demonitor_process(l.monitor) })
   State(..state, leases: kept)
 }

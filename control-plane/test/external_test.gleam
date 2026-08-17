@@ -21,6 +21,7 @@ import zone/render_external
 
 import dns/name
 import fixtures
+import gleam/int
 import gleam/string
 
 /// An external-mode zone input: no NS hosts, no zone key — the shape
@@ -101,16 +102,12 @@ fn desired() -> List(provider.Record) {
 
 fn as_existing(records: List(provider.Record)) -> List(Existing) {
   list.index_map(records, fn(record, index) {
-    Existing("id-" <> int_to_string(index), record)
+    // Distinct ids for every index: these tests are *about* record
+    // identity, so an id generator that collapsed indices past the second
+    // onto one string would hand two records the same id in exactly the
+    // tests whose subject that is.
+    Existing("id-" <> int.to_string(index), record)
   })
-}
-
-fn int_to_string(i: Int) -> String {
-  case i {
-    0 -> "0"
-    1 -> "1"
-    _ -> "n"
-  }
 }
 
 pub fn a_first_sync_is_all_creates_test() {
@@ -215,11 +212,11 @@ fn fake_provider(
 }
 
 fn describe(changes: provider.Changes) -> String {
-  int_to_string(list.length(changes.create))
+  int.to_string(list.length(changes.create))
   <> "/"
-  <> int_to_string(list.length(changes.replace))
+  <> int.to_string(list.length(changes.replace))
   <> "/"
-  <> int_to_string(list.length(changes.delete))
+  <> int.to_string(list.length(changes.delete))
 }
 
 fn broken_provider(reason: String) -> Provider {

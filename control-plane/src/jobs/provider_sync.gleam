@@ -87,8 +87,11 @@ pub fn supervised(
         // boot it has no records out there at all. Waiting out a sweep
         // before the first pass would leave the zone unpublished for that
         // long, which is the one window where nothing else pokes.
+        //
+        // This tick and nothing else: `handle` re-arms after every pass, so
+        // also scheduling one here would start a second, permanent timer
+        // chain beside the first and sweep at twice the stated interval.
         process.send(subject, Tick)
-        let _ = process.send_after(subject, sweep_interval_ms, Tick)
         actor.initialised(State(db_path, prov, provider_name, zone_id, subject))
         |> actor.returning(subject)
         |> Ok
