@@ -31,23 +31,6 @@ pub struct TrieStats {
 }
 
 impl Store {
-    /// Marks every trie node and value reachable from the retained roots.
-    ///
-    /// The mark set is every origin's **complete and pending** heads plus
-    /// retained history roots (§5.4). Pending heads must be in the mark set or
-    /// GC would eat an in-progress bootstrap.
-    pub fn gc_mark(&self) -> Result<(HashSet<Hash>, HashSet<Hash>)> {
-        let trie = Trie::new(self);
-        let mut nodes = HashSet::new();
-        let mut values = HashSet::new();
-        for root in self.retained_roots()? {
-            let reachable = trie.reachable(root)?;
-            nodes.extend(reachable.nodes);
-            values.extend(reachable.values);
-        }
-        Ok((nodes, values))
-    }
-
     /// Runs one mark-and-sweep pass over `trie_nodes` and `trie_values`.
     ///
     /// The whole pass — the retained roots, the mark walk, the candidate
@@ -259,8 +242,10 @@ mod tests {
         let key = SecretKey::generate();
         let old = publish(&store, &[("a", 1), ("b", 2)]);
         let new = publish(&store, &[("a", 1), ("b", 2), ("c", 3)]);
-        let before = store.gc_mark().unwrap().0.len();
-        assert_eq!(before, 0, "nothing is retained until a head points at it");
+        assert!(
+            store.retained_roots().unwrap().is_empty(),
+            "nothing is retained until a head points at it"
+        );
 
         let head = SignedHead::sign(&key, origin(), 2, new, 0);
         store.put_head(Slot::Complete, &head, 0, 0).unwrap();

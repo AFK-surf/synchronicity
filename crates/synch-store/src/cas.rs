@@ -263,11 +263,6 @@ fn window_end_bytes(served: &ChunkRanges, size: u64) -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-fn bitmap_len(groups: u64) -> usize {
-    groups.div_ceil(8) as usize
-}
-
 /// Encodes an object's verified groups for the `blobs.bitmap` column.
 ///
 /// Ranges, not a bit per group, despite the column's name. A bitmap costs
@@ -308,6 +303,12 @@ pub(crate) fn blob_to_ranges(bytes: &[u8], groups: u64) -> ChunkRanges {
 /// Live only inside the v10 migration, which rewrites every partial row into
 /// the range form. Nothing on a running node reads a bitmap any more.
 pub(crate) fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
+    // A bitmap describes no more groups than it has bits for, and the group
+    // count comes from the row's stored size. Bounding the walk by both keeps
+    // the migration's cost proportional to the bytes it is reading — this runs
+    // inside the migration transaction, where a long loop is a daemon that will
+    // not start.
+    let groups = groups.min((bits.len() as u64).saturating_mul(8));
     let mut ranges = Vec::new();
     let mut start: Option<u64> = None;
     for group in 0..groups {
@@ -386,17 +387,6 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
             held,
         }
     }))
-}
-
-#[cfg(test)]
-pub(crate) fn ranges_to_bitmap(ranges: &ChunkRanges, groups: u64) -> Vec<u8> {
-    let mut bits = vec![0u8; bitmap_len(groups)];
-    for r in &ranges.ranges {
-        for group in r.start..r.end.min(groups) {
-            bits[(group / 8) as usize] |= 1 << (group % 8);
-        }
-    }
-    bits
 }
 
 /// Converts our group ranges into bao chunk ranges.
@@ -1534,11 +1524,34 @@ mod tests {
         assert_eq!(victim.read_all(&root).unwrap(), bytes);
     }
 
+    /// The pre-v10 bitmap describes no more groups than it has bits for.
+    ///
+    /// The group count the v10 migration passes comes from the row's stored
+    /// size, and a partial row's size is whatever the writer claimed; the bits
+    /// are what the row actually carries. Reading past them says nothing, and
+    /// the walk is inside the migration transaction, where a long loop is a
+    /// daemon that will not start.
     #[test]
-    fn bitmap_round_trip() {
-        let ranges = ChunkRanges::from_ranges([GroupRange::new(0, 3), GroupRange::new(7, 20)]);
-        let bits = ranges_to_bitmap(&ranges, 20);
-        assert_eq!(bitmap_to_ranges(&bits, 20), ranges);
+    fn a_bitmap_is_read_only_as_far_as_its_bits_reach() {
+        // Groups 0..3 and 7..20 held, in the three bytes that describe 24.
+        let mut bits = vec![0u8; 3];
+        for group in (0..3usize).chain(7..20) {
+            bits[group / 8] |= 1 << (group % 8);
+        }
+        let held = ChunkRanges::from_ranges([GroupRange::new(0, 3), GroupRange::new(7, 20)]);
+        assert_eq!(bitmap_to_ranges(&bits, 20), held);
         assert!(bitmap_to_ranges(&[0u8; 3], 20).is_empty());
+
+        // The same three bytes under a size claiming every group there could
+        // ever be: the same answer, and it arrives.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(bitmap_to_ranges(&bits, u64::MAX));
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the walk is bounded by the bitmap, not by the claim"),
+            held
+        );
     }
 }

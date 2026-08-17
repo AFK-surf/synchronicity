@@ -498,7 +498,16 @@ impl MptClient {
     }
 
     /// Fetches trie nodes by hash.
+    ///
+    /// At most [`MAX_BATCH`] hashes: the responder refuses a longer request
+    /// outright, so a caller that oversteps loses the whole batch rather than
+    /// the tail of it. `MissingWalk::next_batch` is the only caller and stops at
+    /// the cap.
     pub async fn get_nodes(&self, hashes: &[Hash]) -> Result<NodesResponse, NetError> {
+        debug_assert!(
+            hashes.len() <= MAX_BATCH,
+            "a batch past the responder's cap"
+        );
         let batch: Vec<Hash> = hashes.to_vec();
         under_deadline(self.deadline, "a trie node request", async {
             let (mut send, mut recv) = self.connection.open_bi().await?;
@@ -514,7 +523,13 @@ impl MptClient {
     }
 
     /// Fetches out-of-line trie values by hash.
+    ///
+    /// At most [`MAX_BATCH`] hashes, exactly as [`MptClient::get_nodes`].
     pub async fn get_values(&self, hashes: &[Hash]) -> Result<ValuesResponse, NetError> {
+        debug_assert!(
+            hashes.len() <= MAX_BATCH,
+            "a batch past the responder's cap"
+        );
         let batch: Vec<Hash> = hashes.to_vec();
         under_deadline(self.deadline, "a trie value request", async {
             let (mut send, mut recv) = self.connection.open_bi().await?;

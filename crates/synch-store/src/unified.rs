@@ -405,27 +405,27 @@ impl Store {
         limit: Option<usize>,
     ) -> Result<Vec<String>> {
         let conn = self.conn();
-        let upper = format!("{prefix}\u{10ffff}");
         let mut sql = String::from(
             "SELECT DISTINCT path FROM entries
-             WHERE space = ?1 AND path >= ?2 AND path < ?3",
+             WHERE space = ?1 AND path >= ?2",
         );
-        if start_after.is_some() {
-            sql.push_str(" AND path > ?4");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(space.to_string()), Box::new(prefix.to_string())];
+        // The prefix's byte successor bounds the scan from above, so the index
+        // is walked over the prefix's range alone.
+        if let Some(upper) = crate::views::prefix_upper_bound(prefix) {
+            args.push(Box::new(upper));
+            sql.push_str(&format!(" AND path < ?{}", args.len()));
+        }
+        if let Some(after) = start_after {
+            args.push(Box::new(after.to_string()));
+            sql.push_str(&format!(" AND path > ?{}", args.len()));
         }
         sql.push_str(" ORDER BY path");
         if let Some(limit) = limit {
             sql.push_str(&format!(" LIMIT {limit}"));
         }
         let mut stmt = conn.prepare(&sql)?;
-        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(space.to_string()),
-            Box::new(prefix.to_string()),
-            Box::new(upper),
-        ];
-        if let Some(after) = start_after {
-            args.push(Box::new(after.to_string()));
-        }
         let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
         let rows = stmt.query_map(refs.as_slice(), |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
