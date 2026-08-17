@@ -22,8 +22,8 @@ pub use record::{
     KeyError, NodeManifest, SpaceInfo, AD_SPAN_GRANULARITY, RECORD_VERSION,
 };
 pub use wire::{
-    BlobMessage, ChunkRanges, GroupRange, MptMessage, ALPN_BLOB, ALPN_MPT, MAX_BATCH,
-    MAX_FRAME_LEN, MAX_HEADS_PER_MESSAGE, MAX_PROOF_NODES, MAX_RANGES, MAX_SLICE_GROUPS,
+    proof_nodes_upper_bound, BlobMessage, ChunkRanges, GroupRange, MptMessage, ALPN_BLOB, ALPN_MPT,
+    MAX_BATCH, MAX_FRAME_LEN, MAX_HEADS_PER_MESSAGE, MAX_PROOF_NODES, MAX_RANGES, MAX_SLICE_GROUPS,
     PROOF_NODE_LEN, PROTO_VERSION,
 };
 

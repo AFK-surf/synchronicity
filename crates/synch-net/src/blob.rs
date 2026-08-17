@@ -17,7 +17,10 @@ use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
 };
-use synch_core::{now_ns, BlobMessage, ChunkRanges, Hash, MAX_RANGES, MAX_SLICE_GROUPS};
+use synch_core::{
+    now_ns, proof_nodes_upper_bound, BlobMessage, ChunkRanges, Hash, MAX_PROOF_NODES, MAX_RANGES,
+    MAX_SLICE_GROUPS,
+};
 use synch_store::{Proven, Store};
 
 use crate::{
@@ -43,43 +46,52 @@ const MAX_CONCURRENT_STREAMS: usize = 8;
 /// a large object is real disk work on the blocking pool.
 const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// How many windows one proof exchange may take before the requester walks away.
+/// The largest prefix of `remaining` whose proof fits one exchange.
 ///
-/// A ceiling on the exchange as a whole, not just on the empty answers. A
-/// provider that serves one node per window is not barren — it is making
-/// progress, a round trip at a time — and without a bound it can hold a descent
-/// open for one RTT per node of the object's tree.
-///
-/// So the ceiling is based on what an *honest* answer costs. A proof stopping at
-/// `level` names one subtree per `2^level` groups, and a walk that names `n`
-/// subtrees emits fewer than `2n` interior nodes above them, plus at most one
-/// path from the root per disjoint range asked about — a path being no deeper
-/// than the 64 levels a `u64` group index can address. Divide by the window
-/// ([`MAX_PROOF_NODES`](synch_core::MAX_PROOF_NODES)) for the number of windows
-/// the honest answer takes, then
-/// allow a small multiple of it and a floor, so a provider that splits its
-/// answer differently than expected is not cut off for it. The ranges the
-/// exchange did not reach simply go to the ordinary fetch (§6.4).
-///
-/// The count that used to stand here was `8 + groups * 2`, which reads as
-/// generous and is not a bound at all: a span-level round over 100 GB names
-/// about six thousand subtrees and needs one window, and that formula would have
-/// allowed twelve million.
-fn proof_window_ceiling(ranges: &ChunkRanges, level: u8) -> u64 {
-    /// Windows allowed per window an honest answer needs.
-    const SLACK: u64 = 4;
-    /// The smallest ceiling, so a one-node proof still gets a few tries.
-    const FLOOR: u64 = 8;
-    /// The deepest a root-to-range path can be for a `u64` group index.
-    const MAX_PATH: u64 = 64;
-
-    let per_subtree = 1u64 << level.min(63);
-    let subtrees = ranges.count().div_ceil(per_subtree);
-    let nodes = subtrees
-        .saturating_mul(2)
-        .saturating_add((ranges.range_count() as u64).saturating_mul(MAX_PATH));
-    let honest = nodes.div_ceil(synch_core::MAX_PROOF_NODES).max(1);
-    honest.saturating_mul(SLACK).saturating_add(FLOOR)
+/// Sized by [`proof_nodes_upper_bound`], so a provider holding everything asked
+/// for still comes in under [`MAX_PROOF_NODES`] and never truncates. Ranges are
+/// taken whole where they fit and split where they do not, and the count is
+/// clamped to [`MAX_RANGES`] so the set operations under it stay cheap on both
+/// sides (§12).
+fn proof_window(remaining: &ChunkRanges, level: u8) -> ChunkRanges {
+    let mut taken: Vec<synch_core::GroupRange> = Vec::new();
+    for range in remaining.ranges.iter().take(MAX_RANGES) {
+        let candidate = ChunkRanges::from_ranges(taken.iter().copied().chain([*range]));
+        if proof_nodes_upper_bound(&candidate, level) <= MAX_PROOF_NODES {
+            taken.push(*range);
+            continue;
+        }
+        // This range does not fit whole. Take as much of its head as does,
+        // which is at worst nothing — in which case the window is what we have.
+        let mut lo = range.start;
+        let mut hi = range.end;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let probe = ChunkRanges::from_ranges(
+                taken
+                    .iter()
+                    .copied()
+                    .chain([synch_core::GroupRange::new(range.start, mid)]),
+            );
+            if proof_nodes_upper_bound(&probe, level) <= MAX_PROOF_NODES {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if lo > range.start {
+            taken.push(synch_core::GroupRange::new(range.start, lo));
+        }
+        break;
+    }
+    if taken.is_empty() {
+        // Even one group does not fit the budget, which only happens for a
+        // degenerate level; ask for a single group so the walk still advances.
+        if let Some(first) = remaining.ranges.first() {
+            taken.push(synch_core::GroupRange::new(first.start, first.start + 1));
+        }
+    }
+    ChunkRanges::from_ranges(taken)
 }
 
 /// Validates what a provider says it served, before any set operation reads it.
@@ -398,21 +410,24 @@ impl BlobClient {
             served: ChunkRanges::empty(),
         };
         let mut barren = 0u32;
-        let mut windows = proof_window_ceiling(&remaining, level);
         while !remaining.is_empty() {
-            if windows == 0 {
-                tracing::debug!(root = %root, "proof exchange cut off: too many windows");
-                break;
-            }
-            windows -= 1;
-            // The window is the provider's to choose — it is counted in tree
-            // nodes, not groups, and only the provider knows how the tree falls
-            // — so the whole remainder is offered and `ProofEnd` says how much
-            // of it came back. Only the range *count* is clamped here, because
-            // that is the one part of the request the provider must not be made
-            // to pay for (§12).
-            let window =
-                ChunkRanges::from_ranges(remaining.ranges.iter().take(MAX_RANGES).copied());
+            // The window is the *requester's* to choose, and it is chosen so
+            // the provider never has to truncate.
+            //
+            // It used to be the provider's: the whole remainder was offered,
+            // `ProofEnd` reported how much came back, and neither side could
+            // tell an honest short answer from a provider dribbling one node
+            // per round trip. That needed two separate patches — the provider
+            // threw away a truncated walk and *walked the whole thing again*
+            // over the ranges that fit, so both sides would agree node for
+            // node, and the requester carried a heuristic ceiling of three
+            // magic constants to bound the number of round trips. Both existed
+            // only because the split was unpredictable. It is not: the cost of
+            // a walk is bounded by its ranges and level, and while the provider
+            // walks `requested ∩ what it holds` — which we cannot know — a
+            // subset never costs more than the whole. Sizing the window to fit
+            // assuming a full holder therefore fits for every holder.
+            let window = proof_window(&remaining, level);
             let proof = self.get_proof(root, &window, level).await?;
             // Already clamped to the window by `check_served`.
             let served = proof.served.clone();
@@ -499,43 +514,39 @@ mod tests {
     use super::*;
     use synch_core::{GroupRange, AD_SPAN_LEVEL, CHUNK_GROUP_SIZE, MAX_PROOF_NODES};
 
-    /// The window ceiling tracks what an honest answer costs, not how much of
-    /// the object was named.
+    /// The requester sizes each window so the provider never truncates.
     ///
-    /// Counting groups made the ceiling scale with the thing the proof exists to
-    /// avoid touching group by group: a span round over 100 GB names six
-    /// thousand subtrees and one honest window, and the old `8 + groups * 2`
-    /// granted twelve million round trips against it — a bound in name only.
+    /// This is what replaced a pair of compensating mechanisms: a provider that
+    /// threw away a truncated walk and repeated it over the ranges that fit, and
+    /// a requester-side round-trip ceiling built from three magic constants.
+    /// Neither is needed once the split is predictable.
     #[test]
-    fn the_window_ceiling_is_based_on_windows_not_groups() {
+    fn a_proof_window_always_fits_one_exchange() {
         let groups_in = |bytes: u64| bytes / CHUNK_GROUP_SIZE;
         let hundred_gb = ChunkRanges::single(0, groups_in(100_000_000_000));
 
-        // The span-level round of a 100 GB object: one honest window, so a
-        // ceiling in the tens rather than the millions.
-        let span_round = proof_window_ceiling(&hundred_gb, AD_SPAN_LEVEL);
-        assert!(
-            (1..64).contains(&span_round),
-            "a span round over 100 GB should cost a handful of windows, not {span_round}"
-        );
+        // The span-level round of a 100 GB object fits in one exchange whole —
+        // that is the property the whole descent rests on.
+        let span = proof_window(&hundred_gb, AD_SPAN_LEVEL);
+        assert_eq!(span, hundred_gb, "a span round must not be split");
+        assert!(proof_nodes_upper_bound(&span, AD_SPAN_LEVEL) <= MAX_PROOF_NODES);
 
-        // The leaf round of the same object is genuinely large, and the ceiling
-        // grows with it — proportionally to the tree it has to move, which is
-        // what "a few per window" means.
-        let leaf_round = proof_window_ceiling(&hundred_gb, 0);
-        let honest = hundred_gb.count() * 2 / MAX_PROOF_NODES;
-        assert!(leaf_round > honest, "{leaf_round} vs {honest}");
-        assert!(leaf_round < honest * 8, "{leaf_round} vs {honest}");
+        // The leaf round of the same object does not, so it is split — and each
+        // window still fits.
+        let leaf = proof_window(&hundred_gb, 0);
+        assert!(!leaf.is_empty() && leaf != hundred_gb);
+        assert!(proof_nodes_upper_bound(&leaf, 0) <= MAX_PROOF_NODES);
 
-        // Fragmentation costs a root path per range and no more, so a request
-        // split into many small ranges is bounded too.
+        // Fragmentation costs a root path per range, and the window shrinks to
+        // suit rather than overrunning the budget.
         let scattered =
             ChunkRanges::from_ranges((0..1000u64).map(|i| GroupRange::new(i * 1024, i * 1024 + 1)));
-        assert!(proof_window_ceiling(&scattered, 0) < 64);
+        let window = proof_window(&scattered, 0);
+        assert!(!window.is_empty());
+        assert!(proof_nodes_upper_bound(&window, 0) <= MAX_PROOF_NODES);
 
-        // And the floor holds for the degenerate cases rather than yielding a
-        // ceiling of zero, which would refuse the first window outright.
-        assert!(proof_window_ceiling(&ChunkRanges::empty(), 0) >= 8);
-        assert!(proof_window_ceiling(&ChunkRanges::single(0, 1), 63) >= 8);
+        // Degenerate inputs still advance rather than returning nothing.
+        assert!(proof_window(&ChunkRanges::empty(), 0).is_empty());
+        assert!(!proof_window(&ChunkRanges::single(0, 1), 63).is_empty());
     }
 }

@@ -574,23 +574,29 @@ impl Store {
         let (proof, truncated) = walk_proof(root, blob.size, &wanted, level, budget, |node| {
             load_from_outboard(&outboard, root, node)
         })?;
-        let (proof, served) = match truncated {
-            None => (proof, wanted),
-            Some(at) => {
-                // The walk stopped partway. Rather than ship the prefix it
-                // managed and leave the requester to guess which nodes it got,
-                // the walk is repeated over exactly the ranges that fit: both
-                // sides then agree on the answer node for node.
-                let served = wanted.intersect(&ChunkRanges::single(0, at));
-                if served.is_empty() {
-                    return Ok((Vec::new(), served));
-                }
-                let (proof, _) = walk_proof(root, blob.size, &served, level, budget, |node| {
-                    load_from_outboard(&outboard, root, node)
-                })?;
-                (proof, served)
-            }
-        };
+        // A truncated walk is now a refused request, not a partial answer.
+        //
+        // The requester sizes its window from `proof_nodes_upper_bound` so that
+        // a provider holding *everything* it asked for still fits the budget,
+        // and this walk covers `requested ∩ what we hold`, which is a subset of
+        // that and so cannot cost more. Overrunning therefore means the request
+        // was not sized by a conforming requester, and the answer is to say so
+        // rather than to serve a prefix.
+        //
+        // This is what let the second walk go. The old shape shipped a
+        // truncated answer, so the two sides had to be made to agree about
+        // where it stopped — done by discarding the work and walking the whole
+        // thing again over the ranges that fit, at up to `MAX_PROOF_NODES`
+        // random 64-byte outboard reads for a ~50-byte request.
+        if let Some(at) = truncated {
+            return Err(StoreError::Verification {
+                root: *root,
+                reason: format!(
+                    "a proof over these ranges at level {level} exceeds the {budget}-node                      budget (stopped at group {at}); the requester must split the request"
+                ),
+            });
+        }
+        let served = wanted;
 
         let mut encoded = Vec::with_capacity(proof.nodes.len() * PROOF_NODE_LEN);
         for (_, pair) in &proof.nodes {
@@ -1846,7 +1852,14 @@ mod tests {
     /// A proof is clamped to one window like a slice, and `served` is where the
     /// next request starts.
     #[test]
-    fn a_proof_is_clamped_to_one_window() {
+    fn an_over_budget_proof_is_refused_rather_than_truncated() {
+        // The provider used to serve a prefix and report where it stopped,
+        // which meant the two sides had to be made to agree about the cut —
+        // done by discarding the walk and repeating it over the ranges that
+        // fit. Now the requester sizes its window from
+        // `proof_nodes_upper_bound` so a full holder still fits, this walk
+        // covers a subset of that and so cannot cost more, and an over-budget
+        // request means a non-conforming requester.
         let (_d, provider) = store();
         let bytes = data(40 * GROUP);
         let size = bytes.len() as u64;
@@ -1854,21 +1867,31 @@ mod tests {
         let all = ChunkRanges::single(0, group_count(size));
 
         // A budget far below what a leaf-level proof of the whole object needs.
-        let (encoded, served) = provider.encode_proof_bounded(&root, &all, 0, 12).unwrap();
-        assert!(!served.is_empty());
-        assert!(served != all, "the window is short of the request");
-        assert!(encoded.len() as u64 <= 12 * PROOF_NODE_LEN as u64);
+        let err = provider
+            .encode_proof_bounded(&root, &all, 0, 12)
+            .expect_err("an over-budget request must be refused");
+        assert!(err.to_string().contains("budget"), "{err}");
 
-        // And what it did serve verifies on its own.
+        // Sized to the budget, the same request is served whole — and what
+        // comes back verifies and covers exactly what was asked for.
+        let window = ChunkRanges::single(0, 8);
+        assert!(synch_core::proof_nodes_upper_bound(&window, 0) <= 12 + 64);
+        let (encoded, served) = provider
+            .encode_proof_bounded(&root, &window, 0, 128)
+            .unwrap();
+        assert_eq!(served, window, "a sized window is never short");
+
         let (_d2, fetcher) = store();
         let proven = fetcher
             .write_proof(&root, size, &served, 0, &encoded, 0)
             .unwrap();
         assert!(!proven.is_empty());
 
-        // The next window picks up exactly where this one stopped.
+        // And the next window picks up exactly where this one stopped.
         let rest = all.difference(&served);
-        let (_, next) = provider.encode_proof_bounded(&root, &rest, 0, 12).unwrap();
+        let (_, next) = provider
+            .encode_proof_bounded(&root, &rest, 0, 4096)
+            .unwrap();
         assert_eq!(next.ranges[0].start, served.ranges[0].end);
     }
 
