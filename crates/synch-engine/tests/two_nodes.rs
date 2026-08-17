@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use iroh_base::SecretKey;
 use synch_core::{file_key, now_ns, ChunkRanges, FileEntry, Hash, OriginId, SignedHead};
+use synch_engine::{FetchOutcome, Syncer};
 use synch_mpt::Trie;
-use synch_net::{Net, NetOptions, Syncer};
+use synch_net::{Net, NetOptions};
 use synch_store::{Binding, BindingSource, Slot, Store};
 
 struct Node {
@@ -27,7 +28,13 @@ impl Node {
         // A node always trusts itself, so its own key is bound before anything
         // else happens.
         trust(&store, &origin, &secret.public());
-        let net = Net::bind(store.clone(), secret.clone(), NetOptions::loopback())
+        // The endpoint reconciles through a head sink, which is what carries
+        // the §5.2 acceptance rule; without one it speaks the protocol but
+        // adopts nothing. The node dials with the same object it serves
+        // through, so a head arriving in either direction lands in one place.
+        let mut options = NetOptions::loopback();
+        options.heads = Some(Arc::new(Syncer::new(store.clone())) as Arc<dyn synch_net::HeadSink>);
+        let net = Net::bind(store.clone(), secret.clone(), options)
             .await
             .unwrap();
         Node {
@@ -475,7 +482,7 @@ async fn reactive_head_push_propagates() {
         .fetch_pending(&back, &publisher.origin)
         .await
         .unwrap();
-    assert_eq!(outcome, synch_net::FetchOutcome::Completed);
+    assert_eq!(outcome, FetchOutcome::Completed);
     assert_eq!(
         follower.store.complete_head(&publisher.origin).unwrap(),
         Some(head)
@@ -513,7 +520,7 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
         .fetch_pending(&client, &publisher.origin)
         .await
         .unwrap();
-    assert_eq!(outcome, synch_net::FetchOutcome::Abandoned);
+    assert_eq!(outcome, FetchOutcome::Abandoned);
     assert_eq!(
         follower.store.pending_head(&publisher.origin).unwrap(),
         None

@@ -21,7 +21,9 @@ use synch_core::{now_ns, HeadSummary, OriginId, SignedHead, MAX_BATCH};
 use synch_mpt::{Trie, TrieNode};
 use synch_store::{Slot, Store};
 
-use crate::{error::NetError, mpt::MptClient};
+use synch_net::{HeadSink, MptClient, NetError};
+
+use crate::error::{EngineError, Result};
 
 /// How many distinct roots one origin may have retained at a single seq.
 ///
@@ -114,7 +116,7 @@ impl Syncer {
     /// `complete` means "I hold the full trie under this root and can serve
     /// it"; a signed head alone proves nothing about that, so the flag is
     /// computed from the local trie, never assumed.
-    pub fn local_summaries(&self) -> Result<Vec<HeadSummary>, NetError> {
+    pub fn local_summaries(&self) -> Result<Vec<HeadSummary>> {
         let trie = Trie::new(self.store.as_ref());
         let mut out = Vec::new();
         for stored in self.store.all_heads(Slot::Complete)? {
@@ -172,11 +174,7 @@ impl Syncer {
     /// acceptance rule is both sufficient and stricter.
     ///
     /// Returns the highest seq now observed for our origin.
-    pub fn observe_summaries(
-        &self,
-        summaries: &[HeadSummary],
-        now: i64,
-    ) -> Result<Option<u64>, NetError> {
+    pub fn observe_summaries(&self, summaries: &[HeadSummary], now: i64) -> Result<Option<u64>> {
         self.observe_summaries_from(None, summaries, now)
     }
 
@@ -189,7 +187,7 @@ impl Syncer {
         claimed_by: Option<synch_core::NodeId>,
         summaries: &[HeadSummary],
         now: i64,
-    ) -> Result<Option<u64>, NetError> {
+    ) -> Result<Option<u64>> {
         let Some(own) = self.store.self_origin()? else {
             return Ok(None);
         };
@@ -214,7 +212,7 @@ impl Syncer {
     }
 
     /// Offers a head for adoption, applying the full §5.2 acceptance rule.
-    pub fn offer_head(&self, head: &SignedHead, now: i64) -> Result<HeadOutcome, NetError> {
+    pub fn offer_head(&self, head: &SignedHead, now: i64) -> Result<HeadOutcome> {
         // 1. The signature must verify under the key that claims to have made it.
         if head.verify_signature().is_err() {
             return Ok(HeadOutcome::BadSignature);
@@ -229,40 +227,38 @@ impl Syncer {
         // read the same floor, both decide they supersede it, and both write
         // the pending slot, so the lower one clobbered the higher and the
         // higher survived only in `head_history` with nothing to re-drive it.
-        let outcome = self
-            .store
-            .transaction(|txn| -> Result<HeadOutcome, NetError> {
-                // Verified heads are provable history and fork evidence even
-                // when they lose the ordering comparison, so they are retained
-                // either way (§4.4) — but only up to a point. Same-seq forks
-                // are exempt from `root_retention` until the origin publishes
-                // past the forked seq, so a member signing an unlimited number
-                // of roots at one seq bought permanent, unprunable growth on
-                // every peer, surviving even `trust rm`. Two roots prove the
-                // equivocation; the rest add nothing but rows.
-                if txn.fork_width(&head.origin, head.seq)? < MAX_RETAINED_FORKS
-                    || txn.head_history_has(&head.origin, head.seq, &head.root)?
-                {
-                    txn.record_history(head)?;
-                } else {
-                    tracing::warn!(
-                        origin = %head.origin,
-                        seq = head.seq,
-                        "ignoring further same-seq forks: equivocation is already proven"
-                    );
-                }
+        let outcome = self.store.transaction(|txn| -> Result<HeadOutcome> {
+            // Verified heads are provable history and fork evidence even
+            // when they lose the ordering comparison, so they are retained
+            // either way (§4.4) — but only up to a point. Same-seq forks
+            // are exempt from `root_retention` until the origin publishes
+            // past the forked seq, so a member signing an unlimited number
+            // of roots at one seq bought permanent, unprunable growth on
+            // every peer, surviving even `trust rm`. Two roots prove the
+            // equivocation; the rest add nothing but rows.
+            if txn.fork_width(&head.origin, head.seq)? < MAX_RETAINED_FORKS
+                || txn.head_history_has(&head.origin, head.seq, &head.root)?
+            {
+                txn.record_history(head)?;
+            } else {
+                tracing::warn!(
+                    origin = %head.origin,
+                    seq = head.seq,
+                    "ignoring further same-seq forks: equivocation is already proven"
+                );
+            }
 
-                // 3. (seq, root) must be strictly greater, lexicographically.
-                //    Strictly greater on seq alone would not converge: two
-                //    peers receiving different same-seq heads in different
-                //    orders would diverge permanently.
-                let floor = txn.head_floor(&head.origin)?;
-                if !head.supersedes(floor.as_ref()) {
-                    return Ok(HeadOutcome::NotNewer);
-                }
-                txn.put_head(Slot::Pending, head, now, now)?;
-                Ok(HeadOutcome::Pending)
-            })?;
+            // 3. (seq, root) must be strictly greater, lexicographically.
+            //    Strictly greater on seq alone would not converge: two
+            //    peers receiving different same-seq heads in different
+            //    orders would diverge permanently.
+            let floor = txn.head_floor(&head.origin)?;
+            if !head.supersedes(floor.as_ref()) {
+                return Ok(HeadOutcome::NotNewer);
+            }
+            txn.put_head(Slot::Pending, head, now, now)?;
+            Ok(HeadOutcome::Pending)
+        })?;
         if outcome == HeadOutcome::NotNewer {
             return Ok(HeadOutcome::NotNewer);
         }
@@ -280,8 +276,8 @@ impl Syncer {
     /// §10): a crash between them would leave `entries` — what the unified
     /// tree, mirrors, and `synch-s3` serve from — missing a promoted head's
     /// delta, with nothing left to say so.
-    pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<bool, NetError> {
-        let promoted = self.store.transaction(|txn| -> Result<_, NetError> {
+    pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<bool> {
+        let promoted = self.store.transaction(|txn| -> Result<_> {
             let Some(pending) = txn.head(origin, Slot::Pending)? else {
                 return Ok(None);
             };
@@ -348,7 +344,7 @@ impl Syncer {
         &self,
         client: &MptClient,
         origin: &OriginId,
-    ) -> Result<FetchOutcome, NetError> {
+    ) -> Result<FetchOutcome> {
         let Some(pending) = self.store.pending_head(origin)? else {
             return Ok(FetchOutcome::Idle);
         };
@@ -409,15 +405,18 @@ impl Syncer {
                         // Verify each node against the hash it was requested
                         // by. A malicious or corrupt peer can withhold, never
                         // inject.
-                        let actual = TrieNode::hash_of_encoded(bytes)
-                            .map_err(|_| NetError::NodeHashMismatch { expected: *hash })?;
+                        let actual = TrieNode::hash_of_encoded(bytes).map_err(|_| {
+                            EngineError::Net(NetError::NodeHashMismatch { expected: *hash })
+                        })?;
                         if actual != *hash {
-                            return Err(NetError::NodeHashMismatch { expected: *hash });
+                            return Err(EngineError::Net(NetError::NodeHashMismatch {
+                                expected: *hash,
+                            }));
                         }
                         if !requested.contains(hash) {
-                            return Err(NetError::Unexpected(format!(
+                            return Err(EngineError::Net(NetError::Unexpected(format!(
                                 "peer served unrequested trie node {hash}"
-                            )));
+                            ))));
                         }
                         synch_mpt::NodeStore::put_node(store.as_ref(), hash, bytes)?;
                         stored += 1;
@@ -434,7 +433,9 @@ impl Syncer {
                     for (hash, bytes) in &response.values {
                         let actual = synch_core::Hash::new(bytes);
                         if actual != *hash {
-                            return Err(NetError::ValueHashMismatch { expected: *hash });
+                            return Err(EngineError::Net(NetError::ValueHashMismatch {
+                                expected: *hash,
+                            }));
                         }
                         synch_mpt::NodeStore::put_value(store.as_ref(), hash, bytes)?;
                         stored += 1;
@@ -492,7 +493,7 @@ impl Syncer {
     /// This is what the recovery quiesce collects with. It is the ordinary
     /// exchange with an empty decision, so a recovering node learns how far
     /// peers say its origin had got without adopting anything.
-    pub async fn observe_with(&self, client: &MptClient) -> Result<Vec<HeadSummary>, NetError> {
+    pub async fn observe_with(&self, client: &MptClient) -> Result<Vec<HeadSummary>> {
         let ours = self.summaries_off_runtime().await?;
         let exchange = client
             .head_exchange(ours, |_theirs| (Vec::new(), Vec::new()))
@@ -508,7 +509,7 @@ impl Syncer {
     }
 
     /// [`Syncer::offer_head`] on the blocking pool.
-    async fn offer_head_off_runtime(&self, head: &SignedHead) -> Result<HeadOutcome, NetError> {
+    async fn offer_head_off_runtime(&self, head: &SignedHead) -> Result<HeadOutcome> {
         let syncer = self.clone();
         let head = head.clone();
         crate::blocking::offload(move || syncer.offer_head(&head, now_ns())).await
@@ -519,14 +520,14 @@ impl Syncer {
     /// Summarizing asks the trie whether each advertised root is held whole,
     /// which is a walk the first time it is asked of a root (§5.1) — not
     /// something to do on a runtime worker.
-    async fn summaries_off_runtime(&self) -> Result<Vec<HeadSummary>, NetError> {
+    async fn summaries_off_runtime(&self) -> Result<Vec<HeadSummary>> {
         let syncer = self.clone();
         crate::blocking::offload(move || syncer.local_summaries()).await
     }
 
     /// Runs one full `Hello` push-pull exchange with a peer, then fetches
     /// whatever it advertised that we do not have (§5.2, §5.3).
-    pub async fn sync_with(&self, client: &MptClient) -> Result<SyncReport, NetError> {
+    pub async fn sync_with(&self, client: &MptClient) -> Result<SyncReport> {
         let ours = self.summaries_off_runtime().await?;
         let store = self.store.clone();
 
@@ -647,6 +648,52 @@ impl Syncer {
     }
 }
 
+/// The serve side's view of the reconciler (§5.2).
+///
+/// `synch-net` answers `Hello` and `HeadPush` by calling through this, so the
+/// acceptance rule, the binding check and the promotion transaction stay here —
+/// in the layer that owns head state — while the networking crate keeps only
+/// the framing and the streams. It is also what lets one `Syncer` serve both
+/// directions: the same object the node dials with is handed to the endpoint,
+/// so a head flipping to complete rings the one bell either way, instead of a
+/// `Notify` being threaded through the endpoint constructor to connect two
+/// syncers that never knew about each other.
+impl HeadSink for Syncer {
+    fn local_summaries(&self) -> std::result::Result<Vec<HeadSummary>, NetError> {
+        Syncer::local_summaries(self).map_err(to_net)
+    }
+
+    fn observe_summaries_from(
+        &self,
+        peer: synch_core::NodeId,
+        summaries: &[HeadSummary],
+        now: i64,
+    ) -> std::result::Result<(), NetError> {
+        Syncer::observe_summaries_from(self, Some(peer), summaries, now)
+            .map(|_| ())
+            .map_err(to_net)
+    }
+
+    fn offer_head(&self, head: &SignedHead, now: i64) -> std::result::Result<(), NetError> {
+        Syncer::offer_head(self, head, now)
+            .map(|_| ())
+            .map_err(to_net)
+    }
+}
+
+/// Renders an engine failure for the wire.
+///
+/// The seam is one-way by design: the engine names domain failures in its own
+/// error type, and what crosses back into `synch-net` is a protocol-level
+/// description of one. A `NetError` variant per storage fault is what made the
+/// transport enum a domain taxonomy in the first place.
+fn to_net(error: EngineError) -> NetError {
+    match error {
+        EngineError::Net(e) => e,
+        other => NetError::Unexpected(other.to_string()),
+    }
+}
+
 /// True if a failure is about *one origin's* replicated data rather than about
 /// the peer or the connection.
 ///
@@ -655,8 +702,8 @@ impl Syncer {
 /// on every exchange that reaches it. A protocol violation
 /// ([`NetError::NodeHashMismatch`]) or a broken stream is about the peer we are
 /// talking to, and still ends the exchange.
-fn is_origin_fault(error: &NetError) -> bool {
-    matches!(error, NetError::Store(_) | NetError::Mpt(_))
+fn is_origin_fault(error: &EngineError) -> bool {
+    matches!(error, EngineError::Store(_) | EngineError::Mpt(_))
 }
 
 /// Logs a contained per-origin failure and records it in the report.
@@ -665,7 +712,7 @@ fn is_origin_fault(error: &NetError) -> bool {
 /// it from converging with every *other* origin the same peer serves: the
 /// failing head keeps its slot, the exchange carries on, and the count says
 /// plainly that something was left behind (§5.2).
-fn contain(origin: &OriginId, error: &NetError, report: &mut SyncReport) {
+fn contain(origin: &OriginId, error: &EngineError, report: &mut SyncReport) {
     tracing::warn!(
         origin = %origin,
         error = %error,

@@ -8,8 +8,8 @@
 
 use std::time::Duration;
 
+use crate::reconcile::SyncReport;
 use synch_core::{now_ns, NodeId, SignedHead};
-use synch_net::SyncReport;
 
 use crate::{error::Result, node::Node};
 

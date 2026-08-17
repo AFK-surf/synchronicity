@@ -94,7 +94,7 @@ pub struct NetOptions {
     /// Notified when a head flips to complete (§5.2): the unified tree just
     /// changed, and anything materializing it — mirrors — should look again.
     /// The endpoint only rings the bell.
-    pub on_change: Option<Arc<tokio::sync::Notify>>,
+    pub heads: Option<Arc<dyn crate::HeadSink>>,
 }
 
 impl NetOptions {
@@ -109,7 +109,7 @@ impl NetOptions {
             dht_bootstrap: Vec::new(),
             dht_publish_direct_addrs: false,
             on_unknown_key: None,
-            on_change: None,
+            heads: None,
         }
     }
 }
@@ -176,6 +176,37 @@ fn dht_address_lookup(
 
 /// The live outbound connections this endpoint holds, keyed by peer and ALPN.
 type Dialed = std::sync::Mutex<HashMap<(NodeId, &'static [u8]), Connection>>;
+
+/// A [`HeadSink`](crate::HeadSink) that adopts nothing.
+///
+/// The default when no reconciler is supplied — a bare endpoint that speaks the
+/// protocol but has no head state to speak for. It answers `Hello` with an
+/// empty summary list and refuses pushed heads rather than pretending to have
+/// taken them, which is what tests exercising only transport want and what a
+/// misconfigured node should do rather than silently dropping heads.
+#[derive(Debug)]
+struct RefuseHeads;
+
+impl crate::HeadSink for RefuseHeads {
+    fn local_summaries(&self) -> Result<Vec<synch_core::HeadSummary>, NetError> {
+        Ok(Vec::new())
+    }
+
+    fn observe_summaries_from(
+        &self,
+        _peer: synch_core::NodeId,
+        _summaries: &[synch_core::HeadSummary],
+        _now: i64,
+    ) -> Result<(), NetError> {
+        Ok(())
+    }
+
+    fn offer_head(&self, _head: &synch_core::SignedHead, _now: i64) -> Result<(), NetError> {
+        Err(NetError::Unexpected(
+            "this endpoint has no reconciler and cannot adopt heads".into(),
+        ))
+    }
+}
 
 /// A bound endpoint serving both ALPNs.
 #[derive(Debug, Clone)]
@@ -258,9 +289,14 @@ impl Net {
         let router = Router::builder(endpoint)
             .accept(
                 ALPN_MPT,
-                MptProtocol::new(store.clone())
-                    .on_unknown_key(options.on_unknown_key.clone())
-                    .on_change(options.on_change.clone()),
+                MptProtocol::new(
+                    store.clone(),
+                    options
+                        .heads
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(RefuseHeads) as Arc<dyn crate::HeadSink>),
+                )
+                .on_unknown_key(options.on_unknown_key.clone()),
             )
             .accept(
                 ALPN_BLOB,

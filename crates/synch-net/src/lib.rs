@@ -1,4 +1,4 @@
-//! iroh endpoint, the two ALPN protocols, reconciliation, and DNSSEC membership.
+//! iroh endpoint, the two ALPN protocols, and DNSSEC membership.
 //!
 //! `sync/mpt/1` carries head gossip and trie fetches (§5); `sync/blob/1`
 //! carries verified bao slices (§6.4). Both are gated on the bindings table, so
@@ -14,7 +14,6 @@ pub mod endpoint;
 pub mod error;
 pub mod frame;
 pub mod mpt;
-pub mod reconcile;
 pub mod rekor;
 /// Test machinery — a simulated signed zone, transparency log and TUF
 /// repository. Behind the non-default `sim` feature: it is 1300 lines with
@@ -34,7 +33,6 @@ pub use dns::{
 };
 pub use endpoint::{Net, NetOptions};
 pub use error::{NetError, Result};
-pub use mpt::{HeadExchange, MptClient, MptProtocol, NodesResponse, ValuesResponse};
-pub use reconcile::{FetchOutcome, HeadOutcome, SyncReport, Syncer};
+pub use mpt::{HeadExchange, HeadSink, MptClient, MptProtocol, NodesResponse, ValuesResponse};
 pub use rekor::{ProofError, RekorProof};
 pub use tuf::{PinState, TufError, TufMetadata};

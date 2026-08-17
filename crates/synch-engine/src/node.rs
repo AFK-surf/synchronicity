@@ -12,7 +12,9 @@ use synch_core::{
     OriginId, SignedHead, SpaceInfo, SOFTWARE,
 };
 use synch_mpt::Trie;
-use synch_net::{Net, Syncer};
+use synch_net::Net;
+
+use crate::reconcile::Syncer;
 use synch_store::{Binding, BindingSource, KeyState, Slot, Store};
 
 use crate::{
@@ -248,13 +250,16 @@ impl Node {
         // that matters can arrive at either (§3.4).
         let dns_wake = Arc::new(tokio::sync::Notify::new());
         config.net.on_unknown_key = Some(dns_wake.clone());
-        // And every head that flips to complete — dialed out or pushed in —
-        // rings the mirror bell through the same two doors: the endpoint's
-        // serve-side syncer, and the one this node's own rounds dial with.
+        // Every head that flips to complete — dialed out or pushed in — rings
+        // the mirror bell. One syncer now does both: it is handed to the
+        // endpoint as the head sink the serve side reconciles through, and it
+        // is the same object this node's own rounds dial with. That replaces a
+        // `Notify` threaded through the endpoint constructor purely so the
+        // layer that knew a head had flipped could reach the layer that cared.
         let mirror_wake = Arc::new(tokio::sync::Notify::new());
-        config.net.on_change = Some(mirror_wake.clone());
-        let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let syncer = Syncer::new(store.clone()).on_change(Some(mirror_wake.clone()));
+        config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
+        let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
         let node = Node {
             inner: Arc::new(NodeInner {
