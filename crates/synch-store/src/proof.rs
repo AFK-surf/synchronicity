@@ -694,7 +694,11 @@ impl Store {
                 outboard.save(*node, &(left, right))?;
             }
             outboard.sync()?;
-            let _ = fsync_file(&outboard.data.0);
+            // Checked, like the flushes `write_slice` runs: a swallowed ENOSPC
+            // or EIO here lets the row below record a tree that never reached
+            // stable storage. The handle is open for writing, which is what
+            // Windows requires of a flush.
+            fsync_file(&outboard.data.0)?;
             // The row is what later passes read the object's size and bitmap
             // out of. A proof commits no bytes, so an object first met this way
             // is recorded as held-nothing rather than not held at all — and the
@@ -726,6 +730,11 @@ impl Store {
     /// of hashing. Each span is `(first group, width in groups)`, and a `None`
     /// answer means the donor cannot speak to it — the span is not whole in
     /// this object, is not aligned to its tree, or is not held here.
+    ///
+    /// A donor whose files are gone answers `None` to everything rather than
+    /// failing, the same reading [`Store::open_donor`] takes of it: nothing in
+    /// the descent may fail a fetch, and a donor the collector took between the
+    /// plan and the question is a donor with nothing to say.
     pub fn subtree_cvs(&self, root: &Hash, spans: &[(u64, u64)]) -> Result<Vec<Option<Cv>>> {
         let mut out = vec![None; spans.len()];
         let Some(blob) = self.blob(root)? else {
@@ -737,10 +746,13 @@ impl Store {
         }
         let held = blob.verified_groups();
         let tree = Self::tree(blob.size);
+        let Ok(file) = File::open(self.outboard_path(root)) else {
+            return Ok(out);
+        };
         let outboard = PreOrderOutboard {
             root: blake3::Hash::from_bytes(root.0),
             tree,
-            data: DataFile(File::open(self.outboard_path(root))?),
+            data: DataFile(file),
         };
         for (index, &(start, span)) in spans.iter().enumerate() {
             if span == 0 || !span.is_power_of_two() || start % span != 0 {
@@ -933,8 +945,8 @@ impl Store {
         // would cost an index that lies (§6.2).
         sink.payload.flush()?;
         sink.outboard.sync()?;
-        let _ = fsync_file(&sink.payload.0);
-        let _ = fsync_file(&sink.outboard.data.0);
+        fsync_file(&sink.payload.0)?;
+        fsync_file(&sink.outboard.data.0)?;
         let commit = self.commit_groups(root, size, &promoted, None, now)?;
         drop(sink);
         self.trim_to_size(root, commit);
@@ -2026,6 +2038,35 @@ mod tests {
             .write_proof(&root, size, &served, 0, &encoded, 0)
             .unwrap();
         assert_eq!(proven.subtrees.len(), 8);
+    }
+
+    /// A donor whose outboard has gone answers "nothing" rather than failing.
+    ///
+    /// The descent asks about donors it picked out of the index a moment ago,
+    /// and the collector may have taken one in between. Nothing in the descent
+    /// is allowed to fail a fetch — the worst a missing donor may cost is the
+    /// bytes it would have saved.
+    #[test]
+    fn a_donor_whose_outboard_is_gone_speaks_to_nothing() {
+        let (_d, store) = self::store();
+        let bytes = data(16 * GROUP);
+        let root = store.ingest_bytes(&bytes, 0).unwrap();
+        let spans = [(0u64, 4u64), (4, 4)];
+        assert!(
+            store
+                .subtree_cvs(&root, &spans)
+                .unwrap()
+                .iter()
+                .all(Option::is_some),
+            "the donor speaks to both spans while its tree is there"
+        );
+
+        std::fs::remove_file(store.outboard_path(&root)).unwrap();
+        assert_eq!(
+            store.subtree_cvs(&root, &spans).unwrap(),
+            vec![None, None],
+            "and to neither once it is gone"
+        );
     }
 
     /// Objects too small to have a tree have nothing to prove, and say so
