@@ -194,6 +194,10 @@ impl Node {
             tracing::info!(expired, "dns bindings lapsed");
         }
         self.expire_tombstones()?;
+        let abandoned = self.abandon_stale_pending_heads(now)?;
+        if abandoned > 0 {
+            tracing::info!(abandoned, "pending heads nobody could serve");
+        }
         // Ads for objects content GC has since dropped. Staged before the
         // content sweep below rather than after, so a root that goes this pass
         // is retired next pass rather than lingering an interval — and so the
@@ -224,6 +228,42 @@ impl Node {
             );
         }
         Ok(stats)
+    }
+
+    /// Clears pending heads that have sat past `pending_head_ttl` with an
+    /// incomplete trie (§5.2).
+    ///
+    /// `head_floor` is the best of both slots, so a pending head nobody can
+    /// serve holds the floor above every servable head for that origin: the
+    /// node refuses a peer's older complete head and materializes nothing.
+    /// Dropping the head drops the floor, and the older head becomes adoptable
+    /// on the next exchange. A head whose trie *is* here is left alone — it is
+    /// one promotion away from complete, not stranded.
+    ///
+    /// Returns how many were cleared.
+    fn abandon_stale_pending_heads(&self, now: i64) -> Result<usize> {
+        let ttl = self
+            .config()
+            .pending_head_ttl
+            .as_nanos()
+            .min(i64::MAX as u128) as i64;
+        let before = now.saturating_sub(ttl);
+        let trie = synch_mpt::Trie::new(self.store().as_ref());
+        let mut cleared = 0;
+        for stored in self.store().all_heads(synch_store::Slot::Pending)? {
+            if stored.received_at > before || trie.is_complete(stored.head.root)? {
+                continue;
+            }
+            tracing::warn!(
+                origin = %stored.head.origin,
+                seq = stored.head.seq,
+                "abandoning a pending head nobody has served"
+            );
+            self.store()
+                .clear_head(&stored.head.origin, synch_store::Slot::Pending)?;
+            cleared += 1;
+        }
+        Ok(cleared)
     }
 }
 
@@ -327,6 +367,109 @@ mod tests {
             1,
             "only self remains"
         );
+        node.shutdown().await.unwrap();
+    }
+
+    /// A pending head nobody can serve stops holding an origin hostage.
+    ///
+    /// `head_floor` is the best of both slots, so a head pushed reactively by a
+    /// publisher that then goes offline sits in the pending slot refusing every
+    /// older head a peer could actually serve. Past the TTL the maintenance
+    /// pass drops it and head selection re-runs.
+    #[tokio::test]
+    async fn a_pending_head_nobody_serves_is_abandoned_by_maintenance() {
+        use synch_core::{file_key, FileEntry, Hash, SignedHead};
+        use synch_store::{Binding, BindingSource, Slot};
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::Node::init(dir.path(), None).unwrap();
+        let mut config = NodeConfig::loopback(dir.path());
+        config.pending_head_ttl = Duration::from_secs(60);
+        let node = crate::Node::open(config).await.unwrap();
+
+        let key = iroh_base::SecretKey::generate();
+        let origin = synch_core::OriginId::named("nas", "x.example").unwrap();
+        node.store()
+            .put_binding(&Binding {
+                origin: origin.clone(),
+                node_id: key.public(),
+                source: BindingSource::Static,
+                domain: None,
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+
+        // A root this node holds nothing of, pushed long enough ago that the
+        // TTL has run out.
+        let ttl_ns = 60 * 1_000_000_000i64;
+        let now = now_ns();
+        let stranded = SignedHead::sign(&key, origin.clone(), 5, Hash::new(b"unserved"), 0);
+        node.store()
+            .put_head(Slot::Pending, &stranded, now - 2 * ttl_ns, 0)
+            .unwrap();
+
+        // A fresh pending head for another origin is left where it is.
+        let fresh_origin = synch_core::OriginId::named("laptop", "x.example").unwrap();
+        node.store()
+            .put_binding(&Binding {
+                origin: fresh_origin.clone(),
+                node_id: key.public(),
+                source: BindingSource::Static,
+                domain: None,
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+        let fresh = SignedHead::sign(&key, fresh_origin.clone(), 1, Hash::new(b"recent"), 0);
+        node.store()
+            .put_head(Slot::Pending, &fresh, now, 0)
+            .unwrap();
+
+        // And an old pending head whose trie *is* here: one promotion away
+        // from complete, not stranded.
+        let held_origin = synch_core::OriginId::named("vps", "x.example").unwrap();
+        node.store()
+            .put_binding(&Binding {
+                origin: held_origin.clone(),
+                node_id: key.public(),
+                source: BindingSource::Static,
+                domain: None,
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+        let trie = synch_mpt::Trie::new(node.store().as_ref());
+        let root = trie
+            .insert(
+                Hash::EMPTY,
+                &file_key("s", "a.txt").unwrap(),
+                &postcard::to_stdvec(&FileEntry::file(1, 0, Hash::new(b"c"), 1)).unwrap(),
+            )
+            .unwrap();
+        let held = SignedHead::sign(&key, held_origin.clone(), 1, root, 0);
+        node.store()
+            .put_head(Slot::Pending, &held, now - 2 * ttl_ns, 0)
+            .unwrap();
+
+        node.maintenance_pass().unwrap();
+        assert_eq!(node.store().pending_head(&origin).unwrap(), None);
+        assert_eq!(
+            node.store().pending_head(&fresh_origin).unwrap(),
+            Some(fresh)
+        );
+        assert_eq!(node.store().pending_head(&held_origin).unwrap(), Some(held));
+
+        // With the floor dropped, the older head a peer can actually serve is
+        // adopted rather than refused.
+        let servable = SignedHead::sign(&key, origin.clone(), 3, Hash::EMPTY, 0);
+        assert!(crate::Syncer::new(node.store().clone())
+            .offer_head(&servable, now)
+            .unwrap()
+            .accepted());
         node.shutdown().await.unwrap();
     }
 
