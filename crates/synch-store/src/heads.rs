@@ -76,6 +76,18 @@ fn build_head(
     })
 }
 
+/// The columns of a head, joined from the pointer to the signature it names.
+///
+/// `heads` holds `(seq, root)` and the bookkeeping times; the signed head those
+/// identify lives once, in `head_history`. The join is what makes "the current
+/// head" and "the retained history" one fact instead of two copies that have to
+/// be kept in step (§10, v11).
+const HEAD_JOIN: &str = "SELECT h.origin_id, h.seq, h.root, hh.created_at, hh.signed_by, hh.sig,
+        h.received_at, h.verified_at
+ FROM heads h
+ JOIN head_history hh
+   ON hh.origin_id = h.origin_id AND hh.seq = h.seq AND hh.root = h.root";
+
 fn head_in(
     conn: &rusqlite::Connection,
     origin: &OriginId,
@@ -83,8 +95,7 @@ fn head_in(
 ) -> Result<Option<StoredHead>> {
     let row = conn
         .query_row(
-            "SELECT origin_id, seq, root, created_at, signed_by, sig, received_at, verified_at
-             FROM heads WHERE origin_id = ?1 AND slot = ?2",
+            &format!("{HEAD_JOIN} WHERE h.origin_id = ?1 AND h.slot = ?2"),
             params![origin.canonical(), slot.as_str()],
             head_from_row,
         )
@@ -130,10 +141,9 @@ impl Store {
     /// Every slot for every origin.
     pub fn all_heads(&self, slot: Slot) -> Result<Vec<StoredHead>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT origin_id, seq, root, created_at, signed_by, sig, received_at, verified_at
-             FROM heads WHERE slot = ?1 ORDER BY origin_id",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{HEAD_JOIN} WHERE h.slot = ?1 ORDER BY h.origin_id"
+        ))?;
         let rows = stmt.query_map(params![slot.as_str()], head_from_row)?;
         let mut out = Vec::new();
         for row in rows {
@@ -378,8 +388,10 @@ impl Store {
     /// bootstrap.
     pub fn retained_roots(&self) -> Result<Vec<Hash>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT root FROM heads UNION SELECT root FROM head_history")?;
+        // One table, not a union across two. `put_head` writes the signature to
+        // `head_history` before the slot points at it, so every current head's
+        // root is here by construction rather than by coincidence.
+        let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
         let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -497,21 +509,23 @@ fn put_head_in(
     received_at: i64,
     verified_at: i64,
 ) -> Result<()> {
+    // The signature goes to `head_history` and the slot points at it. Writing
+    // it here is what makes the pointer sound for *every* caller, so no caller
+    // has to remember to record history alongside — which is what the old
+    // record-on-arrival-and-again-on-displacement pair of rules was doing by
+    // hand, redundantly, at seven call sites.
+    record_history_in(conn, head)?;
     conn.execute(
-        "INSERT INTO heads (origin_id, slot, seq, root, created_at, signed_by, sig, received_at, verified_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(origin_id, slot) DO UPDATE SET
-           seq = excluded.seq, root = excluded.root, created_at = excluded.created_at,
-           signed_by = excluded.signed_by, sig = excluded.sig,
+           seq = excluded.seq, root = excluded.root,
            received_at = excluded.received_at, verified_at = excluded.verified_at",
         params![
             head.origin.canonical(),
             slot.as_str(),
             head.seq as i64,
             head.root.as_bytes().to_vec(),
-            head.created_at,
-            head.signed_by.as_bytes().to_vec(),
-            head.sig.to_bytes().to_vec(),
             received_at,
             verified_at,
         ],
@@ -620,14 +634,79 @@ mod tests {
         let pending = SignedHead::sign(&key, origin(), 7, Hash([7u8; 32]), 0);
         store.put_head(Slot::Pending, &pending, 0, 0).unwrap();
 
+        // Seven distinct roots: five recorded directly, plus the two the slots
+        // point at — which `put_head` retains, so they are here by
+        // construction rather than needing the union `retained_roots` used to
+        // take across both tables.
         let roots = store.retained_roots().unwrap();
         assert_eq!(roots.len(), 7);
         assert!(roots.contains(&Hash([6u8; 32])));
         // Pending heads must be in the mark set (§5.4).
         assert!(roots.contains(&Hash([7u8; 32])));
 
+        // Pruning below seq 4 drops the first three; seqs 4 and 5 remain, as do
+        // the two the slots point at.
         assert_eq!(store.prune_history(&origin(), 4).unwrap(), 3);
-        assert_eq!(store.head_history(&origin()).unwrap().len(), 2);
+        assert_eq!(store.head_history(&origin()).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn v11_carries_every_head_signature_across_the_rebuild() {
+        // The migration drops the signature columns from `heads`, so it has to
+        // move them into `head_history` first or the rebuild silently loses the
+        // ability to verify the current head. Built by replaying the chain up
+        // to v10 and shaping the old table by hand, so this exercises the
+        // migration rather than the code that now writes the new shape.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::db::DB_FILE);
+        let key = SecretKey::generate();
+        let complete = SignedHead::sign(&key, origin(), 4, Hash([4u8; 32]), 44);
+        let pending = SignedHead::sign(&key, origin(), 5, Hash([5u8; 32]), 55);
+        {
+            let mut conn = rusqlite::Connection::open(&path).unwrap();
+            crate::db::migrate(&mut conn, &crate::schema::MIGRATIONS[..10]).unwrap();
+            // The v10 shape: signatures copied into `heads`, nothing in history.
+            conn.execute_batch(
+                "DROP TABLE heads;
+                 CREATE TABLE heads (
+                   origin_id TEXT NOT NULL, slot TEXT NOT NULL, seq INTEGER NOT NULL,
+                   root BLOB NOT NULL, created_at INTEGER NOT NULL, signed_by BLOB NOT NULL,
+                   sig BLOB NOT NULL, received_at INTEGER NOT NULL, verified_at INTEGER NOT NULL,
+                   PRIMARY KEY (origin_id, slot));",
+            )
+            .unwrap();
+            for (slot, head) in [("complete", &complete), ("pending", &pending)] {
+                conn.execute(
+                    "INSERT INTO heads (origin_id, slot, seq, root, created_at, signed_by, sig,
+                                        received_at, verified_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 2)",
+                    params![
+                        head.origin.canonical(),
+                        slot,
+                        head.seq as i64,
+                        head.root.as_bytes().to_vec(),
+                        head.created_at,
+                        head.signed_by.as_bytes().to_vec(),
+                        head.sig.to_bytes().to_vec(),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        let read_complete = store.complete_head(&origin()).unwrap().unwrap();
+        assert_eq!(read_complete, complete);
+        read_complete
+            .verify_signature()
+            .expect("the signature survived the rebuild");
+        let read_pending = store.pending_head(&origin()).unwrap().unwrap();
+        assert_eq!(read_pending, pending);
+        read_pending.verify_signature().unwrap();
+
+        // Both roots are now markable from the one table GC reads.
+        let roots = store.retained_roots().unwrap();
+        assert!(roots.contains(&complete.root) && roots.contains(&pending.root));
     }
 
     #[test]

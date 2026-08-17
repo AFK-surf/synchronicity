@@ -315,9 +315,10 @@ impl Syncer {
                 .as_ref()
                 .map(|h| h.root)
                 .unwrap_or(synch_core::Hash::EMPTY);
-            if let Some(old) = &displaced {
-                txn.record_history(old)?;
-            }
+            // The displaced head is already retained: `put_head` recorded its
+            // signature when it took the slot. Recording it again here was the
+            // second of two rules that both wrote the same row, kept honest
+            // only by `INSERT OR IGNORE` (§10, v11).
             txn.put_head(Slot::Complete, &pending.head, pending.received_at, now)?;
             txn.clear_head(origin, Slot::Pending)?;
             txn.materialize_diff(origin, old_root, pending.head.root)?;
@@ -1003,15 +1004,17 @@ mod tests {
         let err = syncer.try_promote(&origin, 0).unwrap_err().to_string();
         assert!(err.contains("corrupt record"), "{err}");
 
-        // The complete head is untouched, the pending head is still pending,
-        // and no history row claims the promotion happened.
-        assert_eq!(store.complete_head(&origin).unwrap().unwrap().seq, 1);
+        // The complete head is untouched and the pending head is still pending.
+        //
+        // The poisoned root *is* in `head_history` — every head in a slot has
+        // its signature there by construction (§10, v11), and a pending head is
+        // no exception. What must not have happened is the flip, so that is what
+        // is asserted: the complete slot still names the good root.
+        let complete = store.complete_head(&origin).unwrap().unwrap();
+        assert_eq!(complete.seq, 1);
+        assert_eq!(complete.root, good);
+        assert_ne!(complete.root, poisoned);
         assert_eq!(store.pending_head(&origin).unwrap().unwrap().seq, 2);
-        assert!(!store
-            .head_history(&origin)
-            .unwrap()
-            .iter()
-            .any(|h| h.root == poisoned));
         assert!(store.entry(&origin, "s", "poisoned").unwrap().is_none());
         // And the entry the *complete* head materialized is still there.
         assert!(store.entry(&origin, "s", "a").unwrap().is_some());

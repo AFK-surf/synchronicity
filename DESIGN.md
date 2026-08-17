@@ -1141,15 +1141,19 @@ CREATE TABLE bindings (
 CREATE INDEX bindings_by_key ON bindings (node_id);   -- connection-accept lookup
 
 -- mptsync
+-- A slot is a *pointer* at a signed head, not a copy of one: the signature,
+-- and the `created_at` it covers, live once in `head_history`. Copying them
+-- here meant every head that reached the complete slot was written twice under
+-- two separate rules — on arrival and again on displacement, the second
+-- provably redundant — and the duplication then had to be patched around, with
+-- an explicit retention exemption so pruning would not delete the rows the
+-- current heads shadowed, and a UNION across both tables for the GC mark set.
 CREATE TABLE heads (
   origin_id   TEXT NOT NULL,
   slot        TEXT NOT NULL,             -- 'complete': fully materialized, servable, backs `entries`
                                          -- 'pending' : fetch in progress (§5.2 resumability)
-  seq         INTEGER NOT NULL,
+  seq         INTEGER NOT NULL,          -- with root, names a row of head_history
   root        BLOB NOT NULL,
-  created_at  INTEGER NOT NULL,
-  signed_by   BLOB NOT NULL,             -- device key that signed this head
-  sig         BLOB NOT NULL,
   received_at INTEGER NOT NULL,
   verified_at INTEGER NOT NULL,          -- when the signed_by↔origin binding was checked
   PRIMARY KEY (origin_id, slot)

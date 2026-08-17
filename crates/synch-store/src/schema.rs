@@ -68,6 +68,7 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "verified groups as ranges",
         run: v10_groups_as_ranges,
     },
+    Migration::Sql(V11_HEADS_POINT_AT_HISTORY),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -389,6 +390,42 @@ fn v10_groups_as_ranges(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// v11 — `heads` points into `head_history` rather than copying it.
+///
+/// The two tables carried the same five columns for the same rows, and every
+/// head that reached the complete slot was written to `head_history` twice
+/// under two separate rules: on arrival (`offer_head`, `publish`, `activate`)
+/// and again on displacement (`try_promote`, `publish`, `activate`). The second
+/// rule was provably redundant — every head reaching the complete slot passed
+/// through one of the first three — and was saved only by `INSERT OR IGNORE`.
+///
+/// The duplication then had to be patched around: retention needed an explicit
+/// exemption so it would not delete the history rows shadowing the current
+/// heads, and the GC mark set was a `UNION` across both tables. With `heads`
+/// holding only `(seq, root)` and the signature living in one place, the
+/// exemption becomes referential integrity rather than a special case, and the
+/// mark set is one table.
+///
+/// The backfill is `INSERT OR IGNORE` first so that a head whose history row
+/// was somehow missing does not lose its signature to the rebuild.
+const V11_HEADS_POINT_AT_HISTORY: &str = r#"
+INSERT OR IGNORE INTO head_history (origin_id, seq, root, created_at, signed_by, sig)
+  SELECT origin_id, seq, root, created_at, signed_by, sig FROM heads;
+ALTER TABLE heads RENAME TO heads_v10;
+CREATE TABLE heads (
+  origin_id   TEXT NOT NULL,
+  slot        TEXT NOT NULL,             -- 'complete' | 'pending'
+  seq         INTEGER NOT NULL,
+  root        BLOB NOT NULL,
+  received_at INTEGER NOT NULL,
+  verified_at INTEGER NOT NULL,
+  PRIMARY KEY (origin_id, slot)
+);
+INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
+  SELECT origin_id, slot, seq, root, received_at, verified_at FROM heads_v10;
+DROP TABLE heads_v10;
+"#;
+
 /// The §10 schema as the design document states it — the shape replaying the
 /// whole chain must produce.
 ///
@@ -422,9 +459,6 @@ CREATE TABLE heads (
   slot        TEXT NOT NULL,
   seq         INTEGER NOT NULL,
   root        BLOB NOT NULL,
-  created_at  INTEGER NOT NULL,
-  signed_by   BLOB NOT NULL,
-  sig         BLOB NOT NULL,
   received_at INTEGER NOT NULL,
   verified_at INTEGER NOT NULL,
   PRIMARY KEY (origin_id, slot)

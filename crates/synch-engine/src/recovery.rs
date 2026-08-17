@@ -737,11 +737,11 @@ mod tests {
 
         // The operator rebinds the origin to a fresh key: the lost one no
         // longer speaks for it.
-        let recovered = SecretKey::generate().public();
+        let recovered = SecretKey::generate();
         node.store()
             .remove_binding(&peer_origin, &lost.public(), BindingSource::Static)
             .unwrap();
-        node.trust_rebind(&peer_origin, recovered).unwrap();
+        node.trust_rebind(&peer_origin, recovered.public()).unwrap();
 
         let unreconciled = node.unreconciled_history(&peer_origin).unwrap();
         assert_eq!(unreconciled.len(), 1, "{unreconciled:?}");
@@ -750,8 +750,11 @@ mod tests {
         assert_eq!(unreconciled[0].current_seq, Some(100));
 
         // Once the recovered origin publishes above it, the fork is behind the
-        // current head and no longer unreconciled.
-        let head = SignedHead::sign(&lost, peer_origin.clone(), 1_100, Hash([2u8; 32]), 0);
+        // current head and no longer unreconciled. Signed by the key the origin
+        // was rebound to — signing with the lost one would leave the *new* head
+        // unreconciled in its turn, which is the honest answer and not what
+        // this step is about.
+        let head = SignedHead::sign(&recovered, peer_origin.clone(), 1_100, Hash([2u8; 32]), 0);
         node.store()
             .put_head(Slot::Complete, &head, now_ns(), now_ns())
             .unwrap();

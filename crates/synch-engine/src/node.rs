@@ -657,11 +657,10 @@ impl Node {
 
                 let seq = previous.as_ref().map(|h| h.seq + 1).unwrap_or(1).max(floor);
                 let head = SignedHead::sign(&secret, origin.clone(), seq, root, now);
-                if let Some(previous) = &previous {
-                    txn.record_history(previous)?;
-                }
+                // No explicit history writes: `put_head` records the signature
+                // it is pointing at, and the head being displaced recorded its
+                // own when it took the slot (§10, v11).
                 txn.put_head(Slot::Complete, &head, now, now)?;
-                txn.record_history(&head)?;
                 txn.materialize_diff(&origin, old_root, root)?;
                 Ok(Some(head))
             })?;
