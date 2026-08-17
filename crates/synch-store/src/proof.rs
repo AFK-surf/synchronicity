@@ -855,6 +855,20 @@ impl Store {
             if end_byte > donor.size || !donor.held.covers(subtree.start, subtree.end()) {
                 continue;
             }
+            // The extent a chaining value attests has to be the extent that is
+            // copied. `size` is the caller's claim, and a claim a few bytes
+            // short of the object leaves the final group's run shorter here than
+            // in the donor while both sides' chaining values still cover the
+            // whole of it — so the run would be copied truncated and the row
+            // committed complete at a length no byte on the disk supports.
+            // Requiring the two extents to agree costs nothing honest: a whole
+            // subtree ends at `node.end() * CHUNK_GROUP_SIZE` in both objects,
+            // an honest short tail is the same length in both, and a donor that
+            // runs further at the final group fails the comparison below anyway.
+            let donor_end = node.end().saturating_mul(CHUNK_GROUP_SIZE).min(donor.size);
+            if end_byte != donor_end {
+                continue;
+            }
             // The donor's own word for this run, out of the tree it was given
             // when its bytes were verified into the CAS. `None` means it cannot
             // speak to the position at all — its tree is shaped differently
@@ -1700,6 +1714,68 @@ mod tests {
 
         let promoted = fetcher.promote(&Donor(donor), &proven, 0).unwrap();
         assert_eq!(promoted.count(), 19, "every group but the changed one");
+    }
+
+    /// An understated size cannot promote a short tail.
+    ///
+    /// A claim a few bytes below the object's real length leaves the tree the
+    /// same shape, so the proof verifies and the final group's chaining value
+    /// still attests every byte of it — while the run promotion would copy stops
+    /// at the claim. Committing that run marks the group verified and the row
+    /// complete at a length the bytes on disk do not reach: unreadable
+    /// afterwards, and refusing every honest writer of the real length.
+    #[test]
+    fn an_understated_size_does_not_promote_a_short_tail() {
+        let (_d1, provider) = store();
+        let (_d2, victim) = store();
+        let bytes = data(8 * GROUP + 500);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        // A donor that shares the tail and differs in one interior group, so
+        // the promotion has honest work to do either side of the attack.
+        let mut donor_bytes = bytes.clone();
+        donor_bytes[3 * GROUP + 9] ^= 0xff;
+        let donor = victim.ingest_bytes(&donor_bytes, 0).unwrap();
+
+        // One byte short of the truth, which leaves the group count — and so
+        // the tree the proof is checked against — untouched.
+        let short = size - 1;
+        assert_eq!(group_count(short), group_count(size));
+
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
+        let proven = victim
+            .write_proof(&root, short, &served, 0, &encoded, 0)
+            .expect("the proof verifies: the tree is the same under either size");
+        let promoted = victim.promote(&Donor(donor), &proven, 0).unwrap();
+
+        assert!(
+            !promoted.contains(8),
+            "the tail group's bytes reach further than the claim: {promoted:?}"
+        );
+        assert!(
+            promoted.contains(0) && !promoted.contains(3),
+            "the whole groups either side of the changed one still promote: \
+             {promoted:?}"
+        );
+        let row = victim.blob(&root).unwrap().unwrap();
+        assert!(
+            !row.complete,
+            "nothing completed the object under the claim"
+        );
+
+        // And the honest writer of the real length is not refused by what the
+        // claim left behind: the object completes and reads back whole.
+        let (encoded, served) = provider.encode_slice(&root, &all).unwrap();
+        victim
+            .write_slice(&root, size, &served, &encoded, 0)
+            .expect("an honest writer at the true size still succeeds");
+        let row = victim.blob(&root).unwrap().unwrap();
+        assert!(row.complete);
+        assert_eq!(row.size, size);
+        assert_eq!(victim.read_all(&root).unwrap(), bytes);
     }
 
     /// A size claim racing a write that completes the object cannot brick it.
