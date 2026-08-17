@@ -5,14 +5,13 @@
 ////   serve                 run the service (configuration from CP_* env)
 ////   keygen <apex> <file>  generate the zone CSK; print DNSKEY / DS / anchor
 ////   ds <apex> <file>      print DS + anchor material for an existing key
-////   rekor-publish <apex> <file>
-////                         log the zone key in the transparency log, verify
+////   rekor-publish <file>  log the zone key in the transparency log, verify
 ////                         the proof locally, store and serve it. Run this
 ////                         *after* the DS is live in the parent — the entry
 ////                         carries a DNSSEC chain, and there is no chain to
-////                         build before then (§5.2).
-////   rekor-retire <apex> <file>
-////                         log a retirement breadcrumb for a key. Allowed to
+////                         build before then (§5.2). The apex is this
+////                         deployment's own, from `CP_BASE_DOMAIN`.
+////   rekor-retire <file>   log a retirement breadcrumb for a key. Allowed to
 ////                         be chainless: a retired zone may have no DS left,
 ////                         and clients never treat a retire as authorization.
 ////   seed                  create a demo org/network/devices and publish
@@ -73,10 +72,10 @@ pub fn main() {
   case argv() {
     ["keygen", apex, key_file] -> keygen(apex, key_file)
     ["ds", apex, key_file] -> print_key_material(apex, key_file)
-    ["rekor-publish", apex, key_file] ->
-      run_or_die(fn() { rekor_publish(apex, key_file, "") })
-    ["rekor-retire", apex, key_file] ->
-      run_or_die(fn() { rekor_publish(apex, key_file, "retire") })
+    ["rekor-publish", key_file] ->
+      run_or_die(fn() { rekor_publish(key_file, "") })
+    ["rekor-retire", key_file] ->
+      run_or_die(fn() { rekor_publish(key_file, "retire") })
     ["zone-key", "stage", apex, key_file, incoming_key_file] ->
       run_or_die(fn() { zone_key_stage(apex, key_file, incoming_key_file) })
     ["zone-key", "promote", apex, key_file] ->
@@ -88,7 +87,7 @@ pub fn main() {
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | rekor-retire <apex> <keyfile> | zone-key stage <apex> <keyfile> <incoming-keyfile> | zone-key promote <apex> <keyfile> | provider-sync | seed | seed-admin <email> | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <keyfile> | rekor-retire <keyfile> | zone-key stage <apex> <keyfile> <incoming-keyfile> | zone-key promote <apex> <keyfile> | provider-sync | seed | seed-admin <email> | migrate-check",
       )
       halt(2)
     }
@@ -138,13 +137,6 @@ fn print_material(apex: name.Name, csk: keys.Csk) -> Nil {
   io.println(keys.anchor_line(apex, csk.public))
 }
 
-/// Puts the zone key on the public record and republishes, so the proof
-/// record is served beside the key it is about (§5.2, §5.3).
-///
-/// Idempotent: re-running refreshes the stored checkpoint against a grown
-/// tree without minting a second entry. The zone is republished either way,
-/// which is also how a phase-2 deployment escapes the publish gate after
-/// its first successful logging.
 /// The DNS zone that actually holds and signs the apex's records.
 ///
 /// The apex itself whenever the control plane runs a delegated zone of its
@@ -163,16 +155,37 @@ fn signing_zone_of(
   }
 }
 
+/// The apex and signing zone a ceremony command operates on.
+///
+/// Both come from configuration, and the apex cannot be given on the command
+/// line: it is the zone this deployment publishes and signs, so a
+/// command-line apex was only ever a typo or a way to put an entry naming
+/// somebody else's apex into a public log. Public so the suite can hold that
+/// down without a database or a log.
+pub fn ceremony_zones(
+  cfg: config.Config,
+) -> Result(#(name.Name, name.Name), String) {
+  use apex <- result.try(
+    name.parse(cfg.base_domain)
+    |> result.replace_error("invalid CP_BASE_DOMAIN " <> cfg.base_domain),
+  )
+  use signing_zone <- result.try(signing_zone_of(cfg, apex))
+  Ok(#(apex, signing_zone))
+}
+
+/// Puts the zone key set on the public record and republishes, so the proof
+/// record is served beside the key it is about (§5.2, §5.3).
+///
+/// Idempotent: re-running refreshes the stored checkpoint against a grown
+/// tree without minting a second entry, and republishes either way — which is
+/// how a control plane whose key was not yet logged gets past the publish
+/// gate.
 fn rekor_publish(
-  apex_text: String,
   key_file: String,
   forced_action: String,
 ) -> Result(Nil, String) {
   use cfg <- result.try(config.load())
-  use apex <- result.try(
-    name.parse(apex_text) |> result.replace_error("invalid apex domain"),
-  )
-  use signing_zone <- result.try(signing_zone_of(cfg, apex))
+  use #(apex, signing_zone) <- result.try(ceremony_zones(cfg))
   use csk <- result.try(keys.load(key_file))
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
@@ -397,7 +410,9 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
-      fn(conn, now, actor) { publish.publish_in_tx(conn, csk, now, actor) },
+      fn(conn, now, actor, change) {
+        publish.publish_in_tx(conn, csk, now, actor, change)
+      },
       // Serve mode: commit is publication; there is nobody to nudge.
       fn() { Nil },
     )
@@ -513,7 +528,11 @@ fn serve_external(
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
-      fn(conn, now, actor) { publish.publish_external_in_tx(conn, now, actor) },
+      // External mode gates at the render, not at the publish: the
+      // reconciler holds membership TXT back while a live key is unlogged.
+      fn(conn, now, actor, _change) {
+        publish.publish_external_in_tx(conn, now, actor)
+      },
       // After commit: nudge the reconciler, so a mutation reaches the
       // provider in seconds while the hourly sweep stays the safety net.
       fn() { provider_sync.poke(sync_name) },
@@ -697,9 +716,7 @@ fn zone_key_stage(
       io.println("")
       io.println("; next: give the parent zone the DS above, wait for it to")
       io.println("; appear and for the old DS's TTL to pass, then run")
-      io.println(
-        ";   controlplane rekor-publish " <> apex_text <> " " <> key_file,
-      )
+      io.println(";   controlplane rekor-publish " <> key_file)
       io.println("; so the log entry claims a key set containing both keys.")
       io.println("; only then swap in the incoming key file and run")
       io.println(
@@ -737,9 +754,7 @@ fn zone_key_promote(
       io.println("; promoted: the zone is now signed by this key, and the")
       io.println("; outgoing key has left the DNSKEY RRset.")
       io.println("; next: remove the outgoing DS from the parent, then run")
-      io.println(
-        ";   controlplane rekor-publish " <> apex_text <> " " <> key_file,
-      )
+      io.println(";   controlplane rekor-publish " <> key_file)
       io.println("; so the record claims only the key now in service.")
       Ok(Nil)
     }

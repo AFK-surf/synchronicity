@@ -56,7 +56,9 @@ fn harness_sized(pool_size: Int) -> Harness {
       mailer.LogOnly,
       None,
       None,
-      fn(conn, now, actor) { publish.publish_in_tx(conn, csk, now, actor) },
+      fn(conn, now, actor, change) {
+        publish.publish_in_tx(conn, csk, now, actor, change)
+      },
       fn() { Nil },
     )
   Harness(
@@ -342,6 +344,100 @@ pub fn device_lifecycle_and_invariants_test() {
           <> nas_id
           <> "/keys/"
           <> active_id
+          <> "/revoke",
+      ),
+    )
+  assert revoke.status == 200
+  assert published_nks(h) == []
+}
+
+/// An armed gate must not keep a revoked key resolvable.
+///
+/// The gate holds back *new* claims under a key no transparency log has seen.
+/// A revocation is the opposite: it takes a key out of the zone, and refusing
+/// it leaves the key live in the database while the exempt hourly re-sign keeps
+/// renewing the RRSIGs over it — so the key never ages out either. Removals go
+/// through; additions wait.
+pub fn an_armed_gate_still_lets_a_revocation_through_test() {
+  let h = harness()
+  // Armed for the whole test, restored at the end even if an assertion fails —
+  // then disarmed for the setup, because every step of it is a widening
+  // publish and the point of the test is what happens once it is in place.
+  use <- fixtures.with_gate_armed
+  fixtures.gate_disarmed()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let device_nk = nk()
+  let created =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/devices",
+      json.object([
+        #("label", json.string("nas")),
+        #("nk", json.string(device_nk)),
+      ]),
+    )
+  assert created.status == 200
+  let assert Ok(#(_, tail)) =
+    string.split_once(simulate.read_body(created), "device_id\":\"")
+  let assert [device_id, ..] = string.split(tail, "\"")
+  let assert 200 =
+    call(
+      h,
+      authed(h, Put, "/api/orgs/acme/networks/prod/devices/" <> device_id),
+    ).status
+  assert published_nks(h) == [device_nk]
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(key_id)]]) =
+    sqlite.query(conn, "SELECT id FROM device_keys WHERE device_id = ?", [
+      sqlite.Text(device_id),
+    ])
+  sqlite.close(conn)
+
+  // Now arm it. The zone key has no log record, so a mutation that adds to
+  // what the zone claims is refused — and says which step is missing.
+  fixtures.gate_armed()
+  let widening =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/devices",
+      json.object([
+        #("label", json.string("laptop")),
+        #("nk", json.string(nk())),
+      ]),
+    )
+  assert widening.status == 409
+  assert string.contains(simulate.read_body(widening), "rekor-publish")
+
+  // The revocation of the key already serving goes through, and the key
+  // actually leaves the zone.
+  let revoke =
+    call(
+      h,
+      authed(
+        h,
+        Post,
+        "/api/orgs/acme/devices/"
+          <> device_id
+          <> "/keys/"
+          <> key_id
           <> "/revoke",
       ),
     )

@@ -4,6 +4,7 @@
 import api/auth_api.{type AuthContext}
 import api/middleware.{error_json, now_unix}
 import gleam/dynamic/decode
+import gleam/int
 import gleam/json.{type Json}
 import gleam/list
 import gleam/result
@@ -101,17 +102,23 @@ pub fn transaction(
 /// the tables, and an invariant violation rolls the whole thing back.
 /// DNS answers read the database directly, so the commit itself is what
 /// makes the mutation visible — there is no cache to refresh.
+///
+/// `change` is the handler's own statement about what its mutation does to
+/// the zone (`publish.Change`): a removal must reach the wire even while the
+/// transparency gate is holding new claims back, since the alternative is a
+/// revoked key that stays resolvable.
 pub fn zone_mutation(
   conn: Connection,
   ctx: AuthContext,
   actor: String,
+  change: publish.Change,
   work: fn() -> Result(Json, Response),
 ) -> Response {
   let outcome =
     transaction(conn, fn() {
       use payload <- result.try(work())
       use serial <- result.try(
-        ctx.publish_in_tx(conn, now_unix(), actor)
+        ctx.publish_in_tx(conn, now_unix(), actor, change)
         |> result.map_error(publish_error),
       )
       Ok(#(payload, serial))
@@ -139,6 +146,18 @@ fn publish_error(e: publish.PublishError) -> Response {
       let #(code, message) = build_refusal(build_error)
       error_json(409, code, "zone build refused: " <> message)
     }
+    // The transparency gate. Not a client mistake, but naming the ceremony
+    // step that is missing is worth far more to whoever is looking at the
+    // dashboard than a generic 500 would be.
+    publish.NoRekorRecord(key_tag) ->
+      error_json(
+        409,
+        "no_rekor_record",
+        "the zone key (tag "
+          <> int.to_string(key_tag)
+          <> ") is not on the transparency record, so this change cannot be "
+          <> "published: run `controlplane rekor-publish <keyfile>`",
+      )
     // Db / Model / KeyMismatch are server faults, not client mistakes:
     // the detail goes to the log, never into a response body.
     _ -> {

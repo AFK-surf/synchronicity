@@ -122,10 +122,37 @@ pub fn diff(
       Ok(Changes(
         create: list.sort(create, by_priority),
         replace: replace,
-        delete: foreign,
+        delete: deletable(foreign, desired),
       ))
     }
   }
+}
+
+/// The drift that may actually be removed.
+///
+/// Everything foreign, except this: when the desired set carries **no** proof
+/// records, the published ones stay where they are. "Nothing to publish" is not
+/// "what is published is wrong" — it is what `rekor/store.servable` answers
+/// during a transparency gap, when no live key is covered by a verified record.
+/// Deleting the proofs there would take the zone's transparency records out at
+/// the one moment they are hardest to replace, and it would do it as a side
+/// effect of a pass that changed nothing else. Serve mode's posture in the same
+/// situation is to refuse to emit and leave the published zone standing, and
+/// this is that posture.
+///
+/// A desired set that *does* carry proofs diffs normally, so a refreshed proof
+/// still replaces the chunks it supersedes.
+fn deletable(foreign: List(Existing), desired: List(Record)) -> List(Existing) {
+  case list.any(desired, fn(d) { is_proof_name(d.name) }) {
+    True -> foreign
+    False -> list.filter(foreign, fn(e) { !is_proof_name(e.record.name) })
+  }
+}
+
+/// Whether a name is one of the proof names: the base name every proof's
+/// part 1 shares, or `_synchronicity-rekor-<n>` for a later part.
+fn is_proof_name(name: String) -> Bool {
+  starts_with_label(name, "_synchronicity-rekor") || is_part(name)
 }
 
 /// Creates go out in dependency order rather than name order.
@@ -155,9 +182,7 @@ fn priority(name: String) -> Int {
       case starts_with_label(name, "_synchronicity-transparency") {
         True -> 1
         False ->
-          case
-            starts_with_label(name, "_synchronicity-rekor") || is_part(name)
-          {
+          case is_proof_name(name) {
             True -> 3
             False -> 2
           }

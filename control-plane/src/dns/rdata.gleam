@@ -198,12 +198,13 @@ pub fn opt(udp_size: Int, do_bit: Bool) -> wire.Section {
 /// The label the zone's transparency declaration lives under, one below the
 /// apex (docs/REKOR-ZONE-KEY.md §2.1).
 ///
-/// This record is what makes a log entry the zone's own statement. A
-/// delegation chain is public data anybody can collect, so an entry proving
-/// only that would be something a stranger could mint about a zone that never
-/// heard of them; the declaration is the part only somebody who can write to
-/// the zone can produce. It is signed like every other RRset, and a copy of
-/// it — with its RRSIG — is the bottom link of every chain this service logs.
+/// This record is how an apex says it is a synchronicity control plane, and a
+/// signed copy of it — with its RRSIG — is the bottom link of every chain this
+/// service logs, which is why a zone that has not published one can log
+/// nothing at all. Publishing it takes zone write access; *reading* it takes
+/// nothing, so the copy inside an entry is public DNS anybody can fetch and
+/// embed. It narrows who could have minted an entry to the set of zones that
+/// have declared themselves control planes, and no further.
 ///
 /// It lives here, beside `sync1_text`, because both the zone builder and the
 /// chain collector need it and they sit on opposite sides of an import cycle.

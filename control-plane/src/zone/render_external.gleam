@@ -98,9 +98,9 @@ pub fn render_gated(
         text,
       )
     })
-  // Unconditional, exactly as in serve mode: the declaration is what makes
-  // every logged entry the zone's own statement, so a zone without one has
-  // no working transparency at all.
+  // Unconditional, exactly as in serve mode: a signed copy of the declaration
+  // is the bottom link of every chain this service logs, so a zone that
+  // stopped publishing it could log nothing at all.
   let transparency =
     Record(
       rdata.transparency_label <> "." <> apex,

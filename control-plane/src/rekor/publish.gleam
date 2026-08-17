@@ -74,6 +74,11 @@ pub type PublishError {
   /// The DNSSEC chain could not be collected. Almost always one thing: the
   /// DS is not live in the parent yet, and logging comes after that now.
   NoChain(String)
+  /// The entry is sound but the record it would become cannot be served: it
+  /// does not fit the proof format, or it needs more TXT parts than a reader
+  /// assembles. Never stored — a row the zone cannot serve is a gate that
+  /// passes while `_synchronicity-rekor.<apex>` does not exist.
+  Unservable(String)
 }
 
 pub type Outcome {
@@ -205,6 +210,12 @@ pub fn run(
     proof.verify_against_log(record, log_key.0, log_key.1)
     |> result.map_error(Unverified),
   )
+  // And that the zone can actually serve it. The gate downstream asks only
+  // whether a row exists, so a row that renders to no TXT records would let
+  // publishing succeed and the proof name not exist at all — every `Require`
+  // client failing closed on a zone whose own gate says it is fine. Rendering
+  // is cheap and the answer is not a matter of opinion, so ask it here.
+  use _ <- result.try(proof.to_txt(record) |> result.map_error(Unservable))
   use Nil <- result.try(
     store.put(
       conn,

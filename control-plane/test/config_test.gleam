@@ -1,4 +1,6 @@
 import config
+import controlplane
+import dns/name
 import envoy
 import gleam/option.{None}
 
@@ -106,4 +108,29 @@ pub fn db_must_not_share_a_directory_with_the_key_test() {
     <> "sandbox grants the database's directory, so the signing key must "
     <> "sit elsewhere. Put the database in its own subdirectory, e.g. "
     <> "/var/lib/cp/db/."
+}
+
+/// The ceremony commands take the apex from configuration, never from argv.
+///
+/// `rekor-publish` puts an entry naming an apex into a public log. Reading that
+/// apex from the command line made a typo a claim about a name this deployment
+/// does not own, and the configuration already says which name that is. The
+/// signing zone follows the mode: the apex itself in serve mode, the
+/// provider-hosted zone above it in external mode.
+pub fn a_ceremony_names_the_configured_apex_test() {
+  primary_env()
+  let assert Ok(cfg) = config.load()
+  let assert Ok(apex) = name.parse("sync.test")
+  assert controlplane.ceremony_zones(cfg) == Ok(#(apex, apex))
+
+  envoy.unset("CP_KEY_FILE")
+  envoy.set("CP_DNS_MODE", "external")
+  envoy.set("CP_DNS_PROVIDER", "log-only")
+  envoy.set("CP_SIGNING_ZONE", "test")
+  let assert Ok(external) = config.load()
+  let assert Ok(signing_zone) = name.parse("test")
+  assert controlplane.ceremony_zones(external) == Ok(#(apex, signing_zone))
+  envoy.unset("CP_DNS_MODE")
+  envoy.unset("CP_DNS_PROVIDER")
+  envoy.unset("CP_SIGNING_ZONE")
 }

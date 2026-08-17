@@ -19,6 +19,7 @@ import store/sqlite.{Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
 import zone/model
+import zone/publish
 
 pub fn list_networks(
   ctx: AuthContext,
@@ -60,7 +61,7 @@ pub fn create_network(
     True ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
-        zone_mutation(conn, ctx, live.user_id, fn() {
+        zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
           let insert =
             sqlite.exec(conn, "INSERT INTO networks VALUES (?, ?, ?, ?)", [
               Text(id.new()),
@@ -182,7 +183,7 @@ pub fn delete_network(
         case find_network(conn, org_id, network) {
           Error(Nil) -> error_json(404, "not_found", "no such network")
           Ok(network_id) ->
-            zone_mutation(conn, ctx, live.user_id, fn() {
+            zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
               let work = {
                 use _ <- result.try(
                   sqlite.exec(
@@ -232,7 +233,7 @@ pub fn assign_device(
       Error(Nil), _ -> error_json(404, "not_found", "no such network")
       _, Error(Nil) -> error_json(404, "not_found", "no such device")
       Ok(network_id), Ok(label) ->
-        zone_mutation(conn, ctx, live.user_id, fn() {
+        zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
           // App-level label check first for a friendly message; the trigger
           // and zone build re-verify.
           let clash =
@@ -293,7 +294,7 @@ pub fn unassign_device(
     case find_network(conn, org_id, network) {
       Error(Nil) -> error_json(404, "not_found", "no such network")
       Ok(network_id) ->
-        zone_mutation(conn, ctx, live.user_id, fn() {
+        zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
           let delete =
             sqlite.exec(
               conn,

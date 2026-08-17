@@ -43,6 +43,7 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
@@ -104,10 +105,10 @@ pub type Checkpoint {
 ///
 /// `Error` for a blob past 65535 bytes or an audit path past 255 hops.
 /// Refusing beats emitting *something*: the format exists so two
-/// implementations agree byte for byte, and the two used to disagree about
-/// the failure itself — this side wrapped the length modulo 65536 while the
-/// Rust side clamped it and truncated the blob. Two different wrong answers
-/// in a format whose whole point is agreement is worse than no answer.
+/// implementations agree byte for byte, and a record that does not fit it has
+/// no encoding either of them could agree on. Wrapping a length or truncating
+/// a blob would be two different wrong answers in a format whose whole point
+/// is agreement, which is worse than no answer.
 pub fn encode(proof: Proof) -> Result(BitArray, String) {
   use Nil <- result.try(
     [proof.statement, proof.canonicalized_body, proof.checkpoint]
@@ -155,6 +156,16 @@ pub const txt_prefix = "sync1p"
 /// prefixes, well inside that ceiling.
 pub const txt_chunk_chars = 2000
 
+/// The most records one proof may be split across — the same bound the client
+/// enforces (`MAX_PROOF_PARTS`, crates/synch-net/src/rekor.rs), which fetches
+/// parts `2..=16` and stops.
+///
+/// Named once and refused here, because the publisher's ceiling and the
+/// reader's have to be one number: a proof in seventeen parts publishes
+/// perfectly well and then no client can assemble it, which is a zone that
+/// fails closed for a reason nobody can see from either side.
+pub const max_parts = 16
+
 /// Renders the proof as the TXT payloads a zone serves for it.
 ///
 /// A proof does not fit in one record, so the payload is split across
@@ -179,8 +190,15 @@ pub fn to_txt(proof: Proof) -> Result(List(String), String) {
     bit_array.base64_url_encode(encoded, False)
     |> split_every(txt_chunk_chars, [])
   let total = list.length(chunks)
-  case total > 255 {
-    True -> Error("a proof that needs more than 255 records cannot name them")
+  case total > max_parts {
+    True ->
+      Error(
+        "a proof needing "
+        <> int.to_string(total)
+        <> " records is past the "
+        <> int.to_string(max_parts)
+        <> " every reader assembles",
+      )
     False ->
       Ok(
         list.index_map(chunks, fn(chunk, i) {
@@ -550,33 +568,66 @@ pub fn log_id(spki: BitArray) -> BitArray {
   crypto.hash(crypto.Sha256, spki)
 }
 
-/// Reads a pinned log key file: PEM `PUBLIC KEY` blocks or one base64
-/// SubjectPublicKeyInfo per line, `#` starting a comment. Returns the DER
-/// and the raw point, since verification needs one and the log id the
-/// other. Both an ECDSA P-256 (64-byte point) and an Ed25519 (32-byte
-/// point) key are recognized; everything else is refused.
-pub fn parse_log_key(
+/// Reads log key material: PEM `PUBLIC KEY` blocks, or one base64
+/// SubjectPublicKeyInfo per line, `#` starting a comment — key by key, and the
+/// same grammar the client's `LogKeys::parse` accepts
+/// (crates/synch-net/src/rekor.rs), so a file that works on one side works on
+/// the other.
+///
+/// Each key comes back as its DER and its raw point, since verification needs
+/// one and the log id the other. Both an ECDSA P-256 (64-byte point) and an
+/// Ed25519 (32-byte point) key are recognized; everything else is refused.
+pub fn parse_log_keys(
   text: String,
-) -> Result(#(BitArray, BitArray), ProofError) {
-  let body =
-    text
-    |> string.split("\n")
+) -> Result(List(#(BitArray, BitArray)), ProofError) {
+  use keys <- result.try(
+    string.split(text, "\n")
     |> list.map(fn(line) {
       case string.split_once(line, "#") {
         Ok(#(before, _)) -> before
         Error(Nil) -> line
       }
+      |> string.trim
     })
-    |> list.map(string.trim)
-    |> list.filter(fn(line) {
-      line != ""
-      && line != "-----BEGIN PUBLIC KEY-----"
-      && line != "-----END PUBLIC KEY-----"
-    })
-    |> string.join("")
+    |> list.try_fold(#([], None), read_line),
+  )
+  case keys {
+    #(_, Some(_)) -> Error(UnknownLog("a PEM block is never closed"))
+    // An empty pin set verifies nothing, forever, quietly.
+    #([], None) -> Error(UnknownLog("there are no public keys in the material"))
+    #(found, None) -> Ok(list.reverse(found))
+  }
+}
+
+/// One line of key material: inside a PEM block it is body, outside one it is
+/// a whole key.
+fn read_line(
+  state: #(List(#(BitArray, BitArray)), Option(String)),
+  line: String,
+) -> Result(#(List(#(BitArray, BitArray)), Option(String)), ProofError) {
+  let #(found, block) = state
+  case line, block {
+    "", _ -> Ok(state)
+    "-----BEGIN PUBLIC KEY-----", _ -> Ok(#(found, Some("")))
+    "-----END PUBLIC KEY-----", None ->
+      Error(UnknownLog("a PEM block ends before it begins"))
+    "-----END PUBLIC KEY-----", Some(body) -> {
+      use key <- result.try(spki_key(body))
+      Ok(#([key, ..found], None))
+    }
+    _, Some(body) -> Ok(#(found, Some(body <> line)))
+    _, None -> {
+      use key <- result.try(spki_key(line))
+      Ok(#([key, ..found], None))
+    }
+  }
+}
+
+/// One base64 SubjectPublicKeyInfo as `#(der, point)`.
+fn spki_key(encoded: String) -> Result(#(BitArray, BitArray), ProofError) {
   use der <- result.try(
-    bit_array.base64_decode(body)
-    |> result.replace_error(UnknownLog("the log key file is not base64")),
+    bit_array.base64_decode(encoded)
+    |> result.replace_error(UnknownLog("a log key is not base64")),
   )
   case der {
     <<prefix:bytes-size(27), point:bytes-size(64)>>
@@ -588,6 +639,29 @@ pub fn parse_log_key(
     _ ->
       Error(UnknownLog(
         "the log key is neither an ECDSA P-256 nor an Ed25519 SubjectPublicKeyInfo",
+      ))
+  }
+}
+
+/// The one key in single-key material — a trusted root's `publicKey.rawBytes`,
+/// or a `CP_REKOR_KEY` file naming the log this service submits to.
+///
+/// Several keys is an error rather than a choice: this side writes to one log
+/// and stores the proof under that log's id, so there is no reading of a
+/// multi-key file that could be right. (A *client* pins a set, which is why
+/// `parse_log_keys` reads one.)
+pub fn parse_log_key(
+  text: String,
+) -> Result(#(BitArray, BitArray), ProofError) {
+  use keys <- result.try(parse_log_keys(text))
+  case keys {
+    [key] -> Ok(key)
+    _ ->
+      Error(UnknownLog(
+        "this names "
+        <> int.to_string(list.length(keys))
+        <> " log keys; the control plane submits to one log, so name that"
+        <> " log's key alone",
       ))
   }
 }

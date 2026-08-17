@@ -71,7 +71,7 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |
 | `CP_REKOR_URL` | primary | zone-key transparency log; unset, the shard in service is read from the stored `trusted_root.json` |
-| `CP_REKOR_KEY` | primary | file pinning the log's verification key; unset, it comes from the same trusted-root entry as the endpoint |
+| `CP_REKOR_KEY` | primary | file pinning the log's verification key — exactly one, PEM or base64 SPKI; unset, it comes from the same trusted-root entry as the endpoint |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query` |
 | `CP_TUF_URL` | primary | Sigstore TUF repository this service follows to find the log shard in service, default `https://tuf-repo-cdn.sigstore.dev` |
@@ -96,7 +96,8 @@ secrets.** Protect the replication bucket accordingly.
    ```
 
    Prints the key tag, the **DS record** for the parent zone, and the
-   trust-anchor line clients can pin with `--dnssec-anchor`. Back up the
+   trust-anchor line clients can pin with `--dnssec-anchor`. The file is
+   created `0600` before the private scalar is written into it. Back up the
    key file offline; `keygen` refuses to overwrite an existing file.
    (`controlplane ds <apex> <keyfile>` reprints all of it.)
 
@@ -109,9 +110,12 @@ secrets.** Protect the replication bucket accordingly.
    clients require the record by default):
 
    ```sh
-   controlplane rekor-publish sync.example \
-     /var/lib/synch-controlplane/csk.key
+   controlplane rekor-publish /var/lib/synch-controlplane/csk.key
    ```
+
+   The apex is `CP_BASE_DOMAIN` and is not an argument: this command puts
+   an entry naming an apex into a public log, and the only apex this
+   deployment may name is its own.
 
    Puts the key on a public transparency log, verifies the returned
    proof locally with the same rules clients apply, stores it, and
@@ -236,11 +240,11 @@ control plane itself with
                                                        # 2. publish both
   #   3. add the new DS at the parent; wait for it to go live and for the
   #      old DS's TTL to pass
-  controlplane rekor-publish <apex> /path/old.key      # 4. log both keys
+  controlplane rekor-publish /path/old.key              # 4. log both keys
   #   5. swap CP_KEY_FILE to new.key, restart
   controlplane zone-key promote <apex> /path/new.key   # 6. new key signs
   #   7. remove the old DS at the parent
-  controlplane rekor-retire  <apex> /path/old.key      # 8. retire
+  controlplane rekor-retire  /path/old.key              # 8. retire
   ```
 
   Step 2 is deliberately **not** gated: the signing key is unchanged and
@@ -250,15 +254,12 @@ control plane itself with
   arranged. Getting the order wrong therefore fails at step 6 with a
   message naming step 4, rather than producing a zone clients reject.
 
-  This ordering used to be impossible rather than merely unenforced. The
-  builder emitted exactly one DNSKEY, `ensure_meta` refused to boot on a
-  changed key file, and with `CP_REKOR_REQUIRE=true` the two requirements
-  were circular: `rekor-publish` claims the key set **observed live on the
-  wire**, so a key had to be serving before it could be logged, and the
-  gate would not let it serve until it was logged. Staging breaks the
-  cycle by separating *published* from *active* — the incoming key is in
-  the RRset, where the parent and the log can both see it, without signing
-  anything.
+  Staging is what makes the ordering possible. `rekor-publish` claims the
+  key set **observed live on the wire**, so a key has to be serving before
+  it can be logged, while with `CP_REKOR_REQUIRE=true` the gate will not
+  let a key sign anything until it is logged. Staging separates *published*
+  from *active* — the incoming key rides in the DNSKEY RRset, where the
+  parent and the log can both see it, without signing anything.
 
   If you boot with the staged key file before promoting, the error says so
   and names `zone-key promote`, rather than claiming the key file is

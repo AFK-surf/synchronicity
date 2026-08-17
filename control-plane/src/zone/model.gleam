@@ -74,6 +74,11 @@ pub type ModelError {
   NoZoneMeta
   BadStoredName(String)
   Db(sqlite.Error)
+  /// A stored proof row cannot be turned back into servable TXT records.
+  /// `rekor/publish` refuses to store a record that does not render, so this
+  /// is a row that has been damaged since — reported rather than skipped,
+  /// because a skipped proof is a zone quietly not covering a live key.
+  UnservableProof(String)
 }
 
 /// Validates an nk in z-base-32: exactly a 32-byte key. Curve-point
@@ -134,9 +139,14 @@ fn live_keys(
 /// what this has to get right is *which* claims are worth serving at all.
 /// `servable` answers that: the ones covering a key the zone publishes.
 ///
-/// A stored row that cannot be turned back into a proof is dropped rather
-/// than served: a malformed record would make every client refuse the whole
-/// zone, which is a worse outcome than the one the row was meant to fix.
+/// A stored row that cannot be turned back into servable records fails the
+/// read, rather than being skipped. Skipping it would make the publish gate's
+/// question ("is there a row for this key?") a different question from the
+/// serving one ("is there a proof at the proof name?"), and the gate would pass
+/// while every client failed closed. `rekor/publish` refuses to store a record
+/// it cannot render, so a row that will not render is damage — and damage is
+/// worth a loud refusal, where the zone already published keeps serving and
+/// somebody reads the error.
 fn read_rekor_proofs(
   conn: Connection,
   live_keys: List(BitArray),
@@ -144,17 +154,22 @@ fn read_rekor_proofs(
   use records <- result.try(
     rekor_store.servable(conn, live_keys) |> result.map_error(Db),
   )
-  let encoded =
+  use encoded <- result.try(
     records
-    |> list.filter_map(fn(record) {
-      // A row that will not encode is dropped for the same reason a
-      // malformed one is: serving it would make every client refuse the
-      // whole zone, which is worse than the gap the row was meant to close.
+    |> list.try_map(fn(record) {
       case rekor_publish.to_proof(record) {
-        Ok(built) -> proof.to_txt(built) |> result.replace_error(Nil)
-        Error(_) -> Error(Nil)
+        Ok(built) ->
+          proof.to_txt(built)
+          |> result.map_error(fn(why) {
+            UnservableProof("a stored proof does not render: " <> why)
+          })
+        Error(_) ->
+          Error(UnservableProof(
+            "a stored proof's audit path is not a run of 32-byte hashes",
+          ))
       }
-    })
+    }),
+  )
   // `servable` returns newest first, so taking a prefix sheds the oldest
   // claims — the ones least likely to still be covering a key on the wire.
   let #(kept, shed) = proofs_within_budget(encoded)

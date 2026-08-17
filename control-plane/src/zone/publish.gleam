@@ -25,15 +25,37 @@ pub type PublishError {
   Build(build.BuildError)
   /// The key file's public half does not match zone_meta — wrong key file.
   KeyMismatch
-  /// `CP_REKOR_REQUIRE` is set and the active zone key has no verified
-  /// transparency-log record (docs/REKOR-ZONE-KEY.md §5.3). Refusing to
-  /// publish is the same stance as the §3.2 build-time checks: never emit
-  /// a zone clients are going to reject.
+  /// The active zone key has no verified transparency-log record and this
+  /// emission would widen what the zone claims (docs/REKOR-ZONE-KEY.md §5.3).
+  /// Refusing to publish is the same stance as the §3.2 build-time checks:
+  /// never emit a zone clients are going to reject.
   NoRekorRecord(key_tag: Int)
   /// `zone-key stage` was handed the key already in service.
   IncomingIsActive
   /// `zone-key promote` was run with no rollover in flight.
   NoIncomingKey
+}
+
+/// What an emission does to what the zone claims — the whole of the publish
+/// gate's question.
+///
+/// Chosen by the call site, because only the call site knows: a handler that
+/// inserts a device or a key, or promotes a zone key, is `Widening`; one that
+/// deletes rows or moves a key to `revoked` is `Narrowing`. Anything unsure of
+/// itself is `Widening`.
+pub type Change {
+  /// The zone will claim something it has not claimed before. Gated: an
+  /// unlogged key must not put new content on the wire.
+  Widening
+  /// The zone will claim strictly less than it did — a revoked key, a deleted
+  /// device, an unassigned network member.
+  ///
+  /// Never gated, for the reason `publish_resign` is not: refusing a removal
+  /// cannot withhold an unlogged key from anybody, because that key is already
+  /// serving. It leaves the key live in the database *and* leaves the hourly
+  /// re-sign renewing the RRSIGs over it, so the one thing a gap must never do
+  /// — keep a revoked key resolvable — is exactly what refusing would do.
+  Narrowing
 }
 
 /// A signed RRset ready to store and serve.
@@ -88,24 +110,25 @@ pub fn publish(
   now: Int,
   actor: String,
 ) -> Result(Int, PublishError) {
-  sqlite.transaction(conn, Db, fn() { publish_in_tx(conn, csk, now, actor) })
+  sqlite.transaction(conn, Db, fn() {
+    publish_in_tx(conn, csk, now, actor, Widening)
+  })
 }
 
 /// Re-emits the zone unchanged because its signatures are aging out.
 ///
-/// **The one publish path the transparency gate does not apply to**, and
-/// the reason is that a re-sign says nothing new. It emits the same records
-/// clients have already been accepting, with fresh RRSIG windows; refusing
-/// it does not withhold an unlogged key from anybody, because that key is
-/// already serving. What refusing it does is let the zone's signatures
+/// Ungated, and the reason is that a re-sign says nothing new. It emits the
+/// same records clients have already been accepting, with fresh RRSIG windows;
+/// refusing it does not withhold an unlogged key from anybody, because that
+/// key is already serving. What refusing it does is let the zone's signatures
 /// expire — `sig_validity` defaults to 14 days — at which point every
 /// client fails closed on *DNSSEC*, not on transparency, and the whole zone
 /// goes bogus. A transparency gap should not become a DNS outage.
 ///
-/// Changing what the zone *says* still goes through `publish_in_tx`, which
-/// is gated. So the gate keeps doing its job — no new content is emitted
-/// under an unlogged key — while the hourly job keeps the zone resolvable
-/// long enough for an operator to run `rekor-publish`.
+/// `Widening` emissions are the gated ones. So the gate keeps doing its job —
+/// no new content is emitted under an unlogged key — while the hourly job
+/// keeps the zone resolvable long enough for an operator to run
+/// `rekor-publish`.
 pub fn publish_resign(
   conn: Connection,
   csk: Csk,
@@ -116,18 +139,22 @@ pub fn publish_resign(
 }
 
 /// The publish body, for callers that already opened the transaction.
+/// `change` decides whether the gate applies — see `Change`.
 pub fn publish_in_tx(
   conn: Connection,
   csk: Csk,
   now: Int,
   actor: String,
+  change: Change,
 ) -> Result(Int, PublishError) {
-  emit(conn, csk, now, actor, True)
+  emit(conn, csk, now, actor, case change {
+    Widening -> True
+    Narrowing -> False
+  })
 }
 
-/// The publish body proper. `gated` says whether this emission is a change
-/// to what the zone claims (gated) or a re-signing of what it already
-/// published (not) — see `publish_resign`.
+/// The publish body proper. `gated` says whether the transparency gate
+/// applies to this emission.
 fn emit(
   conn: Connection,
   csk: Csk,

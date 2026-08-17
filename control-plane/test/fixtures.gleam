@@ -5,11 +5,32 @@
 
 import dns/name.{type Name}
 import dnssec/keys.{type Csk}
+import envoy
+import exception
+import rekor/gate
 import store/db
 import store/migrate
 import store/sqlite.{type Connection}
 import thirtytwo
 import zone/publish
+
+/// Runs `body` with the publish gate armed, and disarms it afterwards —
+/// including when the body fails, because the setting is process-wide and one
+/// broken assertion would otherwise arm the gate under every test that happens
+/// to run after it.
+pub fn with_gate_armed(body: fn() -> a) -> a {
+  gate_armed()
+  use <- exception.defer(fn() { gate_disarmed() })
+  body()
+}
+
+pub fn gate_armed() -> Nil {
+  envoy.set(gate.require_env, "true")
+}
+
+pub fn gate_disarmed() -> Nil {
+  envoy.unset(gate.require_env)
+}
 
 /// A unique temp database path (also usable as a generic temp file base).
 @external(erlang, "test_ffi", "tmp_db")

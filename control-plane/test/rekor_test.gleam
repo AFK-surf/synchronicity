@@ -11,7 +11,6 @@ import dns/name
 import dns/rdata
 import dns/wire
 import dnssec/keys
-import envoy
 import fixtures
 import gleam/bit_array
 import gleam/crypto
@@ -26,7 +25,6 @@ import provider/state
 import rekor/cert
 import rekor/chain
 import rekor/client
-import rekor/gate
 import rekor/proof.{type Proof, Proof}
 import rekor/publish as rekor_publish
 import rekor/statement
@@ -207,10 +205,9 @@ pub fn proof_txt_is_chunked_base64url_test() {
 
 /// A record that does not fit the format is refused, not mangled.
 ///
-/// Both sides refuse now. They used to fail *differently* — this side
-/// wrapped the 16-bit length modulo 65536, the Rust side clamped it and
-/// truncated the blob — which in a format whose whole purpose is that two
-/// implementations agree byte for byte is worse than not encoding at all.
+/// Both sides refuse, and that is the assertion: in a format whose whole
+/// purpose is that two implementations agree byte for byte, wrapping a 16-bit
+/// length or truncating a blob is worse than not encoding at all.
 pub fn an_oversized_proof_is_refused_rather_than_mangled_test() {
   let base = fixture_proof()
   let assert Error(_) =
@@ -304,6 +301,28 @@ pub fn checkpoints_parse_or_are_refused_test() {
 /// the publisher owes is *collection*: ask for the right RRsets at the right
 /// names, refuse when one is missing, and carry the bytes verbatim. That is
 /// what this fake exercises.
+/// An RRSIG the collector's rules accept: owned by the queried name, covering
+/// the queried type, with that name's own label count — a shorter one is a
+/// wildcard expansion, which the collector refuses — and the signer a real
+/// zone would have used. A zone signs its own DNSKEY RRset; the parent signs a
+/// DS; the zone one label up signs the declaration, and the collector checks
+/// that last one against the signing zone it was given.
+fn fake_rrsig(zone: name.Name, rtype: Int) -> wire.Rr {
+  let signer = case rtype == wire.type_dnskey {
+    True -> zone
+    False -> list.drop(zone, 1)
+  }
+  wire.Rr(
+    zone,
+    wire.type_rrsig,
+    wire.class_in,
+    3600,
+    rdata.rrsig(rtype, 13, list.length(zone), 3600, 0, 0, 1234, signer, <<
+      0:size(512),
+    >>),
+  )
+}
+
 fn fake_resolver(dnskey_rd: BitArray) -> chain.Resolver {
   fake_resolver_serving([dnskey_rd])
 }
@@ -313,13 +332,7 @@ fn fake_resolver(dnskey_rd: BitArray) -> chain.Resolver {
 /// in full so the incoming key is on the record before it signs anything.
 pub fn fake_resolver_serving(dnskey_rds: List(BitArray)) -> chain.Resolver {
   chain.Resolver(query: fn(zone, rtype) {
-    let rrsig =
-      wire.Rr(zone, wire.type_rrsig, wire.class_in, 3600, <<
-        rtype:int-size(16),
-        13:int-size(8),
-        2:int-size(8),
-        0:size(512),
-      >>)
+    let rrsig = fake_rrsig(zone, rtype)
     case rtype {
       48 ->
         Ok(
@@ -504,11 +517,10 @@ pub fn publish_gate_refuses_an_unlogged_key_test() {
   let conn = fixtures.fresh_conn()
   let csk = fixtures.zone_boot(conn)
   let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
-  // Phase 0/1: off by default, so a control plane that has not logged its
-  // key yet keeps serving.
+  // Disarmed, a control plane that has not logged its key still serves.
   let assert Ok(_) = publish.publish(conn, csk, 1000, "test")
 
-  envoy.set(gate.require_env, "true")
+  use <- fixtures.with_gate_armed
   let assert Error(publish.NoRekorRecord(refused)) =
     publish.publish(conn, csk, 1000, "test")
   assert refused == key_tag
@@ -518,7 +530,6 @@ pub fn publish_gate_refuses_an_unlogged_key_test() {
   let #(log, spki, point) = fake_log(keys.generate())
   let assert Ok(_) = publish_run(conn, apex, csk, log, #(spki, point), 1000)
   let assert Ok(_) = publish.publish(conn, csk, 1000, "test")
-  envoy.unset(gate.require_env)
   sqlite.close(conn)
 }
 
@@ -551,10 +562,9 @@ pub fn a_retire_record_does_not_satisfy_the_gate_test() {
   // and never a licence for the gate either: the key is claimed only by a
   // retire, which covers nothing.
   assert store.servable(conn, []) == Ok([])
-  envoy.set(gate.require_env, "true")
+  use <- fixtures.with_gate_armed
   let assert Error(publish.NoRekorRecord(_)) =
     publish.publish(conn, csk, 1000, "test")
-  envoy.unset(gate.require_env)
   sqlite.close(conn)
 }
 
@@ -887,13 +897,31 @@ pub fn a_malformed_chain_is_refused_before_publishing_test() {
   let assert Error(why) = chain.check_shape(rootless, apex, apex)
   assert string.contains(why, "root")
 
-  // A ladder with a rung missing.
-  let spliced = [
+  // A ladder link that is not an ancestor of the link below it at all.
+  let assert Ok(other) = name.parse("other.test.")
+  let sideways = [
     declaration,
     chain.Link("sync.test.", <<1>>),
+    chain.Link("other.test.", <<2>>),
     chain.Link(".", <<3>>),
   ]
-  let assert Error(_) = chain.check_shape(spliced, apex, apex)
+  let assert Error(why) = chain.check_shape(sideways, apex, apex)
+  assert string.contains(why, "not an ancestor")
+
+  // A signing zone that does not contain the apex is not the authority for
+  // it, whatever else the chain carries — the rule chain.rs:305 enforces.
+  let assert Error(why) =
+    chain.check_shape(
+      [
+        chain.Link("_synchronicity-transparency.sync.test.", <<0>>),
+        chain.Link("other.test.", <<1>>),
+        chain.Link("test.", <<2>>),
+        chain.Link(".", <<3>>),
+      ],
+      apex,
+      other,
+    )
+  assert string.contains(why, "does not contain the apex")
 
   // A declaration for somebody else's zone.
   let assert Error(_) =
@@ -908,6 +936,371 @@ pub fn a_malformed_chain_is_refused_before_publishing_test() {
     )
   let assert Error(_) = chain.check_shape([declaration], apex, apex)
   let assert Error(_) = chain.check_shape([], apex, apex)
+}
+
+// ------------------------------------------- what a record must be to serve
+
+/// The publisher's part bound is the reader's part bound.
+///
+/// A proof in seventeen parts publishes perfectly well and then no client can
+/// assemble it: `MAX_PROOF_PARTS` fetches parts 2..=16 and stops. One number,
+/// named once, refused on this side too.
+pub fn a_proof_needing_more_parts_than_a_reader_fetches_is_refused_test() {
+  let base = fixture_proof()
+  let biggest =
+    Proof(..base, statement: <<
+      0:size(
+        8
+        * proof.max_parts
+        * proof.txt_chunk_chars
+      ),
+    >>)
+  let assert Error(why) = proof.to_txt(biggest)
+  assert string.contains(why, int.to_string(proof.max_parts))
+
+  // And what fits is unaffected: the fixture is a handful of parts.
+  let assert Ok(records) = proof.to_txt(base)
+  assert list.length(records) <= proof.max_parts
+}
+
+/// The gate asks whether a row exists; a client asks whether the proof name
+/// exists. Those are the same question only if a row that cannot be rendered
+/// is never stored.
+pub fn publish_refuses_a_record_the_zone_could_not_serve_test() {
+  let conn = fixtures.fresh_conn()
+  let _csk = fixtures.zone_boot(conn)
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = fake_log(keys.generate())
+  // A zone serving an enormous DNSKEY RRset: the chain goes into the entry's
+  // certificate, so the record this would become needs far more TXT parts
+  // than any reader assembles.
+  let huge = rdata.dnskey(257, 13, <<0:size(80_000)>>)
+  let assert Error(rekor_publish.Unservable(why)) =
+    rekor_publish.run(
+      conn,
+      apex,
+      apex,
+      log,
+      #(spki, point),
+      1000,
+      fake_resolver_serving([huge]),
+      rekor_publish.Current,
+    )
+  assert string.contains(why, "records")
+  // Nothing stored, so nothing for the gate to pass on.
+  let assert Ok([]) = store.servable(conn, [])
+  sqlite.close(conn)
+}
+
+/// And at serve time a row that will not render is a loud failure rather than
+/// a quiet omission: dropping it published a zone whose own gate said it was
+/// fine while every client failed closed on a proof name that did not exist.
+pub fn a_damaged_proof_row_fails_the_read_rather_than_vanishing_test() {
+  let conn = fixtures.fresh_conn()
+  let csk = fixtures.zone_boot(conn)
+  let rd = keys.dnskey_rdata(csk)
+  let assert Ok(Nil) =
+    store.put(
+      conn,
+      store.Record(
+        keyset_sha256: crypto.hash(crypto.Sha256, rd),
+        apex: "sync.test.",
+        action: "create",
+        statement: <<"{}":utf8>>,
+        canonicalized_body: <<0:size(512)>>,
+        log_id: <<0:size(256)>>,
+        log_index: 0,
+        checkpoint: <<>>,
+        // Not a run of 32-byte hashes: this row cannot become a proof.
+        inclusion_path: <<0:size(120)>>,
+        chainless: False,
+        integrated_at: 1,
+        verified_at: 1,
+        keys: [#(crypto.hash(crypto.Sha256, rd), keys.key_tag(rd))],
+      ),
+    )
+  let assert Error(model.UnservableProof(_)) = model.read(conn)
+  sqlite.close(conn)
+}
+
+// --------------------------------------------- agreeing with the client
+
+/// Log key material is one key per PEM block or per line, which is what the
+/// client's `LogKeys::parse` accepts: a file that names two keys reads as two
+/// keys, and a PEM body wrapped across lines reads as one.
+pub fn log_key_material_reads_a_key_per_block_test() {
+  let first = proof.p256_spki(keys.generate().public)
+  let second = proof.p256_spki(keys.generate().public)
+  let encoded = fn(spki) { bit_array.base64_encode(spki, True) }
+  let wrapped = fn(spki) {
+    let text = encoded(spki)
+    "-----BEGIN PUBLIC KEY-----\n"
+    <> string.slice(text, 0, 64)
+    <> "\n"
+    <> string.drop_start(text, 64)
+    <> "\n-----END PUBLIC KEY-----\n"
+  }
+  let file =
+    "# the log keys this deployment pins\n"
+    <> wrapped(first)
+    <> encoded(second)
+    <> "\n"
+  let assert Ok([one, two]) = proof.parse_log_keys(file)
+  assert one.0 == first
+  assert two.0 == second
+
+  // A publisher writes to one log and stores the proof under that log's id,
+  // so two keys is an error rather than a silent choice between them.
+  let assert Error(_) = proof.parse_log_key(file)
+  let assert Ok(#(der, _point)) = proof.parse_log_key(encoded(second))
+  assert der == second
+  let assert Error(_) = proof.parse_log_keys("# nothing but a comment\n")
+}
+
+/// The two canonical renderers escape the same bytes the same way
+/// (`json_string`, crates/synch-net/src/rekor.rs): quote, backslash, the three
+/// named control escapes, and `\u00xx` in lowercase hex for the rest below
+/// U+0020.
+pub fn the_canonical_renderer_escapes_control_characters_test() {
+  let assert Ok(apex) = name.parse("sync.test.")
+  let rd = keys.dnskey_rdata(keys.generate())
+  let rendered =
+    statement.to_json(statement.for_keys(apex, [rd], "cre\u{1}ate\n\t\"\\"))
+  let assert Ok(text) = bit_array.to_string(rendered)
+  assert string.contains(text, "\"action\":\"cre\\u0001ate\\n\\t\\\"\\\\\"")
+}
+
+/// A DNSKEY rdata too short to hold the four-byte header renders as flags 0 and
+/// algorithm 0 — both of them, rather than whatever partial values could be
+/// read out of it. One rule, because the two renderers commit to one byte
+/// string, and the collector refuses such a rdata long before this.
+pub fn a_truncated_dnskey_rdata_has_no_flags_and_no_algorithm_test() {
+  let assert Ok(apex) = name.parse("sync.test.")
+  let assert [key] = statement.for_keys(apex, [<<1, 2, 3>>], "create").keys
+  assert key.flags == 0
+  assert key.algorithm == 0
+}
+
+/// An inclusion-proof hash is a 32-byte SHA-256 node. The stored form is a flat
+/// run of them, so a short one would be re-split at the wrong boundary on the
+/// way back out — the one place to refuse it is where the log's answer arrives.
+pub fn a_short_inclusion_hash_is_refused_where_it_arrives_test() {
+  let entry = fn(hash: BitArray) {
+    "{\"logIndex\":\"7\",\"canonicalizedBody\":\"AAAA\",\"inclusionProof\":{"
+    <> "\"hashes\":[\""
+    <> bit_array.base64_encode(hash, True)
+    <> "\"],\"checkpoint\":{\"envelope\":\"note\"}}}"
+  }
+  let assert Ok(parsed) = client.parse_entry(entry(<<0:size(256)>>))
+  assert parsed.log_index == 7
+  let assert Error(why) = client.parse_entry(entry(<<0:size(128)>>))
+  assert string.contains(why, "32-byte")
+}
+
+// --------------------------------------------------- collecting the chain
+
+/// A resolver over a described delegation: `zones` are the names that really
+/// are zones, and every other name answers nothing at all — which is exactly
+/// what an empty non-terminal looks like on the wire.
+fn delegation_resolver(
+  zones: List(String),
+  declaration_owner: name.Name,
+  dnskey_rd: BitArray,
+) -> chain.Resolver {
+  chain.Resolver(query: fn(zone, rtype) {
+    let is_zone = list.contains(zones, name.to_string(zone))
+    case rtype == wire.type_txt, rtype == wire.type_dnskey, is_zone {
+      True, _, _ ->
+        case zone == declaration_owner {
+          True ->
+            Ok([
+              wire.Rr(
+                zone,
+                wire.type_txt,
+                wire.class_in,
+                300,
+                rdata.txt(rdata.transparency_text),
+              ),
+              fake_rrsig(zone, wire.type_txt),
+            ])
+          False -> Ok([])
+        }
+      _, True, True -> Ok(dnskey_rrs(zone, [dnskey_rd]))
+      _, False, True ->
+        Ok([
+          wire.Rr(zone, chain.type_ds, wire.class_in, 3600, <<
+            1234:int-size(16),
+            13:int-size(8),
+            2:int-size(8),
+            9:size(256),
+          >>),
+          fake_rrsig(zone, chain.type_ds),
+        ])
+      _, _, False -> Ok([])
+    }
+  })
+}
+
+/// A delegation can cross more than one label, and then the names in between
+/// are empty non-terminals: no DNSKEY, no DS, nothing a link could carry.
+///
+/// The ladder is zone cuts, so the walk skips the name that is not a zone. A
+/// link for an empty non-terminal carries no RRsets and every reader refuses
+/// it, so a chain for such a zone has exactly one valid shape and this is it.
+pub fn the_collector_walks_zone_cuts_not_labels_test() {
+  let assert Ok(apex) = name.parse("cp.acme.sync.test.")
+  let owner = name.parse("_synchronicity-transparency.cp.acme.sync.test.")
+  let assert Ok(owner) = owner
+  let rd = keys.dnskey_rdata(keys.generate())
+  // `sync.test` delegates `cp.acme.sync.test` directly: there is no zone at
+  // `acme.sync.test` for anybody to ask about.
+  let resolver =
+    delegation_resolver(
+      ["cp.acme.sync.test.", "sync.test.", "test.", "."],
+      owner,
+      rd,
+    )
+  let assert Ok(#(links, rdatas)) = chain.collect(resolver, apex, apex)
+  assert rdatas == [rd]
+  assert list.map(links, fn(link) { link.zone })
+    == [
+      "_synchronicity-transparency.cp.acme.sync.test.", "cp.acme.sync.test.",
+      "sync.test.", "test.", ".",
+    ]
+  // And the shape rules agree with the walk that produced it.
+  let assert Ok(Nil) = chain.check_shape(links, apex, apex)
+}
+
+/// The two halves of a zone cut have to arrive together. A DS with no DNSKEY
+/// is a delegation to an unsigned zone; a DNSKEY with no DS is a signed zone
+/// its parent delegates insecurely. Either way no reader can walk past that
+/// name, so the collection fails where somebody is watching it.
+pub fn the_collector_refuses_a_broken_delegation_test() {
+  let assert Ok(apex) = name.parse("cp.sync.test.")
+  let assert Ok(owner) = name.parse("_synchronicity-transparency.cp.sync.test.")
+  let rd = keys.dnskey_rdata(keys.generate())
+  let whole =
+    delegation_resolver(
+      ["cp.sync.test.", "sync.test.", "test.", "."],
+      owner,
+      rd,
+    )
+
+  // `sync.test` answers a DS but no DNSKEY.
+  let unsigned =
+    chain.Resolver(query: fn(zone, rtype) {
+      case name.to_string(zone) == "sync.test." && rtype == wire.type_dnskey {
+        True -> Ok([])
+        False -> whole.query(zone, rtype)
+      }
+    })
+  let assert Error(why) = chain.collect(unsigned, apex, apex)
+  assert string.contains(why, "unsigned")
+
+  // `sync.test` answers a DNSKEY but its parent holds no DS for it.
+  let islanded =
+    chain.Resolver(query: fn(zone, rtype) {
+      case name.to_string(zone) == "sync.test." && rtype == chain.type_ds {
+        True -> Ok([])
+        False -> whole.query(zone, rtype)
+      }
+    })
+  let assert Error(why) = chain.collect(islanded, apex, apex)
+  assert string.contains(why, "insecure")
+}
+
+/// Only the records a link owns go into it: `ParsedLink::parse` refuses a link
+/// holding a record its own name does not own, so an extra RR a resolver
+/// decided to include would make the whole entry unverifiable.
+pub fn the_collector_copies_only_what_the_link_owns_test() {
+  let assert Ok(apex) = name.parse("sync.test.")
+  let rd = keys.dnskey_rdata(keys.generate())
+  let clean = fake_resolver_serving([rd])
+  let assert Ok(stray_owner) = name.parse("stray.example.")
+  let padded =
+    chain.Resolver(query: fn(zone, rtype) {
+      use answers <- result.try(clean.query(zone, rtype))
+      Ok(
+        list.append(answers, [
+          wire.Rr(stray_owner, rtype, wire.class_in, 3600, <<
+            7:int-size(16),
+            13:int-size(8),
+            2:int-size(8),
+            9:size(256),
+          >>),
+          fake_rrsig(stray_owner, rtype),
+        ]),
+      )
+    })
+  let assert Ok(#(honest, _)) = chain.collect(clean, apex, apex)
+  let assert Ok(#(collected, _)) = chain.collect(padded, apex, apex)
+  assert list.map(collected, fn(link) { link.rrs })
+    == list.map(honest, fn(link) { link.rrs })
+}
+
+/// The two rules a reader applies to the declaration, applied here too: an
+/// RRSIG covering fewer labels than its owner was expanded from a wildcard, so
+/// the zone published no declaration of its own; and an RRSIG signed by
+/// anything but the signing zone was not made by the authority the chain
+/// claims holds the record.
+pub fn the_collector_refuses_a_declaration_no_reader_would_take_test() {
+  let assert Ok(apex) = name.parse("sync.test.")
+  let assert Ok(owner) = name.parse("_synchronicity-transparency.sync.test.")
+  let rd = keys.dnskey_rdata(keys.generate())
+  let clean = fake_resolver_serving([rd])
+
+  let with_declaration_sig = fn(sig: BitArray) {
+    chain.Resolver(query: fn(zone, rtype) {
+      case zone == owner && rtype == wire.type_txt {
+        True ->
+          Ok([
+            wire.Rr(
+              zone,
+              wire.type_txt,
+              wire.class_in,
+              300,
+              rdata.txt(rdata.transparency_text),
+            ),
+            wire.Rr(zone, wire.type_rrsig, wire.class_in, 300, sig),
+          ])
+        False -> clean.query(zone, rtype)
+      }
+    })
+  }
+
+  let wildcard =
+    rdata.rrsig(wire.type_txt, 13, 2, 300, 0, 0, 1234, apex, <<0:size(512)>>)
+  let assert Error(why) =
+    chain.collect(with_declaration_sig(wildcard), apex, apex)
+  assert string.contains(why, "wildcard")
+
+  let assert Ok(stranger) = name.parse("other.test.")
+  let wrong_signer =
+    rdata.rrsig(wire.type_txt, 13, 3, 300, 0, 0, 1234, stranger, <<0:size(512)>>)
+  let assert Error(why) =
+    chain.collect(with_declaration_sig(wrong_signer), apex, apex)
+  assert string.contains(why, "as its signer")
+}
+
+/// A DNSKEY the claim's digests are computed over has to be reconstructible by
+/// a reader, which rebuilds the rdata as flags ‖ 3 ‖ algorithm ‖ key. RFC 4034
+/// §2.1.2 permits no other protocol byte, so one is a rdata this side will not
+/// claim rather than a rdata the two sides would digest differently.
+pub fn the_collector_refuses_a_dnskey_it_could_not_reconstruct_test() {
+  let assert Ok(apex) = name.parse("sync.test.")
+  let wrong_protocol = <<
+    257:int-size(16),
+    4:int-size(8),
+    13:int-size(8),
+    0:size(512),
+  >>
+  let assert Error(why) =
+    chain.collect(fake_resolver_serving([wrong_protocol]), apex, apex)
+  assert string.contains(why, "protocol 3")
+
+  let truncated = <<257:int-size(16)>>
+  let assert Error(_) =
+    chain.collect(fake_resolver_serving([truncated]), apex, apex)
 }
 
 /// A resolver that declines to answer (SERVFAIL & co.) is not saying the
@@ -987,11 +1380,10 @@ pub fn staging_is_allowed_while_the_gate_is_armed_test() {
   let #(log, spki, point) = fake_log(keys.generate())
   let assert Ok(_) = publish_run(conn, apex, active, log, #(spki, point), 1000)
 
-  envoy.set(gate.require_env, "true")
+  use <- fixtures.with_gate_armed
   let incoming = keys.generate()
   let assert Ok(_) =
     publish.stage_incoming(conn, active, incoming.public, 1000, "test")
-  envoy.unset(gate.require_env)
   sqlite.close(conn)
 }
 
@@ -1008,12 +1400,11 @@ pub fn promotion_refuses_a_key_that_was_never_logged_test() {
   let assert Ok(_) =
     publish.stage_incoming(conn, active, incoming.public, 1000, "test")
 
-  envoy.set(gate.require_env, "true")
+  use <- fixtures.with_gate_armed
   // The record covers the outgoing key, not the incoming one.
   let assert Error(publish.NoRekorRecord(tag)) =
     publish.promote_incoming(conn, incoming, 1000, "test")
   assert tag == keys.key_tag(keys.dnskey_rdata(incoming))
-  envoy.unset(gate.require_env)
 
   // Nothing moved: a refused promotion must not half-apply.
   let assert Ok(meta) = model.read_meta(conn)
@@ -1045,9 +1436,8 @@ pub fn a_logged_staged_key_can_be_promoted_test() {
     )
 
   // 4. promote — accepted now, because the log entry covers the incoming key.
-  envoy.set(gate.require_env, "true")
+  use <- fixtures.with_gate_armed
   let assert Ok(_) = publish.promote_incoming(conn, incoming, 1000, "test")
-  envoy.unset(gate.require_env)
 
   let assert Ok(meta) = model.read_meta(conn)
   assert meta.dnskey_public == incoming.public
@@ -1103,33 +1493,23 @@ pub fn booting_with_the_staged_key_names_the_missing_step_test() {
 // ---------------------------------------------------------- zonekey watch
 
 fn dnskey_rrs(zone: name.Name, rdatas: List(BitArray)) -> List(wire.Rr) {
-  let rrsig =
-    wire.Rr(zone, wire.type_rrsig, wire.class_in, 3600, <<
-      48:int-size(16),
-      13:int-size(8),
-      2:int-size(8),
-      0:size(512),
-    >>)
   list.append(
-    list.map(rdatas, fn(rd) { wire.Rr(zone, 48, wire.class_in, 3600, rd) }),
-    [rrsig],
+    list.map(rdatas, fn(rd) {
+      wire.Rr(zone, wire.type_dnskey, wire.class_in, 3600, rd)
+    }),
+    [fake_rrsig(zone, wire.type_dnskey)],
   )
 }
 
-/// Observe and collect are two DNSKEY queries at the signing zone. The
-/// mailbox is preloaded: odd pops are observe, even pops are collect.
+/// One tick is three DNSKEY queries at the signing zone: two for the
+/// corroborated observation, one for the chain the claim carries. The mailbox
+/// is preloaded in that order.
 fn split_resolver(
   zone: name.Name,
   answers: process.Subject(List(BitArray)),
 ) -> chain.Resolver {
   chain.Resolver(query: fn(qzone, rtype) {
-    let rrsig =
-      wire.Rr(qzone, wire.type_rrsig, wire.class_in, 3600, <<
-        rtype:int-size(16),
-        13:int-size(8),
-        2:int-size(8),
-        0:size(512),
-      >>)
+    let rrsig = fake_rrsig(qzone, rtype)
     case rtype == wire.type_dnskey && qzone == zone {
       True -> {
         let rdatas = case process.receive(answers, 0) {
@@ -1175,9 +1555,12 @@ pub fn the_watcher_stamps_only_keys_the_claim_covers_test() {
   let a = keys.dnskey_rdata(keys.generate())
   let b = keys.dnskey_rdata(keys.generate())
   let answers = process.new_subject()
-  // observe {A,B}, collect {A}, observe {A,B}, collect {A}
+  // Per tick: observe {A,B} twice — the two reads have to agree before the
+  // watcher acts — then collect {A}, so the claim covers A alone.
+  process.send(answers, [a, b])
   process.send(answers, [a, b])
   process.send(answers, [a])
+  process.send(answers, [a, b])
   process.send(answers, [a, b])
   process.send(answers, [a])
   let resolver = split_resolver(apex, answers)
@@ -1225,4 +1608,112 @@ pub fn the_watcher_stamps_only_keys_the_claim_covers_test() {
     == zonekey_watch.Logged
   let assert Ok("submit") = process.receive(submits, 100)
   sqlite.close(conn)
+}
+
+/// The observation prunes the stored key set, and the stored key set is what
+/// the served proofs are held to — so one bad answer would delete a live key's
+/// proof records. Two reads that disagree are not an answer to act on.
+pub fn the_watcher_will_not_act_on_an_unconfirmed_answer_test() {
+  let conn = fixtures.fresh_conn()
+  let assert Ok(apex) = name.parse("sync.test.")
+  let a = keys.dnskey_rdata(keys.generate())
+  let b = keys.dnskey_rdata(keys.generate())
+  let answers = process.new_subject()
+  // A first tick that agrees with itself: {A} is observed and logged.
+  process.send(answers, [a])
+  process.send(answers, [a])
+  process.send(answers, [a])
+  // Then an answer that says {B}, contradicted by the read beside it.
+  process.send(answers, [b])
+  process.send(answers, [a])
+  let resolver = split_resolver(apex, answers)
+  let #(log, spki, point) = fake_log(keys.generate())
+  let tick = fn(now) {
+    zonekey_watch.run_once_with(
+      conn,
+      apex,
+      apex,
+      resolver,
+      log,
+      #(spki, point),
+      now,
+    )
+  }
+
+  assert tick(1000) == zonekey_watch.Logged
+  let assert Ok([logged]) = state.observed_keys(conn)
+  assert logged.key_sha256 == crypto.hash(crypto.Sha256, a)
+
+  // Nothing is logged and — the point — nothing is deleted: A's row survives,
+  // and with it the proof the zone serves for A.
+  assert tick(2000) == zonekey_watch.Quiet
+  let assert Ok([survivor]) = state.observed_keys(conn)
+  assert survivor.key_sha256 == crypto.hash(crypto.Sha256, a)
+  assert survivor.logged_at == Some(1000)
+  sqlite.close(conn)
+}
+
+/// The claim names the keys the RRset authorizes, and nothing else.
+///
+/// A reader's chain walk excludes a key without the Zone Key flag and a key
+/// carrying RFC 5011's REVOKE bit — neither may verify an RRSIG, so neither is
+/// part of the authorized set. A claim naming one would describe a set no
+/// client derives, and every client would refuse the entry as a set its chain
+/// does not prove. The RRset itself still travels whole, because its RRSIG
+/// covers all of it.
+pub fn the_claim_names_only_the_keys_the_rrset_authorizes_test() {
+  let assert Ok(apex) = name.parse("cp.sync.test.")
+  let owner = name.parse("_synchronicity-transparency.cp.sync.test.")
+  let assert Ok(owner) = owner
+  let csk = keys.generate()
+  let usable = keys.dnskey_rdata(csk)
+  let not_a_zone_key = rdata.dnskey(0x0001, keys.algorithm, csk.public)
+  let revoked = rdata.dnskey(0x0181, keys.algorithm, csk.public)
+
+  let base =
+    delegation_resolver(
+      ["cp.sync.test.", "sync.test.", "test.", "."],
+      owner,
+      usable,
+    )
+  let resolver =
+    chain.Resolver(query: fn(zone, rtype) {
+      case rtype == wire.type_dnskey && zone == apex {
+        True -> Ok(dnskey_rrs(zone, [usable, not_a_zone_key, revoked]))
+        False -> base.query(zone, rtype)
+      }
+    })
+
+  let assert Ok(#(links, rdatas)) = chain.collect(resolver, apex, apex)
+  assert rdatas == [usable]
+  // The link still carries all three, or the RRSIG over the RRset would not
+  // verify for any reader.
+  let assert [_declaration, apex_link, ..] = links
+  assert bit_array.byte_size(apex_link.rrs) > bit_array.byte_size(usable) * 3
+}
+
+/// A zone whose apex RRset authorizes nothing cannot publish a claim.
+pub fn a_zone_with_no_usable_key_has_nothing_to_claim_test() {
+  let assert Ok(apex) = name.parse("cp.sync.test.")
+  let owner = name.parse("_synchronicity-transparency.cp.sync.test.")
+  let assert Ok(owner) = owner
+  let csk = keys.generate()
+  let revoked = rdata.dnskey(0x0181, keys.algorithm, csk.public)
+
+  let base =
+    delegation_resolver(
+      ["cp.sync.test.", "sync.test.", "test.", "."],
+      owner,
+      keys.dnskey_rdata(csk),
+    )
+  let resolver =
+    chain.Resolver(query: fn(zone, rtype) {
+      case rtype == wire.type_dnskey && zone == apex {
+        True -> Ok(dnskey_rrs(zone, [revoked]))
+        False -> base.query(zone, rtype)
+      }
+    })
+
+  let assert Error(why) = chain.collect(resolver, apex, apex)
+  assert string.contains(why, "usable zone key")
 }
