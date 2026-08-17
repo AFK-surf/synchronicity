@@ -122,3 +122,71 @@ async fn an_unsigned_zone_is_refused() {
         .expect_err("answers without signatures must not validate");
     server.abort();
 }
+
+/// The forgery the owner-name filter does **not** catch, refused.
+///
+/// An RRSIG is a signature over an RRset; nothing about producing one
+/// requires the signer to own the name. So anybody holding a DNSSEC-signed
+/// zone that chains to the reader's anchor can sign an RRset owned by
+/// *somebody else's* name, and hickory will happily validate it: RFC 4035
+/// §5.3.1 ("the Signer's Name field MUST be the name of the zone that
+/// contains the RRset") is skipped there in two places, both marked TODO.
+///
+/// `Proof::Secure` therefore means "some anchored key signed this", not "the
+/// zone that owns this name signed it", and the gap is a total membership
+/// forgery: a forged `(origin, device key)` binding is full cluster read and
+/// write (§3.2). `secure_txt` closes it, and this is the test that says so.
+///
+/// The suite could not have caught this before: every other negative case
+/// gives the impostor the *same* name as the victim, so "a validly anchored
+/// zone with a **different** name signs for our name" went unexercised.
+#[tokio::test]
+async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
+    use hickory_resolver::proto::rr::Name;
+
+    let attacker_key = SecretKey::generate().public();
+    // A real zone, with a real key, that the reader really does anchor —
+    // everything about `attacker.example` validates. It simply is not
+    // `cluster.example`, and that is the only thing wrong with the answer.
+    let mut attacker = SimZone::new("attacker.example", Vec::new());
+    attacker.impersonate = Some((
+        Name::from_utf8("_synchronicity.cluster.example.").unwrap(),
+        vec![format!(
+            "v=sync1 id=nas nk={} apex=cluster.example",
+            attacker_key.to_z32()
+        )],
+    ));
+    let anchor = anchor_file(&attacker.anchor_record());
+    let (url, server) = attacker.serve().await;
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        doh_url: Some(url),
+        trust_anchor: Some(anchor.path().to_path_buf()),
+        // `off` on purpose: under `require` the apex sandwich in `apex_of`
+        // happens to block this too, which is what hid the hole. The signer
+        // rule has to stand on its own, so it is tested where nothing else
+        // is holding the door.
+        rekor: Some(RekorPolicy::Off),
+        rekor_key: None,
+        rekor_state: None,
+        tuf_url: None,
+        no_tuf: true,
+    })
+    .unwrap();
+
+    let error = resolver
+        .lookup_txt("cluster.example")
+        .await
+        .expect_err("a sibling zone must not sign for this name");
+    assert!(
+        error.to_string().contains("does not contain"),
+        "refused for the wrong reason: {error}"
+    );
+    // And the same through the membership path, which is what an attacker
+    // is actually after.
+    resolver
+        .member_set("cluster.example")
+        .await
+        .expect_err("a forged membership answer must not bind anything");
+    server.abort();
+}

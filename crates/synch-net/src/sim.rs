@@ -51,6 +51,17 @@ pub struct SimZone {
     /// base64url as [`RekorProof::to_txt`] renders it. Empty is the
     /// not-yet-upgraded control plane.
     pub rekor_txt: Vec<String>,
+    /// A TXT RRset this zone serves at a name it **does not own**, signed by
+    /// its own key.
+    ///
+    /// This is the forgery an attacker mounts when they hold any
+    /// DNSSEC-signed zone: an RRSIG is a signature over an RRset, and
+    /// nothing about making one requires the signer to be the owner. Whether
+    /// it is *accepted* is the validator's job — and hickory does not do it
+    /// (RFC 4035 §5.3.1, skipped there with a TODO), so `crate::dns` has to.
+    /// A harness that could not express the forgery could not test the
+    /// defense.
+    pub impersonate: Option<(Name, Vec<String>)>,
 }
 
 impl SimZone {
@@ -86,6 +97,7 @@ impl SimZone {
             ttl: 300,
             unsigned: false,
             rekor_txt: Vec::new(),
+            impersonate: None,
         }
     }
 
@@ -417,6 +429,28 @@ impl SimZone {
         };
         let name = query.name().clone();
         let mut set = match query.query_type() {
+            // Served *before* the zone's own names, because the whole point
+            // is a name this zone has no business answering for.
+            RecordType::TXT
+                if self
+                    .impersonate
+                    .as_ref()
+                    .is_some_and(|(owner, _)| *owner == name) =>
+            {
+                let (owner, texts) = self.impersonate.as_ref().expect("checked");
+                let mut set = RecordSet::new(owner.clone(), RecordType::TXT, 0);
+                for text in texts {
+                    set.insert(
+                        Record::from_rdata(
+                            owner.clone(),
+                            self.ttl,
+                            RData::TXT(TXT::new(vec![text.clone()])),
+                        ),
+                        0,
+                    );
+                }
+                set
+            }
             RecordType::TXT if name == self.txt_name() => {
                 let mut set = RecordSet::new(name, RecordType::TXT, 0);
                 for text in &self.txt {

@@ -482,6 +482,12 @@ pub struct ValidatedTxt {
     pub records: Vec<String>,
     /// How long the answer may be cached, clamped to the §3.2 window.
     pub ttl: Duration,
+    /// The zone whose RRSIG covered this answer, as the signature named it —
+    /// checked to enclose the queried name before the answer was accepted
+    /// (see [`secure_txt`]).
+    pub signer: Name,
+    /// The key tag that RRSIG selected, for the transparency lookup.
+    pub key_tag: u16,
 }
 
 /// How the resolver reaches the DNS and whom it ultimately trusts (§3.2).
@@ -717,7 +723,11 @@ impl DnssecResolver {
             // answer itself yields — the control plane's apex is a name only
             // the log entry knows, and it is checked against this one rather
             // than used to find anything.
-            let (signing_zone, key_tag) = signing_key_of(&name, &response.answers)?;
+            //
+            // It comes out of `secure_txt`, which already held it to
+            // RFC 4035 §5.3.1 before returning: a signer that does not
+            // enclose the queried name never reaches this line.
+            let (signing_zone, key_tag) = (validated.signer.clone(), validated.key_tag);
             // Where the control plane's transparency records live. Taken
             // from the answer this client just DNSSEC-validated, and then
             // held to both ends: it must contain the domain being resolved
@@ -1021,39 +1031,6 @@ impl DnssecResolver {
     }
 }
 
-/// The apex and key tag of the key that signed an answer.
-///
-/// Taken from the RRSIG the validator accepted, never from the answer's
-/// contents: this is the one place the client learns which zone key it is
-/// about to demand a public record for.
-fn signing_key_of(
-    name: &str,
-    answers: &[hickory_resolver::proto::rr::Record],
-) -> Result<(Name, u16), NetError> {
-    use hickory_resolver::proto::{
-        dnssec::rdata::DNSSECRData,
-        rr::{RData, RecordType},
-    };
-
-    let mut qname = Name::from_utf8(name).map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
-    qname.set_fqdn(true);
-    for record in answers {
-        if record.name != qname || !record.proof.is_secure() {
-            continue;
-        }
-        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
-            continue;
-        };
-        if rrsig.input().type_covered != RecordType::TXT {
-            continue;
-        }
-        return Ok((rrsig.input().signer_name.clone(), rrsig.input().key_tag));
-    }
-    Err(NetError::Dns(format!(
-        "{name}: the validated answer carries no RRSIG naming its signer"
-    )))
-}
-
 /// Lifts a verification failure into the error class `synch doctor` explains.
 fn rekor_error(name: &str, error: ProofError) -> NetError {
     let name = name.to_string();
@@ -1325,9 +1302,60 @@ fn secure_txt(
     name: &str,
     answers: &[hickory_resolver::proto::rr::Record],
 ) -> Result<ValidatedTxt, NetError> {
+    use hickory_resolver::proto::{
+        dnssec::rdata::DNSSECRData,
+        rr::{RData, RecordType},
+    };
+
     let mut qname = hickory_resolver::proto::rr::Name::from_utf8(name)
         .map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
     qname.set_fqdn(true);
+
+    // Step one, and it has to be first: *who* signed this. hickory marks
+    // exactly one RRSIG per RRset as the one it verified under (the rest come
+    // back `Indeterminate`), so there is at most one candidate here and an
+    // attacker cannot steer the choice by stapling extra signatures.
+    let signed_by = answers.iter().find_map(|record| {
+        if record.name != qname || !record.proof.is_secure() {
+            return None;
+        }
+        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
+            return None;
+        };
+        (rrsig.input().type_covered == RecordType::TXT).then(|| rrsig.input().clone())
+    });
+    let Some(sig) = signed_by else {
+        return Err(NetError::Dns(format!(
+            "{name}: the validated answer carries no RRSIG naming its signer"
+        )));
+    };
+    let signer = sig.signer_name.to_lowercase();
+
+    // **The check hickory does not make.** RFC 4035 §5.3.1: "The RRSIG RR's
+    // Signer's Name field MUST be the name of the zone that contains the
+    // RRset." hickory 0.26 skips it in two places, both marked TODO — in
+    // `RrsigValidity::check` the rule is quoted verbatim and then not
+    // implemented, and `verify_default_rrset` fires a DNSKEY lookup at
+    // whatever signer name the answer carried. So `Proof::Secure` means only
+    // "some key, at some name the answer chose, signed this" — and an
+    // attacker holding *any* DNSSEC-signed zone can sign an RRset owned by
+    // somebody else's name and have it validate.
+    //
+    // Owner-name filtering does not close it: the forged RRset is owned by
+    // the queried name, which is the whole point of the forgery. The signer
+    // has to enclose the name it signed for, and that is what this asserts.
+    //
+    // Enforced here rather than in a caller so no lookup path can be reached
+    // without it — the membership answer, the proof records, the DNSKEY, and
+    // the public `lookup_txt` all come through this one function.
+    if !signer.zone_of(&qname) {
+        return Err(NetError::Dns(format!(
+            "{name}: the answer is signed by {signer}, which does not contain \
+             the name it answers for — a zone may only sign for names it holds \
+             (RFC 4035 §5.3.1)"
+        )));
+    }
+
     let mut records = Vec::new();
     let mut ttl = MAX_TTL;
     for record in answers {
@@ -1340,6 +1368,17 @@ fn secure_txt(
         if record.name != qname {
             continue;
         }
+        // Only the records this answer is *made of* have to carry a proof.
+        // Co-resident records of other types do not, and RRSIGs especially
+        // do not: hickory marks only the signature it verified under and
+        // returns every other one `Indeterminate`. Demanding a proof on
+        // those refused every answer during an RFC 6781 double-signature key
+        // rollover — which several managed providers run continuously — and
+        // handed anyone who could *add* a record to a response a one-packet
+        // denial of service.
+        if !matches!(record.data, RData::TXT(_)) {
+            continue;
+        }
         if !record.proof.is_secure() {
             // Fail closed: one unvalidated record poisons the answer.
             return Err(NetError::Dns(format!(
@@ -1348,16 +1387,17 @@ fn secure_txt(
             )));
         }
         ttl = ttl.min(Duration::from_secs(u64::from(record.ttl)));
-        if let hickory_resolver::proto::rr::RData::TXT(txt) = &record.data {
-            // A TXT record is a sequence of character-strings; the record
-            // text is their concatenation.
-            let joined: String = txt
-                .txt_data
-                .iter()
-                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                .collect();
-            records.push(joined);
-        }
+        let RData::TXT(txt) = &record.data else {
+            unreachable!("filtered to TXT above")
+        };
+        // A TXT record is a sequence of character-strings; the record
+        // text is their concatenation.
+        let joined: String = txt
+            .txt_data
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        records.push(joined);
     }
     if records.is_empty() {
         return Err(NetError::Dns(format!("{name}: no TXT records")));
@@ -1365,6 +1405,8 @@ fn secure_txt(
     Ok(ValidatedTxt {
         records,
         ttl: clamp_ttl(ttl),
+        signer,
+        key_tag: sig.key_tag,
     })
 }
 
