@@ -62,7 +62,7 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6]
+  [v1, v2, v3, v4, v5, v6, v7]
 }
 
 /// V5: `tuf_material` stops keeping the root chain.
@@ -459,4 +459,18 @@ ALTER TABLE zone_meta
   CHECK (length(dnskey_incoming) IN (64, 0));
 ALTER TABLE zone_meta
   ADD COLUMN key_tag_incoming INTEGER NOT NULL DEFAULT 0;
+"
+
+/// V7: a provider apply can partly succeed.
+///
+/// The reconciler used to stop at the first record a provider refused, which
+/// made "applied" and "failed" the only two states a pass could be in. It
+/// now attempts every change and reports the ones that did not take, so the
+/// state row needs somewhere to say so: `last_failures` is the rendered list
+/// for an operator, `last_partial_at` when it happened. Neither is a work
+/// queue — desired state is still a pure function of the product tables, and
+/// the next sweep recomputes the diff from scratch.
+const v7 = "
+ALTER TABLE provider_sync_state ADD COLUMN last_failures TEXT;
+ALTER TABLE provider_sync_state ADD COLUMN last_partial_at INTEGER;
 "

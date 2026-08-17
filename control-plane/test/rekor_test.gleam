@@ -308,7 +308,7 @@ fn fake_resolver(dnskey_rd: BitArray) -> chain.Resolver {
 /// A resolver whose apex answers a DNSKEY RRset of several keys — what the
 /// zone actually serves mid-rollover, and what `rekor-publish` must claim
 /// in full so the incoming key is on the record before it signs anything.
-fn fake_resolver_serving(dnskey_rds: List(BitArray)) -> chain.Resolver {
+pub fn fake_resolver_serving(dnskey_rds: List(BitArray)) -> chain.Resolver {
   chain.Resolver(query: fn(zone, rtype) {
     let rrsig =
       wire.Rr(zone, wire.type_rrsig, wire.class_in, 3600, <<
@@ -394,7 +394,7 @@ fn publish_run_claiming(
 /// `hashedrekord` body from the submission, exactly as Sigstore returns one,
 /// so the publisher is exercised against the format, not against a mock of
 /// itself.
-fn fake_log(log_csk: keys.Csk) -> #(client.Log, BitArray, BitArray) {
+pub fn fake_log(log_csk: keys.Csk) -> #(client.Log, BitArray, BitArray) {
   let spki = proof.p256_spki(log_csk.public)
   let neighbour = proof.leaf_hash(<<"an earlier entry":utf8>>)
   let entry_of = fn(sub: client.Submission) {
@@ -437,7 +437,7 @@ pub fn publish_stores_a_verified_record_test() {
   let csk_rdata = keys.dnskey_rdata(csk)
   assert outcome.key_tags == [keys.key_tag(csk_rdata)]
 
-  let assert Ok([record]) = store.servable(conn)
+  let assert Ok([record]) = store.servable(conn, [])
   assert record.apex == "sync.test."
   assert record.verified_at == 1000
   let assert [#(key_sha256, key_tag)] = record.keys
@@ -474,7 +474,7 @@ pub fn publish_is_idempotent_test() {
   assert second.log_index == first.log_index
 
   let _ = first
-  let assert Ok(records) = store.servable(conn)
+  let assert Ok(records) = store.servable(conn, [])
   assert list.length(records) == 1
   let assert [record] = records
   assert record.verified_at == 2000
@@ -491,7 +491,7 @@ pub fn publish_refuses_an_unverifiable_proof_test() {
   // The log's own key is not the key we pin: nothing is stored.
   let assert Error(rekor_publish.Unverified(_)) =
     publish_run(conn, apex, csk, log, #(spki, stranger.public), 1000)
-  let assert Ok([]) = store.servable(conn)
+  let assert Ok([]) = store.servable(conn, [])
   sqlite.close(conn)
 }
 
@@ -547,7 +547,7 @@ pub fn a_retire_record_does_not_satisfy_the_gate_test() {
   // A retirement is a monitor breadcrumb, never a licence to serve (§2) —
   // and never a licence for the gate either: the key is claimed only by a
   // retire, which covers nothing.
-  assert store.servable(conn) == Ok([])
+  assert store.servable(conn, []) == Ok([])
   envoy.set(gate.require_env, "true")
   let assert Error(publish.NoRekorRecord(_)) =
     publish.publish(conn, csk, 1000, "test")
@@ -579,6 +579,7 @@ pub fn the_zone_serves_the_proof_record_test() {
       [NsHost(ns1, "127.0.0.1", "")],
       [TxtName(owner, [Member("nas", fixtures.nk(), "", "")])],
       list.index_map(text, fn(t, i) { #(i + 1, t) }),
+      0,
     )
   let assert Ok(rrsets) = build.build(input)
   // One part per owner name: part 1 at the base, part n one label along.
@@ -625,6 +626,7 @@ pub fn a_zone_without_a_proof_has_no_such_name_test() {
       [NsHost(ns1, "127.0.0.1", "")],
       [],
       [],
+      0,
     )
   let assert Ok(rrsets) = build.build(input)
   let assert Ok(rekor_owner) = name.parse("_synchronicity-rekor.sync.test.")
@@ -752,7 +754,7 @@ pub fn publish_refuses_when_the_chain_cannot_be_collected_test() {
   // chain's bottom link — the declaration — and the refusal names it rather
   // than reaching for the DS, which is a later link's problem.
   assert string.contains(why, "_synchronicity-transparency")
-  let assert Ok([]) = store.servable(conn)
+  let assert Ok([]) = store.servable(conn, [])
   sqlite.close(conn)
 }
 
@@ -778,7 +780,7 @@ pub fn a_retire_may_be_chainless_test() {
   assert outcome.chainless
   assert outcome.key_tags == [keys.key_tag(keys.dnskey_rdata(csk))]
   // And it is never served to a client: a retire is a monitor breadcrumb.
-  let assert Ok([]) = store.servable(conn)
+  let assert Ok([]) = store.servable(conn, [])
   sqlite.close(conn)
 }
 

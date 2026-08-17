@@ -320,10 +320,10 @@ The proof travels **inside the zone itself**, as TXT records under the
 split into numbered **parts**, one per owner name:
 
 ```
-_synchronicity-rekor.<apex>     86400 IN TXT "sync1p <group> 1/5 <b64url>"
-_synchronicity-rekor-2.<apex>   86400 IN TXT "sync1p <group> 2/5 <b64url>"
+_synchronicity-rekor.<apex>     300 IN TXT "sync1p <group> 1/5 <b64url>"
+_synchronicity-rekor-2.<apex>   300 IN TXT "sync1p <group> 2/5 <b64url>"
 ...
-_synchronicity-rekor-5.<apex>   86400 IN TXT "sync1p <group> 5/5 <b64url>"
+_synchronicity-rekor-5.<apex>   300 IN TXT "sync1p <group> 5/5 <b64url>"
 ```
 
 Part 1 says how many parts there are, and the client fetches the rest by
@@ -363,7 +363,15 @@ A zone with several control planes shares only the base name, and only
 ~2 KB of it.
 
 There is no selector field: a record's subject is a key set, so a client
-tries each proof it reassembles and membership in a verified set decides:
+tries each proof it reassembles and membership in a verified set decides.
+
+Because the client tries each one, *which* proofs a zone serves is a cost it
+pays per refresh — a chain walk apiece — and bytes at a name providers cap. So
+the zone serves the proofs that could authorize an answer it is capable of
+giving: those whose key set contains at least one key it currently publishes.
+`rekor_records` keeps the rest as the operator's own record of what they
+published, which §5.5 makes the thing monitor reports get compared against.
+docs/EXTERNAL-DNS-PROVIDER.md §4.2.1 has the rule and the bound it produces.
 
 ```
 RekorProof v4
@@ -394,8 +402,13 @@ inside the body: ~+2.1 KB). A deep, ICANN-rooted proof is therefore about
 **5.7 KB, ≈ 7.6 KB base64url** across TXT character-strings: inside the
 DoH/TCP message limit, over the 4 KB EDNS0 UDP advertisement (so these
 answers go over TCP or DoH, which is the only transport this design has
-anyway), and clamped to the client's existing 24 h TTL ceiling. That growth
-is a real cost, paid by clients on behalf of monitors — see §6.
+anyway). The TTL is short — 300 s — and that is not about size but about
+rotation: a client caches nothing itself, so the record's TTL is exactly how
+long a recursive resolver will keep handing out the proof set from before a
+provider rotated its keys, and that interval is the tail of the window in
+which a client fails closed
+(docs/EXTERNAL-DNS-PROVIDER.md §4.2). The growth is a real cost, paid by
+clients on behalf of monitors — see §6.
 
 Why in-band rather than an HTTPS side-channel or a live Rekor query:
 
@@ -524,16 +537,15 @@ Then, in process, no network:
   key that signed the answer is a **member** of it, `predicate.apex` = the
   RRSIG signer, and `action` ∈ {`create`, `rollover`};
 
-Steps 2 and 3 carry their own TTLs — the proof records are served with a
-24 h one, and the zone key changes rarely — but **the client does not
-currently cache them**, so a membership refresh under `require` really does
-perform all three lookups every time, plus whatever DNSKEY and DS queries
-hickory issues to validate each of them. At a TTL clamped to the 60 s floor
-that is tens of round trips a minute, not the one TXT query an earlier
-revision of this section claimed. The TTLs make the caching *possible*; a
-cache in front of the DoH handle is what would make it real, and it is not
-written yet. Stated here rather than left as an aspiration the numbers
-elsewhere in this document quietly assume.
+Steps 2 and 3 carry their own TTLs, but **the client does not currently cache
+them**, so a membership refresh under `require` really does perform all three
+lookups every time, plus whatever DNSKEY and DS queries hickory issues to
+validate each of them. At a TTL clamped to the 60 s floor that is tens of round
+trips a minute, not the one TXT query an earlier revision of this section
+claimed. The TTLs make the caching *possible*; a cache in front of the DoH
+handle is what would make it real, and it is not written yet. Stated here
+rather than left as an aspiration the numbers elsewhere in this document
+quietly assume.
 
 ### 4.2.1 Why the client verifies a chain it does not need
 
@@ -1025,7 +1037,7 @@ correctly rather than inverting on the outcome that matters most.
   base64; §3 explains why that is a floor.) The client downloads all of it
   and uses the chain
   only to enforce a property it already knows — see §4.2.1 for why it must
-  anyway. The 24 h TTL would amortize it if the client cached; it does not
+  anyway. A record TTL would amortize it if the client cached; it does not
   yet (§4.2), so today this is paid on every refresh. Either way it is a real
   transfer of cost from the parties who benefit (monitors, and through them
   every operator) to the parties who pay (clients).

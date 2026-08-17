@@ -26,6 +26,12 @@ pub type SyncState {
     last_attempt_at: Int,
     last_error: Option(String),
     last_error_at: Option(Int),
+    /// The records the provider refused on the last pass that reached it,
+    /// rendered for an operator to read. A pass can now succeed for most of
+    /// a change set and be refused for part of it, and this is the only
+    /// place that difference is visible.
+    last_failures: Option(String),
+    last_partial_at: Option(Int),
   )
 }
 
@@ -34,7 +40,8 @@ pub fn get(conn: Connection) -> Result(Result(SyncState, Nil), sqlite.Error) {
     sqlite.query(
       conn,
       "SELECT provider, provider_zone_id, applied_hash, last_synced_serial,
-            last_ok_at, last_attempt_at, last_error, last_error_at
+            last_ok_at, last_attempt_at, last_error, last_error_at,
+            last_failures, last_partial_at
      FROM provider_sync_state WHERE id = 1",
       [],
     ),
@@ -50,6 +57,8 @@ pub fn get(conn: Connection) -> Result(Result(SyncState, Nil), sqlite.Error) {
         VInt(attempt_at),
         error,
         error_at,
+        failures,
+        partial_at,
       ],
     ] ->
       Ok(SyncState(
@@ -61,6 +70,8 @@ pub fn get(conn: Connection) -> Result(Result(SyncState, Nil), sqlite.Error) {
         attempt_at,
         optional_text(error),
         optional_int(error_at),
+        optional_text(failures),
+        optional_int(partial_at),
       ))
     _ -> Error(Nil)
   })
@@ -83,6 +94,40 @@ pub fn record_ok(
     VInt(now),
     Null,
     Null,
+    Null,
+    Null,
+  ])
+}
+
+/// Records a pass the provider partly refused: the change set went out, some
+/// records did not take. The applied hash and serial deliberately do *not*
+/// advance — the zone is not the set we rendered — so the next sweep
+/// recomputes the diff and retries exactly what is still missing.
+pub fn record_partial(
+  conn: Connection,
+  provider: String,
+  zone_id: String,
+  failures: String,
+  now: Int,
+) -> Result(Nil, sqlite.Error) {
+  use current <- result.try(get(conn))
+  let #(hash, serial, ok_at) = case current {
+    Ok(state) -> #(
+      blob_or_null(state.applied_hash),
+      int_or_null(state.last_synced_serial),
+      int_or_null(state.last_ok_at),
+    )
+    Error(Nil) -> #(Null, Null, Null)
+  }
+  upsert(conn, provider, zone_id, [
+    hash,
+    serial,
+    ok_at,
+    VInt(now),
+    Null,
+    Null,
+    Text(failures),
+    VInt(now),
   ])
 }
 
@@ -111,6 +156,8 @@ pub fn record_error(
     VInt(now),
     Text(message),
     VInt(now),
+    Null,
+    Null,
   ])
 }
 
@@ -124,8 +171,9 @@ fn upsert(
     conn,
     "INSERT INTO provider_sync_state
        (id, provider, provider_zone_id, applied_hash, last_synced_serial,
-        last_ok_at, last_attempt_at, last_error, last_error_at)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_ok_at, last_attempt_at, last_error, last_error_at,
+        last_failures, last_partial_at)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (id) DO UPDATE SET
        provider = excluded.provider,
        provider_zone_id = excluded.provider_zone_id,
@@ -134,10 +182,35 @@ fn upsert(
        last_ok_at = excluded.last_ok_at,
        last_attempt_at = excluded.last_attempt_at,
        last_error = excluded.last_error,
-       last_error_at = excluded.last_error_at",
+       last_error_at = excluded.last_error_at,
+       last_failures = excluded.last_failures,
+       last_partial_at = excluded.last_partial_at",
     [Text(provider), Text(zone_id), ..values],
   )
   |> result.replace(Nil)
+}
+
+/// How long the oldest key the watcher has seen but not yet logged has been
+/// waiting, in seconds — `None` when every observed key is covered.
+///
+/// The one number that says whether the watch loop is keeping up with the
+/// provider's rotations: a key that has been unlogged for longer than a
+/// couple of intervals is a zone whose next answer may fail closed.
+pub fn oldest_unlogged_age(
+  conn: Connection,
+  now: Int,
+) -> Result(Option(Int), sqlite.Error) {
+  use rows <- result.try(
+    sqlite.query(
+      conn,
+      "SELECT min(first_seen) FROM observed_zone_keys WHERE logged_at IS NULL",
+      [],
+    ),
+  )
+  Ok(case rows {
+    [[VInt(first_seen)]] -> Some(now - first_seen)
+    _ -> None
+  })
 }
 
 // ------------------------------------------------- observed provider keys

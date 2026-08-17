@@ -3,10 +3,14 @@
 //// Everything downstream (build, sign, serve) is pure functions of this.
 
 import dns/name.{type Name}
+import dns/rdata
+import dnssec/keys
 import gleam/bit_array
+import gleam/crypto
 import gleam/list
 import gleam/result
 import gleam/string
+import provider/state as provider_state
 import rekor/proof
 import rekor/publish as rekor_publish
 import rekor/store as rekor_store
@@ -57,6 +61,12 @@ pub type ZoneInput {
     /// name: part 1 at `_synchronicity-rekor`, part n at
     /// `_synchronicity-rekor-<n>`.
     rekor_proofs: List(#(Int, String)),
+    /// How many servable proofs the byte budget dropped (§4.2 of
+    /// docs/EXTERNAL-APEX-OWNERSHIP.md). Normally zero — the serving filter
+    /// keeps the set small enough that the budget is unreachable — and
+    /// reported rather than silent when it is not, because a cap nobody is
+    /// told about is how a zone quietly stops covering a live key.
+    rekor_shed: Int,
   )
 }
 
@@ -81,21 +91,60 @@ pub fn read(conn: Connection) -> Result(ZoneInput, ModelError) {
   use meta <- result.try(read_meta(conn))
   use ns_hosts <- result.try(read_ns(conn, meta.apex))
   use txt_names <- result.try(read_txt_names(conn, meta.apex))
-  use rekor_proofs <- result.try(read_rekor_proofs(conn))
-  Ok(ZoneInput(meta, ns_hosts, txt_names, rekor_proofs))
+  use live_keys <- result.try(live_keys(conn, meta))
+  use #(rekor_proofs, shed) <- result.try(read_rekor_proofs(conn, live_keys))
+  Ok(ZoneInput(meta, ns_hosts, txt_names, rekor_proofs, shed))
 }
 
-/// The proof records this zone serves — every verified non-retire record;
-/// with key-set claims there is no per-tag selection, a client tries each.
+/// The digests of the DNSKEY rdata this zone currently publishes — what the
+/// serving filter holds proofs to (`rekor/store.servable`).
+///
+/// Each mode already knows its own key set, and the branch is the mode: a
+/// zone key of its own means this service signs, so the set is what
+/// `zone/build` puts in the DNSKEY RRset — the active key, plus the incoming
+/// one while a rollover stages it. No key means external mode, where the
+/// provider holds the keys and the watcher's `observed_zone_keys` is the
+/// record of what it saw on the validated wire.
+fn live_keys(
+  conn: Connection,
+  meta: ZoneMeta,
+) -> Result(List(BitArray), ModelError) {
+  case meta.dnskey_public {
+    <<>> ->
+      provider_state.observed_keys(conn)
+      |> result.map_error(Db)
+      |> result.map(list.map(_, fn(key) { key.key_sha256 }))
+    public -> {
+      let rdatas = case meta.dnskey_incoming {
+        <<>> -> [rdata.dnskey(keys.flags, keys.algorithm, public)]
+        incoming -> [
+          rdata.dnskey(keys.flags, keys.algorithm, public),
+          rdata.dnskey(keys.flags, keys.algorithm, incoming),
+        ]
+      }
+      Ok(list.map(rdatas, crypto.hash(crypto.Sha256, _)))
+    }
+  }
+}
+
+/// The proof records this zone serves, and how many the budget dropped.
+///
+/// With key-set claims there is no per-tag selection — a client tries each
+/// proof it can reassemble and membership in a verified set decides — so
+/// what this has to get right is *which* claims are worth serving at all.
+/// `servable` answers that: the ones covering a key the zone publishes.
 ///
 /// A stored row that cannot be turned back into a proof is dropped rather
 /// than served: a malformed record would make every client refuse the whole
 /// zone, which is a worse outcome than the one the row was meant to fix.
 fn read_rekor_proofs(
   conn: Connection,
-) -> Result(List(#(Int, String)), ModelError) {
-  use records <- result.try(rekor_store.servable(conn) |> result.map_error(Db))
-  Ok(
+  live_keys: List(BitArray),
+) -> Result(#(List(#(Int, String)), Int), ModelError) {
+  use records <- result.try(
+    rekor_store.servable(conn, live_keys) |> result.map_error(Db),
+  )
+  let encoded =
     records
     |> list.filter_map(fn(record) {
       // A row that will not encode is dropped for the same reason a
@@ -106,13 +155,69 @@ fn read_rekor_proofs(
         Error(_) -> Error(Nil)
       }
     })
-    // One proof is several records, and they go to *different* owner names:
-    // part 1 at the base, part n one label along. Providers cap the combined
-    // content of a single name — Cloudflare at 8192 wire bytes, which one
-    // ICANN-rooted proof exceeds by itself — so the parts have to spread.
-    |> list.flatten
-    |> list.map(fn(text) { #(proof.part_index_of(text), text) }),
-  )
+  // `servable` returns newest first, so taking a prefix sheds the oldest
+  // claims — the ones least likely to still be covering a key on the wire.
+  let #(kept, shed) = proofs_within_budget(encoded)
+  Ok(#(
+    kept
+      // One proof is several records, and they go to *different* owner names:
+      // part 1 at the base, part n one label along. Providers cap the
+      // combined content of a single name, and it is the base name that
+      // fills up, because every proof has a part 1 and they all share it.
+      |> list.flatten
+      |> list.map(fn(text) { #(proof.part_index_of(text), text) }),
+    shed,
+  ))
+}
+
+/// The room a proof's part 1 has at the shared base name.
+///
+/// Cloudflare refuses more than 8192 wire-format bytes of combined content
+/// at one name and type, the tightest cap among the providers this supports,
+/// and the budget holds back one part's worth of that so a chain that grows
+/// a delegation level does not tip the zone over. The serving filter is what
+/// keeps the served set to two or three proofs in the first place; this is
+/// the guard that makes a pathological set shed history instead of handing a
+/// provider a write it will refuse.
+const part_one_budget = 6144
+
+/// The proofs that fit at the shared base name, newest first, and how many
+/// older ones were dropped. Exposed so a table test can hold the budget
+/// still without standing up a log.
+pub fn proofs_within_budget(
+  proofs: List(List(String)),
+) -> #(List(List(String)), Int) {
+  within_budget(proofs, 0, [], 0)
+}
+
+fn within_budget(
+  proofs: List(List(String)),
+  used: Int,
+  kept: List(List(String)),
+  shed: Int,
+) -> #(List(List(String)), Int) {
+  case proofs {
+    [] -> #(list.reverse(kept), shed)
+    [proof_parts, ..rest] -> {
+      let cost = part_one_bytes(proof_parts)
+      case used + cost > part_one_budget {
+        // Everything behind this one is older, so it is shed too.
+        True -> #(list.reverse(kept), shed + 1 + list.length(rest))
+        False -> within_budget(rest, used + cost, [proof_parts, ..kept], shed)
+      }
+    }
+  }
+}
+
+/// One part's wire cost: its characters plus the one length byte each
+/// 255-byte character-string carries.
+fn part_one_bytes(parts: List(String)) -> Int {
+  parts
+  |> list.filter(fn(text) { proof.part_index_of(text) == 1 })
+  |> list.fold(0, fn(total, text) {
+    let length = string.length(text)
+    total + length + { length / 255 } + 1
+  })
 }
 
 /// The health probe's view of the zone: current serial and the soonest

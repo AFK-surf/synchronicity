@@ -1,32 +1,41 @@
-//// The pure half of reconciliation: what the provider holds versus what
-//// the zone wants, as a change set — or a refusal.
+//// The pure half of reconciliation: what the provider holds below the apex
+//// versus what the zone wants, as a change set — or a refusal.
 ////
-//// Three rules make the reconciler incapable of eating a zone it does not
-//// own, and they live here so a table test can hold each one still:
+//// The apex is a name this deployment owns outright
+//// (docs/EXTERNAL-DNS-PROVIDER.md §5.2), which is what lets the scope be
+//// structural: every TXT record strictly below it is ours to reconcile, so a
+//// record down there that the renderer did not produce is drift and drift is
+//// removed. Two rules keep that power from ever pointing at a zone this
+//// deployment does not own, and they live here so a table test can hold each
+//// one still:
 ////
-////   - **Scope.** Operations are computed only over the names the caller
-////     listed; nothing else is ever compared, so nothing else can be
-////     touched. The `_synchronicity` prefix makes the managed set disjoint
-////     from human-managed records by construction.
-////   - **Ownership.** The first sync writes a marker TXT
-////     (`_synchronicity-owner.<apex>`). At any managed name holding data we
-////     did not render, the diff refuses with a named conflict unless the
-////     marker exists — byte-equal records are adopted silently, because
-////     re-creating what is already right is how a migration stays boring.
-////   - **No foreign types.** A non-TXT record squatting at a managed name
-////     is a conflict, never a casualty; external mode only ever publishes
-////     TXT and only ever deletes what it could have published.
+////   - **Ownership.** Deletes require the marker at
+////     `_synchronicity-owner.<apex>`, carrying the scope it authorizes.
+////     Absent it, a record below the apex that we did not render is a named
+////     conflict and the pass touches nothing — which is what a first sync
+////     against an apex somebody else is using looks like. Byte-equal records
+////     are adopted silently, because re-creating what is already right is how
+////     a migration stays boring.
+////   - **TXT only.** A leg lists nothing else, so a record of another type
+////     below the apex never reaches this module: it cannot be deleted and
+////     cannot be a conflict. The rule is structural rather than checked.
 
+import gleam/int
 import gleam/list
+import gleam/order
 import gleam/string
 import provider/provider.{type Changes, type Existing, type Record, Changes}
 
 /// The marker's owner label, below the apex.
 pub const owner_label = "_synchronicity-owner"
 
-/// The marker's value. The external-dns "heritage" convention, so an
-/// operator inspecting the zone can tell whose reconciler claims it.
-pub const owner_value = "heritage=synchronicity-cp"
+/// The marker's value: the external-dns "heritage" convention, plus the
+/// scope it authorizes.
+///
+/// The scope rides in the value because the value is what gates deletes. A
+/// reconciler that finds a marker it does not recognise holds a zone whose
+/// contents it has no licence to remove, and says so instead of guessing.
+pub const owner_value = "heritage=synchronicity-cp,scope=apex"
 
 /// The marker record for an apex (no trailing dot in `apex_name`, matching
 /// how provider APIs spell names).
@@ -40,22 +49,30 @@ pub fn owner_record(apex_name: String) -> Record {
 }
 
 pub type Conflict {
-  /// A managed name holds a record we did not render, and no ownership
-  /// marker says the zone is ours to correct.
+  /// A name below the apex holds a record we did not render, and no
+  /// ownership marker says this apex is ours to correct.
   Foreign(name: String, value: String)
+  /// The marker name holds something that is not this deployment's marker.
+  ///
+  /// Its own conflict because its own remedy: every other conflict is a
+  /// record that belongs somewhere else, while this one is a marker written
+  /// by a different control plane — or by a build whose scope was narrower
+  /// than this one's. Overwriting it would hand this reconciler a licence to
+  /// delete that nobody granted it, so it is refused until somebody removes
+  /// the record and lets this deployment write its own.
+  MarkerMismatch(name: String, value: String)
 }
 
-/// Computes the change set. `existing` must be the provider's records at
-/// managed names only — the caller listed exactly those.
+/// Computes the change set. `existing` is every TXT record the provider
+/// holds strictly below the apex.
 pub fn diff(
   desired: List(Record),
   existing: List(Existing),
 ) -> Result(Changes, Conflict) {
-  // The marker has to be *ours*. Checking only the leftmost label made any
-  // control plane's marker satisfy every other one's ownership test — so two
-  // sharing a zone would each take the other's records for strays and delete
-  // them, with the refusal rule never firing. The desired set names our
-  // marker; nothing else counts as it.
+  // The marker has to be *ours*, by name and by value. Checking only the
+  // leftmost label made any control plane's marker satisfy every other one's
+  // ownership test, and checking only the value would let an older scope
+  // authorize a wider one.
   let ours =
     list.filter_map(desired, fn(d) {
       case d.value == owner_value && starts_with_label(d.name, owner_label) {
@@ -77,9 +94,18 @@ pub fn diff(
   let foreign =
     list.filter(existing, fn(e) { !list.any(desired, fn(d) { matches(e, d) }) })
 
-  case owned, foreign {
-    False, [first, ..] -> Error(Foreign(first.record.name, first.record.value))
-    _, _ -> {
+  // A marker that is not ours is reported as itself, ahead of anything else
+  // it makes foreign: it is the reason the pass cannot proceed, and it is the
+  // one conflict an operator fixes by deleting rather than by moving.
+  let stale_marker =
+    list.find(foreign, fn(e) { starts_with_label(e.record.name, owner_label) })
+
+  case owned, stale_marker, foreign {
+    False, Ok(marker), _ ->
+      Error(MarkerMismatch(marker.record.name, marker.record.value))
+    False, _, [first, ..] ->
+      Error(Foreign(first.record.name, first.record.value))
+    _, _, _ -> {
       let create =
         list.filter(desired, fn(d) {
           !list.any(existing, fn(e) { matches(e, d) })
@@ -93,8 +119,57 @@ pub fn diff(
             Error(Nil) -> Error(Nil)
           }
         })
-      Ok(Changes(create: create, replace: replace, delete: foreign))
+      Ok(Changes(
+        create: list.sort(create, by_priority),
+        replace: replace,
+        delete: foreign,
+      ))
     }
+  }
+}
+
+/// Creates go out in dependency order rather than name order.
+///
+/// The marker first, because it is what authorizes everything else and a
+/// first sync that stopped after it has still made the zone ours. The
+/// declaration next, because every logged claim is a signed copy of it and a
+/// zone without one has no working transparency at all. Membership after
+/// that, because it is the product. The proofs last, because they are the
+/// only records big enough for a provider to refuse on size, and a refused
+/// proof must never be the reason a device add did not land.
+fn by_priority(a: Record, b: Record) -> order.Order {
+  case int.compare(priority(a.name), priority(b.name)) {
+    order.Eq ->
+      case string.compare(a.name, b.name) {
+        order.Eq -> string.compare(a.value, b.value)
+        other -> other
+      }
+    other -> other
+  }
+}
+
+fn priority(name: String) -> Int {
+  case starts_with_label(name, owner_label) {
+    True -> 0
+    False ->
+      case starts_with_label(name, "_synchronicity-transparency") {
+        True -> 1
+        False ->
+          case
+            starts_with_label(name, "_synchronicity-rekor") || is_part(name)
+          {
+            True -> 3
+            False -> 2
+          }
+      }
+  }
+}
+
+/// `_synchronicity-rekor-<n>`, the later parts of a proof.
+fn is_part(name: String) -> Bool {
+  case string.split_once(name, ".") {
+    Ok(#(first, _)) -> string.starts_with(first, "_synchronicity-rekor-")
+    Error(Nil) -> False
   }
 }
 

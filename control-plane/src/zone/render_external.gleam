@@ -29,17 +29,32 @@ import zone/model.{type ZoneInput}
 /// TTLs mirror the serving builder's: data churns, infrastructure doesn't.
 pub const ttl_data = 300
 
-pub const ttl_rekor = 86_400
+/// The proof records' TTL, and the reason it is as short as the data it
+/// guards.
+///
+/// A client caches nothing itself, so the only thing this number controls is
+/// how long the recursive resolver a client asks will keep serving the proof
+/// set from before a provider rotated. That interval is the tail of the
+/// window in which a `Require` client fails closed, and it has to fit —
+/// together with the watch cadence — inside the lifetime of the membership a
+/// client is already holding, or a routine rotation costs member bindings
+/// rather than a few refreshes:
+///
+///     watch cadence + publish + ttl_proof  <  ttl_data + client trust grace
+///     300          + 60      + 300         <  300      + 600
+pub const ttl_proof = 300
+
+/// The declaration's TTL. Its content is fixed forever — the same twenty
+/// bytes every zone publishes — so there is nothing for a short TTL to buy.
+pub const ttl_declaration = 86_400
 
 /// Renders the desired record set, canonically sorted.
 ///
-/// Every name is under the **apex**, never the signing zone. Two control
-/// planes may share one provider-hosted zone, and if they shared a record
-/// name each reconciler would see the other's records as strays at a name it
-/// manages and delete them — forever, on every sweep. Scoping to the apex
-/// makes that collision unrepresentable rather than merely unlikely. The
-/// client finds these names from the `apex=` field of the membership record
-/// it has already validated.
+/// Every name is under the **apex**, never the signing zone. The apex is a
+/// name this deployment owns outright, so everything below it is ours to
+/// publish and — by the same rule — ours to remove when we stop rendering it.
+/// The client finds these names from the `apex=` field of the membership
+/// record it has already validated.
 pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
   use Nil <- result.try(build.validate(input))
   let apex = apex_name(input)
@@ -65,7 +80,7 @@ pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
       Record(
         build.rekor_part_label(index) <> "." <> apex,
         provider.Txt,
-        ttl_rekor,
+        ttl_proof,
         text,
       )
     })
@@ -76,36 +91,13 @@ pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
     Record(
       rdata.transparency_label <> "." <> apex,
       provider.Txt,
-      ttl_rekor,
+      ttl_declaration,
       rdata.transparency_text,
     )
   Ok(sort(
     [diff.owner_record(apex), transparency, ..members]
     |> list.append(rekor),
   ))
-}
-
-/// Every name the rendered set can ever occupy — what the reconciler asks
-/// the provider to list. Includes the empty-set names (`_rekor`, each
-/// network owner) so records we *stopped* rendering still get found and
-/// deleted.
-pub fn managed_names(input: ZoneInput) -> List(String) {
-  let apex = apex_name(input)
-  let owners =
-    list.map(input.txt_names, fn(txt_name) {
-      strip_dot(name.to_string(txt_name.owner))
-    })
-  [diff.owner_label <> "." <> apex, ..rekor_part_names(input, apex)]
-  |> list.append([rdata.transparency_label <> "." <> apex, ..owners])
-  |> list.unique
-}
-
-/// Every proof-part name the rendered set can occupy, so a part we stopped
-/// rendering is still found and deleted.
-fn rekor_part_names(input: ZoneInput, apex: String) -> List(String) {
-  input.rekor_proofs
-  |> list.map(fn(pair) { build.rekor_part_label(pair.0) <> "." <> apex })
-  |> list.unique
 }
 
 /// SHA-256 over the canonically rendered set: the reconciler's stored

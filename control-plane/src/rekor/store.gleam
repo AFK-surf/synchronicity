@@ -16,6 +16,7 @@
 
 import gleam/list
 import gleam/result
+import gleam/string
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 
 pub type Record {
@@ -165,12 +166,43 @@ pub fn covered(
   Ok(!list.is_empty(rows))
 }
 
-/// The proof records a zone serves — every verified record except `retire`
-/// entries, which are monitor breadcrumbs (§2): they are never served,
+/// The proof records a zone serves: every verified record that could
+/// authorize an answer the zone is capable of giving, newest first.
+///
+/// Two filters, for two different reasons.
+///
+/// `retire` entries are monitor breadcrumbs (§2) and are never served,
 /// because a client that enforced them would be treating the log as a
 /// revocation channel, which it is not.
-pub fn servable(conn: Connection) -> Result(List(Record), sqlite.Error) {
-  select(conn, "WHERE r.action != 'retire'", [])
+///
+/// The rest are held to `live_keys` — the digests of the DNSKEY rdata the
+/// zone currently publishes. A proof authorizes an answer when the key that
+/// signed it is a member of the proof's key set, so a claim covering no
+/// live key can never authorize anything: it is history. Keeping it in the
+/// table is how an operator compares monitor reports against what they
+/// published; serving it would cost every client a chain walk it can only
+/// reject, and cost the zone bytes at an owner name a provider caps.
+///
+/// An empty `live_keys` means "the caller does not know yet" — an external
+/// deployment that has booted but not yet observed the provider's keys — and
+/// serves everything, so a boot never blanks the proofs it already has.
+pub fn servable(
+  conn: Connection,
+  live_keys: List(BitArray),
+) -> Result(List(Record), sqlite.Error) {
+  case live_keys {
+    [] -> select(conn, "WHERE r.action != 'retire'", [])
+    _ -> {
+      let placeholders =
+        live_keys |> list.map(fn(_) { "?" }) |> string.join(",")
+      let where_clause = "WHERE r.action != 'retire'
+           AND EXISTS (SELECT 1 FROM rekor_record_keys k
+                        WHERE k.keyset_sha256 = r.keyset_sha256
+                          AND k.action = r.action
+                          AND k.key_sha256 IN (" <> placeholders <> "))"
+      select(conn, where_clause, list.map(live_keys, Blob))
+    }
+  }
 }
 
 fn select(

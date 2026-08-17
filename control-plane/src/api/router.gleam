@@ -258,20 +258,23 @@ fn healthz(serving: Serving) -> Response {
 /// serving whatever was last applied, the same stance `healthz` takes on
 /// absent TUF material in serve mode.
 fn healthz_external(zone_pool: pool.Pool) -> Response {
+  let now = middleware.now_unix()
   let looked =
     pool.with_connection(zone_pool, fn(conn) {
       #(
         model.read_meta(conn),
         provider_state.get(conn),
         provider_state.observed_keys(conn),
+        provider_state.oldest_unlogged_age(conn, now),
       )
     })
   case looked {
-    Ok(#(Ok(meta), Ok(state), Ok(keys))) -> {
+    Ok(#(Ok(meta), Ok(state), Ok(keys), unlogged_age)) -> {
       let synced = case state {
         Ok(s) ->
           s.last_synced_serial == option.Some(meta.soa_serial)
           && s.last_error == option.None
+          && s.last_failures == option.None
         Error(Nil) -> False
       }
       let logged = list.filter(keys, fn(key) { key.logged_at != option.None })
@@ -282,6 +285,15 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
         #("provider_in_sync", json.bool(synced)),
         #("keys_observed", json.int(list.length(keys))),
         #("keys_logged", json.int(list.length(logged))),
+        // How long the watch loop has been behind the wire, which is the
+        // one number that says whether the next answer may fail closed.
+        #(
+          "oldest_unlogged_age",
+          json.nullable(
+            option.from_result(unlogged_age) |> option.flatten,
+            json.int,
+          ),
+        ),
         ..case state {
           Ok(s) -> [
             #("provider", json.string(s.provider)),
@@ -295,6 +307,14 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
             #(
               "provider_last_error_at",
               json.nullable(s.last_error_at, json.int),
+            ),
+            #(
+              "provider_last_failures",
+              json.nullable(s.last_failures, json.string),
+            ),
+            #(
+              "provider_last_partial_at",
+              json.nullable(s.last_partial_at, json.int),
             ),
           ]
           Error(Nil) -> [#("provider", json.string("never synced"))]
