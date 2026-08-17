@@ -13,20 +13,48 @@ import gleam/option.{Some}
 import rekor/cert
 import simplifile
 
-// TODO when this is next regenerated: include a link with at least 128
-// bytes of rdata. Everything here is short-form DER, so neither side's
-// long-form length encoder is exercised by the shared fixture — and every
-// real chain is kilobytes. The contract is written down and checked on the
-// Rust side (`chain_links_use_ders_long_form_lengths_exactly`), but a
-// Gleam-authored fixture crossing 128 bytes is what would actually hold the
-// two encoders together.
 const dir = "test/fixtures/rekor/crossval/"
 
-pub fn main() {
-  let links = [
+/// `n` bytes of `i * 7 mod 256`, which is a permutation (7 is odd, so it
+/// generates Z/256) — every byte value appears before any repeats, and a
+/// reader that drops or reorders one shifts the whole tail rather than
+/// landing on a plausible-looking value.
+pub fn pattern(n: Int) -> BitArray {
+  build_pattern(0, n, <<>>)
+}
+
+fn build_pattern(i: Int, n: Int, acc: BitArray) -> BitArray {
+  case i >= n {
+    True -> acc
+    False -> build_pattern(i + 1, n, <<acc:bits, { i * 7 % 256 }:8>>)
+  }
+}
+
+/// The chain the fixture pins, and the single Gleam-side definition of it:
+/// `rekor_test` asserts *this* list encodes to the checked-in bytes, so a
+/// generator edit that is never regenerated fails instead of drifting. The
+/// Rust suite restates the same structure independently — that restatement
+/// is the actual cross-language check.
+///
+/// The two long links are the point. A chain of real DNSKEY/DS/RRSIG sets
+/// is kilobytes, so every link in production uses DER's *long form* length;
+/// a fixture of only short-form links leaves both sides' long-form encoders
+/// untested, and an off-by-one there passes the whole suite and fails on
+/// the first live submission. 200 bytes takes the one-byte long form
+/// (`0x81 0xc8`), 256 takes the two-byte form (`0x82 0x01 0x00`), and
+/// together they push the outer SEQUENCE over 255 so its own length is
+/// long-form too.
+pub fn links() -> List(cert.Link) {
+  [
     cert.Link("sync.test.", <<0xaa, 0xbb, 0xcc>>),
     cert.Link(".", <<0x01, 0x02>>),
+    cert.Link("long.sync.test.", pattern(200)),
+    cert.Link("longer.sync.test.", pattern(256)),
   ]
+}
+
+pub fn main() {
+  let links = links()
   let write = fn(name, bits) {
     let assert Ok(Nil) = simplifile.write_bits(dir <> name, bits)
     io.println("wrote " <> dir <> name)

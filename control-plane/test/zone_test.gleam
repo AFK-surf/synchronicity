@@ -121,7 +121,9 @@ pub fn build_refuses_bad_input_test() {
   // And an ordinary hint is untouched.
   let fine =
     ZoneInput(..input, txt_names: [
-      TxtName(owner, [Member("a", nk(), "https://relay.example", "1.2.3.4:4433")]),
+      TxtName(owner, [
+        Member("a", nk(), "https://relay.example", "1.2.3.4:4433"),
+      ]),
     ])
   let assert Ok(_) = build.build(fine)
 }

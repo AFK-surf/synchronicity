@@ -30,6 +30,7 @@ import rekor/statement
 import rekor/store
 import simplifile
 import store/sqlite
+import tools/gen_crossval
 import zone/build
 import zone/model.{Member, NsHost, TxtName, ZoneInput, ZoneMeta}
 import zone/publish
@@ -608,12 +609,36 @@ fn chunks(rdata: BitArray) -> Result(String, Nil) {
 /// deterministic — fixed inputs, no signatures — so both suites can hold the
 /// same bytes still: crates/synch-net/tests/rekor_zone_key.rs reads exactly
 /// these files.
+///
+/// The link list comes from the generator rather than being restated here,
+/// so editing `gen_crossval` without re-running it fails this test instead
+/// of leaving the checked-in bytes describing a chain nobody builds. The
+/// Rust suite restates the structure independently — that restatement, not
+/// this one, is the cross-language check.
 pub fn the_chain_extension_encodes_the_crossval_bytes_test() {
-  let links = [
-    cert.Link("sync.test.", <<0xaa, 0xbb, 0xcc>>),
-    cert.Link(".", <<0x01, 0x02>>),
-  ]
-  assert cert.encode_chain(links) == fixture("crossval/chain.der")
+  assert cert.encode_chain(gen_crossval.links())
+    == fixture("crossval/chain.der")
+}
+
+/// The long-form DER lengths, which the fixture reaches only because two of
+/// its links are deliberately large.
+///
+/// A chain of real DNSKEY/DS/RRSIG sets is kilobytes, so long-form lengths
+/// are what production uses everywhere and short-form is the case that
+/// almost never runs. An earlier fixture was 30 bytes — two links of 3 and
+/// 2 rdata bytes — so both sides' long-form encoders were untested by the
+/// thing whose whole job is keeping them together.
+pub fn the_crossval_chain_exercises_both_der_length_forms_test() {
+  let der = fixture("crossval/chain.der")
+  // 200 bytes of rdata: OCTET STRING, one-byte long form.
+  assert contains(der, <<0x04, 0x81, 0xc8>>)
+  // 256: two-byte long form.
+  assert contains(der, <<0x04, 0x82, 0x01, 0x00>>)
+  // And the short form is still present, so neither replaced the other.
+  assert contains(der, <<0x04, 0x03, 0xaa, 0xbb, 0xcc>>)
+  // The outer SEQUENCE is over 255 bytes, so its own length is long-form.
+  let assert <<0x30, first_len_byte:8, _:bits>> = der
+  assert int.bitwise_and(first_len_byte, 0x80) == 0x80
 }
 
 /// A certificate this side builds, read back by this side and — from the

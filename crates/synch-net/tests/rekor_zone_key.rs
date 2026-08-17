@@ -801,6 +801,12 @@ fn the_gleam_certificate_encoders_agree_with_this_one() {
         zonecert::{ChainLink, DnssecChain, OID_DNSSEC_CHAIN},
     };
 
+    // Restated here rather than shared: the Gleam side reads this list out
+    // of its own generator, so the two definitions agreeing is the actual
+    // cross-language check. `i * 7 mod 256` is a permutation of Z/256, so a
+    // reader that drops or reorders a byte shifts the whole tail instead of
+    // landing somewhere plausible.
+    let pattern = |n: usize| -> Vec<u8> { (0..n).map(|i| (i * 7 % 256) as u8).collect() };
     let chain = DnssecChain {
         links: vec![
             ChainLink {
@@ -810,6 +816,17 @@ fn the_gleam_certificate_encoders_agree_with_this_one() {
             ChainLink {
                 zone: ".".into(),
                 rrs: vec![0x01, 0x02],
+            },
+            // The two links that reach DER's long-form lengths — the form
+            // every production chain uses, and the form a 30-byte fixture
+            // of short links left untested on both sides.
+            ChainLink {
+                zone: "long.sync.test.".into(),
+                rrs: pattern(200),
+            },
+            ChainLink {
+                zone: "longer.sync.test.".into(),
+                rrs: pattern(256),
             },
         ],
     };
