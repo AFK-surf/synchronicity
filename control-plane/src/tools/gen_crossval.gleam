@@ -13,6 +13,13 @@ import gleam/option.{Some}
 import rekor/cert
 import simplifile
 
+// TODO when this is next regenerated: include a link with at least 128
+// bytes of rdata. Everything here is short-form DER, so neither side's
+// long-form length encoder is exercised by the shared fixture — and every
+// real chain is kilobytes. The contract is written down and checked on the
+// Rust side (`chain_links_use_ders_long_form_lengths_exactly`), but a
+// Gleam-authored fixture crossing 128 bytes is what would actually hold the
+// two encoders together.
 const dir = "test/fixtures/rekor/crossval/"
 
 pub fn main() {

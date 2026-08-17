@@ -1474,3 +1474,79 @@ fn a_records_part_count_is_capped_at_what_a_proof_can_need() {
         "the cap must admit a real proof several times over"
     );
 }
+
+/// The DER length encoding, pinned explicitly, because the shared fixture
+/// cannot reach it.
+///
+/// The chain extension is the one structure the Gleam publisher and this
+/// Rust verifier both have to produce and consume byte for byte, and a real
+/// chain is kilobytes — so every link uses DER's *long form* length. The
+/// Gleam-authored crossval fixture is 30 bytes of chain (two links of 3 and
+/// 2 rdata bytes), so it exercises only the short form: an off-by-one in
+/// either side's long-form encoder would pass the entire cross-language
+/// suite and be discovered by a live submission no client could read.
+///
+/// This does not fix that — only regenerating the fixture with a large link
+/// does — but it writes the contract down where both sides can be checked
+/// against it, rather than leaving it implied by bytes that never test it.
+#[test]
+fn chain_links_use_ders_long_form_lengths_exactly() {
+    use synch_net::zonecert::{ChainLink, DnssecChain};
+
+    // A link whose rdata crosses each boundary the encoding changes at.
+    let cases = [
+        // 127 bytes: the last value the short form can carry.
+        (127usize, vec![0x7f_u8]),
+        // 128: the first long form, one length byte.
+        (128, vec![0x81, 0x80]),
+        (255, vec![0x81, 0xff]),
+        // 256: two length bytes.
+        (256, vec![0x82, 0x01, 0x00]),
+        // A realistic chain link.
+        (1100, vec![0x82, 0x04, 0x4c]),
+    ];
+    for (size, expected_len_bytes) in cases {
+        let chain = DnssecChain {
+            links: vec![ChainLink {
+                zone: "sync.example.".into(),
+                rrs: vec![0xab; size],
+            }],
+        };
+        let der = chain.encode();
+
+        // The OCTET STRING holding the rdata: tag 0x04, then the length in
+        // whichever form DER requires for that size.
+        let mut wanted = vec![0x04u8];
+        wanted.extend_from_slice(&expected_len_bytes);
+        assert!(
+            der.windows(wanted.len()).any(|w| w == wanted),
+            "a {size}-byte link must encode its length as {expected_len_bytes:02x?}"
+        );
+
+        // And it round-trips, so the reader agrees with the writer.
+        assert_eq!(
+            DnssecChain::decode(&der).expect("a long-form chain must decode"),
+            chain
+        );
+    }
+
+    // The reader refuses the second spelling of a short length, so a producer
+    // that used the long form under 128 could not slip past.
+    let short = DnssecChain {
+        links: vec![ChainLink {
+            zone: "sync.example.".into(),
+            rrs: vec![0xab; 5],
+        }],
+    };
+    let mut non_minimal = short.encode();
+    // Rewrite the innermost OCTET STRING length 0x05 as 0x81 0x05.
+    let at = non_minimal
+        .windows(2)
+        .position(|w| w == [0x04, 0x05])
+        .expect("the octet string header");
+    non_minimal.splice(at + 1..at + 2, [0x81, 0x05]);
+    assert!(
+        DnssecChain::decode(&non_minimal).is_err(),
+        "a long-form length under 128 is a second spelling and must be refused"
+    );
+}

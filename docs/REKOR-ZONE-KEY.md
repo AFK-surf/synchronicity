@@ -524,9 +524,16 @@ Then, in process, no network:
   key that signed the answer is a **member** of it, `predicate.apex` = the
   RRSIG signer, and `action` ∈ {`create`, `rollover`};
 
-Steps 2 and 3 are cacheable on their own TTLs (the proof records carry a
-24 h TTL; the zone key changes rarely) — the steady-state refresh cost stays
-one TXT query.
+Steps 2 and 3 carry their own TTLs — the proof records are served with a
+24 h one, and the zone key changes rarely — but **the client does not
+currently cache them**, so a membership refresh under `require` really does
+perform all three lookups every time, plus whatever DNSKEY and DS queries
+hickory issues to validate each of them. At a TTL clamped to the 60 s floor
+that is tens of round trips a minute, not the one TXT query an earlier
+revision of this section claimed. The TTLs make the caching *possible*; a
+cache in front of the DoH handle is what would make it real, and it is not
+written yet. Stated here rather than left as an aspiration the numbers
+elsewhere in this document quietly assume.
 
 ### 4.2.1 Why the client verifies a chain it does not need
 
@@ -994,9 +1001,10 @@ correctly rather than inverting on the outcome that matters most.
   base64; §3 explains why that is a floor.) The client downloads all of it
   and uses the chain
   only to enforce a property it already knows — see §4.2.1 for why it must
-  anyway. Amortized by the 24 h TTL, but it is a real transfer of cost from
-  the parties who benefit (monitors, and through them every operator) to the
-  parties who pay (clients).
+  anyway. The 24 h TTL would amortize it if the client cached; it does not
+  yet (§4.2), so today this is paid on every refresh. Either way it is a real
+  transfer of cost from the parties who benefit (monitors, and through them
+  every operator) to the parties who pay (clients).
 - **Clients acquire a CDN dependency, bounded.** Following Sigstore's pin set
   means a daemon reaches `tuf-repo-cdn.sigstore.dev`: a few hundred KB, at
   most once a day, on a path where failure is a non-event by construction
