@@ -165,8 +165,14 @@ fn bool_guard(fail: Bool, next: fn() -> Result(a, Nil)) -> Result(a, Nil) {
   }
 }
 
+/// Folds A-Z and nothing else, by byte.
+///
+/// Deliberately not `string.lowercase`, which is Erlang's full Unicode case
+/// folding: RFC 4034 §6.2 canonical form lowercases ASCII A-Z only, and a
+/// DNS label is arbitrary octets, so a UTF-8 label does reach here and would
+/// fold differently. The qname is echoed into the response question section,
+/// so a divergence here is a divergence in what was signed.
 fn lowercase_ascii(s: String) -> String {
-  // Labels are ASCII; string.lowercase is correct and cheap for them.
   case s {
     "" -> ""
     _ ->

@@ -150,7 +150,15 @@ fn publish_error(e: publish.PublishError) -> Response {
 
 /// Human text (and a stable error code) for every way a zone build can
 /// refuse — constructor dumps never reach API clients.
-fn build_refusal(e: build.BuildError) -> #(String, String) {
+///
+/// Public because the API layer refuses the same three per-member rules up
+/// front, before attempting a mutation (see api/devices_api). That check is
+/// deliberately separate from this one, but the *vocabulary* is not: one
+/// broken rule must name itself the same way whether it is caught at the
+/// request or at the publish, or a client cannot write one handler for it.
+/// Only the status differs — 400 for a malformed request, 409 because the
+/// zone the request would produce is the malformed thing.
+pub fn build_refusal(e: build.BuildError) -> #(String, String) {
   case e {
     build.NoNameservers -> #(
       "no_nameservers",
@@ -174,7 +182,8 @@ fn build_refusal(e: build.BuildError) -> #(String, String) {
     )
     build.InvalidNk(_) -> #(
       "invalid_nk",
-      "a device key is not a 52-character z-base-32 ed25519 public key",
+      "a device key is not a 52-character z-base-32 ed25519 public key — the "
+        <> "`nk` value printed by `synch id`",
     )
     build.AmbiguousNk(_) -> #(
       "ambiguous_nk",

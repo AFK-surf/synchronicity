@@ -1125,6 +1125,15 @@ int main(int argc, char **argv) {
         }
         size_t sql_len = c.len - c.pos;
         const uint8_t *sql = get_bytes(&c, sql_len);
+        /* Same guard OP_EXEC applies, for the same reason: sqlite3_exec
+         * stops at the first NUL, so an embedded one would silently hide
+         * every statement after it from a script whose whole purpose is to
+         * run all of them. Every caller passes a literal today; this keeps
+         * a future one from discovering that the hard way. */
+        if (sql && memchr(sql, '\0', sql_len) != NULL) {
+          reply_err_msg(SQLITE_MISUSE, "embedded NUL in SQL");
+          break;
+        }
         char *zsql = malloc(sql_len + 1);
         if (!zsql) {
           fputs("csqlite: out of memory\n", stderr);
