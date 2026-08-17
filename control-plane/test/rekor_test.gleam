@@ -833,3 +833,31 @@ pub fn a_malformed_chain_is_refused_before_publishing_test() {
   let assert Error(_) = chain.check_shape([declaration], apex, apex)
   let assert Error(_) = chain.check_shape([], apex, apex)
 }
+
+/// A resolver that declines to answer (SERVFAIL & co.) is not saying the
+/// RRset is absent, and must never be read that way: the key watch's quiet
+/// wait and the collector's "published yet?" hint are only truthful answers
+/// to an answer that genuinely says nothing is there.
+pub fn response_answers_reads_only_real_answers_test() {
+  let assert Ok(owner) = name.parse("sync.test.")
+  let rr = wire.Rr(owner, wire.type_txt, wire.class_in, 300, <<"v=sync1">>)
+  let message = fn(flags, answers) {
+    wire.Message(0, flags, [], answers, [], [])
+  }
+
+  // NOERROR, with and without records.
+  let assert Ok([_]) = chain.response_answers("doh.test", message(0x8000, [rr]))
+  let assert Ok([]) = chain.response_answers("doh.test", message(0x8000, []))
+  // NXDOMAIN is a genuine absence too, not a fault.
+  let assert Ok([]) = chain.response_answers("doh.test", message(0x8003, []))
+
+  // SERVFAIL: a validating resolver's verdict — an error, never an RRset.
+  let assert Error(why) =
+    chain.response_answers("doh.test", message(0x8002, []))
+  assert string.contains(why, "SERVFAIL")
+  assert string.contains(why, "doh.test")
+
+  let assert Error(why) =
+    chain.response_answers("doh.test", message(0x8005, []))
+  assert string.contains(why, "REFUSED")
+}

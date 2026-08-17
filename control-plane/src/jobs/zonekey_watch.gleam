@@ -144,9 +144,12 @@ pub fn run_once_with(
   // puts it in the provider zone. Both actors start at boot, so on a first
   // boot this one can reach the log before that record exists — and then
   // logs nothing, loudly, every quarter hour until it does. Checking first
-  // turns that into a quiet wait for the other half of the boot.
+  // turns that into a quiet wait for the other half of the boot. A lookup
+  // that *fails* is a different event: reported, never narrated as absence.
   case declaration_live(resolver, apex) {
-    False -> {
+    Ok(True) ->
+      log_if_new(conn, apex, signing_zone, resolver, log, log_key, now)
+    Ok(False) -> {
       io.println(
         "zonekey-watch: waiting for the declaration at "
         <> dns_name.to_string([rdata.transparency_label, ..apex])
@@ -154,22 +157,30 @@ pub fn run_once_with(
       )
       False
     }
-    True -> log_if_new(conn, apex, signing_zone, resolver, log, log_key, now)
+    Error(why) -> {
+      io.println_error("zonekey-watch: declaration lookup failed: " <> why)
+      False
+    }
   }
 }
 
 /// Whether the apex's declaration resolves yet. Absence is the ordinary
 /// state of a control plane that has booted but not yet reconciled, so it is
-/// a reason to wait rather than a fault to report.
-fn declaration_live(resolver: chain.Resolver, apex: dns_name.Name) -> Bool {
+/// a reason to wait rather than a fault to report. A failed lookup is not
+/// absence — it says nothing about the record, and reading it as "not
+/// published" would report a regression that may never have happened — so it
+/// comes back as an error for the caller to log, as every failure here is.
+fn declaration_live(
+  resolver: chain.Resolver,
+  apex: dns_name.Name,
+) -> Result(Bool, String) {
   let owner = [rdata.transparency_label, ..apex]
-  case resolver.query(owner, wire.type_txt) {
-    Ok(answers) ->
-      list.any(answers, fn(rr) {
-        rr.rtype == wire.type_txt && rr.class == wire.class_in
-      })
-    Error(_) -> False
-  }
+  use answers <- result.try(resolver.query(owner, wire.type_txt))
+  Ok(
+    list.any(answers, fn(rr) {
+      rr.rtype == wire.type_txt && rr.class == wire.class_in
+    }),
+  )
 }
 
 fn log_if_new(

@@ -385,9 +385,45 @@ fn doh_query(
   case resp.status {
     200 ->
       case wire.decode_message(resp.body) {
-        Ok(message) -> Ok(message.answers)
+        Ok(message) -> response_answers(url, message)
         Error(Nil) -> Error(url <> " returned a message that does not decode")
       }
     status -> Error(url <> " answered " <> int.to_string(status))
+  }
+}
+
+/// The answer section of a decoded response, or why the response is no
+/// answer at all.
+///
+/// NOERROR and NXDOMAIN both *are* answers: an empty section is what a
+/// genuine absence looks like, and each caller has its own words for that
+/// (the collector's "has the zone published its declaration yet?", the
+/// key watch's quiet wait). Any other rcode — SERVFAIL above all, a
+/// validating resolver's verdict, e.g. while a provider re-signs — is the
+/// resolver declining to answer, and must never be read as the RRset being
+/// absent: that reading reports a publish problem that does not exist.
+pub fn response_answers(
+  url: String,
+  message: wire.Message,
+) -> Result(List(wire.Rr), String) {
+  case rcode(message.flags) {
+    // NOERROR or NXDOMAIN.
+    0 | 3 -> Ok(message.answers)
+    code -> Error(url <> " answered " <> rcode_name(code))
+  }
+}
+
+/// The rcode is the low nibble of the flags word (RFC 1035 §4.1.1).
+fn rcode(flags: Int) -> Int {
+  int.bitwise_and(flags, 0b1111)
+}
+
+fn rcode_name(code: Int) -> String {
+  case code {
+    1 -> "FORMERR"
+    2 -> "SERVFAIL"
+    4 -> "NOTIMP"
+    5 -> "REFUSED"
+    other -> "rcode " <> int.to_string(other)
   }
 }
