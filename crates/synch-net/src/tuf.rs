@@ -361,13 +361,37 @@ impl PinState {
         // temporary carries the mode before it is in place, so the state is
         // never briefly world-readable either.
         let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, text)?;
-        restrict(&temporary)?;
         // Durability before visibility: a rename that reaches the directory
         // ahead of the bytes leaves a valid name over an empty file.
-        std::fs::File::open(&temporary).and_then(|file| file.sync_all())?;
+        //
+        // Synced through the handle that did the writing, and closed before
+        // the rename. Reopening read-only to sync works on Unix and cannot
+        // work on Windows, where `sync_all` is `FlushFileBuffers` and needs
+        // write access — it fails `ERROR_ACCESS_DENIED`, so every save on
+        // Windows returned an error and the state was never written at all.
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            // Narrowed before the bytes land, so the state is never briefly
+            // world-readable.
+            restrict(&temporary)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
         match std::fs::rename(&temporary, path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The rename itself, flushed the way the scanner and the CAS
+                // flush theirs (§6.2): best effort, because a platform that
+                // cannot open a directory as a file simply does not get the
+                // guarantee. Without it the bytes are durable but the name
+                // over them need not be.
+                if let Some(parent) = path.parent() {
+                    if let Ok(dir) = std::fs::File::open(parent) {
+                        let _ = dir.sync_all();
+                    }
+                }
+                Ok(())
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(&temporary);
                 Err(e)
