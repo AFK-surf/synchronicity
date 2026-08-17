@@ -558,6 +558,42 @@ async fn a_zone_that_publishes_its_proof_resolves_under_require() {
 }
 
 #[tokio::test]
+async fn a_colliding_tag_unlogged_zsk_does_not_inherit_the_old_proof() {
+    // The live key is the one that verifies the membership RRSIG
+    // (`signing_key_rdata`). Identifying it by 16-bit tag alone would
+    // accept this: old logged DNSKEY first in the set, a new ZSK with the
+    // same tag signs membership, old Rekor proof still served.
+    let (mut zone, log, proof) = logged_zone();
+    let (zsk, signer) = zone.colliding_key();
+    assert_eq!(zsk.calculate_key_tag().unwrap(), zone.key_tag());
+    zone.add_dnskey(zsk);
+    zone.sign_txt_with(signer);
+    zone.rekor_txt = proof.to_txt().expect("encodes");
+
+    let anchor = write(&zone.anchor_record());
+    let log_key = write(&log.key_pem());
+    let (url, server) = zone.serve().await;
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        doh_url: Some(url),
+        trust_anchor: Some(anchor.path().to_path_buf()),
+        rekor: Some(RekorPolicy::Require),
+        rekor_key: Some(log_key.path().to_path_buf()),
+        rekor_state: None,
+        tuf_url: None,
+        no_tuf: true,
+        tuf_root: None,
+    })
+    .unwrap();
+    let error = resolver.member_set("cluster.example").await.unwrap_err();
+    assert!(
+        matches!(error, NetError::RekorBinding { .. }),
+        "an unlogged colliding-tag ZSK must not inherit the old proof: {error}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn an_absent_proof_record_refuses_under_require_and_resolves_under_off() {
     // Phase 0 of the rollout, seen from a phase 2 client: a control plane
     // that has not published yet. Under `require` the answer is discarded

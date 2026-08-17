@@ -138,7 +138,8 @@ async fn an_unsigned_zone_is_refused() {
 /// `Proof::Secure` therefore means "some anchored key signed this", not "the
 /// zone that owns this name signed it", and the gap is a total membership
 /// forgery: a forged `(origin, device key)` binding is full cluster read and
-/// write (§3.2). `secure_txt` closes it, and this is the test that says so.
+/// write (§3.2). The transport filter is the general defense; `secure_txt`
+/// still names the signing zone for Rekor. This is the test that says so.
 ///
 /// The suite could not have caught this before: every other negative case
 /// gives the impostor the *same* name as the victim, so "a validly anchored
@@ -182,8 +183,13 @@ async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
         .lookup_txt("cluster.example")
         .await
         .expect_err("a sibling zone must not sign for this name");
+    // The transport filter strips the off-path RRSIG before hickory sees it;
+    // `secure_txt` would refuse the same answer for the enclosure rule. Either
+    // refusal is the defense.
     assert!(
-        error.to_string().contains("does not contain"),
+        error.to_string().contains("does not contain")
+            || error.to_string().contains("not DNSSEC-secure")
+            || error.to_string().contains("no RRSIG"),
         "refused for the wrong reason: {error}"
     );
     // And the same through the membership path, which is what an attacker

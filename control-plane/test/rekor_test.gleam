@@ -15,11 +15,14 @@ import envoy
 import fixtures
 import gleam/bit_array
 import gleam/crypto
+import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import jobs/zonekey_watch
+import provider/state
 import rekor/cert
 import rekor/chain
 import rekor/client
@@ -1094,5 +1097,132 @@ pub fn booting_with_the_staged_key_names_the_missing_step_test() {
   let assert Error(message) = publish.ensure_meta(conn, "sync.test", incoming)
   assert string.contains(message, "staged incoming key")
   assert string.contains(message, "zone-key promote")
+  sqlite.close(conn)
+}
+
+// ---------------------------------------------------------- zonekey watch
+
+fn dnskey_rrs(zone: name.Name, rdatas: List(BitArray)) -> List(wire.Rr) {
+  let rrsig =
+    wire.Rr(zone, wire.type_rrsig, wire.class_in, 3600, <<
+      48:int-size(16),
+      13:int-size(8),
+      2:int-size(8),
+      0:size(512),
+    >>)
+  list.append(
+    list.map(rdatas, fn(rd) { wire.Rr(zone, 48, wire.class_in, 3600, rd) }),
+    [rrsig],
+  )
+}
+
+/// Observe and collect are two DNSKEY queries at the signing zone. The
+/// mailbox is preloaded: odd pops are observe, even pops are collect.
+fn split_resolver(
+  zone: name.Name,
+  answers: process.Subject(List(BitArray)),
+) -> chain.Resolver {
+  chain.Resolver(query: fn(qzone, rtype) {
+    let rrsig =
+      wire.Rr(qzone, wire.type_rrsig, wire.class_in, 3600, <<
+        rtype:int-size(16),
+        13:int-size(8),
+        2:int-size(8),
+        0:size(512),
+      >>)
+    case rtype == wire.type_dnskey && qzone == zone {
+      True -> {
+        let rdatas = case process.receive(answers, 0) {
+          Ok(rds) -> rds
+          Error(Nil) -> []
+        }
+        Ok(dnskey_rrs(qzone, rdatas))
+      }
+      False ->
+        Ok([
+          wire.Rr(qzone, rtype, wire.class_in, 3600, <<
+            1234:int-size(16),
+            13:int-size(8),
+            2:int-size(8),
+            9:size(256),
+          >>),
+          rrsig,
+        ])
+    }
+  })
+}
+
+pub fn the_watcher_waits_quietly_for_the_declaration_test() {
+  let conn = fixtures.fresh_conn()
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = fake_log(keys.generate())
+  assert zonekey_watch.run_once_with(
+      conn,
+      apex,
+      apex,
+      silent_resolver(),
+      log,
+      #(spki, point),
+      1000,
+    )
+    == zonekey_watch.WaitingForDeclaration
+  sqlite.close(conn)
+}
+
+pub fn the_watcher_stamps_only_keys_the_claim_covers_test() {
+  let conn = fixtures.fresh_conn()
+  let assert Ok(apex) = name.parse("sync.test.")
+  let a = keys.dnskey_rdata(keys.generate())
+  let b = keys.dnskey_rdata(keys.generate())
+  let answers = process.new_subject()
+  // observe {A,B}, collect {A}, observe {A,B}, collect {A}
+  process.send(answers, [a, b])
+  process.send(answers, [a])
+  process.send(answers, [a, b])
+  process.send(answers, [a])
+  let resolver = split_resolver(apex, answers)
+  let submits = process.new_subject()
+  let #(inner, spki, point) = fake_log(keys.generate())
+  let log =
+    client.Log(submit: fn(sub) {
+      process.send(submits, "submit")
+      inner.submit(sub)
+    })
+
+  assert zonekey_watch.run_once_with(
+      conn,
+      apex,
+      apex,
+      resolver,
+      log,
+      #(spki, point),
+      1000,
+    )
+    == zonekey_watch.Logged
+  let assert Ok("submit") = process.receive(submits, 100)
+
+  let assert Ok(keys) = state.observed_keys(conn)
+  let logged =
+    list.filter_map(keys, fn(key) {
+      case key.logged_at {
+        Some(_) -> Ok(key.key_sha256)
+        None -> Error(Nil)
+      }
+    })
+  assert logged == [crypto.hash(crypto.Sha256, a)]
+  assert list.length(keys) == 2
+
+  // B is still unlogged, so the next tick is not treated as fully covered.
+  assert zonekey_watch.run_once_with(
+      conn,
+      apex,
+      apex,
+      resolver,
+      log,
+      #(spki, point),
+      2000,
+    )
+    == zonekey_watch.Logged
+  let assert Ok("submit") = process.receive(submits, 100)
   sqlite.close(conn)
 }

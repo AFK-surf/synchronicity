@@ -42,6 +42,8 @@ import gleam/string
 import provider/diff
 import provider/provider.{type Provider}
 import provider/state
+import rekor/gate
+import rekor/store as rekor_store
 import store/db
 import store/sqlite.{type Connection}
 import zone/model
@@ -204,8 +206,9 @@ fn pass(
     model.read(conn)
     |> result.map_error(fn(e) { "reading zone: " <> string.inspect(e) }),
   )
+  use omit_members <- result.try(omit_members(conn))
   use desired <- result.try(
-    render_external.render(input)
+    render_external.render_gated(input, omit_members)
     |> result.map_error(fn(e) { "rendering: " <> string.inspect(e) }),
   )
   let hash = render_external.desired_hash(desired)
@@ -238,6 +241,20 @@ fn pass(
   case applied.failed {
     [] -> Ok(Converged(input.meta.soa_serial, hash, changes, input.rekor_shed))
     failures -> Ok(Partial(input.meta.soa_serial, changes, failures))
+  }
+}
+
+/// Armed gate and no verified record: omit membership TXT. A store error
+/// fails the pass rather than guessing. The declaration still renders.
+fn omit_members(conn: Connection) -> Result(Bool, String) {
+  case gate.required() {
+    False -> Ok(False)
+    True ->
+      rekor_store.any_verified(conn)
+      |> result.map(fn(any) { !any })
+      |> result.map_error(fn(e) {
+        "reading rekor records: " <> string.inspect(e)
+      })
   }
 }
 

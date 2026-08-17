@@ -24,8 +24,8 @@ use synch_core::{
 };
 
 use hickory_resolver::proto::{
-    dnssec::TrustAnchors,
-    rr::{Name, RecordType},
+    dnssec::{rdata::RRSIG, TrustAnchors},
+    rr::{Name, Record, RecordType},
 };
 
 use crate::{
@@ -507,8 +507,14 @@ pub struct ValidatedTxt {
     /// checked to enclose the queried name before the answer was accepted
     /// (see `secure_txt`).
     pub signer: Name,
-    /// The key tag that RRSIG selected, for the transparency lookup.
+    /// The key tag that RRSIG selected. A selector, not an identity — the
+    /// live key is [`Self::rrsig`] verified against the DNSKEY set.
     pub key_tag: u16,
+    /// The membership RRSIG itself, kept so the live DNSKEY can be identified
+    /// by actually verifying this signature rather than by 16-bit tag.
+    pub rrsig: RRSIG,
+    /// The TXT RRset that `rrsig` covers, for that re-verification.
+    pub txt_rrset: Vec<Record>,
 }
 
 /// How the resolver reaches the DNS and whom it ultimately trusts (§3.2).
@@ -766,8 +772,10 @@ impl DnssecResolver {
             //
             // It comes out of `secure_txt`, which already held it to
             // RFC 4035 §5.3.1 before returning: a signer that does not
-            // enclose the queried name never reaches this line.
-            let (signing_zone, key_tag) = (validated.signer.clone(), validated.key_tag);
+            // enclose the queried name never reaches this line. The live
+            // DNSKEY is identified later by verifying this RRSIG, not by
+            // treating the 16-bit tag as a key id.
+            let signing_zone = validated.signer.clone();
             // Where the control plane's transparency records live. Taken
             // from the answer this client just DNSSEC-validated, and then
             // held to both ends: it must contain the domain being resolved
@@ -800,8 +808,7 @@ impl DnssecResolver {
                     "Sigstore's TUF repository did not update the pin set; the current pins stand"
                 ),
             }
-            self.verify_zone_key(&domain, &apex, &signing_zone, key_tag)
-                .await?;
+            self.verify_zone_key(&domain, &apex, &validated).await?;
         }
         let set = MemberSet::from_records(&domain, &validated.records)?;
         Ok((set, validated.ttl))
@@ -926,12 +933,15 @@ impl DnssecResolver {
         &self,
         domain: &str,
         apex: &Name,
-        signing_zone: &Name,
-        key_tag: u16,
+        membership: &ValidatedTxt,
     ) -> Result<VerifiedRecord, NetError> {
+        let signing_zone = &membership.signer;
+        let key_tag = membership.rrsig.input().key_tag;
         let zone_text = signing_zone.to_string();
         let apex_text = apex.to_string();
-        let dnskey_rdata = self.zone_dnskey(signing_zone, key_tag).await?;
+        let dnskey_rdata = self
+            .zone_dnskey(signing_zone, &membership.rrsig, &membership.txt_rrset)
+            .await?;
 
         // Under the **apex**, which the membership answer named: every
         // record a control plane owns hangs off its own apex, so two of them
@@ -1039,38 +1049,20 @@ impl DnssecResolver {
         ))
     }
 
-    /// The validated DNSKEY rdata for one key tag at `apex` (§4.2 step 2).
-    async fn zone_dnskey(&self, apex: &Name, key_tag: u16) -> Result<Vec<u8>, NetError> {
-        use hickory_resolver::proto::{
-            dnssec::{rdata::DNSSECRData, PublicKey},
-            rr::RData,
-        };
-
-        let name = apex.to_string();
+    /// The DNSKEY rdata that actually verifies the membership RRSIG.
+    ///
+    /// A 16-bit key tag is not an identity. After looking the DNSKEY set up
+    /// at the signing zone, the live key is the one `signing_key_rdata`
+    /// can re-verify the RRSIG under.
+    async fn zone_dnskey(
+        &self,
+        signing_zone: &Name,
+        rrsig: &RRSIG,
+        txt_rrset: &[Record],
+    ) -> Result<Vec<u8>, NetError> {
+        let name = signing_zone.to_string();
         let response = self.lookup(&name, RecordType::DNSKEY).await?;
-        for record in &response.answers {
-            if record.name != *apex || !record.proof.is_secure() {
-                continue;
-            }
-            let RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)) = &record.data else {
-                continue;
-            };
-            if dnskey.calculate_key_tag().ok() != Some(key_tag) {
-                continue;
-            }
-            // The rdata as the wire carries it — the exact bytes the entry's
-            // subject digest commits to.
-            let mut rdata = Vec::with_capacity(4 + 64);
-            rdata.extend_from_slice(&dnskey.flags().to_be_bytes());
-            rdata.push(3);
-            rdata.push(u8::from(dnskey.public_key().algorithm()));
-            rdata.extend_from_slice(dnskey.public_key().public_bytes());
-            return Ok(rdata);
-        }
-        Err(NetError::Dns(format!(
-            "{name}: no DNSSEC-secure DNSKEY with key tag {key_tag}, \
-             which is the key the answer was signed by"
-        )))
+        signing_key_rdata(signing_zone, rrsig, txt_rrset, &response.answers)
     }
 
     /// One validated lookup over the single transport.
@@ -1091,6 +1083,101 @@ impl DnssecResolver {
             .ok_or_else(|| NetError::Dns(format!("{name}: the endpoint sent no response")))?
             .map_err(|e| NetError::Dns(format!("{name}: {e}")))
     }
+}
+
+/// The DNSKEY rdata that actually verifies `rrsig` over `txt_rrset`.
+///
+/// A 16-bit key tag is not an identity: after a DS/provider compromise an
+/// attacker can publish a new ZSK with the same tag as a previously logged
+/// key, sign membership with the new key, and keep serving the old Rekor
+/// proof. The live key is the one whose public key verifies the RRSIG, not
+/// the first Secure DNSKEY that happens to share its tag.
+///
+/// `verify_rrsig`'s name argument is the TXT owner — the RRset being
+/// checked — not the signing zone. The signing zone is the DNSKEY owner
+/// and the name the DNSKEY RRSIG must enclose (RFC 4035 §5.3.1).
+fn signing_key_rdata(
+    signing_zone: &Name,
+    rrsig: &RRSIG,
+    txt_rrset: &[Record],
+    dnskey_answers: &[Record],
+) -> Result<Vec<u8>, NetError> {
+    use hickory_resolver::proto::{
+        dnssec::{rdata::DNSSECRData, Verifier},
+        rr::{DNSClass, RData, RecordType},
+    };
+
+    let key_tag = rrsig.input().key_tag;
+    let zone_name = signing_zone.to_string();
+
+    // Do not trust Proof::Secure alone on the DNSKEY set. hickory 0.26
+    // will chase whatever signer_name an RRSIG carries; a Secure DNSKEY
+    // RRSIG whose signer does not enclose this zone is an off-path
+    // signature and must not authorize anything here.
+    let dnskey_rrsig_encloses = dnskey_answers.iter().any(|record| {
+        if record.name != *signing_zone || !record.proof.is_secure() {
+            return false;
+        }
+        let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = &record.data else {
+            return false;
+        };
+        sig.input().type_covered == RecordType::DNSKEY
+            && sig.input().signer_name.to_lowercase().zone_of(signing_zone)
+    });
+    if !dnskey_rrsig_encloses {
+        return Err(NetError::Dns(format!(
+            "{zone_name}: no DNSSEC-secure DNSKEY RRSIG whose signer contains \
+             the zone — a zone may only sign for names it holds \
+             (RFC 4035 §5.3.1)"
+        )));
+    }
+
+    let owner = txt_rrset
+        .iter()
+        .find(|record| matches!(record.data, RData::TXT(_)))
+        .map(|record| &record.name)
+        .ok_or_else(|| {
+            NetError::Dns(format!(
+                "{zone_name}: membership RRset has no TXT records to verify \
+                 against the signing key"
+            ))
+        })?;
+
+    let mut matched: Option<Vec<u8>> = None;
+    for record in dnskey_answers {
+        if record.name != *signing_zone || !record.proof.is_secure() {
+            continue;
+        }
+        let RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)) = &record.data else {
+            continue;
+        };
+        if dnskey.calculate_key_tag().ok() != Some(key_tag) {
+            continue;
+        }
+        if dnskey
+            .verify_rrsig(owner, DNSClass::IN, rrsig, txt_rrset.iter())
+            .is_err()
+        {
+            continue;
+        }
+        let rdata = crate::chain::dnskey_rdata(dnskey);
+        if let Some(existing) = &matched {
+            if existing != &rdata {
+                return Err(NetError::Dns(format!(
+                    "{zone_name}: two DNSKEYs with key tag {key_tag} verify \
+                     the membership RRSIG; refusing to guess which one signed it"
+                )));
+            }
+            continue;
+        }
+        matched = Some(rdata);
+    }
+    matched.ok_or_else(|| {
+        NetError::Dns(format!(
+            "{zone_name}: no DNSSEC-secure DNSKEY with key tag {key_tag} \
+             verifies the membership RRSIG"
+        ))
+    })
 }
 
 /// Lifts a verification failure into the error class `synch doctor` explains.
@@ -1383,10 +1470,46 @@ impl hickory_resolver::net::xfer::DnsHandle for DohHandle {
                     .exchange(body)
                     .await
                     .map_err(hickory_resolver::net::NetError::from)?;
-                hickory_resolver::proto::op::DnsResponse::from_buffer(answer)
-                    .map_err(hickory_resolver::net::NetError::from)
+                let mut response = hickory_resolver::proto::op::DnsResponse::from_buffer(answer)
+                    .map_err(hickory_resolver::net::NetError::from)?;
+                strip_off_path_rrsigs(&mut response);
+                Ok(response)
             })),
         }
+    }
+}
+
+/// Drops every RRSIG whose signer does not enclose the owner name.
+///
+/// RFC 4035 §5.3.1: the Signer's Name MUST be the zone that contains the
+/// RRset. hickory 0.26 does not enforce this — `verify_default_rrset` looks
+/// up a DNSKEY at whatever `signer_name` the RRSIG carries (TODO on that
+/// rule) — and DoH is an untrusted transport. Extra junk must not DoS a
+/// valid answer, so a bad RRSIG is stripped rather than failing the whole
+/// message. Hickory then sees an unsigned or correctly-signed RRset and
+/// fails closed.
+///
+/// Parent signing a child DS is fine (`com.` encloses `example.com.`).
+/// `attacker.com` signing `example.com` DS/TXT/DNSKEY is not.
+fn strip_off_path_rrsigs(response: &mut hickory_resolver::proto::op::DnsResponse) {
+    drop_off_path_rrsigs(&mut response.answers);
+    drop_off_path_rrsigs(&mut response.authorities);
+    drop_off_path_rrsigs(&mut response.additionals);
+}
+
+fn drop_off_path_rrsigs(records: &mut Vec<Record>) {
+    records.retain(rrsig_signer_encloses_owner);
+}
+
+fn rrsig_signer_encloses_owner(record: &Record) -> bool {
+    use hickory_resolver::proto::{dnssec::rdata::DNSSECRData, rr::RData};
+    match &record.data {
+        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig
+            .input()
+            .signer_name
+            .to_lowercase()
+            .zone_of(&record.name),
+        _ => true,
     }
 }
 
@@ -1419,14 +1542,15 @@ fn secure_txt(
         let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
             return None;
         };
-        (rrsig.input().type_covered == RecordType::TXT).then(|| rrsig.input().clone())
+        (rrsig.input().type_covered == RecordType::TXT).then(|| rrsig.clone())
     });
-    let Some(sig) = signed_by else {
+    let Some(rrsig) = signed_by else {
         return Err(NetError::Dns(format!(
             "{name}: the validated answer carries no RRSIG naming its signer"
         )));
     };
-    let signer = sig.signer_name.to_lowercase();
+    let key_tag = rrsig.input().key_tag;
+    let signer = rrsig.input().signer_name.to_lowercase();
 
     // **The check hickory does not make.** RFC 4035 §5.3.1: "The RRSIG RR's
     // Signer's Name field MUST be the name of the zone that contains the
@@ -1442,9 +1566,12 @@ fn secure_txt(
     // the queried name, which is the whole point of the forgery. The signer
     // has to enclose the name it signed for, and that is what this asserts.
     //
-    // Enforced here rather than in a caller so no lookup path can be reached
-    // without it — the membership answer, the proof records, the DNSKEY, and
-    // the public `lookup_txt` all come through this one function.
+    // Defense in depth for TXT we accept. The general RFC 4035 §5.3.1
+    // defense is the transport filter (`strip_off_path_rrsigs`): hickory
+    // 0.26 will chase off-path signers for DS and DNSKEY, and those RRsets
+    // never come through this function. This check remains so a membership
+    // or proof TXT cannot name a signing zone that does not hold it — that
+    // name is what Rekor binds to.
     if !signer.zone_of(&qname) {
         return Err(NetError::Dns(format!(
             "{name}: the answer is signed by {signer}, which does not contain \
@@ -1454,6 +1581,7 @@ fn secure_txt(
     }
 
     let mut records = Vec::new();
+    let mut txt_rrset = Vec::new();
     let mut ttl = MAX_TTL;
     for record in answers {
         // DNSSEC proves an RRset is signed by a zone chaining to the trust
@@ -1495,6 +1623,7 @@ fn secure_txt(
             .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
             .collect();
         records.push(joined);
+        txt_rrset.push(record.clone());
     }
     if records.is_empty() {
         return Err(NetError::Dns(format!("{name}: no TXT records")));
@@ -1503,7 +1632,9 @@ fn secure_txt(
         records,
         ttl: clamp_ttl(ttl),
         signer,
-        key_tag: sig.key_tag,
+        key_tag,
+        rrsig,
+        txt_rrset,
     })
 }
 
@@ -1958,5 +2089,242 @@ mod tests {
         // Fail-closed: an empty validated set is not an error here, but the
         // caller keeps existing bindings until they expire on their own.
         assert!(set.rejected.is_empty());
+    }
+
+    #[test]
+    fn signing_key_rdata_picks_the_key_that_verifies_not_the_first_same_tag() {
+        let zone = hickory_resolver::proto::rr::Name::from_utf8("example.").unwrap();
+        let (real_key, real_signer) = p256_at(&zone);
+        let tag = real_key.calculate_key_tag().expect("tag");
+        let (decoy_key, _decoy_signer) = colliding_p256(&zone, tag);
+
+        let owner =
+            hickory_resolver::proto::rr::Name::from_utf8("_synchronicity.example.").unwrap();
+        let txt_rrset = signed_txt(&owner, "v=sync1 id=nas", &real_signer);
+        let rrsig = txt_rrsig(&txt_rrset);
+
+        // Decoy first: a first-match tag lookup would return the wrong key.
+        let dnskeys = vec![
+            secure_dnskey(&zone, decoy_key.clone()),
+            secure_dnskey(&zone, real_key.clone()),
+            secure_dnskey_rrsig(&zone, &[decoy_key.clone(), real_key.clone()], &real_signer),
+        ];
+        let rdata = signing_key_rdata(&zone, &rrsig, &txt_rrset, &dnskeys).unwrap();
+        assert_eq!(rdata, crate::chain::dnskey_rdata(&real_key));
+
+        let only_decoy = vec![
+            secure_dnskey(&zone, decoy_key.clone()),
+            secure_dnskey_rrsig(&zone, &[decoy_key.clone()], &real_signer),
+        ];
+        let err = signing_key_rdata(&zone, &rrsig, &txt_rrset, &only_decoy).unwrap_err();
+        assert!(
+            err.to_string().contains("verifies the membership RRSIG"),
+            "{err}"
+        );
+
+        let stranger = p256_at(&zone).0;
+        let neither = vec![
+            secure_dnskey(&zone, stranger.clone()),
+            secure_dnskey(&zone, decoy_key.clone()),
+            secure_dnskey_rrsig(&zone, &[stranger, decoy_key], &real_signer),
+        ];
+        let err = signing_key_rdata(&zone, &rrsig, &txt_rrset, &neither).unwrap_err();
+        assert!(
+            err.to_string().contains("verifies the membership RRSIG"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn off_path_rrsigs_are_stripped_from_every_section() {
+        use hickory_resolver::proto::{
+            dnssec::rdata::DNSSECRData,
+            op::{DnsResponse, Message, OpCode},
+            rr::{rdata::TXT, Name, RData, Record},
+        };
+
+        let child = Name::from_utf8("cluster.example.").unwrap();
+        let parent = Name::from_utf8("example.").unwrap();
+        let attacker = Name::from_utf8("attacker.example.").unwrap();
+        let owner = Name::from_utf8("_synchronicity.cluster.example.").unwrap();
+
+        let on_path = signed_rrsig(&owner, &child);
+        let parent_ds = signed_rrsig(&child, &parent);
+        let off_path = signed_rrsig(&owner, &attacker);
+        let txt = Record::from_rdata(owner, 300, RData::TXT(TXT::new(vec!["v=sync1".into()])));
+
+        let mut message = Message::response(1, OpCode::Query);
+        message.add_answer(on_path.clone());
+        message.add_answer(off_path.clone());
+        message.add_answer(txt.clone());
+        message.add_authority(parent_ds);
+        message.add_authority(off_path.clone());
+        message.add_additional(off_path);
+        message.add_additional(on_path);
+
+        let mut response = DnsResponse::from_message(message).expect("response");
+        strip_off_path_rrsigs(&mut response);
+
+        let is_rrsig =
+            |record: &Record| matches!(record.data, RData::DNSSEC(DNSSECRData::RRSIG(_)));
+        assert_eq!(response.answers.iter().filter(|r| is_rrsig(r)).count(), 1);
+        assert!(response.answers.iter().any(|r| r.data == txt.data));
+        assert_eq!(response.authorities.len(), 1);
+        assert_eq!(response.additionals.len(), 1);
+        assert!(response.answers.iter().all(rrsig_signer_encloses_owner));
+        assert!(response.authorities.iter().all(rrsig_signer_encloses_owner));
+        assert!(response.additionals.iter().all(rrsig_signer_encloses_owner));
+    }
+
+    fn p256_at(
+        origin: &hickory_resolver::proto::rr::Name,
+    ) -> (
+        hickory_resolver::proto::dnssec::rdata::DNSKEY,
+        hickory_resolver::proto::dnssec::DnssecSigner,
+    ) {
+        use hickory_resolver::proto::dnssec::{
+            crypto::EcdsaSigningKey, rdata::DNSKEY, Algorithm, DnssecSigner, SigningKey,
+        };
+        let algorithm = Algorithm::ECDSAP256SHA256;
+        let pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).expect("keygen");
+        let key = EcdsaSigningKey::from_pkcs8(&pkcs8, algorithm).expect("key load");
+        let public = key.to_public_key().expect("public key");
+        let dnskey = DNSKEY::from_key(&public);
+        let signer = DnssecSigner::new(
+            dnskey.clone(),
+            Box::new(key),
+            origin.clone(),
+            std::time::Duration::from_secs(86_400),
+        );
+        (dnskey, signer)
+    }
+
+    fn colliding_p256(
+        origin: &hickory_resolver::proto::rr::Name,
+        tag: u16,
+    ) -> (
+        hickory_resolver::proto::dnssec::rdata::DNSKEY,
+        hickory_resolver::proto::dnssec::DnssecSigner,
+    ) {
+        for _ in 0..200_000 {
+            let pair = p256_at(origin);
+            if pair.0.calculate_key_tag().ok() == Some(tag) {
+                return pair;
+            }
+        }
+        panic!("no P-256 key with tag {tag} in 200_000 draws");
+    }
+
+    fn signed_txt(
+        owner: &hickory_resolver::proto::rr::Name,
+        text: &str,
+        signer: &hickory_resolver::proto::dnssec::DnssecSigner,
+    ) -> Vec<hickory_resolver::proto::rr::Record> {
+        use hickory_resolver::proto::{
+            dnssec::rdata::{DNSSECRData, RRSIG},
+            rr::{rdata::TXT, DNSClass, RData, Record, RecordSet, RecordType},
+        };
+        let mut set = RecordSet::new(owner.clone(), RecordType::TXT, 0);
+        set.insert(
+            Record::from_rdata(
+                owner.clone(),
+                300,
+                RData::TXT(TXT::new(vec![text.to_string()])),
+            ),
+            0,
+        );
+        let rrsig = RRSIG::from_rrset(
+            &set,
+            DNSClass::IN,
+            time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+            signer,
+        )
+        .expect("sign txt");
+        set.insert_rrsig(Record::from_rdata(
+            owner.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+        ));
+        set.records(true).cloned().collect()
+    }
+
+    fn txt_rrsig(
+        records: &[hickory_resolver::proto::rr::Record],
+    ) -> hickory_resolver::proto::dnssec::rdata::RRSIG {
+        use hickory_resolver::proto::{dnssec::rdata::DNSSECRData, rr::RData};
+        for record in records {
+            if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data {
+                return rrsig.clone();
+            }
+        }
+        panic!("signed set has no RRSIG");
+    }
+
+    fn secure_dnskey(
+        zone: &hickory_resolver::proto::rr::Name,
+        dnskey: hickory_resolver::proto::dnssec::rdata::DNSKEY,
+    ) -> hickory_resolver::proto::rr::Record {
+        use hickory_resolver::proto::{
+            dnssec::{rdata::DNSSECRData, Proof},
+            rr::{RData, Record},
+        };
+        let mut record = Record::from_rdata(
+            zone.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
+        );
+        record.proof = Proof::Secure;
+        record
+    }
+
+    fn secure_dnskey_rrsig(
+        zone: &hickory_resolver::proto::rr::Name,
+        keys: &[hickory_resolver::proto::dnssec::rdata::DNSKEY],
+        signer: &hickory_resolver::proto::dnssec::DnssecSigner,
+    ) -> hickory_resolver::proto::rr::Record {
+        use hickory_resolver::proto::{
+            dnssec::{rdata::DNSSECRData, rdata::RRSIG, Proof},
+            rr::{DNSClass, RData, Record, RecordSet, RecordType},
+        };
+        let mut set = RecordSet::new(zone.clone(), RecordType::DNSKEY, 0);
+        for key in keys {
+            set.insert(
+                Record::from_rdata(
+                    zone.clone(),
+                    300,
+                    RData::DNSSEC(DNSSECRData::DNSKEY(key.clone())),
+                ),
+                0,
+            );
+        }
+        let rrsig = RRSIG::from_rrset(
+            &set,
+            DNSClass::IN,
+            time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+            signer,
+        )
+        .expect("sign dnskey");
+        let mut record =
+            Record::from_rdata(zone.clone(), 300, RData::DNSSEC(DNSSECRData::RRSIG(rrsig)));
+        record.proof = Proof::Secure;
+        record
+    }
+
+    fn signed_rrsig(
+        owner: &hickory_resolver::proto::rr::Name,
+        signer_name: &hickory_resolver::proto::rr::Name,
+    ) -> hickory_resolver::proto::rr::Record {
+        let (_, signer) = p256_at(signer_name);
+        signed_txt(owner, "x", &signer)
+            .into_iter()
+            .find(|record| {
+                matches!(
+                    record.data,
+                    hickory_resolver::proto::rr::RData::DNSSEC(
+                        hickory_resolver::proto::dnssec::rdata::DNSSECRData::RRSIG(_)
+                    )
+                )
+            })
+            .expect("rrsig")
     }
 }

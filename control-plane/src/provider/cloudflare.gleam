@@ -36,13 +36,14 @@ pub fn connect(
   zone_id: String,
   api_url: String,
   apex: String,
+  signing_zone: String,
 ) -> Result(Provider, String) {
   let base = case api_url {
     "" -> real_api
     url -> strip_slash(url)
   }
   use zone_id <- result.try(case zone_id {
-    "" -> discover_zone(base, api_token, apex)
+    "" -> discover_zone(base, api_token, signing_zone)
     id -> Ok(id)
   })
   Ok(Provider(
@@ -55,7 +56,7 @@ pub fn connect(
 fn discover_zone(
   base: String,
   token: String,
-  apex: String,
+  signing_zone: String,
 ) -> Result(String, String) {
   let decoder = {
     use ids <- decode.subfield(
@@ -67,11 +68,15 @@ fn discover_zone(
     )
     decode.success(ids)
   }
-  use ids <- result.try(get_json(base <> "/zones?name=" <> apex, token, decoder))
+  use ids <- result.try(get_json(
+    base <> "/zones?name=" <> signing_zone,
+    token,
+    decoder,
+  ))
   case ids {
     [id] -> Ok(id)
-    [] -> Error("cloudflare has no zone named " <> apex)
-    _ -> Error("cloudflare has more than one zone named " <> apex)
+    [] -> Error("cloudflare has no zone named " <> signing_zone)
+    _ -> Error("cloudflare has more than one zone named " <> signing_zone)
   }
 }
 

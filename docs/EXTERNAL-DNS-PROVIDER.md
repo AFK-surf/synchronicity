@@ -256,7 +256,10 @@ are ours to publish, all of them strictly below the apex:
 
 - membership TXT at `_synchronicity.<network>.<org_slug>.<apex>`, one
   string per non-revoked device key, via the same `rdata.sync1_text`
-  rendering, at `ttl_data`;
+  rendering, at `ttl_data`. Omitted when `CP_REKOR_REQUIRE=true` and no
+  verified log record exists yet — device bindings must not go out
+  before a key is logged. The declaration still renders so the watcher
+  can collect a chain;
 - `_synchronicity-transparency.<apex>` TXT — the declaration (§2.1),
   rendered unconditionally: a zone that stopped publishing it would have
   every entry it ever logged stop verifying. At `ttl_declaration`, because
@@ -407,17 +410,20 @@ not fatal — the same stance `healthz` takes on absent TUF material.
 the §3.3 loop:
 
 1. On a fixed five-minute cadence (`watch_interval_ms` — a constant, not a
-   knob, and one term of the timing relation in §4.2),
-   resolve and DNSSEC-validate the apex DNSKEY RRset over DoH — the
+   knob, and one term of the timing relation in §4.2; thirty seconds
+   while the declaration is not on the wire yet, because the reconciler
+   publishes it at boot),
+   resolve and DNSSEC-validate the signing-zone DNSKEY RRset over DoH — the
    existing `rekor/chain.gleam` collection machinery, which already speaks
    validating DoH for chain assembly.
 2. Compare the zone-signing key set against `observed_zone_keys`.
 3. On change: collect the full chain, build the v2 statement over the new
    set, sign with a freshly minted ephemeral key, submit through the injected
    `rekor/client.Log`, verify inclusion, store the record
-   (`rekor/store.gleam` conventions), update `observed_zone_keys`, and
-   poke the reconciler so the `_synchronicity-rekor` TXT follows. Audit
-   row `action='zonekey.logged'`.
+   (`rekor/store.gleam` conventions), stamp only the observed keys that
+   record covers, and poke the reconciler so the `_synchronicity-rekor`
+   TXT follows. Extra keys stay unlogged so the next tick retries them.
+   Audit row `action='zonekey.logged'`.
 
 `rekor-publish`/`rekor-retire` remain as manual ceremonies for serve mode;
 external mode's logging is continuous by construction because the subject
@@ -596,7 +602,10 @@ licence nobody granted it.
 **Cloudflare** — phase 1, the reference leg (`provider/cloudflare.gleam`).
 v4 REST, single `Authorization: Bearer` token, scopable to Zone:DNS:Edit
 on one zone (the runbook says so; a global API key works but must not be
-recommended). Zone id explicit or discovered once via `GET /zones?name=`.
+recommended). Zone id explicit or discovered once via
+`GET /zones?name=` against the **signing zone** (`CP_SIGNING_ZONE`,
+defaulting to the apex). Listing still keeps only TXT strictly below
+the apex.
 Per-record ids; `per_page=100` pagination on list. TXT content: Cloudflare
 accepts the full string and chunks at 255 bytes server-side. `proxied` is
 meaningless for TXT but the leg pins `proxied: false` on anything it ever

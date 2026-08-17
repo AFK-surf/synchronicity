@@ -3,6 +3,7 @@
 //// provider, and the provider legs' pure edges.
 
 import dnssec/keys
+import envoy
 import gleam/crypto
 import gleam/erlang/process
 import gleam/list
@@ -17,6 +18,8 @@ import provider/provider.{
 }
 import provider/state
 import rekor/client
+import rekor/gate
+import rekor/store as rekor_store
 import store/sqlite
 import zone/build
 import zone/model.{type ZoneInput, Member, TxtName, ZoneInput, ZoneMeta}
@@ -578,15 +581,20 @@ fn watch(
   log_key: #(BitArray, BitArray),
   now: Int,
 ) -> Bool {
-  zonekey_watch.run_once_with(
-    conn,
-    apex,
-    apex,
-    rekor_test.fake_resolver_serving(dnskey_rdatas),
-    log,
-    log_key,
-    now,
-  )
+  case
+    zonekey_watch.run_once_with(
+      conn,
+      apex,
+      apex,
+      rekor_test.fake_resolver_serving(dnskey_rdatas),
+      log,
+      log_key,
+      now,
+    )
+  {
+    zonekey_watch.Logged -> True
+    zonekey_watch.WaitingForDeclaration | zonekey_watch.Quiet -> False
+  }
 }
 
 pub fn external_publish_bumps_the_serial_and_audits_test() {
@@ -628,6 +636,94 @@ pub fn bunny_names_are_relative_and_come_back_qualified_test() {
   assert bunny.qualify("", "sync.test") == "sync.test"
   assert bunny.qualify("_synchronicity-rekor", "sync.test")
     == "_synchronicity-rekor.sync.test"
+
+  // Apex under a broader signing zone: convert against the signing zone,
+  // not the apex, or the record is stored at the wrong name.
+  let fqdn = "_synchronicity-rekor.sync.example.com"
+  assert bunny.relativize(fqdn, "example.com") == "_synchronicity-rekor.sync"
+  assert bunny.qualify("_synchronicity-rekor.sync", "example.com") == fqdn
+  assert bunny.qualify(bunny.relativize(fqdn, "example.com"), "example.com")
+    == fqdn
+  assert bunny.relativize(fqdn, "sync.example.com") == "_synchronicity-rekor"
+}
+
+pub fn require_rekor_omits_members_until_a_key_is_logged_test() {
+  let zone =
+    input([TxtName(member_owner(), [Member("nas", fixtures.nk(), "", "")])])
+  let assert Ok(gated) = render_external.render_gated(zone, True)
+  let gated_names = list.map(gated, fn(r) { r.name })
+  assert !list.contains(gated_names, "_synchronicity.prod.acme.sync.test")
+  assert list.contains(gated_names, "_synchronicity-transparency.sync.test")
+  assert list.contains(gated_names, "_synchronicity-owner.sync.test")
+  assert list.contains(gated_names, "_synchronicity-rekor.sync.test")
+
+  let assert Ok(open) = render_external.render(zone)
+  assert list.contains(
+    list.map(open, fn(r) { r.name }),
+    "_synchronicity.prod.acme.sync.test",
+  )
+}
+
+pub fn require_rekor_keeps_the_declaration_and_drops_members_on_the_wire_test() {
+  let conn = external_conn()
+  envoy.set(gate.require_env, "true")
+  let created = process.new_subject()
+  let prov =
+    Provider(
+      list: fn() { Ok([]) },
+      apply: fn(changes) {
+        process.send(created, list.map(changes.create, fn(r) { r.name }))
+        Ok(provider.Applied(list.length(changes.create), []))
+      },
+      describe: "fake",
+    )
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", 2000)
+  let assert Ok(names) = process.receive(created, 100)
+  assert !list.contains(names, "_synchronicity.prod.acme.sync.test")
+  assert list.contains(names, "_synchronicity-transparency.sync.test")
+
+  let assert Ok(Nil) =
+    rekor_store.put(
+      conn,
+      rekor_store.Record(
+        keyset_sha256: crypto.hash(crypto.Sha256, <<"keyset":utf8>>),
+        apex: "sync.test.",
+        action: "create",
+        statement: <<"{}":utf8>>,
+        canonicalized_body: <<0:size(512)>>,
+        log_id: <<0:size(256)>>,
+        log_index: 0,
+        checkpoint: <<>>,
+        inclusion_path: <<>>,
+        chainless: False,
+        integrated_at: 1,
+        verified_at: 1,
+        keys: [#(crypto.hash(crypto.Sha256, <<"k":utf8>>), 1)],
+      ),
+    )
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", 3000)
+  let assert Ok(again) = process.receive(created, 100)
+  assert list.contains(again, "_synchronicity.prod.acme.sync.test")
+  envoy.unset(gate.require_env)
+  sqlite.close(conn)
+}
+
+pub fn record_logged_stamps_only_the_named_keys_test() {
+  let conn = fixtures.fresh_conn()
+  let a = #(crypto.hash(crypto.Sha256, <<"a":utf8>>), 1, <<"adata":utf8>>)
+  let b = #(crypto.hash(crypto.Sha256, <<"b":utf8>>), 2, <<"bdata":utf8>>)
+  let assert Ok(Nil) = state.record_observed(conn, [a, b], 10)
+  let assert Ok(Nil) = state.record_logged(conn, [a.0], 20)
+  let assert Ok(keys) = state.observed_keys(conn)
+  let logged =
+    list.filter_map(keys, fn(key) {
+      case key.logged_at {
+        Some(_) -> Ok(key.key_sha256)
+        None -> Error(Nil)
+      }
+    })
+  assert logged == [a.0]
+  sqlite.close(conn)
 }
 
 fn string_contains(haystack: String, needle: String) -> Bool {

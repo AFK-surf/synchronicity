@@ -56,21 +56,35 @@ pub const ttl_declaration = 86_400
 /// The client finds these names from the `apex=` field of the membership
 /// record it has already validated.
 pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
+  render_gated(input, False)
+}
+
+/// `omit_members` is the already-computed external require-gate: armed, and
+/// no verified record exists. Membership TXT is dropped so device bindings
+/// never go out before a key is logged; the declaration, owner marker and
+/// any proofs still render so the watcher can collect a chain.
+pub fn render_gated(
+  input: ZoneInput,
+  omit_members: Bool,
+) -> Result(List(Record), build.BuildError) {
   use Nil <- result.try(build.validate(input))
   let apex = apex_name(input)
-  let members =
-    input.txt_names
-    |> list.flat_map(fn(txt_name) {
-      let owner = strip_dot(name.to_string(txt_name.owner))
-      list.map(txt_name.members, fn(m) {
-        Record(
-          owner,
-          provider.Txt,
-          ttl_data,
-          rdata.sync1_text(m.label, m.nk_z32, m.relay, m.addr, apex),
-        )
+  let members = case omit_members {
+    True -> []
+    False ->
+      input.txt_names
+      |> list.flat_map(fn(txt_name) {
+        let owner = strip_dot(name.to_string(txt_name.owner))
+        list.map(txt_name.members, fn(m) {
+          Record(
+            owner,
+            provider.Txt,
+            ttl_data,
+            rdata.sync1_text(m.label, m.nk_z32, m.relay, m.addr, apex),
+          )
+        })
       })
-    })
+  }
   // Each part at its own name: a provider caps the combined content of one
   // name and type (Cloudflare at 8192 wire bytes), which a single
   // ICANN-rooted proof exceeds on its own.

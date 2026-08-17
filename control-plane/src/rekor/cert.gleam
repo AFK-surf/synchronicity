@@ -19,11 +19,12 @@
 //// window, here or anywhere downstream. Three things inside it are
 //// load-bearing and everything else is X.509 ceremony:
 ////
-////   - the SubjectPublicKeyInfo — the zone CSK, which the client compares
-////     against the DNSKEY it validated;
+////   - the SubjectPublicKeyInfo — the ephemeral entry signer, not a
+////     DNSKEY the client compares against;
 ////   - the single `dNSName` SAN — the apex, which the client compares
-////     against the RRSIG signer and a monitor indexes by;
-////   - one custom extension — the DNSSEC chain, below.
+////     against the claimed apex and a monitor indexes by;
+////   - one custom extension — the DNSSEC chain, whose proven DNSKEY
+////     RRset is the authorization.
 ////
 //// The mirror of this module is crates/synch-net/src/{x509,zonecert}.rs.
 //// Both sides carry the same OID and the same DER, and the shared fixture
