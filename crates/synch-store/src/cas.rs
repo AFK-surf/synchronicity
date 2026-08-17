@@ -95,7 +95,7 @@ impl BlobRow {
         }
         match &self.bitmap {
             None => ChunkRanges::empty(),
-            Some(bits) => bitmap_to_ranges(bits, group_count(self.size)),
+            Some(bytes) => blob_to_ranges(bytes, group_count(self.size)),
         }
     }
 
@@ -143,6 +143,17 @@ fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
     complete || held.contains(group_count(size) - 1)
 }
 
+/// What a size claim settled to, and what that costs the bits already held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Settlement {
+    /// The size the row should record.
+    pub(crate) size: u64,
+    /// True when the recorded size changed the object's *group count*, so the
+    /// verified-group bitmap describes a tree that is no longer the one being
+    /// written and must be started again.
+    pub(crate) reset_held: bool,
+}
+
 /// Decides the size an object's row should record when a writer arrives
 /// claiming `claimed`, or refuses the writer.
 ///
@@ -153,13 +164,26 @@ fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
 /// 2. A size no group attests to is a peer's claim off an entry, and yields to
 ///    this writer's — that is what keeps an overstated entry from bricking an
 ///    honest root forever (§5.1, §6.2).
-/// 3. But it yields only as far as the last group. A size that changes the
-///    object's *group count* changes the shape of its tree, and every bit
-///    already in the bitmap was set by a write that verified against this root
-///    under the shape it had. Adopting a count those bits do not fit would
-///    leave the row advertising groups whose bytes are somewhere else — or,
-///    worse, let the payload be truncated to fit a length nobody has proved.
-///    A row holding nothing has no bits to contradict, so it takes any claim.
+/// 3. It yields *completely*, including the bits already held.
+///
+/// Rule 3 used to refuse a claim that changed the object's group count while
+/// any group was held, on the reasoning that a changed count changes the shape
+/// of the tree and so no slice for it could have verified. That reasoning is
+/// wrong, and it inverted the rule it was protecting. bao splits at the largest
+/// power of two below the chunk count, so every size in one bracket shares a
+/// left subtree: 20 groups and 24 groups both split at 16, and a slice covering
+/// groups 0..16 verifies identically under either — the right sibling's
+/// chaining value is opaque bytes from the encoder that join to the same root.
+/// An entry overstating the size within its bracket therefore produced a row
+/// that verified, held real bits, and refused every honest writer of that root
+/// for good: exactly the brick rule 2 exists to prevent, reached through rule 3.
+///
+/// So bits set under a size nothing attests to are themselves only a claim. A
+/// writer offering a different size takes the row, and if the group count moves
+/// the bitmap starts again — a re-fetch, which is cheap next to an object no
+/// one can ever complete. Rule 1 is what stops this churning: the first writer
+/// to hold the final group settles the size permanently, because that is the
+/// one group whose chaining value a wrong size cannot survive.
 ///
 /// The decision belongs inside the transaction that writes the row. Read
 /// outside it, rule 1 is a check against a snapshot: an honest writer finishing
@@ -171,32 +195,29 @@ pub(crate) fn settle_size(
     root: &Hash,
     existing: Option<(u64, bool, &ChunkRanges)>,
     claimed: u64,
-) -> Result<u64> {
+) -> Result<Settlement> {
+    let settled = |size| {
+        Ok(Settlement {
+            size,
+            reset_held: false,
+        })
+    };
     let Some((recorded, complete, held)) = existing else {
-        return Ok(claimed);
+        return settled(claimed);
     };
     if recorded == claimed {
-        return Ok(recorded);
+        return settled(recorded);
     }
-    let refuse = |reason: String| StoreError::Verification {
-        root: *root,
-        reason,
-    };
     if size_is_attested(recorded, complete, held) {
-        return Err(refuse(format!(
-            "size mismatch: have {recorded}, offered {claimed}"
-        )));
+        return Err(StoreError::Verification {
+            root: *root,
+            reason: format!("size mismatch: have {recorded}, offered {claimed}"),
+        });
     }
-    if held.is_empty() || group_count(claimed) == group_count(recorded) {
-        return Ok(claimed);
-    }
-    Err(refuse(format!(
-        "size mismatch: {claimed} bytes is {} chunk groups, and {} groups of this \
-         object are already held under a {}-group tree",
-        group_count(claimed),
-        held.count(),
-        group_count(recorded)
-    )))
+    Ok(Settlement {
+        size: claimed,
+        reset_held: group_count(claimed) != group_count(recorded),
+    })
 }
 
 /// What a bitmap commit settled.
@@ -230,11 +251,63 @@ pub(crate) fn grow_to(file: &File, len: u64) -> Result<()> {
     Ok(())
 }
 
+/// The first byte past the last group of `served`, clamped to `size`.
+///
+/// What a window's writes can actually reach, which is the only length a file
+/// may be grown to on the strength of an unverified claim.
+fn window_end_bytes(served: &ChunkRanges, size: u64) -> u64 {
+    served
+        .ranges
+        .last()
+        .map(|r| r.end.saturating_mul(CHUNK_GROUP_SIZE).min(size))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
 fn bitmap_len(groups: u64) -> usize {
     groups.div_ceil(8) as usize
 }
 
-fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
+/// Encodes an object's verified groups for the `blobs.bitmap` column.
+///
+/// Ranges, not a bit per group, despite the column's name. A bitmap costs
+/// `O(group_count)` to read *and* to write, and both happen on every commit:
+/// `write_slice` reads the row, `commit_groups` reads it again inside its
+/// transaction and rewrites the whole blob — per 8 MiB window. For a 100 GB
+/// object that is 6.1M loop iterations and a 763 KB blob rewritten ~12 200
+/// times, so moving 100 GB of payload cost tens of GB of index traffic and
+/// ~10^11 iterations. It is worse remotely: `encode_slice` reads the row before
+/// anything else, so a `GetSlice` for one group of a 1 TB partial object cost
+/// the provider a 7.6 MB read and 61M iterations for a ~50-byte request.
+///
+/// Verified groups are contiguous runs in practice — fetches walk windows in
+/// order — so the range form is a handful of integers where the bitmap was
+/// hundreds of kilobytes, and both directions are `O(runs)`.
+pub(crate) fn ranges_to_blob(ranges: &ChunkRanges) -> Vec<u8> {
+    let pairs: Vec<(u64, u64)> = ranges.ranges.iter().map(|r| (r.start, r.end)).collect();
+    postcard::to_stdvec(&pairs).expect("range encoding is infallible")
+}
+
+/// Decodes the `blobs.bitmap` column, clamped to the object's group count.
+pub(crate) fn blob_to_ranges(bytes: &[u8], groups: u64) -> ChunkRanges {
+    let pairs: Vec<(u64, u64)> = match postcard::from_bytes(bytes) {
+        Ok(pairs) => pairs,
+        // A row this build cannot read is treated as holding nothing, which
+        // costs a re-fetch and never a wrong claim of availability.
+        Err(_) => return ChunkRanges::empty(),
+    };
+    ChunkRanges::from_ranges(
+        pairs
+            .into_iter()
+            .map(|(start, end)| GroupRange::new(start, end.min(groups))),
+    )
+}
+
+/// Decodes the pre-v10 bit-per-group encoding.
+///
+/// Live only inside the v10 migration, which rewrites every partial row into
+/// the range form. Nothing on a running node reads a bitmap any more.
+pub(crate) fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
     let mut ranges = Vec::new();
     let mut start: Option<u64> = None;
     for group in 0..groups {
@@ -304,7 +377,7 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
         let complete = complete != 0;
         let held = match (complete, &bitmap) {
             (true, _) => ChunkRanges::single(0, total),
-            (false, Some(bits)) => bitmap_to_ranges(bits, total),
+            (false, Some(bytes)) => blob_to_ranges(bytes, total),
             (false, None) => ChunkRanges::empty(),
         };
         RowClaim {
@@ -315,6 +388,7 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn ranges_to_bitmap(ranges: &ChunkRanges, groups: u64) -> Vec<u8> {
     let mut bits = vec![0u8; bitmap_len(groups)];
     for r in &ranges.ranges {
@@ -487,13 +561,22 @@ impl Store {
     ) -> Result<Commit> {
         self.with_immediate_tx(|tx| {
             let claim = read_claim(tx, root)?;
-            let size = settle_size(
+            let settlement = settle_size(
                 root,
                 claim.as_ref().map(|c| (c.size, c.complete, &c.held)),
                 size,
             )?;
+            let size = settlement.size;
             let total = group_count(size);
-            let held = claim.map(|c| c.held).unwrap_or_else(ChunkRanges::empty);
+            // A settlement that moved the group count invalidates the bitmap:
+            // those bits were verified against a tree of a different shape, and
+            // the size that gave them that shape was only ever a claim. Start
+            // the bitmap again rather than carry bits describing a tree nobody
+            // is writing any more.
+            let held = match (settlement.reset_held, claim) {
+                (false, Some(claim)) => claim.held,
+                _ => ChunkRanges::empty(),
+            };
             let verified = held.union(groups).intersect(&ChunkRanges::single(0, total));
             let complete = verified.count() >= total;
             upsert_blob_row(
@@ -501,7 +584,7 @@ impl Store {
                 root,
                 size,
                 complete,
-                (!complete).then(|| ranges_to_bitmap(&verified, total)),
+                (!complete).then(|| ranges_to_blob(&verified)),
                 inline,
                 now,
             )?;
@@ -647,12 +730,19 @@ impl Store {
 
     /// Deletes an object's payload, outboard, and index row.
     pub fn delete_blob(&self, root: &Hash) -> Result<()> {
-        let _ = std::fs::remove_file(self.blob_path(root));
-        let _ = std::fs::remove_file(self.outboard_path(root));
+        // Row first, bytes second. The reverse order leaves the dangerous
+        // orphan: a crash between the unlink and the delete leaves a row saying
+        // `complete=1` with no bytes behind it, so `has_complete_blob` keeps
+        // answering yes, `local_ad` keeps advertising the object to peers, and
+        // reads fail with a raw io error rather than `MissingBlob`. This way a
+        // crash leaves the opposite — files with no row — which costs disk
+        // until the next sweep and never lies to anyone.
         self.conn().execute(
             "DELETE FROM blobs WHERE root = ?1",
             params![root.as_bytes().to_vec()],
         )?;
+        let _ = std::fs::remove_file(self.blob_path(root));
+        let _ = std::fs::remove_file(self.outboard_path(root));
         Ok(())
     }
 
@@ -713,7 +803,6 @@ impl Store {
                 }
             }
         }
-        self.touch(root)?;
         Ok(out)
     }
 
@@ -721,14 +810,6 @@ impl Store {
     pub fn read_all(&self, root: &Hash) -> Result<Vec<u8>> {
         let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
         self.read_range(root, 0, blob.size)
-    }
-
-    fn touch(&self, root: &Hash) -> Result<()> {
-        self.conn().execute(
-            "UPDATE blobs SET last_access = ?2 WHERE root = ?1",
-            params![root.as_bytes().to_vec(), synch_core::now_ns()],
-        )?;
-        Ok(())
     }
 
     // ---- slice serving and receiving --------------------------------------
@@ -872,20 +953,30 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&payload_path)?;
-        // Grown to fit, never shrunk: `size` is still this peer's claim, and
-        // `decode_ranges` below is what turns it into a fact. Sizing the file
-        // *down* on the strength of the claim is how an understated entry used
-        // to destroy verified groups — bytes gone, bitmap bits intact, the node
-        // advertising a group it could no longer serve and no way back short of
-        // deleting the object ([`grow_to`], `docs/DELTA-SYNC.md` §6).
-        grow_to(&payload, size)?;
+        // Grown to fit the *window*, never to the claimed size, and never
+        // shrunk.
+        //
+        // Never shrunk, because sizing a file down on the strength of a claim is
+        // how an understated entry used to destroy verified groups — bytes gone,
+        // bitmap bits intact, the node advertising a group it could no longer
+        // serve ([`grow_to`], `docs/DELTA-SYNC.md` §6).
+        //
+        // Never to the claimed size, because `size` is a peer's assertion off an
+        // entry and this runs *before* `decode_ranges` turns any of it into
+        // fact. An entry claiming 32 TiB for any root made every node that
+        // attempted a fetch create a 32 TiB sparse payload and a 128 GiB sparse
+        // outboard, fail verification, and leave both behind — `trim_to_size`
+        // only runs on a commit that completed the object, so nothing reclaimed
+        // them. Growing to the end of the window bounds the file by what is
+        // about to be verified; `write_at` extends past it as later windows
+        // land, so a real object still fills out normally.
+        grow_to(&payload, window_end_bytes(&served, size))?;
         let outboard_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(self.outboard_path(root))?;
-        grow_to(&outboard_file, tree.outboard_size())?;
         let outboard = PreOrderOutboard {
             root: root_hash,
             tree,
@@ -906,12 +997,27 @@ impl Store {
         // Persist the verified groups (payload and outboard) before the bitmap
         // in the index advances to cover them — otherwise a crash could leave
         // the index claiming groups the disk never received.
-        if let Some(payload) = &payload_for_sync {
-            let _ = fsync_file(payload);
-        }
-        if let Ok(ob) = File::open(self.outboard_path(root)) {
-            let _ = fsync_file(&ob);
-        }
+        // Both flushes are checked. Swallowing them meant an EIO or ENOSPC on
+        // flush let the bitmap advance over data that never reached stable
+        // storage — the exact inversion of the ordering this block exists to
+        // enforce. `try_clone` is likewise no longer allowed to fail silently:
+        // it fails under fd exhaustion, which is precisely when the machine is
+        // least able to afford an unflushed commit.
+        let payload = payload_for_sync.ok_or_else(|| StoreError::Verification {
+            root: *root,
+            reason: "could not duplicate the payload handle to flush it".into(),
+        })?;
+        fsync_file(&payload)?;
+        // Reopened for *write* to flush it. `File::open` hands back a read-only
+        // handle, and Windows refuses `FlushFileBuffers` on one with
+        // ERROR_ACCESS_DENIED — which went unnoticed while the result was
+        // discarded, and became a hard failure the moment these flushes started
+        // being checked. Unix does not care either way.
+        fsync_file(
+            &OpenOptions::new()
+                .write(true)
+                .open(self.outboard_path(root))?,
+        )?;
 
         let commit = self.commit_groups(root, size, &served, None, now)?;
         self.trim_to_size(root, commit);
@@ -1245,10 +1351,7 @@ mod tests {
             .unwrap();
         let ad = fetcher.local_ad(&root).unwrap().unwrap();
         assert!(!ad.is_complete());
-        match ad.state {
-            synch_core::AdState::Partial { ref spans } => assert_eq!(spans, &vec![(0, g)]),
-            synch_core::AdState::Complete => panic!("expected a partial ad"),
-        }
+        assert_eq!(ad.state.spans, vec![(0, g)]);
         assert!(ad.intersects(0, 10));
         assert!(!ad.intersects(2 * g, 3 * g));
     }

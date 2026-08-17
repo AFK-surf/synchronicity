@@ -5,6 +5,7 @@
 //! repository root.
 #![deny(missing_docs)]
 
+pub mod blocking;
 pub mod hash;
 pub mod head;
 pub mod origin;
@@ -12,6 +13,7 @@ pub mod path;
 pub mod record;
 pub mod wire;
 
+pub use blocking::{offload, TaskLost};
 pub use hash::{group_cv, hash_reader, join_cvs, join_root, Cv, Hash, HashParseError};
 pub use head::{head_signing_input, HeadError, HeadSummary, SignedHead, HEAD_SIGNING_DOMAIN};
 pub use origin::{NodeId, OriginId, OriginParseError};
@@ -22,8 +24,9 @@ pub use record::{
     KeyError, NodeManifest, SpaceInfo, AD_SPAN_GRANULARITY, RECORD_VERSION,
 };
 pub use wire::{
-    BlobMessage, ChunkRanges, GroupRange, MptMessage, ALPN_BLOB, ALPN_MPT, MAX_BATCH,
-    MAX_FRAME_LEN, MAX_PROOF_NODES, MAX_RANGES, MAX_SLICE_GROUPS, PROOF_NODE_LEN, PROTO_VERSION,
+    proof_nodes_upper_bound, BlobMessage, ChunkRanges, GroupRange, MptMessage, ALPN_BLOB, ALPN_MPT,
+    MAX_BATCH, MAX_FRAME_LEN, MAX_HEADS_PER_MESSAGE, MAX_PROOF_NODES, MAX_RANGES, MAX_SLICE_GROUPS,
+    PROOF_NODE_LEN, PROTO_VERSION,
 };
 
 /// The software identification string published in [`NodeManifest::software`].

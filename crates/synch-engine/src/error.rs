@@ -93,3 +93,9 @@ impl EngineError {
         EngineError::NotFound(msg.into())
     }
 }
+
+impl synch_core::TaskLost for EngineError {
+    fn task_lost(reason: String) -> Self {
+        EngineError::Blocking(reason)
+    }
+}

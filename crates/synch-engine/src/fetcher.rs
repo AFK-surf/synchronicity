@@ -23,6 +23,53 @@ pub struct Provider {
     pub claims: ChunkRanges,
     /// Its latency EWMA in microseconds; `0` means "never measured".
     pub latency_us: i64,
+    /// A per-selection random value, breaking ties between equally ranked
+    /// providers so the cluster does not converge on one of them (§6.4).
+    pub tiebreak: u64,
+}
+
+/// The rank an unmeasured provider sorts at: the median of the measured ones,
+/// so "unknown" means unknown rather than "worse than everything measured".
+fn median_latency(providers: &[Provider]) -> i64 {
+    let mut measured: Vec<i64> = providers
+        .iter()
+        .map(|p| p.latency_us)
+        .filter(|l| *l > 0)
+        .collect();
+    if measured.is_empty() {
+        return 0;
+    }
+    measured.sort_unstable();
+    let mid = measured.len() / 2;
+    if measured.len() % 2 == 1 {
+        return measured[mid];
+    }
+    // The midpoint of the two middle values, not one of them: landing *on* a
+    // measured peer's rank makes the two tie, and the tiebreak is random, so
+    // the unmeasured peer's position would flap between runs.
+    measured[mid - 1] + (measured[mid] - measured[mid - 1]) / 2
+}
+
+/// What a failed dial contributes to a peer's latency EWMA.
+///
+/// A fixed penalty, not the elapsed time: a dial that fails *fast* — connection
+/// refused, no route — would otherwise feed a small number into the average and
+/// promote the peer for being quick about being useless. Worse than any real
+/// latency, and smoothed by the EWMA, so one failure demotes sharply and a few
+/// successes earn the rank back.
+const FAILURE_PENALTY_US: i64 = 30_000_000;
+
+/// A cheap non-cryptographic random state, seeded from the clock.
+fn jitter_state() -> u64 {
+    (synch_core::now_ns() as u64) ^ 0x9e37_79b9_7f4a_7c15
+}
+
+/// xorshift64*, for tiebreaks. Nothing here needs a real generator.
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
 }
 
 /// A byte window of an object that is present and verified locally.
@@ -156,9 +203,9 @@ async fn futures_join<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F:
 impl Node {
     /// Resolves and ranks the providers for a byte range of an object (§6.4).
     ///
-    /// Ranking is by latency EWMA, then by advertised coverage, then by a
-    /// deterministic tiebreak on the origin's canonical name. Span summaries
-    /// are hints: a stale one costs one wasted round trip, never correctness.
+    /// Ranking is by latency EWMA, then by advertised coverage, then randomly
+    /// (§6.4). Span summaries are hints: a stale one costs one wasted round
+    /// trip, never correctness.
     pub fn providers_for(&self, root: &Hash, start: u64, end: u64) -> Result<Vec<Provider>> {
         let now = now_ns();
         let peers = self.store().peers_seen()?;
@@ -172,12 +219,12 @@ impl Node {
                 // No live binding: we could not dial them even if we wanted to.
                 continue;
             }
-            let claims = match &ad.state {
-                synch_core::AdState::Complete => ChunkRanges::single(0, group_count(ad.size)),
-                synch_core::AdState::Partial { spans } => ChunkRanges::from_ranges(
-                    spans.iter().map(|&(s, e)| groups_for_byte_range(s, e)),
-                ),
-            };
+            let claims = ChunkRanges::from_ranges(
+                ad.state
+                    .spans
+                    .iter()
+                    .map(|&(s, e)| groups_for_byte_range(s, e)),
+            );
             let latency_us = keys
                 .iter()
                 .filter_map(|k| {
@@ -194,23 +241,37 @@ impl Node {
                 keys,
                 claims,
                 latency_us,
+                tiebreak: 0,
             });
         }
+        // Rank by latency, then coverage, then *randomly* — which is what §6.4
+        // specifies and what a deterministic tiebreak quietly undid. Ordering
+        // the tail by canonical origin makes every node in the cluster choose
+        // the same provider first for any object whose holders are unmeasured,
+        // which is precisely the load concentration the random tiebreak exists
+        // to prevent.
+        //
+        // An unmeasured peer sorts into the middle rather than behind every
+        // measured one. `i64::MAX / 2` put a fast new local mirror behind a peer
+        // measured at 400 ms, and nothing would measure it until something else
+        // happened to pick it — a peer with no measurement is unknown, not slow.
+        let mut rng = jitter_state();
+        for provider in out.iter_mut() {
+            provider.tiebreak = next_random(&mut rng);
+        }
+        let unmeasured = median_latency(&out);
         out.sort_by(|a, b| {
-            let a_rank = if a.latency_us == 0 {
-                i64::MAX / 2
-            } else {
-                a.latency_us
+            let rank = |p: &Provider| {
+                if p.latency_us == 0 {
+                    unmeasured
+                } else {
+                    p.latency_us
+                }
             };
-            let b_rank = if b.latency_us == 0 {
-                i64::MAX / 2
-            } else {
-                b.latency_us
-            };
-            a_rank
-                .cmp(&b_rank)
+            rank(a)
+                .cmp(&rank(b))
                 .then(b.claims.count().cmp(&a.claims.count()))
-                .then(a.origin.canonical().cmp(&b.origin.canonical()))
+                .then(a.tiebreak.cmp(&b.tiebreak))
         });
         Ok(out)
     }
@@ -357,19 +418,27 @@ impl Node {
         }
 
         let fanout = self.config().fetch_fanout.max(1);
-        let mut candidates = providers.into_iter();
+        // A pool, not a one-shot iterator. Advancing a single iterator across
+        // batches meant each provider was selected at most once for the whole
+        // fetch, so a provider that served its share and stayed healthy was
+        // never asked again: with one good provider and two ghosts in the first
+        // batch, the good one served a third, the ghosts failed, the iterator
+        // was exhausted, and the fetch reported failure with the holder still
+        // online. §6.4 promises the opposite — a provider that cannot help is
+        // dropped and its groups are re-split across *the remainder*.
+        let mut pool: Vec<Provider> = providers;
+        // Providers are retired only by failing, so a round that makes no
+        // progress at all must end the loop or it would spin forever.
         loop {
-            if remaining.is_empty() {
+            if remaining.is_empty() || pool.is_empty() {
                 break;
             }
-            // One batch: up to `fanout` providers that can help with what is
-            // still missing.
-            let mut chosen = Vec::new();
-            for provider in candidates.by_ref() {
+            let mut chosen: Vec<Provider> = Vec::new();
+            for provider in pool.iter() {
                 if remaining.intersect(&provider.claims).is_empty() {
                     continue;
                 }
-                chosen.push(provider);
+                chosen.push(provider.clone());
                 if chosen.len() >= fanout {
                     break;
                 }
@@ -404,19 +473,31 @@ impl Node {
                 )
             }))
             .await;
+            let mut progressed = false;
             for (origin, result) in results {
                 match result {
                     Ok(got) => {
+                        if !got.is_empty() {
+                            progressed = true;
+                        } else {
+                            // Served nothing despite claiming the range: its
+                            // ads overstate what it has, so stop asking.
+                            pool.retain(|p| p.origin != origin);
+                        }
                         remaining = remaining.difference(&got);
                         report.fetched = report.fetched.union(&got);
                     }
                     Err(e) => {
-                        // A peer that cannot help is skipped and its slice
-                        // stays in `remaining`, so the next batch offers it to
-                        // whoever comes after.
+                        // A peer that cannot help is retired from the pool and
+                        // its slice stays in `remaining`, so the next batch
+                        // offers it to whoever is left.
                         tracing::debug!(origin = %origin, error = %e, "provider failed");
+                        pool.retain(|p| p.origin != origin);
                     }
                 }
+            }
+            if !progressed && pool.is_empty() {
+                break;
             }
         }
 
@@ -536,9 +617,7 @@ impl Node {
         if round.is_empty() {
             return Ok(());
         }
-        let leftover = self
-            .promote_round(root, size, donors, round, report)
-            .await?;
+        let leftover = self.promote_round(root, donors, round, report).await?;
         if span_level == 0 {
             return Ok(());
         }
@@ -586,8 +665,7 @@ impl Node {
             if round.is_empty() {
                 continue;
             }
-            self.promote_round(root, size, donors, round, report)
-                .await?;
+            self.promote_round(root, donors, round, report).await?;
         }
         Ok(())
     }
@@ -734,7 +812,6 @@ impl Node {
     async fn promote_round(
         &self,
         root: &Hash,
-        size: u64,
         donors: &[Donor],
         proven: Proven,
         report: &mut FetchReport,
@@ -744,7 +821,7 @@ impl Node {
         let donors = donors.to_vec();
         let (leftover, supplied) = crate::blocking::offload(move || {
             let mut proven = proven;
-            let supplied = node.promote_blocking(&root, size, &donors, &mut proven)?;
+            let supplied = node.promote_blocking(&root, &donors, &mut proven)?;
             Ok((proven, supplied))
         })
         .await?;
@@ -762,7 +839,6 @@ impl Node {
     fn promote_blocking(
         &self,
         root: &Hash,
-        size: u64,
         donors: &[Donor],
         proven: &mut Proven,
     ) -> Result<Vec<(Donor, ChunkRanges)>> {
@@ -774,7 +850,7 @@ impl Node {
             if donor.root() == *root {
                 continue;
             }
-            let got = self.store().promote(root, size, donor, proven, now_ns())?;
+            let got = self.store().promote(donor, proven, now_ns())?;
             if got.is_empty() {
                 continue;
             }
@@ -876,7 +952,17 @@ impl Node {
                     self.store().record_peer_sync(key, now_ns(), elapsed)?;
                     return Ok(got);
                 }
-                Err(e) => last_error = Some(e),
+                Err(e) => {
+                    // A failed dial has to move the EWMA, or ranking is a
+                    // one-way ratchet: latency was recorded only on success, so
+                    // a peer that was once fast and is now a black hole kept its
+                    // low EWMA and was therefore selected first on every
+                    // subsequent fetch, forever, with nothing able to demote it.
+                    let _ = self
+                        .store()
+                        .record_peer_failure(key, now_ns(), FAILURE_PENALTY_US);
+                    last_error = Some(e);
+                }
             }
         }
         Err(match last_error {
@@ -1062,7 +1148,7 @@ impl Node {
 
     /// The body of [`Node::materialize_blob`], for callers already off the
     /// runtime.
-    pub fn materialize_blob_blocking(
+    pub(crate) fn materialize_blob_blocking(
         &self,
         root: &Hash,
         size: u64,
@@ -1182,10 +1268,46 @@ mod tests {
         let ranked = node.providers_for(&root, 0, 1000).unwrap();
         assert_eq!(ranked.len(), 3);
         assert_eq!(ranked[0].origin, fast);
-        assert_eq!(ranked[1].origin, slow);
-        // A never-measured peer sorts after measured ones but is still a
-        // candidate.
-        assert_eq!(ranked[2].origin, unknown);
+        // A never-measured peer ranks at the median of the measured ones, not
+        // behind all of them: "unknown" is not "slow", and sorting it last is
+        // self-fulfilling — nothing would ever measure it. Here that puts it
+        // ahead of a peer measured at half a second.
+        assert_eq!(ranked[1].origin, unknown);
+        assert_eq!(ranked[2].origin, slow);
+    }
+
+    #[tokio::test]
+    async fn a_failed_dial_demotes_a_peer_that_was_fast() {
+        // Ranking has to move in both directions. Latency was recorded only on
+        // success, so a peer that went dark kept its low EWMA and was chosen
+        // first on every subsequent fetch, forever.
+        let (_d, node) = node().await;
+        let root = Hash::new(b"object");
+        let (gone, gone_key) = trust(&node, "gone");
+        let (steady, steady_key) = trust(&node, "steady");
+        for origin in [&gone, &steady] {
+            node.store()
+                .put_provider(&root, origin, &BlobAd::complete(1000))
+                .unwrap();
+        }
+        node.store().record_peer_sync(&gone_key, 0, 1_000).unwrap();
+        node.store()
+            .record_peer_sync(&steady_key, 0, 50_000)
+            .unwrap();
+        assert_eq!(
+            node.providers_for(&root, 0, 1000).unwrap()[0].origin,
+            gone,
+            "the fast peer leads while it is working"
+        );
+
+        node.store()
+            .record_peer_failure(&gone_key, 1, FAILURE_PENALTY_US)
+            .unwrap();
+        assert_eq!(
+            node.providers_for(&root, 0, 1000).unwrap()[0].origin,
+            steady,
+            "and is demoted once it stops answering"
+        );
     }
 
     #[tokio::test]
@@ -1552,6 +1674,14 @@ mod tests {
         }
         node.store()
             .put_provider(&root, &holder_origin, &BlobAd::complete(size))
+            .unwrap();
+        // Measured, and slower than every ghost, so it deterministically ranks
+        // last. It used to land there for being *unmeasured*, which no longer
+        // sorts to the back — and the tiebreak among equals is random now, by
+        // §6.4 — so the ordering this test depends on has to be stated rather
+        // than inherited.
+        node.store()
+            .record_peer_sync(&holder.node_id(), 0, 100_000)
             .unwrap();
 
         let ranked = node.providers_for(&root, 0, size).unwrap();

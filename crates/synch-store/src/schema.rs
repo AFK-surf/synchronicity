@@ -64,6 +64,11 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V7_OBSERVED_CLAIMED_BY),
     Migration::Sql(V8_S3_CONFIG_NAMESPACE),
     Migration::Sql(V9_ENTRY_UNIX_MODE),
+    Migration::Rust {
+        name: "verified groups as ranges",
+        run: v10_groups_as_ranges,
+    },
+    Migration::Sql(V11_HEADS_POINT_AT_HISTORY),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -190,7 +195,12 @@ CREATE TABLE mirrors (
   space      TEXT NOT NULL,
   policy     TEXT NOT NULL               -- 'newest' | 'origin=<id>' | 'strict' (§7.2)
 );
-INSERT OR REPLACE INTO mirrors (local_path, space, policy)
+-- Plain INSERT, not INSERT OR REPLACE. The key moves from
+-- (origin_id, space) to local_path, so two v3 mirrors that pointed at one
+-- directory collapse here — and the survivor's sweep then deletes the other
+-- origin's materialized files. Failing loudly is the right outcome for an
+-- ambiguous upgrade: the operator picks which mirror that directory is.
+INSERT INTO mirrors (local_path, space, policy)
   SELECT local_path, space, 'origin=' || origin_id FROM mirrors_v3;
 DROP TABLE mirrors_v3;
 "#;
@@ -342,6 +352,80 @@ CREATE INDEX entries_by_path    ON entries (space, path);
 CREATE INDEX entries_by_content ON entries (content);
 "#;
 
+/// v10 — `blobs.bitmap` holds the verified groups as ranges rather than as a
+/// bit per group.
+///
+/// The column keeps its name and type; only the encoding changes. A bitmap cost
+/// `O(group_count)` to read and to write, and a partial object's row is read and
+/// rewritten on every committed window and read again on every slice served, so
+/// the cost fell on exactly the hot paths — quadratic in the object for a fetch,
+/// and a cheap-request/expensive-work amplification for a provider. Runs of
+/// verified groups are contiguous in practice, so the range form is a few
+/// integers where the bitmap was hundreds of kilobytes.
+///
+/// Only partial rows carry the column at all: a complete object's groups are
+/// implied by its size.
+fn v10_groups_as_ranges(tx: &Transaction<'_>) -> Result<()> {
+    let rows: Vec<(Vec<u8>, i64, Vec<u8>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT root, size, bitmap FROM blobs WHERE complete = 0 AND bitmap IS NOT NULL",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (root, size, bits) in rows {
+        let groups = synch_core::group_count(size as u64);
+        let ranges = crate::cas::bitmap_to_ranges(&bits, groups);
+        tx.execute(
+            "UPDATE blobs SET bitmap = ?2 WHERE root = ?1",
+            rusqlite::params![root, crate::cas::ranges_to_blob(&ranges)],
+        )?;
+    }
+    Ok(())
+}
+
+/// v11 — `heads` points into `head_history` rather than copying it.
+///
+/// The two tables carried the same five columns for the same rows, and every
+/// head that reached the complete slot was written to `head_history` twice
+/// under two separate rules: on arrival (`offer_head`, `publish`, `activate`)
+/// and again on displacement (`try_promote`, `publish`, `activate`). The second
+/// rule was provably redundant — every head reaching the complete slot passed
+/// through one of the first three — and was saved only by `INSERT OR IGNORE`.
+///
+/// The duplication then had to be patched around: retention needed an explicit
+/// exemption so it would not delete the history rows shadowing the current
+/// heads, and the GC mark set was a `UNION` across both tables. With `heads`
+/// holding only `(seq, root)` and the signature living in one place, the
+/// exemption becomes referential integrity rather than a special case, and the
+/// mark set is one table.
+///
+/// The backfill is `INSERT OR IGNORE` first so that a head whose history row
+/// was somehow missing does not lose its signature to the rebuild.
+const V11_HEADS_POINT_AT_HISTORY: &str = r#"
+INSERT OR IGNORE INTO head_history (origin_id, seq, root, created_at, signed_by, sig)
+  SELECT origin_id, seq, root, created_at, signed_by, sig FROM heads;
+ALTER TABLE heads RENAME TO heads_v10;
+CREATE TABLE heads (
+  origin_id   TEXT NOT NULL,
+  slot        TEXT NOT NULL,             -- 'complete' | 'pending'
+  seq         INTEGER NOT NULL,
+  root        BLOB NOT NULL,
+  received_at INTEGER NOT NULL,
+  verified_at INTEGER NOT NULL,
+  PRIMARY KEY (origin_id, slot)
+);
+INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
+  SELECT origin_id, slot, seq, root, received_at, verified_at FROM heads_v10;
+DROP TABLE heads_v10;
+"#;
+
 /// The §10 schema as the design document states it — the shape replaying the
 /// whole chain must produce.
 ///
@@ -375,9 +459,6 @@ CREATE TABLE heads (
   slot        TEXT NOT NULL,
   seq         INTEGER NOT NULL,
   root        BLOB NOT NULL,
-  created_at  INTEGER NOT NULL,
-  signed_by   BLOB NOT NULL,
-  sig         BLOB NOT NULL,
   received_at INTEGER NOT NULL,
   verified_at INTEGER NOT NULL,
   PRIMARY KEY (origin_id, slot)

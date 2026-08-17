@@ -124,16 +124,20 @@ impl FileEntry {
     }
 }
 
-/// How much of an object a holder has.
+/// How much of an object a holder has: the byte spans it holds, coalesced at
+/// 16 MiB granularity.
+///
+/// One representation, not two. There used to be a `Complete` variant beside
+/// `Partial`, and it was exactly `Partial { spans: [(0, size)] }` — every
+/// consumer had to branch on the distinction to arrive back at the same answer,
+/// six sites of it, and the same duplication was carried into the
+/// `blob_providers` table as a `complete` column beside the spans. Completeness
+/// is a question you ask of the spans and the size, not a second thing to keep
+/// in step with them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AdState {
-    /// The whole object is held and servable.
-    Complete,
-    /// Only the listed byte spans are held, coalesced at 16 MiB granularity.
-    Partial {
-        /// Held `[start, end)` byte spans.
-        spans: Vec<(u64, u64)>,
-    },
+pub struct AdState {
+    /// Held `[start, end)` byte spans.
+    pub spans: Vec<(u64, u64)>,
 }
 
 /// Granularity at which partial spans are coalesced before publishing (§4.2).
@@ -156,7 +160,13 @@ impl BlobAd {
         BlobAd {
             v: RECORD_VERSION,
             size,
-            state: AdState::Complete,
+            state: AdState {
+                spans: if size == 0 {
+                    Vec::new()
+                } else {
+                    vec![(0, size)]
+                },
+            },
         }
     }
 
@@ -165,23 +175,22 @@ impl BlobAd {
         BlobAd {
             v: RECORD_VERSION,
             size,
-            state: AdState::Partial {
+            state: AdState {
                 spans: coalesce_spans(spans, size),
             },
         }
     }
 
     /// True if the ad covers the whole object.
+    ///
+    /// Derived, not stored: one span reaching from nothing to the object's end.
     pub fn is_complete(&self) -> bool {
-        matches!(self.state, AdState::Complete)
+        self.size == 0 || matches!(self.state.spans.as_slice(), [(0, end)] if *end >= self.size)
     }
 
     /// True if the advertised spans intersect `[start, end)`.
     pub fn intersects(&self, start: u64, end: u64) -> bool {
-        match &self.state {
-            AdState::Complete => start < end.min(self.size),
-            AdState::Partial { spans } => spans.iter().any(|&(s, e)| s < end && start < e),
-        }
+        self.state.spans.iter().any(|&(s, e)| s < end && start < e)
     }
 }
 

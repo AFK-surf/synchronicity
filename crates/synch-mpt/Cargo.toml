@@ -20,3 +20,8 @@ proptest.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Merkle proofs for individual keys: a §13 capability with no v1 caller, kept
+# out of the default surface so it is not something every build maintains.
+proofs = []

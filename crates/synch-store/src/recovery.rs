@@ -64,6 +64,24 @@ impl Store {
         claimed_by: Option<&NodeId>,
         now: i64,
     ) -> Result<bool> {
+        // The seq is stored as SQLite's signed 64-bit integer and the
+        // "keep the greatest" guard below is SQL, so it compares *signed* while
+        // every Rust reader of this column compares unsigned. A seq at or above
+        // 2^63 therefore stored negative and inverted the ordering in both
+        // directions — and §3.4 deliberately does not authenticate the
+        // summaries this comes from, so the value is any member's to choose.
+        // Downstream it feeds `recovery_state`, which can pin a fresh node in
+        // recovery, and then `raise_publish_floor`, which is durable and only
+        // ever rises: a floor set from a bogus claim is a node that can never
+        // publish an acceptable head again.
+        //
+        // Refused rather than clamped: a real head cannot have this seq, so the
+        // claim is not something to record a rounded-down version of.
+        if seq > i64::MAX as u64 {
+            return Err(StoreError::invalid(format!(
+                "a peer advertised head seq {seq} for {origin}, which is past the representable range"
+            )));
+        }
         let changed = self.conn().execute(
             "INSERT INTO observed_heads (origin_id, seq, root, complete, claimed_by, observed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)

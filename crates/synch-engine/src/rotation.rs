@@ -225,12 +225,10 @@ impl Node {
         let root = self.current_root()?;
         let seq = self.next_seq()?;
         let head = SignedHead::sign(&held.secret, self.origin().clone(), seq, root, now_ns());
-        if let Some(previous) = self.store().complete_head(self.origin())? {
-            self.store().record_history(&previous)?;
-        }
+        // `put_head` retains the signature; the displaced head retained its own
+        // when it took the slot (§10, v11).
         self.store()
             .put_head(Slot::Complete, &head, now_ns(), now_ns())?;
-        self.store().record_history(&head)?;
         tracing::info!(
             seq,
             key = %new_key.to_z32(),

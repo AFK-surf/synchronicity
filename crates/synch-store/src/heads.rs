@@ -76,6 +76,18 @@ fn build_head(
     })
 }
 
+/// The columns of a head, joined from the pointer to the signature it names.
+///
+/// `heads` holds `(seq, root)` and the bookkeeping times; the signed head those
+/// identify lives once, in `head_history`. The join is what makes "the current
+/// head" and "the retained history" one fact instead of two copies that have to
+/// be kept in step (§10, v11).
+const HEAD_JOIN: &str = "SELECT h.origin_id, h.seq, h.root, hh.created_at, hh.signed_by, hh.sig,
+        h.received_at, h.verified_at
+ FROM heads h
+ JOIN head_history hh
+   ON hh.origin_id = h.origin_id AND hh.seq = h.seq AND hh.root = h.root";
+
 fn head_in(
     conn: &rusqlite::Connection,
     origin: &OriginId,
@@ -83,8 +95,7 @@ fn head_in(
 ) -> Result<Option<StoredHead>> {
     let row = conn
         .query_row(
-            "SELECT origin_id, seq, root, created_at, signed_by, sig, received_at, verified_at
-             FROM heads WHERE origin_id = ?1 AND slot = ?2",
+            &format!("{HEAD_JOIN} WHERE h.origin_id = ?1 AND h.slot = ?2"),
             params![origin.canonical(), slot.as_str()],
             head_from_row,
         )
@@ -124,20 +135,15 @@ impl Store {
     pub fn head_floor(&self, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
         let complete = self.complete_head(origin)?.map(|h| (h.seq, h.root));
         let pending = self.pending_head(origin)?.map(|h| (h.seq, h.root));
-        Ok(match (complete, pending) {
-            (None, p) => p,
-            (c, None) => c,
-            (Some(c), Some(p)) => Some(if (p.0, p.1 .0) > (c.0, c.1 .0) { p } else { c }),
-        })
+        Ok(best_floor(complete, pending))
     }
 
     /// Every slot for every origin.
     pub fn all_heads(&self, slot: Slot) -> Result<Vec<StoredHead>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT origin_id, seq, root, created_at, signed_by, sig, received_at, verified_at
-             FROM heads WHERE slot = ?1 ORDER BY origin_id",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{HEAD_JOIN} WHERE h.slot = ?1 ORDER BY h.origin_id"
+        ))?;
         let rows = stmt.query_map(params![slot.as_str()], head_from_row)?;
         let mut out = Vec::new();
         for row in rows {
@@ -176,33 +182,27 @@ impl Store {
         Ok(())
     }
 
-    /// Promotes the pending head to complete, atomically (§5.2).
-    ///
-    /// The displaced complete head is retained in `head_history` with its
-    /// signature, as provable history and fork evidence (§4.4, §3.4).
-    pub fn promote_pending(&self, origin: &OriginId, now: i64) -> Result<Option<SignedHead>> {
-        let Some(pending) = self.head(origin, Slot::Pending)? else {
-            return Ok(None);
-        };
-        let displaced = self.complete_head(origin)?;
-        self.with_tx(|tx| {
-            if let Some(old) = &displaced {
-                record_history_in(tx, old)?;
-            }
-            put_head_in(tx, Slot::Complete, &pending.head, pending.received_at, now)?;
-            tx.execute(
-                "DELETE FROM heads WHERE origin_id = ?1 AND slot = 'pending'",
-                params![origin.canonical()],
-            )?;
-            Ok(())
-        })?;
-        Ok(Some(pending.head))
-    }
-
     /// Records a head in `head_history`, keeping its signature.
     pub fn record_history(&self, head: &SignedHead) -> Result<()> {
         let conn = self.conn();
         record_history_in(&conn, head)
+    }
+
+    /// How many distinct roots an origin has retained at one seq.
+    ///
+    /// Two is equivocation and is evidence worth keeping (§4.4). An unbounded
+    /// number is a member signing forever at one seq, which the retention rule
+    /// cannot clear: same-seq forks are *exempt* from `root_retention` until the
+    /// origin publishes past that seq, and an attacker simply never does. Every
+    /// row is verified and bound, so nothing upstream rejects them, and
+    /// `equivocations()` re-reads the whole set per pair, so `doctor` and each
+    /// GC pass go quadratic in the storm.
+    pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
+            params![origin.canonical(), seq as i64],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
     }
 
     /// The retained history for an origin, newest first.
@@ -235,12 +235,28 @@ impl Store {
     /// Equivocation only harms the equivocator's own published view, but it is
     /// reported loudly (§4.4) with both signed heads retained as proof.
     pub fn equivocations(&self) -> Result<Vec<Equivocation>> {
+        self.equivocations_matching(None)
+    }
+
+    /// The same, for one origin.
+    ///
+    /// `prune_history_before` runs once per origin per maintenance pass and
+    /// needs only that origin's forks; calling the unscoped version there made
+    /// each pass do a full-table group-by *and* an unfiltered per-origin
+    /// history read for every origin in the cluster — an N+1 inside an N+1.
+    pub fn equivocations_for(&self, origin: &OriginId) -> Result<Vec<Equivocation>> {
+        self.equivocations_matching(Some(origin))
+    }
+
+    fn equivocations_matching(&self, only: Option<&OriginId>) -> Result<Vec<Equivocation>> {
         let conn = self.conn();
+        let scope = only.map(|o| o.canonical());
         let mut stmt = conn.prepare(
             "SELECT origin_id, seq, COUNT(DISTINCT root) AS roots FROM head_history
+             WHERE ?1 IS NULL OR origin_id = ?1
              GROUP BY origin_id, seq HAVING roots > 1 ORDER BY origin_id, seq",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![scope], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)? as u64,
@@ -267,8 +283,16 @@ impl Store {
         Ok(out)
     }
 
-    /// Deletes history entries older than `keep_seq` for an origin, leaving the
-    /// retention window (§5.4).
+    /// Deletes every history row for an origin below `keep_from_seq`,
+    /// unconditionally.
+    ///
+    /// The blunt version, and the distinction matters: this honours **none** of
+    /// the three exemptions [`Store::prune_history_before`] documents — not the
+    /// current heads, not same-seq fork evidence, not the retention window. It
+    /// is a test and maintenance escape hatch for "drop this history now", and
+    /// the retention path in the maintenance loop must keep using
+    /// `prune_history_before`. Using this one there would delete the rows GC
+    /// marks the live trie from.
     pub fn prune_history(&self, origin: &OriginId, keep_from_seq: u64) -> Result<usize> {
         Ok(self.conn().execute(
             "DELETE FROM head_history WHERE origin_id = ?1 AND seq < ?2",
@@ -320,9 +344,8 @@ impl Store {
         // A seq with more than one retained root is a fork, and both sides of
         // it are evidence.
         let forked: Vec<u64> = self
-            .equivocations()?
+            .equivocations_for(origin)?
             .into_iter()
-            .filter(|e| &e.origin == origin)
             .map(|e| e.seq)
             .collect();
         let moved_past_forks = current_created < before;
@@ -365,8 +388,10 @@ impl Store {
     /// bootstrap.
     pub fn retained_roots(&self) -> Result<Vec<Hash>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT root FROM heads UNION SELECT root FROM head_history")?;
+        // One table, not a union across two. `put_head` writes the signature to
+        // `head_history` before the slot points at it, so every current head's
+        // root is here by construction rather than by coincidence.
+        let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
         let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -390,6 +415,19 @@ impl Txn<'_> {
     /// The pending head, read inside the transaction.
     pub fn pending_head(&self, origin: &OriginId) -> Result<Option<SignedHead>> {
         Ok(self.head(origin, Slot::Pending)?.map(|s| s.head))
+    }
+
+    /// The `(seq, root)` ordering key currently held, read inside the
+    /// transaction.
+    ///
+    /// The acceptance rule reads this and then writes what it read, so it has
+    /// to see the same snapshot the write lands in: split across two lock
+    /// acquisitions, two concurrent offers both read the same floor, both
+    /// decide they beat it, and the lower one wins the race to the slot.
+    pub fn head_floor(&self, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
+        let complete = self.complete_head(origin)?.map(|h| (h.seq, h.root));
+        let pending = self.pending_head(origin)?.map(|h| (h.seq, h.root));
+        Ok(best_floor(complete, pending))
     }
 
     /// Writes a head into a slot, inside the transaction.
@@ -419,6 +457,27 @@ impl Txn<'_> {
     pub fn record_history(&self, head: &SignedHead) -> Result<()> {
         record_history_in(self.conn(), head)
     }
+
+    /// How many distinct roots this origin has retained at one seq, inside the
+    /// transaction. See [`Store::fork_width`].
+    pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
+            params![origin.canonical(), seq as i64],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
+    }
+
+    /// True if this exact head is already retained, so re-offering one already
+    /// on record is never mistaken for widening the fork.
+    pub fn head_history_has(&self, origin: &OriginId, seq: u64, root: &Hash) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM head_history
+             WHERE origin_id = ?1 AND seq = ?2 AND root = ?3",
+            params![origin.canonical(), seq as i64, root.as_bytes().to_vec()],
+            |row| row.get::<_, i64>(0),
+        )? > 0)
+    }
 }
 
 /// A same-seq fork by one origin, with both signed heads as proof.
@@ -432,6 +491,17 @@ pub struct Equivocation {
     pub heads: Vec<SignedHead>,
 }
 
+/// The greater of the two slots' ordering keys, which is what the §5.2
+/// acceptance rule compares against: a head already being fetched is not
+/// fetched again, and a head older than an in-progress target is not adopted.
+fn best_floor(complete: Option<(u64, Hash)>, pending: Option<(u64, Hash)>) -> Option<(u64, Hash)> {
+    match (complete, pending) {
+        (None, p) => p,
+        (c, None) => c,
+        (Some(c), Some(p)) => Some(if (p.0, p.1 .0) > (c.0, c.1 .0) { p } else { c }),
+    }
+}
+
 fn put_head_in(
     conn: &rusqlite::Connection,
     slot: Slot,
@@ -439,21 +509,23 @@ fn put_head_in(
     received_at: i64,
     verified_at: i64,
 ) -> Result<()> {
+    // The signature goes to `head_history` and the slot points at it. Writing
+    // it here is what makes the pointer sound for *every* caller, so no caller
+    // has to remember to record history alongside — which is what the old
+    // record-on-arrival-and-again-on-displacement pair of rules was doing by
+    // hand, redundantly, at seven call sites.
+    record_history_in(conn, head)?;
     conn.execute(
-        "INSERT INTO heads (origin_id, slot, seq, root, created_at, signed_by, sig, received_at, verified_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(origin_id, slot) DO UPDATE SET
-           seq = excluded.seq, root = excluded.root, created_at = excluded.created_at,
-           signed_by = excluded.signed_by, sig = excluded.sig,
+           seq = excluded.seq, root = excluded.root,
            received_at = excluded.received_at, verified_at = excluded.verified_at",
         params![
             head.origin.canonical(),
             slot.as_str(),
             head.seq as i64,
             head.root.as_bytes().to_vec(),
-            head.created_at,
-            head.signed_by.as_bytes().to_vec(),
-            head.sig.to_bytes().to_vec(),
             received_at,
             verified_at,
         ],
@@ -531,32 +603,6 @@ mod tests {
     }
 
     #[test]
-    fn promotion_retains_the_displaced_head_as_evidence() {
-        let (_d, store) = store();
-        let key = SecretKey::generate();
-        let old = SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0);
-        let new = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), 0);
-        store.put_head(Slot::Complete, &old, 0, 0).unwrap();
-        store.put_head(Slot::Pending, &new, 0, 0).unwrap();
-
-        let promoted = store.promote_pending(&origin(), 10).unwrap().unwrap();
-        assert_eq!(promoted, new);
-        assert_eq!(store.complete_head(&origin()).unwrap(), Some(new));
-        assert_eq!(store.pending_head(&origin()).unwrap(), None);
-
-        let history = store.head_history(&origin()).unwrap();
-        assert_eq!(history, vec![old.clone()]);
-        // Retained with its signature: provable history, not just a hash.
-        history[0].verify_signature().unwrap();
-    }
-
-    #[test]
-    fn promotion_without_a_pending_head_is_a_no_op() {
-        let (_d, store) = store();
-        assert!(store.promote_pending(&origin(), 0).unwrap().is_none());
-    }
-
-    #[test]
     fn equivocation_is_detected_with_both_proofs() {
         let (_d, store) = store();
         let key = SecretKey::generate();
@@ -588,14 +634,79 @@ mod tests {
         let pending = SignedHead::sign(&key, origin(), 7, Hash([7u8; 32]), 0);
         store.put_head(Slot::Pending, &pending, 0, 0).unwrap();
 
+        // Seven distinct roots: five recorded directly, plus the two the slots
+        // point at — which `put_head` retains, so they are here by
+        // construction rather than needing the union `retained_roots` used to
+        // take across both tables.
         let roots = store.retained_roots().unwrap();
         assert_eq!(roots.len(), 7);
         assert!(roots.contains(&Hash([6u8; 32])));
         // Pending heads must be in the mark set (§5.4).
         assert!(roots.contains(&Hash([7u8; 32])));
 
+        // Pruning below seq 4 drops the first three; seqs 4 and 5 remain, as do
+        // the two the slots point at.
         assert_eq!(store.prune_history(&origin(), 4).unwrap(), 3);
-        assert_eq!(store.head_history(&origin()).unwrap().len(), 2);
+        assert_eq!(store.head_history(&origin()).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn v11_carries_every_head_signature_across_the_rebuild() {
+        // The migration drops the signature columns from `heads`, so it has to
+        // move them into `head_history` first or the rebuild silently loses the
+        // ability to verify the current head. Built by replaying the chain up
+        // to v10 and shaping the old table by hand, so this exercises the
+        // migration rather than the code that now writes the new shape.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::db::DB_FILE);
+        let key = SecretKey::generate();
+        let complete = SignedHead::sign(&key, origin(), 4, Hash([4u8; 32]), 44);
+        let pending = SignedHead::sign(&key, origin(), 5, Hash([5u8; 32]), 55);
+        {
+            let mut conn = rusqlite::Connection::open(&path).unwrap();
+            crate::db::migrate(&mut conn, &crate::schema::MIGRATIONS[..10]).unwrap();
+            // The v10 shape: signatures copied into `heads`, nothing in history.
+            conn.execute_batch(
+                "DROP TABLE heads;
+                 CREATE TABLE heads (
+                   origin_id TEXT NOT NULL, slot TEXT NOT NULL, seq INTEGER NOT NULL,
+                   root BLOB NOT NULL, created_at INTEGER NOT NULL, signed_by BLOB NOT NULL,
+                   sig BLOB NOT NULL, received_at INTEGER NOT NULL, verified_at INTEGER NOT NULL,
+                   PRIMARY KEY (origin_id, slot));",
+            )
+            .unwrap();
+            for (slot, head) in [("complete", &complete), ("pending", &pending)] {
+                conn.execute(
+                    "INSERT INTO heads (origin_id, slot, seq, root, created_at, signed_by, sig,
+                                        received_at, verified_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 2)",
+                    params![
+                        head.origin.canonical(),
+                        slot,
+                        head.seq as i64,
+                        head.root.as_bytes().to_vec(),
+                        head.created_at,
+                        head.signed_by.as_bytes().to_vec(),
+                        head.sig.to_bytes().to_vec(),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        let read_complete = store.complete_head(&origin()).unwrap().unwrap();
+        assert_eq!(read_complete, complete);
+        read_complete
+            .verify_signature()
+            .expect("the signature survived the rebuild");
+        let read_pending = store.pending_head(&origin()).unwrap().unwrap();
+        assert_eq!(read_pending, pending);
+        read_pending.verify_signature().unwrap();
+
+        // Both roots are now markable from the one table GC reads.
+        let roots = store.retained_roots().unwrap();
+        assert!(roots.contains(&complete.root) && roots.contains(&pending.root));
     }
 
     #[test]

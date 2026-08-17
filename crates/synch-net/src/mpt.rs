@@ -14,7 +14,7 @@ use iroh::{
 };
 use synch_core::{
     now_ns, BlobAd, Hash, HeadSummary, MptMessage, NodeId, OriginId, SignedHead, MAX_BATCH,
-    PROTO_VERSION,
+    MAX_HEADS_PER_MESSAGE, PROTO_VERSION,
 };
 use synch_mpt::NodeStore;
 use synch_store::{Slot, Store};
@@ -22,8 +22,33 @@ use synch_store::{Slot, Store};
 use crate::{
     error::NetError,
     frame::{read_frame, write_frame},
-    reconcile::Syncer,
 };
+
+/// What the `sync/mpt/1` responder needs from the layer that reconciles heads.
+///
+/// The serve side has to answer `Hello` with this node's summaries, record what
+/// a dialing peer advertised, and offer pushed heads for adoption. None of that
+/// is networking — it is the §5.2 acceptance rule, the binding check, and the
+/// promotion transaction — so it is named here as a requirement and implemented
+/// where it belongs, in the engine.
+///
+/// The methods are synchronous and are called from the blocking pool: each one
+/// walks a trie or opens a transaction.
+pub trait HeadSink: Send + Sync + std::fmt::Debug + 'static {
+    /// The head summaries this node advertises in `Hello` (§5.1).
+    fn local_summaries(&self) -> Result<Vec<HeadSummary>, NetError>;
+
+    /// Records what a peer advertised for this node's own origin (§3.4).
+    fn observe_summaries_from(
+        &self,
+        peer: NodeId,
+        summaries: &[HeadSummary],
+        now: i64,
+    ) -> Result<(), NetError>;
+
+    /// Offers a head for adoption under the §5.2 acceptance rule.
+    fn offer_head(&self, head: &SignedHead, now: i64) -> Result<(), NetError>;
+}
 
 /// How often a live session refreshes the sighting it recorded at accept.
 const PEER_SEEN_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
@@ -31,15 +56,17 @@ const PEER_SEEN_REFRESH: std::time::Duration = std::time::Duration::from_secs(60
 /// The `sync/mpt/1` protocol handler.
 #[derive(Debug, Clone)]
 pub struct MptProtocol {
-    syncer: Syncer,
+    store: Arc<Store>,
+    heads: Arc<dyn HeadSink>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl MptProtocol {
-    /// Builds a handler over a store.
-    pub fn new(store: Arc<Store>) -> Self {
+    /// Builds a handler over a store and the reconciler that owns head state.
+    pub fn new(store: Arc<Store>, heads: Arc<dyn HeadSink>) -> Self {
         MptProtocol {
-            syncer: Syncer::new(store),
+            store,
+            heads,
             on_unknown_key: None,
         }
     }
@@ -54,15 +81,8 @@ impl MptProtocol {
         self
     }
 
-    /// Rings `wake` whenever a head this session accepts flips to complete —
-    /// the serve side's half of the change bell (`Syncer::on_change`).
-    pub fn on_change(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
-        self.syncer = self.syncer.on_change(wake);
-        self
-    }
-
     fn store(&self) -> &Arc<Store> {
-        self.syncer.store()
+        &self.store
     }
 }
 
@@ -138,6 +158,7 @@ impl MptProtocol {
                         "unsupported protocol version {proto}"
                     )));
                 }
+                check_heads(heads.len(), "a Hello summary list")?;
                 // A dialing peer's summaries are as good an observation as the
                 // ones we collect by dialing out, and a node in recovery is
                 // more likely to be called than to be calling (§3.4).
@@ -145,10 +166,10 @@ impl MptProtocol {
                 // Summarizing means asking the trie whether we hold each root
                 // whole — a walk on the first ask for a root, memoized after —
                 // so the pair runs on the blocking pool (§5.1).
-                let syncer = self.syncer.clone();
+                let sink = self.heads.clone();
                 let ours = crate::blocking::offload(move || {
-                    syncer.observe_summaries_from(Some(peer), &heads, now_ns())?;
-                    syncer.local_summaries()
+                    sink.observe_summaries_from(peer, &heads, now_ns())?;
+                    sink.local_summaries()
                 })
                 .await?;
                 write_frame(
@@ -164,14 +185,15 @@ impl MptProtocol {
                 // we have that it lacks.
                 match read_frame::<MptMessage>(recv).await? {
                     MptMessage::Heads { heads } => {
+                        check_heads(heads.len(), "a Heads push")?;
                         // Each offer verifies a signature, records history, and
                         // may promote the head — which walks the trie and
                         // re-materializes the changed leaves in one
                         // transaction (§5.2).
-                        let syncer = self.syncer.clone();
+                        let sink = self.heads.clone();
                         crate::blocking::offload(move || {
                             for head in heads {
-                                let _ = syncer.offer_head(&head, now_ns())?;
+                                sink.offer_head(&head, now_ns())?;
                             }
                             Ok(())
                         })
@@ -181,6 +203,7 @@ impl MptProtocol {
                 }
                 match read_frame::<MptMessage>(recv).await? {
                     MptMessage::HeadsWant { origins } => {
+                        check_heads(origins.len(), "a HeadsWant list")?;
                         let heads = self.heads_for(&origins)?;
                         write_frame(send, &MptMessage::Heads { heads }).await?;
                     }
@@ -189,11 +212,10 @@ impl MptProtocol {
                 Ok(())
             }
             MptMessage::HeadPush { head } => {
-                let syncer = self.syncer.clone();
+                let sink = self.heads.clone();
                 let pushed = head.clone();
-                let outcome =
-                    crate::blocking::offload(move || syncer.offer_head(&pushed, now_ns())).await?;
-                tracing::debug!(origin = %head.origin, ?outcome, "head pushed to us");
+                crate::blocking::offload(move || sink.offer_head(&pushed, now_ns())).await?;
+                tracing::debug!(origin = %head.origin, "head pushed to us");
                 // The ack tells the pusher we processed it; an empty Heads is
                 // the smallest well-typed acknowledgement in the schema.
                 write_frame(send, &MptMessage::Heads { heads: Vec::new() }).await?;
@@ -275,6 +297,30 @@ fn check_batch(len: usize) -> Result<(), NetError> {
     if len > MAX_BATCH {
         return Err(NetError::Unexpected(format!(
             "batch of {len} exceeds the {MAX_BATCH} limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Bounds a head-carrying message, which `MAX_BATCH` never covered.
+///
+/// `GetNodes`/`GetValues` are capped at [`MAX_BATCH`] hashes because a cheap
+/// request must not buy expensive work (§12). The head messages had no such
+/// cap and are the more expensive of the two: bounded only by `MAX_FRAME_LEN`
+/// (16 MiB), one `Heads` frame carries on the order of 110 000 `SignedHead`s,
+/// and each one costs an Ed25519 verification *and* a `head_history` insert —
+/// the insert running before the ordering check, so heads that lose the
+/// comparison are persisted too. `HeadsWant` is the same shape with a database
+/// query per origin. Seconds of CPU and hundreds of thousands of autocommit
+/// statements, for 16 MB of upload, repeatable per stream.
+///
+/// The bound is generous next to any real cluster: §12 sizes membership at
+/// N ≤ 100 origins, so a legitimate exchange names tens of heads, not
+/// thousands.
+fn check_heads(len: usize, what: &str) -> Result<(), NetError> {
+    if len > MAX_HEADS_PER_MESSAGE {
+        return Err(NetError::Unexpected(format!(
+            "{what} of {len} exceeds the {MAX_HEADS_PER_MESSAGE} limit"
         )));
     }
     Ok(())
@@ -382,6 +428,7 @@ impl MptClient {
                         "unsupported protocol version {proto}"
                     )));
                 }
+                check_heads(heads.len(), "a Hello summary list")?;
                 heads
             }
             other => return Err(unexpected("Hello", &other)),

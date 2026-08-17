@@ -341,6 +341,24 @@ impl Store {
         Ok(())
     }
 
+    /// Every object root one origin currently advertises a `b:` record for.
+    ///
+    /// Read from the materialized view rather than the trie because that is
+    /// what every other reader uses, and for our own origin the two agree by
+    /// construction.
+    pub fn provider_roots_for_origin(&self, origin: &OriginId) -> Result<Vec<Hash>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT object_root FROM blob_providers WHERE origin_id = ?1 ORDER BY object_root",
+        )?;
+        let rows = stmt.query_map(params![origin.canonical()], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(hash_column(row?, "blob_providers.object_root")?);
+        }
+        Ok(out)
+    }
+
     /// Deletes every provider row for an origin.
     pub fn delete_origin_providers(&self, origin: &OriginId) -> Result<usize> {
         Ok(self.conn().execute(
@@ -368,16 +386,18 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (origin, size, complete, spans) = row?;
-            let state = if complete != 0 {
-                AdState::Complete
-            } else {
-                let spans: Vec<(u64, u64)> = match spans {
-                    Some(bytes) => postcard::from_bytes(&bytes)
-                        .map_err(|e| StoreError::Decode(e.to_string()))?,
-                    None => Vec::new(),
-                };
-                AdState::Partial { spans }
+            // `complete` is the legacy duplicate of "the spans cover the whole
+            // object" and is still written for older readers; the spans are
+            // authoritative. A row written as complete before v11 carries no
+            // spans, so it is reconstituted from the size.
+            let spans: Vec<(u64, u64)> = match spans {
+                Some(bytes) => {
+                    postcard::from_bytes(&bytes).map_err(|e| StoreError::Decode(e.to_string()))?
+                }
+                None if complete != 0 && size > 0 => vec![(0, size as u64)],
+                None => Vec::new(),
             };
+            let state = AdState { spans };
             out.push((
                 origin_column(origin, "blob_providers.origin_id")?,
                 BlobAd {
@@ -432,9 +452,16 @@ impl Store {
     /// Rebuilds `entries` and `blob_providers` for one origin from scratch
     /// (`synch doctor --rebuild`).
     pub fn rematerialize(&self, origin: &OriginId, root: Hash) -> Result<usize> {
-        self.delete_origin_entries(origin)?;
-        self.delete_origin_providers(origin)?;
-        self.materialize_diff(origin, Hash::EMPTY, root)
+        // One transaction, because the intermediate state is destructive. The
+        // two deletes each used to autocommit and the diff was computed outside
+        // any transaction, so `entries` was observably empty for the whole
+        // rebuild — and a mirror pass reading `unified_listing` in that window
+        // builds an empty `known` set and its sweep unlinks the user's files.
+        self.transaction(|txn| {
+            txn.delete_origin_entries(origin)?;
+            txn.delete_origin_providers(origin)?;
+            txn.materialize_diff(origin, Hash::EMPTY, root)
+        })
     }
 
     // ---- spaces -----------------------------------------------------------
@@ -724,6 +751,37 @@ impl Store {
         Ok(())
     }
 
+    /// Records that a peer could not be reached, penalizing its latency EWMA.
+    ///
+    /// Ranking (§6.4) has to be able to move in both directions. With latency
+    /// recorded only on success, a peer that was once fast and has since gone
+    /// dark keeps its low EWMA and is therefore chosen first on every fetch
+    /// from then on, with nothing in the system able to demote it — the fetch
+    /// wastes a slot on it every time.
+    ///
+    /// `last_sync` is deliberately not touched: nothing synced. Only the EWMA
+    /// moves, and it moves the same way a slow success would, so a peer that
+    /// recovers earns its rank back over the following exchanges rather than
+    /// being blacklisted.
+    pub fn record_peer_failure(
+        &self,
+        node_id: &synch_core::NodeId,
+        now: i64,
+        penalty_us: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO peers_seen (node_id, last_addr, last_seen, last_sync, latency_ewma_us)
+             VALUES (?1, NULL, ?2, 0, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET
+               latency_ewma_us = CASE
+                 WHEN peers_seen.latency_ewma_us = 0 THEN excluded.latency_ewma_us
+                 ELSE (peers_seen.latency_ewma_us * 3 + excluded.latency_ewma_us) / 4
+               END",
+            params![node_id.as_bytes().to_vec(), now, penalty_us],
+        )?;
+        Ok(())
+    }
+
     /// Every peer we have seen, most recently seen first.
     pub fn peers_seen(&self) -> Result<Vec<PeerSeen>> {
         let conn = self.conn();
@@ -844,6 +902,33 @@ fn apply_change(
     Ok(())
 }
 
+/// How far ahead of this node's clock a peer's `mtime_ns` may sit.
+///
+/// One year, which is slack for clock skew and for genuinely odd timestamps,
+/// and nowhere near enough to win a selection permanently.
+const MTIME_SKEW_CEILING_NS: i64 = 365 * 24 * 60 * 60 * 1_000_000_000;
+
+/// Clamps a peer-supplied modification time to something this node's clock can
+/// vouch for.
+///
+/// `mtime_ns` is not just metadata: it is the first and dominant component of
+/// the order `VersionPolicy::Newest` maximizes across **all** origins for a
+/// `(space, path)` (§8), and `newest` is the default. `space` is a plain string
+/// inside the trie key, so any member may publish `f:<space>/<path>` for any
+/// space. Unclamped, one member republishing every visible path at
+/// `mtime_ns = i64::MAX` wins selection everywhere — with its own content, or
+/// with a tombstone, which deletes the file from every `newest` mirror in the
+/// cluster. §12's "a malicious origin publishing garbage about its own files
+/// only pollutes its own namespace" does not hold while the unified tree merges
+/// namespaces by `(space, path)`.
+///
+/// Clamped rather than refused: a wrong clock is ordinary, and dropping the
+/// entry would lose a real file. Clamping costs the liar its advantage while
+/// leaving honest skew intact.
+fn clamp_mtime(mtime_ns: i64, now: i64) -> i64 {
+    mtime_ns.min(now.saturating_add(MTIME_SKEW_CEILING_NS))
+}
+
 fn put_entry_in(
     conn: &rusqlite::Connection,
     origin: &OriginId,
@@ -865,7 +950,7 @@ fn put_entry_in(
             path,
             kind_to_int(entry.kind),
             entry.size as i64,
-            entry.mtime_ns,
+            clamp_mtime(entry.mtime_ns, synch_core::now_ns()),
             entry.unix_mode.map(|m| m as i64),
             entry.content.map(|h| h.as_bytes().to_vec()),
             entry.seq as i64,
@@ -882,13 +967,11 @@ fn put_provider_in(
     origin: &OriginId,
     ad: &BlobAd,
 ) -> Result<()> {
-    let (complete, spans) = match &ad.state {
-        AdState::Complete => (1i64, None),
-        AdState::Partial { spans } => (
-            0i64,
-            Some(postcard::to_stdvec(spans).map_err(|e| StoreError::Decode(e.to_string()))?),
-        ),
-    };
+    // The spans are the record; `complete` is derived from them on the way in
+    // rather than tracked beside them, so the two cannot disagree.
+    let complete = i64::from(ad.is_complete());
+    let spans =
+        Some(postcard::to_stdvec(&ad.state.spans).map_err(|e| StoreError::Decode(e.to_string()))?);
     conn.execute(
         "INSERT INTO blob_providers (object_root, origin_id, size, complete, spans)
          VALUES (?1, ?2, ?3, ?4, ?5)

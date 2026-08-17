@@ -246,6 +246,18 @@ impl Store {
     /// The error type is the caller's, so an engine or a net operation can run
     /// its own failures through the same rollback: anything that converts from
     /// [`StoreError`] works.
+    ///
+    /// The transaction begins **immediate**. Every caller here reads and then
+    /// writes what it read — a publish reads the head it is about to displace,
+    /// a promotion reads the pending slot, GC reads the roots it marks from —
+    /// which is the one shape `BEGIN DEFERRED` handles badly: it takes the read
+    /// lock first and upgrades on the first write, and under multi-process WAL
+    /// another process committing in between fails the upgrade outright with
+    /// `SQLITE_BUSY_SNAPSHOT` rather than waiting, because the snapshot the read
+    /// saw is no longer the tip. Nothing is corrupted, but the work is lost and
+    /// the caller has to notice. Taking the write lock up front turns that into
+    /// an ordinary `busy_timeout` wait. In-process the connection mutex already
+    /// serializes writers, so this costs nothing there.
     pub fn transaction<T, E>(
         &self,
         f: impl FnOnce(&Txn<'_>) -> std::result::Result<T, E>,
@@ -253,8 +265,10 @@ impl Store {
     where
         E: From<StoreError>,
     {
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction().map_err(StoreError::from)?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::from)?;
         // On `Err` the `Transaction` is dropped without a commit, which is a
         // rollback: nothing the closure wrote is observable afterwards.
         let out = f(&Txn {
@@ -604,12 +618,25 @@ impl Store {
 
     /// Forgets which roots are known complete.
     ///
-    /// GC never sweeps a node reachable from a head, so the memo survives it
-    /// intact — this exists for the paths that remove trie state outside that
-    /// discipline, where the honest answer is to make the store earn the
-    /// answer again.
+    /// For the paths that remove trie state wholesale, where the honest answer
+    /// is to make the store earn every answer again.
     pub fn forget_complete_roots(&self) {
         self.complete_roots().clear();
+    }
+
+    /// Keeps only the memo entries for roots still in the retained set.
+    ///
+    /// A sweep takes the nodes of every root it did not mark from, so a memo
+    /// entry for one of those becomes a standing lie: `Hello` would go on
+    /// advertising a trie this node can no longer serve. Dropping the whole
+    /// memo is the safe version of that and was what this used to do — but the
+    /// memo is exactly the answer §5.1 exists to avoid recomputing on every
+    /// exchange, and GC runs every five minutes against a thirty-second
+    /// anti-entropy interval, so clearing it wholesale gave the cost back on
+    /// roughly one round in ten, forever. Retaining the marked roots keeps the
+    /// optimization and the honesty.
+    pub fn retain_complete_roots(&self, keep: &std::collections::HashSet<Hash>) {
+        self.complete_roots().retain(|root| keep.contains(root));
     }
 }
 

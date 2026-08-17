@@ -131,7 +131,62 @@ impl TrieNode {
         if nibble_len > MAX_KEY_LEN * 2 {
             return Err(MptError::KeyTooLong(nibble_len / 2));
         }
+        node.check_invariants()?;
         Ok(hash_encoded(node.tag(), bytes))
+    }
+
+    /// Checks the structural invariants the node kinds document (§4.3).
+    ///
+    /// The write path maintains all of these by construction — `collapse`,
+    /// `merge_down` and `wrap_in_ext` exist precisely to — so this is only ever
+    /// about nodes that arrived from a peer. Each one is load-bearing:
+    ///
+    /// - An **empty extension prefix** puts the two readers into disagreement
+    ///   about the same bytes: `Trie::get` does `rest.starts_with(&[])`, which
+    ///   is true, and follows the child; `cursor_child` compares
+    ///   `prefix.first()` against the nibble, which never matches, and reports
+    ///   the whole subtree empty. A root built this way promotes cleanly and
+    ///   materializes nothing, while point lookups still find its keys.
+    /// - An **oversized inline value** is 128 bytes by construction
+    ///   ([`INLINE_VALUE_MAX`]); decoded, it is bounded only by the frame, so a
+    ///   peer could put 16 MiB in a single node and have every diff clone it.
+    /// - An **under-occupied branch** and an **extension above a non-branch**
+    ///   are read consistently, so they corrupt nothing — but they give one
+    ///   key/value map several distinct roots, which is exactly what structural
+    ///   sharing and the reference-pruning walk rely on not happening.
+    ///
+    /// The extension-above-a-branch half of the invariant needs the child node,
+    /// which this cannot load; it is checked where the structure is walked.
+    pub fn check_invariants(&self) -> Result<(), MptError> {
+        let non_canonical = |what: &str| Err(MptError::NonCanonical(what.to_string()));
+        let check_value = |value: &ValueRef| match value {
+            ValueRef::Inline(bytes) if bytes.len() > INLINE_VALUE_MAX => {
+                Err(MptError::NonCanonical(format!(
+                    "inline value of {} bytes exceeds the {INLINE_VALUE_MAX}-byte ceiling",
+                    bytes.len()
+                )))
+            }
+            _ => Ok(()),
+        };
+        match self {
+            TrieNode::Leaf { value, .. } => check_value(value),
+            TrieNode::Ext { prefix, .. } => {
+                if prefix.is_empty() {
+                    return non_canonical("an extension prefix is empty");
+                }
+                Ok(())
+            }
+            TrieNode::Branch { children, value } => {
+                if let Some(value) = value {
+                    check_value(value)?;
+                }
+                let occupants = children.iter().flatten().count() + usize::from(value.is_some());
+                if occupants < 2 {
+                    return non_canonical("a branch has fewer than two occupants");
+                }
+                Ok(())
+            }
+        }
     }
 
     /// The hashes of this node's child nodes.

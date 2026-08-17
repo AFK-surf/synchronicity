@@ -49,42 +49,53 @@ impl Store {
     }
 
     /// Runs one mark-and-sweep pass over `trie_nodes` and `trie_values`.
+    ///
+    /// The whole pass — the retained roots, the mark walk, the candidate
+    /// snapshot and the deletes — runs inside **one** immediate transaction.
+    /// That is not tidiness; splitting it is a data-loss bug. Each of those
+    /// steps used to take the connection mutex separately, and the mark walk
+    /// released it between every node read, so a writer could commit in the
+    /// gap. A publish is one transaction that writes new trie nodes *and* the
+    /// head row: landing between the mark and the snapshot, its nodes were
+    /// absent from the mark set and present in the candidate list, so the sweep
+    /// deleted them while the head row survived pointing at them. The trie is
+    /// authoritative and `entries` cannot regenerate it, so the node's own
+    /// published root became permanently unservable — and `publish` then called
+    /// `note_complete` on it, so the store went on advertising that it could
+    /// serve it. The same window ate a peer's in-flight bootstrap, since
+    /// `fetch_pending` commits each batch as its own write and `reachable`
+    /// silently skips missing children.
     pub fn gc_trie(&self) -> Result<GcStats> {
-        // The sweep never touches a node reachable from a retained root, so a
-        // *current* head's completeness is unaffected — but a root that was
-        // complete before it fell out of the retained set has just had its
-        // nodes taken, and the memo would still vouch for it. GC is rare and a
-        // walk is cheap next to a wrong "yes, I can serve that".
-        self.forget_complete_roots();
-        let roots = self.retained_roots()?;
-        let (nodes, values) = self.gc_mark()?;
-        let mut stats = GcStats {
-            roots_marked: roots.len(),
-            ..GcStats::default()
-        };
-        let all_nodes = self.all_hashes("trie_nodes")?;
-        let all_values = self.all_hashes("trie_values")?;
-        self.with_tx(|tx| {
-            for hash in &all_nodes {
-                if !nodes.contains(hash) {
-                    tx.execute(
-                        "DELETE FROM trie_nodes WHERE hash = ?1",
-                        params![hash.as_bytes().to_vec()],
-                    )?;
-                    stats.nodes += 1;
+        let mut stats = GcStats::default();
+        let (swept_nodes, swept_values, roots) =
+            self.transaction(|txn| -> Result<(usize, usize, Vec<Hash>)> {
+                let conn = txn.conn();
+                let roots = retained_roots_in(conn)?;
+                stats.roots_marked = roots.len();
+                let trie = Trie::new(txn);
+                let mut nodes = HashSet::new();
+                let mut values = HashSet::new();
+                for root in &roots {
+                    let reachable = trie.reachable(*root)?;
+                    nodes.extend(reachable.nodes);
+                    values.extend(reachable.values);
                 }
-            }
-            for hash in &all_values {
-                if !values.contains(hash) {
-                    tx.execute(
-                        "DELETE FROM trie_values WHERE hash = ?1",
-                        params![hash.as_bytes().to_vec()],
-                    )?;
-                    stats.values += 1;
-                }
-            }
-            Ok(())
-        })?;
+                // Deleted set-wise rather than row by row: the old loop pulled
+                // every hash into a `Vec` and issued one
+                // `DELETE ... WHERE hash = ?` per unreferenced row, which on a
+                // large store is millions of statements under the write lock.
+                let n = sweep_unmarked(conn, "trie_nodes", &nodes)?;
+                let v = sweep_unmarked(conn, "trie_values", &values)?;
+                Ok((n, v, roots))
+            })?;
+        stats.nodes = swept_nodes;
+        stats.values = swept_values;
+        // The memo may only vouch for roots the sweep just marked from. A root
+        // that fell out of the retained set has had its nodes taken, and a memo
+        // entry for it would be a standing lie about what this node can serve —
+        // but dropping the *whole* memo, which is what this used to do, throws
+        // away the answer §5.1 exists to avoid recomputing on every `Hello`.
+        self.retain_complete_roots(&roots.into_iter().collect());
         Ok(stats)
     }
 
@@ -99,8 +110,14 @@ impl Store {
     ///
     /// `last_access` is written on ingest and on every download milestone, not
     /// on reads: a streaming read would otherwise cost one row update per
-    /// chunk, and an object nothing references is by construction not being
-    /// read through the tree.
+    /// chunk — each taking the single write connection and appending a WAL
+    /// frame, so gateway range reads and mirror materialization would serialize
+    /// against publishes and GC — and an object nothing references is by
+    /// construction not being read through the tree. `read_range` used to touch
+    /// the row anyway, which cost exactly that and quietly inverted the
+    /// retention semantics: with it a hot object is never collected, without it
+    /// it is. Every write path already stamps the column, so nothing else was
+    /// needed to keep this true.
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
         let referenced = self.referenced_content()?;
         let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
@@ -155,17 +172,50 @@ impl Store {
             })? as usize,
         })
     }
+}
 
-    fn all_hashes(&self, table: &str) -> Result<Vec<Hash>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!("SELECT hash FROM {table}"))?;
-        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(hash_column(row?, "hash")?);
-        }
-        Ok(out)
+/// The GC mark set, read inside the sweeping transaction.
+///
+/// Every origin's complete and pending heads plus retained history roots
+/// (§5.4). Pending heads must be in the mark set or GC would eat an in-progress
+/// bootstrap.
+fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
+    let mut stmt = conn.prepare("SELECT root FROM heads UNION SELECT root FROM head_history")?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(hash_column(row?, "heads.root")?);
     }
+    Ok(out)
+}
+
+/// Deletes every row of `table` whose hash is not in `marked`, in one
+/// statement, and reports how many went.
+///
+/// The marked set goes into a temporary table rather than an `IN (?, ?, …)`
+/// list: the set is the size of the live trie, which is far past SQLite's
+/// parameter limit.
+fn sweep_unmarked(
+    conn: &rusqlite::Connection,
+    table: &str,
+    marked: &HashSet<Hash>,
+) -> Result<usize> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS gc_marked (hash BLOB PRIMARY KEY);
+         DELETE FROM gc_marked;",
+    )?;
+    {
+        let mut insert = conn.prepare("INSERT OR IGNORE INTO gc_marked (hash) VALUES (?1)")?;
+        for hash in marked {
+            insert.execute(params![hash.as_bytes().to_vec()])?;
+        }
+    }
+    let swept = conn.execute(
+        &format!("DELETE FROM {table} WHERE hash NOT IN (SELECT hash FROM gc_marked)"),
+        [],
+    )?;
+    conn.execute_batch("DELETE FROM gc_marked;")?;
+    Ok(swept)
 }
 
 #[cfg(test)]

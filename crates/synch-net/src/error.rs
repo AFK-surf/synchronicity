@@ -182,3 +182,9 @@ impl From<iroh::endpoint::ClosedStream> for NetError {
         NetError::Stream(e.to_string())
     }
 }
+
+impl synch_core::TaskLost for NetError {
+    fn task_lost(reason: String) -> Self {
+        NetError::Blocking(reason)
+    }
+}

@@ -12,7 +12,7 @@ use crate::{
     nibbles::Nibbles,
     node::ValueRef,
     store::NodeStore,
-    trie::{root_opt, Cursor, Frame, Trie, MAX_DEPTH_NIBBLES},
+    trie::{root_opt, Cursor, FanoutGuard, Frame, Trie, MAX_DEPTH_NIBBLES},
 };
 
 /// What happened to one key between two roots.
@@ -76,6 +76,10 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     fn diff_walk(&self, a: Cursor, b: Cursor, out: &mut Vec<Change>) -> Result<(), MptError> {
         let mut path: Vec<u8> = Vec::new();
         let mut stack: Vec<(Frame, Cursor)> = Vec::new();
+        // Keeps the diff proportional to the two tries. This runs inside the
+        // head-promotion transaction, holding the write lock, so an unbounded
+        // walk here is a cluster-wide outage rather than a slow query.
+        let mut guard = FanoutGuard::default();
 
         if !self.enter(&a, &b, &path, out)? {
             return Ok(());
@@ -93,6 +97,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
             let ca = self.cursor_child(&stack[top].0.cursor, nibble)?;
             let cb = self.cursor_child(&stack[top].1, nibble)?;
             path.push(nibble);
+            guard.visit(ca.identity().into_iter().chain(cb.identity()))?;
             if self.enter(&ca, &cb, &path, out)? {
                 stack.push((
                     Frame {
@@ -125,7 +130,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         }
         let va = a.value_ref();
         let vb = b.value_ref();
-        if va != vb {
+        if !same_value(va, vb) {
             let key = Nibbles::from_nibbles(path)
                 .to_bytes()
                 .ok_or(MptError::OddDepthValue)?;
@@ -154,6 +159,34 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
                 })
             })
             .collect()
+    }
+}
+
+/// True if two value references denote the same bytes.
+///
+/// `ValueRef` has two representations for one value — inline, or a hash of an
+/// out-of-line payload — and which one a node carries is a storage decision,
+/// not part of the value. Comparing the references directly reported a change
+/// where there was none: `Inline(x)` and `Hash(blake3(x))` resolve identically.
+/// That produced no false negatives, so nothing was ever corrupted by it, but
+/// it re-materialized rows that had not changed, broke the "every reported key
+/// really differs" contract the property tests assert, and let a peer force a
+/// full re-materialization of an unchanged trie by republishing it with the
+/// representations flipped.
+///
+/// Compared without touching the store: the out-of-line hash *is* the BLAKE3 of
+/// the value, so the inline side can be hashed and the two compared directly.
+fn same_value(a: Option<&ValueRef>, b: Option<&ValueRef>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => match (x, y) {
+            (ValueRef::Inline(p), ValueRef::Inline(q)) => p == q,
+            (ValueRef::Hash(p), ValueRef::Hash(q)) => p == q,
+            (ValueRef::Inline(p), ValueRef::Hash(q)) | (ValueRef::Hash(q), ValueRef::Inline(p)) => {
+                &Hash::new(p) == q
+            }
+        },
+        _ => false,
     }
 }
 
