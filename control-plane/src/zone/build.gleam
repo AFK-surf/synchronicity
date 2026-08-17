@@ -12,6 +12,7 @@ import gleam/int
 import gleam/list
 import gleam/order
 import gleam/result
+import gleam/string
 import zone/model.{type ZoneInput}
 
 /// Data records: TXT, NSEC, SOA — the values clients clamp around.
@@ -43,6 +44,17 @@ pub type BuildError {
   /// defense in depth.
   AmbiguousNk(String)
   BadGlueAddress(String)
+  /// A `relay=` or `addr=` hint carrying something that would change the
+  /// shape of the record it sits in.
+  ///
+  /// A membership record is whitespace-separated `key=value` pairs, and
+  /// these two are the only free-form values in it. The client's parser is
+  /// last-wins for `apex=`, so a hint spelling `x apex=other.example`
+  /// injects an apex that overrides the real one. Clients fail closed on
+  /// that, but a member who can set their own dialing hint should not be
+  /// able to break their network's membership answer — nor to push a record
+  /// past a provider's TXT size limit, which wedges the reconciler.
+  InvalidHint(String)
 }
 
 /// All RRsets for the zone, NSEC chain included, ready to sign.
@@ -224,15 +236,20 @@ pub fn validate(input: ZoneInput) -> Result(Nil, BuildError) {
 }
 
 fn validate_members(members: List(model.Member)) -> Result(Nil, BuildError) {
-  // Label grammar and nk shape.
+  // Label grammar, nk shape, and the two free-form hints.
   use Nil <- result.try(
     list.try_fold(members, Nil, fn(_, m) {
       case name.valid_device_label(m.label) {
         False -> Error(InvalidLabel(m.label))
         True ->
           case model.validate_nk(m.nk_z32) {
-            Ok(_) -> Ok(Nil)
             Error(Nil) -> Error(InvalidNk(m.nk_z32))
+            Ok(_) ->
+              case valid_hint(m.relay), valid_hint(m.addr) {
+                False, _ -> Error(InvalidHint(m.relay))
+                _, False -> Error(InvalidHint(m.addr))
+                True, True -> Ok(Nil)
+              }
           }
       }
     }),
@@ -258,6 +275,33 @@ fn validate_members(members: List(model.Member)) -> Result(Nil, BuildError) {
       False -> Error(DuplicateLabelInZone(label))
     }
   })
+}
+
+/// Whether a `relay=`/`addr=` hint can sit in a membership record without
+/// changing its shape.
+///
+/// The record grammar is whitespace-separated `key=value` pairs, so a hint
+/// containing whitespace is not one value but two fields — and the client's
+/// parser is last-wins for `apex=`, so the second one can override a field
+/// the operator set. A quote breaks the provider round-trip instead:
+/// Cloudflare returns TXT content in presentation form, and the reconciler
+/// folds it by splitting on `"`, so a quoted value comes back as something
+/// other than what was sent and the diff churns forever.
+///
+/// The length bound is about the provider ceiling: Cloudflare refuses a TXT
+/// record past 4096 wire-format bytes, and one oversized member record makes
+/// every subsequent reconcile sweep fail at the same record.
+///
+/// Deliberately a *shape* check and not a URL parse. The client treats these
+/// as opaque strings and re-parses them itself; this exists to keep one
+/// member from rewriting the record their whole network is answered with.
+pub fn valid_hint(hint: String) -> Bool {
+  string.length(hint) <= 255
+  && !string.contains(hint, " ")
+  && !string.contains(hint, "\t")
+  && !string.contains(hint, "\n")
+  && !string.contains(hint, "\r")
+  && !string.contains(hint, "\"")
 }
 
 /// Sorts full RRsets canonically — publish stores them in chain order.

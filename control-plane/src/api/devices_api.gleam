@@ -16,6 +16,7 @@ import gleam/result
 import store/sqlite.{Blob, Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
+import zone/build
 import zone/model
 
 pub fn list_devices(ctx: AuthContext, live: Session, slug: String) -> Response {
@@ -65,16 +66,30 @@ pub fn create_device(
     decode.success(#(label, nk, relay, addr))
   }
   use #(label, nk, relay, addr) <- body_decoder(req, decoder)
-  case name.valid_device_label(label), model.validate_nk(nk) {
-    False, _ ->
+  case
+    name.valid_device_label(label),
+    model.validate_nk(nk),
+    build.valid_hint(relay) && build.valid_hint(addr)
+  {
+    False, _, _ ->
       error_json(400, "bad_label", "device label must match [a-z0-9-]{1,63}")
-    _, Error(Nil) ->
+    _, Error(Nil), _ ->
       error_json(
         400,
         "bad_nk",
         "nk must be the 52-character z-base-32 device key from `synch id`",
       )
-    True, Ok(nk_bytes) ->
+    // Refused here as well as at publish. A membership record is
+    // whitespace-separated key=value pairs, so a hint carrying whitespace
+    // is extra fields rather than one value — and the client's parser is
+    // last-wins for apex=, so it can override a field the operator set.
+    _, _, False ->
+      error_json(
+        400,
+        "bad_hint",
+        "relay and addr must be at most 255 characters with no whitespace or quotes",
+      )
+    True, Ok(nk_bytes), True ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, live.user_id, Member)
         zone_mutation(conn, ctx, live.user_id, fn() {
@@ -141,39 +156,49 @@ pub fn patch_device(
     decode.success(#(relay, addr))
   }
   use #(relay, addr) <- body_decoder(req, decoder)
-  with_db(ctx, fn(conn) {
-    use org_id, _ <- require_org(conn, slug, live.user_id, Member)
-    case find_device(conn, org_id, device_id) {
-      Error(Nil) -> error_json(404, "not_found", "no such device")
-      Ok(_) ->
-        zone_mutation(conn, ctx, live.user_id, fn() {
-          let update =
-            sqlite.exec(
-              conn,
-              "UPDATE devices SET relay = ?, addr = ? WHERE id = ?",
-              [
-                sqlite.text_or_null(relay),
-                sqlite.text_or_null(addr),
-                Text(device_id),
-              ],
-            )
-          case update {
-            Ok(_) -> {
-              let _ =
-                audit(
+  // Refused here as well as at publish: see the create handler above.
+  case build.valid_hint(relay) && build.valid_hint(addr) {
+    False ->
+      error_json(
+        400,
+        "bad_hint",
+        "relay and addr must be at most 255 characters with no whitespace or quotes",
+      )
+    True ->
+      with_db(ctx, fn(conn) {
+        use org_id, _ <- require_org(conn, slug, live.user_id, Member)
+        case find_device(conn, org_id, device_id) {
+          Error(Nil) -> error_json(404, "not_found", "no such device")
+          Ok(_) ->
+            zone_mutation(conn, ctx, live.user_id, fn() {
+              let update =
+                sqlite.exec(
                   conn,
-                  live.user_id,
-                  org_id,
-                  "device.update",
-                  json.object([#("device", json.string(device_id))]),
+                  "UPDATE devices SET relay = ?, addr = ? WHERE id = ?",
+                  [
+                    sqlite.text_or_null(relay),
+                    sqlite.text_or_null(addr),
+                    Text(device_id),
+                  ],
                 )
-              Ok(json.object([#("device_id", json.string(device_id))]))
-            }
-            Error(e) -> Error(constraint_response(e))
-          }
-        })
-    }
-  })
+              case update {
+                Ok(_) -> {
+                  let _ =
+                    audit(
+                      conn,
+                      live.user_id,
+                      org_id,
+                      "device.update",
+                      json.object([#("device", json.string(device_id))]),
+                    )
+                  Ok(json.object([#("device_id", json.string(device_id))]))
+                }
+                Error(e) -> Error(constraint_response(e))
+              }
+            })
+        }
+      })
+  }
 }
 
 pub fn delete_device(

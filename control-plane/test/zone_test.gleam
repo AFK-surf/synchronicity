@@ -97,6 +97,33 @@ pub fn build_refuses_bad_input_test() {
   // No nameservers is not a zone.
   let no_ns = ZoneInput(..input, ns_hosts: [])
   let assert Error(build.NoNameservers) = build.build(no_ns)
+
+  // A dialing hint that would change the record's shape. `relay` and `addr`
+  // are the only free-form values in a membership record, and the record
+  // grammar is whitespace-separated key=value pairs — so a hint carrying a
+  // space is extra fields, and the client's parser is last-wins for apex=,
+  // which means the injected one would override the real one.
+  let injected =
+    ZoneInput(..input, txt_names: [
+      TxtName(owner, [Member("a", nk(), "x apex=evil.example", "")]),
+    ])
+  let assert Error(build.InvalidHint(_)) = build.build(injected)
+
+  // A quote breaks the provider round-trip instead: Cloudflare returns TXT
+  // in presentation form and the reconciler folds it by splitting on `"`,
+  // so a quoted value comes back as something other than what was sent.
+  let quoted =
+    ZoneInput(..input, txt_names: [
+      TxtName(owner, [Member("a", nk(), "", "1.2.3.4\"")]),
+    ])
+  let assert Error(build.InvalidHint(_)) = build.build(quoted)
+
+  // And an ordinary hint is untouched.
+  let fine =
+    ZoneInput(..input, txt_names: [
+      TxtName(owner, [Member("a", nk(), "https://relay.example", "1.2.3.4:4433")]),
+    ])
+  let assert Ok(_) = build.build(fine)
 }
 
 pub fn positive_answer_test() {
