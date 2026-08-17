@@ -16,12 +16,30 @@
 //// The collection itself is ordinary recursive DNS work, done over DoH
 //// against a configurable resolver, one RRset at a time:
 ////
-////   link 0    <apex>    DS + RRSIG            signed by the parent
+////   link 0    _synchronicity-transparency.<apex>
+////                       TXT + RRSIG           the zone's declaration,
+////                                             signed by the apex
+////   link 1    <apex>    DNSKEY + RRSIG        the claimed key set, proved
+////                       DS + RRSIG            by the parent-signed DS
 ////   link i    <zone>    DNSKEY + RRSIG        self-signed
 ////                       DS + RRSIG            signed by *its* parent
 ////   link n    .         DNSKEY + RRSIG        the root, terminated by the
 ////                                             IANA trust anchor a reader
 ////                                             already holds
+////
+//// The apex link carries its own DNSKEY RRset because the RRset *is* the
+//// claim: the walk proves DS → covered key → RRset, and a reader checks the
+//// key that signed an answer for membership. A split-key zone's DS never
+//// names the signing ZSK, and this is how DNSSEC itself authorizes it.
+////
+//// The chain starts one label *below* the apex, at the declaration, because
+//// everything above it is public: any passer-by can read a zone's DNSKEY and
+//// DS records out of an open resolver, so a chain that began at the apex
+//// would be evidence anybody could assemble about anybody's zone. The
+//// declaration is the part that takes write access to the zone, which is the
+//// authority the entry claims to speak with — and it takes no *key* access,
+//// so a zone whose DNSSEC keys live inside a managed provider publishes one
+//// with an ordinary record write.
 ////
 //// Nothing here validates anything. The resolver's answers are copied into
 //// the certificate verbatim and every reader — client and monitor alike —
@@ -72,17 +90,35 @@ pub type Link {
   Link(zone: String, rrs: BitArray)
 }
 
-/// Collects the chain for `apex`, from its own DS up to the root.
+/// Collects the chain for `apex`: the zone's declaration, then its own
+/// DNSKEY RRset and DS, then up to the root — and returns the apex DNSKEY
+/// rdatas beside the links, because that observed RRset is exactly the key
+/// set the resulting entry claims.
 ///
 /// Fails rather than returning a short chain: an entry with half a chain is
 /// an entry every reader rejects, and finding that out at publish time —
 /// where an operator is standing there reading the error — is worth much
-/// more than finding it out later from a client that will not resolve.
-pub fn collect(resolver: Resolver, apex: Name) -> Result(List(Link), String) {
-  let labels = name.to_string(apex) |> string.split(".") |> drop_empty
-  use apex_link <- result.try(ds_link(resolver, apex))
+/// more than finding it out later from a client that will not resolve. That
+/// includes the declaration: a zone that has not published one yet cannot
+/// log, and says so here rather than logging something no client accepts.
+pub fn collect(
+  resolver: Resolver,
+  apex: Name,
+  signing_zone: Name,
+) -> Result(#(List(Link), List(BitArray)), String) {
+  let labels = name.to_string(signing_zone) |> string.split(".") |> drop_empty
+  use declaration <- result.try(declaration_link(resolver, apex))
+  use #(zone_link, rdatas) <- result.try(zone_link(resolver, signing_zone))
   use ancestors <- result.try(ancestor_links(resolver, labels, []))
-  Ok([apex_link, ..ancestors])
+  Ok(#([declaration, zone_link, ..ancestors], rdatas))
+}
+
+/// The bottom link: the apex's own `_synchronicity-transparency` TXT RRset
+/// and the RRSIG it made over it.
+fn declaration_link(resolver: Resolver, apex: Name) -> Result(Link, String) {
+  let owner = [rdata.transparency_label, ..apex]
+  use rrs <- result.try(rrset(resolver, owner, wire.type_txt))
+  Ok(Link(name.to_string(owner), rrs))
 }
 
 /// Walks a chain's *shape*, the way a reader will walk its signatures.
@@ -99,19 +135,33 @@ pub fn collect(resolver: Resolver, apex: Name) -> Result(List(Link), String) {
 /// success and then every client failed closed against an entry no reader
 /// could anchor. A publish that cannot be verified is a publish that must
 /// fail here, loudly, while an operator is still watching.
-pub fn check_shape(links: List(Link), apex: Name) -> Result(Nil, String) {
+pub fn check_shape(
+  links: List(Link),
+  apex: Name,
+  signing_zone: Name,
+) -> Result(Nil, String) {
+  let declared_at = name.to_string([rdata.transparency_label, ..apex])
+  let zone_text = name.to_string(signing_zone)
   case links {
-    [] -> Error("the chain has no links")
-    [first, ..] ->
-      case first.zone == name.to_string(apex) {
-        False ->
+    [] | [_] ->
+      Error("the chain is too short to carry a declaration and a signing zone")
+    [declaration, ..ladder] ->
+      case declaration.zone == declared_at, ladder {
+        False, _ ->
           Error(
             "the chain starts at "
-            <> first.zone
-            <> ", not the apex "
-            <> name.to_string(apex),
+            <> declaration.zone
+            <> ", not the declaration at "
+            <> declared_at,
           )
-        True -> check_ladder(links, apex)
+        True, [first, ..] if first.zone != zone_text ->
+          Error(
+            "the chain's second link is "
+            <> first.zone
+            <> ", not the signing zone "
+            <> zone_text,
+          )
+        True, _ -> check_ladder(ladder, signing_zone)
       }
   }
 }
@@ -155,14 +205,23 @@ fn parent_of(zone: Name) -> Name {
   }
 }
 
-/// The apex's own link: its DS RRset and the parent's signature over it.
-///
-/// No DNSKEY: a reader derives the key it is asking about from the
-/// certificate's own SubjectPublicKeyInfo, so a copy of the DNSKEY here
-/// would be a copy of something nobody is willing to believe.
-fn ds_link(resolver: Resolver, apex: Name) -> Result(Link, String) {
-  use rrs <- result.try(rrset(resolver, apex, type_ds))
-  Ok(Link(name.to_string(apex), rrs))
+/// The signing zone's own link: its DNSKEY RRset (the claimed set) and its
+/// DS RRset, each with the RRSIGs a reader's walk verifies. The DNSKEY rdatas
+/// come back separately, so the publish path claims exactly what it observed.
+fn zone_link(
+  resolver: Resolver,
+  zone: Name,
+) -> Result(#(Link, List(BitArray)), String) {
+  use keys_answers <- result.try(resolver.query(zone, wire.type_dnskey))
+  use keys_rrs <- result.try(rrset_of(keys_answers, zone, wire.type_dnskey))
+  let rdatas =
+    keys_answers
+    |> list.filter(fn(rr) {
+      rr.rtype == wire.type_dnskey && rr.class == wire.class_in
+    })
+    |> list.map(fn(rr) { rr.rdata })
+  use ds <- result.try(rrset(resolver, zone, type_ds))
+  Ok(#(Link(name.to_string(zone), bit_array.concat([keys_rrs, ds])), rdatas))
 }
 
 fn ancestor_links(
@@ -205,6 +264,17 @@ fn rrset(
   rtype: Int,
 ) -> Result(BitArray, String) {
   use answers <- result.try(resolver.query(zone, rtype))
+  rrset_of(answers, zone, rtype)
+}
+
+/// The filtering/validation/encoding half of `rrset`, over answers already
+/// in hand — the apex link fetches DNSKEYs once and needs both the wire run
+/// and the raw rdatas.
+fn rrset_of(
+  answers: List(wire.Rr),
+  zone: Name,
+  rtype: Int,
+) -> Result(BitArray, String) {
   let wanted =
     list.filter(answers, fn(rr) {
       rr.class == wire.class_in
@@ -222,7 +292,13 @@ fn rrset(
         <> type_name(rtype)
         <> " RRset at "
         <> name.to_string(zone)
-        <> " — is the DS live in the parent yet?",
+        <> case rtype {
+          // Each absence has one likely cause, and they are different
+          // enough that a single hint sends an operator the wrong way.
+          t if t == wire.type_txt ->
+            " — has the zone published its declaration yet?"
+          _ -> " — is the DS live in the parent yet?"
+        },
       )
     _, False ->
       Error(
@@ -252,6 +328,7 @@ fn type_name(rtype: Int) -> String {
   case rtype {
     48 -> "DNSKEY"
     43 -> "DS"
+    16 -> "TXT"
     other -> int.to_string(other)
   }
 }

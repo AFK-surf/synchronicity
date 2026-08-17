@@ -111,13 +111,16 @@ pub fn zone_mutation(
     transaction(conn, fn() {
       use payload <- result.try(work())
       use serial <- result.try(
-        publish.publish_in_tx(conn, ctx.csk, now_unix(), actor)
+        ctx.publish_in_tx(conn, now_unix(), actor)
         |> result.map_error(publish_error),
       )
       Ok(#(payload, serial))
     })
   case outcome {
     Ok(#(payload, serial)) -> {
+      // After commit, never inside it: in external mode this pokes the
+      // reconciler, and a provider API call must not hold the write lock.
+      ctx.published()
       json.object([
         #("ok", json.bool(True)),
         #("soa_serial", json.int(serial)),

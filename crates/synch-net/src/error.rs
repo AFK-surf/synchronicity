@@ -76,7 +76,7 @@ pub enum NetError {
         /// The key tag the answer's RRSIG named.
         key_tag: u16,
     },
-    /// A proof record exists but is not a v3 `RekorProof`.
+    /// A proof record exists but is not a v4 `RekorProof`.
     #[error("zone key transparency: malformed proof at {name}: {reason}")]
     RekorMalformed {
         /// The proof record's owner name.
@@ -84,13 +84,13 @@ pub enum NetError {
         /// What failed to decode.
         reason: String,
     },
-    /// The entry's DSSE signature is not the zone key's: whoever logged it
-    /// did not hold the key it claims to log.
-    #[error("zone key transparency: {name}: possession: {reason}")]
-    RekorPossession {
+    /// The entry's DSSE signature does not verify under the certificate's
+    /// own key: the entry misattributes itself.
+    #[error("zone key transparency: {name}: attribution: {reason}")]
+    RekorAttribution {
         /// The proof record's owner name.
         name: String,
-        /// Which possession check failed.
+        /// Which attribution check failed.
         reason: String,
     },
     /// The logged Statement does not describe the key and zone observed.

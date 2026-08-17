@@ -26,7 +26,7 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 const APEX: &str = "zone-key-transparency.demo.invalid";
-const LOG_INDEX: u64 = 68_018_370;
+const LOG_INDEX: u64 = 68_295_246;
 
 /// The zone is its own trust anchor: we own no DNSSEC-signed domain, so the
 /// chain in the certificate terminates at the apex rather than at the ICANN
@@ -54,25 +54,28 @@ fn the_real_published_entry_classifies_tier_a() {
     assert_eq!(finding.tier, Tier::A, "{}", finding.line());
     assert_eq!(finding.apex, format!("{APEX}."));
     assert_eq!(finding.log_index, LOG_INDEX);
-    assert_eq!(finding.key_tag, 31460);
+    let [key] = finding.keys.as_slice() else {
+        panic!("a one-key zone proves one key: {:?}", finding.keys);
+    };
+    assert_eq!(key.key_tag, 32784);
 
-    // The chain validated and covers this key, which is the whole verdict.
+    // The chain validated and proves this set, which is the whole verdict.
     assert!(
         finding.reasons.iter().any(|r| r.contains("chain valid")),
         "{:?}",
         finding.reasons
     );
 
-    // Everything it says about the key it derived from the certificate's own
-    // SubjectPublicKeyInfo — no DNS query anywhere, because the threat model
-    // has a compromised DNS provider in it. The DS is the line a registrar
-    // would show, so an operator can compare without believing the entry.
+    // Everything it says about the keys it read out of the chain-proven
+    // RRset — no DNS query anywhere, because the threat model has a
+    // compromised DNS provider in it. The DS is the line a registrar would
+    // show, so an operator can compare without believing the entry.
     assert!(
-        finding.ds.starts_with("31460 13 2 "),
+        key.ds.starts_with("32784 13 2 "),
         "the derived DS: {}",
-        finding.ds
+        key.ds
     );
-    assert_eq!(finding.spki_sha256.len(), 64);
+    assert_eq!(key.sha256.len(), 64);
 }
 
 /// Reporting, over real bytes: news once, then not again.
@@ -85,13 +88,14 @@ fn the_real_entry_is_a_new_authorization_until_it_is_recorded() {
 
     let apex = synch_net::chain::parse_name(APEX).unwrap();
     let mut known = KnownKeys::default();
+    let key = &finding.keys[0];
     assert!(
-        !known.contains(&apex, &body.certificate.spki),
+        !known.contains_digest(&apex, &key.sha256),
         "a monitor that has never seen this key must report it"
     );
-    known.insert(&apex, &body.certificate.spki);
+    known.insert_digest(&apex, &key.sha256);
     assert!(
-        known.contains(&apex, &body.certificate.spki),
+        known.contains_digest(&apex, &key.sha256),
         "and must not report it a second time"
     );
 }

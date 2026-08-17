@@ -16,13 +16,21 @@
 //! from. Fail closed — every check below refuses rather than degrades, and
 //! the caller keeps its previously cached member set (§4.3).
 //!
+//! What an entry claims is an authorized **key set**: the apex DNSKEY RRset
+//! its embedded chain proves. The entry's own signature is *attribution* —
+//! it names whoever built the entry, via the certificate's key — and
+//! authorizes nothing. Authorization is the chain, and only the chain: an
+//! attacker able to forge a chain for a rogue key necessarily holds that key
+//! and could sign anything it liked, so a possession requirement would add
+//! no security while making a provider-held zone key (Cloudflare's, Bunny's)
+//! impossible to log at all. See docs/EXTERNAL-DNS-PROVIDER.md.
+//!
 //! # Wire format
 //!
-//! `RekorProof` v3, big-endian throughout:
+//! `RekorProof` v4, big-endian throughout:
 //!
 //! ```text
-//! u8       version            = 3
-//! u16      key_tag              selects the record during a rollover window
+//! u8       version            = 4
 //! u8[32]   log_id               SHA-256 of the log's DER SubjectPublicKeyInfo
 //! u64      log_index
 //! u16+[]   statement            the in-toto Statement, byte-exact (PAE preimage)
@@ -30,6 +38,9 @@
 //! u16+[]   checkpoint           signed note: origin, tree size, root hash, sigs
 //! u8+[32]* inclusion_path       Merkle audit path, leaf to root
 //! ```
+//!
+//! There is no key-tag selector: a record's subject is a set, so a client
+//! tries each record the zone serves and membership decides.
 //!
 //! # What this format pins — and why the verifier is a *certificate*
 //!
@@ -46,8 +57,8 @@
 //!    not raw). The log returns these bytes as `canonicalizedBody` and this
 //!    record carries them **verbatim** — nothing here re-canonicalizes JSON,
 //!    because the log already did and the leaf commits to its output.
-//! 2. **The verifier is an `x509Certificate`, never a raw public key.** This
-//!    is the whole of v3. A raw-key entry is *apex-anonymous*: its leaf holds
+//! 2. **The verifier is an `x509Certificate`, never a raw public key.**
+//!    A raw-key entry is *apex-anonymous*: its leaf holds
 //!    a digest, a signature and 91 bytes of SubjectPublicKeyInfo, and nothing
 //!    that names a zone. Nobody could monitor a zone for newly published
 //!    keys, which makes the transparency claim hollow — the threat model has
@@ -78,13 +89,23 @@ use crate::{
     zonecert::{self, DnssecChain},
 };
 
-/// The only `RekorProof` version this build accepts.
+/// The only `RekorProof` version this build accepts: the entry authorizes
+/// the apex DNSKEY RRset its chain proves, the entry signature is
+/// attribution by the certificate's own key, and the wire carries no
+/// key-tag selector. Any other version byte is refused as malformed.
+pub const PROOF_VERSION: u8 = 4;
+
+/// The token every chunk of a proof record starts with.
+pub const PROOF_TXT_PREFIX: &str = "sync1p";
+
+/// The most base64url characters one record carries.
 ///
-/// There is no v2 path left. A v2 record is a raw-public-key entry with no
-/// apex anywhere in its leaf; accepting one would be accepting exactly the
-/// unmonitorable shape v3 exists to abolish, so it is refused as a malformed
-/// version and nothing more.
-pub const PROOF_VERSION: u8 = 3;
+/// Chosen against the tightest provider limit rather than against DNS:
+/// Cloudflare refuses a TXT record past 4096 **wire-format** bytes, which
+/// counts the one-byte length prefix each ≤255-byte character-string adds.
+/// At this size a record is ~2 KB of payload plus a ~22-byte header and
+/// ~8 prefixes, so it clears that ceiling with room for a header that grows.
+pub const PROOF_CHUNK_CHARS: usize = 2000;
 
 /// The label the proof records live under, one below the zone apex.
 pub const REKOR_TXT_PREFIX: &str = "_synchronicity-rekor";
@@ -108,15 +129,11 @@ pub const HASHEDREKORD_KEY_DETAILS: &str = "PKIX_ECDSA_P256_SHA_256";
 pub const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
 
 /// The predicate type carrying the zone-key claim.
-pub const PREDICATE_TYPE: &str = "https://synchronicity.sh/zone-key/v1";
-
-/// DNSSEC algorithm 13, ECDSA P-256/SHA-256 — the only zone-key algorithm
-/// this design logs, and the DSSE signing algorithm (§2: no second signing
-/// identity).
-pub const ZONE_KEY_ALGORITHM: u8 = 13;
-
-/// ZONE + SEP: the single-key (CSK) convention the control plane publishes.
-pub const ZONE_KEY_FLAGS: u16 = 257;
+///
+/// v2 is the key-set claim: the subject is the apex DNSKEY RRset the chain
+/// proves, and the DSSE signer is whoever published the entry — attribution,
+/// not possession.
+pub const PREDICATE_TYPE: &str = "https://synchronicity.sh/zone-key/v2";
 
 /// The log verification keys compiled into this build — the **bootstrap**
 /// set, not the last word.
@@ -165,13 +182,13 @@ MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=
 /// binding mismatch, which is an alarm.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProofError {
-    /// The record could not be decoded as a v2 `RekorProof`.
+    /// The record could not be decoded as a v4 `RekorProof`.
     #[error("malformed proof: {0}")]
     Malformed(String),
-    /// The entry signature is not the zone key's: whoever built the entry did
-    /// not hold the key it claims to log.
-    #[error("possession: {0}")]
-    Possession(String),
+    /// The entry signature does not verify under the certificate's own key:
+    /// the entry misattributes itself, so nothing about it can be believed.
+    #[error("attribution: {0}")]
+    Attribution(String),
     /// The Statement does not describe the key and zone that were observed.
     #[error("binding: {0}")]
     Binding(String),
@@ -200,9 +217,6 @@ pub enum ProofError {
 /// One decoded zone-key transparency record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RekorProof {
-    /// The DNSKEY key tag this record is about, so a rollover window can
-    /// publish two records under one owner name.
-    pub key_tag: u16,
     /// SHA-256 of the log's DER SubjectPublicKeyInfo; selects the pinned key.
     pub log_id: [u8; 32],
     /// The entry's index in the log, needed to walk the audit path.
@@ -222,7 +236,7 @@ pub struct RekorProof {
 }
 
 impl RekorProof {
-    /// Encodes the record in the v3 wire format.
+    /// Encodes the record in the wire format above.
     ///
     /// `None` for a record that does not fit it — a blob past 65535 bytes or
     /// an audit path past 255 hops. Refusing beats emitting *something*: this
@@ -242,13 +256,12 @@ impl RekorProof {
     /// The encoder proper, for a record already known to fit.
     fn encode_unchecked(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
-            45 + self.statement.len()
+            43 + self.statement.len()
                 + self.canonicalized_body.len()
                 + self.checkpoint.len()
                 + 32 * self.inclusion_path.len(),
         );
         out.push(PROOF_VERSION);
-        out.extend_from_slice(&self.key_tag.to_be_bytes());
         out.extend_from_slice(&self.log_id);
         out.extend_from_slice(&self.log_index.to_be_bytes());
         for blob in [&self.statement, &self.canonicalized_body, &self.checkpoint] {
@@ -263,7 +276,7 @@ impl RekorProof {
         out
     }
 
-    /// Decodes a v3 record, refusing anything with bytes left over — a
+    /// Decodes a v4 record, refusing anything with bytes left over — a
     /// record that decodes two ways is a record an attacker can steer.
     pub fn decode(bytes: &[u8]) -> Result<RekorProof, ProofError> {
         let mut reader = Reader::new(bytes);
@@ -273,7 +286,6 @@ impl RekorProof {
                 "version {version} is not {PROOF_VERSION}"
             )));
         }
-        let key_tag = reader.u16("key tag")?;
         let log_id = reader.array32("log id")?;
         let log_index = reader.u64("log index")?;
         let statement = reader.blob16("statement")?.to_vec();
@@ -286,7 +298,6 @@ impl RekorProof {
         }
         reader.finish()?;
         Ok(RekorProof {
-            key_tag,
             log_id,
             log_index,
             statement,
@@ -296,17 +307,46 @@ impl RekorProof {
         })
     }
 
-    /// Decodes one TXT record: base64url, with or without padding. A TXT
-    /// record's character-strings are concatenated before this is called —
-    /// the split into ≤255-byte chunks is DNS packaging, not content.
-    pub fn from_txt(text: &str) -> Result<RekorProof, ProofError> {
-        RekorProof::decode(&base64url_decode(text)?)
-    }
-
-    /// Renders the record as one base64url TXT payload, or `None` for a
-    /// record too large for the format (see [`RekorProof::encode`]).
-    pub fn to_txt(&self) -> Option<String> {
-        Some(base64url_encode(&self.encode()?))
+    /// Renders the record as the TXT payloads a zone serves for it, or
+    /// `None` for a record too large for the wire format itself (see
+    /// [`RekorProof::encode`]).
+    ///
+    /// A proof does not fit in one record. Managed DNS providers cap a TXT
+    /// record well below what a full proof needs — Cloudflare refuses
+    /// anything past 4096 wire-format bytes, and an ICANN-rooted proof is
+    /// about twice that — so the payload is split across several records at
+    /// the same owner name, each carrying a header that says where it
+    /// belongs:
+    ///
+    /// ```text
+    /// sync1p <group> <index>/<total> <base64url chunk>
+    /// ```
+    ///
+    /// `group` is the first four bytes of the SHA-256 of the encoded proof,
+    /// in hex. It ties one proof's chunks together where several proofs
+    /// share a name (a rollover serves two), and it is *checked* after
+    /// reassembly, so chunks of different proofs cannot be spliced into
+    /// something that decodes.
+    pub fn to_txt(&self) -> Option<Vec<String>> {
+        let encoded = self.encode()?;
+        let group = hex_lower(&sha256(&encoded)[..4]);
+        let payload = base64url_encode(&encoded);
+        let chunks: Vec<&str> = payload
+            .as_bytes()
+            .chunks(PROOF_CHUNK_CHARS)
+            .map(|c| std::str::from_utf8(c).expect("base64url is ASCII"))
+            .collect();
+        let total = chunks.len();
+        // The header carries a one-byte index and total, so a proof that
+        // needed more records than that could not name its own pieces.
+        u8::try_from(total).ok()?;
+        Some(
+            chunks
+                .iter()
+                .enumerate()
+                .map(|(i, chunk)| format!("{PROOF_TXT_PREFIX} {group} {}/{total} {chunk}", i + 1))
+                .collect(),
+        )
     }
 
     /// The RFC 6962 leaf hash of this entry: over the log's own body bytes.
@@ -319,6 +359,127 @@ impl RekorProof {
     }
 }
 
+/// Reassembles every complete proof served at one owner name.
+///
+/// The records at `_synchronicity-rekor.<zone>` are a bag: chunks of one
+/// proof, chunks of another during a rollover, and — because the set is
+/// whatever the zone published — possibly records this build cannot read at
+/// all. Chunks are grouped by their `group` field, and a group yields a
+/// proof only when every index it claims is present, the pieces concatenate
+/// to valid base64url, and the digest of the result is the group it said it
+/// was. Anything else is reported rather than silently dropped, so "the zone
+/// published gibberish" stays distinguishable from "the zone published
+/// nothing".
+///
+/// One malformed record never sinks a readable one: each group is decided on
+/// its own, which is what lets a mid-rollover zone serve a record this build
+/// does not understand beside the one it needs.
+pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>> {
+    use std::collections::BTreeMap;
+
+    // group -> (total, index -> chunk)
+    let mut groups: BTreeMap<String, (usize, BTreeMap<usize, String>)> = BTreeMap::new();
+    let mut junk: Vec<ProofError> = Vec::new();
+    for record in records {
+        match parse_chunk(record) {
+            Ok((group, index, total, chunk)) => {
+                let entry = groups.entry(group).or_insert((total, BTreeMap::new()));
+                // A group whose records disagree about how many there are is
+                // not a group; the mismatch shows up as a missing index.
+                entry.0 = entry.0.max(total);
+                entry.1.insert(index, chunk);
+            }
+            Err(e) => junk.push(e),
+        }
+    }
+
+    let mut out = Vec::new();
+    for (group, (total, chunks)) in groups {
+        if chunks.len() != total || !(1..=total).all(|i| chunks.contains_key(&i)) {
+            out.push(Err(ProofError::Malformed(format!(
+                "proof {group} is served in {total} part(s) and {} arrived",
+                chunks.len()
+            ))));
+            continue;
+        }
+        let payload: String = chunks.into_values().collect();
+        out.push(decode_group(&group, &payload));
+    }
+    // Only worth reporting when nothing reassembled: a zone mid-upgrade may
+    // legitimately serve a record beside the ones that work.
+    if out.is_empty() {
+        out.extend(junk.into_iter().map(Err));
+    }
+    out
+}
+
+/// Which part a record is, for a publisher deciding where to put it.
+pub fn part_index_of(record: &str) -> Option<usize> {
+    parse_chunk(record).ok().map(|(_, index, _, _)| index)
+}
+
+/// The largest part count any record at this name claims, capped at the
+/// format's ceiling.
+///
+/// This is what tells a client how many more names to ask for. It is read
+/// from records that have already been DNSSEC-validated, so it is the zone's
+/// own statement — but it is still only a hint about *work*, never about
+/// truth: a wrong count yields a set that fails to reassemble, which is a
+/// refusal, not an acceptance.
+pub fn parts_claimed(records: &[String]) -> usize {
+    records
+        .iter()
+        .filter_map(|record| parse_chunk(record).ok())
+        .map(|(_, _, total, _)| total)
+        .max()
+        .unwrap_or(1)
+}
+
+/// One record, as `sync1p <group> <index>/<total> <chunk>`.
+fn parse_chunk(record: &str) -> Result<(String, usize, usize, String), ProofError> {
+    let malformed = |why: &str| ProofError::Malformed(format!("proof record: {why}"));
+    let mut fields = record.split_whitespace();
+    match fields.next() {
+        Some(PROOF_TXT_PREFIX) => {}
+        _ => return Err(malformed("not a sync1p record")),
+    }
+    let group = fields.next().ok_or_else(|| malformed("no group"))?;
+    if group.len() != 8 || !group.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(malformed("the group is not eight hex digits"));
+    }
+    let counter = fields.next().ok_or_else(|| malformed("no index"))?;
+    let (index, total) = counter
+        .split_once('/')
+        .ok_or_else(|| malformed("the index is not <index>/<total>"))?;
+    let index: usize = index
+        .parse()
+        .map_err(|_| malformed("the index is not a number"))?;
+    let total: usize = total
+        .parse()
+        .map_err(|_| malformed("the total is not a number"))?;
+    if index == 0 || total == 0 || index > total || total > 255 {
+        return Err(malformed("the index is outside 1..=total"));
+    }
+    let chunk = fields.next().ok_or_else(|| malformed("no payload"))?;
+    if fields.next().is_some() {
+        return Err(malformed("trailing fields"));
+    }
+    Ok((group.to_ascii_lowercase(), index, total, chunk.to_string()))
+}
+
+/// Decodes a reassembled payload and holds it to the group it claimed.
+fn decode_group(group: &str, payload: &str) -> Result<RekorProof, ProofError> {
+    let bytes = base64url_decode(payload)?;
+    let digest = hex_lower(&sha256(&bytes)[..4]);
+    if digest != group {
+        return Err(ProofError::Malformed(format!(
+            "proof {group} reassembled to something whose digest is {digest}: \
+             its parts are not all from one record"
+        )));
+    }
+    RekorProof::decode(&bytes)
+}
+
 /// The zone key an answer was actually signed by: what the proof must bind.
 ///
 /// The apex and key tag come from the RRSIG the validator already accepted,
@@ -326,46 +487,36 @@ impl RekorProof {
 /// observation of the chain, never something the proof gets to assert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZoneKey<'a> {
-    /// The zone apex, as the RRSIG signer field names it.
-    pub apex: &'a str,
+    /// The membership domain being resolved. The apex an entry claims has to
+    /// contain it: an entry for a *sibling* namespace must not authorize
+    /// keys used to answer for this one, or an attacker could point the
+    /// requirement at a name the operator's monitor never watches.
+    pub domain: &'a str,
+    /// The zone whose RRSIG signed the answer — the bottom of the entry's
+    /// ladder, and the zone whose key set the chain proves. Not necessarily
+    /// the apex: a control plane at `sync.example.com` served out of the
+    /// `example.com` zone is signed by `example.com`.
+    pub signing_zone: &'a str,
     /// The key tag the RRSIG selected.
     pub key_tag: u16,
     /// The DNSKEY rdata: flags, protocol, algorithm, public key.
     pub dnskey_rdata: &'a [u8],
 }
 
-impl ZoneKey<'_> {
-    /// The raw public key: 64 bytes of uncompressed P-256 coordinates, as
-    /// DNSSEC algorithm 13 stores them (RFC 6605 §4).
-    fn public_key(&self) -> Result<&[u8], ProofError> {
-        let rdata = self.dnskey_rdata;
-        if rdata.len() != 4 + 64 {
-            return Err(ProofError::Binding(format!(
-                "DNSKEY rdata is {} bytes, not the 68 of algorithm 13",
-                rdata.len()
-            )));
-        }
-        let flags = u16::from_be_bytes([rdata[0], rdata[1]]);
-        if flags != ZONE_KEY_FLAGS {
-            return Err(ProofError::Binding(format!(
-                "DNSKEY flags {flags} are not {ZONE_KEY_FLAGS}"
-            )));
-        }
-        if rdata[3] != ZONE_KEY_ALGORITHM {
-            return Err(ProofError::Binding(format!(
-                "DNSKEY algorithm {} is not {ZONE_KEY_ALGORITHM}",
-                rdata[3]
-            )));
-        }
-        Ok(&rdata[4..])
+/// The raw 64-byte uncompressed P-256 point inside a DER
+/// SubjectPublicKeyInfo, or `None` for any other key type.
+///
+/// Used on the entry *signer's* key — the certificate's own — which this
+/// design requires to be P-256 (the `hashedrekord` verifier's
+/// `PKIX_ECDSA_P256_SHA_256`). The zone keys the entry authorizes are not
+/// constrained by algorithm at all: they are matched by rdata membership in
+/// the chain-proven RRset.
+pub fn p256_point(spki: &[u8]) -> Option<&[u8]> {
+    let point = spki.get(27..)?;
+    if point.len() != 64 || p256_spki(point) != spki {
+        return None;
     }
-
-    /// The DER SubjectPublicKeyInfo of this key: what the logged entry's
-    /// certificate must carry, so that the key the log vouches for is the
-    /// key the DNSSEC chain observed.
-    fn der_spki(&self) -> Result<Vec<u8>, ProofError> {
-        Ok(p256_spki(self.public_key()?))
-    }
+    Some(point)
 }
 
 /// What a verified record establishes, for logs and `synch doctor`.
@@ -385,11 +536,19 @@ pub struct VerifiedRecord {
 ///
 /// The chain, in the order the validated algorithm runs it: the log vouches
 /// for a leaf (checkpoint, inclusion) whose body names this zone in a
-/// certificate (apex binding) holding this exact DNSKEY (key binding), whose
-/// signature the zone key itself made (possession), whose digest is the DSSE
-/// PAE of this Statement, and whose Statement names this exact key and zone
-/// (statement binding). Any single failure refuses the whole record — there
-/// is no partial credit.
+/// certificate (apex binding) carrying a DNSSEC chain that proves an
+/// authorized key set (authorization), whose own key signed the entry
+/// (attribution), whose digest is the DSSE PAE of this Statement, and whose
+/// Statement describes exactly that proven set — a set the key that signed
+/// this answer is a member of (key binding). Any single failure refuses the
+/// whole record — there is no partial credit.
+///
+/// There is deliberately no possession check. The entry signature names
+/// whoever built the entry, and that is all it can honestly do: an attacker
+/// able to forge an authorized chain for a rogue key holds that key and
+/// could sign possession too, so requiring the *zone* key's signature would
+/// add nothing — while making a provider-held key (a zone hosted and signed
+/// by Cloudflare or Bunny) impossible to log. Authorization is the chain.
 ///
 /// # The chain extension, and why the client verifies a chain it does not need
 ///
@@ -423,12 +582,6 @@ pub fn verify(
     logs: &LogKeys,
     anchors: &TrustAnchors,
 ) -> Result<VerifiedRecord, ProofError> {
-    if proof.key_tag != key.key_tag {
-        return Err(ProofError::Binding(format!(
-            "proof is for key tag {}, the answer was signed by {}",
-            proof.key_tag, key.key_tag
-        )));
-    }
     let log_key = logs.find(&proof.log_id).ok_or_else(|| {
         ProofError::UnknownLog(match logs.is_empty() {
             // Naming the real reason: an empty pin set is a build with no
@@ -459,61 +612,67 @@ pub fn verify(
     // carrying the entry signature and the certificate that names the signer.
     let body = HashedRekordBody::parse(&proof.canonicalized_body)?;
 
-    // Who the certificate says it is about — the parsed apex and the key its
-    // SubjectPublicKeyInfo implies. Read through `chain::identify`, the same
-    // reader the monitor uses, so no spelling of a name can mean one thing
-    // here and another there.
-    let claimed = chain::identify(&body.certificate).map_err(chain_error)?;
+    // Who the certificate says it is about — the parsed apex. Read through
+    // `chain::identify`, the same reader the monitor uses, so no spelling of
+    // a name can mean one thing here and another there.
+    let claimed_apex = chain::identify(&body.certificate).map_err(chain_error)?;
 
-    // Apex binding: the zone the certificate names is the zone whose RRSIG
-    // signed this answer. This is the check that turns a leaf into something
-    // a monitor for this apex would have seen — an entry naming another apex
-    // is an entry the operator's monitor was never going to look at.
-    let observed_apex = chain::parse_name(key.apex).map_err(chain_error)?;
-    if claimed.apex != observed_apex {
+    // Apex binding. The apex is the control plane's *name*, and the entry is
+    // the only thing that says what it is — so it is not taken on trust but
+    // pinned between two names the client already knows, and it has to sit
+    // in between:
+    //
+    //   <signing zone>  ⊇  <claimed apex>  ⊇  <membership domain>
+    //
+    // The lower bound is what stops an entry for a sibling namespace from
+    // authorizing keys used to answer here: a monitor watching this domain's
+    // delegation path would never look at `other.example.com`, so an entry
+    // naming it must not be usable against `sync.example.com`. The upper
+    // bound is checked inside the chain walk, where the ladder's own bottom
+    // link is the signing zone — see `chain::validate`.
+    let domain = chain::parse_name(key.domain).map_err(chain_error)?;
+    if !claimed_apex.zone_of(&domain) {
         return Err(ProofError::Binding(format!(
-            "the entry's certificate names {}, the answer was signed by {observed_apex}",
-            claimed.apex
+            "the entry's certificate names {claimed_apex}, which does not contain \
+             the membership domain {domain} it would be authorizing",
         )));
     }
 
-    // Key binding: the certificate's SubjectPublicKeyInfo is exactly this
-    // DNSKEY. A possession check alone would pass a signature by the observed
-    // key under an entry that names a *different* key to a monitor. Asserted
-    // twice over — the SPKI byte-for-byte, and the DNSKEY rdata the chain
-    // will be walked against — because the second is what a monitor sees.
-    if body.certificate.spki != key.der_spki()? {
-        return Err(ProofError::Binding(
-            "the logged certificate's key is not this zone's DNSKEY".into(),
-        ));
-    }
-    if claimed.dnskey_rdata != key.dnskey_rdata {
-        return Err(ProofError::Binding(
-            "the chain would be walked against a different key than the answer was signed by"
-                .into(),
-        ));
-    }
-
-    // Discoverability: the entry carries a chain that proves, to anyone
-    // reading the log and nothing else, that this key was delegated for this
+    // Authorization: the entry carries a chain that proves, to anyone
+    // reading the log and nothing else, which keys were delegated for this
     // zone. `chain::authorize` is the *only* way to ask, and it is the same
     // call the monitor makes — neither side gets to choose the apex it feeds
     // the walk. See `chain::authorize` for the break that rule exists to
-    // prevent. Enforced for the monitors' sake, not the client's (see the doc
-    // comment above): a client that accepted a chainless entry would hand an
-    // attacker a key that works and rings no bell.
+    // prevent. What comes back is the proven key set, and it decides the key
+    // binding below; a chainless entry proves nothing and is refused.
     let authorized = chain::authorize(&body.certificate, anchors).map_err(chain_error)?;
-    debug_assert_eq!(authorized.apex, claimed.apex);
 
-    // Possession: the entry signature is the zone key's own. Rekor signs the
-    // hashedrekord's `data.digest` as a prehash — which, because that digest
-    // *is* SHA-256(PAE), is the same signature as ECDSA-SHA256 over the PAE
-    // itself. Verifying it over the PAE is how ring is asked the question.
-    // Rekor entry signatures are ASN.1/DER, not the raw r||s of DNSSEC.
+    // And the ladder's bottom is the zone that actually signed this answer.
+    // Without this an entry could carry a valid chain for some *other* zone
+    // that happens to enclose the apex, and the keys it proves would be that
+    // zone's rather than the one the client is talking to.
+    let observed_signer = chain::parse_name(key.signing_zone).map_err(chain_error)?;
+    if authorized.signing_zone != observed_signer {
+        return Err(ProofError::Binding(format!(
+            "the entry's chain is signed by {}, the answer was signed by {observed_signer}",
+            authorized.signing_zone
+        )));
+    }
+
+    // Attribution: the entry signature verifies under the certificate's own
+    // key — the entry is what its signer made, whoever that is. Rekor signs
+    // the hashedrekord's `data.digest` as a prehash — which, because that
+    // digest *is* SHA-256(PAE), is the same signature as ECDSA-SHA256 over
+    // the PAE itself. Verifying it over the PAE is how ring is asked the
+    // question. Rekor entry signatures are ASN.1/DER, not the raw r||s of
+    // DNSSEC.
     let pae = pae(DSSE_PAYLOAD_TYPE, &proof.statement);
-    let public = key.public_key()?;
-    verify_ecdsa_p256_asn1(public, &pae, &body.signature)
-        .map_err(|_| ProofError::Possession("the entry signature is not this zone key's".into()))?;
+    let signer = p256_point(&body.certificate.spki).ok_or_else(|| {
+        ProofError::Attribution("the certificate's key is not a P-256 SubjectPublicKeyInfo".into())
+    })?;
+    verify_ecdsa_p256_asn1(signer, &pae, &body.signature).map_err(|_| {
+        ProofError::Attribution("the entry signature is not the certificate's key's".into())
+    })?;
 
     // The entry commits to the DSSE PAE of *this* Statement — the body holds
     // only its digest, so the Statement bytes cannot be swapped under it.
@@ -523,9 +682,10 @@ pub fn verify(
         ));
     }
 
-    // Statement binding: the Statement describes the key and zone observed.
+    // Statement and key binding: the Statement describes exactly the proven
+    // set, and the key that signed this answer is a member of it.
     let statement = ZoneKeyStatement::parse(&proof.statement)?;
-    statement.check_binds(key)?;
+    statement.check_binds(&claimed_apex, key, &authorized.proven_keys)?;
 
     Ok(VerifiedRecord {
         log_index: proof.log_index,
@@ -567,8 +727,8 @@ impl HashedRekordBody {
     ///
     /// The `publicKey` arm of Rekor's verifier oneof is **not** handled, at
     /// all: an entry whose verifier is a bare key names no apex anywhere in
-    /// its leaf, which is exactly the unmonitorable shape v3 abolishes. There
-    /// is no branch to reach, no legacy path and no fallback.
+    /// its leaf, so no monitor could ever have seen it. There is no branch
+    /// to reach and no fallback.
     pub fn parse(bytes: &[u8]) -> Result<HashedRekordBody, ProofError> {
         let bad = |why: String| ProofError::Malformed(format!("entry body: {why}"));
         let value: serde_json::Value =
@@ -647,34 +807,67 @@ impl HashedRekordBody {
     }
 }
 
+/// One key of a Statement's claimed set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementKey {
+    /// The DNSKEY key tag (RFC 4034 App. B, over the whole rdata).
+    pub key_tag: u16,
+    /// The DNSSEC algorithm number.
+    pub algorithm: u8,
+    /// The DNSKEY flags.
+    pub flags: u16,
+    /// Lowercase hex SHA-256 of the DNSKEY rdata.
+    pub sha256: String,
+}
+
 /// The in-toto Statement a zone-key entry carries (§2).
+///
+/// The subject is a **key set** — the apex DNSKEY RRset the entry's chain
+/// proves — rendered as one in-toto subject per key, each named by the apex
+/// and identified by the SHA-256 of its DNSKEY rdata. The predicate repeats
+/// the set with the tag, algorithm and flags a human or a monitor wants at a
+/// glance; the two lists must agree entry for entry, in order.
 ///
 /// Built here as well as parsed: the canonical rendering is the thing both
 /// halves of the system have to agree on, so it lives with the parser that
 /// depends on it rather than in whichever tool happened to need it first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneKeyStatement {
-    /// The subject name — the apex, as an FQDN.
-    pub subject_name: String,
-    /// Lowercase hex SHA-256 of the DNSKEY rdata.
-    pub subject_sha256: String,
-    /// The zone this key is claimed for.
+    /// The zone this key set is claimed for.
     pub apex: String,
-    /// The DNSKEY key tag.
-    pub key_tag: u16,
-    /// The DNSSEC algorithm number.
-    pub algorithm: u8,
-    /// The DNSKEY flags.
-    pub flags: u16,
-    /// The DS record line for the parent, `<tag> <alg> 2 <hex digest>`.
-    pub ds: String,
+    /// The claimed keys, in canonical order: ascending key tag, ties broken
+    /// by the hex digest. Both renderers sort the same way, so one set has
+    /// exactly one rendering.
+    pub keys: Vec<StatementKey>,
     /// `create`, `rollover` or `retire`.
     pub action: String,
-    /// The key tag this one replaces, for `rollover`.
-    pub replaces_key_tag: Option<u16>,
 }
 
 impl ZoneKeyStatement {
+    /// The Statement for a key set, from the DNSKEY rdatas themselves —
+    /// tag, algorithm, flags and digest are all derived, and the canonical
+    /// order is applied here.
+    pub fn for_keys(apex: &str, rdatas: &[Vec<u8>], action: &str) -> ZoneKeyStatement {
+        let mut keys: Vec<StatementKey> = rdatas
+            .iter()
+            .map(|rdata| StatementKey {
+                key_tag: chain::key_tag(rdata),
+                algorithm: rdata.get(3).copied().unwrap_or(0),
+                flags: u16::from_be_bytes([
+                    rdata.first().copied().unwrap_or(0),
+                    rdata.get(1).copied().unwrap_or(0),
+                ]),
+                sha256: hex_lower(&sha256(rdata)),
+            })
+            .collect();
+        keys.sort_by(|a, b| (a.key_tag, &a.sha256).cmp(&(b.key_tag, &b.sha256)));
+        ZoneKeyStatement {
+            apex: apex.to_string(),
+            keys,
+            action: action.to_string(),
+        }
+    }
+
     /// Renders the canonical Statement bytes.
     ///
     /// Field order is fixed and there is no whitespace: the signature and
@@ -684,35 +877,48 @@ impl ZoneKeyStatement {
         let mut out = String::new();
         out.push_str("{\"_type\":");
         json_string(&mut out, STATEMENT_TYPE);
-        out.push_str(",\"subject\":[{\"name\":");
-        json_string(&mut out, &self.subject_name);
-        out.push_str(",\"digest\":{\"sha256\":");
-        json_string(&mut out, &self.subject_sha256);
-        out.push_str("}}],\"predicateType\":");
+        out.push_str(",\"subject\":[");
+        for (index, key) in self.keys.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":");
+            json_string(&mut out, &self.apex);
+            out.push_str(",\"digest\":{\"sha256\":");
+            json_string(&mut out, &key.sha256);
+            out.push_str("}}");
+        }
+        out.push_str("],\"predicateType\":");
         json_string(&mut out, PREDICATE_TYPE);
         out.push_str(",\"predicate\":{\"apex\":");
         json_string(&mut out, &self.apex);
-        out.push_str(",\"keyTag\":");
-        out.push_str(&self.key_tag.to_string());
-        out.push_str(",\"algorithm\":");
-        out.push_str(&self.algorithm.to_string());
-        out.push_str(",\"flags\":");
-        out.push_str(&self.flags.to_string());
-        out.push_str(",\"ds\":");
-        json_string(&mut out, &self.ds);
-        out.push_str(",\"action\":");
-        json_string(&mut out, &self.action);
-        out.push_str(",\"replacesKeyTag\":");
-        match self.replaces_key_tag {
-            Some(tag) => out.push_str(&tag.to_string()),
-            None => out.push_str("null"),
+        out.push_str(",\"keys\":[");
+        for (index, key) in self.keys.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"keyTag\":");
+            out.push_str(&key.key_tag.to_string());
+            out.push_str(",\"algorithm\":");
+            out.push_str(&key.algorithm.to_string());
+            out.push_str(",\"flags\":");
+            out.push_str(&key.flags.to_string());
+            out.push_str(",\"sha256\":");
+            json_string(&mut out, &key.sha256);
+            out.push('}');
         }
+        out.push_str("],\"action\":");
+        json_string(&mut out, &self.action);
         out.push_str("}}");
         out.into_bytes()
     }
 
     /// Parses a Statement, accepting unknown members so the predicate can
     /// grow, and refusing anything whose known members are the wrong shape.
+    ///
+    /// The subject list and the predicate's key list must agree — same
+    /// length, same digests, same order — or the statement is describing two
+    /// different sets at once and cannot be believed about either.
     pub fn parse(bytes: &[u8]) -> Result<ZoneKeyStatement, ProofError> {
         let bad = |why: String| ProofError::Malformed(format!("statement: {why}"));
         let value: serde_json::Value =
@@ -742,79 +948,107 @@ impl ZoneKeyStatement {
         let subjects = value["subject"]
             .as_array()
             .ok_or_else(|| bad("subject is not an array".into()))?;
-        let [subject] = subjects.as_slice() else {
-            return Err(bad(format!(
-                "a zone-key entry has exactly one subject, not {}",
-                subjects.len()
-            )));
-        };
+        if subjects.is_empty() {
+            return Err(bad("a zone-key entry claims at least one key".into()));
+        }
         let predicate = &value["predicate"];
-        let key_tag = number(&predicate["keyTag"], "keyTag")?;
-        let algorithm = number(&predicate["algorithm"], "algorithm")?;
-        let flags = number(&predicate["flags"], "flags")?;
-        let replaces_key_tag = match &predicate["replacesKeyTag"] {
-            serde_json::Value::Null => None,
-            other => Some(
-                u16::try_from(number(other, "replacesKeyTag")?)
-                    .map_err(|_| bad("replacesKeyTag is out of range".into()))?,
-            ),
-        };
+        let apex = text(&predicate["apex"], "apex")?;
+        let listed = predicate["keys"]
+            .as_array()
+            .ok_or_else(|| bad("predicate keys is not an array".into()))?;
+        if listed.len() != subjects.len() {
+            return Err(bad(format!(
+                "{} subject(s) but {} predicate key(s)",
+                subjects.len(),
+                listed.len()
+            )));
+        }
+        let mut keys = Vec::with_capacity(listed.len());
+        for (subject, entry) in subjects.iter().zip(listed) {
+            let subject_name = text(&subject["name"], "subject name")?;
+            if subject_name != apex {
+                return Err(bad(format!(
+                    "a subject names {subject_name}, the predicate names {apex}"
+                )));
+            }
+            let subject_sha256 = text(&subject["digest"]["sha256"], "subject sha256 digest")?;
+            let sha256 = text(&entry["sha256"], "key sha256")?;
+            if !subject_sha256.eq_ignore_ascii_case(&sha256) {
+                return Err(bad("a subject digest and its predicate key disagree".into()));
+            }
+            keys.push(StatementKey {
+                key_tag: u16::try_from(number(&entry["keyTag"], "keyTag")?)
+                    .map_err(|_| bad("keyTag is out of range".into()))?,
+                algorithm: u8::try_from(number(&entry["algorithm"], "algorithm")?)
+                    .map_err(|_| bad("algorithm is out of range".into()))?,
+                flags: u16::try_from(number(&entry["flags"], "flags")?)
+                    .map_err(|_| bad("flags is out of range".into()))?,
+                sha256,
+            });
+        }
         Ok(ZoneKeyStatement {
-            subject_name: text(&subject["name"], "subject name")?,
-            subject_sha256: text(&subject["digest"]["sha256"], "subject sha256 digest")?,
-            apex: text(&predicate["apex"], "apex")?,
-            key_tag: u16::try_from(key_tag).map_err(|_| bad("keyTag is out of range".into()))?,
-            algorithm: u8::try_from(algorithm)
-                .map_err(|_| bad("algorithm is out of range".into()))?,
-            flags: u16::try_from(flags).map_err(|_| bad("flags is out of range".into()))?,
-            ds: text(&predicate["ds"], "ds")?,
+            apex,
+            keys,
             action: text(&predicate["action"], "action")?,
-            replaces_key_tag,
         })
     }
 
-    /// Checks that the Statement describes the key and zone observed (§4.2).
+    /// Checks that the Statement describes the proven set and the key
+    /// observed (§4.2).
     ///
-    /// The apex check is what stops a key logged for one zone being replayed
-    /// into another; the digest check is what stops a Statement being reused
-    /// for a different key under the same name.
-    fn check_binds(&self, key: &ZoneKey<'_>) -> Result<(), ProofError> {
-        let digest = hex_lower(&sha256(key.dnskey_rdata));
-        if !self.subject_sha256.eq_ignore_ascii_case(&digest) {
+    /// Three facts, refused independently: the apex is the one whose RRSIG
+    /// signed this answer (stops a set logged for one zone being replayed
+    /// into another); the claimed set is exactly the chain-proven set, digest
+    /// for digest and metadata for metadata (stops a statement describing
+    /// keys its own chain never proved); and the key that signed this answer
+    /// is a member (the point of the whole exercise).
+    fn check_binds(
+        &self,
+        apex: &hickory_resolver::proto::rr::Name,
+        key: &ZoneKey<'_>,
+        proven: &[Vec<u8>],
+    ) -> Result<(), ProofError> {
+        // The Statement and the certificate have to name the same control
+        // plane. The certificate's SAN is what the monitor indexes on and
+        // what the declaration hangs under; a Statement naming something
+        // else would describe a key set for a zone nobody checked.
+        if !same_name(&self.apex, &apex.to_string()) {
+            return Err(ProofError::Binding(format!(
+                "the entry's statement names apex {}, its certificate names {apex}",
+                self.apex
+            )));
+        }
+
+        // The claimed set is the proven set, exactly. Compared as canonical
+        // statements: `for_keys` derives every field from the rdatas alone,
+        // so equality here pins digest, tag, algorithm, flags and order all
+        // at once.
+        let derived = ZoneKeyStatement::for_keys(&self.apex, proven, &self.action);
+        if derived.keys != self.keys {
             return Err(ProofError::Binding(
-                "the subject digest is not this DNSKEY's rdata".into(),
+                "the statement's key set is not the set its chain proves".into(),
             ));
         }
-        if !same_name(&self.apex, key.apex) {
+
+        // Membership: the key that signed this answer is in the proven set.
+        let digest = hex_lower(&sha256(key.dnskey_rdata));
+        if !self
+            .keys
+            .iter()
+            .any(|k| k.sha256.eq_ignore_ascii_case(&digest))
+        {
             return Err(ProofError::Binding(format!(
-                "the entry names apex {}, the answer was signed by {}",
-                self.apex, key.apex
+                "the answer was signed by key tag {}, which is not in the authorized set",
+                key.key_tag
             )));
         }
-        if !same_name(&self.subject_name, key.apex) {
-            return Err(ProofError::Binding(format!(
-                "the subject names {}, the answer was signed by {}",
-                self.subject_name, key.apex
-            )));
-        }
-        if self.key_tag != key.key_tag {
-            return Err(ProofError::Binding(format!(
-                "the entry names key tag {}, the answer was signed by {}",
-                self.key_tag, key.key_tag
-            )));
-        }
-        if self.algorithm != ZONE_KEY_ALGORITHM || self.flags != ZONE_KEY_FLAGS {
-            return Err(ProofError::Binding(format!(
-                "the entry names algorithm {} flags {}, not the CSK convention {ZONE_KEY_ALGORITHM}/{ZONE_KEY_FLAGS}",
-                self.algorithm, self.flags
-            )));
-        }
-        // Only a key being *put into service* is authorization. A `retire`
-        // entry is a breadcrumb for monitors and is allowed to be chainless
-        // on the publish side (a retired zone may have no DS left), so a
-        // client that accepted one would accept an entry carrying no proof
-        // of delegation at all — the exact evasion the chain requirement
-        // exists to close.
+
+        // Only a key set being *put into service* is authorization. A
+        // `retire` entry is a breadcrumb for monitors and is allowed to be
+        // chainless on the publish side (a retired zone may have no DS
+        // left), so a client that accepted one would accept an entry
+        // carrying no proof of delegation at all — the exact evasion the
+        // chain requirement exists to close.
         if !matches!(self.action.as_str(), "create" | "rollover") {
             return Err(ProofError::Binding(format!(
                 "the entry's action is {}, and only create or rollover authorizes a key",
@@ -1125,7 +1359,7 @@ fn verify_ecdsa_p256_asn1(
     uncompressed.extend_from_slice(public);
     signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, &uncompressed)
         .verify(message, signature)
-        .map_err(|_| ProofError::Possession("signature does not verify".into()))
+        .map_err(|_| ProofError::Attribution("signature does not verify".into()))
 }
 
 /// Wraps a raw 64-byte uncompressed P-256 point in a DER SubjectPublicKeyInfo.
@@ -1360,7 +1594,6 @@ mod tests {
 
     fn proof() -> RekorProof {
         RekorProof {
-            key_tag: 34_918,
             log_id: [7u8; 32],
             log_index: 1_234_567,
             statement: b"{\"_type\":\"x\"}".to_vec(),
@@ -1377,9 +1610,89 @@ mod tests {
         let original = proof();
         let bytes = original.encode().expect("a small record encodes");
         assert_eq!(RekorProof::decode(&bytes).unwrap(), original);
-        assert_eq!(
-            RekorProof::from_txt(&original.to_txt().expect("encodes")).unwrap(),
-            original
+        let records = original.to_txt().expect("encodes");
+        let reassembled = proofs_from_txt(&records);
+        let [Ok(only)] = reassembled.as_slice() else {
+            panic!("one proof reassembles to one candidate: {reassembled:?}");
+        };
+        assert_eq!(only, &original);
+    }
+
+    /// A proof is served in pieces, and the pieces are self-describing.
+    #[test]
+    fn a_proof_is_chunked_and_reassembles_in_any_order() {
+        // Big enough to need several records: the whole reason the format
+        // has a header at all.
+        let big = RekorProof {
+            statement: vec![b'x'; 3000],
+            canonicalized_body: vec![b'y'; 3000],
+            ..proof()
+        };
+        let mut records = big.to_txt().expect("encodes");
+        assert!(records.len() > 1, "a real proof spans records");
+        for record in &records {
+            assert!(record.starts_with(PROOF_TXT_PREFIX));
+            assert!(
+                record.len() < 4096,
+                "a record has to fit the tightest provider limit: {}",
+                record.len()
+            );
+        }
+
+        // Order is carried in the records, not in the answer: DNS gives no
+        // ordering guarantee across an RRset.
+        records.reverse();
+        let reassembled = proofs_from_txt(&records);
+        let [Ok(got)] = reassembled.as_slice() else {
+            panic!("one proof, one candidate: {reassembled:?}");
+        };
+        assert_eq!(got, &big);
+
+        // A missing piece is a refusal, not a truncated proof.
+        let short = records[1..].to_vec();
+        assert!(proofs_from_txt(&short)[0].is_err());
+
+        // Two proofs at one name — a rollover — stay separate.
+        let other = RekorProof {
+            log_index: big.log_index + 1,
+            ..big.clone()
+        };
+        let mut both = big.to_txt().expect("encodes");
+        both.extend(other.to_txt().expect("encodes"));
+        let reassembled = proofs_from_txt(&both);
+        assert_eq!(reassembled.len(), 2, "two groups, two proofs");
+        let decoded: Vec<&RekorProof> = reassembled.iter().map(|r| r.as_ref().unwrap()).collect();
+        assert!(decoded.contains(&&big) && decoded.contains(&&other));
+    }
+
+    /// Chunks of different proofs cannot be spliced into one that decodes.
+    ///
+    /// The group is the digest of the whole encoded record, so a mixed set
+    /// either fails to reassemble or reassembles to something whose digest
+    /// is not the group it claimed — checked, because base64url of two
+    /// unrelated halves can still decode to *bytes*.
+    #[test]
+    fn chunks_from_two_proofs_do_not_splice() {
+        let a = RekorProof {
+            statement: vec![b'a'; 3000],
+            ..proof()
+        };
+        let b = RekorProof {
+            statement: vec![b'b'; 3000],
+            ..proof()
+        };
+        let (ra, rb) = (a.to_txt().unwrap(), b.to_txt().unwrap());
+        assert!(ra.len() > 1 && rb.len() > 1);
+        // b's first chunk relabelled with a's group and index.
+        let group = ra[0].split_whitespace().nth(1).unwrap().to_string();
+        let payload = rb[0].split_whitespace().nth(3).unwrap();
+        let forged = format!("{PROOF_TXT_PREFIX} {group} 1/{} {payload}", ra.len());
+        let spliced: Vec<String> = std::iter::once(forged)
+            .chain(ra[1..].iter().cloned())
+            .collect();
+        assert!(
+            proofs_from_txt(&spliced).iter().all(|r| r.is_err()),
+            "a spliced set must not yield a proof"
         );
     }
 
@@ -1389,17 +1702,16 @@ mod tests {
         // them rather than trusting the encoder to agree with itself.
         let bytes = proof().encode().expect("a small record encodes");
         assert_eq!(bytes[0], PROOF_VERSION);
-        assert_eq!(&bytes[1..3], &34_918u16.to_be_bytes());
-        assert_eq!(&bytes[3..35], &[7u8; 32]);
-        assert_eq!(&bytes[35..43], &1_234_567u64.to_be_bytes());
+        assert_eq!(&bytes[1..33], &[7u8; 32]);
+        assert_eq!(&bytes[33..41], &1_234_567u64.to_be_bytes());
         // The statement blob's u16 length prefix, then its bytes.
-        assert_eq!(&bytes[43..45], &13u16.to_be_bytes());
+        assert_eq!(&bytes[41..43], &13u16.to_be_bytes());
     }
 
     #[test]
     fn a_truncated_or_padded_record_is_malformed() {
         let bytes = proof().encode().expect("a small record encodes");
-        for cut in [0, 1, 10, 44, bytes.len() - 1] {
+        for cut in [0, 1, 10, 42, bytes.len() - 1] {
             assert!(matches!(
                 RekorProof::decode(&bytes[..cut]),
                 Err(ProofError::Malformed(_))
@@ -1430,31 +1742,41 @@ mod tests {
 
     #[test]
     fn statements_round_trip_through_their_canonical_form() {
-        let statement = ZoneKeyStatement {
-            subject_name: "sync.example.".into(),
-            subject_sha256: "ab".repeat(32),
-            apex: "sync.example.".into(),
-            key_tag: 34_918,
-            algorithm: 13,
-            flags: 257,
-            ds: "34918 13 2 deadbeef".into(),
-            action: "rollover".into(),
-            replaces_key_tag: Some(1234),
-        };
+        // Two keys, deliberately supplied out of canonical order: a KSK
+        // (flags 257) and a ZSK (flags 256), the split-key shape a
+        // provider-hosted zone has. `for_keys` sorts and derives every field
+        // from the rdatas alone.
+        let ksk = [&[0x01u8, 0x01, 0x03, 0x0d][..], &[0xab; 64][..]].concat();
+        let zsk = [&[0x01u8, 0x00, 0x03, 0x0d][..], &[0xcd; 64][..]].concat();
+        let statement =
+            ZoneKeyStatement::for_keys("sync.example.", &[ksk.clone(), zsk.clone()], "rollover");
+        assert_eq!(statement.keys.len(), 2);
+        let sorted: Vec<u16> = statement.keys.iter().map(|k| k.key_tag).collect();
+        let mut expected = vec![chain::key_tag(&ksk), chain::key_tag(&zsk)];
+        expected.sort_unstable();
+        assert_eq!(sorted, expected, "keys are in canonical tag order");
+        assert_eq!(
+            statement
+                .keys
+                .iter()
+                .map(|k| k.flags)
+                .collect::<Vec<_>>()
+                .len(),
+            2
+        );
+
         let json = statement.to_json();
         assert_eq!(ZoneKeyStatement::parse(&json).unwrap(), statement);
         let text = String::from_utf8(json).unwrap();
         assert!(text.starts_with("{\"_type\":\"https://in-toto.io/Statement/v1\","));
-        assert!(!text.contains(' ') || text.contains("34918 13 2"));
-        assert!(text.ends_with("\"replacesKeyTag\":1234}}"));
+        assert!(!text.contains(' '), "the canonical form has no whitespace");
+        assert!(text.ends_with("\"action\":\"rollover\"}}"), "{text}");
+        assert!(text.contains("\"predicateType\":\"https://synchronicity.sh/zone-key/v2\""));
 
-        let created = ZoneKeyStatement {
-            replaces_key_tag: None,
-            action: "create".into(),
-            ..statement
-        };
-        let text = String::from_utf8(created.to_json()).unwrap();
-        assert!(text.ends_with("\"replacesKeyTag\":null}}"), "{text}");
+        // One rendering: the same set supplied in the other order is the
+        // same bytes.
+        let swapped = ZoneKeyStatement::for_keys("sync.example.", &[zsk, ksk], "rollover");
+        assert_eq!(swapped.to_json(), statement.to_json());
     }
 
     #[test]

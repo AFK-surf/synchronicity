@@ -36,12 +36,18 @@ import email/mailer
 import gleam/erlang/process
 import gleam/int
 import gleam/io
+import gleam/list
 import gleam/option
 import gleam/otp/static_supervisor as sup
 import gleam/result
 import gleam/string
+import jobs/provider_sync
 import jobs/resign
+import jobs/zonekey_watch
 import mist
+import provider/bunny
+import provider/cloudflare
+import provider/provider
 import rekor/chain
 import rekor/client
 import rekor/publish as rekor
@@ -73,13 +79,14 @@ pub fn main() {
     ["rekor-retire", apex, key_file] ->
       run_or_die(fn() { rekor_publish(apex, key_file, "retire") })
     ["tuf-refresh"] -> run_or_die(tuf_refresh)
+    ["provider-sync"] -> run_or_die(provider_sync_once)
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(run_seed)
     ["seed-admin", email] -> run_or_die(fn() { seed_admin(email) })
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | rekor-retire <apex> <keyfile> | tuf-refresh | seed | seed-admin <email> | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | rekor-retire <apex> <keyfile> | tuf-refresh | provider-sync | seed | seed-admin <email> | migrate-check",
       )
       halt(2)
     }
@@ -136,6 +143,24 @@ fn print_material(apex: name.Name, csk: keys.Csk) -> Nil {
 /// tree without minting a second entry. The zone is republished either way,
 /// which is also how a phase-2 deployment escapes the publish gate after
 /// its first successful logging.
+/// The DNS zone that actually holds and signs the apex's records.
+///
+/// The apex itself whenever the control plane runs a delegated zone of its
+/// own — always the case in serve mode, where this service *is* the
+/// authoritative nameserver for the apex. In external mode a provider may
+/// host a zone above the apex instead, and `CP_SIGNING_ZONE` names it.
+fn signing_zone_of(
+  cfg: config.Config,
+  apex: name.Name,
+) -> Result(name.Name, String) {
+  case cfg.dns_mode {
+    config.Serve -> Ok(apex)
+    config.External(_, zone) ->
+      name.parse(zone)
+      |> result.replace_error("invalid CP_SIGNING_ZONE " <> zone)
+  }
+}
+
 fn rekor_publish(
   apex_text: String,
   key_file: String,
@@ -145,29 +170,27 @@ fn rekor_publish(
   use apex <- result.try(
     name.parse(apex_text) |> result.replace_error("invalid apex domain"),
   )
+  use signing_zone <- result.try(signing_zone_of(cfg, apex))
   use csk <- result.try(keys.load(key_file))
   use log_key <- result.try(client.log_key())
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
-  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
-  use action <- result.try(case forced_action {
-    "" ->
-      rekor.action_for(conn, key_tag)
-      |> result.map_error(fn(e) {
-        "reading stored records: " <> string.inspect(e)
-      })
-    forced -> Ok(forced)
-  })
+  let claim = case forced_action {
+    // The retiring subject is the CSK being taken out of service — the one
+    // key this deployment ever put in the zone.
+    "retire" -> rekor.Retire([keys.dnskey_rdata(csk)])
+    _ -> rekor.Current
+  }
   use outcome <- result.try(
     rekor.run(
       conn,
       apex,
-      csk,
+      signing_zone,
       client.http(client.url()),
       log_key,
       now,
       chain.doh(chain.resolver_url()),
-      action,
+      claim,
     )
     |> result.map_error(fn(e) { "logging the zone key: " <> string.inspect(e) }),
   )
@@ -177,8 +200,8 @@ fn rekor_publish(
   )
   sqlite.close(conn)
   io.println(
-    "zone key "
-    <> int.to_string(outcome.key_tag)
+    "zone key set "
+    <> string.join(list.map(outcome.key_tags, int.to_string), ",")
     <> " "
     <> outcome.action
     <> ": log index "
@@ -289,9 +312,12 @@ fn prepare_primary(cfg: Config) -> Result(keys.Csk, String) {
 
 fn serve() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
-  case cfg.role {
-    Primary -> serve_primary(cfg)
-    Replica -> serve_replica(cfg)
+  case cfg.role, cfg.dns_mode {
+    Primary, config.Serve -> serve_primary(cfg)
+    Primary, config.External(provider_cfg, _) ->
+      serve_external(cfg, provider_cfg)
+    // config.load refuses external on a replica, so this arm is serve mode.
+    Replica, _ -> serve_replica(cfg)
   }
 }
 
@@ -332,7 +358,7 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       keys.anchor_line(meta.apex, meta.dnskey_public),
       keys.ds_line(meta.apex, meta.dnskey_public),
       option.None,
-      serving,
+      router.ServingZone(serving),
     )
   let handler = fn(req) { router.handle(req, ctx) }
   let http =
@@ -401,14 +427,16 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
-      csk,
+      fn(conn, now, actor) { publish.publish_in_tx(conn, csk, now, actor) },
+      // Serve mode: commit is publication; there is nobody to nudge.
+      fn() { Nil },
     )
   let ctx =
     router.Context(
       keys.anchor_line(apex, csk.public),
       keys.ds_line(apex, csk.public),
       option.Some(auth),
-      serving,
+      router.ServingZone(serving),
     )
   let handler = fn(req) { router.handle(req, ctx) }
   let http =
@@ -461,6 +489,152 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
     <> endpoint(cfg.http_listen),
   )
   process.sleep_forever()
+  Ok(Nil)
+}
+
+/// External mode (docs/EXTERNAL-DNS-PROVIDER.md): the provider hosts and
+/// signs the zone; this tree runs the product API and two convergence
+/// loops — the reconciler that pushes records through the provider's API,
+/// and the key watcher that keeps the transparency claim covering whatever
+/// keys the provider is signing with. No DNS listeners, no zone key, no
+/// re-sign job: there are no RRSIGs of ours to expire.
+fn serve_external(
+  cfg: Config,
+  provider_cfg: config.ProviderConfig,
+) -> Result(Nil, String) {
+  use log_key <- result.try(client.log_key())
+  use apex <- result.try(
+    name.parse(cfg.base_domain) |> result.replace_error("bad base domain"),
+  )
+  use signing_zone <- result.try(signing_zone_of(cfg, apex))
+  use Nil <- result.try({
+    use conn <- result.try(open_primary_db(cfg))
+    use Nil <- result.try(publish.ensure_meta_external(conn, cfg.base_domain))
+    use _ <- result.try(
+      publish.publish_external(conn, now_unix(), "system:boot")
+      |> result.map_error(fn(e) { "publishing zone: " <> string.inspect(e) }),
+    )
+    sqlite.close(conn)
+    Ok(Nil)
+  })
+  use #(prov, provider_name, zone_id) <- result.try(connect_provider(
+    provider_cfg,
+    cfg.base_domain,
+  ))
+  io.println("dns provider: " <> prov.describe)
+
+  let mail = case cfg.smtp {
+    option.Some(#(host, port, user, pass, from)) ->
+      mailer.Smtp(host, port, user, pass, from)
+    option.None -> mailer.LogOnly
+  }
+  io.println("mailer: " <> mailer.describe(mail))
+  let api_name = process.new_name("cp_api_pool")
+  let sync_name = process.new_name("cp_provider_sync")
+  let api_pool = pool.handle(api_name, db.primary_pragmas)
+  let auth =
+    auth_api.AuthContext(
+      api_pool,
+      cfg.public_url,
+      mail,
+      option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
+      option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
+      fn(conn, now, actor) { publish.publish_external_in_tx(conn, now, actor) },
+      // After commit: nudge the reconciler, so a mutation reaches the
+      // provider in seconds while the hourly sweep stays the safety net.
+      fn() { provider_sync.poke(sync_name) },
+    )
+  let ctx =
+    router.Context("", "", option.Some(auth), router.ExternalZone(api_pool))
+  let handler = fn(req) { router.handle(req, ctx) }
+  let http =
+    wisp_mist.handler(handler, cfg.session_secret)
+    |> mist.new
+    |> mist.bind(cfg.http_listen.address)
+    |> mist.port(cfg.http_listen.port)
+  use _ <- result.try(
+    sup.new(sup.OneForOne)
+    |> sup.restart_tolerance(intensity: 60, period: 10)
+    |> sup.add(pool.supervised(
+      api_name,
+      cfg.db_path,
+      sqlite.ReadWrite,
+      db.primary_pragmas,
+      4,
+    ))
+    |> sup.add(mist.supervised(http))
+    |> sup.add(provider_sync.supervised(
+      sync_name,
+      cfg.db_path,
+      prov,
+      provider_name,
+      zone_id,
+    ))
+    |> sup.add(zonekey_watch.supervised(
+      cfg.db_path,
+      apex,
+      signing_zone,
+      chain.doh(chain.resolver_url()),
+      client.http(client.url()),
+      log_key,
+      sync_name,
+    ))
+    |> sup.start
+    |> result.map_error(fn(_) { "could not start supervision tree" }),
+  )
+  io.println(
+    "external mode for "
+    <> cfg.base_domain
+    <> " — provider "
+    <> provider_name
+    <> ", http "
+    <> endpoint(cfg.http_listen),
+  )
+  process.sleep_forever()
+  Ok(Nil)
+}
+
+/// Builds the configured provider leg, discovering the zone id where the
+/// configuration left it to be discovered.
+fn connect_provider(
+  provider_cfg: config.ProviderConfig,
+  apex: String,
+) -> Result(#(provider.Provider, String, String), String) {
+  case provider_cfg {
+    config.Cloudflare(token, zone_id, api_url) -> {
+      use prov <- result.try(cloudflare.connect(token, zone_id, api_url, apex))
+      Ok(#(prov, "cloudflare", describe_zone(prov.describe)))
+    }
+    config.Bunny(key, zone_id, api_url) -> {
+      use prov <- result.try(bunny.connect(key, zone_id, api_url, apex))
+      Ok(#(prov, "bunny", describe_zone(prov.describe)))
+    }
+    config.LogOnly -> Ok(#(provider.log_only(), "log-only", ""))
+  }
+}
+
+/// The zone id out of a leg's describe line ("<provider> zone <id>").
+fn describe_zone(describe: String) -> String {
+  case string.split(describe, " zone ") {
+    [_, id] -> id
+    _ -> ""
+  }
+}
+
+/// One reconciler pass from the command line: connect, converge, exit.
+/// What an operator runs at cutover instead of waiting for the sweep.
+fn provider_sync_once() -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use provider_cfg <- result.try(case cfg.dns_mode {
+    config.External(provider_cfg, _) -> Ok(provider_cfg)
+    config.Serve -> Error("provider-sync needs CP_DNS_MODE=external")
+  })
+  use #(prov, provider_name, zone_id) <- result.try(connect_provider(
+    provider_cfg,
+    cfg.base_domain,
+  ))
+  io.println("dns provider: " <> prov.describe)
+  provider_sync.run_once(cfg.db_path, prov, provider_name, zone_id)
   Ok(Nil)
 }
 

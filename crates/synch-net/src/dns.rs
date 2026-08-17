@@ -30,7 +30,7 @@ use hickory_resolver::proto::{
 
 use crate::{
     error::NetError,
-    rekor::{self, LogKeys, ProofError, RekorProof, VerifiedRecord, ZoneKey},
+    rekor::{self, LogKeys, ProofError, VerifiedRecord, ZoneKey},
     tuf::{self, PinState, TufBundle, TufError, TufUpdate},
 };
 
@@ -60,8 +60,25 @@ pub fn query_name(domain: &str) -> String {
 /// One name per zone, at the apex — one zone key, one proof set. The client
 /// learns the apex from the RRSIG signer field it already validates, not
 /// from the membership name it asked about.
-pub fn rekor_query_name(apex: &str) -> String {
-    format!("{}.{}", rekor::REKOR_TXT_PREFIX, apex)
+pub fn rekor_query_name(zone: &str) -> String {
+    format!("{}.{}", rekor::REKOR_TXT_PREFIX, zone)
+}
+
+/// Where part `index` of a proof lives (§3).
+///
+/// A proof is far larger than one TXT record, and larger than what a managed
+/// provider will hold at a single owner name — Cloudflare caps the combined
+/// content of one name and type at 8192 wire-format bytes, which an
+/// ICANN-rooted proof exceeds on its own. So the parts are spread across
+/// names, one part each: part 1 at the base name, which is the only one a
+/// client can compute before it has read anything, and every later part one
+/// label along at `_synchronicity-rekor-<index>`. Part 1 says how many
+/// there are.
+pub fn rekor_part_query_name(zone: &str, index: usize) -> String {
+    match index {
+        0 | 1 => rekor_query_name(zone),
+        n => format!("{}-{n}.{}", rekor::REKOR_TXT_PREFIX, zone),
+    }
 }
 
 /// The query name the zone relays Sigstore's TUF metadata under (§10.1).
@@ -71,6 +88,60 @@ pub fn rekor_query_name(apex: &str) -> String {
 /// TXT query and the pin set follows Sigstore without a second transport.
 pub fn tuf_query_name(apex: &str) -> String {
     format!("{}.{}", tuf::TUF_TXT_PREFIX, apex)
+}
+
+/// The control-plane apex a validated membership answer names, checked at
+/// both ends.
+///
+/// Every record in the answer must agree — a set that named two apexes would
+/// be pointing a client at two different control planes for one domain — and
+/// the name has to sit between the domain being resolved and the zone that
+/// signed the answer:
+///
+/// ```text
+/// <signing zone>  ⊇  <apex>  ⊇  <membership domain>
+/// ```
+///
+/// The lower bound is what stops a record from redirecting a client to a
+/// control plane for a *sibling* namespace, whose monitor would never be
+/// watching this one. The upper bound is what stops it pointing outside the
+/// zone that actually vouched for the answer.
+fn apex_of(domain: &str, signing_zone: &Name, records: &[String]) -> Result<Name, NetError> {
+    let named: Vec<String> = records
+        .iter()
+        .filter_map(|record| parse_record(record).ok())
+        .filter_map(|record| record.apex)
+        .collect();
+    let Some(first) = named.first() else {
+        return Err(NetError::Dns(format!(
+            "{domain}: no membership record names an apex= to find its \
+             transparency records under"
+        )));
+    };
+    if named.iter().any(|other| other != first) {
+        return Err(NetError::Dns(format!(
+            "{domain}: the membership records name more than one apex"
+        )));
+    }
+    let mut apex =
+        Name::from_utf8(first).map_err(|e| NetError::Dns(format!("apex {first}: {e}")))?;
+    apex.set_fqdn(true);
+    let apex = apex.to_lowercase();
+
+    let mut owner = Name::from_utf8(domain).map_err(|e| NetError::Dns(format!("{domain}: {e}")))?;
+    owner.set_fqdn(true);
+    if !apex.zone_of(&owner.to_lowercase()) {
+        return Err(NetError::Dns(format!(
+            "{domain}: the records name apex {apex}, which does not contain it"
+        )));
+    }
+    if !signing_zone.zone_of(&apex) {
+        return Err(NetError::Dns(format!(
+            "{domain}: the records name apex {apex}, which is outside {signing_zone}, \
+             the zone that signed the answer"
+        )));
+    }
+    Ok(apex)
 }
 
 /// Clamps a TTL into the §3.2 window.
@@ -90,6 +161,16 @@ pub struct MemberRecord {
     pub relay: Option<String>,
     /// An optional direct-address dialing hint (§3.3).
     pub addr: Option<String>,
+    /// The control plane this record's zone belongs to, as the operator
+    /// names it — where the transparency records for it live.
+    ///
+    /// It is a *hint about where to look*, never an authority: the apex it
+    /// names has to contain this membership domain, has to be contained by
+    /// the zone whose RRSIG signed the answer, and has to be what the log
+    /// entry's own certificate names. A wrong value points at a name with no
+    /// usable proof, which fails closed. Its purpose is to let two control
+    /// planes share one signing zone without sharing a single record name.
+    pub apex: Option<String>,
 }
 
 impl MemberRecord {
@@ -137,6 +218,7 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
     let mut node_key = None;
     let mut relay = None;
     let mut addr = None;
+    let mut apex = None;
     for field in fields {
         let Some((key, value)) = field.split_once('=') else {
             continue;
@@ -161,6 +243,7 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
             }
             "relay" => relay = Some(value.to_string()),
             "addr" => addr = Some(value.to_string()),
+            "apex" => apex = Some(value.to_ascii_lowercase()),
             _ => {}
         }
     }
@@ -170,6 +253,7 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
         node_key: node_key.ok_or(RecordError::MissingKey)?,
         relay,
         addr,
+        apex,
     })
 }
 
@@ -562,7 +646,7 @@ impl DnssecResolver {
     ///
     /// Under [`RekorPolicy::Require`] this is where §4.2's three validated
     /// lookups happen, over the one DoH transport: the membership TXT, the
-    /// DNSKEY at the apex its RRSIG names, and the proof record beside it.
+    /// DNSKEY at the zone its RRSIG names, and the proof record beside it.
     /// A refused proof refuses the whole answer — the caller keeps its
     /// cached member set until its own expiry, exactly as for a bogus chain.
     pub async fn member_set(&self, domain: &str) -> Result<(MemberSet, Duration), NetError> {
@@ -571,7 +655,20 @@ impl DnssecResolver {
         let response = self.lookup(&name, RecordType::TXT).await?;
         let validated = secure_txt(&name, &response.answers)?;
         if self.rekor == RekorPolicy::Require {
-            let (apex, key_tag) = signing_key_of(&name, &response.answers)?;
+            // The zone that signed the answer. Every record this client goes
+            // on to fetch hangs off it, because it is the only name the
+            // answer itself yields — the control plane's apex is a name only
+            // the log entry knows, and it is checked against this one rather
+            // than used to find anything.
+            let (signing_zone, key_tag) = signing_key_of(&name, &response.answers)?;
+            // Where the control plane's transparency records live. Taken
+            // from the answer this client just DNSSEC-validated, and then
+            // held to both ends: it must contain the domain being resolved
+            // and be contained by the zone that signed it. Two control
+            // planes inside one signing zone would otherwise have to share a
+            // single record name — and, on the publishing side, delete each
+            // other's records forever.
+            let apex = apex_of(&domain, &signing_zone, &validated.records)?;
             // The pin set is refreshed *before* the proof is verified, so a
             // proof from a shard Sigstore added since this build shipped
             // verifies in the same refresh that learned about it (§10.2).
@@ -595,7 +692,8 @@ impl DnssecResolver {
                     "the zone's TUF bundle did not update the pin set; the current pins stand"
                 ),
             }
-            self.verify_zone_key(&apex, key_tag).await?;
+            self.verify_zone_key(&domain, &apex, &signing_zone, key_tag)
+                .await?;
         }
         let set = MemberSet::from_records(&domain, &validated.records)?;
         Ok((set, validated.ttl))
@@ -678,13 +776,20 @@ impl DnssecResolver {
     /// record (§4.2). Two more validated lookups, then no network at all.
     pub async fn verify_zone_key(
         &self,
+        domain: &str,
         apex: &Name,
+        signing_zone: &Name,
         key_tag: u16,
     ) -> Result<VerifiedRecord, NetError> {
+        let zone_text = signing_zone.to_string();
         let apex_text = apex.to_string();
-        let dnskey_rdata = self.zone_dnskey(apex, key_tag).await?;
+        let dnskey_rdata = self.zone_dnskey(signing_zone, key_tag).await?;
 
-        let name = rekor_query_name(apex_text.trim_end_matches('.'));
+        // Under the **apex**, which the membership answer named: every
+        // record a control plane owns hangs off its own apex, so two of them
+        // in one signing zone never share a name.
+        let apex_label = apex_text.trim_end_matches('.');
+        let name = rekor_query_name(apex_label);
         let response = self.lookup(&name, RecordType::TXT).await?;
         let absent = || NetError::RekorAbsent {
             name: name.clone(),
@@ -712,14 +817,31 @@ impl DnssecResolver {
         // "the zone published gibberish" stays distinguishable from "the zone
         // published nothing for this key" — the two read very differently in
         // `synch doctor`.
+        // A proof spans several records across several names. Part 1 is the
+        // only name derivable from the answer; it says how many parts there
+        // are, and the rest are fetched by index until the set is whole.
+        // Bounded by what part 1 claims, and by the format's own 255-part
+        // ceiling, so a lying record cannot turn one refresh into a scan.
+        let mut records = records;
+        let wanted = rekor::parts_claimed(&records);
+        for index in 2..=wanted {
+            let part = rekor_part_query_name(apex_label, index);
+            // A part that does not resolve leaves the set incomplete, which
+            // `proofs_from_txt` reports as the missing-part refusal it is —
+            // better than a transport error naming a name the operator never
+            // configured.
+            if let Ok(answer) = self.lookup(&part, RecordType::TXT).await {
+                if let Ok(validated) = secure_txt(&part, &answer.answers) {
+                    records.extend(validated.records);
+                }
+            }
+        }
+
         let mut candidates = Vec::new();
-        let mut malformed = None;
-        for record in &records {
-            match RekorProof::from_txt(record) {
-                // Other key tags belong to the other half of a rollover
-                // window; they are not this answer's business.
-                Ok(candidate) if candidate.key_tag == key_tag => candidates.push(candidate),
-                Ok(_) => {}
+        let mut malformed: Option<rekor::ProofError> = None;
+        for reassembled in rekor::proofs_from_txt(&records) {
+            match reassembled {
+                Ok(candidate) => candidates.push(candidate),
                 Err(e) => malformed = Some(e),
             }
         }
@@ -747,15 +869,15 @@ impl DnssecResolver {
         }
 
         let key = ZoneKey {
-            apex: &apex_text,
+            domain,
+            signing_zone: &zone_text,
             key_tag,
             dnskey_rdata: &dnskey_rdata,
         };
-        // Every candidate, not just the last. A key tag is a 16-bit checksum
-        // over the DNSKEY rdata, so two keys can share one and a zone can
-        // legitimately serve two records under it — the tag selects, the
-        // verification decides. Trying one and giving up would make a
-        // collision look like a bad proof.
+        // Every candidate, not just the last. A record's subject is a key
+        // set, so there is no selector on the wire — a zone can legitimately
+        // serve more than one record (a retirement breadcrumb beside the
+        // live claim), and membership in a verified set is what decides.
         let mut last = None;
         for candidate in &candidates {
             match rekor::verify(candidate, &key, &self.log_keys(), &self.anchors) {
@@ -861,7 +983,7 @@ fn rekor_error(name: &str, error: ProofError) -> NetError {
     let name = name.to_string();
     match error {
         ProofError::Malformed(reason) => NetError::RekorMalformed { name, reason },
-        ProofError::Possession(reason) => NetError::RekorPossession { name, reason },
+        ProofError::Attribution(reason) => NetError::RekorAttribution { name, reason },
         ProofError::Binding(reason) => NetError::RekorBinding { name, reason },
         ProofError::Inclusion(reason) => NetError::RekorInclusion { name, reason },
         ProofError::Checkpoint(reason) => NetError::RekorCheckpoint { name, reason },

@@ -7,6 +7,7 @@ import dns/wire
 import gleam/bit_array
 import gleam/int
 import gleam/list
+import gleam/string
 
 @external(erlang, "cp_udp_ffi", "parse_ip")
 fn parse_ip(text: String) -> Result(BitArray, Nil)
@@ -194,6 +195,23 @@ pub fn opt(udp_size: Int, do_bit: Bool) -> wire.Section {
   )
 }
 
+/// The label the zone's transparency declaration lives under, one below the
+/// apex (docs/REKOR-ZONE-KEY.md §2.1).
+///
+/// This record is what makes a log entry the zone's own statement. A
+/// delegation chain is public data anybody can collect, so an entry proving
+/// only that would be something a stranger could mint about a zone that never
+/// heard of them; the declaration is the part only somebody who can write to
+/// the zone can produce. It is signed like every other RRset, and a copy of
+/// it — with its RRSIG — is the bottom link of every chain this service logs.
+///
+/// It lives here, beside `sync1_text`, because both the zone builder and the
+/// chain collector need it and they sit on opposite sides of an import cycle.
+pub const transparency_label = "_synchronicity-transparency"
+
+/// What the declaration says.
+pub const transparency_text = "v=sync1 transparency"
+
 /// Renders a `v=sync1` membership TXT record's text. Field order matters
 /// only for v=; the client ignores unknown fields and order otherwise.
 pub fn sync1_text(
@@ -201,8 +219,16 @@ pub fn sync1_text(
   nk_z32: String,
   relay: String,
   addr: String,
+  apex: String,
 ) -> String {
-  let base = "v=sync1 id=" <> label <> " nk=" <> nk_z32
+  // `apex=` is how a client finds the transparency records for *this*
+  // control plane. It cannot derive the name: the zone that signed the
+  // answer may hold several control planes, and every one of them owns its
+  // own records. The client checks the value at both ends rather than
+  // trusting it — it must contain the domain and sit inside the signing
+  // zone — so it is a pointer, not an authority.
+  let base =
+    "v=sync1 id=" <> label <> " nk=" <> nk_z32 <> " apex=" <> strip_dot(apex)
   let with_relay = case relay {
     "" -> base
     r -> base <> " relay=" <> r
@@ -210,5 +236,12 @@ pub fn sync1_text(
   case addr {
     "" -> with_relay
     a -> with_relay <> " addr=" <> a
+  }
+}
+
+fn strip_dot(text: String) -> String {
+  case string.ends_with(text, ".") {
+    True -> string.drop_end(text, 1)
+    False -> text
   }
 }

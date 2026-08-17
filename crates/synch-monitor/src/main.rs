@@ -233,7 +233,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
             let Ok(name) = parsed.certificate.single_dns_name() else {
                 continue;
             };
-            if !state.known.apexes().any(|apex| apex == name) {
+            if !state.known.watches(&name) {
                 continue;
             }
             // A watched apex: prove the leaf really is this entry before
@@ -253,7 +253,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
             )
             .map_err(|e| MonitorError::Tile(e.to_string()))?;
             if let Some(finding) = classify(&parsed, index, &anchors) {
-                findings.push((finding, parsed.certificate.spki.clone()));
+                findings.push(finding);
             }
         }
         at = ((at / 256) + 1) * 256;
@@ -268,16 +268,25 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     let mut new_authorizations = Vec::new();
     let mut already_known = 0usize;
     let mut claims = Vec::new();
-    for (finding, spki) in &findings {
+    for finding in &findings {
         match finding.tier {
             Tier::A => {
                 let apex = synch_net::chain::parse_name(&finding.apex);
-                // A tier A finding always came from a parsed SAN, so this
+                // An entry is news when *any* key its chain proves has not
+                // been reported yet — a rotation that pre-publishes one new
+                // key beside a known one is exactly the event to hear about.
+                // A tier A finding always came from a parsed SAN, so parsing
                 // cannot fail; treating an unparseable one as *new* rather
                 // than as known is the safe direction anyway — it reports.
-                match apex.map(|apex| state.known.contains(&apex, spki)) {
-                    Ok(true) => already_known += 1,
-                    _ => new_authorizations.push((finding, spki)),
+                let all_known = apex.is_ok_and(|apex| {
+                    finding
+                        .keys
+                        .iter()
+                        .all(|key| state.known.contains_digest(&apex, &key.sha256))
+                });
+                match all_known {
+                    true => already_known += 1,
+                    false => new_authorizations.push(finding),
                 }
             }
             Tier::B => claims.push(finding),
@@ -285,7 +294,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     }
 
     // stdout is the report: newly authorized keys, and nothing else.
-    for (finding, _) in &new_authorizations {
+    for finding in &new_authorizations {
         println!("{}", render(finding, args.json));
     }
     // Tier B on stderr. It is not an alarm — no client would have taken these
@@ -299,9 +308,11 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     // is deliberately never recorded: the same key arriving later with a
     // chain that *does* verify is a genuine new authorization, and a tier B
     // sighting must not have quietly consumed it.
-    for (finding, spki) in &new_authorizations {
+    for finding in &new_authorizations {
         if let Ok(apex) = synch_net::chain::parse_name(&finding.apex) {
-            state.known.insert(&apex, spki);
+            for key in &finding.keys {
+                state.known.insert_digest(&apex, &key.sha256);
+            }
         }
     }
     state.origin = checkpoint.origin.clone();

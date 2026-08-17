@@ -104,7 +104,7 @@ pub fn log_key() -> Result(#(BitArray, BitArray), String) {
 fn string_of(error: proof.ProofError) -> String {
   case error {
     proof.Malformed(why) -> why
-    proof.Possession(why) -> why
+    proof.Attribution(why) -> why
     proof.Binding(why) -> why
     proof.Inclusion(why) -> why
     proof.CheckpointFailed(why) -> why

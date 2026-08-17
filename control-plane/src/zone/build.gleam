@@ -93,14 +93,29 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
         wire.type_txt,
         ttl_data,
         list.map(txt_name.members, fn(m) {
-          rdata.txt(rdata.sync1_text(m.label, m.nk_z32, m.relay, m.addr))
+          rdata.txt(rdata.sync1_text(
+            m.label,
+            m.nk_z32,
+            m.relay,
+            m.addr,
+            name.to_string(apex),
+          ))
         }),
       )
     })
 
+  // The declaration is unconditional: this service is a synchronicity
+  // control plane for this apex, and the record is how the apex says so. A
+  // zone that stopped publishing it would have every entry it ever logged
+  // stop verifying, so there is no state in which omitting it is right.
+  let transparency =
+    Rrset([rdata.transparency_label, ..apex], wire.type_txt, ttl_rekor, [
+      rdata.txt(rdata.transparency_text),
+    ])
+
   let data =
     list.flatten([
-      [soa, ns, dnskey],
+      [soa, ns, dnskey, transparency],
       glue,
       txt,
       rekor_rrsets(input, apex),
@@ -115,16 +130,30 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
 /// with no proofs simply has no such owner name, which is what phase 0
 /// looks like from a client.
 fn rekor_rrsets(input: ZoneInput, apex: Name) -> List(Rrset) {
-  case input.rekor_proofs {
-    [] -> []
-    proofs -> [
-      Rrset(
-        [rekor_label, ..apex],
-        wire.type_txt,
-        ttl_rekor,
-        list.map(proofs, rdata.txt),
-      ),
-    ]
+  // One RRset per part, at the part's own owner name. A proof is far bigger
+  // than one record, and bigger than what a managed provider will hold at a
+  // single name, so the parts spread out; part 1 sits at the base name
+  // because it is the only one a client can compute before reading anything.
+  input.rekor_proofs
+  |> list.group(fn(pair) { pair.0 })
+  |> dict.to_list
+  |> list.sort(fn(a, b) { int.compare(a.0, b.0) })
+  |> list.map(fn(entry) {
+    let #(index, proofs) = entry
+    Rrset(
+      [rekor_part_label(index), ..apex],
+      wire.type_txt,
+      ttl_rekor,
+      list.map(proofs, fn(pair) { rdata.txt(pair.1) }),
+    )
+  })
+}
+
+/// The label part `index` of a proof lives under.
+pub fn rekor_part_label(index: Int) -> String {
+  case index <= 1 {
+    True -> rekor_label
+    False -> rekor_label <> "-" <> int.to_string(index)
   }
 }
 
@@ -200,7 +229,10 @@ fn glue_rrsets(
   |> result.map(list.flatten)
 }
 
-fn validate(input: ZoneInput) -> Result(Nil, BuildError) {
+/// Re-checks every product invariant the API layer enforces. Exported so
+/// the external-mode renderer refuses exactly what the serving builder
+/// refuses - one rule set, two consumers.
+pub fn validate(input: ZoneInput) -> Result(Nil, BuildError) {
   let apex = input.meta.apex
   use Nil <- result.try(
     list.try_fold(input.txt_names, Nil, fn(_, txt_name) {

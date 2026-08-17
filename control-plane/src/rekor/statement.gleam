@@ -1,102 +1,138 @@
 //// The in-toto Statement a zone-key log entry carries (§2 of
 //// docs/REKOR-ZONE-KEY.md), and the DSSE envelope around it.
 ////
-//// The Statement is signed by the zone key itself: possession of the CSK
-//// is exactly the authority being made transparent, the client already
-//// holds the public key from the validated DNSKEY RRset, and it keeps an
-//// interactive identity provider out of a ceremony designed to run
-//// offline.
+//// The Statement claims a **key set**: the apex DNSKEY RRset the entry's
+//// embedded chain proves. Its DSSE signature is *attribution* — it names
+//// whoever built the entry, via the certificate's key — and authorizes
+//// nothing: authorization is the chain, and only the chain. That is what
+//// lets a provider-hosted zone (Cloudflare's keys, Bunny's keys) be logged
+//// at all, and it costs nothing — an attacker able to forge an authorized
+//// chain for a rogue key holds that key and could sign anything.
 ////
 //// The rendering here is byte-exact and has no equivalent form. The DSSE
 //// signature and the log's Merkle leaf both commit to these bytes, so
-//// field order, the absence of whitespace and the escaping rules are part
-//// of the format — the client's decoder (crates/synch-net/src/rekor.rs)
-//// re-derives nothing and compares everything.
+//// field order, the absence of whitespace, the escaping rules and the
+//// canonical key order are part of the format — the client's decoder
+//// (crates/synch-net/src/rekor.rs) re-derives nothing and compares
+//// everything.
 
 import dns/name.{type Name}
-import dns/rdata
 import dnssec/keys.{type Csk}
 import gleam/bit_array
 import gleam/crypto
 import gleam/int
-import gleam/option.{type Option, None, Some}
+import gleam/list
+import gleam/order
 import gleam/string
 
 /// The in-toto Statement type.
 pub const statement_type = "https://in-toto.io/Statement/v1"
 
 /// The predicate type carrying the zone-key claim.
-pub const predicate_type = "https://synchronicity.sh/zone-key/v1"
+///
+/// v2 is the key-set claim: the subject is the apex DNSKEY RRset the chain
+/// proves, and the DSSE signer is whoever published the entry.
+pub const predicate_type = "https://synchronicity.sh/zone-key/v2"
 
 /// The DSSE payload type of an in-toto Statement.
 pub const dsse_payload_type = "application/vnd.in-toto+json"
 
+/// One key of the claimed set. Every field is derived from the DNSKEY
+/// rdata alone.
+pub type StatementKey {
+  StatementKey(key_tag: Int, algorithm: Int, flags: Int, sha256: String)
+}
+
 pub type Statement {
-  Statement(
-    subject_name: String,
-    subject_sha256: String,
-    apex: String,
-    key_tag: Int,
-    algorithm: Int,
-    flags: Int,
-    ds: String,
-    action: String,
-    replaces_key_tag: Option(Int),
+  Statement(apex: String, keys: List(StatementKey), action: String)
+}
+
+/// The Statement for a key set, from the DNSKEY rdatas themselves — tag,
+/// algorithm, flags and digest all derived, and the canonical order applied:
+/// ascending key tag, ties broken by the hex digest. One set, one rendering.
+pub fn for_keys(
+  apex: Name,
+  rdatas: List(BitArray),
+  action: String,
+) -> Statement {
+  let keys =
+    rdatas
+    |> list.map(statement_key)
+    |> list.sort(fn(a, b) {
+      case int.compare(a.key_tag, b.key_tag) {
+        order.Eq -> string.compare(a.sha256, b.sha256)
+        other -> other
+      }
+    })
+  Statement(apex: name.to_string(apex), keys: keys, action: action)
+}
+
+fn statement_key(rdata: BitArray) -> StatementKey {
+  let #(flags, algorithm) = case rdata {
+    <<flags:int-size(16), _protocol:int-size(8), algorithm:int-size(8), _:bits>> -> #(
+      flags,
+      algorithm,
+    )
+    _ -> #(0, 0)
+  }
+  StatementKey(
+    key_tag: keys.key_tag(rdata),
+    algorithm: algorithm,
+    flags: flags,
+    sha256: string.lowercase(
+      bit_array.base16_encode(crypto.hash(crypto.Sha256, rdata)),
+    ),
   )
 }
 
-/// The Statement for a zone key: what this key is, for which zone, and why
-/// it is being logged now.
-pub fn for_key(
-  apex: Name,
-  public: BitArray,
-  action: String,
-  replaces: Option(Int),
-) -> Statement {
-  let rd = rdata.dnskey(keys.flags, keys.algorithm, public)
-  Statement(
-    subject_name: name.to_string(apex),
-    subject_sha256: string.lowercase(
-      bit_array.base16_encode(crypto.hash(crypto.Sha256, rd)),
-    ),
-    apex: name.to_string(apex),
-    key_tag: keys.key_tag(rd),
-    algorithm: keys.algorithm,
-    flags: keys.flags,
-    ds: keys.ds_fields(apex, public),
-    action: action,
-    replaces_key_tag: replaces,
-  )
+/// The identity of a claimed set: SHA-256 over the concatenated hex digests
+/// in canonical order. What `rekor_records` rows are keyed by — a key tag is
+/// a 16-bit checksum and says nothing about which set an entry claims.
+pub fn keyset_sha256(statement: Statement) -> BitArray {
+  let joined =
+    statement.keys |> list.map(fn(key) { key.sha256 }) |> string.join("")
+  crypto.hash(crypto.Sha256, <<joined:utf8>>)
 }
 
 /// The canonical Statement bytes.
 pub fn to_json(statement: Statement) -> BitArray {
+  let subject =
+    statement.keys
+    |> list.map(fn(key) {
+      "{\"name\":"
+      <> quote(statement.apex)
+      <> ",\"digest\":{\"sha256\":"
+      <> quote(key.sha256)
+      <> "}}"
+    })
+    |> string.join(",")
+  let keys =
+    statement.keys
+    |> list.map(fn(key) {
+      "{\"keyTag\":"
+      <> int.to_string(key.key_tag)
+      <> ",\"algorithm\":"
+      <> int.to_string(key.algorithm)
+      <> ",\"flags\":"
+      <> int.to_string(key.flags)
+      <> ",\"sha256\":"
+      <> quote(key.sha256)
+      <> "}"
+    })
+    |> string.join(",")
   let text =
     "{\"_type\":"
     <> quote(statement_type)
-    <> ",\"subject\":[{\"name\":"
-    <> quote(statement.subject_name)
-    <> ",\"digest\":{\"sha256\":"
-    <> quote(statement.subject_sha256)
-    <> "}}],\"predicateType\":"
+    <> ",\"subject\":["
+    <> subject
+    <> "],\"predicateType\":"
     <> quote(predicate_type)
     <> ",\"predicate\":{\"apex\":"
     <> quote(statement.apex)
-    <> ",\"keyTag\":"
-    <> int.to_string(statement.key_tag)
-    <> ",\"algorithm\":"
-    <> int.to_string(statement.algorithm)
-    <> ",\"flags\":"
-    <> int.to_string(statement.flags)
-    <> ",\"ds\":"
-    <> quote(statement.ds)
-    <> ",\"action\":"
+    <> ",\"keys\":["
+    <> keys
+    <> "],\"action\":"
     <> quote(statement.action)
-    <> ",\"replacesKeyTag\":"
-    <> case statement.replaces_key_tag {
-      Some(tag) -> int.to_string(tag)
-      None -> "null"
-    }
     <> "}}"
   <<text:utf8>>
 }
@@ -138,17 +174,21 @@ fn ecdsa_verify_der(
   public: BitArray,
 ) -> Bool
 
-/// Signs a Statement's DSSE PAE with the zone key, DER/ASN.1 encoded.
+/// Signs a Statement's DSSE PAE with the entry signer's key, DER/ASN.1
+/// encoded. In serve mode the signer is the zone CSK; in external mode an
+/// operational key the zone never carries. Either way it is the key the
+/// entry's certificate names, and the client's attribution check verifies
+/// the signature against exactly that certificate.
 ///
 /// DER, not the raw `r||s` of a DNSSEC signature: this is the byte string a
-/// Rekor entry's `signature.content` carries and the client's possession
-/// check (crates/synch-net/src/rekor.rs) verifies as ASN.1.
-pub fn sign(csk: Csk, payload: BitArray) -> BitArray {
-  ecdsa_sign_der(pae(dsse_payload_type, payload), csk.private)
+/// Rekor entry's `signature.content` carries.
+pub fn sign(signer: Csk, payload: BitArray) -> BitArray {
+  ecdsa_sign_der(pae(dsse_payload_type, payload), signer.private)
 }
 
-/// Verifies a DER DSSE-PAE signature against a DNSKEY public key — the same
-/// possession check the client performs, run here before anything is stored.
+/// Verifies a DER DSSE-PAE signature against the signer's public key — the
+/// same attribution check the client performs, run here before anything is
+/// stored.
 pub fn verify(
   public: BitArray,
   payload: BitArray,

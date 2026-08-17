@@ -60,10 +60,8 @@ fn meta(field: String) -> String {
 
 fn fixture_proof() -> Proof {
   let assert Ok(path) = proof.split_path(fixture("inclusion-path.bin"))
-  let assert Ok(key_tag) = int.parse(meta("key_tag"))
   let assert Ok(log_index) = int.parse(meta("log_index"))
   Proof(
-    key_tag: key_tag,
     log_id: fixture("log-id.bin"),
     log_index: log_index,
     statement: fixture("statement.json"),
@@ -84,42 +82,45 @@ fn fixture_public() -> BitArray {
 pub fn statement_bytes_match_the_fixture_test() {
   let assert Ok(apex) = name.parse(meta("apex"))
   let built =
-    statement.to_json(statement.for_key(
+    statement.to_json(statement.for_keys(
       apex,
-      fixture_public(),
+      [fixture("dnskey.bin")],
       meta("action"),
-      None,
     ))
   // Byte-exact: the signature and the Merkle leaf both commit to these
   // bytes, so "equivalent JSON" is not equivalent.
   assert built == fixture("statement.json")
 }
 
-pub fn statement_fields_are_the_observed_key_test() {
+pub fn statement_fields_are_the_observed_key_set_test() {
   let assert Ok(apex) = name.parse(meta("apex"))
-  let built = statement.for_key(apex, fixture_public(), "create", None)
-  assert built.key_tag == keys.key_tag(fixture("dnskey.bin"))
-  assert built.algorithm == 13
-  assert built.flags == 257
-  assert built.ds == meta("ds")
-  assert built.subject_sha256
+  let built = statement.for_keys(apex, [fixture("dnskey.bin")], "create")
+  let assert [key] = built.keys
+  assert key.key_tag == keys.key_tag(fixture("dnskey.bin"))
+  assert key.algorithm == 13
+  assert key.flags == 257
+  assert key.sha256
     == string.lowercase(
       bit_array.base16_encode(crypto.hash(crypto.Sha256, fixture("dnskey.bin"))),
     )
 }
 
-pub fn statement_renders_a_rollover_test() {
+pub fn a_key_set_has_one_canonical_rendering_test() {
+  // Two keys supplied in either order render to the same bytes: ascending
+  // key tag, ties broken by digest. One set, one rendering — the same rule
+  // the Rust renderer applies.
   let assert Ok(apex) = name.parse("sync.test.")
-  let text =
-    statement.to_json(statement.for_key(
-      apex,
-      fixture_public(),
-      "rollover",
-      Some(1234),
-    ))
-  let assert Ok(json) = bit_array.to_string(text)
+  let ksk = rdata.dnskey(257, 13, <<7:size(512)>>)
+  let zsk = rdata.dnskey(256, 13, <<9:size(512)>>)
+  let one = statement.to_json(statement.for_keys(apex, [ksk, zsk], "rollover"))
+  let two = statement.to_json(statement.for_keys(apex, [zsk, ksk], "rollover"))
+  assert one == two
+  let assert Ok(json) = bit_array.to_string(one)
   assert string.contains(json, "\"action\":\"rollover\"")
-  assert string.ends_with(json, "\"replacesKeyTag\":1234}}")
+  assert string.contains(
+    json,
+    "\"predicateType\":\"https://synchronicity.sh/zone-key/v2\"",
+  )
 }
 
 pub fn dsse_pae_is_the_dsse_pae_test() {
@@ -138,7 +139,7 @@ pub fn the_fixture_signature_verifies_test() {
     fixture("statement.json"),
     signature,
   )
-  // One flipped bit and possession fails — the check is doing work.
+  // One flipped bit and attribution fails — the check is doing work.
   let assert Ok(<<first:int-size(8), rest:bits>>) = Ok(signature)
   let tampered = <<int.bitwise_exclusive_or(first, 1):int-size(8), rest:bits>>
   assert !statement.verify(
@@ -169,11 +170,35 @@ pub fn proof_encoding_matches_the_fixture_test() {
   assert proof.encode(fixture_proof()) == Ok(fixture("proof.bin"))
 }
 
-pub fn proof_txt_is_base64url_test() {
-  let assert Ok(text) = proof.to_txt(fixture_proof())
-  let assert Ok(decoded) = bit_array.base64_url_decode(text)
+/// A proof is served in self-describing pieces, each inside the tightest
+/// provider limit, and they reassemble to exactly the encoded record.
+pub fn proof_txt_is_chunked_base64url_test() {
+  let assert Ok(records) = proof.to_txt(fixture_proof())
+  // Every record names the same group and its place in it.
+  let assert [first, ..] = records
+  let assert [prefix, group, counter, _payload] = string.split(first, " ")
+  assert prefix == proof.txt_prefix
+  assert string.length(group) == 8
+  assert string.ends_with(counter, "/" <> int.to_string(list.length(records)))
+
+  list.each(records, fn(record) {
+    // Comfortably inside Cloudflare's 4096 wire-format bytes, which is the
+    // limit that decides this size.
+    assert string.length(record) < 4096
+    assert string.starts_with(record, proof.txt_prefix <> " " <> group <> " ")
+  })
+
+  // The payloads, in order, are the base64url of the encoded proof.
+  let payload =
+    records
+    |> list.map(fn(r) {
+      let assert [_, _, _, chunk] = string.split(r, " ")
+      chunk
+    })
+    |> string.join("")
+  let assert Ok(decoded) = bit_array.base64_url_decode(payload)
   assert decoded == fixture("proof.bin")
-  assert !string.contains(text, "=")
+  assert !string.contains(payload, "=")
 }
 
 /// A record that does not fit the format is refused, not mangled.
@@ -275,11 +300,11 @@ pub fn checkpoints_parse_or_are_refused_test() {
 /// the publisher owes is *collection*: ask for the right RRsets at the right
 /// names, refuse when one is missing, and carry the bytes verbatim. That is
 /// what this fake exercises.
-fn fake_resolver() -> chain.Resolver {
+fn fake_resolver(dnskey_rd: BitArray) -> chain.Resolver {
   chain.Resolver(query: fn(zone, rtype) {
     let rdata_of = fn(rtype: Int) {
       case rtype {
-        48 -> rdata.dnskey(257, 13, <<7:size(512)>>)
+        48 -> dnskey_rd
         _ -> <<1234:int-size(16), 13:int-size(8), 2:int-size(8), 9:size(256)>>
       }
     }
@@ -309,9 +334,16 @@ fn publish_run(
   log_key: #(BitArray, BitArray),
   now: Int,
 ) {
-  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
-  let assert Ok(action) = rekor_publish.action_for(conn, key_tag)
-  rekor_publish.run(conn, apex, csk, log, log_key, now, fake_resolver(), action)
+  rekor_publish.run(
+    conn,
+    apex,
+    apex,
+    log,
+    log_key,
+    now,
+    fake_resolver(keys.dnskey_rdata(csk)),
+    rekor_publish.Current,
+  )
 }
 
 /// A log a test can hold in its hand: one earlier entry, then ours, with a
@@ -357,18 +389,30 @@ pub fn publish_stores_a_verified_record_test() {
     publish_run(conn, apex, csk, log, #(spki, point), 1000)
   assert outcome.action == "create"
   assert outcome.refreshed == False
-  assert outcome.key_tag == keys.key_tag(keys.dnskey_rdata(csk))
+  // The claimed set is what the resolver's apex DNSKEY RRset holds — the
+  // CSK, observed on the (fake) wire rather than named from memory.
+  let csk_rdata = keys.dnskey_rdata(csk)
+  assert outcome.key_tags == [keys.key_tag(csk_rdata)]
 
-  let assert Ok([record]) = store.for_key_tag(conn, outcome.key_tag)
+  let assert Ok([record]) = store.servable(conn)
   assert record.apex == "sync.test."
   assert record.verified_at == 1000
+  let assert [#(key_sha256, key_tag)] = record.keys
+  assert key_sha256 == crypto.hash(crypto.Sha256, csk_rdata)
+  assert key_tag == keys.key_tag(csk_rdata)
   // What was stored is what a client will be handed, and it verifies.
   let assert Ok(stored) = rekor_publish.to_proof(record)
   let assert Ok(_) = proof.verify_against_log(stored, spki, point)
-  // Possession: the signature the log indexed is inside the stored body.
-  let assert Ok(#(_digest, signature, _certificate)) =
+  // Attribution: the signature the log indexed verifies under the entry\'s
+  // own certificate — an ephemeral signer nothing holds a key file for.
+  let assert Ok(#(_digest, signature, certificate)) =
     proof.parse_body(record.canonicalized_body)
-  assert statement.verify(csk.public, record.statement, signature)
+  let assert Ok(#(cert_spki, _san)) = cert_spki_and_san(certificate)
+  let assert Ok(signer_public) = bit_array.slice(cert_spki, 27, 64)
+  assert statement.verify(signer_public, record.statement, signature)
+  // And it is NOT the zone key\'s signature: the signer is ephemeral, so
+  // the CSK never signs entries — possession is nobody\'s claim to make.
+  assert !statement.verify(csk.public, record.statement, signature)
   sqlite.close(conn)
 }
 
@@ -386,7 +430,8 @@ pub fn publish_is_idempotent_test() {
   assert second.refreshed
   assert second.log_index == first.log_index
 
-  let assert Ok(records) = store.for_key_tag(conn, first.key_tag)
+  let _ = first
+  let assert Ok(records) = store.servable(conn)
   assert list.length(records) == 1
   let assert [record] = records
   assert record.verified_at == 2000
@@ -403,8 +448,7 @@ pub fn publish_refuses_an_unverifiable_proof_test() {
   // The log's own key is not the key we pin: nothing is stored.
   let assert Error(rekor_publish.Unverified(_)) =
     publish_run(conn, apex, csk, log, #(spki, stranger.public), 1000)
-  let assert Ok([]) =
-    store.for_key_tag(conn, keys.key_tag(keys.dnskey_rdata(csk)))
+  let assert Ok([]) = store.servable(conn)
   sqlite.close(conn)
 }
 
@@ -435,13 +479,12 @@ pub fn publish_gate_refuses_an_unlogged_key_test() {
 pub fn a_retire_record_does_not_satisfy_the_gate_test() {
   let conn = fixtures.fresh_conn()
   let csk = fixtures.zone_boot(conn)
-  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
+  let csk_rdata = keys.dnskey_rdata(csk)
   let assert Ok(Nil) =
     store.put(
       conn,
       store.Record(
-        spki_sha256: crypto.hash(crypto.Sha256, proof.p256_spki(csk.public)),
-        key_tag: key_tag,
+        keyset_sha256: crypto.hash(crypto.Sha256, csk_rdata),
         apex: "sync.test.",
         action: "retire",
         statement: <<"{}":utf8>>,
@@ -453,10 +496,15 @@ pub fn a_retire_record_does_not_satisfy_the_gate_test() {
         chainless: True,
         integrated_at: 1,
         verified_at: 1,
+        keys: [
+          #(crypto.hash(crypto.Sha256, csk_rdata), keys.key_tag(csk_rdata)),
+        ],
       ),
     )
-  // A retirement is a monitor breadcrumb, never a licence to serve (§2).
-  assert store.servable(conn, key_tag) == Ok([])
+  // A retirement is a monitor breadcrumb, never a licence to serve (§2) —
+  // and never a licence for the gate either: the key is claimed only by a
+  // retire, which covers nothing.
+  assert store.servable(conn) == Ok([])
   envoy.set(gate.require_env, "true")
   let assert Error(publish.NoRekorRecord(_)) =
     publish.publish(conn, csk, 1000, "test")
@@ -485,20 +533,30 @@ pub fn the_zone_serves_the_proof_record_test() {
       ),
       [NsHost(ns1, "127.0.0.1", "")],
       [TxtName(owner, [Member("nas", fixtures.nk(), "", "")])],
-      [text],
+      list.index_map(text, fn(t, i) { #(i + 1, t) }),
       "",
     )
   let assert Ok(rrsets) = build.build(input)
+  // One part per owner name: part 1 at the base, part n one label along.
   let assert Ok(rekor_owner) = name.parse("_synchronicity-rekor.sync.test.")
   let assert Ok(rrset) =
     list.find(rrsets, fn(r) {
       r.owner == rekor_owner && r.rtype == wire.type_txt
     })
   assert rrset.ttl == build.ttl_rekor
+  let assert [first, ..rest] = text
   let assert [rd] = rrset.rdatas
-  // TXT rdata is a run of ≤255-byte character-strings; the client
-  // concatenates them before decoding.
-  assert chunks(rd) == Ok(text)
+  assert chunks(rd) == Ok(first)
+  // Every later part has its own name, and its own place in the NSEC chain.
+  list.index_map(rest, fn(part, i) {
+    let label = build.rekor_part_label(i + 2)
+    let assert Ok(owner) = name.parse(label <> ".sync.test.")
+    let assert Ok(set) =
+      list.find(rrsets, fn(r) { r.owner == owner && r.rtype == wire.type_txt })
+    let assert [one] = set.rdatas
+    assert chunks(one) == Ok(part)
+    assert list.contains(build.owners_in_order(rrsets), owner)
+  })
   // And the name is in the NSEC chain like any other owner.
   assert list.contains(build.owners_in_order(rrsets), rekor_owner)
 }
@@ -604,26 +662,28 @@ pub fn the_checked_in_certificate_is_this_encoders_output_test() {
 /// Which is the ordinary failure of the inverted ceremony (§5.2): logging
 /// now happens *after* the DS is live in the parent, so "the DS is not there
 /// yet" is the error an operator meets, and it says so.
-pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
+pub fn publish_refuses_when_the_chain_cannot_be_collected_test() {
   let conn = fixtures.fresh_conn()
-  let csk = fixtures.zone_boot(conn)
+  let _csk = fixtures.zone_boot(conn)
   let assert Ok(apex) = name.parse("sync.test.")
   let #(log, spki, point) = fake_log(keys.generate())
-  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
 
   let assert Error(rekor_publish.NoChain(why)) =
     rekor_publish.run(
       conn,
       apex,
-      csk,
+      apex,
       log,
       #(spki, point),
       1000,
       silent_resolver(),
-      "create",
+      rekor_publish.Current,
     )
-  assert string.contains(why, "DS")
-  let assert Ok([]) = store.for_key_tag(conn, key_tag)
+  // Against a resolver that answers nothing, the first thing missing is the
+  // chain's bottom link — the declaration — and the refusal names it rather
+  // than reaching for the DS, which is a later link's problem.
+  assert string.contains(why, "_synchronicity-transparency")
+  let assert Ok([]) = store.servable(conn)
   sqlite.close(conn)
 }
 
@@ -638,17 +698,18 @@ pub fn a_retire_may_be_chainless_test() {
     rekor_publish.run(
       conn,
       apex,
-      csk,
+      apex,
       log,
       #(spki, point),
       1000,
       silent_resolver(),
-      "retire",
+      rekor_publish.Retire([keys.dnskey_rdata(csk)]),
     )
   assert outcome.action == "retire"
   assert outcome.chainless
+  assert outcome.key_tags == [keys.key_tag(keys.dnskey_rdata(csk))]
   // And it is never served to a client: a retire is a monitor breadcrumb.
-  let assert Ok([]) = store.servable(conn, outcome.key_tag)
+  let assert Ok([]) = store.servable(conn)
   sqlite.close(conn)
 }
 
@@ -720,31 +781,57 @@ pub fn parse_body_refuses_a_foreign_entry_kind_test() {
   let assert Error(proof.Binding(_)) = proof.parse_body(<<older:utf8>>)
 }
 
-/// A chain that stops below the root is refused before it is ever published.
-pub fn a_chain_that_does_not_reach_the_root_is_refused_test() {
+/// A chain that is not declaration-then-ladder-to-root is refused before it
+/// is ever published — while an operator is still standing there to read why.
+pub fn a_malformed_chain_is_refused_before_publishing_test() {
   let assert Ok(apex) = name.parse("sync.test.")
+  let declaration = chain.Link("_synchronicity-transparency.sync.test.", <<0>>)
   let full = [
+    declaration,
     chain.Link("sync.test.", <<1>>),
     chain.Link("test.", <<2>>),
     chain.Link(".", <<3>>),
   ]
-  let assert Ok(Nil) = chain.check_shape(full, apex)
+  let assert Ok(Nil) = chain.check_shape(full, apex, apex)
 
-  // The shape CP_DNSSEC_CHAIN_ROOT_DNSKEY=false used to emit: a TLD DNSKEY on
-  // top, anchoring against nothing any reader holds.
-  let rootless = [chain.Link("sync.test.", <<1>>), chain.Link("test.", <<2>>)]
-  let assert Error(why) = chain.check_shape(rootless, apex)
+  // No declaration: a bare ladder is public data anyone could have collected,
+  // so it is not this zone's statement about itself.
+  let bare = [
+    chain.Link("sync.test.", <<1>>),
+    chain.Link("test.", <<2>>),
+    chain.Link(".", <<3>>),
+  ]
+  let assert Error(why) = chain.check_shape(bare, apex, apex)
+  assert string.contains(why, "_synchronicity-transparency")
+
+  // A TLD DNSKEY on top, anchoring against nothing any reader holds.
+  let rootless = [
+    declaration,
+    chain.Link("sync.test.", <<1>>),
+    chain.Link("test.", <<2>>),
+  ]
+  let assert Error(why) = chain.check_shape(rootless, apex, apex)
   assert string.contains(why, "root")
 
   // A ladder with a rung missing.
-  let spliced = [chain.Link("sync.test.", <<1>>), chain.Link(".", <<3>>)]
-  let assert Error(_) = chain.check_shape(spliced, apex)
+  let spliced = [
+    declaration,
+    chain.Link("sync.test.", <<1>>),
+    chain.Link(".", <<3>>),
+  ]
+  let assert Error(_) = chain.check_shape(spliced, apex, apex)
 
-  // A chain that is not about this apex at all.
+  // A declaration for somebody else's zone.
   let assert Error(_) =
     chain.check_shape(
-      [chain.Link("other.test.", <<1>>), chain.Link(".", <<3>>)],
+      [
+        chain.Link("_synchronicity-transparency.other.test.", <<0>>),
+        chain.Link("other.test.", <<1>>),
+        chain.Link(".", <<3>>),
+      ],
+      apex,
       apex,
     )
-  let assert Error(_) = chain.check_shape([], apex)
+  let assert Error(_) = chain.check_shape([declaration], apex, apex)
+  let assert Error(_) = chain.check_shape([], apex, apex)
 }

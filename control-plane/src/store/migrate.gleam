@@ -62,8 +62,47 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3]
+  [v1, v2, v3, v4]
 }
+
+/// V4: external DNS provider mode (docs/EXTERNAL-DNS-PROVIDER.md).
+///
+/// `provider_sync_state` is one row — one deployment has one apex, one
+/// provider. Desired state is derived from the product tables, never
+/// stored: the row records only what the reconciler last did and how it
+/// went, so `/healthz` can answer "in sync?" from `applied_hash` with no
+/// provider round-trip. `last_error` and `last_error_at` travel together by
+/// CHECK — an error without a time, or a time without an error, is a shape
+/// the reporting code would misread.
+///
+/// `observed_zone_keys` is the key watcher's memory: the provider's signing
+/// keys as last seen on the validated wire, and when each was covered by a
+/// logged claim. Keyed by the SHA-256 of the DNSKEY rdata, the digest every
+/// other part of this design names keys by; the rdata itself is stored so a
+/// re-log can claim the exact observed bytes.
+const v4 = "
+CREATE TABLE provider_sync_state (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  provider           TEXT    NOT NULL CHECK (provider IN ('cloudflare','bunny','log-only')),
+  provider_zone_id   TEXT    NOT NULL,
+  applied_hash       BLOB             CHECK (applied_hash IS NULL OR length(applied_hash) = 32),
+  last_synced_serial INTEGER,
+  last_ok_at         INTEGER,
+  last_attempt_at    INTEGER NOT NULL,
+  last_error         TEXT,
+  last_error_at      INTEGER,
+  CHECK ((last_error IS NULL) = (last_error_at IS NULL))
+);
+CREATE TABLE observed_zone_keys (
+  key_sha256   BLOB    NOT NULL CHECK (length(key_sha256) = 32),
+  key_tag      INTEGER NOT NULL,
+  dnskey_rdata BLOB    NOT NULL,
+  first_seen   INTEGER NOT NULL,
+  last_seen    INTEGER NOT NULL,
+  logged_at    INTEGER,
+  PRIMARY KEY (key_sha256)
+);
+"
 
 /// V3: zone-key transparency and the relayed TUF material
 /// (docs/REKOR-ZONE-KEY.md §5.2, §10.3).
@@ -74,17 +113,14 @@ fn migrations() -> List(String) {
 /// not a decomposition of it — so the certificate naming the zone stays
 /// inside `canonicalized_body`, where Rekor put it.
 ///
-/// Identity is `(spki_sha256, action)`: the SHA-256 of the key's DER
-/// SubjectPublicKeyInfo, which is what names a key everywhere else in this
-/// design — a monitor's record of the keys it has reported for a zone is
-/// keyed by the same digest. An RFC 4034 key
-/// tag is only a 16-bit checksum over the DNSKEY rdata, so two distinct keys
-/// collide with odds near 1/65536 per rollover; keying rows on it would let
-/// one key's row silently replace another's, taking its proof out of the
-/// served zone with no error anywhere. `key_tag` remains an indexed column
-/// because it is what a client selects on — it reads the tag from the RRSIG
-/// it just validated — but selection is not identity: a lookup may return two
-/// rows for one tag, and the client tries each until one verifies.
+/// Identity is `(keyset_sha256, action)`: an entry claims a key *set* — the
+/// apex DNSKEY RRset its chain proves — and the identity is the SHA-256 over
+/// that set's canonical rdata digests. The keys themselves are one row each
+/// in `rekor_record_keys`, keyed by the SHA-256 of the DNSKEY rdata (the
+/// digest a monitor's memory uses too), with the RFC 4034 key tag beside it
+/// for operators. A tag is only a 16-bit checksum two keys can share, so it
+/// is display data, never identity; the publish gate's question — is this
+/// key claimed by a verified record — is a join on the rdata digest.
 ///
 /// `chainless` records whether an entry carries a DNSSEC chain, and the CHECK
 /// confines that to `retire`: a zone being retired may have no DS left in its
@@ -102,8 +138,7 @@ fn migrations() -> List(String) {
 /// re-encode.
 const v3 = "
 CREATE TABLE rekor_records (
-  spki_sha256        BLOB    NOT NULL CHECK (length(spki_sha256) = 32),
-  key_tag            INTEGER NOT NULL,
+  keyset_sha256      BLOB    NOT NULL CHECK (length(keyset_sha256) = 32),
   apex               TEXT    NOT NULL,
   action             TEXT    NOT NULL CHECK (action IN ('create','rollover','retire')),
   statement          BLOB    NOT NULL,
@@ -116,10 +151,19 @@ CREATE TABLE rekor_records (
                      CHECK (chainless = 0 OR action = 'retire'),
   integrated_at      INTEGER NOT NULL,
   verified_at        INTEGER NOT NULL,
-  PRIMARY KEY (spki_sha256, action)
+  PRIMARY KEY (keyset_sha256, action)
 );
 CREATE INDEX rekor_records_by_apex ON rekor_records (apex);
-CREATE INDEX rekor_records_by_key_tag ON rekor_records (key_tag);
+CREATE TABLE rekor_record_keys (
+  keyset_sha256 BLOB    NOT NULL CHECK (length(keyset_sha256) = 32),
+  action        TEXT    NOT NULL,
+  key_sha256    BLOB    NOT NULL CHECK (length(key_sha256) = 32),
+  key_tag       INTEGER NOT NULL,
+  PRIMARY KEY (keyset_sha256, action, key_sha256),
+  FOREIGN KEY (keyset_sha256, action)
+    REFERENCES rekor_records (keyset_sha256, action) ON DELETE CASCADE
+);
+CREATE INDEX rekor_record_keys_by_key ON rekor_record_keys (key_sha256);
 CREATE TABLE tuf_material (
   id                INTEGER PRIMARY KEY CHECK (id = 1),
   source            TEXT    NOT NULL,
@@ -319,7 +363,9 @@ CREATE TABLE zone_meta (
   id                 INTEGER PRIMARY KEY CHECK (id = 1),
   base_domain        TEXT NOT NULL,
   soa_serial         INTEGER NOT NULL,
-  dnskey_public      BLOB NOT NULL CHECK (length(dnskey_public) = 64),
+  -- 64 bytes: a P-256 zone key (serve mode). 0 bytes: external mode,
+  -- where the provider holds the zone keys and this row carries none.
+  dnskey_public      BLOB NOT NULL CHECK (length(dnskey_public) IN (64, 0)),
   key_tag            INTEGER NOT NULL,
   sig_inception_skew INTEGER NOT NULL,
   sig_validity       INTEGER NOT NULL,

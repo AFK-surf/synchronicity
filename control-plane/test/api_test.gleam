@@ -50,10 +50,16 @@ fn harness() -> Harness {
       mailer.LogOnly,
       None,
       None,
-      csk,
+      fn(conn, now, actor) { publish.publish_in_tx(conn, csk, now, actor) },
+      fn() { Nil },
     )
   Harness(
-    router.Context("anchor", "ds", Some(auth), serve.Serving(dns_pool, apex)),
+    router.Context(
+      "anchor",
+      "ds",
+      Some(auth),
+      router.ServingZone(serve.Serving(dns_pool, apex)),
+    ),
     db_path,
     token,
     live.csrf,
@@ -527,7 +533,7 @@ pub fn mutation_visible_to_dns_immediately_test() {
   // The DNS path reads the same database the mutation committed to: the
   // device's membership record resolves on the very next query, through
   // the same pooled serving path the real servers use.
-  let router.Context(_, _, _, serving) = h.ctx
+  let assert router.Context(_, _, _, router.ServingZone(serving)) = h.ctx
   let assert Ok(qname) =
     dns_name.parse("_synchronicity.prod.snaporg.sync.test.")
   let question = <<
