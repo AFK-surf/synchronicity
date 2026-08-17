@@ -23,7 +23,7 @@ so neither needs a system library.
 ## Usage
 
 Set up a node. `synch init` is the one command that runs without a daemon — it
-creates the datadir; everything after it is a request to the running daemon over a
+creates the datadir; everything after it is a gRPC call to the running daemon over a
 local control socket:
 
 ```sh
@@ -38,8 +38,9 @@ synch daemon stop                          # ask it to shut down
 
 The socket is `<data-dir>/control.sock` (a `\\.\pipe\synchronicity-…` named pipe
 on Windows), `0600` inside a `0700` data directory, authenticated by a token
-regenerated on every daemon start. With no daemon running, every command except
-`synch init` fails with a message naming that socket.
+regenerated on every daemon start and sent as a header on every call. The service
+schema is `crates/synch-cli/proto/control.proto`. With no daemon running, every
+command except `synch init` fails with a message naming that socket.
 
 Admit a peer. Trust is unilateral, so each side runs this for the other:
 
@@ -186,7 +187,7 @@ synch pin ls
 synch pin rm media/talks/keynote.mp4
 ```
 
-Serve the same data over S3. The gateway is a control-socket client of the
+Serve the same data over S3. The gateway is a control client of the
 daemon — it opens no database of its own — so a `synch daemon run` must be
 live on the same data directory for any `synch-s3` command to work:
 
@@ -217,7 +218,7 @@ about that shape.
 | `synch-store` | the SQLite schema and the content-addressed blob store |
 | `synch-net` | the iroh endpoint, both ALPNs, reconciliation, the DNSSEC resolver, and the zone-key transparency verifier |
 | `synch-engine` | the embeddable node: scanner, publisher, anti-entropy, fetcher, mirrors |
-| `synch-cli` | the `synch` binary: the daemon, the control socket, and the CLI client |
+| `synch-cli` | the `synch` binary: the daemon, the control service, and the CLI client |
 | `synch-s3` | the `synch-s3` binary and the gateway library |
 | `synch-monitor` | the `synch-monitor` binary: walks the transparency log's tiles and classifies every entry that names a watched zone |
 

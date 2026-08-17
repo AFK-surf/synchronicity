@@ -1,7 +1,7 @@
 //! `synch-s3` — an S3-compatible gateway onto a synchronicity cluster (§9.4).
 //!
 //! A thin argument-parsing shell over the gateway library. Every subcommand,
-//! `bucket add` and `key add` included, is a control-socket request to a
+//! `bucket add` and `key add` included, is a control-service call to a
 //! running daemon: this process opens no database and binds no endpoint, so the
 //! daemon remains the only writer and the only endpoint (§9.1).
 

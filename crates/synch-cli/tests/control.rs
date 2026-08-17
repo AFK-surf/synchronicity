@@ -1,16 +1,16 @@
-//! Control-socket round-trips against a daemon in a temp datadir (§11).
+//! Control round-trips against a daemon in a temp datadir (§11).
 //!
 //! The daemon runs in process here — same `Server`, same transport, same
-//! framing the real binary uses — so the whole command surface can be exercised
-//! without paying for a process spawn per command. `tests/cli.rs` keeps the
-//! end-to-end check through the actual binary.
+//! service the real binary serves — so the whole command surface can be
+//! exercised without paying for a process spawn per command. `tests/cli.rs`
+//! keeps the end-to-end check through the actual binary.
 
 use std::path::Path;
 
 use iroh_base::SecretKey;
 use synch_cli::control::{
-    proto::{Response, CHUNK_SIZE, CONTROL_VERSION},
-    Client, EntryInfo, ErrorCode, Request, Server, Upload,
+    proto::{pb, CHUNK_SIZE, CONTROL_VERSION},
+    Client, Command, ControlError, EntryInfo, ErrorCode, Frame, Server,
 };
 use synch_core::OriginId;
 use synch_engine::{Node, NodeConfig};
@@ -48,15 +48,15 @@ impl Daemon {
     }
 }
 
-/// Sends one request and collects every frame of the response.
-async fn frames(data_dir: &Path, request: Request) -> Result<Vec<Response>, ErrorCode> {
+/// Runs one command and collects every frame of its output.
+async fn frames(data_dir: &Path, command: Command) -> Result<Vec<Frame>, ErrorCode> {
     let mut client = Client::connect(data_dir)
         .await
         .unwrap_or_else(|e| panic!("connect: {e}"));
-    client.send(&request).await.unwrap();
+    let mut frames = client.run(command).await.unwrap();
     let mut out = Vec::new();
     loop {
-        match client.next().await {
+        match frames.next().await {
             Ok(Some(frame)) => out.push(frame),
             Ok(None) => return Ok(out),
             Err(e) => return Err(e.code),
@@ -65,23 +65,23 @@ async fn frames(data_dir: &Path, request: Request) -> Result<Vec<Response>, Erro
 }
 
 /// The `Line` frames of a response, as one string.
-async fn lines(data_dir: &Path, request: Request) -> String {
-    let frames = frames(data_dir, request)
+async fn lines(data_dir: &Path, command: Command) -> String {
+    let frames = frames(data_dir, command)
         .await
         .unwrap_or_else(|code| panic!("request failed: {}", code.as_str()));
     frames
         .into_iter()
         .filter_map(|frame| match frame {
-            Response::Line(text) => Some(text),
+            Frame::Line(text) => Some(text),
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// The daemon's error code for a request that must fail.
-async fn failure(data_dir: &Path, request: Request) -> ErrorCode {
-    frames(data_dir, request)
+/// The daemon's error code for a command that must fail.
+async fn failure(data_dir: &Path, command: Command) -> ErrorCode {
+    frames(data_dir, command)
         .await
         .expect_err("the request should have failed")
 }
@@ -107,41 +107,43 @@ async fn every_command_variant_round_trips() {
     let peer_key = SecretKey::generate().public().to_z32();
 
     // Identity and keys.
-    let id = lines(data_dir, Request::Id).await;
+    let id = lines(data_dir, Command::Id(pb::Id {})).await;
     assert!(id.contains("nas@cluster.example"), "{id}");
     assert!(id.contains("active"), "{id}");
     // One key, plus the line saying there was nobody to ask about it (§3.4).
-    let keys = lines(data_dir, Request::KeyLs).await;
+    let keys = lines(data_dir, Command::KeyLs(pb::KeyLs {})).await;
     assert!(keys.contains("bound by 0 of 0 reachable peer(s)"), "{keys}");
     assert!(keys.contains("no trusted peers to ask"), "{keys}");
     assert_eq!(keys.lines().count(), 2, "{keys}");
 
     // A manual round with nobody to run it against says so and succeeds.
-    let sync = lines(data_dir, Request::SyncNow).await;
+    let sync = lines(data_dir, Command::SyncNow(pb::SyncNow {})).await;
     assert!(sync.contains("no dialable peers"), "{sync}");
 
     // Spaces, scanning, and listing.
     assert!(lines(
         data_dir,
-        Request::SpaceAdd {
+        Command::SpaceAdd(pb::SpaceAdd {
             id: "media".into(),
             path: space.path().to_string_lossy().into_owned(),
-        }
+        })
     )
     .await
     .contains("media"));
-    assert!(lines(data_dir, Request::SpaceLs).await.contains("media"));
+    assert!(lines(data_dir, Command::SpaceLs(pb::SpaceLs {}))
+        .await
+        .contains("media"));
 
-    let scan = lines(data_dir, Request::Scan).await;
+    let scan = lines(data_dir, Command::Scan(pb::Scan {})).await;
     assert!(scan.contains("hashed 2"), "{scan}");
     assert!(scan.contains("published seq 1"), "{scan}");
 
     let ls = lines(
         data_dir,
-        Request::Ls {
+        Command::Ls(pb::Ls {
             reference: "media".into(),
             all: false,
-        },
+        }),
     )
     .await;
     assert!(ls.contains("notes.txt"), "{ls}");
@@ -149,10 +151,10 @@ async fn every_command_variant_round_trips() {
 
     let ls = lines(
         data_dir,
-        Request::Ls {
+        Command::Ls(pb::Ls {
             reference: "media/talks".into(),
             all: true,
-        },
+        }),
     )
     .await;
     assert!(ls.contains("talks/a.txt"), "{ls}");
@@ -160,56 +162,58 @@ async fn every_command_variant_round_trips() {
 
     let status = lines(
         data_dir,
-        Request::Status {
+        Command::Status(pb::Status {
             reference: Some("media".into()),
-        },
+        }),
     )
     .await;
     assert!(status.contains("media/notes.txt  1 version(s)"), "{status}");
     assert!(status.contains("nas@cluster.example"), "{status}");
-    assert!(lines(data_dir, Request::Status { reference: None })
-        .await
-        .contains("media/notes.txt"));
+    assert!(
+        lines(data_dir, Command::Status(pb::Status { reference: None }))
+            .await
+            .contains("media/notes.txt")
+    );
 
     // Reads, in full and by range.
     let payload = read(
         data_dir,
-        Request::Cat {
+        Command::Cat(pb::Cat {
             reference: "nas@cluster.example:media/notes.txt".into(),
             range: None,
             from: None,
             strict: false,
-        },
+        }),
     )
     .await;
     assert_eq!(payload, b"hello");
     let payload = read(
         data_dir,
-        Request::Cat {
+        Command::Cat(pb::Cat {
             reference: "media/notes.txt".into(),
             range: Some("1..3".into()),
             from: None,
             strict: false,
-        },
+        }),
     )
     .await;
     assert_eq!(payload, b"el");
     let payload = read(
         data_dir,
-        Request::Get {
+        Command::Get(pb::Get {
             reference: "media/notes.txt".into(),
             from: Some("nas@cluster.example".into()),
             strict: false,
-        },
+        }),
     )
     .await;
     assert_eq!(payload, b"hello");
 
     let log = lines(
         data_dir,
-        Request::Log {
+        Command::Log(pb::Log {
             reference: "media/notes.txt".into(),
-        },
+        }),
     )
     .await;
     assert!(log.contains("seq 1"), "{log}");
@@ -217,57 +221,59 @@ async fn every_command_variant_round_trips() {
     // Membership.
     let trusted = lines(
         data_dir,
-        Request::TrustAdd {
+        Command::TrustAdd(pb::TrustAdd {
             key: peer_key.clone(),
             name: Some("laptop".into()),
             domain: Some("cluster.example".into()),
             note: Some("a test peer".into()),
             addr: Some("127.0.0.1:4433".into()),
-        },
+        }),
     )
     .await;
     assert!(trusted.contains("laptop@cluster.example"), "{trusted}");
-    let trust_ls = lines(data_dir, Request::TrustLs).await;
+    let trust_ls = lines(data_dir, Command::TrustLs(pb::TrustLs {})).await;
     assert!(trust_ls.contains("a test peer"), "{trust_ls}");
-    assert!(lines(data_dir, Request::Peers).await.contains(&peer_key));
+    assert!(lines(data_dir, Command::Peers(pb::Peers {}))
+        .await
+        .contains(&peer_key));
 
     let rebound = SecretKey::generate().public().to_z32();
     assert!(lines(
         data_dir,
-        Request::TrustRebind {
+        Command::TrustRebind(pb::TrustRebind {
             origin: "laptop@cluster.example".into(),
             key: rebound.clone(),
-        }
+        })
     )
     .await
     .contains(&rebound));
     // The rotation-window cleanup: one key's binding goes, the other stays.
     assert!(lines(
         data_dir,
-        Request::TrustRm {
+        Command::TrustRm(pb::TrustRm {
             origin: "laptop@cluster.example".into(),
             key: Some(peer_key.clone()),
-        }
+        })
     )
     .await
     .contains("binding to"));
     assert_eq!(
         failure(
             data_dir,
-            Request::TrustRm {
+            Command::TrustRm(pb::TrustRm {
                 origin: "laptop@cluster.example".into(),
                 key: Some(peer_key.clone()),
-            }
+            })
         )
         .await,
         ErrorCode::NotFound
     );
     assert!(lines(
         data_dir,
-        Request::TrustRm {
+        Command::TrustRm(pb::TrustRm {
             origin: "laptop@cluster.example".into(),
             key: None,
-        }
+        })
     )
     .await
     .contains("removed 1 binding(s)"));
@@ -276,20 +282,24 @@ async fn every_command_variant_round_trips() {
     // still record the domain rather than fail.
     let _ = frames(
         data_dir,
-        Request::DomainAdd {
+        Command::DomainAdd(pb::DomainAdd {
             domain: "cluster.example".into(),
-        },
+        }),
     )
     .await;
-    assert!(lines(data_dir, Request::DomainLs)
+    assert!(lines(data_dir, Command::DomainLs(pb::DomainLs {}))
         .await
         .contains("cluster.example"));
-    let _ = frames(data_dir, Request::DomainRefresh { domain: None }).await;
+    let _ = frames(
+        data_dir,
+        Command::DomainRefresh(pb::DomainRefresh { domain: None }),
+    )
+    .await;
     assert!(lines(
         data_dir,
-        Request::DomainRm {
+        Command::DomainRm(pb::DomainRm {
             domain: "cluster.example".into(),
-        }
+        })
     )
     .await
     .contains("removed"));
@@ -299,11 +309,11 @@ async fn every_command_variant_round_trips() {
     let mirror_path = mirror_dir.path().to_string_lossy().into_owned();
     let mirroring = lines(
         data_dir,
-        Request::MirrorAdd {
+        Command::MirrorAdd(pb::MirrorAdd {
             space: "media".into(),
             path: mirror_path.clone(),
             policy: Some("origin=laptop@cluster.example".into()),
-        },
+        }),
     )
     .await;
     assert!(mirroring.contains("mirroring"), "{mirroring}");
@@ -311,18 +321,20 @@ async fn every_command_variant_round_trips() {
         mirroring.contains("origin=laptop@cluster.example"),
         "{mirroring}"
     );
-    let mirror_ls = lines(data_dir, Request::MirrorLs).await;
+    let mirror_ls = lines(data_dir, Command::MirrorLs(pb::MirrorLs {})).await;
     assert!(mirror_ls.contains("media"), "{mirror_ls}");
     assert!(
         mirror_ls.contains("origin=laptop@cluster.example"),
         "{mirror_ls}"
     );
-    let _ = frames(data_dir, Request::MirrorSync).await.unwrap();
+    let _ = frames(data_dir, Command::MirrorSync(pb::MirrorSync {}))
+        .await
+        .unwrap();
     assert!(lines(
         data_dir,
-        Request::MirrorRm {
+        Command::MirrorRm(pb::MirrorRm {
             path: mirror_path.clone(),
-        }
+        })
     )
     .await
     .contains("removed"));
@@ -331,38 +343,42 @@ async fn every_command_variant_round_trips() {
     let root = blake3::hash(b"hello").to_hex().to_string();
     assert!(lines(
         data_dir,
-        Request::PinAdd {
+        Command::PinAdd(pb::PinAdd {
             target: root.clone()
-        }
+        })
     )
     .await
     .contains(&root));
-    assert!(lines(data_dir, Request::PinLs).await.contains(&root));
+    assert!(lines(data_dir, Command::PinLs(pb::PinLs {}))
+        .await
+        .contains(&root));
     assert!(lines(
         data_dir,
-        Request::PinRm {
+        Command::PinRm(pb::PinRm {
             target: root.clone()
-        }
+        })
     )
     .await
     .contains(&root));
-    assert!(lines(data_dir, Request::PinLs).await.is_empty());
+    assert!(lines(data_dir, Command::PinLs(pb::PinLs {}))
+        .await
+        .is_empty());
 
     // Reports.
-    let doctor = lines(data_dir, Request::Doctor { rebuild: false }).await;
+    let doctor = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: false })).await;
     assert!(doctor.contains("origin: nas@cluster.example"), "{doctor}");
     assert!(doctor.contains("equivocation: none detected"), "{doctor}");
-    let rebuilt = lines(data_dir, Request::Doctor { rebuild: true }).await;
+    let rebuilt = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: true })).await;
     assert!(rebuilt.contains("rebuilt"), "{rebuilt}");
     // Status is the glance, not the byte-identical twin of doctor.
-    let status = lines(data_dir, Request::DaemonStatus).await;
+    let status = lines(data_dir, Command::DaemonStatus(pb::DaemonStatus {})).await;
     assert!(status.contains("origin nas@cluster.example"), "{status}");
     assert!(status.contains("spaces: 1 (media)"), "{status}");
     assert!(status.contains("head: seq"), "{status}");
     assert!(!status.contains("storage:"), "{status}");
 
     // Rotation, end to end and operator-driven (§3.4).
-    let rotate = lines(data_dir, Request::KeyRotate).await;
+    let rotate = lines(data_dir, Command::KeyRotate(pb::KeyRotate {})).await;
     assert!(
         rotate.contains("_synchronicity.cluster.example."),
         "{rotate}"
@@ -376,17 +392,17 @@ async fn every_command_variant_round_trips() {
         .next()
         .unwrap()
         .to_string();
-    let keys = lines(data_dir, Request::KeyLs).await;
+    let keys = lines(data_dir, Command::KeyLs(pb::KeyLs {})).await;
     assert_eq!(keys.lines().count(), 3, "{keys}");
     assert_eq!(keys.matches("active").count(), 1, "{keys}");
 
     let old_key = daemon.node.node_id().to_z32();
     let activated = lines(
         data_dir,
-        Request::KeyActivate {
+        Command::KeyActivate(pb::KeyActivate {
             key: new_key.clone(),
             bind: None,
-        },
+        }),
     )
     .await;
     assert!(activated.contains(&new_key), "{activated}");
@@ -395,23 +411,26 @@ async fn every_command_variant_round_trips() {
 
     let retired = lines(
         data_dir,
-        Request::KeyRetire {
+        Command::KeyRetire(pb::KeyRetire {
             key: old_key.clone(),
-        },
+        }),
     )
     .await;
     assert!(retired.contains("secret deleted"), "{retired}");
     assert!(daemon.node.retiring_endpoints().is_empty());
     // One key, plus the line saying there was nobody to ask about it (§3.4).
-    let keys = lines(data_dir, Request::KeyLs).await;
+    let keys = lines(data_dir, Command::KeyLs(pb::KeyLs {})).await;
     assert!(keys.contains("bound by 0 of 0 reachable peer(s)"), "{keys}");
     assert!(keys.contains("no trusted peers to ask"), "{keys}");
     assert_eq!(keys.lines().count(), 2, "{keys}");
 
     // Removing the space unpublishes its entries.
-    assert!(lines(data_dir, Request::SpaceRm { id: "media".into() })
-        .await
-        .contains("unpublished"));
+    assert!(lines(
+        data_dir,
+        Command::SpaceRm(pb::SpaceRm { id: "media".into() })
+    )
+    .await
+    .contains("unpublished"));
 
     daemon.shutdown().await;
 }
@@ -426,16 +445,16 @@ async fn a_sync_that_reaches_nobody_says_so_in_the_exit_code() {
     // this test fast; the exit contract is the same as for a timeout.
     lines(
         data_dir,
-        Request::TrustAdd {
+        Command::TrustAdd(pb::TrustAdd {
             key: SecretKey::generate().public().to_z32(),
             name: Some("ghost".into()),
             domain: Some("cluster.example".into()),
             note: None,
             addr: None,
-        },
+        }),
     )
     .await;
-    let frames = frames(data_dir, Request::SyncNow).await;
+    let frames = frames(data_dir, Command::SyncNow(pb::SyncNow {})).await;
     // The per-peer line still streams out before the error frame lands.
     assert_eq!(
         frames.expect_err("reaching zero of one peer is a failure"),
@@ -444,13 +463,13 @@ async fn a_sync_that_reaches_nobody_says_so_in_the_exit_code() {
     daemon.shutdown().await;
 }
 
-/// Reads the `Chunk` payload of a response.
-async fn read(data_dir: &Path, request: Request) -> Vec<u8> {
-    let frames = frames(data_dir, request).await.expect("a payload");
+/// Reads the chunked payload of a command.
+async fn read(data_dir: &Path, command: Command) -> Vec<u8> {
+    let frames = frames(data_dir, command).await.expect("a payload");
     frames
         .into_iter()
         .filter_map(|frame| match frame {
-            Response::Chunk(bytes) => Some(bytes),
+            Frame::Chunk(bytes) => Some(bytes),
             _ => None,
         })
         .flatten()
@@ -466,12 +485,12 @@ async fn errors_cross_the_socket_with_their_code() {
     assert_eq!(
         failure(
             data_dir,
-            Request::Cat {
+            Command::Cat(pb::Cat {
                 reference: "nas@cluster.example:media/absent.txt".into(),
                 range: None,
                 from: None,
                 strict: false,
-            }
+            })
         )
         .await,
         ErrorCode::NotFound
@@ -482,10 +501,10 @@ async fn errors_cross_the_socket_with_their_code() {
     assert_eq!(
         failure(
             data_dir,
-            Request::Ls {
+            Command::Ls(pb::Ls {
                 reference: "nospace".into(),
                 all: false,
-            }
+            })
         )
         .await,
         ErrorCode::NotFound
@@ -493,10 +512,10 @@ async fn errors_cross_the_socket_with_their_code() {
     assert_eq!(
         failure(
             data_dir,
-            Request::Ls {
+            Command::Ls(pb::Ls {
                 reference: "stranger@cluster.example:media".into(),
                 all: false,
-            }
+            })
         )
         .await,
         ErrorCode::NotFound
@@ -504,23 +523,27 @@ async fn errors_cross_the_socket_with_their_code() {
     assert_eq!(
         failure(
             data_dir,
-            Request::Status {
+            Command::Status(pb::Status {
                 reference: Some("media/gone.txt".into()),
-            }
+            })
         )
         .await,
         ErrorCode::NotFound
     );
     assert_eq!(
-        failure(data_dir, Request::SpaceRm { id: "ghost".into() }).await,
+        failure(
+            data_dir,
+            Command::SpaceRm(pb::SpaceRm { id: "ghost".into() })
+        )
+        .await,
         ErrorCode::NotFound
     );
     assert_eq!(
         failure(
             data_dir,
-            Request::MirrorRm {
+            Command::MirrorRm(pb::MirrorRm {
                 path: "/no/such/mirror".into(),
-            }
+            })
         )
         .await,
         ErrorCode::NotFound
@@ -528,12 +551,12 @@ async fn errors_cross_the_socket_with_their_code() {
     assert_eq!(
         failure(
             data_dir,
-            Request::Cat {
+            Command::Cat(pb::Cat {
                 reference: "nas@cluster.example:media/pinned.txt".into(),
                 range: None,
                 from: Some("laptop@cluster.example".into()),
                 strict: false,
-            }
+            })
         )
         .await,
         ErrorCode::Invalid
@@ -541,9 +564,9 @@ async fn errors_cross_the_socket_with_their_code() {
     assert_eq!(
         failure(
             data_dir,
-            Request::PinAdd {
+            Command::PinAdd(pb::PinAdd {
                 target: "not-hex".into()
-            }
+            })
         )
         .await,
         ErrorCode::Invalid
@@ -551,13 +574,13 @@ async fn errors_cross_the_socket_with_their_code() {
     assert_eq!(
         failure(
             data_dir,
-            Request::TrustAdd {
+            Command::TrustAdd(pb::TrustAdd {
                 key: "not-a-key".into(),
                 name: None,
                 domain: None,
                 note: None,
                 addr: None,
-            }
+            })
         )
         .await,
         ErrorCode::Invalid
@@ -567,9 +590,9 @@ async fn errors_cross_the_socket_with_their_code() {
     assert_eq!(
         failure(
             data_dir,
-            Request::Take {
+            Command::Take(pb::Take {
                 reference: "nas@cluster.example:media/a.txt".into(),
-            }
+            })
         )
         .await,
         ErrorCode::Invalid
@@ -577,10 +600,10 @@ async fn errors_cross_the_socket_with_their_code() {
     assert_eq!(
         failure(
             data_dir,
-            Request::KeyActivate {
+            Command::KeyActivate(pb::KeyActivate {
                 key: SecretKey::generate().public().to_z32(),
                 bind: None,
-            }
+            })
         )
         .await,
         ErrorCode::NotFound
@@ -602,15 +625,15 @@ async fn scan_and_mirror_sync_stream_progress() {
     for (id, space) in [("media", &media), ("notes", &notes)] {
         lines(
             data_dir,
-            Request::SpaceAdd {
+            Command::SpaceAdd(pb::SpaceAdd {
                 id: id.into(),
                 path: space.path().to_string_lossy().into_owned(),
-            },
+            }),
         )
         .await;
     }
 
-    let progress = progress_of(data_dir, Request::Scan).await;
+    let progress = progress_of(data_dir, Command::Scan(pb::Scan {})).await;
     assert!(
         progress.iter().any(|line| line.contains("scanned media")),
         "{progress:?}"
@@ -623,14 +646,14 @@ async fn scan_and_mirror_sync_stream_progress() {
     let target = tempfile::tempdir().unwrap();
     lines(
         data_dir,
-        Request::MirrorAdd {
+        Command::MirrorAdd(pb::MirrorAdd {
             space: "media".into(),
             path: target.path().to_string_lossy().into_owned(),
             policy: None,
-        },
+        }),
     )
     .await;
-    let progress = progress_of(data_dir, Request::MirrorSync).await;
+    let progress = progress_of(data_dir, Command::MirrorSync(pb::MirrorSync {})).await;
     let target_name = target
         .path()
         .file_name()
@@ -655,10 +678,10 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
     let space = space_with(&[("notes.txt", b"hello")]);
     lines(
         data_dir,
-        Request::SpaceAdd {
+        Command::SpaceAdd(pb::SpaceAdd {
             id: "media".into(),
             path: space.path().to_string_lossy().into_owned(),
-        },
+        }),
     )
     .await;
 
@@ -680,25 +703,25 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
     // Scanning refuses before hashing anything, and says what to run. The
     // node is not broken and the request is not malformed — the state it was
     // made in is what is wrong — so the code says "unavailable" (§3.4).
-    let error = failure_message(data_dir, Request::Scan).await;
+    let error = failure_message(data_dir, Command::Scan(pb::Scan {})).await;
     assert_eq!(error.code, ErrorCode::Unavailable, "{error:?}");
     assert!(error.message.contains("synch recover"), "{error:?}");
     assert!(error.message.contains("seq 100"), "{error:?}");
 
     // Doctor says the same thing in its own words.
-    let doctor = lines(data_dir, Request::Doctor { rebuild: false }).await;
+    let doctor = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: false })).await;
     assert!(doctor.contains("KEY-LOSS RECOVERY"), "{doctor}");
     assert!(doctor.contains("seq 100"), "{doctor}");
 
-    let request = Request::Recover {
+    let request = Command::Recover(pb::Recover {
         wait: Some("0".into()),
         gap: Some(5),
-    };
+    });
     let all = frames(data_dir, request).await.expect("recover should run");
     let progress: Vec<String> = all
         .iter()
         .filter_map(|frame| match frame {
-            Response::Progress(text) => Some(text.clone()),
+            Frame::Progress(text) => Some(text.clone()),
             _ => None,
         })
         .collect();
@@ -708,7 +731,7 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
     let text: Vec<String> = all
         .iter()
         .filter_map(|frame| match frame {
-            Response::Line(text) => Some(text.clone()),
+            Frame::Line(text) => Some(text.clone()),
             _ => None,
         })
         .collect();
@@ -717,19 +740,19 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
     assert!(text.contains("publishing resumes at seq 105"), "{text}");
 
     // And the node publishes again, above everything that was advertised.
-    let scan = lines(data_dir, Request::Scan).await;
+    let scan = lines(data_dir, Command::Scan(pb::Scan {})).await;
     assert!(scan.contains("published seq 105"), "{scan}");
 
-    let doctor = lines(data_dir, Request::Doctor { rebuild: false }).await;
+    let doctor = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: false })).await;
     assert!(!doctor.contains("KEY-LOSS RECOVERY"), "{doctor}");
 
     // A duration this program cannot read fails before any waiting happens.
     let error = failure_message(
         data_dir,
-        Request::Recover {
+        Command::Recover(pb::Recover {
             wait: Some("whenever".into()),
             gap: None,
-        },
+        }),
     )
     .await;
     assert_eq!(error.code, ErrorCode::Invalid);
@@ -760,26 +783,27 @@ async fn a_client_that_hangs_up_mid_quiesce_leaves_the_floor_alone() {
 
     // An hour-long quiesce, abandoned as soon as it has said something.
     let mut client = Client::connect(data_dir).await.unwrap();
-    client
-        .send(&Request::Recover {
+    let mut frames = client
+        .run(Command::Recover(pb::Recover {
             wait: Some("1h".into()),
             gap: None,
-        })
+        }))
         .await
         .unwrap();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(30), client.next())
+    let first = tokio::time::timeout(std::time::Duration::from_secs(30), frames.next())
         .await
         .expect("the quiesce must report as it goes")
         .unwrap()
         .unwrap();
-    assert!(matches!(first, Response::Line(_) | Response::Progress(_)));
+    assert!(matches!(first, Frame::Line(_) | Frame::Progress(_)));
+    drop(frames);
     drop(client);
 
     // The daemon is still there, and nothing was half-applied.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let id = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        lines(data_dir, Request::Id),
+        lines(data_dir, Command::Id(pb::Id {})),
     )
     .await
     .expect("the daemon must keep serving");
@@ -790,30 +814,30 @@ async fn a_client_that_hangs_up_mid_quiesce_leaves_the_floor_alone() {
     daemon.shutdown().await;
 }
 
-/// The structured error a failing request produces, message and all.
+/// The structured error a failing command produces, message and all.
 async fn failure_message(
     data_dir: &Path,
-    request: Request,
+    command: Command,
 ) -> synch_cli::control::proto::ControlError {
     let mut client = Client::connect(data_dir).await.unwrap();
-    client.send(&request).await.unwrap();
+    let mut frames = client.run(command).await.unwrap();
     loop {
-        match client.next().await {
+        match frames.next().await {
             Ok(Some(_)) => {}
-            Ok(None) => panic!("the request should have failed"),
+            Ok(None) => panic!("the command should have failed"),
             Err(e) => return e,
         }
     }
 }
 
-/// The `Progress` frames of a response.
-async fn progress_of(data_dir: &Path, request: Request) -> Vec<String> {
-    frames(data_dir, request)
+/// The progress reports of a command.
+async fn progress_of(data_dir: &Path, command: Command) -> Vec<String> {
+    frames(data_dir, command)
         .await
-        .expect("the request should have succeeded")
+        .expect("the command should have succeeded")
         .into_iter()
         .filter_map(|frame| match frame {
-            Response::Progress(text) => Some(text),
+            Frame::Progress(text) => Some(text),
             _ => None,
         })
         .collect()
@@ -832,31 +856,31 @@ async fn a_multi_megabyte_cat_streams_in_chunks() {
     let space = space_with(&[("big.bin", &payload)]);
     lines(
         data_dir,
-        Request::SpaceAdd {
+        Command::SpaceAdd(pb::SpaceAdd {
             id: "media".into(),
             path: space.path().to_string_lossy().into_owned(),
-        },
+        }),
     )
     .await;
-    lines(data_dir, Request::Scan).await;
+    lines(data_dir, Command::Scan(pb::Scan {})).await;
 
     let mut client = Client::connect(data_dir).await.unwrap();
-    client
-        .send(&Request::Cat {
+    let mut frames = client
+        .run(Command::Cat(pb::Cat {
             reference: "media/big.bin".into(),
             range: None,
             from: None,
             strict: false,
-        })
+        }))
         .await
         .unwrap();
 
     let mut chunks = 0usize;
     let mut received: Vec<u8> = Vec::new();
     let mut delivered_before_the_end = 0usize;
-    while let Some(frame) = client.next().await.unwrap() {
+    while let Some(frame) = frames.next().await.unwrap() {
         match frame {
-            Response::Chunk(bytes) => {
+            Frame::Chunk(bytes) => {
                 assert!(
                     !bytes.is_empty() && bytes.len() <= CHUNK_SIZE,
                     "a chunk of {} bytes",
@@ -887,12 +911,12 @@ async fn a_multi_megabyte_cat_streams_in_chunks() {
     // A bounded range streams the same way, and only the range.
     let ranged = read(
         data_dir,
-        Request::Cat {
+        Command::Cat(pb::Cat {
             reference: "media/big.bin".into(),
             range: Some("1000000..1500000".into()),
             from: None,
             strict: false,
-        },
+        }),
     )
     .await;
     assert_eq!(ranged, payload[1_000_000..1_500_000]);
@@ -900,17 +924,63 @@ async fn a_multi_megabyte_cat_streams_in_chunks() {
     daemon.shutdown().await;
 }
 
-/// The `Entry` frames of a response.
-async fn entries(data_dir: &Path, request: Request) -> Vec<EntryInfo> {
-    frames(data_dir, request)
+/// Every entry of a listing.
+async fn entries(data_dir: &Path, request: pb::ListRequest) -> Vec<EntryInfo> {
+    let mut client = Client::connect(data_dir).await.unwrap();
+    let mut listing = client
+        .list(request)
         .await
-        .unwrap_or_else(|code| panic!("request failed: {}", code.as_str()))
-        .into_iter()
-        .filter_map(|frame| match frame {
-            Response::Entry(info) => Some(*info),
-            _ => None,
-        })
-        .collect()
+        .unwrap_or_else(|e| panic!("list failed: {}", e.code.as_str()));
+    let mut out = Vec::new();
+    while let Some(entry) = listing
+        .next()
+        .await
+        .unwrap_or_else(|e| panic!("list failed: {}", e.code.as_str()))
+    {
+        out.push(entry);
+    }
+    out
+}
+
+/// The one entry a resolve selects.
+async fn resolve(data_dir: &Path, request: pb::ResolveRequest) -> Result<EntryInfo, ErrorCode> {
+    Client::connect(data_dir)
+        .await
+        .unwrap()
+        .resolve(request)
+        .await
+        .map_err(|e| e.code)
+}
+
+/// One config value from the `s3.*` namespace.
+async fn config(data_dir: &Path, key: &str) -> Result<Vec<String>, ErrorCode> {
+    Client::connect(data_dir)
+        .await
+        .unwrap()
+        .config(key)
+        .await
+        .map_err(|e| e.code)
+}
+
+/// Appends one record to a config value in the `s3.*` namespace.
+async fn append_config(data_dir: &Path, key: &str, record: &str) -> Result<(), ErrorCode> {
+    Client::connect(data_dir)
+        .await
+        .unwrap()
+        .append_config(key, record)
+        .await
+        .map_err(|e| e.code)
+}
+
+/// The whole payload of a structured read.
+async fn tree_read(data_dir: &Path, request: pb::ReadRequest) -> Result<Vec<u8>, ErrorCode> {
+    let mut client = Client::connect(data_dir).await.unwrap();
+    let mut chunks = client.read(request).await.map_err(|e| e.code)?;
+    let mut out = Vec::new();
+    while let Some(bytes) = chunks.next().await.map_err(|e| e.code)? {
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
 }
 
 /// The structured requests §9.4 gives the gateway: a listing and a resolve that
@@ -936,17 +1006,17 @@ async fn the_tree_can_be_listed_and_resolved_structurally() {
     let data_dir = dir.path();
     lines(
         data_dir,
-        Request::SpaceAdd {
+        Command::SpaceAdd(pb::SpaceAdd {
             id: "media".into(),
             path: space.path().to_string_lossy().into_owned(),
-        },
+        }),
     )
     .await;
-    lines(data_dir, Request::Scan).await;
+    lines(data_dir, Command::Scan(pb::Scan {})).await;
 
     let listed = entries(
         data_dir,
-        Request::TreeList {
+        pb::ListRequest {
             space: "media".into(),
             prefix: String::new(),
             start_after: None,
@@ -969,7 +1039,7 @@ async fn the_tree_can_be_listed_and_resolved_structurally() {
     // A prefix narrows it and a cursor resumes past a path.
     let listed = entries(
         data_dir,
-        Request::TreeList {
+        pb::ListRequest {
             space: "media".into(),
             prefix: "talks/".into(),
             start_after: None,
@@ -981,7 +1051,7 @@ async fn the_tree_can_be_listed_and_resolved_structurally() {
     assert_eq!(listed.len(), 1, "{listed:?}");
     let listed = entries(
         data_dir,
-        Request::TreeList {
+        pb::ListRequest {
             space: "media".into(),
             prefix: String::new(),
             start_after: Some("notes.txt".into()),
@@ -999,20 +1069,20 @@ async fn the_tree_can_be_listed_and_resolved_structurally() {
     // the structured form.
     #[cfg(not(windows))]
     {
-        let resolved = entries(
+        let resolved = resolve(
             data_dir,
-            Request::TreeResolve {
+            pb::ResolveRequest {
                 space: "media".into(),
                 path: "odd:key.txt".into(),
                 policy: None,
             },
         )
-        .await;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].size, 5);
-        let payload = read(
+        .await
+        .unwrap();
+        assert_eq!(resolved.size, 5);
+        let payload = tree_read(
             data_dir,
-            Request::TreeRead {
+            pb::ReadRequest {
                 space: "media".into(),
                 path: "odd:key.txt".into(),
                 policy: None,
@@ -1020,20 +1090,22 @@ async fn the_tree_can_be_listed_and_resolved_structurally() {
                 len: Some(3),
             },
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(payload, b"olo");
     }
 
     assert_eq!(
-        failure(
+        resolve(
             data_dir,
-            Request::TreeResolve {
+            pb::ResolveRequest {
                 space: "media".into(),
                 path: "absent.txt".into(),
                 policy: None,
             }
         )
-        .await,
+        .await
+        .unwrap_err(),
         ErrorCode::NotFound
     );
 
@@ -1055,13 +1127,13 @@ async fn compare_reports_name_status_between_the_local_node_and_a_peer() {
     let data_dir = dir.path();
     lines(
         data_dir,
-        Request::SpaceAdd {
+        Command::SpaceAdd(pb::SpaceAdd {
             id: "media".into(),
             path: space.path().to_string_lossy().into_owned(),
-        },
+        }),
     )
     .await;
-    lines(data_dir, Request::Scan).await;
+    lines(data_dir, Command::Scan(pb::Scan {})).await;
 
     // A peer publishes: keep.txt identical, changed.txt with other bytes, and a
     // file the local node does not have.
@@ -1090,12 +1162,12 @@ async fn compare_reports_name_status_between_the_local_node_and_a_peer() {
     // Default baseline is the local node; --to names the peer.
     let text = lines(
         data_dir,
-        Request::Compare {
+        Command::Compare(pb::Compare {
             reference: "media".into(),
             from: None,
             to: "laptop@cluster.example".into(),
             json: false,
-        },
+        }),
     )
     .await;
     assert!(text.contains("M  changed.txt"), "{text}");
@@ -1113,12 +1185,12 @@ async fn compare_reports_name_status_between_the_local_node_and_a_peer() {
     // JSON form carries the same three changes.
     let json = lines(
         data_dir,
-        Request::Compare {
+        Command::Compare(pb::Compare {
             reference: "media".into(),
             from: None,
             to: "laptop@cluster.example".into(),
             json: true,
-        },
+        }),
     )
     .await;
     assert!(
@@ -1138,12 +1210,12 @@ async fn compare_reports_name_status_between_the_local_node_and_a_peer() {
     assert_eq!(
         failure(
             data_dir,
-            Request::Compare {
+            Command::Compare(pb::Compare {
                 reference: "media".into(),
                 from: None,
                 to: "ghost@cluster.example".into(),
                 json: false,
-            },
+            }),
         )
         .await,
         ErrorCode::NotFound
@@ -1162,13 +1234,13 @@ async fn a_strict_listing_omits_what_a_strict_resolve_refuses() {
     let data_dir = dir.path();
     lines(
         data_dir,
-        Request::SpaceAdd {
+        Command::SpaceAdd(pb::SpaceAdd {
             id: "media".into(),
             path: space.path().to_string_lossy().into_owned(),
-        },
+        }),
     )
     .await;
-    lines(data_dir, Request::Scan).await;
+    lines(data_dir, Command::Scan(pb::Scan {})).await;
 
     let peer = OriginId::named("laptop", "cluster.example").unwrap();
     let root = daemon
@@ -1190,7 +1262,7 @@ async fn a_strict_listing_omits_what_a_strict_resolve_refuses() {
     let strict = Some("strict".to_string());
     let listed = entries(
         data_dir,
-        Request::TreeList {
+        pb::ListRequest {
             space: "media".into(),
             prefix: String::new(),
             start_after: None,
@@ -1203,30 +1275,32 @@ async fn a_strict_listing_omits_what_a_strict_resolve_refuses() {
     assert_eq!(paths, vec!["agreed.txt"], "{listed:?}");
 
     assert_eq!(
-        failure(
+        resolve(
             data_dir,
-            Request::TreeResolve {
+            pb::ResolveRequest {
                 space: "media".into(),
                 path: "shared.txt".into(),
                 policy: strict,
             }
         )
-        .await,
+        .await
+        .unwrap_err(),
         ErrorCode::Divergent
     );
 
     // `newest` picks the winning version and says the path carries two.
-    let resolved = entries(
+    let resolved = resolve(
         data_dir,
-        Request::TreeResolve {
+        pb::ResolveRequest {
             space: "media".into(),
             path: "shared.txt".into(),
             policy: None,
         },
     )
-    .await;
-    assert_eq!(resolved[0].versions, 2);
-    assert_eq!(resolved[0].origin, "laptop@cluster.example");
+    .await
+    .unwrap();
+    assert_eq!(resolved.versions, 2);
+    assert_eq!(resolved.origin, "laptop@cluster.example");
 
     daemon.shutdown().await;
 }
@@ -1241,38 +1315,25 @@ async fn a_streamed_put_publishes_without_buffering_the_object() {
     let data_dir = dir.path();
     lines(
         data_dir,
-        Request::SpaceAdd {
+        Command::SpaceAdd(pb::SpaceAdd {
             id: "media".into(),
             path: space.path().to_string_lossy().into_owned(),
-        },
+        }),
     )
     .await;
 
     let payload: Vec<u8> = (0..1_500_000u32).map(|i| (i * 7 % 251) as u8).collect();
     let mut client = Client::connect(data_dir).await.unwrap();
-    client
-        .send(&Request::TreePut {
-            space: "media".into(),
-            path: "uploads/report.bin".into(),
-        })
-        .await
-        .unwrap();
-    assert!(
-        matches!(client.next().await.unwrap(), Some(Response::Ready)),
-        "the daemon acks a write before the first byte"
-    );
+    // The call returns once the daemon has taken its gates, which is what tells
+    // the client the payload is wanted.
+    let mut put = client.put("media", "uploads/report.bin").await.unwrap();
     for piece in payload.chunks(CHUNK_SIZE) {
-        client.upload(&Upload::Chunk(piece.to_vec())).await.unwrap();
+        put.chunk(piece.to_vec()).await.unwrap();
     }
-    client.upload(&Upload::End).await.unwrap();
+    let written = put.finish().await.unwrap();
 
-    let mut published = None;
-    while let Some(frame) = client.next().await.unwrap() {
-        if let Response::Entry(info) = frame {
-            published = Some(*info);
-        }
-    }
-    let published = published.expect("the write answers with its published entry");
+    let published = written.entry;
+    assert!(written.path.ends_with("report.bin"), "{}", written.path);
     assert_eq!(published.size, payload.len() as u64);
     assert_eq!(published.content, Some(synch_core::Hash::new(&payload)));
     assert_eq!(published.origin, "nas@cluster.example");
@@ -1283,9 +1344,9 @@ async fn a_streamed_put_publishes_without_buffering_the_object() {
 
     // It reads straight back out, and the space holds nothing else: the staging
     // file went away with the commit.
-    let back = read(
+    let back = tree_read(
         data_dir,
-        Request::TreeRead {
+        pb::ReadRequest {
             space: "media".into(),
             path: "uploads/report.bin".into(),
             policy: None,
@@ -1293,7 +1354,8 @@ async fn a_streamed_put_publishes_without_buffering_the_object() {
             len: None,
         },
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(back, payload);
     let left: Vec<String> = std::fs::read_dir(space.path().join("uploads"))
         .unwrap()
@@ -1314,41 +1376,18 @@ async fn an_abandoned_write_leaves_nothing_behind() {
     let data_dir = dir.path();
     lines(
         data_dir,
-        Request::SpaceAdd {
+        Command::SpaceAdd(pb::SpaceAdd {
             id: "media".into(),
             path: space.path().to_string_lossy().into_owned(),
-        },
+        }),
     )
     .await;
-    lines(data_dir, Request::Scan).await;
+    lines(data_dir, Command::Scan(pb::Scan {})).await;
 
     let mut client = Client::connect(data_dir).await.unwrap();
-    client
-        .send(&Request::TreePut {
-            space: "media".into(),
-            path: "kept.txt".into(),
-        })
-        .await
-        .unwrap();
-    assert!(
-        matches!(client.next().await.unwrap(), Some(Response::Ready)),
-        "the daemon acks a write before the first byte"
-    );
-    client
-        .upload(&Upload::Chunk(b"half an object".to_vec()))
-        .await
-        .unwrap();
-    client
-        .upload(&Upload::Abort("the body was truncated".into()))
-        .await
-        .unwrap();
-    let error = loop {
-        match client.next().await {
-            Ok(Some(_)) => {}
-            Ok(None) => panic!("an abandoned write must fail"),
-            Err(e) => break e,
-        }
-    };
+    let mut put = client.put("media", "kept.txt").await.unwrap();
+    put.chunk(b"half an object".to_vec()).await.unwrap();
+    let error = put.abort("the body was truncated").await;
     assert_eq!(error.code, ErrorCode::Invalid);
     assert!(error.message.contains("abandoned"), "{error}");
 
@@ -1378,34 +1417,13 @@ async fn gateway_config_appends_within_its_namespace() {
     let daemon = Daemon::start(dir.path()).await;
     let data_dir = dir.path();
 
-    assert!(lines(
-        data_dir,
-        Request::ConfigGet {
-            key: "s3.buckets".into()
-        }
-    )
-    .await
-    .is_empty());
+    assert!(config(data_dir, "s3.buckets").await.unwrap().is_empty());
 
     for record in ["photos\tmedia\tnewest", "docs\tpapers\tstrict"] {
-        lines(
-            data_dir,
-            Request::ConfigAppend {
-                key: "s3.buckets".into(),
-                record: record.into(),
-            },
-        )
-        .await;
+        append_config(data_dir, "s3.buckets", record).await.unwrap();
     }
-    let stored = lines(
-        data_dir,
-        Request::ConfigGet {
-            key: "s3.buckets".into(),
-        },
-    )
-    .await;
     assert_eq!(
-        stored.lines().collect::<Vec<_>>(),
+        config(data_dir, "s3.buckets").await.unwrap(),
         vec!["photos\tmedia\tnewest", "docs\tpapers\tstrict"],
         "records arrive in the order they were appended"
     );
@@ -1413,19 +1431,12 @@ async fn gateway_config_appends_within_its_namespace() {
     // Nothing outside the namespace is reachable, in either direction.
     for key in ["self_origin_id", "schema_version", "s3", "s3."] {
         assert_eq!(
-            failure(data_dir, Request::ConfigGet { key: key.into() }).await,
+            config(data_dir, key).await.unwrap_err(),
             ErrorCode::Invalid,
             "{key} must not be readable"
         );
         assert_eq!(
-            failure(
-                data_dir,
-                Request::ConfigAppend {
-                    key: key.into(),
-                    record: "x".into(),
-                }
-            )
-            .await,
+            append_config(data_dir, key, "x").await.unwrap_err(),
             ErrorCode::Invalid,
             "{key} must not be writable"
         );
@@ -1442,18 +1453,24 @@ async fn gateway_config_appends_within_its_namespace() {
 
     // A record is one line: a newline would forge a second record.
     assert_eq!(
-        failure(
-            data_dir,
-            Request::ConfigAppend {
-                key: "s3.keys".into(),
-                record: "id\tsecret\nsmuggled\tin".into(),
-            }
-        )
-        .await,
+        append_config(data_dir, "s3.keys", "id\tsecret\nsmuggled\tin")
+            .await
+            .unwrap_err(),
         ErrorCode::Invalid
     );
 
     daemon.shutdown().await;
+}
+
+/// Runs the cheapest command there is, to see whether the daemon will serve
+/// this client at all.
+///
+/// The version and the token are checked on every call, not once per
+/// connection, so this is what a credential is admitted or refused by.
+async fn admitted(mut client: Client) -> Result<(), ControlError> {
+    let mut frames = client.run(Command::Id(pb::Id {})).await?;
+    while frames.next().await?.is_some() {}
+    Ok(())
 }
 
 #[tokio::test]
@@ -1461,19 +1478,27 @@ async fn a_bad_token_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
 
-    let error = Client::connect_with_token(dir.path(), vec![0u8; 32])
+    let client = Client::connect_with_token(dir.path(), vec![0u8; 32])
         .await
-        .expect_err("a forged token must not open a session");
+        .unwrap();
+    let error = admitted(client)
+        .await
+        .expect_err("a forged token must not be served");
     assert_eq!(error.code, ErrorCode::Unauthorized);
     assert!(error.message.contains("control.token"), "{error}");
 
     // A truncated token is rejected on length alone, and the real one still
     // works afterwards.
-    let error = Client::connect_with_token(dir.path(), vec![1u8; 8])
+    let client = Client::connect_with_token(dir.path(), vec![1u8; 8])
         .await
-        .expect_err("a short token must not open a session");
+        .unwrap();
+    let error = admitted(client)
+        .await
+        .expect_err("a short token must not be served");
     assert_eq!(error.code, ErrorCode::Unauthorized);
-    assert!(Client::connect(dir.path()).await.is_ok());
+    admitted(Client::connect(dir.path()).await.unwrap())
+        .await
+        .unwrap();
 
     daemon.shutdown().await;
 }
@@ -1483,7 +1508,10 @@ async fn a_version_mismatch_names_both_versions() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
 
-    let error = Client::connect_as(dir.path(), CONTROL_VERSION + 7)
+    let client = Client::connect_as(dir.path(), CONTROL_VERSION + 7)
+        .await
+        .unwrap();
+    let error = admitted(client)
         .await
         .expect_err("a different protocol version must not be served");
     assert_eq!(error.code, ErrorCode::VersionMismatch);
@@ -1555,7 +1583,7 @@ async fn a_stale_socket_is_cleared_on_start() {
     assert!(tokio::net::UnixStream::connect(&path).await.is_err());
 
     let daemon = Daemon::reopen(dir.path()).await;
-    assert!(lines(dir.path(), Request::Id)
+    assert!(lines(dir.path(), Command::Id(pb::Id {}))
         .await
         .contains("nas@cluster.example"));
     daemon.shutdown().await;
@@ -1566,7 +1594,7 @@ async fn daemon_stop_ends_the_server_and_clears_the_token() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
 
-    assert!(lines(dir.path(), Request::DaemonStop)
+    assert!(lines(dir.path(), Command::DaemonStop(pb::DaemonStop {}))
         .await
         .contains("stop"));
     let served = tokio::time::timeout(std::time::Duration::from_secs(10), daemon.served)
@@ -1598,7 +1626,8 @@ async fn the_token_is_regenerated_on_every_start() {
     let second = synch_cli::control::transport::read_token(dir.path()).unwrap();
     assert_ne!(first, second);
 
-    let error = Client::connect_with_token(dir.path(), first)
+    let client = Client::connect_with_token(dir.path(), first).await.unwrap();
+    let error = admitted(client)
         .await
         .expect_err("the previous run's token is worthless");
     assert_eq!(error.code, ErrorCode::Unauthorized);
@@ -1617,13 +1646,13 @@ async fn take_adopts_a_peers_deletion_over_the_socket() {
 
     lines(
         data_dir,
-        Request::SpaceAdd {
+        Command::SpaceAdd(pb::SpaceAdd {
             id: "media".into(),
             path: space.path().to_string_lossy().into_owned(),
-        },
+        }),
     )
     .await;
-    lines(data_dir, Request::Scan).await;
+    lines(data_dir, Command::Scan(pb::Scan {})).await;
 
     let peer = OriginId::named("laptop", "cluster.example").unwrap();
     // The peer publishes a live version of `kept.txt` with the same bytes we
@@ -1657,9 +1686,9 @@ async fn take_adopts_a_peers_deletion_over_the_socket() {
     // Taking a live version still works exactly as it did.
     let taken = lines(
         data_dir,
-        Request::Take {
+        Command::Take(pb::Take {
             reference: "laptop@cluster.example:media/kept.txt".into(),
-        },
+        }),
     )
     .await;
     assert!(taken.contains("adopted into"), "{taken}");
@@ -1671,9 +1700,9 @@ async fn take_adopts_a_peers_deletion_over_the_socket() {
     // Taking a deletion removes our copy and publishes our own tombstone.
     let taken = lines(
         data_dir,
-        Request::Take {
+        Command::Take(pb::Take {
             reference: "laptop@cluster.example:media/shared.txt".into(),
-        },
+        }),
     )
     .await;
     assert!(taken.contains("removed"), "{taken}");
@@ -1698,9 +1727,9 @@ async fn take_adopts_a_peers_deletion_over_the_socket() {
         .unwrap();
     let taken = lines(
         data_dir,
-        Request::Take {
+        Command::Take(pb::Take {
             reference: "laptop@cluster.example:media/never-ours.txt".into(),
-        },
+        }),
     )
     .await;
     assert!(taken.contains("already absent"), "{taken}");
@@ -1792,9 +1821,13 @@ async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
         }
     };
-    client.send(&Request::DaemonStop).await.unwrap();
-    while let Ok(Some(_)) = client.next().await {}
-    // The daemon sends the stop once the client has hung up.
+    let mut frames = client
+        .run(Command::DaemonStop(pb::DaemonStop {}))
+        .await
+        .unwrap();
+    while let Ok(Some(_)) = frames.next().await {}
+    // The daemon sends the stop once its answer has been delivered.
+    drop(frames);
     drop(client);
 
     tokio::time::timeout(std::time::Duration::from_secs(30), running)
@@ -1819,7 +1852,7 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
     let data_dir = dir.path();
 
     // No resolver in this process at all: the state is named, not implied.
-    let status = lines(data_dir, Request::DaemonStatus).await;
+    let status = lines(data_dir, Command::DaemonStatus(pb::DaemonStatus {})).await;
     assert!(
         status.contains("trust: no membership resolver in this process"),
         "{status}"
@@ -1828,26 +1861,30 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
     daemon.node.set_dns_resolver(Err(
         "trust anchor /nope: no DNSKEY records in the file".into()
     ));
-    let status = lines(data_dir, Request::DaemonStatus).await;
+    let status = lines(data_dir, Command::DaemonStatus(pb::DaemonStatus {})).await;
     assert!(status.contains("NO RESOLVER"), "{status}");
     assert!(status.contains("membership cannot refresh"), "{status}");
-    let doctor = lines(data_dir, Request::Doctor { rebuild: false }).await;
+    let doctor = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: false })).await;
     assert!(doctor.contains("no DNSKEY records"), "{doctor}");
 
     // A refresh asked for over the socket uses the daemon's resolver and
     // refuses when there is none, rather than building a fresh one per request.
     daemon.node.add_domain("cluster.example").unwrap();
-    let code = failure(data_dir, Request::DomainRefresh { domain: None }).await;
+    let code = failure(
+        data_dir,
+        Command::DomainRefresh(pb::DomainRefresh { domain: None }),
+    )
+    .await;
     assert_eq!(code, ErrorCode::Unavailable);
 
     // With one installed, the whole effective policy is on the page.
     let resolver = std::sync::Arc::new(synch_net::DnssecResolver::with_defaults().unwrap());
     daemon.node.set_dns_resolver(Ok(resolver.clone()));
-    let status = lines(data_dir, Request::DaemonStatus).await;
+    let status = lines(data_dir, Command::DaemonStatus(pb::DaemonStatus {})).await;
     assert!(status.contains("rekor require"), "{status}");
     assert!(status.contains("anchor icann-root"), "{status}");
     assert!(status.contains("log key(s) pinned"), "{status}");
-    let doctor = lines(data_dir, Request::Doctor { rebuild: false }).await;
+    let doctor = lines(data_dir, Command::Doctor(pb::Doctor { rebuild: false })).await;
     assert!(doctor.contains("log key "), "{doctor}");
     assert!(doctor.contains("clock: usable"), "{doctor}");
 

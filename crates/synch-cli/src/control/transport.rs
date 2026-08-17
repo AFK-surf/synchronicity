@@ -1,21 +1,28 @@
 //! The local control transport (§9.3).
 //!
-//! On Unix that is a domain socket at `<data_dir>/control.sock`, created `0600`
+//! gRPC needs a byte stream under it, and this is where that stream comes from.
+//! On Unix it is a domain socket at `<data_dir>/control.sock`, created `0600`
 //! inside a `0700` data directory. On Windows it is a named pipe,
 //! `\\.\pipe\synchronicity-<16 hex of the data dir path hash>`, so several
 //! nodes on one machine do not collide.
 //!
 //! Both platforms authenticate with the 32-byte token in
-//! `<data_dir>/control.token`. On Unix the directory permissions are the
-//! primary control and the token is a second check; on Windows, where pipe ACLs
-//! are easy to get subtly wrong, the token is what actually carries it.
+//! `<data_dir>/control.token`, sent as a header on every call. On Unix the
+//! directory permissions are the primary control and the token is a second
+//! check; on Windows, where pipe ACLs are easy to get subtly wrong, the token is
+//! what actually carries it.
 
 use std::{
     io,
     path::{Path, PathBuf},
+    pin::Pin,
+    task::{Context, Poll},
 };
 
+use hyper_util::rt::TokioIo;
 use iroh_base::SecretKey;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tonic::transport::{server::Connected, Channel, Endpoint, Uri};
 
 /// The Unix socket file inside the data directory.
 pub const SOCKET_FILE: &str = "control.sock";
@@ -25,6 +32,13 @@ pub const TOKEN_FILE: &str = "control.token";
 
 /// How many bytes the control token has.
 pub const TOKEN_LEN: usize = 32;
+
+/// The authority every control channel claims.
+///
+/// HTTP/2 wants one and the local transport has none to offer: the data
+/// directory, not a host and a port, is what says which daemon this is. It is
+/// never resolved — the connector below hands back an already-open stream.
+const LOCAL_AUTHORITY: &str = "http://synchronicity.local";
 
 /// The error a client gets when nothing is listening (§9.1).
 pub fn no_daemon_error(data_dir: &Path) -> io::Error {
@@ -130,10 +144,8 @@ mod imp {
     use super::*;
     use tokio::net::{UnixListener, UnixStream};
 
-    /// A connection as the daemon sees it.
-    pub type ServerConn = UnixStream;
-    /// A connection as the CLI sees it.
-    pub type ClientConn = UnixStream;
+    /// The byte stream the daemon serves gRPC over.
+    pub type Transport = UnixStream;
 
     /// The longest socket path `bind` accepts: `sun_path` minus its NUL.
     const MAX_SOCKET_PATH: usize = 107;
@@ -201,7 +213,7 @@ mod imp {
         }
 
         /// Accepts one connection.
-        pub async fn accept(&mut self) -> io::Result<ServerConn> {
+        pub async fn accept(&mut self) -> io::Result<Transport> {
             let (stream, _addr) = self.inner.accept().await?;
             Ok(stream)
         }
@@ -213,8 +225,8 @@ mod imp {
         }
     }
 
-    /// Connects to a running daemon.
-    pub async fn connect(data_dir: &Path) -> io::Result<ClientConn> {
+    /// Opens one connection to a running daemon.
+    pub async fn dial(data_dir: &Path) -> io::Result<Transport> {
         let path = socket_path(data_dir);
         match UnixStream::connect(&path).await {
             Ok(stream) => Ok(stream),
@@ -236,14 +248,10 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use tokio::net::windows::named_pipe::{
-        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
-    };
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
 
-    /// A connection as the daemon sees it.
-    pub type ServerConn = NamedPipeServer;
-    /// A connection as the CLI sees it.
-    pub type ClientConn = NamedPipeClient;
+    /// The byte stream the daemon serves gRPC over.
+    pub type Transport = NamedPipeServer;
 
     /// `ERROR_PIPE_BUSY`: every instance of the pipe is currently serving a
     /// client, so the caller should wait for a free one.
@@ -306,7 +314,7 @@ mod imp {
         }
 
         /// Waits for a client, then re-arms the next instance.
-        pub async fn accept(&mut self) -> io::Result<ServerConn> {
+        pub async fn accept(&mut self) -> io::Result<Transport> {
             let server = match self.next.take() {
                 Some(server) => server,
                 None => ServerOptions::new().create(&self.name)?,
@@ -317,8 +325,11 @@ mod imp {
         }
     }
 
-    /// Connects to a running daemon, waiting briefly if every instance is busy.
-    pub async fn connect(data_dir: &Path) -> io::Result<ClientConn> {
+    /// Opens one connection to a running daemon, waiting briefly if every
+    /// instance is busy.
+    pub async fn dial(
+        data_dir: &Path,
+    ) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
         let name = endpoint_name(data_dir);
         for _ in 0..40 {
             match ClientOptions::new().open(&name) {
@@ -341,7 +352,88 @@ mod imp {
 
 #[cfg(unix)]
 pub use imp::socket_path;
-pub use imp::{check_socket_path, connect, endpoint_name, ClientConn, Listener, ServerConn};
+pub use imp::{check_socket_path, dial, endpoint_name, Listener, Transport};
+
+/// One accepted connection, ready to be served gRPC over.
+///
+/// The wrapper exists to say what the platform stream cannot: [`Connected`] is
+/// how a tonic server learns about a connection, and neither a Unix socket nor
+/// a named pipe has anything to tell it — the peer is on this machine, holding
+/// this datadir's token, and that is the whole of its identity.
+#[derive(Debug)]
+pub struct Accepted(Transport);
+
+impl Accepted {
+    /// Wraps an accepted connection.
+    pub fn new(transport: Transport) -> Accepted {
+        Accepted(transport)
+    }
+}
+
+impl Connected for Accepted {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+impl AsyncRead for Accepted {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Accepted {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+/// Connects to the daemon owning `data_dir`.
+///
+/// The channel dials once, here, so "nothing is listening" is answered by this
+/// call rather than by the first request made over it.
+pub async fn connect(data_dir: &Path) -> io::Result<Channel> {
+    let data_dir = data_dir.to_path_buf();
+    let connector = tower::service_fn(move |_: Uri| {
+        let data_dir = data_dir.clone();
+        async move { Ok::<_, io::Error>(TokioIo::new(dial(&data_dir).await?)) }
+    });
+    Endpoint::from_static(LOCAL_AUTHORITY)
+        .connect_with_connector(connector)
+        .await
+        .map_err(unwrap_io)
+}
+
+/// Recovers the connector's own error from the transport failure wrapping it.
+///
+/// The wrapper's message is "transport error", which names neither the socket
+/// nor the command that starts a daemon; the error underneath names both.
+fn unwrap_io(e: tonic::transport::Error) -> io::Error {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(link) = source {
+        if let Some(inner) = link.downcast_ref::<io::Error>() {
+            return io::Error::new(inner.kind(), inner.to_string());
+        }
+        source = link.source();
+    }
+    io::Error::other(e.to_string())
+}
 
 #[cfg(test)]
 mod tests {
@@ -409,5 +501,19 @@ mod tests {
             .unwrap_or_else(|| panic!("{name}"));
         assert_eq!(suffix.len(), 16, "{name}");
         assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+    }
+
+    /// Nothing is listening, and the answer has to name the socket and the
+    /// command that starts one rather than "transport error" (§9.1).
+    #[tokio::test]
+    async fn connecting_to_nothing_names_the_socket_and_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = connect(dir.path()).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert!(err.to_string().contains("synch daemon run"), "{err}");
+        assert!(
+            err.to_string().contains(&endpoint_name(dir.path())),
+            "{err}"
+        );
     }
 }

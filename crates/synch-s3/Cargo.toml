@@ -16,7 +16,7 @@ path = "src/lib.rs"
 name = "synch-s3"
 path = "src/main.rs"
 
-# No store and no engine: the gateway is a control-socket client of the daemon
+# No store and no engine: the gateway is a control client of the daemon
 # and nothing more (§9.1, §9.4). `synch-cli` is where the control protocol
 # lives (§11); `synch-core` supplies the record types the protocol carries.
 [dependencies]

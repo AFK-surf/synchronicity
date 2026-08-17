@@ -981,7 +981,7 @@ files.
 ### 9.2 Command surface (v1)
 
 `synch init` and `synch daemon run` act on the datadir directly; every other command
-is a control-socket request to a running daemon (§9.3).
+is a control-service call to a running daemon (§9.3).
 
 ```
 synch init [--id <name>@<domain>]            create identity + database (no daemon)
@@ -1024,9 +1024,11 @@ synch doctor                                 connectivity, DNSSEC, equivocation,
                                              the trust policy in force and the clock it dates by
 ```
 
-### 9.3 The control socket
+### 9.3 The control service
 
-The CLI reaches the daemon over a local, single-user transport:
+The CLI reaches the daemon by gRPC over a local, single-user transport. The schema is
+`crates/synch-cli/proto/control.proto`, compiled at build time by `protox` — a pure-Rust
+protobuf compiler, so no `protoc` is needed on any machine that builds this.
 
 - **Unix**: a domain socket at `<data_dir>/control.sock`, created `0600` in a `0700`
   data directory. Stale sockets from a crashed daemon are detected by connect-then-
@@ -1034,29 +1036,41 @@ The CLI reaches the daemon over a local, single-user transport:
 - **Windows**: a named pipe, `\\.\pipe\synchronicity-<16 hex of the data dir path
   hash>`, so several nodes on one machine do not collide.
 
+The socket is never exposed beyond the local machine — remote access is what the iroh
+endpoint and `synch-s3` are for. HTTP/2 runs over it in the clear: the transport is a
+filesystem object with an owner, so a TLS handshake between two processes of the same
+user would authenticate nothing that the socket has not already established.
+
 Authentication is a 32-byte random token in `<data_dir>/control.token` (`0600`),
-regenerated on every daemon start and sent with every request. Filesystem permissions
-are the primary control on Unix; the token is what actually carries the check on
-Windows, where pipe ACLs are easy to get subtly wrong, and it also prevents a
-different user's client from talking to a pipe it managed to open. The socket is never
-exposed beyond the local machine — remote access is what the iroh endpoint and
-`synch-s3` are for.
+regenerated on every daemon start and sent as an `x-synch-control-token-bin` header on
+every call. Filesystem permissions are the primary control on Unix; the token is what
+actually carries the check on Windows, where pipe ACLs are easy to get subtly wrong,
+and it also prevents a different user's client from talking to a pipe it managed to
+open. An `x-synch-control-version` header travels beside it: client and daemon are
+normally the same binary, so a mismatch — reported with both versions named — catches
+the upgrade-while-running case rather than supporting mixed versions.
 
-Framing is length-prefixed `postcard`, the same as the network protocols (§5.1), with
-a `Request`/`Response` enum pair carrying one variant per command. Two properties the
-protocol needs beyond plain request/response:
+The service has two surfaces, which is what the split in `proto/control.proto` is:
 
-- **Streaming**: `synch cat`, `synch get`, and a long `synch ls` stream their payload
-  as a sequence of `Chunk` frames terminated by `End`, so a multi-gigabyte read is
-  never buffered in either process. Progress-reporting commands (`scan`, `mirror
-  sync`) stream `Progress` frames the CLI renders and discards.
-- **Version match**: the client sends a protocol version in the first frame; a
-  mismatch fails immediately with both versions named. Client and daemon are normally
-  the same binary, so this exists to catch the upgrade-while-running case rather than
-  to support mixed versions.
+- **`Run`** answers a CLI subcommand (§9.2). The command travels as a `oneof` of one
+  message per subcommand, carrying arguments as the text the user typed — references
+  and keys are parsed by the daemon, so a parse failure comes back as an ordinary
+  coded error. The response is a server stream of `line`, `chunk`, and `progress`
+  frames: `synch cat`, `synch get`, and a long `synch ls` stream their payload in
+  bounded chunks, so a multi-gigabyte read is never buffered in either process, and
+  progress-reporting commands (`scan`, `mirror sync`) emit reports the CLI renders and
+  discards.
+- **`List`, `Resolve`, `Read`, `Put`, `GetConfig`, `AppendConfig`** answer a *program*
+  — the S3 gateway (§9.4) — in the data itself rather than in rendered lines, naming
+  space, path, and policy as separate fields. An S3 key may contain a colon, which the
+  `[<origin>:]<space>/<path>` text form would read as an origin, so the gateway cannot
+  go through the text parser at all.
 
-Errors cross the socket as structured values (a code plus a message), so the CLI
-renders a daemon-side failure as its own exit status rather than a transport error.
+Failures cross as a gRPC status carrying an `x-synch-error-code` trailer: the CLI
+renders a daemon-side failure as its own exit status rather than a transport error,
+and the gateway maps it to an HTTP status. The trailer exists because more codes are
+meaningful here — `not-initialized`, `divergent`, `unavailable` — than gRPC has status
+codes to keep apart.
 
 ### 9.4 S3-compatible gateway (`synch-s3`)
 
@@ -1064,19 +1078,19 @@ The second binary target exposes a subset of the S3 HTTP API, so existing S3
 tooling (aws cli, rclone, restic, mc, the SDKs) can read and write a synchronicity
 cluster without knowing anything about it.
 
-**The gateway is a control-socket client of the daemon — nothing more.** It never
+**The gateway is a control client of the daemon — nothing more.** It never
 opens the database, never binds an iroh endpoint, and holds no persistent state of
 its own; its only datadir touch is reading `control.token`, exactly like the CLI.
 This is §9.1's one-writer/one-endpoint rule applied to the gateway, and it is not
 optional hygiene: a second process computing `next_seq` beside the daemon can sign
 two heads at the same seq — self-equivocation broadcast cluster-wide, with the
 losing batch's files recorded as scanned but present in no surviving root. Every
-gateway operation is a daemon request: reads stream over the socket's `Chunk`
-frames straight into the HTTP response, writes stream the HTTP body over the
-socket into the daemon's ingest-and-publish path, and bucket/access-key
-configuration is stored by the daemon (config namespace `s3.*`) via dedicated
-requests — so `synch-s3 bucket add`/`key add` are socket clients too, and the
-daemon remains the only writer and the only endpoint. Objects of any size flow
+gateway operation is a daemon call: `Read`'s chunks stream straight into the HTTP
+response, `Put` streams the HTTP body into the daemon's ingest-and-publish path,
+and bucket/access-key configuration is stored by the daemon (config namespace
+`s3.*`) through `GetConfig`/`AppendConfig` — so `synch-s3 bucket add`/`key add`
+are control clients too, and the daemon remains the only writer and the only
+endpoint. Objects of any size flow
 through both directions **without either process buffering more than a chunk**.
 
 - **Bucket mapping**: a bucket names a space of the unified tree plus a version
@@ -1297,15 +1311,16 @@ synchronicity/
 │   ├── synch-net      # iroh endpoint, ALPN handlers: mptsync + blob protocols, DNSSEC resolver
 │   ├── synch-engine   # the embeddable node API: scanner/watcher/publisher, anti-entropy
 │   │                  # scheduler, fetcher, mirrors — everything a host app needs
-│   ├── synch-cli      # binary target `synch`: the daemon, the control-socket
-│   │                  # server and client, and the clap CLI that drives it
+│   ├── synch-cli      # binary target `synch`: the daemon, the control service
+│   │                  # (schema, server, client), and the clap CLI that drives it
 │   └── synch-s3       # binary target `synch-s3`: S3-compatible gateway (§9.4)
 └── .github/workflows/ # ci.yml, release.yml (below)
 ```
 
 Key dependencies: `iroh`, `bao-tree`, `blake3`, `ed25519-dalek` (via iroh),
 `rusqlite` (bundled), `notify`, `hickory-resolver` (dnssec), `tokio`, `postcard`,
-`serde`, `clap`, `tracing`, `directories`; `axum`/`hyper` (rustls) for `synch-s3`.
+`serde`, `clap`, `tracing`, `directories`; `tonic`/`prost` (with `protox` at build
+time) for the control service; `axum`/`hyper` (rustls) for `synch-s3`.
 
 Testing strategy:
 
@@ -1314,7 +1329,7 @@ Testing strategy:
 - `mptsync`: in-memory duplex-transport simulation of N nodes with random partitions,
   message loss, and interleaved publishes; assert convergence of all heads and tries.
 - `synch-engine`: temp-dir integration tests across 2–3 real endpoints on localhost.
-- `synch-cli`: control-socket round-trips against a daemon in a temp datadir on both
+- `synch-cli`: control round-trips against a daemon in a temp datadir on both
   transports — every command variant, a streamed multi-megabyte `cat`, a rejected bad
   token, a version mismatch, a stale socket left by a killed daemon, and the
   no-daemon error path.
