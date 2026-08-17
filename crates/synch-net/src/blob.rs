@@ -269,7 +269,7 @@ impl BlobProtocol {
                 // goes to the blocking pool with everything else (§10).
                 let store = self.store.clone();
                 let (encoded, served) = crate::blocking::offload(move || {
-                    match store.encode_proof(&root, &ranges, level) {
+                    match store.encode_proof(&root, &ranges, level, MAX_PROOF_NODES) {
                         Ok(pair) => Ok(pair),
                         Err(synch_store::StoreError::MissingBlob(_)) => {
                             Ok((Vec::new(), ChunkRanges::empty()))

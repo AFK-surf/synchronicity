@@ -534,19 +534,21 @@ impl Store {
     ///
     /// The outboard is read positionally, one node at a time, never slurped:
     /// the span-level round over a 100 GB object touches a few thousand of its
-    /// 390 MB of tree.
+    /// Encodes the interior tree over `requested` at `level`, up to `budget`
+    /// nodes, and reports the ranges it covers.
+    ///
+    /// The budget is a parameter rather than a constant read from
+    /// `synch_core`. It is a *frame* bound — how much of an answer fits one
+    /// exchange — and the frame belongs to the layer that writes it, so
+    /// `synch-net` supplies `MAX_PROOF_NODES` at the call site. The tell that
+    /// it wanted to be a parameter was already here: this used to be a public
+    /// wrapper over a private `encode_proof_bounded` whose only reason to exist
+    /// was "so that the clamping can be exercised without a 128 GB object". The
+    /// test-only variant is now the real one.
+    ///
+    /// An over-budget request is refused rather than truncated; see the walk
+    /// below for why that is safe once the requester sizes its own windows.
     pub fn encode_proof(
-        &self,
-        root: &Hash,
-        requested: &ChunkRanges,
-        level: u8,
-    ) -> Result<(Vec<u8>, ChunkRanges)> {
-        self.encode_proof_bounded(root, requested, level, MAX_PROOF_NODES)
-    }
-
-    /// [`Store::encode_proof`] with the window bound spelled out, so that the
-    /// clamping can be exercised without a 128 GB object.
-    fn encode_proof_bounded(
         &self,
         root: &Hash,
         requested: &ChunkRanges,
@@ -1220,7 +1222,9 @@ mod tests {
         let root = provider.ingest_bytes(&bytes, 0).unwrap();
         let all = ChunkRanges::single(0, group_count(size));
 
-        let (encoded, served) = provider.encode_proof(&root, &all, 0).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
         assert_eq!(served, all);
         let proven = fetcher
             .write_proof(&root, size, &served, 0, &encoded, 0)
@@ -1258,9 +1262,13 @@ mod tests {
         let all = ChunkRanges::single(0, group_count(size));
 
         // Spans of four groups: five of them, and the tree above them.
-        let (encoded, served) = provider.encode_proof(&root, &all, 2).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 2, MAX_PROOF_NODES)
+            .unwrap();
         assert_eq!(served, all);
-        let (leaf_encoded, _) = provider.encode_proof(&root, &all, 0).unwrap();
+        let (leaf_encoded, _) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
         assert!(
             encoded.len() * 3 < leaf_encoded.len(),
             "a span proof is much cheaper than a leaf proof: {} vs {}",
@@ -1297,7 +1305,9 @@ mod tests {
         let size = new.len() as u64;
 
         let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = holder.encode_proof(&new_root, &all, 2).unwrap();
+        let (encoded, served) = holder
+            .encode_proof(&new_root, &all, 2, MAX_PROOF_NODES)
+            .unwrap();
         let proven = store
             .write_proof(&new_root, size, &served, 2, &encoded, 0)
             .unwrap();
@@ -1340,7 +1350,9 @@ mod tests {
         let groups = group_count(size);
 
         let all = ChunkRanges::single(0, groups);
-        let (encoded, served) = provider.encode_proof(&new_root, &all, 0).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&new_root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
         let proven = fetcher
             .write_proof(&new_root, size, &served, 0, &encoded, 0)
             .unwrap();
@@ -1393,7 +1405,9 @@ mod tests {
         let all = ChunkRanges::single(0, group_count(size));
 
         // Spans of sixteen groups, three of which are untouched.
-        let (encoded, served) = provider.encode_proof(&new_root, &all, 4).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&new_root, &all, 4, MAX_PROOF_NODES)
+            .unwrap();
         let spans = fetcher
             .write_proof(&new_root, size, &served, 4, &encoded, 0)
             .unwrap();
@@ -1433,7 +1447,9 @@ mod tests {
         let size = new.len() as u64;
 
         let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider.encode_proof(&new_root, &all, 0).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&new_root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
         let proven = fetcher
             .write_proof(&new_root, size, &served, 0, &encoded, 0)
             .unwrap();
@@ -1477,7 +1493,9 @@ mod tests {
         let mut promoted = ChunkRanges::empty();
         for level in [2u8, 0] {
             let want = all.difference(&promoted);
-            let (encoded, served) = provider.encode_proof(&new_root, &want, level).unwrap();
+            let (encoded, served) = provider
+                .encode_proof(&new_root, &want, level, MAX_PROOF_NODES)
+                .unwrap();
             let proven = fetcher
                 .write_proof(&new_root, size, &served, level, &encoded, 0)
                 .unwrap();
@@ -1536,7 +1554,9 @@ mod tests {
 
         // Spans of four groups. A bit flips inside the donor's outboard, under
         // the span covering groups 4..8, behind the store's back.
-        let (encoded, served) = provider.encode_proof(&new_root, &all, 2).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&new_root, &all, 2, MAX_PROOF_NODES)
+            .unwrap();
         let proven = fetcher
             .write_proof(&new_root, size, &served, 2, &encoded, 0)
             .unwrap();
@@ -1597,7 +1617,9 @@ mod tests {
         let donor = fetcher.ingest_bytes(&mine, 0).unwrap();
 
         let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider.encode_proof(&my_root, &all, 0).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&my_root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
 
         // The forgery attempt: my object's proof bytes, offered as theirs.
         assert!(
@@ -1655,7 +1677,9 @@ mod tests {
         let donor = fetcher.ingest_bytes(&donor_bytes, 0).unwrap();
 
         let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider.encode_proof(&root, &all, 0).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
 
         // A proof cannot be *taken* at a length the object does not have.
         let short = 16 * GROUP as u64;
@@ -1711,7 +1735,9 @@ mod tests {
 
             let all = ChunkRanges::single(0, group_count(size));
             let (slice, slice_served) = provider.encode_slice(&root, &all).unwrap();
-            let (proof, proof_served) = provider.encode_proof(&root, &all, 0).unwrap();
+            let (proof, proof_served) = provider
+                .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+                .unwrap();
 
             std::thread::scope(|scope| {
                 let (victim, root) = (&victim, &root);
@@ -1757,7 +1783,9 @@ mod tests {
         assert_eq!(group_count(lie), group_count(size));
 
         let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider.encode_proof(&root, &all, 0).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
         victim
             .write_proof(&root, lie, &served, 0, &encoded, 0)
             .expect("the proof verifies: the lie is invisible in the tree");
@@ -1799,7 +1827,9 @@ mod tests {
         let size = new.len() as u64;
 
         let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider.encode_proof(&new_root, &all, 0).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&new_root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
         let proven = fetcher
             .write_proof(&new_root, size, &served, 0, &encoded, 0)
             .unwrap();
@@ -1817,7 +1847,9 @@ mod tests {
         let root = provider.ingest_bytes(&bytes, 0).unwrap();
         let all = ChunkRanges::single(0, group_count(size));
 
-        let (encoded, served) = provider.encode_proof(&root, &all, 0).unwrap();
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
         for flip in [0usize, 63, 64, encoded.len() - 1] {
             let mut tampered = encoded.clone();
             tampered[flip] ^= 0xff;
@@ -1868,7 +1900,7 @@ mod tests {
 
         // A budget far below what a leaf-level proof of the whole object needs.
         let err = provider
-            .encode_proof_bounded(&root, &all, 0, 12)
+            .encode_proof(&root, &all, 0, 12)
             .expect_err("an over-budget request must be refused");
         assert!(err.to_string().contains("budget"), "{err}");
 
@@ -1876,9 +1908,7 @@ mod tests {
         // comes back verifies and covers exactly what was asked for.
         let window = ChunkRanges::single(0, 8);
         assert!(synch_core::proof_nodes_upper_bound(&window, 0) <= 12 + 64);
-        let (encoded, served) = provider
-            .encode_proof_bounded(&root, &window, 0, 128)
-            .unwrap();
+        let (encoded, served) = provider.encode_proof(&root, &window, 0, 128).unwrap();
         assert_eq!(served, window, "a sized window is never short");
 
         let (_d2, fetcher) = store();
@@ -1889,9 +1919,7 @@ mod tests {
 
         // And the next window picks up exactly where this one stopped.
         let rest = all.difference(&served);
-        let (_, next) = provider
-            .encode_proof_bounded(&root, &rest, 0, 4096)
-            .unwrap();
+        let (_, next) = provider.encode_proof(&root, &rest, 0, 4096).unwrap();
         assert_eq!(next.ranges[0].start, served.ranges[0].end);
     }
 
@@ -1911,7 +1939,9 @@ mod tests {
             .unwrap();
 
         let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = partial.encode_proof(&root, &all, 0).unwrap();
+        let (encoded, served) = partial
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
         assert_eq!(served, half);
         // What it served is a proof against the same root, from a node that
         // holds half the object.
@@ -1931,7 +1961,7 @@ mod tests {
             let bytes = data(size);
             let root = store.ingest_bytes(&bytes, 0).unwrap();
             let all = ChunkRanges::single(0, group_count(bytes.len() as u64));
-            let (encoded, served) = store.encode_proof(&root, &all, 0).unwrap();
+            let (encoded, served) = store.encode_proof(&root, &all, 0, MAX_PROOF_NODES).unwrap();
             assert!(encoded.is_empty(), "{size} bytes");
             assert_eq!(served, all, "{size} bytes");
             // And promoting into one is a no-op rather than an error: inline

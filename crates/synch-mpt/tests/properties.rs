@@ -195,6 +195,11 @@ proptest! {
 
     /// Every key in a complete trie has a proof that verifies, and every absent
     /// key has a verifying proof of absence.
+    ///
+    /// Behind the `proofs` feature with the module it exercises: single-key
+    /// proofs are a §13 capability with no v1 caller, so they are not part of
+    /// the default build (DESIGN.md §4.3).
+    #[cfg(feature = "proofs")]
     #[test]
     fn proofs_verify(items in map_strategy(), probes in prop::collection::vec(key_strategy(), 0..8)) {
         let store = MemStore::new();
