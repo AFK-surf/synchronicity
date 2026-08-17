@@ -71,12 +71,28 @@ pub enum FetchOutcome {
 #[derive(Debug, Clone)]
 pub struct Syncer {
     store: Arc<Store>,
+    /// Rung when a promotion flips a head to complete: the unified tree just
+    /// changed, and anything materializing it — mirrors — should look again.
+    on_change: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Syncer {
     /// Binds a syncer to a store.
     pub fn new(store: Arc<Store>) -> Self {
-        Syncer { store }
+        Syncer {
+            store,
+            on_change: None,
+        }
+    }
+
+    /// Rings `wake` whenever a head flips to complete (§5.2).
+    ///
+    /// Every merge path ends in [`Syncer::try_promote`] — the Hello exchange
+    /// in either direction, a pushed head whose trie was already here, a
+    /// pending head's completed fetch — so this one bell covers all of them.
+    pub fn on_change(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.on_change = wake;
+        self
     }
 
     /// The store this syncer reconciles into.
@@ -240,6 +256,11 @@ impl Syncer {
         match promoted {
             Some(head) => {
                 tracing::debug!(origin = %origin, seq = head.seq, "head flipped to complete");
+                if let Some(wake) = &self.on_change {
+                    // One permit no matter how often this rings: passes
+                    // coalesce, and a wake landing mid-pass is not lost.
+                    wake.notify_one();
+                }
                 Ok(true)
             }
             None => Ok(false),

@@ -27,8 +27,9 @@ use crate::{
 /// where the kernel grants them, a scheduler tick (1–10 ms) where it uses the
 /// coarse clock, and the full-second stamps of older filesystems. Inside the
 /// window a same-size in-place rewrite can share the hashed write's mtime,
-/// so the stat proves nothing and the bytes are hashed again.
-const RACY_WINDOW_NS: i64 = 2_000_000_000;
+/// so the stat proves nothing and the bytes are hashed again. The mirror's
+/// currency check (mirror.rs) trusts a verified record under the same window.
+pub(crate) const RACY_WINDOW_NS: i64 = 2_000_000_000;
 
 /// What one scan found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -871,8 +872,9 @@ pub(crate) fn mtime_nanos(metadata: &std::fs::Metadata) -> i64 {
 
 /// A platform file identity, when one is cheaply available.
 ///
-/// Together with size and mtime this is what lets the scanner skip hashing.
-fn file_identity(metadata: &std::fs::Metadata) -> Option<Vec<u8>> {
+/// Together with size and mtime this is what lets the scanner skip hashing,
+/// and what lets a mirror trust a verified file without reading it back.
+pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> Option<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

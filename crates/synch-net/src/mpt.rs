@@ -54,6 +54,13 @@ impl MptProtocol {
         self
     }
 
+    /// Rings `wake` whenever a head this session accepts flips to complete —
+    /// the serve side's half of the change bell (`Syncer::on_change`).
+    pub fn on_change(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.syncer = self.syncer.on_change(wake);
+        self
+    }
+
     fn store(&self) -> &Arc<Store> {
         self.syncer.store()
     }

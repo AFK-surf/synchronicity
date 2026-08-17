@@ -1209,3 +1209,52 @@ async fn a_mirror_re_ingests_its_own_copy_when_the_cas_has_dropped_it() {
     nas.node.shutdown().await.unwrap();
     vps.node.shutdown().await.unwrap();
 }
+
+/// §7.2 end to end: a mirror on a node that is never asked to sync follows
+/// the tree as the node learns it. The exchange flips the head to complete,
+/// which rings the mirror bell, and the standing loop's pass does the rest.
+#[tokio::test]
+async fn a_mirror_follows_the_tree_as_the_node_learns_it() {
+    let nas = spawn("nas").await;
+    let vps = spawn("vps").await;
+    introduce(&[&nas, &vps]);
+
+    // The standing loop, as the daemon would run it.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let runner = vps.node.clone();
+    let mirror_loop = tokio::spawn(async move {
+        runner
+            .run_mirrors(async {
+                let _ = rx.await;
+            })
+            .await;
+    });
+
+    let target = tempfile::tempdir().unwrap();
+    vps.node
+        .add_mirror("media", target.path(), &VersionPolicy::Newest)
+        .unwrap();
+
+    nas.node.add_space("media", nas.space.path()).unwrap();
+    std::fs::write(nas.space.path().join("clip.txt"), b"on air").unwrap();
+    nas.node.scan_publish_push().await.unwrap();
+
+    // The exchange completes the head's trie; no `sync_mirror` call follows.
+    vps.node.sync_with_peer(&nas.node.node_id()).await.unwrap();
+    let mirrored = target.path().join("clip.txt");
+    for _ in 0..500 {
+        if mirrored.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(std::fs::read(&mirrored).unwrap(), b"on air");
+
+    tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), mirror_loop)
+        .await
+        .expect("the mirror loop must stop promptly")
+        .unwrap();
+    nas.node.shutdown().await.unwrap();
+    vps.node.shutdown().await.unwrap();
+}

@@ -88,7 +88,7 @@ What still verifies, and always will:
 | Re-ingest of a mirrored file | `ingest_file` hashes by construction |
 | A range read | `read_range` is a bao decode against the root |
 | Serving a slice | `encode_ranges_validated` |
-| The mirror's currency check | the target file is user-mutable, so its root is recomputed every pass — drift detection, not CAS scrubbing |
+| The mirror's currency check | the target file is user-mutable, so a path no record vouches for is re-hashed; a file the pass wrote or hashed itself is believed by its stat — drift detection, not CAS scrubbing |
 
 ## 3. Design overview
 
@@ -368,31 +368,27 @@ file's name. Then:
 
 `MirrorReport::reflinked` counts the files that cost no data movement.
 
-**Non-convergence, and the one loop the currency check cannot break.** A mirror
-pass decides "already current?" by hashing the file on disk (§7.2), and rewrites
-it when the hash is wrong. That converges on every ordinary cause of a wrong
-hash — a torn write, a local edit, a version this pass supersedes. It does not
-converge when the *CAS payload* is the thing that is wrong: the row calls the
-object complete, the fetch finds every group held, materialization clones the
-payload without re-reading it (§2.1), and the next pass hashes the same file,
-finds the same wrong answer, and writes the same bytes again. `written`
-increments forever and `skipped` stays empty, which is a mirror reporting
-progress while making none.
+**Currency: a stat, not a hash.** A mirror pass decides "already current?"
+the way the scanner decides "unchanged?" for the node's own spaces: a file the
+pass wrote or hashed itself is believed by its record — the content root,
+length, stored mtime, and platform identity, believed past the scanner's racy
+window — and only a path no record vouches for is hashed. A quiet pass costs
+the tree's syscalls rather than its bytes, which is what makes "the engine
+keeps the directory in sync" (§7.2) cheap enough to actually run. The anchor
+is deliberately stronger than the scanner's: the published mtime is
+peer-chosen data, so a file is never believed for *matching the entry* — only
+for matching the record of what this process itself wrote or hashed.
 
-So a pass remembers, per target, what content root it wrote there and the length
-and mtime of the payload it wrote it from. When the next pass is about to write
-the *same* root from the *same* payload over a file that still does not hash to
-it, the payload is named as the suspect in `skipped` and the file is left alone.
-The bytes are still never re-verified — the memory is a stat, not a hash.
-
-Two limits, both deliberate. It lives in memory, per process: a restart forgets
-it and costs one more rewrite before the loop is noticed again, which is cheaper
-than a durable "suspect object" record nothing could ever clear. And it
-identifies the payload by length and mtime, which is enough to notice a payload
-that has been *replaced* — by `synch blob rm` and a refetch, by a restore, by the
-filesystem's own repair — so the mirror converges on the very next pass after a
-repair; a payload rewritten with the same length and the same mtime is
-indistinguishable here and stays suspect until the daemon restarts.
+The record is in memory, per process, and the price is paid on restart: the
+first pass of every mirror hashes the whole tree once, and that pass doubles
+as the mirror's only scrub — whatever has drifted or rotted is found and
+rewritten there. Between restarts, what a stat that never moved hides stays
+hidden: a same-size rewrite that restores length, mtime, and identity, and
+bytes that rot at rest beneath the record — including a CAS payload already
+rotted before a pass wrote from it. Both are the filesystem-integrity domain
+§2.1 delegates, and neither can send the pass into a rewrite loop: a written
+file is recorded and a recorded file is believed, so the pass converges by
+construction rather than by guard.
 
 **The trade-off, stated plainly.** A mirror on a *different filesystem from the
 CAS* keeps the whole network win — the delta happens in the CAS, before the

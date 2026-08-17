@@ -31,7 +31,7 @@ use synch_store::{EntryRow, MirrorRow, VersionPolicy};
 
 use crate::{
     error::{EngineError, Result},
-    node::{paths_overlap, stored_root, Node},
+    node::{paths_overlap, stored_root, MirrorWrite, Node},
 };
 
 /// What one mirror pass did.
@@ -102,6 +102,9 @@ impl Node {
             }
         }
         self.store().put_mirror(&key, space, policy)?;
+        // Wake the standing loop rather than letting the mirror wait out the
+        // interval for its first pass.
+        self.mirror_wake().notify_one();
         Ok(key)
     }
 
@@ -129,6 +132,10 @@ impl Node {
     }
 
     async fn sync_mirror_row(&self, mirror: &MirrorRow) -> Result<MirrorReport> {
+        // Passes serialize node-wide: whether the standing loop or `synch
+        // mirror sync` asked, two passes over one root would plan against
+        // each other's half-written state.
+        let _pass = self.lock_mirrors().await;
         let root_dir = PathBuf::from(&mirror.local_path);
 
         // A pass runs in three phases, because only the middle one is
@@ -211,7 +218,6 @@ impl Node {
             let root = root_dir.clone();
             let path = want.path.clone();
             let written_target = want.target.clone();
-            let written_content = want.content;
             let outcome = crate::blocking::offload(move || {
                 if escapes_via_symlink(&root, &path) {
                     return Ok(Written::Escaped);
@@ -228,31 +234,34 @@ impl Node {
                 // after, and a filesystem that refuses the stamp — a mount
                 // that will not take the mode, a foreign owner — is reported
                 // rather than allowed to fail the whole pass.
-                Ok(match apply_metadata(&want.target, want.meta) {
-                    Ok(()) => Written::Fully(kind),
-                    Err(e) => Written::WithoutMetadata(kind, e.to_string()),
+                let stamped = apply_metadata(&want.target, want.meta);
+                // No read-back: a successful write is trusted the way the CAS
+                // trusts its own payloads (§2.1). What later passes trust is
+                // the record anchored to the fresh stat — anything that moves
+                // the file moves the stat, and the next pass hashes again.
+                Ok(match MirrorWrite::of(&want.target, want.content) {
+                    Some(record) => match stamped {
+                        Ok(()) => Written::Fully(kind, record),
+                        Err(e) => Written::WithoutMetadata(kind, record, e.to_string()),
+                    },
+                    None => Written::Failed(
+                        "the file was gone before its write could be recorded".into(),
+                    ),
                 })
             })
             .await?;
-            // Remembered whenever the bytes landed, so the pass after this one
-            // can tell a file it wrote and got wrong from one it has not tried
-            // yet (`Node::note_mirror_write`).
-            if matches!(outcome, Written::Fully(_) | Written::WithoutMetadata(_, _)) {
-                let payload = payload_fingerprint(self, &written_content);
-                self.note_mirror_write(
-                    &written_target,
-                    crate::node::MirrorWrite {
-                        content: written_content,
-                        payload,
-                    },
-                );
+            // Remembered whenever the bytes landed, so later passes can
+            // believe the file's stat instead of re-hashing it
+            // (`Node::note_mirror_write`).
+            if let Written::Fully(_, record) | Written::WithoutMetadata(_, record, _) = &outcome {
+                self.note_mirror_write(&written_target, record.clone());
             }
             match outcome {
-                Written::Fully(kind) => {
+                Written::Fully(kind, _) => {
                     report.written += 1;
                     report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
                 }
-                Written::WithoutMetadata(kind, why) => {
+                Written::WithoutMetadata(kind, _, why) => {
                     report.written += 1;
                     report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
                     report.skipped.push((
@@ -274,22 +283,96 @@ impl Node {
         // origin's entry for it gone, tombstones included — leaves the mirror
         // too. The listing cannot report those, so the last step is to look at
         // what is on disk and drop whatever the tree no longer names.
-        report.removed += crate::blocking::offload(move || {
+        let removed = crate::blocking::offload(move || {
             let root = root_dir;
             sweep(&root, &root, &known)
         })
         .await?;
+        report.removed += removed.len();
+        // Whatever was proven about those targets proves nothing now: a file
+        // that comes back under the same path starts unproven.
+        for path in removed {
+            self.forget_mirror_write(&path);
+        }
         Ok(report)
     }
 
-    /// Brings every configured mirror up to date.
-    pub async fn sync_all_mirrors(&self) -> Result<Vec<(String, MirrorReport)>> {
+    /// Brings every configured mirror up to date, one pass each.
+    ///
+    /// A mirror whose pass fails is reported in its slot rather than stopping
+    /// the rest: this is the standing loop's body, and one broken mirror must
+    /// not starve the others.
+    pub async fn sync_all_mirrors(&self) -> Result<Vec<(String, Result<MirrorReport>)>> {
         let mut out = Vec::new();
         for mirror in self.store().mirrors()? {
-            let report = self.sync_mirror_row(&mirror).await?;
-            out.push((mirror.local_path, report));
+            let path = mirror.local_path.clone();
+            let report = self.sync_mirror_row(&mirror).await;
+            out.push((path, report));
         }
         Ok(out)
+    }
+
+    /// Runs the standing mirror loop until `shutdown` resolves (§7.2).
+    ///
+    /// A pass runs on every wake — a head flipping complete on any exchange,
+    /// a local publish, a freshly added mirror — and one runs before the
+    /// first wait, so a tree the node already holds materializes at startup
+    /// rather than on the first change. The `mirror_interval` fallback is the
+    /// backstop for drift nobody rang about: a `chmod` moves nothing a record
+    /// holds, and only a pass repairs it.
+    pub async fn run_mirrors(&self, shutdown: impl std::future::Future<Output = ()>) {
+        let shutdown = std::pin::pin!(shutdown);
+        let mut shutdown = shutdown;
+        let wake = self.mirror_wake();
+        loop {
+            self.sync_all_mirrors_logged().await;
+            tokio::select! {
+                _ = &mut shutdown => return,
+                _ = wake.notified() => {}
+                _ = tokio::time::sleep(crate::aae::jittered(self.config().mirror_interval)) => {}
+            }
+        }
+    }
+
+    /// One pass over every mirror, logged rather than streamed: the standing
+    /// loop has no client on the other end. A quiet pass says nothing — a
+    /// tree this size reports `current` on every interval, and that is not
+    /// news.
+    async fn sync_all_mirrors_logged(&self) {
+        match self.sync_all_mirrors().await {
+            Ok(reports) => {
+                for (path, report) in reports {
+                    match report {
+                        Ok(report)
+                            if report.written + report.removed + report.retouched > 0
+                                || !report.skipped.is_empty() =>
+                        {
+                            tracing::info!(
+                                path = %path,
+                                written = report.written,
+                                current = report.current,
+                                retouched = report.retouched,
+                                removed = report.removed,
+                                skipped = report.skipped.len(),
+                                fetched_bytes = report.fetched_bytes,
+                                reused_bytes = report.reused_bytes,
+                                "mirror pass"
+                            );
+                            for (skipped, reason) in &report.skipped {
+                                tracing::info!(path = %path, skipped = %skipped, reason = %reason, "mirror skipped a path");
+                            }
+                        }
+                        Ok(report) => {
+                            tracing::debug!(path = %path, current = report.current, "mirror pass")
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %path, error = %e, "mirror pass failed")
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not list mirrors"),
+        }
     }
 }
 
@@ -314,10 +397,11 @@ struct WantedContent {
 /// How one write in phase 2 ended.
 #[derive(Debug)]
 enum Written {
-    /// Bytes and metadata both, and how the bytes got there.
-    Fully(crate::CloneKind),
+    /// Bytes and metadata both, how the bytes got there, and the record
+    /// later passes will trust.
+    Fully(crate::CloneKind, MirrorWrite),
     /// The bytes landed; the filesystem refused the metadata.
-    WithoutMetadata(crate::CloneKind, String),
+    WithoutMetadata(crate::CloneKind, MirrorWrite, String),
     /// Refused by the symlink-escape guard: nothing was written.
     Escaped,
     /// The object could not be materialized. The target is as it was.
@@ -379,6 +463,7 @@ fn plan_pass(
                 // is not in this mirror's view.
                 synch_store::Selection::Absent => {
                     report.removed += remove_if_present(&target)?;
+                    node.forget_mirror_write(&target);
                     continue;
                 }
                 // A `strict` mirror never guesses (§7.2) — and that includes
@@ -390,6 +475,9 @@ fn plan_pass(
                 synch_store::Selection::Divergent => {
                     let removed = remove_if_present(&target)?;
                     report.removed += removed;
+                    if removed > 0 {
+                        node.forget_mirror_write(&target);
+                    }
                     report.skipped.push((
                         set.path.clone(),
                         format!(
@@ -411,6 +499,7 @@ fn plan_pass(
             // a tombstone — the deletion is the assertion this mirror follows.
             if selected.kind == EntryKind::Tombstone {
                 report.removed += remove_if_present(&target)?;
+                node.forget_mirror_write(&target);
                 continue;
             }
             if selected.kind == EntryKind::Dir {
@@ -449,11 +538,41 @@ fn plan_pass(
                 continue;
             };
             let meta = Metadata::of(&selected);
-            // The currency check: whenever the file on the disk is the right
-            // length it is hashed, because that hash *is* the answer to "is
-            // this already the selected version?". A file of the wrong length
-            // is not hashed here — it cannot be current — and may still be
-            // hashed below, if delta turns out to want to know what it is.
+            // The currency check: is the file on disk already the selected
+            // version? A record this process holds answers with a stat — the
+            // mirror wrote or hashed the file itself, and length, stored
+            // mtime, and platform identity all still match, past the racy
+            // window — because nothing that moves the file leaves the stat
+            // standing. Without a record the content speaks for itself: a
+            // file of the right length is hashed, because that hash *is* the
+            // answer, and the answer becomes the record.
+            let recorded = node.mirror_write_was(&target);
+            if let Some(recorded) = &recorded {
+                if let Ok(stat) = std::fs::metadata(&target) {
+                    if stat.is_file() && still_current(recorded, &stat, &content) {
+                        // Believed without a read. Only the metadata can have
+                        // drifted: a bare chmod moves nothing the record
+                        // holds.
+                        if metadata_matches(&target, meta) {
+                            report.current += 1;
+                        } else if let Err(e) = apply_metadata(&target, meta) {
+                            report.skipped.push((
+                                set.path.clone(),
+                                format!(
+                                    "content is current, but its metadata could not be reproduced: {e}"
+                                ),
+                            ));
+                        } else {
+                            // The stamp moved the mtime; re-anchor the record
+                            // to the stat it leaves behind.
+                            note_record(node, &target, content);
+                            report.retouched += 1;
+                        }
+                        continue;
+                    }
+                }
+            }
+
             let on_disk = same_size_root(&target, selected.size);
             if on_disk == Some(content) {
                 // Right bytes, and possibly the wrong mode or mtime: a local
@@ -462,9 +581,6 @@ fn plan_pass(
                 // touching the content. Repairing it is a `stat` and a syscall
                 // or two — refetching the object to fix a permission bit is
                 // not.
-                // Whatever this pass or an earlier one wrote here landed: the
-                // suspicion the guard below carries is discharged.
-                node.forget_mirror_write(&target);
                 if metadata_matches(&target, meta) {
                     report.current += 1;
                 } else if let Err(e) = apply_metadata(&target, meta) {
@@ -477,46 +593,19 @@ fn plan_pass(
                 } else {
                     report.retouched += 1;
                 }
+                // The hash just proved the file; anchor the record to the
+                // stat the pass leaves behind (a retouch moved the mtime).
+                // This is also what graduates a racily-clean record: once the
+                // proof is comfortably newer than the mtime it vouches for,
+                // later passes trust the stat and skip this hash.
+                note_record(node, &target, content);
                 continue;
             }
 
-            // The file is not the selected version — and the previous pass
-            // wrote the selected version here. Writing it again would produce
-            // the same bytes from the same payload and leave the file exactly as
-            // wrong as it is now: the mirror would report `written` on every
-            // pass, forever, and never converge. What that pattern means is a
-            // CAS payload that rotted at rest under a row that still calls the
-            // object complete — the one wrong-hash cause the currency check
-            // cannot fix, because nothing upstream of it doubts the object
-            // (`docs/DELTA-SYNC.md` §2.1, §6).
-            //
-            // So the payload is named as the suspect and the path is left as it
-            // is. Deleting the object is not this pass's call to make — it may
-            // be pinned, it may be another mirror's current version, and the
-            // operator is the one who can say whether the disk under it is
-            // failing — but reporting it is, and `synch blob rm` followed by a
-            // pass will refetch it from a provider.
-            //
-            // A file that is not *there* proves nothing and is not guarded: it
-            // may never have been written, or a pass in between may have removed
-            // it for a tombstone the policy has since stopped selecting.
+            // The file is not the selected version. A file that is not there
+            // proves nothing, and whatever was recorded about it is stale.
             if on_disk.is_none() {
                 node.forget_mirror_write(&target);
-            } else if node.mirror_write_was(&target)
-                == Some(crate::node::MirrorWrite {
-                    content,
-                    payload: payload_fingerprint(node, &content),
-                })
-            {
-                report.skipped.push((
-                    set.path.clone(),
-                    format!(
-                        "written from {content} on the previous pass and the file still does \
-                         not hash to it: the CAS payload for that object is suspect, so this \
-                         pass is not writing it again"
-                    ),
-                ));
-                continue;
             }
 
             // Where the bytes of this version might already be (§3.2). Donors
@@ -727,15 +816,14 @@ fn system_time(ns: i64) -> SystemTime {
 /// The content root of the file at `target`, if it is the right length to be
 /// the version being materialized.
 ///
-/// This is the currency check, and the hash is the whole of it: an object is
-/// its bytes, so "is the file already this version?" is "does it hash to this
-/// root?". Size first, because it settles almost every case for the price of a
-/// `stat` — and a file of the wrong length is not hashed here at all, because
-/// no hash of it could answer yes.
+/// This is the currency check's evidence of last resort, asked only of paths
+/// no record vouches for — a daemon restart, a moved stat, a file the mirror
+/// has never seen. Size first, because it settles almost every case for the
+/// price of a `stat` — and a file of the wrong length is not hashed here at
+/// all, because no hash of it could answer yes.
 ///
-/// Streamed, because a mirror carries objects far larger than memory and this
-/// question is asked of every path on every pass. Anything unreadable answers
-/// `None`, and the pass rewrites it.
+/// Streamed, because a mirror carries objects far larger than memory.
+/// Anything unreadable answers `None`, and the pass rewrites it.
 ///
 /// The root rather than a bare "current?": naming the object that is on the
 /// disk is also what tells the pass whether the file is a version the descent
@@ -748,17 +836,30 @@ fn same_size_root(target: &Path, wanted_size: u64) -> Option<synch_core::Hash> {
     hash_file(target)
 }
 
-/// A cheap identity for the CAS payload behind an object: its length and its
-/// modification time.
-///
-/// Emphatically not a hash. Re-reading an object to identify it is the
-/// scrubbing §2.1 refuses, and what this is for does not need one: it only has
-/// to notice that a payload has been *replaced*, so the rot guard in
-/// [`Node::note_mirror_write`] lets go when the operator repairs the object.
-/// `None` for an inline object, which has no payload file.
-fn payload_fingerprint(node: &Node, content: &synch_core::Hash) -> Option<(u64, i64)> {
-    let meta = std::fs::metadata(node.store().blob_path(content)).ok()?;
-    Some((meta.len(), crate::scanner::mtime_nanos(&meta)))
+/// True while a record and the stat describe the same file: same object,
+/// same length, same stored mtime, same platform identity — and the record
+/// is comfortably newer than that mtime, so no same-size in-place rewrite
+/// can have shared the stamp (the scanner's racy window, scanner.rs).
+/// Anything less and the file speaks for itself, hashed on this pass.
+fn still_current(
+    record: &MirrorWrite,
+    stat: &std::fs::Metadata,
+    content: &synch_core::Hash,
+) -> bool {
+    record.content == *content
+        && record.size == stat.len()
+        && record.mtime_ns == crate::scanner::mtime_nanos(stat)
+        && record.file_id == crate::scanner::file_identity(stat)
+        && record.recorded_at.saturating_sub(record.mtime_ns) >= crate::scanner::RACY_WINDOW_NS
+}
+
+/// Anchors a target's record to the stat currently on disk, or drops the
+/// record if the file is already gone.
+fn note_record(node: &Node, target: &Path, content: synch_core::Hash) {
+    match MirrorWrite::of(target, content) {
+        Some(record) => node.note_mirror_write(target, record),
+        None => node.forget_mirror_write(target),
+    }
 }
 
 /// Streams a file through BLAKE3 for its content root.
@@ -845,14 +946,14 @@ fn remove_if_present(target: &Path) -> Result<usize> {
 }
 
 /// Removes files under a mirror root whose path the unified tree no longer
-/// carries, and returns how many went.
-fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<usize> {
+/// carries, and returns the targets that went.
+fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
-    let mut removed = 0;
+    let mut removed = Vec::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         // `is_dir` follows links, and a materialized symlink pointing at a
@@ -862,7 +963,7 @@ fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<usize> {
             .map(|m| m.is_dir())
             .unwrap_or(false);
         if is_dir {
-            removed += sweep(root, &path, known)?;
+            removed.extend(sweep(root, &path, known)?);
             continue;
         }
         let Ok(relative) = path.strip_prefix(root) else {
@@ -875,7 +976,7 @@ fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<usize> {
             .join("/");
         if !known.contains(&relative) {
             std::fs::remove_file(&path)?;
-            removed += 1;
+            removed.push(path);
         }
     }
     Ok(removed)
@@ -1024,76 +1125,81 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A rotted CAS payload stops the pass instead of being rewritten forever.
-    ///
-    /// The one wrong-hash cause the currency check cannot fix. Nothing upstream
-    /// of the mirror doubts the object — the row calls it complete, the fetch
-    /// finds every group held, and materialization clones the payload without
-    /// re-reading it, which is the settled at-rest trust posture (§2.1) — so the
-    /// pass writes the rot to disk, the pass after it hashes the file, finds the
-    /// same wrong answer, and writes the same bytes again. `written` climbs on
-    /// every pass and the mirror never converges.
-    ///
-    /// The bytes are still not re-verified here: what changed is that a pass
-    /// knows what the last one wrote, and a path it wrote from a root that still
-    /// does not hash to that root is reported with the payload named, not
-    /// rewritten.
+    /// A file the mirror holds a record for is believed by its stat, without
+    /// a read. Proving a negative: strip every permission bit between passes.
+    /// A pass that tried to hash the file would fail to open it and rewrite
+    /// it (`written`); a pass that trusts the record sees only the drifted
+    /// mode and repairs it (`retouched`).
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_rotted_payload_is_reported_rather_than_rewritten_forever() {
+    async fn a_recorded_file_is_believed_without_a_read() {
         let (_d, node) = node().await;
         let target = tempfile::tempdir().unwrap();
         node.add_mirror("media", target.path(), &VersionPolicy::Newest)
             .unwrap();
-        // Large enough to have a payload file rather than living in the index.
-        let payload: Vec<u8> = (0..80_000u32).map(|i| (i * 7 % 251) as u8).collect();
-        publish_entry(&node, &peer(), "disk.img", &payload, 1);
-        let content = node.versions("media", "disk.img").unwrap().entries[0]
-            .content
-            .unwrap();
-
-        // The payload rots at rest, behind the store's back and without
-        // changing its length — a flipped bit on a disk nobody is checksumming.
-        let path = node.store().blob_path(&content);
-        let mut raw = std::fs::read(&path).unwrap();
-        raw[40_000] ^= 0xff;
-        std::fs::write(&path, &raw).unwrap();
-
-        // The first pass writes it: nothing has told the mirror otherwise.
+        publish_entry_with_mode(&node, &peer(), "f.txt", b"hello", STAMP, Some(0o100644));
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.written, 1, "{report:?}");
+
+        let written = target.path().join("f.txt");
+        std::fs::set_permissions(&written, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.retouched, 1, "{report:?}");
+        assert_eq!(report.written, 0, "{report:?}");
         assert!(report.skipped.is_empty(), "{report:?}");
-        let file = target.path().join("disk.img");
-        assert_ne!(
-            std::fs::read(&file).unwrap(),
-            payload,
-            "the rot came across"
-        );
+        assert_eq!(on_disk_mode(&written), 0o644);
 
-        // The second pass recognizes the loop rather than joining it.
+        // And once the mode is repaired, quiet passes stay quiet.
         let report = node.sync_mirror(target.path()).await.unwrap();
-        assert_eq!(report.written, 0, "{report:?}");
-        assert_eq!(report.current, 0, "{report:?}");
-        assert_eq!(report.skipped.len(), 1, "{report:?}");
-        let (path_reported, why) = &report.skipped[0];
-        assert_eq!(path_reported, "disk.img");
-        assert!(
-            why.contains("payload") && why.contains(&content.to_string()),
-            "the report names the object at fault: {why}"
-        );
-        // And it stays that way rather than alternating.
-        let report = node.sync_mirror(target.path()).await.unwrap();
-        assert_eq!(report.written, 0, "{report:?}");
-        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert_eq!(report.current, 1, "{report:?}");
+        node.shutdown().await.unwrap();
+    }
 
-        // Repairing the payload — `synch blob rm` and a refetch, a restore, the
-        // filesystem's own repair — lets the very next pass converge. The guard
-        // notices by the payload's length and mtime, never by reading it back.
-        raw[40_000] ^= 0xff;
-        std::fs::write(&path, &raw).unwrap();
-        set_modified(&path, STAMP).unwrap();
+    /// A same-length local edit moves the mtime, which moves the stat, which
+    /// spends the hash — and the hash sends the pass to rewrite the file.
+    #[tokio::test]
+    async fn a_same_size_local_edit_is_repaired() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        publish_entry(&node, &peer(), "f.txt", b"hello", STAMP);
+        node.sync_mirror(target.path()).await.unwrap();
+
+        let written = target.path().join("f.txt");
+        std::fs::write(&written, b"world").unwrap();
+
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.written, 1, "{report:?}");
-        assert_eq!(std::fs::read(&file).unwrap(), payload);
+        assert_eq!(std::fs::read(&written).unwrap(), b"hello");
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.current, 1, "{report:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    /// An atomic replace that spoofs the published stamp — same length, same
+    /// mtime — still lands on a different inode, and the identity half of the
+    /// record catches what the timestamps cannot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_atomic_replace_with_a_spoofed_mtime_is_repaired() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        publish_entry(&node, &peer(), "f.txt", b"hello", STAMP);
+        node.sync_mirror(target.path()).await.unwrap();
+
+        let written = target.path().join("f.txt");
+        let staged = target.path().join("staged-replacement");
+        std::fs::write(&staged, b"world").unwrap();
+        set_modified(&staged, STAMP).unwrap();
+        std::fs::rename(&staged, &written).unwrap();
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "{report:?}");
+        assert_eq!(std::fs::read(&written).unwrap(), b"hello");
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.current, 1, "{report:?}");
         node.shutdown().await.unwrap();
@@ -1656,6 +1762,99 @@ mod tests {
         assert!(unsafe_name("nul.txt").is_some());
         assert!(unsafe_name("bad<name").is_some());
         assert!(unsafe_name("trailing ").is_some());
+    }
+
+    /// The standing loop materializes on a wake, with no `sync_mirror` call:
+    /// adding the mirror rings the bell and the pass follows.
+    #[tokio::test]
+    async fn the_mirror_loop_runs_a_pass_on_wake() {
+        let (_d, node) = node().await;
+        publish_entry(&node, &peer(), "a.txt", b"hello", 1);
+        let target = tempfile::tempdir().unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let runner = node.clone();
+        let handle = tokio::spawn(async move {
+            runner
+                .run_mirrors(async {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+
+        for _ in 0..500 {
+            if target.path().join("a.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read(target.path().join("a.txt")).unwrap(),
+            b"hello",
+            "the wake from add_mirror drove a pass with no sync_mirror call"
+        );
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the loop must stop promptly")
+            .unwrap();
+        node.shutdown().await.unwrap();
+    }
+
+    /// The interval is the backstop for a change no bell covered. The wake
+    /// from `add_mirror` is consumed by the first file; the second, published
+    /// straight into the store with nothing rung, only the fallback pass can
+    /// bring across.
+    #[tokio::test]
+    async fn the_mirror_loop_falls_back_to_its_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        Node::init(dir.path(), None).unwrap();
+        let mut config = NodeConfig::loopback(dir.path());
+        config.mirror_interval = Duration::from_millis(40);
+        let node = Node::open(config).await.unwrap();
+        let target = tempfile::tempdir().unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let runner = node.clone();
+        let handle = tokio::spawn(async move {
+            runner
+                .run_mirrors(async {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+
+        publish_entry(&node, &peer(), "first.txt", b"one", 1);
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        for _ in 0..500 {
+            if target.path().join("first.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(target.path().join("first.txt").exists(), "the wake ran");
+
+        publish_entry(&node, &peer(), "second.txt", b"two", 1);
+        for _ in 0..500 {
+            if target.path().join("second.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read(target.path().join("second.txt")).unwrap(),
+            b"two",
+            "nothing rang for this one; the interval pass carried it"
+        );
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the loop must stop promptly")
+            .unwrap();
+        node.shutdown().await.unwrap();
     }
 
     #[cfg(unix)]

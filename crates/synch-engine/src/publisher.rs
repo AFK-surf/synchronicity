@@ -167,6 +167,9 @@ impl Node {
             if let Err(e) = self.push_head(head).await {
                 tracing::debug!(error = %e, "could not push the new head");
             }
+            // This node's own origin's tree just moved, and mirrors follow
+            // the unified tree — which includes it.
+            self.mirror_wake().notify_one();
         }
         Ok(head)
     }

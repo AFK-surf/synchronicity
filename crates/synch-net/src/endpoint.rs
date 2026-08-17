@@ -91,6 +91,10 @@ pub struct NetOptions {
     /// immediate DNS re-resolution. The endpoint only rings the bell; the rate
     /// limiting and the resolving belong to whoever is listening.
     pub on_unknown_key: Option<Arc<tokio::sync::Notify>>,
+    /// Notified when a head flips to complete (§5.2): the unified tree just
+    /// changed, and anything materializing it — mirrors — should look again.
+    /// The endpoint only rings the bell.
+    pub on_change: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl NetOptions {
@@ -105,6 +109,7 @@ impl NetOptions {
             dht_bootstrap: Vec::new(),
             dht_publish_direct_addrs: false,
             on_unknown_key: None,
+            on_change: None,
         }
     }
 }
@@ -253,7 +258,9 @@ impl Net {
         let router = Router::builder(endpoint)
             .accept(
                 ALPN_MPT,
-                MptProtocol::new(store.clone()).on_unknown_key(options.on_unknown_key.clone()),
+                MptProtocol::new(store.clone())
+                    .on_unknown_key(options.on_unknown_key.clone())
+                    .on_change(options.on_change.clone()),
             )
             .accept(
                 ALPN_BLOB,

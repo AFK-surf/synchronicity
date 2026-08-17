@@ -23,6 +23,12 @@ pub struct NodeConfig {
     /// The base anti-entropy round interval (§5.3, default 30 s with ±50 %
     /// jitter).
     pub aae_interval: Duration,
+    /// The backstop interval between mirror passes (§7.2, default 60 s with
+    /// ±50 % jitter). Passes normally run because the unified tree changed
+    /// and rang the bell; the interval is only for drift nobody rang about —
+    /// a `chmod` moves nothing a mirror record holds, and only a pass
+    /// repairs it.
+    pub mirror_interval: Duration,
     /// How long a scanner rescan waits after a watcher hint (§7.1).
     pub watch_debounce: Duration,
     /// Full rescan interval (§7.1).
@@ -72,6 +78,7 @@ impl NodeConfig {
             data_dir: data_dir.into(),
             net: NetOptions::default(),
             aae_interval: Duration::from_secs(30),
+            mirror_interval: Duration::from_secs(60),
             watch_debounce: Duration::from_millis(500),
             scan_interval: Duration::from_secs(3600),
             publish_quiesce: crate::publisher::DEFAULT_PUBLISH_QUIESCE,
@@ -116,6 +123,7 @@ mod tests {
     fn defaults_match_the_design() {
         let config = NodeConfig::new("/tmp/x");
         assert_eq!(config.aae_interval, Duration::from_secs(30));
+        assert_eq!(config.mirror_interval, Duration::from_secs(60));
         assert_eq!(config.watch_debounce, Duration::from_millis(500));
         assert_eq!(config.scan_interval, Duration::from_secs(3600));
         assert_eq!(config.publish_quiesce, Duration::from_secs(2));

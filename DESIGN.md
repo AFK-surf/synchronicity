@@ -787,7 +787,11 @@ Materialization reads the unified tree (§8), so every materializing surface nam
 - `synch mirror add <space> <local-dir> [--policy newest|origin=<id>|strict]` —
   continuous read-only mirror of the unified tree for that space: the engine keeps
   the directory in sync with the policy-selected version of every path (fetching
-  content via §6.4). Under `strict`, divergent paths are skipped and reported —
+  content via §6.4). A standing loop runs a pass the moment the tree changes — a
+  head flipping to complete on any exchange, a local publish, a newly added mirror
+  all ring it — once at startup, and on a 60 s backstop interval; a pass over an
+  unchanged tree costs the tree's stats, not its bytes (docs/DELTA-SYNC.md §3.5).
+  Under `strict`, divergent paths are skipped and reported —
   the mirror never guesses. Mirrored trees are never indexed back into the local
   origin trie (no echo).
 - `synch cat <space>/<path> [--range a..b] [--from <origin>|--strict]` — stream to

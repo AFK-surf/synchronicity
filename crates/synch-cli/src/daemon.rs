@@ -3,7 +3,8 @@
 //! The daemon holds the one endpoint, the one database writer, and the one
 //! lifecycle. It serves the control socket concurrently with the engine's
 //! standing work — the anti-entropy scheduler, the scanner, the filesystem
-//! watcher, the batching publisher, and the maintenance/GC pass.
+//! watcher, the batching publisher, the mirror loop, and the maintenance/GC
+//! pass.
 
 use anyhow::{Context, Result};
 use synch_engine::{Node, NodeConfig};
@@ -60,6 +61,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let maintenance = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
         node.run_maintenance(shutdown).await
     });
+    // The standing mirror loop: materializes the unified tree whenever it
+    // changes, and once at startup (§7.2).
+    let mirrors = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+        node.run_mirrors(shutdown).await
+    });
     // Membership is only as live as its last validated lookup: without this
     // loop a DNSSEC cluster dissolves one TTL plus grace after the last manual
     // refresh, because `run_maintenance` expires bindings and nothing renews
@@ -94,7 +100,16 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         _ = stopped.recv() => {}
     }
 
-    let _ = tokio::join!(control, aae, scanner, watcher, maintenance, publisher, dns);
+    let _ = tokio::join!(
+        control,
+        aae,
+        scanner,
+        watcher,
+        maintenance,
+        publisher,
+        dns,
+        mirrors
+    );
     node.shutdown().await?;
     Ok(())
 }

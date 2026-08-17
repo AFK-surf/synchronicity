@@ -51,9 +51,10 @@ struct NodeInner {
     /// The batch between staging and one signed root (§7.1).
     publisher: Publisher,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
-    /// What the last mirror pass wrote at each target path, so a pass can tell
-    /// "this file is not current" from "this file is not current *and I am the
-    /// one who just wrote it*" (`docs/DELTA-SYNC.md` §3.5, §6).
+    /// What the running mirror passes believe about the file at each target
+    /// path, and the stat that belief is anchored to — so a quiet pass can
+    /// skip re-hashing every file it has already written or read
+    /// (`docs/DELTA-SYNC.md` §3.5).
     mirror_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, MirrorWrite>>,
     /// When each configured membership domain is next due for re-resolution,
     /// and when it was last attempted (§3.2, §3.4).
@@ -61,23 +62,52 @@ struct NodeInner {
     /// Rung when an inbound connection is refused for an unknown device key,
     /// which §3.4 makes a trigger for an immediate DNS re-resolution.
     dns_wake: Arc<tokio::sync::Notify>,
+    /// Rung when the unified tree may have changed — an accepted head flipped
+    /// complete, a local publish landed, a mirror was added — so the standing
+    /// mirror loop materializes it without waiting out its interval (§7.2).
+    mirror_wake: Arc<tokio::sync::Notify>,
+    /// Serializes mirror passes, whether the standing loop or `synch mirror
+    /// sync` asked: two passes over one root would plan against each other's
+    /// half-written state.
+    mirror_lock: tokio::sync::Mutex<()>,
     /// Rung when a space is added or removed, so the watcher re-registers
     /// without waiting for the next filesystem hint (§7.1).
     spaces_changed: Arc<tokio::sync::Notify>,
 }
 
-/// What one mirror pass materialized at one target, and out of what.
+/// What mirror passes believe about the file at one target, and the stat
+/// that belief is anchored to.
 ///
-/// See [`Node::note_mirror_write`] for why a pass remembers this at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// See [`Node::note_mirror_write`] for why a pass remembers anything at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MirrorWrite {
-    /// The content root that was written.
+    /// The content root the file is believed to be.
     pub(crate) content: Hash,
-    /// The CAS payload's length and modification time when it was written — a
-    /// cheap identity for "the same bytes as last time", never a hash of them.
-    /// `None` for an object small enough to live in the index (§6.2), which has
-    /// no payload file to stat.
-    pub(crate) payload: Option<(u64, i64)>,
+    /// The file's length when recorded.
+    pub(crate) size: u64,
+    /// The file's stored mtime when recorded.
+    pub(crate) mtime_ns: i64,
+    /// The file's platform identity when recorded (dev+inode on unix).
+    pub(crate) file_id: Option<Vec<u8>>,
+    /// When the record was taken: the racy-window anchor.
+    pub(crate) recorded_at: i64,
+}
+
+impl MirrorWrite {
+    /// A record for the file now at `target`, believed to be `content`: the
+    /// stat the belief is anchored to, taken just after the write or hash
+    /// that established it. `None` if the file is already gone, in which case
+    /// there is nothing to anchor.
+    pub(crate) fn of(target: &Path, content: Hash) -> Option<MirrorWrite> {
+        let stat = std::fs::metadata(target).ok().filter(|m| m.is_file())?;
+        Some(MirrorWrite {
+            content,
+            size: stat.len(),
+            mtime_ns: crate::scanner::mtime_nanos(&stat),
+            file_id: crate::scanner::file_identity(&stat),
+            recorded_at: synch_core::now_ns(),
+        })
+    }
 }
 
 /// What `init` created.
@@ -218,8 +248,13 @@ impl Node {
         // that matters can arrive at either (§3.4).
         let dns_wake = Arc::new(tokio::sync::Notify::new());
         config.net.on_unknown_key = Some(dns_wake.clone());
+        // And every head that flips to complete — dialed out or pushed in —
+        // rings the mirror bell through the same two doors: the endpoint's
+        // serve-side syncer, and the one this node's own rounds dial with.
+        let mirror_wake = Arc::new(tokio::sync::Notify::new());
+        config.net.on_change = Some(mirror_wake.clone());
         let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
-        let syncer = Syncer::new(store.clone());
+        let syncer = Syncer::new(store.clone()).on_change(Some(mirror_wake.clone()));
         let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
         let node = Node {
             inner: Arc::new(NodeInner {
@@ -235,6 +270,8 @@ impl Node {
                 mirror_writes: std::sync::Mutex::new(Default::default()),
                 dns: std::sync::Mutex::new(Default::default()),
                 dns_wake,
+                mirror_wake,
+                mirror_lock: tokio::sync::Mutex::new(()),
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
             }),
         };
@@ -513,6 +550,16 @@ impl Node {
         self.inner.dns_wake.clone()
     }
 
+    /// The bell that wakes the standing mirror loop (§7.2).
+    pub(crate) fn mirror_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.mirror_wake.clone()
+    }
+
+    /// Serializes a mirror pass against every other pass on this node.
+    pub(crate) async fn lock_mirrors(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.mirror_lock.lock().await
+    }
+
     /// Rings the unknown-key bell as an inbound refusal would.
     ///
     /// The endpoint rings it on its own; this is how a caller that already
@@ -681,51 +728,45 @@ impl Node {
         Ok(Some((blob_key(root), Some(bytes))))
     }
 
-    /// Records what a mirror pass materialized at `target`
-    /// (`docs/DELTA-SYNC.md` §3.5).
+    /// Records what a mirror pass believes about the file at `target`, and
+    /// the stat that belief is anchored to (`docs/DELTA-SYNC.md` §3.5).
     ///
-    /// The mirror's currency check hashes the file it finds and rewrites it when
-    /// the hash is wrong, which converges on every ordinary cause of a wrong
-    /// hash — a truncated write, a user's edit, a version this pass replaced.
-    /// It does not converge on one: a CAS payload that rotted at rest. The
-    /// object is complete and verified as far as the index is concerned, so
-    /// nothing refetches it; materialization clones it without re-reading it,
-    /// which is the settled trust posture (§2.1); and the pass after this one
-    /// hashes the file, finds the same wrong answer, and writes the same wrong
-    /// bytes again, reporting `written` forever.
-    ///
-    /// So a pass remembers what it wrote where, and which payload it wrote it
-    /// from. When the next one is about to write the *same* content root, from
-    /// the *same* payload, over a file that still does not hash to it, the
-    /// payload — not the file — is the thing at fault, and the path is reported
-    /// instead of rewritten ([`Node::mirror_write_was`]).
+    /// The belief comes from one of two moments: the pass wrote the file
+    /// itself (a successful write is trusted, the same at-rest posture the
+    /// CAS takes toward its own payloads, §2.1), or the pass found the file
+    /// on disk and hashed it to the selected root. Either way the record lets
+    /// later passes answer "is this already the selected version?" with a
+    /// stat instead of a hash, so a quiet pass costs the tree's syscalls, not
+    /// its bytes. The stat is the evidence the scanner trusts for the node's
+    /// own files — length, stored mtime, platform identity, past the racy
+    /// window — with a stronger anchor than the scanner's: not a
+    /// peer-published mtime that happens to match, but a write or hash this
+    /// process performed itself.
     ///
     /// Two limits, both deliberate:
     ///
-    /// - **In memory, per process.** This is a hint about the immediately
-    ///   preceding pass, not a durable quarantine. A restart forgets it and the
-    ///   next pass writes once more before noticing again, which costs one
-    ///   rewrite and keeps the store free of a "suspect object" record that
-    ///   nothing would ever be able to clear.
-    /// - **The payload is identified by length and mtime, not by hash.** Reading
-    ///   the object back to identify it is exactly the scrubbing §2.1 refuses.
-    ///   A stat is enough for the job it has: noticing that the payload has been
-    ///   *replaced* — by `synch blob rm` and a refetch, a restore, a filesystem
-    ///   repair — so that the suspicion clears and the mirror converges on the
-    ///   very next pass. A payload rewritten with the same length and the same
-    ///   mtime is indistinguishable from the old one here, and stays suspect
-    ///   until the daemon restarts.
+    /// - **In memory, per process.** Nothing durable ever calls a file good,
+    ///   so there is no stale verdict to clear. The price is paid on restart:
+    ///   every mirror's first pass hashes the whole tree once, and that pass
+    ///   doubles as the mirror's only scrub.
+    /// - **A stat that never moved hides what lies beneath it.** A same-size
+    ///   rewrite that restores length, mtime, and identity — and bytes that
+    ///   rot at rest behind an unmoved stat, including a CAS payload already
+    ///   rotted before a pass wrote from it — are invisible until the next
+    ///   restart's hash. That is the filesystem-integrity domain, and §2.1
+    ///   delegates it there.
     pub(crate) fn note_mirror_write(&self, target: &Path, write: MirrorWrite) {
         self.mirror_writes().insert(target.to_path_buf(), write);
     }
 
-    /// What the previous pass wrote at `target`, if this process wrote anything.
+    /// What passes believe about `target`, if this process believes anything.
     pub(crate) fn mirror_write_was(&self, target: &Path) -> Option<MirrorWrite> {
-        self.mirror_writes().get(target).copied()
+        self.mirror_writes().get(target).cloned()
     }
 
-    /// Forgets what was written at `target` — called when the file turns out to
-    /// be current, which is the evidence that whatever was written landed.
+    /// Forgets what was believed about `target` — called when the file leaves
+    /// the mirror, when the file is gone or the wrong length, and when a
+    /// fresh write or hash re-anchors the belief.
     pub(crate) fn forget_mirror_write(&self, target: &Path) {
         self.mirror_writes().remove(target);
     }
