@@ -70,7 +70,7 @@ pub type Repo {
   Repo(get: fn(String) -> Result(Option(BitArray), String))
 }
 
-/// What a refresh established, for the CLI and the hourly job.
+/// What a refresh established, for the refresh job's log line.
 pub type Outcome {
   Outcome(
     root_version: Int,

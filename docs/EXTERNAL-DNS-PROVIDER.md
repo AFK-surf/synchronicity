@@ -223,7 +223,9 @@ Boot refusals, in the house "silent dead config is a lie" posture:
 
 In external mode `serve_primary` builds a smaller tree: API pool, HTTP
 (dashboard + REST — DoH is not mounted), the provider reconciler (§4.3),
-and the key watcher (§4.4). No DNS pool, no UDP/TCP listeners, no hourly
+the key watcher (§4.4), and the TUF refresh job both primary modes share —
+which log shard the watcher submits to is answered from stored material in
+either mode. No DNS pool, no UDP/TCP listeners, no hourly
 re-sign job — there are no RRSIGs of ours to expire. `keygen`, `ds`, and
 `/api/zone/anchor` refuse in external mode with a message naming the
 reason.

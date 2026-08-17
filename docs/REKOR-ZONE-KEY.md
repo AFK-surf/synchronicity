@@ -598,7 +598,7 @@ belongs.
 | `CP_SIGNING_ZONE` | primary, external only | The DNS zone the provider actually hosts, when it is not the apex — a control plane at `sync.example.com` served out of `example.com` sets it to `example.com`. Defaults to `CP_BASE_DOMAIN`, and must be a name that *contains* it; boot refuses anything else, and refuses the variable outright in serve mode, where this service is the authoritative nameserver for its own apex and the two are the same by construction. It decides where the proof records go and where a chain's ladder starts (§2). |
 
 Every one of these is read at its use site rather than through boot
-configuration, so `rekor-publish` and `tuf-refresh` see the same values a
+configuration, so `rekor-publish` sees the same values a
 running primary would.
 
 Replicas need nothing: the proof is public data in the database and rides the
@@ -1466,11 +1466,14 @@ reading.
   since expired keeps naming the log: expiry gates updates, never operation
   (§10.2), so it is checked at ingestion, where refusing costs nothing but a
   retry.
-- The hourly job refetches when the stored timestamp is within 3 days of
-  expiry. It does not republish the zone — no record depends on this.
-  `controlplane tuf-refresh` does the same on demand (the air-gapped ceremony
-  runs it where there is egress and couriers the database, as with everything
-  else).
+- The refresh job (`jobs/tuf_refresh`) fetches when nothing is stored —
+  at boot, so a fresh control plane can name a shard within seconds — and
+  refetches hourly once the stored timestamp is within 3 days of expiry,
+  in both primary modes. It does not republish the zone — no record
+  depends on this. There is no on-demand command and none is needed:
+  `rekor-publish` itself fetches first when the stored material cannot
+  name a log, so the air-gapped ceremony on its egress host leaves the
+  couriered database carrying the material, as with everything else.
 - `/healthz` reports the stored timestamp expiry and root version, as
   `tuf_timestamp_expires_at` and `tuf_root_version`, so an operator can see a
   service heading for a stale idea of which shard is in service. Absent

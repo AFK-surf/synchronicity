@@ -15,8 +15,6 @@
 ////                         log a retirement breadcrumb for a key. Allowed to
 ////                         be chainless: a retired zone may have no DS left,
 ////                         and clients never treat a retire as authorization.
-////   tuf-refresh           refetch Sigstore's TUF metadata, so this service
-////                         submits to the log shard currently in service
 ////   seed                  create a demo org/network/devices and publish
 ////   seed-admin <email>    first-user bootstrap: print a one-time magic link
 ////   migrate-check         replay the migration chain against a scratch DB
@@ -43,6 +41,7 @@ import gleam/result
 import gleam/string
 import jobs/provider_sync
 import jobs/resign
+import jobs/tuf_refresh
 import jobs/zonekey_watch
 import mist
 import provider/bunny
@@ -56,7 +55,6 @@ import store/migrate
 import store/pool
 import store/sqlite
 import tools/seed
-import tuf/anchor
 import tuf/fetch as tuf_fetch
 import wisp/wisp_mist
 import zone/model
@@ -79,7 +77,6 @@ pub fn main() {
       run_or_die(fn() { rekor_publish(apex, key_file, "") })
     ["rekor-retire", apex, key_file] ->
       run_or_die(fn() { rekor_publish(apex, key_file, "retire") })
-    ["tuf-refresh"] -> run_or_die(tuf_refresh)
     ["provider-sync"] -> run_or_die(provider_sync_once)
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(run_seed)
@@ -87,7 +84,7 @@ pub fn main() {
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | rekor-retire <apex> <keyfile> | tuf-refresh | provider-sync | seed | seed-admin <email> | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | rekor-retire <apex> <keyfile> | provider-sync | seed | seed-admin <email> | migrate-check",
       )
       halt(2)
     }
@@ -229,50 +226,6 @@ fn rekor_publish(
       // means, and an operator who is surprised by the report is an operator
       // who did not publish this key.
       False -> ", DNSSEC chain carried (monitors will report this key)"
-    },
-  )
-  Ok(Nil)
-}
-
-/// Refetches Sigstore's TUF metadata, which is how this service learns which
-/// log shard to submit to (§10.3, §10.6).
-///
-/// Nothing about the zone changes — clients read Sigstore's repository
-/// themselves — so this does not republish. The air-gapped ceremony runs it
-/// where there is egress and couriers the database, as with everything else.
-/// Failing costs nothing beyond staying on the shard already stored.
-fn tuf_refresh() -> Result(Nil, String) {
-  use cfg <- result.try(config.load())
-  use conn <- result.try(open_primary_db(cfg))
-  let now = now_unix()
-  let source = tuf_fetch.url()
-  // Named in the output because it is the one thing about this command an
-  // operator cannot infer from the result: everything below the anchor is
-  // checked against it, so which anchor was used is the claim being made.
-  use anchored <- result.try(anchor.load())
-  use outcome <- result.try(tuf_fetch.refresh(
-    conn,
-    tuf_fetch.http(source),
-    source,
-    now,
-  ))
-  sqlite.close(conn)
-  io.println(
-    "tuf: verified against "
-    <> anchor.describe(anchored)
-    <> " — root "
-    <> int.to_string(outcome.root_version)
-    <> ", timestamp "
-    <> int.to_string(outcome.timestamp_version)
-    <> " (expires "
-    <> int.to_string(outcome.timestamp_expires)
-    <> "), snapshot "
-    <> int.to_string(outcome.snapshot_version)
-    <> ", targets "
-    <> int.to_string(outcome.targets_version)
-    <> case outcome.changed {
-      True -> " — stored"
-      False -> " — unchanged"
     },
   )
   Ok(Nil)
@@ -490,6 +443,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
     ))
     |> sup.add(mist.supervised(http))
     |> sup.add(resign.supervised(cfg.db_path, csk))
+    |> sup.add(tuf_refresh.supervised(cfg.db_path))
     |> sup.start
     |> result.map_error(fn(_) { "could not start supervision tree" }),
   )
@@ -509,8 +463,10 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
 /// signs the zone; this tree runs the product API and two convergence
 /// loops — the reconciler that pushes records through the provider's API,
 /// and the key watcher that keeps the transparency claim covering whatever
-/// keys the provider is signing with. No DNS listeners, no zone key, no
-/// re-sign job: there are no RRSIGs of ours to expire.
+/// keys the provider is signing with — plus the TUF refresh job both
+/// primary modes share, since which shard to submit to is answered from
+/// stored material either way. No DNS listeners, no zone key, no re-sign
+/// job: there are no RRSIGs of ours to expire.
 fn serve_external(
   cfg: Config,
   provider_cfg: config.ProviderConfig,
@@ -575,6 +531,7 @@ fn serve_external(
       4,
     ))
     |> sup.add(mist.supervised(http))
+    |> sup.add(tuf_refresh.supervised(cfg.db_path))
     |> sup.add(provider_sync.supervised(
       sync_name,
       cfg.db_path,

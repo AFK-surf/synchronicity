@@ -124,9 +124,9 @@ secrets.** Protect the replication bucket accordingly.
 
    **Which log it submits to is discovered, not compiled in.** The shard
    in service and its verification key both come out of the
-   `trusted_root.json` this service stores (step 4), so a Sigstore
-   rotation is a `tuf-refresh` away rather than a release away. On a host
-   that has never fetched, this command does step 4's fetch first; a
+   `trusted_root.json` this service stores (see "TUF freshness" below), so a
+   Sigstore rotation is a refresh away rather than a release away. On a host
+   that has never fetched, this command does that fetch first; a
    deployment with no egress to `CP_TUF_URL` names the log itself with
    `CP_REKOR_URL` and `CP_REKOR_KEY` together.
 
@@ -156,31 +156,27 @@ secrets.** Protect the replication bucket accordingly.
    key tag down. Your own record of what you published is the only thing
    that distinguishes a report you caused from one you did not.
 
-4. **Fetch Sigstore's TUF metadata** (once there is egress):
+**TUF metadata needs no command.** The primary walks `CP_TUF_URL` on its
+own — at boot when nothing is stored, and hourly once the stored timestamp
+is within three days of expiring — the way TUF consistent snapshots are
+meant to be walked: timestamp names the snapshot, the snapshot names the
+targets, the targets name `trusted_root.json` by digest. Every file is
+stored verbatim (docs/REKOR-ZONE-KEY.md §10). That file is what this
+service reads to decide **where to submit** (step 3), so a Sigstore shard
+rotation costs a refresh rather than a release. It does not touch the
+zone: clients walk Sigstore's repository themselves for their own log
+pins, and no record depends on this.
 
-   ```sh
-   controlplane tuf-refresh
-   ```
-
-   Walks `CP_TUF_URL` the way TUF consistent snapshots are meant to be
-   walked — timestamp names the snapshot, the snapshot names the targets,
-   the targets name `trusted_root.json` by digest — and stores every file
-   verbatim (docs/REKOR-ZONE-KEY.md §10). That file is what this service
-   reads to decide **where to submit** (step 3), so a Sigstore shard
-   rotation costs a refresh rather than a release. It does not touch the
-   zone: clients walk Sigstore's repository themselves for their own log
-   pins, and no record depends on this.
-
-   Because that decision is one no client can re-check, this service
-   verifies the chain itself before storing it — signatures over canonical
-   JSON, role thresholds, expiries and monotonicity, anchored on
-   `priv/tuf/sigstore_tuf_root.json`, the same root the client embeds — and
-   refuses anything that does not check out, keeping whatever was already
-   stored. `CP_TUF_ROOT` names a different anchor for a deployment running
-   its own TUF repository. The hourly job refetches on its own once the
-   stored timestamp is within three days of expiring; run this by hand
-   after any long outage, or on an egress host before couriering the
-   database in an air-gapped deployment.
+Because that decision is one no client can re-check, this service verifies
+the chain itself before storing it — signatures over canonical JSON, role
+thresholds, expiries and monotonicity, anchored on
+`priv/tuf/sigstore_tuf_root.json`, the same root the client embeds — and
+refuses anything that does not check out, keeping whatever was already
+stored. `CP_TUF_ROOT` names a different anchor for a deployment running
+its own TUF repository. In an air-gapped deployment the material arrives
+the way everything does: `rekor-publish` fetches on demand when the stored
+material cannot name a log, so running the ceremony on the egress host
+leaves the couriered database carrying it.
 
 4. Start the primary (systemd unit in `ops/systemd/`). First boot
    migrates the DB, writes zone metadata and publishes the (empty) zone.
@@ -276,8 +272,9 @@ control plane itself with
   first run reports only what you did not know. The keys it records are
   bookkeeping about what it has already told you, **not** a trust list:
   an attacker's key is recorded once reported, the same as yours.
-- **TUF freshness** (docs/REKOR-ZONE-KEY.md §10): `tuf-refresh` keeps this
-  service's idea of which transparency-log shard is in service current.
+- **TUF freshness** (docs/REKOR-ZONE-KEY.md §10): the primary's refresh
+  job keeps this service's idea of which transparency-log shard is in
+  service current, with no operator involvement.
   `/healthz` reports `tuf_root_version` and `tuf_timestamp_expires_at`; an
   expiry that stops moving means the hourly refetch is failing — check
   egress to `CP_TUF_URL`. It is not urgent: expired material keeps naming

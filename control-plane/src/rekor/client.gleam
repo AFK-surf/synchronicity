@@ -96,8 +96,8 @@ pub type Target {
 ///   log case, where no trusted root has anything to say.
 ///
 /// With neither set and no material stored, this fails rather than guessing
-/// a hostname: `controlplane tuf-refresh` is the fix, and [`resolve`] runs it
-/// for the callers that can.
+/// a hostname: `jobs/tuf_refresh` fetches at boot and hourly from there, and
+/// [`resolve`] fetches on the spot for the callers that can.
 pub fn discover(conn: Connection, now: Int) -> Result(Target, String) {
   let override_url = envoy.get("CP_REKOR_URL") |> option.from_result
   use override_key <- result.try(case envoy.get("CP_REKOR_KEY") {
@@ -126,17 +126,16 @@ pub fn discover(conn: Connection, now: Int) -> Result(Target, String) {
 /// [`discover`], refetching the TUF material once if it cannot answer.
 ///
 /// A refresh is the only thing that can change discovery's answer: it is what
-/// puts the directory there on a control plane that has never run
-/// `tuf-refresh`, and what moves it on when Sigstore opens a shard this copy
-/// has not heard about. So a failure to discover is worth one fetch — and if
-/// that fetch fails too, both reasons are reported, because "no material" and
-/// "no egress" are different problems with different fixes.
+/// puts the directory there on a control plane that has never fetched, and
+/// what moves it on when Sigstore opens a shard this copy has not heard
+/// about. So a failure to discover is worth one fetch — and if that fetch
+/// fails too, both reasons are reported, because "no material" and "no
+/// egress" are different problems with different fixes.
 ///
 /// For the callers that can afford a network round trip on a bad day:
-/// `rekor-publish` is a ceremony with egress by assumption. The external-mode
-/// watcher calls [`discover`] alone and lets the hourly refetch do the
-/// fetching, so a quarter-hourly loop never turns into a quarter-hourly
-/// fetch.
+/// `rekor-publish` is a ceremony with egress by assumption. The background
+/// loops call [`discover`] alone and let `jobs/tuf_refresh` do the fetching,
+/// so a quarter-hourly tick never turns into a quarter-hourly fetch.
 pub fn resolve(
   conn: Connection,
   repo: fetch.Repo,
@@ -170,8 +169,8 @@ fn stored_tlogs(conn: Connection) -> Result(List(trusted_root.Tlog), String) {
   use material <- result.try(
     stored
     |> result.replace_error(
-      "no TUF material stored: run `controlplane tuf-refresh`, or name the log "
-      <> "with CP_REKOR_URL and CP_REKOR_KEY",
+      "no TUF material stored yet — the refresh job fetches at boot and "
+      <> "hourly; or name the log with CP_REKOR_URL and CP_REKOR_KEY",
     ),
   )
   trusted_root.tlogs(material.trusted_root)

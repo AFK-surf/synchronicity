@@ -120,13 +120,13 @@ pub fn expiry_timestamps_parse_in_every_shape_the_repository_writes_test() {
 /// consistent-snapshot names the walk asks for.
 /// The moment the fixture chain was fetched — the `now` every test that
 /// walks it must use, or the checked-in material expires out from under the
-/// suite. Public because resign_test drives the job's TUF leg with it.
+/// suite. Public because tuf_refresh_test drives the job with it.
 pub fn verify_at() -> Int {
   number("verify_at")
 }
 
 /// A repository serving the checked-in fixture chain. Public because
-/// resign_test drives the job's TUF leg with it.
+/// tuf_refresh_test drives the job with it.
 pub fn fake_repo() -> fetch.Repo {
   let digest = field("trusted_root_sha256")
   let files =
@@ -371,10 +371,11 @@ pub fn the_log_to_submit_to_comes_from_the_stored_material_test() {
   envoy.unset("CP_REKOR_URL")
   envoy.unset("CP_REKOR_KEY")
 
-  // Nothing stored: discovery fails saying what to run rather than falling
-  // back to a hostname this build was compiled with.
+  // Nothing stored: discovery fails saying where the material comes from
+  // rather than falling back to a hostname this build was compiled with.
   let assert Error(why) = client.discover(conn, now)
-  assert string.contains(why, "tuf-refresh")
+  assert string.contains(why, "no TUF material stored")
+  assert string.contains(why, "CP_REKOR_URL")
 
   let assert Ok(_) = fetch.refresh(conn, fake_repo(), "https://tuf.test", now)
   let assert Ok(target) = client.discover(conn, now)
@@ -392,7 +393,7 @@ pub fn a_first_ceremony_fetches_the_directory_it_needs_test() {
   envoy.unset("CP_REKOR_KEY")
 
   // Nothing stored, so resolving fetches: the first `rekor-publish` on a
-  // fresh control plane does not have to be told to run `tuf-refresh` first.
+  // fresh control plane does not have to be told to fetch first.
   let assert Ok(target) =
     client.resolve(conn, fake_repo(), "https://tuf.test", now)
   let assert Ok(logs) = trusted_root.tlogs(fixture("trusted-root.json"))

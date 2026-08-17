@@ -1,18 +1,9 @@
 import fixtures.{now_unix, tmp_db}
-import gleam/option.{None}
 import jobs/resign
 import store/db
 import store/migrate
 import store/sqlite
-import tuf/fetch
-import tuf_test
 import zone/publish
-
-/// A repository with nothing in it. The re-sign job's TUF leg is exercised
-/// in tuf_test; here it must simply not reach the network.
-fn no_repo() -> fetch.Repo {
-  fetch.Repo(get: fn(_path) { Ok(None) })
-}
 
 pub fn resign_republishes_near_expiry_test() {
   let path = tmp_db()
@@ -22,7 +13,7 @@ pub fn resign_republishes_near_expiry_test() {
   let assert Ok(1) = publish.publish(conn, csk, now_unix(), "test")
 
   // Fresh signatures: the job leaves the zone alone.
-  resign.run_once_with(path, csk, no_repo())
+  resign.run_once(path, csk)
   let assert Ok([[sqlite.Int(1)]]) =
     sqlite.query(conn, "SELECT soa_serial FROM zone_meta", [])
 
@@ -31,30 +22,12 @@ pub fn resign_republishes_near_expiry_test() {
     sqlite.exec(conn, "UPDATE presigned_rrsets SET sig_expires_at = ?", [
       sqlite.Int(now_unix() + 3600),
     ])
-  resign.run_once_with(path, csk, no_repo())
+  resign.run_once(path, csk)
   let assert Ok([[sqlite.Int(2)]]) =
     sqlite.query(conn, "SELECT soa_serial FROM zone_meta", [])
   // And the new signatures are far in the future again.
   let assert Ok([[sqlite.Int(expires)]]) =
     sqlite.query(conn, "SELECT min(sig_expires_at) FROM presigned_rrsets", [])
   assert expires > now_unix() + 1_000_000
-  sqlite.close(conn)
-}
-
-pub fn a_tuf_refetch_stores_without_touching_the_zone_test() {
-  let path = tmp_db()
-  let assert Ok(conn) = db.open_primary(path)
-  let assert Ok(_) = migrate.migrate(conn)
-  let csk = fixtures.zone_boot(conn)
-  let assert Ok(1) = publish.publish(conn, csk, now_unix(), "test")
-
-  // Nothing in the zone depends on TUF material — it names the log shard
-  // this service submits to and nothing else — so a refetch that stores a
-  // whole new chain must leave the serial exactly where it was.
-  resign.run_once_at(path, csk, tuf_test.fake_repo(), tuf_test.verify_at())
-  let assert Ok([[sqlite.Int(1)]]) =
-    sqlite.query(conn, "SELECT soa_serial FROM zone_meta", [])
-  let assert Ok([[sqlite.Int(1)]]) =
-    sqlite.query(conn, "SELECT count(*) FROM tuf_material", [])
   sqlite.close(conn)
 }
