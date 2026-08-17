@@ -224,21 +224,38 @@ control plane itself with
   this is a planned outage of new-validation, existing caches keep
   working. **Zone key rollover** (proactive) is the same dance with both
   DS records present during the window; v1 keeps this manual and rare.
-  With transparency enabled the order is: `keygen`, publish both DNSKEYs,
-  **add the DS at the parent and wait**, then `rekor-publish <apex>
-  <newkey>`, then switch signing, then `rekor-retire <apex> <oldkey>`.
-  Logging comes after the DS because the entry carries the DNSSEC chain
-  that the DS makes buildable; the two-key window is what covers the gap,
-  since the old key keeps signing until the new one is logged. Every
-  monitor watching the apex will report the new key — tell them first,
-  and record the key tag.
+
+  **What the code supports today, stated plainly, because it is less than
+  the paragraph above used to promise.** The zone builder emits exactly
+  one DNSKEY, from `zone_meta.dnskey_public`, so there is no two-key
+  window to publish: a rollover is a swap, and validators that have
+  cached the old DS have a gap until the parent TTL runs out. Worse, with
+  `CP_REKOR_REQUIRE=true` the swap cannot be completed at all —
+  `rekor-publish` derives its claim from the key set **observed live on
+  the wire**, so a new key must already be serving before it can be
+  logged, and the gate will not let it serve until it is logged. The two
+  requirements are circular.
+
+  So: **unset `CP_REKOR_REQUIRE`, restart, swap the key, wait for the DS,
+  run `rekor-publish <apex>`, then re-arm the gate and restart.** The
+  zone keeps serving throughout — the hourly re-sign is no longer gated
+  (see below) — but new *content* will not publish while the active key
+  is unlogged, which is the gate doing its job.
+
+  Every monitor watching the apex will report the new key — tell them
+  first, and record the key tag.
 - **Zone key transparency** (docs/REKOR-ZONE-KEY.md): `rekor-publish`
   puts the zone key on a public log and the zone serves the proof at
   `_synchronicity-rekor.<apex>`. Rollout is phased — publish first
   (`CP_REKOR_REQUIRE` unset), turn the gate on once every key in play has
-  a verified record. With the gate on, *every* publish path refuses while
-  the active key has none, including the hourly re-sign; that is
-  deliberate, and `rekor-publish` is how you get out of it.
+  a verified record. With the gate on, publishing a **change** to the zone
+  refuses while the active key has no record, and `rekor-publish` is how
+  you get out of it. The hourly **re-sign** is deliberately not gated: it
+  emits records clients already accept, so refusing it withholds nothing
+  from anybody — it just lets the signatures expire after `sig_validity`
+  (14 days by default) and takes the whole zone bogus on DNSSEC rather
+  than on transparency. A transparency gap should not become a DNS
+  outage.
 - **Watch the log** (docs/REKOR-ZONE-KEY.md §5.5). A required log with no
   watcher is a formality. `synch-monitor` reads the whole log's tiles and
   reports **every newly authorized key** for the apexes you watch:

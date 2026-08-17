@@ -87,12 +87,49 @@ pub fn publish(
   sqlite.transaction(conn, Db, fn() { publish_in_tx(conn, csk, now, actor) })
 }
 
+/// Re-emits the zone unchanged because its signatures are aging out.
+///
+/// **The one publish path the transparency gate does not apply to**, and
+/// the reason is that a re-sign says nothing new. It emits the same records
+/// clients have already been accepting, with fresh RRSIG windows; refusing
+/// it does not withhold an unlogged key from anybody, because that key is
+/// already serving. What refusing it does is let the zone's signatures
+/// expire — `sig_validity` defaults to 14 days — at which point every
+/// client fails closed on *DNSSEC*, not on transparency, and the whole zone
+/// goes bogus. A transparency gap should not become a DNS outage.
+///
+/// Changing what the zone *says* still goes through `publish_in_tx`, which
+/// is gated. So the gate keeps doing its job — no new content is emitted
+/// under an unlogged key — while the hourly job keeps the zone resolvable
+/// long enough for an operator to run `rekor-publish`.
+pub fn publish_resign(
+  conn: Connection,
+  csk: Csk,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  sqlite.transaction(conn, Db, fn() { emit(conn, csk, now, actor, False) })
+}
+
 /// The publish body, for callers that already opened the transaction.
 pub fn publish_in_tx(
   conn: Connection,
   csk: Csk,
   now: Int,
   actor: String,
+) -> Result(Int, PublishError) {
+  emit(conn, csk, now, actor, True)
+}
+
+/// The publish body proper. `gated` says whether this emission is a change
+/// to what the zone claims (gated) or a re-signing of what it already
+/// published (not) — see `publish_resign`.
+fn emit(
+  conn: Connection,
+  csk: Csk,
+  now: Int,
+  actor: String,
+  gated: Bool,
 ) -> Result(Int, PublishError) {
   use _ <- result.try(exec(
     conn,
@@ -104,19 +141,21 @@ pub fn publish_in_tx(
     True -> Ok(Nil)
     False -> Error(KeyMismatch)
   })
-  use Nil <- result.try(
-    gate.check(
-      conn,
-      meta.key_tag,
-      crypto.hash(crypto.Sha256, keys.dnskey_rdata(csk)),
-    )
-    |> result.map_error(fn(e) {
-      case e {
-        gate.NoRecord(key_tag) -> NoRekorRecord(key_tag)
-        gate.Db(error) -> Db(error)
-      }
-    }),
-  )
+  use Nil <- result.try(case gated {
+    False -> Ok(Nil)
+    True ->
+      gate.check(
+        conn,
+        meta.key_tag,
+        crypto.hash(crypto.Sha256, keys.dnskey_rdata(csk)),
+      )
+      |> result.map_error(fn(e) {
+        case e {
+          gate.NoRecord(key_tag) -> NoRekorRecord(key_tag)
+          gate.Db(error) -> Db(error)
+        }
+      })
+  })
   use rrsets <- result.try(build.build(input) |> result.map_error(Build))
   let inception = now - meta.sig_inception_skew
   let expiration = now + meta.sig_validity
