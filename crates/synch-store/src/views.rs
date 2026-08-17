@@ -386,16 +386,18 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (origin, size, complete, spans) = row?;
-            let state = if complete != 0 {
-                AdState::Complete
-            } else {
-                let spans: Vec<(u64, u64)> = match spans {
-                    Some(bytes) => postcard::from_bytes(&bytes)
-                        .map_err(|e| StoreError::Decode(e.to_string()))?,
-                    None => Vec::new(),
-                };
-                AdState::Partial { spans }
+            // `complete` is the legacy duplicate of "the spans cover the whole
+            // object" and is still written for older readers; the spans are
+            // authoritative. A row written as complete before v11 carries no
+            // spans, so it is reconstituted from the size.
+            let spans: Vec<(u64, u64)> = match spans {
+                Some(bytes) => {
+                    postcard::from_bytes(&bytes).map_err(|e| StoreError::Decode(e.to_string()))?
+                }
+                None if complete != 0 && size > 0 => vec![(0, size as u64)],
+                None => Vec::new(),
             };
+            let state = AdState { spans };
             out.push((
                 origin_column(origin, "blob_providers.origin_id")?,
                 BlobAd {
@@ -965,13 +967,11 @@ fn put_provider_in(
     origin: &OriginId,
     ad: &BlobAd,
 ) -> Result<()> {
-    let (complete, spans) = match &ad.state {
-        AdState::Complete => (1i64, None),
-        AdState::Partial { spans } => (
-            0i64,
-            Some(postcard::to_stdvec(spans).map_err(|e| StoreError::Decode(e.to_string()))?),
-        ),
-    };
+    // The spans are the record; `complete` is derived from them on the way in
+    // rather than tracked beside them, so the two cannot disagree.
+    let complete = i64::from(ad.is_complete());
+    let spans =
+        Some(postcard::to_stdvec(&ad.state.spans).map_err(|e| StoreError::Decode(e.to_string()))?);
     conn.execute(
         "INSERT INTO blob_providers (object_root, origin_id, size, complete, spans)
          VALUES (?1, ?2, ?3, ?4, ?5)

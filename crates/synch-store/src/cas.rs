@@ -1343,8 +1343,7 @@ mod tests {
         let ad = fetcher.local_ad(&root).unwrap().unwrap();
         assert!(!ad.is_complete());
         match ad.state {
-            synch_core::AdState::Partial { ref spans } => assert_eq!(spans, &vec![(0, g)]),
-            synch_core::AdState::Complete => panic!("expected a partial ad"),
+            synch_core::AdState { ref spans } => assert_eq!(spans, &vec![(0, g)]),
         }
         assert!(ad.intersects(0, 10));
         assert!(!ad.intersects(2 * g, 3 * g));

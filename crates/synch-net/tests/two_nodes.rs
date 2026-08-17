@@ -719,7 +719,7 @@ async fn a_small_edit_to_a_large_object_transfers_the_edit() {
     assert_eq!(equal, 3, "only the edited span differs");
     let mut promoted = follower
         .store
-        .promote(&new_root, size, &synch_store::Donor(old_root), &spans, 0)
+        .promote(&synch_store::Donor(old_root), &spans, 0)
         .unwrap();
     assert_eq!(promoted.count(), 48);
 
@@ -733,7 +733,7 @@ async fn a_small_edit_to_a_large_object_transfers_the_edit() {
     promoted = promoted.union(
         &follower
             .store
-            .promote(&new_root, size, &synch_store::Donor(old_root), &leaves, 0)
+            .promote(&synch_store::Donor(old_root), &leaves, 0)
             .unwrap(),
     );
     assert_eq!(promoted.count(), groups - 1, "everything but the edit");

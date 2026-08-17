@@ -252,6 +252,25 @@ impl Subtree {
     /// caller comparing objects needs; writing its interior back into *this*
     /// object's outboard needs bao's name for it, and that is a walk down from
     /// the root. `None` for a run that is not a subtree of this tree at all.
+    /// Finds the subtree covering `[start, start + groups)` by descending.
+    ///
+    /// `promote` calls this once per proven span because [`ProvenSubtree`]
+    /// carries only `(start, groups)` and not the `TreeNode` the walk that
+    /// produced it already held — so the descent recomputes a value that was in
+    /// hand a moment earlier.
+    ///
+    /// It stays a descent deliberately. A whole subtree is aligned and a power
+    /// of two wide, so its node index is `start | ((1 << level) - 1)` and could
+    /// be built in constant time — but `bao_tree::TreeNode` wraps a private
+    /// field with no public constructor (0.16 keeps `from_start_chunk_and_level`
+    /// behind `cfg(test)`), so that identity cannot be expressed from here.
+    /// Carrying the node in `ProvenSubtree` instead would leak `TreeNode`
+    /// through `synch-store`'s public API into `synch-engine`, and keeping it
+    /// in a private side-table parallel to the public `Vec` buys a desync
+    /// hazard. The descent is `O(log groups)` of integer arithmetic — tens of
+    /// operations per span — so all three of those cost more than they save.
+    /// The real fix is the seam: were the proof walk to live behind a narrower
+    /// interface, the node would simply travel with its subtree.
     fn locate(tree: &BaoTree, total: u64, start: u64, groups: u64) -> Option<Subtree> {
         let mut node = Subtree::root_of(tree, total);
         loop {
@@ -758,39 +777,24 @@ impl Store {
     /// is left to the leaf-level round that follows it.
     ///
     /// Returns the groups newly committed.
-    pub fn promote(
-        &self,
-        root: &Hash,
-        size: u64,
-        donor: &Donor,
-        proven: &Proven,
-        now: i64,
-    ) -> Result<ChunkRanges> {
-        // A proof of one object is not a proof of another, however alike their
-        // trees. Two objects of a size share a shape, so every positional check
-        // below would pass for the wrong proof and the promotion would fill
-        // this object with a stranger's bytes and mark it complete (§5.1).
-        if proven.root != *root {
-            return Err(StoreError::Verification {
-                root: *root,
-                reason: format!("a proof of {} is not a proof of this object", proven.root),
-            });
-        }
-        // And a proof of this object at some other length is not a proof of it
-        // either. "Whole" — the property that makes a subtree comparable across
-        // objects at all — is a fact about where the object ends, so a proof
-        // taken under a short size hands out whole-looking subtrees that this
-        // object does not end after, and promoting them completes the row at a
-        // fraction of its length (see [`Proven`]).
-        if proven.size != size {
-            return Err(StoreError::Verification {
-                root: *root,
-                reason: format!(
-                    "a proof taken at {} bytes is not a proof of this object at {size} bytes",
-                    proven.size
-                ),
-            });
-        }
+    pub fn promote(&self, donor: &Donor, proven: &Proven, now: i64) -> Result<ChunkRanges> {
+        // The object and its length come off the proof itself.
+        //
+        // They used to be passed alongside it and checked for agreement, and
+        // `DELTA-SYNC.md` §3.1 presented that as a security property. It was
+        // not one: tracing every construction site, `write_proof` builds
+        // `Proven` from its own arguments and `Proven::none` from the caller's
+        // locals, and `promote` was then handed those same locals again — no
+        // peer-supplied value ever reached `proven.root` or `proven.size`
+        // independently of what the caller already had. The check could only
+        // ever catch a caller mixing up two objects, which is what taking the
+        // values from one place makes unrepresentable instead.
+        //
+        // The real protection is elsewhere and unaffected: `walk_proof`
+        // recomputes every chaining value to the root, so a proof of another
+        // object cannot verify in the first place.
+        let root = &proven.root;
+        let size = proven.size;
         let groups = group_count(size);
         // Inline blobs never delta (§4): one group is smaller than the round
         // trip that would discover it could be reused.
@@ -1334,9 +1338,7 @@ mod tests {
         let proven = fetcher
             .write_proof(&new_root, size, &served, 0, &encoded, 0)
             .unwrap();
-        let promoted = fetcher
-            .promote(&new_root, size, &Donor(old_root), &proven, 0)
-            .unwrap();
+        let promoted = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
 
         assert_eq!(promoted, all.difference(&ChunkRanges::single(5, 6)));
         assert_eq!(promoted.count(), groups - 1);
@@ -1390,9 +1392,7 @@ mod tests {
             .write_proof(&new_root, size, &served, 4, &encoded, 0)
             .unwrap();
         assert_eq!(spans.subtrees.len(), 4);
-        let promoted = fetcher
-            .promote(&new_root, size, &Donor(old_root), &spans, 0)
-            .unwrap();
+        let promoted = fetcher.promote(&Donor(old_root), &spans, 0).unwrap();
         assert_eq!(promoted.count(), 48, "three whole spans: {promoted:?}");
 
         // A third node fetches one of those spans from the promoter and gets
@@ -1436,9 +1436,7 @@ mod tests {
             "the tail group is short"
         );
 
-        let promoted = fetcher
-            .promote(&new_root, size, &Donor(old_root), &proven, 0)
-            .unwrap();
+        let promoted = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
         assert!(
             promoted.contains(6),
             "the short tail is reusable: {promoted:?}"
@@ -1477,9 +1475,7 @@ mod tests {
             let proven = fetcher
                 .write_proof(&new_root, size, &served, level, &encoded, 0)
                 .unwrap();
-            let got = fetcher
-                .promote(&new_root, size, &Donor(old_root), &proven, 0)
-                .unwrap();
+            let got = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
             promoted = promoted.union(&got);
         }
         assert_eq!(
@@ -1548,9 +1544,7 @@ mod tests {
         raw[offset as usize + 8 + 3] ^= 0xff;
         std::fs::write(fetcher.outboard_path(&old_root), &raw).unwrap();
 
-        let promoted = fetcher
-            .promote(&new_root, size, &Donor(old_root), &proven, 0)
-            .unwrap();
+        let promoted = fetcher.promote(&Donor(old_root), &proven, 0).unwrap();
         assert!(
             !promoted.overlaps(span.start, span.end()),
             "the span over the rotted tree is refused: {promoted:?}"
@@ -1578,7 +1572,14 @@ mod tests {
     /// asked for it. The root travelling with the subtrees is what makes the
     /// refusal possible.
     #[test]
-    fn a_proof_of_another_object_is_refused() {
+    fn a_proof_is_spent_on_the_object_it_was_taken_for() {
+        // `promote` reads the object and its length off the proof rather than
+        // taking them alongside it, so "spending a proof on the wrong object"
+        // is no longer a thing a caller can express — which is what the pair of
+        // checks that used to guard it could only ever catch. The guarantee
+        // that matters is unchanged and lives in `walk_proof`: a proof only
+        // verifies against the root it was taken for, so it can never be turned
+        // into bytes for a different object.
         let (_d1, provider) = store();
         let (_d2, fetcher) = store();
         let mine = data(8 * GROUP);
@@ -1591,17 +1592,30 @@ mod tests {
 
         let all = ChunkRanges::single(0, group_count(size));
         let (encoded, served) = provider.encode_proof(&my_root, &all, 0).unwrap();
-        let proven = fetcher
-            .write_proof(&my_root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        assert!(matches!(
-            fetcher.promote(&their_root, size, &Donor(donor), &proven, 0),
-            Err(StoreError::Verification { .. })
-        ));
+
+        // The forgery attempt: my object's proof bytes, offered as theirs.
+        assert!(
+            matches!(
+                fetcher.write_proof(&their_root, size, &served, 0, &encoded, 0),
+                Err(StoreError::Verification { .. })
+            ),
+            "a proof must not verify against another object's root"
+        );
         assert!(
             fetcher.blob(&their_root).unwrap().is_none(),
             "nothing was written for the object the proof was not about"
         );
+
+        // And spent honestly, it names the object it was taken for — which is
+        // now the only object it can be spent on. (A promote that actually
+        // moves groups is covered by `a_proof_carries_the_length_it_was_taken_at`;
+        // here the donor *is* the object, so there is nothing left to fill.)
+        let proven = fetcher
+            .write_proof(&my_root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert_eq!(proven.root, my_root);
+        assert_eq!(proven.size, size);
+        fetcher.promote(&Donor(donor), &proven, 0).unwrap();
     }
 
     /// A proof of the right object at the wrong length is refused.
@@ -1617,20 +1631,35 @@ mod tests {
     /// length: unreadable, and refusing every honest writer of the rest for
     /// good, exactly as an unattested size claim once did.
     #[test]
-    fn a_proof_spent_at_the_wrong_length_is_refused() {
+    fn a_proof_carries_the_length_it_was_taken_at() {
+        // The length is part of the proof rather than a parameter beside it, so
+        // a proof cannot be spent at a length it was not taken at. "Whole" —
+        // the property that makes a subtree comparable across objects — is a
+        // fact about where the object ends, and a proof taken under a short
+        // size would hand out whole-looking subtrees this object does not end
+        // after.
         let (_d1, provider) = store();
         let (_d2, fetcher) = store();
         let bytes = data(20 * GROUP);
         let size = bytes.len() as u64;
         let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        // A donor sharing every group but the last: a real reuse, so what the
-        // refusal costs is visible next to what it would have allowed.
+        // A donor sharing every group but the last: a real reuse.
         let mut donor_bytes = bytes.clone();
         donor_bytes[19 * GROUP] ^= 0xff;
         let donor = fetcher.ingest_bytes(&donor_bytes, 0).unwrap();
 
         let all = ChunkRanges::single(0, group_count(size));
         let (encoded, served) = provider.encode_proof(&root, &all, 0).unwrap();
+
+        // A proof cannot be *taken* at a length the object does not have.
+        let short = 16 * GROUP as u64;
+        assert!(
+            fetcher
+                .write_proof(&root, short, &served, 0, &encoded, 0)
+                .is_err(),
+            "a proof must not verify under a length the tree does not have"
+        );
+
         let proven = fetcher
             .write_proof(&root, size, &served, 0, &encoded, 0)
             .unwrap();
@@ -1639,23 +1668,7 @@ mod tests {
             "a proof carries the size it was taken at"
         );
 
-        let short = 16 * GROUP as u64;
-        assert!(matches!(
-            fetcher.promote(&root, short, &Donor(donor), &proven, 0),
-            Err(StoreError::Verification { .. })
-        ));
-        let row = fetcher.blob(&root).unwrap().unwrap();
-        assert!(
-            !row.complete,
-            "nothing was promoted into a truncated object"
-        );
-        assert!(row.verified_groups().is_empty());
-        assert_eq!(row.size, size);
-
-        // At the length it was taken at, the same proof spends perfectly well.
-        let promoted = fetcher
-            .promote(&root, size, &Donor(donor), &proven, 0)
-            .unwrap();
+        let promoted = fetcher.promote(&Donor(donor), &proven, 0).unwrap();
         assert_eq!(promoted.count(), 19, "every group but the changed one");
     }
 
@@ -1784,9 +1797,7 @@ mod tests {
         let proven = fetcher
             .write_proof(&new_root, size, &served, 0, &encoded, 0)
             .unwrap();
-        let promoted = fetcher
-            .promote(&new_root, size, &Donor(tiny), &proven, 0)
-            .unwrap();
+        let promoted = fetcher.promote(&Donor(tiny), &proven, 0).unwrap();
         assert!(promoted.is_empty(), "{promoted:?}");
     }
 
@@ -1903,13 +1914,7 @@ mod tests {
             // And promoting into one is a no-op rather than an error: inline
             // blobs never delta (§4).
             let promoted = store
-                .promote(
-                    &root,
-                    bytes.len() as u64,
-                    &Donor(root),
-                    &Proven::none(root, bytes.len() as u64),
-                    0,
-                )
+                .promote(&Donor(root), &Proven::none(root, bytes.len() as u64), 0)
                 .unwrap();
             assert!(promoted.is_empty());
         }

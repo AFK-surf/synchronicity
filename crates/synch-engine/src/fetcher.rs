@@ -219,12 +219,12 @@ impl Node {
                 // No live binding: we could not dial them even if we wanted to.
                 continue;
             }
-            let claims = match &ad.state {
-                synch_core::AdState::Complete => ChunkRanges::single(0, group_count(ad.size)),
-                synch_core::AdState::Partial { spans } => ChunkRanges::from_ranges(
-                    spans.iter().map(|&(s, e)| groups_for_byte_range(s, e)),
-                ),
-            };
+            let claims = ChunkRanges::from_ranges(
+                ad.state
+                    .spans
+                    .iter()
+                    .map(|&(s, e)| groups_for_byte_range(s, e)),
+            );
             let latency_us = keys
                 .iter()
                 .filter_map(|k| {
@@ -855,7 +855,7 @@ impl Node {
             if donor.root() == *root {
                 continue;
             }
-            let got = self.store().promote(root, size, donor, proven, now_ns())?;
+            let got = self.store().promote(donor, proven, now_ns())?;
             if got.is_empty() {
                 continue;
             }
