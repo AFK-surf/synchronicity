@@ -332,7 +332,7 @@ mod tests {
         assert!(trie.is_complete(new).unwrap());
 
         // Once history is pruned, the old root's private nodes go.
-        store.prune_history(&origin(), 2).unwrap();
+        store.prune_history_before(&origin(), 1).unwrap();
         let stats = store.gc_trie().unwrap();
         assert!(stats.nodes > 0);
         assert!(!store.has_node(&old).unwrap());

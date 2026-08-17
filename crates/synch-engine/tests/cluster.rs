@@ -654,7 +654,7 @@ async fn gc_keeps_the_current_root_servable() {
     // Drop the retention window entirely, then sweep.
     nas.node
         .store()
-        .prune_history(nas.node.origin(), u64::MAX)
+        .prune_history_before(nas.node.origin(), i64::MAX)
         .unwrap();
     let stats = nas.node.maintenance_pass().unwrap();
     assert!(stats.nodes > 0, "old roots must actually be swept");
