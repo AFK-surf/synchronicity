@@ -132,20 +132,21 @@ impl ScriptedPeer {
 /// A pair of endpoints that trust each other, for exercising a real exchange.
 ///
 /// Membership is unilateral per node (§3.2), so both stores are told about the
-/// other's device key before anything is dialled.
+/// other's device key before anything is dialled. The client's data directory
+/// comes back with them: dropping it would take its database with it.
 pub(crate) async fn trusting_pair(
     server_store: std::sync::Arc<synch_store::Store>,
     server_options: crate::endpoint::NetOptions,
-) -> (crate::endpoint::Net, crate::endpoint::Net) {
+) -> (
+    crate::endpoint::Net,
+    crate::endpoint::Net,
+    tempfile::TempDir,
+) {
     let server_secret = SecretKey::generate();
     let client_secret = SecretKey::generate();
     let client_dir = tempfile::tempdir().expect("a temp dir");
     let client_store =
         std::sync::Arc::new(synch_store::Store::open(client_dir.path()).expect("a client store"));
-    // The directory outlives the store for the length of the test through the
-    // store's own handle; leaking the guard is what keeps it alive without a
-    // fixture struct nothing else needs.
-    std::mem::forget(client_dir);
     trust(&server_store, client_secret.public());
     trust(&client_store, server_secret.public());
 
@@ -159,7 +160,7 @@ pub(crate) async fn trusting_pair(
     )
     .await
     .expect("the client binds");
-    (server, client)
+    (server, client, client_dir)
 }
 
 /// Binds a device key to an origin of its own in a store, statically.

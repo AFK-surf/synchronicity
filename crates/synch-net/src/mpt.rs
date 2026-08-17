@@ -776,7 +776,7 @@ mod tests {
             heads: Some(sink.clone() as std::sync::Arc<dyn HeadSink>),
             ..crate::endpoint::NetOptions::loopback()
         };
-        let (server, client) = trusting_pair(store.clone(), options).await;
+        let (server, client, _client_dir) = trusting_pair(store.clone(), options).await;
 
         let pushed = vec![
             SignedHead::sign(&signer, bad.clone(), 1, Hash::new(b"a"), 0),
