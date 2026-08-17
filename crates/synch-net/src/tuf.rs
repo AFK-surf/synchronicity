@@ -90,6 +90,19 @@ const TARGETS_META: &str = "targets.json";
 /// event that should still cost an upgrade (§10.4).
 pub const EMBEDDED_TUF_ROOT: &str = include_str!("sigstore_tuf_root.json");
 
+/// The Sigstore `trusted_root.json` this build boots from — the **bootstrap**
+/// pin set and log directory, not the last word.
+///
+/// The consistent-snapshot target `6494e21e…`, its SHA-256 checked against
+/// the signed `targets.json`; fetched 2026-08-16 from
+/// `tuf-repo-cdn.sigstore.dev`. It is the signed artifact itself rather than
+/// keys copied out of it, so which logs exist, where they are served and
+/// which of them is currently in service are all read from one place — here
+/// until a bundle verifies, and from that bundle's trusted root afterwards.
+/// Nothing about a Sigstore log rotation reaches this file: only a root-level
+/// incident does, and that is [`EMBEDDED_TUF_ROOT`]'s business.
+pub const EMBEDDED_TRUSTED_ROOT: &str = include_str!("sigstore_trusted_root.json");
+
 /// Why a TUF update was refused.
 ///
 /// The variants are the failure *classes* `synch doctor` explains. None of
@@ -262,8 +275,8 @@ impl PinState {
     /// The state a build starts from: the embedded root, nothing accepted.
     ///
     /// `trusted_root` is empty here — a client that has never completed an
-    /// update runs on [`crate::rekor::EMBEDDED_LOG_KEYS`], the bootstrap
-    /// snapshot, exactly as it did before this module existed.
+    /// update runs on [`EMBEDDED_TRUSTED_ROOT`], the bootstrap snapshot,
+    /// exactly as it did before this module existed.
     pub fn embedded() -> PinState {
         PinState {
             root: EMBEDDED_TUF_ROOT.as_bytes().to_vec(),
@@ -284,6 +297,24 @@ impl PinState {
             true => None,
             false => tlog_keys(&self.trusted_root).ok(),
         }
+    }
+
+    /// The trusted root in force: the accepted one, or the embedded
+    /// bootstrap snapshot when no update has ever been accepted.
+    pub fn trusted_root_in_force(&self) -> &[u8] {
+        match self.trusted_root.is_empty() {
+            true => EMBEDDED_TRUSTED_ROOT.as_bytes(),
+            false => &self.trusted_root,
+        }
+    }
+
+    /// The transparency logs it names — where they are, not only their keys.
+    ///
+    /// This is what makes the endpoint follow Sigstore too: a reader asks
+    /// its pin state which log to read rather than carrying a hostname a
+    /// rotation will invalidate.
+    pub fn tlogs(&self) -> Result<Vec<Tlog>, TufError> {
+        tlogs(self.trusted_root_in_force())
     }
 
     /// Reads persisted state, returning `None` when the file is absent or
@@ -455,40 +486,239 @@ pub fn update(bundle: &TufBundle, state: &PinState, now: u64) -> Result<TufUpdat
     })
 }
 
-/// The transparency-log keys a Sigstore trusted root names.
+/// One transparency log a Sigstore trusted root names: where it is, the key
+/// its checkpoints are signed with, and the window it was in service for.
+///
+/// The `baseUrl` matters as much as the key. A build that pins keys but
+/// hardcodes an endpoint has only moved the rotation problem: the log to
+/// *read* — and, for the control plane, to *write* — is named by the same
+/// signed artifact that names the key, so both follow Sigstore together or
+/// neither does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tlog {
+    /// Where the log is served, no trailing slash.
+    pub base_url: String,
+    /// The DER SubjectPublicKeyInfo of its verification key.
+    pub spki: Vec<u8>,
+    /// SHA-256 of that SPKI — what a proof's `log_id` names (and *not* the
+    /// `logId.keyId` the trusted root carries beside it, which is the C2SP
+    /// note key id; see [`crate::rekor::LogKeys`]).
+    pub log_id: [u8; 32],
+    /// `validFor.start`, seconds since the epoch. Absent means "always".
+    pub valid_from: i64,
+    /// `validFor.end`, if the log has been retired.
+    pub valid_until: Option<i64>,
+}
+
+impl Tlog {
+    /// Whether this log was in service at `now`.
+    pub fn valid_at(&self, now: u64) -> bool {
+        let now = now as i64;
+        self.valid_from <= now && self.valid_until.is_none_or(|end| now < end)
+    }
+}
+
+/// The transparency logs a Sigstore trusted root names, in the order it
+/// lists them.
 ///
 /// Only `tlogs` — the entries this design pins. Each `publicKey.rawBytes` is
 /// a DER SubjectPublicKeyInfo, which is exactly what [`LogKeys`] parses and
 /// what a proof's `log_id` is SHA-256 over.
-pub fn tlog_keys(trusted_root: &[u8]) -> Result<LogKeys, TufError> {
+pub fn tlogs(trusted_root: &[u8]) -> Result<Vec<Tlog>, TufError> {
     let bad = |why: String| TufError::Malformed(format!("trusted root: {why}"));
     let value: serde_json::Value =
         serde_json::from_slice(trusted_root).map_err(|e| bad(e.to_string()))?;
-    let tlogs = value["tlogs"]
+    let entries = value["tlogs"]
         .as_array()
         .ok_or_else(|| bad("tlogs is not an array".into()))?;
-    let mut lines = String::new();
-    for tlog in tlogs {
+    let mut logs = Vec::with_capacity(entries.len());
+    for tlog in entries {
         let raw = tlog["publicKey"]["rawBytes"]
             .as_str()
             .ok_or_else(|| bad("a tlog has no publicKey.rawBytes".into()))?;
-        lines.push_str(raw);
-        lines.push('\n');
+        let spki = base64_decode(raw).map_err(|_| bad("a tlog key is not base64".into()))?;
+        let base_url = tlog["baseUrl"]
+            .as_str()
+            .ok_or_else(|| bad("a tlog has no baseUrl".into()))?;
+        // A window that will not parse is not a reason to drop the log —
+        // its key is still pinned — but it must not read as *currently*
+        // valid, so an unparseable start is treated as "not yet".
+        let when = &tlog["publicKey"]["validFor"];
+        let valid_from = match when.get("start") {
+            None => 0,
+            Some(start) => start
+                .as_str()
+                .and_then(parse_rfc3339)
+                .ok_or_else(|| bad("a tlog's validFor.start is not RFC 3339".into()))?,
+        };
+        let valid_until = match when.get("end") {
+            None => None,
+            Some(end) => Some(
+                end.as_str()
+                    .and_then(parse_rfc3339)
+                    .ok_or_else(|| bad("a tlog's validFor.end is not RFC 3339".into()))?,
+            ),
+        };
+        logs.push(Tlog {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            log_id: sha256(&spki),
+            spki,
+            valid_from,
+            valid_until,
+        });
     }
-    let keys = LogKeys::parse(&lines).map_err(|e| bad(e.to_string()))?;
-    if keys.is_empty() {
+    if logs.is_empty() {
         // Adopting an empty pin set would silently refuse every zone from
         // then on. §10.2's whole posture is that TUF trouble is never worse
         // than not having the record, so this is trouble, not an update.
         return Err(bad("it names no transparency logs".into()));
     }
-    Ok(keys)
+    Ok(logs)
+}
+
+/// The log in service at `now`, the one a submission goes to and a monitor
+/// reads — the latest-started of those whose window contains `now`.
+///
+/// Sigstore's trusted root keeps retired shards listed so old proofs stay
+/// checkable, so "the current log" is a question about windows and not about
+/// list order. `None` when every listed log is retired or not yet open,
+/// which is a trusted root this build cannot use for anything live.
+pub fn current_tlog(logs: &[Tlog], now: u64) -> Option<&Tlog> {
+    logs.iter()
+        .filter(|log| log.valid_at(now))
+        .max_by_key(|log| log.valid_from)
+}
+
+/// The transparency-log keys a Sigstore trusted root names — every log it
+/// lists, retired ones included, because a proof from a retired shard is
+/// still a proof.
+pub fn tlog_keys(trusted_root: &[u8]) -> Result<LogKeys, TufError> {
+    let bad = |why: String| TufError::Malformed(format!("trusted root: {why}"));
+    let mut lines = String::new();
+    for log in tlogs(trusted_root)? {
+        lines.push_str(&base64_encode(&log.spki));
+        lines.push('\n');
+    }
+    LogKeys::parse(&lines).map_err(|e| bad(e.to_string()))
 }
 
 /// The version of a `root.json`, without verifying anything about it.
 fn root_version(bytes: &[u8]) -> Option<u64> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     value["signed"]["version"].as_u64()
+}
+
+// ------------------------------------------------------------- fetching
+
+/// The default Sigstore TUF repository, the one `EMBEDDED_TUF_ROOT` anchors.
+pub const SIGSTORE_TUF_URL: &str = "https://tuf-repo-cdn.sigstore.dev";
+
+/// How many root versions past the one already trusted [`fetch_bundle`] will
+/// probe before giving up. Sigstore rotates roughly yearly; this is decades
+/// of headroom and a bound on a repository that answers 200 to everything.
+const ROOT_CEILING: u64 = 200;
+
+/// A TUF repository, as the one operation walking it needs.
+///
+/// Injected rather than hardwired, exactly as the control plane's relay does
+/// it: everything [`fetch_bundle`] decides is then testable without egress,
+/// and a caller brings whichever HTTP client it already has (the client's is
+/// async, the monitor's blocking).
+///
+/// `Ok(None)` is a file the repository does not have — the end of the root
+/// chain is precisely that answer — and `Err` a repository that could not be
+/// reached at all. The two are different facts: one ends a walk, the other
+/// abandons it.
+#[allow(missing_debug_implementations)]
+pub trait Repo {
+    /// Fetches one path relative to the repository root.
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String>;
+}
+
+/// Walks a TUF repository into a bundle, starting the root chain at
+/// `from_root` — the version the caller already trusts.
+///
+/// **This verifies nothing.** It follows the consistent-snapshot naming so
+/// that the right files are collected — timestamp names the snapshot
+/// version, the snapshot names the targets version, the targets name the
+/// target's digest — and hands the result to [`update`], which is where
+/// every signature, expiry and rollback bound is checked. Fetching over a
+/// hostile transport is therefore not a vulnerability but a denial: the
+/// bytes are self-authenticating, so a tampering mirror produces a bundle
+/// that fails verification and leaves the current pins standing.
+pub fn fetch_bundle(repo: &dyn Repo, from_root: u64) -> Result<TufBundle, TufError> {
+    let fetch = |path: &str| -> Result<Vec<u8>, TufError> {
+        repo.get(path)
+            .map_err(TufError::Malformed)?
+            .ok_or_else(|| TufError::Chain(format!("the repository has no {path}")))
+    };
+
+    // The root chain, from the version already trusted up to whatever the
+    // repository last published. The walk ends at the first version the
+    // repository does not have — that is how TUF says "this is current".
+    let mut roots = Vec::new();
+    for version in from_root..from_root.saturating_add(ROOT_CEILING) {
+        match repo
+            .get(&format!("{version}.root.json"))
+            .map_err(TufError::Malformed)?
+        {
+            None => break,
+            Some(bytes) => roots.push(bytes),
+        }
+    }
+    if roots.is_empty() {
+        return Err(TufError::Chain(format!(
+            "the repository has no {from_root}.root.json, the root this client trusts"
+        )));
+    }
+
+    let timestamp = fetch("timestamp.json")?;
+    let snapshot_version = meta_version(&timestamp, SNAPSHOT_META)?;
+    let snapshot = fetch(&format!("{snapshot_version}.{SNAPSHOT_META}"))?;
+    let targets_version = meta_version(&snapshot, TARGETS_META)?;
+    let targets = fetch(&format!("{targets_version}.{TARGETS_META}"))?;
+
+    // The one target the whole chain exists to carry, named by its digest.
+    // `update` re-derives that digest from the bytes, so a repository that
+    // serves something else here fails verification rather than this fetch.
+    let digest = target_digest(&targets, TRUSTED_ROOT_TARGET)?;
+    let trusted_root = fetch(&format!("targets/{digest}.{TRUSTED_ROOT_TARGET}"))?;
+
+    Ok(TufBundle {
+        roots,
+        timestamp,
+        snapshot,
+        targets,
+        trusted_root,
+    })
+}
+
+/// The version a role lists for the file below it, unverified — enough to
+/// name the next file to fetch.
+fn meta_version(bytes: &[u8], file: &str) -> Result<u64, TufError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| TufError::Malformed(format!("{file}: {e}")))?;
+    value["signed"]["meta"][file]["version"]
+        .as_u64()
+        .ok_or_else(|| TufError::Malformed(format!("the metadata does not list {file}")))
+}
+
+/// The SHA-256 `targets.json` names for a target, unverified — enough to
+/// name the consistent-snapshot file to fetch.
+fn target_digest(targets: &[u8], name: &str) -> Result<String, TufError> {
+    let value: serde_json::Value = serde_json::from_slice(targets)
+        .map_err(|e| TufError::Malformed(format!("{TARGETS_META}: {e}")))?;
+    let digest = value["signed"]["targets"][name]["hashes"]["sha256"]
+        .as_str()
+        .ok_or_else(|| {
+            TufError::Malformed(format!("{TARGETS_META} names no {name} with a sha256"))
+        })?;
+    match digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        true => Ok(digest.to_ascii_lowercase()),
+        false => Err(TufError::Malformed(format!(
+            "{TARGETS_META} gives {name} a digest that is not a SHA-256"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------- metadata
@@ -1306,6 +1536,84 @@ mod tests {
             tlog_keys(b"not json"),
             Err(TufError::Malformed(_))
         ));
+        assert!(matches!(tlogs(b"not json"), Err(TufError::Malformed(_))));
+        // A log with a key but nowhere to reach it is half an answer, and
+        // the half that is missing is the one this change exists to supply.
+        assert!(matches!(
+            tlogs(br#"{"tlogs":[{"publicKey":{"rawBytes":"MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244="}}]}"#),
+            Err(TufError::Malformed(_))
+        ));
+    }
+
+    /// A trusted root with three shards: one closed, one open, one not yet.
+    fn three_shards() -> Vec<u8> {
+        let ed25519 = "MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=";
+        let p256 = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==";
+        serde_json::json!({"tlogs": [
+            {
+                "baseUrl": "https://retired.example/",
+                "publicKey": {"rawBytes": p256, "validFor": {
+                    "start": "2021-01-12T11:53:27Z",
+                    "end": "2025-09-23T00:00:00Z",
+                }},
+            },
+            {
+                "baseUrl": "https://open.example",
+                "publicKey": {"rawBytes": ed25519, "validFor": {
+                    "start": "2025-09-23T00:00:00Z",
+                }},
+            },
+            {
+                "baseUrl": "https://next.example",
+                "publicKey": {"rawBytes": ed25519, "validFor": {
+                    "start": "2030-01-01T00:00:00Z",
+                }},
+            },
+        ]})
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn the_current_log_is_the_one_whose_window_is_open_now() {
+        let logs = tlogs(&three_shards()).unwrap();
+        // 2026-08-16: the middle shard.
+        let open = current_tlog(&logs, 1_786_854_774).expect("a log in service");
+        assert_eq!(open.base_url, "https://open.example");
+        // 2023: the first, before the middle one opened.
+        assert_eq!(
+            current_tlog(&logs, 1_690_000_000).unwrap().base_url,
+            "https://retired.example",
+            "a trailing slash is not part of a base URL"
+        );
+        // 2035: the last, once the others have been superseded.
+        assert_eq!(
+            current_tlog(&logs, 2_050_000_000).unwrap().base_url,
+            "https://next.example"
+        );
+        // Before any of them opened, nothing is in service — which is a
+        // trusted root to report on, not one to guess a hostname from.
+        assert!(current_tlog(&logs, 0).is_none());
+
+        // Every shard stays pinned regardless: a proof from the retired one
+        // is still a proof, and its checkpoint still has to verify.
+        assert_eq!(tlog_keys(&three_shards()).unwrap().keys().len(), 3);
+    }
+
+    #[test]
+    fn the_embedded_trusted_root_names_a_log_in_service() {
+        let logs = tlogs(EMBEDDED_TRUSTED_ROOT.as_bytes()).expect("the embedded trusted root");
+        // The bootstrap has to be usable on its own — a build whose embedded
+        // artifact names no open shard cannot make a first request at all.
+        let now = 1_786_854_774;
+        let open = current_tlog(&logs, now).expect("an open shard in the embedded root");
+        assert!(open.base_url.starts_with("https://"));
+        // And the bootstrap pin set is exactly what that artifact names, not
+        // a separately maintained list that can drift from it.
+        assert_eq!(
+            crate::rekor::LogKeys::embedded(),
+            tlog_keys(EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap()
+        );
     }
 
     #[test]

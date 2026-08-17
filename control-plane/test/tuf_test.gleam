@@ -10,13 +10,17 @@
 import dns/name
 import dns/wire
 import dnssec/keys
+import envoy
 import fixtures
 import gleam/bit_array
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import rekor/client
+import rekor/proof
 import simplifile
 import store/migrate
 import store/sqlite
@@ -24,6 +28,7 @@ import tuf/bundle.{type Bundle, Bundle}
 import tuf/fetch
 import tuf/meta
 import tuf/store as tuf_store
+import tuf/trusted_root
 import zone/build
 import zone/model.{type ZoneInput, Member, NsHost, TxtName, ZoneInput, ZoneMeta}
 
@@ -289,6 +294,175 @@ pub fn refetching_is_due_only_near_expiry_test() {
   assert !fetch.due(conn, material.timestamp_expires - fetch.refetch_window - 1)
   assert fetch.due(conn, material.timestamp_expires - fetch.refetch_window)
   assert fetch.due(conn, material.timestamp_expires + 1)
+  sqlite.close(conn)
+}
+
+// ---------------------------------------------------------- log discovery
+
+/// A trusted root with three shards: one closed, one open, one not yet — the
+/// shape a rotation actually has, which the real fixture only has a snapshot
+/// of at one instant.
+fn three_shards() -> BitArray {
+  let assert Ok(real) = trusted_root.tlogs(fixture("trusted-root.json"))
+  let assert [first, second, ..] = real
+  let entry = fn(
+    url: String,
+    log: trusted_root.Tlog,
+    window: List(#(String, String)),
+  ) {
+    json.object([
+      #("baseUrl", json.string(url)),
+      #(
+        "publicKey",
+        json.object([
+          #("rawBytes", json.string(bit_array.base64_encode(log.spki, True))),
+          #(
+            "validFor",
+            json.object(
+              list.map(window, fn(pair) { #(pair.0, json.string(pair.1)) }),
+            ),
+          ),
+        ]),
+      ),
+    ])
+  }
+  let text =
+    json.object([
+      #(
+        "tlogs",
+        json.preprocessed_array([
+          entry("https://retired.test/", first, [
+            #("start", "2021-01-12T11:53:27Z"),
+            #("end", "2025-09-23T00:00:00Z"),
+          ]),
+          entry("https://open.test", second, [
+            #("start", "2025-09-23T00:00:00Z"),
+          ]),
+          entry("https://next.test", second, [
+            #("start", "2030-01-01T00:00:00Z"),
+          ]),
+        ]),
+      ),
+    ])
+    |> json.to_string
+  <<text:utf8>>
+}
+
+pub fn the_real_trusted_root_names_the_log_to_write_to_test() {
+  let assert Ok(logs) = trusted_root.tlogs(fixture("trusted-root.json"))
+  let assert Ok(open) = trusted_root.current(logs, number("verify_at"))
+  // Asserted as a shape, never as a hostname: pinning the name here is the
+  // thing this module exists to stop doing.
+  assert string.starts_with(open.base_url, "https://")
+  assert !string.ends_with(open.base_url, "/")
+  assert trusted_root.valid_at(open, number("verify_at"))
+
+  // And the log ids the client pins are the digests of the keys named
+  // beside those URLs — the same crossval the Rust suite asserts, so the
+  // two sides cannot drift into pinning one log and writing to another.
+  let ids =
+    logs
+    |> list.map(fn(log) {
+      string.lowercase(bit_array.base16_encode(proof.log_id(log.spki)))
+    })
+    |> list.sort(string.compare)
+  assert ids == list.sort(string.split(field("log_ids"), ","), string.compare)
+}
+
+pub fn the_current_log_is_the_one_whose_window_is_open_test() {
+  let assert Ok(logs) = trusted_root.tlogs(three_shards())
+  // 2026-08: the middle shard. A trailing slash is not part of a base URL.
+  let assert Ok(open) = trusted_root.current(logs, 1_786_854_774)
+  assert open.base_url == "https://open.test"
+  // 2023, before it opened; 2035, after the next one did.
+  let assert Ok(before) = trusted_root.current(logs, 1_690_000_000)
+  assert before.base_url == "https://retired.test"
+  let assert Ok(after) = trusted_root.current(logs, 2_050_000_000)
+  assert after.base_url == "https://next.test"
+  // Every shard closed or not yet open is a fact to report, not a hostname
+  // to guess.
+  let assert Error(_) = trusted_root.current(logs, 0)
+
+  // An operator redirecting to a shard the root already names gets its key
+  // for free; one it does not name has to bring the key itself.
+  let assert Ok(named) = trusted_root.for_url(logs, "https://retired.test/")
+  assert named.valid_until != None
+  let assert Error(_) = trusted_root.for_url(logs, "https://elsewhere.test")
+}
+
+pub fn a_trusted_root_that_does_not_parse_names_no_log_test() {
+  let assert Error(_) = trusted_root.tlogs(<<"not json":utf8>>)
+  let assert Error(_) = trusted_root.tlogs(<<"{\"tlogs\":[]}":utf8>>)
+  // A log with a key but nowhere to reach it is half an answer, and the
+  // half that is missing is the one discovery needs.
+  let assert Error(_) =
+    trusted_root.tlogs(<<
+      "{\"tlogs\":[{\"publicKey\":{\"rawBytes\":\"MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=\"}}]}":utf8,
+    >>)
+}
+
+pub fn the_log_to_submit_to_comes_from_the_stored_material_test() {
+  let conn = fixtures.fresh_conn()
+  let now = number("verify_at")
+  envoy.unset("CP_REKOR_URL")
+  envoy.unset("CP_REKOR_KEY")
+
+  // Nothing stored: discovery fails saying what to run rather than falling
+  // back to a hostname this build was compiled with.
+  let assert Error(why) = client.discover(conn, now)
+  assert string.contains(why, "tuf-refresh")
+
+  let assert Ok(_) = fetch.refresh(conn, fake_repo(), "https://tuf.test", now)
+  let assert Ok(target) = client.discover(conn, now)
+  let assert Ok(logs) = trusted_root.tlogs(fixture("trusted-root.json"))
+  let assert Ok(open) = trusted_root.current(logs, now)
+  assert target.url == open.base_url
+  assert target.key == #(open.spki, open.point)
+  sqlite.close(conn)
+}
+
+pub fn a_first_ceremony_fetches_the_directory_it_needs_test() {
+  let conn = fixtures.fresh_conn()
+  let now = number("verify_at")
+  envoy.unset("CP_REKOR_URL")
+  envoy.unset("CP_REKOR_KEY")
+
+  // Nothing stored, so resolving fetches: the first `rekor-publish` on a
+  // fresh control plane does not have to be told to run `tuf-refresh` first,
+  // and what it fetches is the same material the zone will relay.
+  let assert Ok(target) =
+    client.resolve(conn, fake_repo(), "https://tuf.test", now)
+  let assert Ok(logs) = trusted_root.tlogs(fixture("trusted-root.json"))
+  let assert Ok(open) = trusted_root.current(logs, now)
+  assert target.url == open.base_url
+  let assert Ok(Ok(material)) = tuf_store.get(conn)
+  assert material.trusted_root == fixture("trusted-root.json")
+  sqlite.close(conn)
+
+  // No material and no egress is two problems, and the message says both:
+  // one is fixed by couriering a database, the other by opening a firewall.
+  let offline = fixtures.fresh_conn()
+  let dead = fetch.Repo(get: fn(_) { Error("no route to host") })
+  let assert Error(why) = client.resolve(offline, dead, "https://tuf.test", now)
+  assert string.contains(why, "no TUF material stored")
+  assert string.contains(why, "no route to host")
+  sqlite.close(offline)
+}
+
+pub fn a_named_log_and_key_are_taken_as_given_test() {
+  let conn = fixtures.fresh_conn()
+  let now = number("verify_at")
+  // The self-hosted case: no trusted root has anything to say about this
+  // log, and discovery must not go looking.
+  envoy.set("CP_REKOR_URL", "https://log.test/")
+  envoy.set("CP_REKOR_KEY", "test/fixtures/rekor/log-key.pem")
+  let assert Ok(target) = client.discover(conn, now)
+  assert target.url == "https://log.test"
+  let assert Ok(pem) = simplifile.read("test/fixtures/rekor/log-key.pem")
+  let assert Ok(pinned) = proof.parse_log_key(pem)
+  assert target.key == pinned
+  envoy.unset("CP_REKOR_URL")
+  envoy.unset("CP_REKOR_KEY")
   sqlite.close(conn)
 }
 

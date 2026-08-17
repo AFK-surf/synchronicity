@@ -432,15 +432,22 @@ but the requirement is about the key being *public*; an internal deployment
 that wants neither the public log nor its own says `--rekor off` in so many
 words rather than inheriting it from an unrelated flag.
 
-The embedded default keys (`rekor::EMBEDDED_LOG_KEYS`) are the Sigstore
-production logs, snapshotted from Sigstore's TUF `trusted_root.json` at build
-time. They are the **bootstrap** set, not the last word: a client that has
-accepted a TUF bundle from the zone runs on the pin set that bundle's
-`trusted_root.json` names instead, and that state persists in
-`<data-dir>/rekor-pins.json`. §10 is the whole of that mechanism — including
-why naming `--rekor-key` disables it outright. So the resolution order is:
-`--rekor-key` if given, else the last TUF-verified pin set, else the embedded
-bootstrap. Only the last of those is a build-time constant.
+The embedded default keys are the logs Sigstore's `trusted_root.json` names,
+and the client ships **that artifact** rather than keys copied out of it
+(`tuf::EMBEDDED_TRUSTED_ROOT`, whose SHA-256 is the one the signed
+`targets.json` gives for the target). It is the **bootstrap** set, not the
+last word: a client that has accepted a TUF bundle from the zone runs on the
+pin set that bundle's `trusted_root.json` names instead, and that state
+persists in `<data-dir>/rekor-pins.json`. §10 is the whole of that mechanism —
+including why naming `--rekor-key` disables it outright. So the resolution
+order is: `--rekor-key` if given, else the last TUF-verified pin set, else the
+embedded bootstrap. Only the last of those is a build-time constant.
+
+Shipping the artifact rather than an extract is what lets everything else in
+this design stop naming a log. A trusted root is a **directory**: for each
+shard, where it is served, its key, and the window it was in service for. The
+key set and the endpoint therefore come from one signed file, at every layer
+that needs either (§5.1, §5.5, §10.6).
 
 ### 4.2 Refresh pipeline
 
@@ -577,8 +584,8 @@ belongs.
 
 | Variable | Role | Meaning |
 |---|---|---|
-| `CP_REKOR_URL` | primary | Rekor v2 write endpoint (`POST /api/v2/log/entries`). Default `https://log2025-1.rekor.sigstore.dev`. |
-| `CP_REKOR_KEY` | primary | Optional file pinning a self-hosted log's verification key; absent means the embedded key of the log at `CP_REKOR_URL`'s default — log2025-1's Ed25519 key alone, not the client's whole pinned set, because this side submits to exactly one log and verifies what that log returns. Redirecting `CP_REKOR_URL` without naming the matching key here is the misconfiguration to watch for: the publish then fails its own verification rather than storing something clients would refuse. |
+| `CP_REKOR_URL` | primary | Rekor v2 write endpoint (`POST /api/v2/log/entries`). No default: absent, the shard in service is read from the relayed `trusted_root.json` (§10.6). |
+| `CP_REKOR_KEY` | primary | Optional file pinning a self-hosted log's verification key. Absent, the key is the one the trusted root names beside the endpoint — one key, not the client's whole pinned set, because this side submits to exactly one log and verifies what that log returns. Redirecting `CP_REKOR_URL` to a log the trusted root does not name, without naming the matching key here, is refused up front rather than storing something clients would reject. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
 | `CP_REKOR_REQUIRE` | primary | `true` arms the publish gate of §5.3. Off by default, because the rollout publishes before it enforces (§7). |
 | `CP_TUF_URL` | primary | The Sigstore TUF repository this zone relays (§10.3). Default `https://tuf-repo-cdn.sigstore.dev`. |
@@ -814,11 +821,18 @@ root trust anchor with `synch_net::chain` — the same validator the client
 runs, deliberately the same code. `--dnssec-anchor` replaces that anchor for a
 monitor watching a privately-anchored deployment, with the same
 different-universe semantics the client's flag has, and `--rekor-key`
-replaces the log keys. Those two flags are the monitor's whole trust surface:
-**it has no TUF path**, because TUF material reaches a client by being relayed
-in a zone and a monitor reads a log, not a zone. Its pin set is the embedded
-one or the file it was handed, and a Sigstore log rotation is an upgrade or a
-`--rekor-key` for the monitor even though it is neither for a client.
+replaces the log keys. Those two flags are the monitor's whole trust surface.
+
+**Its TUF path is its own** (§10.6). TUF material reaches a *client* by being
+relayed in a zone, because a client resolves DNS and should not be made to
+depend on a CDN; a monitor is already an HTTP client of a log it does not
+trust, so it walks Sigstore's repository itself and verifies what it gets
+with `synch_net::tuf` — the client's code, against the client's embedded
+root — persisting the pin state in `rekor-pins.json` beside its state file.
+That is where **both** the keys and the log's base URL come from, so a
+Sigstore shard rotation is no more an upgrade for the monitor than it is for
+a client. `--no-tuf` runs on the pins already persisted, and `--log` names an
+endpoint outright.
 Signature *windows* are not enforced
 (§4.2.1), and the monitor has **no clock at all** to enforce them against: an
 entry's `integratedTime` sits outside the Merkle commitment and is therefore
@@ -1193,8 +1207,9 @@ other, and substituting one for the other yields a proof that matches no pin
 and fails as "unknown log" — which reads like a misconfigured client. The
 production code was always right (it derives the id from the *pinned* key,
 never from anything the server said); only the submission driver was wrong.
-Both `rekor::EMBEDDED_LOG_KEYS` and `rekor/proof.log_id` now say so where
-somebody would look.
+Both `rekor::LogKeys` and `rekor/proof.log_id` now say so where somebody
+would look, and `tuf::tlogs` derives the id from `publicKey.rawBytes` rather
+than reading the `logId.keyId` sitting beside it in the trusted root.
 
 **Both chain shapes, always.** `SimDelegation` builds a synthetic
 root → TLD → apex ladder with real DS records and its own anchor, beside the
@@ -1283,7 +1298,8 @@ Rust verifier.
 the real path against the public log:
 
 ```
-export CP_REKOR_URL=https://log2025-1.rekor.sigstore.dev
+# No CP_REKOR_URL: the shard in service comes out of the relayed
+# trusted_root.json, and `rekor-publish` fetches it if nothing is stored.
 export CP_DNSSEC_CHAIN_RESOLVER=https://cloudflare-dns.com/dns-query
 # ...after the DS is live in the parent:
 gleam run -- rekor-publish sync.example /etc/synchronicity/csk.key
@@ -1342,7 +1358,8 @@ means a stock client and an updated one read the same bundle.
 
 The client embeds two artifacts: the Sigstore **TUF root role**
 (`EMBEDDED_TUF_ROOT` — `root.json` version 15, the ultimate pin) and the
-current **bootstrap log-key snapshot** (`EMBEDDED_LOG_KEYS`, unchanged). Pin
+current **bootstrap trusted root** (`EMBEDDED_TRUSTED_ROOT` — Sigstore's own
+`trusted_root.json`, which names the logs *and* where they are served). Pin
 resolution order: an explicit `--rekor-key` file (a static, different
 universe — TUF refresh disabled entirely, and the record is not even asked
 for); else the last TUF-verified pin set persisted in the daemon's data
@@ -1469,3 +1486,36 @@ compromise, or a root chain the embedded floor can no longer reach.
 
 There is no TUF leg in the control-plane e2e. See §9 for why that e2e is a
 negative test and what stands in for the positive one.
+
+### 10.6 The endpoint follows too
+
+Pinning keys through TUF while hardcoding a hostname only moves the rotation
+problem. A build that knows `log2025-1…` submits into a closed shard the day
+the next one opens, and a monitor pointed at it goes quiet — *silently*,
+because an empty log reads exactly like a log with nothing new in it. So the
+same signed artifact that supplies the keys supplies the endpoint. Nothing in
+this repository names a Sigstore log outside of fixtures and this document.
+
+A `trusted_root.json` entry carries `baseUrl`, `publicKey.rawBytes`, and
+`publicKey.validFor`. The **log in service** is the latest-started of those
+whose window contains now; retired shards stay listed, stay pinned — a proof
+from a closed shard is still a proof — and are never selected. Both
+implementations select with that one rule (`tuf/trusted_root.current` and
+`tuf::current_tlog`), because the control plane writes to whichever shard it
+picks and the client has to verify what comes back.
+
+| Component | Where it gets the log | Override |
+|---|---|---|
+| Control plane | the relayed `trusted_root.json` in `tuf_material`, read at the moment of use — so the 15-minute external-mode key watcher picks up a rotation without a restart. With nothing stored, `rekor-publish` fetches first. | `CP_REKOR_URL` + `CP_REKOR_KEY`, together, for a self-hosted log |
+| Client | never talks to a log at all: a proof arrives inside the zone (§1) | — |
+| `synch-monitor` | walks the TUF repository itself and verifies it with the client's own [`synch_net::tuf`] code, persisting the pin state in `rekor-pins.json` beside its state file | `--log`, `--rekor-key`, `--no-tuf` |
+
+The monitor fetches rather than waiting for a zone to relay because it is
+already an HTTP client of a log it does not trust; a client is not, and
+should not be made to depend on a CDN. Both paths end in the same
+verification: `tuf::fetch_bundle` walks the consistent-snapshot naming and
+checks *nothing*, then hands what it collected to `tuf::update`. A tampering
+mirror produces a bundle that fails verification and leaves the pins in force
+standing, which is §10.2's rule reaching the fetch path unchanged — a TUF
+repository that is unreachable, stale or hostile is never worse than not
+having asked.

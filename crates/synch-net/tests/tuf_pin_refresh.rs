@@ -165,6 +165,115 @@ fn the_real_sigstore_chain_verifies_and_yields_the_pin_set() {
     );
 }
 
+/// The checked-in Sigstore files, served under the consistent-snapshot paths
+/// the repository actually publishes them at.
+///
+/// The fixture stores them by role (`snapshot.json`), the repository serves
+/// them by version (`165.snapshot.json`) and the target by digest — so a
+/// walk that resolved the wrong version, or read the digest out of the wrong
+/// field, would find nothing here rather than quietly assemble something.
+struct FixtureRepo;
+
+impl tuf::Repo for FixtureRepo {
+    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let named = |name: &str| Some(fixture(name));
+        let versions = fixture_field("root_versions");
+        for version in versions.split(',') {
+            if path == format!("{version}.root.json") {
+                return Ok(named(&format!("root-{version}.json")));
+            }
+        }
+        Ok(match path {
+            "timestamp.json" => named("timestamp.json"),
+            _ if path == format!("{}.snapshot.json", fixture_number("snapshot_version")) => {
+                named("snapshot.json")
+            }
+            _ if path == format!("{}.targets.json", fixture_number("targets_version")) => {
+                named("targets.json")
+            }
+            _ if path
+                == format!(
+                    "targets/{}.trusted_root.json",
+                    fixture_field("trusted_root_sha256")
+                ) =>
+            {
+                named("trusted-root.json")
+            }
+            // Every other path is a file the repository does not have,
+            // which is how the root walk knows where to stop.
+            _ => None,
+        })
+    }
+}
+
+#[test]
+fn walking_the_repository_finds_the_chain_the_zone_relays() {
+    // The monitor's half of §10: it has no zone to relay a bundle to it, so
+    // it walks Sigstore's repository itself. What it assembles must be the
+    // same chain the control plane relays and the client verifies — the
+    // fetch is a different path to the same bytes, not a second format.
+    let floor = fixture_number("chain_floor");
+    let walked =
+        tuf::fetch_bundle(&FixtureRepo, floor).expect("the fixture repository is walkable");
+    assert_eq!(walked, fixture_chain_bundle());
+
+    // And it goes through the ordinary verifier from there, with no
+    // dispensation for having been fetched rather than relayed.
+    let state = PinState {
+        root: fixture(&format!("root-{floor}.json")),
+        root_version: floor,
+        timestamp_version: 0,
+        snapshot_version: 0,
+        targets_version: 0,
+        trusted_root: Vec::new(),
+        updated_at: 0,
+    };
+    let update = tuf::update(&walked, &state, fixture_number("verify_at")).expect("it verifies");
+    assert_eq!(update.state.trusted_root, fixture("trusted-root.json"));
+
+    // The walk starts where the caller already is: a client at the current
+    // root collects only that root, and one past the end finds nothing at
+    // all rather than inventing a chain.
+    let current = fixture_number("root_version");
+    let from_current = tuf::fetch_bundle(&FixtureRepo, current).unwrap();
+    assert_eq!(
+        from_current.roots,
+        vec![fixture(&format!("root-{current}.json"))]
+    );
+    assert!(matches!(
+        tuf::fetch_bundle(&FixtureRepo, current + 1),
+        Err(TufError::Chain(_))
+    ));
+}
+
+#[test]
+fn the_log_to_read_comes_from_the_same_artifact_as_the_keys() {
+    // The endpoint follows Sigstore for the same reason the keys do. What
+    // the real trusted root names is asserted as a *shape* — an https base
+    // URL for a shard that is open at the moment the fixture was fetched,
+    // whose key is in the pin set — because pinning the hostname in a test
+    // is the thing being removed.
+    let trusted_root = fixture("trusted-root.json");
+    let logs = tuf::tlogs(&trusted_root).expect("the real trusted root lists its logs");
+    let at = fixture_number("verify_at");
+    let open = tuf::current_tlog(&logs, at).expect("Sigstore has a shard open");
+    assert!(open.base_url.starts_with("https://"));
+    assert!(!open.base_url.ends_with('/'));
+    assert!(open.valid_at(at));
+
+    let keys = tuf::tlog_keys(&trusted_root).unwrap();
+    assert!(
+        keys.find(&open.log_id).is_some(),
+        "the log to read must be one of the logs pinned"
+    );
+    // Retired shards stay pinned and stay out of the way: still verifiable,
+    // never selected.
+    assert!(logs.len() > 1);
+    for log in &logs {
+        assert!(keys.find(&log.log_id).is_some());
+    }
+}
+
 #[test]
 fn the_real_chain_expires() {
     // Expiry gates the update and nothing else: a year after the fixture was

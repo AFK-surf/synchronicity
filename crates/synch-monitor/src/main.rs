@@ -36,11 +36,21 @@ use clap::Parser;
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::{
     classify::{classify, Finding, Tier},
+    discover::{self, HttpRepo},
     state::MonitorState,
     tiles::{HttpTiles, Tree},
     MonitorError,
 };
 use synch_net::rekor::{Checkpoint, HashedRekordBody, LogKeys};
+
+/// Seconds since the epoch — what TUF's expiry and validity windows are read
+/// against.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Watch a Rekor v2 transparency log for zone-key entries.
 ///
@@ -67,21 +77,32 @@ use synch_net::rekor::{Checkpoint, HashedRekordBody, LogKeys};
    2  the run could not finish (transport, checkpoint, state)"
 )]
 struct Args {
-    /// The log's base URL.
-    #[arg(
-        long,
-        env = "SYNCH_MONITOR_LOG",
-        default_value = "https://log2025-1.rekor.sigstore.dev"
-    )]
-    log: String,
+    /// The log's base URL. Discovered from Sigstore's TUF repository when
+    /// not given, which is how a monitor survives a shard rotation.
+    #[arg(long, env = "SYNCH_MONITOR_LOG")]
+    log: Option<String>,
 
     /// Where to persist the last checkpoint, the last index, the apexes to
     /// watch and the keys already reported for each.
     #[arg(long, env = "SYNCH_MONITOR_STATE")]
     state: PathBuf,
 
-    /// A file of log verification keys, *replacing* the embedded Sigstore
-    /// set — the same "an override is a different universe" semantics the
+    /// The TUF repository to discover the log and its keys from.
+    #[arg(long, env = "SYNCH_MONITOR_TUF", default_value = synch_net::tuf::SIGSTORE_TUF_URL)]
+    tuf: String,
+
+    /// Do not contact the TUF repository: run on the pins already persisted,
+    /// or on the embedded bootstrap trusted root if there are none.
+    #[arg(long)]
+    no_tuf: bool,
+
+    /// Where to persist the TUF pin state. Defaults to `rekor-pins.json`
+    /// beside the state file, the name the client uses too.
+    #[arg(long)]
+    rekor_pins: Option<PathBuf>,
+
+    /// A file of log verification keys, *replacing* the discovered set —
+    /// the same "an override is a different universe" semantics the
     /// client's `--rekor-key` has.
     #[arg(long)]
     rekor_key: Option<PathBuf>,
@@ -126,10 +147,12 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<i32, MonitorError> {
-    let logs = match &args.rekor_key {
-        Some(path) => LogKeys::from_file(path)
-            .map_err(|e| MonitorError::Checkpoint(format!("{}: {e}", path.display())))?,
-        None => LogKeys::embedded(),
+    let keys_override = match &args.rekor_key {
+        Some(path) => Some(
+            LogKeys::from_file(path)
+                .map_err(|e| MonitorError::Checkpoint(format!("{}: {e}", path.display())))?,
+        ),
+        None => None,
     };
     let anchors = match &args.dnssec_anchor {
         Some(path) => TrustAnchors::from_file(path)
@@ -137,6 +160,9 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
         None => TrustAnchors::default(),
     };
 
+    // Everything local before anything remote: an unseeded state file is the
+    // first-run mistake, and finding out about it after a TUF walk and a
+    // checkpoint fetch would be a slower way to learn the same thing.
     let mut state = MonitorState::load(&args.state)?;
     if state.known.keys.is_empty() {
         return Err(MonitorError::State(format!(
@@ -147,7 +173,33 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
         )));
     }
 
-    let source = HttpTiles::new(&args.log)?;
+    // Discovery decides both which log this run reads and which keys its
+    // checkpoint must verify under, and the two come from one trusted root —
+    // a pin set from one artifact and an endpoint from another is how a
+    // rotation ends up looking like an equivocation.
+    let repo = match args.no_tuf {
+        true => None,
+        false => Some(HttpRepo::new(&args.tuf)?),
+    };
+    let pins = match &args.rekor_pins {
+        Some(path) => path.clone(),
+        None => discover::pins_beside(&args.state),
+    };
+    let found = discover::discover(
+        repo.as_ref().map(|repo| repo as &dyn synch_net::tuf::Repo),
+        &pins,
+        args.log.as_deref(),
+        keys_override,
+        now_unix(),
+        &mut |warning| eprintln!("synch-monitor: {warning}"),
+    )?;
+    eprintln!(
+        "synch-monitor: reading {} (via {})",
+        found.base_url, found.source
+    );
+    let logs = found.keys;
+
+    let source = HttpTiles::new(&found.base_url)?;
     let checkpoint = Checkpoint::parse(&source.checkpoint()?)
         .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
     checkpoint

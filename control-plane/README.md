@@ -189,8 +189,8 @@ listen address.
 | `CP_GOOGLE_CLIENT_SECRET` | primary | Google OAuth client secret. |
 | `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in. |
 | `CP_GITHUB_CLIENT_SECRET` | primary | GitHub OAuth client secret. |
-| `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Default `https://log2025-1.rekor.sigstore.dev`. |
-| `CP_REKOR_KEY` | primary | File pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev (Ed25519) snapshot. Set it for a self-hosted log. |
+| `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Unset — the normal case — the shard in service is read from the relayed `trusted_root.json`, so a Sigstore rotation costs a `tuf-refresh` and not a release. |
+| `CP_REKOR_KEY` | primary | File pinning the log's verification key. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
 | `CP_TUF_URL` | primary | Sigstore TUF repository this zone relays, so clients' log pins follow it. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched by `controlplane tuf-refresh` and by the hourly job within three days of the stored timestamp's expiry. |
