@@ -17,9 +17,17 @@
 //// stale-but-serving zone — the provider keeps answering with whatever was
 //// last applied — never to a failed control plane. Staleness is recorded
 //// in `provider_sync_state` where `/healthz` reports it, and a conflict
-//// (foreign data at a managed name with no ownership marker) stops the
-//// pass without touching anything: the reconciler must be incapable of
-//// eating a zone it does not own.
+//// (a record below the apex we did not render, with no ownership marker)
+//// stops the pass without touching anything: the reconciler must be
+//// incapable of eating a zone it does not own.
+////
+//// A pass can also *partly* apply. Records go out independently and a
+//// refused one is reported rather than aborting the rest, because the
+//// records this zone publishes are not equally urgent and the big ones are
+//// not the important ones: a transparency proof the provider refuses on
+//// size must never be the reason a device revocation failed to land. A
+//// partial pass does not advance `applied_hash`, so the next sweep
+//// recomputes the diff and retries exactly what is still missing.
 
 import gleam/erlang/process.{type Name, type Subject}
 import gleam/int
@@ -137,15 +145,27 @@ pub fn run_once_with(
 ) -> Nil {
   case pass(conn, prov, zone_id, now) {
     Ok(Fresh) -> Nil
-    Ok(Applied(serial, hash, changes)) -> {
+    Ok(Converged(serial, hash, changes, shed)) -> {
       let _ = state.record_ok(conn, provider_name, zone_id, hash, serial, now)
-      let _ = audit_sync(conn, now, serial, changes)
+      let _ = audit_sync(conn, now, serial, changes, shed, [])
       io.println(
         "provider-sync: applied serial "
         <> int.to_string(serial)
         <> " ("
         <> describe_changes(changes)
+        <> describe_shed(shed)
         <> ")",
+      )
+    }
+    Ok(Partial(serial, changes, failures)) -> {
+      let rendered = render_failures(failures)
+      let _ = state.record_partial(conn, provider_name, zone_id, rendered, now)
+      let _ = audit_sync(conn, now, serial, changes, 0, failures)
+      io.println_error(
+        "provider-sync: serial "
+        <> int.to_string(serial)
+        <> " partly applied — the provider refused "
+        <> rendered,
       )
     }
     Error(why) -> {
@@ -159,7 +179,16 @@ type Outcome {
   /// The stored hash already matches the desired set — nothing to do, no
   /// provider traffic. The sweep's common case.
   Fresh
-  Applied(serial: Int, hash: BitArray, changes: provider.Changes)
+  Converged(serial: Int, hash: BitArray, changes: provider.Changes, shed: Int)
+  /// The change set went out and the provider refused part of it. The hash
+  /// is deliberately absent: the zone is not the set we rendered, so nothing
+  /// may record it as applied, and the next sweep recomputes the diff and
+  /// retries what is still missing.
+  Partial(
+    serial: Int,
+    changes: provider.Changes,
+    failures: List(provider.Failure),
+  )
 }
 
 fn pass(
@@ -186,30 +215,27 @@ fn pass(
       s.applied_hash == Some(hash)
       && s.last_synced_serial == Some(input.meta.soa_serial)
       && s.last_error == option.None
+      // A pass the provider partly refused left records missing, so the
+      // short-circuit must not fire until a later pass gets them out.
+      && s.last_failures == option.None
     Error(Nil) -> False
   }
   use <- fresh_guard(fresh)
   use existing <- result.try(
-    prov.list(render_external.managed_names(input))
-    |> result.map_error(fn(e) { "provider list: " <> e }),
+    prov.list() |> result.map_error(fn(e) { "provider list: " <> e }),
   )
   use changes <- result.try(
-    diff.diff(desired, existing)
-    |> result.map_error(fn(conflict) {
-      let diff.Foreign(name, value) = conflict
-      "conflict: "
-      <> name
-      <> " holds a record this zone did not render ("
-      <> value
-      <> ") and no ownership marker — refusing to touch it"
-    }),
+    diff.diff(desired, existing) |> result.map_error(describe_conflict),
   )
-  use Nil <- result.try(case provider.no_changes(changes) {
-    True -> Ok(Nil)
+  use applied <- result.try(case provider.no_changes(changes) {
+    True -> Ok(provider.Applied(0, []))
     False ->
       prov.apply(changes) |> result.map_error(fn(e) { "provider apply: " <> e })
   })
-  Ok(Applied(input.meta.soa_serial, hash, changes))
+  case applied.failed {
+    [] -> Ok(Converged(input.meta.soa_serial, hash, changes, input.rekor_shed))
+    failures -> Ok(Partial(input.meta.soa_serial, changes, failures))
+  }
 }
 
 fn fresh_guard(
@@ -222,6 +248,29 @@ fn fresh_guard(
   }
 }
 
+/// Each conflict with the remedy that actually applies to it. The apex is
+/// this deployment's alone, so a record below it either belongs on a sibling
+/// name or is a marker somebody else wrote.
+fn describe_conflict(conflict: diff.Conflict) -> String {
+  case conflict {
+    diff.Foreign(name, value) ->
+      "conflict: "
+      <> name
+      <> " holds a record this zone did not render ("
+      <> value
+      <> ") and no ownership marker — refusing to touch it. The apex is this"
+      <> " deployment's alone: move that record to a sibling name"
+    diff.MarkerMismatch(name, value) ->
+      "conflict: "
+      <> name
+      <> " holds an ownership marker this deployment did not write ("
+      <> value
+      <> "). Another control plane is publishing into this apex, or an older"
+      <> " build left a marker of a narrower scope — delete the record and"
+      <> " this deployment will write its own"
+  }
+}
+
 fn describe_changes(changes: provider.Changes) -> String {
   "+"
   <> int.to_string(list.length(changes.create))
@@ -231,11 +280,28 @@ fn describe_changes(changes: provider.Changes) -> String {
   <> int.to_string(list.length(changes.delete))
 }
 
+/// A dropped proof is said out loud. A cap nobody is told about reads as
+/// "everything is published" when it is not.
+fn describe_shed(shed: Int) -> String {
+  case shed {
+    0 -> ""
+    n -> ", " <> int.to_string(n) <> " older proof(s) over budget"
+  }
+}
+
+fn render_failures(failures: List(provider.Failure)) -> String {
+  failures
+  |> list.map(fn(failure) { failure.name <> " (" <> failure.reason <> ")" })
+  |> string.join("; ")
+}
+
 fn audit_sync(
   conn: Connection,
   now: Int,
   serial: Int,
   changes: provider.Changes,
+  shed: Int,
+  failures: List(provider.Failure),
 ) -> Result(Nil, sqlite.Error) {
   sqlite.exec(
     conn,
@@ -250,6 +316,8 @@ fn audit_sync(
             #("create", json.int(list.length(changes.create))),
             #("replace", json.int(list.length(changes.replace))),
             #("delete", json.int(list.length(changes.delete))),
+            #("proofs_shed", json.int(shed)),
+            #("refused", json.int(list.length(failures))),
           ]),
         ),
       ),

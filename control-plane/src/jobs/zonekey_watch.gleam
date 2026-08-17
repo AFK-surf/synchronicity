@@ -3,21 +3,27 @@
 ////
 //// The provider holds the zone's private keys and rotates them on its own
 //// schedule, so the claim cannot be a ceremony an operator runs — it has
-//// to follow the wire. Every fifteen minutes this actor resolves the apex
+//// to follow the wire. Every five minutes this actor resolves the apex
 //// DNSKEY RRset over DoH; when the set differs from what the last logged
 //// claim covered, it collects the chain, logs a fresh claim (signed by an
 //// ephemeral key `rekor/publish` mints and discards — attribution is not
 //// authorization), and pokes the reconciler so the `_synchronicity-rekor`
 //// record follows into the provider zone.
 ////
-//// The failure direction is closed: a provider that cuts to a
-//// never-pre-published key strands `Require` clients until this loop
-//// re-logs — at most one watch interval plus propagation. Providers
-//// pre-publish rotations in the RRset as standard practice, and the
-//// key-set claim covers a pre-published key before it ever signs, which
-//// makes the gap theoretical in the ordinary case. Every failure here is a
-//// log line and a `/healthz` count, never a crash: clients keep verifying
-//// against the last logged set for as long as it keeps signing.
+//// A provider that pre-publishes — the standard rotation dance, and what
+//// Cloudflare does — puts its next key in the RRset days before it signs
+//// with it. That changes the set, so this loop logs a claim covering *both*
+//// keys while the old one is still signing, and the cut happens with the
+//// incoming key already on the public record. The claim's subject being a
+//// key set rather than one key is what lets a single entry span both sides
+//// of the cut.
+////
+//// A provider that cuts to a key it never published strands `Require`
+//// clients until this loop re-logs, and the cadence is set so that window
+//// fits inside the lifetime of the membership a client already holds
+//// (`zone/render_external.ttl_proof`). Every failure here is a log line and
+//// a `/healthz` count, never a crash: clients keep verifying against the
+//// last logged set for as long as it keeps signing.
 
 import dns/name as dns_name
 import dns/rdata
@@ -45,7 +51,10 @@ import store/sqlite.{type Connection}
 @external(erlang, "cp_sys_ffi", "now_unix")
 fn now_unix() -> Int
 
-const watch_interval_ms = 900_000
+/// How often the wire is re-read. Not a knob: it is one term of the timing
+/// relation in `zone/render_external.ttl_proof`, and moving it alone would
+/// silently widen the window a rotation can strand clients for.
+const watch_interval_ms = 300_000
 
 pub type Msg {
   Tick

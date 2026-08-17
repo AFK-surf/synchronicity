@@ -248,6 +248,20 @@ pub fn migrate_adds_the_rollover_slot_to_an_existing_zone_test() {
     sqlite.exec(conn, "ALTER TABLE zone_meta DROP COLUMN dnskey_incoming", [])
   let assert Ok(_) =
     sqlite.exec(conn, "ALTER TABLE zone_meta DROP COLUMN key_tag_incoming", [])
+  // Everything the rewind skipped past has to come off too, or the re-run
+  // re-adds a column that is already there.
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "ALTER TABLE provider_sync_state DROP COLUMN last_failures",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "ALTER TABLE provider_sync_state DROP COLUMN last_partial_at",
+      [],
+    )
   let assert Ok(v) = migrate.migrate(conn)
   assert v == migrate.build_version()
 

@@ -21,10 +21,17 @@ pub const ttl_data = 300
 /// Infrastructure records: NS, DNSKEY, glue.
 pub const ttl_infra = 3600
 
-/// Zone-key proofs: a day, clamped to the client's own 24 h ceiling. The
-/// zone key changes rarely, and the client caches this separately from the
-/// membership answer — so the steady-state refresh stays one TXT query.
-pub const ttl_rekor = 86_400
+/// Zone-key proofs: as short as the data they guard, and for the same reason
+/// `zone/render_external.ttl_proof` is.
+///
+/// A client caches nothing of its own (docs/REKOR-ZONE-KEY.md §4.2), so this
+/// TTL buys it no round trips — the only thing it governs is how long a
+/// recursive resolver keeps handing out the proof set from before a key
+/// rollover. A rollover here goes through a published two-key overlap, so
+/// that window is covered either way; matching the external mode's number
+/// keeps one answer to "how stale can a proof a client sees be" rather than
+/// two.
+pub const ttl_rekor = 300
 
 /// The label the zone-key proofs live under, one below the apex.
 pub const rekor_label = "_synchronicity-rekor"

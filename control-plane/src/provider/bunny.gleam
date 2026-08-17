@@ -7,10 +7,10 @@
 ////   - names are **relative** to the zone in Bunny's model (`""` for the
 ////     apex itself), so the leg converts against the apex both ways and
 ////     the rest of the reconciler only ever sees fully qualified names;
-////   - record types are numeric — TXT is 3 — and everything else at a
-////     managed name is simply not listed, which the diff reads as foreign
-////     data and refuses to touch. Correct both ways: this leg never
-////     deletes what it could not have created.
+////   - record types are numeric — TXT is 3 — and this leg lists nothing
+////     else, so a record of another type below the apex never reaches the
+////     diff. That is the scope rule working structurally: this leg cannot
+////     delete what it could not have created.
 ////
 //// The caution the design states plainly: a Bunny API key is
 //// account-scoped — its blast radius is every zone on the account — and
@@ -53,7 +53,7 @@ pub fn connect(
     id -> Ok(id)
   })
   Ok(Provider(
-    list: fn(names) { list_records(base, api_key, zone_id, apex, names) },
+    list: fn() { list_records(base, api_key, zone_id, apex) },
     apply: fn(changes) { apply_changes(base, api_key, zone_id, apex, changes) },
     describe: "bunny zone " <> zone_id,
   ))
@@ -92,7 +92,6 @@ fn list_records(
   key: String,
   zone_id: String,
   apex: String,
-  names: List(String),
 ) -> Result(List(Existing), String) {
   let decoder = {
     use records <- decode.subfield(
@@ -119,42 +118,53 @@ fn list_records(
     )
   })
   // The whole zone came back; scope discipline is enforced here, so the
-  // diff never sees — and so can never delete — a record outside the
-  // managed set.
-  |> list.filter(fn(existing) { list.contains(names, existing.record.name) })
+  // diff never sees — and so can never delete — a record outside the apex
+  // this deployment owns.
+  |> list.filter(fn(existing) { provider.below(existing.record.name, apex) })
   |> Ok
 }
 
+/// Creates, then replaces, then deletes, every one of them attempted — the
+/// same posture and the same ordering reason as the Cloudflare leg.
 fn apply_changes(
   base: String,
   key: String,
   zone_id: String,
   apex: String,
   changes: provider.Changes,
-) -> Result(Nil, String) {
+) -> Result(provider.Applied, String) {
   let records = base <> "/dnszone/" <> zone_id <> "/records"
-  use Nil <- result.try(
+  let created =
     changes.create
-    |> list.try_each(fn(record) {
-      send_json(http.Put, records, key, record_body(record, apex))
-    }),
-  )
-  use Nil <- result.try(
-    changes.replace
-    |> list.try_each(fn(pair) {
-      let #(existing, record) = pair
-      send_json(
-        http.Post,
-        records <> "/" <> existing.id,
-        key,
-        record_body(record, apex),
+    |> list.map(fn(record) {
+      #(
+        record.name,
+        send_json(http.Put, records, key, record_body(record, apex)),
       )
-    }),
-  )
-  changes.delete
-  |> list.try_each(fn(existing) {
-    send_json(http.Delete, records <> "/" <> existing.id, key, "")
-  })
+    })
+  let replaced =
+    changes.replace
+    |> list.map(fn(pair) {
+      let #(existing, record) = pair
+      #(
+        record.name,
+        send_json(
+          http.Post,
+          records <> "/" <> existing.id,
+          key,
+          record_body(record, apex),
+        ),
+      )
+    })
+  let deleted =
+    changes.delete
+    |> list.map(fn(existing) {
+      #(
+        existing.record.name,
+        send_json(http.Delete, records <> "/" <> existing.id, key, ""),
+      )
+    })
+  Ok(provider.tally(list.flatten([created, replaced, deleted])))
 }
 
 fn record_body(record: provider.Record, apex: String) -> String {

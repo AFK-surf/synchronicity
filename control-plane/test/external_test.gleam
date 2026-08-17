@@ -2,10 +2,13 @@
 //// renderer, the diff's refusal rules, the reconciler against a fake
 //// provider, and the provider legs' pure edges.
 
+import dnssec/keys
+import gleam/crypto
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import jobs/provider_sync
+import jobs/zonekey_watch
 import provider/bunny
 import provider/cloudflare
 import provider/diff
@@ -13,6 +16,7 @@ import provider/provider.{
   type Existing, type Provider, Existing, Provider, Record,
 }
 import provider/state
+import rekor/client
 import store/sqlite
 import zone/build
 import zone/model.{type ZoneInput, Member, TxtName, ZoneInput, ZoneMeta}
@@ -22,6 +26,7 @@ import zone/render_external
 import dns/name
 import fixtures
 import gleam/string
+import rekor_test
 
 /// An external-mode zone input: no NS hosts, no zone key — the shape
 /// `model.read` produces from an `ensure_meta_external` database.
@@ -32,6 +37,7 @@ fn input(txt_names: List(model.TxtName)) -> ZoneInput {
     [],
     txt_names,
     [#(1, "proofblob")],
+    0,
   )
 }
 
@@ -58,11 +64,57 @@ pub fn the_renderer_emits_data_records_and_the_marker_test() {
   // No SOA/NS/DNSKEY shape anywhere: every record is TXT by type.
   assert list.all(records, fn(r) { r.rtype == provider.Txt })
 
-  // Managed names cover every name the set can occupy — including ones
-  // currently empty, so stopped records still get found and deleted.
-  let managed = render_external.managed_names(input([]))
-  assert list.contains(managed, "_synchronicity-rekor.sync.test")
-  assert list.contains(managed, "_synchronicity-owner.sync.test")
+  // The proof records are as short-lived as the data they guard: a resolver
+  // holding a stale proof set is the tail of the window a rotation makes a
+  // client fail closed for.
+  let assert Ok(proof_record) =
+    list.find(records, fn(r) { r.name == "_synchronicity-rekor.sync.test" })
+  assert proof_record.ttl == render_external.ttl_proof
+  // The declaration's content never changes, so nothing is bought by
+  // re-fetching it.
+  let assert Ok(declaration) =
+    list.find(records, fn(r) {
+      r.name == "_synchronicity-transparency.sync.test"
+    })
+  assert declaration.ttl == render_external.ttl_declaration
+}
+
+/// The timing relation of `render_external.ttl_proof`, asserted so that
+/// moving one term fails here rather than in a rotation.
+///
+/// The window a client fails closed for after an unannounced provider
+/// rotation is the watch cadence plus publication plus the resolver's cached
+/// proof, and it has to fit inside the lifetime of the membership that client
+/// is already holding — else a routine rotation costs bindings rather than a
+/// few refreshes. The client's half of the relation (a 60 s re-resolution
+/// floor and a 600 s trust grace) is asserted in `crates/synch-net`.
+pub fn the_rotation_window_fits_inside_a_binding_lifetime_test() {
+  let watch_cadence = 300
+  let publish_slack = 60
+  let client_trust_grace = 600
+  assert watch_cadence + publish_slack + render_external.ttl_proof
+    < render_external.ttl_data + client_trust_grace
+}
+
+/// The budget at the shared base name, held still without standing up a log.
+///
+/// Every proof has a part 1 and they all land at
+/// `_synchronicity-rekor.<apex>`, so that name is what fills up. The serving
+/// filter keeps the set to two or three; this is what makes a pathological
+/// set shed history instead of handing the provider a write it refuses.
+pub fn the_proof_budget_sheds_the_oldest_test() {
+  let part = fn(index: Int) {
+    [string.repeat("x", 2000) <> "-" <> int_to_string(index)]
+  }
+  // Three fit at ~2028 wire bytes each.
+  let #(kept, shed) = model.proofs_within_budget([part(0), part(1), part(0)])
+  assert list.length(kept) == 3
+  assert shed == 0
+  // The fourth does not, and everything behind it is older still.
+  let #(kept, shed) =
+    model.proofs_within_budget([part(0), part(1), part(0), part(1), part(0)])
+  assert list.length(kept) == 3
+  assert shed == 2
 }
 
 pub fn the_renderer_refuses_what_the_builder_refuses_test() {
@@ -175,6 +227,87 @@ pub fn foreign_data_with_the_marker_is_deleted_test() {
   assert deleted == ["v=sync1 id=gone nk=stale"]
 }
 
+pub fn the_scope_is_everything_strictly_below_the_apex_test() {
+  // The apex is a name this deployment owns outright, so everything under it
+  // is ours — and the apex itself is not, because that is where the zone's
+  // own SOA, NS and DNSKEY live along with whatever a registrar asks for.
+  assert provider.below("_synchronicity-rekor.sync.test", "sync.test")
+  assert provider.below("_synchronicity.prod.acme.sync.test", "sync.test")
+  assert !provider.below("sync.test", "sync.test")
+  // A sibling of the apex is somebody else's — the dashboard's own name, for
+  // one, which external mode never publishes.
+  assert !provider.below("dashboard.test", "sync.test")
+  assert !provider.below("notsync.test", "sync.test")
+  // Providers hand names back lowercased and configuration need not be.
+  assert provider.below("_synchronicity-rekor.SYNC.test", "sync.TEST")
+}
+
+pub fn a_marker_of_another_scope_authorizes_nothing_test() {
+  // The marker's value carries the scope it authorizes. One that does not
+  // name this scope leaves a record below the apex a conflict rather than a
+  // delete: a reconciler that widened its reach on the strength of a marker
+  // it does not recognise would be removing records it was never told it
+  // could.
+  let existing =
+    as_existing([
+      Record(
+        "_synchronicity-owner.sync.test",
+        provider.Txt,
+        300,
+        "heritage=synchronicity-cp",
+      ),
+      Record("_synchronicity-rekor-6.sync.test", provider.Txt, 300, "stale"),
+    ])
+  // Reported as the marker it is, not as one of the records it made foreign:
+  // it is the reason the pass cannot proceed, and the only conflict an
+  // operator fixes by deleting rather than by moving.
+  let assert Error(diff.MarkerMismatch(name, value)) =
+    diff.diff(desired(), existing)
+  assert name == "_synchronicity-owner.sync.test"
+  assert value == "heritage=synchronicity-cp"
+}
+
+pub fn a_proof_part_we_stopped_rendering_is_deleted_test() {
+  // A proof that shrank from six parts to five leaves a record at a name the
+  // renderer no longer produces. Under a structural scope it is still found,
+  // which is the whole reason the scope is structural.
+  let existing =
+    as_existing([
+      diff.owner_record("sync.test"),
+      Record("_synchronicity-rekor-6.sync.test", provider.Txt, 300, "orphan"),
+    ])
+  let assert Ok(changes) = diff.diff(desired(), existing)
+  let deleted = list.map(changes.delete, fn(e) { e.record.name })
+  assert deleted == ["_synchronicity-rekor-6.sync.test"]
+}
+
+pub fn creates_go_out_marker_first_and_proofs_last_test() {
+  // Dependency order, not name order: the marker authorizes everything else,
+  // the declaration is what makes a logged claim the zone's own statement,
+  // membership is the product, and the proofs are the only records big enough
+  // for a provider to refuse on size — so they can never be the reason a
+  // device add did not land.
+  let wanted = [
+    Record("_synchronicity-rekor.sync.test", provider.Txt, 300, "sync1p …"),
+    Record("_synchronicity.prod.acme.sync.test", provider.Txt, 300, "v=sync1 …"),
+    Record(
+      "_synchronicity-transparency.sync.test",
+      provider.Txt,
+      86_400,
+      "v=sync1 transparency",
+    ),
+    diff.owner_record("sync.test"),
+  ]
+  let assert Ok(changes) = diff.diff(wanted, [])
+  assert list.map(changes.create, fn(r) { r.name })
+    == [
+      "_synchronicity-owner.sync.test",
+      "_synchronicity-transparency.sync.test",
+      "_synchronicity.prod.acme.sync.test",
+      "_synchronicity-rekor.sync.test",
+    ]
+}
+
 pub fn a_ttl_change_is_a_replace_not_a_foreign_record_test() {
   let existing =
     as_existing([
@@ -202,15 +335,41 @@ fn fake_provider(
   calls: process.Subject(String),
 ) -> Provider {
   Provider(
-    list: fn(_names) {
+    list: fn() {
       process.send(calls, "list")
       Ok(listing)
     },
     apply: fn(changes) {
       process.send(calls, "apply " <> describe(changes))
-      Ok(Nil)
+      Ok(provider.Applied(list.length(changes.create), []))
     },
     describe: "fake",
+  )
+}
+
+/// A provider that refuses exactly one name and takes everything else — a
+/// proof record too big for its owner name, which is the shape that used to
+/// abort the pass before the membership records behind it.
+fn picky_provider(refuses: String, calls: process.Subject(String)) -> Provider {
+  Provider(
+    list: fn() {
+      process.send(calls, "list")
+      Ok([])
+    },
+    apply: fn(changes) {
+      let outcomes =
+        list.map(changes.create, fn(record) {
+          case record.name == refuses {
+            True -> #(record.name, Error("content too long for this name"))
+            False -> {
+              process.send(calls, "applied " <> record.name)
+              #(record.name, Ok(Nil))
+            }
+          }
+        })
+      Ok(provider.tally(outcomes))
+    },
+    describe: "picky",
   )
 }
 
@@ -224,7 +383,7 @@ fn describe(changes: provider.Changes) -> String {
 
 fn broken_provider(reason: String) -> Provider {
   Provider(
-    list: fn(_names) { Error(reason) },
+    list: fn() { Error(reason) },
     apply: fn(_changes) { Error(reason) },
     describe: "broken",
   )
@@ -319,6 +478,118 @@ pub fn a_provider_outage_is_recorded_and_recovered_from_test() {
   let assert Ok(Ok(healed)) = state.get(conn)
   assert healed.last_error == None
   sqlite.close(conn)
+}
+
+pub fn a_refused_record_does_not_hold_back_the_others_test() {
+  let conn = external_conn()
+  let calls = process.new_subject()
+  let prov = picky_provider("_synchronicity.prod.acme.sync.test", calls)
+
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", 2000)
+  let assert Ok("list") = process.receive(calls, 100)
+  // One refused record used to abort the pass at that record, taking
+  // everything behind it with it. Every other record goes out now.
+  let applied = drain(calls, [])
+  assert list.contains(applied, "applied _synchronicity-owner.sync.test")
+  assert list.contains(applied, "applied _synchronicity-transparency.sync.test")
+
+  // Recorded as partial, and the applied hash deliberately did not advance:
+  // the zone is not the set we rendered.
+  let assert Ok(Ok(partial)) = state.get(conn)
+  let assert Some(failures) = partial.last_failures
+  assert string_contains(failures, "_synchronicity.prod.acme.sync.test")
+  assert partial.last_partial_at == Some(2000)
+  assert partial.applied_hash == None
+
+  // So the next pass does not short-circuit on the hash: it lists again and
+  // retries what is still missing.
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", 3000)
+  let assert Ok("list") = process.receive(calls, 100)
+  sqlite.close(conn)
+}
+
+fn drain(calls: process.Subject(String), seen: List(String)) -> List(String) {
+  case process.receive(calls, 50) {
+    Ok(message) -> drain(calls, [message, ..seen])
+    Error(Nil) -> seen
+  }
+}
+
+// ---------------------------------------------------------- the key watcher
+
+/// The watcher is external mode's whole rotation loop: it follows the
+/// provider's keys because nobody tells us when they move.
+pub fn the_watcher_logs_a_changed_key_set_and_stays_quiet_otherwise_test() {
+  let conn = external_conn()
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = rekor_test.fake_log(keys.generate())
+  let first = keys.dnskey_rdata(keys.generate())
+  let second = keys.dnskey_rdata(keys.generate())
+
+  // A first look at a zone whose key is not on the record logs a claim.
+  assert watch(conn, apex, [first], log, #(spki, point), 1000)
+  let assert Ok(logged) = state.observed_keys(conn)
+  assert list.length(logged) == 1
+  assert list.all(logged, fn(key) { key.logged_at == Some(1000) })
+
+  // The same set on the next tick is silent: nothing has moved, so there is
+  // nothing to say and no entry to mint.
+  assert !watch(conn, apex, [first], log, #(spki, point), 2000)
+
+  // A provider pre-publishing its next key changes the set, so the claim is
+  // re-made covering *both* — which is what makes the eventual cut a
+  // non-event: the incoming key is on the public record before it signs.
+  assert watch(conn, apex, [first, second], log, #(spki, point), 3000)
+  let assert Ok(both) = state.observed_keys(conn)
+  assert list.length(both) == 2
+  assert list.all(both, fn(key) { key.logged_at == Some(3000) })
+
+  // And the retirement of the outgoing key is a change like any other.
+  assert watch(conn, apex, [second], log, #(spki, point), 4000)
+  let assert Ok([survivor]) = state.observed_keys(conn)
+  assert survivor.key_sha256 == crypto.hash(crypto.Sha256, second)
+  sqlite.close(conn)
+}
+
+pub fn the_watcher_retries_after_a_logging_failure_test() {
+  let conn = external_conn()
+  let assert Ok(apex) = name.parse("sync.test.")
+  let rdata = keys.dnskey_rdata(keys.generate())
+  let dead = client.Log(submit: fn(_submission) { Error("log unreachable") })
+  let #(log, spki, point) = rekor_test.fake_log(keys.generate())
+
+  // A log that cannot be reached is a log line, never a crash — and the key
+  // stays unlogged, which is what `/healthz` reports as an age.
+  assert !watch(conn, apex, [rdata], dead, #(spki, point), 1000)
+  let assert Ok([seen]) = state.observed_keys(conn)
+  assert seen.logged_at == None
+  let assert Ok(Some(age)) = state.oldest_unlogged_age(conn, 1300)
+  assert age == 300
+
+  // The set has not changed, but it is still uncovered, so the next tick
+  // tries again rather than mistaking "already seen" for "already logged".
+  assert watch(conn, apex, [rdata], log, #(spki, point), 2000)
+  let assert Ok(None) = state.oldest_unlogged_age(conn, 2000)
+  sqlite.close(conn)
+}
+
+fn watch(
+  conn: sqlite.Connection,
+  apex: name.Name,
+  dnskey_rdatas: List(BitArray),
+  log: client.Log,
+  log_key: #(BitArray, BitArray),
+  now: Int,
+) -> Bool {
+  zonekey_watch.run_once_with(
+    conn,
+    apex,
+    apex,
+    rekor_test.fake_resolver_serving(dnskey_rdatas),
+    log,
+    log_key,
+    now,
+  )
 }
 
 pub fn external_publish_bumps_the_serial_and_audits_test() {

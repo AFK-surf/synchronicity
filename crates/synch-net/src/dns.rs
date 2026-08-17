@@ -47,6 +47,21 @@ pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Extra grace before a binding that vanished from DNS expires (§3.2).
 pub const DEFAULT_TRUST_GRACE: Duration = Duration::from_secs(10 * 60);
 
+/// The longest a control plane in external mode can take to get a rotated
+/// provider key onto the public record and visible to a client: its key-watch
+/// cadence, a minute for the log round trip and the reconciler, and the TTL it
+/// publishes proof records with — 300 + 60 + 300 as those constants stand in
+/// `control-plane/src/jobs/zonekey_watch.gleam` and
+/// `control-plane/src/zone/render_external.gleam`.
+///
+/// It is named here because this is the half that pays for it. A refresh under
+/// [`RekorPolicy::Require`] fails closed for that whole window — the answer
+/// validates, but the proof set a resolver still holds covers only the keys
+/// from before the rotation — and the bindings a client already has must
+/// outlive it, or an ordinary provider rotation costs member bindings instead
+/// of a few refreshes.
+pub const CONTROL_PLANE_REPUBLISH_WINDOW: Duration = Duration::from_secs(660);
+
 /// The DoH endpoint used when none is configured.
 pub const DEFAULT_DOH_URL: &str = "https://1.1.1.1/dns-query";
 
@@ -1903,6 +1918,28 @@ mod tests {
         assert_eq!(
             clamp_ttl(Duration::from_secs(300)),
             Duration::from_secs(300)
+        );
+    }
+
+    /// The client's half of the timing relation the control plane states in
+    /// `zone/render_external.ttl_proof`.
+    ///
+    /// A binding lives for the answer's TTL plus the grace, so the tight case
+    /// is a zone served at this client's TTL floor: even then, what a client
+    /// holds has to last at least as long as the control plane needs to
+    /// re-publish after a provider rotates. The zone actually publishes
+    /// membership at 300 s, so the margin in practice is four minutes; the
+    /// floor is what has no margin, and this is what fails if either side's
+    /// constants drift apart.
+    #[test]
+    fn bindings_outlive_a_provider_rotation() {
+        assert!(
+            MIN_TTL + DEFAULT_TRUST_GRACE >= CONTROL_PLANE_REPUBLISH_WINDOW,
+            "a client would drop DNS-sourced members before the control plane \
+             could re-publish: {:?} + {:?} < {:?}",
+            MIN_TTL,
+            DEFAULT_TRUST_GRACE,
+            CONTROL_PLANE_REPUBLISH_WINDOW
         );
     }
 

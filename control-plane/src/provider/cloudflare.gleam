@@ -46,7 +46,7 @@ pub fn connect(
     id -> Ok(id)
   })
   Ok(Provider(
-    list: fn(names) { list_records(base, api_token, zone_id, names) },
+    list: fn() { list_records(base, api_token, zone_id, apex) },
     apply: fn(changes) { apply_changes(base, api_token, zone_id, changes) },
     describe: "cloudflare zone " <> zone_id,
   ))
@@ -75,77 +75,139 @@ fn discover_zone(
   }
 }
 
+const per_page = 100
+
+/// Cloudflare paginates and this leg walks every page, so a zone that holds
+/// the apex among a great many other names still lists completely. The cap
+/// is a runaway guard, not a policy: a zone with more than this many TXT
+/// records is a zone this leg has misunderstood, and saying so beats
+/// looping.
+const max_pages = 50
+
 fn list_records(
   base: String,
   token: String,
   zone_id: String,
-  names: List(String),
+  apex: String,
 ) -> Result(List(Existing), String) {
-  // One request per managed name. The managed set is a handful of names
-  // and the filter keeps every response small and unpaginated in practice;
-  // per_page=100 covers a rollover-window's worth of member records under
-  // one owner with room to spare.
-  names
-  |> list.try_map(fn(name) {
-    let decoder = {
-      use records <- decode.subfield(
-        ["result"],
-        decode.list({
-          use id <- decode.field("id", decode.string)
-          use rtype <- decode.field("type", decode.string)
-          use record_name <- decode.field("name", decode.string)
-          use content <- decode.field("content", decode.string)
-          use ttl <- decode.field("ttl", decode.int)
-          decode.success(#(id, rtype, record_name, content, ttl))
-        }),
-      )
-      decode.success(records)
-    }
-    use rows <- result.try(get_json(
-      base <> "/zones/" <> zone_id <> "/dns_records?per_page=100&name=" <> name,
-      token,
-      decoder,
-    ))
+  // Every TXT record strictly below the apex — the whole scope, in one
+  // structural rule, so a name the renderer has stopped producing is still
+  // found and removed. Filtering server-side by type keeps the pages small;
+  // the suffix is applied here because not every provider offers it.
+  list_page(base, token, zone_id, apex, 1, [])
+}
+
+fn list_page(
+  base: String,
+  token: String,
+  zone_id: String,
+  apex: String,
+  page: Int,
+  acc: List(Existing),
+) -> Result(List(Existing), String) {
+  use <- page_guard(page, zone_id)
+  let decoder = {
+    use records <- decode.subfield(
+      ["result"],
+      decode.list({
+        use id <- decode.field("id", decode.string)
+        use rtype <- decode.field("type", decode.string)
+        use record_name <- decode.field("name", decode.string)
+        use content <- decode.field("content", decode.string)
+        use ttl <- decode.field("ttl", decode.int)
+        decode.success(#(id, rtype, record_name, content, ttl))
+      }),
+    )
+    decode.success(records)
+  }
+  use rows <- result.try(get_json(
+    base
+      <> "/zones/"
+      <> zone_id
+      <> "/dns_records?type=TXT&per_page="
+      <> int.to_string(per_page)
+      <> "&page="
+      <> int.to_string(page),
+    token,
+    decoder,
+  ))
+  let kept =
     rows
-    |> list.filter(fn(row) { row.1 == "TXT" })
+    |> list.filter(fn(row) { row.1 == "TXT" && provider.below(row.2, apex) })
     |> list.map(fn(row) {
       let #(id, _, record_name, content, ttl) = row
       Existing(id, Record(record_name, provider.Txt, ttl, unquote_txt(content)))
     })
-    |> Ok
-  })
-  |> result.map(list.flatten)
+  let acc = list.append(acc, kept)
+  case list.length(rows) < per_page {
+    True -> Ok(acc)
+    False -> list_page(base, token, zone_id, apex, page + 1, acc)
+  }
 }
 
+fn page_guard(
+  page: Int,
+  zone_id: String,
+  next: fn() -> Result(List(Existing), String),
+) -> Result(List(Existing), String) {
+  case page > max_pages {
+    True ->
+      Error(
+        "cloudflare zone "
+        <> zone_id
+        <> " has more than "
+        <> int.to_string(max_pages * per_page)
+        <> " TXT records; refusing to keep paging",
+      )
+    False -> next()
+  }
+}
+
+/// Creates, then replaces, then deletes — and every one of them attempted.
+///
+/// The order matters in one direction: creating before deleting means a
+/// proof's old and new parts briefly coexist, which a client handles by
+/// trying each proof it can reassemble, where deleting first would expose a
+/// window in which the zone serves an incomplete one.
+///
+/// Nothing aborts. A record the API refuses is reported by name and the rest
+/// of the change set still goes out, because the alternative is one
+/// oversized proof record holding back every membership change behind it.
 fn apply_changes(
   base: String,
   token: String,
   zone_id: String,
   changes: provider.Changes,
-) -> Result(Nil, String) {
+) -> Result(provider.Applied, String) {
   let records = base <> "/zones/" <> zone_id <> "/dns_records"
-  use Nil <- result.try(
+  let created =
     changes.create
-    |> list.try_each(fn(record) {
-      send_json(http.Post, records, token, record_body(record))
-    }),
-  )
-  use Nil <- result.try(
+    |> list.map(fn(record) {
+      #(record.name, send_json(http.Post, records, token, record_body(record)))
+    })
+  let replaced =
     changes.replace
-    |> list.try_each(fn(pair) {
+    |> list.map(fn(pair) {
       let #(existing, record) = pair
-      send_json(
-        http.Put,
-        records <> "/" <> existing.id,
-        token,
-        record_body(record),
+      #(
+        record.name,
+        send_json(
+          http.Put,
+          records <> "/" <> existing.id,
+          token,
+          record_body(record),
+        ),
       )
-    }),
-  )
-  changes.delete
-  |> list.try_each(fn(existing) {
-    send_json(http.Delete, records <> "/" <> existing.id, token, "")
-  })
+    })
+  let deleted =
+    changes.delete
+    |> list.map(fn(existing) {
+      #(
+        existing.record.name,
+        send_json(http.Delete, records <> "/" <> existing.id, token, ""),
+      )
+    })
+  Ok(provider.tally(list.flatten([created, replaced, deleted])))
 }
 
 fn record_body(record: provider.Record) -> String {
