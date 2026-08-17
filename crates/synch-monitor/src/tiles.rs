@@ -48,6 +48,17 @@
 //! Transient failures — a 429, a 5xx, a dropped connection — are retried
 //! with backoff a few times before a run gives up, because a reader that
 //! fetches ahead meets more of them than one that does not.
+//!
+//! A run pins one checkpoint and then reads for minutes while the log keeps
+//! integrating, so the one failure retries cannot fix is a *superseded*
+//! partial: the frontier tile the pinned size named is collected as the tree
+//! grows past it, and a walk that reaches the frontier last meets a 404 at
+//! the very end. That 404 is a stale width, not a broken log — [`Tree`]
+//! re-resolves the size the log commits to now, reads the tile at the width
+//! that size implies, and keeps only the pinned prefix. Tiles are
+//! append-only, so the prefix is byte-for-byte what the pinned checkpoint
+//! committed to, and every consumer verifies against that checkpoint exactly
+//! as if the narrower tile had still been there.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -55,7 +66,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
-use synch_net::rekor::{leaf_hash, node_hash, sha256};
+use synch_net::rekor::{Checkpoint, leaf_hash, node_hash, sha256};
 
 use crate::MonitorError;
 
@@ -78,6 +89,13 @@ use crate::MonitorError;
 /// number near it.
 const MAX_TILE_BYTES: usize = 256 * (2 + u16::MAX as usize);
 
+/// How many times a vanished partial tile is re-resolved against the log's
+/// current size before the run gives up. One pass almost always settles it —
+/// the checkpoint read and the tile fetch are a round-trip apart — but a log
+/// integrating faster than that can outgrow the fresh width as well, and the
+/// bound keeps that chase from following the frontier forever.
+const MAX_WIDTH_CHASES: u32 = 4;
+
 /// Where tiles come from.
 ///
 /// The returned future is required to be `Send` so a caller may run several
@@ -87,12 +105,32 @@ const MAX_TILE_BYTES: usize = 256 * (2 + u16::MAX as usize);
 pub trait TileSource {
     /// Fetches one tile path, relative to the log's base URL.
     ///
-    /// `Ok(None)` means the log answered 404 — a tile that does not exist,
-    /// which is a fact about the tree, not a failure.
+    /// `Ok(None)` means the log answered 404. For a full tile that is a fact
+    /// about the tree; for a partial one it may only mean the log has grown
+    /// past the width asked for — [`Tree`] consults
+    /// [`TileSource::checkpoint_size`] before believing it.
     fn fetch(
         &self,
         path: &str,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, MonitorError>> + Send;
+
+    /// The tree size the log's *current* checkpoint commits to, asked of the
+    /// log anew on every call.
+    ///
+    /// [`Tree`] wants this when a partial tile 404s: a partial names the
+    /// frontier of the tree at one size, and a log that has grown since
+    /// serves that tile wider — or whole. `Ok(None)` means this source
+    /// cannot say — a fixture, a static mirror — and a missing partial then
+    /// stays missing.
+    ///
+    /// The size only ever *widens* a fetch, and nothing here verifies it.
+    /// That is safe because the bytes it leads to are cut back to the pinned
+    /// width and verified against the pinned checkpoint like everything
+    /// else: a log lying about its size can make a run fail, which a broken
+    /// log can do anyway, but cannot make wrong bytes pass.
+    fn checkpoint_size(&self) -> impl Future<Output = Result<Option<u64>, MonitorError>> + Send {
+        async { Ok(None) }
+    }
 }
 
 /// A Rekor v2 log read over HTTPS, with an in-process cache.
@@ -142,22 +180,22 @@ impl HttpTiles {
             .await?
             .ok_or_else(|| MonitorError::Transport("the log serves no checkpoint".into()))
     }
-}
 
-impl TileSource for HttpTiles {
-    async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
-        let cached = self.cache.lock().expect("tile cache").get(path).cloned();
-        if let Some(hit) = cached {
-            return Ok(hit);
-        }
+    /// One GET, with retries, never cached.
+    ///
+    /// [`TileSource::fetch`] adds the cache; [`TileSource::checkpoint_size`]
+    /// takes this path directly, because the caller asks precisely when the
+    /// size it pinned has gone stale, and a cached answer would be the stale
+    /// one.
+    async fn get(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
         let url = format!("{}/{path}", self.base);
         let mut delay = FIRST_RETRY_DELAY;
         let mut attempt = 1;
-        let body = loop {
+        loop {
             let retryable = match self.client.get(&url).send().await {
                 Ok(response) => match response.status().as_u16() {
                     200 => match read_capped(response).await {
-                        Ok(Some(body)) => break Some(body),
+                        Ok(Some(body)) => return Ok(Some(body)),
                         // Over the cap is the server misbehaving, not a
                         // transient fault: retrying would just ask it to
                         // flood us again.
@@ -168,7 +206,7 @@ impl TileSource for HttpTiles {
                         }
                         Err(e) => format!("{url}: {e}"),
                     },
-                    404 => break None,
+                    404 => return Ok(None),
                     status @ (429 | 500..=599) => format!("{url}: the log answered {status}"),
                     status => {
                         return Err(MonitorError::Transport(format!(
@@ -184,12 +222,33 @@ impl TileSource for HttpTiles {
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(MAX_RETRY_DELAY);
-        };
+        }
+    }
+}
+
+impl TileSource for HttpTiles {
+    async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+        let cached = self.cache.lock().expect("tile cache").get(path).cloned();
+        if let Some(hit) = cached {
+            return Ok(hit);
+        }
+        let body = self.get(path).await?;
         self.cache
             .lock()
             .expect("tile cache")
             .insert(path.to_string(), body.clone());
         Ok(body)
+    }
+
+    async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
+        let body = self
+            .get("api/v2/checkpoint")
+            .await?
+            .ok_or_else(|| MonitorError::Transport("the log serves no checkpoint".into()))?;
+        let checkpoint = Checkpoint::parse(&body).map_err(|e| {
+            MonitorError::Transport(format!("the log's current checkpoint does not parse: {e}"))
+        })?;
+        Ok(Some(checkpoint.tree_size))
     }
 }
 
@@ -254,10 +313,105 @@ impl<'a, S: TileSource> Tree<'a, S> {
         format!("api/v2/tile/{level}/{}{suffix}", groups.join("/"))
     }
 
+    /// How many hashes tile `(tile_level, index)` holds in a tree of `size`.
+    fn width_at(size: u64, tile_level: u32, index: u64) -> u64 {
+        let available = (size >> (8 * tile_level)).saturating_sub(index * 256);
+        available.min(256)
+    }
+
     /// How many hashes tile `(tile_level, index)` holds at this tree size.
     fn width(&self, tile_level: u32, index: u64) -> u64 {
-        let available = (self.size >> (8 * tile_level)).saturating_sub(index * 256);
-        available.min(256)
+        Self::width_at(self.size, tile_level, index)
+    }
+
+    /// The bytes of tile `(level, index)` at the width the pinned size names,
+    /// recovering when the log has grown past it.
+    ///
+    /// A partial tile names the frontier of the tree at one instant; by the
+    /// time a long walk asks for it, a log still integrating may serve that
+    /// tile wider — or whole — and have collected the width the pinned size
+    /// named. A 404 on the pinned path is therefore not yet a broken log:
+    /// re-resolve the current size, and if it widens this tile, fetch the
+    /// wider tile and keep only the pinned prefix. Tiles are append-only, so
+    /// that prefix is byte-for-byte what the pinned checkpoint committed to,
+    /// and everything downstream verifies against that checkpoint regardless
+    /// of where the bytes were found.
+    ///
+    /// `tile_level` drives the width arithmetic — 0 for entry bundles, which
+    /// hold framed entries rather than 32-byte nodes but tile identically.
+    async fn tile_bytes(
+        &self,
+        level: &str,
+        tile_level: u32,
+        index: u64,
+        width: u64,
+    ) -> Result<Vec<u8>, MonitorError> {
+        let path = Self::path(level, index, width);
+        if let Some(data) = self.source.fetch(&path).await? {
+            return Ok(data);
+        }
+        let mut width_now = width;
+        for _ in 0..MAX_WIDTH_CHASES {
+            if width_now == 256 {
+                break; // a full tile is permanent; missing means a broken log
+            }
+            let size = match self.source.checkpoint_size().await? {
+                Some(size) => size,
+                None => break, // this source cannot say whether the log grew
+            };
+            let widened = Self::width_at(size, tile_level, index);
+            if widened <= width_now {
+                break; // the log has not grown into this tile: genuinely missing
+            }
+            width_now = widened;
+            let wider_path = Self::path(level, index, width_now);
+            match self.source.fetch(&wider_path).await? {
+                Some(data) => return Self::cut(level, &wider_path, data, width),
+                None => continue, // outgrown again within a round-trip: re-resolve
+            }
+        }
+        Err(MonitorError::Tile(format!("{path} is missing")))
+    }
+
+    /// `data` — a tile fetched wider than the pinned `width` — cut back to
+    /// exactly that width. Entry bundles are length-framed and walked; hash
+    /// tiles are a flat 32 bytes per node. A wider tile that cannot even
+    /// yield the pinned prefix is not the tile the checkpoint committed to.
+    fn cut(
+        level: &str,
+        path: &str,
+        mut data: Vec<u8>,
+        width: u64,
+    ) -> Result<Vec<u8>, MonitorError> {
+        let end = match level {
+            "entries" => {
+                let mut at = 0usize;
+                for _ in 0..width {
+                    let header = data.get(at..at + 2).ok_or_else(|| {
+                        MonitorError::Tile(format!("{path}: truncated length"))
+                    })?;
+                    let length = usize::from(u16::from_be_bytes([header[0], header[1]]));
+                    at += 2;
+                    if data.get(at..at + length).is_none() {
+                        return Err(MonitorError::Tile(format!("{path}: truncated entry")));
+                    }
+                    at += length;
+                }
+                at
+            }
+            _ => {
+                let end = width as usize * 32;
+                if data.len() < end {
+                    return Err(MonitorError::Tile(format!(
+                        "{path}: {} bytes, short of the {end} the pinned width holds",
+                        data.len()
+                    )));
+                }
+                end
+            }
+        };
+        data.truncate(end);
+        Ok(data)
     }
 
     /// The bytes of a hash tile.
@@ -269,11 +423,8 @@ impl<'a, S: TileSource> Tree<'a, S> {
                 self.size
             )));
         }
-        let path = Self::path(&tile_level.to_string(), index, width);
-        self.source
-            .fetch(&path)
-            .await?
-            .ok_or_else(|| MonitorError::Tile(format!("{path} is missing")))
+        self.tile_bytes(&tile_level.to_string(), tile_level, index, width)
+            .await
     }
 
     /// The hash of the complete subtree at `(level, index)`.
@@ -444,10 +595,8 @@ impl<'a, S: TileSource> Tree<'a, S> {
     pub async fn entry_bundle(&self, index: u64) -> Result<Vec<(u64, Vec<u8>)>, MonitorError> {
         let request = self.bundle_request(index)?;
         let data = self
-            .source
-            .fetch(&request.path)
-            .await?
-            .ok_or_else(|| MonitorError::Tile(format!("{} is missing", request.path)))?;
+            .tile_bytes("entries", 0, index / 256, request.count)
+            .await?;
         self.bundle_decode(&request, &data)
     }
 
@@ -476,10 +625,9 @@ impl<'a, S: TileSource> Tree<'a, S> {
         stream::iter(firsts)
             .map(move |first| async move {
                 let request = self.bundle_request(first)?;
-                let data =
-                    self.source.fetch(&request.path).await?.ok_or_else(|| {
-                        MonitorError::Tile(format!("{} is missing", request.path))
-                    })?;
+                let data = self
+                    .tile_bytes("entries", 0, first / 256, request.count)
+                    .await?;
                 self.bundle_decode(&request, &data)
             })
             .buffered(self.concurrency)
@@ -567,6 +715,18 @@ mod tests {
             let index: u64 = digits.split('/').fold(0u64, |acc, group| {
                 acc * 1000 + group.trim_start_matches('x').parse::<u64>().unwrap()
             });
+            // Serve exactly what a log of this size serves: a width growth
+            // has superseded is collected, the way the real log drops it.
+            let tile_level: u32 = match level {
+                "entries" => 0,
+                level => level.parse().unwrap(),
+            };
+            let current = ((self.leaves.len() as u64) >> (8 * tile_level))
+                .saturating_sub(index * 256)
+                .min(256);
+            if width != current {
+                return Ok(None);
+            }
             if level == "entries" {
                 let mut out = Vec::new();
                 for i in 0..width {
@@ -576,7 +736,6 @@ mod tests {
                 }
                 return Ok(Some(out));
             }
-            let tile_level: u32 = level.parse().unwrap();
             let span = 1u64 << (8 * tile_level);
             let mut out = Vec::new();
             for i in 0..width {
@@ -584,6 +743,10 @@ mod tests {
                 out.extend_from_slice(&reference_root(&self.leaves, start, start + span));
             }
             Ok(Some(out))
+        }
+
+        async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
+            Ok(Some(self.leaves.len() as u64))
         }
     }
 
@@ -807,5 +970,52 @@ mod tests {
             honest_tree.leaf_matches(300, b"entry 300").await.unwrap(),
             "and the honest body must still match"
         );
+    }
+
+    #[tokio::test]
+    async fn a_frontier_tile_completed_since_the_pin_is_read_from_the_full_tile() {
+        // Pinned at 1_000, the walk asks for entries tile 3 as `.p/232`; the
+        // log, now at 1_300, completed that tile long ago and serves it
+        // whole. Level-1 hash tile 0 is still partial — wider than the pin
+        // named — so the root check exercises the wider-partial recovery at
+        // the same time.
+        let log = log(1_300);
+        let tree = Tree::new(&log, 1_000, 4);
+        assert_eq!(
+            tree.root().await.unwrap(),
+            reference_root(&log.leaves, 0, 1_000)
+        );
+        let bundles: Vec<Vec<(u64, Vec<u8>)>> =
+            tree.bundle_stream(0, 1_000).try_collect().await.unwrap();
+        assert_eq!(bundles.len(), 4);
+        assert_eq!(bundles[3].len(), 232);
+        assert_eq!(bundles[3][231], (999, b"entry 999".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_frontier_tile_widened_since_the_pin_is_read_from_the_wider_partial() {
+        // The same race, but the log grew only within the tile: the pinned
+        // `.p/232` is gone and the tile is now `.p/252` — still partial,
+        // still the same prefix.
+        let log = log(1_020);
+        let tree = Tree::new(&log, 1_000, 4);
+        let bundle = tree.entry_bundle(768).await.unwrap();
+        assert_eq!(bundle.len(), 232);
+        assert_eq!(bundle[0], (768, b"entry 768".to_vec()));
+        assert_eq!(bundle[231], (999, b"entry 999".to_vec()));
+        assert_eq!(
+            tree.root().await.unwrap(),
+            reference_root(&log.leaves, 0, 1_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_the_log_never_grew_into_stays_missing() {
+        // Pinned past what the log serves: re-resolving the size says tile 3
+        // holds nothing, and no wider tile can stand in for the pinned one.
+        let log = log(768);
+        let tree = Tree::new(&log, 1_000, 4);
+        let err = tree.entry_bundle(768).await.unwrap_err();
+        assert!(matches!(err, MonitorError::Tile(_)), "{err}");
     }
 }
