@@ -154,8 +154,15 @@ pub struct VersionSet {
 impl VersionSet {
     /// Groups one path's entries into its versions.
     ///
-    /// `entries` must all name the same `(space, path)`.
-    pub fn from_entries(space: &str, path: &str, mut entries: Vec<EntryRow>) -> VersionSet {
+    /// `entries` must all name the same `(space, path)`. `now` is the reader's
+    /// clock, which is what a published `mtime_ns` is ordered under; it is
+    /// never stored.
+    pub fn from_entries(
+        space: &str,
+        path: &str,
+        mut entries: Vec<EntryRow>,
+        now: i64,
+    ) -> VersionSet {
         entries.sort_by_key(|entry| entry.origin.canonical());
         let mut versions: Vec<Version> = Vec::new();
         for entry in &entries {
@@ -177,7 +184,7 @@ impl VersionSet {
                 }),
             }
         }
-        versions.sort_by_key(version_key);
+        versions.sort_by_key(|version| version_key(version, now));
         VersionSet {
             space: space.to_string(),
             path: path.to_string(),
@@ -205,8 +212,17 @@ impl VersionSet {
     /// Applies a version policy (§8).
     ///
     /// Never writes and never merges: it picks one of the assertions, or
-    /// refuses.
-    pub fn select(&self, policy: &VersionPolicy) -> Selection {
+    /// refuses. `now` is the reader's clock, which the order clamps published
+    /// times against.
+    ///
+    /// A tombstone is one origin's assertion about *its own* copy, so under the
+    /// unified policies it takes that origin's version out of consideration
+    /// rather than the path: §8's rule is that a path exists in the tree iff at
+    /// least one origin currently publishes a live entry for it, and that the
+    /// path stays visible until every publisher tombstones it. Pinned to an
+    /// origin the deletion is the answer — that mirror follows one origin's
+    /// view, deletions included.
+    pub fn select(&self, policy: &VersionPolicy, now: i64) -> Selection {
         match policy {
             VersionPolicy::Origin(origin) => {
                 match self.entries.iter().find(|e| &e.origin == origin) {
@@ -219,7 +235,8 @@ impl VersionSet {
                 match self
                     .entries
                     .iter()
-                    .max_by(|a, b| entry_key(a).cmp(&entry_key(b)))
+                    .filter(|entry| entry.kind != EntryKind::Tombstone)
+                    .max_by(|a, b| entry_key(a, now).cmp(&entry_key(b, now)))
                 {
                     Some(entry) => Selection::Selected(Box::new(entry.clone())),
                     None => Selection::Absent,
@@ -314,27 +331,44 @@ fn identity_of_version(version: &Version) -> Identity {
     }
 }
 
-/// The deterministic total order `newest` maximizes: `(mtime_ns,
-/// content_root, symlink target, origin)` (§8).
+/// The deterministic total order `newest` maximizes: `(mtime_ns, content_root,
+/// symlink target, origin)` (§8), with the published time read as no later than
+/// now.
 ///
-/// Every component is data every node holds identically, so the same
-/// assertions select the same version everywhere. The content root breaks
-/// mtime ties (a tombstone, having none, loses such a tie to content); the
+/// Every component is data every node holds identically, so the same assertions
+/// select the same version everywhere. The content root breaks mtime ties; the
 /// target breaks ties between content-less kinds, which §8 identifies by
-/// `(kind, target)` and which would otherwise be indistinguishable to the
-/// order while being distinct versions; and the canonical origin breaks the
-/// remaining tie between two attestors of the same version — which one is
-/// named as the source of the bytes, never which bytes.
-fn entry_key(entry: &EntryRow) -> (i64, Option<[u8; 32]>, Option<String>, String) {
+/// `(kind, target)` and which would otherwise be indistinguishable to the order
+/// while being distinct versions; and the canonical origin breaks the remaining
+/// tie between two attestors of the same version — which one is named as the
+/// source of the bytes, never which bytes.
+///
+/// `mtime_ns` is a member's own assertion and any member may publish
+/// `f:<space>/<path>` for any space, so read as of now the most a stamp can
+/// claim is the present instant — exactly the claim an honest publish makes.
+/// An unbounded one would sit above every entry that will ever be published,
+/// for every path, permanently; bounded, it wins no more than publishing right
+/// now would, and what it wins is one round of a contest the rest of the key
+/// settles.
+///
+/// Clamped here rather than on the way in, because the row is the leaf: the
+/// same trie has to materialize identically on every node and after a rebuild,
+/// so the time-dependence belongs to the reading and not to the data.
+fn entry_key(entry: &EntryRow, now: i64) -> (i64, Option<[u8; 32]>, Option<String>, String) {
     let (_, content, target) = identity(entry);
-    (entry.mtime_ns, content, target, entry.origin.canonical())
+    (
+        entry.mtime_ns.min(now),
+        content,
+        target,
+        entry.origin.canonical(),
+    )
 }
 
 /// The same order at version granularity, for presenting a version list.
-fn version_key(version: &Version) -> (i64, Option<[u8; 32]>, Option<String>, String) {
+fn version_key(version: &Version, now: i64) -> (i64, Option<[u8; 32]>, Option<String>, String) {
     let (_, content, target) = identity_of_version(version);
     (
-        version.mtime_ns,
+        version.mtime_ns.min(now),
         content,
         target,
         version
@@ -348,9 +382,17 @@ fn version_key(version: &Version) -> (i64, Option<[u8; 32]>, Option<String>, Str
 
 impl Store {
     /// Every version of one path (§8).
+    ///
+    /// The reader's clock is taken here, once: it bounds how a published
+    /// `mtime_ns` orders and is never written down.
     pub fn versions_for(&self, space: &str, path: &str) -> Result<VersionSet> {
         let entries = self.entries_for_path(space, path)?;
-        Ok(VersionSet::from_entries(space, path, entries))
+        Ok(VersionSet::from_entries(
+            space,
+            path,
+            entries,
+            synch_core::now_ns(),
+        ))
     }
 
     /// The unified listing under a prefix: one version set per path, ordered by
@@ -376,6 +418,9 @@ impl Store {
             params![space, first, last],
         )?;
 
+        // One clock reading for the whole listing, so every path in it orders
+        // its versions against the same instant.
+        let now = synch_core::now_ns();
         let mut out: Vec<VersionSet> = Vec::new();
         let mut current: Vec<EntryRow> = Vec::new();
         for row in rows {
@@ -385,13 +430,14 @@ impl Store {
                     space,
                     &path,
                     std::mem::take(&mut current),
+                    now,
                 ));
             }
             current.push(row);
         }
         if let Some(first) = current.first() {
             let path = first.path.clone();
-            out.push(VersionSet::from_entries(space, &path, current));
+            out.push(VersionSet::from_entries(space, &path, current, now));
         }
         Ok(out)
     }
@@ -436,6 +482,10 @@ impl Store {
 mod tests {
     use super::*;
     use synch_core::FileEntry;
+
+    /// A reading clock later than any time these tests publish, so the order
+    /// clamps nothing except where a test is about the clamp.
+    const READ_AT: i64 = i64::MAX;
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -491,7 +541,7 @@ mod tests {
         assert_eq!(set.versions[0].attestors.len(), 3);
         // Agreement renders as a plain file: any policy reads the same bytes.
         for policy in [VersionPolicy::Newest, VersionPolicy::Strict] {
-            let selected = set.select(&policy).entry().unwrap().clone();
+            let selected = set.select(&policy, READ_AT).entry().unwrap().clone();
             assert_eq!(selected.content, Some(content));
         }
     }
@@ -521,29 +571,39 @@ mod tests {
         assert!(set.is_divergent());
 
         // `newest` takes the greater mtime, and says so identically every time.
-        let selected = set.select(&VersionPolicy::Newest).entry().unwrap().clone();
+        let selected = set
+            .select(&VersionPolicy::Newest, READ_AT)
+            .entry()
+            .unwrap()
+            .clone();
         assert_eq!(selected.origin, origin("nas"));
         for _ in 0..5 {
             assert_eq!(
-                set.select(&VersionPolicy::Newest).entry().unwrap().origin,
+                set.select(&VersionPolicy::Newest, READ_AT)
+                    .entry()
+                    .unwrap()
+                    .origin,
                 origin("nas")
             );
         }
         // A pin reads the other side.
         assert_eq!(
-            set.select(&VersionPolicy::Origin(origin("laptop")))
+            set.select(&VersionPolicy::Origin(origin("laptop")), READ_AT)
                 .entry()
                 .unwrap()
                 .content,
             Some(Hash::new(b"ours"))
         );
         // Strict refuses, and the version list is what the caller reports.
-        assert_eq!(set.select(&VersionPolicy::Strict), Selection::Divergent);
+        assert_eq!(
+            set.select(&VersionPolicy::Strict, READ_AT),
+            Selection::Divergent
+        );
         assert_eq!(set.describe().len(), 2);
         assert!(set.describe()[0].contains("nas@x.example"));
         // A pin on an origin that publishes nothing here selects nothing.
         assert_eq!(
-            set.select(&VersionPolicy::Origin(origin("vps"))),
+            set.select(&VersionPolicy::Origin(origin("vps")), READ_AT),
             Selection::Absent
         );
     }
@@ -565,7 +625,11 @@ mod tests {
         }
         let set = store.versions_for("s", "tied").unwrap();
         assert!(set.is_divergent());
-        let winner = set.select(&VersionPolicy::Newest).entry().unwrap().clone();
+        let winner = set
+            .select(&VersionPolicy::Newest, READ_AT)
+            .entry()
+            .unwrap()
+            .clone();
         // Whichever root sorts greater wins, and the answer does not depend on
         // which origin happened to publish first.
         let expected = if Hash::new(b"one").as_bytes() > Hash::new(b"two").as_bytes() {
@@ -605,9 +669,15 @@ mod tests {
         let set = store.versions_for("s", "f").unwrap();
         assert_eq!(set.version_count(), 2, "live + tombstone is divergence");
         assert!(set.exists(), "the path stays visible until it is resolved");
-        // The deletion is the newer assertion, so `newest` selects it.
-        let selected = set.select(&VersionPolicy::Newest).entry().unwrap().clone();
-        assert_eq!(selected.kind, EntryKind::Tombstone);
+        // The deletion speaks for the origin that published it, so `newest`
+        // reads the version that is still live (§8).
+        let selected = set
+            .select(&VersionPolicy::Newest, READ_AT)
+            .entry()
+            .unwrap()
+            .clone();
+        assert_eq!(selected.kind, EntryKind::File);
+        assert_eq!(selected.origin, origin("nas"));
 
         // Once every publisher tombstones it, the path has left the tree.
         store
@@ -686,7 +756,7 @@ mod tests {
         assert!(described.contains("-> ../b"), "{described}");
 
         // The newest mtime still selects deterministically.
-        let selected = set.select(&VersionPolicy::Newest);
+        let selected = set.select(&VersionPolicy::Newest, READ_AT);
         assert_eq!(
             selected.entry().unwrap().symlink_target.as_deref(),
             Some("../b")
@@ -728,7 +798,7 @@ mod tests {
 
         // Selection runs on the real mtimes both sides published, so every
         // node picks the same side: the file here, which is newer.
-        let selected = set.select(&VersionPolicy::Newest);
+        let selected = set.select(&VersionPolicy::Newest, READ_AT);
         assert_eq!(selected.entry().unwrap().kind, EntryKind::File);
 
         // And with the link newer, the link wins — deterministically, and not
@@ -738,8 +808,209 @@ mod tests {
             .unwrap();
         let set = store.versions_for("media", "x").unwrap();
         assert_eq!(
-            set.select(&VersionPolicy::Newest).entry().unwrap().kind,
+            set.select(&VersionPolicy::Newest, READ_AT)
+                .entry()
+                .unwrap()
+                .kind,
             EntryKind::Symlink
         );
+    }
+
+    /// A tombstone speaks for its own origin's copy, not for the path (§8).
+    ///
+    /// The unified tree merges assertions from every member by `(space, path)`,
+    /// so a deletion that removed the path outright would let any member delete
+    /// any file from every `newest` reader in the cluster. §8's rule is that a
+    /// path exists while at least one origin publishes a live entry for it, and
+    /// stays visible until every publisher tombstones it.
+    #[test]
+    fn a_tombstone_removes_only_its_own_origins_version() {
+        let (_d, store) = store();
+        let live = Hash::new(b"still here");
+        store
+            .put_entry(
+                &origin("nas"),
+                "media",
+                "f",
+                &FileEntry::file(9, 100, live, 1),
+            )
+            .unwrap();
+        // A deletion published later than the live version, which is what an
+        // attacker would send and what an honest late deletion looks like too.
+        store
+            .put_entry(
+                &origin("laptop"),
+                "media",
+                "f",
+                &FileEntry::tombstone(9_000, 2, None),
+            )
+            .unwrap();
+
+        let set = store.versions_for("media", "f").unwrap();
+        assert!(set.exists(), "one origin still publishes it");
+        let selected = set
+            .select(&VersionPolicy::Newest, READ_AT)
+            .entry()
+            .unwrap()
+            .clone();
+        assert_eq!(selected.content, Some(live));
+        assert_eq!(selected.origin, origin("nas"));
+
+        // Pinned to the origin that deleted it, the deletion is the answer.
+        let pinned = set.select(&VersionPolicy::Origin(origin("laptop")), READ_AT);
+        assert_eq!(pinned.entry().unwrap().kind, EntryKind::Tombstone);
+
+        // Once every publisher has deleted it, the path is gone for everyone.
+        store
+            .put_entry(
+                &origin("nas"),
+                "media",
+                "f",
+                &FileEntry::tombstone(9_000, 3, None),
+            )
+            .unwrap();
+        let set = store.versions_for("media", "f").unwrap();
+        assert!(!set.exists());
+        assert_eq!(
+            set.select(&VersionPolicy::Newest, READ_AT),
+            Selection::Absent
+        );
+    }
+
+    /// One origin publishing alone reads exactly as it always did.
+    #[test]
+    fn a_lone_origins_tombstone_still_empties_the_path() {
+        let (_d, store) = store();
+        store
+            .put_entry(
+                &origin("nas"),
+                "media",
+                "f",
+                &FileEntry::file(9, 100, Hash::new(b"c"), 1),
+            )
+            .unwrap();
+        assert!(store
+            .versions_for("media", "f")
+            .unwrap()
+            .select(&VersionPolicy::Newest, READ_AT)
+            .entry()
+            .is_some());
+
+        store
+            .put_entry(
+                &origin("nas"),
+                "media",
+                "f",
+                &FileEntry::tombstone(200, 2, None),
+            )
+            .unwrap();
+        let set = store.versions_for("media", "f").unwrap();
+        assert!(!set.exists());
+        assert_eq!(
+            set.select(&VersionPolicy::Newest, READ_AT),
+            Selection::Absent
+        );
+        assert_eq!(
+            set.select(&VersionPolicy::Strict, READ_AT),
+            Selection::Absent
+        );
+        // The pinned view still sees the deletion itself.
+        assert_eq!(
+            set.select(&VersionPolicy::Origin(origin("nas")), READ_AT)
+                .entry()
+                .unwrap()
+                .kind,
+            EntryKind::Tombstone
+        );
+    }
+
+    /// What a node materializes is the leaf, not the leaf plus its clock.
+    ///
+    /// Every component of the selection order has to be data every node holds
+    /// identically, or two nodes materializing the same trie at different times
+    /// select different versions — and `doctor --rebuild` changes the answer
+    /// again.
+    #[test]
+    fn a_leaf_materializes_to_the_same_row_whatever_the_clock_says() {
+        let (_d, store) = store();
+        let dated_ahead = FileEntry::file(9, i64::MAX, Hash::new(b"c"), 1);
+        store
+            .put_entry(&origin("nas"), "media", "f", &dated_ahead)
+            .unwrap();
+        let row = store.versions_for("media", "f").unwrap().entries[0].clone();
+        assert_eq!(row.mtime_ns, i64::MAX, "the leaf is stored as published");
+
+        // Materialized again — a rebuild, or another node — it is the same row.
+        store
+            .put_entry(&origin("nas"), "media", "f", &dated_ahead)
+            .unwrap();
+        assert_eq!(
+            store.versions_for("media", "f").unwrap().entries[0],
+            row,
+            "and the second materialization agrees with the first"
+        );
+    }
+
+    /// A version dated in the future orders as of now.
+    ///
+    /// `mtime_ns` is a member's own assertion and any member may publish for
+    /// any space, so an unbounded stamp would sit above every entry that will
+    /// ever be published, for every path, permanently. Read against the
+    /// reader's clock it claims the present instant and no more — the same
+    /// claim an honest publish at this instant makes, settled by the rest of
+    /// the order rather than by a number nothing can reach.
+    #[test]
+    fn a_version_dated_in_the_future_orders_as_of_now() {
+        let (_d, store) = store();
+        store
+            .put_entry(
+                &origin("liar"),
+                "media",
+                "f",
+                &FileEntry::file(9, i64::MAX, Hash::new(b"theirs"), 1),
+            )
+            .unwrap();
+        store
+            .put_entry(
+                &origin("nas"),
+                "media",
+                "f",
+                &FileEntry::file(9, 1_000, Hash::new(b"ours"), 1),
+            )
+            .unwrap();
+
+        let now = 2_000;
+        let set = store.versions_for("media", "f").unwrap();
+        let key_of = |name: &str| {
+            let entry = set
+                .entries
+                .iter()
+                .find(|e| e.origin == origin(name))
+                .expect("the entry");
+            entry_key(entry, now)
+        };
+        assert_eq!(key_of("liar").0, now, "read as of now, never past it");
+        assert_eq!(key_of("nas").0, 1_000, "an honest stamp is left alone");
+
+        // Republished at this instant, the honest entry is its equal: what the
+        // inflated stamp bought is nothing the publisher could not have had.
+        store
+            .put_entry(
+                &origin("nas"),
+                "media",
+                "f",
+                &FileEntry::file(9, now, Hash::new(b"ours"), 2),
+            )
+            .unwrap();
+        let set = store.versions_for("media", "f").unwrap();
+        let key_of = |name: &str| {
+            let entry = set
+                .entries
+                .iter()
+                .find(|e| e.origin == origin(name))
+                .expect("the entry");
+            entry_key(entry, now)
+        };
+        assert_eq!(key_of("liar").0, key_of("nas").0);
     }
 }

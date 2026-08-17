@@ -521,6 +521,9 @@ mod tests {
         }
     }
 
+    /// A reading clock later than any time these tests publish.
+    const READ_AT: i64 = i64::MAX;
+
     #[test]
     fn a_symlink_version_shows_its_target() {
         let set = VersionSet::from_entries(
@@ -530,6 +533,7 @@ mod tests {
                 symlink_row("nas", "../a", 1),
                 symlink_row("laptop", "../a", 2),
             ],
+            READ_AT,
         );
         assert_eq!(set.version_count(), 1, "same target, same version");
         let lines = version_set(&set);
@@ -607,6 +611,7 @@ mod tests {
             "media",
             "f.txt",
             vec![row("nas", b"same", 1), row("laptop", b"same", 2)],
+            READ_AT,
         );
         assert!(!set.is_divergent());
         let lines = version_set(&set);
@@ -624,6 +629,7 @@ mod tests {
             "media",
             "f.txt",
             vec![row("nas", b"theirs", 100), row("laptop", b"ours", 200)],
+            READ_AT,
         );
         let lines = version_set(&set);
         assert!(lines[0].contains("2 version(s)"), "{lines:?}");
@@ -638,8 +644,12 @@ mod tests {
         let mut deleted = row("nas", b"gone", 300);
         deleted.kind = EntryKind::Tombstone;
         deleted.content = None;
-        let set =
-            VersionSet::from_entries("media", "f.txt", vec![row("laptop", b"live", 100), deleted]);
+        let set = VersionSet::from_entries(
+            "media",
+            "f.txt",
+            vec![row("laptop", b"live", 100), deleted],
+            READ_AT,
+        );
         let lines = version_set(&set);
         assert!(lines[1].contains("(deleted)"), "{lines:?}");
         assert!(lines[1].contains("deleted"), "{lines:?}");

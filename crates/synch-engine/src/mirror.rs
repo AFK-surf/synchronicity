@@ -435,6 +435,9 @@ fn plan_pass(
     // Detect folding collisions before writing anything: the
     // lexicographically first path wins and the rest are reported.
     let mut claimed: HashMap<String, String> = HashMap::new();
+    // One clock reading for the pass, so every path in it selects against the
+    // same instant.
+    let now = synch_core::now_ns();
     let mut report = MirrorReport::default();
     let mut known: HashSet<String> = HashSet::new();
     let mut wanted: Vec<WantedContent> = Vec::new();
@@ -468,7 +471,7 @@ fn plan_pass(
                 ));
                 continue;
             }
-            let selected = match set.select(policy) {
+            let selected = match set.select(policy, now) {
                 synch_store::Selection::Selected(entry) => *entry,
                 // The policy selects nothing here — an `origin=` pin on an
                 // origin that publishes no version of this path — so the path
@@ -1315,16 +1318,24 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// A path leaves a `newest` mirror when every publisher has deleted it, and
+    /// not before (§8).
+    ///
+    /// A tombstone is one origin's assertion about its own copy. While another
+    /// origin still publishes a live version the path is still in the tree, and
+    /// the mirror carries the newest live version of it.
     #[tokio::test]
-    async fn a_tombstoned_selection_removes_the_file() {
+    async fn a_tombstone_removes_a_path_once_every_publisher_has_deleted_it() {
         let (_d, node) = node().await;
         let target = tempfile::tempdir().unwrap();
         node.add_mirror("media", target.path(), &VersionPolicy::Newest)
             .unwrap();
         publish_entry(&node, &peer(), "a.txt", b"hello", 1);
+        publish_entry(&node, &other(), "a.txt", b"hello", 1);
         node.sync_mirror(target.path()).await.unwrap();
+        assert!(target.path().join("a.txt").exists());
 
-        // A newer tombstone is the selected version, so the file goes.
+        // One publisher deletes its copy: the other still publishes the path.
         node.store()
             .put_entry(
                 &other(),
@@ -1334,15 +1345,58 @@ mod tests {
             )
             .unwrap();
         let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert_eq!(
+            std::fs::read(target.path().join("a.txt")).unwrap(),
+            b"hello",
+            "the surviving publisher's version is what the mirror carries"
+        );
+
+        // The last publisher deletes it too, and the path leaves the tree.
+        node.store()
+            .put_entry(
+                &peer(),
+                "media",
+                "a.txt",
+                &FileEntry::tombstone(500, 2, None),
+            )
+            .unwrap();
+        let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.removed, 1);
         assert!(!target.path().join("a.txt").exists());
+        node.shutdown().await.unwrap();
+    }
 
-        // Pinned to the origin that still publishes it, the same tree keeps it.
+    /// A mirror pinned to one origin follows that origin's deletions.
+    ///
+    /// `origin=` is a mirror of one node's view, so its tombstone is the answer
+    /// for that path even while other origins publish it — and the reverse: the
+    /// pinned origin's live version stands while others delete theirs.
+    #[tokio::test]
+    async fn a_pinned_mirror_follows_its_own_origins_deletion() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        publish_entry(&node, &peer(), "a.txt", b"hello", 1);
+        node.store()
+            .put_entry(
+                &other(),
+                "media",
+                "a.txt",
+                &FileEntry::tombstone(500, 2, None),
+            )
+            .unwrap();
+
         node.add_mirror("media", target.path(), &VersionPolicy::Origin(peer()))
             .unwrap();
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.written, 1);
         assert!(target.path().join("a.txt").exists());
+
+        node.add_mirror("media", target.path(), &VersionPolicy::Origin(other()))
+            .unwrap();
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.removed, 1);
+        assert!(!target.path().join("a.txt").exists());
         node.shutdown().await.unwrap();
     }
 

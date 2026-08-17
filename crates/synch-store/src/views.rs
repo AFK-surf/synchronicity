@@ -929,33 +929,15 @@ fn apply_change(
     Ok(())
 }
 
-/// How far ahead of this node's clock a peer's `mtime_ns` may sit.
+/// Materializes one trie leaf into `entries`.
 ///
-/// One year, which is slack for clock skew and for genuinely odd timestamps,
-/// and nowhere near enough to win a selection permanently.
-const MTIME_SKEW_CEILING_NS: i64 = 365 * 24 * 60 * 60 * 1_000_000_000;
-
-/// Clamps a peer-supplied modification time to something this node's clock can
-/// vouch for.
-///
-/// `mtime_ns` is not just metadata: it is the first and dominant component of
-/// the order `VersionPolicy::Newest` maximizes across **all** origins for a
-/// `(space, path)` (§8), and `newest` is the default. `space` is a plain string
-/// inside the trie key, so any member may publish `f:<space>/<path>` for any
-/// space. Unclamped, one member republishing every visible path at
-/// `mtime_ns = i64::MAX` wins selection everywhere — with its own content, or
-/// with a tombstone, which deletes the file from every `newest` mirror in the
-/// cluster. §12's "a malicious origin publishing garbage about its own files
-/// only pollutes its own namespace" does not hold while the unified tree merges
-/// namespaces by `(space, path)`.
-///
-/// Clamped rather than refused: a wrong clock is ordinary, and dropping the
-/// entry would lose a real file. Clamping costs the liar its advantage while
-/// leaving honest skew intact.
-fn clamp_mtime(mtime_ns: i64, now: i64) -> i64 {
-    mtime_ns.min(now.saturating_add(MTIME_SKEW_CEILING_NS))
-}
-
+/// The row is the leaf, verbatim. Every column here is what the origin
+/// published and what every other node holding this trie also materializes:
+/// two nodes with the same trie must produce the same `entries`, and
+/// `doctor --rebuild` must produce what the original materialization did, or
+/// version selection stops being a function of the data (§8). A peer's
+/// `mtime_ns` is judged where it is *used* — [`VersionSet::select`] orders
+/// under the reader's own clock — not where it is stored.
 fn put_entry_in(
     conn: &rusqlite::Connection,
     origin: &OriginId,
@@ -977,7 +959,7 @@ fn put_entry_in(
             path,
             kind_to_int(entry.kind),
             entry.size as i64,
-            clamp_mtime(entry.mtime_ns, synch_core::now_ns()),
+            entry.mtime_ns,
             entry.unix_mode.map(|m| m as i64),
             entry.content.map(|h| h.as_bytes().to_vec()),
             entry.seq as i64,

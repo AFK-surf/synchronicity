@@ -864,11 +864,20 @@ content.** What it does do is aggregate:
   individually addressable as `<origin>:<space>/<path>`.
 - **Selection, not resolution**: any read of a bare `<space>/<path>` must pick one
   version, and does so by an explicit, deterministic policy:
-  - `newest` (default) — the version with the greatest `(mtime_ns, content_root,
-    origin)`, a total order, so every node selects the same version from the same
-    assertions. This is presentation, not resolution: nothing is written, no
-    assertion changes, and the losing versions remain first-class and marked.
-    Two trust caveats are inherent and accepted (§12): `mtime_ns` is
+  - `newest` (default) — the greatest `(mtime_ns, content_root, symlink target,
+    origin)` among the path's **live** versions, a total order, so every node
+    selects the same version from the same assertions. A tombstone takes its own
+    origin's version out of the running rather than the path: the path resolves
+    to the newest live version among the remaining origins and is absent only
+    once every publisher has tombstoned it, which is the same rule as "a path
+    exists iff at least one origin publishes a live entry for it" above. This is
+    presentation, not resolution: nothing is written, no assertion changes, and
+    the losing versions remain first-class and marked.
+    The row a node materializes is the trie leaf verbatim, so every component of
+    the order is data every node holds identically; `mtime_ns` is read as no
+    later than the reading node's own clock, which bounds what a stamp can claim
+    to the present instant without making the stored view a function of when it
+    was stored. Two trust caveats are inherent and accepted (§12): `mtime_ns` is
     member-supplied file metadata — a member with a skewed clock or a deliberate
     `touch -d` wins `newest` on every surface until its entries are outranked,
     adopted over, or the member is removed; and determinism holds only over *the
@@ -1346,8 +1355,20 @@ CI (GitHub Actions):
   forward wipe no seq rule prevents; `head_history` retention plus fork-evidence
   surfacing (§3.4) makes it visible. Same-seq forks are detected
   and reported with retained signed proofs (§4.4). A malicious *origin* publishing
-  garbage about its own files only pollutes its own namespace, which the version
-  model already treats as "their claim, not truth".
+  garbage about its own files pollutes its own namespace, which the version model
+  already treats as "their claim, not truth" — but the unified tree (§8) is a
+  merge across namespaces by `(space, path)`, and `space` is a plain string in the
+  trie key any member may publish under. Under `newest`, a member can therefore
+  put its own version of any path in front of every other member's: `mtime_ns` is
+  its own assertion, and while a read orders it as of the reader's clock rather
+  than as of the number published, an entry claiming the present instant is
+  exactly what an honest publish claims. What it cannot do is *remove* another
+  member's file: a tombstone asserts that the publishing origin deleted its copy,
+  so it takes that origin's version out of the running and leaves the path
+  carrying the newest live version among the rest (§8). A space where one
+  member's assertions must not stand in for another's is a space to read under
+  `origin=` or `strict`, which select from one origin's view and refuse
+  divergence respectively.
 - **Resource exhaustion — a trust stance, not a defense**: every peer that can send
   us a request at all is an authorized member (§3.2), and members are extended basic
   trust not to DoS each other. There are therefore **no per-peer rate limits and no
