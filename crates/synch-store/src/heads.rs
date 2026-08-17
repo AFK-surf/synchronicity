@@ -305,11 +305,10 @@ impl Store {
     ///
     /// Returns how many rows were dropped.
     pub fn prune_history_before(&self, origin: &OriginId, before: i64) -> Result<usize> {
-        // Reads and deletes in one immediate transaction, over one snapshot.
-        // Deciding what is doomed outside it means a writer on the blocking
-        // pool can make a row current in between — the pointer `heads` holds
-        // into this table would then name a row that is gone, and a live head
-        // reads as absent rather than as an error.
+        // Reads and deletes in one immediate transaction, over one snapshot:
+        // deciding what is doomed outside it lets a writer on the blocking pool
+        // make a row current in between, and the row `heads` points at would go
+        // with the rest of the pass.
         self.with_immediate_tx(|tx| {
             let complete = head_in(tx, origin, Slot::Complete)?;
             let pending = head_in(tx, origin, Slot::Pending)?;
@@ -338,10 +337,9 @@ impl Store {
                 if forked.contains(&seq) && !(current_seq > seq && moved_past_forks) {
                     continue;
                 }
-                // The `NOT EXISTS` is the guarantee rather than the decision:
-                // whatever this pass concluded, a row a slot points at is not
-                // deletable, so the join every head read goes through cannot be
-                // broken from here.
+                // The exemption again, as a condition of the delete rather
+                // than of the decision: a row a slot points at is not deletable
+                // from here whatever this pass concluded.
                 pruned += tx.execute(
                     "DELETE FROM head_history
                       WHERE origin_id = ?1 AND seq = ?2 AND root = ?3
@@ -677,10 +675,8 @@ mod tests {
     /// A row a slot points at is never pruned, whatever the horizon says.
     ///
     /// `heads` names a `head_history` row and every head read joins the two, so
-    /// a pruned row makes a live head read as absent rather than as an error.
-    /// The exemption is checked twice — once when the doomed set is chosen, and
-    /// once in the delete itself — because the first is a decision and the
-    /// second is the guarantee.
+    /// the row behind a slot is exempt — checked once when the doomed set is
+    /// chosen, and again as a condition of the delete.
     #[test]
     fn a_row_a_slot_points_at_survives_every_prune() {
         let (_d, store) = store();

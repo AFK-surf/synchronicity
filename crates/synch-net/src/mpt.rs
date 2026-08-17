@@ -14,7 +14,7 @@ use iroh::{
 };
 use synch_core::{
     now_ns, BlobAd, Hash, HeadSummary, MptMessage, NodeId, OriginId, SignedHead, MAX_BATCH,
-    MAX_HEADS_PER_MESSAGE, PROTO_VERSION,
+    MAX_HEADS_PER_MESSAGE, MAX_PROVIDER_ADS, PROTO_VERSION,
 };
 use synch_mpt::NodeStore;
 use synch_store::{Slot, Store};
@@ -263,8 +263,11 @@ impl MptProtocol {
             }
             MptMessage::FindProviders { object_root } => {
                 // Hints are unverified — content is hash-verified regardless,
-                // so a wrong hint only wastes a dial (§5.1).
-                let ads = self.store().providers(&object_root)?;
+                // so a wrong hint only wastes a dial (§5.1) — and bounded, so
+                // one small request cannot buy the asker an unbounded table of
+                // rows to write.
+                let mut ads = self.store().providers(&object_root)?;
+                ads.truncate(MAX_PROVIDER_ADS);
                 write_frame(send, &MptMessage::Providers { ads }).await?;
                 Ok(())
             }
@@ -527,7 +530,15 @@ impl MptClient {
             write_frame(&mut send, &MptMessage::FindProviders { object_root }).await?;
             let _ = send.finish();
             match read_frame::<MptMessage>(&mut recv).await? {
-                MptMessage::Providers { ads } => Ok(ads),
+                MptMessage::Providers { ads } => {
+                    if ads.len() > MAX_PROVIDER_ADS {
+                        return Err(NetError::Unexpected(format!(
+                            "a Providers answer of {} exceeds the {MAX_PROVIDER_ADS} limit",
+                            ads.len()
+                        )));
+                    }
+                    Ok(ads)
+                }
                 MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
                 other => Err(unexpected("Providers", &other)),
             }
@@ -573,8 +584,8 @@ impl MptClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{bare_endpoint, StalledPeer};
-    use synch_core::ALPN_MPT;
+    use crate::testing::{bare_endpoint, ScriptedPeer, StalledPeer};
+    use synch_core::{BlobAd, ALPN_MPT};
 
     /// How long a test waits before calling a request hung rather than slow.
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -642,5 +653,56 @@ mod tests {
 
         dialer.close().await;
         peer.shutdown().await;
+    }
+
+    /// A provider answer past the bound is refused before a row is written.
+    ///
+    /// Hints are unverified by design, but taking one still costs a row and
+    /// nothing in the answer vouches that the origins in it exist — so the
+    /// length is checked the way every other batch message's is.
+    #[tokio::test]
+    async fn a_provider_answer_past_the_bound_is_refused() {
+        let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS + 1)
+            .map(|i| {
+                (
+                    OriginId::named(&format!("origin{i}"), "x.example").unwrap(),
+                    BlobAd::complete(1000),
+                )
+            })
+            .collect();
+        let peer = ScriptedPeer::bind(ALPN_MPT, MptMessage::Providers { ads }).await;
+        let dialer = bare_endpoint(ALPN_MPT).await;
+        let connection = dialer.connect(peer.addr.clone(), ALPN_MPT).await.unwrap();
+        let client = MptClient::new(connection);
+
+        let err = client
+            .find_providers(Hash::new(b"object"))
+            .await
+            .expect_err("an over-long answer is refused");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+
+        // One ad short of the bound is an ordinary answer.
+        let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS)
+            .map(|i| {
+                (
+                    OriginId::named(&format!("origin{i}"), "x.example").unwrap(),
+                    BlobAd::complete(1000),
+                )
+            })
+            .collect();
+        let honest = ScriptedPeer::bind(ALPN_MPT, MptMessage::Providers { ads }).await;
+        let connection = dialer.connect(honest.addr.clone(), ALPN_MPT).await.unwrap();
+        assert_eq!(
+            MptClient::new(connection)
+                .find_providers(Hash::new(b"object"))
+                .await
+                .unwrap()
+                .len(),
+            MAX_PROVIDER_ADS
+        );
+
+        dialer.close().await;
+        peer.shutdown().await;
+        honest.shutdown().await;
     }
 }

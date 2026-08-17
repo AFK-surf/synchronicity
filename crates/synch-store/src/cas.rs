@@ -493,10 +493,11 @@ impl Store {
         }
         std::fs::rename(&staging, &target)?;
         // Flush the payload contents, the outboard, and the directory entries
-        // before the index row claims this blob is complete.
-        if let Ok(payload) = File::open(&target) {
-            let _ = fsync_file(&payload);
-        }
+        // before the index row claims this blob is complete. Checked, like the
+        // flushes below it: a swallowed ENOSPC or EIO here is a row claiming
+        // bytes the disk never took. Opened for *writing* to flush it, because
+        // Windows refuses `FlushFileBuffers` on a read-only handle.
+        fsync_file(&OpenOptions::new().write(true).open(&target)?)?;
         fsync_parent(&target);
         write_and_sync(&self.outboard_path(&root), &outboard)?;
         self.write_blob_row(&root, size, true, None, None, now)?;

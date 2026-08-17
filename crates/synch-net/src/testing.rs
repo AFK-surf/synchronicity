@@ -74,3 +74,57 @@ impl StalledPeer {
         self.endpoint.close().await;
     }
 }
+
+/// A peer that answers every stream it is given with one canned frame.
+///
+/// What a client's own validation has to be exercised against: a well-formed
+/// answer that is not one an honest responder would ever send.
+pub(crate) struct ScriptedPeer {
+    /// Where to dial it.
+    pub(crate) addr: EndpointAddr,
+    endpoint: Endpoint,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ScriptedPeer {
+    /// Binds one and starts answering.
+    pub(crate) async fn bind<T>(alpn: &'static [u8], reply: T) -> ScriptedPeer
+    where
+        T: serde::Serialize + Send + Sync + 'static,
+    {
+        let endpoint = bare_endpoint(alpn).await;
+        let addr = direct_addr(&endpoint);
+        let listening = endpoint.clone();
+        let reply = std::sync::Arc::new(reply);
+        let task = tokio::spawn(async move {
+            while let Some(incoming) = listening.accept().await {
+                let Ok(connection) = incoming.await else {
+                    continue;
+                };
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    while let Ok((mut send, _recv)) = connection.accept_bi().await {
+                        if crate::frame::write_frame(&mut send, reply.as_ref())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let _ = send.finish();
+                    }
+                });
+            }
+        });
+        ScriptedPeer {
+            addr,
+            endpoint,
+            task,
+        }
+    }
+
+    /// Stops answering and closes the endpoint.
+    pub(crate) async fn shutdown(self) {
+        self.task.abort();
+        self.endpoint.close().await;
+    }
+}

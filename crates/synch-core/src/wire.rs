@@ -108,6 +108,18 @@ pub const PROOF_NODE_LEN: usize = 64;
 /// disjoint runs.
 pub const MAX_RANGES: usize = 4096;
 
+/// How many provider hints one [`MptMessage::Providers`] may carry (§5.1).
+///
+/// A hint is unverified by design — content is hash-verified whatever the hint
+/// said — but taking one still costs a `blob_providers` row, and `OriginId`
+/// arrives off the wire without anything vouching that the origin exists. An
+/// unbounded answer therefore buys the responder's peer a table of fabricated
+/// origins for one small request.
+///
+/// §12 sizes a cluster at N ≤ 100 origins, and one object has at most one ad per
+/// origin, so a legitimate answer names tens.
+pub const MAX_PROVIDER_ADS: usize = 256;
+
 /// A message on the `sync/mpt/1` ALPN (§5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MptMessage {
@@ -162,7 +174,7 @@ pub enum MptMessage {
         /// The object root being looked up.
         object_root: Hash,
     },
-    /// Unverified provider hints.
+    /// Unverified provider hints. At most [`MAX_PROVIDER_ADS`] per answer.
     Providers {
         /// `(origin, ad)` pairs.
         ads: Vec<(OriginId, BlobAd)>,

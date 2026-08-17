@@ -888,13 +888,32 @@ impl Node {
                     continue;
                 }
             };
-            for (origin, ad) in ads {
-                if &origin == self.origin() {
-                    continue;
+            // Storing a hint is a row, and the origin in one is a peer's word:
+            // nothing in the answer establishes that the origin exists, and
+            // nothing sweeps `blob_providers`. A hint about an origin this node
+            // has no live binding for could never be dialled anyway
+            // ([`Node::providers_for`] drops it), so it is not worth a row.
+            //
+            // The writes go to the blocking pool with every other database
+            // path: this runs inside a fetch on a runtime worker, and a bounded
+            // answer is still a row apiece (§10).
+            let node = self.clone();
+            let root = *root;
+            learned += crate::blocking::offload(move || {
+                let now = now_ns();
+                let mut stored = 0usize;
+                for (origin, ad) in ads {
+                    if &origin == node.origin()
+                        || node.store().keys_for_origin(&origin, now)?.is_empty()
+                    {
+                        continue;
+                    }
+                    node.store().put_provider(&root, &origin, &ad)?;
+                    stored += 1;
                 }
-                self.store().put_provider(root, &origin, &ad)?;
-                learned += 1;
-            }
+                Ok(stored)
+            })
+            .await?;
         }
         if learned > 0 {
             tracing::debug!(hints = learned, "learned providers from peers");
