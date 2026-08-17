@@ -75,6 +75,7 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query` |
 | `CP_TUF_URL` | primary | Sigstore TUF repository relayed in the zone, default `https://tuf-repo-cdn.sigstore.dev` |
+| `CP_TUF_ROOT` | primary | `root.json` this service anchors TUF verification on; defaults to `priv/tuf/sigstore_tuf_root.json`, the root the client embeds |
 
 > **Why the database gets its own directory.** Each SQLite connection
 > runs in a `csqlite` worker sandboxed (Landlock on Linux, `unveil`/
@@ -170,9 +171,13 @@ secrets.** Protect the replication bucket accordingly.
    the log keys it names, so Sigstore's log rotations stop being a client
    upgrade. The same file is what this service reads to decide where to
    submit (step 3), so the rotation stops being a control-plane upgrade
-   too. This service checks structure, versions and expiries only —
-   it is a relay, not the verifier — and refuses a fetch that would walk
-   clients backwards. The hourly job refetches on its own once the stored
+   too. Because of that second job, this service verifies the chain itself
+   before storing it — signatures over canonical JSON, role thresholds,
+   expiries and monotonicity, anchored on `priv/tuf/sigstore_tuf_root.json`,
+   the same root the client embeds — and refuses anything that does not
+   check out, keeping whatever was already stored. `CP_TUF_ROOT` names a
+   different anchor for a deployment running its own TUF repository.
+   The hourly job refetches on its own once the stored
    timestamp is within three days of expiring; run this by hand after any
    long outage, or on an egress host before couriering the database in an
    air-gapped deployment. Skipping it entirely is fine: clients keep the

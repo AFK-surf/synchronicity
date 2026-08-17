@@ -1420,18 +1420,43 @@ them fail a refresh: TUF trouble is never worse than not having the record.
   repository; the primary fetches the metadata files verbatim — walking
   timestamp → snapshot → targets to the consistent-snapshot target names —
   and stores them in a `tuf_material` table with their versions and the
-  timestamp expiry.
-- The CP is a **relay, not the verifier**: it checks structure, versions,
-  expiries and the one digest `targets.json` hands it — refusing obvious
-  garbage, expired material, and any fetch that would walk clients backwards
-  — but it verifies **no signatures at all**. The cryptographic gate is the
-  client's. What keeps the relay honest is the shared fixture
+  timestamp expiry. `CP_TUF_ROOT` replaces the anchor for a deployment
+  running its own TUF repository, with the same "an override is a different
+  universe" semantics `CP_REKOR_KEY` has; the walk starts at whatever version
+  the anchor declares, so the floor and the anchor cannot disagree.
+- **The CP verifies what it stores** (`tuf/verify`), running the same
+  workflow the client runs against the same anchor — `priv/tuf/
+  sigstore_tuf_root.json`, byte-identical to `EMBEDDED_TUF_ROOT`. Root chain
+  endorsed by both the old root and the new, thresholds counted over
+  *distinct* keys, signatures checked over canonical JSON, expiries,
+  monotonicity against what is stored, and the target's digest. Nothing that
+  fails is stored, so whatever was stored before keeps being served.
+
+  This half used to be absent, on the argument that the CP was a relay and
+  the client the verifier: bad stored material cost nothing but zone bytes,
+  because clients ignore what does not verify and keep their pins. That
+  argument stopped covering everything when §10.6 made the same stored
+  `trusted_root.json` decide **where this service submits** — a decision no
+  client ever sees, and so a decision no client can re-verify. Unverified, a
+  mirror that beat TLS could have pointed a control plane at a log nobody
+  monitors, had its forged proof believed, and satisfied `CP_REKOR_REQUIRE`
+  on the way past. Clients would still have refused the zone (the forged
+  log matches no pin of theirs), so it was a fail-closed denial rather than a
+  silent compromise — but "loud at the client" is not "checked at the
+  source".
+
+  What keeps the two implementations honest is the shared fixture
   (`control-plane/test/fixtures/tuf`): one checked-in copy of the real
-  Sigstore chain that the Gleam encoder must reproduce byte for byte and the
-  Rust verifier must walk to the real pin set. Two implementations of one
-  format drift silently unless something outside both of them holds the bytes
-  still. Bad stored material costs nothing but zone bytes: clients ignore it
-  and keep their pins.
+  Sigstore chain that the Gleam encoder must reproduce byte for byte and
+  *both* verifiers must walk to the real pin set. Canonical JSON is checked
+  a third way on top of that — against digests from an implementation in
+  neither language — because two implementations that share an author can be
+  wrong together.
+
+  What verification does **not** do is gate serving. Stored material that has
+  since expired keeps being relayed and keeps naming the log: expiry gates
+  updates, never operation (§10.2), so it is checked at ingestion, where
+  refusing costs nothing but a retry.
 - `zone/build` emits the bundle record from `tuf_material`; the hourly job
   refetches when the stored timestamp is within 3 days of expiry and, when
   the fetch changed anything, republishes in the same tick — the zone is

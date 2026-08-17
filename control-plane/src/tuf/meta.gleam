@@ -1,17 +1,17 @@
-//// The few fields of a TUF metadata file this service actually reads
+//// The few fields of a TUF metadata file the **walk** reads
 //// (docs/REKOR-ZONE-KEY.md §10.3).
 ////
-//// The control plane is a **relay, not the verifier**: it checks structure,
-//// versions and expiries — enough to refuse obvious garbage and to refuse
-//// regressions — and never a signature. The cryptographic gate is the
-//// client's, in crates/synch-net/src/tuf.rs, and the e2e keeps this side
-//// honest by running that verifier against what the zone serves.
+//// Deliberately shallow, and deliberately not the gate: a role's `_type`,
+//// `version` and `expires`, the version a role lists for the file below it,
+//// and the digest `targets.json` gives for `trusted_root.json` — exactly
+//// enough to know which file to ask the repository for next. Nothing read
+//// here is trusted on the strength of having been read here.
 ////
-//// So the reads here are deliberately shallow: a role's `_type`, `version`
-//// and `expires`, the version a role lists for the file below it, and the
-//// digest `targets.json` gives for `trusted_root.json`. Anything a relay
-//// does not need is not parsed, because parsing it would suggest the relay
-//// was checking it.
+//// The gate is `tuf/verify`, which re-reads all of it from the same bytes
+//// with the signatures checked. Keeping the two apart is what stops a
+//// convenience read during the walk from quietly becoming a security
+//// decision: this module can be wrong about a file and the worst it can do
+//// is fetch the wrong one, which then fails to verify.
 
 import gleam/bit_array
 import gleam/dynamic/decode

@@ -1,11 +1,18 @@
-//// TUF-driven pin refresh, the relay half (docs/REKOR-ZONE-KEY.md §10).
+//// TUF-driven pin refresh: fetching, framing, serving, and discovering the
+//// log from what was stored (docs/REKOR-ZONE-KEY.md §10).
 ////
 //// The load-bearing test here is the shared fixture in test/fixtures/tuf:
 //// real Sigstore metadata, framed into the bundle record, asserted against
 //// the same bytes the Rust client's decoder is asserted against
 //// (crates/synch-net/tests/tuf_pin_refresh.rs). Everything else in this
-//// suite is about what a *relay* owes: refuse garbage, refuse regressions,
-//// serve what it has, and be absent quietly when it has nothing.
+//// suite is about what this side owes around that: refuse garbage, refuse
+//// regressions, serve what it has, be absent quietly when it has nothing,
+//// and read the log to submit to out of what it stored.
+////
+//// The cryptographic gate those fetches pass through lives in
+//// tuf_verify_test — every `refresh` below therefore also exercises the real
+//// Sigstore chain through the real verifier, which is why a fixture that
+//// stopped verifying would fail this file too.
 
 import dns/name
 import dns/wire
@@ -13,6 +20,7 @@ import dnssec/keys
 import envoy
 import fixtures
 import gleam/bit_array
+import gleam/crypto
 import gleam/int
 import gleam/json
 import gleam/list
@@ -239,7 +247,7 @@ pub fn a_refresh_refuses_a_version_regression_test() {
   let assert Ok(Nil) = tuf_store.put(conn, ahead)
   let assert Error(why) =
     fetch.refresh(conn, fake_repo(), "https://tuf.test", now)
-  assert string.contains(why, "regression")
+  assert string.contains(why, "older than the stored")
   let assert Ok(Ok(kept)) = tuf_store.get(conn)
   assert kept.timestamp_version == ahead.timestamp_version
   sqlite.close(conn)
@@ -263,7 +271,8 @@ pub fn a_refresh_refuses_a_repository_missing_the_root_floor_test() {
   let empty = fetch.Repo(get: fn(_path) { Ok(None) })
   let assert Error(why) =
     fetch.refresh(conn, empty, "https://tuf.test", number("verify_at"))
-  assert string.contains(why, int.to_string(fetch.root_floor))
+  let assert Ok(floor) = fetch.root_floor()
+  assert string.contains(why, int.to_string(floor))
   sqlite.close(conn)
 }
 
@@ -279,7 +288,10 @@ pub fn a_refresh_refuses_a_tampered_target_test() {
     })
   let assert Error(why) =
     fetch.refresh(conn, tampered, "https://tuf.test", number("verify_at"))
-  assert string.contains(why, "digest")
+  // The class is what matters: the chain says what these bytes must be and
+  // they are not it. Whether the length or the digest is the first thing to
+  // disagree is not a promise worth pinning.
+  assert string.contains(why, "target hash")
   sqlite.close(conn)
 }
 
@@ -576,4 +588,55 @@ fn chunks(rdata: BitArray) -> Result(String, Nil) {
 fn unwrap_bits(sliced: Result(BitArray, Nil)) -> BitArray {
   let assert Ok(bits) = sliced
   bits
+}
+
+// ------------------------------------------------- the redirection attack
+
+pub fn a_mirror_that_rewrites_the_target_and_its_digest_is_refused_test() {
+  // The attack §10.6 created and `tuf/verify` closes, in one test.
+  //
+  // A mirror that beats TLS serves its own `trusted_root.json` — naming a
+  // transparency log it controls — *and* rewrites `targets.json` so the
+  // digest and length match it. Every check this side used to perform then
+  // passes: the structure is right, the versions agree, nothing regresses,
+  // and the target hashes to exactly what the metadata says. Stored, that
+  // file would have told `rekor/client.discover` to submit the zone-key
+  // claim into a log nobody monitors.
+  //
+  // What refuses it is the signature over `targets.json`, which the mirror
+  // cannot produce, and which nothing on this side used to check.
+  let forged = <<"{\"tlogs\":[{\"baseUrl\":\"https://evil.test\"}]}":utf8>>
+  let digest =
+    string.lowercase(
+      bit_array.base16_encode(crypto.hash(crypto.Sha256, forged)),
+    )
+  let assert Ok(honest_targets) = bit_array.to_string(fixture("targets.json"))
+  let rewritten =
+    honest_targets
+    |> string.replace(field("trusted_root_sha256"), digest)
+    |> string.replace(
+      "\"length\": "
+        <> int.to_string(bit_array.byte_size(fixture("trusted-root.json"))),
+      "\"length\": " <> int.to_string(bit_array.byte_size(forged)),
+    )
+  let honest = fake_repo()
+  let mirror =
+    fetch.Repo(get: fn(path) {
+      case
+        string.contains(path, fetch.trusted_root_target),
+        string.contains(path, ".targets.json")
+      {
+        True, _ -> Ok(Some(forged))
+        _, True -> Ok(Some(<<rewritten:utf8>>))
+        _, _ -> honest.get(path)
+      }
+    })
+  let conn = fixtures.fresh_conn()
+  let assert Error(why) =
+    fetch.refresh(conn, mirror, "https://mirror.test", number("verify_at"))
+  assert string.contains(why, "does not verify")
+  assert string.contains(why, "threshold")
+  // Nothing was stored, so nothing downstream can read it.
+  assert tuf_store.get(conn) == Ok(Error(Nil))
+  sqlite.close(conn)
 }

@@ -20,3 +20,8 @@
 # SHA-256 `targets.json` names — a CRLF checkout is a different file.
 crates/synch-net/src/sigstore_tuf_root.json -text
 crates/synch-net/src/sigstore_trusted_root.json -text
+
+# The control plane's copy of that same root, shipped in priv/ because Gleam
+# has no include-bytes. Its signatures are checked over canonical JSON built
+# from these bytes, so a CRLF checkout is a root that verifies nothing.
+control-plane/priv/tuf/sigstore_tuf_root.json -text

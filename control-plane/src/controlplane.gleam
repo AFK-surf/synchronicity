@@ -56,6 +56,7 @@ import store/migrate
 import store/pool
 import store/sqlite
 import tools/seed
+import tuf/anchor
 import tuf/fetch as tuf_fetch
 import wisp/wisp_mist
 import zone/model
@@ -246,6 +247,10 @@ fn tuf_refresh() -> Result(Nil, String) {
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
   let source = tuf_fetch.url()
+  // Named in the output because it is the one thing about this command an
+  // operator cannot infer from the result: everything below the anchor is
+  // checked against it, so which anchor was used is the claim being made.
+  use anchored <- result.try(anchor.load())
   use outcome <- result.try(tuf_fetch.refresh(
     conn,
     tuf_fetch.http(source),
@@ -258,7 +263,9 @@ fn tuf_refresh() -> Result(Nil, String) {
   )
   sqlite.close(conn)
   io.println(
-    "tuf: root "
+    "tuf: verified against "
+    <> anchor.describe(anchored)
+    <> " — root "
     <> int.to_string(outcome.root_version)
     <> ", timestamp "
     <> int.to_string(outcome.timestamp_version)

@@ -4,6 +4,7 @@
 -module(cp_crypto_ffi).
 -export([ec_generate/0, ecdsa_sign_raw/2, ecdsa_verify_raw/3,
          ecdsa_sign_der/2, ecdsa_verify_der/3, ed25519_verify/3,
+         ed25519_verify_safe/3, ecdsa_verify_any_safe/3,
          ed25519_generate_public/0, self_signed_cert/7, cert_spki_and_san/1, cert_extension/2]).
 
 -include_lib("public_key/include/public_key.hrl").
@@ -46,10 +47,36 @@ ecdsa_verify_der(Msg, Der, Pub64) ->
     crypto:verify(ecdsa, sha256, Msg, Der,
                   [<<4, Pub64/binary>>, prime256v1]).
 
-%% Ed25519 over a raw message — the signature scheme log2025-1's checkpoints
-%% use. EdDSA hashes internally, so the algorithm digest is `none`.
+%% Ed25519 over a raw message — the signature scheme a tiled log's
+%% checkpoints use. EdDSA hashes internally, so the algorithm digest is
+%% `none`.
 ed25519_verify(Msg, Sig, Pub32) ->
     crypto:verify(eddsa, none, Msg, Sig, [Pub32, ed25519]).
+
+%% The same two verifications, guarded — for TUF metadata (tuf/verify), where
+%% the key material and the signatures both come out of a file a hostile
+%% mirror may have written.
+%%
+%% `crypto:verify/5` answers false for a signature that merely fails, but
+%% *raises* for one it cannot parse at all, and for a public key of the wrong
+%% length. Those are ordinary contents of a file being checked, not faults:
+%% a root that lists one unusable key must fall to a threshold error, not
+%% take the process down. Every other caller in this service hands these
+%% functions material it has already parsed, which is why the unguarded forms
+%% stay as they are.
+ed25519_verify_safe(Msg, Sig, Pub32) ->
+    try ed25519_verify(Msg, Sig, Pub32) catch _:_ -> false end.
+
+%% DER first, since that is what Sigstore's TUF signatures are; the
+%% fixed-width r||s form is the same signature written the other way, and the
+%% client accepts both too.
+ecdsa_verify_any_safe(Msg, Sig, Pub64) ->
+    try ecdsa_verify_der(Msg, Sig, Pub64) of
+        true -> true;
+        false -> try ecdsa_verify_raw(Msg, Sig, Pub64) catch _:_ -> false end
+    catch
+        _:_ -> try ecdsa_verify_raw(Msg, Sig, Pub64) catch _:_ -> false end
+    end.
 
 pad32(Bin) when byte_size(Bin) =:= 32 -> Bin;
 pad32(Bin) when byte_size(Bin) < 32 ->
