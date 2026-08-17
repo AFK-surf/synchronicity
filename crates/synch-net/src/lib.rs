@@ -16,6 +16,11 @@ pub mod frame;
 pub mod mpt;
 pub mod reconcile;
 pub mod rekor;
+/// Test machinery — a simulated signed zone, transparency log and TUF
+/// repository. Behind the non-default `sim` feature: it is 1300 lines with
+/// no place in a shipped binary, and no business being part of this crate's
+/// stable surface.
+#[cfg(feature = "sim")]
 #[doc(hidden)]
 pub mod sim;
 pub mod tuf;

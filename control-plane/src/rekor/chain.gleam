@@ -10,8 +10,10 @@
 ////
 //// Which forces the publish ordering (§5.2): a chain can only be built once
 //// the **DS is live in the parent**, so logging moves to *after* the DS is
-//// in place rather than before. The existing two-key rollover window covers
-//// the gap — the old key keeps signing until the new one is logged.
+//// in place rather than before. The two-key rollover window covers the gap
+//// — `zone-key stage` publishes the incoming key in the DNSKEY RRset
+//// without making it a signer, so the old key keeps signing until the new
+//// one is logged, and the claim this module collects names both.
 ////
 //// The collection itself is ordinary recursive DNS work, done over DoH
 //// against a configurable resolver, one RRset at a time:

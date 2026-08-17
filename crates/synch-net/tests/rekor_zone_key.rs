@@ -546,6 +546,7 @@ async fn a_zone_that_publishes_its_proof_resolves_under_require() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     let (set, _ttl) = resolver
@@ -581,6 +582,7 @@ async fn an_absent_proof_record_refuses_under_require_and_resolves_under_off() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     };
 
     let strict = DnssecResolver::with_options(&options(RekorPolicy::Require)).unwrap();
@@ -630,6 +632,7 @@ async fn a_proof_record_covering_only_someone_elses_keys_is_refused() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
@@ -665,6 +668,7 @@ async fn a_chainless_entry_is_refused_through_the_whole_resolver_path() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
@@ -691,6 +695,7 @@ async fn a_garbled_proof_record_is_refused_as_malformed() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
     let error = resolver.member_set("cluster.example").await.unwrap_err();
@@ -796,6 +801,12 @@ fn the_gleam_certificate_encoders_agree_with_this_one() {
         zonecert::{ChainLink, DnssecChain, OID_DNSSEC_CHAIN},
     };
 
+    // Restated here rather than shared: the Gleam side reads this list out
+    // of its own generator, so the two definitions agreeing is the actual
+    // cross-language check. `i * 7 mod 256` is a permutation of Z/256, so a
+    // reader that drops or reorders a byte shifts the whole tail instead of
+    // landing somewhere plausible.
+    let pattern = |n: usize| -> Vec<u8> { (0..n).map(|i| (i * 7 % 256) as u8).collect() };
     let chain = DnssecChain {
         links: vec![
             ChainLink {
@@ -805,6 +816,17 @@ fn the_gleam_certificate_encoders_agree_with_this_one() {
             ChainLink {
                 zone: ".".into(),
                 rrs: vec![0x01, 0x02],
+            },
+            // The two links that reach DER's long-form lengths — the form
+            // every production chain uses, and the form a 30-byte fixture
+            // of short links left untested on both sides.
+            ChainLink {
+                zone: "long.sync.test.".into(),
+                rrs: pattern(200),
+            },
+            ChainLink {
+                zone: "longer.sync.test.".into(),
+                rrs: pattern(256),
             },
         ],
     };
@@ -1316,4 +1338,232 @@ fn rrsig_expirations(chain: &synch_net::zonecert::DnssecChain) -> Vec<u64> {
         }
     }
     out
+}
+
+/// A P-256 log's checkpoint verifies whichever ECDSA encoding it used.
+///
+/// ECDSA signatures travel two ways — IEEE P1363's fixed 64-byte `r ‖ s`,
+/// and ASN.1/DER — and the verifier used to accept only the fixed form.
+/// Sigstore signs its notes with DER (the live `rekor.sigstore.dev`
+/// signature is 70 bytes opening `30 44 02 20`), so that log's checkpoints
+/// could never verify. It failed closed, so nothing was wrongly accepted,
+/// but the day Sigstore opens a P-256-keyed v2 shard every client would
+/// refuse every proof from it.
+///
+/// Nothing caught it because `SimLog` signed the fixed form too: the mock
+/// produced exactly the bytes the bug required. It signs DER now, so the
+/// assertion below is about the world rather than about ourselves — and the
+/// first half of the test says so out loud, by reading the encoding off the
+/// wire rather than trusting that the simulator changed.
+#[test]
+fn a_p256_checkpoint_verifies_in_der_which_is_what_sigstore_signs() {
+    let log = SimLog::new("rekor.sim");
+    let checkpoint = log.checkpoint();
+    let keys = LogKeys::parse(&log.key_pem()).expect("the log's own key");
+
+    // The signature really is DER: an ASN.1 SEQUENCE tag, and a length that
+    // is not the fixed form's 64 bytes.
+    let text = String::from_utf8(checkpoint.clone()).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("\u{2014} rekor.sim"))
+        .expect("the log's own signature line");
+    let blob = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(line.rsplit(' ').next().unwrap())
+            .expect("base64")
+    };
+    let signature = &blob[4..]; // drop the four-byte key hint
+    assert_eq!(signature[0], 0x30, "not a DER SEQUENCE: {signature:02x?}");
+    assert_ne!(
+        signature.len(),
+        64,
+        "a 64-byte signature would be the fixed form, and the point is that \
+         this is not it"
+    );
+
+    synch_net::rekor::Checkpoint::parse(&checkpoint)
+        .expect("the note parses")
+        .verify_under(&keys)
+        .expect("a DER checkpoint signature must verify under a P-256 log key");
+}
+
+/// A minimal, well-formed P-256 SubjectPublicKeyInfo — the shape the
+/// certificate builder wants, with a stand-in point.
+fn p256_spki_stub() -> Vec<u8> {
+    synch_net::rekor::p256_spki(&[0x11; 64])
+}
+
+/// A certificate that decodes two ways decodes no ways.
+///
+/// Each of these is a second spelling of a value that already had one, and
+/// for bytes sitting in a public log that is the whole problem: the leaf
+/// must mean the same thing to this reader and to an auditor reading it with
+/// anything else. Go's `crypto/x509` — which Rekor itself calls — refuses
+/// all of them, so the public log would not have taken such a certificate;
+/// relying on that would be keeping this design's invariant in somebody
+/// else's parser.
+#[test]
+fn a_certificate_with_two_readings_is_refused() {
+    use synch_net::x509::{Certificate, SelfSigned, OID_SUBJECT_ALT_NAME};
+
+    let spki = p256_spki_stub();
+    let base = || SelfSigned {
+        common_name: "synchronicity zone key",
+        dns_name: "sync.example",
+        spki: &spki,
+        serial: &[0x01],
+        not_before: synch_net::x509::x509_time(1_760_000_000),
+        not_after: synch_net::x509::x509_time(1_900_000_000),
+        extensions: &[],
+    };
+    let sig = |_: &[u8]| vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+
+    // Baseline: the shape this design mints really does parse.
+    let good = base().build(sig);
+    assert!(Certificate::parse(&good).is_ok(), "the control must parse");
+
+    // Trailing bytes after the outer SEQUENCE.
+    let mut trailing = good.clone();
+    trailing.push(0x00);
+    assert!(
+        Certificate::parse(&trailing).is_err(),
+        "bytes after the certificate must be refused"
+    );
+
+    // Two copies of the chain extension: the lookup used to take the first,
+    // so a reader taking the last would disagree about the evidence that
+    // decides reported-versus-silent.
+    let doubled = vec![
+        (
+            synch_net::zonecert::OID_DNSSEC_CHAIN.to_vec(),
+            b"first".to_vec(),
+        ),
+        (
+            synch_net::zonecert::OID_DNSSEC_CHAIN.to_vec(),
+            b"second".to_vec(),
+        ),
+    ];
+    let mut spec = base();
+    spec.extensions = &doubled;
+    let two_chains = spec.build(sig);
+    let parsed = Certificate::parse(&two_chains).expect("it is still a certificate");
+    assert!(
+        parsed
+            .extension(synch_net::zonecert::OID_DNSSEC_CHAIN)
+            .is_none(),
+        "an extension present twice must resolve to neither copy"
+    );
+    // And the SAN rule it was always supposed to match still holds.
+    assert!(
+        parsed.extension(OID_SUBJECT_ALT_NAME).is_some(),
+        "a single extension is unaffected"
+    );
+}
+
+/// One record cannot turn a refresh into a scan.
+///
+/// The wire format lets a record claim up to 255 parts, and the client
+/// fetches parts 2..=N sequentially with a per-query timeout inside a loop
+/// that walks configured domains one at a time — so `1/255` cost every
+/// resolving client 254 round trips before verifying a byte, and stalled
+/// every *other* domain behind it for long enough that cached bindings
+/// expire. The claim is now capped at what a real proof can need.
+#[test]
+fn a_records_part_count_is_capped_at_what_a_proof_can_need() {
+    use synch_net::rekor::{parts_claimed, MAX_PROOF_PARTS};
+
+    assert_eq!(
+        parts_claimed(&["sync1p aabbccdd 1/255 QUJD".to_string()]),
+        MAX_PROOF_PARTS,
+        "a lying record must not name how much work this client does"
+    );
+    // Honest counts are untouched, including the single-record case.
+    assert_eq!(parts_claimed(&["sync1p aabbccdd 1/3 QUJD".to_string()]), 3);
+    assert_eq!(parts_claimed(&["sync1p aabbccdd 1/1 QUJD".to_string()]), 1);
+    assert_eq!(parts_claimed(&[]), 1);
+    // The cap has to clear a real proof with room to spare: an
+    // ICANN-rooted one is 8202 base64url characters (§3), five records.
+    let real_proof_chars = 8202;
+    assert!(
+        MAX_PROOF_PARTS * synch_net::rekor::PROOF_CHUNK_CHARS > 3 * real_proof_chars,
+        "the cap must admit a real proof several times over"
+    );
+}
+
+/// The DER length encoding, pinned explicitly, because the shared fixture
+/// cannot reach it.
+///
+/// The chain extension is the one structure the Gleam publisher and this
+/// Rust verifier both have to produce and consume byte for byte, and a real
+/// chain is kilobytes — so every link uses DER's *long form* length. The
+/// Gleam-authored crossval fixture is 30 bytes of chain (two links of 3 and
+/// 2 rdata bytes), so it exercises only the short form: an off-by-one in
+/// either side's long-form encoder would pass the entire cross-language
+/// suite and be discovered by a live submission no client could read.
+///
+/// This does not fix that — only regenerating the fixture with a large link
+/// does — but it writes the contract down where both sides can be checked
+/// against it, rather than leaving it implied by bytes that never test it.
+#[test]
+fn chain_links_use_ders_long_form_lengths_exactly() {
+    use synch_net::zonecert::{ChainLink, DnssecChain};
+
+    // A link whose rdata crosses each boundary the encoding changes at.
+    let cases = [
+        // 127 bytes: the last value the short form can carry.
+        (127usize, vec![0x7f_u8]),
+        // 128: the first long form, one length byte.
+        (128, vec![0x81, 0x80]),
+        (255, vec![0x81, 0xff]),
+        // 256: two length bytes.
+        (256, vec![0x82, 0x01, 0x00]),
+        // A realistic chain link.
+        (1100, vec![0x82, 0x04, 0x4c]),
+    ];
+    for (size, expected_len_bytes) in cases {
+        let chain = DnssecChain {
+            links: vec![ChainLink {
+                zone: "sync.example.".into(),
+                rrs: vec![0xab; size],
+            }],
+        };
+        let der = chain.encode();
+
+        // The OCTET STRING holding the rdata: tag 0x04, then the length in
+        // whichever form DER requires for that size.
+        let mut wanted = vec![0x04u8];
+        wanted.extend_from_slice(&expected_len_bytes);
+        assert!(
+            der.windows(wanted.len()).any(|w| w == wanted),
+            "a {size}-byte link must encode its length as {expected_len_bytes:02x?}"
+        );
+
+        // And it round-trips, so the reader agrees with the writer.
+        assert_eq!(
+            DnssecChain::decode(&der).expect("a long-form chain must decode"),
+            chain
+        );
+    }
+
+    // The reader refuses the second spelling of a short length, so a producer
+    // that used the long form under 128 could not slip past.
+    let short = DnssecChain {
+        links: vec![ChainLink {
+            zone: "sync.example.".into(),
+            rrs: vec![0xab; 5],
+        }],
+    };
+    let mut non_minimal = short.encode();
+    // Rewrite the innermost OCTET STRING length 0x05 as 0x81 0x05.
+    let at = non_minimal
+        .windows(2)
+        .position(|w| w == [0x04, 0x05])
+        .expect("the octet string header");
+    non_minimal.splice(at + 1..at + 2, [0x81, 0x05]);
+    assert!(
+        DnssecChain::decode(&non_minimal).is_err(),
+        "a long-form length under 128 is a second spelling and must be refused"
+    );
 }

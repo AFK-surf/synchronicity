@@ -77,7 +77,11 @@ pub fn run_once(db_path: String, csk: Csk) -> Nil {
         )
       case due {
         Ok([[sqlite.Int(threshold)]]) if now >= threshold -> {
-          case publish.publish(conn, csk, now, "system:resign") {
+          // The re-sign path, which the transparency gate does not apply
+          // to: this emits records clients already accept, and refusing it
+          // would let the zone go bogus in `sig_validity` days — turning a
+          // transparency gap into a DNSSEC outage.
+          case publish.publish_resign(conn, csk, now, "system:resign") {
             Ok(serial) -> {
               io.println(
                 "resign: republished, serial " <> int.to_string(serial),

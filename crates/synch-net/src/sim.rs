@@ -51,6 +51,17 @@ pub struct SimZone {
     /// base64url as [`RekorProof::to_txt`] renders it. Empty is the
     /// not-yet-upgraded control plane.
     pub rekor_txt: Vec<String>,
+    /// A TXT RRset this zone serves at a name it **does not own**, signed by
+    /// its own key.
+    ///
+    /// This is the forgery an attacker mounts when they hold any
+    /// DNSSEC-signed zone: an RRSIG is a signature over an RRset, and
+    /// nothing about making one requires the signer to be the owner. Whether
+    /// it is *accepted* is the validator's job — and hickory does not do it
+    /// (RFC 4035 §5.3.1, skipped there with a TODO), so `crate::dns` has to.
+    /// A harness that could not express the forgery could not test the
+    /// defense.
+    pub impersonate: Option<(Name, Vec<String>)>,
 }
 
 impl SimZone {
@@ -86,6 +97,7 @@ impl SimZone {
             ttl: 300,
             unsigned: false,
             rekor_txt: Vec::new(),
+            impersonate: None,
         }
     }
 
@@ -417,6 +429,28 @@ impl SimZone {
         };
         let name = query.name().clone();
         let mut set = match query.query_type() {
+            // Served *before* the zone's own names, because the whole point
+            // is a name this zone has no business answering for.
+            RecordType::TXT
+                if self
+                    .impersonate
+                    .as_ref()
+                    .is_some_and(|(owner, _)| *owner == name) =>
+            {
+                let (owner, texts) = self.impersonate.as_ref().expect("checked");
+                let mut set = RecordSet::new(owner.clone(), RecordType::TXT, 0);
+                for text in texts {
+                    set.insert(
+                        Record::from_rdata(
+                            owner.clone(),
+                            self.ttl,
+                            RData::TXT(TXT::new(vec![text.clone()])),
+                        ),
+                        0,
+                    );
+                }
+                set
+            }
             RecordType::TXT if name == self.txt_name() => {
                 let mut set = RecordSet::new(name, RecordType::TXT, 0);
                 for text in &self.txt {
@@ -634,17 +668,24 @@ impl SimLog {
     /// A log named `origin` with a fresh key. The key is fixed for the life
     /// of the log, so its id, its PEM and every checkpoint it signs are one
     /// coherent universe a test can pin.
+    ///
+    /// **Signs ASN.1/DER, because Sigstore does.** This used to sign the
+    /// fixed 64-byte `r ‖ s` form, which happened to be the only encoding
+    /// the verifier accepted — so the mock produced exactly the bytes the
+    /// bug required and the whole P-256 path was green while being unusable
+    /// against the real log. A simulator that agrees with the implementation
+    /// rather than with the world tests nothing.
     pub fn new(origin: &str) -> SimLog {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             &rng,
         )
         .expect("keygen")
         .as_ref()
         .to_vec();
         let key = ring::signature::EcdsaKeyPair::from_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             &pkcs8,
             &rng,
         )
@@ -713,7 +754,13 @@ impl SimLog {
             self.origin,
             rekor::base64_encode(&root)
         );
-        let signature = sign_p256(&self.pkcs8, body.as_bytes());
+        // **ASN.1/DER, because that is what Sigstore signs notes with** —
+        // the live `rekor.sigstore.dev` signature is 70 bytes opening
+        // `30 44 02 20`. This used to sign the raw `r ‖ s` form; since
+        // the verifier only accepted that same form, the mock agreed with
+        // the bug and the whole P-256 checkpoint path was green while being
+        // unusable against the real log.
+        let signature = sign_p256_der(&self.pkcs8, body.as_bytes());
         // The four-byte key hint is a selector, never a credential; the
         // verifier tries the pinned key regardless of what it says.
         let mut blob = self.log_id()[..4].to_vec();
@@ -852,6 +899,7 @@ impl SimTuf {
         let root = self.embedded_root();
         crate::tuf::PinState {
             root,
+            root_chain: Vec::new(),
             root_version: 1,
             timestamp_version: 0,
             snapshot_version: 0,
@@ -1258,19 +1306,6 @@ pub fn hashedrekord_body(statement: &[u8], signature_der: &[u8], certificate: &[
     out.push_str(&rekor::base64_encode(certificate));
     out.push_str("\"}}}}}}");
     out.into_bytes()
-}
-
-/// Signs with ECDSA P-256/SHA-256, producing the raw `r || s` form a DNSSEC
-/// signature and a signed-note (checkpoint) signature both use.
-fn sign_p256(pkcs8: &[u8], message: &[u8]) -> Vec<u8> {
-    let rng = ring::rand::SystemRandom::new();
-    let key = ring::signature::EcdsaKeyPair::from_pkcs8(
-        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-        pkcs8,
-        &rng,
-    )
-    .expect("key load");
-    key.sign(&rng, message).expect("sign").as_ref().to_vec()
 }
 
 /// Signs with ECDSA P-256/SHA-256, producing the ASN.1/DER form a Rekor

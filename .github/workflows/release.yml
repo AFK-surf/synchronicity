@@ -62,10 +62,10 @@ jobs:
         run: |
           if [ "${{ matrix.zigbuild }}" = "true" ]; then
             cargo zigbuild --release --target ${{ matrix.target }} \
-              --bin synch --bin synch-s3
+              --bin synch --bin synch-s3 --bin synch-monitor
           else
             cargo build --release --target ${{ matrix.target }} \
-              --bin synch --bin synch-s3
+              --bin synch --bin synch-s3 --bin synch-monitor
           fi
 
       - name: Package
@@ -78,9 +78,11 @@ jobs:
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp "target/${{ matrix.target }}/release/synch.exe" "dist/${name}/"
             cp "target/${{ matrix.target }}/release/synch-s3.exe" "dist/${name}/"
+            cp "target/${{ matrix.target }}/release/synch-monitor.exe" "dist/${name}/"
           else
             cp "target/${{ matrix.target }}/release/synch" "dist/${name}/"
             cp "target/${{ matrix.target }}/release/synch-s3" "dist/${name}/"
+            cp "target/${{ matrix.target }}/release/synch-monitor" "dist/${name}/"
           fi
           cp README.md LICENSE DESIGN.md "dist/${name}/"
 

@@ -57,9 +57,10 @@ pub fn query_name(domain: &str) -> String {
 
 /// The query name a zone's key-transparency proofs live under (§3).
 ///
-/// One name per zone, at the apex — one zone key, one proof set. The client
-/// learns the apex from the RRSIG signer field it already validates, not
-/// from the membership name it asked about.
+/// One name per zone, at the apex — one zone key, one proof set. The apex
+/// comes from the `apex=` field of the membership answer, held between the
+/// signing zone the RRSIG names and the domain being resolved (see
+/// `apex_of`); the RRSIG signer is the *bound*, not the lookup.
 pub fn rekor_query_name(zone: &str) -> String {
     format!("{}.{}", rekor::REKOR_TXT_PREFIX, zone)
 }
@@ -431,6 +432,11 @@ enum Pins {
         keys: LogKeys,
         state: PinState,
         path: Option<std::path::PathBuf>,
+        /// The `root.json` every persisted state is re-walked from before it
+        /// is believed — [`tuf::EMBEDDED_TUF_ROOT`] unless `--tuf-root`
+        /// replaced it. Held here so a reload cannot silently anchor at
+        /// something the file itself supplied.
+        anchor: Vec<u8>,
         /// When the repository was last walked, successfully or not, so a
         /// membership refresh on a short TTL does not become a request to
         /// Sigstore's CDN every time it fires. Seeded from the persisted
@@ -482,6 +488,12 @@ pub struct ValidatedTxt {
     pub records: Vec<String>,
     /// How long the answer may be cached, clamped to the §3.2 window.
     pub ttl: Duration,
+    /// The zone whose RRSIG covered this answer, as the signature named it —
+    /// checked to enclose the queried name before the answer was accepted
+    /// (see `secure_txt`).
+    pub signer: Name,
+    /// The key tag that RRSIG selected, for the transparency lookup.
+    pub key_tag: u16,
 }
 
 /// How the resolver reaches the DNS and whom it ultimately trusts (§3.2).
@@ -552,6 +564,16 @@ pub struct ResolverOptions {
     /// is stated in §10.4: the pin set stops following Sigstore, so the day
     /// a shard rotates is the day this client needs a new build.
     pub no_tuf: bool,
+    /// A `root.json` *replacing* [`tuf::EMBEDDED_TUF_ROOT`] as the anchor
+    /// every pin state is verified against.
+    ///
+    /// The same "an override is a different universe" semantics as
+    /// `trust_anchor` and `rekor_key`: with this set, a persisted pin state
+    /// chaining from the built-in Sigstore root no longer loads, and vice
+    /// versa. For a deployment running its own TUF repository — the client
+    /// counterpart of the control plane's `CP_TUF_ROOT` — and for the test
+    /// harness, which anchors at a root it minted.
+    pub tuf_root: Option<std::path::PathBuf>,
 }
 
 /// Whether zone-key transparency is enforced (§4.1).
@@ -616,13 +638,22 @@ impl DnssecResolver {
                 Pins::Static(LogKeys::from_file(path).map_err(|e| NetError::Dns(e.to_string()))?)
             }
             None => {
+                // The anchor is decided here, from the binary or from an
+                // explicit override, and never from the state file — which
+                // is the point of re-walking the chain at all.
+                let anchor = match &options.tuf_root {
+                    None => tuf::EMBEDDED_TUF_ROOT.as_bytes().to_vec(),
+                    Some(path) => std::fs::read(path)
+                        .map_err(|e| NetError::Dns(format!("TUF root {}: {e}", path.display())))?,
+                };
                 let state = options
                     .rekor_state
                     .as_deref()
-                    .and_then(PinState::load)
-                    .unwrap_or_else(PinState::embedded);
+                    .and_then(|path| PinState::load_anchored(path, &anchor))
+                    .unwrap_or_else(|| PinState::anchored(&anchor));
                 Pins::Tuf {
                     keys: state.log_keys().unwrap_or_else(LogKeys::embedded),
+                    anchor,
                     // A walk is due when the last one has aged out, and a
                     // state that was never written is a client that has
                     // never walked — so a fresh install refreshes at once
@@ -717,7 +748,11 @@ impl DnssecResolver {
             // answer itself yields — the control plane's apex is a name only
             // the log entry knows, and it is checked against this one rather
             // than used to find anything.
-            let (signing_zone, key_tag) = signing_key_of(&name, &response.answers)?;
+            //
+            // It comes out of `secure_txt`, which already held it to
+            // RFC 4035 §5.3.1 before returning: a signer that does not
+            // enclose the queried name never reaches this line.
+            let (signing_zone, key_tag) = (validated.signer.clone(), validated.key_tag);
             // Where the control plane's transparency records live. Taken
             // from the answer this client just DNSSEC-validated, and then
             // held to both ends: it must contain the domain being resolved
@@ -772,18 +807,30 @@ impl DnssecResolver {
         let Some(source) = self.tuf.clone() else {
             return Ok(None);
         };
-        let now = now_unix();
         // Two decisions under the lock and nothing else: whether a walk is
         // due, and which root version it starts from. The walk itself is
         // seconds of network, and holding a mutex across it would serialize
         // every membership refresh in the process behind a CDN.
-        let from_root = {
+        let (now, from_root) = {
             let mut pins = self.pins();
             let Pins::Tuf {
                 state, checked_at, ..
             } = &mut *pins
             else {
                 return Ok(None);
+            };
+            // No trustworthy clock, no refresh. Expiry is the only bound on
+            // how old the metadata a mirror may serve is, and the pins
+            // already in force are the safe place to stay.
+            let Some(now) = now_unix(state.updated_at) else {
+                return Err(tuf_error(
+                    &source,
+                    TufError::Expiry(
+                        "the system clock is unreadable, so no expiry could be \
+                         checked; the current pins stand"
+                            .into(),
+                    ),
+                ));
             };
             if now < checked_at.saturating_add(tuf::REFRESH_INTERVAL) {
                 return Ok(None);
@@ -792,7 +839,7 @@ impl DnssecResolver {
             // that is slow or down costs one attempt a day and not one per
             // membership refresh for as long as it stays down.
             *checked_at = now;
-            state.root_version
+            (now, state.root_version)
         };
         let metadata = self.walk_tuf(&source, from_root).await?;
 
@@ -801,7 +848,11 @@ impl DnssecResolver {
         // and monotonicity is a property of the file, not of a process.
         let mut pins = self.pins();
         let Pins::Tuf {
-            keys, state, path, ..
+            keys,
+            state,
+            path,
+            anchor,
+            ..
         } = &mut *pins
         else {
             return Ok(None);
@@ -810,8 +861,14 @@ impl DnssecResolver {
         // coherent set — the root bytes, the trusted-root bytes and the
         // versions that describe them — so taking the newer *state* is
         // right and taking the newer of each field would not be.
-        let current = match path.as_deref().and_then(PinState::load) {
-            Some(stored) if versions(&stored) >= versions(state) => stored,
+        //
+        // Re-walked from this resolver's anchor, exactly as at startup: the
+        // file is shared, so it is no more trusted here than it was there.
+        let current = match path
+            .as_deref()
+            .and_then(|path| PinState::load_anchored(path, anchor))
+        {
+            Some(stored) if dominates(&stored, state) => stored,
             _ => state.clone(),
         };
         let update = tuf::update(&metadata, &current, now).map_err(|e| tuf_error(&source, e))?;
@@ -1021,39 +1078,6 @@ impl DnssecResolver {
     }
 }
 
-/// The apex and key tag of the key that signed an answer.
-///
-/// Taken from the RRSIG the validator accepted, never from the answer's
-/// contents: this is the one place the client learns which zone key it is
-/// about to demand a public record for.
-fn signing_key_of(
-    name: &str,
-    answers: &[hickory_resolver::proto::rr::Record],
-) -> Result<(Name, u16), NetError> {
-    use hickory_resolver::proto::{
-        dnssec::rdata::DNSSECRData,
-        rr::{RData, RecordType},
-    };
-
-    let mut qname = Name::from_utf8(name).map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
-    qname.set_fqdn(true);
-    for record in answers {
-        if record.name != qname || !record.proof.is_secure() {
-            continue;
-        }
-        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
-            continue;
-        };
-        if rrsig.input().type_covered != RecordType::TXT {
-            continue;
-        }
-        return Ok((rrsig.input().signer_name.clone(), rrsig.input().key_tag));
-    }
-    Err(NetError::Dns(format!(
-        "{name}: the validated answer carries no RRSIG naming its signer"
-    )))
-}
-
 /// Lifts a verification failure into the error class `synch doctor` explains.
 fn rekor_error(name: &str, error: ProofError) -> NetError {
     let name = name.to_string();
@@ -1085,23 +1109,58 @@ fn tuf_error(source: &TufSource, error: TufError) -> NetError {
     }
 }
 
-/// A pin state's versions, ordered the way TUF orders an update: the root
-/// first, then each role below it.
-fn versions(state: &PinState) -> (u64, u64, u64, u64) {
-    (
+/// A pin state's versions: the root, then each role below it.
+fn versions(state: &PinState) -> [u64; 4] {
+    [
         state.root_version,
         state.timestamp_version,
         state.snapshot_version,
         state.targets_version,
-    )
+    ]
 }
 
-/// Seconds since the epoch, for the expiry checks every TUF role carries.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
+/// Whether `a` is at least as far along as `b` in **every** role.
+///
+/// The four versions are independently-monotone counters, so "further along"
+/// is componentwise dominance and not the lexicographic order a tuple
+/// comparison gives. Comparing tuples let the root version dominate the
+/// other three outright: a state ahead on `root` but behind on
+/// timestamp/snapshot/targets read as newer, and adopting it dropped the
+/// rollback floors for those roles to the lower numbers — which is the whole
+/// thing the floors exist to prevent.
+///
+/// When neither state dominates the other they are not comparable, and the
+/// answer is to keep what is in memory rather than to pick by a tie-break
+/// that means nothing.
+fn dominates(a: &PinState, b: &PinState) -> bool {
+    versions(a)
+        .iter()
+        .zip(versions(b).iter())
+        .all(|(a, b)| a >= b)
+}
+
+/// Seconds since the epoch, for the expiry checks every TUF role carries,
+/// floored by the last state this client accepted.
+///
+/// Two things it must not do, and used to do both.
+///
+/// A clock this code cannot read used to become `0`. Every expiry check is
+/// `expires > now`, so at zero *nothing has ever expired* — root, timestamp,
+/// snapshot and targets all pass. That is the wrong direction: expiry is the
+/// only bound on how old the metadata a mirror serves may be, so a clock
+/// failure removed the bound entirely. It now yields `None`, and a refresh
+/// with no trustworthy clock does not run.
+///
+/// And a clock that has been moved *backwards* — a bad NTP step, a dead RTC
+/// coming up at the epoch — would reopen the same window. `updated_at` is
+/// already persisted with every accepted state and was read back and never
+/// used; it is exactly the monotonic floor for this, so it is the floor now.
+fn now_unix(floor: u64) -> Option<u64> {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .ok()?
+        .as_secs();
+    Some(now.max(floor))
 }
 
 /// How long one file of a TUF walk may take.
@@ -1325,9 +1384,60 @@ fn secure_txt(
     name: &str,
     answers: &[hickory_resolver::proto::rr::Record],
 ) -> Result<ValidatedTxt, NetError> {
+    use hickory_resolver::proto::{
+        dnssec::rdata::DNSSECRData,
+        rr::{RData, RecordType},
+    };
+
     let mut qname = hickory_resolver::proto::rr::Name::from_utf8(name)
         .map_err(|e| NetError::Dns(format!("{name}: {e}")))?;
     qname.set_fqdn(true);
+
+    // Step one, and it has to be first: *who* signed this. hickory marks
+    // exactly one RRSIG per RRset as the one it verified under (the rest come
+    // back `Indeterminate`), so there is at most one candidate here and an
+    // attacker cannot steer the choice by stapling extra signatures.
+    let signed_by = answers.iter().find_map(|record| {
+        if record.name != qname || !record.proof.is_secure() {
+            return None;
+        }
+        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
+            return None;
+        };
+        (rrsig.input().type_covered == RecordType::TXT).then(|| rrsig.input().clone())
+    });
+    let Some(sig) = signed_by else {
+        return Err(NetError::Dns(format!(
+            "{name}: the validated answer carries no RRSIG naming its signer"
+        )));
+    };
+    let signer = sig.signer_name.to_lowercase();
+
+    // **The check hickory does not make.** RFC 4035 §5.3.1: "The RRSIG RR's
+    // Signer's Name field MUST be the name of the zone that contains the
+    // RRset." hickory 0.26 skips it in two places, both marked TODO — in
+    // `RrsigValidity::check` the rule is quoted verbatim and then not
+    // implemented, and `verify_default_rrset` fires a DNSKEY lookup at
+    // whatever signer name the answer carried. So `Proof::Secure` means only
+    // "some key, at some name the answer chose, signed this" — and an
+    // attacker holding *any* DNSSEC-signed zone can sign an RRset owned by
+    // somebody else's name and have it validate.
+    //
+    // Owner-name filtering does not close it: the forged RRset is owned by
+    // the queried name, which is the whole point of the forgery. The signer
+    // has to enclose the name it signed for, and that is what this asserts.
+    //
+    // Enforced here rather than in a caller so no lookup path can be reached
+    // without it — the membership answer, the proof records, the DNSKEY, and
+    // the public `lookup_txt` all come through this one function.
+    if !signer.zone_of(&qname) {
+        return Err(NetError::Dns(format!(
+            "{name}: the answer is signed by {signer}, which does not contain \
+             the name it answers for — a zone may only sign for names it holds \
+             (RFC 4035 §5.3.1)"
+        )));
+    }
+
     let mut records = Vec::new();
     let mut ttl = MAX_TTL;
     for record in answers {
@@ -1340,6 +1450,17 @@ fn secure_txt(
         if record.name != qname {
             continue;
         }
+        // Only the records this answer is *made of* have to carry a proof.
+        // Co-resident records of other types do not, and RRSIGs especially
+        // do not: hickory marks only the signature it verified under and
+        // returns every other one `Indeterminate`. Demanding a proof on
+        // those refused every answer during an RFC 6781 double-signature key
+        // rollover — which several managed providers run continuously — and
+        // handed anyone who could *add* a record to a response a one-packet
+        // denial of service.
+        if !matches!(record.data, RData::TXT(_)) {
+            continue;
+        }
         if !record.proof.is_secure() {
             // Fail closed: one unvalidated record poisons the answer.
             return Err(NetError::Dns(format!(
@@ -1348,16 +1469,17 @@ fn secure_txt(
             )));
         }
         ttl = ttl.min(Duration::from_secs(u64::from(record.ttl)));
-        if let hickory_resolver::proto::rr::RData::TXT(txt) = &record.data {
-            // A TXT record is a sequence of character-strings; the record
-            // text is their concatenation.
-            let joined: String = txt
-                .txt_data
-                .iter()
-                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-                .collect();
-            records.push(joined);
-        }
+        let RData::TXT(txt) = &record.data else {
+            unreachable!("filtered to TXT above")
+        };
+        // A TXT record is a sequence of character-strings; the record
+        // text is their concatenation.
+        let joined: String = txt
+            .txt_data
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        records.push(joined);
     }
     if records.is_empty() {
         return Err(NetError::Dns(format!("{name}: no TXT records")));
@@ -1365,6 +1487,8 @@ fn secure_txt(
     Ok(ValidatedTxt {
         records,
         ttl: clamp_ttl(ttl),
+        signer,
+        key_tag: sig.key_tag,
     })
 }
 
@@ -1444,6 +1568,7 @@ mod tests {
                 rekor_state: None,
                 tuf_url: None,
                 no_tuf: true,
+                tuf_root: None,
             })
             .unwrap();
         }
@@ -1458,6 +1583,7 @@ mod tests {
             rekor_state: None,
             tuf_url: None,
             no_tuf: true,
+            tuf_root: None,
         })
         .unwrap_err();
         assert!(err.to_string().contains("trust anchor"), "{err}");
@@ -1471,6 +1597,7 @@ mod tests {
             rekor_state: None,
             tuf_url: None,
             no_tuf: true,
+            tuf_root: None,
         })
         .unwrap_err();
         assert!(err.to_string().contains("no DNSKEY records"), "{err}");
@@ -1491,6 +1618,7 @@ mod tests {
             rekor_state: None,
             tuf_url: None,
             no_tuf: true,
+            tuf_root: None,
         })
         .unwrap();
     }
@@ -1559,6 +1687,7 @@ mod tests {
             rekor_state: None,
             tuf_url: None,
             no_tuf: true,
+            tuf_root: None,
         })
         .unwrap();
         let err = tokio::time::timeout(

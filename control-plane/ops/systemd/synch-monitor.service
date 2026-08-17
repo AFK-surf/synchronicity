@@ -1,0 +1,44 @@
+# Watches the transparency log for keys authorized under your apexes.
+#
+# This is the half of the design that turns "the key had to be published"
+# into "somebody saw it published". A required log with no watcher is a
+# formality, so this ships as a unit rather than as a shell snippet in a
+# runbook.
+#
+# Run it somewhere that is NOT the control plane's network. The point is an
+# independent view: a monitor an attacker can reach through the same hole
+# they used on the DNS is a monitor that can be silenced with it.
+#
+# Fill in /etc/synch-monitor/monitor.env — at minimum SYNCH_MONITOR_STATE.
+# Seed the state file first with the apexes to watch and the keys already
+# accounted for, so the first run reports only what you did not know:
+#
+#   echo '{"known":{"keys":{"sync.example":[]}}}' \
+#     > /var/lib/synch-monitor/state.json
+#
+# A first run against a log with 10^8 entries in it wants a starting point:
+# pass --from-index, or the walk downloads the whole log. See RUNBOOK.md.
+[Unit]
+Description=synchronicity transparency-log monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=synch-monitor
+Group=synch-monitor
+EnvironmentFile=/etc/synch-monitor/monitor.env
+WorkingDirectory=/var/lib/synch-monitor
+ExecStart=/opt/synch-monitor/bin/synch-monitor
+# Exit codes are the interface (see `synch-monitor --help`):
+#   0  nothing new        10 unauthorized claims, no alarm
+#  20  NEW AUTHORIZATION  30 the run could not finish
+# 20 and 30 both want a human, and both are failures to systemd so that
+# `systemctl --failed` and any OnFailure= hook fire on either. A wedged
+# monitor is not a quiet one.
+SuccessExitStatus=0 10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/synch-monitor
+ProtectHome=true
+PrivateTmp=true

@@ -19,6 +19,12 @@ pub type ZoneMeta {
     soa_serial: Int,
     dnskey_public: BitArray,
     key_tag: Int,
+    /// The key a rollover is bringing in: published in the DNSKEY RRset so
+    /// the parent can be given its DS and `rekor-publish` can claim it, but
+    /// never a signer until `zone-key promote` makes it `dnskey_public`.
+    /// Empty when no rollover is in flight.
+    dnskey_incoming: BitArray,
+    key_tag_incoming: Int,
     sig_inception_skew: Int,
     sig_validity: Int,
     sig_refresh_before: Int,
@@ -129,6 +135,7 @@ pub fn health(conn: Connection) -> Result(#(Int, Int), Nil) {
 pub fn read_meta(conn: Connection) -> Result(ZoneMeta, ModelError) {
   let sql =
     "SELECT base_domain, soa_serial, dnskey_public, key_tag,
+            dnskey_incoming, key_tag_incoming,
             sig_inception_skew, sig_validity, sig_refresh_before
      FROM zone_meta WHERE id = 1"
   case sqlite.query(conn, sql, []) {
@@ -138,6 +145,8 @@ pub fn read_meta(conn: Connection) -> Result(ZoneMeta, ModelError) {
         sqlite.Int(serial),
         sqlite.Blob(dnskey),
         sqlite.Int(tag),
+        sqlite.Blob(incoming),
+        sqlite.Int(incoming_tag),
         sqlite.Int(skew),
         sqlite.Int(validity),
         sqlite.Int(refresh),
@@ -145,7 +154,17 @@ pub fn read_meta(conn: Connection) -> Result(ZoneMeta, ModelError) {
     ]) ->
       case name.parse(base) {
         Ok(apex) ->
-          Ok(ZoneMeta(apex, serial, dnskey, tag, skew, validity, refresh))
+          Ok(ZoneMeta(
+            apex,
+            serial,
+            dnskey,
+            tag,
+            incoming,
+            incoming_tag,
+            skew,
+            validity,
+            refresh,
+          ))
         Error(Nil) -> Error(BadStoredName(base))
       }
     Ok([]) -> Error(NoZoneMeta)

@@ -184,6 +184,10 @@ fn build_refusal(e: build.BuildError) -> #(String, String) {
       "bad_glue",
       "nameserver glue address '" <> address <> "' is not a valid IP address",
     )
+    build.InvalidHint(_) -> #(
+      "bad_hint",
+      "a relay or addr hint carries whitespace, a quote, or more than 255 characters — it would change the shape of the membership record it sits in",
+    )
   }
 }
 

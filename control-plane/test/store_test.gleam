@@ -215,3 +215,98 @@ pub fn oversized_value_refused_test() {
     sqlite.query(conn, "SELECT zeroblob(32*1024*1024)", [])
   sqlite.close(conn)
 }
+
+/// An existing database gains the rollover staging columns without losing
+/// its zone.
+///
+/// Every other migration test starts from an empty file, which exercises
+/// the v6 `ALTER TABLE` against a table one statement old. The case that
+/// matters is the deployed one: a zone_meta row with a real key and serial
+/// in it, written before these columns existed. It must come back
+/// unchanged, with an empty staging slot meaning "no rollover in flight".
+pub fn migrate_adds_the_rollover_slot_to_an_existing_zone_test() {
+  let path = tmp_db()
+  let assert Ok(conn) = db.open_primary(path)
+  let assert Ok(_) = migrate.migrate(conn)
+
+  // A zone as a pre-v6 build would have left it: named columns, so this
+  // insert says nothing about the columns v6 adds.
+  let key = <<7:size(512)>>
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO zone_meta
+         (id, base_domain, soa_serial, dnskey_public, key_tag,
+          sig_inception_skew, sig_validity, sig_refresh_before)
+       VALUES (1, 'sync.test', 42, ?, 4242, 3600, 1209600, 604800)",
+      [sqlite.Blob(key)],
+    )
+  // Rewind to before the staging columns and re-run the migration, which
+  // is what an upgrade of a running deployment does.
+  let assert Ok(_) = sqlite.script(conn, "PRAGMA user_version = 5")
+  let assert Ok(_) =
+    sqlite.exec(conn, "ALTER TABLE zone_meta DROP COLUMN dnskey_incoming", [])
+  let assert Ok(_) =
+    sqlite.exec(conn, "ALTER TABLE zone_meta DROP COLUMN key_tag_incoming", [])
+  let assert Ok(v) = migrate.migrate(conn)
+  assert v == migrate.build_version()
+
+  let assert Ok([
+    [
+      Int(serial),
+      sqlite.Blob(stored),
+      Int(tag),
+      sqlite.Blob(incoming),
+      Int(incoming_tag),
+    ],
+  ]) =
+    sqlite.query(
+      conn,
+      "SELECT soa_serial, dnskey_public, key_tag,
+              dnskey_incoming, key_tag_incoming
+         FROM zone_meta WHERE id = 1",
+      [],
+    )
+  assert serial == 42
+  assert stored == key
+  assert tag == 4242
+  // No rollover in flight, which is every zone until somebody starts one.
+  assert incoming == <<>>
+  assert incoming_tag == 0
+  sqlite.close(conn)
+}
+
+/// The staging slot's length constraint survives `ALTER TABLE`.
+///
+/// SQLite restricts what `ADD COLUMN` may carry, and a constraint that is
+/// quietly not applied is worse than none: `dnskey_incoming` would accept a
+/// truncated key, `zone/build` would publish it as a DNSKEY, and the zone
+/// would serve a key nothing can validate. Checked rather than assumed.
+pub fn the_staging_slot_refuses_a_key_of_the_wrong_length_test() {
+  let assert Ok(conn) = db.open_primary(tmp_db())
+  let assert Ok(_) = migrate.migrate(conn)
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO zone_meta
+         (id, base_domain, soa_serial, dnskey_public, key_tag,
+          sig_inception_skew, sig_validity, sig_refresh_before)
+       VALUES (1, 'sync.test', 1, ?, 1, 3600, 1209600, 604800)",
+      [sqlite.Blob(<<7:size(512)>>)],
+    )
+  // A P-256 public key is 64 bytes; empty means no rollover in flight.
+  let assert Ok(_) =
+    sqlite.exec(conn, "UPDATE zone_meta SET dnskey_incoming = ?", [
+      sqlite.Blob(<<9:size(512)>>),
+    ])
+  let assert Ok(_) =
+    sqlite.exec(conn, "UPDATE zone_meta SET dnskey_incoming = ?", [
+      sqlite.Blob(<<>>),
+    ])
+  // Anything else is refused by the database itself.
+  let assert Error(_) =
+    sqlite.exec(conn, "UPDATE zone_meta SET dnskey_incoming = ?", [
+      sqlite.Blob(<<1, 2, 3, 4, 5>>),
+    ])
+  sqlite.close(conn)
+}

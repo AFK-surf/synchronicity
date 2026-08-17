@@ -59,15 +59,24 @@ use synch_net::rekor::{leaf_hash, node_hash, sha256};
 
 use crate::MonitorError;
 
-/// The largest tile this reader will accept.
+/// The largest tile this reader will accept, **derived from the format
+/// rather than guessed at**.
 ///
-/// A full hash tile is 256 × 32 = 8 KiB. An entry bundle is 256 bodies, each
-/// a `hashedrekord` with at most Rekor's own 4 MiB request limit behind it,
-/// but in practice kilobytes — 16 MiB is far above anything the format can
-/// legitimately produce and far below what would hurt. The point is that
-/// *some* bound exists: the log is the party this monitor is auditing, so it
-/// is precisely the party whose response size must not be taken on trust.
-const MAX_TILE_BYTES: usize = 16 * 1024 * 1024;
+/// A full hash tile is 256 × 32 = 8 KiB. A full entry bundle is 256 bodies,
+/// each framed by a big-endian `u16` length, so the largest one the wire
+/// format can express is `256 × (2 + 65535)` = 16,777,472 bytes. The
+/// previous bound was a round 16 MiB — 16,777,216 — which sits *256 bytes
+/// below* that, so a bundle an honest log may legitimately serve was
+/// refused. Since a refusal here is a hard error with no skip and no
+/// progress saved, a single such bundle wedged every monitor permanently,
+/// and an attacker able to land 256 consecutive maximal entries could put
+/// one there on purpose.
+///
+/// The point of the bound stands: the log is the party this monitor is
+/// auditing, so it is precisely the party whose response size must not be
+/// taken on trust. It just has to be the *format's* ceiling, not a round
+/// number near it.
+const MAX_TILE_BYTES: usize = 256 * (2 + u16::MAX as usize);
 
 /// Where tiles come from.
 ///
@@ -147,22 +156,16 @@ impl TileSource for HttpTiles {
         let body = loop {
             let retryable = match self.client.get(&url).send().await {
                 Ok(response) => match response.status().as_u16() {
-                    200 => match response.bytes().await {
-                        Ok(body) if body.len() > MAX_TILE_BYTES => {
-                            // Capped, because a monitor reads from a log it
-                            // does not trust: an 8 KiB hash tile and a
-                            // 256-entry bundle are both bounded by the
-                            // format, so anything past the cap is a server
-                            // trying to exhaust the reader rather than a
-                            // tile. The client's DoH path has had this bound
-                            // since the audit that asked for it; this path
-                            // had not.
+                    200 => match read_capped(response).await {
+                        Ok(Some(body)) => break Some(body),
+                        // Over the cap is the server misbehaving, not a
+                        // transient fault: retrying would just ask it to
+                        // flood us again.
+                        Ok(None) => {
                             return Err(MonitorError::Transport(format!(
-                                "{url}: {} bytes, over the {MAX_TILE_BYTES}-byte cap",
-                                body.len()
+                                "{url}: over the {MAX_TILE_BYTES}-byte cap"
                             )));
                         }
-                        Ok(body) => break Some(body.to_vec()),
                         Err(e) => format!("{url}: {e}"),
                     },
                     404 => break None,
@@ -188,6 +191,29 @@ impl TileSource for HttpTiles {
             .insert(path.to_string(), body.clone());
         Ok(body)
     }
+}
+
+/// Reads a response body, refusing to allocate past the tile cap.
+///
+/// `Ok(None)` means the cap was crossed. Streaming rather than `bytes()`:
+/// a monitor reads from a log it does not trust, and `bytes()` on an
+/// endless body allocates without limit — a bound applied to its result is
+/// a bound on nothing, because the allocation has already happened. An
+/// 8 KiB hash tile and a 256-entry bundle are both bounded by the format,
+/// so anything past the cap is a server trying to exhaust the reader
+/// rather than a tile.
+///
+/// The length check runs *before* each chunk is appended, so the buffer
+/// never exceeds the cap at all.
+async fn read_capped(mut response: reqwest::Response) -> Result<Option<Vec<u8>>, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_TILE_BYTES {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
 }
 
 /// One tree, at one size, read through a [`TileSource`].
@@ -450,11 +476,10 @@ impl<'a, S: TileSource> Tree<'a, S> {
         stream::iter(firsts)
             .map(move |first| async move {
                 let request = self.bundle_request(first)?;
-                let data = self
-                    .source
-                    .fetch(&request.path)
-                    .await?
-                    .ok_or_else(|| MonitorError::Tile(format!("{} is missing", request.path)))?;
+                let data =
+                    self.source.fetch(&request.path).await?.ok_or_else(|| {
+                        MonitorError::Tile(format!("{} is missing", request.path))
+                    })?;
                 self.bundle_decode(&request, &data)
             })
             .buffered(self.concurrency)
@@ -590,7 +615,10 @@ mod tests {
             "api/v2/tile/entries/x264/349"
         );
         assert_eq!(Tree::<MemoryLog>::path("0", 0, 256), "api/v2/tile/0/000");
-        assert_eq!(Tree::<MemoryLog>::path("1", 7, 13), "api/v2/tile/1/007.p/13");
+        assert_eq!(
+            Tree::<MemoryLog>::path("1", 7, 13),
+            "api/v2/tile/1/007.p/13"
+        );
         assert_eq!(
             Tree::<MemoryLog>::path("0", 1_234_567, 256),
             "api/v2/tile/0/x001/x234/567"
@@ -701,5 +729,83 @@ mod tests {
         let empty: Vec<Vec<(u64, Vec<u8>)>> =
             tree.bundle_stream(500, 500).try_collect().await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// A log whose hash tiles are honest and whose entry bundles are not.
+    ///
+    /// This is the shape of the attack `leaf_matches` exists to catch, and
+    /// the reason the check has to run *before* the walk decides to skip an
+    /// entry: the hash tiles still commit to the real leaves, so the
+    /// checkpoint root, the consistency proof and every inclusion path
+    /// continue to verify. Only the bundle lies. A monitor that parsed the
+    /// bundle first and skipped on "does not parse" or "not a watched zone"
+    /// would drop the substituted entry without ever hashing it — silent,
+    /// while the victim's client still accepts the genuine proof.
+    struct TamperedBundles {
+        honest: MemoryLog,
+        at: u64,
+        instead: Vec<u8>,
+    }
+
+    impl TileSource for TamperedBundles {
+        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+            let served = self.honest.fetch(path).await?;
+            if !path.starts_with("api/v2/tile/entries/") {
+                // Hash tiles pass through untouched: the tree stays valid.
+                return Ok(served);
+            }
+            let mut leaves = self.honest.leaves.clone();
+            leaves[self.at as usize] = self.instead.clone();
+            let bundle = self.at / 256;
+            let width = (leaves.len() as u64).saturating_sub(bundle * 256).min(256);
+            let mut out = Vec::new();
+            for i in 0..width {
+                let body = &leaves[(bundle * 256 + i) as usize];
+                out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                out.extend_from_slice(body);
+            }
+            Ok(Some(out))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_substituted_entry_body_does_not_match_the_leaf_the_log_committed_to() {
+        let honest = log(600);
+        let tampered = TamperedBundles {
+            honest: log(600),
+            at: 300,
+            // Something that would fail `HashedRekordBody::parse`, which is
+            // the cheapest way for a log to make an entry "uninteresting".
+            instead: b"not an entry at all".to_vec(),
+        };
+
+        // The tree is unchanged as far as every hash-based check can tell:
+        // same size, same root, same inclusion paths.
+        let honest_tree = Tree::new(&honest, 600, 1);
+        let tampered_tree = Tree::new(&tampered, 600, 1);
+        assert_eq!(
+            tampered_tree.subtree_hash(0, 600).await.unwrap(),
+            honest_tree.subtree_hash(0, 600).await.unwrap(),
+            "the hash tiles are honest, which is what makes this attack work"
+        );
+
+        // The bundle really does serve the substitute...
+        let bundle = tampered_tree.entry_bundle(300).await.unwrap();
+        let served = &bundle
+            .iter()
+            .find(|(index, _)| *index == 300)
+            .expect("entry 300")
+            .1;
+        assert_eq!(served, b"not an entry at all");
+
+        // ...and this is the one check that notices.
+        assert!(
+            !tampered_tree.leaf_matches(300, served).await.unwrap(),
+            "a body the log did not commit to must not match its leaf"
+        );
+        assert!(
+            honest_tree.leaf_matches(300, b"entry 300").await.unwrap(),
+            "and the honest body must still match"
+        );
     }
 }

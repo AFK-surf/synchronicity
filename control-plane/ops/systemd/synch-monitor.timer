@@ -1,0 +1,22 @@
+# Runs the monitor hourly.
+#
+# Cadence is a detection-latency choice, not a correctness one: the walk
+# resumes from the last index, so running it more often costs less per run
+# rather than more. Hourly means an attacker's entry is reported within the
+# hour of it being logged — while their substituted DS is still propagating,
+# with luck.
+#
+# Persistent=true so a machine that was off does not silently skip the
+# window it was off for. The whole failure mode this design guards against
+# is a gap nobody notices.
+[Unit]
+Description=Run the synchronicity transparency-log monitor hourly
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+Unit=synch-monitor.service
+
+[Install]
+WantedBy=timers.target

@@ -2,6 +2,7 @@ import dns/name
 import dns/query
 import dns/wire
 import dnssec/keys
+import dnssec/sign
 import fixtures.{demo_conn, nk}
 import gleam/bit_array
 import gleam/list
@@ -15,7 +16,17 @@ fn demo_input(csk: keys.Csk) -> ZoneInput {
   let assert Ok(owner) = name.parse("_synchronicity.prod.acme.sync.test.")
   let rd = keys.dnskey_rdata(csk)
   ZoneInput(
-    ZoneMeta(apex, 7, csk.public, keys.key_tag(rd), 3600, 1_209_600, 604_800),
+    ZoneMeta(
+      apex,
+      7,
+      csk.public,
+      keys.key_tag(rd),
+      <<>>,
+      0,
+      3600,
+      1_209_600,
+      604_800,
+    ),
     [NsHost(ns1, "127.0.0.1", "")],
     [
       TxtName(owner, [
@@ -97,6 +108,35 @@ pub fn build_refuses_bad_input_test() {
   // No nameservers is not a zone.
   let no_ns = ZoneInput(..input, ns_hosts: [])
   let assert Error(build.NoNameservers) = build.build(no_ns)
+
+  // A dialing hint that would change the record's shape. `relay` and `addr`
+  // are the only free-form values in a membership record, and the record
+  // grammar is whitespace-separated key=value pairs — so a hint carrying a
+  // space is extra fields, and the client's parser is last-wins for apex=,
+  // which means the injected one would override the real one.
+  let injected =
+    ZoneInput(..input, txt_names: [
+      TxtName(owner, [Member("a", nk(), "x apex=evil.example", "")]),
+    ])
+  let assert Error(build.InvalidHint(_)) = build.build(injected)
+
+  // A quote breaks the provider round-trip instead: Cloudflare returns TXT
+  // in presentation form and the reconciler folds it by splitting on `"`,
+  // so a quoted value comes back as something other than what was sent.
+  let quoted =
+    ZoneInput(..input, txt_names: [
+      TxtName(owner, [Member("a", nk(), "", "1.2.3.4\"")]),
+    ])
+  let assert Error(build.InvalidHint(_)) = build.build(quoted)
+
+  // And an ordinary hint is untouched.
+  let fine =
+    ZoneInput(..input, txt_names: [
+      TxtName(owner, [
+        Member("a", nk(), "https://relay.example", "1.2.3.4:4433"),
+      ]),
+    ])
+  let assert Ok(_) = build.build(fine)
 }
 
 pub fn positive_answer_test() {
@@ -224,4 +264,79 @@ pub fn udp_truncation_test() {
 
 fn rcode(flags: Int) -> Int {
   flags % 16
+}
+
+/// A zone mid-rollover serves both keys, signed by the outgoing one, and
+/// the signature verifies.
+///
+/// This is the property the whole staging mechanism rests on: a two-key
+/// DNSKEY RRset is still a validly signed RRset under the DS the parent
+/// already published, so publishing the incoming key costs the zone
+/// nothing. If the RRSIG did not cover both rdatas in canonical order,
+/// staging a key would take the zone bogus instead of preparing a
+/// rollover.
+pub fn a_staged_zone_serves_both_keys_under_one_valid_signature_test() {
+  let active = keys.generate()
+  let incoming = keys.generate()
+  let tag = keys.key_tag(keys.dnskey_rdata(active))
+  let input = demo_input(active)
+  let staged =
+    ZoneInput(
+      ..input,
+      meta: ZoneMeta(
+        ..input.meta,
+        dnskey_incoming: incoming.public,
+        key_tag_incoming: keys.key_tag(keys.dnskey_rdata(incoming)),
+      ),
+    )
+  let assert Ok(rrsets) = build.build(staged)
+  let assert Ok(dnskey) =
+    list.find(rrsets, fn(r) { r.rtype == wire.type_dnskey })
+
+  // Both keys are published...
+  assert list.length(dnskey.rdatas) == 2
+  assert list.contains(dnskey.rdatas, keys.dnskey_rdata(active))
+  assert list.contains(dnskey.rdatas, keys.dnskey_rdata(incoming))
+
+  // ...and the outgoing key's signature covers the pair.
+  let rrsig_rr =
+    sign.sign_rrset(
+      active,
+      tag,
+      staged.meta.apex,
+      dnskey.owner,
+      wire.type_dnskey,
+      dnskey.ttl,
+      dnskey.rdatas,
+      0,
+      100,
+    )
+  let size = bit_array.byte_size(rrsig_rr)
+  let assert Ok(signature) = bit_array.slice(rrsig_rr, size - 64, 64)
+  assert sign.verify_rrset(
+    active,
+    tag,
+    staged.meta.apex,
+    dnskey.owner,
+    wire.type_dnskey,
+    dnskey.ttl,
+    dnskey.rdatas,
+    0,
+    100,
+    signature,
+  )
+
+  // The incoming key signs nothing: it is published, not trusted.
+  assert !sign.verify_rrset(
+    incoming,
+    keys.key_tag(keys.dnskey_rdata(incoming)),
+    staged.meta.apex,
+    dnskey.owner,
+    wire.type_dnskey,
+    dnskey.ttl,
+    dnskey.rdatas,
+    0,
+    100,
+    signature,
+  )
 }

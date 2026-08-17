@@ -378,14 +378,34 @@ pub fn part_index_of(record: &str) -> Option<usize> {
     parse_chunk(record).ok().map(|(_, index, _, _)| index)
 }
 
-/// The largest part count any record at this name claims, capped at the
-/// format's ceiling.
+/// The most parts a client will gather to reassemble one proof.
+///
+/// An ICANN-rooted proof is ~6.1 KB encoded — 8202 base64url characters,
+/// five records at [`PROOF_CHUNK_CHARS`] apiece (docs/REKOR-ZONE-KEY.md §3).
+/// Sixteen is a little over three times that, so every proof this design
+/// actually produces fits with room for a chain that grows, while the work
+/// a single record can demand stays bounded at fifteen extra lookups
+/// instead of the format's 254.
+pub const MAX_PROOF_PARTS: usize = 16;
+
+/// The largest part count any record at this name claims, capped at
+/// [`MAX_PROOF_PARTS`].
 ///
 /// This is what tells a client how many more names to ask for. It is read
 /// from records that have already been DNSSEC-validated, so it is the zone's
 /// own statement — but it is still only a hint about *work*, never about
 /// truth: a wrong count yields a set that fails to reassemble, which is a
 /// refusal, not an acceptance.
+///
+/// The cap is what keeps "a hint about work" from being a hint about *how
+/// much* work. The format allows a `total` up to 255, and the client fetches
+/// parts 2..=N sequentially with a per-query timeout — so one record
+/// spelling `1/255` cost every resolving client 254 round trips before a
+/// byte of proof was verified, inside a refresh loop that walks configured
+/// domains one at a time. One hostile or simply mistaken zone could stall
+/// membership refresh for every other domain past the grace window after
+/// which cached bindings expire. The threat model's attacker *is* the zone,
+/// so "it would only be hurting itself" does not hold.
 pub fn parts_claimed(records: &[String]) -> usize {
     records
         .iter()
@@ -393,6 +413,7 @@ pub fn parts_claimed(records: &[String]) -> usize {
         .map(|(_, _, total, _)| total)
         .max()
         .unwrap_or(1)
+        .min(MAX_PROOF_PARTS)
 }
 
 /// One record, as `sync1p <group> <index>/<total> <chunk>`.
@@ -1156,14 +1177,41 @@ pub struct LogKey {
 }
 
 impl LogKey {
+    /// Verifies a checkpoint signature, accepting **either** ECDSA encoding.
+    ///
+    /// An ECDSA signature travels two ways — IEEE P1363's fixed 64-byte
+    /// `r ‖ s`, and ASN.1/DER — and this only tried the fixed form. Sigstore
+    /// signs its notes with DER: the live `rekor.sigstore.dev` signature is
+    /// 70 bytes opening `30 44 02 20`, an unmistakable DER header. A DER
+    /// signature can never satisfy a fixed-width verifier, so that log's
+    /// checkpoints could not verify at all.
+    ///
+    /// It failed *closed*, so nothing was ever wrongly accepted. But it is a
+    /// latent outage on a schedule: the day Sigstore opens a P-256-keyed v2
+    /// shard, every client refuses every proof from it with a "checkpoint"
+    /// error that reads like a misconfigured pin set. Ed25519 has one
+    /// encoding and needed no such choice, which is why the only real
+    /// checkpoint fixtures — both from the Ed25519 shard — never showed it.
+    ///
+    /// Accepting both is not a weakening: either encoding of a valid
+    /// signature is a valid signature by that key, and nothing here treats a
+    /// signature as unique.
     fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), ProofError> {
-        let algorithm: &dyn signature::VerificationAlgorithm = match self.algorithm {
-            LogKeyAlgorithm::EcdsaP256Sha256 => &signature::ECDSA_P256_SHA256_FIXED,
-            LogKeyAlgorithm::Ed25519 => &signature::ED25519,
+        let algorithms: &[&dyn signature::VerificationAlgorithm] = match self.algorithm {
+            LogKeyAlgorithm::EcdsaP256Sha256 => &[
+                &signature::ECDSA_P256_SHA256_ASN1,
+                &signature::ECDSA_P256_SHA256_FIXED,
+            ],
+            LogKeyAlgorithm::Ed25519 => &[&signature::ED25519],
         };
-        signature::UnparsedPublicKey::new(algorithm, &self.point)
-            .verify(message, signature)
-            .map_err(|_| ProofError::Checkpoint("signature does not verify".into()))
+        match algorithms.iter().any(|algorithm| {
+            signature::UnparsedPublicKey::new(*algorithm, &self.point)
+                .verify(message, signature)
+                .is_ok()
+        }) {
+            true => Ok(()),
+            false => Err(ProofError::Checkpoint("signature does not verify".into())),
+        }
     }
 }
 

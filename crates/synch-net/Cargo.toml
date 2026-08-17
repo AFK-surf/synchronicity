@@ -8,6 +8,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# The simulated signed zone, transparency log and TUF repository
+# (`crate::sim`). Test machinery: 1300 lines of harness that has no place in
+# a shipped binary and no business being part of this crate's public API.
+# Enabled below as a dev-dependency on this same crate, which is how an
+# integration test in another crate reaches it without every `synch` and
+# `synch-s3` build carrying it.
+sim = []
+
 [dependencies]
 base64.workspace = true
 futures-core.workspace = true
@@ -31,6 +40,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# This crate's own tests need the harness; production builds do not.
+synch-net = { path = ".", features = ["sim"] }
 hex.workspace = true
 postcard.workspace = true
 time.workspace = true

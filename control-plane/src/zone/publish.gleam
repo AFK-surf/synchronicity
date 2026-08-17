@@ -30,6 +30,10 @@ pub type PublishError {
   /// publish is the same stance as the §3.2 build-time checks: never emit
   /// a zone clients are going to reject.
   NoRekorRecord(key_tag: Int)
+  /// `zone-key stage` was handed the key already in service.
+  IncomingIsActive
+  /// `zone-key promote` was run with no rollover in flight.
+  NoIncomingKey
 }
 
 /// A signed RRset ready to store and serve.
@@ -87,12 +91,49 @@ pub fn publish(
   sqlite.transaction(conn, Db, fn() { publish_in_tx(conn, csk, now, actor) })
 }
 
+/// Re-emits the zone unchanged because its signatures are aging out.
+///
+/// **The one publish path the transparency gate does not apply to**, and
+/// the reason is that a re-sign says nothing new. It emits the same records
+/// clients have already been accepting, with fresh RRSIG windows; refusing
+/// it does not withhold an unlogged key from anybody, because that key is
+/// already serving. What refusing it does is let the zone's signatures
+/// expire — `sig_validity` defaults to 14 days — at which point every
+/// client fails closed on *DNSSEC*, not on transparency, and the whole zone
+/// goes bogus. A transparency gap should not become a DNS outage.
+///
+/// Changing what the zone *says* still goes through `publish_in_tx`, which
+/// is gated. So the gate keeps doing its job — no new content is emitted
+/// under an unlogged key — while the hourly job keeps the zone resolvable
+/// long enough for an operator to run `rekor-publish`.
+pub fn publish_resign(
+  conn: Connection,
+  csk: Csk,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  sqlite.transaction(conn, Db, fn() { emit(conn, csk, now, actor, False) })
+}
+
 /// The publish body, for callers that already opened the transaction.
 pub fn publish_in_tx(
   conn: Connection,
   csk: Csk,
   now: Int,
   actor: String,
+) -> Result(Int, PublishError) {
+  emit(conn, csk, now, actor, True)
+}
+
+/// The publish body proper. `gated` says whether this emission is a change
+/// to what the zone claims (gated) or a re-signing of what it already
+/// published (not) — see `publish_resign`.
+fn emit(
+  conn: Connection,
+  csk: Csk,
+  now: Int,
+  actor: String,
+  gated: Bool,
 ) -> Result(Int, PublishError) {
   use _ <- result.try(exec(
     conn,
@@ -104,19 +145,21 @@ pub fn publish_in_tx(
     True -> Ok(Nil)
     False -> Error(KeyMismatch)
   })
-  use Nil <- result.try(
-    gate.check(
-      conn,
-      meta.key_tag,
-      crypto.hash(crypto.Sha256, keys.dnskey_rdata(csk)),
-    )
-    |> result.map_error(fn(e) {
-      case e {
-        gate.NoRecord(key_tag) -> NoRekorRecord(key_tag)
-        gate.Db(error) -> Db(error)
-      }
-    }),
-  )
+  use Nil <- result.try(case gated {
+    False -> Ok(Nil)
+    True ->
+      gate.check(
+        conn,
+        meta.key_tag,
+        crypto.hash(crypto.Sha256, keys.dnskey_rdata(csk)),
+      )
+      |> result.map_error(fn(e) {
+        case e {
+          gate.NoRecord(key_tag) -> NoRekorRecord(key_tag)
+          gate.Db(error) -> Db(error)
+        }
+      })
+  })
   use rrsets <- result.try(build.build(input) |> result.map_error(Build))
   let inception = now - meta.sig_inception_skew
   let expiration = now + meta.sig_validity
@@ -257,7 +300,10 @@ pub fn ensure_meta_external(
     Error(model.NoZoneMeta) ->
       sqlite.exec(
         conn,
-        "INSERT INTO zone_meta VALUES (1, ?, 0, ?, 0, 3600, 1209600, 604800)",
+        "INSERT INTO zone_meta
+           (id, base_domain, soa_serial, dnskey_public, key_tag,
+            sig_inception_skew, sig_validity, sig_refresh_before)
+         VALUES (1, ?, 0, ?, 0, 3600, 1209600, 604800)",
         [Text(base_domain), Blob(<<>>)],
       )
       |> result.replace(Nil)
@@ -288,16 +334,33 @@ pub fn ensure_meta(
             <> " does not match configured "
             <> base_domain,
           )
+        // A key file that matches the *staged* key is the second half of a
+        // rollover: the operator has swapped in the incoming key and this
+        // boot is meant to promote it. Say exactly that, because the
+        // generic message sends them looking for the wrong key file.
         _, False ->
-          Error(
-            "zone key file does not match the key this zone was created with",
-          )
+          case meta.dnskey_incoming == csk.public {
+            True ->
+              Error(
+                "this key file is the staged incoming key (tag "
+                <> int.to_string(meta.key_tag_incoming)
+                <> "), which is published but not yet promoted; run "
+                <> "`controlplane zone-key promote` before serving with it",
+              )
+            False ->
+              Error(
+                "zone key file does not match the key this zone was created with",
+              )
+          }
       }
     }
     Error(model.NoZoneMeta) ->
       sqlite.exec(
         conn,
-        "INSERT INTO zone_meta VALUES (1, ?, 0, ?, ?, 3600, 1209600, 604800)",
+        "INSERT INTO zone_meta
+           (id, base_domain, soa_serial, dnskey_public, key_tag,
+            sig_inception_skew, sig_validity, sig_refresh_before)
+         VALUES (1, ?, 0, ?, ?, 3600, 1209600, 604800)",
         [Text(base_domain), Blob(csk.public), VInt(tag)],
       )
       |> result.replace(Nil)
@@ -327,7 +390,106 @@ pub fn set_ns_hosts(
 }
 
 fn exec(conn: Connection, sql: String) -> Result(Nil, PublishError) {
-  sqlite.exec(conn, sql, [])
+  exec_with(conn, sql, [])
+}
+
+fn exec_with(
+  conn: Connection,
+  sql: String,
+  params: List(sqlite.Value),
+) -> Result(Nil, PublishError) {
+  sqlite.exec(conn, sql, params)
   |> result.map_error(Db)
   |> result.replace(Nil)
+}
+
+/// Stages the key a rollover is bringing in.
+///
+/// Public half only — the incoming key never signs while it is staged, it
+/// only rides in the DNSKEY RRset so the parent can be handed its DS and
+/// `rekor-publish` can claim a key set that already contains it. The
+/// republish this does is *not* gated: the signing key is unchanged and
+/// already on the record, so nothing here is a claim the gate exists to
+/// hold back.
+pub fn stage_incoming(
+  conn: Connection,
+  csk: Csk,
+  incoming_public: BitArray,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  sqlite.transaction(conn, Db, fn() {
+    stage_incoming_in_tx(conn, csk, incoming_public, now, actor)
+  })
+}
+
+fn stage_incoming_in_tx(
+  conn: Connection,
+  csk: Csk,
+  incoming_public: BitArray,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  use meta <- result.try(model.read_meta(conn) |> result.map_error(Model))
+  use Nil <- result.try(case incoming_public == meta.dnskey_public {
+    True -> Error(IncomingIsActive)
+    False -> Ok(Nil)
+  })
+  let tag =
+    keys.key_tag(rdata.dnskey(keys.flags, keys.algorithm, incoming_public))
+  use _ <- result.try(
+    exec_with(
+      conn,
+      "UPDATE zone_meta SET dnskey_incoming = ?, key_tag_incoming = ? WHERE id = 1",
+      [Blob(incoming_public), VInt(tag)],
+    ),
+  )
+  emit(conn, csk, now, actor, False)
+}
+
+/// Promotes the staged key: it becomes the signer, and the outgoing key
+/// leaves the RRset.
+///
+/// `csk` must be the incoming key's own file — this is the boot where the
+/// operator has swapped it in. Gated, because after this the zone is signed
+/// by a key that had better already be on the public record; that is the
+/// whole point of having published and logged it while it was staged.
+pub fn promote_incoming(
+  conn: Connection,
+  csk: Csk,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  sqlite.transaction(conn, Db, fn() {
+    promote_incoming_in_tx(conn, csk, now, actor)
+  })
+}
+
+fn promote_incoming_in_tx(
+  conn: Connection,
+  csk: Csk,
+  now: Int,
+  actor: String,
+) -> Result(Int, PublishError) {
+  use meta <- result.try(model.read_meta(conn) |> result.map_error(Model))
+  use Nil <- result.try(case meta.dnskey_incoming {
+    <<>> -> Error(NoIncomingKey)
+    incoming ->
+      case incoming == csk.public {
+        True -> Ok(Nil)
+        False -> Error(KeyMismatch)
+      }
+  })
+  let tag = keys.key_tag(keys.dnskey_rdata(csk))
+  use _ <- result.try(
+    exec_with(
+      conn,
+      "UPDATE zone_meta
+        SET dnskey_public = ?, key_tag = ?,
+            dnskey_incoming = ?, key_tag_incoming = 0
+      WHERE id = 1",
+      [Blob(csk.public), VInt(tag), Blob(<<>>)],
+    ),
+  )
+  emit(conn, csk, now, actor, True)
 }

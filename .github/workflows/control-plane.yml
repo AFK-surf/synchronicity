@@ -3,9 +3,23 @@ name: control-plane
 on:
   push:
     branches: [main]
-    paths: ['control-plane/**', '.github/workflows/control-plane.yml']
+    # `crates/**` too: the Gleam suite asserts against fixtures the
+    # Rust side writes, and the Rust suite asserts against fixtures
+    # this side writes. A change to either half that does not run the
+    # other half's tests is a format divergence nothing catches.
+    paths:
+      - 'control-plane/**'
+      - 'crates/**'
+      - '.github/workflows/control-plane.yml'
   pull_request:
-    paths: ['control-plane/**', '.github/workflows/control-plane.yml']
+    # `crates/**` too: the Gleam suite asserts against fixtures the
+    # Rust side writes, and the Rust suite asserts against fixtures
+    # this side writes. A change to either half that does not run the
+    # other half's tests is a format divergence nothing catches.
+    paths:
+      - 'control-plane/**'
+      - 'crates/**'
+      - '.github/workflows/control-plane.yml'
 
 env:
   CARGO_TERM_COLOR: always

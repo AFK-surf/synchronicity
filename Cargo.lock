@@ -3911,6 +3911,7 @@ dependencies = [
  "serde_json",
  "synch-core",
  "synch-mpt",
+ "synch-net",
  "synch-store",
  "tempfile",
  "thiserror 2.0.20",

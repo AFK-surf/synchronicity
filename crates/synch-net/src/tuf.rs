@@ -154,6 +154,13 @@ pub struct TufMetadata {
     pub trusted_root: Vec<u8>,
 }
 
+/// The on-disk format of the pin state.
+///
+/// Bumped to 2 when `root_chain` arrived: a v1 file records a root nothing
+/// re-verified, so it is not readable as v2 state and a client that meets
+/// one starts from the embedded bootstrap and re-learns.
+const STATE_FORMAT_VERSION: u64 = 2;
+
 /// The pin set a client is running on, and where it came from (§10.2).
 ///
 /// Persisted as one file, global across domains: `<data-dir>/rekor-pins.json`
@@ -161,10 +168,34 @@ pub struct TufMetadata {
 /// and not of any domain being resolved, so every domain shares one floor
 /// and a hostile mirror gets one client's versions to walk back, not one per
 /// domain it is asked about.
+///
+/// The on-disk format is versioned; a file this build cannot read is
+/// ignored rather than trusted, which lands on the bootstrap pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinState {
     /// The accepted `root.json`, verbatim — the next update chains from it.
+    ///
+    /// **Never trusted straight off disk.** [`PinState::load`] recomputes it
+    /// by walking `root_chain` from [`EMBEDDED_TUF_ROOT`] and refuses a file
+    /// whose stored bytes are not what that walk produced. See `root_chain`.
     pub root: Vec<u8>,
+    /// Every root accepted *beyond* the embedded one, in ascending version
+    /// order. Empty means the embedded root is still what is in force.
+    ///
+    /// This exists so the persisted state is verifiable rather than merely
+    /// well-formed. It used to be absent, and `load` checked only that the
+    /// version number inside the stored root equalled the version number
+    /// stored beside it — a self-consistency test that any file satisfies.
+    /// Whatever root the file named became the client's world, and every
+    /// later update chained from it, so anyone who could write one file in
+    /// the data directory chose the transparency-log key set outright. The
+    /// project's own test suite demonstrated it: a helper wrote a wholly
+    /// synthetic root into the pin file and the full resolver ran on it.
+    ///
+    /// Keeping the chain costs a few kilobytes and makes the file
+    /// self-authenticating against the binary — which is what the module
+    /// docs claimed all along.
+    pub root_chain: Vec<Vec<u8>>,
     /// Its version.
     pub root_version: u64,
     /// The accepted `timestamp.json` version.
@@ -187,9 +218,16 @@ impl PinState {
     /// update runs on [`EMBEDDED_TRUSTED_ROOT`], the bootstrap snapshot,
     /// exactly as it did before this module existed.
     pub fn embedded() -> PinState {
+        PinState::anchored(EMBEDDED_TUF_ROOT.as_bytes())
+    }
+
+    /// The starting state for a caller-supplied root — what
+    /// [`PinState::embedded`] is for the built-in one.
+    pub fn anchored(anchor: &[u8]) -> PinState {
         PinState {
-            root: EMBEDDED_TUF_ROOT.as_bytes().to_vec(),
-            root_version: root_version(EMBEDDED_TUF_ROOT.as_bytes()).unwrap_or(0),
+            root: anchor.to_vec(),
+            root_chain: Vec::new(),
+            root_version: root_version(anchor).unwrap_or(0),
             timestamp_version: 0,
             snapshot_version: 0,
             targets_version: 0,
@@ -234,15 +272,38 @@ impl PinState {
     /// file. A client that refused to start over a corrupt cache would be
     /// exactly the availability coupling §10.2 forbids.
     pub fn load(path: &Path) -> Option<PinState> {
+        PinState::load_anchored(path, EMBEDDED_TUF_ROOT.as_bytes())
+    }
+
+    /// The same, against a caller-supplied root of trust.
+    ///
+    /// Production always anchors at [`EMBEDDED_TUF_ROOT`] — that is what
+    /// [`PinState::load`] is. This form exists for a deployment running its
+    /// own TUF repository, and for the test harness, which necessarily
+    /// anchors at a root it minted. The anchor is an *argument* rather than
+    /// something read out of the file, because the whole point is that the
+    /// binary decides what the file is allowed to say.
+    pub fn load_anchored(path: &Path, anchor: &[u8]) -> Option<PinState> {
         let text = std::fs::read_to_string(path).ok()?;
         let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        if value["version"].as_u64() != Some(1) {
+        // A file this build cannot read is not an error: the pin set falls
+        // back to the bootstrap snapshot and the next accepted update
+        // rewrites it. That is also how the format version bump lands — a
+        // v1 file, which carried no re-walkable root chain, is simply not
+        // read, which is the safe direction.
+        if value["version"].as_u64() != Some(STATE_FORMAT_VERSION) {
             return None;
         }
         let blob = |key: &str| -> Option<Vec<u8>> { base64_decode(value[key].as_str()?).ok() };
         let number = |key: &str| value[key].as_u64();
+        let root_chain: Vec<Vec<u8>> = value["root_chain"]
+            .as_array()?
+            .iter()
+            .map(|entry| base64_decode(entry.as_str()?).ok())
+            .collect::<Option<_>>()?;
         let state = PinState {
             root: blob("root")?,
+            root_chain,
             root_version: number("root_version")?,
             timestamp_version: number("timestamp_version")?,
             snapshot_version: number("snapshot_version")?,
@@ -250,12 +311,19 @@ impl PinState {
             trusted_root: blob("trusted_root")?,
             updated_at: number("updated_at").unwrap_or(0),
         };
-        // A stored root that does not parse, or whose recorded version is
-        // not the one in its bytes, is not state we can chain from.
-        match root_version(&state.root) == Some(state.root_version) {
-            true => Some(state),
-            false => None,
+
+        // **Re-derive the trusted root from the binary rather than believing
+        // the file.** Walking the stored chain from `EMBEDDED_TUF_ROOT`
+        // re-runs the same dual-threshold check `update` applies to a live
+        // chain, so a stored root is accepted only if the root compiled into
+        // *this build* transitively signed it. Nothing else about the file is
+        // load-bearing: the versions and the trusted root beside it are only
+        // believed once this succeeds.
+        let (walked, version) = verify_root_chain(anchor, &state.root_chain).ok()?;
+        if walked != state.root || version != state.root_version {
+            return None;
         }
+        Some(state)
     }
 
     /// Writes the state at mode 0600, replacing whatever was there.
@@ -265,8 +333,13 @@ impl PinState {
     /// user chooses.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let text = serde_json::json!({
-            "version": 1,
+            "version": STATE_FORMAT_VERSION,
             "root": base64_encode(&self.root),
+            "root_chain": self
+                .root_chain
+                .iter()
+                .map(|root| base64_encode(root))
+                .collect::<Vec<_>>(),
             "root_version": self.root_version,
             "timestamp_version": self.timestamp_version,
             "snapshot_version": self.snapshot_version,
@@ -278,8 +351,52 @@ impl PinState {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, text)?;
-        restrict(path)
+        // Written to a sibling and renamed over, rather than truncating the
+        // real file and filling it in. A plain write leaves the state
+        // half-formed for as long as it takes, and a reader that catches it
+        // there — another process, or this one after a crash — gets a file
+        // that does not parse. `load` answers `None` to that, which the
+        // resolver turns into a silent reset to the bootstrap pins,
+        // discarding every update ever accepted with no log line at all. The
+        // temporary carries the mode before it is in place, so the state is
+        // never briefly world-readable either.
+        let temporary = path.with_extension("json.tmp");
+        // Durability before visibility: a rename that reaches the directory
+        // ahead of the bytes leaves a valid name over an empty file.
+        //
+        // Synced through the handle that did the writing, and closed before
+        // the rename. Reopening read-only to sync works on Unix and cannot
+        // work on Windows, where `sync_all` is `FlushFileBuffers` and needs
+        // write access — it fails `ERROR_ACCESS_DENIED`, so every save on
+        // Windows returned an error and the state was never written at all.
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            // Narrowed before the bytes land, so the state is never briefly
+            // world-readable.
+            restrict(&temporary)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
+        match std::fs::rename(&temporary, path) {
+            Ok(()) => {
+                // The rename itself, flushed the way the scanner and the CAS
+                // flush theirs (§6.2): best effort, because a platform that
+                // cannot open a directory as a file simply does not get the
+                // guarantee. Without it the bytes are durable but the name
+                // over them need not be.
+                if let Some(parent) = path.parent() {
+                    if let Ok(dir) = std::fs::File::open(parent) {
+                        let _ = dir.sync_all();
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temporary);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -308,6 +425,32 @@ pub struct TufUpdate {
     pub changed: bool,
 }
 
+/// Walks a stored root chain from the root this build embeds, returning the
+/// trusted root's bytes and version.
+///
+/// The same rule [`update`] applies to a live chain, applied to a persisted
+/// one: each step is exactly one version on, signed by the thresholds of
+/// *both* the root it succeeds and itself. Expiry is deliberately not
+/// checked — an intermediate in a stored chain is expected to be expired,
+/// and the final root's expiry is `update`'s business at refresh time, not a
+/// reason to refuse to start.
+fn verify_root_chain(anchor: &[u8], chain: &[Vec<u8>]) -> Result<(Vec<u8>, u64), TufError> {
+    let mut trusted = Root::parse(anchor)?;
+    for bytes in chain {
+        let candidate = Root::parse(bytes)?;
+        if candidate.version != trusted.version + 1 {
+            return Err(TufError::Chain(format!(
+                "stored root {} does not follow root {}",
+                candidate.version, trusted.version
+            )));
+        }
+        trusted.check_role(ROOT_ROLE, &candidate.meta)?;
+        candidate.check_role(ROOT_ROLE, &candidate.meta)?;
+        trusted = candidate;
+    }
+    Ok((trusted.bytes, trusted.version))
+}
+
 /// Verifies collected metadata and, if it is newer, returns the state to
 /// adopt (§10.2).
 ///
@@ -320,6 +463,9 @@ pub struct TufUpdate {
 /// root names and bounded by the version the state already accepted.
 pub fn update(metadata: &TufMetadata, state: &PinState, now: u64) -> Result<TufUpdate, TufError> {
     let mut trusted = Root::parse(&state.root)?;
+    // Every root this update accepts is appended, so the state it produces
+    // can be re-walked from the embedded root when it is next loaded.
+    let mut chain = state.root_chain.clone();
 
     // 1. Walk the root chain. Each step must be signed by the thresholds of
     //    *both* the old root and the new one: the old root says who may
@@ -339,6 +485,7 @@ pub fn update(metadata: &TufMetadata, state: &PinState, now: u64) -> Result<TufU
         }
         trusted.check_role(ROOT_ROLE, &candidate.meta)?;
         candidate.check_role(ROOT_ROLE, &candidate.meta)?;
+        chain.push(candidate.bytes.clone());
         trusted = candidate;
     }
     if trusted.version < state.root_version {
@@ -384,6 +531,7 @@ pub fn update(metadata: &TufMetadata, state: &PinState, now: u64) -> Result<TufU
     Ok(TufUpdate {
         state: PinState {
             root: trusted.bytes,
+            root_chain: chain,
             root_version: trusted.version,
             timestamp_version: timestamp.version,
             snapshot_version: snapshot.version,

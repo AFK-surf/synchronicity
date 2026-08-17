@@ -224,37 +224,88 @@ control plane itself with
   this is a planned outage of new-validation, existing caches keep
   working. **Zone key rollover** (proactive) is the same dance with both
   DS records present during the window; v1 keeps this manual and rare.
-  With transparency enabled the order is: `keygen`, publish both DNSKEYs,
-  **add the DS at the parent and wait**, then `rekor-publish <apex>
-  <newkey>`, then switch signing, then `rekor-retire <apex> <oldkey>`.
-  Logging comes after the DS because the entry carries the DNSSEC chain
-  that the DS makes buildable; the two-key window is what covers the gap,
-  since the old key keeps signing until the new one is logged. Every
-  monitor watching the apex will report the new key — tell them first,
-  and record the key tag.
+
+  **The rollover, step by step.** `zone_meta` carries a staging slot for
+  the key coming in, so the zone can serve a two-key DNSKEY RRset while
+  the outgoing key keeps signing — the ordinary DNSSEC rollover, and the
+  thing that makes the sequence below possible at all:
+
+  ```
+  controlplane keygen        <apex> /path/new.key      # 1. mint
+  controlplane zone-key stage <apex> /path/old.key /path/new.key
+                                                       # 2. publish both
+  #   3. add the new DS at the parent; wait for it to go live and for the
+  #      old DS's TTL to pass
+  controlplane rekor-publish <apex> /path/old.key      # 4. log both keys
+  #   5. swap CP_KEY_FILE to new.key, restart
+  controlplane zone-key promote <apex> /path/new.key   # 6. new key signs
+  #   7. remove the old DS at the parent
+  controlplane rekor-retire  <apex> /path/old.key      # 8. retire
+  ```
+
+  Step 2 is deliberately **not** gated: the signing key is unchanged and
+  already on the record, so there is no new claim for the gate to hold
+  back. Step 6 **is** gated, and that is the point — it refuses unless
+  the incoming key is already on the public record, which is what step 4
+  arranged. Getting the order wrong therefore fails at step 6 with a
+  message naming step 4, rather than producing a zone clients reject.
+
+  This ordering used to be impossible rather than merely unenforced. The
+  builder emitted exactly one DNSKEY, `ensure_meta` refused to boot on a
+  changed key file, and with `CP_REKOR_REQUIRE=true` the two requirements
+  were circular: `rekor-publish` claims the key set **observed live on the
+  wire**, so a key had to be serving before it could be logged, and the
+  gate would not let it serve until it was logged. Staging breaks the
+  cycle by separating *published* from *active* — the incoming key is in
+  the RRset, where the parent and the log can both see it, without signing
+  anything.
+
+  If you boot with the staged key file before promoting, the error says so
+  and names `zone-key promote`, rather than claiming the key file is
+  wrong.
+
+  Every monitor watching the apex will report the new key — tell them
+  first, and record the key tag.
 - **Zone key transparency** (docs/REKOR-ZONE-KEY.md): `rekor-publish`
   puts the zone key on a public log and the zone serves the proof at
   `_synchronicity-rekor.<apex>`. Rollout is phased — publish first
   (`CP_REKOR_REQUIRE` unset), turn the gate on once every key in play has
-  a verified record. With the gate on, *every* publish path refuses while
-  the active key has none, including the hourly re-sign; that is
-  deliberate, and `rekor-publish` is how you get out of it.
+  a verified record. With the gate on, publishing a **change** to the zone
+  refuses while the active key has no record, and `rekor-publish` is how
+  you get out of it. The hourly **re-sign** is deliberately not gated: it
+  emits records clients already accept, so refusing it withholds nothing
+  from anybody — it just lets the signatures expire after `sig_validity`
+  (14 days by default) and takes the whole zone bogus on DNSSEC rather
+  than on transparency. A transparency gap should not become a DNS
+  outage.
 - **Watch the log** (docs/REKOR-ZONE-KEY.md §5.5). A required log with no
   watcher is a formality. `synch-monitor` reads the whole log's tiles and
   reports **every newly authorized key** for the apexes you watch:
 
   ```sh
   echo '{"known":{"keys":{"sync.example":[]}}}' > /var/lib/synch-monitor/state.json
-  synch-monitor --state /var/lib/synch-monitor/state.json
+  # --from-index is not optional in practice: without it the first run
+  # walks the log from entry 0, and the production shard has ~10^8 entries
+  # in it. Take the current tree size from the checkpoint and subtract
+  # however far back you want to look.
+  size=$(curl -sS https://log2025-1.rekor.sigstore.dev/api/v2/checkpoint | sed -n 2p)
+  synch-monitor --state /var/lib/synch-monitor/state.json \
+                --from-index "$((size - 200000))"
   ```
+
+  Then install the unit and timer beside it — `ops/systemd/
+  synch-monitor.{service,timer}` — which run it hourly from the recorded
+  index. **Run it somewhere that is not the control plane's network**;
+  the independence is the point.
 
   Exit codes: `0` nothing new, `10` unauthorized claims naming your apex
   (recorded, no alarm — no client would have accepted one), `20` **a key
   was authorized for your apex that this monitor had not seen: check it
-  against what you published**, `2` the run could not finish. These
-  numbers changed when the tiering was reduced to two; a rule written
-  against the old `30` now matches nothing, which is the intended way to
-  find out.
+  against what you published**, `30` the run could not finish. They are
+  ordered by severity so a rule testing `>= 10` reads correctly — which
+  is why failure is `30` and not the `2` it used to be, since at `2` it
+  sorted below "nothing new" and that rule silently ignored every failed
+  run. A monitor that cannot finish is not a monitor with nothing to say.
 
   New authorizations go to **stdout**, one line each with the apex, key
   tag, the DS your registrar should be showing, the SPKI digest and the

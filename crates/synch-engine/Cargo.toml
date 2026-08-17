@@ -27,6 +27,8 @@ tracing.workspace = true
 rustix.workspace = true
 
 [dev-dependencies]
+# The simulated zone/log harness, for tests only.
+synch-net = { workspace = true, features = ["sim"] }
 iroh-base.workspace = true
 synch-store.workspace = true
 tempfile.workspace = true

@@ -87,10 +87,19 @@ delegation and no DNSKEY of its own. Then `example.com` signs everything —
 membership answers, the declaration, all of it — and it is `example.com`'s key
 set the chain proves. So a chain reads as the declaration at the apex, then
 the ladder starting at the **signing zone**, and the rule tying them together
-is that the signing zone must contain the apex. The proof records live at the
-signing zone rather than the apex, because it is the only name a client can
-compute from an answer: the apex is a name only the entry knows.
-`CP_SIGNING_ZONE` names it when it differs (§5.1); it defaults to the apex.
+is that the signing zone must contain the apex. `CP_SIGNING_ZONE` names it
+when it differs (§5.1); it defaults to the apex.
+
+**The proof records live at the apex**, and the membership answer says where
+that apex is (`apex=`, §3). An earlier revision put them at the signing zone,
+on the grounds that it was the only name a client could compute from an
+answer — true before the `apex=` field existed, and the reason that claim
+still appears in older prose. It is wrong now, and it mattered: two control
+planes inside one signing zone would have had to share a single record name,
+and would have deleted each other's records forever. The one name a client
+takes from the answer itself is the **signing zone**, from the RRSIG signer
+field, and it is used to *bound* the apex rather than to find anything:
+`signing zone ⊇ apex ⊇ membership domain`.
 
 ### 2.1 Why the entry looks the way it does
 
@@ -401,8 +410,11 @@ Why in-band rather than an HTTPS side-channel or a live Rekor query:
   sees.
 
 The record sits at the **apex** (one zone key, one proof set), not per
-membership name — the client learns the apex from the RRSIG signer field it
-already validates.
+membership name. The client learns the apex from the `apex=` field of the
+membership answer it just validated, and holds it between two names it
+already knows — it must contain the membership domain, and be contained by
+the signing zone the RRSIG names. A wrong value points at a name with no
+usable proof, which fails closed.
 
 One more record rides the same mechanism at the apex: the **declaration** at
 `_synchronicity-transparency.<apex>`, a fixed 20-byte TXT the zone always
@@ -461,11 +473,14 @@ the one DoH transport, then verifies entirely offline:
 
 1. `_synchronicity.<domain> TXT` — as today (hickory in-process validation,
    secure-proof-only, owner-name check).
-2. `<apex> DNSKEY` — apex taken from the TXT answer's RRSIG signer field;
-   select the DNSKEY whose key tag matches that RRSIG. This yields the exact
-   zone-key rdata bytes the chain must prove.
-3. `_synchronicity-rekor.<apex> TXT` — the proof record matching that key
-   tag.
+2. `<signing zone> DNSKEY` — the signing zone taken from the TXT answer's
+   RRSIG signer field (which is also checked to *contain* the queried name,
+   RFC 4035 §5.3.1); select the DNSKEY whose key tag matches that RRSIG.
+   This yields the exact zone-key rdata bytes the chain must prove.
+3. `_synchronicity-rekor.<apex> TXT` — the proof records, at the apex the
+   membership answer named, which must sit between the signing zone and the
+   domain being resolved. A proof spanning several records continues at
+   `_synchronicity-rekor-<n>.<apex>`, bounded by `MAX_PROOF_PARTS`.
 
 Before step 3, and off the DNS transport entirely, the pin set may be
 refreshed from Sigstore's TUF repository — at most once a day, so this is not
@@ -509,9 +524,16 @@ Then, in process, no network:
   key that signed the answer is a **member** of it, `predicate.apex` = the
   RRSIG signer, and `action` ∈ {`create`, `rollover`};
 
-Steps 2 and 3 are cacheable on their own TTLs (the proof records carry a
-24 h TTL; the zone key changes rarely) — the steady-state refresh cost stays
-one TXT query.
+Steps 2 and 3 carry their own TTLs — the proof records are served with a
+24 h one, and the zone key changes rarely — but **the client does not
+currently cache them**, so a membership refresh under `require` really does
+perform all three lookups every time, plus whatever DNSKEY and DS queries
+hickory issues to validate each of them. At a TTL clamped to the 60 s floor
+that is tens of round trips a minute, not the one TXT query an earlier
+revision of this section claimed. The TTLs make the caching *possible*; a
+cache in front of the DoH handle is what would make it real, and it is not
+written yet. Stated here rather than left as an aspiration the numbers
+elsewhere in this document quietly assume.
 
 ### 4.2.1 Why the client verifies a chain it does not need
 
@@ -626,8 +648,9 @@ ceremony, and the reason is §2.2: a `create` or `rollover` entry carries a
 DNSSEC chain, a chain starts at the apex's DS, and there is no DS to fetch
 before the parent publishes it. So the sequence is: create the key → publish
 the DNSKEY in the zone → get the DS into the parent → **then** log. The
-existing two-key rollover window covers the gap; the old key keeps signing
-until the new one is logged, which is exactly what that window is for.
+two-key rollover window covers the gap: `zone-key stage` puts the incoming
+key in the DNSKEY RRset without making it a signer, so the old key keeps
+signing until the new one is logged (§5.4).
 
 The command says out loud what publishing now means, because there is no
 longer any way to publish quietly:
@@ -749,29 +772,52 @@ unsaid, because each is the kind of thing a reader may assume is present:
 Zone-key rollover stays the rare, manual, two-DS dance — with the logging
 step moved **after** the parent DS, for the reason in §5.2:
 
-1. `keygen` the new key.
-2. Publish both DNSKEYs in the zone.
-3. Add the second DS at the parent, and wait for it to be live.
-4. `rekor-publish <apex> <newkey>` — action `rollover`, naming the old tag,
-   carrying the chain that the new DS makes buildable. The action and the
-   replaced tag come from the records already stored for the apex; there is
-   no old key file to name. **Expect every monitor
-   watching the zone to report the new key** — that is what publishing now
-   means, there is nothing to suppress it with, and it is the reason step 0
-   of this runbook is telling whoever watches the monitor.
-5. Publish the new proof record (the command republishes the zone for you).
-6. Switch signing to the new key.
-7. Retire: `rekor-retire <apex> <oldkey>`, then drop the old DNSKEY, DS and
-   proof record.
+1. `keygen <apex> new.key`.
+2. `zone-key stage <apex> old.key new.key` — the incoming key joins the
+   DNSKEY RRset. `zone_meta` keeps it in a staging slot (`dnskey_incoming`)
+   that is *published but never a signer*, so the zone still validates under
+   the DS the parent already has.
+3. Add the second DS at the parent, and wait for it to be live and for the
+   old DS's TTL to pass.
+4. `rekor-publish <apex> old.key` — action `rollover`, naming the old tag,
+   carrying the chain that the new DS makes buildable, and claiming the
+   **two-key set** the zone now serves. The key file here is still the
+   *active* one: it is what re-signs the zone at the end of the command, and
+   the claim itself comes from live DNS rather than from any key file. The
+   action and the replaced tag come from the records already stored for the
+   apex. **Expect every monitor watching the zone to report the new key** —
+   that is what publishing now means, there is nothing to suppress it with,
+   and it is the reason step 0 of this runbook is telling whoever watches
+   the monitor.
+5. Swap `CP_KEY_FILE` to the new key and restart.
+6. `zone-key promote <apex> new.key` — the staged key becomes the signer and
+   the outgoing key leaves the RRset.
+7. Remove the old DS at the parent, then `rekor-retire <apex> old.key` and
+   drop the old proof record.
 
-**Nothing enforces that ordering but the operator.** In particular the
-dashboard does not refuse the signing-switch step while the new key lacks a
-verified record: it says nothing about zone keys at all, and manages orgs,
-networks and devices. The only automatic enforcement
-anywhere on this side is the publish gate of §5.3, which is off by default and
-is about the *active* key rather than about the order of a rollover. Steps 1–7
-are a runbook, and they are a runbook because a zone-key rollover is rare,
-manual and human-supervised on purpose.
+**Step 6 is enforced; the rest is the operator's.** Promotion runs through
+the publish gate of §5.3, so with `CP_REKOR_REQUIRE=true` it refuses a key
+that was never logged — the one ordering mistake in this sequence that would
+produce a zone clients reject — and says which step was skipped. Staging in
+step 2 is deliberately *not* gated: the signing key is unchanged and already
+on the record, so there is nothing there for the gate to hold back, and
+gating it would only move the deadlock described below.
+
+The remaining steps are unenforced. In particular the dashboard says nothing
+about zone keys at all — it manages orgs, networks and devices — and nothing
+checks that the parent DS actually went live before step 4. Those are a
+runbook, and they are a runbook because a zone-key rollover is rare, manual
+and human-supervised on purpose.
+
+**Why a staging slot exists at all.** Without one, rollover under
+`CP_REKOR_REQUIRE=true` is not merely unenforced but impossible. The gate
+demands the active key already be on the public record; `rekor-publish`
+claims the key set it reads from *live DNS*; and a key cannot be in live DNS
+before the zone serves it. Publishing the new key required having logged it,
+and logging it required having published it. Separating *published* from
+*active* is what breaks the cycle: the incoming key sits in the RRset, where
+the parent and the log can both see it, while the outgoing key keeps
+signing.
 
 Key *loss* recovery follows the same steps and is **not a special case**: an
 ordinary `rekor-publish` producing an ordinary reported authorization,
@@ -979,9 +1025,10 @@ correctly rather than inverting on the outcome that matters most.
   base64; §3 explains why that is a floor.) The client downloads all of it
   and uses the chain
   only to enforce a property it already knows — see §4.2.1 for why it must
-  anyway. Amortized by the 24 h TTL, but it is a real transfer of cost from
-  the parties who benefit (monitors, and through them every operator) to the
-  parties who pay (clients).
+  anyway. The 24 h TTL would amortize it if the client cached; it does not
+  yet (§4.2), so today this is paid on every refresh. Either way it is a real
+  transfer of cost from the parties who benefit (monitors, and through them
+  every operator) to the parties who pay (clients).
 - **Clients acquire a CDN dependency, bounded.** Following Sigstore's pin set
   means a daemon reaches `tuf-repo-cdn.sigstore.dev`: a few hundred KB, at
   most once a day, on a path where failure is a non-event by construction

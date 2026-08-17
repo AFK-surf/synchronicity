@@ -30,6 +30,7 @@ import rekor/statement
 import rekor/store
 import simplifile
 import store/sqlite
+import tools/gen_crossval
 import zone/build
 import zone/model.{Member, NsHost, TxtName, ZoneInput, ZoneMeta}
 import zone/publish
@@ -301,22 +302,42 @@ pub fn checkpoints_parse_or_are_refused_test() {
 /// names, refuse when one is missing, and carry the bytes verbatim. That is
 /// what this fake exercises.
 fn fake_resolver(dnskey_rd: BitArray) -> chain.Resolver {
+  fake_resolver_serving([dnskey_rd])
+}
+
+/// A resolver whose apex answers a DNSKEY RRset of several keys — what the
+/// zone actually serves mid-rollover, and what `rekor-publish` must claim
+/// in full so the incoming key is on the record before it signs anything.
+fn fake_resolver_serving(dnskey_rds: List(BitArray)) -> chain.Resolver {
   chain.Resolver(query: fn(zone, rtype) {
-    let rdata_of = fn(rtype: Int) {
-      case rtype {
-        48 -> dnskey_rd
-        _ -> <<1234:int-size(16), 13:int-size(8), 2:int-size(8), 9:size(256)>>
-      }
-    }
-    Ok([
-      wire.Rr(zone, rtype, wire.class_in, 3600, rdata_of(rtype)),
+    let rrsig =
       wire.Rr(zone, wire.type_rrsig, wire.class_in, 3600, <<
         rtype:int-size(16),
         13:int-size(8),
         2:int-size(8),
         0:size(512),
-      >>),
-    ])
+      >>)
+    case rtype {
+      48 ->
+        Ok(
+          list.append(
+            list.map(dnskey_rds, fn(rd) {
+              wire.Rr(zone, rtype, wire.class_in, 3600, rd)
+            }),
+            [rrsig],
+          ),
+        )
+      _ ->
+        Ok([
+          wire.Rr(zone, rtype, wire.class_in, 3600, <<
+            1234:int-size(16),
+            13:int-size(8),
+            2:int-size(8),
+            9:size(256),
+          >>),
+          rrsig,
+        ])
+    }
   })
 }
 
@@ -342,6 +363,28 @@ fn publish_run(
     log_key,
     now,
     fake_resolver(keys.dnskey_rdata(csk)),
+    rekor_publish.Current,
+  )
+}
+
+/// `publish_run` for a zone serving more than one DNSKEY — the mid-rollover
+/// state, where the claim has to cover both the outgoing and incoming keys.
+fn publish_run_claiming(
+  conn: sqlite.Connection,
+  apex: name.Name,
+  dnskey_rds: List(BitArray),
+  log: client.Log,
+  log_key: #(BitArray, BitArray),
+  now: Int,
+) {
+  rekor_publish.run(
+    conn,
+    apex,
+    apex,
+    log,
+    log_key,
+    now,
+    fake_resolver_serving(dnskey_rds),
     rekor_publish.Current,
   )
 }
@@ -527,6 +570,8 @@ pub fn the_zone_serves_the_proof_record_test() {
         7,
         csk.public,
         keys.key_tag(keys.dnskey_rdata(csk)),
+        <<>>,
+        0,
         3600,
         1_209_600,
         604_800,
@@ -571,6 +616,8 @@ pub fn a_zone_without_a_proof_has_no_such_name_test() {
         7,
         csk.public,
         keys.key_tag(keys.dnskey_rdata(csk)),
+        <<>>,
+        0,
         3600,
         1_209_600,
         604_800,
@@ -608,12 +655,36 @@ fn chunks(rdata: BitArray) -> Result(String, Nil) {
 /// deterministic — fixed inputs, no signatures — so both suites can hold the
 /// same bytes still: crates/synch-net/tests/rekor_zone_key.rs reads exactly
 /// these files.
+///
+/// The link list comes from the generator rather than being restated here,
+/// so editing `gen_crossval` without re-running it fails this test instead
+/// of leaving the checked-in bytes describing a chain nobody builds. The
+/// Rust suite restates the structure independently — that restatement, not
+/// this one, is the cross-language check.
 pub fn the_chain_extension_encodes_the_crossval_bytes_test() {
-  let links = [
-    cert.Link("sync.test.", <<0xaa, 0xbb, 0xcc>>),
-    cert.Link(".", <<0x01, 0x02>>),
-  ]
-  assert cert.encode_chain(links) == fixture("crossval/chain.der")
+  assert cert.encode_chain(gen_crossval.links())
+    == fixture("crossval/chain.der")
+}
+
+/// The long-form DER lengths, which the fixture reaches only because two of
+/// its links are deliberately large.
+///
+/// A chain of real DNSKEY/DS/RRSIG sets is kilobytes, so long-form lengths
+/// are what production uses everywhere and short-form is the case that
+/// almost never runs. An earlier fixture was 30 bytes — two links of 3 and
+/// 2 rdata bytes — so both sides' long-form encoders were untested by the
+/// thing whose whole job is keeping them together.
+pub fn the_crossval_chain_exercises_both_der_length_forms_test() {
+  let der = fixture("crossval/chain.der")
+  // 200 bytes of rdata: OCTET STRING, one-byte long form.
+  assert contains(der, <<0x04, 0x81, 0xc8>>)
+  // 256: two-byte long form.
+  assert contains(der, <<0x04, 0x82, 0x01, 0x00>>)
+  // And the short form is still present, so neither replaced the other.
+  assert contains(der, <<0x04, 0x03, 0xaa, 0xbb, 0xcc>>)
+  // The outer SEQUENCE is over 255 bytes, so its own length is long-form.
+  let assert <<0x30, first_len_byte:8, _:bits>> = der
+  assert int.bitwise_and(first_len_byte, 0x80) == 0x80
 }
 
 /// A certificate this side builds, read back by this side and — from the
@@ -860,4 +931,166 @@ pub fn response_answers_reads_only_real_answers_test() {
   let assert Error(why) =
     chain.response_answers("doh.test", message(0x8005, []))
   assert string.contains(why, "REFUSED")
+}
+
+// ------------------------------------------------------ the key rollover
+
+/// The deadlock the staging slot exists to break.
+///
+/// With the gate armed, a zone key could not be replaced at all. The gate
+/// demands the active key already be on the public record; `rekor-publish`
+/// claims the key set it reads out of *live DNS*; and a key cannot be in
+/// live DNS before the zone serves it. Replacing the key therefore required
+/// publishing it, which required having logged it, which required having
+/// published it.
+///
+/// Staging breaks the cycle by letting the incoming key be *published*
+/// without being *active*: it rides in the DNSKEY RRset, where the parent
+/// and the log can both see it, while the outgoing key keeps signing.
+pub fn a_staged_key_is_published_without_becoming_the_signer_test() {
+  let conn = fixtures.fresh_conn()
+  let active = fixtures.zone_boot(conn)
+  let incoming = keys.generate()
+
+  let assert Ok(_) =
+    publish.stage_incoming(conn, active, incoming.public, 1000, "test")
+
+  // Both keys are in the RRset the zone serves...
+  let assert Ok(meta) = model.read_meta(conn)
+  assert meta.dnskey_public == active.public
+  assert meta.dnskey_incoming == incoming.public
+  assert meta.key_tag_incoming == keys.key_tag(keys.dnskey_rdata(incoming))
+  let assert Ok(input) = model.read(conn)
+  let assert Ok(rrsets) = build.build(input)
+  let assert Ok(dnskey) =
+    list.find(rrsets, fn(r) { r.rtype == wire.type_dnskey })
+  assert list.length(dnskey.rdatas) == 2
+
+  // ...but the active key is still the only signer, so the zone stays
+  // valid under the DS the parent already published.
+  assert meta.key_tag == keys.key_tag(keys.dnskey_rdata(active))
+  sqlite.close(conn)
+}
+
+/// Staging is not gated, and it must not be: the signing key is unchanged
+/// and already on the record, so there is no new claim for the gate to
+/// hold back — and if staging *were* gated the deadlock would simply move.
+pub fn staging_is_allowed_while_the_gate_is_armed_test() {
+  let conn = fixtures.fresh_conn()
+  let active = fixtures.zone_boot(conn)
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = fake_log(keys.generate())
+  let assert Ok(_) = publish_run(conn, apex, active, log, #(spki, point), 1000)
+
+  envoy.set(gate.require_env, "true")
+  let incoming = keys.generate()
+  let assert Ok(_) =
+    publish.stage_incoming(conn, active, incoming.public, 1000, "test")
+  envoy.unset(gate.require_env)
+  sqlite.close(conn)
+}
+
+/// Promotion *is* gated, and refuses the incoming key until it has been
+/// logged — which is the ordering the whole sequence exists to enforce.
+pub fn promotion_refuses_a_key_that_was_never_logged_test() {
+  let conn = fixtures.fresh_conn()
+  let active = fixtures.zone_boot(conn)
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = fake_log(keys.generate())
+  let assert Ok(_) = publish_run(conn, apex, active, log, #(spki, point), 1000)
+
+  let incoming = keys.generate()
+  let assert Ok(_) =
+    publish.stage_incoming(conn, active, incoming.public, 1000, "test")
+
+  envoy.set(gate.require_env, "true")
+  // The record covers the outgoing key, not the incoming one.
+  let assert Error(publish.NoRekorRecord(tag)) =
+    publish.promote_incoming(conn, incoming, 1000, "test")
+  assert tag == keys.key_tag(keys.dnskey_rdata(incoming))
+  envoy.unset(gate.require_env)
+
+  // Nothing moved: a refused promotion must not half-apply.
+  let assert Ok(meta) = model.read_meta(conn)
+  assert meta.dnskey_public == active.public
+  assert meta.dnskey_incoming == incoming.public
+  sqlite.close(conn)
+}
+
+/// The whole sequence, in the order an operator runs it.
+pub fn a_logged_staged_key_can_be_promoted_test() {
+  let conn = fixtures.fresh_conn()
+  let active = fixtures.zone_boot(conn)
+  let incoming = keys.generate()
+  let assert Ok(apex) = name.parse("sync.test.")
+  let #(log, spki, point) = fake_log(keys.generate())
+
+  // 1. stage, 2. (parent publishes the DS), 3. log the set that now
+  // contains both keys.
+  let assert Ok(_) =
+    publish.stage_incoming(conn, active, incoming.public, 1000, "test")
+  let assert Ok(_) =
+    publish_run_claiming(
+      conn,
+      apex,
+      [keys.dnskey_rdata(active), keys.dnskey_rdata(incoming)],
+      log,
+      #(spki, point),
+      1000,
+    )
+
+  // 4. promote — accepted now, because the log entry covers the incoming key.
+  envoy.set(gate.require_env, "true")
+  let assert Ok(_) = publish.promote_incoming(conn, incoming, 1000, "test")
+  envoy.unset(gate.require_env)
+
+  let assert Ok(meta) = model.read_meta(conn)
+  assert meta.dnskey_public == incoming.public
+  assert meta.key_tag == keys.key_tag(keys.dnskey_rdata(incoming))
+  // The outgoing key has left the RRset, so the zone stops asking the world
+  // to trust a key it no longer signs with.
+  assert meta.dnskey_incoming == <<>>
+  assert meta.key_tag_incoming == 0
+  let assert Ok(input) = model.read(conn)
+  let assert Ok(rrsets) = build.build(input)
+  let assert Ok(dnskey) =
+    list.find(rrsets, fn(r) { r.rtype == wire.type_dnskey })
+  assert list.length(dnskey.rdatas) == 1
+  sqlite.close(conn)
+}
+
+/// Promotion with nothing staged, and staging the key already in service:
+/// both are operator slips that must not silently do something.
+pub fn the_rollover_commands_refuse_incoherent_input_test() {
+  let conn = fixtures.fresh_conn()
+  let active = fixtures.zone_boot(conn)
+  let assert Error(publish.NoIncomingKey) =
+    publish.promote_incoming(conn, active, 1000, "test")
+  let assert Error(publish.IncomingIsActive) =
+    publish.stage_incoming(conn, active, active.public, 1000, "test")
+
+  // And promoting with the wrong key file is a mismatch, not a promotion
+  // of whatever happens to be staged.
+  let incoming = keys.generate()
+  let assert Ok(_) =
+    publish.stage_incoming(conn, active, incoming.public, 1000, "test")
+  let assert Error(publish.KeyMismatch) =
+    publish.promote_incoming(conn, keys.generate(), 1000, "test")
+  sqlite.close(conn)
+}
+
+/// Booting with the staged key file says which step is missing.
+///
+/// The generic "does not match the key this zone was created with" sends an
+/// operator mid-rollover looking for a key file that is not the problem.
+pub fn booting_with_the_staged_key_names_the_missing_step_test() {
+  let conn = fixtures.fresh_conn()
+  let active = fixtures.zone_boot(conn)
+  let incoming = keys.generate()
+  let assert Ok(_) =
+    publish.stage_incoming(conn, active, incoming.public, 1000, "test")
+  let assert Error(message) = publish.ensure_meta(conn, "sync.test", incoming)
+  assert string.contains(message, "staged incoming key")
+  assert string.contains(message, "zone-key promote")
+  sqlite.close(conn)
 }

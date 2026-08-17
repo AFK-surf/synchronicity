@@ -43,6 +43,7 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
         // Nothing in this suite exercises pin refresh, and no test run
         // reaches Sigstore by accident.
         no_tuf: true,
+        tuf_root: None,
     })
     .unwrap();
 
