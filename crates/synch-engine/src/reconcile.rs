@@ -412,47 +412,38 @@ impl Syncer {
                 let store = self.store.clone();
                 let requested = missing.nodes.clone();
                 learned += crate::blocking::offload(move || {
-                    let mut stored = 0usize;
-                    for (hash, bytes) in &response.nodes {
-                        // Verify each node against the hash it was requested
-                        // by. A malicious or corrupt peer can withhold, never
-                        // inject.
-                        let actual = TrieNode::hash_of_encoded(bytes).map_err(|_| {
-                            EngineError::Net(NetError::NodeHashMismatch { expected: *hash })
-                        })?;
-                        if actual != *hash {
-                            return Err(EngineError::Net(NetError::NodeHashMismatch {
-                                expected: *hash,
-                            }));
-                        }
-                        if !requested.contains(hash) {
-                            return Err(EngineError::Net(NetError::Unexpected(format!(
-                                "peer served unrequested trie node {hash}"
-                            ))));
-                        }
-                        synch_mpt::NodeStore::put_node(store.as_ref(), hash, bytes)?;
-                        stored += 1;
-                    }
-                    Ok(stored)
+                    take_served(
+                        &requested,
+                        &response.nodes,
+                        "node",
+                        |bytes| TrieNode::hash_of_encoded(bytes).ok(),
+                        |expected| NetError::NodeHashMismatch { expected },
+                        |hash, bytes| {
+                            Ok(synch_mpt::NodeStore::put_node(store.as_ref(), hash, bytes)?)
+                        },
+                    )
                 })
                 .await?;
             }
             if !missing.values.is_empty() {
                 let response = client.get_values(&missing.values).await?;
                 let store = self.store.clone();
+                let requested = missing.values.clone();
                 learned += crate::blocking::offload(move || {
-                    let mut stored = 0usize;
-                    for (hash, bytes) in &response.values {
-                        let actual = synch_core::Hash::new(bytes);
-                        if actual != *hash {
-                            return Err(EngineError::Net(NetError::ValueHashMismatch {
-                                expected: *hash,
-                            }));
-                        }
-                        synch_mpt::NodeStore::put_value(store.as_ref(), hash, bytes)?;
-                        stored += 1;
-                    }
-                    Ok(stored)
+                    take_served(
+                        &requested,
+                        &response.values,
+                        "value",
+                        |bytes| Some(synch_core::Hash::new(bytes)),
+                        |expected| NetError::ValueHashMismatch { expected },
+                        |hash, bytes| {
+                            Ok(synch_mpt::NodeStore::put_value(
+                                store.as_ref(),
+                                hash,
+                                bytes,
+                            )?)
+                        },
+                    )
                 })
                 .await?;
             }
@@ -660,6 +651,46 @@ impl Syncer {
         }
         Ok(report)
     }
+}
+
+/// Verifies one batch of what a peer served and commits it, refusing anything
+/// that was not asked for.
+///
+/// Two things are checked and both are containment: a payload has to hash to the
+/// hash it was requested by, and it has to be one of the hashes this walk asked
+/// for. Without the second, a peer answering every request with `missing` plus
+/// one self-consistent pair of its own counts as progress on every round — the
+/// unproductive counter never fires, the fetch loop never ends, and the junk
+/// lands in the trie tables.
+///
+/// Nodes and values differ only in how a payload is hashed, where it is stored
+/// and which error names it, so the checks live here rather than in two loops
+/// that have to be kept in step.
+///
+/// Returns how many were stored.
+fn take_served(
+    requested: &[synch_core::Hash],
+    served: &[(synch_core::Hash, Vec<u8>)],
+    what: &str,
+    hash_of: impl Fn(&[u8]) -> Option<synch_core::Hash>,
+    mismatch: impl Fn(synch_core::Hash) -> NetError,
+    put: impl Fn(&synch_core::Hash, &[u8]) -> Result<()>,
+) -> Result<usize> {
+    let mut stored = 0usize;
+    for (hash, bytes) in served {
+        if !requested.contains(hash) {
+            return Err(EngineError::Net(NetError::Unexpected(format!(
+                "peer served unrequested trie {what} {hash}"
+            ))));
+        }
+        // A malicious or corrupt peer can withhold, never inject.
+        if hash_of(bytes) != Some(*hash) {
+            return Err(EngineError::Net(mismatch(*hash)));
+        }
+        put(hash, bytes)?;
+        stored += 1;
+    }
+    Ok(stored)
 }
 
 /// The serve side's view of the reconciler (§5.2).
@@ -871,6 +902,50 @@ mod tests {
         // A head at a later seq is the origin moving on, and is taken normally.
         let next = SignedHead::sign(&key, origin.clone(), 2, Hash([1u8; 32]), 0);
         assert!(syncer.offer_head(&next, 0).unwrap().accepted());
+    }
+
+    /// A peer may only answer with what it was asked for.
+    ///
+    /// A self-consistent pair nobody requested counts as progress if it is
+    /// taken: the unproductive counter resets on every round, the fetch never
+    /// gives up on the peer, and the junk is written to the trie tables. Values
+    /// are held to it exactly as nodes are, which is why one helper does both.
+    #[test]
+    fn a_peer_may_not_answer_with_what_was_not_asked_for() {
+        let wanted = Hash::new(b"wanted");
+        let junk = b"nobody asked for this".to_vec();
+        let unrequested = Hash::new(&junk);
+        let stored = std::cell::RefCell::new(Vec::new());
+        let take = |requested: &[Hash], served: &[(Hash, Vec<u8>)]| {
+            take_served(
+                requested,
+                served,
+                "value",
+                |bytes| Some(Hash::new(bytes)),
+                |expected| NetError::ValueHashMismatch { expected },
+                |hash, _| {
+                    stored.borrow_mut().push(*hash);
+                    Ok(())
+                },
+            )
+        };
+
+        let err = take(&[wanted], &[(unrequested, junk.clone())])
+            .expect_err("an unrequested value is refused");
+        assert!(err.to_string().contains("unrequested"), "{err}");
+        assert!(stored.borrow().is_empty(), "and nothing was written");
+
+        // What was asked for is taken, and a payload that does not hash to the
+        // hash it was requested by is still refused on its own terms.
+        assert_eq!(take(&[unrequested], &[(unrequested, junk)]).unwrap(), 1);
+        assert!(matches!(
+            take(
+                &[unrequested],
+                &[(unrequested, b"different bytes".to_vec())]
+            ),
+            Err(EngineError::Net(NetError::ValueHashMismatch { .. }))
+        ));
+        assert_eq!(*stored.borrow(), vec![unrequested]);
     }
 
     #[test]
