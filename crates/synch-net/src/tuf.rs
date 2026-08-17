@@ -169,7 +169,8 @@ const STATE_FORMAT_VERSION: u64 = 2;
 /// and a hostile mirror gets one client's versions to walk back, not one per
 /// domain it is asked about.
 ///
-/// The on-disk format is versioned by [`STATE_FORMAT_VERSION`].
+/// The on-disk format is versioned; a file this build cannot read is
+/// ignored rather than trusted, which lands on the bootstrap pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinState {
     /// The accepted `root.json`, verbatim — the next update chains from it.

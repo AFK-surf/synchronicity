@@ -26,6 +26,8 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# The simulated zone/log harness, for tests only.
+synch-net = { workspace = true, features = ["sim"] }
 tempfile.workspace = true
 time.workspace = true
 

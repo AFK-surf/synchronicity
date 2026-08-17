@@ -60,7 +60,7 @@ pub fn query_name(domain: &str) -> String {
 /// One name per zone, at the apex — one zone key, one proof set. The apex
 /// comes from the `apex=` field of the membership answer, held between the
 /// signing zone the RRSIG names and the domain being resolved (see
-/// [`apex_of`]); the RRSIG signer is the *bound*, not the lookup.
+/// `apex_of`); the RRSIG signer is the *bound*, not the lookup.
 pub fn rekor_query_name(zone: &str) -> String {
     format!("{}.{}", rekor::REKOR_TXT_PREFIX, zone)
 }
@@ -490,7 +490,7 @@ pub struct ValidatedTxt {
     pub ttl: Duration,
     /// The zone whose RRSIG covered this answer, as the signature named it —
     /// checked to enclose the queried name before the answer was accepted
-    /// (see [`secure_txt`]).
+    /// (see `secure_txt`).
     pub signer: Name,
     /// The key tag that RRSIG selected, for the transparency lookup.
     pub key_tag: u16,
