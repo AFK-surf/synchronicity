@@ -62,7 +62,7 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5]
+  [v1, v2, v3, v4, v5, v6]
 }
 
 /// V5: `tuf_material` stops keeping the root chain.
@@ -433,4 +433,30 @@ CREATE TABLE audit_log (
   action TEXT NOT NULL,
   detail TEXT NOT NULL
 );
+"
+
+/// V6: a staging slot for the key a rollover is bringing in.
+///
+/// Without it a zone key cannot be replaced at all: `ensure_meta` refuses
+/// to boot when the key file disagrees with `dnskey_public`, and the
+/// DNSKEY RRset is built from that one column, so the RRset can never hold
+/// two keys. That makes DNSSEC's ordinary rollover — publish the incoming
+/// key beside the outgoing one, wait for the parent DS and for caches to
+/// pick it up, then switch signers — unrepresentable, and with
+/// `CP_REKOR_REQUIRE=true` it deadlocks outright: the publish gate demands
+/// the active key already be logged, `rekor-publish` claims the key set it
+/// reads from live DNS, and a key cannot be in live DNS before it is
+/// served.
+///
+/// The incoming key is public-only and never signs. It rides in the DNSKEY
+/// RRset so the parent can be given its DS and so `rekor-publish` can claim
+/// it, and `zone-key promote` moves it into `dnskey_public` once both are
+/// true. Empty means no rollover in flight, which is every zone until
+/// somebody starts one.
+const v6 = "
+ALTER TABLE zone_meta
+  ADD COLUMN dnskey_incoming BLOB NOT NULL DEFAULT x''
+  CHECK (length(dnskey_incoming) IN (64, 0));
+ALTER TABLE zone_meta
+  ADD COLUMN key_tag_incoming INTEGER NOT NULL DEFAULT 0;
 "

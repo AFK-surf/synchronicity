@@ -648,8 +648,9 @@ ceremony, and the reason is §2.2: a `create` or `rollover` entry carries a
 DNSSEC chain, a chain starts at the apex's DS, and there is no DS to fetch
 before the parent publishes it. So the sequence is: create the key → publish
 the DNSKEY in the zone → get the DS into the parent → **then** log. The
-existing two-key rollover window covers the gap; the old key keeps signing
-until the new one is logged, which is exactly what that window is for.
+two-key rollover window covers the gap: `zone-key stage` puts the incoming
+key in the DNSKEY RRset without making it a signer, so the old key keeps
+signing until the new one is logged (§5.4).
 
 The command says out loud what publishing now means, because there is no
 longer any way to publish quietly:
@@ -771,29 +772,52 @@ unsaid, because each is the kind of thing a reader may assume is present:
 Zone-key rollover stays the rare, manual, two-DS dance — with the logging
 step moved **after** the parent DS, for the reason in §5.2:
 
-1. `keygen` the new key.
-2. Publish both DNSKEYs in the zone.
-3. Add the second DS at the parent, and wait for it to be live.
-4. `rekor-publish <apex> <newkey>` — action `rollover`, naming the old tag,
-   carrying the chain that the new DS makes buildable. The action and the
-   replaced tag come from the records already stored for the apex; there is
-   no old key file to name. **Expect every monitor
-   watching the zone to report the new key** — that is what publishing now
-   means, there is nothing to suppress it with, and it is the reason step 0
-   of this runbook is telling whoever watches the monitor.
-5. Publish the new proof record (the command republishes the zone for you).
-6. Switch signing to the new key.
-7. Retire: `rekor-retire <apex> <oldkey>`, then drop the old DNSKEY, DS and
-   proof record.
+1. `keygen <apex> new.key`.
+2. `zone-key stage <apex> old.key new.key` — the incoming key joins the
+   DNSKEY RRset. `zone_meta` keeps it in a staging slot (`dnskey_incoming`)
+   that is *published but never a signer*, so the zone still validates under
+   the DS the parent already has.
+3. Add the second DS at the parent, and wait for it to be live and for the
+   old DS's TTL to pass.
+4. `rekor-publish <apex> old.key` — action `rollover`, naming the old tag,
+   carrying the chain that the new DS makes buildable, and claiming the
+   **two-key set** the zone now serves. The key file here is still the
+   *active* one: it is what re-signs the zone at the end of the command, and
+   the claim itself comes from live DNS rather than from any key file. The
+   action and the replaced tag come from the records already stored for the
+   apex. **Expect every monitor watching the zone to report the new key** —
+   that is what publishing now means, there is nothing to suppress it with,
+   and it is the reason step 0 of this runbook is telling whoever watches
+   the monitor.
+5. Swap `CP_KEY_FILE` to the new key and restart.
+6. `zone-key promote <apex> new.key` — the staged key becomes the signer and
+   the outgoing key leaves the RRset.
+7. Remove the old DS at the parent, then `rekor-retire <apex> old.key` and
+   drop the old proof record.
 
-**Nothing enforces that ordering but the operator.** In particular the
-dashboard does not refuse the signing-switch step while the new key lacks a
-verified record: it says nothing about zone keys at all, and manages orgs,
-networks and devices. The only automatic enforcement
-anywhere on this side is the publish gate of §5.3, which is off by default and
-is about the *active* key rather than about the order of a rollover. Steps 1–7
-are a runbook, and they are a runbook because a zone-key rollover is rare,
-manual and human-supervised on purpose.
+**Step 6 is enforced; the rest is the operator's.** Promotion runs through
+the publish gate of §5.3, so with `CP_REKOR_REQUIRE=true` it refuses a key
+that was never logged — the one ordering mistake in this sequence that would
+produce a zone clients reject — and says which step was skipped. Staging in
+step 2 is deliberately *not* gated: the signing key is unchanged and already
+on the record, so there is nothing there for the gate to hold back, and
+gating it would only move the deadlock described below.
+
+The remaining steps are unenforced. In particular the dashboard says nothing
+about zone keys at all — it manages orgs, networks and devices — and nothing
+checks that the parent DS actually went live before step 4. Those are a
+runbook, and they are a runbook because a zone-key rollover is rare, manual
+and human-supervised on purpose.
+
+**Why a staging slot exists at all.** Without one, rollover under
+`CP_REKOR_REQUIRE=true` is not merely unenforced but impossible. The gate
+demands the active key already be on the public record; `rekor-publish`
+claims the key set it reads from *live DNS*; and a key cannot be in live DNS
+before the zone serves it. Publishing the new key required having logged it,
+and logging it required having published it. Separating *published* from
+*active* is what breaks the cycle: the incoming key sits in the RRset, where
+the parent and the log can both see it, while the outgoing key keeps
+signing.
 
 Key *loss* recovery follows the same steps and is **not a special case**: an
 ordinary `rekor-publish` producing an ordinary reported authorization,

@@ -77,6 +77,10 @@ pub fn main() {
       run_or_die(fn() { rekor_publish(apex, key_file, "") })
     ["rekor-retire", apex, key_file] ->
       run_or_die(fn() { rekor_publish(apex, key_file, "retire") })
+    ["zone-key", "stage", apex, key_file, incoming_key_file] ->
+      run_or_die(fn() { zone_key_stage(apex, key_file, incoming_key_file) })
+    ["zone-key", "promote", apex, key_file] ->
+      run_or_die(fn() { zone_key_promote(apex, key_file) })
     ["provider-sync"] -> run_or_die(provider_sync_once)
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(run_seed)
@@ -84,7 +88,7 @@ pub fn main() {
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | rekor-retire <apex> <keyfile> | provider-sync | seed | seed-admin <email> | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <apex> <keyfile> | rekor-retire <apex> <keyfile> | zone-key stage <apex> <keyfile> <incoming-keyfile> | zone-key promote <apex> <keyfile> | provider-sync | seed | seed-admin <email> | migrate-check",
       )
       halt(2)
     }
@@ -637,5 +641,105 @@ fn endpoint(listen: config.Listen) -> String {
   case string.contains(listen.address, ":") {
     True -> "[" <> listen.address <> "]:" <> int.to_string(listen.port)
     False -> listen.address <> ":" <> int.to_string(listen.port)
+  }
+}
+
+/// Step 1 of a zone-key rollover: publish the incoming key beside the one
+/// in service, without handing it any signing duty.
+///
+/// The zone then serves a two-key DNSKEY RRset, still signed by the active
+/// key. That is what makes the rest of the rollover possible: the parent
+/// can be given the incoming DS, and `rekor-publish` can claim a key set
+/// that already contains the incoming key — which is the step the publish
+/// gate will look for when the incoming key later takes over.
+fn zone_key_stage(
+  apex_text: String,
+  key_file: String,
+  incoming_key_file: String,
+) -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use apex <- result.try(
+    name.parse(apex_text) |> result.replace_error("invalid apex domain"),
+  )
+  use csk <- result.try(keys.load(key_file))
+  use incoming <- result.try(keys.load(incoming_key_file))
+  use conn <- result.try(open_primary_db(cfg))
+  case
+    publish.stage_incoming(
+      conn,
+      csk,
+      incoming.public,
+      now_unix(),
+      "zone-key stage",
+    )
+  {
+    Ok(_) -> {
+      io.println("; incoming key staged and published beside the active key.")
+      print_material(apex, incoming)
+      io.println("")
+      io.println("; next: give the parent zone the DS above, wait for it to")
+      io.println("; appear and for the old DS's TTL to pass, then run")
+      io.println(
+        ";   controlplane rekor-publish " <> apex_text <> " " <> key_file,
+      )
+      io.println("; so the log entry claims a key set containing both keys.")
+      io.println("; only then swap in the incoming key file and run")
+      io.println(
+        ";   controlplane zone-key promote "
+        <> apex_text
+        <> " <incoming-keyfile>",
+      )
+      Ok(Nil)
+    }
+    Error(publish.IncomingIsActive) ->
+      Error("that key is already the active zone key")
+    Error(other) -> Error("staging the incoming key: " <> string.inspect(other))
+  }
+}
+
+/// Step 2: the staged key becomes the signer and the outgoing key leaves
+/// the RRset. `key_file` is the incoming key's own file.
+///
+/// Gated: after this the zone is signed by the incoming key, so under
+/// `CP_REKOR_REQUIRE=true` it refuses unless that key is already on the
+/// public record — which is exactly what step 1 and the `rekor-publish`
+/// between them arranged.
+fn zone_key_promote(
+  apex_text: String,
+  key_file: String,
+) -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use _apex <- result.try(
+    name.parse(apex_text) |> result.replace_error("invalid apex domain"),
+  )
+  use csk <- result.try(keys.load(key_file))
+  use conn <- result.try(open_primary_db(cfg))
+  case publish.promote_incoming(conn, csk, now_unix(), "zone-key promote") {
+    Ok(_) -> {
+      io.println("; promoted: the zone is now signed by this key, and the")
+      io.println("; outgoing key has left the DNSKEY RRset.")
+      io.println("; next: remove the outgoing DS from the parent, then run")
+      io.println(
+        ";   controlplane rekor-publish " <> apex_text <> " " <> key_file,
+      )
+      io.println("; so the record claims only the key now in service.")
+      Ok(Nil)
+    }
+    Error(publish.NoIncomingKey) ->
+      Error("no rollover in flight: run `zone-key stage` first")
+    Error(publish.KeyMismatch) ->
+      Error("this is not the staged incoming key file")
+    // The gate refusing here means the incoming key was never logged while
+    // it was staged — the one ordering mistake this whole sequence exists
+    // to prevent, so name the step that was skipped rather than the rule.
+    Error(publish.NoRekorRecord(tag)) ->
+      Error(
+        "the incoming key (tag "
+        <> int.to_string(tag)
+        <> ") is not on the public record: run `rekor-publish` while it is "
+        <> "still staged, then promote",
+      )
+    Error(other) ->
+      Error("promoting the incoming key: " <> string.inspect(other))
   }
 }

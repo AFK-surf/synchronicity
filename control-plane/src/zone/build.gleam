@@ -85,10 +85,19 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
       ttl_infra,
       list.map(input.ns_hosts, fn(h) { rdata.ns(h.host) }),
     )
-  let dnskey =
-    Rrset(apex, wire.type_dnskey, ttl_infra, [
+  // Both keys while a rollover is in flight, so the parent can be handed
+  // the incoming DS and `rekor-publish` can claim a set that already
+  // contains the key about to take over. Only the active key signs; the
+  // canonical RDATA sort in `dnssec/sign` puts the RRset in wire order for
+  // the RRSIG regardless of which order they are listed in here.
+  let dnskey_rdatas = case input.meta.dnskey_incoming {
+    <<>> -> [rdata.dnskey(keys.flags, keys.algorithm, input.meta.dnskey_public)]
+    incoming -> [
       rdata.dnskey(keys.flags, keys.algorithm, input.meta.dnskey_public),
-    ])
+      rdata.dnskey(keys.flags, keys.algorithm, incoming),
+    ]
+  }
+  let dnskey = Rrset(apex, wire.type_dnskey, ttl_infra, dnskey_rdatas)
 
   use glue <- result.try(glue_rrsets(input, apex))
 

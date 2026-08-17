@@ -225,22 +225,44 @@ control plane itself with
   working. **Zone key rollover** (proactive) is the same dance with both
   DS records present during the window; v1 keeps this manual and rare.
 
-  **What the code supports today, stated plainly, because it is less than
-  the paragraph above used to promise.** The zone builder emits exactly
-  one DNSKEY, from `zone_meta.dnskey_public`, so there is no two-key
-  window to publish: a rollover is a swap, and validators that have
-  cached the old DS have a gap until the parent TTL runs out. Worse, with
-  `CP_REKOR_REQUIRE=true` the swap cannot be completed at all —
-  `rekor-publish` derives its claim from the key set **observed live on
-  the wire**, so a new key must already be serving before it can be
-  logged, and the gate will not let it serve until it is logged. The two
-  requirements are circular.
+  **The rollover, step by step.** `zone_meta` carries a staging slot for
+  the key coming in, so the zone can serve a two-key DNSKEY RRset while
+  the outgoing key keeps signing — the ordinary DNSSEC rollover, and the
+  thing that makes the sequence below possible at all:
 
-  So: **unset `CP_REKOR_REQUIRE`, restart, swap the key, wait for the DS,
-  run `rekor-publish <apex>`, then re-arm the gate and restart.** The
-  zone keeps serving throughout — the hourly re-sign is no longer gated
-  (see below) — but new *content* will not publish while the active key
-  is unlogged, which is the gate doing its job.
+  ```
+  controlplane keygen        <apex> /path/new.key      # 1. mint
+  controlplane zone-key stage <apex> /path/old.key /path/new.key
+                                                       # 2. publish both
+  #   3. add the new DS at the parent; wait for it to go live and for the
+  #      old DS's TTL to pass
+  controlplane rekor-publish <apex> /path/old.key      # 4. log both keys
+  #   5. swap CP_KEY_FILE to new.key, restart
+  controlplane zone-key promote <apex> /path/new.key   # 6. new key signs
+  #   7. remove the old DS at the parent
+  controlplane rekor-retire  <apex> /path/old.key      # 8. retire
+  ```
+
+  Step 2 is deliberately **not** gated: the signing key is unchanged and
+  already on the record, so there is no new claim for the gate to hold
+  back. Step 6 **is** gated, and that is the point — it refuses unless
+  the incoming key is already on the public record, which is what step 4
+  arranged. Getting the order wrong therefore fails at step 6 with a
+  message naming step 4, rather than producing a zone clients reject.
+
+  This ordering used to be impossible rather than merely unenforced. The
+  builder emitted exactly one DNSKEY, `ensure_meta` refused to boot on a
+  changed key file, and with `CP_REKOR_REQUIRE=true` the two requirements
+  were circular: `rekor-publish` claims the key set **observed live on the
+  wire**, so a key had to be serving before it could be logged, and the
+  gate would not let it serve until it was logged. Staging breaks the
+  cycle by separating *published* from *active* — the incoming key is in
+  the RRset, where the parent and the log can both see it, without signing
+  anything.
+
+  If you boot with the staged key file before promoting, the error says so
+  and names `zone-key promote`, rather than claiming the key file is
+  wrong.
 
   Every monitor watching the apex will report the new key — tell them
   first, and record the key tag.

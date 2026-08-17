@@ -28,7 +28,7 @@ import gleam/string
 fn input(txt_names: List(model.TxtName)) -> ZoneInput {
   let assert Ok(apex) = name.parse("sync.test.")
   ZoneInput(
-    ZoneMeta(apex, 7, <<>>, 0, 3600, 1_209_600, 604_800),
+    ZoneMeta(apex, 7, <<>>, 0, <<>>, 0, 3600, 1_209_600, 604_800),
     [],
     txt_names,
     [#(1, "proofblob")],

@@ -2,6 +2,7 @@ import dns/name
 import dns/query
 import dns/wire
 import dnssec/keys
+import dnssec/sign
 import fixtures.{demo_conn, nk}
 import gleam/bit_array
 import gleam/list
@@ -15,7 +16,17 @@ fn demo_input(csk: keys.Csk) -> ZoneInput {
   let assert Ok(owner) = name.parse("_synchronicity.prod.acme.sync.test.")
   let rd = keys.dnskey_rdata(csk)
   ZoneInput(
-    ZoneMeta(apex, 7, csk.public, keys.key_tag(rd), 3600, 1_209_600, 604_800),
+    ZoneMeta(
+      apex,
+      7,
+      csk.public,
+      keys.key_tag(rd),
+      <<>>,
+      0,
+      3600,
+      1_209_600,
+      604_800,
+    ),
     [NsHost(ns1, "127.0.0.1", "")],
     [
       TxtName(owner, [
@@ -253,4 +264,79 @@ pub fn udp_truncation_test() {
 
 fn rcode(flags: Int) -> Int {
   flags % 16
+}
+
+/// A zone mid-rollover serves both keys, signed by the outgoing one, and
+/// the signature verifies.
+///
+/// This is the property the whole staging mechanism rests on: a two-key
+/// DNSKEY RRset is still a validly signed RRset under the DS the parent
+/// already published, so publishing the incoming key costs the zone
+/// nothing. If the RRSIG did not cover both rdatas in canonical order,
+/// staging a key would take the zone bogus instead of preparing a
+/// rollover.
+pub fn a_staged_zone_serves_both_keys_under_one_valid_signature_test() {
+  let active = keys.generate()
+  let incoming = keys.generate()
+  let tag = keys.key_tag(keys.dnskey_rdata(active))
+  let input = demo_input(active)
+  let staged =
+    ZoneInput(
+      ..input,
+      meta: ZoneMeta(
+        ..input.meta,
+        dnskey_incoming: incoming.public,
+        key_tag_incoming: keys.key_tag(keys.dnskey_rdata(incoming)),
+      ),
+    )
+  let assert Ok(rrsets) = build.build(staged)
+  let assert Ok(dnskey) =
+    list.find(rrsets, fn(r) { r.rtype == wire.type_dnskey })
+
+  // Both keys are published...
+  assert list.length(dnskey.rdatas) == 2
+  assert list.contains(dnskey.rdatas, keys.dnskey_rdata(active))
+  assert list.contains(dnskey.rdatas, keys.dnskey_rdata(incoming))
+
+  // ...and the outgoing key's signature covers the pair.
+  let rrsig_rr =
+    sign.sign_rrset(
+      active,
+      tag,
+      staged.meta.apex,
+      dnskey.owner,
+      wire.type_dnskey,
+      dnskey.ttl,
+      dnskey.rdatas,
+      0,
+      100,
+    )
+  let size = bit_array.byte_size(rrsig_rr)
+  let assert Ok(signature) = bit_array.slice(rrsig_rr, size - 64, 64)
+  assert sign.verify_rrset(
+    active,
+    tag,
+    staged.meta.apex,
+    dnskey.owner,
+    wire.type_dnskey,
+    dnskey.ttl,
+    dnskey.rdatas,
+    0,
+    100,
+    signature,
+  )
+
+  // The incoming key signs nothing: it is published, not trusted.
+  assert !sign.verify_rrset(
+    incoming,
+    keys.key_tag(keys.dnskey_rdata(incoming)),
+    staged.meta.apex,
+    dnskey.owner,
+    wire.type_dnskey,
+    dnskey.ttl,
+    dnskey.rdatas,
+    0,
+    100,
+    signature,
+  )
 }
