@@ -78,7 +78,8 @@ pub struct HttpTiles {
 }
 
 impl HttpTiles {
-    /// A source reading from `base` (e.g. `https://log2025-1.rekor.sigstore.dev`).
+    /// A source reading from `base` — the log [`crate::discover`] resolved,
+    /// or whatever `--log` named.
     pub fn new(base: &str) -> Result<HttpTiles, MonitorError> {
         Ok(HttpTiles {
             base: base.trim_end_matches('/').to_string(),

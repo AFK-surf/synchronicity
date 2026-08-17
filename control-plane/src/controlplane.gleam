@@ -56,6 +56,7 @@ import store/migrate
 import store/pool
 import store/sqlite
 import tools/seed
+import tuf/anchor
 import tuf/fetch as tuf_fetch
 import wisp/wisp_mist
 import zone/model
@@ -172,9 +173,18 @@ fn rekor_publish(
   )
   use signing_zone <- result.try(signing_zone_of(cfg, apex))
   use csk <- result.try(keys.load(key_file))
-  use log_key <- result.try(client.log_key())
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
+  // Which shard to submit to comes out of the relayed TUF material, so a
+  // ceremony run after Sigstore rotates goes to the new log without a
+  // release. On a control plane that has never fetched, this fetches.
+  let tuf_source = tuf_fetch.url()
+  use target <- result.try(client.resolve(
+    conn,
+    tuf_fetch.http(tuf_source),
+    tuf_source,
+    now,
+  ))
   let claim = case forced_action {
     // The retiring subject is the CSK being taken out of service — the one
     // key this deployment ever put in the zone.
@@ -186,8 +196,8 @@ fn rekor_publish(
       conn,
       apex,
       signing_zone,
-      client.http(client.url()),
-      log_key,
+      client.http(target.url),
+      target.key,
       now,
       chain.doh(chain.resolver_url()),
       claim,
@@ -204,7 +214,9 @@ fn rekor_publish(
     <> string.join(list.map(outcome.key_tags, int.to_string), ",")
     <> " "
     <> outcome.action
-    <> ": log index "
+    <> ": "
+    <> target.url
+    <> " log index "
     <> int.to_string(outcome.log_index)
     <> case outcome.refreshed {
       True -> " (proof refreshed, no new entry)"
@@ -235,6 +247,10 @@ fn tuf_refresh() -> Result(Nil, String) {
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
   let source = tuf_fetch.url()
+  // Named in the output because it is the one thing about this command an
+  // operator cannot infer from the result: everything below the anchor is
+  // checked against it, so which anchor was used is the claim being made.
+  use anchored <- result.try(anchor.load())
   use outcome <- result.try(tuf_fetch.refresh(
     conn,
     tuf_fetch.http(source),
@@ -247,7 +263,9 @@ fn tuf_refresh() -> Result(Nil, String) {
   )
   sqlite.close(conn)
   io.println(
-    "tuf: root "
+    "tuf: verified against "
+    <> anchor.describe(anchored)
+    <> " — root "
     <> int.to_string(outcome.root_version)
     <> ", timestamp "
     <> int.to_string(outcome.timestamp_version)
@@ -502,7 +520,6 @@ fn serve_external(
   cfg: Config,
   provider_cfg: config.ProviderConfig,
 ) -> Result(Nil, String) {
-  use log_key <- result.try(client.log_key())
   use apex <- result.try(
     name.parse(cfg.base_domain) |> result.replace_error("bad base domain"),
   )
@@ -575,8 +592,6 @@ fn serve_external(
       apex,
       signing_zone,
       chain.doh(chain.resolver_url()),
-      client.http(client.url()),
-      log_key,
       sync_name,
     ))
     |> sup.start

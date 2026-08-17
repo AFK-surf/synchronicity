@@ -488,12 +488,13 @@ fn ed25519_verify(
 
 /// Verifies that the pinned log key signed this checkpoint.
 ///
-/// The algorithm follows the key: a 64-byte point is an uncompressed P-256
-/// key whose checkpoint signatures are raw `r||s` (rekor.sigstore.dev and a
-/// self-hosted or simulated log); a 32-byte point is Ed25519
-/// (log2025-1.rekor.sigstore.dev, the default public log). One matching
-/// signature line is enough — the other signature lines beside it are parsed
-/// and simply not our key.
+/// The algorithm follows the key, never the endpoint: a 64-byte point is an
+/// uncompressed P-256 key whose checkpoint signatures are raw `r||s`, and a
+/// 32-byte point is Ed25519. Sigstore's shards have used both, and which one
+/// a given log signs with is a property of the key the trusted root names
+/// beside it (`tuf/trusted_root`) rather than something this build knows in
+/// advance. One matching signature line is enough — the other signature
+/// lines beside it are parsed and simply not our key.
 pub fn verify_checkpoint(
   checkpoint: Checkpoint,
   log_public: BitArray,

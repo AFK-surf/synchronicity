@@ -65,6 +65,7 @@
 #![deny(missing_docs)]
 
 pub mod classify;
+pub mod discover;
 pub mod state;
 pub mod tiles;
 

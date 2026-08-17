@@ -14,6 +14,7 @@ use synch_net::{
     error::NetError,
     rekor::{self, HashedRekordBody, LogKeys, ProofError, RekorProof, ZoneKey},
     sim::{hashedrekord_body, SimLog, SimZone},
+    tuf,
     zonecert::OID_DNSSEC_CHAIN,
 };
 
@@ -892,8 +893,9 @@ fn regenerate_the_shared_fixture() {
 /// ever claimed in a log nobody can edit, and the chain is self-anchored for
 /// the same reason — we own no DNSSEC-signed domain, and minting a
 /// certificate naming somebody else's would be squatting. Afterwards the
-/// pinned constants in this file and in `crates/synch-monitor/tests/
-/// real_entry.rs` move with it, and PROVENANCE.txt is rewritten.
+/// index and origin asserted in this file and in `crates/synch-monitor/tests/
+/// real_entry.rs` move with it, and PROVENANCE.txt is rewritten — including
+/// the log it names, which this run discovers rather than assumes.
 #[tokio::test]
 #[ignore]
 async fn publish_a_real_entry() {
@@ -902,9 +904,21 @@ async fn publish_a_real_entry() {
         Some("yes-write-to-the-real-log"),
         "refusing to write to a permanent public log without being asked"
     );
-    const LOG: &str = "https://log2025-1.rekor.sigstore.dev";
-    // SHA-256 of the log's DER SubjectPublicKeyInfo, pinned in this build.
-    const LOG_ID: &str = "b54813cb63d8859870a5e78500cc6adcfdf59723edae93ee8d25faf2475a0690";
+    // Which shard to write to is discovered, not pinned here: a fixture
+    // regeneration run after Sigstore rotates must reach the log that is
+    // actually open, not POST into a closed one and report the 4xx as a
+    // format problem. The log id follows from the same entry's key, which is
+    // also the pin the verification below will select on.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
+    let tlogs = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes())
+        .expect("the embedded trusted root lists its logs");
+    let open = tuf::current_tlog(&tlogs, now).expect("Sigstore has a shard open");
+    let log = open.base_url.clone();
+    let log_id = open.log_id;
+    println!("publishing to {log}");
 
     let zone = SimZone::new("zone-key-transparency.demo.invalid", member_records());
     let statement = zone.zone_key_statement("rollover");
@@ -929,7 +943,7 @@ async fn publish_a_real_entry() {
         .build()
         .expect("http client");
     let response = http
-        .post(format!("{LOG}/api/v2/log/entries"))
+        .post(format!("{log}/api/v2/log/entries"))
         .header("content-type", "application/json")
         .header("accept", "application/json")
         .body(request)
@@ -970,7 +984,7 @@ async fn publish_a_real_entry() {
         .collect();
 
     let proof = RekorProof {
-        log_id: hex::decode(LOG_ID).unwrap().try_into().unwrap(),
+        log_id,
         log_index,
         statement: statement_json.clone(),
         canonicalized_body,

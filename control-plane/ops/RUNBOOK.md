@@ -70,11 +70,12 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link mail (absent = log-only) |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |
-| `CP_REKOR_URL` | primary | zone-key transparency log, default `https://log2025-1.rekor.sigstore.dev` |
-| `CP_REKOR_KEY` | primary | file pinning the log's verification key; defaults to the embedded log2025-1.rekor.sigstore.dev snapshot |
+| `CP_REKOR_URL` | primary | zone-key transparency log; unset, the shard in service is read from the relayed `trusted_root.json` |
+| `CP_REKOR_KEY` | primary | file pinning the log's verification key; unset, it comes from the same trusted-root entry as the endpoint |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query` |
 | `CP_TUF_URL` | primary | Sigstore TUF repository relayed in the zone, default `https://tuf-repo-cdn.sigstore.dev` |
+| `CP_TUF_ROOT` | primary | `root.json` this service anchors TUF verification on; defaults to `priv/tuf/sigstore_tuf_root.json`, the root the client embeds |
 
 > **Why the database gets its own directory.** Each SQLite connection
 > runs in a `csqlite` worker sandboxed (Landlock on Linux, `unveil`/
@@ -121,6 +122,14 @@ secrets.** Protect the replication bucket accordingly.
    checkpoint against a grown tree. Nothing is stored that did not
    verify.
 
+   **Which log it submits to is discovered, not compiled in.** The shard
+   in service and its verification key both come out of the
+   `trusted_root.json` this service relays (step 4), so a Sigstore
+   rotation is a `tuf-refresh` away rather than a release away. On a host
+   that has never fetched, this command does step 4's fetch first; a
+   deployment with no egress to `CP_TUF_URL` names the log itself with
+   `CP_REKOR_URL` and `CP_REKOR_KEY` together.
+
    **It needs the DS to be live first.** The entry carries the DNSSEC
    chain from the apex's DS up to the root, which is what lets a monitor
    decide offline whether this key was ever delegated — and there is
@@ -160,9 +169,15 @@ secrets.** Protect the replication bucket accordingly.
    `_synchronicity-tuf.<apex>` (docs/REKOR-ZONE-KEY.md §10). Clients
    verify that chain offline against a TUF root built into them and adopt
    the log keys it names, so Sigstore's log rotations stop being a client
-   upgrade. This service checks structure, versions and expiries only —
-   it is a relay, not the verifier — and refuses a fetch that would walk
-   clients backwards. The hourly job refetches on its own once the stored
+   upgrade. The same file is what this service reads to decide where to
+   submit (step 3), so the rotation stops being a control-plane upgrade
+   too. Because of that second job, this service verifies the chain itself
+   before storing it — signatures over canonical JSON, role thresholds,
+   expiries and monotonicity, anchored on `priv/tuf/sigstore_tuf_root.json`,
+   the same root the client embeds — and refuses anything that does not
+   check out, keeping whatever was already stored. `CP_TUF_ROOT` names a
+   different anchor for a deployment running its own TUF repository.
+   The hourly job refetches on its own once the stored
    timestamp is within three days of expiring; run this by hand after any
    long outage, or on an egress host before couriering the database in an
    air-gapped deployment. Skipping it entirely is fine: clients keep the

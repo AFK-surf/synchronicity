@@ -57,8 +57,6 @@ type State {
     apex: dns_name.Name,
     signing_zone: dns_name.Name,
     resolver: chain.Resolver,
-    log: Log,
-    log_key: #(BitArray, BitArray),
     reconciler: Name(provider_sync.Msg),
     subject: Subject(Msg),
   )
@@ -69,8 +67,6 @@ pub fn supervised(
   apex: dns_name.Name,
   signing_zone: dns_name.Name,
   resolver: chain.Resolver,
-  log: Log,
-  log_key: #(BitArray, BitArray),
   reconciler: Name(provider_sync.Msg),
 ) -> supervision.ChildSpecification(Nil) {
   supervision.worker(fn() {
@@ -84,8 +80,6 @@ pub fn supervised(
           apex,
           signing_zone,
           resolver,
-          log,
-          log_key,
           reconciler,
           subject,
         ))
@@ -102,16 +96,28 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case db.open_primary(state.db_path) {
     Error(_) -> io.println_error("zonekey-watch: database unavailable")
     Ok(conn) -> {
-      let poked =
-        run_once_with(
-          conn,
-          state.apex,
-          state.signing_zone,
-          state.resolver,
-          state.log,
-          state.log_key,
-          now_unix(),
-        )
+      let now = now_unix()
+      // The log is resolved on every tick rather than captured at boot: this
+      // process is meant to run for months, and Sigstore opening the next
+      // shard should cost a TUF refresh, not a restart. Failing to resolve
+      // is a log line like every other failure here — the claim already in
+      // the zone keeps verifying while it is unresolvable.
+      let poked = case client.discover(conn, now) {
+        Error(why) -> {
+          io.println_error("zonekey-watch: no transparency log: " <> why)
+          False
+        }
+        Ok(target) ->
+          run_once_with(
+            conn,
+            state.apex,
+            state.signing_zone,
+            state.resolver,
+            client.http(target.url),
+            target.key,
+            now,
+          )
+      }
       sqlite.close(conn)
       case poked {
         True -> provider_sync.poke(state.reconciler)

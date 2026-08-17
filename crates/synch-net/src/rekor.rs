@@ -135,46 +135,6 @@ pub const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
 /// not possession.
 pub const PREDICATE_TYPE: &str = "https://synchronicity.sh/zone-key/v2";
 
-/// The log verification keys compiled into this build — the **bootstrap**
-/// set, not the last word.
-///
-/// A snapshot of Sigstore's production transparency logs, taken from the
-/// TUF repository's `trusted_root.json` (consistent-snapshot target
-/// `6494e21e…`, its SHA-256 checked against the signed `targets.json`;
-/// fetched 2026-08-15 from `tuf-repo-cdn.sigstore.dev`).
-///
-/// These are what a client runs on until it learns better. The in-client TUF
-/// workflow ships (§10, [`crate::tuf`]): a client that accepts a TUF bundle
-/// relayed by a zone runs on the tlogs that bundle's `trusted_root.json`
-/// names instead, persisted in `<data-dir>/rekor-pins.json` and **replacing**
-/// this set rather than unioning with it. So the resolution order is
-/// `--rekor-key` if given, else the last TUF-verified pin set, else this.
-/// Rotating a Sigstore log key is therefore not a new build any more; only a
-/// TUF-*root*-level incident is.
-///
-/// Note that this format's `log_id` is always SHA-256 over the DER
-/// SubjectPublicKeyInfo, computed here from the key bytes themselves.
-///
-/// **There are two 32-byte log ids in play and only one of them is ours.**
-/// Rekor's `TransparencyLogEntry.logId.keyId` — which sits a few lines away
-/// from the checkpoint in the same JSON response, and is exactly as long, and
-/// looks exactly as plausible — is the C2SP **note key id**,
-/// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`. Copying that value into a proof
-/// produces a record that matches no pin and fails with "unknown log", which
-/// reads like a misconfigured pin set rather than the mix-up it is. The
-/// trusted root shows the same split: it agrees with us for the P-256 log and
-/// disagrees for the Ed25519 one. What a proof's `log_id` must match is this
-/// convention. (Found the hard way while driving a live submission; the
-/// control plane's `rekor/proof.log_id` was right all along.)
-pub const EMBEDDED_LOG_KEYS: &str = "\
-# Sigstore production transparency logs, snapshotted from the TUF
-# repository's trusted_root.json. See EMBEDDED_LOG_KEYS in rekor.rs.
-# rekor.sigstore.dev — ECDSA P-256, valid from 2021-01-12
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==
-# log2025-1.rekor.sigstore.dev — Ed25519, valid from 2025-09-23
-MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=
-";
-
 /// Why a zone-key transparency record was refused.
 ///
 /// The variants are the failure *classes* `synch doctor` explains: an absent
@@ -1212,15 +1172,40 @@ impl LogKey {
 /// A file of keys *replaces* the embedded set rather than adding to it —
 /// the same "an override is a different universe" semantics as
 /// `--dnssec-anchor`. An empty set accepts nothing.
+///
+/// A key is selected by `log_id`, and **there are two 32-byte log ids in play
+/// and only one of them is ours.** This format's is SHA-256 over the DER
+/// SubjectPublicKeyInfo, computed here from the key bytes themselves. Rekor's
+/// `TransparencyLogEntry.logId.keyId` — which sits a few lines away from the
+/// checkpoint in the same JSON response, and is exactly as long, and looks
+/// exactly as plausible — is the C2SP **note key id**,
+/// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`. Copying that value into a proof
+/// produces a record that matches no pin and fails with "unknown log", which
+/// reads like a misconfigured pin set rather than the mix-up it is. Sigstore's
+/// trusted root shows the same split — it agrees with us for the P-256 log
+/// and disagrees for the Ed25519 one — which is why [`crate::tuf::tlogs`]
+/// derives the id from `publicKey.rawBytes` and deliberately never reads the
+/// `logId.keyId` beside it. (Found the hard way while driving a live
+/// submission; the control plane's `rekor/proof.log_id` was right all along.)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogKeys {
     keys: Vec<LogKey>,
 }
 
 impl LogKeys {
-    /// The keys compiled into this build (see [`EMBEDDED_LOG_KEYS`]).
+    /// The bootstrap set: the logs the embedded `trusted_root.json` names
+    /// (see [`crate::tuf::EMBEDDED_TRUSTED_ROOT`]).
+    ///
+    /// These are what a client runs on until it learns better. A client that
+    /// accepts a TUF bundle relayed by a zone runs on the tlogs *that*
+    /// bundle's trusted root names instead, persisted in
+    /// `<data-dir>/rekor-pins.json` and **replacing** this set rather than
+    /// unioning with it (§10, [`crate::tuf`]). So the resolution order is
+    /// `--rekor-key` if given, else the last TUF-verified pin set, else this.
+    /// Rotating a Sigstore log key — or a whole log — is therefore not a new
+    /// build any more; only a TUF-*root*-level incident is.
     pub fn embedded() -> LogKeys {
-        LogKeys::parse(EMBEDDED_LOG_KEYS).unwrap_or_default()
+        crate::tuf::tlog_keys(crate::tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap_or_default()
     }
 
     /// Reads a key file: PEM `PUBLIC KEY` blocks, or one base64

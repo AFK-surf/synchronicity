@@ -1,30 +1,35 @@
-//// Fetching Sigstore's TUF metadata and storing it verbatim
+//// Fetching Sigstore's TUF metadata, verifying it, and storing it verbatim
 //// (docs/REKOR-ZONE-KEY.md §10.3).
 ////
-//// This service is a **relay, not the verifier**. It walks the repository
-//// the way TUF's consistent snapshots are meant to be walked — timestamp
-//// names the snapshot version, the snapshot names the targets version, the
-//// targets name the target's digest — and checks structure, versions,
-//// expiries and the one digest the chain hands it. It checks no
-//// signatures: the cryptographic gate is the client's, in
-//// crates/synch-net/src/tuf.rs. Nothing in CI carries what this side
-//// stores through that verifier — the e2e's zone-key leg is negative
-//// only — so the agreement rests on the shared fixtures both sides read,
-//// which is a weaker guarantee than an end-to-end run and worth knowing.
+//// This service relays the metadata a client verifies, and it **also
+//// verifies it itself** (`tuf/verify`), against the same anchor the client
+//// embeds. The second half used to be absent, on the argument that bad
+//// stored material cost nothing but zone bytes: clients ignore what does not
+//// verify and keep their pins, so a relay could be a relay. That stopped
+//// being the whole story when `rekor/client.discover` began reading the
+//// stored `trusted_root.json` to decide **where this service submits** —
+//// a decision no client ever sees, and so a decision no client can
+//// re-verify (§10.6).
 ////
-//// Bad stored material therefore costs nothing but zone bytes — clients
-//// ignore it and keep their pins — while a *regression* is refused here,
-//// because serving a client older material than it already has is the one
-//// thing a relay can do that a client cannot simply shrug off.
+//// So the walk is a walk — timestamp names the snapshot version, the
+//// snapshot names the targets version, the targets name the target's digest
+//// — and nothing it collects is stored until the whole chain verifies from
+//// the anchor down: signatures over canonical JSON, thresholds, expiries,
+//// monotonicity, and the target's digest. What is stored is therefore
+//// material this side has checked, not merely material it received.
 ////
 //// The repository arrives as an injected pair of functions rather than a
 //// hardwired endpoint, the same shape as `rekor/client`: everything this
 //// module decides is then testable without egress, and the HTTP leg stays
 //// one small function.
+////
+//// One thing verification does *not* do is gate serving. Stored material
+//// that has since expired keeps being relayed and keeps naming the log, on
+//// §10.2's rule that expiry gates updates and never operation. Expiry is
+//// checked at the moment of ingestion, where refusing costs nothing but a
+//// retry.
 
 import envoy
-import gleam/bit_array
-import gleam/crypto
 import gleam/http/request
 import gleam/httpc
 import gleam/int
@@ -33,17 +38,26 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import store/sqlite.{type Connection}
+import tuf/anchor
 import tuf/meta
 import tuf/store.{Material}
+import tuf/verify
 
 /// The oldest `root.json` version this release's clients can chain from —
 /// the floor §10.1 says is stated per release.
 ///
-/// It is the version crates/synch-net embeds (`EMBEDDED_TUF_ROOT`), so the
-/// chain the zone relays always starts exactly where a stock client starts.
+/// It is not a constant any more but the version of the anchor in
+/// `priv/tuf`, which is byte-identical to the one crates/synch-net embeds
+/// (`EMBEDDED_TUF_ROOT`). Reading it from the file rather than restating it
+/// keeps the walk, the verification and the relayed chain agreeing about
+/// where the bottom is by construction — a floor written down twice is a
+/// floor that eventually disagrees with itself.
+///
 /// Raising it is a release note: a client older than the floor keeps its
 /// pins rather than following, which is the designed failure.
-pub const root_floor = 15
+pub fn root_floor() -> Result(Int, String) {
+  anchor.load() |> result.map(fn(loaded) { loaded.version })
+}
 
 /// How many root versions past the floor the walk will probe before giving
 /// up. Sigstore rotates roughly yearly; this is decades of headroom and a
@@ -83,10 +97,16 @@ pub fn url() -> String {
 /// The HTTP repository at `base`.
 ///
 /// Plain GETs over verified TLS (gleam_httpc verifies certificates by
-/// default), and the verification is *not* load-bearing here: every byte
-/// fetched is self-authenticating and gets checked by the client against
-/// its embedded root. A hostile transport can deny this fetch; it cannot
-/// make it mean anything.
+/// default), and the TLS is *not* load-bearing: every byte fetched is
+/// self-authenticating and gets checked against the anchor in `priv/tuf`
+/// before it is stored, and again by the client against the identical root
+/// it embeds. A hostile transport can deny this fetch; it cannot make it
+/// mean anything.
+///
+/// That sentence used to be a half-truth — nothing on this side checked a
+/// signature, so a hostile transport could make the fetch mean whatever it
+/// liked to *this* process, which mattered once the material started naming
+/// the log to submit to. `tuf/verify` is what makes it true.
 pub fn http(base: String) -> Repo {
   Repo(get: fn(path) {
     let url = strip_slash(base) <> "/" <> path
@@ -105,7 +125,7 @@ pub fn http(base: String) -> Repo {
   })
 }
 
-/// Refetches the repository and stores it, refusing regressions.
+/// Refetches the repository, verifies the chain, and stores it.
 ///
 /// Returns the versions now stored. `changed` is false when the repository
 /// has published nothing since the last fetch, which is what most runs of
@@ -121,18 +141,21 @@ pub fn refresh(
     |> result.map_error(fn(e) { "reading tuf_material: " <> string.inspect(e) }),
   )
   let previous = option.from_result(stored)
+  use anchored <- result.try(anchor.load())
 
-  // The root chain, from the floor a stock client embeds up to whatever the
+  // The root chain, from the anchor this build holds up to whatever the
   // repository last published. The walk ends at the first version the
   // repository does not have — that is how TUF says "this is current".
-  use roots <- result.try(root_chain(repo, root_floor, []))
+  use roots <- result.try(
+    root_chain(repo, anchored.version, anchored.version, []),
+  )
   use #(root_version, _) <- result.try(case list.last(roots) {
     Ok(head) -> Ok(head)
     Error(Nil) ->
       Error(
         "the repository has no "
-        <> int.to_string(root_floor)
-        <> ".root.json, which is the root this build's clients embed",
+        <> anchor.describe(anchored)
+        <> ", which is the root this build chains from",
       )
   })
 
@@ -169,7 +192,10 @@ pub fn refresh(
   ))
 
   // The one target the whole chain exists to carry, named by its digest.
-  use #(digest, length) <- result.try(meta.read_target(
+  // Read here only to name the file to fetch — that the bytes match the
+  // digest is `verify`'s to say, where the digest itself has been checked
+  // against a signature.
+  use #(digest, _length) <- result.try(meta.read_target(
     targets,
     trusted_root_target,
   ))
@@ -177,60 +203,37 @@ pub fn refresh(
     repo,
     "targets/" <> digest <> "." <> trusted_root_target,
   ))
-  use Nil <- result.try(
-    case
-      sha256_hex(trusted_root) == string.lowercase(digest)
-      && bit_array.byte_size(trusted_root) == length
-    {
-      True -> Ok(Nil)
-      False ->
-        Error(
-          trusted_root_target
-          <> " does not match the digest targets.json names for it",
-        )
-    },
-  )
 
-  // Expiry: a relay that stores already-expired material is relaying
-  // something no client will ever adopt. Refuse it and keep what is there.
-  use Nil <- result.try(case timestamp_role.expires > now {
-    True -> Ok(Nil)
-    False ->
-      Error(
-        "timestamp.json expired at " <> int.to_string(timestamp_role.expires),
-      )
-  })
-
-  // Regressions: serving a client older material than it already accepted
-  // cannot help it and can only ever be someone trying to freeze it.
-  use Nil <- result.try(case previous {
-    None -> Ok(Nil)
+  // The gate. Everything above this line is a walk — it decided which files
+  // to ask for and nothing more. Signatures over canonical JSON, role
+  // thresholds, expiries, monotonicity against what is stored, and the
+  // target's digest are all checked here, from the anchor down, and nothing
+  // is stored unless they all hold.
+  let floors = case previous {
+    None -> verify.no_floors()
     Some(old) ->
-      list.try_fold(
-        [
-          #("root.json", root_version, old.root_version),
-          #("timestamp.json", timestamp_role.version, old.timestamp_version),
-          #("snapshot.json", snapshot_role.version, old.snapshot_version),
-          #("targets.json", targets_role.version, old.targets_version),
-        ],
-        Nil,
-        fn(_, triple) {
-          let #(file, fetched, have) = triple
-          case fetched >= have {
-            True -> Ok(Nil)
-            False ->
-              Error(
-                "refusing a regression: "
-                <> file
-                <> " fetched at version "
-                <> int.to_string(fetched)
-                <> ", stored is "
-                <> int.to_string(have),
-              )
-          }
-        },
+      verify.Floors(
+        root: old.root_version,
+        timestamp: old.timestamp_version,
+        snapshot: old.snapshot_version,
+        targets: old.targets_version,
       )
-  })
+  }
+  use _ <- result.try(
+    verify.verify(
+      anchored.bytes,
+      list.map(roots, fn(pair) { pair.1 }),
+      timestamp,
+      snapshot,
+      targets,
+      trusted_root,
+      floors,
+      now,
+    )
+    |> result.map_error(fn(e) {
+      "refusing material that does not verify: " <> verify.describe(e)
+    }),
+  )
 
   let material =
     Material(
@@ -284,17 +287,22 @@ pub fn due(conn: Connection, now: Int) -> Bool {
 /// How close to expiry the hourly job refetches (§10.3).
 pub const refetch_window = 259_200
 
-/// The target the chain exists to authenticate.
-pub const trusted_root_target = "trusted_root.json"
+/// The target the chain exists to authenticate. Defined by `tuf/verify`,
+/// which is the module that has to be right about it: the walk uses this
+/// name to build a path, the verifier uses it to look up a signed digest,
+/// and two spellings of it would mean fetching one file and checking
+/// another.
+pub const trusted_root_target = verify.trusted_root_target
 
 /// Walks `<version>.root.json` upward from `version` until the repository
-/// has no more.
+/// has no more, bounded relative to `floor`.
 fn root_chain(
   repo: Repo,
+  floor: Int,
   version: Int,
   acc: List(#(Int, BitArray)),
 ) -> Result(List(#(Int, BitArray)), String) {
-  case version > root_floor + root_ceiling {
+  case version > floor + root_ceiling {
     True ->
       Error("the repository's root chain does not end; refusing to walk on")
     False -> {
@@ -305,7 +313,7 @@ fn root_chain(
         Some(bytes) -> {
           use role <- result.try(meta.read_role(bytes, "root"))
           use Nil <- result.try(agrees(path, role.version, version))
-          root_chain(repo, version + 1, [#(version, bytes), ..acc])
+          root_chain(repo, floor, version + 1, [#(version, bytes), ..acc])
         }
       }
     }
@@ -342,8 +350,4 @@ fn strip_slash(base: String) -> String {
     True -> strip_slash(string.drop_end(base, 1))
     False -> base
   }
-}
-
-fn sha256_hex(bytes: BitArray) -> String {
-  string.lowercase(bit_array.base16_encode(crypto.hash(crypto.Sha256, bytes)))
 }
