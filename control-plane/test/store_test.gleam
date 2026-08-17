@@ -275,3 +275,38 @@ pub fn migrate_adds_the_rollover_slot_to_an_existing_zone_test() {
   assert incoming_tag == 0
   sqlite.close(conn)
 }
+
+/// The staging slot's length constraint survives `ALTER TABLE`.
+///
+/// SQLite restricts what `ADD COLUMN` may carry, and a constraint that is
+/// quietly not applied is worse than none: `dnskey_incoming` would accept a
+/// truncated key, `zone/build` would publish it as a DNSKEY, and the zone
+/// would serve a key nothing can validate. Checked rather than assumed.
+pub fn the_staging_slot_refuses_a_key_of_the_wrong_length_test() {
+  let assert Ok(conn) = db.open_primary(tmp_db())
+  let assert Ok(_) = migrate.migrate(conn)
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO zone_meta
+         (id, base_domain, soa_serial, dnskey_public, key_tag,
+          sig_inception_skew, sig_validity, sig_refresh_before)
+       VALUES (1, 'sync.test', 1, ?, 1, 3600, 1209600, 604800)",
+      [sqlite.Blob(<<7:size(512)>>)],
+    )
+  // A P-256 public key is 64 bytes; empty means no rollover in flight.
+  let assert Ok(_) =
+    sqlite.exec(conn, "UPDATE zone_meta SET dnskey_incoming = ?", [
+      sqlite.Blob(<<9:size(512)>>),
+    ])
+  let assert Ok(_) =
+    sqlite.exec(conn, "UPDATE zone_meta SET dnskey_incoming = ?", [
+      sqlite.Blob(<<>>),
+    ])
+  // Anything else is refused by the database itself.
+  let assert Error(_) =
+    sqlite.exec(conn, "UPDATE zone_meta SET dnskey_incoming = ?", [
+      sqlite.Blob(<<1, 2, 3, 4, 5>>),
+    ])
+  sqlite.close(conn)
+}
