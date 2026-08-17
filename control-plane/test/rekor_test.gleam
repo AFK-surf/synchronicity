@@ -313,6 +313,7 @@ fn publish_run(
   rekor_publish.run(
     conn,
     apex,
+    apex,
     log,
     log_key,
     now,
@@ -637,6 +638,7 @@ pub fn publish_refuses_when_the_ds_is_not_live_yet_test() {
     rekor_publish.run(
       conn,
       apex,
+      apex,
       log,
       #(spki, point),
       1000,
@@ -658,6 +660,7 @@ pub fn a_retire_may_be_chainless_test() {
   let assert Ok(outcome) =
     rekor_publish.run(
       conn,
+      apex,
       apex,
       log,
       #(spki, point),
@@ -752,7 +755,7 @@ pub fn a_malformed_chain_is_refused_before_publishing_test() {
     chain.Link("test.", <<2>>),
     chain.Link(".", <<3>>),
   ]
-  let assert Ok(Nil) = chain.check_shape(full, apex)
+  let assert Ok(Nil) = chain.check_shape(full, apex, apex)
 
   // No declaration: a bare ladder is public data anyone could have collected,
   // so it is not this zone's statement about itself.
@@ -761,7 +764,7 @@ pub fn a_malformed_chain_is_refused_before_publishing_test() {
     chain.Link("test.", <<2>>),
     chain.Link(".", <<3>>),
   ]
-  let assert Error(why) = chain.check_shape(bare, apex)
+  let assert Error(why) = chain.check_shape(bare, apex, apex)
   assert string.contains(why, "_synchronicity-transparency")
 
   // A TLD DNSKEY on top, anchoring against nothing any reader holds.
@@ -770,7 +773,7 @@ pub fn a_malformed_chain_is_refused_before_publishing_test() {
     chain.Link("sync.test.", <<1>>),
     chain.Link("test.", <<2>>),
   ]
-  let assert Error(why) = chain.check_shape(rootless, apex)
+  let assert Error(why) = chain.check_shape(rootless, apex, apex)
   assert string.contains(why, "root")
 
   // A ladder with a rung missing.
@@ -779,7 +782,7 @@ pub fn a_malformed_chain_is_refused_before_publishing_test() {
     chain.Link("sync.test.", <<1>>),
     chain.Link(".", <<3>>),
   ]
-  let assert Error(_) = chain.check_shape(spliced, apex)
+  let assert Error(_) = chain.check_shape(spliced, apex, apex)
 
   // A declaration for somebody else's zone.
   let assert Error(_) =
@@ -790,7 +793,8 @@ pub fn a_malformed_chain_is_refused_before_publishing_test() {
         chain.Link(".", <<3>>),
       ],
       apex,
+      apex,
     )
-  let assert Error(_) = chain.check_shape([declaration], apex)
-  let assert Error(_) = chain.check_shape([], apex)
+  let assert Error(_) = chain.check_shape([declaration], apex, apex)
+  let assert Error(_) = chain.check_shape([], apex, apex)
 }

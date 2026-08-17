@@ -181,8 +181,11 @@ pub fn publish_external(
   conn: Connection,
   now: Int,
   actor: String,
+  signing_zone: String,
 ) -> Result(Int, PublishError) {
-  sqlite.transaction(conn, Db, fn() { publish_external_in_tx(conn, now, actor) })
+  sqlite.transaction(conn, Db, fn() {
+    publish_external_in_tx(conn, now, actor, signing_zone)
+  })
 }
 
 /// The external-mode publish body (docs/EXTERNAL-DNS-PROVIDER.md): bump the
@@ -195,6 +198,7 @@ pub fn publish_external_in_tx(
   conn: Connection,
   now: Int,
   actor: String,
+  signing_zone: String,
 ) -> Result(Int, PublishError) {
   use _ <- result.try(exec(
     conn,
@@ -202,7 +206,7 @@ pub fn publish_external_in_tx(
   ))
   use input <- result.try(model.read(conn) |> result.map_error(Model))
   use records <- result.try(
-    render_external.render(input) |> result.map_error(Build),
+    render_external.render(input, signing_zone) |> result.map_error(Build),
   )
   use _ <- result.try(
     sqlite.exec(

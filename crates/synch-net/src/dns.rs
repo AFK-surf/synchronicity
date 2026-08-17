@@ -562,7 +562,7 @@ impl DnssecResolver {
     ///
     /// Under [`RekorPolicy::Require`] this is where §4.2's three validated
     /// lookups happen, over the one DoH transport: the membership TXT, the
-    /// DNSKEY at the apex its RRSIG names, and the proof record beside it.
+    /// DNSKEY at the zone its RRSIG names, and the proof record beside it.
     /// A refused proof refuses the whole answer — the caller keeps its
     /// cached member set until its own expiry, exactly as for a bogus chain.
     pub async fn member_set(&self, domain: &str) -> Result<(MemberSet, Duration), NetError> {
@@ -571,7 +571,12 @@ impl DnssecResolver {
         let response = self.lookup(&name, RecordType::TXT).await?;
         let validated = secure_txt(&name, &response.answers)?;
         if self.rekor == RekorPolicy::Require {
-            let (apex, key_tag) = signing_key_of(&name, &response.answers)?;
+            // The zone that signed the answer. Every record this client goes
+            // on to fetch hangs off it, because it is the only name the
+            // answer itself yields — the control plane's apex is a name only
+            // the log entry knows, and it is checked against this one rather
+            // than used to find anything.
+            let (signing_zone, key_tag) = signing_key_of(&name, &response.answers)?;
             // The pin set is refreshed *before* the proof is verified, so a
             // proof from a shard Sigstore added since this build shipped
             // verifies in the same refresh that learned about it (§10.2).
@@ -580,9 +585,9 @@ impl DnssecResolver {
             // or invalid bundle leaves the current pins standing, because a
             // control plane that stops fetching must degrade to a frozen pin
             // set — today's behavior — and never to a failed cluster.
-            match self.refresh_tuf(&apex).await {
+            match self.refresh_tuf(&signing_zone).await {
                 Ok(Some(update)) if update.changed => tracing::info!(
-                    apex = %apex,
+                    zone = %signing_zone,
                     root = update.state.root_version,
                     timestamp = update.state.timestamp_version,
                     logs = update.log_keys.keys().len(),
@@ -590,12 +595,13 @@ impl DnssecResolver {
                 ),
                 Ok(_) => {}
                 Err(e) => tracing::debug!(
-                    apex = %apex,
+                    zone = %signing_zone,
                     error = %e,
                     "the zone's TUF bundle did not update the pin set; the current pins stand"
                 ),
             }
-            self.verify_zone_key(&apex, key_tag).await?;
+            self.verify_zone_key(&domain, &signing_zone, key_tag)
+                .await?;
         }
         let set = MemberSet::from_records(&domain, &validated.records)?;
         Ok((set, validated.ttl))
@@ -678,13 +684,19 @@ impl DnssecResolver {
     /// record (§4.2). Two more validated lookups, then no network at all.
     pub async fn verify_zone_key(
         &self,
-        apex: &Name,
+        domain: &str,
+        signing_zone: &Name,
         key_tag: u16,
     ) -> Result<VerifiedRecord, NetError> {
-        let apex_text = apex.to_string();
-        let dnskey_rdata = self.zone_dnskey(apex, key_tag).await?;
+        let zone_text = signing_zone.to_string();
+        let dnskey_rdata = self.zone_dnskey(signing_zone, key_tag).await?;
 
-        let name = rekor_query_name(apex_text.trim_end_matches('.'));
+        // The proof records live at the **signing zone**, not at the control
+        // plane's apex. That is not a preference: the apex is a name only the
+        // entry knows, and a client has to be able to compute where to look
+        // from the answer alone. The zone that signed the answer is the one
+        // name it can always derive.
+        let name = rekor_query_name(zone_text.trim_end_matches('.'));
         let response = self.lookup(&name, RecordType::TXT).await?;
         let absent = || NetError::RekorAbsent {
             name: name.clone(),
@@ -744,7 +756,8 @@ impl DnssecResolver {
         }
 
         let key = ZoneKey {
-            apex: &apex_text,
+            domain,
+            signing_zone: &zone_text,
             key_tag,
             dnskey_rdata: &dnskey_rdata,
         };

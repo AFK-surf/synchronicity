@@ -102,6 +102,7 @@ pub type Outcome {
 pub fn run(
   conn: Connection,
   apex: Name,
+  signing_zone: Name,
   log: Log,
   log_key: #(BitArray, BitArray),
   now: Int,
@@ -113,13 +114,15 @@ pub fn run(
   use #(links, subjects) <- result.try(case claim {
     Retire(subjects) -> Ok(#(None, subjects))
     Current ->
-      case chain.collect(resolver, apex) {
+      case chain.collect(resolver, apex, signing_zone) {
         Error(why) -> Error(NoChain(why))
         Ok(#(links, rdatas)) ->
-          case chain.check_shape(links, apex), rdatas {
+          case chain.check_shape(links, apex, signing_zone), rdatas {
             Error(why), _ -> Error(NoChain(why))
             Ok(Nil), [] ->
-              Error(NoChain("the apex answered no DNSKEY RRset to claim"))
+              Error(NoChain(
+                "the signing zone answered no DNSKEY RRset to claim",
+              ))
             Ok(Nil), rdatas ->
               Ok(#(
                 Some(

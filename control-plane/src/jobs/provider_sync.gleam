@@ -54,6 +54,7 @@ type State {
     provider: Provider,
     provider_name: String,
     zone_id: String,
+    signing_zone: String,
     subject: Subject(Msg),
   )
 }
@@ -74,12 +75,20 @@ pub fn supervised(
   prov: Provider,
   provider_name: String,
   zone_id: String,
+  signing_zone: String,
 ) -> supervision.ChildSpecification(Nil) {
   supervision.worker(fn() {
     let builder =
       actor.new_with_initialiser(1000, fn(subject) {
         let _ = process.send_after(subject, sweep_interval_ms, Tick)
-        actor.initialised(State(db_path, prov, provider_name, zone_id, subject))
+        actor.initialised(State(
+          db_path,
+          prov,
+          provider_name,
+          zone_id,
+          signing_zone,
+          subject,
+        ))
         |> actor.returning(subject)
         |> Ok
       })
@@ -92,7 +101,13 @@ pub fn supervised(
 
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   let Tick = msg
-  run_once(state.db_path, state.provider, state.provider_name, state.zone_id)
+  run_once(
+    state.db_path,
+    state.provider,
+    state.provider_name,
+    state.zone_id,
+    state.signing_zone,
+  )
   let _ = process.send_after(state.subject, sweep_interval_ms, Tick)
   actor.continue(state)
 }
@@ -103,6 +118,7 @@ pub fn run_once(
   prov: Provider,
   provider_name: String,
   zone_id: String,
+  signing_zone: String,
 ) -> Nil {
   // Deliberately not pooled, exactly as `resign`: this job needs a writer
   // for its state row, and an owned short-lived connection cannot starve
@@ -110,7 +126,14 @@ pub fn run_once(
   case db.open_primary(db_path) {
     Error(_) -> io.println_error("provider-sync: database unavailable")
     Ok(conn) -> {
-      run_once_with(conn, prov, provider_name, zone_id, now_unix())
+      run_once_with(
+        conn,
+        prov,
+        provider_name,
+        zone_id,
+        signing_zone,
+        now_unix(),
+      )
       sqlite.close(conn)
     }
   }
@@ -123,9 +146,10 @@ pub fn run_once_with(
   prov: Provider,
   provider_name: String,
   zone_id: String,
+  signing_zone: String,
   now: Int,
 ) -> Nil {
-  case pass(conn, prov, zone_id, now) {
+  case pass(conn, prov, zone_id, now, signing_zone) {
     Ok(Fresh) -> Nil
     Ok(Applied(serial, hash, changes)) -> {
       let _ = state.record_ok(conn, provider_name, zone_id, hash, serial, now)
@@ -157,13 +181,14 @@ fn pass(
   prov: Provider,
   _zone_id: String,
   _now: Int,
+  signing_zone: String,
 ) -> Result(Outcome, String) {
   use input <- result.try(
     model.read(conn)
     |> result.map_error(fn(e) { "reading zone: " <> string.inspect(e) }),
   )
   use desired <- result.try(
-    render_external.render(input)
+    render_external.render(input, signing_zone)
     |> result.map_error(fn(e) { "rendering: " <> string.inspect(e) }),
   )
   let hash = render_external.desired_hash(desired)
@@ -180,7 +205,7 @@ fn pass(
   }
   use <- fresh_guard(fresh)
   use existing <- result.try(
-    prov.list(render_external.managed_names(input))
+    prov.list(render_external.managed_names(input, signing_zone))
     |> result.map_error(fn(e) { "provider list: " <> e }),
   )
   use changes <- result.try(

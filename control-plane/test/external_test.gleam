@@ -25,6 +25,10 @@ import gleam/string
 
 /// An external-mode zone input: no NS hosts, no zone key — the shape
 /// `model.read` produces from an `ensure_meta_external` database.
+/// The signing zone in these fixtures: the control plane runs its own
+/// delegated zone, so it is the apex.
+const apex_text = "sync.test"
+
 fn input(txt_names: List(model.TxtName)) -> ZoneInput {
   let assert Ok(apex) = name.parse("sync.test.")
   ZoneInput(
@@ -46,6 +50,7 @@ pub fn the_renderer_emits_data_records_and_the_marker_test() {
   let assert Ok(records) =
     render_external.render(
       input([TxtName(member_owner(), [Member("nas", nk, "", "")])]),
+      apex_text,
     )
   let names = list.map(records, fn(r) { r.name })
   assert list.contains(names, "_synchronicity-owner.sync.test")
@@ -62,7 +67,7 @@ pub fn the_renderer_emits_data_records_and_the_marker_test() {
 
   // Managed names cover every name the set can occupy — including ones
   // currently empty, so stopped records still get found and deleted.
-  let managed = render_external.managed_names(input([]))
+  let managed = render_external.managed_names(input([]), apex_text)
   assert list.contains(managed, "_synchronicity-rekor.sync.test")
   assert list.contains(managed, "_synchronicity-owner.sync.test")
 }
@@ -78,16 +83,17 @@ pub fn the_renderer_refuses_what_the_builder_refuses_test() {
         Member("laptop", nk, "", ""),
       ]),
     ])
-  let assert Error(build.AmbiguousNk(_)) = render_external.render(bad)
+  let assert Error(build.AmbiguousNk(_)) =
+    render_external.render(bad, apex_text)
 }
 
 pub fn the_desired_hash_is_stable_test() {
   let nk = fixtures.nk()
   let zone = input([TxtName(member_owner(), [Member("nas", nk, "", "")])])
-  let assert Ok(one) = render_external.render(zone)
-  let assert Ok(two) = render_external.render(zone)
+  let assert Ok(one) = render_external.render(zone, apex_text)
+  let assert Ok(two) = render_external.render(zone, apex_text)
   assert render_external.desired_hash(one) == render_external.desired_hash(two)
-  let assert Ok(other) = render_external.render(input([]))
+  let assert Ok(other) = render_external.render(input([]), apex_text)
   assert render_external.desired_hash(one)
     != render_external.desired_hash(other)
 }
@@ -246,7 +252,8 @@ fn external_conn() -> sqlite.Connection {
        INSERT INTO network_devices VALUES ('n1', 'd1', 0);",
     )
   fixtures.add_key(conn, "k1", "d1", "active", 1)
-  let assert Ok(_) = publish.publish_external(conn, 1000, "test:boot")
+  let assert Ok(_) =
+    publish.publish_external(conn, 1000, "test:boot", apex_text)
   conn
 }
 
@@ -255,7 +262,7 @@ pub fn the_reconciler_converges_then_goes_quiet_test() {
   let calls = process.new_subject()
   let prov = fake_provider([], calls)
 
-  provider_sync.run_once_with(conn, prov, "log-only", "z1", 2000)
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", apex_text, 2000)
   let assert Ok("list") = process.receive(calls, 100)
   let assert Ok("apply " <> _) = process.receive(calls, 100)
   let assert Ok(Ok(synced)) = state.get(conn)
@@ -264,12 +271,13 @@ pub fn the_reconciler_converges_then_goes_quiet_test() {
 
   // Converged: the second pass answers from the stored hash — one SELECT,
   // no provider traffic at all.
-  provider_sync.run_once_with(conn, prov, "log-only", "z1", 3000)
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", apex_text, 3000)
   let assert Error(Nil) = process.receive(calls, 100)
 
   // A mutation moves the serial, so the next pass applies again.
-  let assert Ok(_) = publish.publish_external(conn, 4000, "test:mutation")
-  provider_sync.run_once_with(conn, prov, "log-only", "z1", 5000)
+  let assert Ok(_) =
+    publish.publish_external(conn, 4000, "test:mutation", apex_text)
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", apex_text, 5000)
   let assert Ok("list") = process.receive(calls, 100)
   sqlite.close(conn)
 }
@@ -287,6 +295,7 @@ pub fn a_conflict_stops_the_pass_and_is_reported_test() {
     fake_provider([foreign], calls),
     "log-only",
     "z1",
+    apex_text,
     2000,
   )
   // Listed, refused, nothing applied.
@@ -305,6 +314,7 @@ pub fn a_provider_outage_is_recorded_and_recovered_from_test() {
     broken_provider("api down"),
     "log-only",
     "z1",
+    apex_text,
     2000,
   )
   let assert Ok(Ok(stale)) = state.get(conn)
@@ -316,6 +326,7 @@ pub fn a_provider_outage_is_recorded_and_recovered_from_test() {
     fake_provider([], calls),
     "log-only",
     "z1",
+    apex_text,
     3000,
   )
   let assert Ok(Ok(healed)) = state.get(conn)
@@ -325,7 +336,8 @@ pub fn a_provider_outage_is_recorded_and_recovered_from_test() {
 
 pub fn external_publish_bumps_the_serial_and_audits_test() {
   let conn = external_conn()
-  let assert Ok(serial) = publish.publish_external(conn, 2000, "test:again")
+  let assert Ok(serial) =
+    publish.publish_external(conn, 2000, "test:again", apex_text)
   assert serial == 2
   let assert Ok([[sqlite.Int(rows)]]) =
     sqlite.query(

@@ -28,7 +28,15 @@ pub type DnsMode {
   /// material at all — transparency claims are signed with an ephemeral
   /// key minted per entry, because the signature is attribution and
   /// authorization is the chain (docs/EXTERNAL-DNS-PROVIDER.md §2.1).
-  External(provider: ProviderConfig)
+  ///
+  /// `signing_zone` is the DNS zone the provider actually hosts, which need
+  /// not be the apex: a control plane at `sync.example.com` may live
+  /// entirely inside the `example.com` zone, with no delegation of its own.
+  /// The zone's own keys sign every record under it, so that zone — not the
+  /// apex — is where the proof and TUF records go and where a chain's
+  /// ladder starts. Equal to the apex unless `CP_SIGNING_ZONE` says
+  /// otherwise.
+  External(provider: ProviderConfig, signing_zone: String)
 }
 
 /// Which provider, and how to reach it. `zone_id` empty means "discover by
@@ -77,8 +85,8 @@ pub fn load() -> Result(Config, String) {
     Ok(other) -> Error("CP_ROLE must be primary or replica, got " <> other)
     Error(Nil) -> Error("CP_ROLE is required (primary | replica)")
   })
-  use dns_mode <- result.try(dns_mode(role))
   use base_domain <- result.try(required("CP_BASE_DOMAIN"))
+  use dns_mode <- result.try(dns_mode(role, base_domain))
   use db_path <- result.try(required("CP_DB_PATH"))
   use key_file <- result.try(case role, dns_mode {
     // External mode holds no zone key — the provider signs the zone, and a
@@ -155,20 +163,26 @@ pub fn load() -> Result(Config, String) {
 /// operational key, refuses on a replica, and — the other direction —
 /// provider configuration present while the mode is `serve` is refused as
 /// dead config: a credential that quietly does nothing is a lie.
-fn dns_mode(role: Role) -> Result(DnsMode, String) {
+fn dns_mode(role: Role, base_domain: String) -> Result(DnsMode, String) {
   let provider_env_present =
     list.any(
       ["CP_DNS_PROVIDER", "CP_CLOUDFLARE_API_TOKEN", "CP_BUNNY_API_KEY"],
       fn(key) { result.is_ok(envoy.get(key)) },
     )
   case envoy.get("CP_DNS_MODE") {
+    Error(Nil) | Ok("serve") if provider_env_present ->
+      Error(
+        "provider configuration (CP_DNS_PROVIDER / CP_*_API_*) is set "
+        <> "but CP_DNS_MODE is not external — remove it, or set "
+        <> "CP_DNS_MODE=external",
+      )
     Error(Nil) | Ok("serve") ->
-      case provider_env_present {
+      case result.is_ok(envoy.get("CP_SIGNING_ZONE")) {
         True ->
           Error(
-            "provider configuration (CP_DNS_PROVIDER / CP_*_API_*) is set "
-            <> "but CP_DNS_MODE is not external — remove it, or set "
-            <> "CP_DNS_MODE=external",
+            "CP_SIGNING_ZONE is only meaningful with CP_DNS_MODE=external: "
+            <> "a serving control plane is the authoritative nameserver for "
+            <> "its own apex, so the apex is the signing zone by definition",
           )
         False -> Ok(Serve)
       }
@@ -182,9 +196,35 @@ fn dns_mode(role: Role) -> Result(DnsMode, String) {
         Primary -> Ok(Nil)
       })
       use provider <- result.try(provider_config())
-      Ok(External(provider))
+      use signing_zone <- result.try(signing_zone(base_domain))
+      Ok(External(provider, signing_zone))
     }
     Ok(other) -> Error("CP_DNS_MODE must be serve or external, got " <> other)
+  }
+}
+
+/// The zone the provider hosts. Defaults to the apex — the ordinary case,
+/// where the control plane runs a delegated zone of its own — and must
+/// otherwise be a name that *contains* the apex, since a zone that does not
+/// hold the apex's records cannot sign them.
+fn signing_zone(base_domain: String) -> Result(String, String) {
+  case envoy.get("CP_SIGNING_ZONE") {
+    Error(Nil) -> Ok(base_domain)
+    Ok(zone) -> {
+      let zone = string.lowercase(string.trim(zone))
+      let apex = string.lowercase(base_domain)
+      case zone == apex || string.ends_with(apex, "." <> zone) {
+        True -> Ok(zone)
+        False ->
+          Error(
+            "CP_SIGNING_ZONE "
+            <> zone
+            <> " does not contain CP_BASE_DOMAIN "
+            <> apex
+            <> ", so it cannot be the zone that signs its records",
+          )
+      }
+    }
   }
 }
 

@@ -54,6 +54,7 @@ type State {
   State(
     db_path: String,
     apex: dns_name.Name,
+    signing_zone: dns_name.Name,
     resolver: chain.Resolver,
     log: Log,
     log_key: #(BitArray, BitArray),
@@ -65,6 +66,7 @@ type State {
 pub fn supervised(
   db_path: String,
   apex: dns_name.Name,
+  signing_zone: dns_name.Name,
   resolver: chain.Resolver,
   log: Log,
   log_key: #(BitArray, BitArray),
@@ -79,6 +81,7 @@ pub fn supervised(
         actor.initialised(State(
           db_path,
           apex,
+          signing_zone,
           resolver,
           log,
           log_key,
@@ -102,6 +105,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         run_once_with(
           conn,
           state.apex,
+          state.signing_zone,
           state.resolver,
           state.log,
           state.log_key,
@@ -123,12 +127,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 pub fn run_once_with(
   conn: Connection,
   apex: dns_name.Name,
+  signing_zone: dns_name.Name,
   resolver: chain.Resolver,
   log: Log,
   log_key: #(BitArray, BitArray),
   now: Int,
 ) -> Bool {
-  case observe(resolver, apex) {
+  case observe(resolver, signing_zone) {
     Error(why) -> {
       io.println_error("zonekey-watch: " <> why)
       False
@@ -145,7 +150,16 @@ pub fn run_once_with(
         True -> False
         False ->
           case
-            rekor.run(conn, apex, log, log_key, now, resolver, rekor.Current)
+            rekor.run(
+              conn,
+              apex,
+              signing_zone,
+              log,
+              log_key,
+              now,
+              resolver,
+              rekor.Current,
+            )
           {
             Ok(outcome) -> {
               let _ = state.record_logged(conn, now)

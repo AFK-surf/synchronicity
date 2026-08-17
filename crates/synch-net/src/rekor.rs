@@ -325,8 +325,16 @@ impl RekorProof {
 /// observation of the chain, never something the proof gets to assert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZoneKey<'a> {
-    /// The zone apex, as the RRSIG signer field names it.
-    pub apex: &'a str,
+    /// The membership domain being resolved. The apex an entry claims has to
+    /// contain it: an entry for a *sibling* namespace must not authorize
+    /// keys used to answer for this one, or an attacker could point the
+    /// requirement at a name the operator's monitor never watches.
+    pub domain: &'a str,
+    /// The zone whose RRSIG signed the answer — the bottom of the entry's
+    /// ladder, and the zone whose key set the chain proves. Not necessarily
+    /// the apex: a control plane at `sync.example.com` served out of the
+    /// `example.com` zone is signed by `example.com`.
+    pub signing_zone: &'a str,
     /// The key tag the RRSIG selected.
     pub key_tag: u16,
     /// The DNSKEY rdata: flags, protocol, algorithm, public key.
@@ -447,14 +455,24 @@ pub fn verify(
     // a name can mean one thing here and another there.
     let claimed_apex = chain::identify(&body.certificate).map_err(chain_error)?;
 
-    // Apex binding: the zone the certificate names is the zone whose RRSIG
-    // signed this answer. This is the check that turns a leaf into something
-    // a monitor for this apex would have seen — an entry naming another apex
-    // is an entry the operator's monitor was never going to look at.
-    let observed_apex = chain::parse_name(key.apex).map_err(chain_error)?;
-    if claimed_apex != observed_apex {
+    // Apex binding. The apex is the control plane's *name*, and the entry is
+    // the only thing that says what it is — so it is not taken on trust but
+    // pinned between two names the client already knows, and it has to sit
+    // in between:
+    //
+    //   <signing zone>  ⊇  <claimed apex>  ⊇  <membership domain>
+    //
+    // The lower bound is what stops an entry for a sibling namespace from
+    // authorizing keys used to answer here: a monitor watching this domain's
+    // delegation path would never look at `other.example.com`, so an entry
+    // naming it must not be usable against `sync.example.com`. The upper
+    // bound is checked inside the chain walk, where the ladder's own bottom
+    // link is the signing zone — see `chain::validate`.
+    let domain = chain::parse_name(key.domain).map_err(chain_error)?;
+    if !claimed_apex.zone_of(&domain) {
         return Err(ProofError::Binding(format!(
-            "the entry's certificate names {claimed_apex}, the answer was signed by {observed_apex}",
+            "the entry's certificate names {claimed_apex}, which does not contain \
+             the membership domain {domain} it would be authorizing",
         )));
     }
 
@@ -466,6 +484,18 @@ pub fn verify(
     // prevent. What comes back is the proven key set, and it decides the key
     // binding below; a chainless entry proves nothing and is refused.
     let authorized = chain::authorize(&body.certificate, anchors).map_err(chain_error)?;
+
+    // And the ladder's bottom is the zone that actually signed this answer.
+    // Without this an entry could carry a valid chain for some *other* zone
+    // that happens to enclose the apex, and the keys it proves would be that
+    // zone's rather than the one the client is talking to.
+    let observed_signer = chain::parse_name(key.signing_zone).map_err(chain_error)?;
+    if authorized.signing_zone != observed_signer {
+        return Err(ProofError::Binding(format!(
+            "the entry's chain is signed by {}, the answer was signed by {observed_signer}",
+            authorized.signing_zone
+        )));
+    }
 
     // Attribution: the entry signature verifies under the certificate's own
     // key — the entry is what its signer made, whoever that is. Rekor signs
@@ -493,7 +523,7 @@ pub fn verify(
     // Statement and key binding: the Statement describes exactly the proven
     // set, and the key that signed this answer is a member of it.
     let statement = ZoneKeyStatement::parse(&proof.statement)?;
-    statement.check_binds(key, &authorized.proven_keys)?;
+    statement.check_binds(&claimed_apex, key, &authorized.proven_keys)?;
 
     Ok(VerifiedRecord {
         log_index: proof.log_index,
@@ -810,11 +840,20 @@ impl ZoneKeyStatement {
     /// for digest and metadata for metadata (stops a statement describing
     /// keys its own chain never proved); and the key that signed this answer
     /// is a member (the point of the whole exercise).
-    fn check_binds(&self, key: &ZoneKey<'_>, proven: &[Vec<u8>]) -> Result<(), ProofError> {
-        if !same_name(&self.apex, key.apex) {
+    fn check_binds(
+        &self,
+        apex: &hickory_resolver::proto::rr::Name,
+        key: &ZoneKey<'_>,
+        proven: &[Vec<u8>],
+    ) -> Result<(), ProofError> {
+        // The Statement and the certificate have to name the same control
+        // plane. The certificate's SAN is what the monitor indexes on and
+        // what the declaration hangs under; a Statement naming something
+        // else would describe a key set for a zone nobody checked.
+        if !same_name(&self.apex, &apex.to_string()) {
             return Err(ProofError::Binding(format!(
-                "the entry names apex {}, the answer was signed by {}",
-                self.apex, key.apex
+                "the entry's statement names apex {}, its certificate names {apex}",
+                self.apex
             )));
         }
 

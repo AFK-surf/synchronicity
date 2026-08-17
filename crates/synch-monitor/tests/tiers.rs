@@ -44,16 +44,18 @@ struct Shape {
     /// The trust anchor a reader of this entry holds, in `--dnssec-anchor`
     /// syntax.
     anchor: String,
-    /// The apex a resolver would report from the RRSIG signer field. Almost
+    /// The zone a resolver would report from the RRSIG signer field — the
+    /// signing zone, and in these shapes the membership domain too. Almost
     /// always the zone's own; a malformed-SAN shape is where it differs.
-    observed_apex: String,
+    observed_zone: String,
 }
 
 /// Would a client accept this proof? The real verifier, no re-implementation.
 fn client_accepts(shape: &Shape) -> bool {
     let rdata = shape.zone.dnskey_rdata();
     let key = ZoneKey {
-        apex: &shape.observed_apex,
+        domain: &shape.observed_zone,
+        signing_zone: &shape.observed_zone,
         key_tag: shape.zone.key_tag(),
         dnskey_rdata: &rdata,
     };
@@ -153,14 +155,14 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     let leak = |name: &str| -> &'static str { Box::leak(name.to_string().into_boxed_str()) };
     let mut push =
         |name: &str, g: Ground, log: SimLog, proof: RekorProof, observed: Option<String>| {
-            let observed_apex = observed.unwrap_or_else(|| g.zone.apex());
+            let observed_zone = observed.unwrap_or_else(|| g.zone.apex());
             out.push(Shape {
                 name: leak(&format!("{name} ({})", rooted.label())),
                 zone: g.zone,
                 log,
                 proof,
                 anchor: g.anchor,
-                observed_apex,
+                observed_zone,
             });
         };
     let certificate = |g: &Ground| {

@@ -104,12 +104,13 @@ pub type Link {
 pub fn collect(
   resolver: Resolver,
   apex: Name,
+  signing_zone: Name,
 ) -> Result(#(List(Link), List(BitArray)), String) {
-  let labels = name.to_string(apex) |> string.split(".") |> drop_empty
+  let labels = name.to_string(signing_zone) |> string.split(".") |> drop_empty
   use declaration <- result.try(declaration_link(resolver, apex))
-  use #(apex_link, rdatas) <- result.try(apex_link(resolver, apex))
+  use #(zone_link, rdatas) <- result.try(zone_link(resolver, signing_zone))
   use ancestors <- result.try(ancestor_links(resolver, labels, []))
-  Ok(#([declaration, apex_link, ..ancestors], rdatas))
+  Ok(#([declaration, zone_link, ..ancestors], rdatas))
 }
 
 /// The bottom link: the apex's own `_synchronicity-transparency` TXT RRset
@@ -134,12 +135,16 @@ fn declaration_link(resolver: Resolver, apex: Name) -> Result(Link, String) {
 /// success and then every client failed closed against an entry no reader
 /// could anchor. A publish that cannot be verified is a publish that must
 /// fail here, loudly, while an operator is still watching.
-pub fn check_shape(links: List(Link), apex: Name) -> Result(Nil, String) {
+pub fn check_shape(
+  links: List(Link),
+  apex: Name,
+  signing_zone: Name,
+) -> Result(Nil, String) {
   let declared_at = name.to_string([rdata.transparency_label, ..apex])
-  let apex_text = name.to_string(apex)
+  let zone_text = name.to_string(signing_zone)
   case links {
     [] | [_] ->
-      Error("the chain is too short to carry a declaration and an apex")
+      Error("the chain is too short to carry a declaration and a signing zone")
     [declaration, ..ladder] ->
       case declaration.zone == declared_at, ladder {
         False, _ ->
@@ -149,14 +154,14 @@ pub fn check_shape(links: List(Link), apex: Name) -> Result(Nil, String) {
             <> ", not the declaration at "
             <> declared_at,
           )
-        True, [first, ..] if first.zone != apex_text ->
+        True, [first, ..] if first.zone != zone_text ->
           Error(
             "the chain's second link is "
             <> first.zone
-            <> ", not the apex "
-            <> apex_text,
+            <> ", not the signing zone "
+            <> zone_text,
           )
-        True, _ -> check_ladder(ladder, apex)
+        True, _ -> check_ladder(ladder, signing_zone)
       }
   }
 }
@@ -200,23 +205,23 @@ fn parent_of(zone: Name) -> Name {
   }
 }
 
-/// The apex's own link: its DNSKEY RRset (the claimed set) and its DS RRset,
-/// each with the RRSIGs a reader's walk verifies. The DNSKEY rdatas come
-/// back separately, so the publish path claims exactly what it observed.
-fn apex_link(
+/// The signing zone's own link: its DNSKEY RRset (the claimed set) and its
+/// DS RRset, each with the RRSIGs a reader's walk verifies. The DNSKEY rdatas
+/// come back separately, so the publish path claims exactly what it observed.
+fn zone_link(
   resolver: Resolver,
-  apex: Name,
+  zone: Name,
 ) -> Result(#(Link, List(BitArray)), String) {
-  use keys_answers <- result.try(resolver.query(apex, wire.type_dnskey))
-  use keys_rrs <- result.try(rrset_of(keys_answers, apex, wire.type_dnskey))
+  use keys_answers <- result.try(resolver.query(zone, wire.type_dnskey))
+  use keys_rrs <- result.try(rrset_of(keys_answers, zone, wire.type_dnskey))
   let rdatas =
     keys_answers
     |> list.filter(fn(rr) {
       rr.rtype == wire.type_dnskey && rr.class == wire.class_in
     })
     |> list.map(fn(rr) { rr.rdata })
-  use ds <- result.try(rrset(resolver, apex, type_ds))
-  Ok(#(Link(name.to_string(apex), bit_array.concat([keys_rrs, ds])), rdatas))
+  use ds <- result.try(rrset(resolver, zone, type_ds))
+  Ok(#(Link(name.to_string(zone), bit_array.concat([keys_rrs, ds])), rdatas))
 }
 
 fn ancestor_links(

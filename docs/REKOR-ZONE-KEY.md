@@ -67,8 +67,8 @@ managed provider holds be logged at all. Keeping Fulcio/OIDC out keeps the
 ceremony runnable offline.
 
 The chain does not begin at the apex. It begins one label below it, at the
-zone's **declaration** — `_synchronicity-transparency.<apex> TXT
-"v=sync1 transparency"`, signed by the apex's own keys. Everything above
+**declaration** — `_synchronicity-transparency.<apex> TXT
+"v=sync1 transparency"`, signed by the zone that holds it. Everything above
 that record is public data: anybody can read a zone's DNSKEY and DS records
 out of an open resolver, so an entry proving only those would be something a
 stranger could mint about a zone that never heard of them, and a monitor
@@ -77,6 +77,20 @@ declaration is the part that takes write access to the zone, which is exactly
 the authority the entry claims to speak with — and it asks nothing of the
 private key, so a provider-held zone publishes one with an ordinary record
 write.
+
+**The apex and the signing zone are two different names.** The apex is the
+control plane's *name*; the **signing zone** is whatever DNS zone actually
+holds and signs its records. Usually they coincide, because the control plane
+runs a delegated zone of its own. They need not: a control plane at
+`sync.example.com` may live entirely inside the `example.com` zone, with no
+delegation and no DNSKEY of its own. Then `example.com` signs everything —
+membership answers, the declaration, all of it — and it is `example.com`'s key
+set the chain proves. So a chain reads as the declaration at the apex, then
+the ladder starting at the **signing zone**, and the rule tying them together
+is that the signing zone must contain the apex. The proof and TUF records live
+at the signing zone rather than the apex, because it is the only name a client
+can compute from an answer: the apex is a name only the entry knows.
+`CP_SIGNING_ZONE` names it when it differs (§5.1); it defaults to the apex.
 
 ### 2.1 Why the entry looks the way it does
 
@@ -529,6 +543,7 @@ belongs.
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
 | `CP_REKOR_REQUIRE` | primary | `true` arms the publish gate of §5.3. Off by default, because the rollout publishes before it enforces (§7). |
 | `CP_TUF_URL` | primary | The Sigstore TUF repository this zone relays (§10.3). Default `https://tuf-repo-cdn.sigstore.dev`. |
+| `CP_SIGNING_ZONE` | primary, external only | The DNS zone the provider actually hosts, when it is not the apex — a control plane at `sync.example.com` served out of `example.com` sets it to `example.com`. Defaults to `CP_BASE_DOMAIN`, and must be a name that *contains* it; boot refuses anything else, and refuses the variable outright in serve mode, where this service is the authoritative nameserver for its own apex and the two are the same by construction. It decides where the proof and TUF records go and where a chain's ladder starts (§2). |
 
 Every one of these is read at its use site rather than through boot
 configuration, so `rekor-publish` and `tuf-refresh` see the same values a

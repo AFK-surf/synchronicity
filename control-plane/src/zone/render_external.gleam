@@ -32,9 +32,18 @@ pub const ttl_data = 300
 pub const ttl_rekor = 86_400
 
 /// Renders the desired record set, canonically sorted.
-pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
+/// `signing_zone` is the DNS zone the provider actually hosts. It is where
+/// the proof and TUF records go, because it is the only name a client can
+/// compute from a membership answer — the apex is a name only the log entry
+/// knows. Equal to the apex whenever the control plane runs a zone of its
+/// own, which is the ordinary case.
+pub fn render(
+  input: ZoneInput,
+  signing_zone: String,
+) -> Result(List(Record), build.BuildError) {
   use Nil <- result.try(build.validate(input))
   let apex = apex_name(input)
+  let zone = strip_dot(signing_zone)
   let members =
     input.txt_names
     |> list.flat_map(fn(txt_name) {
@@ -50,12 +59,12 @@ pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
     })
   let rekor =
     list.map(input.rekor_proofs, fn(text) {
-      Record(build.rekor_label <> "." <> apex, provider.Txt, ttl_rekor, text)
+      Record(build.rekor_label <> "." <> zone, provider.Txt, ttl_rekor, text)
     })
   let tuf = case input.tuf_bundle {
     "" -> []
     text -> [
-      Record(build.tuf_label <> "." <> apex, provider.Txt, ttl_rekor, text),
+      Record(build.tuf_label <> "." <> zone, provider.Txt, ttl_rekor, text),
     ]
   }
   // Unconditional, exactly as in serve mode: the declaration is what makes
@@ -79,16 +88,17 @@ pub fn render(input: ZoneInput) -> Result(List(Record), build.BuildError) {
 /// the provider to list. Includes the empty-set names (`_rekor`, `_tuf`,
 /// each network owner) so records we *stopped* rendering still get found
 /// and deleted.
-pub fn managed_names(input: ZoneInput) -> List(String) {
+pub fn managed_names(input: ZoneInput, signing_zone: String) -> List(String) {
   let apex = apex_name(input)
+  let zone = strip_dot(signing_zone)
   let owners =
     list.map(input.txt_names, fn(txt_name) {
       strip_dot(name.to_string(txt_name.owner))
     })
   [
     diff.owner_label <> "." <> apex,
-    build.rekor_label <> "." <> apex,
-    build.tuf_label <> "." <> apex,
+    build.rekor_label <> "." <> zone,
+    build.tuf_label <> "." <> zone,
     rdata.transparency_label <> "." <> apex,
     ..owners
   ]

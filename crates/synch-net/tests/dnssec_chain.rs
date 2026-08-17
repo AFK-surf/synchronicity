@@ -18,7 +18,7 @@ use hickory_resolver::proto::{dnssec::TrustAnchors, rr::Name};
 use synch_net::{
     chain::{self, ChainError, TRANSPARENCY_TEXT},
     sim::{SimDelegation, SimZone},
-    zonecert::ChainLink,
+    zonecert::{ChainLink, DnssecChain},
 };
 
 fn apex(text: &str) -> Name {
@@ -50,12 +50,13 @@ fn anchored_at(zone: &SimZone) -> TrustAnchors {
 #[test]
 fn a_declared_zone_proves_the_keys_its_declaration_sits_under() {
     let zone = SimZone::new("cluster.example", Vec::new());
-    let (proven, valid) = chain::validate(
+    let (proven, signing_zone, valid) = chain::validate(
         &zone.dnssec_chain(),
         &apex("cluster.example."),
         &anchored_at(&zone),
     )
     .expect("a declared zone validates");
+    assert_eq!(signing_zone, apex("cluster.example."));
     assert_eq!(valid.anchor_zone, "cluster.example.");
     assert!(valid.anchored_directly, "the apex is its own anchor here");
     assert_eq!(valid.links, 1, "the declaration is not a delegation step");
@@ -67,12 +68,13 @@ fn a_declared_zone_proves_the_keys_its_declaration_sits_under() {
 #[test]
 fn a_declared_zone_under_a_delegation_ladder_validates_too() {
     let ladder = SimDelegation::new("cluster.example", Vec::new());
-    let (proven, valid) = chain::validate(
+    let (proven, signing_zone, valid) = chain::validate(
         &ladder.chain(),
         &apex("cluster.example."),
         &anchored_at(&ladder.root),
     )
     .expect("a declared zone under a ladder validates");
+    assert_eq!(signing_zone, apex("cluster.example."));
     assert_eq!(valid.anchor_zone, ".");
     assert!(!valid.anchored_directly);
     assert_eq!(
@@ -80,6 +82,73 @@ fn a_declared_zone_under_a_delegation_ladder_validates_too() {
         "apex, TLD, root — the declaration is not one"
     );
     assert_eq!(proven, vec![ladder.apex.dnskey_rdata()]);
+}
+
+/// A control plane that is not a zone of its own.
+///
+/// `sync.example.` has no delegation and no DNSKEY — it is a name inside the
+/// `example.` zone, and `example.` signs everything under it, the declaration
+/// included. The chain is the declaration at `sync.example.` over a ladder
+/// that starts at `example.`, and the keys it proves are `example.`'s,
+/// because those are the keys that will sign the membership answers.
+#[test]
+fn an_apex_served_out_of_the_zone_above_it_validates() {
+    let zone = SimZone::new("example", Vec::new());
+    let apex_name = apex("sync.example.");
+    let declared_at = chain::transparency_name(&apex_name).expect("declaration name");
+
+    let carried = DnssecChain {
+        links: vec![
+            link(
+                &declared_at,
+                zone.signed_txt(declared_at.clone(), TRANSPARENCY_TEXT, inception()),
+            ),
+            link(&apex("example."), zone.dnskey_records(inception())),
+        ],
+    };
+
+    let (proven, signing_zone, valid) = chain::validate(&carried, &apex_name, &anchored_at(&zone))
+        .expect("an apex inside the zone above it validates");
+    assert_eq!(
+        signing_zone,
+        apex("example."),
+        "the ladder's bottom is the zone that holds the name, not the name"
+    );
+    assert_eq!(valid.anchor_zone, "example.");
+    assert_eq!(
+        proven,
+        vec![zone.dnskey_rdata()],
+        "the proven set is the signing zone's, since those keys sign the answers"
+    );
+}
+
+/// The signing zone has to actually contain the apex.
+///
+/// A ladder for some unrelated zone, with a declaration spliced under a name
+/// that zone does not hold, proves nothing about the apex — and is refused on
+/// the containment rule before any signature is checked.
+#[test]
+fn a_ladder_for_a_zone_that_does_not_contain_the_apex_is_refused() {
+    let zone = SimZone::new("other.example", Vec::new());
+    let apex_name = apex("sync.example.");
+    let declared_at = chain::transparency_name(&apex_name).expect("declaration name");
+
+    let carried = DnssecChain {
+        links: vec![
+            link(
+                &declared_at,
+                zone.signed_txt(declared_at.clone(), TRANSPARENCY_TEXT, inception()),
+            ),
+            link(&apex("other.example."), zone.dnskey_records(inception())),
+        ],
+    };
+
+    let error = chain::validate(&carried, &apex_name, &anchored_at(&zone))
+        .expect_err("a zone that does not contain the apex cannot speak for it");
+    assert!(
+        matches!(&error, ChainError::Structure(why) if why.contains("does not contain")),
+        "{error}"
+    );
 }
 
 /// A chain that starts at the apex authorizes nothing, however well the

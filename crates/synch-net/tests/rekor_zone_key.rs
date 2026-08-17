@@ -49,7 +49,8 @@ fn verify(proof: &RekorProof, zone: &SimZone, log: &SimLog) -> Result<(), ProofE
     let apex = zone.apex();
     let rdata = zone.dnskey_rdata();
     let key = ZoneKey {
-        apex: &apex,
+        domain: &apex,
+        signing_zone: &apex,
         key_tag: zone.key_tag(),
         dnskey_rdata: &rdata,
     };
@@ -189,7 +190,8 @@ fn an_observed_key_outside_the_proven_set_fails_binding() {
     let apex = zone.apex();
     let rdata = stranger.dnskey_rdata();
     let key = ZoneKey {
-        apex: &apex,
+        domain: &apex,
+        signing_zone: &apex,
         key_tag: stranger.key_tag(),
         dnskey_rdata: &rdata,
     };
@@ -501,7 +503,8 @@ fn a_pin_set_that_names_no_log_accepts_nothing() {
     let apex = zone.apex();
     let rdata = zone.dnskey_rdata();
     let key = ZoneKey {
-        apex: &apex,
+        domain: &apex,
+        signing_zone: &apex,
         key_tag: zone.key_tag(),
         dnskey_rdata: &rdata,
     };
@@ -740,7 +743,8 @@ fn the_shared_fixture_decodes_and_verifies() {
     // independent under this claim.
     assert_eq!(body.certificate.spki, rekor::p256_spki(&dnskey_rdata[4..]));
     let key = ZoneKey {
-        apex: &apex,
+        domain: &apex,
+        signing_zone: &apex,
         key_tag: fixture_field("key_tag").parse().expect("a key tag"),
         dnskey_rdata: &dnskey_rdata,
     };
@@ -976,7 +980,8 @@ async fn publish_a_real_entry() {
     // has to be one this build's own client accepts, or the fixture would
     // pin a shape nothing can read.
     let key = ZoneKey {
-        apex: &zone.apex(),
+        domain: &zone.apex(),
+        signing_zone: &zone.apex(),
         key_tag: zone.key_tag(),
         dnskey_rdata: &zone.dnskey_rdata(),
     };
@@ -1084,7 +1089,8 @@ mod real_rekor_v3 {
         assert_eq!(chain::key_tag(&dnskey_rdata), KEY_TAG);
 
         let key = ZoneKey {
-            apex: &format!("{APEX}."),
+            domain: &format!("{APEX}."),
+            signing_zone: &format!("{APEX}."),
             key_tag: KEY_TAG,
             dnskey_rdata: &dnskey_rdata,
         };

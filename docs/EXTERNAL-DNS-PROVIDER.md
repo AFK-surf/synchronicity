@@ -240,11 +240,20 @@ are ours to publish:
 - membership TXT at `_synchronicity.<network>.<org_slug>.<apex>`, one
   string per non-revoked device key, via the same `rdata.sync1_text`
   rendering;
-- `_synchronicity-transparency.<apex>` TXT — the zone's declaration
-  (§2.1), rendered unconditionally: a zone that stopped publishing it would
-  have every entry it ever logged stop verifying;
-- `_synchronicity-rekor.<apex>` TXT — the v2 proof records;
-- `_synchronicity-tuf.<apex>` TXT — the relayed TUF bundle.
+- `_synchronicity-transparency.<apex>` TXT — the declaration (§2.1),
+  rendered unconditionally: a zone that stopped publishing it would have
+  every entry it ever logged stop verifying;
+- `_synchronicity-rekor.<signing zone>` TXT — the v2 proof records;
+- `_synchronicity-tuf.<signing zone>` TXT — the relayed TUF bundle.
+
+The last two sit at the **signing zone** rather than the apex. The apex is
+the control plane's name; the signing zone is the zone the provider actually
+hosts, and the two differ when a control plane at `sync.example.com` lives
+inside the `example.com` zone with no delegation of its own
+(`CP_SIGNING_ZONE`). A client can only compute the signing zone — it reads it
+off the RRSIG signer of the answer it just validated — whereas the apex is a
+name only the log entry knows, so that is where the records a client must
+*find* have to live.
 
 SOA, NS, DNSKEY, NSEC/NSEC3, and every RRSIG are the provider's business.
 The renderer re-runs the product-invariant validation `build.build`

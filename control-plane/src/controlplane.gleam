@@ -143,6 +143,24 @@ fn print_material(apex: name.Name, csk: keys.Csk) -> Nil {
 /// tree without minting a second entry. The zone is republished either way,
 /// which is also how a phase-2 deployment escapes the publish gate after
 /// its first successful logging.
+/// The DNS zone that actually holds and signs the apex's records.
+///
+/// The apex itself whenever the control plane runs a delegated zone of its
+/// own — always the case in serve mode, where this service *is* the
+/// authoritative nameserver for the apex. In external mode a provider may
+/// host a zone above the apex instead, and `CP_SIGNING_ZONE` names it.
+fn signing_zone_of(
+  cfg: config.Config,
+  apex: name.Name,
+) -> Result(name.Name, String) {
+  case cfg.dns_mode {
+    config.Serve -> Ok(apex)
+    config.External(_, zone) ->
+      name.parse(zone)
+      |> result.replace_error("invalid CP_SIGNING_ZONE " <> zone)
+  }
+}
+
 fn rekor_publish(
   apex_text: String,
   key_file: String,
@@ -152,6 +170,7 @@ fn rekor_publish(
   use apex <- result.try(
     name.parse(apex_text) |> result.replace_error("invalid apex domain"),
   )
+  use signing_zone <- result.try(signing_zone_of(cfg, apex))
   use csk <- result.try(keys.load(key_file))
   use log_key <- result.try(client.log_key())
   use conn <- result.try(open_primary_db(cfg))
@@ -166,6 +185,7 @@ fn rekor_publish(
     rekor.run(
       conn,
       apex,
+      signing_zone,
       client.http(client.url()),
       log_key,
       now,
@@ -294,7 +314,8 @@ fn serve() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
   case cfg.role, cfg.dns_mode {
     Primary, config.Serve -> serve_primary(cfg)
-    Primary, config.External(provider_cfg) -> serve_external(cfg, provider_cfg)
+    Primary, config.External(provider_cfg, _) ->
+      serve_external(cfg, provider_cfg)
     // config.load refuses external on a replica, so this arm is serve mode.
     Replica, _ -> serve_replica(cfg)
   }
@@ -485,11 +506,17 @@ fn serve_external(
   use apex <- result.try(
     name.parse(cfg.base_domain) |> result.replace_error("bad base domain"),
   )
+  use signing_zone <- result.try(signing_zone_of(cfg, apex))
   use Nil <- result.try({
     use conn <- result.try(open_primary_db(cfg))
     use Nil <- result.try(publish.ensure_meta_external(conn, cfg.base_domain))
     use _ <- result.try(
-      publish.publish_external(conn, now_unix(), "system:boot")
+      publish.publish_external(
+        conn,
+        now_unix(),
+        "system:boot",
+        name.to_string(signing_zone),
+      )
       |> result.map_error(fn(e) { "publishing zone: " <> string.inspect(e) }),
     )
     sqlite.close(conn)
@@ -517,7 +544,14 @@ fn serve_external(
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
-      fn(conn, now, actor) { publish.publish_external_in_tx(conn, now, actor) },
+      fn(conn, now, actor) {
+        publish.publish_external_in_tx(
+          conn,
+          now,
+          actor,
+          name.to_string(signing_zone),
+        )
+      },
       // After commit: nudge the reconciler, so a mutation reaches the
       // provider in seconds while the hourly sweep stays the safety net.
       fn() { provider_sync.poke(sync_name) },
@@ -547,10 +581,12 @@ fn serve_external(
       prov,
       provider_name,
       zone_id,
+      name.to_string(signing_zone),
     ))
     |> sup.add(zonekey_watch.supervised(
       cfg.db_path,
       apex,
+      signing_zone,
       chain.doh(chain.resolver_url()),
       client.http(client.url()),
       log_key,
@@ -603,7 +639,7 @@ fn describe_zone(describe: String) -> String {
 fn provider_sync_once() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
   use provider_cfg <- result.try(case cfg.dns_mode {
-    config.External(provider_cfg) -> Ok(provider_cfg)
+    config.External(provider_cfg, _) -> Ok(provider_cfg)
     config.Serve -> Error("provider-sync needs CP_DNS_MODE=external")
   })
   use #(prov, provider_name, zone_id) <- result.try(connect_provider(
@@ -611,7 +647,17 @@ fn provider_sync_once() -> Result(Nil, String) {
     cfg.base_domain,
   ))
   io.println("dns provider: " <> prov.describe)
-  provider_sync.run_once(cfg.db_path, prov, provider_name, zone_id)
+  use apex <- result.try(
+    name.parse(cfg.base_domain) |> result.replace_error("bad base domain"),
+  )
+  use signing_zone <- result.try(signing_zone_of(cfg, apex))
+  provider_sync.run_once(
+    cfg.db_path,
+    prov,
+    provider_name,
+    zone_id,
+    name.to_string(signing_zone),
+  )
   Ok(Nil)
 }
 

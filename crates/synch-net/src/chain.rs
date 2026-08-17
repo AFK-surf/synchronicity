@@ -36,15 +36,34 @@
 //! from a stranger's.
 //!
 //! So the chain does not start at the apex. It starts one label below it, at
-//! `_synchronicity-transparency.<apex>`, whose TXT RRset the apex's own keys
-//! signed. That record is the zone owner's **declaration**: *this zone is a
-//! synchronicity control plane, and its keys are meant to be found in the
-//! log*. Only somebody who can put a record into the zone can produce it, and
-//! that is precisely the authority the entry claims to speak with. It is what
-//! makes an entry the zone's own statement rather than a bystander's
+//! `_synchronicity-transparency.<apex>`, whose TXT RRset is signed by the
+//! zone that holds it. That record is the operator's **declaration**: *this
+//! name is a synchronicity control plane, and its keys are meant to be found
+//! in the log*. Only somebody who can put a record into the zone can produce
+//! it, and that is precisely the authority the entry claims to speak with. It
+//! is what makes an entry the zone's own statement rather than a bystander's
 //! transcription — and, unlike signing the entry with the zone key, it asks
 //! nothing of the private key, so a zone whose DNSSEC keys live inside a
 //! managed provider can publish one with an ordinary record write.
+//!
+//! # The apex and the signing zone are two different names
+//!
+//! The apex is the control plane's *name*. The **signing zone** is whatever
+//! DNS zone actually holds and signs its records. Usually they coincide — the
+//! control plane runs a delegated zone of its own. They need not: a control
+//! plane at `sync.example.` may be served entirely out of the `example.` zone,
+//! with no delegation and no DNSKEY of its own. Then `example.` signs
+//! everything, the declaration included, and it is `example.`'s key set that
+//! the ladder proves and that signs membership answers.
+//!
+//! So a chain reads as: the declaration at the apex, then the ladder starting
+//! at the **signing zone** and climbing to the anchor. The rule tying them
+//! together is that the signing zone must **enclose** the apex — it has to be
+//! a zone the declaration could actually live in. Everything else follows
+//! from that: the declaration is verified under the signing zone's own
+//! chain-proven keys, and its RRSIG names that zone as signer, because per
+//! RFC 4035 §5.3.1 the closest enclosing zone is the only one entitled to
+//! sign a name it contains.
 //!
 //! What the declaration does **not** do is prevent an ancestor zone from
 //! making one about itself. A parent that nullifies its child's delegation
@@ -152,8 +171,15 @@ pub struct ValidChain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authorized {
     /// The apex, parsed and normalized from the certificate's single
-    /// `dNSName` SAN.
+    /// `dNSName` SAN — the control plane's *name*.
     pub apex: Name,
+    /// The zone that actually holds and signs the apex's records, read out
+    /// of the chain's own ladder. Equal to the apex when the control plane
+    /// runs a delegated zone; an ancestor of it when the apex is served out
+    /// of a zone above it. The proven keys belong to *this* zone, so it —
+    /// not the apex — is what a DS is computed against and what a
+    /// membership answer's RRSIG signer must be.
+    pub signing_zone: Name,
     /// The DNSKEY rdatas of the apex RRset the chain proved — the authorized
     /// key set. Read out of the chain's own apex link, never looked up, and
     /// never derived from the certificate's key: the certificate's
@@ -194,9 +220,10 @@ pub fn authorize(
             DnssecChain::decode(value).map_err(|e| ChainError::Malformed(e.to_string()))?
         }
     };
-    let (proven_keys, chain) = validate(&carried, &apex, anchors)?;
+    let (proven_keys, signing_zone, chain) = validate(&carried, &apex, anchors)?;
     Ok(Authorized {
         apex,
+        signing_zone,
         proven_keys,
         chain,
     })
@@ -245,7 +272,7 @@ pub fn validate(
     chain: &DnssecChain,
     apex: &Name,
     anchors: &TrustAnchors,
-) -> Result<(Vec<Vec<u8>>, ValidChain), ChainError> {
+) -> Result<(Vec<Vec<u8>>, Name, ValidChain), ChainError> {
     let links = chain.links.as_slice();
     if links.is_empty() {
         return Err(ChainError::Absent);
@@ -256,12 +283,12 @@ pub fn validate(
         .iter()
         .map(ParsedLink::parse)
         .collect::<Result<_, _>>()?;
-    // Two links is the floor: the declaration, and an apex that is itself the
-    // anchor. Anything shorter cannot carry both.
+    // Two links is the floor: the declaration, and a signing zone that is
+    // itself the anchor. Anything shorter cannot carry both.
     if parsed.len() < 2 {
         return Err(ChainError::Structure(format!(
             "the chain has {} link(s): it must carry the declaration at \
-             {declared_at} and the apex {apex_name}",
+             {declared_at} and the zone that signs it",
             parsed.len()
         )));
     }
@@ -271,26 +298,33 @@ pub fn validate(
             parsed[0].zone
         )));
     }
-    if parsed[1].zone != apex_name {
+    // The ladder's bottom is the signing zone. It need not be the apex — a
+    // control plane may be served out of a zone above it — but it must be a
+    // zone the declaration could live in, or it is not the authority for
+    // this name at all.
+    let signing_zone = parsed[1].zone.clone();
+    if !signing_zone.zone_of(&apex_name) {
         return Err(ChainError::Structure(format!(
-            "the second link is for {}, not the apex {apex_name}",
-            parsed[1].zone
+            "the ladder starts at {signing_zone}, which does not contain the \
+             apex {apex_name}"
         )));
     }
 
-    // Everything from the apex up is the delegation ladder, walked top-down
-    // to the apex's own DNSKEY RRset.
+    // Everything from the signing zone up is the delegation ladder, walked
+    // top-down to that zone's own DNSKEY RRset.
     let ladder = &parsed[1..];
     let (trusted, anchor_zone) = walk_ladder(ladder, anchors)?;
 
-    // `trusted` is now the apex's own DNSKEY RRset. The declaration under it
-    // must be signed by that set, or the zone never said any of this.
-    verify_declaration(&parsed[0], trusted, &apex_name)?;
+    // `trusted` is now the signing zone's DNSKEY RRset. The declaration must
+    // be signed by that set, or nobody who could speak for this name said
+    // any of it.
+    verify_declaration(&parsed[0], trusted, &signing_zone)?;
 
     let proven: Vec<Vec<u8>> = trusted.iter().map(rdata_of).collect();
     debug_assert!(!proven.is_empty(), "a verified DNSKEY set is non-empty");
     Ok((
         proven,
+        signing_zone,
         ValidChain {
             anchor_zone,
             links: ladder.len(),
@@ -359,13 +393,13 @@ fn walk_ladder<'a>(
 ///   hand back a perfectly valid RRSIG for a record the zone never wrote. RFC
 ///   4035 §5.3.2 gives the tell: a wildcard-expanded RRSIG has fewer labels
 ///   in its `num_labels` field than the owner name it arrived under;
-/// - the signature is by the apex's chain-proven keys, and the RRSIG names
-///   the apex as the signer — the closest enclosing zone, per RFC 4035
+/// - the signature is by the signing zone's chain-proven keys, and the RRSIG
+///   names that zone as the signer — the closest enclosing zone, per RFC 4035
 ///   §5.3.1. Anything else is some other zone speaking for this name.
 fn verify_declaration(
     link: &ParsedLink,
-    apex_keys: &[Record],
-    apex: &Name,
+    zone_keys: &[Record],
+    signing_zone: &Name,
 ) -> Result<(), ChainError> {
     if link.txt.is_empty() {
         return Err(ChainError::Structure(format!(
@@ -388,16 +422,17 @@ fn verify_declaration(
                 link.zone
             )));
         }
-        if sig.input().signer_name.to_lowercase() != *apex {
+        if sig.input().signer_name.to_lowercase() != *signing_zone {
             return Err(ChainError::Structure(format!(
-                "the declaration at {} names {} as its signer, not the apex \
-                 {apex}",
+                "the declaration at {} names {} as its signer, not {}, the \
+                 zone the chain says holds it",
                 link.zone,
-                sig.input().signer_name
+                sig.input().signer_name,
+                signing_zone
             )));
         }
     }
-    verify_rrset(link, RecordType::TXT, &link.txt, &link.txt_sigs, apex_keys)
+    verify_rrset(link, RecordType::TXT, &link.txt, &link.txt_sigs, zone_keys)
 }
 
 /// Whether one TXT record carries the declaration text.

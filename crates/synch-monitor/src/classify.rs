@@ -241,17 +241,28 @@ pub fn classify(
             // whole of the verdict: these keys are authorized for this apex,
             // and the monitor does not — cannot — say by whom.
             finding.tier = Tier::A;
+            // The DS is derived against the **signing zone**, not the apex:
+            // these keys belong to whatever zone actually holds the apex's
+            // records, and that is the zone whose registrar would show the
+            // DS. For a control plane running its own delegated zone the two
+            // names are the same; for one served out of a zone above it they
+            // are not, and computing the digest over the apex would print a
+            // DS that matches nothing anywhere.
             finding.keys = authorized
                 .proven_keys
                 .iter()
                 .map(|rdata| AuthorizedKey {
                     key_tag: chain::key_tag(rdata),
                     sha256: hex::encode(sha256(rdata)),
-                    ds: chain::ds_fields(&apex, rdata),
+                    ds: chain::ds_fields(&authorized.signing_zone, rdata),
                 })
                 .collect();
+            let served_by = match authorized.signing_zone == apex {
+                true => String::new(),
+                false => format!(", served out of {}", authorized.signing_zone),
+            };
             finding.reasons.push(format!(
-                "DNSSEC chain valid to {} ({} link(s)): {} key(s) authorized for {apex}",
+                "DNSSEC chain valid to {} ({} link(s)): {} key(s) authorized for {apex}{served_by}",
                 authorized.chain.anchor_zone,
                 authorized.chain.links,
                 finding.keys.len()
