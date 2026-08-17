@@ -36,10 +36,25 @@
 //! - an entry is **included** when its body hashes to `stored_hash(0, index)`,
 //!   and the audit path this module derives walks to the checkpoint's root
 //!   under `synch_net`'s own RFC 6962 walk — the same code the client runs.
+//!
+//! # Fetching posture
+//!
+//! A log of 10⁸ entries is ~400 000 bundles; fetched one round-trip at a
+//! time that is most of a day, so reads run ahead of consumption with a
+//! bounded, caller-chosen concurrency — [`Tree::bundle_stream`] for the scan
+//! itself, and the part reads inside [`Tree::subtree_hash`]. The bound stays
+//! small on purpose: the log is free community infrastructure, and the
+//! answer to "slow" is a handful of requests in flight, not a flood.
+//! Transient failures — a 429, a 5xx, a dropped connection — are retried
+//! with backoff a few times before a run gives up, because a reader that
+//! fetches ahead meets more of them than one that does not.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Mutex;
+use std::time::Duration;
 
+use futures_util::stream::{self, Stream, StreamExt, TryStreamExt};
 use synch_net::rekor::{leaf_hash, node_hash, sha256};
 
 use crate::MonitorError;
@@ -55,13 +70,20 @@ use crate::MonitorError;
 const MAX_TILE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Where tiles come from.
+///
+/// The returned future is required to be `Send` so a caller may run several
+/// fetches at once; no implementor in this crate holds unsynchronized state
+/// across an await.
 #[allow(missing_debug_implementations)]
 pub trait TileSource {
     /// Fetches one tile path, relative to the log's base URL.
     ///
     /// `Ok(None)` means the log answered 404 — a tile that does not exist,
     /// which is a fact about the tree, not a failure.
-    fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError>;
+    fn fetch(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, MonitorError>> + Send;
 }
 
 /// A Rekor v2 log read over HTTPS, with an in-process cache.
@@ -69,13 +91,26 @@ pub trait TileSource {
 /// The cache is what makes reading a 10⁸-entry log tolerable: one walk of a
 /// bundle touches the same handful of hash tiles for every entry in it.
 /// Partial tiles are cached under their width, so a frontier tile that grows
-/// is a different cache entry rather than a stale one.
+/// is a different cache entry rather than a stale one. The cache sits behind
+/// a mutex so that fetches running concurrently can share it; two fetches
+/// racing the same path may both go to the network, which is benign — the
+/// bytes are the same and the last write wins.
 #[derive(Debug)]
 pub struct HttpTiles {
     base: String,
-    client: reqwest::blocking::Client,
-    cache: RefCell<HashMap<String, Option<Vec<u8>>>>,
+    client: reqwest::Client,
+    cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
 }
+
+/// How many times a fetch is tried before the run gives up, and the delay
+/// before the first retry (doubled each time, capped at 8 s).
+///
+/// Retried at all because a reader that fetches ahead meets more transient
+/// failures than a serial one; bounded because a log that is down is a
+/// transport failure the run should report, not something to wait out.
+const MAX_ATTEMPTS: u32 = 4;
+const FIRST_RETRY_DELAY: Duration = Duration::from_millis(500);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
 
 impl HttpTiles {
     /// A source reading from `base` — the log [`crate::discover`] resolved,
@@ -83,77 +118,99 @@ impl HttpTiles {
     pub fn new(base: &str) -> Result<HttpTiles, MonitorError> {
         Ok(HttpTiles {
             base: base.trim_end_matches('/').to_string(),
-            client: reqwest::blocking::Client::builder()
+            client: reqwest::Client::builder()
                 .user_agent("synch-monitor")
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(Duration::from_secs(30))
                 .build()
                 .map_err(|e| MonitorError::Transport(e.to_string()))?,
-            cache: RefCell::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
         })
     }
 
     /// The signed checkpoint, verbatim.
-    pub fn checkpoint(&self) -> Result<Vec<u8>, MonitorError> {
-        self.fetch("api/v2/checkpoint")?
+    pub async fn checkpoint(&self) -> Result<Vec<u8>, MonitorError> {
+        self.fetch("api/v2/checkpoint")
+            .await?
             .ok_or_else(|| MonitorError::Transport("the log serves no checkpoint".into()))
     }
 }
 
 impl TileSource for HttpTiles {
-    fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
-        if let Some(hit) = self.cache.borrow().get(path) {
-            return Ok(hit.clone());
+    async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+        let cached = self.cache.lock().expect("tile cache").get(path).cloned();
+        if let Some(hit) = cached {
+            return Ok(hit);
         }
         let url = format!("{}/{path}", self.base);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| MonitorError::Transport(format!("{url}: {e}")))?;
-        let body = match response.status().as_u16() {
-            200 => {
-                // Capped, because a monitor reads from a log it does not
-                // trust: an 8 KiB hash tile and a 256-entry bundle are both
-                // bounded by the format, so anything past the cap is a server
-                // trying to exhaust the reader rather than a tile. The
-                // client's DoH path has had this bound since the audit that
-                // asked for it; this path had not.
-                let body = response
-                    .bytes()
-                    .map_err(|e| MonitorError::Transport(format!("{url}: {e}")))?;
-                if body.len() > MAX_TILE_BYTES {
-                    return Err(MonitorError::Transport(format!(
-                        "{url}: {} bytes, over the {MAX_TILE_BYTES}-byte cap",
-                        body.len()
-                    )));
-                }
-                Some(body.to_vec())
+        let mut delay = FIRST_RETRY_DELAY;
+        let mut attempt = 1;
+        let body = loop {
+            let retryable = match self.client.get(&url).send().await {
+                Ok(response) => match response.status().as_u16() {
+                    200 => match response.bytes().await {
+                        Ok(body) if body.len() > MAX_TILE_BYTES => {
+                            // Capped, because a monitor reads from a log it
+                            // does not trust: an 8 KiB hash tile and a
+                            // 256-entry bundle are both bounded by the
+                            // format, so anything past the cap is a server
+                            // trying to exhaust the reader rather than a
+                            // tile. The client's DoH path has had this bound
+                            // since the audit that asked for it; this path
+                            // had not.
+                            return Err(MonitorError::Transport(format!(
+                                "{url}: {} bytes, over the {MAX_TILE_BYTES}-byte cap",
+                                body.len()
+                            )));
+                        }
+                        Ok(body) => break Some(body.to_vec()),
+                        Err(e) => format!("{url}: {e}"),
+                    },
+                    404 => break None,
+                    status @ (429 | 500..=599) => format!("{url}: the log answered {status}"),
+                    status => {
+                        return Err(MonitorError::Transport(format!(
+                            "{url}: the log answered {status}"
+                        )));
+                    }
+                },
+                Err(e) => format!("{url}: {e}"),
+            };
+            attempt += 1;
+            if attempt > MAX_ATTEMPTS {
+                return Err(MonitorError::Transport(retryable));
             }
-            404 => None,
-            status => {
-                return Err(MonitorError::Transport(format!(
-                    "{url}: the log answered {status}"
-                )))
-            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(MAX_RETRY_DELAY);
         };
         self.cache
-            .borrow_mut()
+            .lock()
+            .expect("tile cache")
             .insert(path.to_string(), body.clone());
         Ok(body)
     }
 }
 
 /// One tree, at one size, read through a [`TileSource`].
+///
+/// `concurrency` bounds how many tile fetches may be in flight at once: the
+/// part reads inside [`Tree::subtree_hash`] and the read-ahead of
+/// [`Tree::bundle_stream`]. It is clamped to at least one, and the right
+/// value is small — the log is shared infrastructure.
 #[allow(missing_debug_implementations)]
-pub struct Tree<'a> {
-    source: &'a dyn TileSource,
+pub struct Tree<'a, S: TileSource> {
+    source: &'a S,
     size: u64,
+    concurrency: usize,
 }
 
-impl<'a> Tree<'a> {
+impl<'a, S: TileSource> Tree<'a, S> {
     /// The tree of `size` leaves a checkpoint commits to.
-    pub fn new(source: &'a dyn TileSource, size: u64) -> Tree<'a> {
-        Tree { source, size }
+    pub fn new(source: &'a S, size: u64, concurrency: usize) -> Tree<'a, S> {
+        Tree {
+            source,
+            size,
+            concurrency: concurrency.max(1),
+        }
     }
 
     /// The path of a tile, in the tlog-tiles naming scheme.
@@ -178,7 +235,7 @@ impl<'a> Tree<'a> {
     }
 
     /// The bytes of a hash tile.
-    fn hash_tile(&self, tile_level: u32, index: u64) -> Result<Vec<u8>, MonitorError> {
+    async fn hash_tile(&self, tile_level: u32, index: u64) -> Result<Vec<u8>, MonitorError> {
         let width = self.width(tile_level, index);
         if width == 0 {
             return Err(MonitorError::Tile(format!(
@@ -186,9 +243,10 @@ impl<'a> Tree<'a> {
                 self.size
             )));
         }
-        let path = Tree::path(&tile_level.to_string(), index, width);
+        let path = Self::path(&tile_level.to_string(), index, width);
         self.source
-            .fetch(&path)?
+            .fetch(&path)
+            .await?
             .ok_or_else(|| MonitorError::Tile(format!("{path} is missing")))
     }
 
@@ -197,7 +255,7 @@ impl<'a> Tree<'a> {
     /// Levels that are not a multiple of eight are not stored directly: a
     /// tile holds its base level and every higher node inside it is the hash
     /// of a contiguous run of those, which is what `fold` reconstructs.
-    fn stored_hash(&self, level: u32, index: u64) -> Result<[u8; 32], MonitorError> {
+    async fn stored_hash(&self, level: u32, index: u64) -> Result<[u8; 32], MonitorError> {
         let tile_level = level / 8;
         let within = level % 8;
         // `index << within` overflows for a level/index pair a hostile log
@@ -207,7 +265,7 @@ impl<'a> Tree<'a> {
         })?;
         let tile_index = shifted >> 8;
         let offset = index - ((tile_index << 8) >> within);
-        let data = self.hash_tile(tile_level, tile_index)?;
+        let data = self.hash_tile(tile_level, tile_index).await?;
         let start = (offset << within) as usize * 32;
         let end = ((offset + 1) << within) as usize * 32;
         let slice = data.get(start..end).ok_or_else(|| {
@@ -224,7 +282,10 @@ impl<'a> Tree<'a> {
     /// aligned complete subtrees the log has stored, then folded from the
     /// right — RFC 6962's own recursion, expressed over stored hashes so that
     /// nothing has to be recomputed from leaves.
-    pub fn subtree_hash(&self, lo: u64, hi: u64) -> Result<[u8; 32], MonitorError> {
+    ///
+    /// The parts are independent tile reads and are fetched together, up to
+    /// the tree's concurrency; the fold itself runs strictly in order.
+    pub async fn subtree_hash(&self, lo: u64, hi: u64) -> Result<[u8; 32], MonitorError> {
         if lo >= hi {
             return Err(MonitorError::Tile(format!("empty range [{lo},{hi})")));
         }
@@ -235,94 +296,168 @@ impl<'a> Tree<'a> {
             while at & (span - 1) != 0 {
                 span /= 2;
             }
-            parts.push(self.stored_hash(span.trailing_zeros(), at / span)?);
+            parts.push((span.trailing_zeros(), at / span));
             at += span;
         }
-        let mut hash = *parts.last().expect("non-empty range");
-        for part in parts.iter().rev().skip(1) {
+        let hashes = stream::iter(parts)
+            .map(|(level, index)| self.stored_hash(level, index))
+            .buffered(self.concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut hash = *hashes.last().expect("non-empty range");
+        for part in hashes.iter().rev().skip(1) {
             hash = node_hash(part, &hash);
         }
         Ok(hash)
     }
 
     /// The Merkle root of the whole tree, recomputed from tiles.
-    pub fn root(&self) -> Result<[u8; 32], MonitorError> {
+    pub async fn root(&self) -> Result<[u8; 32], MonitorError> {
         match self.size {
             0 => Ok(sha256(&[])),
-            size => self.subtree_hash(0, size),
+            size => self.subtree_hash(0, size).await,
         }
     }
 
     /// The RFC 6962 audit path from leaf `index` to this tree's root.
-    pub fn inclusion_path(&self, index: u64) -> Result<Vec<[u8; 32]>, MonitorError> {
+    pub async fn inclusion_path(&self, index: u64) -> Result<Vec<[u8; 32]>, MonitorError> {
         if index >= self.size {
             return Err(MonitorError::Tile(format!(
                 "entry {index} is outside a tree of {}",
                 self.size
             )));
         }
-        self.path_within(0, self.size, index)
-    }
-
-    fn path_within(&self, lo: u64, hi: u64, index: u64) -> Result<Vec<[u8; 32]>, MonitorError> {
-        if lo + 1 == hi {
-            return Ok(Vec::new());
-        }
-        let split = lo + max_pow2_lt(hi - lo);
-        match index < split {
-            true => {
-                let mut path = self.path_within(lo, split, index)?;
-                path.push(self.subtree_hash(split, hi)?);
-                Ok(path)
-            }
-            false => {
-                let mut path = self.path_within(split, hi, index)?;
-                path.push(self.subtree_hash(lo, split)?);
-                Ok(path)
+        // Walk from the root down to the leaf, noting the sibling range at
+        // each level, then hash the siblings leaf-first — the order the
+        // recursive formulation of this same walk produces them in.
+        let mut siblings = Vec::new();
+        let (mut lo, mut hi) = (0u64, self.size);
+        while lo + 1 < hi {
+            let split = lo + max_pow2_lt(hi - lo);
+            if index < split {
+                siblings.push((split, hi));
+                hi = split;
+            } else {
+                siblings.push((lo, split));
+                lo = split;
             }
         }
+        let mut path = Vec::with_capacity(siblings.len());
+        for (lo, hi) in siblings.into_iter().rev() {
+            path.push(self.subtree_hash(lo, hi).await?);
+        }
+        Ok(path)
     }
 
-    /// The bodies in the entry bundle covering `index`, in order.
+    /// What to fetch to read the entry bundle covering `index`.
+    ///
+    /// Fetching and decoding are separate steps ([`Tree::bundle_request`],
+    /// [`Tree::bundle_decode`]) so a caller can run many fetches at once and
+    /// still decode strictly in order — which [`Tree::bundle_stream`] does.
+    pub fn bundle_request(&self, index: u64) -> Result<BundleRequest, MonitorError> {
+        if index >= self.size {
+            return Err(MonitorError::Tile(format!(
+                "entry {index} is outside a tree of {}",
+                self.size
+            )));
+        }
+        let first_index = (index / 256) * 256;
+        let count = self.size.saturating_sub(first_index).min(256);
+        let path = Self::path("entries", index / 256, count);
+        Ok(BundleRequest {
+            first_index,
+            count,
+            path,
+        })
+    }
+
+    /// Decodes the bundle fetched for `request`.
     ///
     /// The framing is a big-endian `uint16` length before each body, 256 to a
     /// full bundle. Returned as `(index, body)` so a caller can name an entry
     /// without recomputing the arithmetic.
-    pub fn entry_bundle(&self, index: u64) -> Result<Vec<(u64, Vec<u8>)>, MonitorError> {
-        if index >= self.size {
-            return Err(MonitorError::Tile(format!(
-                "entry {index} is outside a tree of {}",
-                self.size
-            )));
-        }
-        let bundle = index / 256;
-        let width = self.size.saturating_sub(bundle * 256).min(256);
-        let path = Tree::path("entries", bundle, width);
-        let data = self
-            .source
-            .fetch(&path)?
-            .ok_or_else(|| MonitorError::Tile(format!("{path} is missing")))?;
-        let mut out = Vec::with_capacity(width as usize);
+    pub fn bundle_decode(
+        &self,
+        request: &BundleRequest,
+        data: &[u8],
+    ) -> Result<Vec<(u64, Vec<u8>)>, MonitorError> {
+        let mut out = Vec::with_capacity(request.count as usize);
         let mut at = 0usize;
         while at < data.len() {
             let length = match data.get(at..at + 2) {
                 Some(header) => usize::from(u16::from_be_bytes([header[0], header[1]])),
-                None => return Err(MonitorError::Tile(format!("{path}: truncated length"))),
+                None => {
+                    return Err(MonitorError::Tile(format!(
+                        "{}: truncated length",
+                        request.path
+                    )))
+                }
             };
             at += 2;
             let body = data
                 .get(at..at + length)
-                .ok_or_else(|| MonitorError::Tile(format!("{path}: truncated entry")))?;
-            out.push((bundle * 256 + out.len() as u64, body.to_vec()));
+                .ok_or_else(|| MonitorError::Tile(format!("{}: truncated entry", request.path)))?;
+            out.push((request.first_index + out.len() as u64, body.to_vec()));
             at += length;
         }
-        if out.len() as u64 != width {
+        if out.len() as u64 != request.count {
             return Err(MonitorError::Tile(format!(
-                "{path}: {} entries, expected {width}",
-                out.len()
+                "{}: {} entries, expected {}",
+                request.path,
+                out.len(),
+                request.count
             )));
         }
         Ok(out)
+    }
+
+    /// The bodies in the entry bundle covering `index`, in order.
+    ///
+    /// For reading one bundle. A scan wants [`Tree::bundle_stream`], which
+    /// fetches ahead instead of one round-trip per bundle.
+    pub async fn entry_bundle(&self, index: u64) -> Result<Vec<(u64, Vec<u8>)>, MonitorError> {
+        let request = self.bundle_request(index)?;
+        let data = self
+            .source
+            .fetch(&request.path)
+            .await?
+            .ok_or_else(|| MonitorError::Tile(format!("{} is missing", request.path)))?;
+        self.bundle_decode(&request, &data)
+    }
+
+    /// Every entry bundle covering `[from, to)`, in index order, with up to
+    /// the tree's concurrency of fetches in flight.
+    ///
+    /// `to` must not exceed the tree's size, and may sit mid-bundle — the
+    /// bundle holding it is read whole and the caller skips past what it did
+    /// not ask for, exactly as with [`Tree::entry_bundle`]. An empty range
+    /// yields an empty stream.
+    ///
+    /// The order guarantee is the contract: fetching runs ahead of decoding,
+    /// but bundles leave the stream strictly in index order, so a consumer's
+    /// "how far have I read" bookkeeping stays deterministic.
+    pub fn bundle_stream(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> impl Stream<Item = Result<Vec<(u64, Vec<u8>)>, MonitorError>> + '_ {
+        let firsts: Vec<u64> = match from < to {
+            true => ((from / 256)..=((to - 1) / 256))
+                .map(|bundle| bundle * 256)
+                .collect(),
+            false => Vec::new(),
+        };
+        stream::iter(firsts)
+            .map(move |first| async move {
+                let request = self.bundle_request(first)?;
+                let data = self
+                    .source
+                    .fetch(&request.path)
+                    .await?
+                    .ok_or_else(|| MonitorError::Tile(format!("{} is missing", request.path)))?;
+                self.bundle_decode(&request, &data)
+            })
+            .buffered(self.concurrency)
     }
 
     /// Whether the entry at `index` really is the leaf the tree stored there.
@@ -330,9 +465,20 @@ impl<'a> Tree<'a> {
     /// Cheap and total: the log's own hash tile already commits to the leaf,
     /// so a bundle body that hashes differently is a bundle the log did not
     /// serialize, caught before anything is parsed out of it.
-    pub fn leaf_matches(&self, index: u64, body: &[u8]) -> Result<bool, MonitorError> {
-        Ok(self.stored_hash(0, index)? == leaf_hash(body))
+    pub async fn leaf_matches(&self, index: u64, body: &[u8]) -> Result<bool, MonitorError> {
+        Ok(self.stored_hash(0, index).await? == leaf_hash(body))
     }
+}
+
+/// One entry bundle to fetch, as [`Tree::bundle_request`] describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleRequest {
+    /// The index of the bundle's first entry.
+    pub first_index: u64,
+    /// How many entries the bundle holds at this tree size.
+    pub count: u64,
+    /// The tile path to fetch.
+    pub path: String,
 }
 
 /// A tile's internal node: the hash of a contiguous run of its base hashes.
@@ -386,7 +532,7 @@ mod tests {
     }
 
     impl TileSource for MemoryLog {
-        fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
             let rest = path.strip_prefix("api/v2/tile/").expect("tile path");
             let (level, rest) = rest.split_once('/').expect("level");
             let (digits, width) = match rest.split_once(".p/") {
@@ -440,40 +586,41 @@ mod tests {
     #[test]
     fn tile_paths_are_three_digit_groups_from_the_right() {
         assert_eq!(
-            Tree::path("entries", 264_349, 256),
+            Tree::<MemoryLog>::path("entries", 264_349, 256),
             "api/v2/tile/entries/x264/349"
         );
-        assert_eq!(Tree::path("0", 0, 256), "api/v2/tile/0/000");
-        assert_eq!(Tree::path("1", 7, 13), "api/v2/tile/1/007.p/13");
+        assert_eq!(Tree::<MemoryLog>::path("0", 0, 256), "api/v2/tile/0/000");
+        assert_eq!(Tree::<MemoryLog>::path("1", 7, 13), "api/v2/tile/1/007.p/13");
         assert_eq!(
-            Tree::path("0", 1_234_567, 256),
+            Tree::<MemoryLog>::path("0", 1_234_567, 256),
             "api/v2/tile/0/x001/x234/567"
         );
     }
 
-    #[test]
-    fn roots_recomputed_from_tiles_match_the_reference_tree() {
+    #[tokio::test]
+    async fn roots_recomputed_from_tiles_match_the_reference_tree() {
         // Sizes that straddle every awkward boundary: a single leaf, one
         // short of a tile, exactly a tile, one past it, and two tile levels.
         for size in [1u64, 2, 3, 255, 256, 257, 511, 1000, 65_536, 65_537] {
             let log = log(size);
-            let tree = Tree::new(&log, size);
+            let tree = Tree::new(&log, size, 8);
             assert_eq!(
-                tree.root().unwrap(),
+                tree.root().await.unwrap(),
                 reference_root(&log.leaves, 0, size),
                 "size {size}"
             );
         }
     }
 
-    #[test]
-    fn audit_paths_from_tiles_verify_under_the_clients_own_walk() {
+    #[tokio::test]
+    async fn audit_paths_from_tiles_verify_under_the_clients_own_walk() {
         let size = 1_000u64;
         let log = log(size);
-        let tree = Tree::new(&log, size);
-        let root = tree.root().unwrap();
+        // Concurrency 1: nothing here may depend on fetches overlapping.
+        let tree = Tree::new(&log, size, 1);
+        let root = tree.root().await.unwrap();
         for index in [0u64, 1, 255, 256, 511, 512, 998, 999] {
-            let path = tree.inclusion_path(index).unwrap();
+            let path = tree.inclusion_path(index).await.unwrap();
             synch_net::rekor::verify_inclusion(
                 index,
                 size,
@@ -484,43 +631,75 @@ mod tests {
             .unwrap_or_else(|e| panic!("index {index}: {e}"));
             assert!(tree
                 .leaf_matches(index, &log.leaves[index as usize])
+                .await
                 .unwrap());
-            assert!(!tree.leaf_matches(index, b"something else").unwrap());
+            assert!(!tree.leaf_matches(index, b"something else").await.unwrap());
         }
     }
 
-    #[test]
-    fn consistency_is_the_old_root_recomputed_from_the_new_trees_tiles() {
+    #[tokio::test]
+    async fn consistency_is_the_old_root_recomputed_from_the_new_trees_tiles() {
         // A tree that grew: the prefix's root, recomputed from the *new*
         // tree's stored hashes, is the root the monitor persisted. That is
         // precisely what an RFC 6962 consistency proof asserts, so a monitor
         // that can read tiles never has to ask for one.
         let grown = log(1_000);
         let old_root = reference_root(&grown.leaves, 0, 700);
-        let tree = Tree::new(&grown, 1_000);
-        assert_eq!(tree.subtree_hash(0, 700).unwrap(), old_root);
+        let tree = Tree::new(&grown, 1_000, 4);
+        assert_eq!(tree.subtree_hash(0, 700).await.unwrap(), old_root);
         // A forked log — one leaf rewritten inside the prefix — no longer
         // reproduces it, which is the split view the check exists to catch.
         let mut forked = log(1_000);
         forked.leaves[42] = b"a different history".to_vec();
         assert_ne!(
-            Tree::new(&forked, 1_000).subtree_hash(0, 700).unwrap(),
+            Tree::new(&forked, 1_000, 4)
+                .subtree_hash(0, 700)
+                .await
+                .unwrap(),
             old_root
         );
     }
 
-    #[test]
-    fn entry_bundles_decode_their_length_framing() {
+    #[tokio::test]
+    async fn entry_bundles_decode_their_length_framing() {
         let log = log(600);
-        let tree = Tree::new(&log, 600);
-        let full = tree.entry_bundle(0).unwrap();
+        let tree = Tree::new(&log, 600, 4);
+        let full = tree.entry_bundle(0).await.unwrap();
         assert_eq!(full.len(), 256);
         assert_eq!(full[0], (0, b"entry 0".to_vec()));
         assert_eq!(full[255].0, 255);
-        let partial = tree.entry_bundle(512).unwrap();
+        let partial = tree.entry_bundle(512).await.unwrap();
         assert_eq!(partial.len(), 88);
         assert_eq!(partial[0].0, 512);
         assert_eq!(partial[87], (599, b"entry 599".to_vec()));
-        assert!(tree.entry_bundle(600).is_err());
+        assert!(tree.entry_bundle(600).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bundle_streams_decode_every_bundle_strictly_in_order() {
+        let log = log(1_000);
+        // Deliberately below the bundle count, so read-ahead has work in
+        // flight and the in-order contract is what is being exercised.
+        let tree = Tree::new(&log, 1_000, 2);
+        let bundles: Vec<Vec<(u64, Vec<u8>)>> =
+            tree.bundle_stream(0, 1_000).try_collect().await.unwrap();
+        assert_eq!(bundles.len(), 4);
+        for (expected_first, bundle) in [0u64, 256, 512, 768].into_iter().zip(&bundles) {
+            assert_eq!(bundle.first().unwrap().0, expected_first);
+        }
+        // The stream agrees with the one-bundle reader on content.
+        assert_eq!(bundles[0], tree.entry_bundle(0).await.unwrap());
+        assert_eq!(bundles[3].len(), 232);
+        assert_eq!(bundles[3][231].0, 999);
+
+        // A mid-bundle start still reads the whole bundle and leaves the
+        // skipping to the caller; an empty range is an empty stream.
+        let mid: Vec<Vec<(u64, Vec<u8>)>> =
+            tree.bundle_stream(100, 300).try_collect().await.unwrap();
+        assert_eq!(mid.len(), 2);
+        assert_eq!(mid[0][0].0, 0);
+        let empty: Vec<Vec<(u64, Vec<u8>)>> =
+            tree.bundle_stream(500, 500).try_collect().await.unwrap();
+        assert!(empty.is_empty());
     }
 }

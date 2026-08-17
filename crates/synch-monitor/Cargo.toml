@@ -11,14 +11,19 @@ authors.workspace = true
 [dependencies]
 base64.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 hickory-resolver.workspace = true
+# The scan path is fully async. `blocking` remains for discover::HttpRepo
+# alone: synch_net::tuf::Repo is a synchronous trait, and the TUF walk is a
+# handful of sequential fetches made once per run on a blocking thread.
 reqwest = { workspace = true, features = ["blocking"] }
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 synch-net.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

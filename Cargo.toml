@@ -38,6 +38,7 @@ bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 directories = "6.0.0"
 futures-core = "0.3"
+futures-util = { version = "0.3.31", default-features = false, features = ["alloc"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["dnssec-ring", "tokio"] }

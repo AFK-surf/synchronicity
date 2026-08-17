@@ -3866,6 +3866,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
+ "futures-util",
  "hex",
  "hickory-resolver",
  "reqwest",
@@ -3876,6 +3877,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "time",
+ "tokio",
 ]
 
 [[package]]

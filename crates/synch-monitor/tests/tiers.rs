@@ -572,11 +572,11 @@ fn an_extension_nothing_reads_does_not_disturb_the_verdict() {
 
 /// A monitor reads leaves out of tiles; assert it against a whole simulated
 /// log rather than against a hand-built bundle.
-#[test]
-fn a_monitor_finds_a_zones_entry_by_walking_bundles() {
+#[tokio::test]
+async fn a_monitor_finds_a_zones_entry_by_walking_bundles() {
     struct Bundles(Vec<Vec<u8>>);
     impl TileSource for Bundles {
-        fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
             assert!(path.starts_with("api/v2/tile/entries/"), "{path}");
             let mut out = Vec::new();
             for body in &self.0 {
@@ -595,10 +595,10 @@ fn a_monitor_finds_a_zones_entry_by_walking_bundles() {
         b"somebody else's entry".to_vec(),
         proof.canonicalized_body.clone(),
     ]);
-    let tree = Tree::new(&bundles, 2);
+    let tree = Tree::new(&bundles, 2, 4);
 
     let mut found = Vec::new();
-    for (index, body) in tree.entry_bundle(0).unwrap() {
+    for (index, body) in tree.entry_bundle(0).await.unwrap() {
         let Ok(parsed) = HashedRekordBody::parse(&body) else {
             continue;
         };

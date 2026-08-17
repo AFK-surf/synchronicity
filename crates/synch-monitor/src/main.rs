@@ -31,8 +31,10 @@
 //! They are ordered by severity, so a rule testing `>=` reads correctly.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
+use futures_util::stream::StreamExt;
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::{
     classify::{classify, Finding, Tier},
@@ -50,6 +52,15 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// A duration for a progress line, rounded to what fits in a few characters.
+fn rough_eta(secs: u64) -> String {
+    match secs {
+        0..=89 => format!("{secs}s"),
+        90..=3599 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
+    }
 }
 
 /// Watch a Rekor v2 transparency log for zone-key entries.
@@ -122,6 +133,17 @@ struct Args {
     #[arg(long)]
     max_entries: Option<u64>,
 
+    /// How many tile fetches may be in flight at once. A full-history
+    /// catch-up on a big log is hundreds of thousands of bundles, which at
+    /// one request per round-trip is most of a day; the default keeps that
+    /// in minutes while staying polite to a free, community-run log.
+    #[arg(
+        long,
+        env = "SYNCH_MONITOR_CONCURRENCY",
+        default_value_t = std::num::NonZeroUsize::new(8).unwrap()
+    )]
+    concurrency: std::num::NonZeroUsize,
+
     /// Write the findings as JSON lines instead of one human line each.
     #[arg(long)]
     json: bool,
@@ -135,9 +157,10 @@ struct Args {
     no_save: bool,
 }
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let args = Args::parse();
-    match run(&args) {
+    match run(&args).await {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("synch-monitor: {e}");
@@ -146,7 +169,7 @@ fn main() {
     }
 }
 
-fn run(args: &Args) -> Result<i32, MonitorError> {
+async fn run(args: &Args) -> Result<i32, MonitorError> {
     let keys_override = match &args.rekor_key {
         Some(path) => Some(
             LogKeys::from_file(path)
@@ -177,22 +200,37 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     // checkpoint must verify under, and the two come from one trusted root —
     // a pin set from one artifact and an endpoint from another is how a
     // rotation ends up looking like an equivocation.
-    let repo = match args.no_tuf {
-        true => None,
-        false => Some(HttpRepo::new(&args.tuf)?),
-    };
+    //
+    // It runs on a blocking thread: `synch_net::tuf::Repo` is a synchronous
+    // trait and HttpRepo a blocking client, which suits a handful of
+    // sequential fetches made once per run — but a blocking reqwest call
+    // panics on a runtime thread, so it cannot run in place.
     let pins = match &args.rekor_pins {
         Some(path) => path.clone(),
         None => discover::pins_beside(&args.state),
     };
-    let found = discover::discover(
-        repo.as_ref().map(|repo| repo as &dyn synch_net::tuf::Repo),
-        &pins,
-        args.log.as_deref(),
-        keys_override,
+    let (tuf, no_tuf, log, now) = (
+        args.tuf.clone(),
+        args.no_tuf,
+        args.log.clone(),
         now_unix(),
-        &mut |warning| eprintln!("synch-monitor: {warning}"),
-    )?;
+    );
+    let found = tokio::task::spawn_blocking(move || {
+        let repo = match no_tuf {
+            true => None,
+            false => Some(HttpRepo::new(&tuf)?),
+        };
+        discover::discover(
+            repo.as_ref().map(|repo| repo as &dyn synch_net::tuf::Repo),
+            &pins,
+            log.as_deref(),
+            keys_override,
+            now,
+            &mut |warning| eprintln!("synch-monitor: {warning}"),
+        )
+    })
+    .await
+    .map_err(|e| MonitorError::Transport(format!("discovery: {e}")))??;
     eprintln!(
         "synch-monitor: reading {} (via {})",
         found.base_url, found.source
@@ -200,15 +238,16 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     let logs = found.keys;
 
     let source = HttpTiles::new(&found.base_url)?;
-    let checkpoint = Checkpoint::parse(&source.checkpoint()?)
+    let checkpoint = Checkpoint::parse(&source.checkpoint().await?)
         .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
     checkpoint
         .verify_under(&logs)
         .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
 
-    let tree = Tree::new(&source, checkpoint.tree_size);
+    let tree = Tree::new(&source, checkpoint.tree_size, args.concurrency.get());
     if tree
         .root()
+        .await
         .map_err(|e| MonitorError::Checkpoint(e.to_string()))?
         != checkpoint.root_hash
     {
@@ -235,6 +274,7 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
         }
         let prefix = tree
             .subtree_hash(0, state.tree_size)
+            .await
             .map_err(|e| MonitorError::Checkpoint(e.to_string()))?;
         if hex::encode(prefix) != state.root {
             return Err(MonitorError::Checkpoint(format!(
@@ -258,22 +298,36 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
             );
         }
     }
-    let mut at = args.from_index.unwrap_or(state.next_index);
-    // `at` advances as the scan runs; the summary needs where it began.
-    let started_at = at;
+    let started_at = args.from_index.unwrap_or(state.next_index);
     let end = match args.max_entries {
         // Saturating: `--from-index` and `--max-entries` are both operator
         // input, and their sum is not bounded by anything but the CLI.
-        Some(max) => checkpoint.tree_size.min(at.saturating_add(max)),
+        Some(max) => checkpoint.tree_size.min(started_at.saturating_add(max)),
         None => checkpoint.tree_size,
     };
+    let total = end.saturating_sub(started_at);
+    if total > 0 {
+        eprintln!(
+            "synch-monitor: reading entries {started_at}..{end} ({total} to classify), \
+             {} fetch(es) in flight",
+            args.concurrency
+        );
+    }
+    let scan_started = Instant::now();
+    let mut last_progress = scan_started;
     let mut findings = Vec::new();
-    while at < end {
-        for (index, body) in tree.entry_bundle(at)? {
-            if index < at || index >= end {
+    // Bundles arrive strictly in index order, however far fetching has run
+    // ahead — the findings and the bookkeeping are exactly as a serial scan
+    // would produce them.
+    let mut bundles = tree.bundle_stream(started_at, end);
+    while let Some(bundle) = bundles.next().await {
+        let entries = bundle?;
+        for (index, body) in &entries {
+            let index = *index;
+            if index < started_at || index >= end {
                 continue;
             }
-            let Ok(parsed) = HashedRekordBody::parse(&body) else {
+            let Ok(parsed) = HashedRekordBody::parse(body) else {
                 // Almost every entry in a public log is somebody else's, in
                 // a shape this design says nothing about. Not an event.
                 continue;
@@ -290,16 +344,16 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
             }
             // A watched apex: prove the leaf really is this entry before
             // reading anything out of it, then classify.
-            if !tree.leaf_matches(index, &body)? {
+            if !tree.leaf_matches(index, body).await? {
                 return Err(MonitorError::Tile(format!(
                     "entry {index} does not hash to the leaf the log stored"
                 )));
             }
-            let path = tree.inclusion_path(index)?;
+            let path = tree.inclusion_path(index).await?;
             synch_net::rekor::verify_inclusion(
                 index,
                 checkpoint.tree_size,
-                synch_net::rekor::leaf_hash(&body),
+                synch_net::rekor::leaf_hash(body),
                 &path,
                 checkpoint.root_hash,
             )
@@ -308,7 +362,21 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
                 findings.push(finding);
             }
         }
-        at = ((at / 256) + 1) * 256;
+        let covered = entries
+            .last()
+            .map(|(last, _)| last + 1)
+            .unwrap_or(started_at)
+            .min(end);
+        let read = covered.saturating_sub(started_at);
+        if last_progress.elapsed() >= Duration::from_secs(10) {
+            let rate = read as f64 / scan_started.elapsed().as_secs_f64();
+            let eta = match rate > 0.0 {
+                true => rough_eta(((total - read) as f64 / rate) as u64),
+                false => "unknown".to_string(),
+            };
+            eprintln!("synch-monitor: {read}/{total} entries ({rate:.0}/s, eta {eta})");
+            last_progress = Instant::now();
+        }
     }
 
     // Sort the classified entries into the three things a run can have found.
@@ -376,9 +444,10 @@ fn run(args: &Args) -> Result<i32, MonitorError> {
     }
 
     eprintln!(
-        "synch-monitor: {} entries read to index {end}; {} new authorization(s), \
+        "synch-monitor: {} entries read to index {end} in {:.0}s; {} new authorization(s), \
          {already_known} already recorded, {} unauthorized claim(s)",
         end.saturating_sub(started_at),
+        scan_started.elapsed().as_secs_f64(),
         new_authorizations.len(),
         claims.len()
     );
