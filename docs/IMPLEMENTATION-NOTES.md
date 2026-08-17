@@ -82,21 +82,31 @@ it.
 
 `newest` is "the greatest `(mtime_ns, content_root, origin)`", and §8 requires
 it to be a total order so every node selects the same version from the same
-assertions. Two things that phrase does not pin down:
+assertions. Three things that phrase does not pin down:
 
-- **A tombstone has no content root.** It sorts as `None`, which is below every
-  `Some`, so at equal mtimes a deletion loses to content. The tombstone still
-  wins on a *later* mtime, which is what makes "deleted after you last wrote"
-  read as a deletion.
+- **A tombstone is not in the running.** §8 has a path exist while at least one
+  origin publishes a live entry for it, and stay visible until *every* publisher
+  tombstones it — so the order is taken over the live entries alone, and a
+  deletion removes its own origin's version rather than the path. A path all of
+  whose publishers have deleted it selects nothing, which is the same answer the
+  policy gives for a path nobody publishes.
 - **The `origin` component never decides which version wins** — two entries
   with the same content root *are* the same version — so it decides only which
   attestor is named as the source of the bytes. The maximum is taken over
   entries rather than versions, which yields both answers at once and is the
   same result either way.
+- **`mtime_ns` is read as no later than the reading node's clock.** It is a
+  member's own assertion about its own file, and any member may publish
+  `f:<space>/<path>` for any space, so an unbounded stamp would sit at the top
+  of the order for every path forever. The clamp is applied by the comparator
+  from a clock the caller passes in and is never stored: the row a node
+  materializes is the trie leaf verbatim, so two nodes holding one trie hold one
+  `entries`, and `doctor --rebuild` reproduces what the original materialization
+  produced.
 
-The order is computed over `entries` alone: mtime, content root, and canonical
-origin are all data every node holds identically, so no node needs to ask
-another what it selected.
+The order is otherwise computed over `entries` alone: mtime, content root, and
+canonical origin are all data every node holds identically, so no node needs to
+ask another what it selected.
 
 ### §8, §9.2 — how divergence is marked in a listing
 

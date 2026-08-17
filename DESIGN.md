@@ -537,7 +537,7 @@ Values     { values: Vec<(Hash, Bytes)>, missing: Vec<Hash> }
 // content is hash-verified regardless, so a wrong hint only wastes a dial. The
 // fetcher falls back to this when it wants a root no local ad covers:
 FindProviders { object_root: Hash }
-Providers  { ads: Vec<(OriginId, BlobAd)> }
+Providers  { ads: Vec<(OriginId, BlobAd)> }                // ≤ 256 ads per answer
 
 // binding introspection: which device keys does the answering peer currently hold
 // bound for an origin? Purely informational within the trusted cluster; this is

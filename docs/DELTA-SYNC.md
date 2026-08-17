@@ -325,7 +325,16 @@ Two shapes of subtree are promotable, and between them they cover everything the
 descent produces: a **whole** subtree, whose chaining value is comparable across
 objects at all (§2), and a **single group**, comparable whenever both objects run
 the same distance past its start. A multi-group subtree cut short by the end of
-the object is neither, and the leaf round settles it. One reuse is given up by
+the object is neither, and the leaf round settles it.
+
+"The same distance past its start" is checked rather than assumed: a run is
+copied only where its extent under the size being filled equals its extent under
+the donor's own size. A chaining value attests the whole of the run it covers,
+and the size a fetch is filling is a claim off an entry — one a few bytes short
+leaves the tree the same shape, so the proof verifies, the final group's value
+matches, and the run copied would stop before the bytes that value speaks for.
+Committing that marks the group verified and the row complete at a length the
+disk does not reach. One reuse is given up by
 comparing trees rather than hashing bytes: a new object whose tail group is
 *shorter* than the donor's group at that index — a truncation — cannot match,
 because the donor's tree has no value for "the first k bytes of that group". It
@@ -457,7 +466,8 @@ costs the size of the change.
 | --- | --- |
 | No provider answers a proof request | Full fetch, as before. |
 | Proof verification fails | Provider dropped for the exchange (as with a bad slice); next candidate tried; delta abandoned for this object if none remain. |
-| A proof offered for the wrong object, or at the wrong length | Refused at `promote`: the root *and* the size travel with the proof (§3.1). |
+| A proof offered for the wrong object, or at the wrong length | The root and the size travel with the proof (§3.1), so a proof only ever verifies against the object it was taken for and is spent at the length it was taken at. |
+| An entry understates a root's size by less than a group | The tail group is not promoted: its extent under the claim is shorter than under the donor, so the run a chaining value attests is not the run that would be copied, and promotion refuses it. The groups before it promote normally, and the honest writer of the real length is not refused by what the claim left behind. |
 | An entry overstates a root's size | The row records the claim, and the next writer with a different one replaces it — a size is only settled once the final group is held, because no earlier group's chaining value depends on it. The claim can only ever be wrong within the last 16 KiB group: anything that changes the object's group count changes the shape of its tree, so no proof or slice for it would verify. |
 | An entry **under**states a root's size | Refused before anything is written. Nothing is resized on the strength of an unproved length — the payload and outboard only ever grow until a commit settles the size — so a claim short enough to contradict groups already in the bitmap is rejected, and the bytes, the bitmap and the row are exactly as they were. |
 | A size claim racing a write that completes the object | The claim loses. Whether a claimed size may stand is decided inside the same transaction as the bitmap read-union-write, so the two writers serialize: the honest one either finds the claim and replaces it, or lands first and has the claim refused against the size its final group now attests to. Before that the decision was made on a snapshot taken before the work, and the second committer overwrote the first's size — leaving the row `complete` under a length no byte on the disk supported: unreadable, refusing every honest writer for good, and pinned against the collector by the entry that named it. |
@@ -497,7 +507,7 @@ appended bytes.
 2. `synch-store`: `encode_proof` (positional outboard reads, mirror of
    `encode_slice_inner`), `write_proof` (verify, then sparse `.obao` commits)
    returning `Proven`, `subtree_cvs` (the donor-side comparison), and
-   `promote(root, size, donor, proven)` with the §3.4 compare-then-clone;
+   `promote(donor, proven)` with the §3.4 compare-then-clone;
    `commit_groups` for the transactional bitmap union.
 3. `synch-net`: serve `GetProof`; client `get_proof` and `fetch_proof_into`.
 4. `synch-engine`: donor resolution (`donor_roots`, `donors_for`); the
