@@ -35,3 +35,9 @@ migrate-check: csqlite
 # the build context; nothing here is used from the host).
 image tag="controlplane:dev":
     docker build -t {{tag}} .
+
+# Boot that image and check what only running it can check: the shipment,
+# the sandboxed csqlite, the SPA in priv/web, DNS on both transports and
+# the HEALTHCHECK. CI runs this before it publishes anything.
+image-smoke tag="controlplane:dev": (image tag)
+    ./ops/image-smoke.sh {{tag}}
