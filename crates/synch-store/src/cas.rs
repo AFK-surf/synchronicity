@@ -677,12 +677,19 @@ impl Store {
 
     /// Deletes an object's payload, outboard, and index row.
     pub fn delete_blob(&self, root: &Hash) -> Result<()> {
-        let _ = std::fs::remove_file(self.blob_path(root));
-        let _ = std::fs::remove_file(self.outboard_path(root));
+        // Row first, bytes second. The reverse order leaves the dangerous
+        // orphan: a crash between the unlink and the delete leaves a row saying
+        // `complete=1` with no bytes behind it, so `has_complete_blob` keeps
+        // answering yes, `local_ad` keeps advertising the object to peers, and
+        // reads fail with a raw io error rather than `MissingBlob`. This way a
+        // crash leaves the opposite — files with no row — which costs disk
+        // until the next sweep and never lies to anyone.
         self.conn().execute(
             "DELETE FROM blobs WHERE root = ?1",
             params![root.as_bytes().to_vec()],
         )?;
+        let _ = std::fs::remove_file(self.blob_path(root));
+        let _ = std::fs::remove_file(self.outboard_path(root));
         Ok(())
     }
 
@@ -743,7 +750,6 @@ impl Store {
                 }
             }
         }
-        self.touch(root)?;
         Ok(out)
     }
 
@@ -751,14 +757,6 @@ impl Store {
     pub fn read_all(&self, root: &Hash) -> Result<Vec<u8>> {
         let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
         self.read_range(root, 0, blob.size)
-    }
-
-    fn touch(&self, root: &Hash) -> Result<()> {
-        self.conn().execute(
-            "UPDATE blobs SET last_access = ?2 WHERE root = ?1",
-            params![root.as_bytes().to_vec(), synch_core::now_ns()],
-        )?;
-        Ok(())
     }
 
     // ---- slice serving and receiving --------------------------------------
@@ -936,12 +934,18 @@ impl Store {
         // Persist the verified groups (payload and outboard) before the bitmap
         // in the index advances to cover them — otherwise a crash could leave
         // the index claiming groups the disk never received.
-        if let Some(payload) = &payload_for_sync {
-            let _ = fsync_file(payload);
-        }
-        if let Ok(ob) = File::open(self.outboard_path(root)) {
-            let _ = fsync_file(&ob);
-        }
+        // Both flushes are checked. Swallowing them meant an EIO or ENOSPC on
+        // flush let the bitmap advance over data that never reached stable
+        // storage — the exact inversion of the ordering this block exists to
+        // enforce. `try_clone` is likewise no longer allowed to fail silently:
+        // it fails under fd exhaustion, which is precisely when the machine is
+        // least able to afford an unflushed commit.
+        let payload = payload_for_sync.ok_or_else(|| StoreError::Verification {
+            root: *root,
+            reason: "could not duplicate the payload handle to flush it".into(),
+        })?;
+        fsync_file(&payload)?;
+        fsync_file(&File::open(self.outboard_path(root))?)?;
 
         let commit = self.commit_groups(root, size, &served, None, now)?;
         self.trim_to_size(root, commit);

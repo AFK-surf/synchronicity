@@ -23,6 +23,15 @@ use synch_store::{Slot, Store};
 
 use crate::{error::NetError, mpt::MptClient};
 
+/// How many distinct roots one origin may have retained at a single seq.
+///
+/// Two is what proves equivocation (§4.4), and the proof is the reason those
+/// rows are exempt from ordinary retention. Past that the rows add no evidence
+/// and cannot be pruned, so an origin signing at one seq forever would grow
+/// every peer's `head_history` without bound. A little headroom over two, so a
+/// genuinely confused origin is recorded rather than truncated at the minimum.
+pub const MAX_RETAINED_FORKS: usize = 8;
+
 /// How many full fetch rounds may make no progress before the pending head is
 /// abandoned and head selection re-runs (§5.2).
 pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
@@ -225,8 +234,23 @@ impl Syncer {
             .transaction(|txn| -> Result<HeadOutcome, NetError> {
                 // Verified heads are provable history and fork evidence even
                 // when they lose the ordering comparison, so they are retained
-                // either way (§4.4).
-                txn.record_history(head)?;
+                // either way (§4.4) — but only up to a point. Same-seq forks
+                // are exempt from `root_retention` until the origin publishes
+                // past the forked seq, so a member signing an unlimited number
+                // of roots at one seq bought permanent, unprunable growth on
+                // every peer, surviving even `trust rm`. Two roots prove the
+                // equivocation; the rest add nothing but rows.
+                if txn.fork_width(&head.origin, head.seq)? < MAX_RETAINED_FORKS
+                    || txn.head_history_has(&head.origin, head.seq, &head.root)?
+                {
+                    txn.record_history(head)?;
+                } else {
+                    tracing::warn!(
+                        origin = %head.origin,
+                        seq = head.seq,
+                        "ignoring further same-seq forks: equivocation is already proven"
+                    );
+                }
 
                 // 3. (seq, root) must be strictly greater, lexicographically.
                 //    Strictly greater on seq alone would not converge: two

@@ -172,33 +172,27 @@ impl Store {
         Ok(())
     }
 
-    /// Promotes the pending head to complete, atomically (§5.2).
-    ///
-    /// The displaced complete head is retained in `head_history` with its
-    /// signature, as provable history and fork evidence (§4.4, §3.4).
-    pub fn promote_pending(&self, origin: &OriginId, now: i64) -> Result<Option<SignedHead>> {
-        let Some(pending) = self.head(origin, Slot::Pending)? else {
-            return Ok(None);
-        };
-        let displaced = self.complete_head(origin)?;
-        self.with_tx(|tx| {
-            if let Some(old) = &displaced {
-                record_history_in(tx, old)?;
-            }
-            put_head_in(tx, Slot::Complete, &pending.head, pending.received_at, now)?;
-            tx.execute(
-                "DELETE FROM heads WHERE origin_id = ?1 AND slot = 'pending'",
-                params![origin.canonical()],
-            )?;
-            Ok(())
-        })?;
-        Ok(Some(pending.head))
-    }
-
     /// Records a head in `head_history`, keeping its signature.
     pub fn record_history(&self, head: &SignedHead) -> Result<()> {
         let conn = self.conn();
         record_history_in(&conn, head)
+    }
+
+    /// How many distinct roots an origin has retained at one seq.
+    ///
+    /// Two is equivocation and is evidence worth keeping (§4.4). An unbounded
+    /// number is a member signing forever at one seq, which the retention rule
+    /// cannot clear: same-seq forks are *exempt* from `root_retention` until the
+    /// origin publishes past that seq, and an attacker simply never does. Every
+    /// row is verified and bound, so nothing upstream rejects them, and
+    /// `equivocations()` re-reads the whole set per pair, so `doctor` and each
+    /// GC pass go quadratic in the storm.
+    pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
+            params![origin.canonical(), seq as i64],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
     }
 
     /// The retained history for an origin, newest first.
@@ -263,8 +257,16 @@ impl Store {
         Ok(out)
     }
 
-    /// Deletes history entries older than `keep_seq` for an origin, leaving the
-    /// retention window (§5.4).
+    /// Deletes every history row for an origin below `keep_from_seq`,
+    /// unconditionally.
+    ///
+    /// The blunt version, and the distinction matters: this honours **none** of
+    /// the three exemptions [`Store::prune_history_before`] documents — not the
+    /// current heads, not same-seq fork evidence, not the retention window. It
+    /// is a test and maintenance escape hatch for "drop this history now", and
+    /// the retention path in the maintenance loop must keep using
+    /// `prune_history_before`. Using this one there would delete the rows GC
+    /// marks the live trie from.
     pub fn prune_history(&self, origin: &OriginId, keep_from_seq: u64) -> Result<usize> {
         Ok(self.conn().execute(
             "DELETE FROM head_history WHERE origin_id = ?1 AND seq < ?2",
@@ -428,6 +430,27 @@ impl Txn<'_> {
     pub fn record_history(&self, head: &SignedHead) -> Result<()> {
         record_history_in(self.conn(), head)
     }
+
+    /// How many distinct roots this origin has retained at one seq, inside the
+    /// transaction. See [`Store::fork_width`].
+    pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
+            params![origin.canonical(), seq as i64],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
+    }
+
+    /// True if this exact head is already retained, so re-offering one already
+    /// on record is never mistaken for widening the fork.
+    pub fn head_history_has(&self, origin: &OriginId, seq: u64, root: &Hash) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT COUNT(*) FROM head_history
+             WHERE origin_id = ?1 AND seq = ?2 AND root = ?3",
+            params![origin.canonical(), seq as i64, root.as_bytes().to_vec()],
+            |row| row.get::<_, i64>(0),
+        )? > 0)
+    }
 }
 
 /// A same-seq fork by one origin, with both signed heads as proof.
@@ -548,32 +571,6 @@ mod tests {
             store.head_floor(&origin()).unwrap(),
             Some((5, Hash([2u8; 32])))
         );
-    }
-
-    #[test]
-    fn promotion_retains_the_displaced_head_as_evidence() {
-        let (_d, store) = store();
-        let key = SecretKey::generate();
-        let old = SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0);
-        let new = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), 0);
-        store.put_head(Slot::Complete, &old, 0, 0).unwrap();
-        store.put_head(Slot::Pending, &new, 0, 0).unwrap();
-
-        let promoted = store.promote_pending(&origin(), 10).unwrap().unwrap();
-        assert_eq!(promoted, new);
-        assert_eq!(store.complete_head(&origin()).unwrap(), Some(new));
-        assert_eq!(store.pending_head(&origin()).unwrap(), None);
-
-        let history = store.head_history(&origin()).unwrap();
-        assert_eq!(history, vec![old.clone()]);
-        // Retained with its signature: provable history, not just a hash.
-        history[0].verify_signature().unwrap();
-    }
-
-    #[test]
-    fn promotion_without_a_pending_head_is_a_no_op() {
-        let (_d, store) = store();
-        assert!(store.promote_pending(&origin(), 0).unwrap().is_none());
     }
 
     #[test]

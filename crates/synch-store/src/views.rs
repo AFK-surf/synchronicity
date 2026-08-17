@@ -432,9 +432,16 @@ impl Store {
     /// Rebuilds `entries` and `blob_providers` for one origin from scratch
     /// (`synch doctor --rebuild`).
     pub fn rematerialize(&self, origin: &OriginId, root: Hash) -> Result<usize> {
-        self.delete_origin_entries(origin)?;
-        self.delete_origin_providers(origin)?;
-        self.materialize_diff(origin, Hash::EMPTY, root)
+        // One transaction, because the intermediate state is destructive. The
+        // two deletes each used to autocommit and the diff was computed outside
+        // any transaction, so `entries` was observably empty for the whole
+        // rebuild — and a mirror pass reading `unified_listing` in that window
+        // builds an empty `known` set and its sweep unlinks the user's files.
+        self.transaction(|txn| {
+            txn.delete_origin_entries(origin)?;
+            txn.delete_origin_providers(origin)?;
+            txn.materialize_diff(origin, Hash::EMPTY, root)
+        })
     }
 
     // ---- spaces -----------------------------------------------------------

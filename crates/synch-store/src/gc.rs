@@ -110,8 +110,14 @@ impl Store {
     ///
     /// `last_access` is written on ingest and on every download milestone, not
     /// on reads: a streaming read would otherwise cost one row update per
-    /// chunk, and an object nothing references is by construction not being
-    /// read through the tree.
+    /// chunk — each taking the single write connection and appending a WAL
+    /// frame, so gateway range reads and mirror materialization would serialize
+    /// against publishes and GC — and an object nothing references is by
+    /// construction not being read through the tree. `read_range` used to touch
+    /// the row anyway, which cost exactly that and quietly inverted the
+    /// retention semantics: with it a hot object is never collected, without it
+    /// it is. Every write path already stamps the column, so nothing else was
+    /// needed to keep this true.
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
         let referenced = self.referenced_content()?;
         let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
