@@ -25,10 +25,20 @@
 //! 10  unauthorized claims only — tier B naming a watched apex, no alarm
 //! 20  new authorizations seen — a key was authorized for a watched apex
 //!     that this monitor had not recorded: check it against what you published
-//!  2  the run could not finish (transport, checkpoint, state)
+//! 30  the run could not finish (transport, checkpoint, state)
 //! ```
 //!
-//! They are ordered by severity, so a rule testing `>=` reads correctly.
+//! They are ordered by severity, so a rule testing `>=` reads correctly —
+//! and **that ordering is why a failed run is 30 and not 2.** A monitor that
+//! cannot finish is not a monitor with nothing to say: it is the state an
+//! attacker most wants it in, because a wedged run and a quiet run look
+//! identical from the outside. With failure sorted below the success codes,
+//! the `>= 10` rule these docs invite ignored every failed run, which is
+//! exactly backwards.
+//!
+//! A run that fails partway still prints and records everything it
+//! classified before the failure, so an alarming entry found at index N is
+//! not lost to a transport error at index N+1.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -85,7 +95,9 @@ fn rough_eta(secs: u64) -> String {
       does not verify. No client would have accepted one; recorded, no alarm.
   20  new authorizations seen — a key was authorized for a watched apex that
       this monitor had not recorded. Check it against what you published.
-   2  the run could not finish (transport, checkpoint, state)"
+  30  the run could not finish (transport, checkpoint, state). Sorts above
+      the others on purpose: a wedged monitor is not a quiet one. Anything
+      classified before the failure is still reported."
 )]
 struct Args {
     /// The log's base URL. Discovered from Sigstore's TUF repository when
@@ -157,6 +169,14 @@ struct Args {
     no_save: bool,
 }
 
+/// A run that could not finish. **Above** the success codes, not below
+/// them: the codes are documented as severity-ordered so that `>= 10` reads
+/// correctly, and a monitor that cannot complete is not a monitor with
+/// nothing to report — it is the state an attacker most wants it in. At the
+/// old value of 2 it sorted below "nothing new", so the alerting rule the
+/// docs invite ignored precisely the runs that needed a human.
+const EXIT_INCOMPLETE: i32 = 30;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = Args::parse();
@@ -164,7 +184,7 @@ async fn main() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("synch-monitor: {e}");
-            std::process::exit(2);
+            std::process::exit(EXIT_INCOMPLETE);
         }
     }
 }
@@ -299,6 +319,11 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
         }
     }
     let started_at = args.from_index.unwrap_or(state.next_index);
+    // How far the walk actually got. It is the resume point when the walk
+    // fails partway: saving `end` there would step over the entries the run
+    // never classified, and saving `started_at` would re-read work already
+    // reported. Advanced per completed bundle, below.
+    let mut at = started_at;
     let end = match args.max_entries {
         // Saturating: `--from-index` and `--max-entries` are both operator
         // input, and their sum is not bounded by anything but the CLI.
@@ -315,69 +340,99 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
     }
     let scan_started = Instant::now();
     let mut last_progress = scan_started;
+    // The walk runs inside an async block so that a failure partway through
+    // does not take the findings with it. A monitor that read an alarming
+    // entry at index N and then hit a 503 at N+1 used to print nothing at
+    // all and exit as a failure — the one outcome that must never be silent
+    // was the easiest to silence. Everything classified before the error is
+    // reported and recorded below; the error decides the exit code, not
+    // whether the news gets out.
     let mut findings = Vec::new();
-    // Bundles arrive strictly in index order, however far fetching has run
-    // ahead — the findings and the bookkeeping are exactly as a serial scan
-    // would produce them.
-    let mut bundles = tree.bundle_stream(started_at, end);
-    while let Some(bundle) = bundles.next().await {
-        let entries = bundle?;
-        for (index, body) in &entries {
-            let index = *index;
-            if index < started_at || index >= end {
-                continue;
+    let outcome: Result<(), MonitorError> = async {
+        // Bundles arrive strictly in index order, however far fetching has
+        // run ahead — the findings and the bookkeeping are exactly as a
+        // serial scan would produce them.
+        let mut bundles = tree.bundle_stream(started_at, end);
+        while let Some(bundle) = bundles.next().await {
+            let entries = bundle?;
+            for (index, body) in &entries {
+                let index = *index;
+                if index < started_at || index >= end {
+                    continue;
+                }
+                // **Before anything is read out of it, and before any
+                // decision to skip it.** The hash tiles are checked against
+                // the signed checkpoint; the entry bundles are a separate
+                // resource served by the same party this monitor exists to
+                // audit, and nothing else binds them to the tree.
+                //
+                // Deciding to *skip* on unauthenticated bytes is the whole
+                // attack: a log that replaces one body with something that
+                // fails to parse, or that names an unwatched zone, hides the
+                // entry while its hash tiles stay honest — so every root and
+                // consistency check still passes, and the victim's client,
+                // whose proof carries a real path to the real leaf, still
+                // accepts it. Silent monitor, working forgery. Costs one
+                // level-0 hash tile per 256 entries, cached.
+                if !tree.leaf_matches(index, body).await? {
+                    return Err(MonitorError::Tile(format!(
+                        "entry {index} does not hash to the leaf the log stored"
+                    )));
+                }
+                let Ok(parsed) = HashedRekordBody::parse(body) else {
+                    // Almost every entry in a public log is somebody else's,
+                    // in a shape this design says nothing about. Not an event.
+                    continue;
+                };
+                // Parsed, never trimmed. The watch filter and the chain walk
+                // have to agree on what a name is, or an entry can be
+                // recognised as belonging to a watched zone and then
+                // classified against a different one (see
+                // `synch_net::chain::authorize`).
+                let Ok(name) = parsed.certificate.single_dns_name() else {
+                    continue;
+                };
+                if !state.known.watches(&name) {
+                    continue;
+                }
+                let path = tree.inclusion_path(index).await?;
+                synch_net::rekor::verify_inclusion(
+                    index,
+                    checkpoint.tree_size,
+                    synch_net::rekor::leaf_hash(body),
+                    &path,
+                    checkpoint.root_hash,
+                )
+                .map_err(|e| MonitorError::Tile(e.to_string()))?;
+                if let Some(finding) = classify(&parsed, index, &anchors) {
+                    findings.push(finding);
+                }
             }
-            let Ok(parsed) = HashedRekordBody::parse(body) else {
-                // Almost every entry in a public log is somebody else's, in
-                // a shape this design says nothing about. Not an event.
-                continue;
-            };
-            // Parsed, never trimmed. The watch filter and the chain walk
-            // have to agree on what a name is, or an entry can be recognised
-            // as belonging to a watched zone and then classified against a
-            // different one (see `synch_net::chain::authorize`).
-            let Ok(name) = parsed.certificate.single_dns_name() else {
-                continue;
-            };
-            if !state.known.watches(&name) {
-                continue;
-            }
-            // A watched apex: prove the leaf really is this entry before
-            // reading anything out of it, then classify.
-            if !tree.leaf_matches(index, body).await? {
-                return Err(MonitorError::Tile(format!(
-                    "entry {index} does not hash to the leaf the log stored"
-                )));
-            }
-            let path = tree.inclusion_path(index).await?;
-            synch_net::rekor::verify_inclusion(
-                index,
-                checkpoint.tree_size,
-                synch_net::rekor::leaf_hash(body),
-                &path,
-                checkpoint.root_hash,
-            )
-            .map_err(|e| MonitorError::Tile(e.to_string()))?;
-            if let Some(finding) = classify(&parsed, index, &anchors) {
-                findings.push(finding);
+            let covered = entries
+                .last()
+                .map(|(last, _)| last + 1)
+                .unwrap_or(started_at)
+                .min(end);
+            // Only once the whole bundle is through: a failure mid-bundle
+            // leaves `at` at the previous boundary, so the next run re-reads
+            // that bundle rather than stepping over the entries it never
+            // classified. Re-reading is free of double-reports, because
+            // anything already reported is recorded as known.
+            at = covered;
+            let read = covered.saturating_sub(started_at);
+            if last_progress.elapsed() >= Duration::from_secs(10) {
+                let rate = read as f64 / scan_started.elapsed().as_secs_f64();
+                let eta = match rate > 0.0 {
+                    true => rough_eta(((total - read) as f64 / rate) as u64),
+                    false => "unknown".to_string(),
+                };
+                eprintln!("synch-monitor: {read}/{total} entries ({rate:.0}/s, eta {eta})");
+                last_progress = Instant::now();
             }
         }
-        let covered = entries
-            .last()
-            .map(|(last, _)| last + 1)
-            .unwrap_or(started_at)
-            .min(end);
-        let read = covered.saturating_sub(started_at);
-        if last_progress.elapsed() >= Duration::from_secs(10) {
-            let rate = read as f64 / scan_started.elapsed().as_secs_f64();
-            let eta = match rate > 0.0 {
-                true => rough_eta(((total - read) as f64 / rate) as u64),
-                false => "unknown".to_string(),
-            };
-            eprintln!("synch-monitor: {read}/{total} entries ({rate:.0}/s, eta {eta})");
-            last_progress = Instant::now();
-        }
+        Ok(())
     }
+    .await;
 
     // Sort the classified entries into the three things a run can have found.
     //
@@ -438,9 +493,31 @@ async fn run(args: &Args) -> Result<i32, MonitorError> {
     state.origin = checkpoint.origin.clone();
     state.tree_size = checkpoint.tree_size;
     state.root = hex::encode(checkpoint.root_hash);
-    state.next_index = end;
+    // How far the walk *actually* got, which is `end` only when it finished.
+    // Recording `end` after a partial walk would step over every entry the
+    // failure prevented us from classifying, and they would never be looked
+    // at again.
+    state.next_index = match outcome {
+        Ok(()) => end,
+        Err(_) => at.min(end),
+    };
+    let reached = state.next_index;
     if !args.no_save {
-        state.save(&args.state)?;
+        // A save failure must not swallow the report either: it is printed
+        // by now, so say so and carry on to the exit code.
+        if let Err(e) = state.save(&args.state) {
+            eprintln!("synch-monitor: could not write the state file: {e}");
+            return Ok(EXIT_INCOMPLETE);
+        }
+    }
+    if let Err(e) = outcome {
+        eprintln!("synch-monitor: {e}");
+        eprintln!(
+            "synch-monitor: the walk stopped at index {reached}; \
+             {} finding(s) above were classified before it stopped",
+            findings.len()
+        );
+        return Ok(EXIT_INCOMPLETE);
     }
 
     eprintln!(
