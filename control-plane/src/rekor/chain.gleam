@@ -696,14 +696,46 @@ fn replace_error(result: Result(a, Nil), what: String) -> Result(a, String) {
 
 /// The RFC 8484 resolver at `url`: `POST` a wire-format query with the DO
 /// bit set, read the answer section back.
+///
+/// The answer is **not** trusted here — see the module docs. Every record
+/// this returns is re-checked before it becomes a chain, and the chain is
+/// re-checked by every reader, so a hostile resolver produces material that
+/// fails to publish or fails to verify rather than material that is
+/// believed. Callers that spend an answer on something *irreversible* want
+/// [`doh_validating`] instead.
 pub fn doh(url: String) -> Resolver {
-  Resolver(query: fn(zone, rtype) { doh_query(url, zone, rtype) })
+  Resolver(query: fn(zone, rtype) { doh_query(url, zone, rtype, False) })
+}
+
+/// The same, refusing any answer the resolver did not mark authenticated.
+///
+/// For the one caller whose answer is not re-checked by anything: the key
+/// watcher's `observe` spends it on `record_observed`, which issues
+/// `DELETE FROM observed_zone_keys WHERE key_sha256 NOT IN (...)` and so
+/// decides which keys the control plane will serve proofs for. A resolver
+/// that can pick that set can drop a covered key — membership withheld — or
+/// add one the operator never published, which the watcher then submits to a
+/// public log as this zone's claim. Neither is undoable and neither is
+/// checked downstream.
+///
+/// §5.1 of docs/EXTERNAL-DNS-PROVIDER.md says this step resolves *and
+/// DNSSEC-validates*. The AD bit is how a validating resolver says it did
+/// (RFC 4035 §3.2.3). Requiring it makes an unvalidated answer a refusal
+/// rather than an observation, and the watch simply waits — which is what a
+/// resolver that cannot validate should cost, given what the answer buys.
+///
+/// The DO bit is already set and CD is already clear, so an honest upstream
+/// SERVFAILs on bogus data; that defends against everyone *except* the
+/// resolver, and the resolver is the party this guards against.
+pub fn doh_validating(url: String) -> Resolver {
+  Resolver(query: fn(zone, rtype) { doh_query(url, zone, rtype, True) })
 }
 
 fn doh_query(
   url: String,
   zone: Name,
   rtype: Int,
+  require_authenticated: Bool,
 ) -> Result(List(wire.Rr), String) {
   let question =
     bit_array.concat([
@@ -736,7 +768,20 @@ fn doh_query(
   case resp.status {
     200 ->
       case wire.decode_message(resp.body) {
-        Ok(message) -> response_answers(url, message)
+        Ok(message) ->
+          case require_authenticated && !authenticated(message.flags) {
+            True ->
+              Error(
+                url
+                <> " answered without the AD bit for "
+                <> name.to_string(zone)
+                <> " — this answer decides which keys this zone serves proofs "
+                <> "for and is not checked by anything downstream, so an "
+                <> "answer the resolver will not vouch for is not one to act "
+                <> "on. Point CP_DNSSEC_CHAIN_RESOLVER at a validating resolver.",
+              )
+            False -> response_answers(url, message)
+          }
         Error(Nil) -> Error(url <> " returned a message that does not decode")
       }
     status -> Error(url <> " answered " <> int.to_string(status))
@@ -767,6 +812,14 @@ pub fn response_answers(
 /// The rcode is the low nibble of the flags word (RFC 1035 §4.1.1).
 fn rcode(flags: Int) -> Int {
   int.bitwise_and(flags, 0b1111)
+}
+
+/// The AD bit (RFC 4035 §3.2.3): the resolver says it validated this answer.
+///
+/// Bit 5 of the flags word, counting from the low end — `QR|Opcode|AA|TC|RD`
+/// then `RA|Z|AD|CD` then the rcode nibble.
+pub fn authenticated(flags: Int) -> Bool {
+  int.bitwise_and(flags, 0x0020) != 0
 }
 
 fn rcode_name(code: Int) -> String {

@@ -213,8 +213,21 @@ resolver, and the resolver is the named attacker. The minted entry is tier B
 mint-entry consequences are mutually exclusive. Impact is availability plus a
 permanent junk public leaf, not a client-trust bypass. Severity medium-high.
 
-**Fix**: require AD on the DNSKEY response, and make `record_observed`
-additive-with-aging rather than deleting on a single observation.
+**Fix (applied, first half)**: the key watcher now takes
+`chain.doh_validating`, which refuses any answer the resolver did not mark
+authenticated (AD, RFC 4035 §3.2.3). Chain assembly keeps the plain resolver —
+its output is copied into the certificate and re-verified by every reader, so
+a hostile resolver there produces an entry that verifies nowhere. The
+watcher's answer is spent on `record_observed` and re-checked by nothing,
+which is the whole asymmetry. `CP_DNSSEC_CHAIN_RESOLVER` must therefore be
+validating in external mode; the default is. Documented in
+EXTERNAL-DNS-PROVIDER.md §5.1, REKOR-ZONE-KEY.md's env table and the RUNBOOK.
+
+The second half — making `record_observed` additive-with-aging rather than
+deleting on a single observation — is **not** done. It is a larger change to
+how the watcher decides a key is gone, and worth doing: AD makes the resolver
+say it validated, which is a much better answer than nothing, but a compromised
+validating resolver still gets one destructive write per observation.
 
 ### M2. Dial hints from one membership domain repoint any key the node trusts
 

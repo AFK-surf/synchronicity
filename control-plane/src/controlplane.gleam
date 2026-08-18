@@ -576,7 +576,11 @@ fn serve_external(
       cfg.db_path,
       apex,
       signing_zone,
-      chain.doh(chain.resolver_url()),
+      // Validating: this watcher spends its answer on record_observed, which
+      // decides which keys the zone serves proofs for and is checked by
+      // nothing downstream. The publish path above uses the plain resolver —
+      // its answer becomes a chain every reader verifies.
+      chain.doh_validating(chain.resolver_url()),
       sync_name,
     ))
     |> sup.start

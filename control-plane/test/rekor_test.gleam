@@ -1525,6 +1525,24 @@ pub fn response_answers_reads_only_real_answers_test() {
   assert string.contains(why, "REFUSED")
 }
 
+/// The AD bit is what a validating resolver's verdict looks like when it is
+/// *positive*, and the key watcher requires it.
+///
+/// `observe` spends its answer on `record_observed`, which deletes every
+/// observed key not in the set it was handed — deciding which keys the zone
+/// serves proofs for, with nothing downstream re-checking it. The collector
+/// is the opposite case: its answer becomes a chain every reader verifies,
+/// so it takes the plain resolver and this bit is not required there.
+pub fn the_ad_bit_marks_an_answer_a_resolver_vouched_for_test() {
+  // Bit 5 of the flags word. 0x8000 is QR alone — an answer the resolver
+  // did not claim to have validated.
+  assert !chain.authenticated(0x8000)
+  assert chain.authenticated(0x8020)
+  // And it is independent of the rcode nibble beside it.
+  assert chain.authenticated(0x8023)
+  assert !chain.authenticated(0x8003)
+}
+
 // ------------------------------------------------------ the key rollover
 
 /// The deadlock the staging slot exists to break.
