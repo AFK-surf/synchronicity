@@ -522,10 +522,14 @@ impl MemberSet {
 /// Parses and normalizes a DoH endpoint URL.
 ///
 /// `https://` or `http://`, host required, query path defaulting to
-/// `/dns-query`. Plaintext is not the security hole it looks like: the
-/// answers are DNSSEC-validated in process exactly as on the UDP-53 default
-/// path, so http costs query privacy and a denial lever — the same things
-/// UDP already concedes — and nothing about integrity.
+/// `/dns-query`. Plaintext concedes what UDP-53 always conceded: query
+/// privacy and a denial lever. It concedes integrity only as far as the
+/// validation below it is sound — and that is a real qualifier, not a
+/// formality. A party who can add a record to a response reaches
+/// [`covered_by_signed_data`], and the one time this code took hickory's
+/// `Proof::Secure` for "this record is signed", a spliced class-CH TXT was a
+/// full membership forgery. Prefer `https://` and treat the in-process
+/// validation as the last line rather than the only one.
 fn doh_url(url: &str) -> Result<reqwest::Url, NetError> {
     let bad = |why: String| NetError::Dns(format!("DoH endpoint {url}: {why}"));
     let mut parsed = reqwest::Url::parse(url).map_err(|e| bad(e.to_string()))?;
@@ -1359,7 +1363,7 @@ fn signing_key_rdata(
     // RRSIG whose signer does not enclose this zone is an off-path
     // signature and must not authorize anything here.
     let dnskey_rrsig_encloses = dnskey_answers.iter().any(|record| {
-        if record.name != *signing_zone || !record.proof.is_secure() {
+        if !covered_by_signed_data(record, signing_zone) {
             return false;
         }
         let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = &record.data else {
@@ -1389,7 +1393,7 @@ fn signing_key_rdata(
 
     let mut matched: Option<Vec<u8>> = None;
     for record in dnskey_answers {
-        if record.name != *signing_zone || !record.proof.is_secure() {
+        if !covered_by_signed_data(record, signing_zone) {
             continue;
         }
         let RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)) = &record.data else {
@@ -1847,6 +1851,37 @@ fn rrsig_signer_encloses_owner(record: &Record) -> bool {
     }
 }
 
+/// Whether a record is one the RRSIG that validated its group actually
+/// **covers** — the question `Proof::Secure` looks like it answers and does
+/// not.
+///
+/// hickory groups an answer into RRsets by `(name, record_type)` and nothing
+/// else (`DnssecDnsHandle::verify_rrsets`, with a standing `TODO: support
+/// non-IN classes?`), then stamps the verdict onto *every* record in the
+/// group. The signed-data construction, meanwhile, filters by
+/// `(dns_class, type_covered, name)` (`TBS::new`) and builds its `RecordSet`
+/// hard-coded to class IN. So a record of another class is dropped from the
+/// bytes the signature is checked over — the honest RRSIG still verifies —
+/// and comes back marked `Secure` anyway.
+///
+/// A record spliced into a DoH response as class CH therefore arrives
+/// "DNSSEC-validated" while being signed by nobody. On the membership path
+/// that is a full read/write binding for a key the zone never published, from
+/// one added record, and it survives `--rekor require` untouched: the
+/// transparency proof covers the zone *key*, which really did sign the real
+/// RRset.
+///
+/// The rule this function states, and the reason it exists as a named
+/// predicate rather than three more `&&`s at four call sites: **the set of
+/// records accepted must be exactly the set the verifier canonicalizes.**
+/// hickory's is `(name, type, class)`; so is this. Matching it by
+/// construction is what keeps the next unmodelled dimension from being the
+/// next vulnerability.
+fn covered_by_signed_data(record: &Record, owner: &Name) -> bool {
+    use hickory_resolver::proto::rr::DNSClass;
+    record.name == *owner && record.dns_class == DNSClass::IN && record.proof.is_secure()
+}
+
 /// Applies the fail-closed §3.2 record checks to one answer set.
 ///
 /// Shared by both backends so the acceptance rule cannot drift between
@@ -1859,7 +1894,7 @@ fn secure_txt(
 ) -> Result<ValidatedTxt, NetError> {
     use hickory_resolver::proto::{
         dnssec::rdata::DNSSECRData,
-        rr::{RData, RecordType},
+        rr::{DNSClass, RData, RecordType},
     };
 
     let mut qname = hickory_resolver::proto::rr::Name::from_utf8(name)
@@ -1879,7 +1914,7 @@ fn secure_txt(
     // before anything is bound to it, so a chosen RRSIG that does not verify
     // under a secure DNSKEY of the signing zone refuses the answer.
     let signed_by = answers.iter().find_map(|record| {
-        if record.name != qname || !record.proof.is_secure() {
+        if !covered_by_signed_data(record, &qname) {
             return None;
         }
         let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
@@ -1934,6 +1969,13 @@ fn secure_txt(
         // bind attacker keys into the member set. Only records owned by the
         // queried name count.
         if record.name != qname {
+            continue;
+        }
+        // And of the class the signature covers. See `covered_by_signed_data`:
+        // a record of another class is one the RRSIG's own canonicalization
+        // drops, so it is *not* signed — but hickory stamps the whole group
+        // `Secure` regardless, and accepting it here is a membership forgery.
+        if record.dns_class != DNSClass::IN {
             continue;
         }
         // Only the records this answer is *made of* have to carry a proof.

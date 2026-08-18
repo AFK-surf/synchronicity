@@ -666,7 +666,18 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
 struct Classified {
     /// The log's origin line: the label the evidence is filed under.
     origin: String,
-    /// The canonicalized entry body, verified against the signed checkpoint.
+    /// The canonicalized entry body, verified against the signed checkpoint —
+    /// **only for tier A**, and empty for tier B.
+    ///
+    /// Evidence is kept for findings that become reports. A tier B finding
+    /// never does: it is noted to stderr and deliberately not recorded, so
+    /// that the same key arriving later with a chain that *does* verify is
+    /// still news. Keeping its body would hand the size of this run's memory
+    /// to whoever is publishing tier B entries — and that is anybody, for the
+    /// price of one self-signed certificate naming a name on the watched
+    /// zone's delegation path, which is public. The state file has excluded
+    /// these bodies from the start for exactly this reason; the same
+    /// arithmetic applies before the run ends.
     body: Vec<u8>,
     /// The verdict.
     finding: Finding,
@@ -872,9 +883,15 @@ async fn walk_log<S: TileSource>(
                     continue;
                 }
                 if let Some(finding) = classify(&parsed, index, anchors) {
+                    // Tier B is noted, never recorded — so its body is never
+                    // needed, and never held. See `Classified::body`.
+                    let body = match finding.tier {
+                        Tier::A => body.clone(),
+                        Tier::B => Vec::new(),
+                    };
                     walked.classified.push(Classified {
                         origin: checkpoint.origin.clone(),
-                        body: body.clone(),
+                        body,
                         finding,
                     });
                 }

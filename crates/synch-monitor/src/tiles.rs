@@ -190,11 +190,37 @@ pub trait TileSource {
 /// a mutex so that fetches running concurrently can share it; two fetches
 /// racing the same path may both go to the network, which is benign — the
 /// bytes are the same and the last write wins.
+///
+/// **It caches hash tiles and nothing else, and it is bounded.** Both halves
+/// of that are memory bounds rather than preferences. Entry bundles are read
+/// exactly once, in index order, by [`Tree::bundle_stream`] — caching them
+/// buys nothing and costs the whole log: a first run over a 10⁸-entry shard
+/// is ~400 000 bundles, and at the format's own ceiling that is far more than
+/// any host has. Hash tiles are re-read constantly and so are worth keeping,
+/// but keeping *all* of them is 8 KiB per 256 entries, gigabytes over the
+/// same shard. A bounded map holds the working set — the interior tiles the
+/// root recomputation re-reads and the level-0 tiles of the region being
+/// walked — and evicts the rest, which for a sequential walk is the tiles it
+/// will never ask for again.
 #[derive(Debug)]
 pub struct HttpTiles {
     base: String,
     client: reqwest::Client,
     cache: Mutex<HashMap<String, Option<Vec<u8>>>>,
+    /// Insertion order, for eviction. A queue rather than a true LRU: the
+    /// access pattern is a sequential sweep, where the two agree.
+    cached_order: Mutex<std::collections::VecDeque<String>>,
+}
+
+/// How many hash tiles [`HttpTiles`] keeps. 8 KiB apiece, so this is a ~16 MiB
+/// ceiling — room for every interior tile a production-sized tree has plus a
+/// long run of the level-0 tiles being swept, and a hard bound regardless of
+/// how long the walk runs.
+const MAX_CACHED_TILES: usize = 2048;
+
+/// Whether a path is one worth caching: hash tiles, not entry bundles.
+fn cacheable(path: &str) -> bool {
+    path.starts_with("api/v2/tile/") && !path.starts_with("api/v2/tile/entries/")
 }
 
 /// How many times a fetch is tried before the run gives up, and the delay
@@ -219,6 +245,7 @@ impl HttpTiles {
                 .build()
                 .map_err(|e| MonitorError::Transport(e.to_string()))?,
             cache: Mutex::new(HashMap::new()),
+            cached_order: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -280,16 +307,41 @@ impl HttpTiles {
     fn cached(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<Vec<u8>>>> {
         self.cache.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Caches one hash tile, evicting the oldest past [`MAX_CACHED_TILES`].
+    ///
+    /// The bound is what keeps a full-history walk's memory flat. Evicting a
+    /// tile is never a correctness question: the next request for it re-fetches,
+    /// and every consumer re-verifies against the pinned checkpoint regardless
+    /// of where the bytes came from — `Tree::verify_leaf` in particular reads
+    /// its leaf hash out of bytes it folded itself, not out of this map.
+    fn remember(&self, path: &str, body: Option<Vec<u8>>) {
+        let mut cache = self.cached();
+        if cache.insert(path.to_string(), body).is_some() {
+            return;
+        }
+        let mut order = self.cached_order.lock().unwrap_or_else(|e| e.into_inner());
+        order.push_back(path.to_string());
+        while order.len() > MAX_CACHED_TILES {
+            if let Some(oldest) = order.pop_front() {
+                cache.remove(&oldest);
+            }
+        }
+    }
 }
 
 impl TileSource for HttpTiles {
     async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+        if !cacheable(path) {
+            // Entry bundles: read once, in order, never asked for again.
+            return self.get(path).await;
+        }
         let cached = self.cached().get(path).cloned();
         if let Some(hit) = cached {
             return Ok(hit);
         }
         let body = self.get(path).await?;
-        self.cached().insert(path.to_string(), body.clone());
+        self.remember(path, body.clone());
         Ok(body)
     }
 
@@ -344,11 +396,47 @@ pub struct Tree<'a, S: TileSource> {
     size: u64,
     concurrency: usize,
     /// The hash tiles already folded up to the checkpoint's root, by
-    /// `(tile level, index)` — see [`Tree::authenticate_tile`]. A tile holds
-    /// 256 entries, so this is what turns a per-entry cost into a per-tile
-    /// one. Per tree, because a tree is one checkpoint.
-    authenticated: Mutex<std::collections::HashSet<(u32, u64)>>,
+    /// `(root, tile level, index)` — see [`Tree::authenticate_tile`]. A tile
+    /// holds 256 entries, so this is what turns a per-entry cost into a
+    /// per-tile one.
+    ///
+    /// The **root is part of the key**, and that is not decoration. `Tree` is
+    /// public and `root` is a per-call argument, so two calls may name two
+    /// different checkpoints; without it, a tile authenticated against the
+    /// first would be treated as authenticated against the second.
+    authenticated: Mutex<std::collections::HashSet<([u8; 32], u32, u64)>>,
+    /// The bytes of the most recently authenticated **level-0** tiles, with
+    /// the root they were authenticated against.
+    ///
+    /// [`Tree::verify_leaf`] must compare a body against a leaf hash out of a
+    /// tile it has *itself* folded up to the signed root — not out of a second
+    /// fetch of the same path, which a log is free to answer differently. So
+    /// the verified bytes are kept rather than re-requested.
+    ///
+    /// Two entries, because entries are walked in index order: 255 of every
+    /// 256 leaves hit the current tile and the boundary hits the previous one.
+    /// A miss is not a correctness question — it re-fetches and re-folds — so
+    /// this is sized for the access pattern and nothing else. Unbounded
+    /// storage here would be 8 KiB per 256 entries, which over a 10⁸-entry log
+    /// is gigabytes.
+    leaf_tiles: Mutex<std::collections::VecDeque<AuthenticatedTile>>,
 }
+
+/// One level-0 hash tile [`Tree`] has folded up to a signed root, kept so that
+/// [`Tree::verify_leaf`] reads its leaf hash out of verified bytes.
+#[derive(Debug)]
+struct AuthenticatedTile {
+    /// The checkpoint root the fold was checked against.
+    root: [u8; 32],
+    /// The tile's index.
+    index: u64,
+    /// Its 256 (or, at the frontier, fewer) node hashes.
+    data: Vec<u8>,
+}
+
+/// How many authenticated level-0 tiles' bytes [`Tree`] keeps. See
+/// `Tree::leaf_tiles`.
+const LEAF_TILE_MEMO: usize = 2;
 
 impl<'a, S: TileSource> Tree<'a, S> {
     /// The tree of `size` leaves a checkpoint commits to.
@@ -358,6 +446,7 @@ impl<'a, S: TileSource> Tree<'a, S> {
             size,
             concurrency: concurrency.max(1),
             authenticated: Mutex::new(std::collections::HashSet::new()),
+            leaf_tiles: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -722,20 +811,49 @@ impl<'a, S: TileSource> Tree<'a, S> {
     }
 
     /// Whether tile `(tile_level, index)` has already been authenticated
-    /// against this tree's checkpoint.
-    fn is_authenticated(&self, tile_level: u32, index: u64) -> bool {
+    /// against `root`.
+    fn is_authenticated(&self, root: [u8; 32], tile_level: u32, index: u64) -> bool {
         self.authenticated
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&(tile_level, index))
+            .contains(&(root, tile_level, index))
     }
 
     /// Records that it has.
-    fn mark_authenticated(&self, tile_level: u32, index: u64) {
+    fn mark_authenticated(&self, root: [u8; 32], tile_level: u32, index: u64) {
         self.authenticated
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((tile_level, index));
+            .insert((root, tile_level, index));
+    }
+
+    /// The verified bytes of level-0 tile `index`, if they are still held.
+    fn remembered_leaf_tile(&self, root: [u8; 32], index: u64) -> Option<Vec<u8>> {
+        self.leaf_tiles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|held| held.root == root && held.index == index)
+            .map(|held| held.data.clone())
+    }
+
+    /// Keeps the bytes of a level-0 tile this tree has folded to `root`.
+    fn remember_leaf_tile(&self, root: [u8; 32], index: u64, data: &[u8]) {
+        let mut held = self.leaf_tiles.lock().unwrap_or_else(|e| e.into_inner());
+        if held
+            .iter()
+            .any(|held| held.root == root && held.index == index)
+        {
+            return;
+        }
+        held.push_back(AuthenticatedTile {
+            root,
+            index,
+            data: data.to_vec(),
+        });
+        while held.len() > LEAF_TILE_MEMO {
+            held.pop_front();
+        }
     }
 
     /// Authenticates hash tile `(tile_level, index)` against `root`.
@@ -766,7 +884,7 @@ impl<'a, S: TileSource> Tree<'a, S> {
         // frontier tile, collecting what has to be checked on the way.
         let mut chain = Vec::new();
         let (mut level, mut at) = (tile_level, index);
-        while !self.is_authenticated(level, at) {
+        while !self.is_authenticated(root, level, at) {
             chain.push((level, at));
             if self.width(level, at) != 256 {
                 break; // the frontier: pinned by the root recomputation
@@ -782,6 +900,9 @@ impl<'a, S: TileSource> Tree<'a, S> {
                 256 => {
                     let data = self.hash_tile(level, at).await?;
                     let parent = self.stored_hash(8 * (level + 1), at).await?;
+                    if level == 0 {
+                        self.remember_leaf_tile(root, at, &data);
+                    }
                     let folded = fold(&data).ok_or_else(|| {
                         MonitorError::Tile(format!(
                             "hash tile {level}/{at} is {} bytes, which is not a run of \
@@ -806,7 +927,7 @@ impl<'a, S: TileSource> Tree<'a, S> {
                     }
                 }
             }
-            self.mark_authenticated(level, at);
+            self.mark_authenticated(root, level, at);
         }
         Ok(())
     }
@@ -822,10 +943,19 @@ impl<'a, S: TileSource> Tree<'a, S> {
     /// against a tile that has first been folded up to a node the checkpoint
     /// committed to (`Tree::authenticate_tile`).
     ///
+    /// **The leaf hash is read out of the bytes this tree folded**, never out
+    /// of a second fetch of the same path. That distinction is the whole
+    /// guarantee: `TileSource::fetch` promises nothing about determinism, so a
+    /// log that answered the authenticating fetch honestly and a later one
+    /// with a tile whose leaf hash it had swapped would defeat the check
+    /// entirely — a static-file server answering two GETs. Holding the
+    /// verified bytes (`Tree::leaf_tiles`) removes the question rather than
+    /// relying on a cache to make it moot.
+    ///
     /// **Cost.** The fetch budget is the same as the unauthenticated
-    /// comparison's: one level-0 hash tile per 256 entries, cached, plus one
-    /// level-1 tile per 65,536 entries and one level-2 tile per 16.7 M — tiles
-    /// the root recomputation is largely reading anyway. What is added is one
+    /// comparison's: one level-0 hash tile per 256 entries, plus one level-1
+    /// tile per 65,536 entries and one level-2 tile per 16.7 M — tiles the
+    /// root recomputation is largely reading anyway. What is added is one
     /// 255-node fold per tile, *memoized*, so the 256 entries inside a tile
     /// share it: about one SHA-256 compression per entry, against the ~26 an
     /// audit path per entry would have cost.
@@ -841,8 +971,45 @@ impl<'a, S: TileSource> Tree<'a, S> {
                 self.size
             )));
         }
-        self.authenticate_tile(0, index / 256, root).await?;
-        match self.stored_hash(0, index).await? == leaf_hash(body) {
+        let tile = index / 256;
+        self.authenticate_tile(0, tile, root).await?;
+        // Out of the bytes `authenticate_tile` folded, or — if the memo has
+        // rolled past them — out of a fresh authentication of the same tile,
+        // never out of a bare re-fetch.
+        let data = match self.remembered_leaf_tile(root, tile) {
+            Some(data) => data,
+            None => {
+                let data = self.hash_tile(0, tile).await?;
+                // A full tile is bound by folding it into the node its parent
+                // holds. A *partial* one is not foldable at all — its nodes are
+                // complete subtrees of differing sizes — and needs no parent:
+                // it is the frontier, pinned by the root recomputation that
+                // `authenticate_tile` has already run against this same `root`.
+                if self.width(0, tile) == 256 {
+                    let folded = fold(&data).ok_or_else(|| {
+                        MonitorError::Tile(format!(
+                            "hash tile 0/{tile} is {} bytes, which is not a run of \
+                             complete-subtree hashes",
+                            data.len()
+                        ))
+                    })?;
+                    if folded != self.stored_hash(8, tile).await? {
+                        return Err(MonitorError::Tile(format!(
+                            "hash tile 0/{tile} does not fold to the node its parent tile \
+                             stores for it: the log is serving tiles that do not belong to \
+                             the tree it signed"
+                        )));
+                    }
+                }
+                self.remember_leaf_tile(root, tile, &data);
+                data
+            }
+        };
+        let start = (index - tile * 256) as usize * 32;
+        let stored = data.get(start..start + 32).ok_or_else(|| {
+            MonitorError::Tile(format!("entry {index} is past the end of tile 0/{tile}"))
+        })?;
+        match stored == leaf_hash(body) {
             true => Ok(()),
             false => Err(MonitorError::Tile(format!(
                 "entry {index} does not hash to the leaf the signed checkpoint \
@@ -1149,6 +1316,87 @@ mod tests {
     /// compares a body against a level-0 tile.
     ///
     /// Everything above level 8 stays honest, which is what keeps the
+    /// A log that answers the *same* level-0 tile path honestly once and with
+    /// a swapped leaf hash every time after.
+    ///
+    /// `TileSource::fetch` promises nothing about determinism — it is a remote
+    /// server, and a static-file host answering two GETs differently is not
+    /// even misbehaviour it has to plan. So a `verify_leaf` that authenticated
+    /// one fetch of a tile and then read its leaf hash out of a *second* fetch
+    /// would bind a body to bytes nothing folded. This is that log.
+    struct ShiftyTile {
+        honest: MemoryLog,
+        at: u64,
+        /// The leaf hash served in place of the honest one — set to the hash
+        /// of the body the log wants believed, so a `verify_leaf` reading this
+        /// second fetch would *accept* a forgery rather than merely misfire.
+        instead: [u8; 32],
+        served: Mutex<usize>,
+    }
+
+    impl TileSource for ShiftyTile {
+        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+            let served = self.honest.fetch(path).await?;
+            let Some(mut data) = served else {
+                return Ok(None);
+            };
+            // Only the one tile holding `at`, and only after its first read:
+            // the root recomputation reads level-0 tiles too, and tampering
+            // with those would be an ordinary forged-tile test rather than
+            // this one.
+            if let Some(rest) = path.strip_prefix("api/v2/tile/0/") {
+                let digits = rest.split(".p/").next().unwrap_or(rest);
+                let index = digits.split('/').fold(0u64, |acc, group| {
+                    acc * 1000 + group.trim_start_matches('x').parse::<u64>().unwrap()
+                });
+                if index == self.at / 256 {
+                    let mut count = self.served.lock().unwrap_or_else(|e| e.into_inner());
+                    *count += 1;
+                    if *count > 1 {
+                        let start = (self.at - index * 256) as usize * 32;
+                        data[start..start + 32].copy_from_slice(&self.instead);
+                    }
+                }
+            }
+            Ok(Some(data))
+        }
+
+        async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
+            self.honest.checkpoint_size().await
+        }
+    }
+
+    /// The leaf hash a body is checked against comes from bytes this tree
+    /// folded, so a log cannot swap it on a second read.
+    #[tokio::test]
+    async fn a_tile_that_changes_between_fetches_cannot_move_the_leaf() {
+        let honest = log(600);
+        let root = Tree::new(&honest, 600, 4).root().await.unwrap();
+        let shifty = ShiftyTile {
+            honest: log(600),
+            at: 300,
+            instead: leaf_hash(b"forged 300"),
+            served: Mutex::new(0),
+        };
+        let tree = Tree::new(&shifty, 600, 4);
+        // The honest body for entry 300 still verifies, however many times the
+        // tile is read on the way.
+        tree.verify_leaf(300, b"entry 300", root)
+            .await
+            .expect("the honest body must verify against the folded tile");
+        // And the body the log tried to swap in — the one its second answer
+        // says is the leaf — is refused. This is the direction that matters:
+        // against a `verify_leaf` that re-read the tile, this call succeeds.
+        let error = tree
+            .verify_leaf(300, b"forged 300", root)
+            .await
+            .expect_err("a body that is not the committed leaf must be refused");
+        assert!(
+            error.to_string().contains("does not hash to the leaf"),
+            "refused for the wrong reason: {error}"
+        );
+    }
+
     /// checkpoint root and the consistency prefix intact: the forgery is
     /// invisible to every check except a walk to the signed root.
     struct TamperedBundles {
