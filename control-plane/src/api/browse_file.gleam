@@ -79,58 +79,142 @@ pub fn handle(
   )
 
   let registry = browse_api.registry(browse)
+  // The read-attempt trail is complete: from here on every refusal writes a
+  // `browse.download` audit row too, so "who tried to read what" is answerable
+  // for the failures as well as the successes.
+  let download = Download(db, registry, user_id, org_id, network, space, path)
   let attached =
     agent.sessions_for(registry, network_id)
     |> list.filter(agent.exposes(_, space))
-  use first <- pick(attached)
-
-  // A read is a same-origin GET with cookies and needs no CSRF token, so a
-  // hostile page can start one from an `img` tag. The cap is what stops it
-  // starting a hundred.
-  use Nil <- require(
-    agent.claim_stream(registry, user_id),
-    429,
-    "too many downloads open at once (limit "
-      <> int.to_string(agent.streams_per_user())
-      <> ")",
-  )
-
-  // Two tunnel steps. The resolve pins the version to its content root and
-  // names the origins currently holding it; the read is then addressed *by
-  // root*, so a publish landing in between cannot swap the bytes mid-download.
-  let download = Download(db, registry, user_id, org_id, network, space, path)
-  case agent.ask(first, agent.Resolve(space, path, from)) {
-    Error(refusal) -> {
-      agent.release_stream(registry, user_id)
-      refused(status_of(refusal.code), refusal.message)
-    }
-    Ok(agent.Resolved(_origin, root, size, _seq, holders)) -> {
-      // Holders first, then anyone: a non-holder still answers correctly, its
-      // blob fetcher pulling the missing ranges from peers bao-verified. One
-      // extra internal hop, the same bytes.
-      let session = case agent.route(attached, holders) {
-        Some(session) -> session
-        None -> first
-      }
-      case wanted_range(req, size) {
-        Error(Nil) -> {
-          agent.release_stream(registry, user_id)
-          refused(
-            416,
-            "that Range is not satisfiable for a "
-              <> int.to_string(size)
-              <> "-byte object",
+  case attached {
+    [] ->
+      deny(
+        download,
+        "",
+        503,
+        "no-device-attached",
+        "no attached daemon exposes " <> space,
+      )
+    [first, ..] ->
+      // A read is a same-origin GET with cookies and needs no CSRF token, so a
+      // hostile page can start one from an `img` tag. The cap is what stops it
+      // starting a hundred.
+      case agent.claim_stream(registry, user_id) {
+        False ->
+          deny(
+            download,
+            "",
+            429,
+            "too-many-downloads",
+            "too many downloads open at once (limit "
+              <> int.to_string(agent.streams_per_user())
+              <> ")",
           )
-        }
-        Ok(#(start, length, partial)) ->
-          stream(req, session, download, root, size, start, length, partial)
+        True ->
+          // Two tunnel steps. The resolve pins the version to its content root
+          // and names the origins currently holding it; the read is then
+          // addressed *by root*, so a publish landing in between cannot swap
+          // the bytes mid-download.
+          case agent.ask(first, agent.Resolve(space, path, from)) {
+            Error(refusal) -> {
+              agent.release_stream(registry, user_id)
+              deny(
+                download,
+                "",
+                status_of(refusal.code),
+                refusal.code,
+                refusal.message,
+              )
+            }
+            Ok(agent.Resolved(_origin, root, size, _seq, holders)) -> {
+              // Holders first, then anyone: a non-holder still answers
+              // correctly, its blob fetcher pulling the missing ranges from
+              // peers bao-verified. One extra internal hop, the same bytes.
+              let session = case agent.route(attached, holders) {
+                Some(session) -> session
+                None -> first
+              }
+              case wanted_range(req, size) {
+                Error(Nil) -> {
+                  agent.release_stream(registry, user_id)
+                  deny_range(download, root, size)
+                }
+                Ok(#(start, length, partial)) ->
+                  stream(
+                    req,
+                    session,
+                    download,
+                    root,
+                    size,
+                    start,
+                    length,
+                    partial,
+                  )
+              }
+            }
+            Ok(_) -> {
+              agent.release_stream(registry, user_id)
+              deny(
+                download,
+                "",
+                502,
+                "bad-answer",
+                "the daemon answered the wrong question",
+              )
+            }
+          }
       }
-    }
-    Ok(_) -> {
-      agent.release_stream(registry, user_id)
-      refused(502, "the daemon answered the wrong question")
-    }
   }
+}
+
+/// Records a refused download in the same trail the successes land in, then
+/// returns the plain-text refusal.
+fn deny(
+  download: Download,
+  root: String,
+  status: Int,
+  outcome: String,
+  message: String,
+) -> HttpResponse(mist.ResponseData) {
+  browse_api.audit_download(
+    download.db,
+    download.user_id,
+    download.org_id,
+    download.network,
+    download.space,
+    download.path,
+    root,
+    0,
+    outcome,
+  )
+  refused(status, message)
+}
+
+/// A 416 carries `Content-Range: bytes */<size>` (RFC 7233 §4.2), so a client
+/// learns the object's real length rather than only that its range was wrong.
+fn deny_range(
+  download: Download,
+  root: String,
+  size: Int,
+) -> HttpResponse(mist.ResponseData) {
+  browse_api.audit_download(
+    download.db,
+    download.user_id,
+    download.org_id,
+    download.network,
+    download.space,
+    download.path,
+    root,
+    0,
+    "range-not-satisfiable",
+  )
+  refused(
+    416,
+    "that Range is not satisfiable for a "
+      <> int.to_string(size)
+      <> "-byte object",
+  )
+  |> response.set_header("content-range", "bytes */" <> int.to_string(size))
 }
 
 /// Opens the chunked response and relays the stream into it.
@@ -156,6 +240,10 @@ fn stream(
     ),
     #("x-content-type-options", "nosniff"),
     #("accept-ranges", "bytes"),
+    // Forwarded from the daemon's resolve, not recomputed: the daemon is the
+    // data authority (it bao-verifies every byte it serves), so the control
+    // plane relays its BLAKE3 root rather than re-hashing a stream it only
+    // passes through. A client that wants to check runs `b3sum` itself.
     #("x-synch-root", root),
     #("x-synch-device", session.label),
     ..case partial {
@@ -284,16 +372,6 @@ fn require(
   case condition {
     True -> next(Nil)
     False -> refused(status, message)
-  }
-}
-
-fn pick(
-  sessions: List(Session),
-  next: fn(Session) -> HttpResponse(mist.ResponseData),
-) -> HttpResponse(mist.ResponseData) {
-  case sessions {
-    [first, ..] -> next(first)
-    [] -> refused(503, "no attached daemon exposes that space")
   }
 }
 

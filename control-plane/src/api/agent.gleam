@@ -52,6 +52,18 @@ pub const protocol_version = 1
 /// How long an attach nonce stays redeemable.
 const nonce_ttl = 60
 
+/// The most outstanding nonces the registry holds at once.
+///
+/// An unauthenticated `hello` mints one, so without a ceiling a flood grows
+/// the list to rate×`nonce_ttl` and turns every mint and redeem into an O(n)
+/// scan of it — an O(n²) stall on the single actor that also answers every
+/// browse and download call. Capping the list keeps every operation O(cap):
+/// past the cap the oldest-expiring nonces are dropped, which at worst makes
+/// one in-flight attach re-challenge, while single-use and the 60s expiry are
+/// untouched. At the default heartbeat cadence a legitimate fleet is nowhere
+/// near this.
+const nonce_cap = 4096
+
 /// How many chunks an attached daemon may send before it must wait for
 /// credit, and the window the relay keeps open.
 ///
@@ -65,6 +77,11 @@ const query_timeout = 15_000
 
 /// How long a download waits for the next frame before giving up.
 const stream_timeout = 60_000
+
+/// How long a one-shot question may sit unanswered before the session
+/// reclaims it. Longer than `query_timeout` so the caller's own timeout
+/// reports first; this is the backstop that frees the leaked entry after.
+const waiting_lease = 30
 
 /// How many downloads one user may have open at once.
 ///
@@ -255,12 +272,14 @@ fn handle_registry(state: Registry, message: Msg) -> actor.Next(Registry, Msg) {
         |> bit_array.base16_encode
         |> string.lowercase
       process.send(reply, nonce)
-      actor.continue(
-        Registry(..state, nonces: [
-          #(nonce, now + nonce_ttl),
-          ..live(state.nonces, now)
-        ]),
-      )
+      // Sweep the expired, then cap. The list is capped on every insert, so
+      // `live` only ever scans at most `nonce_cap` entries — the flood cannot
+      // make this or `Redeem` grow unbounded. Newest-first, so `take` keeps the
+      // freshest and drops the oldest-expiring, which is the right one to lose.
+      let kept =
+        [#(nonce, now + nonce_ttl), ..live(state.nonces, now)]
+        |> list.take(nonce_cap)
+      actor.continue(Registry(..state, nonces: kept))
     }
     Redeem(nonce, reply) -> {
       let fresh = live(state.nonces, now)
@@ -434,8 +453,15 @@ type Claim {
 }
 
 type Waiting {
-  ForAnswer(Subject(Result(Answer, Refusal)))
-  ForStream(Subject(Event))
+  /// A one-shot question, with the unix second past which it is abandoned. A
+  /// daemon that answers a wrong-shaped frame or never answers at all would
+  /// otherwise leave the entry — and the caller's reply subject — here forever;
+  /// the heartbeat sweep replies an error and drops it once the deadline passes.
+  ForAnswer(reply: Subject(Result(Answer, Refusal)), deadline: Int)
+  /// A stream. No deadline: a large download over a slow link is legitimately
+  /// long, and its liveness is the relay watchdog's job — it aborts on 60s of
+  /// no progress, which removes this entry via `Abort`.
+  ForStream(sink: Subject(Event))
 }
 
 type Conn {
@@ -761,7 +787,7 @@ fn answered(
     Error(_) -> mist.continue(state)
     Ok(#(id, answer)) -> {
       case list.key_find(state.waiting, id) {
-        Ok(ForAnswer(reply)) -> process.send(reply, Ok(answer))
+        Ok(ForAnswer(reply, _)) -> process.send(reply, Ok(answer))
         _ -> Nil
       }
       mist.continue(Conn(..state, waiting: without(state.waiting, id)))
@@ -772,6 +798,30 @@ fn answered(
 /// Every waiting request but one.
 fn without(waiting: List(#(Int, Waiting)), id: Int) -> List(#(Int, Waiting)) {
   list.filter(waiting, fn(pair) { pair.0 != id })
+}
+
+/// Drops one-shot questions whose deadline has passed, replying an error to
+/// each so its caller is not left waiting on a subject nobody will answer.
+/// Streams are exempt: they carry no deadline and are reclaimed by the relay.
+fn sweep_waiting(state: Conn, now: Int) -> Conn {
+  let #(expired, kept) =
+    list.partition(state.waiting, fn(entry) {
+      case entry.1 {
+        ForAnswer(_, deadline) -> deadline <= now
+        ForStream(_) -> False
+      }
+    })
+  list.each(expired, fn(entry) {
+    case entry.1 {
+      ForAnswer(reply, _) ->
+        process.send(
+          reply,
+          Error(Refusal("unavailable", "the attached daemon did not answer")),
+        )
+      ForStream(_) -> Nil
+    }
+  })
+  Conn(..state, waiting: kept)
 }
 
 fn streamed(
@@ -789,7 +839,7 @@ fn streamed(
       case list.key_find(state.waiting, id) {
         Ok(ForStream(sink)) -> process.send(sink, event)
         // An error frame for a one-shot question is that question's refusal.
-        Ok(ForAnswer(reply)) ->
+        Ok(ForAnswer(reply, _)) ->
           case event {
             Broken(code, message) ->
               process.send(reply, Error(Refusal(code, message)))
@@ -832,6 +882,10 @@ fn outgoing(
       case state.misses >= 2 {
         True -> mist.stop()
         False -> {
+          // Reclaim one-shot questions the daemon abandoned before sending a
+          // ping — the leak `answered` cannot plug on a malformed frame, since
+          // a frame it could not decode carries no id to key on.
+          let state = sweep_waiting(state, now_unix())
           let _ = send(conn, json.object([#("t", json.string("ping"))]))
           process.send_after(state.inbox, 30_000, Beat)
           mist.continue(Conn(..state, misses: state.misses + 1))
@@ -842,7 +896,7 @@ fn outgoing(
       let _ = send(conn, question_json(id, question))
       mist.continue(
         Conn(..state, next_id: id + 1, waiting: [
-          #(id, ForAnswer(reply)),
+          #(id, ForAnswer(reply, now_unix() + waiting_lease)),
           ..state.waiting
         ]),
       )
