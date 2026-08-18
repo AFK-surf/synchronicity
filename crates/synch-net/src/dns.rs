@@ -1810,9 +1810,20 @@ impl hickory_resolver::net::xfer::DnsHandle for DohHandle {
 /// reachable by anyone who can add a record to a response, including an on-path
 /// attacker against a plaintext DoH endpoint. It is a bug in the dependency's
 /// signature-selection logic and cannot be fixed from this side. What this
-/// side does close is the other half of the same quirk: hickory's choice of
-/// *which* RRSIG is the signer does not decide which zone key must carry a
-/// transparency proof (see [`ValidatedTxt::rrsigs`]).
+/// side does close is only the off-path half.
+///
+/// The other half of the quirk stays open, and saying so is the point: which
+/// RRSIG hickory reports as the signer **does** decide which zone key must
+/// carry a transparency proof. `secure_txt` takes exactly one by `find_map`,
+/// `ValidatedTxt` carries that one, and `verify_zone_key` identifies the key
+/// by verifying it. The choice follows the order the answer's records arrived
+/// in and the untrusted transport chooses that order, so during an RFC 6781
+/// double-signature rollover a transport can pick which of the zone's live
+/// keys the requirement lands on — see the note in `secure_txt`. It cannot be
+/// steered onto a key that did not sign, so the failure is availability, not
+/// acceptance: under `Require` the un-logged key of the pair fails closed for
+/// the length of `CONTROL_PLANE_REPUBLISH_WINDOW`, which is documented as
+/// exactly the state where only one live key has a published proof.
 fn strip_off_path_rrsigs(response: &mut hickory_resolver::proto::op::DnsResponse) {
     drop_off_path_rrsigs(&mut response.answers);
     drop_off_path_rrsigs(&mut response.authorities);

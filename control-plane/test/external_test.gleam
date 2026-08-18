@@ -89,11 +89,18 @@ pub fn the_renderer_emits_data_records_and_the_marker_test() {
 /// proof, and it has to fit inside the lifetime of the membership that client
 /// is already holding — else a routine rotation costs bindings rather than a
 /// few refreshes. The client's half of the relation (a 60 s re-resolution
-/// floor and a 600 s trust grace) is asserted in `crates/synch-net`.
+/// floor and a 900 s trust grace) is asserted in `crates/synch-net`.
+///
+/// The grace is `DEFAULT_TRUST_GRACE` in `crates/synch-net/src/dns.rs` and it
+/// is 15 minutes, not the 600 this test and the constant's own comment used
+/// to carry. The direction is worth noting: the wrong number *understated*
+/// the margin, so the relation was being maintained against a tighter budget
+/// than the real one. It holds either way — but a relation written down to be
+/// checked should be the one that is true.
 pub fn the_rotation_window_fits_inside_a_binding_lifetime_test() {
   let watch_cadence = 300
   let publish_slack = 60
-  let client_trust_grace = 600
+  let client_trust_grace = 900
   assert watch_cadence + publish_slack + render_external.ttl_proof
     < render_external.ttl_data + client_trust_grace
 }

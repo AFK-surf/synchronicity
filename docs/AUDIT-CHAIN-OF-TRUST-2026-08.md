@@ -530,17 +530,25 @@ revocation claim and state plainly that a leaked shard key is unrecoverable.
   938,074,384 iterations / ~0.9 s of CPU on the async task with no
   `spawn_blocking`, from one hostile zone per TTL, in a serial refresh loop where
   every neighbouring cost is bounded. Index the parts once.
-- **`Checkpoint::parse` splits the signed note at the first blank line**
-  (`rekor.rs:1183`); Go's `sumdb/note` uses the last. Demonstrated: appending
-  `"\n— attacker <b64>\n"` to a genuine checkpoint is accepted here and refused by
-  Go. The checkpoint is not covered by the leaf hash, so it is malleable in the
-  zone's TXT. No authorization break, but it is checkpoint malleability on a
-  genuine note — slightly stronger than filed.
-- **`strip_off_path_rrsigs` documents a defence that does not exist**
-  (`dns.rs:1811-1813`), referencing a `ValidatedTxt::rrsigs` field that is not
-  there (the field is singular). The file contradicts itself at `:1889-1893`.
-  During a double-signature rollover a transport that controls answer ordering
-  deterministically picks which key must carry a proof.
+- ~~**`Checkpoint::parse` splits the signed note at the first blank line**~~
+  **fixed.** Now `rfind`, matching Go's `sumdb/note`. The genuine bytes end in a
+  newline, so one appended signature line creates a second blank line: splitting
+  at the first left `signed` as the real note, so the log's own signature was
+  still in the signature list and still verified, and the appended line rode
+  along as though the log had put it there. Splitting at the last moves the log's
+  signature into the signed text, where no pinned key matches. Covered by
+  `a_checkpoint_with_a_block_appended_is_not_the_one_the_log_signed`, which
+  asserts on *verification* rather than on parsing — an earlier version asserted
+  on the signature count and passed with the bug still in, which is worth
+  recording as the kind of test that looks load-bearing and is not.
+- ~~**`strip_off_path_rrsigs` documents a defence that does not exist**~~
+  **fixed (doc).** It claimed hickory's choice of signer "does not decide which
+  zone key must carry a transparency proof" and linked a `ValidatedTxt::rrsigs`
+  field that does not exist — the field is singular, and the claim is false: the
+  choice decides exactly that, as the same file says at `:1889-1893`. The doc now
+  states what is true, including that the exposure is availability rather than
+  acceptance: a transport can pick which of two live keys the requirement lands
+  on during a rollover, but not steer it onto a key that did not sign.
 - ~~**A wildcard watch entry parses and watches almost nothing**~~ **fixed.**
   Measured: `*.example.com` watched `example.com` and up and *nothing* below,
   including `cp.example.com` — the ordinary shape of both a control plane and a
@@ -565,17 +573,21 @@ revocation claim and state plainly that a leaked shard key is unrecoverable.
   file. Downgraded: CI asserts `tlogs` parses the shipped file, so it cannot reach
   production. The residual is that the byte-equality test freezes both copies, so
   Gleam's strictness would block the *client's* embedded root from updating.
-- **The control plane's trusted root never refreshes, and a comment says it does**
-  — `controlplane.gleam:493-495` advertises "the TUF refresh job both primary
-  modes share"; no such job exists in either mode, and `jobs/resign.gleam:6-7`
-  says the opposite in the same tree. The no-refresh design itself is sound and
-  defended; the false comment is the defect.
+- ~~**The control plane's trusted root never refreshes, and a comment says it
+  does**~~ **fixed (doc).** `controlplane.gleam` advertised "the TUF refresh job
+  both primary modes share"; no such job exists in either mode, and
+  `jobs/resign.gleam:6-7` said the opposite in the same tree. The no-refresh
+  design is sound and defended — the comment now says so and names the shipped
+  file, instead of sending a reader looking for a job migration v8 removed.
 - **A frozen pin set is invisible until fatal.** The only signal is a `warn!` after
   seven consecutive days, inside `member_set`, only under `Require`. `doctor`
   never prints the last successful walk.
 - **A failed Rekor submission costs a full 300 s tick**, leaving exactly one
-  retry of headroom in the documented timing relation — which is itself
-  maintained against a stale `600` where the real `DEFAULT_TRUST_GRACE` is 900.
+  retry of headroom in the documented timing relation. The stale `600` is
+  **fixed**: `render_external.gleam` and the test that pins the relation both
+  said 600 where `DEFAULT_TRUST_GRACE` is 900. Worth noting the direction — the
+  wrong number *understated* the margin, so the relation was being held against
+  a tighter budget than the real one. The retry-headroom observation stands.
 - **Publisher and client ship opposite defaults**: `gate.required()` is off unless
   `CP_REKOR_REQUIRE=true`, while the client defaults to `Require`. A stock control
   plane publishes a zone every stock client refuses, and `promote` without a prior
