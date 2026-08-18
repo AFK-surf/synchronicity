@@ -21,7 +21,10 @@
 //! write and the staging file goes with it, so a body that fails its checksum
 //! never becomes a published assertion.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use axum::body::Body;
 use tokio_stream::StreamExt;
@@ -48,7 +51,14 @@ pub enum Framing {
     Chunked,
 }
 
-/// Reads the framing a request declared.
+/// Reads the framing a request declared, from everything that declares it.
+///
+/// Two headers say a body is framed and a client may send either: the
+/// `STREAMING-…` sentinels in `x-amz-content-sha256`, and `Content-Encoding:
+/// aws-chunked`. Keying off only the first — and only its exact uppercase
+/// spelling — is how framing ends up stored as object content behind a `200`,
+/// which is the corruption this module exists to prevent. So both are
+/// consulted, case-insensitively and trimmed.
 ///
 /// The signed-chunk variants are refused rather than accepted-and-ignored:
 /// verifying a per-chunk signature means carrying the rolling signing state
@@ -56,18 +66,43 @@ pub enum Framing {
 /// answering as though it had made one would be claiming an authentication it
 /// never performed. `NotImplemented` makes a client fall back to a form this
 /// gateway does check.
-pub fn framing(payload_hash: &str) -> S3Result<Framing> {
-    // The value is a hex digest, a sentinel, or one of the streaming forms;
-    // only the streaming forms frame the body.
-    if !payload_hash.starts_with("STREAMING-") {
-        return Ok(Framing::Plain);
+pub fn framing(payload_hash: &str, content_encoding: Option<&str>) -> S3Result<Framing> {
+    let declared = payload_hash.trim().to_ascii_uppercase();
+    if declared.starts_with("STREAMING-") {
+        return match declared.as_str() {
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => Ok(Framing::Chunked),
+            other => Err(S3Error::not_implemented(&format!(
+                "the {other} body encoding"
+            ))),
+        };
     }
-    match payload_hash {
-        "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => Ok(Framing::Chunked),
-        other => Err(S3Error::not_implemented(&format!(
-            "the {other} body encoding"
-        ))),
+    // The encoding header alone is enough. A client that frames its body
+    // without naming a streaming sentinel is rarer than one that does, but its
+    // body is framed either way, and guessing `Plain` corrupts the object.
+    let chunked_encoding = content_encoding.is_some_and(|encoding| {
+        encoding
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
+    });
+    if chunked_encoding {
+        return Ok(Framing::Chunked);
     }
+    Ok(Framing::Plain)
+}
+
+/// Refuses a declared payload length that belongs to no framing.
+///
+/// `x-amz-decoded-content-length` only means anything alongside framing. A
+/// request that sends it without either framing header disagrees with this
+/// gateway about the shape of its own body, and the safe reading of that
+/// disagreement is to refuse rather than to pick one.
+pub fn check_declared_length(framing: Framing, declared_length: bool) -> S3Result<()> {
+    if declared_length && framing == Framing::Plain {
+        return Err(S3Error::invalid(
+            "x-amz-decoded-content-length names a length for a body that declares no framing",
+        ));
+    }
+    Ok(())
 }
 
 /// A checksum algorithm a trailer can carry.
@@ -215,7 +250,11 @@ impl Decoder {
                     }
                 },
                 State::Data(remaining) => {
-                    let take = (remaining as usize).min(input.len());
+                    // Via `u64` and not `remaining as usize`: on a 32-bit
+                    // target the cast truncates a chunk larger than 4 GiB, and
+                    // the decoder would resynchronize in the middle of the
+                    // payload — treating content as framing.
+                    let take = remaining.min(input.len() as u64) as usize;
                     let (payload, rest) = input.split_at(take);
                     if let Some(digests) = self.digests.as_mut() {
                         digests.update(payload);
@@ -282,6 +321,13 @@ impl Decoder {
     fn take_line(&mut self, input: &mut &[u8]) -> S3Result<Option<Vec<u8>>> {
         match input.iter().position(|&b| b == b'\n') {
             Some(idx) => {
+                // Checked on this path too, not only when the newline is
+                // missing: one piece carrying megabytes of header followed by a
+                // newline would otherwise sail past the cap that exists to stop
+                // exactly that.
+                if self.line.len() + idx > MAX_LINE {
+                    return Err(S3Error::invalid("a chunk header is too long"));
+                }
                 self.line.extend_from_slice(&input[..idx]);
                 *input = &input[idx + 1..];
                 let mut line = std::mem::take(&mut self.line);
@@ -367,6 +413,35 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(text).ok()
 }
 
+/// Where a decoder leaves the failure its stream could only carry as an I/O
+/// error.
+///
+/// A body is a stream of bytes; once it has started there is no status left to
+/// change and no S3 code to attach, so a decoder that fails mid-body can only
+/// end the stream. That reaches the caller as a plain I/O error, and the caller
+/// turns it into `InvalidArgument` — the wrong answer for the failure this
+/// decoder exists to detect. `BadDigest` tells an SDK to retry the upload;
+/// `InvalidArgument` tells it to give up. So the real error is left here, and
+/// the caller reads it back when it sees the stream fail.
+#[derive(Debug, Clone, Default)]
+pub struct DecodeFault(Arc<Mutex<Option<S3Error>>>);
+
+impl DecodeFault {
+    fn record(&self, error: S3Error) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
+    }
+
+    /// The decoder's own account of the failure, if it had one, and otherwise
+    /// whatever the caller made of the broken stream.
+    pub fn explain(&self, fallback: S3Error) -> S3Error {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or(fallback)
+    }
+}
+
 /// Wraps a framed request body so what comes out of it is the payload.
 ///
 /// A `Plain` body is handed back untouched — the decoder is not in the path at
@@ -375,13 +450,15 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 /// The decoded pieces travel over a short channel, the same shape a read takes
 /// in the other direction: a stalled consumer stops the decoder within a piece
 /// or two, so a slow daemon costs bounded memory rather than a buffered body.
-pub fn decode(body: Body, framing: Framing, declared: Option<u64>) -> Body {
+pub fn decode(body: Body, framing: Framing, declared: Option<u64>) -> (Body, DecodeFault) {
+    let fault = DecodeFault::default();
     if framing == Framing::Plain {
-        return body;
+        return (body, fault);
     }
     let mut decoder = Decoder::new(declared);
     let mut stream = body.into_data_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(2);
+    let reporting = fault.clone();
     tokio::spawn(async move {
         while let Some(piece) = stream.next().await {
             let piece = match piece {
@@ -399,6 +476,7 @@ pub fn decode(body: Body, framing: Framing, declared: Option<u64>) -> Body {
                     }
                 }
                 Err(e) => {
+                    reporting.record(e.clone());
                     let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                     return;
                 }
@@ -409,8 +487,224 @@ pub fn decode(body: Body, framing: Framing, declared: Option<u64>) -> Body {
         // is the same thing a truncated body does, and the daemon treats it the
         // same way: the staging file goes, and nothing is published.
         if let Err(e) = decoder.finish() {
+            reporting.record(e.clone());
             let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
         }
     });
-    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+    (
+        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        fault,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode_all(pieces: &[&[u8]], expected: Option<u64>) -> S3Result<Vec<u8>> {
+        let mut decoder = Decoder::new(expected);
+        let mut out = Vec::new();
+        for piece in pieces {
+            out.extend_from_slice(&decoder.push(piece)?);
+        }
+        decoder.finish()?;
+        Ok(out)
+    }
+
+    fn body(payload: &[u8]) -> Vec<u8> {
+        let mut framed = format!("{:x}\r\n", payload.len()).into_bytes();
+        framed.extend_from_slice(payload);
+        framed.extend_from_slice(b"\r\n0\r\n\r\n");
+        framed
+    }
+
+    /// Both headers declare framing, in any spelling.
+    ///
+    /// Reading only the exact-uppercase sentinel is how a framed body gets
+    /// stored as object content behind a `200`.
+    #[test]
+    fn framing_is_read_from_either_header() {
+        let plain = |h: &str| framing(h, None).unwrap();
+        assert_eq!(plain("UNSIGNED-PAYLOAD"), Framing::Plain);
+        assert_eq!(plain(&"a".repeat(64)), Framing::Plain);
+        for spelling in [
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            "streaming-unsigned-payload-trailer",
+            "  STREAMING-UNSIGNED-PAYLOAD-TRAILER  ",
+            "Streaming-Unsigned-Payload-Trailer",
+        ] {
+            assert_eq!(plain(spelling), Framing::Chunked, "{spelling}");
+        }
+        for encoding in [
+            "aws-chunked",
+            "AWS-CHUNKED",
+            "gzip, aws-chunked",
+            " aws-chunked ",
+        ] {
+            assert_eq!(
+                framing("UNSIGNED-PAYLOAD", Some(encoding)).unwrap(),
+                Framing::Chunked,
+                "{encoding}"
+            );
+        }
+        assert_eq!(
+            framing("UNSIGNED-PAYLOAD", Some("gzip")).unwrap(),
+            Framing::Plain
+        );
+        // A signed-chunk body is refused rather than mis-decoded, in any case.
+        for signed in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "streaming-aws4-hmac-sha256-payload-trailer",
+        ] {
+            assert_eq!(framing(signed, None).unwrap_err().status, 501);
+        }
+    }
+
+    #[test]
+    fn a_declared_length_without_framing_is_refused() {
+        assert!(check_declared_length(Framing::Chunked, true).is_ok());
+        assert!(check_declared_length(Framing::Chunked, false).is_ok());
+        assert!(check_declared_length(Framing::Plain, false).is_ok());
+        assert!(check_declared_length(Framing::Plain, true).is_err());
+    }
+
+    /// The wire pieces are whatever the network chose, so every split has to
+    /// decode the same.
+    #[test]
+    fn framing_survives_any_split() {
+        let framed = body(b"hello, payload");
+        for at in 0..=framed.len() {
+            let (head, tail) = framed.split_at(at);
+            let decoded =
+                decode_all(&[head, tail], None).unwrap_or_else(|e| panic!("split at {at}: {e}"));
+            assert_eq!(decoded, b"hello, payload", "split at {at}");
+        }
+        // And one byte at a time, which splits every CRLF and every size line.
+        let single: Vec<&[u8]> = framed.chunks(1).collect();
+        assert_eq!(decode_all(&single, None).unwrap(), b"hello, payload");
+    }
+
+    #[test]
+    fn empty_and_multi_chunk_bodies() {
+        assert_eq!(decode_all(&[b"0\r\n\r\n"], Some(0)).unwrap(), b"");
+        let framed = b"3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n";
+        assert_eq!(decode_all(&[framed], Some(6)).unwrap(), b"abcdef");
+        // Chunk extensions are ignored, which is what they are for.
+        let extended = b"3;chunk-signature=deadbeef\r\nabc\r\n0\r\n\r\n";
+        assert_eq!(decode_all(&[extended], None).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn malformed_frames_are_refused() {
+        // Ends mid-frame.
+        assert!(decode_all(&[b"5\r\nhel"], None).is_err());
+        // No trailer section at all.
+        assert!(decode_all(&[b"3\r\nabc\r\n0\r\n"], None).is_err());
+        // A chunk longer than its size says.
+        assert!(decode_all(&[b"3\r\nabcdef\r\n0\r\n\r\n"], None).is_err());
+        // Trailing bytes past the final chunk.
+        assert!(decode_all(&[b"0\r\n\r\nextra"], None).is_err());
+        // A size that is not hex.
+        assert!(decode_all(&[b"zz\r\nabc\r\n0\r\n\r\n"], None).is_err());
+        // A header line that never ends...
+        let long = vec![b'a'; MAX_LINE + 1];
+        assert!(decode_all(&[&long], None).is_err());
+        // ...including when the newline does arrive, eventually.
+        let mut with_newline = vec![b'a'; MAX_LINE + 1];
+        with_newline.push(b'\n');
+        assert!(decode_all(&[&with_newline], None).is_err());
+    }
+
+    #[test]
+    fn a_declared_length_is_held_to() {
+        let framed = body(b"12345");
+        assert!(decode_all(&[&framed], Some(5)).is_ok());
+        // Too long is caught as it is exceeded, not only at the end.
+        assert!(decode_all(&[&framed], Some(4)).is_err());
+        // Too short is caught when the body ends.
+        assert!(decode_all(&[&framed], Some(6)).is_err());
+    }
+
+    #[test]
+    fn trailer_checksums_are_verified() {
+        use base64::Engine;
+        let payload = b"the payload, not the framing";
+        let digest = |algorithm: &str| {
+            let mut digests = Digests::new();
+            digests.update(payload);
+            base64::engine::general_purpose::STANDARD
+                .encode(digests.finish(Algorithm::parse(algorithm).unwrap()))
+        };
+        for algorithm in ["crc32", "crc32c", "crc64nvme", "sha256"] {
+            let mut framed = format!("{:x}\r\n", payload.len()).into_bytes();
+            framed.extend_from_slice(payload);
+            framed.extend_from_slice(
+                format!(
+                    "\r\n0\r\nx-amz-checksum-{algorithm}:{}\r\n\r\n",
+                    digest(algorithm)
+                )
+                .as_bytes(),
+            );
+            assert_eq!(
+                decode_all(&[&framed], None).unwrap(),
+                payload,
+                "{algorithm}"
+            );
+
+            // The same body with a digest that does not match must fail, and
+            // fail as `BadDigest` so a client knows to retry rather than to
+            // give up.
+            let wrong = String::from_utf8(framed.clone())
+                .unwrap()
+                .replace(&digest(algorithm), "AAAAAAAAAAAAAAAAAAAAAA==");
+            let error = decode_all(&[wrong.as_bytes()], None).unwrap_err();
+            assert_eq!(error.code, "BadDigest", "{algorithm}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_unverifiable_checksum_is_refused_rather_than_skipped() {
+        let framed = b"3\r\nabc\r\n0\r\nx-amz-checksum-sha1:AAAA\r\n\r\n";
+        assert_eq!(
+            decode_all(&[framed], None).unwrap_err().code,
+            "NotImplemented"
+        );
+        // A trailer this gateway has no opinion about is not a checksum and is
+        // simply carried past.
+        let other = b"3\r\nabc\r\n0\r\nx-amz-something:value\r\n\r\n";
+        assert_eq!(decode_all(&[other], None).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn an_oversized_trailer_is_refused() {
+        let mut framed = b"0\r\n".to_vec();
+        for i in 0..512 {
+            framed.extend_from_slice(format!("x-pad-{i}:{}\r\n", "v".repeat(64)).as_bytes());
+        }
+        framed.extend_from_slice(b"\r\n");
+        assert!(decode_all(&[&framed], None).is_err());
+    }
+
+    #[test]
+    fn a_decoder_fault_carries_its_code_to_the_caller() {
+        let fault = DecodeFault::default();
+        assert_eq!(
+            fault.explain(S3Error::invalid("fallback")).code,
+            "InvalidArgument"
+        );
+        fault.record(S3Error::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "BadDigest",
+            "mismatch",
+        ));
+        assert_eq!(
+            fault.explain(S3Error::invalid("fallback")).code,
+            "BadDigest"
+        );
+        // Read once: a second look does not resurrect it.
+        assert_eq!(
+            fault.explain(S3Error::invalid("fallback")).code,
+            "InvalidArgument"
+        );
+    }
 }

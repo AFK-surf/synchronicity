@@ -1704,3 +1704,119 @@ async fn a_key_can_be_rewritten_after_it_is_deleted() {
     }
     harness.stop().await;
 }
+
+/// An `aws-chunked` body is unwrapped however the client declared it.
+///
+/// Keying only off an exact-case `x-amz-content-sha256` sentinel left the
+/// framing stored as object content, behind a `200` and an ETag over the framed
+/// bytes — the corruption the decoder exists to prevent.
+#[tokio::test]
+async fn framing_is_detected_from_either_header() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let payload = b"the payload, not the framing";
+    let framed = format!(
+        "{:x}\r\n{}\r\n0\r\n\r\n",
+        payload.len(),
+        String::from_utf8_lossy(payload)
+    );
+
+    let declarations: [(&str, Option<&str>); 3] = [
+        ("streaming-unsigned-payload-trailer", None),
+        ("UNSIGNED-PAYLOAD", Some("aws-chunked")),
+        ("STREAMING-UNSIGNED-PAYLOAD-TRAILER", Some("aws-chunked")),
+    ];
+    for (i, (sha, encoding)) in declarations.iter().enumerate() {
+        let key = format!("framed-{i}.txt");
+        let mut request = http
+            .put(harness.url(&format!("/my-media/{key}")))
+            .header("x-amz-content-sha256", *sha)
+            .header("x-amz-decoded-content-length", payload.len().to_string())
+            .body(framed.clone());
+        if let Some(encoding) = encoding {
+            request = request.header("content-encoding", *encoding);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            200,
+            "{sha}/{encoding:?}"
+        );
+
+        let stored = http
+            .get(harness.url(&format!("/my-media/{key}")))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(stored.as_ref(), payload, "{sha}/{encoding:?}");
+    }
+
+    // A declared length with no framing at all is a client disagreeing with us
+    // about the shape of its own body, and is refused rather than guessed at.
+    let response = http
+        .put(harness.url("/my-media/mismatched.txt"))
+        .header("x-amz-decoded-content-length", "10")
+        .body("plain bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    harness.stop().await;
+}
+
+/// A trailer checksum that does not match reaches the client as `BadDigest`.
+///
+/// SDKs branch on it: `BadDigest` means retry the upload, `InvalidArgument`
+/// means give up. Flattening the decoder's verdict into the daemon's generic
+/// "the write was abandoned" told every client the wrong one.
+#[tokio::test]
+async fn a_failed_trailer_checksum_is_reported_as_bad_digest() {
+    use base64::Engine;
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let payload = b"checksummed payload".to_vec();
+    let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(&payload);
+    let digest = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+    let framed = |d: &str| {
+        format!(
+            "{:x}\r\n{}\r\n0\r\nx-amz-checksum-crc32c:{d}\r\n\r\n",
+            payload.len(),
+            String::from_utf8_lossy(&payload)
+        )
+    };
+
+    // The honest one lands.
+    let response = http
+        .put(harness.url("/my-media/good.txt"))
+        .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+        .header("x-amz-decoded-content-length", payload.len().to_string())
+        .body(framed(&digest))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // The mismatched one does not, and says why in the client's vocabulary.
+    let response = http
+        .put(harness.url("/my-media/corrupt.txt"))
+        .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+        .header("x-amz-decoded-content-length", payload.len().to_string())
+        .body(framed("AAAAAA=="))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("BadDigest"), "{body}");
+
+    // And nothing was published for it.
+    let response = http
+        .get(harness.url("/my-media/corrupt.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    harness.stop().await;
+}

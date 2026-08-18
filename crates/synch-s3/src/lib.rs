@@ -292,12 +292,22 @@ fn check_headers(headers: &BTreeMap<String, String>) -> S3Result<()> {
 ///
 /// Both write paths take it, because both can receive one: mountpoint sends
 /// `--upload-checksums crc32c` by default, and every upload it makes is framed.
-fn payload(headers: &BTreeMap<String, String>, body: Body) -> S3Result<Body> {
-    let declared = headers.get("x-amz-content-sha256").map(String::as_str);
-    let framing = chunked::framing(declared.unwrap_or(auth::UNSIGNED_PAYLOAD))?;
+fn payload(
+    headers: &BTreeMap<String, String>,
+    body: Body,
+) -> S3Result<(Body, chunked::DecodeFault)> {
+    let declared = headers
+        .get("x-amz-content-sha256")
+        .map(String::as_str)
+        .unwrap_or(auth::UNSIGNED_PAYLOAD);
+    let framing = chunked::framing(
+        declared,
+        headers.get("content-encoding").map(String::as_str),
+    )?;
     let length = headers
         .get("x-amz-decoded-content-length")
         .and_then(|v| v.parse::<u64>().ok());
+    chunked::check_declared_length(framing, length.is_some())?;
     Ok(chunked::decode(body, framing, length))
 }
 
@@ -331,11 +341,12 @@ async fn upload_part(
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| S3Error::invalid("partNumber must be a number"))?;
     let reference = UploadRef::new(upload_id, &bucket.space, key);
+    let (body, fault) = payload(headers, body)?;
     let part = gateway
         .daemon
-        .upload_part(reference, number, payload(headers, body)?)
+        .upload_part(reference, number, body)
         .await
-        .map_err(|e| e.about_upload(upload_id))?;
+        .map_err(|e| fault.explain(e).about_upload(upload_id))?;
 
     let mut response = HeaderMap::new();
     insert(&mut response, header::ETAG, &quoted(&part.root.to_hex()));
@@ -758,11 +769,15 @@ async fn put_object(
     // space directory, hash, CAS, stage, publish (§7.1) — and comes back as the
     // published entry, so the ETag is the root the daemon computed rather than
     // one this process hashed from a copy it kept.
+    let (body, fault) = payload(headers, body)?;
     let published: EntryInfo = gateway
         .daemon
-        .put(&bucket.space, key, payload(headers, body)?)
+        .put(&bucket.space, key, body)
         .await
-        .map_err(|e| e.with_key(key))?;
+        // A body that died mid-stream reaches here as the daemon's account of
+        // an abandoned write; the decoder's account, if it has one, is the more
+        // useful of the two and the one a client can act on.
+        .map_err(|e| fault.explain(e).with_key(key))?;
 
     let mut headers = HeaderMap::new();
     insert(
