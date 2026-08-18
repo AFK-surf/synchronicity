@@ -307,21 +307,30 @@ impl MissingWalk {
                 self.frontier.push((reference, hash, depth));
                 break;
             }
-            // The bound every *walk* in this crate carries, applied to the
-            // *fetch* — which carried none at all. `hash_of_encoded` bounds one
-            // node's nibble run at `MAX_KEY_LEN * 2`, and DESIGN §12 read that
-            // as bounding ingest depth; it does not, because the bound is per
-            // node and a path is made of many. So a member could hang an
-            // arbitrarily large graph below the depth any valid key reaches: the
-            // fetch pulled and committed all of it, `is_complete` vouched for
-            // the root, `iter` and `diff` pruned at `MAX_DEPTH_NIBBLES` so the
-            // promotion succeeded, and the nodes were then reachable from a
-            // retained head — marked by every GC pass, reflected in no `entries`
-            // row, and served on to every peer that adopted the head.
+            // The depth bound every *walk* in this crate carries, applied to the
+            // *fetch*, which carried none. `hash_of_encoded` bounds one node's
+            // nibble run at `MAX_KEY_LEN * 2` and DESIGN §12 read that as
+            // bounding ingest depth; it does not, because the bound is per node
+            // and a path is made of many. Without this, a chain of nodes reaching
+            // past the depth any valid key addresses was pulled and committed in
+            // full, `is_complete` vouched for the root, `iter` and `diff` pruned
+            // at `MAX_DEPTH_NIBBLES` so the promotion succeeded, and the nodes
+            // were then reachable from a retained head: marked by every GC pass,
+            // reflected in no `entries` row, and served on to every peer.
             //
-            // A position at this depth is on no valid key's path, so refusing to
-            // walk it costs nothing an honest origin can produce. An `MptError`,
-            // so it fails that origin and not the peer relaying it (§12).
+            // What this is and is not. It refuses a *position* no valid key
+            // reaches, which is a canonicality rule and costs nothing an honest
+            // origin can produce — no key `insert` accepts descends this far. It
+            // is **not** a bound on how much a member can make a peer store,
+            // and it should not be read as one: `seen` deduplicates on hash, so
+            // a node is expanded at whichever depth it is popped at first, and
+            // one extra branch pointing at every rung of a deep chain makes the
+            // whole chain reachable at depth 1. What bounds storage is that this
+            // walk is deduplicated at all — the fetch costs one node per
+            // *distinct* node served, so a member gets no leverage over a peer
+            // beyond what it uploads (§12 puts that under `synch trust rm`).
+            //
+            // An `MptError`, so it fails that origin and not the peer relaying it.
             if depth > MAX_DEPTH_NIBBLES {
                 return Err(MptError::NonCanonical(format!(
                     "a trie node sits at nibble depth {depth}, past the \

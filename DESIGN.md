@@ -1511,11 +1511,13 @@ CI (GitHub Actions):
   count alone bounds nothing when the payloads are the publishing origin's to
   choose; trie keys are bounded to 4 KiB and trie values to 32 KiB; and the fetch
   that ingests a peer's trie stops descending at the ~8 K nibbles a 4 KiB key
-  reaches. That last one is a bound on the *path*, and the key bound does not
-  imply it: the node encoding caps one node's nibble run, so without it a member
-  could hang an arbitrarily large graph below the depth any key reaches — pulled,
-  committed, vouched for by `is_complete`, reflected in no `entries` row, and
-  marked by every GC pass thereafter. A `GetSlice` is bounded the same way, on
+  reaches. That last one is a canonicality rule about *positions*, and the key
+  bound does not imply it: the node encoding caps one node's nibble run, so
+  without it a chain reaching past that depth was pulled, committed, vouched for
+  by `is_complete`, reflected in no `entries` row, and marked by every GC pass
+  thereafter. It is not a quota — the ingest walk deduplicates on hash, so what a
+  member can make a peer store is what it uploads, which is the membership
+  question above rather than a sanity bound. A `GetSlice` is bounded the same way, on
   both axes: at
   most 512 groups are encoded per exchange (§6.4), and at most 4 096 ranges are
   accepted in one request, because the range set operations are quadratic in the

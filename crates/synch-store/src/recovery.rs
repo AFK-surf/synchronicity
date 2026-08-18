@@ -150,11 +150,20 @@ impl Store {
     /// value writes over the first one's. `append_config` already makes this
     /// argument for a list; a maximum needs it just as much.
     pub fn raise_publish_floor(&self, seq: u64) -> Result<u64> {
+        // The comparison is SQLite's, and SQLite's `INTEGER` is signed — so a
+        // floor past `i64::MAX` would compare as negative and read back as a
+        // number this column cannot hold. Refused rather than clamped, the same
+        // way `record_observed_head` refuses a seq it cannot store: a floor is a
+        // durable promise about what this node will not publish below, and one
+        // that silently means something else is worse than none.
+        let comparable = i64::try_from(seq).map_err(|_| {
+            StoreError::column("config.publish_floor", "past the representable range")
+        })?;
         self.conn().execute(
             "INSERT INTO config (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value
                WHERE CAST(excluded.value AS INTEGER) > CAST(config.value AS INTEGER)",
-            params![FLOOR_KEY, seq.to_string()],
+            params![FLOOR_KEY, comparable.to_string()],
         )?;
         Ok(self.publish_floor()?.unwrap_or(0))
     }

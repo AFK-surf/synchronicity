@@ -1026,6 +1026,13 @@ pub(crate) fn is_origin_fault(error: &EngineError) -> bool {
 
 /// Whether a store failure is about replicated data rather than about this
 /// node's own disk or database.
+///
+/// `Invalid` is "a caller supplied an argument the store refuses", and on the
+/// paths this guards the argument is always something a peer or an origin
+/// supplied: a summary claiming a seq past the representable range, a head whose
+/// `(origin, seq, root)` already retains a different signature. The store's other
+/// `Invalid`s — a schema stamp this build cannot read, a migration that failed —
+/// belong to `Store::open` and are unreachable from an exchange.
 fn is_origin_store_fault(error: &synch_store::StoreError) -> bool {
     match error {
         // What a peer published, read back and refused.

@@ -332,10 +332,14 @@ fn an_oversized_value_is_refused_by_the_write_path() {
 ///
 /// The node encoding bounds one node's nibble run, and DESIGN §12 read that as
 /// bounding ingest depth. It does not: a path is made of many nodes. Without a
-/// bound on the *path*, a member could have every peer pull and commit an
-/// arbitrarily large graph that `is_complete` then vouches for, that no
-/// `entries` row reflects, and that every GC pass marks from the retained head
-/// above it.
+/// rule about the *path*, a chain reaching past that depth was pulled and
+/// committed, `is_complete` vouched for the root, no `entries` row reflected any
+/// of it, and every GC pass marked it from the retained head above.
+///
+/// A canonicality rule, not a quota: the walk deduplicates on hash, so a node is
+/// expanded at whichever depth it is reached first and sharing can make a deep
+/// chain shallow. What bounds storage is the deduplication itself — a member gets
+/// no leverage beyond what it uploads.
 #[test]
 fn a_node_past_the_key_depth_is_refused_by_the_walk() {
     let store = MemStore::new();
