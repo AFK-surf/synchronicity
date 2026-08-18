@@ -2,16 +2,16 @@
 //! nodes, so it must refuse structures the trie's own documented invariants
 //! forbid.
 //!
-//! F10 was the serious one: an empty `Ext` prefix made `get` and every
-//! structural walk disagree about the same root, so a head promoted cleanly
-//! while writing zero rows to `entries` — and the engine's direct `trie.get`
-//! reads still saw the keys. F9's remaining bullets were an oversized inline
-//! value, a nibble outside the radix-16 alphabet (an out-of-bounds panic when
-//! it reached `insert`), and under-occupied branches giving one key/value map
-//! several distinct roots.
+//! F10 is the serious one: admitted, an empty `Ext` prefix makes `get` and
+//! every structural walk disagree about the same root, so a head promotes
+//! cleanly while writing zero rows to `entries` — and the engine's direct
+//! `trie.get` reads still see the keys. F9's remaining bullets are an oversized
+//! inline value, a nibble outside the radix-16 alphabet (an out-of-bounds panic
+//! if it reaches `insert`), and under-occupied branches giving one key/value
+//! map several distinct roots.
 //!
-//! All four are now rejected at the boundary, so the structures below never
-//! reach a store.
+//! All four are rejected at the boundary, so the structures below never reach
+//! a store.
 
 use synch_core::{Hash, INLINE_VALUE_MAX};
 use synch_mpt::{MemStore, MptError, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
@@ -46,9 +46,9 @@ fn an_empty_ext_prefix_is_refused() {
 
 #[test]
 fn get_and_the_structural_walks_agree_even_if_one_slips_through() {
-    // Defence in depth: `get` no longer treats an empty prefix as a
-    // transparent hop, so even a node planted directly into a store cannot put
-    // the two readers into disagreement.
+    // Defence in depth: `get` does not treat an empty prefix as a transparent
+    // hop, so even a node planted directly into a store cannot put the two
+    // readers into disagreement.
     let store = MemStore::new();
     let leaf = TrieNode::Leaf {
         key_rest: Nibbles::from_bytes(b"k"),

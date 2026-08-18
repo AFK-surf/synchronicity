@@ -149,7 +149,7 @@ impl Node {
         //
         // Phase 1 keeps listing order, which is what the symlink-escape guard
         // depends on: a link the mirror writes for `sub` is on disk before
-        // `sub/passwd` is judged, exactly as when the two steps were
+        // `sub/passwd` is judged, exactly as it would be with the two steps
         // interleaved. Phase 2 re-checks it immediately before each write, so
         // the gap between the check and the write it guards stays one write
         // wide rather than one pass wide.
@@ -622,7 +622,7 @@ fn plan_pass(
             // Where the bytes of this version might already be (§3.2). Donors
             // are CAS objects and nothing else, so that the descent has one
             // shape of thing to reason about — but the capability a file donor
-            // used to buy is kept, and this is where it is paid for.
+            // would buy is kept, and this is where it is paid for.
             //
             // The case is a real one: the CAS collected the version this mirror
             // is sitting on, so the lineage names a root nothing here holds,
@@ -781,7 +781,7 @@ fn metadata_matches(target: &Path, meta: Metadata) -> bool {
 /// Times first and mode second, with owner-write restored while the stamp
 /// happens: setting a file's times needs a writable descriptor, so a file whose
 /// published mode is read-only — `0444` is an ordinary mode for published media
-/// — could not be stamped once its own mode had been applied. The pass that got
+/// — cannot be stamped once its own mode has been applied, and a pass that got
 /// the mode right would break the pass after it.
 fn apply_metadata(target: &Path, meta: Metadata) -> std::io::Result<()> {
     #[cfg(unix)]

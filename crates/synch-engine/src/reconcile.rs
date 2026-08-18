@@ -34,11 +34,11 @@ use crate::error::{EngineError, Result};
 /// confused origin is recorded rather than truncated at the minimum.
 ///
 /// A bound on what is *retained*, never on what is accepted. Refusing a head
-/// because the fork was already wide enough made acceptance depend on arrival
-/// order and so destroyed the `(seq, root)` maximum §5.2 converges to: an
-/// origin signing nine roots at one seq left two honest peers holding different
-/// heads, according to which of the nine each saw first, and each then refused
-/// the other's forever.
+/// because the fork is already wide enough would make acceptance depend on
+/// arrival order and so destroy the `(seq, root)` maximum §5.2 converges to: an
+/// origin signing nine roots at one seq would leave two honest peers holding
+/// different heads, according to which of the nine each saw first, each then
+/// refusing the other's forever.
 /// The cap is applied by evicting the lowest-ordered retained roots at the seq
 /// instead ([`synch_store::Txn::trim_forks`]), which is the same set on every
 /// peer however the roots arrived.
@@ -269,11 +269,11 @@ impl Syncer {
             return Ok(HeadOutcome::Unbound);
         }
         // The ordering check and the write that acts on it are one transaction.
-        // Read-then-write across two lock acquisitions let two concurrent
+        // Read-then-write across two lock acquisitions would let two concurrent
         // offers — one per peer connection, all on the blocking pool — both
         // read the same floor, both decide they supersede it, and both write
-        // the pending slot, so the lower one clobbered the higher and the
-        // higher survived only in `head_history` with nothing to re-drive it.
+        // the pending slot, so the lower one clobbers the higher and the higher
+        // survives only in `head_history` with nothing to re-drive it.
         let outcome = self.store.transaction(|txn| -> Result<HeadOutcome> {
             // Verified heads are provable history and fork evidence even
             // when they lose the ordering comparison, so they are retained
@@ -345,16 +345,16 @@ impl Syncer {
                 return Ok(None);
             }
             let displaced = txn.complete_head(origin)?;
-            // The pending head must actually beat the complete one. This used
-            // to rest on "pending is always greater", an invariant `offer_head`
+            // The pending head must actually beat the complete one, rather than
+            // rest on "pending is always greater", an invariant `offer_head`
             // maintains and two other writers do not: `publish` and the key
             // rotation in `activate` both derive their seq from the *complete*
             // slot alone and write it directly, never consulting pending. So a
             // peer relaying an older head of our own origin — signed by a key
             // of ours that is still bound, which is exactly the §3.4 recovery
-            // shape — could sit in the pending slot while a local publish moved
-            // the complete slot past it, and this would then install the lesser
-            // head and roll `entries` back to it.
+            // shape — can sit in the pending slot while a local publish moves
+            // the complete slot past it, and taking that invariant on trust
+            // would install the lesser head and roll `entries` back to it.
             let floor = displaced.as_ref().map(|h| (h.seq, h.root));
             if !pending.head.supersedes(floor.as_ref()) {
                 tracing::debug!(
@@ -371,9 +371,9 @@ impl Syncer {
                 .map(|h| h.root)
                 .unwrap_or(synch_core::Hash::EMPTY);
             // The displaced head is already retained: `put_head` recorded its
-            // signature when it took the slot. Recording it again here was the
-            // second of two rules that both wrote the same row, kept honest
-            // only by `INSERT OR IGNORE` (§10, v11).
+            // signature when it took the slot. Recording it again here would be
+            // a second rule writing the same row, kept honest only by
+            // `INSERT OR IGNORE` (§10, v11).
             txn.put_head(Slot::Complete, &pending.head, pending.received_at, now)?;
             txn.clear_head(origin, Slot::Pending)?;
             txn.materialize_diff(origin, old_root, pending.head.root)?;
@@ -709,14 +709,14 @@ impl Syncer {
 /// loop never ends, and the junk lands in the trie tables.
 ///
 /// The third is what bounds the answer's *size*. A request is capped at
-/// [`MAX_BATCH`] hashes, but the response it draws was capped only by the frame
+/// [`MAX_BATCH`] hashes, but the response it draws is capped only by the frame
 /// length: a peer could answer 256 wanted hashes with a 16 MiB frame repeating
 /// one of them, every entry passing both other checks, and each repeat costs an
 /// autocommit `INSERT OR IGNORE` on the store's single write connection — so a
-/// cheap request bought six figures of serialized statements, blocking every
-/// other database user in the process. Counting repeats as `learned` also
-/// defeated the [`MAX_UNPRODUCTIVE_ROUNDS`] escape, since a peer serving one
-/// real node and 10^5 copies of it makes progress forever.
+/// cheap request would buy six figures of serialized statements, blocking every
+/// other database user in the process. Counting repeats as `learned` would also
+/// defeat the [`MAX_UNPRODUCTIVE_ROUNDS`] escape, since a peer serving one real
+/// node and 10^5 copies of it makes progress forever.
 ///
 /// Nodes and values differ only in how a payload is hashed, where it is stored
 /// and which error names it, so the checks live here rather than in two loops
@@ -797,8 +797,8 @@ impl HeadSink for Syncer {
 ///
 /// The seam is one-way by design: the engine names domain failures in its own
 /// error type, and what crosses back into `synch-net` is a protocol-level
-/// description of one. A `NetError` variant per storage fault is what made the
-/// transport enum a domain taxonomy in the first place.
+/// description of one. A `NetError` variant per storage fault is what would
+/// make the transport enum a domain taxonomy.
 fn to_net(error: EngineError) -> NetError {
     match error {
         EngineError::Net(e) => e,
@@ -987,12 +987,12 @@ mod tests {
 
     /// The same head set, offered in any order, settles on the same head.
     ///
-    /// This is the join-semilattice §5.2 rests on, and the fork cap used to
-    /// break it: the ninth root at a seq was refused, so a node that met the
-    /// greatest root early kept it and a node that met it tenth never took it,
-    /// and the two then refused each other's heads forever. Acceptance is now
-    /// decided by `supersedes` alone, so the greatest `(seq, root)` wins from
-    /// every arrival order.
+    /// This is the join-semilattice §5.2 rests on, and the fork cap must not
+    /// break it: refusing the ninth root at a seq would leave a node that met
+    /// the greatest root early holding it while a node that met it tenth never
+    /// took it, and the two would then refuse each other's heads forever.
+    /// Acceptance is decided by `supersedes` alone, so the greatest
+    /// `(seq, root)` wins from every arrival order.
     #[test]
     fn arrival_order_cannot_change_which_head_a_node_settles_on() {
         let roots: Vec<u8> = (1..=9).collect();
@@ -1003,8 +1003,8 @@ mod tests {
             .map(|i| SignedHead::sign(&key, origin.clone(), 1, Hash([*i; 32]), 0))
             .collect();
 
-        // Ascending, descending, and the shape the repro used: the greatest
-        // root first, so every later offer loses the comparison.
+        // Ascending, descending, and the shape that stresses it hardest: the
+        // greatest root first, so every later offer loses the comparison.
         let mut orders: Vec<Vec<usize>> = vec![
             (0..heads.len()).collect(),
             (0..heads.len()).rev().collect(),
@@ -1107,12 +1107,12 @@ mod tests {
     /// A peer may answer each wanted hash once.
     ///
     /// Containment alone bounds *which* hashes may come back, not how many
-    /// times: a request capped at `MAX_BATCH` drew a response capped only by
-    /// the frame length, so one wanted node repeated to fill 16 MiB passed
-    /// every check and cost an autocommit insert apiece on the store's single
-    /// write connection. Counting the repeats as progress also defeated
-    /// `MAX_UNPRODUCTIVE_ROUNDS`, so a peer serving one real node and a
-    /// hundred thousand copies of it never looked stuck.
+    /// times: a request capped at `MAX_BATCH` draws a response capped only by
+    /// the frame length, so one wanted node repeated to fill 16 MiB would pass
+    /// every other check and cost an autocommit insert apiece on the store's
+    /// single write connection. Counting the repeats as progress would also
+    /// defeat `MAX_UNPRODUCTIVE_ROUNDS`, so a peer serving one real node and a
+    /// hundred thousand copies of it would never look stuck.
     #[test]
     fn a_peer_may_not_answer_the_same_hash_twice() {
         let payload = b"a node that really was asked for".to_vec();

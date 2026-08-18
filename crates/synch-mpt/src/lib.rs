@@ -25,10 +25,10 @@ pub mod node;
 /// Behind a feature and off by default. No v1 flow needs them — anti-entropy
 /// replicates whole tries rather than proving single keys — and DESIGN.md §13
 /// is explicit that the capability is deliberately ahead of its use. Shipping
-/// it in the default surface made it a public, tested, maintained API with no
-/// caller anywhere in the workspace; behind a flag it stays available to the
-/// partial-replication work §13 describes without being something every build
-/// has to keep correct.
+/// it in the default surface would make it a public, tested, maintained API
+/// with no caller anywhere in the workspace; behind a flag it stays available
+/// to the partial-replication work §13 describes without being something every
+/// build has to keep correct.
 #[cfg(feature = "proofs")]
 pub mod proof;
 pub mod store;

@@ -258,13 +258,13 @@ impl Node {
             OriginId::Key(_) => {}
         }
         // One transaction, as §10 requires of every multi-step state change.
-        // As seven autocommit writes, a crash after the head slots were cleared
-        // but before the views were left `entries` rows for an origin with no
-        // head in either slot — and nothing removes those: `rebuild_views`
-        // iterates the complete slots, so an origin with neither is never
-        // visited, and the command refuses to run twice. The unified tree reads
-        // `entries` regardless of heads, so every path stayed duplicated under
-        // both identities, in every mirror, permanently.
+        // As seven autocommit writes, a crash after the head slots are cleared
+        // but before the views are would leave `entries` rows for an origin
+        // with no head in either slot — and nothing removes those:
+        // `rebuild_views` iterates the complete slots, so an origin with
+        // neither is never visited, and the command refuses to run twice. The
+        // unified tree reads `entries` regardless of heads, so every path would
+        // stay duplicated under both identities, in every mirror, permanently.
         let adopted = origin.clone();
         let now = now_ns();
         store.transaction(|txn| -> Result<()> {
@@ -313,11 +313,9 @@ impl Node {
         let dns_wake = Arc::new(tokio::sync::Notify::new());
         config.net.on_unknown_key = Some(dns_wake.clone());
         // Every head that flips to complete — dialed out or pushed in — rings
-        // the mirror bell. One syncer now does both: it is handed to the
-        // endpoint as the head sink the serve side reconciles through, and it
-        // is the same object this node's own rounds dial with. That replaces a
-        // `Notify` threaded through the endpoint constructor purely so the
-        // layer that knew a head had flipped could reach the layer that cared.
+        // the mirror bell. One syncer does both: it is handed to the endpoint
+        // as the head sink the serve side reconciles through, and it is the
+        // same object this node's own rounds dial with.
         let mirror_wake = Arc::new(tokio::sync::Notify::new());
         let syncer = Syncer::new(store.clone()).on_change(Some(mirror_wake.clone()));
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);

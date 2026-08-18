@@ -12,14 +12,15 @@
 //!
 //! Note what such a structure *is*: a valid trie describing 16^k entries in
 //! k + 1 nodes. There is no local check that calls it malformed, because it is
-//! not — so the fix is not a structural rule but a proportionality one. A walk
-//! may visit only so many positions per distinct node it has actually reached
-//! (`FanoutGuard`), which honest data never approaches and this exceeds by
-//! orders of magnitude.
+//! not — so the defence is not a structural rule but a proportionality one. A
+//! walk may visit only so many positions per distinct node it has actually
+//! reached (`FanoutGuard`), which honest data never approaches and this exceeds
+//! by orders of magnitude.
 //!
-//! Deduplicating positions by node hash is the obvious fix and is wrong: one
-//! leaf legitimately sits at as many positions as there are keys carrying its
-//! value, so pruning repeats silently drops keys. `scan_pagination` catches it.
+//! Deduplicating positions by node hash is the obvious defence and is wrong:
+//! one leaf legitimately sits at as many positions as there are keys carrying
+//! its value, so pruning repeats silently drops keys. `scan_pagination` catches
+//! it.
 
 use synch_core::Hash;
 use synch_mpt::{node::hash_encoded, MemStore, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
@@ -68,12 +69,12 @@ fn a_fanout_bomb_is_refused_rather_than_walked() {
     let root = fanout_bomb(&store, 6);
     let trie = Trie::new(&store);
 
-    // The fetch side is unchanged and still cheap: dedup on hash means the
-    // whole structure is 7 nodes, and the completeness gate still passes.
+    // The fetch side is cheap either way: dedup on hash means the whole
+    // structure is 7 nodes, and the completeness gate passes.
     assert_eq!(store.node_count(), 7);
     assert!(trie.is_complete(root).unwrap());
 
-    // The diff — which head promotion runs inside the write transaction — now
+    // The diff — which head promotion runs inside the write transaction —
     // refuses it instead of expanding it.
     let err = trie
         .diff(Hash::EMPTY, root)
@@ -83,7 +84,7 @@ fn a_fanout_bomb_is_refused_rather_than_walked() {
         "unexpected error: {err}"
     );
 
-    // Scanning is bounded the same way; `collect` had the identical defect.
+    // Scanning is bounded the same way; `collect` walks positions alike.
     let err = trie.iter(root).expect_err("iteration must be refused too");
     assert!(err.to_string().contains("no key set can produce"), "{err}");
 }

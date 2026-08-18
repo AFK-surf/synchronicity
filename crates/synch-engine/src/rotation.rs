@@ -205,18 +205,18 @@ impl Node {
         // reason a publish does (§10): the binding, the two key states, and the
         // re-signed head are one atomic move of this node's identity.
         //
-        // As separate autocommit statements this had two failure modes. The two
-        // key-state updates could be interrupted between them, leaving no
-        // active key at all — `Node::open` then refuses to start, and the
-        // command that would repair it needs a running daemon. And the head was
-        // built from `current_root()` and `next_seq()` read outside any
-        // transaction, while the publisher runs as an independent task that
-        // takes no lock this path holds: a publish committing between those two
-        // reads made activation sign `(publish_seq + 1, OLD_ROOT)` into the
-        // complete slot, so `entries` held the new root's state while the head
-        // named the old one — and `push_head` then handed that head to the whole
-        // membership, where every peer materialized a rollback of the batch that
-        // had just been published.
+        // As separate autocommit statements this would have two failure modes.
+        // The two key-state updates could be interrupted between them, leaving
+        // no active key at all — `Node::open` then refuses to start, and the
+        // command that would repair it needs a running daemon. And a head built
+        // from `current_root()` and `next_seq()` read outside any transaction,
+        // while the publisher runs as an independent task that takes no lock
+        // this path holds, lets a publish commit between those two reads: the
+        // activation signs `(publish_seq + 1, OLD_ROOT)` into the complete
+        // slot, so `entries` holds the new root's state while the head names
+        // the old one — and `push_head` hands that head to the whole
+        // membership, where every peer materializes a rollback of the batch
+        // just published.
         let origin = self.origin().clone();
         let secret = held.secret.clone();
         let now = now_ns();
@@ -346,9 +346,9 @@ mod tests {
     async fn a_key_identified_origin_cannot_rotate() {
         let dir = tempfile::tempdir().unwrap();
         let node = node(dir.path(), None).await;
-        // Refused upfront, before a key is generated: the old behavior stored
-        // a `retiring` key that could never be activated and that nothing ever
-        // cleaned up.
+        // Refused upfront, before a key is generated: refusing later would
+        // leave a `staged` key that could never be activated and that nothing
+        // ever cleans up.
         let err = node.rotate_key().unwrap_err();
         assert!(err.to_string().contains("key-identified"), "{err}");
         assert!(err.to_string().contains("--id"), "{err}");

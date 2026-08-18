@@ -302,14 +302,14 @@ impl Store {
     ///
     /// "Published past the forked seq" is read off the *retained history*, not
     /// off the complete slot, and that is the difference between a bounded rule
-    /// and an open one. Reading it off the complete head asked whether the head
+    /// and an open one. Reading it off the complete head asks whether the head
     /// this node holds *now* is older than retention, so any origin publishing
-    /// once per `root_retention` pinned every fork row it had ever signed —
-    /// and every trie node reachable from those roots, since retained roots are
-    /// GC mark roots. It was open at the other end too: a fork at a seq *above*
-    /// the complete head never satisfied `current_seq > seq`, so an origin
-    /// signing two roots at each of a thousand far-future seqs and serving none
-    /// of the tries made every one of those rows permanent, `trust rm` and all.
+    /// once per `root_retention` pins every fork row it has ever signed — and
+    /// every trie node reachable from those roots, since retained roots are GC
+    /// mark roots. It is open at the other end too: a fork at a seq *above* the
+    /// complete head never satisfies `current_seq > seq`, so an origin signing
+    /// two roots at each of a thousand far-future seqs and serving none of the
+    /// tries makes every one of those rows permanent, `trust rm` and all.
     /// A retained head at a *higher* seq is the same proof that the origin
     /// moved on, it is what an origin flooding future seqs supplies by the
     /// thousand, and only the single highest forked seq is left without one.
@@ -375,9 +375,8 @@ impl Store {
             // While a fork is exempt, so is the lowest head the origin is on
             // record at above it. That row is the *proof* the origin moved past
             // the fork, and it is older than the window, so an ordinary pass
-            // would take it — leaving a fork that nothing can ever retire,
-            // which is the shape of the bug this rule replaces. It stays until
-            // the fork it speaks about can go with it.
+            // would take it — leaving a fork that nothing can ever retire. It
+            // stays until the fork it speaks about can go with it.
             let witnesses: std::collections::HashSet<u64> = forked
                 .iter()
                 .copied()
@@ -627,9 +626,8 @@ fn put_head_in(
 ) -> Result<()> {
     // The signature goes to `head_history` and the slot points at it. Writing
     // it here is what makes the pointer sound for *every* caller, so no caller
-    // has to remember to record history alongside — which is what the old
-    // record-on-arrival-and-again-on-displacement pair of rules was doing by
-    // hand, redundantly, at seven call sites.
+    // has to remember to record history alongside — a rule that would
+    // otherwise have to be kept by hand, redundantly, at every call site.
     record_history_in(conn, head, received_at)?;
     // A `seq` past `i64::MAX` would bind as a negative integer and invert every
     // SQL ordering over `heads` and `head_history` — silently, and for good,
@@ -769,8 +767,7 @@ mod tests {
 
         // Seven distinct roots: five recorded directly, plus the two the slots
         // point at — which `put_head` retains, so they are here by
-        // construction rather than needing the union `retained_roots` used to
-        // take across both tables.
+        // construction rather than needing a union across both tables.
         let roots = store.retained_roots().unwrap();
         assert_eq!(roots.len(), 7);
         assert!(roots.contains(&Hash([6u8; 32])));

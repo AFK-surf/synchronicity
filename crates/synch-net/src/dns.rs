@@ -1484,7 +1484,7 @@ fn dominates(a: &PinState, b: &PinState) -> bool {
 /// any instant the clock can reach, freezing the pin set permanently, with no
 /// error to report because from the code's point of view nothing failed. That
 /// is exactly the freeze [`MAX_CLOCK_FLOOR_LEAD`] closes one field over, and
-/// it was applied to the floor inside [`now_unix`] and not to this.
+/// it applies to the floor inside [`now_unix`] and not to this.
 ///
 /// The caller stamps `now` immediately afterwards, so a file claiming the
 /// future costs one walk and then repairs itself.
@@ -2522,8 +2522,8 @@ mod tests {
     ///
     /// The malformed-set rule is that every binding such a key would create is
     /// dropped. A hint is part of what a record creates: harvesting one from a
-    /// record whose binding was refused let a single added record both evict a
-    /// member and name where to reach that member's key.
+    /// record whose binding is refused would let a single added record both
+    /// evict a member and name where to reach that member's key.
     #[test]
     fn an_ambiguous_key_contributes_no_hints() {
         let k = key();

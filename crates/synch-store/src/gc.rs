@@ -45,9 +45,9 @@ impl Store {
     /// the candidate list, so the sweep deletes them while the head row
     /// survives pointing at them. The trie is
     /// authoritative and `entries` cannot regenerate it, so the node's own
-    /// published root became permanently unservable — and `publish` then called
-    /// `note_complete` on it, so the store went on advertising that it could
-    /// serve it. The same window ate a peer's in-flight bootstrap, since
+    /// published root becomes permanently unservable — and `publish` then calls
+    /// `note_complete` on it, so the store goes on advertising that it can
+    /// serve it. The same window eats a peer's in-flight bootstrap, since
     /// `fetch_pending` commits each batch as its own write and `reachable`
     /// silently skips missing children.
     pub fn gc_trie(&self) -> Result<GcStats> {
@@ -59,22 +59,22 @@ impl Store {
                 stats.roots_marked = roots.len();
                 // One accumulating mark set across every retained root, not one
                 // walk per root. Successive roots of an origin share all but
-                // the path that changed, so walking each into its own set made
-                // the pass cost a store read per node *per root* — and
-                // `head_history` holds a row per publish for `root_retention`,
-                // so that multiplier is in the thousands for a node that
-                // publishes steadily. All of it inside the immediate
-                // transaction below, which holds the one write connection.
+                // the path that changed, so walking each into its own set would
+                // cost a store read per node *per root* — and `head_history`
+                // holds a row per publish for `root_retention`, so that
+                // multiplier is in the thousands for a node that publishes
+                // steadily. All of it inside the immediate transaction below,
+                // which holds the one write connection.
                 let trie = Trie::new(txn);
                 let mut marked = synch_mpt::Reachable::default();
                 for root in &roots {
                     trie.reach_into(*root, &mut marked)?;
                 }
                 let (nodes, values) = (marked.nodes, marked.values);
-                // Deleted set-wise rather than row by row: the old loop pulled
-                // every hash into a `Vec` and issued one
-                // `DELETE ... WHERE hash = ?` per unreferenced row, which on a
-                // large store is millions of statements under the write lock.
+                // Deleted set-wise rather than row by row: pulling every hash
+                // into a `Vec` and issuing one `DELETE ... WHERE hash = ?` per
+                // unreferenced row is, on a large store, millions of statements
+                // under the write lock.
                 let n = sweep_unmarked(conn, "trie_nodes", &nodes)?;
                 let v = sweep_unmarked(conn, "trie_values", &values)?;
                 Ok((n, v, roots))
@@ -698,10 +698,10 @@ mod tests {
     ///
     /// The rule is that the origin published past the forked seq and the head
     /// that did so is itself older than retention. Reading "the head that did
-    /// so" off the complete slot asked a different question — is the head we
-    /// hold *now* old? — so an origin publishing once per retention window kept
-    /// every fork it had ever signed, and every trie node under those roots,
-    /// alive on every peer forever.
+    /// so" off the complete slot asks a different question — is the head we
+    /// hold *now* old? — under which an origin publishing once per retention
+    /// window keeps every fork it has ever signed, and every trie node under
+    /// those roots, alive on every peer forever.
     #[test]
     fn a_live_origin_does_not_pin_its_old_forks() {
         let (_d, store) = store();

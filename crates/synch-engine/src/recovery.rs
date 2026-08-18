@@ -360,9 +360,9 @@ impl Node {
 
         // A node holding its own current head is not resuming from loss, and
         // peers echoing our published history back is not history to leap
-        // over: re-running recover after a successful recovery used to burn
-        // another gap's worth of seqs every time. Only an observation beyond
-        // our own head says some peer holds history we lost.
+        // over: re-running recover after a successful recovery would otherwise
+        // burn another gap's worth of seqs every time. Only an observation
+        // beyond our own head says some peer holds history we lost.
         if let Some(own) = self.store().complete_head(self.origin())? {
             if own.seq >= observed.seq {
                 tracing::info!(
@@ -478,8 +478,8 @@ mod tests {
         OriginId::named("nas", "cluster.example").unwrap()
     }
 
-    /// The regression that matters most: a node nobody has ever heard of is not
-    /// in recovery, and publishes at seq 1 exactly as before.
+    /// A node nobody has ever heard of is not in recovery, and publishes at
+    /// seq 1.
     #[tokio::test]
     async fn a_fresh_node_is_not_in_recovery() {
         let (_d, node) = node(nas()).await;
@@ -609,7 +609,8 @@ mod tests {
 
     /// Re-running recover on a node that holds its own head leaves the floor
     /// alone: peers echoing our published history back is not history to leap
-    /// over, and each accidental re-run used to burn another gap of seqs.
+    /// over, and an accidental re-run would otherwise burn another gap of seqs
+    /// every time.
     #[tokio::test]
     async fn recover_is_idempotent_once_the_node_holds_its_own_head() {
         let (_d, node) = node(nas()).await;

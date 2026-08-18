@@ -21,10 +21,9 @@ use crate::{error::Result, node::Node};
 /// inotify reports those opens, reads, and closes as events in their own
 /// right. Hinting on them makes the watcher chase its own tail — hint,
 /// rescan, read, hint — one full rescan of every space per debounce window,
-/// forever, on a tree nobody has touched. That is what an idle daemon was
-/// spending a large fraction of a core on, and what an idle *peer* was then
-/// spending it on too, because each of those rescans went on to stage,
-/// publish, and push.
+/// forever, on a tree nobody has touched. That is a large fraction of a core
+/// for an idle daemon to spend, and for an idle *peer* to spend with it,
+/// because each of those rescans goes on to stage, publish, and push.
 ///
 /// So access events are dropped, with one exception: a close-after-write is
 /// how an editor's final write shows up on some platforms. Everything else —

@@ -279,11 +279,10 @@ impl MptProtocol {
                 // decode of each row's spans, not by the `truncate` below: a
                 // cap after the work is not a cap on the work (§12).
                 //
-                // On the blocking pool with every other database read. This
-                // and `GetBindings` were the two handlers left running SQLite
-                // on a runtime worker, and this one takes the single global
-                // connection mutex to do it, so its cost was borne by every
-                // other connection and timer in the process.
+                // On the blocking pool with every other database read. Run on
+                // a runtime worker it would take the single global connection
+                // mutex there, so its cost would be borne by every other
+                // connection and timer in the process.
                 let store = self.store().clone();
                 let mut ads =
                     crate::blocking::offload(move || Ok(store.providers(&object_root)?)).await?;
@@ -318,17 +317,18 @@ fn check_batch(len: usize) -> Result<(), NetError> {
     Ok(())
 }
 
-/// Bounds a head-carrying message, which `MAX_BATCH` never covered.
+/// Bounds a head-carrying message, which `MAX_BATCH` does not cover.
 ///
 /// `GetNodes`/`GetValues` are capped at [`MAX_BATCH`] hashes because a cheap
-/// request must not buy expensive work (§12). The head messages had no such
-/// cap and are the more expensive of the two: bounded only by `MAX_FRAME_LEN`
-/// (16 MiB), one `Heads` frame carries on the order of 110 000 `SignedHead`s,
-/// and each one costs an Ed25519 verification *and* a `head_history` insert —
-/// the insert running before the ordering check, so heads that lose the
-/// comparison are persisted too. `HeadsWant` is the same shape with a database
-/// query per origin. Seconds of CPU and hundreds of thousands of autocommit
-/// statements, for 16 MB of upload, repeatable per stream.
+/// request must not buy expensive work (§12). The head messages need a cap of
+/// their own and are the more expensive of the two: bounded only by
+/// `MAX_FRAME_LEN` (16 MiB), one `Heads` frame carries on the order of 110 000
+/// `SignedHead`s, and each one costs an Ed25519 verification *and* a
+/// `head_history` insert — the insert running before the ordering check, so
+/// heads that lose the comparison are persisted too. `HeadsWant` is the same
+/// shape with a database query per origin. Seconds of CPU and hundreds of
+/// thousands of autocommit statements, for 16 MB of upload, repeatable per
+/// stream.
 ///
 /// The bound is generous next to any real cluster: §12 sizes membership at
 /// N ≤ 100 origins, so a legitimate exchange names tens of heads, not
@@ -476,13 +476,14 @@ impl MptClient {
             let received = match read_frame::<MptMessage>(&mut recv).await? {
                 MptMessage::Heads { heads } => {
                     // The answer to our own `HeadsWant` is bounded like every
-                    // other head-carrying message. It was the one that was not:
-                    // the responder caps its `Hello`, its `Heads` push and its
-                    // `HeadsWant`, and this side caps the `Hello` it reads back
-                    // — but a peer could answer a want-list of one origin with
-                    // a full frame of heads, and `sync_with` offers every one
-                    // of them, at an Ed25519 verification and a `head_history`
-                    // insert apiece. Same rule as `Providers` on this side.
+                    // other head-carrying message, and it is the easiest one to
+                    // overlook: the responder caps its `Hello`, its `Heads`
+                    // push and its `HeadsWant`, and this side caps the `Hello`
+                    // it reads back — but a peer could answer a want-list of
+                    // one origin with a full frame of heads, and `sync_with`
+                    // offers every one of them, at an Ed25519 verification and
+                    // a `head_history` insert apiece. Same rule as `Providers`
+                    // on this side.
                     check_heads(heads.len(), "a Heads answer")?;
                     heads
                 }
@@ -799,11 +800,10 @@ mod tests {
 
     /// The provider handler does not run SQLite on a runtime worker.
     ///
-    /// `FindProviders` and `GetBindings` were the two handlers left running the
-    /// store inline, and this one takes the single global connection mutex and
-    /// decodes every row's spans under it. On a busy store that is an unbounded
-    /// wait on a worker that also drives every other connection, timer and
-    /// control request in the process (§10, §12).
+    /// `FindProviders` takes the single global connection mutex and decodes
+    /// every row's spans under it. Run inline on a busy store that is an
+    /// unbounded wait on a worker that also drives every other connection,
+    /// timer and control request in the process (§10, §12).
     ///
     /// Measured by the runtime's own clock. The stream is opened *before* the
     /// store is made busy, so the per-stream binding check — a single bounded

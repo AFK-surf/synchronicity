@@ -74,9 +74,10 @@ impl OriginId {
 ///
 /// Every other way to build one — [`OriginId::named`], [`FromStr`] — checks the
 /// label and the domain, and the value that comes off a wire or out of a stored
-/// record is the one place that was taken as given. It keys `blob_providers`,
-/// `bindings` and `entries` by its canonical rendering, so an unvalidated one is
-/// an arbitrary row key: a 64 KB label, or a thousand spellings of one member.
+/// record is the one place that would otherwise be taken as given. It keys
+/// `blob_providers`, `bindings` and `entries` by its canonical rendering, so an
+/// unvalidated one is an arbitrary row key: a 64 KB label, or a thousand
+/// spellings of one member.
 impl<'de> Deserialize<'de> for OriginId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         /// The same shape, decoded before it is judged.

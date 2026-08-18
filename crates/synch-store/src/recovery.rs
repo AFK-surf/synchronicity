@@ -67,7 +67,7 @@ impl Store {
         // The seq is stored as SQLite's signed 64-bit integer and the
         // "keep the greatest" guard below is SQL, so it compares *signed* while
         // every Rust reader of this column compares unsigned. A seq at or above
-        // 2^63 therefore stored negative and inverted the ordering in both
+        // 2^63 would therefore store negative and invert the ordering in both
         // directions — and §3.4 deliberately does not authenticate the
         // summaries this comes from, so the value is any member's to choose.
         // Downstream it feeds `recovery_state`, which can pin a fresh node in

@@ -347,10 +347,10 @@ async fn untrusted_peers_are_refused() {
 
 /// A request costs a stream, not a session.
 ///
-/// Every fetch used to dial: a mirror pass or a large `get` opened one QUIC
-/// session per file, each one a handshake here and a connection left idling
-/// out over there. Requests to the same peer and ALPN now share one session,
-/// and only a session that is actually gone is replaced.
+/// A fetch that dials for itself costs a session: a mirror pass or a large
+/// `get` would open one QUIC session per file, each one a handshake here and a
+/// connection left idling out over there. Requests to the same peer and ALPN
+/// share one session, and only a session that is actually gone is replaced.
 #[tokio::test]
 async fn requests_to_a_peer_share_one_session() {
     let client = Node::spawn("laptop").await;
@@ -546,10 +546,10 @@ fn count_nodes(store: &Store) -> usize {
 /// An object larger than one frame transfers, a window at a time (§6.4).
 ///
 /// A bao slice is encoded into memory whole and travels in a single framed
-/// message, so a fetch that asked for a whole large object asked the provider
-/// for something it could neither hold nor send: everything above
-/// `MAX_FRAME_LEN` failed with a truncated stream, which is to say the store
-/// could not replicate a video file. The requester now walks the object in
+/// message, so a fetch that asks for a whole large object would ask the
+/// provider for something it can neither hold nor send: everything above
+/// `MAX_FRAME_LEN` fails with a truncated stream, which is to say a store that
+/// cannot replicate a video file. The requester walks the object in
 /// `MAX_SLICE_GROUPS` windows, and the provider clamps to the same bound
 /// whatever it is asked for.
 #[tokio::test]
@@ -588,9 +588,9 @@ async fn an_object_larger_than_one_frame_transfers() {
 /// converging with the others (§5.2).
 ///
 /// Materialization is deliberately atomic — a head whose delta will not apply
-/// does not flip — but that failure used to end the whole exchange, and the
+/// does not flip — but that failure must not end the whole exchange: the
 /// poisoned head is durable, so a single bad record from any trusted origin
-/// stopped *every* origin's metadata from reaching this node, on every sync
+/// would stop *every* origin's metadata from reaching this node, on every sync
 /// from then on.
 #[tokio::test]
 async fn a_poisoned_origin_does_not_hold_up_the_others() {
@@ -618,8 +618,8 @@ async fn a_poisoned_origin_does_not_hold_up_the_others() {
     healthy.publish(1, &[("good.txt", b"readable")]);
 
     // The poisoned node picks up the healthy origin's head, so one exchange
-    // now carries both — `nas@…` sorts before `vps@…`, so the bad one is
-    // handled first and used to end the exchange before the good one was read.
+    // carries both — `nas@…` sorts before `vps@…`, so the bad one is handled
+    // first, before the good one is read.
     let to_healthy = poisoned
         .net
         .connect_mpt(healthy.net.direct_addr())

@@ -38,9 +38,10 @@ impl Node {
     /// peer's to choose — one `fetch_pending` per head it hands back, each
     /// looping to [`MAX_UNPRODUCTIVE_ROUNDS`], plus a pass over every pending
     /// head — so per-request deadlines compose into no bound at all. A peer
-    /// answering just inside each one held this loop indefinitely, and
-    /// `anti_entropy_round` returns on the first success, so no other peer was
-    /// reached and no pending trie was fetched for as long as it kept that up.
+    /// answering just inside each one would hold this loop indefinitely, and
+    /// `anti_entropy_round` returns on the first success, so no other peer
+    /// would be reached and no pending trie fetched for as long as it kept that
+    /// up.
     ///
     /// [`MAX_UNPRODUCTIVE_ROUNDS`]: crate::reconcile::MAX_UNPRODUCTIVE_ROUNDS
     pub async fn sync_with_peer(&self, node_id: &NodeId) -> Result<SyncReport> {
@@ -67,9 +68,9 @@ impl Node {
     pub fn dialable_peers(&self) -> Result<Vec<NodeId>> {
         // Every key this node holds, not just the active one: through a
         // rotation window the retiring key is still bound to our own origin,
-        // and filtering only the active key made the node dial itself and
-        // report itself unreachable — in exactly the window where an operator
-        // is watching `sync` and `key ls` the hardest (§3.4).
+        // and filtering only the active key would leave the node dialling
+        // itself and reporting itself unreachable — in exactly the window where
+        // an operator is watching `sync` and `key ls` the hardest (§3.4).
         let own: Vec<NodeId> = self
             .device_keys()?
             .into_iter()

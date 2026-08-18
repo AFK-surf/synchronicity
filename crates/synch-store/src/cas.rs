@@ -786,9 +786,10 @@ impl Store {
     /// referenced set, the pinned set and the candidate rows as three separate
     /// statements and then deletes in a fourth, which is exactly the split
     /// [`Store::gc_trie`] documents as a data-loss bug: a `synch pin`, or a
-    /// resumed fetch's first commit, landing in the gap was decided against by
-    /// a snapshot taken before it existed. The pin case is the plain one — the
-    /// command reports success and the object is unlinked moments later — and
+    /// resumed fetch's first commit, landing in the gap would otherwise be
+    /// decided against by a snapshot taken before it existed. The pin case is
+    /// the plain one — the command reports success and the object is unlinked
+    /// moments later — and
     /// the fetch case is worse, because `commit_groups` then re-inserts a row
     /// whose bitmap claims groups whose bytes went to an unlinked inode, which
     /// the node advertises and nothing ever re-verifies.
@@ -1069,13 +1070,13 @@ impl Store {
         //
         // Never to the claimed size, because `size` is a peer's assertion off an
         // entry and this runs *before* `decode_ranges` turns any of it into
-        // fact. An entry claiming 32 TiB for any root made every node that
-        // attempted a fetch create a 32 TiB sparse payload and a 128 GiB sparse
-        // outboard, fail verification, and leave both behind — `trim_to_size`
-        // only runs on a commit that completed the object, so nothing reclaimed
-        // them. Growing to the end of the window bounds the file by what is
-        // about to be verified; `write_at` extends past it as later windows
-        // land, so a real object still fills out normally.
+        // fact. An entry claiming 32 TiB for any root would otherwise have
+        // every node that attempts a fetch create a 32 TiB sparse payload and a
+        // 128 GiB sparse outboard, fail verification, and leave both behind —
+        // `trim_to_size` only runs on a commit that completed the object, so
+        // nothing would reclaim them. Growing to the end of the window bounds
+        // the file by what is about to be verified; `write_at` extends past it
+        // as later windows land, so a real object still fills out normally.
         grow_to(&payload, window_end_bytes(&served, size))?;
         let outboard_file = OpenOptions::new()
             .read(true)
@@ -1103,12 +1104,12 @@ impl Store {
         // Persist the verified groups (payload and outboard) before the bitmap
         // in the index advances to cover them — otherwise a crash could leave
         // the index claiming groups the disk never received.
-        // Both flushes are checked. Swallowing them meant an EIO or ENOSPC on
-        // flush let the bitmap advance over data that never reached stable
+        // Both flushes are checked. Swallowing them would let an EIO or ENOSPC
+        // on flush advance the bitmap over data that never reached stable
         // storage — the exact inversion of the ordering this block exists to
-        // enforce. `try_clone` is likewise no longer allowed to fail silently:
-        // it fails under fd exhaustion, which is precisely when the machine is
-        // least able to afford an unflushed commit.
+        // enforce. `try_clone` may likewise not fail silently: it fails under
+        // fd exhaustion, which is precisely when the machine is least able to
+        // afford an unflushed commit.
         let payload = payload_for_sync.ok_or_else(|| StoreError::Verification {
             root: *root,
             reason: "could not duplicate the payload handle to flush it".into(),
@@ -1126,9 +1127,8 @@ impl Store {
         fsync_parent(&payload_path);
         // Reopened for *write* to flush it. `File::open` hands back a read-only
         // handle, and Windows refuses `FlushFileBuffers` on one with
-        // ERROR_ACCESS_DENIED — which went unnoticed while the result was
-        // discarded, and became a hard failure the moment these flushes started
-        // being checked. Unix does not care either way.
+        // ERROR_ACCESS_DENIED — a hard failure here, since these flushes are
+        // checked rather than discarded. Unix does not care either way.
         fsync_file(
             &OpenOptions::new()
                 .write(true)

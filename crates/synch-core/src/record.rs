@@ -145,8 +145,9 @@ pub struct AdState {
 /// a span is sixteen bytes — so an origin can publish one record naming a
 /// million spans, and every peer that materializes it, and every peer that
 /// answers `FindProviders` for it, decodes the lot. §12 promises to cap the
-/// cost of any single extreme message; without this the cap was applied after
-/// the decode, which is after the allocation it was meant to bound.
+/// cost of any single extreme message; without this the cap could only be
+/// applied after the decode, which is after the allocation it is meant to
+/// bound.
 ///
 /// Generous next to anything honest: spans are 16 MiB-granular runs of held
 /// bytes, a fetch walks windows in order, and `coalesce_spans` merges what

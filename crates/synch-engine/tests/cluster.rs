@@ -592,9 +592,9 @@ async fn an_untrusted_node_learns_nothing() {
 
 #[tokio::test]
 async fn pinning_fetches_what_it_promises_to_keep() {
-    // §9.2: a pin is a promise the bytes stay available here. Pinning content
-    // this node had never read used to mark zero rows and report success —
-    // the promise now starts by fetching what it guards.
+    // §9.2: a pin is a promise the bytes stay available here, so it starts by
+    // fetching what it guards: pinning content this node has never read must
+    // not mark zero rows and report success.
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     introduce(&[&nas, &laptop]);

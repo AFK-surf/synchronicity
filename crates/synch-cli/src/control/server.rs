@@ -1017,8 +1017,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::SpaceAdd(pb::SpaceAdd { id, path }) => {
-            // A typo'd path used to become a fresh empty directory with no
-            // signal; creating it is a feature, doing so silently was not.
+            // A typo'd path otherwise becomes a fresh empty directory with no
+            // signal; creating it is a feature, doing so silently is not.
             let created = !std::path::Path::new(&path).is_dir();
             node.add_space(&id, &path)?;
             out.line(format!("indexing {path} as {id}")).await?;
@@ -1345,8 +1345,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             out.line(format!("mirroring {space} into {stored} ({policy})"))
                 .await?;
             // Configuring the mirror before the space first syncs is a
-            // legitimate order of operations; doing it to a typo'd id is
-            // not, and the two used to be indistinguishable.
+            // legitimate order of operations; doing it to a typo'd id is not,
+            // and nothing else in the exchange tells the two apart.
             if ensure_known_space(node, &space).is_err() {
                 out.line(format!(
                     "note: no origin publishes {space} yet; the mirror stays empty until one does"
@@ -1501,11 +1501,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                         reached += 1;
                         // §12 makes an origin this node cannot apply fail that
                         // origin and no other, and says the count of origins
-                        // left behind is in the sync report. It was counted and
-                        // never printed, so the one visible sign of a peer
-                        // publishing something unapplicable was a `warn!` line
-                        // in the daemon log. Only shown when non-zero: a healthy
-                        // sync should not grow a column of zeroes.
+                        // left behind is in the sync report. Counted but not
+                        // printed, the one visible sign of a peer publishing
+                        // something unapplicable would be a `warn!` line in the
+                        // daemon log. Only shown when non-zero: a healthy sync
+                        // should not grow a column of zeroes.
                         let left_behind = if report.heads_failed > 0 {
                             format!(" · {} origin(s) left behind", report.heads_failed)
                         } else {

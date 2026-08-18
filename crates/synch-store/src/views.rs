@@ -439,8 +439,9 @@ impl Store {
             // spans, so it is reconstituted from the size.
             // Decoded as an [`AdState`], whose own `Deserialize` stops at
             // `MAX_AD_SPANS` — the column is that struct's one field, so the
-            // bytes are the same either way and the cap comes for free. Reading
-            // it as a bare `Vec` was what let a row hold millions of spans.
+            // bytes are the same either way and the cap comes for free.
+            // Reading it as a bare `Vec` is what would let a row hold millions
+            // of spans.
             let state: AdState = match spans {
                 Some(bytes) => {
                     postcard::from_bytes(&bytes).map_err(|e| StoreError::Decode(e.to_string()))?

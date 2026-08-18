@@ -2,19 +2,19 @@
 //! walk declaring itself exhausted.
 //!
 //! `MissingWalk::next_batch` pushes a missing *node* onto both `missing.nodes`
-//! and `self.deferred`, so `resume()` re-queues it. A missing *value* went to
-//! `missing.values` only: its parent node loaded fine, so it was never
-//! deferred, `seen` kept it from being revisited, and `is_exhausted()` consults
-//! only `frontier` and `deferred`.
+//! and `self.deferred`, so `resume()` re-queues it. A missing *value* put on
+//! `missing.values` alone would not be re-queued: its parent node loads fine,
+//! so it is never deferred, `seen` keeps it from being revisited, and
+//! `is_exhausted()` consults only `frontier` and `deferred`.
 //!
-//! The consequence was in `reconcile.rs`: `fetch_pending` broke out of its loop
-//! with `unproductive` at 1, so `MAX_UNPRODUCTIVE_ROUNDS` could never fire for
-//! a value-only failure — the §5.2 "no wedging on unservable heads" property
-//! did not exist for out-of-line values — and `note_complete` then vouched for
-//! a root the node could not serve (F5).
+//! The consequence lands in `reconcile.rs`: `fetch_pending` would break out of
+//! its loop with `unproductive` at 1, so `MAX_UNPRODUCTIVE_ROUNDS` could never
+//! fire for a value-only failure — the §5.2 "no wedging on unservable heads"
+//! property would not hold for out-of-line values — and `note_complete` would
+//! then vouch for a root the node cannot serve (F5).
 //!
-//! The fix defers a node whose values have not arrived, so the walk keeps
-//! asking and the fetch loop can see it is making no progress.
+//! A node whose values have not arrived is therefore deferred too, so the walk
+//! keeps asking and the fetch loop can see it is making no progress.
 
 use synch_core::Hash;
 use synch_mpt::{MemStore, MissingWalk, Trie};

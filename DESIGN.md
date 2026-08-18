@@ -465,11 +465,12 @@ Notes:
   `newest` surfaces silently re-serve the file. The remedy for both is ending the
   divergence while it is visible — `synch take` the deletion (§8) on the holdout,
   or the holdout deletes its copy — rather than letting the TTL decide.
-- **`BlobAd` granularity — one record per object per holder.** An earlier draft
-  advertised every hash-tree node individually; that is unsound at scale: a single
-  100 GB file yields ~6.1 M leaf groups and ~12 M trie records — larger than the
-  entire per-origin metadata quota (§12) — and replicating per-chunk ad churn during
-  swarm downloads amplifies metadata O(N²) exactly when the network is busiest. The
+- **`BlobAd` granularity — one record per object per holder.** Advertising every
+  hash-tree node individually is the obvious alternative and is unsound at scale: a
+  single 100 GB file yields ~6.1 M leaf groups and ~12 M trie records — larger than
+  the entire per-origin metadata quota (§12) — and replicating per-chunk ad churn
+  during swarm downloads amplifies metadata O(N²) exactly when the network is
+  busiest. The
   any-subtree-servable property does **not** depend on per-node ads: it comes from
   bao itself (§6.1) — any holder of a verified slice necessarily also holds the
   root-path hashes needed to re-serve it. Ads therefore carry only a coarse span
@@ -622,9 +623,9 @@ Properties:
   when the trie is fully present under the new root.
 - **Bandwidth *and work* ∝ change**: unchanged subtrees are pruned at the first
   shared hash. The distinction is worth stating because getting one without the
-  other is easy and was once the case here: a walk that filters *requests* by
-  presence still descends into everything present, so bandwidth is proportional to
-  the change while CPU is proportional to the tree. Pruning traversal needs a
+  other is easy: a walk that filters *requests* by presence still descends into
+  everything present, so bandwidth is proportional to the change while CPU is
+  proportional to the tree. Pruning traversal needs a
   stronger fact than "I have this node" — a node is committed the moment it
   arrives, so a present node's children may be absent, and presence alone proves
   nothing about a subtree. The reference root `R` supplies it: hashes matching a

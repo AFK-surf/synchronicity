@@ -101,8 +101,12 @@ impl ProvenSubtree {
 ///   object does not end after — promote them and the row is complete at 80% of
 ///   its length: unreadable, and refusing every honest writer of the rest.
 ///
-/// [`Store::promote`] checks both against what it was asked to fill; without
-/// them in the type there is nothing there to check.
+/// Carrying them here is what makes the hazard unrepresentable rather than
+/// checked: [`Store::promote`] reads the object and its length off the proof, so
+/// a caller has no way to spend one on a different object, and `walk_proof`
+/// binds both to the tree it verified. A check against a root and size the
+/// caller passed separately would only ever catch a caller disagreeing with
+/// itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proven {
     /// The object root every subtree here was chained back to.
@@ -246,18 +250,16 @@ impl Subtree {
         Some((left, right))
     }
 
-    /// Finds the node of a tree that covers exactly this run of groups.
+    /// Finds the subtree covering `[start, start + groups)` by descending from
+    /// the root, or `None` for a run that is not a subtree of this tree at all.
     ///
     /// A [`ProvenSubtree`] names itself by position and width, which is all a
     /// caller comparing objects needs; writing its interior back into *this*
     /// object's outboard needs bao's name for it, and that is a walk down from
-    /// the root. `None` for a run that is not a subtree of this tree at all.
-    /// Finds the subtree covering `[start, start + groups)` by descending.
-    ///
-    /// `promote` calls this once per proven span because [`ProvenSubtree`]
-    /// carries only `(start, groups)` and not the `TreeNode` the walk that
-    /// produced it already held — so the descent recomputes a value that was in
-    /// hand a moment earlier.
+    /// the root. `promote` calls this once per proven span, because
+    /// [`ProvenSubtree`] carries only `(start, groups)` and not the `TreeNode`
+    /// the walk that produced it already held — so the descent recomputes a
+    /// value that was in hand a moment earlier.
     ///
     /// It stays a descent deliberately. A whole subtree is aligned and a power
     /// of two wide, so its node index is `start | ((1 << level) - 1)` and could
@@ -471,12 +473,12 @@ fn load_from_outboard<R: ReadAt>(
 /// unflagged join of its root pair — and that is what those same bytes carry
 /// when they sit as a subtree of a larger object.
 ///
-/// Returning `None` there instead cost a donor its most valuable answer. A
-/// donor whose group count is exactly the span the round asks about is whole
+/// Returning `None` there instead would cost a donor its most valuable answer.
+/// A donor whose group count is exactly the span the round asks about is whole
 /// for exactly one span — its own — and is not whole for any other, so every
-/// span failed: `promoted` came back empty, the zero-match exit skipped the
+/// span would fail: `promoted` comes back empty, the zero-match exit skips the
 /// leaf round, and an object grown from a donor of exactly the span size
-/// re-fetched all of itself. `promote` still pins the extent, since it checks
+/// re-fetches all of itself. `promote` still pins the extent, since it checks
 /// the proven subtree's byte range against the donor's.
 fn cv_at<R: ReadAt>(
     root: &Hash,
@@ -541,21 +543,20 @@ struct OpenDonor {
 impl Store {
     // ---- proof serving ----------------------------------------------------
 
-    /// Encodes the tree over `requested` down to `level`, without the payload
-    /// (`docs/DELTA-SYNC.md` §3.1).
+    /// Encodes the interior tree over `requested` at `level`, up to `budget`
+    /// nodes, without the payload (`docs/DELTA-SYNC.md` §3.1).
     ///
     /// Returns the pre-order node pairs and the ranges they actually cover.
     /// Like a slice, a proof is served for the intersection of what was asked
     /// for and what the provider verifiably holds — a partial holder's outboard
     /// carries every node on the path to its own groups, and nothing else — and
     /// like a slice it is clamped to one window, here counted in nodes rather
-    /// than groups ([`MAX_PROOF_NODES`]). `ProofEnd` carries the second return
-    /// value, and the requester's next window starts where it stopped.
+    /// than groups. `ProofEnd` carries the second return value, and the
+    /// requester's next window starts where it stopped.
     ///
     /// The outboard is read positionally, one node at a time, never slurped:
     /// the span-level round over a 100 GB object touches a few thousand of its
-    /// Encodes the interior tree over `requested` at `level`, up to `budget`
-    /// nodes, and reports the ranges it covers.
+    /// nodes, where the outboard as a whole is hundreds of megabytes.
     ///
     /// The budget is a parameter rather than a constant read from
     /// `synch_core`. It is a *frame* bound — how much of an answer fits one
@@ -593,7 +594,7 @@ impl Store {
         let (proof, truncated) = walk_proof(root, blob.size, &wanted, level, budget, |node| {
             load_from_outboard(&outboard, root, node)
         })?;
-        // A truncated walk is now a refused request, not a partial answer.
+        // A truncated walk is a refused request, not a partial answer.
         //
         // The requester sizes its window from `proof_nodes_upper_bound` so that
         // a provider holding *everything* it asked for still fits the budget,
@@ -602,16 +603,18 @@ impl Store {
         // was not sized by a conforming requester, and the answer is to say so
         // rather than to serve a prefix.
         //
-        // This is what let the second walk go. The old shape shipped a
-        // truncated answer, so the two sides had to be made to agree about
-        // where it stopped — done by discarding the work and walking the whole
-        // thing again over the ranges that fit, at up to `MAX_PROOF_NODES`
-        // random 64-byte outboard reads for a ~50-byte request.
+        // Refusing is also what keeps this to a single walk. Serving a
+        // truncated answer would mean making the two sides agree about where it
+        // stopped — done by discarding the work and walking the whole thing
+        // again over the ranges that fit, at up to `MAX_PROOF_NODES` random
+        // 64-byte outboard reads for a ~50-byte request.
         if let Some(at) = truncated {
             return Err(StoreError::Verification {
                 root: *root,
                 reason: format!(
-                    "a proof over these ranges at level {level} exceeds the {budget}-node                      budget (stopped at group {at}); the requester must split the request"
+                    "a proof over these ranges at level {level} exceeds the \
+                     {budget}-node budget (stopped at group {at}); the requester \
+                     must split the request"
                 ),
             });
         }
@@ -838,9 +841,9 @@ impl Store {
         // only catch a caller mixing up two objects — which taking the values
         // from one place makes unrepresentable instead.
         //
-        // The real protection is elsewhere and unaffected: `walk_proof`
-        // recomputes every chaining value to the root, so a proof of another
-        // object cannot verify in the first place.
+        // The real protection is elsewhere: `walk_proof` recomputes every
+        // chaining value to the root, so a proof of another object cannot
+        // verify in the first place.
         let root = &proven.root;
         let size = proven.size;
         let groups = group_count(size);
@@ -937,10 +940,10 @@ impl Store {
             // Everything from here on writes, and everything that decides
             // *whether* to write is above: the comparison happens strictly
             // before a byte of this run lands in the payload. Judging after
-            // writing — as an earlier shape of this did — means a run that
-            // turns out not to match has already overwritten whatever was at
-            // those offsets, and a group another writer had just verified into
-            // the bitmap becomes a bit that lies (§6.2).
+            // writing would mean a run that turns out not to match has already
+            // overwritten whatever was at those offsets, and a group another
+            // writer had just verified into the bitmap becomes a bit that lies
+            // (§6.2).
 
             // The nodes *under* the run come across as well, or the groups this
             // pass gains could be held and not served (§3.4, §6.3).
@@ -1218,10 +1221,10 @@ mod tests {
     ///
     /// The span a delta round asks about is a power of two, so a donor whose
     /// group count is exactly that power is whole for precisely one span — its
-    /// own — and for no other. Answering `None` there meant such a donor
-    /// vouched for nothing at all: every span of the new object failed, nothing
-    /// was promoted, and the object that had been extended by one group
-    /// re-fetched all of itself.
+    /// own — and for no other. Answering `None` there would leave such a donor
+    /// vouching for nothing at all: every span of the new object fails, nothing
+    /// is promoted, and an object extended by one group re-fetches all of
+    /// itself.
     #[test]
     fn a_donor_the_width_of_the_span_vouches_for_its_whole_tree() {
         let (_dir, store) = store();
@@ -1832,10 +1835,10 @@ mod tests {
             "nothing was written for the object the proof was not about"
         );
 
-        // And spent honestly, it names the object it was taken for — which is
-        // now the only object it can be spent on. (A promote that actually
-        // moves groups is covered by `a_proof_carries_the_length_it_was_taken_at`;
-        // here the donor *is* the object, so there is nothing left to fill.)
+        // And spent honestly, it names the object it was taken for — the only
+        // object it can be spent on. (A promote that actually moves groups is
+        // covered by `a_proof_carries_the_length_it_was_taken_at`; here the
+        // donor *is* the object, so there is nothing left to fill.)
         let proven = fetcher
             .write_proof(&my_root, size, &served, 0, &encoded, 0)
             .unwrap();
@@ -1977,8 +1980,8 @@ mod tests {
     /// is always the claim.
     ///
     /// A bounded loop rather than a stress test: the interleaving is rare enough
-    /// that the original took dozens of rounds to hit, and what is asserted is
-    /// the invariant, which has to hold on every one of them.
+    /// to take dozens of rounds to hit, and what is asserted is the invariant,
+    /// which has to hold on every one of them.
     #[test]
     fn a_size_claim_racing_a_completing_write_never_wins() {
         let (_d1, provider) = store();
