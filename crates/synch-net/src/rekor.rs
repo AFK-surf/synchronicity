@@ -343,17 +343,37 @@ impl RekorProof {
 /// its own, which is what lets a mid-rollover zone serve a record this build
 /// does not understand beside the one it needs.
 ///
-/// **And one *added* record never sinks a complete one either.** A group is not
-/// one reading of the records at its name; it is every reading they support. A
-/// single `total` taken across the group — or a single chunk per index — hands
-/// anyone who can place one TXT record at `_synchronicity-rekor.<apex>` a free
-/// denial: they read the operator's group off public DNS and publish
-/// `sync1p <group> 9/9 …`, and a set that is otherwise whole can never complete
-/// again. So the records claiming each `total` are assembled separately, a
-/// duplicated index contributes a candidate rather than overwriting the real
-/// chunk, and the group digest — over the whole encoded proof — is still the
-/// only thing that decides acceptance. Injected records cost readings, never
-/// the answer.
+/// **An added record does not *overwrite* a complete one.** A group is not one
+/// reading of the records at its name; it is every reading they support. A
+/// single `total` taken across the group — or a single chunk per index — would
+/// hand anyone who can place a TXT record at `_synchronicity-rekor.<apex>` a
+/// free and permanent denial: they read the operator's group off public DNS and
+/// publish `sync1p <group> 9/9 …`, and a set that is otherwise whole can never
+/// complete again. So the records claiming each `total` are assembled
+/// separately, a duplicated index contributes a *candidate* rather than
+/// replacing the real chunk, and the group digest — over the whole encoded
+/// proof — remains the only thing that decides acceptance.
+///
+/// **What this does not do is make an injected record free.** The readings one
+/// group may ask for are the product of its per-index candidate counts, so they
+/// are capped (`MAX_GROUP_ASSEMBLIES`), and a `total` whose product exceeds
+/// the cap is skipped **whole** — the honest assembly inside it along with the
+/// injected ones. The number of reassembled proofs a refresh will verify is
+/// capped too, and those are ordered by a group digest an attacker can grind.
+/// So an injector cannot forge an answer, but *can* deny one, and the
+/// suppression is not distinguishable from a zone that published nothing usable.
+/// `tests` pins this behaviour deliberately, under the name it deserves:
+/// padding the name is denial-by-cost.
+///
+/// That is a bound rather than a defence, and it cannot be much else. Every
+/// record here arrives DNSSEC-validated, so the party who can add one is the
+/// party who signs the zone — in external mode, the managed provider, which the
+/// threat model names explicitly. That party can equally delete the records or
+/// refuse to serve the name, so no work bound reachable from this function
+/// changes what they can do to availability; what the design does defend is
+/// *authorization*, which the group digest and the chain walk hold regardless.
+/// Raising or reshaping the caps moves the number of records an injector needs
+/// and nothing else, which is why they are caps and not cleverness.
 pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>> {
     use std::collections::BTreeMap;
 
@@ -2280,6 +2300,14 @@ mod tests {
 
         // And the readings one group can ask for are bounded, so padding the
         // name is denial-by-cost rather than unbounded work.
+        //
+        // Note what this asserts, because it is the honest half of the
+        // paragraph on `proofs_from_txt`: the padded group is refused *whole*,
+        // so the honest assembly inside it is lost with the injected ones.
+        // The cap buys a bounded refusal, not a surviving answer — and against
+        // the only party who can place a record here (whoever signs the zone)
+        // nothing reachable from this function could buy more, since they can
+        // delete the records instead.
         let mut flooded = records.clone();
         for n in 0..40 {
             flooded.push(format!(

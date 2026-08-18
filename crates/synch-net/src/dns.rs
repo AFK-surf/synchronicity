@@ -1085,7 +1085,10 @@ impl DnssecResolver {
                     ),
                 ));
             };
-            if now < checked_at.saturating_add(tuf::REFRESH_INTERVAL) {
+            // Due on the interval, and also whenever the stamp is ahead of the
+            // clock — see `refresh_due` for why the pin file can claim that
+            // and what it would otherwise freeze.
+            if !refresh_due(*checked_at, now) {
                 return Ok(None);
             }
             // Stamped before the walk rather than after it, so a repository
@@ -1482,6 +1485,27 @@ fn dominates(a: &PinState, b: &PinState) -> bool {
         .all(|(a, b)| a >= b)
 }
 
+/// Whether a TUF walk is due, given when the last one was stamped.
+///
+/// Ordinarily this is just the interval. The other arm is the one worth
+/// naming: a `checked_at` **ahead of the clock** is not a recent check, it is
+/// an impossible one, and it makes the walk due rather than postponing it.
+///
+/// It can be ahead because it is seeded from `PinState::updated_at`, the one
+/// field of `rekor-pins.json` that is believed rather than re-derived from the
+/// root this build embeds. A corrupt or hand-edited file — or one written
+/// while the clock was very wrong — would otherwise put the next refresh past
+/// any instant the clock can reach, freezing the pin set permanently, with no
+/// error to report because from the code's point of view nothing failed. That
+/// is exactly the freeze [`MAX_CLOCK_FLOOR_LEAD`] closes one field over, and
+/// it was applied to the floor inside [`now_unix`] and not to this.
+///
+/// The caller stamps `now` immediately afterwards, so a file claiming the
+/// future costs one walk and then repairs itself.
+fn refresh_due(checked_at: u64, now: u64) -> bool {
+    checked_at > now || now >= checked_at.saturating_add(tuf::REFRESH_INTERVAL)
+}
+
 /// How far ahead of the system clock a persisted floor may be before the floor
 /// is the thing that is wrong.
 ///
@@ -1592,14 +1616,25 @@ impl Repo for HttpRepo {
             .map_err(|e| format!("{url}: {e}"))?;
         match response.status().as_u16() {
             200 => {
-                let body = response.bytes().map_err(|e| format!("{url}: {e}"))?;
+                // Read through a `take`, never `bytes()`. A cap applied to the
+                // result of `bytes()` is a bound on nothing, because the
+                // allocation has already happened — an endless body from a
+                // hostile mirror, or from anyone who can answer for the CDN,
+                // exhausts the reader before the comparison ever runs, and
+                // this sits on the membership-refresh path. One byte past the
+                // cap is read so that "exactly at the cap" and "over it" stay
+                // distinguishable. The monitor's copy of this function
+                // (`crates/synch-monitor/src/discover.rs`) reads the same way.
+                use std::io::Read;
+                let mut body = Vec::new();
+                response
+                    .take(MAX_TUF_BYTES as u64 + 1)
+                    .read_to_end(&mut body)
+                    .map_err(|e| format!("{url}: {e}"))?;
                 if body.len() > MAX_TUF_BYTES {
-                    return Err(format!(
-                        "{url}: {} bytes, over the {MAX_TUF_BYTES}-byte cap",
-                        body.len()
-                    ));
+                    return Err(format!("{url}: over the {MAX_TUF_BYTES}-byte cap"));
                 }
-                Ok(Some(body.to_vec()))
+                Ok(Some(body))
             }
             // The end of the root chain is a 404, and Sigstore's CDN answers
             // 403 for an object that is not there.
@@ -2604,12 +2639,38 @@ mod tests {
             u64::MAX,
         ] {
             assert_eq!(now_unix(absurd), Some(now), "floor {absurd}");
-            let after = now_unix(absurd).unwrap();
+            // And the walk really does become due. This has to be asked of
+            // `refresh_due`, which is the thing that decides it: the earlier
+            // form of this assertion compared `now_unix(absurd)` against
+            // `absurd + REFRESH_INTERVAL`, which is true for any clamped clock
+            // whatever the gate does, so it passed while the gate was frozen.
             assert!(
-                after < absurd.saturating_add(tuf::REFRESH_INTERVAL),
-                "a walk must still become due"
+                refresh_due(absurd, now_unix(absurd).unwrap()),
+                "a walk must still become due under floor {absurd}"
             );
         }
+    }
+
+    /// The refresh gate, including the arm the pin file can lie its way into.
+    #[test]
+    fn a_walk_is_due_on_the_interval_and_whenever_the_stamp_is_impossible() {
+        let now = 1_800_000_000;
+
+        // The ordinary interval.
+        assert!(!refresh_due(now, now), "just checked");
+        assert!(!refresh_due(now - 1, now), "a second ago");
+        assert!(!refresh_due(now - (tuf::REFRESH_INTERVAL - 1), now));
+        assert!(refresh_due(now - tuf::REFRESH_INTERVAL, now), "on the nose");
+        assert!(refresh_due(0, now), "never walked");
+
+        // A stamp ahead of the clock is impossible, so it is due rather than
+        // postponed. Without this a single integer in `rekor-pins.json` — the
+        // one field `load_anchored` does not re-derive — stops every pin
+        // refresh for good, across restarts, silently.
+        assert!(refresh_due(now + 1, now));
+        assert!(refresh_due(now + tuf::REFRESH_INTERVAL * 100, now));
+        assert!(refresh_due(4_102_444_800, now), "a stamp dated 2100");
+        assert!(refresh_due(u64::MAX, now), "and one that cannot overflow");
     }
 
     #[test]

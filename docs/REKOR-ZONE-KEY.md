@@ -398,9 +398,28 @@ complete again, or `1/5 <junk>` and the real part 1 is overwritten, and the
 client reports the operator's own zone as having published gibberish. So the
 records claiming each `total` are assembled separately, a duplicated index
 contributes a *candidate* chunk rather than replacing the real one, and the
-group digest is still the only thing that decides acceptance — injected records
-cost readings, never the answer. The readings one group may ask for are capped,
-so a name padded with conflicting records is bounded work and a named refusal.
+group digest is still the only thing that decides acceptance — so an injected
+record cannot *overwrite* the answer or forge one.
+
+**It can still deny one, and that is stated rather than claimed away.** The
+readings a group may ask for are the product of its per-index candidate counts,
+so they are capped (`MAX_GROUP_ASSEMBLIES`); a `total` whose product exceeds the
+cap is skipped whole, the honest assembly inside it included. The reassembled
+proofs a refresh will verify are capped too (`MAX_PROOF_CANDIDATES`), ordered by
+a group digest an attacker can grind. Enough padding at the name therefore
+suppresses a proof that is otherwise complete, and the client reports a named
+refusal rather than distinguishing "somebody padded this name" from "this zone
+published nothing usable".
+
+That residue is not closable here, which is why it is documented instead. Every
+record on this path arrives DNSSEC-validated, so whoever can add one is whoever
+signs the zone — the compromised managed provider named above — and that party
+can delete the records or refuse the name just as easily. No work bound
+reachable from the client changes what they can do to availability. What the
+group digest and the chain walk do hold, against exactly that party, is
+*authorization*: they cannot make a client accept a key the delegation does not
+authorize. Fail-closed availability against the zone's own signer is the
+standing posture (§4.3), not a gap in this mechanism.
 
 **Why parts, and why across names.** Both limits are the provider's, not
 DNS's. Cloudflare refuses a single TXT record past **4096 wire-format bytes**
@@ -1010,8 +1029,11 @@ code, against the client's embedded root — persisting the pin state in
 `rekor-pins.json` beside its state file, the same file name under the same
 rules. That is where **both** the keys and the log's base URL come from, so a
 Sigstore shard rotation is no more an upgrade for the monitor than it is for
-a client. `--no-tuf` runs on the pins already persisted, and `--log` names an
-endpoint outright.
+a client. `--no-tuf` runs on the pins already persisted; `--rekor-key`
+*replaces* the key set and turns the walk off with it, the same "static in
+both directions" rule the client's flag has (§4.1); and `--log` names an
+endpoint outright — narrowing which shard is read, never the key set, so a run
+under it says which pinned shards it is leaving unread.
 Signature *windows* are not enforced
 (§4.2.1), and the monitor has **no clock at all** to enforce them against: an
 entry's `integratedTime` sits outside the Merkle commitment and is therefore
@@ -1508,9 +1530,12 @@ gleam run -- rekor-publish /etc/synchronicity/csk.key
 # therefore skips a stretch of the log the monitor has never read: skipping
 # entries is a real loss of coverage, so it is stated rather than defaulted.
 echo '{"known":{"keys":{"sync.example":[]}}}' > monitor.json
-cargo run -p synch-monitor -- --state monitor.json \
+cargo run -p synch-monitor -- run --state monitor.json \
   --from-index <n> --allow-gap --max-entries 512
 ```
+
+`run` is a subcommand and is not optional; `entry` is the other one, which
+reads a stored body back out of the state file by log index.
 
 ## 10. TUF-driven pin refresh
 
