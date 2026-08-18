@@ -550,8 +550,12 @@ that needs either (§5.1, §5.5, §10.6).
 
 ### 4.2 Refresh pipeline
 
-A membership refresh under `require` performs three validated lookups over
-the one DoH transport, then verifies entirely offline:
+A membership refresh under `require` performs, over the one DoH transport,
+a membership lookup and then — per apex candidate — a DNSKEY lookup and one
+lookup per proof part, then verifies entirely offline. A real ICANN-rooted
+proof is three or four parts, so the ordinary single-apex case is five or six
+validated lookups, not three; the steps below are the *stages*, not the
+round-trip count, and §6 prices what that costs:
 
 1. `_synchronicity.<domain> TXT` — as today (hickory in-process validation,
    secure-proof-only, owner-name check).
@@ -721,7 +725,22 @@ verification per RRSIG and treats a *failed* one as the winner, so the whole
 RRset comes back bogus and every lookup for the name fails. It is availability
 only, it is fail-closed, it is a bug in that library's signature selection
 rather than in this design, and the same capability already delivers the same
-outcome by simply dropping the answer — so it is no escalation. What *is* closed
+outcome by simply dropping the answer — so it is no escalation.
+
+**A second thing that capability could once do was not availability-only, and
+is worth recording because the reasoning above is what hid it.** hickory
+groups an answer into RRsets by `(name, record_type)` and stamps its verdict
+on every record in the group, while the signed-data construction filters by
+*class*. A record added to a response in another class was therefore dropped
+from the bytes the signature covers — so the honest RRSIG still verified —
+and came back marked `Proof::Secure` having been signed by nobody. On this
+path that was a full read/write membership binding for a key the zone never
+published, and `require` was no defence: the proof covers the zone *key*,
+which really did sign the real RRset. The client now accepts exactly the set
+the verifier canonicalizes (`dns::covered_by_signed_data`). The general
+lesson is the one §4.2.1 states for chains and this section had not applied
+to itself: a validator's *verdict* is not a substitute for knowing which
+bytes it covered. What *is* closed
 on this side is the other half of the same quirk: whichever signature the
 library happened to verify under, the key a proof is demanded for is one this
 client re-verified against the DNSKEY set itself, so the transport cannot steer
@@ -981,8 +1000,9 @@ when `subtree_hash(0, size)` is its root; the log is **consistent** with the
 last run when `subtree_hash(0, old_size)` is the root the monitor persisted
 (which is exactly what an RFC 6962 consistency proof establishes, obtained
 directly instead of asked for); and an entry is **included** when its body
-hashes to a leaf the *signed root* commits to, confirmed again by an audit path
-run through the client's own RFC 6962 walk.
+hashes to a leaf the *signed root* commits to — read out of a level-0 tile
+this monitor has itself folded up to that root, never out of a second fetch of
+the same tile, which a log is free to answer differently.
 
 That last one is `Tree::verify_leaf`, and how it reaches the signed root is the
 whole of its value. The leaf's own hash lives in a level-0 hash tile, which is
@@ -1273,10 +1293,15 @@ leaf. Only one exists today.
   is unmonitorable in the direction that matters: a third party cannot
   *enumerate* what is being logged, only confirm a name they already guessed,
   and a searchable index is a server-side query that a compromised log can
-  answer selectively. It stays documented as **plan B**: if a future Rekor
-  release ever adds certificate policy that rejects self-signed
-  end-entity certificates, the beacon is the fallback that needs no new entry
-  type.
+  answer selectively. It stays documented as **plan B**, with one thing
+  stated plainly because it is easy to miss under time pressure: a beacon
+  entry carries a `publicKey` verifier and therefore has **nowhere to put the
+  DNSSEC chain**. Adopting it does not preserve this design with a smaller
+  record — it discards tier A/B classification, and with it the invariant
+  §4.2.1 calls the whole point. If a future Rekor release ever adds
+  certificate policy that rejects self-signed end-entity certificates, the
+  beacon is what is reachable without a new entry type; it is not what is
+  reachable without a redesign.
 - **A self-signed certificate with the apex in a `dNSName` SAN.** *Shipped.*
   Rekor validates certificates not at all and copies the DER into the leaf
   verbatim, so the name lands inside the Merkle commitment where it can be
@@ -1632,8 +1657,16 @@ repository and attempts an update:
    refuse every zone from then on, which is exactly the "worse than not
    having asked" this section forbids.
 
-**The state file is re-verified against the binary, whole.** Nothing in it is
-believed because it is there. The stored root chain is re-walked from the root
+**The state file's pin set is re-verified against the binary.** Nothing that
+decides *which keys are pinned* is believed because it is there — but the
+qualifier is exact, and two fields sit outside it: `timestamp_version` and
+`snapshot_version` are rollback floors read verbatim, because the files they
+describe are not persisted to re-derive them from. A local writer can park
+them at the ceiling and freeze pin refresh permanently. That is strictly less
+than the same writer already has — a `source='static'` binding in `synch.db`
+never expires — and it is reported rather than silent (`pin_refresh_overdue`
+warns, and a `checked_at` ahead of the clock reads as due), but it is not
+"whole" and should not be read as such. The stored root chain is re-walked from the root
 *this build* embeds, applying the same dual-threshold rule a live chain gets, so
 a stored root counts only if the embedded root transitively signed it. And the
 stored `targets.json` is kept beside it and re-checked the same way — the

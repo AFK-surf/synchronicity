@@ -423,6 +423,26 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
     let anchors = anchors_in_force(args.dnssec_anchor.as_ref())?;
     let surface = trust_surface(args)?;
 
+    // `--rekor-key` replaces the keys and nothing else. The *endpoints* still
+    // come from the trusted root in force — the persisted pins, else the
+    // embedded Sigstore bootstrap — so a run given a self-hosted log's key and
+    // no `--log` fetches Sigstore's shards and checks their checkpoints under
+    // a key that did not sign them. Every shard fails, every one lands in
+    // `failures`, and the run exits 30. Every time, forever.
+    //
+    // That is the documented private-deployment path (§6: "a self-hosted log
+    // plus `--rekor-key`/`CP_REKOR_KEY`"), so the population it describes
+    // would have had clients that verify and a monitor that never completes a
+    // run — which §5.5 calls the worst outcome there is, since a required log
+    // with no watcher is a formality. Refused at startup, naming the flag,
+    // rather than discovered from an exit code after a walk.
+    if args.rekor_key.is_some() && args.log.is_none() {
+        return Err(MonitorError::State(
+            "--rekor-key replaces the log keys but not the log endpoints, which              still come from the trusted root in force — so this run would read              Sigstore's shards and check them under your key, and fail on every              one. Name the log with --log <url>."
+                .to_string(),
+        ));
+    }
+
     // Everything local before anything remote: an unseeded watch list is the
     // first-run mistake, and finding out about it after a TUF walk and a
     // checkpoint fetch would be a slower way to learn the same thing.

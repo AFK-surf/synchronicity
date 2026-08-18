@@ -266,10 +266,11 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
         provider_state.get(conn),
         provider_state.observed_keys(conn),
         provider_state.oldest_unlogged_age(conn, now),
+        tuf_store.get(conn),
       )
     })
   case looked {
-    Ok(#(Ok(meta), Ok(state), Ok(keys), unlogged_age)) -> {
+    Ok(#(Ok(meta), Ok(state), Ok(keys), unlogged_age, tuf)) -> {
       let synced = case state {
         Ok(s) ->
           s.last_synced_serial == option.Some(meta.soa_serial)
@@ -278,6 +279,41 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
         Error(Nil) -> False
       }
       let logged = list.filter(keys, fn(key) { key.logged_at != option.None })
+      // The same TUF material serve mode reports, for the same reason and
+      // with more of it: the refresh job runs in both primary modes (§10.3),
+      // external mode is where the 15-minute key watcher reads the shard at
+      // the moment of use, and an operator whose stored material has gone
+      // stale has no other way to see it. Absent material is reported by its
+      // absence, not as unhealthy.
+      let tuf_fields = case tuf {
+        Ok(Ok(material)) -> [
+          #("tuf_root_version", json.int(material.root_version)),
+          #("tuf_timestamp_expires_at", json.int(material.timestamp_expires)),
+        ]
+        _ -> []
+      }
+      let provider_fields = case state {
+        Ok(s) -> [
+          #("provider", json.string(s.provider)),
+          #("provider_zone_id", json.string(s.provider_zone_id)),
+          #(
+            "provider_last_synced_serial",
+            json.nullable(s.last_synced_serial, json.int),
+          ),
+          #("provider_last_ok_at", json.nullable(s.last_ok_at, json.int)),
+          #("provider_last_error", json.nullable(s.last_error, json.string)),
+          #("provider_last_error_at", json.nullable(s.last_error_at, json.int)),
+          #(
+            "provider_last_failures",
+            json.nullable(s.last_failures, json.string),
+          ),
+          #(
+            "provider_last_partial_at",
+            json.nullable(s.last_partial_at, json.int),
+          ),
+        ]
+        Error(Nil) -> [#("provider", json.string("never synced"))]
+      }
       json.object([
         #("status", json.string("ok")),
         #("mode", json.string("external")),
@@ -294,31 +330,7 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
             json.int,
           ),
         ),
-        ..case state {
-          Ok(s) -> [
-            #("provider", json.string(s.provider)),
-            #("provider_zone_id", json.string(s.provider_zone_id)),
-            #(
-              "provider_last_synced_serial",
-              json.nullable(s.last_synced_serial, json.int),
-            ),
-            #("provider_last_ok_at", json.nullable(s.last_ok_at, json.int)),
-            #("provider_last_error", json.nullable(s.last_error, json.string)),
-            #(
-              "provider_last_error_at",
-              json.nullable(s.last_error_at, json.int),
-            ),
-            #(
-              "provider_last_failures",
-              json.nullable(s.last_failures, json.string),
-            ),
-            #(
-              "provider_last_partial_at",
-              json.nullable(s.last_partial_at, json.int),
-            ),
-          ]
-          Error(Nil) -> [#("provider", json.string("never synced"))]
-        }
+        ..list.append(provider_fields, tuf_fields)
       ])
       |> json.to_string
       |> wisp.json_response(200)

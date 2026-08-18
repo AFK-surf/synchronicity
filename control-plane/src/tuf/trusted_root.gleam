@@ -150,9 +150,16 @@ pub fn valid_at(log: Tlog, now: Int) -> Bool {
 pub fn current(logs: List(Tlog), now: Int) -> Result(Tlog, String) {
   logs
   |> list.filter(valid_at(_, now))
+  // Latest-started wins, and **ties go to the last listed** — which is what
+  // `Iterator::max_by_key` returns, so `tuf::current_tlog` and this pick the
+  // same shard. §10.6 says both implementations select with one rule because
+  // the control plane writes to whichever shard it picks and a monitor reads
+  // whichever *it* picks; a tie resolved differently on the two sides is the
+  // control plane submitting where nobody is watching, which reads exactly
+  // like a log with nothing new in it.
   |> list.fold(None, fn(best, log) {
     case best {
-      Some(Tlog(valid_from: from, ..)) if from >= log.valid_from -> best
+      Some(Tlog(valid_from: from, ..)) if from > log.valid_from -> best
       _ -> Some(log)
     }
   })
