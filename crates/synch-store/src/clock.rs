@@ -68,13 +68,25 @@ impl Store {
     /// Called from the maintenance pass and from each membership refresh: those
     /// are the two places that run on a schedule and already write, so the
     /// floor advances without putting a write on the connection-accept path.
+    ///
+    /// The comparison and the write are one statement, because the two callers
+    /// run on the same multi-threaded blocking pool and the connection mutex is
+    /// released between two acquisitions. Read-then-write let a refresh thread
+    /// that read the floor, stalled, and then wrote its own older reading
+    /// overwrite a newer one the maintenance pass had just recorded — a floor
+    /// that stepped *backwards*, which is the one thing this module exists to
+    /// prevent, and a binding whose expiry fell in the gap read live again.
     pub fn advance_trust_floor(&self, reading: i64) -> Result<i64> {
-        let floor = self.trust_floor()?;
-        if !clock_is_trusted(reading) || reading <= floor {
-            return Ok(floor);
+        if !clock_is_trusted(reading) {
+            return self.trust_floor();
         }
-        self.set_config(CLOCK_FLOOR_KEY, &reading.to_string())?;
-        Ok(reading)
+        self.conn().execute(
+            "INSERT INTO config (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+               WHERE CAST(excluded.value AS INTEGER) > CAST(config.value AS INTEGER)",
+            rusqlite::params![CLOCK_FLOOR_KEY, reading.to_string()],
+        )?;
+        self.trust_floor()
     }
 
     /// The instant a trust decision is evaluated at: `reading`, floored by

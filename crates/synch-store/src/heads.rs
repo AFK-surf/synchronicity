@@ -182,6 +182,80 @@ impl Store {
         Ok(())
     }
 
+    /// Clears a head slot only if it still holds `(seq, root)`.
+    ///
+    /// Abandonment is a decision about *one* head, and the two places that
+    /// make it — a fetch that gave up after several round trips, and the
+    /// maintenance sweep, which walks a trie before it decides — reach their
+    /// verdict on a snapshot taken long before the delete. `clear_head` deletes
+    /// whatever occupies the slot, so a newer head that a concurrent
+    /// `offer_head` installed in the gap went with it: the serve side's
+    /// `HeadPush` runs on the blocking pool while a fetch is between round
+    /// trips, and the slot is written under a per-statement lock, so the two
+    /// interleave freely. The head is recoverable — a peer holding it complete
+    /// re-offers it on the next round — but only after a delay the caller never
+    /// intended.
+    ///
+    /// Naming the head being condemned makes the decision and the delete one
+    /// step, which is what [`crate::Txn`]'s own `clear_head` gets for free by
+    /// reading and writing inside one transaction.
+    ///
+    /// Returns whether the slot was cleared.
+    pub fn clear_head_at(
+        &self,
+        origin: &OriginId,
+        slot: Slot,
+        seq: u64,
+        root: &Hash,
+    ) -> Result<bool> {
+        let cleared = self.conn().execute(
+            "DELETE FROM heads
+              WHERE origin_id = ?1 AND slot = ?2 AND seq = ?3 AND root = ?4",
+            params![
+                origin.canonical(),
+                slot.as_str(),
+                seq as i64,
+                root.as_bytes().to_vec()
+            ],
+        )?;
+        Ok(cleared > 0)
+    }
+
+    /// The seq this node's next head for `origin` must carry.
+    ///
+    /// One function, because "what comes next" is one rule and it had three
+    /// writers restating it. `publish` and the key rotation in `activate` both
+    /// derived it from the **complete slot alone**, and `try_promote` carried a
+    /// ten-line comment explaining that it therefore could not trust "pending
+    /// is always greater than complete" and had to re-check the ordering itself
+    /// — a downstream reader defending against an invariant with no owner.
+    ///
+    /// What the complete slot alone misses:
+    ///
+    /// - **The pending slot.** A peer's copy of one of our own heads — signed
+    ///   by a key of ours that is still bound, which is exactly the §3.4
+    ///   recovery shape — sits there for the length of a fetch. Publishing
+    ///   `complete.seq + 1` against it mints a second root at a seq this
+    ///   origin has already signed.
+    /// - **Retained history.** A database restored from a backup still has a
+    ///   complete head, so `recovery_state` does not call it recovery (§3.4
+    ///   covers key loss, not a rolled-back store) and nothing stops it
+    ///   publishing straight into seqs it used before the restore. Every head
+    ///   a peer has relayed back to us since is in `head_history`, verified and
+    ///   bound, and that is the highest seq this node can prove its origin
+    ///   reached.
+    ///
+    /// Self-equivocation is not a theoretical harm: both roots are valid and
+    /// bound, so every peer takes the greater one under the §5.2 rule, and if
+    /// that is the *older* root this node's own `entries` are rolled back to it
+    /// on every peer that adopted it.
+    ///
+    /// The publishing floor (§3.4) is applied here too, so recovery's "resume
+    /// above what peers saw" and this rule cannot disagree.
+    pub fn next_own_seq(&self, origin: &OriginId) -> Result<u64> {
+        next_own_seq_in(&self.conn(), origin)
+    }
+
     /// Records a head in `head_history`, keeping its signature.
     ///
     /// `now` is when this node received the head, which is what retention
@@ -470,6 +544,15 @@ impl Txn<'_> {
         Ok(best_floor(complete, pending))
     }
 
+    /// The seq this node's next head for `origin` must carry, read inside the
+    /// transaction that will write it.
+    ///
+    /// See [`Store::next_own_seq`] for why this is one function and not a rule
+    /// each writer restates.
+    pub fn next_own_seq(&self, origin: &OriginId) -> Result<u64> {
+        next_own_seq_in(self.conn(), origin)
+    }
+
     /// Writes a head into a slot, inside the transaction.
     ///
     /// The caller must have verified the signature *and* the binding first
@@ -653,6 +736,26 @@ fn put_head_in(
         ],
     )?;
     Ok(())
+}
+
+/// The one implementation behind [`Store::next_own_seq`] and
+/// [`Txn::next_own_seq`], so the two scopes cannot drift.
+fn next_own_seq_in(conn: &rusqlite::Connection, origin: &OriginId) -> Result<u64> {
+    // The highest seq this node can prove the origin reached, from every place
+    // that records one: both slots, and the retained history behind them.
+    let highest: i64 = conn
+        .query_row(
+            "SELECT MAX(seq) FROM (
+             SELECT seq FROM heads        WHERE origin_id = ?1
+             UNION ALL
+             SELECT seq FROM head_history WHERE origin_id = ?1
+         )",
+            params![origin.canonical()],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .unwrap_or(0);
+    let floor = crate::recovery::publish_floor_in(conn)?.unwrap_or(0);
+    Ok((highest.max(0) as u64).saturating_add(1).max(floor))
 }
 
 fn record_history_in(

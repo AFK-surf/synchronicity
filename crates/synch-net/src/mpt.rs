@@ -60,12 +60,24 @@ pub trait HeadSink: Send + Sync + std::fmt::Debug + 'static {
 /// How often a live session refreshes the sighting it recorded at accept.
 const PEER_SEEN_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many peers the sighting throttle remembers before it drops what has
+/// lapsed.
+///
+/// The map is keyed by device key, so it is bounded by the membership in any
+/// honest cluster (§12 sizes that at N ≤ 100) — but a key with no live binding
+/// never reaches the sighting closure at all, so this is a backstop against a
+/// membership larger than anyone has, not against a stranger.
+const MAX_TRACKED_SIGHTINGS: usize = 4096;
+
 /// The `sync/mpt/1` protocol handler.
 #[derive(Debug, Clone)]
 pub struct MptProtocol {
     store: Arc<Store>,
     heads: Arc<dyn HeadSink>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
+    /// When each peer's sighting was last written, shared across every
+    /// connection this handler serves.
+    last_sighting: Arc<std::sync::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>>,
 }
 
 impl MptProtocol {
@@ -75,6 +87,7 @@ impl MptProtocol {
             store,
             heads,
             on_unknown_key: None,
+            last_sighting: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -101,14 +114,42 @@ impl ProtocolHandler for MptProtocol {
         // `synch peers`. Refreshed as requests arrive, but at most once an
         // interval — the sighting is for an operator's eyes, not worth a write
         // per stream.
+        //
+        // The throttle is shared across connections rather than captured per
+        // `accept`, and the write goes to the blocking pool. Both matter: it is
+        // a row update and a WAL frame on the store's one write connection, and
+        // a per-connection throttle throttles nothing — a peer that opens N
+        // sessions bought N writes on runtime workers for the price of N
+        // handshakes.
         let store = self.store().clone();
-        let mut refreshed: Option<std::time::Instant> = None;
+        let last = self.last_sighting.clone();
         let sighting = move |peer: NodeId| {
-            if refreshed.is_some_and(|at| at.elapsed() < PEER_SEEN_REFRESH) {
-                return;
+            let store = store.clone();
+            let last = last.clone();
+            async move {
+                {
+                    let mut seen = last.lock().expect("the sighting lock");
+                    if seen
+                        .get(&peer)
+                        .is_some_and(|at: &std::time::Instant| at.elapsed() < PEER_SEEN_REFRESH)
+                    {
+                        return;
+                    }
+                    // Stamped before the write, so concurrent streams do not
+                    // each queue one while the first is still in flight.
+                    if seen.len() >= MAX_TRACKED_SIGHTINGS {
+                        seen.retain(|_, at| at.elapsed() < PEER_SEEN_REFRESH);
+                    }
+                    seen.insert(peer, std::time::Instant::now());
+                }
+                let recorded: Result<(), NetError> = crate::blocking::offload(move || {
+                    Ok(store.record_peer_seen(&peer, None, now_ns())?)
+                })
+                .await;
+                if let Err(e) = recorded {
+                    tracing::debug!(peer = %peer.fmt_short(), error = %e, "could not record a sighting");
+                }
             }
-            let _ = store.record_peer_seen(&peer, None, now_ns());
-            refreshed = Some(std::time::Instant::now());
         };
 
         let handler = self.clone();

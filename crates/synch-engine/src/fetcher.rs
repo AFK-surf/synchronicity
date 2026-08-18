@@ -292,7 +292,11 @@ impl Node {
     /// nobody holds even partially has no size to fetch by, and is refused
     /// rather than half-promised.
     pub async fn pin_object(&self, root: &Hash, size_hint: Option<u64>) -> Result<()> {
-        let blob = self.store().blob(root)?;
+        let blob = {
+            let store = self.store().clone();
+            let root = *root;
+            crate::blocking::offload(move || Ok(store.blob(&root)?)).await?
+        };
         if !blob.as_ref().is_some_and(|b| b.complete) {
             let Some(size) = blob.as_ref().map(|b| b.size).or(size_hint) else {
                 return Err(EngineError::NotFound(format!(
@@ -302,7 +306,12 @@ impl Node {
             };
             self.fetch_all(root, size).await?;
         }
-        if !self.store().set_pinned(root, true)? {
+        let pinned = {
+            let store = self.store().clone();
+            let root = *root;
+            crate::blocking::offload(move || Ok(store.set_pinned(&root, true)?)).await?
+        };
+        if !pinned {
             return Err(EngineError::NotFound(format!(
                 "object {root} left the store before it could be pinned"
             )));
@@ -349,10 +358,12 @@ impl Node {
         donors: &[Donor],
     ) -> Result<FetchReport> {
         if size == 0 {
-            return self.take_empty_object(root);
+            let node = self.clone();
+            let root = *root;
+            return crate::blocking::offload(move || node.take_empty_object(&root)).await;
         }
         let mut report = FetchReport::default();
-        let mut remaining = wanted.difference(&self.local_groups(root)?);
+        let mut remaining = wanted.difference(&self.local_groups_off_runtime(root).await?);
         if remaining.is_empty() {
             report.complete = true;
             return Ok(report);
@@ -378,7 +389,7 @@ impl Node {
         let mut providers = if remaining.is_empty() {
             Vec::new()
         } else {
-            self.providers_for(root, 0, size.max(1))?
+            self.providers_off_runtime(root, size).await?
         };
         if providers.is_empty() && !remaining.is_empty() {
             // No local ad covers this root — a cold cache, or an origin just
@@ -485,7 +496,9 @@ impl Node {
             let root = *root;
             crate::blocking::offload(move || node.on_content_progress(&root).map(|_| ())).await?;
         }
-        report.complete = wanted.difference(&self.local_groups(root)?).is_empty();
+        report.complete = wanted
+            .difference(&self.local_groups_off_runtime(root).await?)
+            .is_empty();
         Ok(report)
     }
 
@@ -734,7 +747,7 @@ impl Node {
         level: u8,
         report: &mut FetchReport,
     ) -> Result<Proven> {
-        let mut providers = self.providers_for(root, 0, size.max(1))?;
+        let mut providers = self.providers_off_runtime(root, size).await?;
         if providers.is_empty() {
             providers = self.ask_peers_for_providers(root, size).await?;
         }
@@ -772,7 +785,7 @@ impl Node {
     ) -> Result<synch_net::ProofOutcome> {
         let mut last_error = None;
         for key in &provider.keys {
-            let addr = match self.peer_addr(key)? {
+            let addr = match self.peer_addr_off_runtime(key).await? {
                 Some(addr) => addr,
                 None => iroh::EndpointAddr::new(*key),
             };
@@ -783,7 +796,7 @@ impl Node {
                     // proof descent is also a walk of as many windows as the
                     // range needs.
                     let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
+                    self.record_dial_off_runtime(key, elapsed).await;
                     let outcome = client
                         .fetch_proof_into(self.store(), *root, size, ask, level)
                         .await?;
@@ -925,7 +938,7 @@ impl Node {
     async fn ask_peers_for_providers(&self, root: &Hash, size: u64) -> Result<Vec<Provider>> {
         if self.provider_discovery_backed_off(root, now_ns()) {
             tracing::debug!(root = %root, "provider discovery backed off; not dialling");
-            let known = self.providers_for(root, 0, size.max(1))?;
+            let known = self.providers_off_runtime(root, size).await?;
             if !known.is_empty() {
                 // An ad reached this node some other way — head replication, or
                 // another fetch's hints — so the miss is stale.
@@ -934,10 +947,7 @@ impl Node {
             return Ok(known);
         }
         let mut learned = 0;
-        for peer in self.dialable_peers()? {
-            let addr = self
-                .peer_addr(&peer)?
-                .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
+        for (peer, addr) in self.dial_targets().await? {
             let client = match self.net().connect_mpt(addr).await {
                 Ok(client) => client,
                 Err(e) => {
@@ -987,13 +997,25 @@ impl Node {
         if learned > 0 {
             tracing::debug!(hints = learned, "learned providers from peers");
         }
-        let found = self.providers_for(root, 0, size.max(1))?;
+        let found = self.providers_off_runtime(root, size).await?;
         if found.is_empty() {
             self.note_provider_miss(root, now_ns());
         } else {
             self.clear_provider_miss(root);
         }
         Ok(found)
+    }
+
+    /// [`Node::providers_for`] on the blocking pool.
+    ///
+    /// One `blob_providers` scan plus a `peers_seen` read and a binding query
+    /// per candidate — store work, and reached from inside a fetch running on a
+    /// runtime worker (§10).
+    async fn providers_off_runtime(&self, root: &Hash, size: u64) -> Result<Vec<Provider>> {
+        let node = self.clone();
+        let root = *root;
+        let end = size.max(1);
+        crate::blocking::offload(move || node.providers_for(&root, 0, end)).await
     }
 
     async fn fetch_from(
@@ -1005,7 +1027,7 @@ impl Node {
     ) -> Result<ChunkRanges> {
         let mut last_error = None;
         for key in &provider.keys {
-            let addr = match self.peer_addr(key)? {
+            let addr = match self.peer_addr_off_runtime(key).await? {
                 Some(addr) => addr,
                 None => iroh::EndpointAddr::new(*key),
             };
@@ -1021,7 +1043,7 @@ impl Node {
                     // dial was refused, inverting the ranking under exactly the
                     // load it exists to spread.
                     let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
+                    self.record_dial_off_runtime(key, elapsed).await;
                     let got = client.fetch_into(self.store(), *root, size, ask).await?;
                     return Ok(got);
                 }
@@ -1031,9 +1053,7 @@ impl Node {
                     // peer that was once fast and is now a black hole keeps its
                     // low EWMA and is therefore selected first on every
                     // subsequent fetch, forever, with nothing able to demote it.
-                    let _ = self
-                        .store()
-                        .record_peer_failure(key, now_ns(), FAILURE_PENALTY_US);
+                    self.record_dial_failure_off_runtime(key).await;
                     last_error = Some(e);
                 }
             }
@@ -1042,6 +1062,54 @@ impl Node {
             Some(e) => EngineError::Net(e),
             None => EngineError::not_found(format!("no dialable key for {}", provider.origin)),
         })
+    }
+
+    /// [`Node::peer_addr`] on the blocking pool: it reads `peers_seen`.
+    pub(crate) async fn peer_addr_off_runtime(
+        &self,
+        key: &synch_core::NodeId,
+    ) -> Result<Option<iroh::EndpointAddr>> {
+        let node = self.clone();
+        let key = *key;
+        crate::blocking::offload(move || node.peer_addr(&key)).await
+    }
+
+    /// Records how long a dial took, on the blocking pool.
+    ///
+    /// A row update and a WAL frame per dial, which is not something to do on
+    /// the worker the dial itself is being driven from (§10). Ranking is
+    /// advisory, so a failure to record it is logged rather than propagated:
+    /// losing one measurement must not fail a fetch that otherwise worked.
+    async fn record_dial_off_runtime(&self, key: &synch_core::NodeId, elapsed_us: i64) {
+        let store = self.store().clone();
+        let key = *key;
+        let recorded: Result<()> = crate::blocking::offload(move || {
+            Ok(store.record_peer_sync(&key, now_ns(), elapsed_us)?)
+        })
+        .await;
+        if let Err(e) = recorded {
+            tracing::debug!(peer = %key.fmt_short(), error = %e, "could not record dial latency");
+        }
+    }
+
+    /// Records a failed dial's penalty, on the blocking pool.
+    async fn record_dial_failure_off_runtime(&self, key: &synch_core::NodeId) {
+        let store = self.store().clone();
+        let key = *key;
+        let recorded: Result<()> = crate::blocking::offload(move || {
+            Ok(store.record_peer_failure(&key, now_ns(), FAILURE_PENALTY_US)?)
+        })
+        .await;
+        if let Err(e) = recorded {
+            tracing::debug!(peer = %key.fmt_short(), error = %e, "could not record dial failure");
+        }
+    }
+
+    /// [`Node::local_groups`] on the blocking pool.
+    pub(crate) async fn local_groups_off_runtime(&self, root: &Hash) -> Result<ChunkRanges> {
+        let node = self.clone();
+        let root = *root;
+        crate::blocking::offload(move || node.local_groups(&root)).await
     }
 
     /// The groups of an object we hold and have verified.
@@ -1116,7 +1184,16 @@ impl Node {
         start: u64,
         len: Option<u64>,
     ) -> Result<PreparedRange> {
-        let entry = self.resolve(space, path, policy)?;
+        // Resolving the entry is a `versions_for` query and a policy decision
+        // over it, and the donor lineage below is another; both are store work
+        // and this runs on a runtime worker for every gateway read (§10). They
+        // go over together, after the window is known, so a read costs one
+        // handoff rather than three.
+        let entry = {
+            let node = self.clone();
+            let (space, path, policy) = (space.to_string(), path.to_string(), policy.clone());
+            crate::blocking::offload(move || node.resolve(&space, &path, &policy)).await?
+        };
         if entry.kind == synch_core::EntryKind::Tombstone {
             return Err(EngineError::not_found(format!(
                 "{} was deleted at seq {}",
@@ -1148,15 +1225,22 @@ impl Node {
         // few hundred: below one span the descent costs more than the read
         // (§4). Whole-object reads always descend.
         let whole = start == 0 && end == entry.size;
-        let donors = match self.store().versions_for(space, path) {
-            Ok(versions) if whole || end - start >= DESCENT_MIN_RANGE => {
-                self.donors_for(&entry, &versions)?
-            }
-            Ok(_) => Vec::new(),
-            Err(e) => {
-                tracing::debug!(error = %e, "no version set for donors");
-                Vec::new()
-            }
+        let donors = {
+            let node = self.clone();
+            let (space, path) = (space.to_string(), path.to_string());
+            let entry = entry.clone();
+            let worth_descending = whole || end - start >= DESCENT_MIN_RANGE;
+            crate::blocking::offload(move || {
+                Ok(match node.store().versions_for(&space, &path) {
+                    Ok(versions) if worth_descending => node.donors_for(&entry, &versions)?,
+                    Ok(_) => Vec::new(),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "no version set for donors");
+                        Vec::new()
+                    }
+                })
+            })
+            .await?
         };
         let wanted = ChunkRanges::from_ranges([groups_for_byte_range(start, end)])
             .intersect(&ChunkRanges::single(0, group_count(entry.size)));

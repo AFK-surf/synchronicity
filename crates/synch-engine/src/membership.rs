@@ -518,9 +518,15 @@ impl Node {
         resolver: &dyn MemberResolver,
         domain: Option<&str>,
     ) -> Result<Vec<DomainOutcome>> {
-        let domains = match domain {
-            None => self.domains()?,
-            Some(name) => vec![self.configured_domain(name)?],
+        // Both branches read `config`, and every caller of this is async (§10).
+        let domains = {
+            let node = self.clone();
+            let named = domain.map(str::to_string);
+            crate::blocking::offload(move || match named {
+                None => node.domains(),
+                Some(name) => Ok(vec![node.configured_domain(&name)?]),
+            })
+            .await?
         };
         self.refresh_these(resolver, &domains, now_ns()).await
     }
@@ -535,9 +541,15 @@ impl Node {
         resolver: &dyn MemberResolver,
         now: i64,
     ) -> Result<Vec<DomainOutcome>> {
+        // The configured list is a `config` read and this runs on a runtime
+        // worker (§10).
+        let configured = {
+            let node = self.clone();
+            crate::blocking::offload(move || node.domains()).await?
+        };
         let due: Vec<String> = {
             let schedule = self.dns_schedule();
-            self.domains()?
+            configured
                 .into_iter()
                 .filter(|d| schedule.get(d).is_none_or(|s| s.due_at <= now))
                 .collect()
@@ -605,7 +617,12 @@ impl Node {
         let mut shutdown = shutdown;
         let wake = self.dns_wake();
         loop {
-            let delay = self.next_dns_delay(now_ns());
+            // The configured domain list is a `config` read, so working out the
+            // next delay is store work like anything else (§10).
+            let node = self.clone();
+            let delay = crate::blocking::offload(move || Ok(node.next_dns_delay(now_ns())))
+                .await
+                .unwrap_or(DNS_POLL_FLOOR);
             let refreshed = tokio::select! {
                 _ = &mut shutdown => return,
                 _ = tokio::time::sleep(delay) => {

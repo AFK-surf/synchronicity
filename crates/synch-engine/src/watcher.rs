@@ -50,6 +50,12 @@ pub struct SpaceWatcher {
 impl SpaceWatcher {
     /// Starts watching every configured space root.
     pub fn start(node: &Node) -> Result<SpaceWatcher> {
+        let configured = Self::configured_spaces(node)?;
+        Self::start_with(node, &configured)
+    }
+
+    /// The same, over a configured set the caller has already read.
+    pub fn start_with(node: &Node, configured: &HashSet<PathBuf>) -> Result<SpaceWatcher> {
         let (tx, rx) = mpsc::channel(64);
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             if event.is_ok_and(|event| changes_something(&event)) {
@@ -66,7 +72,7 @@ impl SpaceWatcher {
             debounce: node.config().watch_debounce,
             watching: HashSet::new(),
         };
-        out.resync(node)?;
+        out.resync_to(configured);
         Ok(out)
     }
 
@@ -79,12 +85,25 @@ impl SpaceWatcher {
     /// indexes. Failing to watch a root is not fatal — the periodic scan is
     /// the guarantee (§7.1).
     pub fn resync(&mut self, node: &Node) -> Result<usize> {
-        let configured: HashSet<PathBuf> = node
+        Ok(self.resync_to(&Self::configured_spaces(node)?))
+    }
+
+    /// The space roots the store currently names.
+    ///
+    /// Split out from [`SpaceWatcher::resync`] so the standing loop can read it
+    /// on the blocking pool: this is a `spaces` query and the loop runs on a
+    /// runtime worker (§10).
+    pub fn configured_spaces(node: &Node) -> Result<HashSet<PathBuf>> {
+        Ok(node
             .store()
             .spaces()?
             .into_iter()
             .map(|space| PathBuf::from(&space.local_path))
-            .collect();
+            .collect())
+    }
+
+    /// Applies a configured set that has already been read.
+    pub fn resync_to(&mut self, configured: &HashSet<PathBuf>) -> usize {
         let mut changed = 0;
         for path in configured.difference(&self.watching.clone()) {
             match self.watcher.watch(path, RecursiveMode::Recursive) {
@@ -97,12 +116,12 @@ impl SpaceWatcher {
                 }
             }
         }
-        for path in self.watching.clone().difference(&configured) {
+        for path in self.watching.clone().difference(configured) {
             let _ = self.watcher.unwatch(path);
             self.watching.remove(path);
             changed += 1;
         }
-        Ok(changed)
+        changed
     }
 
     /// The space roots currently registered.
@@ -142,7 +161,19 @@ impl Node {
     /// [`run_publisher`](Node::run_publisher), which every host running this
     /// loop is expected to run beside it.
     pub async fn run_watcher(&self, shutdown: impl std::future::Future<Output = ()>) {
-        let mut watcher = match SpaceWatcher::start(self) {
+        // The configured set is a store read and this loop runs on a runtime
+        // worker, so every read of it goes over to the blocking pool (§10).
+        let spaces = |node: Node| async move {
+            crate::blocking::offload(move || SpaceWatcher::configured_spaces(&node)).await
+        };
+        let configured = match spaces(self.clone()).await {
+            Ok(configured) => configured,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read the configured spaces; watcher not started");
+                return;
+            }
+        };
+        let mut watcher = match SpaceWatcher::start_with(self, &configured) {
             Ok(watcher) => watcher,
             Err(e) => {
                 tracing::warn!(error = %e, "watcher unavailable; relying on periodic scans");
@@ -158,8 +189,9 @@ impl Node {
                 // `space add` / `space rm` ring this so a new root is watched
                 // at once rather than at the next filesystem hint.
                 _ = spaces_changed.notified() => {
-                    if let Err(e) = watcher.resync(self) {
-                        tracing::warn!(error = %e, "re-registering spaces failed");
+                    match spaces(self.clone()).await {
+                        Ok(configured) => { watcher.resync_to(&configured); }
+                        Err(e) => tracing::warn!(error = %e, "re-registering spaces failed"),
                     }
                 }
                 triggered = watcher.next_rescan() => {
@@ -169,8 +201,9 @@ impl Node {
                     // Every pass re-registers, so a space that appeared while
                     // the daemon ran is watched from here on even if the nudge
                     // was missed.
-                    if let Err(e) = watcher.resync(self) {
-                        tracing::warn!(error = %e, "re-registering spaces failed");
+                    match spaces(self.clone()).await {
+                        Ok(configured) => { watcher.resync_to(&configured); }
+                        Err(e) => tracing::warn!(error = %e, "re-registering spaces failed"),
                     }
                     // Staged, not published: a burst of editor saves is one
                     // batch and therefore one head (§7.1). Off the runtime,

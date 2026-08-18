@@ -80,7 +80,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             // The datadir holds a signing key and the control token: it is the
             // owner's alone from the moment it exists (§9.3).
             transport::harden_data_dir(&data_dir)?;
-            let report = Node::init(&data_dir, origin)?;
+            // Creating the store runs the migration chain and fsyncs a new
+            // database, which is blocking work on the multi-thread runtime this
+            // binary starts (§10).
+            let dir = data_dir.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                let _scope = synch_core::BlockingScope::enter();
+                Node::init(&dir, origin)
+            })
+            .await
+            .context("the initializing task did not complete")??;
             println!("origin:     {}", report.origin);
             println!("device key: {}", report.node_id.to_z32());
             println!("data dir:   {}", report.data_dir.display());
@@ -97,7 +106,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                     data_dir.display()
                 );
             }
-            let report = Node::adopt_named_origin(&data_dir, origin)?;
+            let dir = data_dir.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                let _scope = synch_core::BlockingScope::enter();
+                Node::adopt_named_origin(&dir, origin)
+            })
+            .await
+            .context("the renaming task did not complete")??;
             println!("origin:     {}  (was {})", report.origin, report.previous);
             println!("device key: {}", report.node_id.to_z32());
             println!("next:       synch daemon run && synch scan");

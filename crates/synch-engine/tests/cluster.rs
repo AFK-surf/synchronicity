@@ -12,6 +12,21 @@ use synch_core::{now_ns, OriginId};
 use synch_engine::{Node, NodeConfig, VersionPolicy};
 use synch_store::{Binding, BindingSource};
 
+/// Runs a closure that touches the store on the blocking pool.
+///
+/// The scope is what marks the thread as one blocking work belongs on, which is
+/// what `Store::conn`'s assertion reads (§10). `spawn_blocking` alone does not:
+/// tokio propagates the runtime handle into a blocking task, so the guard
+/// cannot tell one from a worker by itself.
+async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(move || {
+        let _scope = synch_core::BlockingScope::enter();
+        f()
+    })
+    .await
+    .unwrap()
+}
+
 struct Peer {
     _data: tempfile::TempDir,
     space: tempfile::TempDir,
@@ -27,7 +42,14 @@ async fn spawn_with(name: &str, tune: impl FnOnce(&mut NodeConfig)) -> Peer {
     let data = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     let origin = OriginId::named(name, "cluster.example").unwrap();
-    Node::init(data.path(), Some(origin)).unwrap();
+    // On the blocking pool: creating a store runs the migration chain, and
+    // `Store::conn` refuses to be acquired on a multi-thread runtime worker
+    // (§10). Most tests here run current-thread, where that is silent; the
+    // multi-thread one below is why this helper does it properly.
+    let dir = data.path().to_path_buf();
+    off_runtime(move || Node::init(&dir, Some(origin)))
+        .await
+        .unwrap();
     let mut config = NodeConfig::loopback(data.path());
     tune(&mut config);
     let node = Node::open(config).await.unwrap();
@@ -40,16 +62,22 @@ async fn spawn_with(name: &str, tune: impl FnOnce(&mut NodeConfig)) -> Peer {
 
 /// Static trust is unilateral, so every node must be told about every other.
 fn introduce(peers: &[&Peer]) {
+    let nodes: Vec<&Node> = peers.iter().map(|p| &p.node).collect();
+    introduce_nodes(&nodes);
+}
+
+/// The same, over the nodes alone, so a multi-thread test can run it inside a
+/// blocking scope.
+fn introduce_nodes(peers: &[&Node]) {
     for a in peers {
         for b in peers {
-            if a.node.origin() == b.node.origin() {
+            if a.origin() == b.origin() {
                 continue;
             }
-            a.node
-                .store()
+            a.store()
                 .put_binding(&Binding {
-                    origin: b.node.origin().clone(),
-                    node_id: b.node.node_id(),
+                    origin: b.origin().clone(),
+                    node_id: b.node_id(),
                     source: BindingSource::Static,
                     domain: None,
                     note: None,
@@ -58,7 +86,7 @@ fn introduce(peers: &[&Peer]) {
                 })
                 .unwrap();
             // Direct addresses only: these tests never touch the network.
-            a.node.remember_peer(&b.node.net().direct_addr()).unwrap();
+            a.remember_peer(&b.net().direct_addr()).unwrap();
         }
     }
 }
@@ -1311,4 +1339,77 @@ async fn a_provider_hint_for_an_unbound_origin_is_not_stored() {
         !learned.contains(&stranger),
         "the origin we could not dial is not: {learned:?}"
     );
+}
+
+/// The whole sync-and-fetch path runs without blocking a runtime worker on the
+/// store (§10).
+///
+/// This is the test the guard needs to have teeth. `Store::conn` asserts that
+/// it is not being acquired on a **multi-thread** runtime worker outside a
+/// blocking scope, and the rest of the suite runs on `#[tokio::test]`'s
+/// current-thread runtime, where the assertion is deliberately silent: one
+/// worker the test itself is driving is not the hazard. The daemon runs
+/// multi-thread, so this test runs multi-thread, and it drives the paths four
+/// prior audit passes kept leaving call sites behind on — the accept path, the
+/// `Hello` exchange and its push/pull decision, the trie fetch, provider
+/// discovery, the blob fetch, publishing, and the maintenance pass.
+///
+/// A violation is a panic inside the offending task, so the assertion below is
+/// really "the work completed at all": a parked-worker regression fails here
+/// with a message naming the rule instead of showing up as a daemon that goes
+/// quiet under load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sync_path_never_touches_the_store_on_a_runtime_worker() {
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    {
+        let (a, b) = (nas.node.clone(), laptop.node.clone());
+        off_runtime(move || introduce_nodes(&[&a, &b])).await;
+    }
+
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(nas.space.path().join("big.bin"), &payload).unwrap();
+    std::fs::write(nas.space.path().join("small.txt"), b"hello").unwrap();
+    off_runtime({
+        let node = nas.node.clone();
+        let path = nas.space.path().to_path_buf();
+        move || node.add_space("media", &path).unwrap()
+    })
+    .await;
+
+    // Publish and push: the scan, the head, and the fan-out to the membership.
+    let head = tokio::time::timeout(Duration::from_secs(30), nas.node.scan_publish_push())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a head");
+    assert_eq!(head.seq, 1);
+
+    // Pull: the `Hello` exchange, its decision, and the trie fetch under it.
+    let report = tokio::time::timeout(Duration::from_secs(30), laptop.node.anti_entropy_round())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(report.peer.is_some(), "{report:?}");
+
+    // Fetch: provider ranking, the dial, and the windowed slice transfer.
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(60),
+        laptop.node.read_path(
+            "media",
+            "big.bin",
+            &VersionPolicy::Origin(nas.node.origin().clone()),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(bytes, payload);
+
+    // And the maintenance pass, which is the other standing loop.
+    let node = laptop.node.clone();
+    off_runtime(move || node.maintenance_pass()).await.unwrap();
+
+    nas.node.shutdown().await.unwrap();
+    laptop.node.shutdown().await.unwrap();
 }

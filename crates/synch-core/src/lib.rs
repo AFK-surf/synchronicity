@@ -13,7 +13,7 @@ pub mod path;
 pub mod record;
 pub mod wire;
 
-pub use blocking::{offload, TaskLost};
+pub use blocking::{assert_off_runtime, blocking_is_allowed, offload, BlockingScope, TaskLost};
 pub use hash::{group_cv, hash_reader, join_cvs, join_root, Cv, Hash, HashParseError};
 pub use head::{head_signing_input, HeadError, HeadSummary, SignedHead, HEAD_SIGNING_DOMAIN};
 pub use origin::{NodeId, OriginId, OriginParseError};

@@ -1161,19 +1161,40 @@ the invariant that matters is that every multi-step state change (head flips,
 publish batches) is a single transaction and no partial state is ever observable;
 read concurrency is deliberately traded away for that simplicity.
 
-**Blocking work never runs on the runtime.** The store and the CAS are
-synchronous by design — `synch-store` has no async runtime dependency at all —
-and so is everything built directly on them: the scanner's directory walks and
-BLAKE3 hashing, publish transactions, slice encode and decode, mirror
-materialization, GC. None of that belongs on a tokio worker thread. A worker
-hashing a 10 GB file is a worker that is not polling the endpoint, the control
-socket, or a timer, and the multi-thread runtime has only one worker per core,
-so a few concurrent scans would stall the daemon outright. Every long or
-unbounded blocking operation reachable from an async context is therefore
-dispatched to tokio's blocking pool (`synch_engine::blocking`,
-`synch_net::blocking`, and the control server's own helper). Short bounded
-lookups — one indexed `SELECT`, a single `stat` — stay inline, where the handoff
-would cost more than the work itself.
+**Blocking work never runs on the runtime, and that is checked.** The store and
+the CAS are synchronous by design — `synch-store` has no async runtime
+dependency at all — and so is everything built directly on them: the scanner's
+directory walks and BLAKE3 hashing, publish transactions, slice encode and
+decode, mirror materialization, GC. None of that belongs on a tokio worker
+thread. A worker hashing a 10 GB file is a worker that is not polling the
+endpoint, the control socket, or a timer, and the multi-thread runtime has only
+one worker per core, so a few concurrent scans would stall the daemon outright.
+Every blocking operation reachable from an async context is therefore dispatched
+to tokio's blocking pool (`synch_engine::blocking`, `synch_net::blocking`, and
+the control server's own helper).
+
+**Every** one, with no "short enough to stay inline" exception. There used to be
+one, for a single indexed `SELECT` or a `stat`, and it was the wrong shape of
+rule twice over. It measured the wrong thing: what a store call costs on a
+worker is not the query, it is the wait for the one connection mutex, and a
+publish batch or a GC pass holds that for as long as it runs whatever the
+waiting caller wanted to read. And it made correctness a per-call-site
+judgement across a couple of hundred sites, which is not a rule a reader can
+check — four separate audit passes moved call sites off the runtime and each one
+left some behind, because a violation compiles, passes its tests, and shows up
+only as a daemon that goes quiet under load.
+
+So the rule is now enforced rather than described. `synch_core::blocking`'s
+`offload` marks its thread with a `BlockingScope`, and `Store::conn` asserts, in
+debug builds, that it is either inside one or not on a multi-thread runtime at
+all — the same shape as the guard that made "no `Store::conn` inside a
+transaction" a named panic instead of a silent deadlock. The daemon runs
+multi-thread, so a debug daemon catches a violation at the call site; the
+`#[tokio::test]` suite runs current-thread, where one worker the test is driving
+is not the hazard and the assertion is deliberately silent; and
+`the_sync_path_never_touches_the_store_on_a_runtime_worker` runs the whole
+accept/exchange/fetch/publish/maintain path multi-thread so CI carries the same
+check.
 
 This relocates the queue rather than removing it: the one connection mutex is
 still the bottleneck, and a long exclusive holder (a GC pass, a full publish

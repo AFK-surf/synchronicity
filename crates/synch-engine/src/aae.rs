@@ -45,9 +45,16 @@ impl Node {
     ///
     /// [`MAX_UNPRODUCTIVE_ROUNDS`]: crate::reconcile::MAX_UNPRODUCTIVE_ROUNDS
     pub async fn sync_with_peer(&self, node_id: &NodeId) -> Result<SyncReport> {
-        let addr = self
-            .peer_addr(node_id)?
-            .unwrap_or_else(|| iroh::EndpointAddr::new(*node_id));
+        // The address lookup and the latency record are both store work, and
+        // both used to run here, on the runtime worker that is also driving the
+        // endpoint (§10). `peers_seen` is read whole for the first and written
+        // for the second, each taking the one global connection mutex.
+        let addr = {
+            let node = self.clone();
+            let key = *node_id;
+            crate::blocking::offload(move || node.peer_addr(&key)).await?
+        }
+        .unwrap_or_else(|| iroh::EndpointAddr::new(*node_id));
         let started = std::time::Instant::now();
         let client = self.net().connect_mpt(addr).await?;
         let budget = self.config().sync_round_budget;
@@ -60,8 +67,44 @@ impl Node {
                 ))
             })??;
         let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-        self.store().record_peer_sync(node_id, now_ns(), elapsed)?;
+        let node = self.clone();
+        let key = *node_id;
+        crate::blocking::offload(move || {
+            Ok(node.store().record_peer_sync(&key, now_ns(), elapsed)?)
+        })
+        .await?;
         Ok(report)
+    }
+
+    /// [`Node::dialable_peers`] on the blocking pool.
+    ///
+    /// Two queries over `device_keys` and `bindings`, which is store work like
+    /// any other: every async caller reaches the set this way.
+    pub(crate) async fn dialable_peers_off_runtime(&self) -> Result<Vec<NodeId>> {
+        let node = self.clone();
+        crate::blocking::offload(move || node.dialable_peers()).await
+    }
+
+    /// Every peer this node may dial, with the last address it was seen at.
+    ///
+    /// One hop to the blocking pool for the whole membership rather than a
+    /// `peers_seen` read per peer on the runtime worker (§10) — and one
+    /// definition of "who do I dial and where", instead of the same loop
+    /// written out in the push, the recovery quiesce and the rotation probe.
+    pub(crate) async fn dial_targets(&self) -> Result<Vec<(NodeId, iroh::EndpointAddr)>> {
+        let node = self.clone();
+        crate::blocking::offload(move || {
+            let peers = node.dialable_peers()?;
+            let mut targets = Vec::with_capacity(peers.len());
+            for peer in peers {
+                let addr = node
+                    .peer_addr(&peer)?
+                    .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
+                targets.push((peer, addr));
+            }
+            Ok(targets)
+        })
+        .await
     }
 
     /// The trusted device keys this node may dial, excluding its own.
@@ -89,7 +132,7 @@ impl Node {
     /// Picking randomly rather than round-robin is what makes the gossip
     /// converge in `O(log N)` rounds after a partition heals.
     pub async fn anti_entropy_round(&self) -> Result<RoundReport> {
-        let peers = self.dialable_peers()?;
+        let peers = self.dialable_peers_off_runtime().await?;
         if peers.is_empty() {
             return Ok(RoundReport::default());
         }
@@ -120,14 +163,7 @@ impl Node {
     /// them before it returns. Run together, one slow peer costs one deadline
     /// rather than delaying every peer behind it.
     pub async fn push_head(&self, head: &SignedHead) -> Result<usize> {
-        let peers = self.dialable_peers()?;
-        let mut targets = Vec::with_capacity(peers.len());
-        for peer in peers {
-            let addr = self
-                .peer_addr(&peer)?
-                .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
-            targets.push((peer, addr));
-        }
+        let targets = self.dial_targets().await?;
         let results = crate::join::futures_join(targets.into_iter().map(|(peer, addr)| async move {
             match self.net().connect_mpt(addr).await {
                 Ok(client) => match client.push_head(head).await {
@@ -350,15 +386,22 @@ impl Node {
             };
 
             // `is_complete` walks a peer's node graph, so it can raise on its
-            // own; a head whose completeness cannot even be decided is in the
-            // same position as one whose promotion failed.
+            // own — but only in cases `try_promote` has already met: it walks
+            // the same root over the transaction just above, against the same
+            // rows and the same memo, so a graph this raises on made `outcome`
+            // an `Err` and `poisoned` is already true. What is left is the
+            // divergence the two walks *can* have, which is a transient store
+            // failure on the second one, and the answer to that is to leave the
+            // head where it is for a pass rather than to condemn it: reading it
+            // as incomplete would make a `SQLITE_BUSY` past the TTL abandon a
+            // head whose trie is wholly here.
             let complete = match trie.is_complete(stored.head.root) {
                 Ok(complete) => complete,
                 Err(e) => {
                     tracing::warn!(
                         origin = %origin,
                         error = %e,
-                        "origin left behind: its pending trie cannot be walked"
+                        "cannot decide whether a pending trie is here; leaving it for a pass"
                     );
                     true
                 }
@@ -374,11 +417,21 @@ impl Node {
                 poisoned,
                 "abandoning a pending head"
             );
+            // The head this pass judged, named explicitly. Between the snapshot
+            // above and here the sweep ran a promotion transaction and a trie
+            // walk, and a `HeadPush` accepted on the blocking pool in that
+            // window would otherwise be deleted by a verdict reached about a
+            // different head — and condemned by *its* `received_at`.
             if contained(
                 "clearing a pending head",
-                self.store().clear_head(origin, synch_store::Slot::Pending),
+                self.store().clear_head_at(
+                    origin,
+                    synch_store::Slot::Pending,
+                    stored.head.seq,
+                    &stored.head.root,
+                ),
             )
-            .is_some()
+            .is_some_and(|dropped| dropped)
             {
                 abandoned += 1;
             }

@@ -404,7 +404,11 @@ impl Syncer {
         client: &MptClient,
         origin: &OriginId,
     ) -> Result<FetchOutcome> {
-        let Some(pending) = self.store.pending_head(origin)? else {
+        let Some(pending) = ({
+            let store = self.store.clone();
+            let origin = origin.clone();
+            crate::blocking::offload(move || Ok(store.pending_head(&origin)?)).await?
+        }) else {
             return Ok(FetchOutcome::Idle);
         };
         // What this origin's trie looked like when we last held all of it. Every
@@ -545,7 +549,22 @@ impl Syncer {
                         seq = pending.seq,
                         "abandoning pending head: providers persistently missing nodes"
                     );
-                    self.store.clear_head(origin, Slot::Pending)?;
+                    // The head this fetch judged, not whatever is in the slot
+                    // now: a `HeadPush` accepted while we were between round
+                    // trips would otherwise be deleted by a verdict that was
+                    // never about it.
+                    let store = self.store.clone();
+                    let (origin, seq, root) = (origin.clone(), pending.seq, pending.root);
+                    let dropped = crate::blocking::offload(move || {
+                        Ok(store.clear_head_at(&origin, Slot::Pending, seq, &root)?)
+                    })
+                    .await?;
+                    if !dropped {
+                        tracing::debug!(
+                            "a newer head arrived while this one was being fetched; \
+                             leaving the slot to it"
+                        );
+                    }
                     return Ok(FetchOutcome::Abandoned);
                 }
             } else {
@@ -614,50 +633,91 @@ impl Syncer {
         crate::blocking::offload(move || syncer.local_summaries()).await
     }
 
+    /// What this node advertises, and the heads it can actually hand over.
+    ///
+    /// Read together because the push decision needs both and because the
+    /// second used to be read from inside the exchange closure, on a runtime
+    /// worker. One walk per unproven root and one query per origin, once.
+    async fn advertisement_off_runtime(&self) -> Result<(Vec<HeadSummary>, Vec<SignedHead>)> {
+        let syncer = self.clone();
+        crate::blocking::offload(move || {
+            let summaries = syncer.local_summaries()?;
+            let servable = syncer
+                .store
+                .all_heads(Slot::Complete)?
+                .into_iter()
+                .map(|stored| stored.head)
+                .collect();
+            Ok((summaries, servable))
+        })
+        .await
+    }
+
     /// Runs one full `Hello` push-pull exchange with a peer, then fetches
     /// whatever it advertised that we do not have (§5.2, §5.3).
     pub async fn sync_with(&self, client: &MptClient) -> Result<SyncReport> {
-        let ours = self.summaries_off_runtime().await?;
-        let store = self.store.clone();
+        // The summaries and the servable heads behind them come over together,
+        // in one hop to the blocking pool. The decision below used to read the
+        // complete slot once per advertised origin *inside* the closure, which
+        // `head_exchange` calls on the runtime worker driving the connection —
+        // a two-table join per origin behind the store's one global mutex, on
+        // the thread the endpoint and every timer in the process share (§10).
+        // Nothing about the decision needs the store: it needs the heads, and
+        // the heads are already being read.
+        let (ours, servable) = self.advertisement_off_runtime().await?;
 
         let mut report = SyncReport::default();
         let theirs = client
             .head_exchange(ours.clone(), |theirs| {
                 // Both slots may be advertised per origin, so the comparison is
                 // against the best summary either side has for it, never the
-                // first one that happens to match.
-                let best = |set: &[HeadSummary], origin: &OriginId| {
-                    set.iter()
-                        .filter(|s| &s.origin == origin)
-                        .map(|s| s.order_key())
-                        .max()
+                // first one that happens to match. Indexed once rather than
+                // re-scanned per origin: the scan was quadratic in the number
+                // of summaries, on both sides of the decision.
+                let best_of = |set: &[HeadSummary]| {
+                    let mut best: std::collections::HashMap<OriginId, (u64, [u8; 32])> =
+                        std::collections::HashMap::new();
+                    for summary in set {
+                        let key = summary.order_key();
+                        best.entry(summary.origin.clone())
+                            .and_modify(|held| {
+                                if key > *held {
+                                    *held = key;
+                                }
+                            })
+                            .or_insert(key);
+                    }
+                    best
                 };
+                let theirs_best = best_of(theirs);
+                let ours_best = best_of(&ours);
+
                 // Push: the servable head we hold, whenever it beats theirs.
                 // Keyed off the complete slot directly rather than off whichever
                 // summary was advertised: what we can hand over is exactly what
                 // the complete slot holds.
-                let mut push = Vec::new();
-                let mut pushed_for: Vec<OriginId> = Vec::new();
-                for summary in &ours {
-                    if pushed_for.contains(&summary.origin) {
-                        continue;
-                    }
-                    let Ok(Some(head)) = store.complete_head(&summary.origin) else {
-                        continue;
-                    };
-                    let mine = (head.seq, head.root.0);
-                    if best(theirs, &summary.origin).is_none_or(|peer| mine > peer) {
-                        pushed_for.push(summary.origin.clone());
-                        push.push(head);
-                    }
-                }
+                let push: Vec<SignedHead> = servable
+                    .iter()
+                    .filter(|head| {
+                        let mine = (head.seq, head.root.0);
+                        theirs_best
+                            .get(&head.origin)
+                            .is_none_or(|peer| mine > *peer)
+                    })
+                    .cloned()
+                    .collect();
                 // Pull: origins where the peer is ahead of us.
                 let mut want = Vec::new();
+                let mut asked: std::collections::HashSet<&OriginId> =
+                    std::collections::HashSet::new();
                 for summary in theirs {
-                    if want.contains(&summary.origin) {
+                    if !asked.insert(&summary.origin) {
                         continue;
                     }
-                    if best(&ours, &summary.origin).is_none_or(|mine| summary.order_key() > mine) {
+                    if ours_best
+                        .get(&summary.origin)
+                        .is_none_or(|mine| summary.order_key() > *mine)
+                    {
                         want.push(summary.origin.clone());
                     }
                 }
@@ -715,7 +775,11 @@ impl Syncer {
         // says its nodes may be fetched from any peer advertising a complete
         // head for that origin at or above its seq. Do exactly that here, which
         // is what turns "I heard about it" into "I can serve it".
-        for stored in self.store.all_heads(Slot::Pending)? {
+        let pending_heads = {
+            let store = self.store.clone();
+            crate::blocking::offload(move || Ok(store.all_heads(Slot::Pending)?)).await?
+        };
+        for stored in pending_heads {
             let pending = stored.head;
             let servable = theirs.summaries.iter().any(|summary| {
                 summary.origin == pending.origin

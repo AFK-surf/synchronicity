@@ -273,6 +273,16 @@ impl Store {
              mutex is not reentrant, so this deadlocks: use the `Txn` the closure \
              was handed, not the `Store` it came from."
         );
+        // The other half of the same idea (§10). Every acquisition here is a
+        // wait on the one global connection mutex, and a long holder — a publish
+        // batch, a GC pass, a slice commit — parks whoever is waiting for as
+        // long as it runs. On a runtime worker that is the endpoint, the control
+        // socket and every timer in the process, which is why the rule is
+        // "blocking work goes to the blocking pool" and why it needs a checker
+        // rather than a convention: four audit passes moved call sites off the
+        // runtime and each left some behind, because a violation compiles,
+        // passes its tests, and only shows up as a daemon that goes quiet.
+        synch_core::assert_off_runtime("a Store connection acquisition");
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

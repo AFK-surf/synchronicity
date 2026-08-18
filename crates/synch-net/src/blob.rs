@@ -142,7 +142,7 @@ impl ProtocolHandler for BlobProtocol {
             &self.store.clone(),
             connection,
             self.on_unknown_key.as_ref(),
-            |_| {},
+            |_| std::future::ready(()),
             move |_peer, mut send, mut recv| {
                 let handler = handler.clone();
                 async move {

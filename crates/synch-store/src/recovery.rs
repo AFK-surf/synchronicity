@@ -134,13 +134,7 @@ impl Store {
 
     /// The seq this node may not publish below (§3.4 step 3).
     pub fn publish_floor(&self) -> Result<Option<u64>> {
-        match self.config(FLOOR_KEY)? {
-            None => Ok(None),
-            Some(text) => text
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|_| StoreError::column("config.publish_floor", text)),
-        }
+        publish_floor_in(&self.conn())
     }
 
     /// Raises the publishing floor, returning the floor now in force.
@@ -148,10 +142,39 @@ impl Store {
     /// The floor only ever moves up: lowering it could hand out a seq an
     /// earlier publish already used, which is exactly the collision the gap
     /// exists to avoid.
+    ///
+    /// One statement, so "only ever moves up" is a property of the database
+    /// rather than of the interleaving. Read-then-write across two acquisitions
+    /// of the connection is not monotonic under any concurrency at all: the
+    /// mutex is released between the two, so a second raiser reading the old
+    /// value writes over the first one's. `append_config` already makes this
+    /// argument for a list; a maximum needs it just as much.
     pub fn raise_publish_floor(&self, seq: u64) -> Result<u64> {
-        let effective = self.publish_floor()?.unwrap_or(0).max(seq);
-        self.set_config(FLOOR_KEY, &effective.to_string())?;
-        Ok(effective)
+        self.conn().execute(
+            "INSERT INTO config (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+               WHERE CAST(excluded.value AS INTEGER) > CAST(config.value AS INTEGER)",
+            params![FLOOR_KEY, seq.to_string()],
+        )?;
+        Ok(self.publish_floor()?.unwrap_or(0))
+    }
+}
+
+/// The publishing floor, read off a connection the caller already holds.
+pub(crate) fn publish_floor_in(conn: &rusqlite::Connection) -> Result<Option<u64>> {
+    let text: Option<String> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![FLOOR_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match text {
+        None => Ok(None),
+        Some(text) => text
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| StoreError::column("config.publish_floor", text)),
     }
 }
 
