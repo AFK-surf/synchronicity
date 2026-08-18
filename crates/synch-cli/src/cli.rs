@@ -312,6 +312,32 @@ pub enum Command {
     },
     /// Scan every configured space and publish the result.
     Scan,
+    /// Expose named spaces read-only to the control plane the zone names.
+    Cloud {
+        /// The cloud subcommand.
+        #[command(subcommand)]
+        command: CloudCommand,
+    },
+}
+
+/// `synch cloud ...`
+///
+/// The node half of the two-key opt-in: nothing is browsable from a dashboard
+/// until an org admin enables browsing for the network *and* an operator names
+/// spaces here. There is no `--url`: where to attach is read from the same
+/// DNSSEC-validated zone that names the membership.
+#[derive(Debug, Subcommand)]
+pub enum CloudCommand {
+    /// Expose these spaces, and only these, through the tunnel.
+    Enable {
+        /// A space id to expose. Repeat for several; at least one is required.
+        #[arg(long = "space", value_name = "ID", required = true)]
+        spaces: Vec<String>,
+    },
+    /// Stop answering the control plane and drop any open tunnel.
+    Disable,
+    /// Per membership domain: record found, attached, last error.
+    Status,
 }
 
 /// `synch id set ...`
@@ -713,9 +739,23 @@ mod tests {
             vec!["synch", "recover"],
             vec!["synch", "recover", "--wait", "90m", "--gap", "5000"],
             vec!["synch", "doctor"],
+            vec!["synch", "cloud", "enable", "--space", "media"],
+            vec![
+                "synch", "cloud", "enable", "--space", "media", "--space", "docs",
+            ],
+            vec!["synch", "cloud", "disable"],
+            vec!["synch", "cloud", "status"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
+    }
+
+    /// No flag, no exposure: `cloud enable` with nothing named would have to
+    /// mean either "no spaces" or "every space", and the surface refuses
+    /// rather than choose.
+    #[test]
+    fn cloud_enable_names_at_least_one_space() {
+        assert!(Cli::try_parse_from(["synch", "cloud", "enable"]).is_err());
     }
 
     /// `--from` and `--strict` are two answers to the same question, so the

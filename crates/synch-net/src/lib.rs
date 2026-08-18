@@ -31,8 +31,8 @@ pub mod zonecert;
 
 pub use blob::{proof_window, BlobClient, BlobProtocol, Proof, ProofOutcome, Slice};
 pub use dns::{
-    DialHint, DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError, RekorPolicy,
-    ResolverOptions,
+    ControlPlaneRecord, CpRecordError, DialHint, DnssecResolver, MemberRecord, MemberResolver,
+    MemberSet, RecordError, RekorPolicy, ResolverOptions,
 };
 pub use endpoint::{Net, NetOptions, DIAL_TIMEOUT, REQUEST_TIMEOUT};
 pub use error::{NetError, Result};

@@ -88,6 +88,14 @@ pub async fn run(config: NodeConfig) -> Result<()> {
             None => shutdown.await,
         }
     });
+    // The outbound tunnel to the control plane the membership zone names — off
+    // until `synch cloud enable`, and a settings read per interval when it is.
+    // It shares this process's node, database handle and resolver by
+    // construction, because it *is* the daemon (§9.1).
+    let cloud_resolver = resolver.clone();
+    let cloud = spawn_loop(&node, &stop_tx, move |node, shutdown| async move {
+        node.run_cloud(cloud_resolver, shutdown).await
+    });
     // What turns the scanner's and the watcher's staged changes into heads: one
     // batch per quiet period or per 1000 entries, whichever comes first (§7.1).
     let publisher = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
@@ -128,7 +136,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         maintenance,
         publisher,
         dns,
-        mirrors
+        mirrors,
+        cloud
     );
     node.shutdown().await?;
     Ok(())

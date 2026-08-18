@@ -9,6 +9,7 @@
 
 pub mod aae;
 mod blocking;
+pub mod cloud;
 pub mod compare;
 pub mod config;
 pub mod error;
@@ -28,6 +29,7 @@ pub mod tree;
 pub mod watcher;
 
 pub use aae::RoundReport;
+pub use cloud::{CloudDomainStatus, CloudSettings};
 pub use compare::{CompareChange, CompareReport, CompareStatus};
 pub use config::{default_data_dir, NodeConfig};
 pub use error::{EngineError, Result};

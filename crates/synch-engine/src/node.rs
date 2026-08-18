@@ -97,6 +97,12 @@ struct NodeInner {
     /// Rung when a space is added or removed, so the watcher re-registers
     /// without waiting for the next filesystem hint (§7.1).
     spaces_changed: Arc<tokio::sync::Notify>,
+    /// What the cloud-attach task has achieved per membership domain.
+    ///
+    /// In memory and nowhere else: a stored table of live connections is a
+    /// lie the moment the process dies, and `synch cloud status` is asking
+    /// what this daemon is doing now.
+    cloud: std::sync::Mutex<std::collections::HashMap<String, crate::cloud::CloudDomainStatus>>,
 }
 
 /// What mirror passes believe about the file at one target, and the stat
@@ -340,6 +346,7 @@ impl Node {
                 mirror_wake,
                 mirror_lock: tokio::sync::Mutex::new(()),
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
+                cloud: std::sync::Mutex::new(Default::default()),
             }),
         };
         // A batch that was still buffered when the process died was never
@@ -641,6 +648,17 @@ impl Node {
     ) -> std::sync::MutexGuard<'_, crate::membership::ResolverSlot> {
         self.inner
             .dns_resolver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What the cloud-attach task has achieved per membership domain.
+    pub(crate) fn cloud_slot(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, crate::cloud::CloudDomainStatus>>
+    {
+        self.inner
+            .cloud
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

@@ -114,6 +114,24 @@ pub fn rekor_query_name(zone: &str) -> String {
     format!("{}.{}", rekor::REKOR_TXT_PREFIX, zone)
 }
 
+/// The label a base's control-plane attach record lives under.
+pub const CP_TXT_PREFIX: &str = "_synchronicity-cp";
+
+/// The version tag a control-plane attach record opens with.
+pub const CP_RECORD_VERSION_TAG: &str = "synccp1";
+
+/// The query name a base's control-plane attach record lives under.
+///
+/// One record per apex, beside the transparency declaration and the proof set,
+/// because it states the same kind of fact: which control plane covers this
+/// base. The apex comes from the membership answer's `apex=` field, held
+/// between the signing zone and the membership domain by `apex_of` — the
+/// bounds that make the lookup safe are the ones the proof set already relies
+/// on, so nothing new is trusted here.
+pub fn control_plane_query_name(apex: &str) -> String {
+    format!("{CP_TXT_PREFIX}.{apex}")
+}
+
 /// Where part `index` of a proof lives (§3).
 ///
 /// A proof is far larger than one TXT record, and larger than what a managed
@@ -347,6 +365,73 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
         relay,
         addr,
         apex,
+    })
+}
+
+/// The attach endpoint one control plane publishes at its apex.
+///
+/// A deployment fact, never a policy: it says *this base's control plane
+/// attaches here*, and nothing about which network may be browsed. Which
+/// network may is decided at the endpoint itself, where a refusal is immediate
+/// rather than a TTL away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRecord {
+    /// The base URL a daemon opens its attach connection against.
+    pub url: String,
+}
+
+/// Why a control-plane attach record was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CpRecordError {
+    /// The record did not start with `v=synccp1`.
+    #[error("not a v=synccp1 record")]
+    NotSyncCp1,
+    /// The record had no `url=` field.
+    #[error("record has no url= field")]
+    MissingUrl,
+    /// The `url=` field was not an `https://` origin.
+    ///
+    /// Plaintext is refused rather than downgraded: the record is a redirect
+    /// target for a connection that carries a device-key proof, so the
+    /// transport under it is not negotiable. `SYNCH_CLOUD_URL` is where a test
+    /// deployment says otherwise, deliberately outside the zone.
+    #[error("url= must be an https:// endpoint: {0}")]
+    BadUrl(String),
+    /// A field appeared more than once.
+    #[error("duplicate field {0}=")]
+    Duplicate(&'static str),
+}
+
+/// Parses one `v=synccp1` TXT record.
+///
+/// Fields are whitespace-separated `key=value` pairs, `v=synccp1` first, and
+/// unknown fields are ignored — the same grammar and the same growth rule as
+/// the membership record beside it.
+pub fn parse_control_plane_record(text: &str) -> Result<ControlPlaneRecord, CpRecordError> {
+    let mut fields = text.split_whitespace();
+    match fields.next() {
+        Some(first) if first == format!("v={CP_RECORD_VERSION_TAG}") => {}
+        _ => return Err(CpRecordError::NotSyncCp1),
+    }
+    let mut url = None;
+    for field in fields {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        if key == "url" {
+            if url.is_some() {
+                return Err(CpRecordError::Duplicate("url"));
+            }
+            url = Some(value.to_string());
+        }
+    }
+    let url = url.ok_or(CpRecordError::MissingUrl)?;
+    let trimmed = url.trim_end_matches('/');
+    if !trimmed.starts_with("https://") || trimmed.len() <= "https://".len() {
+        return Err(CpRecordError::BadUrl(url));
+    }
+    Ok(ControlPlaneRecord {
+        url: trimmed.to_string(),
     })
 }
 
@@ -949,6 +1034,47 @@ impl DnssecResolver {
         answers: &[hickory_resolver::proto::rr::Record],
     ) -> Result<ValidatedTxt, NetError> {
         secure_txt(name, answers, now_unix(0))
+    }
+
+    /// Resolves the control plane a membership domain's base attaches to.
+    ///
+    /// Two validated lookups and no configuration: the membership answer for
+    /// `domain` names the apex, `apex_of` holds that apex between the signing
+    /// zone and the domain exactly as the transparency lookup does, and the
+    /// attach record is read at `_synchronicity-cp.<apex>`. Every step is
+    /// DNSSEC-validated fail-closed, so a stripped, spoofed or absent answer
+    /// yields no endpoint rather than a redirected one.
+    ///
+    /// The TTL is the shorter of the two answers': the endpoint is only as
+    /// believable as the apex that led to it.
+    pub async fn control_plane(
+        &self,
+        domain: &str,
+    ) -> Result<(ControlPlaneRecord, Duration), NetError> {
+        let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
+        let name = query_name(&domain);
+        let response = self.lookup(&name, RecordType::TXT).await?;
+        let membership = self.validated_txt(&name, &response.answers)?;
+        let apex = apex_of(&domain, &membership.signer, &membership.records)?;
+        let cp_name = control_plane_query_name(apex.to_string().trim_end_matches('.'));
+        let response = self.lookup(&cp_name, RecordType::TXT).await?;
+        let validated = self.validated_txt(&cp_name, &response.answers)?;
+        // One unreadable record must not sink a readable one, for the reason
+        // the proof set applies the same rule: a control plane mid-upgrade can
+        // leave an old-format record beside a current one.
+        let mut refusal = None;
+        for record in &validated.records {
+            match parse_control_plane_record(record) {
+                Ok(record) => {
+                    return Ok((record, validated.ttl.min(membership.ttl)));
+                }
+                Err(e) => refusal = Some(e),
+            }
+        }
+        Err(NetError::Dns(match refusal {
+            Some(e) => format!("{cp_name}: no usable attach record: {e}"),
+            None => format!("{cp_name} publishes no attach record"),
+        }))
     }
 
     /// Resolves and applies the §3.2 rules in one step.
@@ -2493,6 +2619,57 @@ mod tests {
             CONTROL_PLANE_REPUBLISH_WINDOW,
             CONTROL_PLANE_WATCH_CADENCE + CONTROL_PLANE_LOG_ROUND_TRIP + CONTROL_PLANE_PROOF_TTL
         );
+    }
+
+    /// The attach record hangs off the apex, and only the apex — a client
+    /// that could not name the apex has nowhere to look.
+    #[test]
+    fn the_attach_record_is_read_at_the_apex() {
+        assert_eq!(
+            control_plane_query_name("sync.example"),
+            "_synchronicity-cp.sync.example"
+        );
+    }
+
+    #[test]
+    fn attach_records_parse_and_refuse() {
+        assert_eq!(
+            parse_control_plane_record("v=synccp1 url=https://sync.example").unwrap(),
+            ControlPlaneRecord {
+                url: "https://sync.example".into()
+            }
+        );
+        // A trailing slash is the same endpoint, and the signing context binds
+        // the URL — so it is normalized here rather than left to disagree.
+        assert_eq!(
+            parse_control_plane_record("v=synccp1 url=https://sync.example/ future=field")
+                .unwrap()
+                .url,
+            "https://sync.example"
+        );
+        assert_eq!(
+            parse_control_plane_record("v=sync1 nk=x").unwrap_err(),
+            CpRecordError::NotSyncCp1
+        );
+        assert_eq!(
+            parse_control_plane_record("v=synccp1").unwrap_err(),
+            CpRecordError::MissingUrl
+        );
+        assert_eq!(
+            parse_control_plane_record("v=synccp1 url=a url=b").unwrap_err(),
+            CpRecordError::Duplicate("url")
+        );
+        // The record redirects a connection carrying a device-key proof, so
+        // plaintext is a refusal rather than a downgrade.
+        for bad in ["http://sync.example", "https://", "sync.example"] {
+            assert!(
+                matches!(
+                    parse_control_plane_record(&format!("v=synccp1 url={bad}")),
+                    Err(CpRecordError::BadUrl(_))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     /// A duplicated `apex=` is a rejected record, like a duplicated `nk=`.

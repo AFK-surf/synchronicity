@@ -65,6 +65,7 @@ time = "0.3"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
 tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen", "router", "server"] }
 tonic-prost = "0.14.6"
