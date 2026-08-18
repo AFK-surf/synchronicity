@@ -13,7 +13,7 @@ pub type NodeId = PublicKey;
 /// It never changes for the lifetime of a node, across any number of device-key
 /// rotations (§3.1). Canonical text rendering is `key:<z-base-32>` for
 /// key-identified origins and `<id>@<domain>` for named ones.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum OriginId {
     /// No name: the device key is the identity (not rotatable).
     Key(NodeId),
@@ -66,6 +66,30 @@ impl OriginId {
                 format!("key:{}", &z[..10.min(z.len())])
             }
             OriginId::Named { .. } => self.canonical(),
+        }
+    }
+}
+
+/// Decoding re-validates, because an `OriginId` arriving here is a peer's word.
+///
+/// Every other way to build one — [`OriginId::named`], [`FromStr`] — checks the
+/// label and the domain, and the value that comes off a wire or out of a stored
+/// record is the one place that was taken as given. It keys `blob_providers`,
+/// `bindings` and `entries` by its canonical rendering, so an unvalidated one is
+/// an arbitrary row key: a 64 KB label, or a thousand spellings of one member.
+impl<'de> Deserialize<'de> for OriginId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The same shape, decoded before it is judged.
+        #[derive(Deserialize)]
+        enum Wire {
+            Key(NodeId),
+            Named { domain: String, id: String },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Key(key) => Ok(OriginId::Key(key)),
+            Wire::Named { domain, id } => {
+                OriginId::named(&id, &domain).map_err(serde::de::Error::custom)
+            }
         }
     }
 }
@@ -201,6 +225,52 @@ mod tests {
         assert!(normalize_domain("a..b").is_err());
         assert!(normalize_domain("-lead.example").is_err());
         assert!(normalize_domain("ok.example.com").is_ok());
+    }
+
+    /// An origin off the wire is checked the way a constructed one is.
+    ///
+    /// The encoding is a peer's to choose, and what comes out of it keys rows
+    /// in three tables — so a label no constructor would produce must not
+    /// become a row key here either.
+    #[test]
+    fn a_decoded_origin_is_validated_like_a_constructed_one() {
+        let good = OriginId::named("nas", "cluster.example").unwrap();
+        let bytes = postcard::to_stdvec(&good).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<OriginId>(&bytes).unwrap(),
+            good,
+            "an honest origin round trips"
+        );
+
+        // The same shape, with a label and a domain nothing would accept.
+        #[derive(serde::Serialize)]
+        enum Forged {
+            #[allow(dead_code)]
+            Key(NodeId),
+            Named {
+                domain: String,
+                id: String,
+            },
+        }
+        for (id, domain) in [
+            ("x".repeat(64), "cluster.example".to_string()),
+            ("nas".to_string(), "not a domain".to_string()),
+            (String::new(), "cluster.example".to_string()),
+        ] {
+            let forged = postcard::to_stdvec(&Forged::Named { domain, id }).unwrap();
+            assert!(
+                postcard::from_bytes::<OriginId>(&forged).is_err(),
+                "a forged origin must not decode"
+            );
+        }
+
+        // Case is normalized rather than being a second identity for one member.
+        let shouty = postcard::to_stdvec(&Forged::Named {
+            domain: "Cluster.Example".into(),
+            id: "NAS".into(),
+        })
+        .unwrap();
+        assert_eq!(postcard::from_bytes::<OriginId>(&shouty).unwrap(), good);
     }
 
     #[test]

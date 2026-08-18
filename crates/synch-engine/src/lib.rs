@@ -14,6 +14,7 @@ pub mod config;
 pub mod error;
 pub mod fetcher;
 pub mod ignore;
+mod join;
 pub mod membership;
 pub mod mirror;
 pub mod node;

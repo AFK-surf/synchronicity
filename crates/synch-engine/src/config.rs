@@ -53,6 +53,21 @@ pub struct NodeConfig {
     /// like [`NodeConfig::fetch_fanout`]: no shipped binary reads it from a
     /// file.
     pub delta_min_size: u64,
+    /// How long a pending head may sit with an incomplete trie before the
+    /// maintenance pass abandons it (§5.2).
+    ///
+    /// A head reaches the pending slot by reactive push (§5.3) long before its
+    /// trie does, and `head_floor` is the best of both slots — so while it sits
+    /// there the node refuses a peer's older but *servable* head for that
+    /// origin, and materializes nothing for it. If the publisher goes offline
+    /// between the push and the fetch, nobody can serve the pending trie and
+    /// nothing else can be adopted in its place. Clearing it drops the floor
+    /// and head selection re-runs.
+    ///
+    /// Thirty anti-entropy intervals at the defaults: long enough that every
+    /// peer holding the trie has had many rounds to serve it, short enough that
+    /// an origin is not stranded for an afternoon.
+    pub pending_head_ttl: Duration,
     /// How long old roots are retained (§5.4).
     pub root_retention: Duration,
     /// How long this node's own tombstones are kept before a later root drops
@@ -86,6 +101,7 @@ impl NodeConfig {
             ad_update_interval: Duration::from_secs(60),
             fetch_fanout: 3,
             delta_min_size: synch_core::AD_SPAN_GRANULARITY,
+            pending_head_ttl: Duration::from_secs(900),
             root_retention: Duration::from_secs(7 * 24 * 3600),
             tombstone_ttl: Duration::from_secs(90 * 24 * 3600),
             recovery_quiesce: crate::recovery::DEFAULT_RECOVERY_QUIESCE,
@@ -131,6 +147,7 @@ mod tests {
         assert_eq!(config.ad_update_interval, Duration::from_secs(60));
         assert_eq!(config.fetch_fanout, 3);
         assert_eq!(config.delta_min_size, 16 * 1024 * 1024);
+        assert_eq!(config.pending_head_ttl, Duration::from_secs(900));
         assert_eq!(config.root_retention, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(config.tombstone_ttl, Duration::from_secs(90 * 24 * 3600));
         assert_eq!(config.recovery_quiesce, Duration::from_secs(3600));

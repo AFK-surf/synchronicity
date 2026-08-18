@@ -24,6 +24,7 @@ use synch_core::{
 use synch_store::{Proven, Store};
 
 use crate::{
+    endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
     frame::{read_bytes, read_frame, write_bytes, write_frame},
 };
@@ -32,20 +33,6 @@ use crate::{
 /// fetch gives up on it and lets the caller try someone else.
 const MAX_BARREN_WINDOWS: u32 = 4;
 
-/// How many requests one connection may have in flight at once.
-///
-/// The bound that the old handle-one-stream-at-a-time loop looked like but was
-/// not: that serialized a peer's requests without limiting what a peer could
-/// cost us, since nothing capped connections.
-const MAX_CONCURRENT_STREAMS: usize = 8;
-
-/// How long one request may take, start to finish.
-///
-/// Covers the read as well as the work: without it a peer that opens a stream
-/// and sends nothing holds a task indefinitely. Generous, because one window of
-/// a large object is real disk work on the blocking pool.
-const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
 /// The largest prefix of `remaining` whose proof fits one exchange.
 ///
 /// Sized by [`proof_nodes_upper_bound`], so a provider holding everything asked
@@ -53,7 +40,13 @@ const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// taken whole where they fit and split where they do not, and the count is
 /// clamped to [`MAX_RANGES`] so the set operations under it stay cheap on both
 /// sides (§12).
-fn proof_window(remaining: &ChunkRanges, level: u8) -> ChunkRanges {
+///
+/// Public because a caller walking a large region in rounds has to cut it the
+/// same way: what fits depends on the level and on how fragmented the ranges
+/// are — a contiguous run costs one node per subtree plus a root path, a
+/// scattered set costs a root path each — so any second answer to "how much per
+/// round?" would disagree with this one.
+pub fn proof_window(remaining: &ChunkRanges, level: u8) -> ChunkRanges {
     let mut taken: Vec<synch_core::GroupRange> = Vec::new();
     for range in remaining.ranges.iter().take(MAX_RANGES) {
         let candidate = ChunkRanges::from_ranges(taken.iter().copied().chain([*range]));
@@ -144,64 +137,23 @@ impl BlobProtocol {
 
 impl ProtocolHandler for BlobProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let remote = connection.remote_id();
-        match self.store.is_trusted_key(&remote, now_ns()) {
-            Ok(true) => {}
-            _ => {
-                if let Some(wake) = &self.on_unknown_key {
-                    wake.notify_waiters();
+        let handler = self.clone();
+        crate::serve::serve_connection(
+            &self.store.clone(),
+            connection,
+            self.on_unknown_key.as_ref(),
+            |_| {},
+            move |_peer, mut send, mut recv| {
+                let handler = handler.clone();
+                async move {
+                    if let Err(e) = handler.handle_stream(&mut send, &mut recv).await {
+                        tracing::debug!(error = %e, "blob stream ended");
+                    }
+                    let _ = send.finish();
                 }
-                connection.close(0u32.into(), b"untrusted");
-                return Err(AcceptError::from_err(std::io::Error::other(
-                    "peer has no live binding",
-                )));
-            }
-        }
-
-        // One task per stream, bounded by a semaphore.
-        //
-        // Handling streams one at a time to completion was not a concurrency
-        // bound — it bounded nothing, since a peer can open more connections —
-        // but it did bound *throughput*: because the encode runs on the
-        // blocking pool via `.await`, the connection could not accept another
-        // stream while one window was being built, so §6.3's "swarm behaviour
-        // falls out naturally" did not survive any client that pipelines. The
-        // semaphore is the real bound, and it is per connection.
-        let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
-        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-            // §3.2 enforcement is per message, not just per connection: a
-            // binding revoked or expired mid-connection must cut off further
-            // requests, not linger for the life of the QUIC session.
-            if !matches!(self.store.is_trusted_key(&remote, now_ns()), Ok(true)) {
-                tracing::debug!(peer = %remote.fmt_short(), "closing connection: binding lapsed");
-                connection.close(0u32.into(), b"untrusted");
-                break;
-            }
-            let Ok(permit) = limit.clone().acquire_owned().await else {
-                break;
-            };
-            let handler = self.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                // A read timeout, because there was none anywhere in the blob
-                // path: a trusted-key peer could open a stream, send nothing,
-                // and hold the task forever with nothing to reap it — which
-                // also defeated the per-message binding re-check above, since
-                // the loop never came back round.
-                let served = tokio::time::timeout(
-                    STREAM_TIMEOUT,
-                    handler.handle_stream(&mut send, &mut recv),
-                )
-                .await;
-                match served {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::debug!(error = %e, "blob stream ended"),
-                    Err(_) => tracing::debug!("blob stream timed out"),
-                }
-                let _ = send.finish();
-            });
-        }
-        Ok(())
+            },
+        )
+        .await
     }
 }
 
@@ -293,6 +245,8 @@ impl BlobProtocol {
 #[derive(Debug, Clone)]
 pub struct BlobClient {
     connection: Connection,
+    /// How long any one exchange on this connection may wait for its answer.
+    deadline: std::time::Duration,
 }
 
 /// A received slice, together with what the provider actually served.
@@ -327,7 +281,18 @@ pub struct ProofOutcome {
 impl BlobClient {
     /// Wraps an established `sync/blob/1` connection.
     pub fn new(connection: Connection) -> Self {
-        BlobClient { connection }
+        BlobClient {
+            connection,
+            deadline: REQUEST_TIMEOUT,
+        }
+    }
+
+    /// The same client under a deadline of the caller's choosing, for tests
+    /// that need a stall to be reported in milliseconds rather than minutes.
+    #[cfg(test)]
+    pub(crate) fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// The peer's device key.
@@ -337,23 +302,26 @@ impl BlobClient {
 
     /// Requests a verified slice.
     pub async fn get_slice(&self, root: Hash, ranges: &ChunkRanges) -> Result<Slice, NetError> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(
-            &mut send,
-            &BlobMessage::GetSlice {
-                root,
-                ranges: ranges.clone(),
-            },
-        )
-        .await?;
-        let _ = send.finish();
+        under_deadline(self.deadline, "a slice request", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(
+                &mut send,
+                &BlobMessage::GetSlice {
+                    root,
+                    ranges: ranges.clone(),
+                },
+            )
+            .await?;
+            let _ = send.finish();
 
-        let encoded = read_bytes(&mut recv).await?;
-        let served = match read_frame::<BlobMessage>(&mut recv).await? {
-            BlobMessage::SliceEnd { served } => check_served(served, ranges)?,
-            _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
-        };
-        Ok(Slice { encoded, served })
+            let encoded = read_bytes(&mut recv).await?;
+            let served = match read_frame::<BlobMessage>(&mut recv).await? {
+                BlobMessage::SliceEnd { served } => check_served(served, ranges)?,
+                _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
+            };
+            Ok(Slice { encoded, served })
+        })
+        .await
     }
 
     /// Requests the tree over a range, without its bytes.
@@ -363,24 +331,27 @@ impl BlobClient {
         ranges: &ChunkRanges,
         level: u8,
     ) -> Result<Proof, NetError> {
-        let (mut send, mut recv) = self.connection.open_bi().await?;
-        write_frame(
-            &mut send,
-            &BlobMessage::GetProof {
-                root,
-                ranges: ranges.clone(),
-                level,
-            },
-        )
-        .await?;
-        let _ = send.finish();
+        under_deadline(self.deadline, "a proof request", async {
+            let (mut send, mut recv) = self.connection.open_bi().await?;
+            write_frame(
+                &mut send,
+                &BlobMessage::GetProof {
+                    root,
+                    ranges: ranges.clone(),
+                    level,
+                },
+            )
+            .await?;
+            let _ = send.finish();
 
-        let encoded = read_bytes(&mut recv).await?;
-        let served = match read_frame::<BlobMessage>(&mut recv).await? {
-            BlobMessage::ProofEnd { served } => check_served(served, ranges)?,
-            _ => return Err(NetError::Unexpected("expected ProofEnd".into())),
-        };
-        Ok(Proof { encoded, served })
+            let encoded = read_bytes(&mut recv).await?;
+            let served = match read_frame::<BlobMessage>(&mut recv).await? {
+                BlobMessage::ProofEnd { served } => check_served(served, ranges)?,
+                _ => return Err(NetError::Unexpected("expected ProofEnd".into())),
+            };
+            Ok(Proof { encoded, served })
+        })
+        .await
     }
 
     /// Requests the tree over a range and commits it to the local CAS,
@@ -512,7 +483,41 @@ impl BlobClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synch_core::{GroupRange, AD_SPAN_LEVEL, CHUNK_GROUP_SIZE, MAX_PROOF_NODES};
+    use crate::testing::{bare_endpoint, StalledPeer};
+    use synch_core::{GroupRange, AD_SPAN_LEVEL, ALPN_BLOB, CHUNK_GROUP_SIZE, MAX_PROOF_NODES};
+
+    /// A peer that keeps the session open and answers nothing fails the
+    /// request instead of holding the fetch forever.
+    ///
+    /// `STREAM_TIMEOUT` bounds what this node does for a peer; the deadline
+    /// here bounds what a peer can do to this node, and the windowed fetches
+    /// above apply it once per window so a long walk is never cut short for
+    /// making steady progress.
+    #[tokio::test]
+    async fn a_peer_that_answers_nothing_fails_a_slice_and_a_proof() {
+        let peer = StalledPeer::bind(ALPN_BLOB).await;
+        let dialer = bare_endpoint(ALPN_BLOB).await;
+        let connection = dialer.connect(peer.addr.clone(), ALPN_BLOB).await.unwrap();
+        let client =
+            BlobClient::new(connection).with_deadline(std::time::Duration::from_millis(100));
+        let patience = std::time::Duration::from_secs(10);
+        let root = Hash::new(b"object");
+        let ranges = ChunkRanges::single(0, 4);
+
+        let slice = tokio::time::timeout(patience, client.get_slice(root, &ranges))
+            .await
+            .expect("a slice request must not hang")
+            .expect_err("a stalled peer serves no slice");
+        assert!(slice.to_string().contains("went unanswered"), "{slice}");
+        let proof = tokio::time::timeout(patience, client.get_proof(root, &ranges, 0))
+            .await
+            .expect("a proof request must not hang")
+            .expect_err("a stalled peer serves no proof");
+        assert!(proof.to_string().contains("went unanswered"), "{proof}");
+
+        dialer.close().await;
+        peer.shutdown().await;
+    }
 
     /// The requester sizes each window so the provider never truncates.
     ///

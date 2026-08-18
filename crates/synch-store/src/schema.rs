@@ -69,6 +69,10 @@ pub const MIGRATIONS: &[Migration] = &[
         run: v10_groups_as_ranges,
     },
     Migration::Sql(V11_HEADS_POINT_AT_HISTORY),
+    Migration::Rust {
+        name: "history records local receipt",
+        run: v12_history_recorded_at,
+    },
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -426,6 +430,35 @@ INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
 DROP TABLE heads_v10;
 "#;
 
+/// v12 — `head_history` records when a row was received locally.
+///
+/// Retention keys on `recorded_at`. `created_at` is the signer's own choice and
+/// is never clamped, so a row claiming to have been created at the end of time
+/// would outlive every retention window — and with it every trie node reachable
+/// from its root, which GC marks from this table.
+///
+/// Existing rows are stamped with the migration's own time: what this node knows
+/// about them is that it holds them now.
+fn v12_history_recorded_at(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE head_history RENAME TO head_history_v11;
+         CREATE TABLE head_history (
+           origin_id TEXT, seq INTEGER, root BLOB, created_at INTEGER,
+           signed_by BLOB, sig BLOB, recorded_at INTEGER NOT NULL,
+           PRIMARY KEY (origin_id, seq, root)
+         );",
+    )?;
+    tx.execute(
+        "INSERT INTO head_history
+           (origin_id, seq, root, created_at, signed_by, sig, recorded_at)
+         SELECT origin_id, seq, root, created_at, signed_by, sig, ?1
+           FROM head_history_v11",
+        rusqlite::params![synch_core::now_ns()],
+    )?;
+    tx.execute_batch("DROP TABLE head_history_v11;")?;
+    Ok(())
+}
+
 /// The §10 schema as the design document states it — the shape replaying the
 /// whole chain must produce.
 ///
@@ -465,7 +498,7 @@ CREATE TABLE heads (
 );
 CREATE TABLE head_history (
   origin_id TEXT, seq INTEGER, root BLOB, created_at INTEGER,
-  signed_by BLOB, sig BLOB,
+  signed_by BLOB, sig BLOB, recorded_at INTEGER NOT NULL,
   PRIMARY KEY (origin_id, seq, root)
 );
 CREATE TABLE trie_nodes    (hash BLOB PRIMARY KEY, data BLOB NOT NULL);

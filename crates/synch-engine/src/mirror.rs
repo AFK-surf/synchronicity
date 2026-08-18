@@ -435,6 +435,9 @@ fn plan_pass(
     // Detect folding collisions before writing anything: the
     // lexicographically first path wins and the rest are reported.
     let mut claimed: HashMap<String, String> = HashMap::new();
+    // One clock reading for the pass, so every path in it selects against the
+    // same instant.
+    let now = synch_core::now_ns();
     let mut report = MirrorReport::default();
     let mut known: HashSet<String> = HashSet::new();
     let mut wanted: Vec<WantedContent> = Vec::new();
@@ -442,6 +445,18 @@ fn plan_pass(
     {
         for set in listing {
             known.insert(set.path.clone());
+            // Before the target path is built, because building it is already
+            // the damage: on Windows `Path::join` reads a backslash as a
+            // separator and a drive-prefixed argument as a root, so a published
+            // `..\..\Users\x` or `C:\Windows\x` names a file outside the
+            // mirror root — and the branches below remove what they are given.
+            // Both bytes are ordinary in a Unix filename, so they stay legal
+            // where entries are published and are refused here, at the boundary
+            // where they mean something.
+            if let Some(reason) = unsafe_name(&set.path) {
+                report.skipped.push((set.path.clone(), reason));
+                continue;
+            }
             let target = root_dir.join(&set.path);
             // Defense in depth against a peer that plants a symlink and a file
             // beneath it (`sub` -> `/etc`, then `sub/passwd`): materialized in
@@ -456,7 +471,7 @@ fn plan_pass(
                 ));
                 continue;
             }
-            let selected = match set.select(policy) {
+            let selected = match set.select(policy, now) {
                 synch_store::Selection::Selected(entry) => *entry,
                 // The policy selects nothing here — an `origin=` pin on an
                 // origin that publishes no version of this path — so the path
@@ -503,10 +518,6 @@ fn plan_pass(
                 continue;
             }
             if selected.kind == EntryKind::Dir {
-                continue;
-            }
-            if let Some(reason) = unsafe_name(&set.path) {
-                report.skipped.push((set.path.clone(), reason));
                 continue;
             }
             if selected.kind == EntryKind::Symlink {
@@ -1307,16 +1318,24 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// A path leaves a `newest` mirror when every publisher has deleted it, and
+    /// not before (§8).
+    ///
+    /// A tombstone is one origin's assertion about its own copy. While another
+    /// origin still publishes a live version the path is still in the tree, and
+    /// the mirror carries the newest live version of it.
     #[tokio::test]
-    async fn a_tombstoned_selection_removes_the_file() {
+    async fn a_tombstone_removes_a_path_once_every_publisher_has_deleted_it() {
         let (_d, node) = node().await;
         let target = tempfile::tempdir().unwrap();
         node.add_mirror("media", target.path(), &VersionPolicy::Newest)
             .unwrap();
         publish_entry(&node, &peer(), "a.txt", b"hello", 1);
+        publish_entry(&node, &other(), "a.txt", b"hello", 1);
         node.sync_mirror(target.path()).await.unwrap();
+        assert!(target.path().join("a.txt").exists());
 
-        // A newer tombstone is the selected version, so the file goes.
+        // One publisher deletes its copy: the other still publishes the path.
         node.store()
             .put_entry(
                 &other(),
@@ -1326,15 +1345,58 @@ mod tests {
             )
             .unwrap();
         let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.removed, 0, "{report:?}");
+        assert_eq!(
+            std::fs::read(target.path().join("a.txt")).unwrap(),
+            b"hello",
+            "the surviving publisher's version is what the mirror carries"
+        );
+
+        // The last publisher deletes it too, and the path leaves the tree.
+        node.store()
+            .put_entry(
+                &peer(),
+                "media",
+                "a.txt",
+                &FileEntry::tombstone(500, 2, None),
+            )
+            .unwrap();
+        let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.removed, 1);
         assert!(!target.path().join("a.txt").exists());
+        node.shutdown().await.unwrap();
+    }
 
-        // Pinned to the origin that still publishes it, the same tree keeps it.
+    /// A mirror pinned to one origin follows that origin's deletions.
+    ///
+    /// `origin=` is a mirror of one node's view, so its tombstone is the answer
+    /// for that path even while other origins publish it — and the reverse: the
+    /// pinned origin's live version stands while others delete theirs.
+    #[tokio::test]
+    async fn a_pinned_mirror_follows_its_own_origins_deletion() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        publish_entry(&node, &peer(), "a.txt", b"hello", 1);
+        node.store()
+            .put_entry(
+                &other(),
+                "media",
+                "a.txt",
+                &FileEntry::tombstone(500, 2, None),
+            )
+            .unwrap();
+
         node.add_mirror("media", target.path(), &VersionPolicy::Origin(peer()))
             .unwrap();
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.written, 1);
         assert!(target.path().join("a.txt").exists());
+
+        node.add_mirror("media", target.path(), &VersionPolicy::Origin(other()))
+            .unwrap();
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.removed, 1);
+        assert!(!target.path().join("a.txt").exists());
         node.shutdown().await.unwrap();
     }
 
@@ -1392,6 +1454,71 @@ mod tests {
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.written, 1);
         assert_eq!(report.skipped.len(), 2);
+        node.shutdown().await.unwrap();
+    }
+
+    /// A name this platform must not be asked to open is refused before the
+    /// mirror does anything with it — removals included.
+    ///
+    /// `Path::join` on Windows reads a backslash as a separator and a
+    /// drive-prefixed argument as a root, so a published `..\..\Users\x` or
+    /// `C:\Windows\x` names a file outside the mirror root, and all three
+    /// branches that select nothing to write reach for the target and remove
+    /// it. Both bytes are ordinary in a Unix filename and stay legal where
+    /// entries are published, so the refusal belongs here.
+    #[tokio::test]
+    async fn a_name_this_platform_cannot_open_is_refused_before_any_removal() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+
+        let tombstoned = r"sub\..\..\escape.txt";
+        let divergent = r"C:\Windows\hosts";
+        let unpinned = r"D:\other\thing";
+        // Where these names are ordinary filenames they land inside the
+        // mirror, so the removal branches have something to take and the
+        // refusal is what keeps it. Where they instead name somewhere outside
+        // the root — which is the reason the refusal exists — there is nothing
+        // to plant, and the skip is the whole of what there is to observe.
+        #[cfg(unix)]
+        for name in [tombstoned, divergent, unpinned] {
+            std::fs::write(target.path().join(name), b"not the mirror's to touch").unwrap();
+        }
+
+        // The three selections that remove: a tombstone, a strict mirror's
+        // divergence, and a path the pinned origin does not publish.
+        node.store()
+            .put_entry(
+                &peer(),
+                "media",
+                tombstoned,
+                &FileEntry::tombstone(500, 2, None),
+            )
+            .unwrap();
+        publish_entry(&node, &peer(), divergent, b"mine", 1);
+        publish_entry(&node, &other(), divergent, b"theirs", 2);
+        publish_entry(&node, &other(), unpinned, b"theirs", 1);
+
+        for policy in [
+            VersionPolicy::Newest,
+            VersionPolicy::Strict,
+            VersionPolicy::Origin(peer()),
+        ] {
+            node.add_mirror("media", target.path(), &policy).unwrap();
+            let report = node.sync_mirror(target.path()).await.unwrap();
+            assert_eq!(report.removed, 0, "{policy:?}: {report:?}");
+            assert_eq!(report.written, 0, "{policy:?}: {report:?}");
+            assert_eq!(report.skipped.len(), 3, "{policy:?}: {report:?}");
+            for (_, reason) in &report.skipped {
+                assert!(reason.contains("reserved character"), "{reason}");
+            }
+            #[cfg(unix)]
+            for name in [tombstoned, divergent, unpinned] {
+                assert!(
+                    target.path().join(name).exists(),
+                    "{policy:?} removed {name}"
+                );
+            }
+        }
         node.shutdown().await.unwrap();
     }
 

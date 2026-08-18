@@ -654,7 +654,7 @@ async fn gc_keeps_the_current_root_servable() {
     // Drop the retention window entirely, then sweep.
     nas.node
         .store()
-        .prune_history(nas.node.origin(), u64::MAX)
+        .prune_history_before(nas.node.origin(), i64::MAX)
         .unwrap();
     let stats = nas.node.maintenance_pass().unwrap();
     assert!(stats.nodes > 0, "old roots must actually be swept");
@@ -1257,4 +1257,58 @@ async fn a_mirror_follows_the_tree_as_the_node_learns_it() {
         .unwrap();
     nas.node.shutdown().await.unwrap();
     vps.node.shutdown().await.unwrap();
+}
+
+/// A provider hint is only worth a row for an origin this node could dial.
+///
+/// Hints are unverified by design — content is hash-verified whatever the hint
+/// said — but taking one costs a `blob_providers` row, and the origin in it is
+/// a peer's word. An origin with no live binding here is one `providers_for`
+/// would skip anyway, so the row buys nothing and is not written.
+#[tokio::test]
+async fn a_provider_hint_for_an_unbound_origin_is_not_stored() {
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    introduce(&[&nas, &laptop]);
+
+    // An object the NAS holds whole, advertised by itself and by an origin the
+    // laptop has never heard of.
+    let payload = big_payload(50_000);
+    let root = nas.node.store().ingest_bytes(&payload, now_ns()).unwrap();
+    let ad = nas.node.store().local_ad(&root).unwrap().unwrap();
+    nas.node
+        .store()
+        .put_provider(&root, nas.node.origin(), &ad)
+        .unwrap();
+    let stranger = OriginId::named("stranger", "elsewhere.example").unwrap();
+    nas.node
+        .store()
+        .put_provider(&root, &stranger, &ad)
+        .unwrap();
+
+    // The laptop holds no ad for this root, so the fetch asks its peers.
+    let report = laptop
+        .node
+        .fetch_all(&root, payload.len() as u64)
+        .await
+        .unwrap();
+    assert!(report.complete, "{report:?}");
+    assert_eq!(laptop.node.store().read_all(&root).unwrap(), payload);
+
+    let learned: Vec<OriginId> = laptop
+        .node
+        .store()
+        .providers(&root)
+        .unwrap()
+        .into_iter()
+        .map(|(origin, _)| origin)
+        .collect();
+    assert!(
+        learned.contains(nas.node.origin()),
+        "the peer we are bound to is worth a row: {learned:?}"
+    );
+    assert!(
+        !learned.contains(&stranger),
+        "the origin we could not dial is not: {learned:?}"
+    );
 }

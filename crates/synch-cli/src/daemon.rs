@@ -86,20 +86,31 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     });
 
     // An initial scan and push, so a fresh daemon converges immediately rather
-    // than waiting a full interval.
-    if let Err(e) = node.scan_publish_push().await {
-        tracing::warn!(error = %e, "initial scan failed");
-    }
-
+    // than waiting a full interval — with the stop signal watched throughout
+    // it. The scan reads every space and pushes the head it produces to every
+    // peer, so it is the one piece of startup work that depends on the outside
+    // world, and a daemon that cannot be stopped while it runs is a daemon an
+    // operator has to kill.
+    let mut stopping = false;
     tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            println!("shutting down");
-            let _ = stop_tx.send(());
+        scanned = node.scan_publish_push() => {
+            if let Err(e) = scanned {
+                tracing::warn!(error = %e, "initial scan failed");
+            }
         }
-        _ = stopped.recv() => {}
+        stop = wait_for_stop(&stop_tx, &mut stopped) => {
+            stop?;
+            stopping = true;
+        }
+    }
+    if !stopping {
+        wait_for_stop(&stop_tx, &mut stopped).await?;
     }
 
+    // A plain join: every loop either selects on the shutdown signal or is
+    // bounded by the dial timeout and the per-request deadline the network
+    // layer applies, so none of them can outlive the stop by more than one
+    // request.
     let _ = tokio::join!(
         control,
         aae,
@@ -111,6 +122,26 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         mirrors
     );
     node.shutdown().await?;
+    Ok(())
+}
+
+/// Waits for the daemon to be told to stop: `Ctrl-C`, or a `synch daemon stop`
+/// request landing on the control socket.
+///
+/// `Ctrl-C` fires the same broadcast a control request does, so both paths shut
+/// every task down the one way.
+async fn wait_for_stop(
+    stop_tx: &broadcast::Sender<()>,
+    stopped: &mut broadcast::Receiver<()>,
+) -> Result<()> {
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            println!("shutting down");
+            let _ = stop_tx.send(());
+        }
+        _ = stopped.recv() => {}
+    }
     Ok(())
 }
 

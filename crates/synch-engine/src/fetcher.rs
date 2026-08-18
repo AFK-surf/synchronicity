@@ -1,13 +1,12 @@
 //! Content fetching: provider resolution, ranking, and verified range reads
 //! (§6.3, §6.4).
 
-use std::future::Future;
-
 use synch_core::{group_count, groups_for_byte_range, now_ns, ChunkRanges, Hash, OriginId};
 use synch_store::{Donor, EntryRow, Proven, ProvenSubtree, VersionPolicy, VersionSet};
 
 use crate::{
     error::{EngineError, Result},
+    join::futures_join,
     node::Node,
     scanner::CloneKind,
 };
@@ -170,34 +169,6 @@ fn split_ranges(ranges: &ChunkRanges, parts: usize) -> Vec<ChunkRanges> {
         out.push(ChunkRanges::from_ranges(share));
     }
     out
-}
-
-/// Runs several futures to completion together, collecting their outputs.
-///
-/// A hand-rolled join rather than a `futures` dependency: this is the only
-/// place in the workspace that needs one, and it needs the simplest possible
-/// shape — no cancellation, no early return, every branch polled to the end.
-async fn futures_join<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
-    let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
-    let mut out = Vec::with_capacity(pending.len());
-    std::future::poll_fn(move |cx| {
-        let mut index = 0;
-        while index < pending.len() {
-            match pending[index].as_mut().poll(cx) {
-                std::task::Poll::Ready(value) => {
-                    out.push(value);
-                    pending.remove(index);
-                }
-                std::task::Poll::Pending => index += 1,
-            }
-        }
-        if pending.is_empty() {
-            std::task::Poll::Ready(std::mem::take(&mut out))
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await
 }
 
 impl Node {
@@ -654,12 +625,14 @@ impl Node {
         };
         let mut left = unsettled;
         while !left.is_empty() {
-            // A batch at a time, because the proven subtrees of a leaf-level
-            // round are one per 16 KiB group and a re-keyed 100 GB container
-            // makes every span unsettled at once: held whole, that list is
-            // hundreds of megabytes of a node's memory to say something about
-            // bytes it is about to fetch anyway.
-            let batch = left.take(LEAF_ROUND_BATCH);
+            // One exchange's worth at a time, because the proven subtrees of a
+            // leaf-level round are one per 16 KiB group and a re-keyed 100 GB
+            // container makes every span unsettled at once: held whole, that
+            // list is hundreds of megabytes of a node's memory to say something
+            // about bytes it is about to fetch anyway. The size of an exchange
+            // is the provider's window sizer's answer, asked here rather than
+            // guessed, so the two cannot disagree about where a round ends.
+            let batch = synch_net::proof_window(&left, 0);
             left = left.difference(&batch);
             let round = self.fetch_proofs(root, size, &batch, 0, report).await?;
             if round.is_empty() {
@@ -917,13 +890,32 @@ impl Node {
                     continue;
                 }
             };
-            for (origin, ad) in ads {
-                if &origin == self.origin() {
-                    continue;
+            // Storing a hint is a row, and the origin in one is a peer's word:
+            // nothing in the answer establishes that the origin exists, and
+            // nothing sweeps `blob_providers`. A hint about an origin this node
+            // has no live binding for could never be dialled anyway
+            // ([`Node::providers_for`] drops it), so it is not worth a row.
+            //
+            // The writes go to the blocking pool with every other database
+            // path: this runs inside a fetch on a runtime worker, and a bounded
+            // answer is still a row apiece (§10).
+            let node = self.clone();
+            let root = *root;
+            learned += crate::blocking::offload(move || {
+                let now = now_ns();
+                let mut stored = 0usize;
+                for (origin, ad) in ads {
+                    if &origin == node.origin()
+                        || node.store().keys_for_origin(&origin, now)?.is_empty()
+                    {
+                        continue;
+                    }
+                    node.store().put_provider(&root, &origin, &ad)?;
+                    stored += 1;
                 }
-                self.store().put_provider(root, &origin, &ad)?;
-                learned += 1;
-            }
+                Ok(stored)
+            })
+            .await?;
         }
         if learned > 0 {
             tracing::debug!(hints = learned, "learned providers from peers");
@@ -1193,15 +1185,6 @@ impl Node {
         Ok(kind)
     }
 }
-
-/// How much of an object one leaf-level proof round covers at a time.
-///
-/// A leaf round proves one subtree per 16 KiB group, so the list it produces is
-/// proportional to the region it covers — and the region can be the whole object
-/// when every span changed. 8192 groups is 128 MiB of object per round: enough
-/// that the round trips disappear against the work, small enough that the list
-/// stays a few hundred kilobytes whatever the object.
-const LEAF_ROUND_BATCH: u64 = 8192;
 
 /// The smallest range a cold read runs the delta descent for
 /// (`docs/DELTA-SYNC.md` §4).

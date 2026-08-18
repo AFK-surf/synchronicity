@@ -35,6 +35,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
+synch-store.workspace = true
 tempfile.workspace = true
 
 [lints]

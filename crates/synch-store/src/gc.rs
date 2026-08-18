@@ -17,6 +17,8 @@ pub struct GcStats {
     pub values: usize,
     /// Content objects swept.
     pub blobs: usize,
+    /// CAS files swept that no row accounted for.
+    pub orphans: usize,
     /// Roots marked from.
     pub roots_marked: usize,
 }
@@ -31,23 +33,6 @@ pub struct TrieStats {
 }
 
 impl Store {
-    /// Marks every trie node and value reachable from the retained roots.
-    ///
-    /// The mark set is every origin's **complete and pending** heads plus
-    /// retained history roots (§5.4). Pending heads must be in the mark set or
-    /// GC would eat an in-progress bootstrap.
-    pub fn gc_mark(&self) -> Result<(HashSet<Hash>, HashSet<Hash>)> {
-        let trie = Trie::new(self);
-        let mut nodes = HashSet::new();
-        let mut values = HashSet::new();
-        for root in self.retained_roots()? {
-            let reachable = trie.reachable(root)?;
-            nodes.extend(reachable.nodes);
-            values.extend(reachable.values);
-        }
-        Ok((nodes, values))
-    }
-
     /// Runs one mark-and-sweep pass over `trie_nodes` and `trie_values`.
     ///
     /// The whole pass — the retained roots, the mark walk, the candidate
@@ -135,7 +120,57 @@ impl Store {
         Ok(stats)
     }
 
-    /// Runs both sweeps, with `before` as the content retention horizon.
+    /// Removes CAS files that no `blobs` row accounts for.
+    ///
+    /// The row sweeps walk rows, so a payload or an outboard left without one —
+    /// a fetch that failed verification, a crash between
+    /// [`Store::delete_blob`]'s row delete and its unlinks — is disk nothing
+    /// else would ever reclaim.
+    ///
+    /// A file counts as orphaned only once its own mtime is older than the same
+    /// retention horizon `gc_content` uses. Payload and outboard are created
+    /// before the row that describes them, so inside that window a file with no
+    /// row is a write in progress, not a leftover. Anything in the CAS
+    /// directory that is not named for an object is left alone.
+    ///
+    /// Returns how many files went.
+    pub fn gc_orphans(&self, before: i64) -> Result<usize> {
+        let mut swept = 0;
+        let shards = match std::fs::read_dir(self.cas_dir()) {
+            Ok(shards) => shards,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        for shard in shards {
+            let shard = shard?.path();
+            let files = match std::fs::read_dir(&shard) {
+                Ok(files) => files,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            for file in files {
+                let path = file?.path();
+                let Some(root) = cas_root_of(&path) else {
+                    continue;
+                };
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if !meta.is_file() || mtime_nanos(&meta).is_none_or(|at| at >= before) {
+                    continue;
+                }
+                if self.blob(&root)?.is_some() {
+                    continue;
+                }
+                if std::fs::remove_file(&path).is_ok() {
+                    swept += 1;
+                }
+            }
+        }
+        Ok(swept)
+    }
+
+    /// Runs every sweep, with `before` as the content retention horizon.
     pub fn gc(&self, before: i64) -> Result<GcStats> {
         let trie = self.gc_trie()?;
         let content = self.gc_content(before)?;
@@ -143,6 +178,9 @@ impl Store {
             nodes: trie.nodes,
             values: trie.values,
             blobs: content.blobs,
+            // After the content sweep, so a row it took this pass leaves no
+            // files behind for a whole retention window.
+            orphans: self.gc_orphans(before)?,
             roots_marked: trie.roots_marked,
         })
     }
@@ -176,6 +214,27 @@ impl Store {
 
 /// The GC mark set, read inside the sweeping transaction.
 ///
+/// The object a CAS file is named for: `<hex>` for a payload, `<hex>.obao` for
+/// an outboard.
+///
+/// `None` for anything else in the directory, which is then left alone.
+fn cas_root_of(path: &std::path::Path) -> Option<Hash> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".obao").unwrap_or(name);
+    let bytes = hex::decode(stem).ok()?;
+    Hash::from_slice(&bytes).ok()
+}
+
+/// A file's modification time in unix nanoseconds, if it has one this side of
+/// the epoch.
+fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_nanos()).ok())
+}
+
 /// Every origin's complete and pending heads plus retained history roots
 /// (§5.4). Pending heads must be in the mark set or GC would eat an in-progress
 /// bootstrap.
@@ -259,8 +318,10 @@ mod tests {
         let key = SecretKey::generate();
         let old = publish(&store, &[("a", 1), ("b", 2)]);
         let new = publish(&store, &[("a", 1), ("b", 2), ("c", 3)]);
-        let before = store.gc_mark().unwrap().0.len();
-        assert_eq!(before, 0, "nothing is retained until a head points at it");
+        assert!(
+            store.retained_roots().unwrap().is_empty(),
+            "nothing is retained until a head points at it"
+        );
 
         let head = SignedHead::sign(&key, origin(), 2, new, 0);
         store.put_head(Slot::Complete, &head, 0, 0).unwrap();
@@ -314,7 +375,7 @@ mod tests {
         let old = publish(&store, &[("a", 1)]);
         let new = publish(&store, &[("a", 1), ("b", 2)]);
         store
-            .record_history(&SignedHead::sign(&key, origin(), 1, old, 0))
+            .record_history(&SignedHead::sign(&key, origin(), 1, old, 0), 0)
             .unwrap();
         store
             .put_head(
@@ -332,7 +393,7 @@ mod tests {
         assert!(trie.is_complete(new).unwrap());
 
         // Once history is pruned, the old root's private nodes go.
-        store.prune_history(&origin(), 2).unwrap();
+        store.prune_history_before(&origin(), 1).unwrap();
         let stats = store.gc_trie().unwrap();
         assert!(stats.nodes > 0);
         assert!(!store.has_node(&old).unwrap());
@@ -387,6 +448,49 @@ mod tests {
         assert!(store.blob(&fresh).unwrap().is_none());
     }
 
+    /// CAS files no row accounts for are reclaimed, once they are old enough
+    /// to be leftovers rather than a write in progress.
+    ///
+    /// A fetch that fails verification leaves a payload and an outboard with no
+    /// `blobs` row, and the row sweeps walk rows — so without this the disk
+    /// only ever grows. The payload of a live object is written before its row,
+    /// which is why the horizon is the same one content GC uses.
+    #[test]
+    fn stray_cas_files_are_swept_once_they_are_old_enough() {
+        let (_d, store) = store();
+        let live = store.ingest_bytes(&vec![7u8; 100_000], 0).unwrap();
+        let stale = Hash::new(b"a fetch that never verified");
+        let fresh = Hash::new(b"a fetch still running");
+        for root in [&stale, &fresh] {
+            let path = store.blob_path(root);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"leftovers").unwrap();
+            std::fs::write(store.outboard_path(root), b"leftovers").unwrap();
+        }
+        // Something in the directory that is not named for an object at all.
+        let stranger = store.cas_dir().join("ab").join("README");
+        std::fs::create_dir_all(stranger.parent().unwrap()).unwrap();
+        std::fs::write(&stranger, b"not ours").unwrap();
+
+        // A horizon in the past leaves everything: every file was written now.
+        assert_eq!(store.gc_orphans(0).unwrap(), 0);
+        assert!(store.blob_path(&stale).exists());
+
+        // A horizon in the future takes the two payloads and their outboards,
+        // and nothing that a row or a name speaks for.
+        let horizon = synch_core::now_ns() + 60 * 1_000_000_000;
+        assert_eq!(store.gc_orphans(horizon).unwrap(), 4);
+        for root in [&stale, &fresh] {
+            assert!(!store.blob_path(root).exists());
+            assert!(!store.outboard_path(root).exists());
+        }
+        assert!(store.blob_path(&live).exists(), "a file with a row stays");
+        assert!(stranger.exists(), "and so does a file that is not ours");
+
+        // The full pass reports what it took.
+        assert_eq!(store.gc(0).unwrap().orphans, 0);
+    }
+
     #[test]
     fn history_pruning_keeps_the_current_heads_and_fork_evidence() {
         // §5.4 prunes old roots by retention; §3.4 and §4.4 make same-seq
@@ -398,9 +502,12 @@ mod tests {
         let fork_b = SignedHead::sign(&key, origin(), 2, Hash([3u8; 32]), 200);
         let current = SignedHead::sign(&key, origin(), 3, Hash([4u8; 32]), 300);
         for head in [&old, &fork_a, &fork_b, &current] {
-            store.record_history(head).unwrap();
+            // Received here when it was signed, which is what retention reads.
+            store.record_history(head, head.created_at).unwrap();
         }
-        store.put_head(Slot::Complete, &current, 0, 0).unwrap();
+        store
+            .put_head(Slot::Complete, &current, current.created_at, 0)
+            .unwrap();
 
         // A horizon past every row: the plain old root goes, the current head
         // stays because it is current, and both fork rows stay because the
@@ -422,15 +529,43 @@ mod tests {
         assert!(store.equivocations().unwrap().is_empty());
     }
 
+    /// A head dated at the end of time is pruned like any other.
+    ///
+    /// `created_at` is signed but is the signer's own choice and is never
+    /// clamped, so retention that read it would leave a row — and every trie
+    /// node reachable from its root — permanent on every peer that took it.
+    /// What ages a row out is when this node recorded it.
+    #[test]
+    fn a_head_dated_at_the_end_of_time_still_ages_out() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let liar = SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), i64::MAX);
+        let current = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), i64::MAX);
+        store.record_history(&liar, 100).unwrap();
+        store.put_head(Slot::Complete, &current, 200, 0).unwrap();
+
+        // Inside the horizon it stays, like any recently received row.
+        assert_eq!(store.prune_history_before(&origin(), 50).unwrap(), 0);
+        // Past it, the signed date buys nothing.
+        assert_eq!(store.prune_history_before(&origin(), 150).unwrap(), 1);
+        let kept: Vec<u64> = store
+            .head_history(&origin())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.seq)
+            .collect();
+        assert_eq!(kept, vec![2], "only the current head is left");
+    }
+
     #[test]
     fn a_fork_at_the_current_seq_is_never_pruned() {
         let (_d, store) = store();
         let key = SecretKey::generate();
         let a = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), 100);
         let b = SignedHead::sign(&key, origin(), 2, Hash([3u8; 32]), 100);
-        store.record_history(&a).unwrap();
-        store.record_history(&b).unwrap();
-        store.put_head(Slot::Complete, &a, 0, 0).unwrap();
+        store.record_history(&a, a.created_at).unwrap();
+        store.record_history(&b, b.created_at).unwrap();
+        store.put_head(Slot::Complete, &a, a.created_at, 0).unwrap();
 
         // The origin has not published past the forked seq, so no horizon
         // drops the evidence.
@@ -444,13 +579,13 @@ mod tests {
         assert!(store.history_origins().unwrap().is_empty());
         let key = SecretKey::generate();
         store
-            .record_history(&SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0))
+            .record_history(&SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0), 0)
             .unwrap();
         assert_eq!(store.history_origins().unwrap(), vec![origin()]);
     }
 
     #[test]
-    fn full_gc_reports_both_sweeps() {
+    fn full_gc_reports_every_sweep() {
         let (_d, store) = store();
         let trie = Trie::new(&store);
         trie.insert(Hash::EMPTY, b"k", &vec![7u8; 500]).unwrap();
@@ -459,5 +594,8 @@ mod tests {
         assert!(stats.nodes > 0);
         assert_eq!(stats.values, 1);
         assert_eq!(stats.blobs, 1);
+        // The content sweep took the row and its files together, so the file
+        // sweep behind it finds nothing left over.
+        assert_eq!(stats.orphans, 0);
     }
 }

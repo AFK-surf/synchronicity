@@ -50,6 +50,14 @@ pub enum HeadOutcome {
     Unbound,
     /// The head is not strictly greater than what we already hold.
     NotNewer,
+    /// The origin already has [`MAX_RETAINED_FORKS`] roots on record at this
+    /// seq, and this is another one (§4.4).
+    ///
+    /// Refused outright rather than retained: past the cap a further root is no
+    /// more evidence than the two that already prove the equivocation, and the
+    /// rows it would add are exempt from retention until the origin publishes
+    /// past the forked seq — which an origin flooding one seq never does.
+    ForkFlood,
     /// The head was adopted as pending and its trie must be fetched.
     Pending,
     /// The head was adopted and its trie was already present, so the complete
@@ -211,6 +219,21 @@ impl Syncer {
         Ok(self.store.observed_head(&own)?.map(|o| o.seq))
     }
 
+    /// The full signed heads for the origins a peer asked about (§5.1).
+    ///
+    /// Only complete heads are handed out: what this advertises is a head whose
+    /// trie this node can serve, and the pending slot's is by definition one it
+    /// cannot.
+    pub fn heads_for(&self, origins: &[OriginId]) -> Result<Vec<SignedHead>> {
+        let mut out = Vec::new();
+        for origin in origins {
+            if let Some(head) = self.store.head(origin, Slot::Complete)? {
+                out.push(head.head);
+            }
+        }
+        Ok(out)
+    }
+
     /// Offers a head for adoption, applying the full §5.2 acceptance rule.
     pub fn offer_head(&self, head: &SignedHead, now: i64) -> Result<HeadOutcome> {
         // 1. The signature must verify under the key that claims to have made it.
@@ -228,25 +251,29 @@ impl Syncer {
         // the pending slot, so the lower one clobbered the higher and the
         // higher survived only in `head_history` with nothing to re-drive it.
         let outcome = self.store.transaction(|txn| -> Result<HeadOutcome> {
-            // Verified heads are provable history and fork evidence even
-            // when they lose the ordering comparison, so they are retained
-            // either way (§4.4) — but only up to a point. Same-seq forks
-            // are exempt from `root_retention` until the origin publishes
-            // past the forked seq, so a member signing an unlimited number
-            // of roots at one seq bought permanent, unprunable growth on
-            // every peer, surviving even `trust rm`. Two roots prove the
-            // equivocation; the rest add nothing but rows.
-            if txn.fork_width(&head.origin, head.seq)? < MAX_RETAINED_FORKS
-                || txn.head_history_has(&head.origin, head.seq, &head.root)?
+            // Same-seq forks are exempt from `root_retention` until the
+            // origin publishes past the forked seq, so a member signing an
+            // unlimited number of roots at one seq would buy permanent,
+            // unprunable growth on every peer, surviving even `trust rm`.
+            // Two roots prove the equivocation; past the cap the head is
+            // refused before anything is written. Suppressing only its
+            // history row would not do: `put_head` records the history the
+            // slot points at, so a head that reaches the slot always brings
+            // its row with it.
+            if txn.fork_width(&head.origin, head.seq)? >= MAX_RETAINED_FORKS
+                && !txn.head_history_has(&head.origin, head.seq, &head.root)?
             {
-                txn.record_history(head)?;
-            } else {
                 tracing::warn!(
                     origin = %head.origin,
                     seq = head.seq,
-                    "ignoring further same-seq forks: equivocation is already proven"
+                    "refusing further same-seq forks: equivocation is already proven"
                 );
+                return Ok(HeadOutcome::ForkFlood);
             }
+            // Verified heads are provable history and fork evidence even
+            // when they lose the ordering comparison, so they are retained
+            // either way (§4.4).
+            txn.record_history(head, now)?;
 
             // 3. (seq, root) must be strictly greater, lexicographically.
             //    Strictly greater on seq alone would not converge: two
@@ -259,8 +286,8 @@ impl Syncer {
             txn.put_head(Slot::Pending, head, now, now)?;
             Ok(HeadOutcome::Pending)
         })?;
-        if outcome == HeadOutcome::NotNewer {
-            return Ok(HeadOutcome::NotNewer);
+        if !outcome.accepted() {
+            return Ok(outcome);
         }
         if self.try_promote(&head.origin, now)? {
             Ok(HeadOutcome::Completed)
@@ -400,47 +427,38 @@ impl Syncer {
                 let store = self.store.clone();
                 let requested = missing.nodes.clone();
                 learned += crate::blocking::offload(move || {
-                    let mut stored = 0usize;
-                    for (hash, bytes) in &response.nodes {
-                        // Verify each node against the hash it was requested
-                        // by. A malicious or corrupt peer can withhold, never
-                        // inject.
-                        let actual = TrieNode::hash_of_encoded(bytes).map_err(|_| {
-                            EngineError::Net(NetError::NodeHashMismatch { expected: *hash })
-                        })?;
-                        if actual != *hash {
-                            return Err(EngineError::Net(NetError::NodeHashMismatch {
-                                expected: *hash,
-                            }));
-                        }
-                        if !requested.contains(hash) {
-                            return Err(EngineError::Net(NetError::Unexpected(format!(
-                                "peer served unrequested trie node {hash}"
-                            ))));
-                        }
-                        synch_mpt::NodeStore::put_node(store.as_ref(), hash, bytes)?;
-                        stored += 1;
-                    }
-                    Ok(stored)
+                    take_served(
+                        &requested,
+                        &response.nodes,
+                        "node",
+                        |bytes| TrieNode::hash_of_encoded(bytes).ok(),
+                        |expected| NetError::NodeHashMismatch { expected },
+                        |hash, bytes| {
+                            Ok(synch_mpt::NodeStore::put_node(store.as_ref(), hash, bytes)?)
+                        },
+                    )
                 })
                 .await?;
             }
             if !missing.values.is_empty() {
                 let response = client.get_values(&missing.values).await?;
                 let store = self.store.clone();
+                let requested = missing.values.clone();
                 learned += crate::blocking::offload(move || {
-                    let mut stored = 0usize;
-                    for (hash, bytes) in &response.values {
-                        let actual = synch_core::Hash::new(bytes);
-                        if actual != *hash {
-                            return Err(EngineError::Net(NetError::ValueHashMismatch {
-                                expected: *hash,
-                            }));
-                        }
-                        synch_mpt::NodeStore::put_value(store.as_ref(), hash, bytes)?;
-                        stored += 1;
-                    }
-                    Ok(stored)
+                    take_served(
+                        &requested,
+                        &response.values,
+                        "value",
+                        |bytes| Some(synch_core::Hash::new(bytes)),
+                        |expected| NetError::ValueHashMismatch { expected },
+                        |hash, bytes| {
+                            Ok(synch_mpt::NodeStore::put_value(
+                                store.as_ref(),
+                                hash,
+                                bytes,
+                            )?)
+                        },
+                    )
                 })
                 .await?;
             }
@@ -615,7 +633,9 @@ impl Syncer {
                     report.heads_accepted += 1;
                     report.tries_completed += 1;
                 }
-                HeadOutcome::BadSignature | HeadOutcome::Unbound => report.heads_rejected += 1,
+                HeadOutcome::BadSignature | HeadOutcome::Unbound | HeadOutcome::ForkFlood => {
+                    report.heads_rejected += 1
+                }
                 HeadOutcome::NotNewer => {}
             }
         }
@@ -648,6 +668,46 @@ impl Syncer {
     }
 }
 
+/// Verifies one batch of what a peer served and commits it, refusing anything
+/// that was not asked for.
+///
+/// Two things are checked and both are containment: a payload has to hash to the
+/// hash it was requested by, and it has to be one of the hashes this walk asked
+/// for. Without the second, a peer answering every request with `missing` plus
+/// one self-consistent pair of its own counts as progress on every round — the
+/// unproductive counter never fires, the fetch loop never ends, and the junk
+/// lands in the trie tables.
+///
+/// Nodes and values differ only in how a payload is hashed, where it is stored
+/// and which error names it, so the checks live here rather than in two loops
+/// that have to be kept in step.
+///
+/// Returns how many were stored.
+fn take_served(
+    requested: &[synch_core::Hash],
+    served: &[(synch_core::Hash, Vec<u8>)],
+    what: &str,
+    hash_of: impl Fn(&[u8]) -> Option<synch_core::Hash>,
+    mismatch: impl Fn(synch_core::Hash) -> NetError,
+    put: impl Fn(&synch_core::Hash, &[u8]) -> Result<()>,
+) -> Result<usize> {
+    let mut stored = 0usize;
+    for (hash, bytes) in served {
+        if !requested.contains(hash) {
+            return Err(EngineError::Net(NetError::Unexpected(format!(
+                "peer served unrequested trie {what} {hash}"
+            ))));
+        }
+        // A malicious or corrupt peer can withhold, never inject.
+        if hash_of(bytes) != Some(*hash) {
+            return Err(EngineError::Net(mismatch(*hash)));
+        }
+        put(hash, bytes)?;
+        stored += 1;
+    }
+    Ok(stored)
+}
+
 /// The serve side's view of the reconciler (§5.2).
 ///
 /// `synch-net` answers `Hello` and `HeadPush` by calling through this, so the
@@ -678,6 +738,10 @@ impl HeadSink for Syncer {
         Syncer::offer_head(self, head, now)
             .map(|_| ())
             .map_err(to_net)
+    }
+
+    fn heads_for(&self, origins: &[OriginId]) -> std::result::Result<Vec<SignedHead>, NetError> {
+        Syncer::heads_for(self, origins).map_err(to_net)
     }
 }
 
@@ -807,6 +871,100 @@ mod tests {
         assert_eq!(store.pending_head(&origin).unwrap(), Some(head));
         // The complete slot is untouched while a fetch is in progress.
         assert_eq!(store.complete_head(&origin).unwrap(), None);
+    }
+
+    /// A member signing endlessly at one seq stops being recorded.
+    ///
+    /// Same-seq forks outlive `root_retention` until the origin publishes past
+    /// the forked seq, which an origin flooding one seq never does. Two roots
+    /// prove the equivocation; past the cap the head is refused before anything
+    /// is written, so neither the history nor the slot grows.
+    #[test]
+    fn same_seq_forks_stop_being_taken_at_the_cap() {
+        let (_d, store, key, origin) = setup();
+        let syncer = Syncer::new(store.clone());
+        // Ascending roots, so each one supersedes the last and would be adopted
+        // on its merits were the fork not already proven.
+        for i in 1..=MAX_RETAINED_FORKS as u8 {
+            let head = SignedHead::sign(&key, origin.clone(), 1, Hash([i; 32]), 0);
+            assert!(
+                syncer.offer_head(&head, 0).unwrap().accepted(),
+                "fork {i} is evidence and is taken"
+            );
+        }
+        assert_eq!(store.fork_width(&origin, 1).unwrap(), MAX_RETAINED_FORKS);
+
+        for i in 1..=4u8 {
+            let flood = SignedHead::sign(
+                &key,
+                origin.clone(),
+                1,
+                Hash([MAX_RETAINED_FORKS as u8 + i; 32]),
+                0,
+            );
+            assert_eq!(
+                syncer.offer_head(&flood, 0).unwrap(),
+                HeadOutcome::ForkFlood
+            );
+        }
+        assert_eq!(
+            store.fork_width(&origin, 1).unwrap(),
+            MAX_RETAINED_FORKS,
+            "the retained set stops at the cap"
+        );
+        assert_eq!(
+            store.head_floor(&origin).unwrap().unwrap().1,
+            Hash([MAX_RETAINED_FORKS as u8; 32]),
+            "and no refused fork reached a slot"
+        );
+
+        // A head at a later seq is the origin moving on, and is taken normally.
+        let next = SignedHead::sign(&key, origin.clone(), 2, Hash([1u8; 32]), 0);
+        assert!(syncer.offer_head(&next, 0).unwrap().accepted());
+    }
+
+    /// A peer may only answer with what it was asked for.
+    ///
+    /// A self-consistent pair nobody requested counts as progress if it is
+    /// taken: the unproductive counter resets on every round, the fetch never
+    /// gives up on the peer, and the junk is written to the trie tables. Values
+    /// are held to it exactly as nodes are, which is why one helper does both.
+    #[test]
+    fn a_peer_may_not_answer_with_what_was_not_asked_for() {
+        let wanted = Hash::new(b"wanted");
+        let junk = b"nobody asked for this".to_vec();
+        let unrequested = Hash::new(&junk);
+        let stored = std::cell::RefCell::new(Vec::new());
+        let take = |requested: &[Hash], served: &[(Hash, Vec<u8>)]| {
+            take_served(
+                requested,
+                served,
+                "value",
+                |bytes| Some(Hash::new(bytes)),
+                |expected| NetError::ValueHashMismatch { expected },
+                |hash, _| {
+                    stored.borrow_mut().push(*hash);
+                    Ok(())
+                },
+            )
+        };
+
+        let err = take(&[wanted], &[(unrequested, junk.clone())])
+            .expect_err("an unrequested value is refused");
+        assert!(err.to_string().contains("unrequested"), "{err}");
+        assert!(stored.borrow().is_empty(), "and nothing was written");
+
+        // What was asked for is taken, and a payload that does not hash to the
+        // hash it was requested by is still refused on its own terms.
+        assert_eq!(take(&[unrequested], &[(unrequested, junk)]).unwrap(), 1);
+        assert!(matches!(
+            take(
+                &[unrequested],
+                &[(unrequested, b"different bytes".to_vec())]
+            ),
+            Err(EngineError::Net(NetError::ValueHashMismatch { .. }))
+        ));
+        assert_eq!(*stored.borrow(), vec![unrequested]);
     }
 
     #[test]

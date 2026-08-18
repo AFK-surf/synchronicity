@@ -51,6 +51,32 @@ pub struct EntryRow {
     pub symlink_target: Option<String>,
 }
 
+/// The smallest string that sorts above every path carrying `prefix`.
+///
+/// Paths are compared as bytes, and `prefix` is a prefix of a string exactly
+/// when the string sorts in `[prefix, successor)` — so this is what turns a
+/// prefix listing into one range scan of the index. The successor is the
+/// prefix with its last character raised by one, carrying into the character
+/// before it where there is nothing above (`U+10FFFF`), and skipping the
+/// surrogate block, which no `char` occupies. A prefix made only of `U+10FFFF`
+/// has no successor and no upper bound: nothing sorts above it either.
+pub(crate) fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut head = prefix.to_string();
+    while let Some(last) = head.pop() {
+        let raised = match last as u32 + 1 {
+            // The surrogate range is not a scalar value; the next character
+            // above `U+D7FF` is `U+E000`.
+            code @ 0xd800..=0xdfff => 0xe000.max(code),
+            code => code,
+        };
+        if let Some(next) = char::from_u32(raised) {
+            head.push(next);
+            return Some(head);
+        }
+    }
+    None
+}
+
 fn kind_to_int(kind: EntryKind) -> i64 {
     match kind {
         EntryKind::File => 0,
@@ -182,14 +208,15 @@ impl Store {
         start_after: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<EntryRow>> {
-        let mut filter = String::from("WHERE space = ?1 AND path >= ?2 AND path < ?3");
-        // `prefix || 0x7f` bounds the LIKE-free prefix scan from above.
-        let upper = format!("{prefix}\u{10ffff}");
-        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(space.to_string()),
-            Box::new(prefix.to_string()),
-            Box::new(upper),
-        ];
+        let mut filter = String::from("WHERE space = ?1 AND path >= ?2");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(space.to_string()), Box::new(prefix.to_string())];
+        // The prefix's byte successor bounds the scan from above, so the index
+        // is walked over the prefix's range alone.
+        if let Some(upper) = prefix_upper_bound(prefix) {
+            args.push(Box::new(upper));
+            filter.push_str(&format!(" AND path < ?{}", args.len()));
+        }
         if let Some(origin) = origin {
             args.push(Box::new(origin.canonical()));
             filter.push_str(&format!(" AND origin_id = ?{}", args.len()));
@@ -902,33 +929,15 @@ fn apply_change(
     Ok(())
 }
 
-/// How far ahead of this node's clock a peer's `mtime_ns` may sit.
+/// Materializes one trie leaf into `entries`.
 ///
-/// One year, which is slack for clock skew and for genuinely odd timestamps,
-/// and nowhere near enough to win a selection permanently.
-const MTIME_SKEW_CEILING_NS: i64 = 365 * 24 * 60 * 60 * 1_000_000_000;
-
-/// Clamps a peer-supplied modification time to something this node's clock can
-/// vouch for.
-///
-/// `mtime_ns` is not just metadata: it is the first and dominant component of
-/// the order `VersionPolicy::Newest` maximizes across **all** origins for a
-/// `(space, path)` (§8), and `newest` is the default. `space` is a plain string
-/// inside the trie key, so any member may publish `f:<space>/<path>` for any
-/// space. Unclamped, one member republishing every visible path at
-/// `mtime_ns = i64::MAX` wins selection everywhere — with its own content, or
-/// with a tombstone, which deletes the file from every `newest` mirror in the
-/// cluster. §12's "a malicious origin publishing garbage about its own files
-/// only pollutes its own namespace" does not hold while the unified tree merges
-/// namespaces by `(space, path)`.
-///
-/// Clamped rather than refused: a wrong clock is ordinary, and dropping the
-/// entry would lose a real file. Clamping costs the liar its advantage while
-/// leaving honest skew intact.
-fn clamp_mtime(mtime_ns: i64, now: i64) -> i64 {
-    mtime_ns.min(now.saturating_add(MTIME_SKEW_CEILING_NS))
-}
-
+/// The row is the leaf, verbatim. Every column here is what the origin
+/// published and what every other node holding this trie also materializes:
+/// two nodes with the same trie must produce the same `entries`, and
+/// `doctor --rebuild` must produce what the original materialization did, or
+/// version selection stops being a function of the data (§8). A peer's
+/// `mtime_ns` is judged where it is *used* — [`VersionSet::select`] orders
+/// under the reader's own clock — not where it is stored.
 fn put_entry_in(
     conn: &rusqlite::Connection,
     origin: &OriginId,
@@ -950,7 +959,7 @@ fn put_entry_in(
             path,
             kind_to_int(entry.kind),
             entry.size as i64,
-            clamp_mtime(entry.mtime_ns, synch_core::now_ns()),
+            entry.mtime_ns,
             entry.unix_mode.map(|m| m as i64),
             entry.content.map(|h| h.as_bytes().to_vec()),
             entry.seq as i64,
@@ -1375,5 +1384,70 @@ mod tests {
         assert_eq!(peers[0].last_sync, 30);
         assert!(peers[0].latency_ewma_us > 1000 && peers[0].latency_ewma_us < 2000);
         assert_eq!(peers[0].last_addr, Some(vec![1, 2]));
+    }
+
+    /// A listing must not stop short of a path that sorts high.
+    ///
+    /// A prefix scan is bounded by the prefix's byte successor, so every path
+    /// carrying the prefix is inside it — including one whose next character is
+    /// the highest there is. What the mirror's unlink sweep reads is this
+    /// listing, so a path missing from it is a file the sweep would remove.
+    #[test]
+    fn a_prefix_listing_reaches_every_path_under_it() {
+        assert_eq!(prefix_upper_bound("a").as_deref(), Some("b"));
+        assert_eq!(prefix_upper_bound("az").as_deref(), Some("a{"));
+        assert_eq!(prefix_upper_bound("é").as_deref(), Some("ê"));
+        // The character above `U+D7FF` is `U+E000`: the surrogate block is not
+        // a scalar value.
+        assert_eq!(prefix_upper_bound("\u{d7ff}").as_deref(), Some("\u{e000}"));
+        // `U+10FFFF` has nothing above it, so the carry goes left, and a prefix
+        // made only of it has no upper bound at all.
+        assert_eq!(prefix_upper_bound("a\u{10ffff}").as_deref(), Some("b"));
+        assert_eq!(prefix_upper_bound("\u{10ffff}"), None);
+        assert_eq!(prefix_upper_bound(""), None);
+
+        let (_d, store) = store();
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        for path in [
+            "docs/a.txt",
+            "docs/\u{10ffff}.txt",
+            "docs/\u{10ffff}\u{10ffff}",
+            "elsewhere.txt",
+        ] {
+            store
+                .put_entry(
+                    &origin,
+                    "s",
+                    path,
+                    &FileEntry::file(1, 0, Hash::new(path.as_bytes()), 1),
+                )
+                .unwrap();
+        }
+        let listed: Vec<String> = store
+            .list_entries(None, "s", "docs/", None, None)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                "docs/a.txt".to_string(),
+                "docs/\u{10ffff}.txt".to_string(),
+                "docs/\u{10ffff}\u{10ffff}".to_string(),
+            ]
+        );
+        assert_eq!(
+            store.unified_paths("s", "docs/", None, None).unwrap(),
+            listed
+        );
+        // And a prefix with no successor still lists what carries it.
+        assert_eq!(
+            store
+                .list_entries(None, "s", "\u{10ffff}", None, None)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }

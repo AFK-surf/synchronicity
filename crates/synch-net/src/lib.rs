@@ -15,6 +15,7 @@ pub mod error;
 pub mod frame;
 pub mod mpt;
 pub mod rekor;
+mod serve;
 /// Test machinery — a simulated signed zone, transparency log and TUF
 /// repository. Behind the non-default `sim` feature: it is 1300 lines with
 /// no place in a shipped binary, and no business being part of this crate's
@@ -22,16 +23,18 @@ pub mod rekor;
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub mod sim;
+#[cfg(test)]
+mod testing;
 pub mod tuf;
 pub mod x509;
 pub mod zonecert;
 
-pub use blob::{BlobClient, BlobProtocol, Proof, ProofOutcome, Slice};
+pub use blob::{proof_window, BlobClient, BlobProtocol, Proof, ProofOutcome, Slice};
 pub use dns::{
     DnssecResolver, MemberRecord, MemberResolver, MemberSet, RecordError, RekorPolicy,
     ResolverOptions,
 };
-pub use endpoint::{Net, NetOptions};
+pub use endpoint::{Net, NetOptions, DIAL_TIMEOUT, REQUEST_TIMEOUT};
 pub use error::{NetError, Result};
 pub use mpt::{HeadExchange, HeadSink, MptClient, MptProtocol, NodesResponse, ValuesResponse};
 pub use rekor::{ProofError, RekorProof};

@@ -874,7 +874,7 @@ mod tests {
                 let root = trie.insert(Hash::EMPTY, b"k", b"v")?;
                 let head = synch_core::SignedHead::sign(&key, origin.clone(), 1, root, 0);
                 txn.put_head(crate::heads::Slot::Complete, &head, 0, 0)?;
-                txn.record_history(&head)?;
+                txn.record_history(&head, 0)?;
                 Err(StoreError::invalid("boom"))
             })
             .unwrap_err()
@@ -895,7 +895,7 @@ mod tests {
                 let root = trie.insert(Hash::EMPTY, b"k", b"v")?;
                 let head = synch_core::SignedHead::sign(&key, origin.clone(), 1, root, 0);
                 txn.put_head(crate::heads::Slot::Complete, &head, 0, 0)?;
-                txn.record_history(&head)?;
+                txn.record_history(&head, 0)?;
                 Ok(root)
             })
             .unwrap();

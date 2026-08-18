@@ -183,9 +183,12 @@ impl Store {
     }
 
     /// Records a head in `head_history`, keeping its signature.
-    pub fn record_history(&self, head: &SignedHead) -> Result<()> {
+    ///
+    /// `now` is when this node received the head, which is what retention
+    /// measures age from (§5.4).
+    pub fn record_history(&self, head: &SignedHead, now: i64) -> Result<()> {
         let conn = self.conn();
-        record_history_in(&conn, head)
+        record_history_in(&conn, head, now)
     }
 
     /// How many distinct roots an origin has retained at one seq.
@@ -235,44 +238,24 @@ impl Store {
     /// Equivocation only harms the equivocator's own published view, but it is
     /// reported loudly (§4.4) with both signed heads retained as proof.
     pub fn equivocations(&self) -> Result<Vec<Equivocation>> {
-        self.equivocations_matching(None)
-    }
-
-    /// The same, for one origin.
-    ///
-    /// `prune_history_before` runs once per origin per maintenance pass and
-    /// needs only that origin's forks; calling the unscoped version there made
-    /// each pass do a full-table group-by *and* an unfiltered per-origin
-    /// history read for every origin in the cluster — an N+1 inside an N+1.
-    pub fn equivocations_for(&self, origin: &OriginId) -> Result<Vec<Equivocation>> {
-        self.equivocations_matching(Some(origin))
-    }
-
-    fn equivocations_matching(&self, only: Option<&OriginId>) -> Result<Vec<Equivocation>> {
         let conn = self.conn();
-        let scope = only.map(|o| o.canonical());
         let mut stmt = conn.prepare(
             "SELECT origin_id, seq, COUNT(DISTINCT root) AS roots FROM head_history
-             WHERE ?1 IS NULL OR origin_id = ?1
              GROUP BY origin_id, seq HAVING roots > 1 ORDER BY origin_id, seq",
         )?;
-        let rows = stmt.query_map(params![scope], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as u64,
-                row.get::<_, i64>(2)? as usize,
-            ))
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
         })?;
         let mut pairs = Vec::new();
         for row in rows {
-            let (origin, seq, count) = row?;
-            pairs.push((origin_column(origin, "head_history.origin_id")?, seq, count));
+            let (origin, seq) = row?;
+            pairs.push((origin_column(origin, "head_history.origin_id")?, seq));
         }
         drop(stmt);
         drop(conn);
 
         let mut out = Vec::new();
-        for (origin, seq, _count) in pairs {
+        for (origin, seq) in pairs {
             let heads: Vec<SignedHead> = self
                 .head_history(&origin)?
                 .into_iter()
@@ -281,23 +264,6 @@ impl Store {
             out.push(Equivocation { origin, seq, heads });
         }
         Ok(out)
-    }
-
-    /// Deletes every history row for an origin below `keep_from_seq`,
-    /// unconditionally.
-    ///
-    /// The blunt version, and the distinction matters: this honours **none** of
-    /// the three exemptions [`Store::prune_history_before`] documents — not the
-    /// current heads, not same-seq fork evidence, not the retention window. It
-    /// is a test and maintenance escape hatch for "drop this history now", and
-    /// the retention path in the maintenance loop must keep using
-    /// `prune_history_before`. Using this one there would delete the rows GC
-    /// marks the live trie from.
-    pub fn prune_history(&self, origin: &OriginId, keep_from_seq: u64) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM head_history WHERE origin_id = ?1 AND seq < ?2",
-            params![origin.canonical(), keep_from_seq as i64],
-        )?)
     }
 
     /// Every origin that has retained history.
@@ -330,55 +296,61 @@ impl Store {
     /// - **Anything newer than `before`**, which is the retention window
     ///   itself.
     ///
-    /// Age is the head's own `created_at`, which is the only time this table
-    /// carries. For this node's own history that is this node's clock; for a
-    /// replicated origin it is the origin's, which is the same member-supplied
-    /// metadata §8 and §12 already accept for `mtime_ns`.
+    /// Age is `recorded_at`: when *this node* took the row. `created_at` is
+    /// signed but is the signer's own unclamped choice, so keying retention on
+    /// it would let an origin date a head at the end of time and make both the
+    /// row and every trie node reachable from its root permanent here (§5.4).
+    /// The same goes for the complete head, whose `received_at` is what says
+    /// whether the cluster has visibly moved past a fork.
     ///
     /// Returns how many rows were dropped.
     pub fn prune_history_before(&self, origin: &OriginId, before: i64) -> Result<usize> {
-        let complete = self.complete_head(origin)?;
-        let pending = self.pending_head(origin)?;
-        let current_seq = complete.as_ref().map(|h| h.seq).unwrap_or(0);
-        let current_created = complete.as_ref().map(|h| h.created_at).unwrap_or(i64::MIN);
-        // A seq with more than one retained root is a fork, and both sides of
-        // it are evidence.
-        let forked: Vec<u64> = self
-            .equivocations_for(origin)?
-            .into_iter()
-            .map(|e| e.seq)
-            .collect();
-        let moved_past_forks = current_created < before;
+        // Reads and deletes in one immediate transaction, over one snapshot:
+        // deciding what is doomed outside it lets a writer on the blocking pool
+        // make a row current in between, and the row `heads` points at would go
+        // with the rest of the pass.
+        self.with_immediate_tx(|tx| {
+            let complete = head_in(tx, origin, Slot::Complete)?;
+            let pending = head_in(tx, origin, Slot::Pending)?;
+            let current_seq = complete.as_ref().map(|h| h.head.seq).unwrap_or(0);
+            let current_recorded = complete.as_ref().map(|h| h.received_at).unwrap_or(i64::MIN);
+            // A seq with more than one retained root is a fork, and both sides
+            // of it are evidence.
+            let forked = forked_seqs_in(tx, origin)?;
+            let moved_past_forks = current_recorded < before;
 
-        let mut doomed = Vec::new();
-        for head in self.head_history(origin)? {
-            if head.created_at >= before {
-                continue;
-            }
-            let is_current = [complete.as_ref(), pending.as_ref()]
+            let mut pruned = 0;
+            for (seq, root, recorded_at) in history_receipts_in(tx, origin)? {
+                if recorded_at >= before {
+                    continue;
+                }
+                let is_current = [
+                    complete.as_ref().map(|c| &c.head),
+                    pending.as_ref().map(|p| &p.head),
+                ]
                 .into_iter()
                 .flatten()
-                .any(|h| h.seq == head.seq && h.root == head.root);
-            if is_current {
-                continue;
-            }
-            if forked.contains(&head.seq) && !(current_seq > head.seq && moved_past_forks) {
-                continue;
-            }
-            doomed.push((head.seq, head.root));
-        }
-
-        let pruned = doomed.len();
-        self.with_tx(|tx| {
-            for (seq, root) in &doomed {
-                tx.execute(
-                    "DELETE FROM head_history WHERE origin_id = ?1 AND seq = ?2 AND root = ?3",
-                    params![origin.canonical(), *seq as i64, root.as_bytes().to_vec()],
+                .any(|h| h.seq == seq && h.root == root);
+                if is_current {
+                    continue;
+                }
+                if forked.contains(&seq) && !(current_seq > seq && moved_past_forks) {
+                    continue;
+                }
+                // The exemption again, as a condition of the delete rather
+                // than of the decision: a row a slot points at is not deletable
+                // from here whatever this pass concluded.
+                pruned += tx.execute(
+                    "DELETE FROM head_history
+                      WHERE origin_id = ?1 AND seq = ?2 AND root = ?3
+                        AND NOT EXISTS (
+                              SELECT 1 FROM heads h
+                               WHERE h.origin_id = ?1 AND h.seq = ?2 AND h.root = ?3)",
+                    params![origin.canonical(), seq as i64, root.as_bytes().to_vec()],
                 )?;
             }
-            Ok(())
-        })?;
-        Ok(pruned)
+            Ok(pruned)
+        })
     }
 
     /// The roots that GC must mark from: every origin's complete and pending
@@ -454,8 +426,8 @@ impl Txn<'_> {
     }
 
     /// Records a head in `head_history`, inside the transaction.
-    pub fn record_history(&self, head: &SignedHead) -> Result<()> {
-        record_history_in(self.conn(), head)
+    pub fn record_history(&self, head: &SignedHead, now: i64) -> Result<()> {
+        record_history_in(self.conn(), head, now)
     }
 
     /// How many distinct roots this origin has retained at one seq, inside the
@@ -502,6 +474,49 @@ fn best_floor(complete: Option<(u64, Hash)>, pending: Option<(u64, Hash)>) -> Op
     }
 }
 
+/// Every retained row for an origin as `(seq, root, recorded_at)`.
+///
+/// What retention reads: the signature and the signed time are of no interest to
+/// it, and the time it does need is not on [`SignedHead`].
+fn history_receipts_in(
+    conn: &rusqlite::Connection,
+    origin: &OriginId,
+) -> Result<Vec<(u64, Hash, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, root, recorded_at FROM head_history
+         WHERE origin_id = ?1 ORDER BY seq DESC, root DESC",
+    )?;
+    let rows = stmt.query_map(params![origin.canonical()], |row| {
+        Ok((
+            row.get::<_, i64>(0)? as u64,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (seq, root, recorded_at) = row?;
+        out.push((seq, hash_column(root, "head_history.root")?, recorded_at));
+    }
+    Ok(out)
+}
+
+/// The seqs at which an origin has more than one retained root.
+fn forked_seqs_in(conn: &rusqlite::Connection, origin: &OriginId) -> Result<Vec<u64>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq FROM head_history WHERE origin_id = ?1
+         GROUP BY seq HAVING COUNT(DISTINCT root) > 1",
+    )?;
+    let rows = stmt.query_map(params![origin.canonical()], |row| {
+        Ok(row.get::<_, i64>(0)? as u64)
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn put_head_in(
     conn: &rusqlite::Connection,
     slot: Slot,
@@ -514,7 +529,7 @@ fn put_head_in(
     // has to remember to record history alongside — which is what the old
     // record-on-arrival-and-again-on-displacement pair of rules was doing by
     // hand, redundantly, at seven call sites.
-    record_history_in(conn, head)?;
+    record_history_in(conn, head, received_at)?;
     conn.execute(
         "INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -533,10 +548,15 @@ fn put_head_in(
     Ok(())
 }
 
-fn record_history_in(conn: &rusqlite::Connection, head: &SignedHead) -> Result<()> {
+fn record_history_in(
+    conn: &rusqlite::Connection,
+    head: &SignedHead,
+    recorded_at: i64,
+) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO head_history (origin_id, seq, root, created_at, signed_by, sig)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO head_history
+           (origin_id, seq, root, created_at, signed_by, sig, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             head.origin.canonical(),
             head.seq as i64,
@@ -544,6 +564,7 @@ fn record_history_in(conn: &rusqlite::Connection, head: &SignedHead) -> Result<(
             head.created_at,
             head.signed_by.as_bytes().to_vec(),
             head.sig.to_bytes().to_vec(),
+            recorded_at,
         ],
     )?;
     Ok(())
@@ -610,7 +631,7 @@ mod tests {
         let b = SignedHead::sign(&key, origin(), 7, Hash([2u8; 32]), 0);
         let c = SignedHead::sign(&key, origin(), 8, Hash([3u8; 32]), 0);
         for h in [&a, &b, &c] {
-            store.record_history(h).unwrap();
+            store.record_history(h, 0).unwrap();
         }
         let found = store.equivocations().unwrap();
         assert_eq!(found.len(), 1);
@@ -627,12 +648,13 @@ mod tests {
         let key = SecretKey::generate();
         for seq in 1..=5u64 {
             let h = SignedHead::sign(&key, origin(), seq, Hash([seq as u8; 32]), 0);
-            store.record_history(&h).unwrap();
+            // Received in seq order, which is what retention reads.
+            store.record_history(&h, seq as i64).unwrap();
         }
         let head = SignedHead::sign(&key, origin(), 6, Hash([6u8; 32]), 0);
-        store.put_head(Slot::Complete, &head, 0, 0).unwrap();
+        store.put_head(Slot::Complete, &head, 10, 0).unwrap();
         let pending = SignedHead::sign(&key, origin(), 7, Hash([7u8; 32]), 0);
-        store.put_head(Slot::Pending, &pending, 0, 0).unwrap();
+        store.put_head(Slot::Pending, &pending, 10, 0).unwrap();
 
         // Seven distinct roots: five recorded directly, plus the two the slots
         // point at — which `put_head` retains, so they are here by
@@ -644,10 +666,40 @@ mod tests {
         // Pending heads must be in the mark set (§5.4).
         assert!(roots.contains(&Hash([7u8; 32])));
 
-        // Pruning below seq 4 drops the first three; seqs 4 and 5 remain, as do
+        // A horizon past the first three drops them; seqs 4 and 5 remain, as do
         // the two the slots point at.
-        assert_eq!(store.prune_history(&origin(), 4).unwrap(), 3);
+        assert_eq!(store.prune_history_before(&origin(), 4).unwrap(), 3);
         assert_eq!(store.head_history(&origin()).unwrap().len(), 4);
+    }
+
+    /// A row a slot points at is never pruned, whatever the horizon says.
+    ///
+    /// `heads` names a `head_history` row and every head read joins the two, so
+    /// the row behind a slot is exempt — checked once when the doomed set is
+    /// chosen, and again as a condition of the delete.
+    #[test]
+    fn a_row_a_slot_points_at_survives_every_prune() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let complete = SignedHead::sign(&key, origin(), 3, Hash([3u8; 32]), 0);
+        let pending = SignedHead::sign(&key, origin(), 4, Hash([4u8; 32]), 0);
+        // Recorded long before any horizon this test uses.
+        store.put_head(Slot::Complete, &complete, 1, 1).unwrap();
+        store.put_head(Slot::Pending, &pending, 1, 1).unwrap();
+        store
+            .record_history(&SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0), 1)
+            .unwrap();
+
+        assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 1);
+        assert_eq!(
+            store.complete_head(&origin()).unwrap(),
+            Some(complete),
+            "the current head is still readable"
+        );
+        assert_eq!(store.pending_head(&origin()).unwrap(), Some(pending));
+        // And a second pass over the same horizon finds nothing left to take.
+        assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 0);
+        assert_eq!(store.head_history(&origin()).unwrap().len(), 2);
     }
 
     #[test]

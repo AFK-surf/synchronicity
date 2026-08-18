@@ -537,7 +537,7 @@ Values     { values: Vec<(Hash, Bytes)>, missing: Vec<Hash> }
 // content is hash-verified regardless, so a wrong hint only wastes a dial. The
 // fetcher falls back to this when it wants a root no local ad covers:
 FindProviders { object_root: Hash }
-Providers  { ads: Vec<(OriginId, BlobAd)> }
+Providers  { ads: Vec<(OriginId, BlobAd)> }                // ≤ 256 ads per answer
 
 // binding introspection: which device keys does the answering peer currently hold
 // bound for an origin? Purely informational within the trusted cluster; this is
@@ -632,11 +632,11 @@ Properties:
   trusted peer, connect if needed, run a full `Hello` push-pull exchange. This repairs
   anything the reactive path missed (dropped connections, simultaneous partitions) and
   is the mechanism that guarantees convergence.
-- **On-connect**: every peer pairing maintains an mpt session (`sync/mpt/1`), and it
-  begins with a `Hello` exchange. Dialing a peer for a blob fetch opens (or reuses)
-  that mpt session alongside `sync/blob/1` — blob fetches double as sync
-  opportunities. `Hello` exists only on the mpt ALPN; the blob ALPN carries nothing
-  but `GetSlice`/`SliceEnd`.
+- **On-connect**: an mpt session (`sync/mpt/1`) begins with a `Hello` exchange, and
+  each ALPN's session is held open and reused across requests for as long as it is
+  live. The two are independent: `Hello` exists only on the mpt ALPN, and the blob
+  ALPN carries nothing but `GetSlice`/`SliceEnd` and `GetProof`/`ProofEnd`, so a
+  blob fetch neither opens nor needs an mpt session.
 
 Expected staleness with push + pull-gossip is `O(log N)` rounds after any partition
 heals; at N ≤ 100 and 30 s rounds this is well under 5 minutes worst-case, typically
@@ -645,11 +645,19 @@ sub-second via push.
 ### 5.4 Trie garbage collection
 
 Old roots are kept for `root_retention` (default 7 days) to serve laggard peers cheap
-diffs and to power `synch log` history (§8). GC is mark-and-sweep in SQLite: mark from
+diffs and to power `synch log` history (§8). Age is measured from when this node
+recorded the row, not from the `created_at` the signer chose: the signed time is
+display metadata, and keying retention on it would let an origin make its rows —
+and every trie node reachable from them — permanent on every peer. GC is mark-and-sweep in SQLite: mark from
 all retained heads (each origin's **complete and pending** heads + retained history
 roots — pending heads must be in the mark set or GC would eat an in-progress
 bootstrap), sweep unmarked
 `trie_nodes`/`trie_values`. Runs incrementally in the maintenance loop.
+
+The same pass sweeps CAS files that no `blobs` row accounts for — what a fetch
+that failed verification leaves behind — using the content retention horizon as
+the cutoff, so a payload written moments before its row is never mistaken for a
+leftover.
 
 ---
 
@@ -856,11 +864,20 @@ content.** What it does do is aggregate:
   individually addressable as `<origin>:<space>/<path>`.
 - **Selection, not resolution**: any read of a bare `<space>/<path>` must pick one
   version, and does so by an explicit, deterministic policy:
-  - `newest` (default) — the version with the greatest `(mtime_ns, content_root,
-    origin)`, a total order, so every node selects the same version from the same
-    assertions. This is presentation, not resolution: nothing is written, no
-    assertion changes, and the losing versions remain first-class and marked.
-    Two trust caveats are inherent and accepted (§12): `mtime_ns` is
+  - `newest` (default) — the greatest `(mtime_ns, content_root, symlink target,
+    origin)` among the path's **live** versions, a total order, so every node
+    selects the same version from the same assertions. A tombstone takes its own
+    origin's version out of the running rather than the path: the path resolves
+    to the newest live version among the remaining origins and is absent only
+    once every publisher has tombstoned it, which is the same rule as "a path
+    exists iff at least one origin publishes a live entry for it" above. This is
+    presentation, not resolution: nothing is written, no assertion changes, and
+    the losing versions remain first-class and marked.
+    The row a node materializes is the trie leaf verbatim, so every component of
+    the order is data every node holds identically; `mtime_ns` is read as no
+    later than the reading node's own clock, which bounds what a stamp can claim
+    to the present instant without making the stored view a function of when it
+    was stored. Two trust caveats are inherent and accepted (§12): `mtime_ns` is
     member-supplied file metadata — a member with a skewed clock or a deliberate
     `touch -d` wins `newest` on every surface until its entries are outranked,
     adopted over, or the member is removed; and determinism holds only over *the
@@ -1160,6 +1177,9 @@ CREATE TABLE heads (
 );
 CREATE TABLE head_history  (origin_id TEXT, seq INTEGER, root BLOB, created_at INTEGER,
                             signed_by BLOB, sig BLOB,    -- sig kept: provable fork/equivocation evidence
+                            recorded_at INTEGER NOT NULL,-- when this node received the row: what
+                                                         -- retention keys on, since created_at is
+                                                         -- the signer's own unclamped choice
                             PRIMARY KEY (origin_id, seq, root)); -- same-seq forks both stored;
                                                                  -- for §8 history + §3.4 evidence,
                                                                  -- pruned by retention
@@ -1335,8 +1355,20 @@ CI (GitHub Actions):
   forward wipe no seq rule prevents; `head_history` retention plus fork-evidence
   surfacing (§3.4) makes it visible. Same-seq forks are detected
   and reported with retained signed proofs (§4.4). A malicious *origin* publishing
-  garbage about its own files only pollutes its own namespace, which the version
-  model already treats as "their claim, not truth".
+  garbage about its own files pollutes its own namespace, which the version model
+  already treats as "their claim, not truth" — but the unified tree (§8) is a
+  merge across namespaces by `(space, path)`, and `space` is a plain string in the
+  trie key any member may publish under. Under `newest`, a member can therefore
+  put its own version of any path in front of every other member's: `mtime_ns` is
+  its own assertion, and while a read orders it as of the reader's clock rather
+  than as of the number published, an entry claiming the present instant is
+  exactly what an honest publish claims. What it cannot do is *remove* another
+  member's file: a tombstone asserts that the publishing origin deleted its copy,
+  so it takes that origin's version out of the running and leaves the path
+  carrying the newest live version among the rest (§8). A space where one
+  member's assertions must not stand in for another's is a space to read under
+  `origin=` or `strict`, which select from one origin's view and refuse
+  divergence respectively.
 - **Resource exhaustion — a trust stance, not a defense**: every peer that can send
   us a request at all is an authorized member (§3.2), and members are extended basic
   trust not to DoS each other. There are therefore **no per-peer rate limits and no
