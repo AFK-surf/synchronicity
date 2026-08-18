@@ -109,15 +109,8 @@ fn the_real_sigstore_chain_verifies_and_yields_the_pin_set() {
     let metadata = fixture_chain_metadata();
     let floor = fixture_number("chain_floor");
     let state = PinState {
-        root: fixture(&format!("root-{floor}.json")),
-        root_chain: Vec::new(),
         root_version: floor,
-        timestamp_version: 0,
-        snapshot_version: 0,
-        targets_version: 0,
-        targets: Vec::new(),
-        trusted_root: Vec::new(),
-        updated_at: 0,
+        ..PinState::anchored(&fixture(&format!("root-{floor}.json")))
     };
     // Verified at the moment the fixture was fetched: a checked-in chain
     // expires, and pinning the clock is what keeps it checkable.
@@ -211,15 +204,8 @@ fn walking_the_repository_finds_the_whole_chain() {
     // And it goes through the ordinary verifier from there, with no
     // dispensation for having been fetched rather than relayed.
     let state = PinState {
-        root: fixture(&format!("root-{floor}.json")),
-        root_chain: Vec::new(),
         root_version: floor,
-        timestamp_version: 0,
-        snapshot_version: 0,
-        targets_version: 0,
-        targets: Vec::new(),
-        trusted_root: Vec::new(),
-        updated_at: 0,
+        ..PinState::anchored(&fixture(&format!("root-{floor}.json")))
     };
     let update = tuf::update(&walked, &state, fixture_number("verify_at")).expect("it verifies");
     assert_eq!(update.state.trusted_root, fixture("trusted-root.json"));
@@ -275,10 +261,8 @@ fn the_real_chain_expires() {
     let at = fixture_number("verify_at") + 365 * 86_400;
     let floor = fixture_number("chain_floor");
     let state = PinState {
-        root: fixture(&format!("root-{floor}.json")),
-        root_chain: Vec::new(),
         root_version: floor,
-        ..PinState::embedded()
+        ..PinState::anchored(&fixture(&format!("root-{floor}.json")))
     };
     assert!(matches!(
         tuf::update(&fixture_chain_metadata(), &state, at),
@@ -296,10 +280,8 @@ fn the_real_chain_cannot_be_reached_from_below_its_floor() {
     // which is what makes this a floor and not a bug.
     let floor = fixture_number("chain_floor");
     let state = PinState {
-        root: fixture(&format!("root-{floor}.json")),
-        root_chain: Vec::new(),
         root_version: floor,
-        ..PinState::embedded()
+        ..PinState::anchored(&fixture(&format!("root-{floor}.json")))
     };
     let error = tuf::update(&fixture_metadata(), &state, fixture_number("verify_at"));
     assert!(matches!(error, Err(TufError::Chain(_))), "{error:?}");
@@ -583,12 +565,11 @@ fn state_is_monotonic_across_two_zones_sharing_one_file() {
 
     let ahead = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
     ahead.state.save(&path).unwrap();
-    // Re-walked from the root this harness minted, exactly as a client
-    // re-walks from the one its binary embeds: the file is never believed
-    // on its own say-so. `rotate_root` above means the chain is non-empty
-    // here, so this also exercises the walk rather than the trivial case.
+    // Read back against the root this harness minted, exactly as a client
+    // reads against the one its binary embeds. `rotate_root` above means the
+    // chain is non-empty here, so the round-trip carries one.
     let reloaded = PinState::load_anchored(&path, &repo.embedded_root())
-        .expect("the state persists and re-walks from the anchor");
+        .expect("the state persists and loads under its own anchor");
     assert_eq!(reloaded, ahead.state);
 
     let error = tuf::update(&stale, &reloaded, at(NOW));
@@ -686,7 +667,7 @@ fn refreshing(
         tuf_url: None,
         no_tuf: false,
         // The harness mints its own TUF root, so that is the anchor every
-        // persisted pin state here is re-walked from — the same rule
+        // persisted pin state here records itself against — the same rule
         // production applies with the built-in Sigstore root.
         tuf_root: tuf_root.map(std::path::Path::to_path_buf),
     }
@@ -696,18 +677,12 @@ fn refreshing(
 /// is what "a build that embeds this root" means to the resolver.
 fn seed_state(path: &std::path::Path, embedded_root: &std::path::Path) {
     let root = std::fs::read(embedded_root).unwrap();
+    // Anchored at that root: it *is* the anchor the resolver is given below,
+    // so the state's provenance digest has to name it or the load falls back
+    // to the bootstrap pins.
     let state = PinState {
-        root,
-        // Empty: this root *is* the anchor the resolver is given below, so
-        // there is nothing to walk to reach it.
-        root_chain: Vec::new(),
         root_version: 1,
-        timestamp_version: 0,
-        snapshot_version: 0,
-        targets_version: 0,
-        targets: Vec::new(),
-        trusted_root: Vec::new(),
-        updated_at: 0,
+        ..PinState::anchored(&root)
     };
     state.save(path).unwrap();
 }
@@ -744,7 +719,7 @@ async fn a_walked_chain_teaches_a_log_the_build_never_knew() {
 
     // And it was persisted, so the next process starts where this one ended.
     let persisted = PinState::load_anchored(&state_path, &std::fs::read(embedded.path()).unwrap())
-        .expect("the pin state is written and re-walks from the anchor");
+        .expect("the pin state is written and loads under its anchor");
     assert_eq!(persisted.root_version, 1);
     assert!(persisted.timestamp_version >= 1);
     assert!(rekor::LogKeys::default() != persisted.log_keys().unwrap());
@@ -992,15 +967,8 @@ async fn regenerate_the_shared_fixture() {
         .unwrap()
         .as_secs();
     let state = PinState {
-        root: chain[0].1.clone(),
-        root_chain: Vec::new(),
         root_version: floor,
-        timestamp_version: 0,
-        snapshot_version: 0,
-        targets_version: 0,
-        targets: Vec::new(),
-        trusted_root: Vec::new(),
-        updated_at: 0,
+        ..PinState::anchored(&chain[0].1)
     };
     let update = tuf::update(&walked, &state, now).expect("the fetched chain must verify");
 
@@ -1062,9 +1030,10 @@ async fn regenerate_the_shared_fixture() {
 /// would chain from it, and anyone able to write one file in the data directory
 /// would choose the transparency-log key set outright.
 ///
-/// The state is re-walked from the anchor the *binary* holds, so a root minted
-/// by somebody else fails to load and the client falls back to its bootstrap
-/// pins rather than adopting a stranger's universe.
+/// The state names the anchor it was accumulated under, and the *binary*
+/// decides which anchor that has to be — so a state minted against somebody
+/// else's root fails to load and the client falls back to its bootstrap pins
+/// rather than adopting a stranger's universe.
 #[test]
 fn a_pin_file_anchored_somewhere_else_does_not_load() {
     let dir = tempfile::tempdir().unwrap();

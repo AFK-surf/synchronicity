@@ -1064,18 +1064,7 @@ impl SimTuf {
     /// A [`crate::tuf::PinState`] anchored at that embedded root and nothing
     /// else — a fresh install.
     pub fn embedded_state(&self) -> crate::tuf::PinState {
-        let root = self.embedded_root();
-        crate::tuf::PinState {
-            root,
-            root_chain: Vec::new(),
-            root_version: 1,
-            timestamp_version: 0,
-            snapshot_version: 0,
-            targets_version: 0,
-            targets: Vec::new(),
-            trusted_root: Vec::new(),
-            updated_at: 0,
-        }
+        crate::tuf::PinState::anchored(&self.embedded_root())
     }
 
     /// The current root version.

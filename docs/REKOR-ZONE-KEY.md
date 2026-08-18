@@ -1657,34 +1657,32 @@ repository and attempts an update:
    refuse every zone from then on, which is exactly the "worse than not
    having asked" this section forbids.
 
-**The state file's pin set is re-verified against the binary.** Nothing that
-decides *which keys are pinned* is believed because it is there — but the
-qualifier is exact, and two fields sit outside it: `timestamp_version` and
-`snapshot_version` are rollback floors read verbatim, because the files they
-describe are not persisted to re-derive them from. A local writer can park
-them at the ceiling and freeze pin refresh permanently. That is strictly less
-than the same writer already has — a `source='static'` binding in `synch.db`
-never expires — and it is reported rather than silent (`pin_refresh_overdue`
-warns, and a `checked_at` ahead of the clock reads as due), but it is not
-"whole" and should not be read as such. The stored root chain is re-walked from the root
-*this build* embeds, applying the same dual-threshold rule a live chain gets, so
-a stored root counts only if the embedded root transitively signed it. And the
-stored `targets.json` is kept beside it and re-checked the same way — the
-walked root's targets role must have signed it, and it must name this exact
-`trusted_root` by digest — because the pin set is computed from `trusted_root`
-and nothing else on disk binds that field to the chain. Expiry is deliberately
-not checked on load: a stored state is expected to age between refreshes, and
-refusing to start on stale material is the availability coupling this section
-forbids. A file that fails any of this is not loaded at all; the client falls
-back to the embedded bootstrap, re-learns on its next walk, and **says so** —
-"no file" is a fresh install and unremarkable, but a file that is present and
-does not check out is a truncated write, a different `--tuf-root`, or somebody
-rewriting the pin set, and an operator has to be able to see it.
+**The state file is this client's own, and is read as written.** The pin set,
+the root chain, the version floors and the accepted `targets.json` all come
+back off disk as they went on. The precondition for tampering with any of it is
+a same-uid write inside the `0700` data directory — which is strictly *more*
+than an attacker needs to own the client outright, since the same access writes
+a `source='static'` binding straight into `synch.db`, and that never expires.
+An earlier design re-derived the pin set from the binary on every load: the
+stored chain re-walked from the embedded root, the stored `targets.json`
+re-checked against it. It was defence in depth against a writer who was already
+past the gate, it was never whole — `timestamp_version` and `snapshot_version`
+have no persisted files to re-derive them from, so they were read verbatim
+regardless, and parking them at the ceiling froze refresh permanently — and it
+has been removed rather than left as a half-claim. Local disk is trusted.
 
-The precondition for any of that mattering is a same-uid write inside the
-`0700` data directory, which is strictly weaker than what the same access
-already allows — writing bindings straight into `synch.db`. It is defence in
-depth, and it is what makes the claim above true rather than aspirational.
+One check remains, and it is provenance rather than trust: the state records
+the SHA-256 of the TUF root it was accumulated under, and a load under a
+different anchor is refused. `update` chains from the *stored* root rather than
+re-walking from the binary's anchor, so a state carried across a `--tuf-root`
+switch would go on extending the old repository's chain and never self-correct.
+Expiry is deliberately not checked on load: a stored state is expected to age
+between refreshes, and refusing to start on stale material is the availability
+coupling this section forbids. A file that does not load at all — a truncated
+write, an older on-disk format, another repository's state — lands the client
+on the embedded bootstrap, which re-learns on the next walk and **says so**:
+"no file" is a fresh install and unremarkable, but a file that is present and
+was not read is something an operator has to be able to see.
 
 **At most one walk a day** (`tuf::REFRESH_INTERVAL`). Membership re-resolves
 on the zone's TTL, which can be a minute; the pin set moves when Sigstore

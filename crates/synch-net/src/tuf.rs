@@ -158,11 +158,10 @@ pub struct TufMetadata {
 /// The on-disk format of the pin state.
 ///
 /// The version is what makes the file's *contents* a contract rather than a
-/// hint: every field this build reads is re-verified against the binary's own
-/// anchor before it is believed, and a file written to any other format is not
-/// read at all. A client that meets one starts from the embedded bootstrap and
-/// re-learns on its next walk, which costs one refresh and concedes nothing.
-const STATE_FORMAT_VERSION: u64 = 3;
+/// hint: a file written to any other format is not read at all. A client that
+/// meets one starts from the embedded bootstrap and re-learns on its next
+/// walk, which costs one refresh and concedes nothing.
+const STATE_FORMAT_VERSION: u64 = 4;
 
 /// The pin set a client is running on, and where it came from (§10.2).
 ///
@@ -178,18 +177,14 @@ const STATE_FORMAT_VERSION: u64 = 3;
 pub struct PinState {
     /// The accepted `root.json`, verbatim — the next update chains from it.
     ///
-    /// **Never trusted straight off disk.** [`PinState::load`] recomputes it
-    /// by walking `root_chain` from [`EMBEDDED_TUF_ROOT`] and refuses a file
-    /// whose stored bytes are not what that walk produced. See `root_chain`.
+    /// Read as written. The data directory is the owner's own (§9.3), so
+    /// this is material this client persisted for itself, not input.
     pub root: Vec<u8>,
     /// Every root accepted *beyond* the embedded one, in ascending version
     /// order. Empty means the embedded root is still what is in force.
     ///
-    /// This is what makes the persisted root verifiable rather than merely
-    /// well-formed: [`PinState::load_anchored`] re-walks it from the anchor
-    /// **the binary holds**, applying the same dual-threshold rule [`update`]
-    /// applies to a live chain, so a stored root is believed only if the root
-    /// compiled into this build transitively signed it.
+    /// Kept so a later [`update`] can hand the whole lineage back to a peer
+    /// that needs it, and so the accepted roots survive a restart.
     pub root_chain: Vec<Vec<u8>>,
     /// Its version.
     pub root_version: u64,
@@ -202,14 +197,9 @@ pub struct PinState {
     /// The accepted `targets.json`, verbatim — the role that *names* the
     /// trusted root, kept beside it so the pair can be re-checked on load.
     ///
-    /// Without these bytes nothing on disk binds `trusted_root` to the root
-    /// chain: the versions beside it are numbers any writer can type, and the
-    /// pin set — which log keys a client accepts a proof from, and which
-    /// endpoints a monitor reads — is computed from `trusted_root` alone. With
-    /// them, [`PinState::load_anchored`] re-runs the targets-role threshold
-    /// against the walked root and re-checks the target digest, so the file is
-    /// authenticated end to end against the binary and not merely internally
-    /// consistent.
+    /// Kept because [`update`] needs the accepted version to enforce the
+    /// targets rollback floor, and because a `trusted_root` with no
+    /// `targets.json` beside it cannot be re-checked against a live walk.
     pub targets: Vec<u8>,
     /// The accepted `trusted_root.json`, verbatim — the pin set is derived
     /// from it rather than stored beside it, so the two cannot disagree.
@@ -220,6 +210,15 @@ pub struct PinState {
     /// the real clock by the resolver so a value from the file cannot become
     /// an unbounded one (see `crate::dns`).
     pub updated_at: u64,
+    /// SHA-256 of the TUF root this state was accumulated under.
+    ///
+    /// Not a security check — the file is this client's own (§9.3). It
+    /// answers "is this state even about my repository", which a `--tuf-root`
+    /// pointed somewhere new makes false. [`update`] chains from `root`
+    /// rather than re-walking from the binary's anchor, so a state carried
+    /// across that switch would keep extending the wrong repository's chain
+    /// and never self-correct. One digest comparison ends that.
+    pub anchor_digest: [u8; 32],
 }
 
 impl PinState {
@@ -244,6 +243,7 @@ impl PinState {
             targets: Vec::new(),
             trusted_root: Vec::new(),
             updated_at: 0,
+            anchor_digest: crate::rekor::sha256(anchor),
         }
     }
 
@@ -291,9 +291,14 @@ impl PinState {
     /// Production always anchors at [`EMBEDDED_TUF_ROOT`] — that is what
     /// [`PinState::load`] is. This form exists for a deployment running its
     /// own TUF repository, and for the test harness, which necessarily
-    /// anchors at a root it minted. The anchor is an *argument* rather than
-    /// something read out of the file, because the whole point is that the
-    /// binary decides what the file is allowed to say.
+    /// anchors at a root it minted.
+    ///
+    /// The anchor is used to answer one question — whether this state was
+    /// accumulated under the repository this build is pointed at — and not
+    /// to authenticate the file's contents. The data directory is the
+    /// owner's own (§9.3); a writer inside it can already write bindings
+    /// straight into `synch.db`, so re-deriving the pin set from the binary
+    /// on every load bought nothing that access did not already concede.
     pub fn load_anchored(path: &Path, anchor: &[u8]) -> Option<PinState> {
         let text = std::fs::read_to_string(path).ok()?;
         let value: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -310,6 +315,7 @@ impl PinState {
             .iter()
             .map(|entry| base64_decode(entry.as_str()?).ok())
             .collect::<Option<_>>()?;
+        let stored_digest: [u8; 32] = blob("anchor_digest")?.try_into().ok()?;
         let state = PinState {
             root: blob("root")?,
             root_chain,
@@ -320,54 +326,23 @@ impl PinState {
             targets: blob("targets")?,
             trusted_root: blob("trusted_root")?,
             updated_at: number("updated_at").unwrap_or(0),
+            anchor_digest: stored_digest,
         };
 
-        // **Re-derive everything from the binary rather than believing the
-        // file.** Walking the stored chain from the anchor this build holds
-        // re-runs the same dual-threshold check `update` applies to a live
-        // chain, so a stored root is believed only if the root compiled into
-        // *this build* transitively signed it.
-        let (walked, version) = verify_root_chain(anchor, &state.root_chain).ok()?;
-        if walked != state.root || version != state.root_version {
-            return None;
-        }
-
-        // The root chain is only half the answer. The pin set is computed from
-        // `trusted_root`, so `trusted_root` is the field that has to chain to
-        // the binary too: the walked root's targets role must have signed the
-        // stored `targets.json`, and that `targets.json` must name this exact
-        // target. Anything less and the versions in the file are the only
-        // thing between a local writer and the log key set.
-        //
-        // Expiry is deliberately not checked, exactly as for the intermediate
-        // roots above: a stored state is expected to age between refreshes,
-        // and refusing to start on stale material is the availability coupling
-        // §10.2 forbids. Freshness is `update`'s business at refresh time.
-        let trusted = Root::parse(&state.root).ok()?;
-        match state.trusted_root.is_empty() {
-            // No update has ever been accepted: the bootstrap snapshot stands
-            // and nothing in the file speaks about the pin set. A file that
-            // carries a targets role anyway is not a state this build wrote.
-            true => state.targets.is_empty().then_some(state),
-            false => {
-                let targets = Meta::parse(&state.targets, TARGETS_ROLE).ok()?;
-                if targets.version != state.targets_version {
-                    return None;
-                }
-                trusted.check_role(TARGETS_ROLE, &targets).ok()?;
-                targets
-                    .check_target(TRUSTED_ROOT_TARGET, &state.trusted_root)
-                    .ok()?;
-                Some(state)
-            }
-        }
+        // The one thing the file is not taken at its word about, and it is a
+        // provenance question rather than a trust one: `update` chains from
+        // `state.root` rather than re-walking from the binary's anchor, so a
+        // state accumulated under a different `--tuf-root` would keep
+        // extending that repository's chain forever. Falling back to the
+        // bootstrap costs one refresh and lands on the right repository.
+        (state.anchor_digest == crate::rekor::sha256(anchor)).then_some(state)
     }
 
     /// Writes the state at mode 0600, replacing whatever was there.
     ///
-    /// The pin set is not a secret, but the data directory is the owner's
-    /// alone (§9.3) and a file another user can rewrite is a pin set another
-    /// user chooses.
+    /// The pin set is not a secret; 0600 is the same hygiene the rest of the
+    /// data directory gets (§9.3), which is where the trust in these bytes
+    /// comes from in the first place.
     ///
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let text = serde_json::json!({
@@ -385,6 +360,7 @@ impl PinState {
             "targets": base64_encode(&self.targets),
             "trusted_root": base64_encode(&self.trusted_root),
             "updated_at": self.updated_at,
+            "anchor_digest": base64_encode(&self.anchor_digest),
         })
         .to_string();
         if let Some(parent) = path.parent() {
@@ -484,32 +460,6 @@ pub struct TufUpdate {
     pub changed: bool,
 }
 
-/// Walks a stored root chain from the root this build embeds, returning the
-/// trusted root's bytes and version.
-///
-/// The same rule [`update`] applies to a live chain, applied to a persisted
-/// one: each step is exactly one version on, signed by the thresholds of
-/// *both* the root it succeeds and itself. Expiry is deliberately not
-/// checked — an intermediate in a stored chain is expected to be expired,
-/// and the final root's expiry is `update`'s business at refresh time, not a
-/// reason to refuse to start.
-fn verify_root_chain(anchor: &[u8], chain: &[Vec<u8>]) -> Result<(Vec<u8>, u64), TufError> {
-    let mut trusted = Root::parse(anchor)?;
-    for bytes in chain {
-        let candidate = Root::parse(bytes)?;
-        if candidate.version != trusted.version + 1 {
-            return Err(TufError::Chain(format!(
-                "stored root {} does not follow root {}",
-                candidate.version, trusted.version
-            )));
-        }
-        trusted.check_role(ROOT_ROLE, &candidate.meta)?;
-        candidate.check_role(ROOT_ROLE, &candidate.meta)?;
-        trusted = candidate;
-    }
-    Ok((trusted.bytes, trusted.version))
-}
-
 /// Verifies collected metadata and, if it is newer, returns the state to
 /// adopt (§10.2).
 ///
@@ -598,6 +548,9 @@ pub fn update(metadata: &TufMetadata, state: &PinState, now: u64) -> Result<TufU
             targets: metadata.targets.clone(),
             trusted_root: metadata.trusted_root.clone(),
             updated_at: now,
+            // Carried through: an update moves the chain forward, never the
+            // repository it is a chain for.
+            anchor_digest: state.anchor_digest,
         },
         log_keys,
         changed,
@@ -1654,18 +1607,6 @@ mod tests {
             .collect();
         assert_eq!(siblings, vec!["rekor-pins.json".to_string()]);
 
-        // A state that *claims* a trusted root has to carry the targets role
-        // that names it, and that role has to check out against the walked
-        // root — so a trusted root with a targets role that says nothing about
-        // it is not state at all.
-        let unbacked = PinState {
-            trusted_root: br#"{"tlogs":[]}"#.to_vec(),
-            targets_version: 9,
-            ..state.clone()
-        };
-        unbacked.save(&path).unwrap();
-        assert_eq!(PinState::load(&path), None);
-
         // Anything unreadable as state reads as no state at all, rather
         // than as an error a client could be stopped by.
         assert_eq!(
@@ -1675,6 +1616,10 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(PinState::load(&path), None);
         std::fs::write(&path, r#"{"version":3}"#).unwrap();
+        assert_eq!(PinState::load(&path), None);
+        // A well-formed file of the current format still needs every field
+        // the state is made of; a partial one is not state.
+        std::fs::write(&path, r#"{"version":4}"#).unwrap();
         assert_eq!(PinState::load(&path), None);
     }
 

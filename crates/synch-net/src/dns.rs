@@ -575,12 +575,15 @@ enum Pins {
     /// is what a one-shot command or a test wants).
     Tuf {
         keys: LogKeys,
-        state: PinState,
+        /// Boxed: the whole of a TUF state is an order of magnitude wider
+        /// than the static variant beside it, and this enum is cloned on
+        /// every read of the pin set.
+        state: Box<PinState>,
         path: Option<std::path::PathBuf>,
-        /// The `root.json` every persisted state is re-walked from before it
-        /// is believed — [`tuf::EMBEDDED_TUF_ROOT`] unless `--tuf-root`
-        /// replaced it. Held here so a reload cannot silently anchor at
-        /// something the file itself supplied.
+        /// The `root.json` a persisted state has to name as the repository it
+        /// was accumulated under — [`tuf::EMBEDDED_TUF_ROOT`] unless
+        /// `--tuf-root` replaced it. Held here so a reload cannot silently
+        /// anchor at something the file itself supplied.
         anchor: Vec<u8>,
         /// When the repository was last walked, successfully or not, so a
         /// membership refresh on a short TTL does not become a request to
@@ -609,9 +612,9 @@ impl Pins {
 /// that refused to start over a damaged cache would be the availability
 /// coupling §10.2 forbids — but it discards every update ever accepted, so it
 /// is not something to do silently. "No file" is a fresh install and is
-/// unremarkable; "a file that does not verify against this binary's anchor" is
-/// either a truncated write, a build with a different `--tuf-root`, or somebody
-/// rewriting the pin set, and an operator has to be able to see it.
+/// unremarkable; "a file that is present and did not load" is a truncated
+/// write, a build of an older on-disk format, or a `--tuf-root` pointed at a
+/// different repository, and an operator has to be able to see it.
 fn load_pin_state(path: &Path, anchor: &[u8]) -> Option<PinState> {
     match PinState::load_anchored(path, anchor) {
         Some(state) => Some(state),
@@ -619,9 +622,8 @@ fn load_pin_state(path: &Path, anchor: &[u8]) -> Option<PinState> {
             if path.exists() {
                 tracing::warn!(
                     path = %path.display(),
-                    "the transparency pin state does not verify against this build's \
-                     TUF root and was not loaded; starting from the embedded \
-                     bootstrap pins and re-learning on the next walk"
+                    "the transparency pin state was not loaded; starting from the \
+                     embedded bootstrap pins and re-learning on the next walk"
                 );
             }
             None
@@ -761,7 +763,7 @@ pub struct ResolverOptions {
     /// a shard rotates is the day this client needs a new build.
     pub no_tuf: bool,
     /// A `root.json` *replacing* [`tuf::EMBEDDED_TUF_ROOT`] as the anchor
-    /// every pin state is verified against.
+    /// every pin state records itself against.
     ///
     /// The same "an override is a different universe" semantics as
     /// `trust_anchor` and `rekor_key`: with this set, a persisted pin state
@@ -835,8 +837,9 @@ impl DnssecResolver {
             }
             None => {
                 // The anchor is decided here, from the binary or from an
-                // explicit override, and never from the state file — which
-                // is the point of re-walking the chain at all.
+                // explicit override, and never from the state file — which is
+                // what makes the state's recorded anchor a check on where it
+                // came from rather than a restatement of itself.
                 let anchor = match &options.tuf_root {
                     None => tuf::EMBEDDED_TUF_ROOT.as_bytes().to_vec(),
                     Some(path) => std::fs::read(path)
@@ -855,7 +858,7 @@ impl DnssecResolver {
                     // never walked — so a fresh install refreshes at once
                     // and a restarted one does not.
                     checked_at: state.updated_at,
-                    state,
+                    state: Box::new(state),
                     path: options.rekor_state.clone(),
                 }
             }
@@ -1104,16 +1107,15 @@ impl DnssecResolver {
         // the versions that describe them — so taking the newer *state* is
         // right and taking the newer of each field would not be.
         //
-        // Re-walked from this resolver's anchor, exactly as at startup: the
-        // file is shared, so it is no more trusted here than it was there —
-        // both the root chain and the targets role that names the trusted root
-        // are re-verified against the anchor this binary holds.
+        // Read against this resolver's anchor, exactly as at startup: a state
+        // accumulated under some other TUF repository is not this resolver's to
+        // adopt, however far along it is.
         let current = match path
             .as_deref()
             .and_then(|path| load_pin_state(path, anchor))
         {
             Some(stored) if dominates(&stored, state) => stored,
-            _ => state.clone(),
+            _ => (**state).clone(),
         };
         let update = tuf::update(&metadata, &current, now).map_err(|e| tuf_error(&source, e))?;
         if let Some(path) = path.as_deref() {
@@ -1124,7 +1126,7 @@ impl DnssecResolver {
             }
         }
         *keys = update.log_keys.clone();
-        *state = update.state.clone();
+        **state = update.state.clone();
         Ok(Some(update))
     }
 
@@ -1477,9 +1479,9 @@ fn dominates(a: &PinState, b: &PinState) -> bool {
 /// naming: a `checked_at` **ahead of the clock** is not a recent check, it is
 /// an impossible one, and it makes the walk due rather than postponing it.
 ///
-/// It can be ahead because it is seeded from `PinState::updated_at`, the one
-/// field of `rekor-pins.json` that is believed rather than re-derived from the
-/// root this build embeds. A corrupt or hand-edited file — or one written
+/// It can be ahead because it is seeded from `PinState::updated_at`, and the
+/// state file is read as written (§10.2): the data directory is the owner's
+/// own, so nothing in it is re-derived. A corrupt or hand-edited file — or one written
 /// while the clock was very wrong — would otherwise put the next refresh past
 /// any instant the clock can reach, freezing the pin set permanently, with no
 /// error to report because from the code's point of view nothing failed. That
@@ -2677,9 +2679,8 @@ mod tests {
         assert!(refresh_due(0, now), "never walked");
 
         // A stamp ahead of the clock is impossible, so it is due rather than
-        // postponed. Without this a single integer in `rekor-pins.json` — the
-        // one field `load_anchored` does not re-derive — stops every pin
-        // refresh for good, across restarts, silently.
+        // postponed. Without this a single integer in `rekor-pins.json` stops
+        // every pin refresh for good, across restarts, silently.
         assert!(refresh_due(now + 1, now));
         assert!(refresh_due(now + tuf::REFRESH_INTERVAL * 100, now));
         assert!(refresh_due(4_102_444_800, now), "a stamp dated 2100");
