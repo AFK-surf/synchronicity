@@ -8,7 +8,9 @@ and the Gleam control plane (`control-plane/`).
 Method: seven independent adversarial reviews from different angles, then a
 three-way false-positive challenge pass in which every finding had to survive a
 reviewer whose explicit goal was to kill it. 41 findings were raised; 1 was
-killed outright, 12 were downgraded or had their reasoning corrected, 40 stand.
+killed outright, 12 were downgraded or had their reasoning corrected, and 1 was
+withdrawn after the fact when the design document turned out to have described
+it already (see **Withdrawn** below). 39 stand.
 
 Baseline: `cargo test --workspace`, `cargo clippy --workspace --all-targets
 -D warnings`, `cargo fmt --all --check` and `gleam test` (181 tests) all pass on
@@ -21,54 +23,46 @@ in three cases it changes what the fix should be.
 
 ---
 
+## Withdrawn
+
+### ~~H1. Two of the nine pin-state fields are never re-derived~~ — withdrawn, and the surrounding design has since been simplified
+
+Filed as the audit's top finding: `PinState::load_anchored` re-derived `root`,
+`root_version`, `targets`, `targets_version` and `trusted_root` from the
+binary's anchor but read `timestamp_version` and `snapshot_version` verbatim,
+so a writer in the data directory could park both rollback floors at `u64::MAX`
+and freeze pin refresh permanently. The mechanism was real and was verified end
+to end in a scratch harness.
+
+**It should not have been filed.** §10.2 of `docs/REKOR-ZONE-KEY.md` already
+described it, in terms, before this audit ran — naming the two fields, naming
+the ceiling, naming the permanent freeze, and giving the reason it was accepted:
+the precondition is a same-uid write inside the `0700` data directory, and that
+same access already writes a never-expiring `source='static'` binding straight
+into `synch.db`. That is a deliberate, argued, documented decision, which is
+exactly the challenge pass's fourth kill criterion. Neither the original review
+nor the challenge found the passage; both read the code and the test file and
+stopped there. The lesson is narrow and worth stating: a repo that carries its
+security argument in prose has to be searched as prose, and "the tests do not
+cover it" is not evidence that the designers did not consider it.
+
+The finding is withdrawn on its merits, not softened.
+
+Separately, and at the maintainer's direction, the premise it was arguing about
+has now been settled the other way: local disk is trusted, so the load-time
+re-derivation has been removed rather than extended. `load_anchored` reads the
+state as written; what remains is a provenance check — the state records the
+SHA-256 of the TUF root it was accumulated under and is not read under a
+different anchor, because `update` chains from the stored root rather than
+re-walking, so a state carried across a `--tuf-root` switch would extend the
+wrong repository's chain forever. `verify_root_chain` is gone,
+`tests/pin_state_authentication.rs` is now `tests/pin_state.rs` covering
+round-trip, provenance and the clock floors, and §10.2 has been rewritten to
+describe what the code now does.
+
 ## High
 
-### H1. Two of the nine pin-state fields are never re-derived, and both are permanent rollback floors
-
-`crates/synch-net/src/tuf.rs:317-318`. `PinState::load_anchored` re-walks the root
-chain from the embedded anchor, checks `root`/`root_version` against the walk,
-checks `targets_version == targets.version`, re-runs the targets-role threshold
-and re-checks the `trusted_root` digest — but reads `timestamp_version` and
-`snapshot_version` straight out of the file and never compares them to anything.
-Those are exactly the two rollback floors `tuf::update` enforces at `:566` and
-`:572`.
-
-A writer in the data directory parks both floors at `u64::MAX` alongside a
-genuine older `(root_chain, targets, trusted_root)` triple. The file loads, and
-every subsequent honest walk dies in `timestamp.check_rollback` — permanently,
-because a failed update never rewrites the file. Both the client and the monitor
-(`crates/synch-monitor/src/discover.rs:142`) load the same file and derive both
-their key set and their shard endpoints from it.
-
-Machine-verified end to end in a scratch harness:
-
-```
-v1 pins: live=true compromised=true
-v2 pins: live=true compromised=false
-after rollback: live=true compromised=true  (floors ts=MAX snap=MAX)
-next honest walk: Err(Rollback("timestamp.json version 3 is older than the
-                               accepted 18446744073709551615"))
-```
-
-`crates/synch-net/tests/pin_state_authentication.rs` exists for exactly this
-threat and states it verbatim in its module doc, but its coverage misses these
-two fields: the all-floors-at-MAX case at `:95-97` also substitutes the
-`trusted_root`, so the load dies on that arm first, and the field-by-field table
-at `:127-140` lists only `targets`, `targets_version`, `root`, `root_version`.
-
-Correction from the challenge pass: `dominates` (`dns.rs:1467`) does refuse a
-*stale* restore, because `targets_version` is pinned by equality. It does not
-refuse the *freeze* variant (keep the current triple, park only the two
-unauthenticated floors), and it guards only the in-process re-read — the delivery
-vector is process start, which compares nothing, and the monitor is a fresh
-process every run.
-
-**Fix**: persist `timestamp.json`/`snapshot.json` and re-verify them in
-`load_anchored`, or drop the two fields and seed those floors from freshly
-verified metadata on each walk. They buy nothing across a restart that the
-`targets` floor does not already buy.
-
-### H2. An apex added to the monitor's watch list is never rescanned
+### H1. An apex added to the monitor's watch list is never rescanned
 
 `crates/synch-monitor/src/main.rs:902`, `:964`. Read coverage is one `next_index`
 per log, but the watch filter is applied per entry inside the walk: an entry
@@ -96,7 +90,7 @@ onboarding recipe (`docs/REKOR-ZONE-KEY.md:1546-1559`) is `--from-index <n>
 as a surface change — reset that log's `next_index`, or refuse the run naming the
 new apex and the index it would skip.
 
-### H3. The provider reconciler never re-reads the provider once converged
+### H2. The provider reconciler never re-reads the provider once converged
 
 `control-plane/src/jobs/provider_sync.gleam:219-231`. `pass` computes its hash
 from local state only and returns `Ok(Fresh)` before `prov.list()`, so a sweep
@@ -119,11 +113,18 @@ Correction: "forever" should read "until the next local mutation or process
 restart" — boot and every product mutation bump the serial. In a quiescent
 deployment that is unbounded.
 
-**Fix**: make the short-circuit time-bounded — skip `prov.list()` only while
-`now - last_ok_at` is under an interval, so at least one sweep per interval lists
-and diffs.
+**Fix (applied)**: the short-circuit is now time-bounded. `recently_listed`
+ANDs `now - last_ok_at < reconcile_interval` into `fresh`, so a converged
+reconciler still lists and diffs with nothing on our side changed. The interval
+is 900 s, set by what a forged record has to outlive to be worth planting:
+`ttl_data` (300) plus the client's `DEFAULT_TRUST_GRACE` (900) is 1200, so the
+sweep has to fall inside that to be the thing bounding the exposure. Covered by
+`a_converged_reconciler_still_reads_the_provider_eventually_test` and
+`drift_introduced_at_the_provider_is_repaired_without_a_local_change_test` —
+both driving a *converged* pass, since a first pass short-circuits on
+`state.get` returning `Error(Nil)` and never consults the interval.
 
-### H4. The external transparency gate deletes the published membership set instead of withholding a new one
+### H3. The external transparency gate deletes the published membership set instead of withholding a new one
 
 `control-plane/src/zone/render_external.gleam:72-87` with
 `control-plane/src/provider/diff.gleam:145-150`. When `omit_members` fires,
@@ -149,9 +150,26 @@ so a 600 s outage is invisible. The teeth are an outage beyond ~20 minutes —
 which dissolves membership for every org on the control plane, including clients
 running `RekorPolicy::Off` — and the permanent variants.
 
-**Fix**: shield membership in `diff.deletable` the way proof names already are
-when the gate is the reason it is absent. "Do not add" is the gate; "remove what
-is working" is not.
+**Fix (applied)**: membership is shielded in `diff.deletable` the way proof
+records already are, when the gate is the reason it is absent. "Do not add" is
+the gate; "remove what is working" is not.
+
+The shield is the **withheld records**, matched by name and value —
+`diff_gated(desired, existing, withheld)`, with `diff/2` delegating as `[]` and
+the reconciler rendering the ungated set to supply them. A first attempt passed
+a `Bool` and shielded by name shape; adversarial review killed it, correctly. A
+shape predicate cannot separate "membership we are holding back" from
+"membership the renderer stopped producing", so it also froze **revoked
+devices' records and outright forgeries** in the zone for as long as the gate
+stayed armed — unbounded, and made permanent by the SHA-384 DS bug below. That
+was a worse hole than the one being fixed. Matching the actual withheld records
+shields exactly the set that was withheld and nothing else.
+
+Covered by `published_members_survive_a_pass_the_gate_withheld_test` (which
+also asserts the revocation case still deletes),
+`the_gate_shields_withheld_records_not_membership_shaped_names_test` (a revoked
+record and a forgery are both still deleted while the gate is armed), and
+`the_gate_does_not_shield_anything_but_membership_test`.
 
 ---
 
@@ -232,7 +250,11 @@ one, so the type-4 arm is dead code. The Rust reader dispatches correctly
 This runs for every ancestor zone cut (`:501`), not just the signing zone, so any
 zone on the ladder publishing only a digest-type-4 DS makes `chain.collect` fail
 unconditionally — and the error text names SHA-384 as accepted. In external mode
-that is a permanent `omit_members`, i.e. H4.
+that is a **permanent** `omit_members`: the gate arms and never disarms without a
+code change. Since H3 that no longer deletes the published membership, but the
+zone then runs indefinitely on a withheld set, publishing no new device. This is
+therefore the finding that bounds how long H3's shield can be load-bearing, and
+the one worth fixing first in this section.
 
 **Fix**: add `ds_digest_384` and dispatch per digest type.
 

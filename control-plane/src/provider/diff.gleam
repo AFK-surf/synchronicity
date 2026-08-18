@@ -65,9 +65,39 @@ pub type Conflict {
 
 /// Computes the change set. `existing` is every TXT record the provider
 /// holds strictly below the apex.
+///
+/// Equivalent to [`diff_gated`] with the transparency gate open, which is
+/// what every caller outside the reconciler wants.
 pub fn diff(
   desired: List(Record),
   existing: List(Existing),
+) -> Result(Changes, Conflict) {
+  diff_gated(desired, existing, [])
+}
+
+/// The same, told which records the transparency gate withheld.
+///
+/// `withheld` is what `render_external.render` produced and
+/// `render_external.render_gated` then dropped: the membership this pass
+/// *would* have published if a live zone key were covered by a verified
+/// record. That cannot be recovered from `desired`, because "the gate is
+/// armed" and "the last device was revoked" both arrive here as a desired set
+/// with no membership in it, and they call for opposite actions.
+///
+/// It is a list of records rather than a flag, and that distinction is the
+/// whole of the safety here. A flag can only say "shield membership", which a
+/// name-shaped predicate then reads as "shield anything named like
+/// membership" — including a revoked device's record, which is exactly the
+/// record the renderer stopped producing, and including a TXT an attacker
+/// planted at a `_synchronicity.*` name this deployment never rendered. Both
+/// are `foreign`, both match the shape, and both would be frozen in the zone
+/// for as long as the gate stayed armed, which is unbounded. Matching the
+/// actual withheld records by name *and* value shields the set that was
+/// withheld and nothing else.
+pub fn diff_gated(
+  desired: List(Record),
+  existing: List(Existing),
+  withheld: List(Record),
 ) -> Result(Changes, Conflict) {
   // The marker has to be *ours*, by name and by value. Checking only the
   // leftmost label made any control plane's marker satisfy every other one's
@@ -122,7 +152,7 @@ pub fn diff(
       Ok(Changes(
         create: list.sort(create, by_priority),
         replace: replace,
-        delete: deletable(foreign, desired),
+        delete: deletable(foreign, desired, withheld),
       ))
     }
   }
@@ -142,11 +172,43 @@ pub fn diff(
 ///
 /// A desired set that *does* carry proofs diffs normally, so a refreshed proof
 /// still replaces the chunks it supersedes.
-fn deletable(foreign: List(Existing), desired: List(Record)) -> List(Existing) {
-  case list.any(desired, fn(d) { is_proof_name(d.name) }) {
-    True -> foreign
-    False -> list.filter(foreign, fn(e) { !is_proof_name(e.record.name) })
-  }
+///
+/// Membership withheld by the require-gate gets the same shield on the same
+/// reasoning. What is published is not wrong — it is the set this control
+/// plane rendered from its own tables this very pass and then held back
+/// because a live zone key is not yet covered. Deleting it would take the
+/// zone's *product* down as a side effect of a transparency gap, and it would
+/// do so globally: `omit_members` is armed by any uncovered observed key,
+/// including a next key pre-published for a rotation that is not signing
+/// anything yet, so the common trigger is a routine RFC 6781 rollover rather
+/// than an attack. It would also reach past the policy it enforces —
+/// membership TXT *is* the member set, so a client running `RekorPolicy::Off`
+/// loses its peers to a gate it opted out of. Withholding leaves
+/// last-known-good standing and lets `require` clients fail closed on the
+/// missing proof, which is the design working rather than the publisher
+/// pre-empting it.
+///
+/// The shield is the withheld records themselves, matched by name *and*
+/// value. It is deliberately not a predicate over names: a revoked device's
+/// record and a forged one both carry a membership-shaped name and neither is
+/// in `withheld`, because the renderer did not produce them this pass. A
+/// name-shaped shield would freeze both in the zone for as long as the gate
+/// stayed armed — which is unbounded, and which an attacker who can get one
+/// uncovered key observed can arm at will.
+fn deletable(
+  foreign: List(Existing),
+  desired: List(Record),
+  withheld: List(Record),
+) -> List(Existing) {
+  let keep_proofs = !list.any(desired, fn(d) { is_proof_name(d.name) })
+  list.filter(foreign, fn(e) {
+    let shielded =
+      { keep_proofs && is_proof_name(e.record.name) }
+      || list.any(withheld, fn(w) {
+        w.name == e.record.name && w.value == e.record.value
+      })
+    !shielded
+  })
 }
 
 /// Whether a name is one of the proof names: the base name every proof's
