@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import {
   useInfiniteQuery,
   useMutation,
@@ -216,6 +216,25 @@ function Directory({
   onNavigate: (path: string) => void
 }) {
   const [open, setOpen] = useState('')
+  // Downloads target a hidden same-origin iframe rather than the top window, so
+  // a refused download (a plain-text 4xx/5xx with no attachment) renders in the
+  // frame and never replaces the Files page. A successful download carries
+  // Content-Disposition: attachment, which the browser streams straight to disk
+  // — the iframe navigation is cancelled — so large files never touch memory
+  // here. The iframe's load fires only for the error case, where its body text
+  // is the message to surface.
+  const [downloadError, setDownloadError] = useState('')
+  const frame = useRef<HTMLIFrameElement>(null)
+  const onFrameLoad = () => {
+    try {
+      const text = frame.current?.contentDocument?.body?.innerText?.trim() ?? ''
+      if (text !== '') setDownloadError(text)
+    } catch {
+      // Same-origin, so this should not throw; if it somehow does, a download
+      // that failed silently is better than a crash.
+    }
+  }
+  const startDownload = () => setDownloadError('')
   // Paginated at the source: a directory of a million paths is a paged read,
   // not one giant frame crossing the tunnel.
   const listing = useInfiniteQuery({
@@ -236,6 +255,24 @@ function Directory({
 
   return (
     <div>
+      <iframe
+        ref={frame}
+        name="synch-dl"
+        title="download"
+        onLoad={onFrameLoad}
+        className="hidden"
+      />
+      {downloadError !== '' && (
+        <div className="mb-3 flex items-start gap-3 rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
+          <span className="flex-1">Download failed: {downloadError}</span>
+          <button
+            onClick={() => setDownloadError('')}
+            className="text-red-400 hover:text-red-200"
+          >
+            dismiss
+          </button>
+        </div>
+      )}
       <Breadcrumb space={space} path={path} onNavigate={onNavigate} />
       <div className="overflow-x-auto rounded-lg border border-neutral-800">
         <table className="w-full text-sm">
@@ -258,6 +295,7 @@ function Directory({
                 opened={open === entry.path}
                 onOpen={() => setOpen(open === entry.path ? '' : entry.path)}
                 onNavigate={onNavigate}
+                onDownload={startDownload}
               />
             ))}
             {entries.length === 0 && (
@@ -328,6 +366,7 @@ function Row({
   opened,
   onOpen,
   onNavigate,
+  onDownload,
 }: {
   base: string
   space: string
@@ -335,6 +374,7 @@ function Row({
   opened: boolean
   onOpen: () => void
   onNavigate: (path: string) => void
+  onDownload: () => void
 }) {
   const divergent = entry.versions > 1
   return (
@@ -380,6 +420,9 @@ function Row({
           ) : (
             <a
               href={`${base}/file${browseQuery({ space, path: entry.path })}`}
+              target="synch-dl"
+              rel="noopener"
+              onClick={onDownload}
               className="text-sm font-medium text-teal-300 hover:underline"
             >
               download
@@ -390,7 +433,12 @@ function Row({
       {opened && (
         <tr>
           <td colSpan={5} className="bg-neutral-950 px-4 py-3">
-            <Drawer base={base} space={space} entry={entry} />
+            <Drawer
+              base={base}
+              space={space}
+              entry={entry}
+              onDownload={onDownload}
+            />
           </td>
         </tr>
       )}
@@ -405,10 +453,12 @@ function Drawer({
   base,
   space,
   entry,
+  onDownload,
 }: {
   base: string
   space: string
   entry: BrowseEntry
+  onDownload: () => void
 }) {
   // The daemon orders versions with the newest-wins pick last, which is the
   // one the plain download link would have taken.
@@ -428,6 +478,7 @@ function Drawer({
             path={entry.path}
             version={version}
             newest={index === 0}
+            onDownload={onDownload}
           />
         ))}
       </div>
@@ -441,12 +492,14 @@ function VersionRow({
   path,
   version,
   newest,
+  onDownload,
 }: {
   base: string
   space: string
   path: string
   version: BrowseVersion
   newest: boolean
+  onDownload: () => void
 }) {
   const from = version.attestors[0] ?? ''
   return (
@@ -472,6 +525,9 @@ function VersionRow({
       </code>
       <a
         href={`${base}/file${browseQuery({ space, path, from })}`}
+        target="synch-dl"
+        rel="noopener"
+        onClick={onDownload}
         className="ml-auto text-xs font-semibold text-teal-300 hover:underline"
       >
         download ↓{newest ? ' (newest)' : ''}
@@ -481,6 +537,7 @@ function VersionRow({
 }
 
 function bytes(size: number): string {
+  if (!Number.isFinite(size) || size < 0) return '—'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let value = size
   let unit = 0
@@ -492,6 +549,11 @@ function bytes(size: number): string {
 }
 
 function day(mtimeNs: number): string {
-  if (mtimeNs === 0) return '—'
-  return new Date(mtimeNs / 1_000_000).toISOString().slice(0, 10)
+  // The mtime comes from a semi-trusted daemon, so an out-of-range value must
+  // render as a dash rather than throw a RangeError that (with no error
+  // boundary above) would blank the whole table.
+  if (!Number.isFinite(mtimeNs) || mtimeNs === 0) return '—'
+  const date = new Date(mtimeNs / 1_000_000)
+  const iso = Number.isNaN(date.getTime()) ? '' : date.toISOString()
+  return iso === '' ? '—' : iso.slice(0, 10)
 }
