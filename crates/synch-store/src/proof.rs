@@ -732,9 +732,9 @@ impl Store {
     /// this object, is not aligned to its tree, or is not held here.
     ///
     /// A donor whose files are gone answers `None` to everything rather than
-    /// failing, the same reading [`Store::open_donor`] takes of it: nothing in
-    /// the descent may fail a fetch, and a donor the collector took between the
-    /// plan and the question is a donor with nothing to say.
+    /// failing: nothing in the descent may fail a fetch, and a donor the
+    /// collector took between the plan and the question is a donor with
+    /// nothing to say.
     pub fn subtree_cvs(&self, root: &Hash, spans: &[(u64, u64)]) -> Result<Vec<Option<Cv>>> {
         let mut out = vec![None; spans.len()];
         let Some(blob) = self.blob(root)? else {

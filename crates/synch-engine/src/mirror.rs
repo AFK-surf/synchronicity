@@ -1474,6 +1474,12 @@ mod tests {
         let tombstoned = r"sub\..\..\escape.txt";
         let divergent = r"C:\Windows\hosts";
         let unpinned = r"D:\other\thing";
+        // Where these names are ordinary filenames they land inside the
+        // mirror, so the removal branches have something to take and the
+        // refusal is what keeps it. Where they instead name somewhere outside
+        // the root — which is the reason the refusal exists — there is nothing
+        // to plant, and the skip is the whole of what there is to observe.
+        #[cfg(unix)]
         for name in [tombstoned, divergent, unpinned] {
             std::fs::write(target.path().join(name), b"not the mirror's to touch").unwrap();
         }
@@ -1505,6 +1511,7 @@ mod tests {
             for (_, reason) in &report.skipped {
                 assert!(reason.contains("reserved character"), "{reason}");
             }
+            #[cfg(unix)]
             for name in [tombstoned, divergent, unpinned] {
                 assert!(
                     target.path().join(name).exists(),
