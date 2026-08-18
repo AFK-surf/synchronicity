@@ -1055,6 +1055,20 @@ impl DnssecResolver {
         let name = query_name(&domain);
         let response = self.lookup(&name, RecordType::TXT).await?;
         let membership = self.validated_txt(&name, &response.answers)?;
+        // The membership answer is what yields the apex the attach record hangs
+        // off, so it gets the *same* gate `member_set` applies before any of
+        // its own records are trusted: under `RekorPolicy::Require` the zone key
+        // that signed it must be on the transparency log. Without this a DNS
+        // provider or registrar compromise — the exact adversary the Rekor
+        // design exists to stop — could add an unlogged DNSKEY, sign a
+        // `_synchronicity-cp` record pointing at an attacker, and the daemon
+        // would attach and stream every exposed space to them. `apex=` and the
+        // `url=` inside the record are only bound by DNSSEC otherwise, so the
+        // zone-key gate is what makes trusting them safe.
+        self.gate_answer(&domain, &membership).await?;
+        // The apex the attach record hangs off. Always needed here (unlike in
+        // `member_set`, where an `apex=` field is only required under Require),
+        // because a control plane that offers cloud attach always publishes it.
         let apex = apex_of(&domain, &membership.signer, &membership.records)?;
         let cp_name = control_plane_query_name(apex.to_string().trim_end_matches('.'));
         let response = self.lookup(&cp_name, RecordType::TXT).await?;
@@ -1062,6 +1076,12 @@ impl DnssecResolver {
         // One unreadable record must not sink a readable one, for the reason
         // the proof set applies the same rule: a control plane mid-upgrade can
         // leave an old-format record beside a current one.
+        //
+        // `url=` is checked only for an `https://` origin (see
+        // `parse_control_plane_record`) and is otherwise an opaque redirect
+        // target. That is acceptable *because* the zone key that published it is
+        // gated above: a value this record carries is one the logged zone key
+        // chose to publish, and WebPKI TLS on the WSS connection sits on top.
         let mut refusal = None;
         for record in &validated.records {
             match parse_control_plane_record(record) {
@@ -1077,6 +1097,45 @@ impl DnssecResolver {
         }))
     }
 
+    /// Applies the §4.2 transparency gate to a validated membership answer.
+    ///
+    /// The one place the gate lives, so `member_set` and `control_plane` cannot
+    /// drift apart about what "trusting a membership answer" means. A no-op
+    /// unless `RekorPolicy::Require` — under `Off` an answer needs no `apex=`
+    /// field at all, which DNSSEC-only deployments rely on. Under `Require`,
+    /// `apex_of` holds the apex between the signing zone and the domain at both
+    /// ends, the pin set is refreshed (never fatally — an unreachable TUF
+    /// repository leaves the current pins standing), and the zone key that
+    /// signed the answer must carry a verified log record or the whole answer
+    /// is refused.
+    async fn gate_answer(&self, domain: &str, membership: &ValidatedTxt) -> Result<(), NetError> {
+        if self.rekor != RekorPolicy::Require {
+            return Ok(());
+        }
+        let apex = apex_of(domain, &membership.signer, &membership.records)?;
+        match self.refresh_tuf().await {
+            Ok(Some(update)) if update.changed => tracing::info!(
+                root = update.state.root_version,
+                timestamp = update.state.timestamp_version,
+                logs = update.log_keys.keys().len(),
+                "transparency-log pin set updated from Sigstore's TUF repository"
+            ),
+            Ok(_) => {}
+            Err(e) if self.pin_refresh_overdue() => tracing::warn!(
+                error = %e,
+                stale_after = PIN_REFRESH_STALE_AFTER,
+                "Sigstore's TUF repository has not updated the pin set in far \
+                 longer than the refresh interval; the pins in force are frozen"
+            ),
+            Err(e) => tracing::debug!(
+                error = %e,
+                "Sigstore's TUF repository did not update the pin set; the current pins stand"
+            ),
+        }
+        self.verify_zone_key(domain, &apex, membership).await?;
+        Ok(())
+    }
+
     /// Resolves and applies the §3.2 rules in one step.
     ///
     /// Under [`RekorPolicy::Require`] this is where §4.2's three validated
@@ -1089,70 +1148,17 @@ impl DnssecResolver {
         let name = query_name(&domain);
         let response = self.lookup(&name, RecordType::TXT).await?;
         let validated = self.validated_txt(&name, &response.answers)?;
-        if self.rekor == RekorPolicy::Require {
-            // The zone that signed the answer. Every record this client goes
-            // on to fetch hangs off it, because it is the only name the
-            // answer itself yields — the control plane's apex is a name only
-            // the log entry knows, and it is checked against this one rather
-            // than used to find anything.
-            //
-            // It comes out of `secure_txt`, which already held it to
-            // RFC 4035 §5.3.1 before returning: a signer that does not
-            // enclose the queried name never reaches this line. The live
-            // DNSKEYs are identified later by verifying the answer's own
-            // RRSIGs, not by treating a 16-bit tag as a key id.
-            let signing_zone = validated.signer.clone();
-            // Where the control plane's transparency records live. Taken
-            // from the answer this client just DNSSEC-validated, and then
-            // held to both ends: an apex must contain the domain being
-            // resolved and be contained by the zone that signed it. Two
-            // control planes inside one signing zone would otherwise have to
-            // share a single record name — and, on the publishing side, delete
-            // each other's records forever.
-            let apex = apex_of(&domain, &signing_zone, &validated.records)?;
-            // The pin set is refreshed *before* the proof is verified, so a
-            // proof from a shard Sigstore added since this build shipped
-            // verifies in the same refresh that learned about it (§10.2).
-            //
-            // And nothing about it can fail this refresh: an unreachable,
-            // stale or hostile TUF repository leaves the current pins
-            // standing, because a client that cannot read Sigstore must
-            // degrade to a frozen pin set — the behavior a build-time
-            // snapshot always had — and never to a failed cluster. At most
-            // once a day, too: the pins move on Sigstore's schedule, not on
-            // the zone's TTL.
-            match self.refresh_tuf().await {
-                Ok(Some(update)) if update.changed => tracing::info!(
-                    root = update.state.root_version,
-                    timestamp = update.state.timestamp_version,
-                    logs = update.log_keys.keys().len(),
-                    "transparency-log pin set updated from Sigstore's TUF repository"
-                ),
-                Ok(_) => {}
-                // A failure that has been going on far longer than the refresh
-                // interval is not the same event as one failure. The pins are
-                // frozen — at what a walk last established, or at the build's
-                // bootstrap snapshot if none ever has — and a client running on
-                // frozen pins will refuse every proof from the day Sigstore
-                // rotates a shard. That is an operator's problem to see, so it
-                // is a warning rather than a line only `--verbose` prints.
-                Err(e) if self.pin_refresh_overdue() => tracing::warn!(
-                    error = %e,
-                    stale_after = PIN_REFRESH_STALE_AFTER,
-                    "Sigstore's TUF repository has not updated the pin set in far \
-                     longer than the refresh interval; the pins in force are frozen"
-                ),
-                Err(e) => tracing::debug!(
-                    error = %e,
-                    "Sigstore's TUF repository did not update the pin set; the current pins stand"
-                ),
-            }
-            // One apex, one verification. `apex_of` has already refused an
-            // answer that names none or names two, so there is no branch here
-            // in which the requirement goes unchecked — a straight line rather
-            // than an invariant about how many times a loop ran.
-            self.verify_zone_key(&domain, &apex, &validated).await?;
-        }
+        // The §4.2 gate: under `RekorPolicy::Require` the zone key that signed
+        // the answer must be on the transparency log, checked against the apex
+        // the answer names. `apex_of` has already refused an answer that names
+        // none or names two, so the requirement is a straight line rather than
+        // an invariant about how many times a loop ran. The pins are refreshed
+        // *before* the proof is verified, so a proof from a shard Sigstore
+        // added since this build shipped verifies in the same refresh that
+        // learned about it (§10.2) — and never fatally to the refresh, because
+        // a client that cannot read Sigstore degrades to a frozen pin set
+        // rather than a failed cluster.
+        self.gate_answer(&domain, &validated).await?;
         let set = MemberSet::from_records(&domain, &validated.records)?;
         Ok((set, validated.ttl))
     }

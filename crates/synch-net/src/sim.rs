@@ -51,6 +51,10 @@ pub struct SimZone {
     /// base64url as [`RekorProof::to_txt`] renders it. Empty is the
     /// not-yet-upgraded control plane.
     pub rekor_txt: Vec<String>,
+    /// The control-plane attach record served at `_synchronicity-cp.<origin>`,
+    /// e.g. `v=synccp1 url=https://sync.example`. Empty is a deployment that
+    /// does not offer cloud attach, and the name does not exist.
+    pub cp_txt: Vec<String>,
     /// Extra DNSKEYs served at the apex after the zone's own key.
     extra_dnskeys: Vec<DNSKEY>,
     /// If set, membership (and impersonated) TXT is signed by this instead of
@@ -140,6 +144,7 @@ impl SimZone {
             ttl: 300,
             unsigned: false,
             rekor_txt: Vec::new(),
+            cp_txt: Vec::new(),
             extra_dnskeys: Vec::new(),
             txt_signer: None,
             impersonate: None,
@@ -435,6 +440,11 @@ impl SimZone {
         Name::from_utf8(format!("{}.{}", rekor::REKOR_TXT_PREFIX, self.origin)).expect("rekor name")
     }
 
+    /// The name the control-plane attach record lives under.
+    pub fn cp_name(&self) -> Name {
+        Name::from_utf8(format!("{}.{}", crate::dns::CP_TXT_PREFIX, self.origin)).expect("cp name")
+    }
+
     /// Which proof part `name` is the owner for, if any.
     fn rekor_part_index(&self, name: &Name) -> Option<usize> {
         let text = name.to_string();
@@ -603,6 +613,20 @@ impl SimZone {
                     return response;
                 }
                 self.chunked_txt(name, &mine)
+            }
+            RecordType::TXT if !self.cp_txt.is_empty() && name == self.cp_name() => {
+                let mut set = RecordSet::new(name.clone(), RecordType::TXT, 0);
+                for text in &self.cp_txt {
+                    set.insert(
+                        Record::from_rdata(
+                            name.clone(),
+                            self.ttl,
+                            RData::TXT(TXT::new(vec![text.clone()])),
+                        ),
+                        0,
+                    );
+                }
+                set
             }
             RecordType::DNSKEY if name == self.origin => {
                 let mut set = RecordSet::new(name, RecordType::DNSKEY, 0);

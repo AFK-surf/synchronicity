@@ -59,6 +59,23 @@ const HEARTBEAT_MISSES: u32 = 2;
 /// frame, so a deep queue would only hide a stalled socket.
 const WRITE_AHEAD: usize = 8;
 
+/// How long one write to the socket may take before the session is torn down.
+///
+/// A control plane that stops reading (a zero-window stall, or a hostile peer
+/// that never drains) blocks the writer; without this bound the write would
+/// hang forever. Set above the heartbeat window so a merely slow-but-live link
+/// is not killed, but finite so a wedged one is.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The most requests and streams one session may have in flight at once.
+///
+/// A hostile control plane can otherwise open unbounded LS/STAT/RESOLVE tasks
+/// and READ streams, each doing blocking-pool store work. Over the cap a
+/// request is refused with a coded error rather than queued. The control
+/// plane's per-user cap does not protect the daemon — that is a different
+/// process trusting a different thing — so the daemon holds its own ceiling.
+const MAX_INFLIGHT: usize = 64;
+
 /// How many entries one listing page carries.
 const PAGE_LIMIT: usize = 500;
 
@@ -338,30 +355,113 @@ impl Drop for Stream {
     }
 }
 
+/// A message from a spawned task back to the session loop.
+///
+/// This is what keeps the session's bookkeeping truthful: a one-shot request
+/// or a stream that has ended tells the loop so, rather than leaving a map
+/// entry or an in-flight count that no longer means anything.
+#[derive(Debug)]
+enum Internal {
+    /// A READ stream ended — success, error, or cancellation — so its map
+    /// entry can go. Without this the entry leaks per completed download and
+    /// the reused-id guard refuses the id forever.
+    ReadDone(u32),
+    /// A one-shot LS/STAT/RESOLVE task finished, so the in-flight count drops.
+    RequestDone,
+    /// The writer task gave up on the socket — a failed or stalled write — so
+    /// the session is over.
+    WriterFailed(String),
+}
+
+/// Aborts the writer task when the session ends, whichever way it ends.
+#[derive(Debug)]
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Answers frames until the connection ends.
-async fn serve<S, R>(node: &Node, mut sink: S, mut stream: R) -> Result<()>
+///
+/// The socket write lives in a dedicated task, not in the select loop: a write
+/// blocked on backpressure from a control plane that has stopped reading would
+/// otherwise stall every other branch — the heartbeat that is meant to kill a
+/// dead session could not fire, and the whole task would hang holding the read
+/// half, the streams, and their blob handles. With the writer split off, the
+/// loop keeps polling the heartbeat and the read half no matter how wedged the
+/// write direction is, and the writer's own timeout tears the session down.
+async fn serve<S, R>(node: &Node, sink: S, mut stream: R) -> Result<()>
 where
-    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send,
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin
+        + Send
+        + 'static,
     R: futures_util::Stream<
             Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
         > + Unpin,
 {
     let (writes, mut outgoing) = mpsc::channel::<Message>(WRITE_AHEAD);
+    let (internal, mut events) = mpsc::channel::<Internal>(WRITE_AHEAD);
+
+    // The writer owns the sink. Each write is bounded by `WRITE_TIMEOUT`, so a
+    // peer that stops reading is a session that ends rather than a task that
+    // hangs. When the loop returns, `writes` drops, `outgoing.recv()` yields
+    // `None`, and the writer exits — the `AbortOnDrop` is only the backstop for
+    // a write still in progress at that moment.
+    let writer = {
+        let internal = internal.clone();
+        let mut sink = sink;
+        tokio::spawn(async move {
+            while let Some(message) = outgoing.recv().await {
+                match tokio::time::timeout(WRITE_TIMEOUT, sink.send(message)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        let _ = internal
+                            .send(Internal::WriterFailed(format!(
+                                "the tunnel write failed: {e}"
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = internal
+                            .send(Internal::WriterFailed(
+                                "the control plane stopped reading; the write stalled".into(),
+                            ))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        })
+    };
+    let _writer_guard = AbortOnDrop(writer);
+
     let mut streams: HashMap<u32, Stream> = HashMap::new();
-    let mut beat = tokio::time::interval(HEARTBEAT);
+    // One-shot LS/STAT/RESOLVE tasks in flight; streams are counted separately
+    // by the map, and the cap is on the sum.
+    let mut requests: usize = 0;
+    // First tick one period out, not immediately: a `tokio` interval fires at
+    // once otherwise, which would ping on connect and, worse, spend a miss
+    // before any time had passed — making the two-miss window 30s, not 60s.
+    let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut unanswered = 0u32;
 
     loop {
         tokio::select! {
-            // Writing first: a full write channel is backpressure on every
-            // producer, and it must drain before anything else is accepted.
-            biased;
-            message = outgoing.recv() => {
-                let Some(message) = message else { return Ok(()) };
-                sink.send(message)
-                    .await
-                    .map_err(|e| EngineError::invalid(format!("the tunnel write failed: {e}")))?;
+            event = events.recv() => {
+                match event {
+                    Some(Internal::WriterFailed(why)) => return Err(EngineError::invalid(why)),
+                    // On completion, however it completed: the entry goes and
+                    // the id is free to be reused.
+                    Some(Internal::ReadDone(id)) => { streams.remove(&id); }
+                    Some(Internal::RequestDone) => requests = requests.saturating_sub(1),
+                    // The loop holds a sender, so this only happens at shutdown.
+                    None => return Ok(()),
+                }
             }
             _ = beat.tick() => {
                 if unanswered >= HEARTBEAT_MISSES {
@@ -370,9 +470,11 @@ where
                     )));
                 }
                 unanswered += 1;
-                if writes.send(text(&Up::Ping)?).await.is_err() {
-                    return Ok(());
-                }
+                // `try_send`, never `await`: a full channel means the writer is
+                // behind, which the write timeout already covers — the loop must
+                // not block here, or it stops polling the very branches that
+                // detect a dead peer.
+                let _ = writes.try_send(text(&Up::Ping)?);
             }
             incoming = stream.next() => {
                 let Some(incoming) = incoming else { return Ok(()) };
@@ -384,7 +486,7 @@ where
                         let frame: Down = serde_json::from_str(&body).map_err(|e| {
                             EngineError::invalid(format!("malformed tunnel frame: {e}"))
                         })?;
-                        handle(node, &writes, &mut streams, frame).await?;
+                        handle(node, &writes, &internal, &mut streams, &mut requests, frame)?;
                     }
                     // Content only ever travels upward, so a binary frame from
                     // the control plane is a protocol violation rather than a
@@ -404,15 +506,22 @@ where
 }
 
 /// Serves one control frame.
-async fn handle(
+///
+/// Never awaits: every answer is produced in a spawned task and delivered
+/// through the writer channel, so serving a frame cannot block the session
+/// loop. A `try_send` that finds the channel full is treated as backpressure
+/// on the offending request, not on the session.
+fn handle(
     node: &Node,
     writes: &Writer,
+    internal: &mpsc::Sender<Internal>,
     streams: &mut HashMap<u32, Stream>,
+    requests: &mut usize,
     frame: Down,
 ) -> Result<()> {
     match frame {
         Down::Ping => {
-            let _ = writes.send(text(&Up::Pong)?).await;
+            let _ = writes.try_send(text(&Up::Pong)?);
         }
         Down::Pong => {}
         Down::Err { id, code, message } => {
@@ -436,20 +545,32 @@ async fn handle(
             cursor,
             all,
         } => {
+            if over_capacity(writes, streams, *requests, id) {
+                return Ok(());
+            }
+            *requests += 1;
             let node = node.clone();
             let writes = writes.clone();
+            let internal = internal.clone();
             tokio::spawn(async move {
                 let page = list_page(&node, &space, &path, cursor, all)
                     .await
                     .map(|frame| with_id(frame, id));
                 answer(&writes, id, page).await;
+                let _ = internal.send(Internal::RequestDone).await;
             });
         }
         Down::Stat { id, space, path } => {
+            if over_capacity(writes, streams, *requests, id) {
+                return Ok(());
+            }
+            *requests += 1;
             let node = node.clone();
             let writes = writes.clone();
+            let internal = internal.clone();
             tokio::spawn(async move {
                 answer(&writes, id, stat(&node, id, &space, &path).await).await;
+                let _ = internal.send(Internal::RequestDone).await;
             });
         }
         Down::Resolve {
@@ -458,10 +579,16 @@ async fn handle(
             path,
             from,
         } => {
+            if over_capacity(writes, streams, *requests, id) {
+                return Ok(());
+            }
+            *requests += 1;
             let node = node.clone();
             let writes = writes.clone();
+            let internal = internal.clone();
             tokio::spawn(async move {
                 answer(&writes, id, resolve(&node, id, &space, &path, from).await).await;
+                let _ = internal.send(Internal::RequestDone).await;
             });
         }
         Down::Read {
@@ -476,34 +603,36 @@ async fn handle(
             // replacement: the old one's chunks would be read as the new
             // one's. Refusing keeps the id space the control plane's problem.
             if streams.contains_key(&id) {
-                let _ = writes
-                    .send(text(&Up::Err {
-                        id: Some(id),
-                        code: "invalid".into(),
-                        message: format!("request {id} is already streaming"),
-                    })?)
-                    .await;
+                let _ = writes.try_send(text(&Up::Err {
+                    id: Some(id),
+                    code: "invalid".into(),
+                    message: format!("request {id} is already streaming"),
+                })?);
+                return Ok(());
+            }
+            if over_capacity(writes, streams, *requests, id) {
                 return Ok(());
             }
             let permits = Arc::new(Semaphore::new(credit as usize));
             let task = {
                 let node = node.clone();
                 let writes = writes.clone();
+                let internal = internal.clone();
                 let permits = permits.clone();
                 tokio::spawn(async move {
                     if let Err(e) = read(&node, &writes, id, &root, size, start, len, permits).await
                     {
-                        let _ = writes
-                            .send(Message::text(
-                                serde_json::to_string(&Up::Err {
-                                    id: Some(id),
-                                    code: code_of(&e).to_string(),
-                                    message: e.to_string(),
-                                })
-                                .unwrap_or_default(),
-                            ))
-                            .await;
+                        let _ = writes.try_send(Message::text(
+                            serde_json::to_string(&Up::Err {
+                                id: Some(id),
+                                code: code_of(&e).to_string(),
+                                message: e.to_string(),
+                            })
+                            .unwrap_or_default(),
+                        ));
                     }
+                    // Whichever way it ended, the session loop drops the entry.
+                    let _ = internal.send(Internal::ReadDone(id)).await;
                 })
             };
             streams.insert(
@@ -518,6 +647,27 @@ async fn handle(
         Down::Challenge { .. } | Down::Attached { .. } => {}
     }
     Ok(())
+}
+
+/// Whether a new request would exceed the per-session ceiling, refusing it with
+/// a coded error if so.
+fn over_capacity(
+    writes: &Writer,
+    streams: &HashMap<u32, Stream>,
+    requests: usize,
+    id: u32,
+) -> bool {
+    if streams.len() + requests < MAX_INFLIGHT {
+        return false;
+    }
+    if let Ok(message) = text(&Up::Err {
+        id: Some(id),
+        code: "unavailable".into(),
+        message: format!("this session already has {MAX_INFLIGHT} requests in flight"),
+    }) {
+        let _ = writes.try_send(message);
+    }
+    true
 }
 
 /// Sends one request's answer, or the coded refusal it failed with.
@@ -845,6 +995,12 @@ async fn read(
     // The allowlist is enforced on the *root*, not on a space the frame
     // claims: a root reachable only through a space the operator did not
     // expose is not readable however the request is spelled.
+    //
+    // The check is per-frame, not per-chunk: a READ already admitted streams to
+    // completion even if the operator narrows the allowlist mid-transfer. That
+    // is the same grain the whole tunnel enforces at — a request is authorized
+    // when it arrives — and one in-flight file finishing is the bounded cost of
+    // it. `disable` and a narrowed list still take effect on the next frame.
     let exposed = {
         let settings = node.cloud_settings()?;
         node.store()
@@ -944,6 +1100,166 @@ mod tests {
 
     fn origin(name: &str) -> OriginId {
         OriginId::named(name, "x.example").unwrap()
+    }
+
+    /// Encodes one control frame as the control plane would put it on the wire.
+    fn down_msg(frame: &Down) -> Message {
+        Message::text(serde_json::to_string(frame).unwrap())
+    }
+
+    /// The next text frame the node sent, decoded — skipping binary chunks so a
+    /// caller waiting for a control answer is not tripped by content.
+    async fn next_up(rx: &mut mpsc::UnboundedReceiver<Message>) -> Up {
+        loop {
+            match rx.recv().await.expect("the node sent a frame") {
+                Message::Text(body) => {
+                    let up: Up = serde_json::from_str(&body).expect("a valid Up");
+                    // Skip the node's own heartbeat pings; a Pong answering the
+                    // test's ping is a real frame and is returned.
+                    if matches!(up, Up::Ping) {
+                        continue;
+                    }
+                    return up;
+                }
+                Message::Binary(_) => continue,
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    }
+
+    /// Runs `serve` end to end against an in-process socket, exercising the real
+    /// framing: JSON control frames, the binary CHUNK codec, credit flow, and
+    /// the request-id multiplexing across LS → RESOLVE → READ → PING. The
+    /// attach handshake itself is `attach_once`, tested for its signing bytes
+    /// against the control plane's; this covers everything downstream of it.
+    #[tokio::test]
+    async fn serve_answers_ls_resolve_and_read_over_the_wire() {
+        let (dir, node) = node().await;
+        node.add_space("media", dir.path().join("media")).unwrap();
+        node.enable_cloud(&["media".to_string()]).unwrap();
+        // Larger than one chunk, so the CHUNK framing and the multi-chunk
+        // credit path both run rather than fitting in a single frame.
+        let payload = vec![0xABu8; MAX_CHUNK + 4321];
+        let root = node
+            .store()
+            .ingest_bytes(&payload, synch_core::now_ns())
+            .unwrap();
+        node.store()
+            .put_entry(
+                &origin("nas"),
+                "media",
+                "big.bin",
+                &FileEntry::file(payload.len() as u64, 1, root, 1),
+            )
+            .unwrap();
+
+        // Two halves of one socket: `to_node` carries Down frames in, `from_node`
+        // collects Up frames out.
+        let (to_node, node_rx) = mpsc::unbounded_channel::<Message>();
+        let (node_tx, mut from_node) = mpsc::unbounded_channel::<Message>();
+        let stream = Box::pin(futures_util::stream::unfold(node_rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|m| (Ok::<Message, tokio_tungstenite::tungstenite::Error>(m), rx))
+        }));
+        let sink = Box::pin(futures_util::sink::unfold(
+            node_tx,
+            |tx, m: Message| async move {
+                tx.send(m)
+                    .map_err(|_| tokio_tungstenite::tungstenite::Error::ConnectionClosed)?;
+                Ok::<_, tokio_tungstenite::tungstenite::Error>(tx)
+            },
+        ));
+        let served = {
+            let node = node.clone();
+            tokio::spawn(async move {
+                let _ = serve(&node, sink, stream).await;
+            })
+        };
+
+        // LS: the directory lists the file.
+        to_node
+            .send(down_msg(&Down::Ls {
+                id: 1,
+                space: "media".into(),
+                path: String::new(),
+                cursor: None,
+                all: false,
+            }))
+            .unwrap();
+        let Up::Page { id, entries, .. } = next_up(&mut from_node).await else {
+            panic!("expected a page")
+        };
+        assert_eq!(id, 1);
+        assert!(entries.iter().any(|e| e.name == "big.bin"));
+
+        // RESOLVE: pin the version to its content root.
+        to_node
+            .send(down_msg(&Down::Resolve {
+                id: 2,
+                space: "media".into(),
+                path: "big.bin".into(),
+                from: None,
+            }))
+            .unwrap();
+        let Up::Resolved { id, root, size, .. } = next_up(&mut from_node).await else {
+            panic!("expected a resolution")
+        };
+        assert_eq!(id, 2);
+        assert_eq!(size, payload.len() as u64);
+
+        // READ by pinned root: META, then the content in ≤64 KiB chunks under
+        // the initial credit, then DONE. The bytes must match exactly.
+        to_node
+            .send(down_msg(&Down::Read {
+                id: 3,
+                root: root.clone(),
+                size,
+                start: 0,
+                len: None,
+                credit: 8,
+            }))
+            .unwrap();
+        let Up::Meta {
+            id,
+            size: meta_size,
+            root: meta_root,
+        } = next_up(&mut from_node).await
+        else {
+            panic!("expected a meta frame before content")
+        };
+        assert_eq!(id, 3);
+        assert_eq!(meta_size, payload.len() as u64);
+        assert_eq!(meta_root, root);
+
+        let mut got = Vec::new();
+        loop {
+            match from_node.recv().await.expect("a frame") {
+                Message::Binary(bytes) => {
+                    let (chunk_id, _seq, data) = decode_chunk(&bytes).expect("a content frame");
+                    assert_eq!(chunk_id, 3);
+                    assert!(data.len() <= MAX_CHUNK);
+                    got.extend_from_slice(data);
+                }
+                Message::Text(body) => {
+                    if let Up::Done { id } = serde_json::from_str(&body).unwrap() {
+                        assert_eq!(id, 3);
+                        break;
+                    }
+                }
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert_eq!(got, payload, "the streamed bytes match the file");
+
+        // PING/PONG multiplexes over the same connection.
+        to_node.send(down_msg(&Down::Ping)).unwrap();
+        assert!(matches!(next_up(&mut from_node).await, Up::Pong));
+
+        // Closing the Down half ends the session cleanly.
+        drop(to_node);
+        let _ = served.await;
+        node.shutdown().await.unwrap();
     }
 
     /// No validated record, no connection: a resolver outage degrades the
