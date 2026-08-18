@@ -389,34 +389,28 @@ proofs are in flight (a rollover serves both), and every reader re-derives it
 after reassembly, so parts of different proofs cannot be spliced into
 something that decodes.
 
-**A group is every reading its records support, not one.** Anyone who can place
-a TXT record at these names — a compromised managed provider, squarely in the
-threat model — reads the operator's `group` off public DNS. Taking a single
-`total` across the group, or a single chunk per index, made that a free and
-permanent denial: publish `sync1p <group> 9/9 AAAA` and the set can never
-complete again, or `1/5 <junk>` and the real part 1 is overwritten, and the
-client reports the operator's own zone as having published gibberish. So the
-records claiming each `total` are assembled separately, a duplicated index
-contributes a *candidate* chunk rather than replacing the real one, and the
-group digest is still the only thing that decides acceptance — so an injected
-record cannot *overwrite* the answer or forge one.
+**A group is one reading of its records.** Records claiming different `total`s
+are separate readings — a rollover legitimately serves a five-part set beside a
+nine-part one — but within one reading each index arrives once or not at all. A
+duplicated index is the zone disagreeing with itself about what it published,
+and it is refused by name rather than guessed at.
 
-**It can still deny one, and that is stated rather than claimed away.** The
-readings a group may ask for are the product of its per-index candidate counts,
-so they are capped (`MAX_GROUP_ASSEMBLIES`); a `total` whose product exceeds the
-cap is skipped whole, the honest assembly inside it included. The reassembled
-proofs a refresh will verify are capped too (`MAX_PROOF_CANDIDATES`), ordered by
-a group digest an attacker can grind. Enough padding at the name therefore
-suppresses a proof that is otherwise complete, and the client reports a named
-refusal rather than distinguishing "somebody padded this name" from "this zone
-published nothing usable".
+The alternative was to treat duplicates as alternatives and try every reading
+they support. That is a product over the per-index counts, so it needed a cap,
+and the cap is what an injector then aimed at: past it the group was refused
+whole, the honest assembly inside it included. It never bought a *surviving*
+answer — only a bounded refusal — and it bought that against a party who did
+not need to be beaten this way.
 
-That residue is not closable here, which is why it is documented instead. Every
-record on this path arrives DNSSEC-validated, so whoever can add one is whoever
-signs the zone — the compromised managed provider named above — and that party
-can delete the records or refuse the name just as easily. No work bound
-reachable from the client changes what they can do to availability. What the
-group digest and the chain walk do hold, against exactly that party, is
+**Because the party who can do this is the party who signs the zone.** Every
+record on this path arrives DNSSEC-validated, so duplicating an index takes the
+zone's key, and whoever holds it can delete the records or refuse the name just
+as easily. No work bound reachable from the client changes what they can do to
+availability, and a client cannot distinguish "somebody padded this name" from
+"this zone published nothing usable" in any case. Fail-closed availability
+against the zone's own signer is the standing posture (§4.3), not something
+this mechanism was ever going to recover. What the group digest and the chain
+walk do hold, against exactly that party, is
 *authorization*: they cannot make a client accept a key the delegation does not
 authorize. Fail-closed availability against the zone's own signer is the
 standing posture (§4.3), not a gap in this mechanism.

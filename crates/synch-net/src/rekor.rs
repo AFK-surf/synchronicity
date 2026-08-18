@@ -343,37 +343,22 @@ impl RekorProof {
 /// its own, which is what lets a mid-rollover zone serve a record this build
 /// does not understand beside the one it needs.
 ///
-/// **An added record does not *overwrite* a complete one.** A group is not one
-/// reading of the records at its name; it is every reading they support. A
-/// single `total` taken across the group — or a single chunk per index — would
-/// hand anyone who can place a TXT record at `_synchronicity-rekor.<apex>` a
-/// free and permanent denial: they read the operator's group off public DNS and
-/// publish `sync1p <group> 9/9 …`, and a set that is otherwise whole can never
-/// complete again. So the records claiming each `total` are assembled
-/// separately, a duplicated index contributes a *candidate* rather than
-/// replacing the real chunk, and the group digest — over the whole encoded
-/// proof — remains the only thing that decides acceptance.
+/// **A record added at an index the zone already published is a
+/// contradiction, and the group is refused.** Records claiming different
+/// `total`s are still separate readings — a rollover legitimately serves a
+/// five-part set beside a nine-part one — but within one reading each index
+/// arrives once or not at all.
 ///
-/// **What this does not do is make an injected record free.** The readings one
-/// group may ask for are the product of its per-index candidate counts, so they
-/// are capped (`MAX_GROUP_ASSEMBLIES`), and a `total` whose product exceeds
-/// the cap is skipped **whole** — the honest assembly inside it along with the
-/// injected ones. The number of reassembled proofs a refresh will verify is
-/// capped too, and those are ordered by a group digest an attacker can grind.
-/// So an injector cannot forge an answer, but *can* deny one, and the
-/// suppression is not distinguishable from a zone that published nothing usable.
-/// `tests` pins this behaviour deliberately, under the name it deserves:
-/// padding the name is denial-by-cost.
-///
-/// That is a bound rather than a defence, and it cannot be much else. Every
-/// record here arrives DNSSEC-validated, so the party who can add one is the
-/// party who signs the zone — in external mode, the managed provider, which the
-/// threat model names explicitly. That party can equally delete the records or
-/// refuse to serve the name, so no work bound reachable from this function
-/// changes what they can do to availability; what the design does defend is
-/// *authorization*, which the group digest and the chain walk hold regardless.
-/// Raising or reshaping the caps moves the number of records an injector needs
-/// and nothing else, which is why they are caps and not cleverness.
+/// This is a deliberate narrowing from treating duplicates as alternatives and
+/// trying every combination. That is a product over the per-index counts, it
+/// needs a cap to be safe, and the cap is what an injector then aims at —
+/// past it the group is refused whole, honest assembly included. It never
+/// bought a surviving answer against the only party who can reach these
+/// records: every one of them arrives DNSSEC-validated, so duplicating an
+/// index takes the zone's signing key, and whoever holds that can delete the
+/// records instead. Availability against the zone's own signer is not
+/// defensible here and is not claimed (§4.3); *authorization* is, and the
+/// group digest and the chain walk hold it whatever the records look like.
 pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>> {
     use std::collections::BTreeMap;
 
@@ -401,17 +386,27 @@ pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>
     out
 }
 
-/// The most assemblies one group's records may be tried in.
+/// Reassembles one group: one reading per part count its records claim.
 ///
-/// The readings a group supports are the product of how many chunks each index
-/// has candidates for, so a set with many duplicated indices could ask for
-/// unbounded work. A complete group is one assembly; every record an attacker
-/// adds at a duplicated index doubles the count, so this is room for several
-/// injections and a bound on all of them.
-const MAX_GROUP_ASSEMBLIES: usize = 64;
-
-/// Reassembles one group, trying every reading its records support until the
-/// digest agrees.
+/// **One chunk per index, and a duplicated index is a contradiction rather
+/// than a candidate.** The alternative — treating duplicates as alternatives
+/// and trying every combination — is a product over the per-index counts, so
+/// it needs a cap, and the cap is what the injector then aims at: past it the
+/// group is refused whole, honest assembly and all.
+///
+/// It bought nothing to be worth that. Every record here arrives
+/// DNSSEC-validated, so the only party who can duplicate an index is the party
+/// who signs the zone — in external mode the managed provider the threat model
+/// names. That party can delete the records or refuse the name outright, so no
+/// amount of combinatorial patience changes what they can do to availability.
+/// What the design defends is *authorization*, and that is the group digest
+/// and the chain walk, which hold whatever the records look like.
+///
+/// So the rule is the one a self-contradicting answer gets everywhere else
+/// here: read it one way, and refuse if the records do not agree on what that
+/// way is. Distinct claimed totals are still separate readings — that is a sum
+/// over the records, not a product, and it is what lets a `1/5` set and a
+/// `1/9` set coexist at one name during a rollover.
 fn assemble_group(group: &str, parts: &[(usize, usize, String)]) -> Result<RekorProof, ProofError> {
     // The part counts the records claim, smallest first: a complete honest set
     // is tried before any larger count an added record invented.
@@ -424,50 +419,39 @@ fn assemble_group(group: &str, parts: &[(usize, usize, String)]) -> Result<Rekor
         // Only records that agree on the count take part in its reading. A
         // record claiming some other total is a different reading, not a hole
         // in this one.
-        let candidates: Vec<Vec<&str>> = (1..=total)
-            .map(|index| {
-                parts
-                    .iter()
-                    .filter(|(at, claimed, _)| *at == index && *claimed == total)
-                    .map(|(_, _, chunk)| chunk.as_str())
-                    .collect()
-            })
-            .collect();
-        let missing = candidates.iter().filter(|c| c.is_empty()).count();
-        if missing > 0 {
-            last = Some(ProofError::Malformed(format!(
-                "proof {group} is served in {total} part(s) and {missing} did not arrive"
-            )));
-            continue;
-        }
-        let assemblies = candidates
-            .iter()
-            .try_fold(1usize, |product, c| product.checked_mul(c.len()))
-            .unwrap_or(usize::MAX);
-        if assemblies > MAX_GROUP_ASSEMBLIES {
-            last = Some(ProofError::Malformed(format!(
-                "proof {group} is served in {total} part(s) with {assemblies} ways \
-                 to read them, past the {MAX_GROUP_ASSEMBLIES} this build will try"
-            )));
-            continue;
-        }
-        // Every combination of one chunk per index, in a deterministic order:
-        // the assembly number read as a mixed-radix odometer over the
-        // per-index candidate lists.
-        for assembly in 0..assemblies {
-            let mut rest = assembly;
-            let payload: String = candidates
+        let mut payload = String::new();
+        let mut broken = None;
+        for index in 1..=total {
+            let mut chunks = parts
                 .iter()
-                .map(|chunks| {
-                    let choice = rest % chunks.len();
-                    rest /= chunks.len();
-                    chunks[choice]
-                })
-                .collect();
-            match decode_group(group, &payload) {
-                Ok(proof) => return Ok(proof),
-                Err(e) => last = Some(e),
+                .filter(|(at, claimed, _)| *at == index && *claimed == total)
+                .map(|(_, _, chunk)| chunk.as_str());
+            match (chunks.next(), chunks.next()) {
+                (Some(chunk), None) => payload.push_str(chunk),
+                (None, _) => {
+                    broken = Some(ProofError::Malformed(format!(
+                        "proof {group} is served in {total} part(s) and part {index} \
+                         did not arrive"
+                    )));
+                    break;
+                }
+                (Some(_), Some(_)) => {
+                    broken = Some(ProofError::Malformed(format!(
+                        "proof {group} is served in {total} part(s) and part {index} \
+                         arrived more than once, so the zone does not agree with \
+                         itself about what it published"
+                    )));
+                    break;
+                }
             }
+        }
+        if let Some(e) = broken {
+            last = Some(e);
+            continue;
+        }
+        match decode_group(group, &payload) {
+            Ok(proof) => return Ok(proof),
+            Err(e) => last = Some(e),
         }
     }
     Err(last.unwrap_or_else(|| {
@@ -2239,33 +2223,49 @@ mod tests {
         assert_eq!(p256.note_hint(&checkpoint.origin), None);
     }
 
-    /// One record added at the proof name cannot deny a group that is complete.
+    /// A group is one reading of its records, and a zone that contradicts
+    /// itself is refused rather than guessed at.
     ///
-    /// Anyone who can place a TXT record at `_synchronicity-rekor.<apex>` reads
-    /// the operator's group off public DNS. A single `total` taken across the
-    /// group, or a single chunk per index, made that a free and permanent denial:
-    /// publish `sync1p <group> 9/9 …` and the set can never complete again, or
-    /// `1/5 <junk>` and the real chunk 1 is overwritten. A group is every reading
-    /// its records support, and the group digest still decides acceptance.
+    /// Records claiming different `total`s are separate readings — a rollover
+    /// legitimately serves a five-part set beside a nine-part one — so a
+    /// raised total cannot hole the real set. Within one reading each index
+    /// arrives once: a duplicate is the zone disagreeing with itself about
+    /// what it published, and there is no reading of that worth picking.
+    ///
+    /// **This makes a denial cheaper for the party who can mount one, and that
+    /// is the honest trade.** Every record here arrives DNSSEC-validated, so
+    /// duplicating an index takes the zone's signing key — and whoever holds it
+    /// can delete the records or refuse the name instead. Trying every
+    /// combination bought a bounded refusal rather than a surviving answer
+    /// (past the bound the whole group went, honest assembly included), at the
+    /// price of a combinatorial space that had to be capped. Availability
+    /// against the zone's own signer is not defensible here and is not claimed;
+    /// authorization is, and the group digest decides that either way.
     #[test]
-    fn one_added_record_cannot_deny_a_complete_group() {
+    fn a_group_is_one_reading_and_a_contradiction_is_refused() {
         let big = RekorProof {
             statement: vec![b'x'; 3000],
             canonicalized_body: vec![b'y'; 3000],
             ..proof()
         };
-        let records = big.to_txt().expect("encodes");
+        let records = big.to_txt().expect("a multi-part proof");
         let total = records.len();
-        assert!(total > 1);
-        let group = records[0].split_whitespace().nth(1).unwrap().to_string();
-        let reassembles = |records: &[String]| {
-            proofs_from_txt(records)
+        assert!(total > 1, "the fixture must actually span several parts");
+        let group = records[0]
+            .split(' ')
+            .nth(1)
+            .expect("a group field")
+            .to_string();
+        let reassembles = |set: &[String]| -> Vec<RekorProof> {
+            proofs_from_txt(set)
                 .into_iter()
                 .filter_map(Result::ok)
-                .collect::<Vec<_>>()
+                .collect()
         };
+        assert_eq!(reassembles(&records), vec![big.clone()]);
 
-        // A record claiming a part count nobody else does.
+        // A record inventing a larger count is a *different* reading, and the
+        // real one is still read.
         let mut inflated = records.clone();
         inflated.push(format!("{PROOF_TXT_PREFIX} {group} 9/9 AAAA"));
         assert_eq!(
@@ -2274,51 +2274,24 @@ mod tests {
             "a raised total is one more reading, not a hole in the real one"
         );
 
-        // A duplicate of a real index, carrying junk.
-        let mut overwritten = records.clone();
-        overwritten.push(format!("{PROOF_TXT_PREFIX} {group} 1/{total} AAAA"));
-        assert_eq!(
-            reassembles(&overwritten),
-            vec![big.clone()],
-            "a duplicated index is another candidate chunk, not a replacement"
+        // A duplicate of a real index, inside the real reading, is a refusal
+        // naming the index — not a silent pick between two chunks.
+        let mut duplicated = records.clone();
+        duplicated.push(format!("{PROOF_TXT_PREFIX} {group} 1/{total} AAAA"));
+        let refused = proofs_from_txt(&duplicated);
+        assert!(
+            matches!(&refused[0], Err(ProofError::Malformed(why))
+                if why.contains("arrived more than once")),
+            "{refused:?}"
         );
 
-        // Both at once, and a duplicate of the *last* index too.
-        let mut everything = overwritten.clone();
-        everything.push(format!("{PROOF_TXT_PREFIX} {group} 9/9 AAAA"));
-        everything.push(format!("{PROOF_TXT_PREFIX} {group} {total}/{total} AAAA"));
-        assert_eq!(reassembles(&everything), vec![big.clone()]);
-
-        // A genuinely incomplete group is still refused, and says which part
-        // count it was reading when it gave up.
+        // A genuinely incomplete group is refused too, and says which part is
+        // missing rather than which count it gave up on.
         let missing = &records[1..];
         let refusal = proofs_from_txt(missing);
         assert!(
             matches!(&refusal[0], Err(ProofError::Malformed(why)) if why.contains("did not arrive")),
             "{refusal:?}"
-        );
-
-        // And the readings one group can ask for are bounded, so padding the
-        // name is denial-by-cost rather than unbounded work.
-        //
-        // Note what this asserts, because it is the honest half of the
-        // paragraph on `proofs_from_txt`: the padded group is refused *whole*,
-        // so the honest assembly inside it is lost with the injected ones.
-        // The cap buys a bounded refusal, not a surviving answer — and against
-        // the only party who can place a record here (whoever signs the zone)
-        // nothing reachable from this function could buy more, since they can
-        // delete the records instead.
-        let mut flooded = records.clone();
-        for n in 0..40 {
-            flooded.push(format!(
-                "{PROOF_TXT_PREFIX} {group} {}/{total} AAAA{n}",
-                (n % total) + 1
-            ));
-        }
-        let flood = proofs_from_txt(&flooded);
-        assert!(
-            matches!(&flood[0], Err(ProofError::Malformed(why)) if why.contains("ways")),
-            "{flood:?}"
         );
     }
 
