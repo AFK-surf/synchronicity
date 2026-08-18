@@ -1460,6 +1460,78 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
+        Command::CloudEnable(pb::CloudEnable { spaces }) => {
+            let settings = node.enable_cloud(&spaces)?;
+            out.line(format!("exposing {}", settings.spaces.join(", ")))
+                .await?;
+            let domains = node.domains()?;
+            if domains.is_empty() {
+                // Nothing to attach to and nothing that will change that on
+                // its own: the endpoint comes from a membership zone, so a
+                // node with no membership domain has nowhere to look.
+                out.line(
+                    "note: no membership domains are configured, so there is no zone to \
+                     discover a control plane from; `synch domain add <domain>` first",
+                )
+                .await?;
+            }
+            for domain in domains {
+                out.line(format!(
+                    "{domain}: discovering _synchronicity-cp at its apex (`synch cloud status`)"
+                ))
+                .await?;
+            }
+        }
+
+        Command::CloudDisable(pb::CloudDisable {}) => {
+            node.disable_cloud()?;
+            out.line("cloud attach disabled; any open tunnel is dropped")
+                .await?;
+        }
+
+        Command::CloudStatus(pb::CloudStatus {}) => {
+            let settings = node.cloud_settings()?;
+            out.line(format!(
+                "cloud: {} · spaces: {}",
+                if settings.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                if settings.spaces.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    settings.spaces.join(", ")
+                }
+            ))
+            .await?;
+            let status = node.cloud_status();
+            if status.is_empty() {
+                out.progress("(no attach attempts yet)").await?;
+            }
+            for domain in status {
+                out.line(format!(
+                    "{:<32} {:<10} {}{}",
+                    domain.domain,
+                    if domain.attached {
+                        "attached"
+                    } else {
+                        "detached"
+                    },
+                    domain
+                        .endpoint
+                        .as_deref()
+                        .unwrap_or("(no validated _synchronicity-cp record)"),
+                    domain
+                        .last_error
+                        .as_ref()
+                        .map(|why| format!("  last error: {why}"))
+                        .unwrap_or_default(),
+                ))
+                .await?;
+            }
+        }
+
         Command::SyncNow(pb::SyncNow {}) => {
             let peers = node.dialable_peers()?;
             if peers.is_empty() {

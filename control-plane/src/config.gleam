@@ -75,6 +75,11 @@ pub type Config {
     google: Option(#(String, String)),
     github: Option(#(String, String)),
     dns_mode: DnsMode,
+    /// Whether daemons may attach and browse (`CP_BROWSE`). Off by default:
+    /// the attach endpoint, the apex record naming it, and the browse API
+    /// all exist only when this is on, in the same shape an unset optional
+    /// provider takes.
+    browse: Bool,
   )
 }
 
@@ -141,6 +146,7 @@ pub fn load() -> Result(Config, String) {
     Replica -> Ok("")
   })
   use smtp <- result.try(smtp_config())
+  use browse <- result.try(browse_enabled(role, public_url))
   Ok(Config(
     role,
     base_domain,
@@ -155,7 +161,51 @@ pub fn load() -> Result(Config, String) {
     credential_pair("CP_GOOGLE_CLIENT_ID", "CP_GOOGLE_CLIENT_SECRET"),
     credential_pair("CP_GITHUB_CLIENT_ID", "CP_GITHUB_CLIENT_SECRET"),
     dns_mode,
+    browse,
   ))
+}
+
+/// `CP_BROWSE`: `on` or `off` (the default).
+///
+/// Refused on a replica, which has no sessions and no tunnels; and refused
+/// on a primary that has not been told its own public URL, because the apex
+/// record names that URL and a daemon signs its attach proof over it — a
+/// loopback default published into DNS would send every node nowhere.
+fn browse_enabled(role: Role, public_url: String) -> Result(Bool, String) {
+  case envoy.get("CP_BROWSE") {
+    Error(Nil) | Ok("off") -> Ok(False)
+    Ok("on") ->
+      case role, result.is_ok(envoy.get("CP_PUBLIC_URL")) {
+        Replica, _ ->
+          Error(
+            "CP_BROWSE is primary-only: a replica holds no sessions and no "
+            <> "attach tunnels",
+          )
+        Primary, False ->
+          Error(
+            "CP_BROWSE=on needs CP_PUBLIC_URL: the apex record publishes it "
+            <> "and attaching daemons sign their proof over it, so the "
+            <> "default "
+            <> public_url
+            <> " would send them nowhere",
+          )
+        Primary, True -> Ok(True)
+      }
+    Ok(other) -> Error("CP_BROWSE must be on or off, got " <> other)
+  }
+}
+
+/// The attach endpoint the apex publishes, or `""` when browsing is off.
+///
+/// Read here rather than threaded through every publish path: it is a
+/// deployment constant, and this module is the one place the environment is
+/// read. An empty answer means the record is not emitted at all, which is
+/// what a zone with the feature off looks like to a client.
+pub fn browse_endpoint() -> String {
+  case envoy.get("CP_BROWSE"), envoy.get("CP_PUBLIC_URL") {
+    Ok("on"), Ok(url) -> string.trim(url)
+    _, _ -> ""
+  }
 }
 
 /// `CP_DNS_MODE`: `serve` (the default — today's behavior, zero-config

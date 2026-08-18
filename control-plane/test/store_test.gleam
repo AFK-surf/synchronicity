@@ -125,7 +125,8 @@ fn seeded_conn() -> sqlite.Connection {
        INSERT INTO orgs VALUES ('o1', 'acme', 'Acme', 0);
        INSERT INTO devices VALUES ('d1', 'o1', 'nas', NULL, NULL, 'u1', 0);
        INSERT INTO devices VALUES ('d2', 'o1', 'nas', NULL, NULL, 'u1', 0);
-       INSERT INTO networks VALUES ('n1', 'o1', 'prod', 0);",
+       INSERT INTO networks (id, org_id, name, created_at)
+         VALUES ('n1', 'o1', 'prod', 0);",
     )
   conn
 }
@@ -262,6 +263,8 @@ pub fn migrate_adds_the_rollover_slot_to_an_existing_zone_test() {
       "ALTER TABLE provider_sync_state DROP COLUMN last_partial_at",
       [],
     )
+  let assert Ok(_) =
+    sqlite.exec(conn, "ALTER TABLE networks DROP COLUMN browse_enabled", [])
   let assert Ok(v) = migrate.migrate(conn)
   assert v == migrate.build_version()
 

@@ -18,8 +18,8 @@ use synch_engine::{EntryRef, Node, NodeConfig};
 
 use crate::{
     cli::{
-        Cli, Command, DaemonCommand, DomainCommand, IdCommand, KeyCommand, MirrorCommand,
-        PinCommand, SpaceCommand, TrustCommand,
+        Cli, CloudCommand, Command, DaemonCommand, DomainCommand, IdCommand, KeyCommand,
+        MirrorCommand, PinCommand, SpaceCommand, TrustCommand,
     },
     control::{proto::pb, transport, Client, Command as Cmd, Frame},
     daemon,
@@ -298,6 +298,14 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         }
         Command::Doctor { rebuild } => Cmd::Doctor(pb::Doctor { rebuild: *rebuild }),
         Command::Scan => Cmd::Scan(pb::Scan {}),
+
+        Command::Cloud { command } => match command {
+            CloudCommand::Enable { spaces } => Cmd::CloudEnable(pb::CloudEnable {
+                spaces: spaces.clone(),
+            }),
+            CloudCommand::Disable => Cmd::CloudDisable(pb::CloudDisable {}),
+            CloudCommand::Status => Cmd::CloudStatus(pb::CloudStatus {}),
+        },
     })
 }
 

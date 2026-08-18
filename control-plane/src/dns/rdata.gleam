@@ -213,6 +213,23 @@ pub const transparency_label = "_synchronicity-transparency"
 /// What the declaration says.
 pub const transparency_text = "v=sync1 transparency"
 
+/// The label the cloud-attach endpoint lives under, one below the apex.
+///
+/// Beside the transparency declaration and for the same reason: every network
+/// under one base attaches to the same control plane, so the endpoint is one
+/// deployment fact at one name — not a copy per network, where the copies can
+/// skew and every browse toggle becomes a zone mutation.
+pub const browse_label = "_synchronicity-cp"
+
+/// Renders the attach record's text: `v=synccp1 url=<endpoint>`.
+///
+/// Deliberately no network, no policy, and no per-org field. Whether a given
+/// network may be browsed is decided at the endpoint, where a change takes
+/// effect at once and never reaches public DNS.
+pub fn synccp1_text(url: String) -> String {
+  "v=synccp1 url=" <> url
+}
+
 /// Renders a `v=sync1` membership TXT record's text. Field order matters
 /// only for v=; the client ignores unknown fields and order otherwise.
 pub fn sync1_text(

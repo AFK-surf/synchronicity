@@ -131,6 +131,12 @@ message Command {
     Scan scan = 36;
     // `synch sync`
     SyncNow sync_now = 37;
+    // `synch cloud enable --space <id>...`
+    CloudEnable cloud_enable = 38;
+    // `synch cloud disable`
+    CloudDisable cloud_disable = 39;
+    // `synch cloud status`
+    CloudStatus cloud_status = 40;
   }
 }
 
@@ -333,6 +339,26 @@ message Doctor {
 }
 
 message Scan {}
+
+// Exposes this node's read surface to the control plane its membership zone
+// names, for the spaces listed and no others.
+//
+// The list is the whole of the exposure: a space nobody named is a space the
+// tunnel cannot see, so an operator cannot share one by forgetting a flag.
+// Enabling replaces the list rather than adding to it — `cloud enable` states
+// what is exposed, it does not accumulate it.
+message CloudEnable {
+  // The space ids to expose. At least one; the empty list is refused rather
+  // than read as "everything".
+  repeated string spaces = 1;
+}
+
+// Stops answering the control plane and drops any open tunnel.
+message CloudDisable {}
+
+// Per membership domain: whether a record was found, whether the tunnel is
+// attached, and the last error if there was one.
+message CloudStatus {}
 
 // One push-pull exchange with every dialable peer, now.
 //

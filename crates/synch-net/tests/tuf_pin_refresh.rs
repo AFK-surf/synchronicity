@@ -905,6 +905,110 @@ async fn no_tuf_walks_nothing_and_is_not_a_failure() {
     server.abort();
 }
 
+// ----------------------------------------------- cloud-attach discovery
+
+/// The attach endpoint is only as trustworthy as the membership answer that
+/// yields its apex, so discovery gates that answer's zone key exactly as
+/// `member_set` does. Under `RekorPolicy::Require`, a DNSSEC-valid membership
+/// answer whose key is *not* on the transparency log yields no endpoint — even
+/// when the zone serves a perfectly-formed `_synchronicity-cp` record.
+///
+/// This is the DNS-provider/registrar compromise the Rekor design exists to
+/// stop: an attacker who can add an unlogged DNSKEY and sign a
+/// `_synchronicity-cp` record pointing at themselves must not be able to make
+/// a daemon attach and stream its exposed spaces.
+#[tokio::test]
+async fn discovery_refuses_an_unlogged_zone_under_require() {
+    let mut zone = SimZone::new("cluster.example", member_records());
+    // The zone would love to be attached to — but its key was never logged.
+    zone.cp_txt = vec!["v=synccp1 url=https://attacker.example".to_string()];
+    let log = SimLog::new("rekor.sim");
+    let anchor = write(&zone.anchor_record());
+    let log_key = write(&log.key_pem());
+    let (url, server) = zone.serve().await;
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        rekor_key: Some(log_key.path().to_path_buf()),
+        ..refreshing(url, anchor.path(), None, None)
+    })
+    .unwrap();
+
+    let error = resolver
+        .control_plane("cluster.example")
+        .await
+        .expect_err("an unlogged zone key must yield no endpoint under Require");
+    // The security property is that no endpoint is yielded, and the refusal is
+    // the transparency gate on the membership answer — the daemon never reaches
+    // the attach record. The sim serves an unsigned NODATA for the absent proof
+    // (it synthesizes no NSEC), so hickory reports a bogus negative rather than
+    // a validated empty set; against a real control plane the same absence is a
+    // signed negative and surfaces as `RekorAbsent`. Either way the endpoint is
+    // refused, which is what matters.
+    assert!(
+        matches!(&error, NetError::RekorAbsent { .. })
+            || matches!(&error, NetError::Dns(msg) if msg.contains(rekor::REKOR_TXT_PREFIX)),
+        "the membership answer's zone key must be gated before the attach record is trusted: {error}"
+    );
+    server.abort();
+}
+
+/// The positive control: the *same* zone, once its key is logged, discovers
+/// its endpoint. Without this the refusal above could be the harness failing
+/// to serve the record rather than the gate refusing it.
+#[tokio::test]
+async fn discovery_yields_the_endpoint_once_the_key_is_logged() {
+    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut log = SimLog::new("rekor.sim");
+    zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
+    zone.cp_txt = vec!["v=synccp1 url=https://sync.example".to_string()];
+    let anchor = write(&zone.anchor_record());
+    let log_key = write(&log.key_pem());
+    let (url, server) = zone.serve().await;
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        rekor_key: Some(log_key.path().to_path_buf()),
+        ..refreshing(url, anchor.path(), None, None)
+    })
+    .unwrap();
+
+    let (record, _ttl) = resolver
+        .control_plane("cluster.example")
+        .await
+        .expect("a logged zone key discovers its endpoint");
+    assert_eq!(record.url, "https://sync.example");
+    server.abort();
+}
+
+/// And the gate is what refuses: with transparency off, the unlogged zone's
+/// endpoint is discovered. So the refusal above is the Rekor check, not
+/// something incidental about the answer.
+#[tokio::test]
+async fn discovery_without_the_gate_trusts_the_dnssec_answer_alone() {
+    let mut zone = SimZone::new("cluster.example", member_records());
+    zone.cp_txt = vec!["v=synccp1 url=https://sync.example".to_string()];
+    let anchor = write(&zone.anchor_record());
+    let (url, server) = zone.serve().await;
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        doh_url: Some(url),
+        trust_anchor: Some(anchor.path().to_path_buf()),
+        rekor: Some(RekorPolicy::Off),
+        rekor_key: None,
+        rekor_state: None,
+        tuf_url: None,
+        no_tuf: true,
+        tuf_root: None,
+    })
+    .unwrap();
+
+    let (record, _ttl) = resolver
+        .control_plane("cluster.example")
+        .await
+        .expect("with the gate off, a DNSSEC-valid answer is enough");
+    assert_eq!(record.url, "https://sync.example");
+    server.abort();
+}
+
 // -------------------------------------------------------------- fixtures
 
 /// Refetches the conformance fixture from the live Sigstore repository.

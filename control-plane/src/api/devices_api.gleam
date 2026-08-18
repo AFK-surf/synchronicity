@@ -2,7 +2,9 @@
 //// inside its own transaction, so DNS contents and tables can never
 //// disagree. Network membership lives in api/networks_api.
 
+import api/agent
 import api/auth_api.{type AuthContext, with_db}
+import api/browse_api.{type Browse}
 import api/common.{
   Admin, Member, audit, body_decoder, constraint_response, db_error, find_device,
   require_org, text_at, zone_mutation,
@@ -12,6 +14,7 @@ import auth/session.{type Session}
 import dns/name
 import gleam/dynamic/decode
 import gleam/json
+import gleam/option.{type Option, Some}
 import gleam/result
 import store/sqlite.{Blob, Int as VInt, Text}
 import util/id
@@ -359,14 +362,27 @@ pub fn retire_key(
   key_state_change(ctx, live, slug, device_id, key_id, Retire)
 }
 
+/// Revoking a key takes it out of the zone — and out of every tunnel
+/// standing on it, in the same request.
+///
+/// Attach proofs verify only against `active` keys, so a revoked key cannot
+/// attach again; without this a session that had already attached would keep
+/// answering until it happened to reconnect, which is the one window the
+/// revocation exists to close.
 pub fn revoke_key(
   ctx: AuthContext,
+  browse: Option(Browse),
   live: Session,
   slug: String,
   device_id: String,
   key_id: String,
 ) -> Response {
-  key_state_change(ctx, live, slug, device_id, key_id, Revoke)
+  let outcome = key_state_change(ctx, live, slug, device_id, key_id, Revoke)
+  case outcome.status, browse {
+    200, Some(browse) -> agent.drop_key(browse_api.registry(browse), key_id)
+    _, _ -> Nil
+  }
+  outcome
 }
 
 fn key_state_change(

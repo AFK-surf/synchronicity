@@ -10,17 +10,23 @@ authors.workspace = true
 
 [dependencies]
 directories.workspace = true
+futures-util.workspace = true
+hex.workspace = true
 iroh.workspace = true
 iroh-base.workspace = true
 notify.workspace = true
 postcard.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 synch-core.workspace = true
 synch-mpt.workspace = true
 synch-net.workspace = true
 synch-store.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# The cloud-attach tunnel: an outbound WebSocket client, TLS through rustls.
+# No server half is pulled in — the daemon dials out and never listens.
+tokio-tungstenite.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

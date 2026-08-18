@@ -46,7 +46,8 @@ pub fn run(cfg: Config, conn: Connection, csk: Csk) -> Result(Nil, String) {
        INSERT OR IGNORE INTO org_members VALUES ('org-acme', 'seed-user', 'owner', "
         <> now
         <> ");
-       INSERT OR IGNORE INTO networks VALUES ('net-prod', 'org-acme', 'prod', "
+       INSERT OR IGNORE INTO networks (id, org_id, name, created_at)
+       VALUES ('net-prod', 'org-acme', 'prod', "
         <> now
         <> ");
        DELETE FROM network_devices;

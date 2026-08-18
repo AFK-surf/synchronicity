@@ -82,7 +82,8 @@ pub fn demo_conn() -> #(Connection, Name) {
       conn,
       "INSERT INTO users VALUES ('u1', 'a@example.com', NULL, 0);
        INSERT INTO orgs VALUES ('o1', 'acme', 'Acme', 0);
-       INSERT INTO networks VALUES ('n1', 'o1', 'prod', 0);
+       INSERT INTO networks (id, org_id, name, created_at)
+         VALUES ('n1', 'o1', 'prod', 0);
        INSERT INTO devices VALUES ('d1', 'o1', 'nas', NULL, NULL, 'u1', 0);
        INSERT INTO devices VALUES ('d2', 'o1', 'laptop', NULL, NULL, 'u1', 0);
        INSERT INTO network_devices VALUES ('n1', 'd1', 0);

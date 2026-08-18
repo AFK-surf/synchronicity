@@ -136,9 +136,23 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
       rdata.txt(rdata.transparency_text),
     ])
 
+  // Conditional, unlike the declaration above: a deployment that does not
+  // offer cloud attach has no endpoint to name, and the name simply does not
+  // exist — which is what a daemon's fail-closed discovery reads as "there is
+  // nowhere to attach", rather than as an endpoint it should keep retrying.
+  let browse = case input.browse_url {
+    "" -> []
+    url -> [
+      Rrset([rdata.browse_label, ..apex], wire.type_txt, ttl_data, [
+        rdata.txt(rdata.synccp1_text(url)),
+      ]),
+    ]
+  }
+
   let data =
     list.flatten([
       [soa, ns, dnskey, transparency],
+      browse,
       glue,
       txt,
       rekor_rrsets(input, apex),

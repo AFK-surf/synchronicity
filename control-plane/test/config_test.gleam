@@ -23,6 +23,7 @@ fn primary_env() -> Nil {
   envoy.unset("CP_GOOGLE_CLIENT_SECRET")
   envoy.unset("CP_GITHUB_CLIENT_ID")
   envoy.unset("CP_GITHUB_CLIENT_SECRET")
+  envoy.unset("CP_BROWSE")
 }
 
 pub fn listen_defaults_to_all_interfaces_test() {

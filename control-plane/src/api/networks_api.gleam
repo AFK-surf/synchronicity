@@ -63,12 +63,17 @@ pub fn create_network(
         use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
         zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
           let insert =
-            sqlite.exec(conn, "INSERT INTO networks VALUES (?, ?, ?, ?)", [
-              Text(id.new()),
-              Text(org_id),
-              Text(network),
-              VInt(now_unix()),
-            ])
+            sqlite.exec(
+              conn,
+              "INSERT INTO networks (id, org_id, name, created_at)
+               VALUES (?, ?, ?, ?)",
+              [
+                Text(id.new()),
+                Text(org_id),
+                Text(network),
+                VInt(now_unix()),
+              ],
+            )
           case insert {
             Ok(_) -> {
               let _ =
