@@ -60,6 +60,7 @@ pub struct SimZone {
     /// If set, membership (and impersonated) TXT is signed by this instead of
     /// the zone CSK. Other RRsets stay under `signer`.
     txt_signer: Option<DnssecSigner>,
+    declaration_signer: Option<DnssecSigner>,
     /// A TXT RRset this zone serves at a name it **does not own**, signed by
     /// its own key.
     ///
@@ -147,6 +148,7 @@ impl SimZone {
             cp_txt: Vec::new(),
             extra_dnskeys: Vec::new(),
             txt_signer: None,
+            declaration_signer: None,
             impersonate: None,
             splice_foreign_class: Vec::new(),
         }
@@ -211,6 +213,38 @@ impl SimZone {
     /// zone CSK.
     pub fn sign_txt_with(&mut self, signer: DnssecSigner) {
         self.txt_signer = Some(signer);
+    }
+
+    /// A signer holding *this zone's key* but naming `signer_name` in the
+    /// RRSIGs it makes.
+    ///
+    /// The one shape that reaches `verify_declaration`'s signer-name check.
+    /// An RRSIG carries its own `signer_name`, and verification reconstructs
+    /// the signed data from the record, so a signature made under a foreign
+    /// name still verifies against the zone's DNSKEY — the key material and
+    /// the key tag both match. Only the name comparison catches it, and
+    /// without a way to build this the check had no test at all.
+    pub fn signer_named(&self, signer_name: &str) -> DnssecSigner {
+        // A fresh key, deliberately. `verify_declaration` compares the signer
+        // name *before* it verifies the signature, so what this has to
+        // produce is an RRSIG naming the wrong zone — whether that RRSIG
+        // would also verify is the next check's business, and making the key
+        // match would only test the two checks together.
+        let algorithm = Algorithm::ECDSAP256SHA256;
+        let pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).expect("keygen");
+        let key = EcdsaSigningKey::from_pkcs8(&pkcs8, algorithm).expect("key load");
+        DnssecSigner::new(
+            self.dnskey.clone(),
+            Box::new(key),
+            chain::parse_name(signer_name).expect("a signer name"),
+            std::time::Duration::from_secs(86_400),
+        )
+    }
+
+    /// Signs the transparency declaration with `signer` instead of the zone
+    /// CSK — see [`SimZone::signer_named`].
+    pub fn sign_declaration_with(&mut self, signer: DnssecSigner) {
+        self.declaration_signer = Some(signer);
     }
 
     /// The DS field an operator hands a registrar: `<tag> <alg> 2 <sha256
@@ -287,6 +321,17 @@ impl SimZone {
         text: &str,
         inception: time::OffsetDateTime,
     ) -> Vec<Record> {
+        self.signed_txt_by(owner, text, inception, &self.signer)
+    }
+
+    /// The same, under a caller-chosen signer.
+    pub fn signed_txt_by(
+        &self,
+        owner: Name,
+        text: &str,
+        inception: time::OffsetDateTime,
+        signer: &DnssecSigner,
+    ) -> Vec<Record> {
         let mut set = RecordSet::new(owner.clone(), RecordType::TXT, 0);
         set.insert(
             Record::from_rdata(
@@ -297,7 +342,7 @@ impl SimZone {
             0,
         );
         let rrsig =
-            RRSIG::from_rrset(&set, DNSClass::IN, inception, &self.signer).expect("sign txt rrset");
+            RRSIG::from_rrset(&set, DNSClass::IN, inception, signer).expect("sign txt rrset");
         set.insert_rrsig(Record::from_rdata(
             owner,
             self.ttl,
@@ -310,10 +355,11 @@ impl SimZone {
     /// the chain's bottom link, and the thing that makes an entry the zone's
     /// own statement rather than a copy of its public records.
     pub fn declaration_records(&self, inception: time::OffsetDateTime) -> Vec<Record> {
-        self.signed_txt(
+        self.signed_txt_by(
             self.transparency_name(),
             chain::TRANSPARENCY_TEXT,
             inception,
+            self.declaration_signer.as_ref().unwrap_or(&self.signer),
         )
     }
 
@@ -1088,18 +1134,7 @@ impl SimTuf {
     /// A [`crate::tuf::PinState`] anchored at that embedded root and nothing
     /// else — a fresh install.
     pub fn embedded_state(&self) -> crate::tuf::PinState {
-        let root = self.embedded_root();
-        crate::tuf::PinState {
-            root,
-            root_chain: Vec::new(),
-            root_version: 1,
-            timestamp_version: 0,
-            snapshot_version: 0,
-            targets_version: 0,
-            targets: Vec::new(),
-            trusted_root: Vec::new(),
-            updated_at: 0,
-        }
+        crate::tuf::PinState::anchored(&self.embedded_root())
     }
 
     /// The current root version.
@@ -1325,9 +1360,9 @@ impl SimTufKey {
             .as_ref()
             .to_vec();
         let key = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).expect("key load");
-        let mut spki = vec![
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ];
+        // The same prefix `LogKey::from_spki` strips back off, named once
+        // there rather than spelled out again here.
+        let mut spki = crate::rekor::ED25519_SPKI_PREFIX.to_vec();
         spki.extend_from_slice(ring::signature::KeyPair::public_key(&key).as_ref());
         SimTufKey {
             pkcs8,
@@ -1516,13 +1551,13 @@ fn sign_p256_der(pkcs8: &[u8], message: &[u8]) -> Vec<u8> {
 }
 
 /// A DER SubjectPublicKeyInfo around a raw uncompressed P-256 point.
+///
+/// The real one. A private copy of the same 27 bytes lived here, which is
+/// exactly the shape that drifts: the harness mints the keys the parser is
+/// then asserted against, so a divergence between the two would make the
+/// suite agree with itself about a format neither one gets right.
 fn p256_spki(point: &[u8]) -> Vec<u8> {
-    let mut der = vec![
-        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
-        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-    ];
-    der.extend_from_slice(point);
-    der
+    crate::rekor::p256_spki(point)
 }
 
 /// The canonical wire form of a name: lowercase labels, length-prefixed,

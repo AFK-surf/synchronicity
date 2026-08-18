@@ -92,6 +92,24 @@ pub struct MonitorState {
     /// run has recorded one.
     #[serde(default)]
     pub surface: Option<TrustSurface>,
+    /// The watch list the recorded [`Self::logs`] positions actually cover,
+    /// sorted, as of the last completed walk.
+    ///
+    /// Read coverage is one `next_index` per log, but the watch filter is
+    /// applied *per entry* inside the walk: an entry naming an unwatched apex
+    /// is stepped over and the position advances past it. So a `next_index`
+    /// is only meaningful together with the watch list that produced it —
+    /// widening the list later does not reach back, and every entry for the
+    /// new apex already in the log stays unclassified for good.
+    ///
+    /// Kept apart from [`TrustSurface`] because it is not one: a surface
+    /// change invalidates recorded *verdicts*, while this invalidates
+    /// recorded *coverage*, and the remedies differ. `None` is a state file
+    /// written before this field existed, which is treated as "covers
+    /// whatever it currently watches" — the alternative is refusing every
+    /// upgrade, and the gap it would name is one no run can close anyway.
+    #[serde(default)]
+    pub watched: Option<Vec<String>>,
     /// Position per log, keyed by the origin line its checkpoints carry.
     ///
     /// **A map, because the client trusts more than one log.** A monitor

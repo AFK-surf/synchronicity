@@ -9,6 +9,21 @@ use synch_net::dns::{
 };
 use synch_store::{Binding, BindingSource, ClockStatus, Equivocation};
 
+/// How long one domain's membership refresh may take before the pass moves on.
+///
+/// `refresh_these` walks the due domains **serially**, and they are unrelated
+/// to one another: a binding lapses at `ttl + DEFAULT_TRUST_GRACE` from its
+/// own last good refresh, whether or not its zone was the one that stalled.
+/// The floor on that is `MIN_TTL + DEFAULT_TRUST_GRACE` — sixteen minutes —
+/// so the deadline has to be a small fraction of it for the queue behind a
+/// slow zone to still be served.
+///
+/// Ninety seconds is well above what an honest `member_set` costs even under
+/// `Require` (up to 18 validated lookups, each bounded by the transport's own
+/// per-exchange timeout) and far below the lapse window. A zone that exceeds
+/// it costs itself its own refresh, and nothing else.
+const REFRESH_DEADLINE: Duration = Duration::from_secs(90);
+
 use crate::{
     error::{EngineError, Result},
     node::Node,
@@ -442,11 +457,37 @@ impl Node {
         // it. And each field is read as the one thing it means, so an `addr=`
         // value cannot fall through into a relay URL this node then makes
         // outbound requests to.
+        //
+        // **And only when this domain is the key's sole live source.** "Holds
+        // a live binding" is not enough on its own: `peers_seen.last_addr` is
+        // keyed on `node_id` alone and overwrites, nothing prunes it, and no
+        // successful connection ever writes a real address back — every other
+        // writer passes `None`, which `COALESCE` preserves. So a second
+        // configured membership domain naming a key this node already trusts
+        // would repoint every future dial of it, permanently, through an
+        // answer that is genuinely DNSSEC-valid for *that* domain. Gating on
+        // this answer's own bindings would not help: `refresh_dns_bindings`
+        // ran first and has no cross-domain conflict check, so the hostile
+        // answer binds the key itself and any this-answer test passes.
+        //
+        // Sole-source is the test that holds, and it is the same posture §3.2
+        // already takes towards an ambiguous key: when two domains both vouch
+        // for one key there is no way to say which one's dialing data is
+        // right, so neither is used and discovery answers instead. A key bound
+        // statically is likewise not a DNS answer's to repoint.
         for (key_bytes, hints) in &set.hints {
             let Ok(key) = NodeId::from_bytes(key_bytes) else {
                 continue;
             };
             if !self.store().is_trusted_key(&key, now)? {
+                continue;
+            }
+            if !self.hint_source_is_sole(&key, &set.domain, now)? {
+                tracing::debug!(
+                    domain = %set.domain,
+                    "a dial hint was ignored: the key it names is also live from \
+                     another source, so which hint is right cannot be decided"
+                );
                 continue;
             }
             let mut addr = iroh::EndpointAddr::new(key);
@@ -637,7 +678,35 @@ impl Node {
             // Stamped before the lookup runs, so a resolver that hangs or fails
             // cannot be retried in a tight loop.
             self.note_dns_attempt(domain, now, MIN_TTL);
-            let result = match self.refresh_domain(resolver, domain, now).await {
+            // Bounded, because this loop is serial and the domains in it are
+            // unrelated. One `member_set` under `Require` issues up to 18
+            // validated lookups — membership TXT, DNSKEY, and the proof
+            // records — each of which recurses, and the transport's own
+            // timeout applies per exchange rather than to the whole thing. A
+            // zone that answers slowly enough therefore spends every other
+            // domain's refresh budget, and their bindings lapse at
+            // `ttl + DEFAULT_TRUST_GRACE` whether or not their own zone was
+            // ever asked. `rekor.rs` names this exact failure and closes only
+            // the part-count multiplier: "the threat model's attacker *is*
+            // the zone, so 'it would only be hurting itself' does not hold."
+            //
+            // The deadline is per domain and well inside that lapse window,
+            // so a hostile or merely broken zone costs itself its own refresh
+            // and nothing else. Timing out is an ordinary refresh failure:
+            // cached bindings keep their expiry and only the retry moves.
+            let result = match tokio::time::timeout(
+                REFRESH_DEADLINE,
+                self.refresh_domain(resolver, domain, now),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(synch_net::NetError::Dns(format!(
+                    "{domain}: membership refresh exceeded {}s and was abandoned so the \
+                     other domains due in this pass could run; cached bindings are kept",
+                    REFRESH_DEADLINE.as_secs()
+                ))
+                .into())
+            }) {
                 Ok(refresh) => {
                     self.note_dns_attempt(domain, now, refresh.ttl);
                     self.note_dns_outcome(domain, now, None);
@@ -656,6 +725,22 @@ impl Node {
             });
         }
         Ok(out)
+    }
+
+    /// Whether `domain` is the only live source vouching for `key`.
+    ///
+    /// True when every live binding for the key is a DNS binding from this
+    /// same domain. A live binding from another domain, or a static one, makes
+    /// it false: the key is not this answer's alone to supply dialing data
+    /// for.
+    fn hint_source_is_sole(&self, key: &NodeId, domain: &str, now: i64) -> Result<bool> {
+        let bindings = self.store().bindings_for_key(key)?;
+        let clock = self.store().trust_instant(now)?;
+        let mut live = bindings.iter().filter(|b| b.is_live(clock)).peekable();
+        if live.peek().is_none() {
+            return Ok(false);
+        }
+        Ok(live.all(|b| b.source == BindingSource::Dns && b.domain.as_deref() == Some(domain)))
     }
 
     fn note_dns_attempt(&self, domain: &str, now: i64, ttl: Duration) {
@@ -1009,6 +1094,69 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// A second membership domain cannot repoint a key the first one vouches
+    /// for.
+    ///
+    /// `peers_seen.last_addr` is keyed on `node_id` alone and overwrites;
+    /// nothing prunes the table and no successful connection writes a real
+    /// address back, so a hint that lands is permanent. A node configured with
+    /// two domains would therefore let either of them steer every future dial
+    /// of any key the other trusts — through an answer that is genuinely
+    /// DNSSEC-valid for the domain that served it, so no signature check
+    /// catches it.
+    ///
+    /// Gating on the *answer's own* bindings does not help:
+    /// `refresh_dns_bindings` runs first and has no cross-domain conflict
+    /// check, so the hostile answer binds the key itself and any this-answer
+    /// test passes. Sole-source is the test that holds.
+    #[tokio::test]
+    async fn a_second_domain_cannot_repoint_a_key_the_first_one_vouches_for() {
+        let (_d, node) = node().await;
+        let shared = SecretKey::generate().public();
+        let now = now_ns();
+
+        // Domain A vouches for the key and supplies its address.
+        let a = MemberSet::from_records(
+            "a.example",
+            &[format!(
+                "v=sync1 id=nas nk={} addr=192.0.2.7:4433",
+                shared.to_z32()
+            )],
+        )
+        .unwrap();
+        node.apply_member_set(&a, Duration::from_secs(300), now)
+            .unwrap();
+        let first = node.peer_addr(&shared).unwrap().expect("A's hint applies");
+        assert_eq!(first.ip_addrs().count(), 1);
+
+        // Domain B names the same key and points it somewhere else. The
+        // answer is well-formed and would be validly signed for b.example.
+        let b = MemberSet::from_records(
+            "b.example",
+            &[format!(
+                "v=sync1 id=nas nk={} addr=198.51.100.66:9999 relay=https://attacker.example",
+                shared.to_z32()
+            )],
+        )
+        .unwrap();
+        node.apply_member_set(&b, Duration::from_secs(300), now)
+            .unwrap();
+
+        // The recorded address is untouched: two domains vouch for this key
+        // now, so neither one's dialing data is used.
+        let after = node.peer_addr(&shared).unwrap().expect("A's hint stands");
+        assert_eq!(
+            after.ip_addrs().collect::<Vec<_>>(),
+            first.ip_addrs().collect::<Vec<_>>(),
+            "a second domain must not repoint a key the first one vouches for"
+        );
+        assert_eq!(
+            after.relay_urls().count(),
+            0,
+            "and must not add a relay this node would then dial through"
+        );
+    }
+
     #[tokio::test]
     async fn hints_are_applied_only_for_bound_keys_and_only_in_shape() {
         // M6: a hint steers an address only for a key the set binds, and only
@@ -1304,6 +1452,77 @@ mod tests {
                 Ok((set, ttl))
             })
         }
+    }
+
+    /// One domain that never answers does not spend the whole pass.
+    ///
+    /// `refresh_these` is serial and the domains in it are unrelated, so
+    /// without a per-domain deadline a zone that answers slowly enough
+    /// consumes every other domain's refresh budget — and their bindings
+    /// lapse at `ttl + DEFAULT_TRUST_GRACE` from their *own* last good
+    /// refresh, whether or not their zone was ever asked. The threat model's
+    /// attacker is the zone, so "it would only be hurting itself" does not
+    /// hold.
+    #[tokio::test(start_paused = true)]
+    async fn one_stalling_domain_does_not_spend_the_whole_pass() {
+        #[derive(Debug)]
+        struct Stalling {
+            good: Vec<String>,
+        }
+        impl MemberResolver for Stalling {
+            fn resolve_members<'a>(
+                &'a self,
+                domain: &'a str,
+            ) -> synch_net::dns::MemberSetFuture<'a> {
+                let records = self.good.clone();
+                Box::pin(async move {
+                    if domain == "slow.example" {
+                        // Never answers. With `start_paused` the runtime
+                        // auto-advances, so this costs no wall clock — the
+                        // deadline is what ends it, not the sleep.
+                        tokio::time::sleep(Duration::from_secs(86_400)).await;
+                    }
+                    let set = MemberSet::from_records(domain, &records)?;
+                    Ok((set, MIN_TTL))
+                })
+            }
+        }
+
+        let (_d, node) = node().await;
+        let nas = SecretKey::generate().public();
+        let resolver = Stalling {
+            good: vec![format!("v=sync1 id=nas nk={}", nas.to_z32())],
+        };
+
+        let started = tokio::time::Instant::now();
+        let outcomes = node
+            .refresh_these(
+                &resolver,
+                &["slow.example".to_string(), "fast.example".to_string()],
+                now_ns(),
+            )
+            .await
+            .expect("the pass itself must not fail");
+
+        // The stalling domain is reported as a failure and named.
+        assert_eq!(outcomes.len(), 2);
+        let slow = outcomes
+            .iter()
+            .find(|o| o.domain == "slow.example")
+            .unwrap();
+        let why = slow.result.as_ref().expect_err("it never answered");
+        assert!(why.contains("slow.example"), "{why}");
+        assert!(why.contains("abandoned"), "{why}");
+
+        // And the domain behind it in the queue was still resolved.
+        let fast = outcomes
+            .iter()
+            .find(|o| o.domain == "fast.example")
+            .unwrap();
+        assert!(fast.result.is_ok(), "{:?}", fast.result);
+
+        // The pass ended on the deadline, not on the stall.
+        assert!(started.elapsed() < REFRESH_DEADLINE * 2);
     }
 
     #[tokio::test]

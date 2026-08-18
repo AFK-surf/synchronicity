@@ -514,10 +514,14 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
 /// signs the zone; this tree runs the product API and two convergence
 /// loops — the reconciler that pushes records through the provider's API,
 /// and the key watcher that keeps the transparency claim covering whatever
-/// keys the provider is signing with — plus the TUF refresh job both
-/// primary modes share, since which shard to submit to is answered from
-/// stored material either way. No DNS listeners, no zone key, no re-sign
-/// job: there are no RRSIGs of ours to expire.
+/// keys the provider is signing with. No DNS listeners, no zone key, no
+/// re-sign job: there are no RRSIGs of ours to expire.
+///
+/// And no TUF refresh job — in either mode. Which shard to submit to is
+/// answered from `priv/tuf/sigstore_trusted_root.json`, which ships in the
+/// image and moves on a deploy (see `tuf/trusted_root`); nothing here walks
+/// a repository. This comment used to say the opposite, which sent a reader
+/// looking for a job that migration v8 removed.
 fn serve_external(
   cfg: Config,
   provider_cfg: config.ProviderConfig,
@@ -609,7 +613,11 @@ fn serve_external(
       cfg.db_path,
       apex,
       signing_zone,
-      chain.doh(chain.resolver_url()),
+      // Validating: this watcher spends its answer on record_observed, which
+      // decides which keys the zone serves proofs for and is checked by
+      // nothing downstream. The publish path above uses the plain resolver —
+      // its answer becomes a chain every reader verifies.
+      chain.doh_validating(chain.resolver_url()),
       sync_name,
     ))
     |> sup.start

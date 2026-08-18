@@ -153,17 +153,30 @@ if docker logs "$CONTAINER" 2>&1 | grep -q "filesystem unconfined"; then
 fi
 ok "csqlite workers sandbox themselves under the default runtime profile"
 
-# The TUF anchor is a tracked source file riding the shipment
-# (priv/tuf/, COPYed in by the shipment stage); when the build drops it —
-# a broadened .dockerignore once did — the service still boots and serves
-# and every check above still passes, but tuf-refresh can never anchor,
-# which kills Rekor discovery for `rekor-publish` and the external-mode
-# key watcher. The job ticks at boot on a fresh database, so the failure
-# line is already in the logs; no network is needed for it to appear.
-if docker logs "$CONTAINER" 2>&1 | grep -q "priv/tuf is missing from this build"; then
-  logs_and_fail "the TUF anchor did not ship in the image (priv/tuf missing)"
+# The trusted root is a tracked source file riding the shipment (priv/tuf/,
+# COPYed in by the shipment stage); when the build drops it — a broadened
+# .dockerignore once did — the service still boots and serves and every
+# check above still passes, but `rekor-publish` and the external-mode key
+# watcher can never discover a log.
+#
+# Asserted against the filesystem rather than the logs. The string a
+# missing file produces (`trusted_root.shipped`) is only ever reached from
+# `client.discover`, whose boot-time caller is the external-mode key
+# watcher — and this container runs CP_ROLE=primary, which never mounts it.
+# Grepping for it therefore passed whether the file shipped or not, which
+# is the exact regression this check exists to catch.
+# Searched by name rather than at a fixed path. `priv_dir/1` resolves
+# through `code:priv_dir(controlplane)`, so the file's location inside the
+# shipment is the release layout's business, and a check that hardcodes one
+# and silently stops matching when that moves is the failure mode being
+# fixed here — not a new guard worth introducing. There is exactly one file
+# of this name in the tree, so the name is the whole question: did it ship.
+if ! docker run --rm --entrypoint /bin/sh "$IMAGE" -c \
+  'find /opt/synch-controlplane -name sigstore_trusted_root.json -size +0 \
+     | grep -q .'; then
+  fail "the trusted root did not ship in the image (priv/tuf/sigstore_trusted_root.json missing or empty)"
 fi
-ok "the TUF anchor ships in priv/tuf"
+ok "the trusted root ships in priv/tuf"
 
 # --- the shipped SPA ---------------------------------------------------
 #

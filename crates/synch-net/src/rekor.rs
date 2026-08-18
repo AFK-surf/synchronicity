@@ -1180,8 +1180,19 @@ impl Checkpoint {
     pub fn parse(bytes: &[u8]) -> Result<Checkpoint, ProofError> {
         let bad = |why: &str| ProofError::Malformed(format!("checkpoint: {why}"));
         let text = std::str::from_utf8(bytes).map_err(|_| bad("not UTF-8"))?;
+        // The **last** blank line, as Go's `sumdb/note` does
+        // (`bytes.LastIndex`). Splitting at the first is a real divergence
+        // rather than a stylistic one: the checkpoint is not covered by the
+        // leaf hash, so it is attacker-malleable in the zone's TXT, and
+        // appending `"\n— attacker <b64>\n"` to a *genuine* checkpoint makes
+        // the first blank line fall before the log's own signature line.
+        // Split there and `signed` is exactly the real note, the real
+        // signature verifies over it, and the appended block is accepted as
+        // part of the signature section. Go splits after it and refuses. Two
+        // readers disagreeing about which bytes a log signed is the thing
+        // this whole design exists to prevent.
         let split = text
-            .find("\n\n")
+            .rfind("\n\n")
             .ok_or_else(|| bad("no blank line between the note and its signatures"))?;
         let signed = &text[..split + 1];
         let mut lines = signed.lines();
@@ -1474,6 +1485,24 @@ impl LogKeys {
     }
 }
 
+/// The DER SubjectPublicKeyInfo prefix for an uncompressed P-256 point:
+/// the `id-ecPublicKey` / `prime256v1` algorithm identifier, the bit-string
+/// header, and the `0x04` uncompressed-point tag.
+///
+/// One definition. It was written out three times in this file and again in
+/// `sim.rs`, and "the sites are what get forgotten" is the whole argument for
+/// naming it: a reader checking whether two of them agree has to compare 27
+/// hex bytes by eye.
+pub(crate) const P256_SPKI_PREFIX: &[u8] = &[
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+];
+
+/// The same for an Ed25519 key.
+pub(crate) const ED25519_SPKI_PREFIX: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
 impl LogKey {
     /// Parses a DER SubjectPublicKeyInfo holding a P-256 or Ed25519 key.
     ///
@@ -1481,13 +1510,6 @@ impl LogKey {
     /// refused, rather than a general ASN.1 reader parsing whatever it is
     /// handed. The `id` is SHA-256 over the DER bytes exactly as given.
     pub fn from_spki(der: &[u8]) -> Result<LogKey, ProofError> {
-        const P256_SPKI_PREFIX: &[u8] = &[
-            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
-            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-        ];
-        const ED25519_SPKI_PREFIX: &[u8] = &[
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ];
         let id = sha256(der);
         if let Some(point) = der.strip_prefix(P256_SPKI_PREFIX) {
             if point.len() == 64 {
@@ -1556,10 +1578,6 @@ fn verify_ecdsa_p256_asn1(
 /// `prime256v1` plus the bit-string header and the `0x04` uncompressed-point
 /// tag — the same 27 bytes [`LogKey::from_spki`] strips back off.
 pub fn p256_spki(point: &[u8]) -> Vec<u8> {
-    const P256_SPKI_PREFIX: &[u8] = &[
-        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
-        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-    ];
     let mut der = Vec::with_capacity(P256_SPKI_PREFIX.len() + point.len());
     der.extend_from_slice(P256_SPKI_PREFIX);
     der.extend_from_slice(point);
@@ -2050,6 +2068,46 @@ mod tests {
                 "{broken:?} must not parse"
             );
         }
+    }
+
+    /// A genuine checkpoint with a block appended is not read as the genuine
+    /// one plus noise.
+    ///
+    /// The checkpoint is not covered by the leaf hash, so whatever sits in the
+    /// zone's TXT is attacker-malleable. Splitting the note at the *first*
+    /// blank line makes `signed` exactly the real note bytes, so the log's
+    /// real signature verifies over it and the appended block rides along as
+    /// signature lines. Go's `sumdb/note` splits at the last blank line and
+    /// refuses. Two readers disagreeing about which bytes a log signed is
+    /// exactly what this design exists to prevent.
+    #[test]
+    fn a_checkpoint_with_a_block_appended_is_not_the_one_the_log_signed() {
+        let genuine = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
+        let honest = Checkpoint::parse(genuine).expect("the real checkpoint parses");
+
+        let embedded = LogKeys::embedded();
+        let vouched = |c: &Checkpoint| {
+            embedded
+                .keys()
+                .iter()
+                .any(|k| c.verify_signature(k).is_ok())
+        };
+        assert!(vouched(&honest), "the genuine checkpoint verifies");
+
+        // The genuine bytes end in a newline, so one appended signature line
+        // creates a *second* blank line. Splitting at the first leaves
+        // `signed` as the real note, so the log's own signature is still in
+        // the signature list and still verifies — the extra line rides along
+        // as though the log had put it there. Splitting at the last, as Go
+        // does, moves the log's signature into the signed text, where no
+        // pinned key matches it any more.
+        let mut forged = genuine.to_vec();
+        forged.extend_from_slice("\n— attacker AAAAAAAA\n".as_bytes());
+        let accepted = Checkpoint::parse(&forged).is_ok_and(|c| vouched(&c));
+        assert!(
+            !accepted,
+            "a checkpoint carrying a line the log never signed must not verify"
+        );
     }
 
     #[test]

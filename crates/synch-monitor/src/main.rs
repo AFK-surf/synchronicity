@@ -397,9 +397,13 @@ fn check_watch_list(known: &KnownKeys, state_path: &Path) -> Result<(), MonitorE
     let unwatchable = known.unwatchable();
     if !unwatchable.is_empty() {
         return Err(MonitorError::State(format!(
-            "{} watches {} entr{} that are not domain names ({}) — an entry that \
-             does not parse can never match a certificate, so it watches nothing \
-             and this monitor would report no alarm whatever the log held",
+            "{} watches {} entr{} that cannot match a certificate ({}) — a name \
+             that does not parse never matches one, and a wildcard matches only \
+             its own ancestors, so neither covers `cp.<apex>`: the ordinary \
+             shape of both a control plane and a takeover. Either way the entry \
+             watches nothing and this monitor would report no alarm whatever the \
+             log held. Watch the apex itself; it already covers every name on \
+             its delegation path",
             state_path.display(),
             unwatchable.len(),
             match unwatchable.len() {
@@ -469,6 +473,55 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
         }
     }
     state.surface = Some(surface.clone());
+
+    // A watch list that has *widened* since the recorded positions were
+    // written is a coverage gap, and a silent one. Read coverage is one
+    // `next_index` per log, but the watch filter runs per entry inside the
+    // walk: an entry naming an unwatched apex was stepped over and the
+    // position advanced past it. Adding that apex now reaches nothing behind
+    // the position, so every entry the log already holds for it stays
+    // unclassified for good and the run still exits 0.
+    //
+    // That is the same "these entries are permanently unread" event
+    // `--from-index` is refused for, arriving through the state file instead
+    // of the command line, so it gets the same treatment and the same escape.
+    if let Some(covered) = state.watched.clone() {
+        let widened = state.known.widening_over(&covered);
+        if !widened.is_empty() && !args.allow_gap {
+            let behind = state
+                .logs
+                .iter()
+                .map(|(origin, position)| format!("{origin} at {}", position.next_index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(MonitorError::State(format!(
+                "{} now watches {} that it did not when its positions were \
+                 recorded ({behind}) — the watch filter runs per entry, so every \
+                 entry already in the log for {} was stepped over and no run will \
+                 ever classify it. Pass --allow-gap to accept that, or \
+                 --from-index 0 to re-read from the start",
+                args.state.display(),
+                widened.join(", "),
+                match widened.len() {
+                    1 => "it",
+                    _ => "them",
+                },
+            )));
+        }
+        if !widened.is_empty() {
+            eprintln!(
+                "synch-monitor: watch list widened to include {} after its positions \
+                 were recorded; entries already in the log for {} stay unclassified \
+                 (--allow-gap)",
+                widened.join(", "),
+                match widened.len() {
+                    1 => "it",
+                    _ => "them",
+                },
+            );
+        }
+    }
+
     eprintln!(
         "synch-monitor: watching {} apex(es) ({}) under anchors {} and log keys {}",
         state.known.keys.len(),
@@ -638,6 +691,12 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
         }
     }
     if !args.no_save {
+        // Stamp what the positions being written actually cover. Taken from
+        // the list as it stands *now*, auto-inserts included: those names
+        // were matched by the set already in force for every entry this walk
+        // read, so recording them is what stops the next run calling its own
+        // bookkeeping a widening.
+        state.watched = Some(state.known.keys.keys().cloned().collect());
         // A save failure must not swallow the report either: it is printed
         // by now, so say so and carry on to the exit code.
         if let Err(e) = state.save(&args.state) {
@@ -1226,6 +1285,59 @@ mod tests {
         // A list of names is accepted.
         check_watch_list(&watching("cluster.example.com"), path)
             .expect("a domain name is a watchable apex");
+
+        // A wildcard parses — the label is legal — and then watches only its
+        // own ancestors: measured, `*.example.com` matches `example.com` and
+        // matches neither `cp.example.com` nor `a.b.example.com`. That is the
+        // same silent-nothing this guard exists to refuse, reached through a
+        // spelling that looks broader rather than narrower.
+        let wild = watching("*.example.com");
+        assert!(wild.watches(&synch_net::chain::parse_name("example.com").unwrap()));
+        assert!(!wild.watches(&synch_net::chain::parse_name("cp.example.com").unwrap()));
+        let error = check_watch_list(&wild, path).expect_err("a wildcard watches nothing useful");
+        assert!(error.to_string().contains("wildcard"), "{error}");
+
+        // And the apex itself is the thing that actually covers both.
+        let apex = watching("example.com");
+        assert!(apex.watches(&synch_net::chain::parse_name("cp.example.com").unwrap()));
+    }
+
+    /// A watch list that widened since the positions were recorded is a
+    /// coverage gap, and the same permanent kind `--from-index` is refused for.
+    ///
+    /// The filter runs per entry inside the walk, so an entry naming an
+    /// unwatched apex was stepped over and `next_index` advanced past it.
+    /// Nothing reaches back for it — not a later run, not the auto-insert —
+    /// so the run that would silently fail to classify it has to say so.
+    #[test]
+    fn a_watch_list_that_widened_since_the_last_walk_is_a_gap() {
+        let recorded = vec!["a.example.com.".to_string()];
+
+        // A sibling: watched now, watched by nothing before. `watches` pairs
+        // names by delegation in either direction and these are unrelated, so
+        // every entry for it already in the log is unread for good.
+        let widened = watching("cp.example.com").widening_over(&recorded);
+        assert_eq!(widened, vec!["cp.example.com.".to_string()]);
+
+        // The same name is not a widening.
+        assert!(watching("a.example.com")
+            .widening_over(&recorded)
+            .is_empty());
+
+        // Nor is a name the old list already watched — which is exactly what
+        // the auto-insert writes when it records the apex of an entry it just
+        // reported, and that entry was reported *because* the old set matched
+        // it. Comparing the literal names instead would call this a gap and
+        // refuse a run that lost nothing.
+        assert!(watching("sub.a.example.com")
+            .widening_over(&recorded)
+            .is_empty());
+        // Upward too: the walk matches in both directions.
+        assert!(watching("example.com").widening_over(&recorded).is_empty());
+
+        // And a first run, with nothing recorded, is not a widening either —
+        // there are no positions for it to be a gap against.
+        assert!(watching("cp.example.com").widening_over(&[]).len().eq(&1));
     }
 
     /// **D7.** A `--from-index` that leaves a permanent hole is refused, not

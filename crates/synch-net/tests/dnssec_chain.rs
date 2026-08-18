@@ -63,6 +63,33 @@ fn a_declared_zone_proves_the_keys_its_declaration_sits_under() {
     assert_eq!(proven, vec![zone.dnskey_rdata()]);
 }
 
+/// A declaration whose RRSIG names some other zone as its signer is refused.
+///
+/// RFC 4035 §5.3.1: the signer is the closest enclosing zone. An RRSIG
+/// carries its own `signer_name`, so a signature made under a foreign name is
+/// still a well-formed record sitting in a well-formed RRset — and the
+/// declaration is the one link that makes an entry the *zone's own statement*
+/// rather than a copy of records anyone can read. Without this check some
+/// other zone can speak for this name.
+///
+/// It had no test: deleting the comparison left the whole suite green,
+/// because nothing in the tree could build an RRSIG whose signer name was not
+/// the zone's own.
+#[test]
+fn a_declaration_signed_under_another_zones_name_is_refused() {
+    let mut zone = SimZone::new("cluster.example", Vec::new());
+    zone.sign_declaration_with(zone.signer_named("somewhere.else."));
+    let error = chain::validate(
+        &zone.dnssec_chain(),
+        &apex("cluster.example."),
+        &anchored_at(&zone),
+    )
+    .expect_err("a declaration signed under another zone's name is not this zone's");
+    let text = error.to_string();
+    assert!(text.contains("somewhere.else"), "{text}");
+    assert!(text.contains("cluster.example"), "{text}");
+}
+
 /// The same over a real ladder shape: root → TLD → apex, three delegation
 /// links under the declaration.
 #[test]

@@ -73,9 +73,11 @@ RUN gleam deps download
 COPY src/ ./src/
 # The SPA is served out of priv/web (src/api/static.gleam), so it has to
 # be in place before the export copies priv/ into the shipment. So does
-# the TUF anchor: tuf/anchor.gleam reads priv/tuf/sigstore_tuf_root.json
-# at runtime — a tracked source file, so a plain COPY ships it (only the
-# build-artifact paths under priv/ are dockerignored).
+# the trusted root: tuf/trusted_root.gleam reads
+# priv/tuf/sigstore_trusted_root.json at runtime — a tracked source file,
+# so a plain COPY ships it (only the build-artifact paths under priv/ are
+# dockerignored). image-smoke.sh asserts it is actually there, because a
+# build that drops it still boots and serves and passes every other check.
 COPY --from=web /src/web/dist/ ./priv/web/
 COPY priv/tuf/ ./priv/tuf/
 RUN gleam export erlang-shipment

@@ -35,6 +35,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      # And the configuration that actually ships. synch-net dev-depends on
+      # itself with features = ["sim"], so `--all-targets` resolves `sim` ON
+      # for the whole graph and neither line above ever lints the library as
+      # a released client has it. `--lib` resolves it off. `cargo doc` also
+      # compiles that configuration, but rustdoc's -D warnings denies rustdoc
+      # lints rather than rustc's, so dead_code and unused_imports unique to
+      # the shipped build reached nobody, and clippy never saw it at all.
+      - run: cargo clippy --workspace --lib -- -D warnings
 
   test:
     name: test (${{ matrix.os }})

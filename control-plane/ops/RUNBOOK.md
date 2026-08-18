@@ -73,7 +73,7 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_REKOR_URL` | primary | zone-key transparency log; unset, the shard in service is read from the stored `trusted_root.json` |
 | `CP_REKOR_KEY` | primary | file pinning the log's verification key — exactly one, PEM or base64 SPKI; unset, it comes from the same trusted-root entry as the endpoint |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
-| `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query` |
+| `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query`. In external mode it must be a **validating** resolver: the key watcher refuses answers without the AD bit. |
 
 > **Why the database gets its own directory.** Each SQLite connection
 > runs in a `csqlite` worker sandboxed (Landlock on Linux, `unveil`/

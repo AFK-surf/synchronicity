@@ -563,14 +563,24 @@ round-trip count, and §6 prices what that costs:
 3. `_synchronicity-rekor.<apex> TXT` — the proof records, at an apex the
    membership answer named, which must sit between the signing zone and the
    domain being resolved. A proof spanning several records continues at
-   `_synchronicity-rekor-<n>.<apex>`, bounded by `MAX_PROOF_PARTS`. Where the
-   answer's records name **more than one** usable apex — a stale record from a
-   decommissioned control plane, a migration in flight — each is tried in turn,
-   most-attested first and bounded, rather than the whole answer failing: that
-   is the same "one unreadable record must not sink a readable one" rule the
-   member records and the proof records already get, and without it one stale
-   TXT partitions a domain until a human deletes it. Only an answer where *no*
-   record names a usable apex is a refusal.
+   `_synchronicity-rekor-<n>.<apex>`, bounded by `MAX_PROOF_PARTS`. An answer
+   whose records name **more than one** usable apex is a **refusal**, not a
+   list to try in turn: one answer is covered by one control plane, and which
+   of them it is cannot be guessed. The cases that look like they need a
+   candidate list — a decommissioned control plane's leftovers, a migration in
+   flight, two control planes inside one signing zone — all relocate the owner
+   name along with the apex, so none of them produces two apexes at one name;
+   and trying several in turn would let whichever one an attacker can get
+   published decide the answer, which is the opposite of what "most-attested
+   first" sounds like it buys. The "one unreadable record must not sink a
+   readable one" rule applies *within* the member records and the proof
+   records, where the records are independent — the apex is not one of
+   several, it is the thing that says whose records these are. See `apex_of`
+   and `member_set` in `crates/synch-net/src/dns.rs`: "One apex, one
+   verification."
+
+   (`MAX_PROOF_CANDIDATES` bounds the *proof* candidates at a single apex.
+   That list is genuinely tried in turn, and is a different question.)
 
 Before step 3, and off the DNS transport entirely, the pin set may be
 refreshed from Sigstore's TUF repository — at most once a day, so this is not
@@ -748,7 +758,7 @@ the requirement onto a key that signed nothing.
 |---|---|---|
 | `CP_REKOR_URL` | primary | Rekor v2 write endpoint (`POST /api/v2/log/entries`). No default: absent, the shard in service is read from the stored `trusted_root.json` (§10.6). |
 | `CP_REKOR_KEY` | primary | Optional file pinning a self-hosted log's verification key. Absent, the key is the one the trusted root names beside the endpoint — one key, not the client's whole pinned set, because this side submits to exactly one log and verifies what that log returns. Redirecting `CP_REKOR_URL` to a log the trusted root does not name, without naming the matching key here, is refused up front rather than storing something clients would reject. |
-| `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
+| `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain is collected from. Default `https://cloudflare-dns.com/dns-query`. For chain assembly this is not a trust decision — every reader verifies the signatures itself — so point it at your own resolver if you would rather not tell a third party when you rotate keys. In **external mode** it must also be *validating*: the key watcher requires the AD bit, because its answer decides which keys the zone serves proofs for and nothing downstream re-checks it. |
 | `CP_REKOR_REQUIRE` | primary | `true` arms the publish gate of §5.3. Off by default, because the rollout publishes before it enforces (§7). Serve mode refuses the zone; external mode still publishes the declaration, owner marker and proofs so the watcher can log, and omits membership TXT until a verified record exists. |
 | `CP_SIGNING_ZONE` | primary, external only | The DNS zone the provider actually hosts, when it is not the apex — a control plane at `sync.example.com` served out of `example.com` sets it to `example.com`. Defaults to `CP_BASE_DOMAIN`, and must be a name that *contains* it; boot refuses anything else, and refuses the variable outright in serve mode, where this service is the authoritative nameserver for its own apex and the two are the same by construction. It decides where a chain's ladder starts; proof records still live at the apex (§2). |
 
@@ -1601,12 +1611,17 @@ tampering mirror produces material that fails verification" a structural
 property rather than a claim about the fetch.
 
 Everything below the root refreshes on its own. The root itself is a build:
-`crates/synch-net` embeds `root.json` version 15 as `EMBEDDED_TUF_ROOT`, the
-control plane ships the byte-identical file at
-`priv/tuf/sigstore_tuf_root.json`, and the walk starts at whatever version
-that file declares — so the floor and the anchor cannot disagree. Raising the
-floor is a release note: a client below it has nothing to bridge the gap and
-keeps its pins rather than guessing.
+`crates/synch-net` embeds `root.json` version 15 as `EMBEDDED_TUF_ROOT`, and
+the walk starts at whatever version that file declares — so the floor and the
+anchor cannot disagree. Raising the floor is a release note: a client below it
+has nothing to bridge the gap and keeps its pins rather than guessing.
+
+The control plane ships no TUF root, because it walks no repository: what it
+needs is the *trusted root* the walk would have produced, and it ships that
+directly at `priv/tuf/sigstore_trusted_root.json` (§10.3). It carried a
+byte-identical copy of the TUF root for a while, which nothing read — a file
+whose only effect was to suggest, to anyone who found it, that the control
+plane anchored a walk somewhere.
 
 `SYNCH_TUF` / `--tuf` (client) and `--tuf` (monitor) name a different
 repository. These are mirror knobs, not trust knobs — whatever they name is
@@ -1657,34 +1672,32 @@ repository and attempts an update:
    refuse every zone from then on, which is exactly the "worse than not
    having asked" this section forbids.
 
-**The state file's pin set is re-verified against the binary.** Nothing that
-decides *which keys are pinned* is believed because it is there — but the
-qualifier is exact, and two fields sit outside it: `timestamp_version` and
-`snapshot_version` are rollback floors read verbatim, because the files they
-describe are not persisted to re-derive them from. A local writer can park
-them at the ceiling and freeze pin refresh permanently. That is strictly less
-than the same writer already has — a `source='static'` binding in `synch.db`
-never expires — and it is reported rather than silent (`pin_refresh_overdue`
-warns, and a `checked_at` ahead of the clock reads as due), but it is not
-"whole" and should not be read as such. The stored root chain is re-walked from the root
-*this build* embeds, applying the same dual-threshold rule a live chain gets, so
-a stored root counts only if the embedded root transitively signed it. And the
-stored `targets.json` is kept beside it and re-checked the same way — the
-walked root's targets role must have signed it, and it must name this exact
-`trusted_root` by digest — because the pin set is computed from `trusted_root`
-and nothing else on disk binds that field to the chain. Expiry is deliberately
-not checked on load: a stored state is expected to age between refreshes, and
-refusing to start on stale material is the availability coupling this section
-forbids. A file that fails any of this is not loaded at all; the client falls
-back to the embedded bootstrap, re-learns on its next walk, and **says so** —
-"no file" is a fresh install and unremarkable, but a file that is present and
-does not check out is a truncated write, a different `--tuf-root`, or somebody
-rewriting the pin set, and an operator has to be able to see it.
+**The state file is this client's own, and is read as written.** The pin set,
+the root chain, the version floors and the accepted `targets.json` all come
+back off disk as they went on. The precondition for tampering with any of it is
+a same-uid write inside the `0700` data directory — which is strictly *more*
+than an attacker needs to own the client outright, since the same access writes
+a `source='static'` binding straight into `synch.db`, and that never expires.
+An earlier design re-derived the pin set from the binary on every load: the
+stored chain re-walked from the embedded root, the stored `targets.json`
+re-checked against it. It was defence in depth against a writer who was already
+past the gate, it was never whole — `timestamp_version` and `snapshot_version`
+have no persisted files to re-derive them from, so they were read verbatim
+regardless, and parking them at the ceiling froze refresh permanently — and it
+has been removed rather than left as a half-claim. Local disk is trusted.
 
-The precondition for any of that mattering is a same-uid write inside the
-`0700` data directory, which is strictly weaker than what the same access
-already allows — writing bindings straight into `synch.db`. It is defence in
-depth, and it is what makes the claim above true rather than aspirational.
+One check remains, and it is provenance rather than trust: the state records
+the SHA-256 of the TUF root it was accumulated under, and a load under a
+different anchor is refused. `update` chains from the *stored* root rather than
+re-walking from the binary's anchor, so a state carried across a `--tuf-root`
+switch would go on extending the old repository's chain and never self-correct.
+Expiry is deliberately not checked on load: a stored state is expected to age
+between refreshes, and refusing to start on stale material is the availability
+coupling this section forbids. A file that does not load at all — a truncated
+write, an older on-disk format, another repository's state — lands the client
+on the embedded bootstrap, which re-learns on the next walk and **says so**:
+"no file" is a fresh install and unremarkable, but a file that is present and
+was not read is something an operator has to be able to see.
 
 **At most one walk a day** (`tuf::REFRESH_INTERVAL`). Membership re-resolves
 on the zone's TTL, which can be a minute; the pin set moves when Sigstore

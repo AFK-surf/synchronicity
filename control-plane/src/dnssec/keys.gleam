@@ -70,6 +70,20 @@ pub fn ds_digest(apex: Name, dnskey_rdata: BitArray) -> BitArray {
   )
 }
 
+/// The same over SHA-384 — RFC 4509 digest type 4.
+///
+/// A registrar that publishes only a type-4 DS is a delegation this
+/// publisher has to be able to follow, because `chain.rs`'s `covers`
+/// dispatches on the digest type and follows it. Comparing a 48-byte digest
+/// against `ds_digest`'s 32 bytes can only ever be false, which made every
+/// such zone unpublishable rather than merely unusual.
+pub fn ds_digest_384(apex: Name, dnskey_rdata: BitArray) -> BitArray {
+  crypto.hash(
+    crypto.Sha384,
+    bit_array.concat([name.encode(apex), dnskey_rdata]),
+  )
+}
+
 /// The DS record for the parent zone, presentation form. Takes the public
 /// key alone — replicas hold no private material and still serve this.
 pub fn ds_line(apex: Name, public: BitArray) -> String {

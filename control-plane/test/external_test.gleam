@@ -90,11 +90,18 @@ pub fn the_renderer_emits_data_records_and_the_marker_test() {
 /// proof, and it has to fit inside the lifetime of the membership that client
 /// is already holding — else a routine rotation costs bindings rather than a
 /// few refreshes. The client's half of the relation (a 60 s re-resolution
-/// floor and a 600 s trust grace) is asserted in `crates/synch-net`.
+/// floor and a 900 s trust grace) is asserted in `crates/synch-net`.
+///
+/// The grace is `DEFAULT_TRUST_GRACE` in `crates/synch-net/src/dns.rs` and it
+/// is 15 minutes, not the 600 this test and the constant's own comment used
+/// to carry. The direction is worth noting: the wrong number *understated*
+/// the margin, so the relation was being maintained against a tighter budget
+/// than the real one. It holds either way — but a relation written down to be
+/// checked should be the one that is true.
 pub fn the_rotation_window_fits_inside_a_binding_lifetime_test() {
   let watch_cadence = 300
   let publish_slack = 60
-  let client_trust_grace = 600
+  let client_trust_grace = 900
   assert watch_cadence + publish_slack + render_external.ttl_proof
     < render_external.ttl_data + client_trust_grace
 }
@@ -287,6 +294,103 @@ pub fn a_proof_part_we_stopped_rendering_is_deleted_test() {
   assert deleted == ["_synchronicity-rekor-6.sync.test"]
 }
 
+/// The require-gate withholds membership; it does not retract it.
+///
+/// The trigger is `omit_members`, which is armed by *any* uncovered observed
+/// key — including a next key pre-published for an RFC 6781 rollover that is
+/// not signing anything yet. The zone is still signed by the covered key it
+/// was always signed by, and every client is still happy. Deleting the member
+/// records there would take the product down during a routine rotation, and
+/// take it down for `RekorPolicy::Off` clients too, which opted out of the
+/// requirement the gate enforces. Fail-closed for a publisher is "do not emit
+/// new claims", not "retract correct ones already standing".
+pub fn published_members_survive_a_pass_the_gate_withheld_test() {
+  let member =
+    Record("_synchronicity.prod.acme.sync.test", provider.Txt, 300, "v=sync1 …")
+  let published = as_existing([diff.owner_record("sync.test"), member])
+  // What `render_gated(input, True)` produces: everything but the members.
+  let gated_desired = [
+    diff.owner_record("sync.test"),
+    Record(
+      "_synchronicity-transparency.sync.test",
+      provider.Txt,
+      86_400,
+      "v=sync1 transparency",
+    ),
+  ]
+
+  // The withheld set is what the ungated render produced, so the published
+  // member is in it and survives.
+  let assert Ok(gated) = diff.diff_gated(gated_desired, published, [member])
+  assert gated.delete == []
+
+  // And the distinction is real: the same desired set with nothing withheld
+  // means the last device was revoked, which must still delete.
+  let assert Ok(revoked) = diff.diff_gated(gated_desired, published, [])
+  assert list.map(revoked.delete, fn(e) { e.record.name })
+    == ["_synchronicity.prod.acme.sync.test"]
+}
+
+/// The shield covers the withheld *records*, never the name shape.
+///
+/// This is the difference between "hold back what we would have published"
+/// and "stop deleting anything that looks like membership". A revoked
+/// device's record and one an attacker planted both carry a
+/// membership-shaped name and neither is in the withheld set, because the
+/// renderer did not produce them. Shielding by shape would freeze both for as
+/// long as the gate stayed armed, which is unbounded.
+pub fn the_gate_shields_withheld_records_not_membership_shaped_names_test() {
+  let live =
+    Record("_synchronicity.prod.acme.sync.test", provider.Txt, 300, "v=sync1 …")
+  let revoked =
+    Record(
+      "_synchronicity.prod.acme.sync.test",
+      provider.Txt,
+      300,
+      "v=sync1 …ᴿ",
+    )
+  let forged =
+    Record(
+      "_synchronicity.attacker.acme.sync.test",
+      provider.Txt,
+      300,
+      "v=sync1 l=attacker",
+    )
+  let existing =
+    as_existing([diff.owner_record("sync.test"), live, revoked, forged])
+  let gated_desired = [diff.owner_record("sync.test")]
+
+  // The gate is armed and `live` is what this pass rendered and held back.
+  let assert Ok(changes) = diff.diff_gated(gated_desired, existing, [live])
+  let deleted =
+    list.sort(
+      list.map(changes.delete, fn(e) { e.record.value }),
+      string.compare,
+    )
+  // Both the revoked record and the forgery go; only the withheld one stays.
+  assert deleted == ["v=sync1 l=attacker", "v=sync1 …ᴿ"]
+}
+
+/// The shield is membership only — other drift is still drift.
+pub fn the_gate_does_not_shield_anything_but_membership_test() {
+  let member =
+    Record("_synchronicity.prod.acme.sync.test", provider.Txt, 300, "v=sync1 …")
+  let existing =
+    as_existing([
+      diff.owner_record("sync.test"),
+      Record("_synchronicity-rekor.sync.test", provider.Txt, 60, "sync1p old"),
+      Record("_unrelated.sync.test", provider.Txt, 300, "junk"),
+    ])
+  let desired_now = [
+    diff.owner_record("sync.test"),
+    Record("_synchronicity-rekor.sync.test", provider.Txt, 60, "sync1p new"),
+  ]
+  let assert Ok(changes) = diff.diff_gated(desired_now, existing, [member])
+  let deleted =
+    list.sort(list.map(changes.delete, fn(e) { e.record.name }), string.compare)
+  assert deleted == ["_synchronicity-rekor.sync.test", "_unrelated.sync.test"]
+}
+
 pub fn published_proofs_survive_a_pass_with_none_to_publish_test() {
   // Rendering *no* proofs is what a transparency gap looks like: no live key
   // is covered by a verified record, so `servable` answers nothing. That is not
@@ -466,15 +570,105 @@ pub fn the_reconciler_converges_then_goes_quiet_test() {
   assert synced.last_error == None
   assert synced.last_synced_serial == Some(1)
 
-  // Converged: the second pass answers from the stored hash — one SELECT,
-  // no provider traffic at all.
-  provider_sync.run_once_with(conn, prov, "log-only", "z1", 3000)
+  // Converged, and inside `reconcile_interval`: the second pass answers from
+  // the stored hash — one SELECT, no provider traffic at all.
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", 2100)
   let assert Error(Nil) = process.receive(calls, 100)
 
   // A mutation moves the serial, so the next pass applies again.
   let assert Ok(_) = publish.publish_external(conn, 4000, "test:mutation")
   provider_sync.run_once_with(conn, prov, "log-only", "z1", 5000)
   let assert Ok("list") = process.receive(calls, 100)
+  sqlite.close(conn)
+}
+
+/// Quiet is not forever: the skip expires and the provider is read again.
+///
+/// Every input to the hash short-circuit is this control plane's own state,
+/// so without a time bound a deployment that stops mutating stops looking at
+/// the zone it holds delete authority over — and drift introduced at the
+/// provider survives exactly as long as nobody here writes anything. The
+/// module doc claims the sweep self-heals that; this is the term that makes
+/// it true.
+pub fn a_converged_reconciler_still_reads_the_provider_eventually_test() {
+  let conn = external_conn()
+  let calls = process.new_subject()
+  let prov = fake_provider([], calls)
+
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", 2000)
+  let assert Ok("list") = process.receive(calls, 100)
+  let assert Ok("apply " <> _) = process.receive(calls, 100)
+
+  // Well inside the interval: still quiet, so the cheap path is intact.
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", 2100)
+  let assert Error(Nil) = process.receive(calls, 100)
+
+  // Past it, with nothing whatever changed on our side — no mutation, no
+  // serial bump, the same hash — and the provider is listed again.
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", 2000 + 901)
+  let assert Ok("list") = process.receive(calls, 100)
+  sqlite.close(conn)
+}
+
+/// And what that read is *for*: a record nobody here wrote is removed, from a
+/// zone that had already converged and has had no local change since.
+///
+/// The reconciler holds delete authority below the apex, and this is the case
+/// that authority exists for — an API token, not the provider itself, adding
+/// a membership record for a key the control plane never issued. It has to be
+/// driven through a *converged* pass: on a first pass `state.get` is
+/// `Error(Nil)` and the short-circuit is already false, so the interval term
+/// is never consulted and the test would pass with the fix reverted.
+pub fn drift_introduced_at_the_provider_is_repaired_without_a_local_change_test() {
+  let conn = external_conn()
+  let calls = process.new_subject()
+  // The marker has to be there, or the pass refuses the whole zone rather
+  // than editing one record in it — that guard is orthogonal to this one.
+  let owner = Existing("owner-1", diff.owner_record("sync.test"))
+  let forged =
+    Existing(
+      "forged-1",
+      Record(
+        "_synchronicity.attacker.acme.sync.test",
+        provider.Txt,
+        300,
+        "v=sync1 l=attacker k=zzzz",
+      ),
+    )
+
+  // Converge, then let the pass go quiet.
+  provider_sync.run_once_with(
+    conn,
+    fake_provider([], calls),
+    "log-only",
+    "z1",
+    2000,
+  )
+  let assert Ok("list") = process.receive(calls, 100)
+  let assert Ok("apply " <> _) = process.receive(calls, 100)
+  provider_sync.run_once_with(
+    conn,
+    fake_provider([], calls),
+    "log-only",
+    "z1",
+    2100,
+  )
+  let assert Error(Nil) = process.receive(calls, 100)
+
+  // Now the record appears at the provider. Nothing changes on our side: no
+  // mutation, no serial bump, the same hash. Only the clock moves.
+  provider_sync.run_once_with(
+    conn,
+    fake_provider([owner, forged], calls),
+    "p",
+    "z1",
+    2000 + 901,
+  )
+  let assert Ok("list") = process.receive(calls, 100)
+  let assert Ok("apply " <> applied) = process.receive(calls, 100)
+  // `describe` is create/replace/delete: exactly one delete, and it is the
+  // record this control plane never rendered.
+  assert string.ends_with(applied, "/1")
   sqlite.close(conn)
 }
 

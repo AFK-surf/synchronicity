@@ -8,6 +8,18 @@
 //// and the pass short-circuits on a stored hash of the last applied set,
 //// which makes the sweep's common case one SELECT and no provider traffic.
 ////
+//// That short-circuit is *time-bounded*, and has to be. Every input to it —
+//// the applied hash, the SOA serial, the last error — is our own state, so
+//// on its own it only ever asks "did we change anything", and a pass that
+//// never lists the provider cannot see what the provider was told by
+//// somebody else. The reconciler holds delete authority below the apex, and
+//// that authority is the only thing standing between an API token and a
+//// forged record in a zone this deployment owns; coupling it to our own
+//// write traffic means the quietest tenant is repaired least often, which
+//// is backwards. So the hash may skip a pass, but not indefinitely:
+//// `reconcile_interval` is the longest a record nobody here wrote can sit
+//// in the zone unseen.
+////
 //// There is deliberately no outbox. Desired state is a pure function of
 //// the current tables (the property `zone/build` exploits), so
 //// desired-plus-sweep is simpler than any queue and, unlike one,
@@ -34,7 +46,7 @@ import gleam/int
 import gleam/io
 import gleam/json
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{type Option, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
@@ -53,10 +65,30 @@ import zone/render_external
 fn now_unix() -> Int
 
 /// The repair sweep. Short enough that drift — a record edited by hand at
-/// the provider, a change lost to a failed apply — is corrected in minutes
-/// rather than hours, and cheap when nothing has moved: the hash
-/// short-circuit makes an unchanged pass one SELECT and no provider call.
+/// the provider, a change lost to a failed apply — is corrected in minutes,
+/// and cheap when nothing has moved: the hash short-circuit makes most passes
+/// one SELECT and no provider call. Every `reconcile_interval` one of them
+/// lists anyway, so "minutes" is the sweep and `reconcile_interval` is the
+/// worst case.
 const sweep_interval_ms = 300_000
+
+/// How long the hash short-circuit may go on skipping the provider.
+///
+/// Seconds, against `last_ok_at`. Past this, a sweep lists and diffs even
+/// when nothing on our side moved, which is what makes the "self-heals drift
+/// introduced behind our back" claim above true rather than conditional on
+/// the tenant happening to be busy.
+///
+/// The number is set by what a forged record has to outlive to be worth
+/// planting: a client that reads one holds it for `render_external.ttl_data`
+/// (300) plus the client's own trust grace (900, `DEFAULT_TRUST_GRACE` in
+/// `crates/synch-net/src/dns.rs`), so 1200 seconds is the point past which
+/// this sweep stops being the thing that bounds the exposure. 900 sits inside
+/// that with a sweep to spare — three `sweep_interval_ms` ticks — and costs
+/// four list calls per zone per hour in the steady state, which is nothing
+/// against either provider's budget (Cloudflare's is per-account per-5-min
+/// and a zone this size lists in one request).
+const reconcile_interval = 900
 
 pub type Msg {
   Tick
@@ -200,7 +232,7 @@ fn pass(
   conn: Connection,
   prov: Provider,
   _zone_id: String,
-  _now: Int,
+  now: Int,
 ) -> Result(Outcome, String) {
   use input <- result.try(
     model.read(conn)
@@ -224,14 +256,31 @@ fn pass(
       // A pass the provider partly refused left records missing, so the
       // short-circuit must not fire until a later pass gets them out.
       && s.last_failures == option.None
+      // And only while the last confirmed read of the provider is recent.
+      // Everything above is our own state; this is the one term that makes
+      // the skip expire, so drift nobody here wrote is still found.
+      && recently_listed(s.last_ok_at, now)
     Error(Nil) -> False
   }
   use <- fresh_guard(fresh)
   use existing <- result.try(
     prov.list() |> result.map_error(fn(e) { "provider list: " <> e }),
   )
+  // What the gate held back, as records rather than as a flag. A flag can
+  // only say "membership", which downstream has to turn into a predicate over
+  // names — and a revoked device's record carries a membership-shaped name
+  // too, as does one an attacker planted. Rendering the ungated set says
+  // exactly which records this pass would have published, so the shield
+  // covers those and nothing else.
+  use withheld <- result.try(case omit_members {
+    False -> Ok([])
+    True ->
+      render_external.render(input)
+      |> result.map_error(fn(e) { "rendering: " <> string.inspect(e) })
+  })
   use changes <- result.try(
-    diff.diff(desired, existing) |> result.map_error(describe_conflict),
+    diff.diff_gated(desired, existing, withheld)
+    |> result.map_error(describe_conflict),
   )
   use applied <- result.try(case provider.no_changes(changes) {
     True -> Ok(provider.Applied(0, []))
@@ -279,6 +328,19 @@ fn omit_members(conn: Connection) -> Result(Bool, String) {
             "reading rekor records: " <> string.inspect(e)
           })
       }
+  }
+}
+
+/// Whether the provider was last read recently enough to skip reading it.
+///
+/// A state with no `last_ok_at` has never confirmed a read, so it is never
+/// recent. A stamp in the future — a clock stepped back since it was written
+/// — reads as due rather than as valid forever, the same direction the
+/// resolver's pin-refresh clock is bounded in.
+fn recently_listed(last_ok_at: Option(Int), now: Int) -> Bool {
+  case last_ok_at {
+    option.None -> False
+    Some(at) -> at <= now && now - at < reconcile_interval
   }
 }
 

@@ -447,9 +447,24 @@ the §3.3 loop:
    knob, and one term of the timing relation in §4.2; thirty seconds
    while the declaration is not on the wire yet, because the reconciler
    publishes it at boot),
-   resolve and DNSSEC-validate the signing-zone DNSKEY RRset over DoH — the
-   existing `rekor/chain.gleam` collection machinery, which already speaks
-   validating DoH for chain assembly.
+   resolve the signing-zone DNSKEY RRset over DoH through
+   `rekor/chain.doh_validating`, which refuses any answer the resolver did
+   not mark authenticated (the AD bit, RFC 4035 §3.2.3).
+
+   The AD requirement is this step's alone, and the asymmetry is the point.
+   Chain *assembly* deliberately does not trust its resolver — every RRset it
+   collects is copied into the certificate verbatim and re-verified by every
+   reader, so a hostile resolver there produces an entry that verifies
+   nowhere. This answer is spent on `record_observed`, which deletes every
+   observed key outside the set it was handed and so decides which keys the
+   zone serves proofs for; nothing downstream re-checks it. A resolver that
+   will not vouch for an answer is therefore a resolver whose answer this
+   step does not act on, and the watch waits instead.
+
+   Operationally: `CP_DNSSEC_CHAIN_RESOLVER` must name a validating resolver
+   in external mode. The default (`cloudflare-dns.com`) is one. A
+   non-validating or AD-stripping resolver leaves the watcher permanently
+   quiet, which the job logs on every tick.
 2. Compare the zone-signing key set against `observed_zone_keys`.
 3. On change: collect the full chain, build the v2 statement over the new
    set, sign with a freshly minted ephemeral key, submit through the injected

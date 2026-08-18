@@ -48,6 +48,27 @@ struct Shape {
     /// signing zone, and in these shapes the membership domain too. Almost
     /// always the zone's own; a malformed-SAN shape is where it differs.
     observed_zone: String,
+    /// The signer a resolver reported for the *membership answer*, when that
+    /// is not `observed_zone`.
+    ///
+    /// Separate because every `ZoneKey` in this tree used to set
+    /// `signing_zone` equal to the apex, which made
+    /// `rekor::verify`'s "the chain proves a signing zone the answer was not
+    /// signed by" check unreachable from the harness — deleting it left the
+    /// whole suite green. It is live code: the upstream guards force both
+    /// names to be ancestors-or-equal of the domain, and two ancestors of one
+    /// name are comparable but need not be equal.
+    observed_signer: Option<String>,
+}
+
+impl Shape {
+    /// The signing zone a reader would report, defaulting to the observed
+    /// zone.
+    fn signer(&self) -> &str {
+        self.observed_signer
+            .as_deref()
+            .unwrap_or(&self.observed_zone)
+    }
 }
 
 /// Would a client accept this proof? The real verifier, no re-implementation.
@@ -55,7 +76,7 @@ fn client_accepts(shape: &Shape) -> bool {
     let rdata = shape.zone.dnskey_rdata();
     let key = ZoneKey {
         domain: &shape.observed_zone,
-        signing_zone: &shape.observed_zone,
+        signing_zone: shape.signer(),
         key_tag: shape.zone.key_tag(),
         dnskey_rdata: &rdata,
     };
@@ -163,6 +184,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
                 proof,
                 anchor: g.anchor,
                 observed_zone,
+                observed_signer: None,
             });
         };
     let certificate = |g: &Ground| {
@@ -293,6 +315,65 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     }
 
     out
+}
+
+/// The chain may not prove a signing zone the membership answer was not
+/// signed by.
+///
+/// Both names are constrained only to be ancestors-or-equal of the domain
+/// being resolved — `claimed_apex ⊇ domain` at the entry, `signing_zone ⊇
+/// apex` in the chain walk, `observed_signer ⊇ domain` at the resolver — and
+/// two ancestors of one name are comparable but need not be equal. So a
+/// parent zone's entry can be offered for a child's answer, and only this
+/// check says no.
+///
+/// It had no test: every `ZoneKey` in the tree set `signing_zone` equal to the
+/// apex, so deleting the check left the whole suite green. The gain it holds
+/// is real — `check_binds` matches key membership on rdata digest, not on
+/// publishing zone, so with shared key material the parent's entry would
+/// otherwise authorize the child's answer.
+#[test]
+fn an_entry_whose_chain_proves_another_signing_zone_is_refused() {
+    let g = ground(Rooted::SelfAnchored);
+    let mut log = SimLog::new("rekor.sim");
+    let statement = g.zone.zone_key_statement("create");
+    let certificate = g
+        .zone
+        .certificate(&[(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())]);
+    let proof = log.log_certified(&g.zone, &statement, &certificate);
+    let keys = LogKeys::parse(&log.key_pem()).unwrap();
+    let anchors = anchors(&g.anchor);
+    let rdata = g.zone.dnskey_rdata();
+    let apex = g.zone.apex();
+    // A name inside the zone: an answer for it is covered by this apex, so
+    // every guard upstream of the check is satisfied.
+    let child = format!("sync.{apex}");
+
+    // The control: the answer is signed by the zone the chain proves.
+    let honest = ZoneKey {
+        domain: &child,
+        signing_zone: &apex,
+        key_tag: g.zone.key_tag(),
+        dnskey_rdata: &rdata,
+    };
+    rekor::verify(&proof, &honest, &keys, &anchors)
+        .expect("an entry for the zone that signed the answer verifies");
+
+    // The same entry offered for an answer signed by the child itself. The
+    // chain proves `apex`; the resolver reported `child`.
+    let mismatched = ZoneKey {
+        domain: &child,
+        signing_zone: &child,
+        key_tag: g.zone.key_tag(),
+        dnskey_rdata: &rdata,
+    };
+    let error = rekor::verify(&proof, &mismatched, &keys, &anchors)
+        .expect_err("the chain proves a zone the answer was not signed by");
+    let text = error.to_string();
+    assert!(
+        text.contains(&apex) || text.contains(&child),
+        "the refusal should name the zones it is comparing: {text}"
+    );
 }
 
 /// The tier of a proof about `zone`, anchored at that zone's own key — the

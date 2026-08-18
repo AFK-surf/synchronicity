@@ -797,6 +797,16 @@ fn the_shared_fixture_decodes_and_verifies() {
         "the audit path is a flat run of 32-byte hashes"
     );
     assert_eq!(proof.log_index.to_string(), fixture_field("log_index"));
+    // The part ceiling, which is a *coupling* rather than a property of this
+    // entry: raising it on the publishing side alone silently truncates every
+    // proof past the old limit, client-side and permanently, while lowering it
+    // there fails loudly at publish time. The invisible direction is the one
+    // that matters, and neither suite could see it while each compared its own
+    // constant to itself.
+    assert_eq!(
+        synch_net::rekor::MAX_PROOF_PARTS.to_string(),
+        fixture_field("max_proof_parts"),
+    );
     // Re-encoding is byte-identical: the format has exactly one rendering.
     assert_eq!(proof.encode().unwrap(), fixture("proof.bin"));
 
@@ -914,6 +924,46 @@ fn the_gleam_certificate_encoders_agree_with_this_one() {
     assert!(!by_oid(synch_net::x509::OID_SUBJECT_ALT_NAME));
 }
 
+/// The DS digest construction, both types, against the Gleam side's bytes.
+///
+/// `covers` recomputes these to decide whether a delegation walks, and the
+/// control plane recomputes them to decide whether a chain is publishable —
+/// two implementations of one hash input (canonical owner name in wire form,
+/// then the DNSKEY rdata), with nothing outside either of them holding it
+/// still until this fixture.
+///
+/// The fixture's owner name is mixed case, which pins the *control plane's*
+/// lowercasing — `name.encode` there does the folding itself. It does not
+/// pin this side's: hickory folds case when it parses a `Name`, so
+/// `ds_input`'s `to_lowercase` is belt-and-braces and removing it leaves this
+/// test green. What is pinned here is that both sides land on the same bytes
+/// for the same logical delegation, which is the property `covers` needs.
+///
+/// The SHA-384 arm is the one that needed pinning. It was dead on the Gleam
+/// side — both digest types pooled and compared against the SHA-256 hash, so
+/// a 48-byte digest could never match — which made a zone whose parent
+/// publishes only a type-4 DS unpublishable, while `covers` here follows it
+/// happily.
+#[test]
+fn the_ds_digests_match_the_control_planes() {
+    use hickory_resolver::proto::rr::Name;
+    let zone: Name = "Sync.Test.".parse().unwrap();
+    let dnskey_rdata = {
+        let mut rd = vec![0x01, 0x01, 0x03, 0x0d];
+        rd.extend_from_slice(&[0u8; 63]);
+        rd.push(7);
+        rd
+    };
+    assert_eq!(
+        synch_net::chain::ds_digest_sha256_for_tests(&zone, &dnskey_rdata),
+        fixture("crossval/ds-digest-sha256.bin"),
+    );
+    assert_eq!(
+        synch_net::chain::ds_digest_sha384_for_tests(&zone, &dnskey_rdata),
+        fixture("crossval/ds-digest-sha384.bin"),
+    );
+}
+
 /// Rewrites the shared fixture. Not part of the suite — a zone key and a log
 /// key are minted here, so running it invalidates every byte downstream of
 /// them; it exists so the fixture can be regenerated when the format
@@ -963,11 +1013,17 @@ fn regenerate_the_shared_fixture() {
     write_file(
         "meta.txt",
         format!(
-            "apex={}\nkey_tag={}\nlog_index={}\naction={}\n",
+            // `max_proof_parts` is not about this entry. It is one number
+            // that has to be the same on both sides — the publisher refuses
+            // to emit more parts than it, the client stops reading at it —
+            // and until it landed here each suite asserted its own constant
+            // against itself, which passes however far apart the two drift.
+            "apex={}\nkey_tag={}\nlog_index={}\naction={}\nmax_proof_parts={}\n",
             zone.apex(),
             zone.key_tag(),
             proof.log_index,
             statement.action,
+            synch_net::rekor::MAX_PROOF_PARTS,
         )
         .as_bytes(),
     );
