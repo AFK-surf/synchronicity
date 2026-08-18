@@ -1,42 +1,64 @@
-//! The daemon side of the control socket (§9.3).
+//! The daemon side of the control service (§9.3).
 //!
-//! One connection carries one command. The daemon checks the protocol version
-//! and the datadir token before it looks at the request, then streams the
-//! response back as `Line`, `Chunk`, and `Progress` frames terminated by `End`,
-//! or a structured `Error`.
+//! Every call is authenticated by the interceptor below — the protocol version
+//! and the datadir token, both headers — before a handler sees it. Handlers
+//! stream their answer back as it is produced and report a failure as a coded
+//! status, so a client renders a daemon-side refusal as its own exit code
+//! rather than as a transport error.
 
-use std::{str::FromStr, sync::Arc};
+use std::{
+    pin::Pin,
+    str::FromStr,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use synch_core::{now_ns, Hash, NodeId, OriginId};
 use synch_engine::{EntryRef, Node, VersionPolicy};
 use synch_store::{EntryRow, VersionSet};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::broadcast,
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::{wrappers::ReceiverStream, Stream};
+use tonic::{
+    service::{interceptor::InterceptedService, Interceptor},
+    Request, Response, Status, Streaming,
 };
 
 use crate::{
     control::{
         proto::{
-            read_frame, tokens_match, write_frame, ControlError, EntryInfo, ErrorCode, Hello,
-            Request, Response, Upload, CHUNK_SIZE, CONTROL_VERSION,
+            pb::{
+                self,
+                control_server::{Control, ControlServer},
+            },
+            tokens_match, Command, ControlError, EntryInfo, ErrorCode, PutPart, CHUNK_SIZE,
+            CONTROL_VERSION, MAX_MESSAGE_LEN, TOKEN_HEADER, VERSION_HEADER,
         },
-        transport::{self, Listener},
+        transport::{self, Accepted, Listener},
     },
     render,
 };
 
+/// How many accepted connections may wait for the server to pick them up.
+const ACCEPT_BACKLOG: usize = 16;
+
+/// How many produced messages may wait for the client to read them.
+///
+/// The point of the bound is that it exists: a reader that stalls stops the
+/// handler that is producing for it within a message or two, so a slow client
+/// costs bounded memory rather than a buffered response.
+const SEND_AHEAD: usize = 4;
+
 /// Runs a blocking store or filesystem operation off the runtime.
 ///
-/// The daemon serves this socket on the same runtime that carries the endpoint,
+/// The daemon serves this service on the same runtime that carries the endpoint,
 /// the scanner, and every timer in the process (§9.1). A request that streams an
 /// object, rebuilds the derived views, or unpublishes a space does real disk
 /// work, and doing it on the worker thread that polled the connection stops that
 /// worker from polling anything else for as long as it takes (§10). Requests
 /// that only read a handful of indexed rows stay inline.
-async fn offload<T, F>(f: F) -> std::result::Result<T, ControlError>
+async fn offload<T, F>(f: F) -> Result<T, ControlError>
 where
-    F: FnOnce() -> std::result::Result<T, ControlError> + Send + 'static,
+    F: FnOnce() -> Result<T, ControlError> + Send + 'static,
     T: Send + 'static,
 {
     match tokio::task::spawn_blocking(f).await {
@@ -53,6 +75,47 @@ where
 /// spinning on the peers it is polling.
 const POLL_FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a stopping daemon waits for its calls to finish before it closes
+/// their connections anyway.
+///
+/// Every handler already ends itself when the stop arrives, so this is only the
+/// window their last frame flushes through — the backstop for one that cannot
+/// end itself, not a budget anything is expected to spend. The daemon's exit
+/// waits on it, so it is small on purpose: `synch daemon stop` competes with
+/// every other shutdown task for the operator's patience.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Runs a handler's work, giving it up when the daemon starts stopping.
+///
+/// A call must not be able to hold the shutdown open: `synch recover` waits an
+/// hour by default, and a gateway read lasts as long as its HTTP client cares
+/// to keep reading. Both would otherwise still be running — and still being
+/// waited for — long after the operator asked the daemon to stop.
+async fn until_stopped<F>(mut stopping: broadcast::Receiver<()>, work: F) -> Done
+where
+    F: std::future::Future<Output = Done>,
+{
+    tokio::select! {
+        done = work => done,
+        _ = stopping.recv() => Err(stopped()),
+    }
+}
+
+/// A spawned task that is cancelled when the handle goes out of scope.
+///
+/// Dropping a [`tokio::task::JoinHandle`] detaches its task instead of ending
+/// it, which is the wrong default for work that exists only to answer one
+/// call: a handler that is cancelled — the client hung up, the daemon is
+/// stopping — would leave it running against a node that is being shut down.
+#[derive(Debug)]
+struct Cancelling<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Cancelling<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The control server: a bound listener plus the node it serves.
 ///
 /// Binding is separate from running so a daemon can report that it is (or is
@@ -65,7 +128,12 @@ pub struct Server {
     stop: broadcast::Sender<()>,
     /// Subscribed at bind time, not at run time: a stop sent between the two
     /// would otherwise be sent to nobody and the server would wait forever.
+    /// One receiver per job that has to react to it.
     stopping: broadcast::Receiver<()>,
+    /// The loop that owns the listener.
+    accepting: broadcast::Receiver<()>,
+    /// The bound on how long the drain that follows may take.
+    draining: broadcast::Receiver<()>,
 }
 
 impl Server {
@@ -79,12 +147,16 @@ impl Server {
         let listener = Listener::bind(&data_dir).await?;
         let token = Arc::new(transport::write_token(&data_dir)?);
         let stopping = stop.subscribe();
+        let accepting = stop.subscribe();
+        let draining = stop.subscribe();
         Ok(Server {
             node,
             listener,
             token,
             stop,
             stopping,
+            accepting,
+            draining,
         })
     }
 
@@ -95,181 +167,465 @@ impl Server {
 
     /// Serves until `stop` fires — which `synch daemon stop` does by sending on
     /// the same channel.
-    pub async fn run(mut self) -> std::io::Result<()> {
-        loop {
-            tokio::select! {
-                _ = self.stopping.recv() => break,
-                accepted = self.listener.accept() => {
-                    let stream = match accepted {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "control accept failed");
-                            continue;
+    ///
+    /// The shutdown drains rather than severs: a response on its way out
+    /// reaches its client before the connection carrying it closes. Draining is
+    /// bounded twice over — each handler gives up when the stop arrives, and a
+    /// grace period caps whatever that misses — so `run` returns, and the
+    /// daemon exits, however long the call it was serving would have taken.
+    pub async fn run(self) -> std::io::Result<()> {
+        let Server {
+            node,
+            mut listener,
+            token,
+            stop,
+            mut stopping,
+            mut accepting,
+            mut draining,
+        } = self;
+
+        let (connections, incoming) = mpsc::channel::<std::io::Result<Accepted>>(ACCEPT_BACKLOG);
+        let accepts = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = accepting.recv() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok(stream) => {
+                            if connections.send(Ok(Accepted::new(stream))).await.is_err() {
+                                break;
+                            }
                         }
-                    };
-                    let node = self.node.clone();
-                    let token = self.token.clone();
-                    let stop = self.stop.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle(node, token, stop, stream).await {
-                            // A client that walked away mid-response is
-                            // ordinary, not a daemon fault.
-                            tracing::debug!(error = %e, "control connection ended");
-                        }
-                    });
+                        Err(e) => tracing::warn!(error = %e, "control accept failed"),
+                    },
                 }
             }
-        }
-        transport::remove_token(&self.node.config().data_dir);
-        Ok(())
+            // Handed back rather than dropped: the socket file goes with it,
+            // and it must outlive the drain below.
+            listener
+        });
+
+        let service = InterceptedService::new(
+            ControlServer::new(ControlService {
+                node: node.clone(),
+                stop,
+            })
+            .max_decoding_message_size(MAX_MESSAGE_LEN)
+            .max_encoding_message_size(MAX_MESSAGE_LEN),
+            Authenticate { token },
+        );
+
+        // Scoped, so that whichever way the drain ends the server future is
+        // dropped here rather than left pinned. Giving up on it is not the same
+        // as ending it: it owns the connection tasks and the receiving half of
+        // `incoming`, and leaving it alive would strand the accept loop below
+        // in a send nobody will ever read.
+        let served = {
+            let serving = tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(ReceiverStream::new(incoming), async move {
+                    let _ = stopping.recv().await;
+                });
+            tokio::pin!(serving);
+            tokio::select! {
+                served = &mut serving => served,
+                _ = async {
+                    let _ = draining.recv().await;
+                    tokio::time::sleep(DRAIN_GRACE).await;
+                } => {
+                    tracing::warn!(
+                        "a control call was still running {}s after the stop; closing anyway",
+                        DRAIN_GRACE.as_secs()
+                    );
+                    Ok(())
+                }
+            }
+        };
+
+        // The token goes first and the socket last, so the two are never both
+        // available to a replacement daemon: while `control.token` exists this
+        // socket is still bound, and a `Listener::bind` for this datadir is
+        // refused until the last of it is gone. The other order lets a
+        // replacement bind, mint its own token, and have this process delete it.
+        transport::remove_token(&node.config().data_dir);
+        drop(accepts.await);
+        served.map_err(std::io::Error::other)
     }
 }
 
-/// Runs one connection: handshake, request, streamed response.
-async fn handle<S>(
-    node: Node,
+/// The version and token check every call passes through.
+#[derive(Clone)]
+struct Authenticate {
     token: Arc<Vec<u8>>,
-    stop: broadcast::Sender<()>,
-    mut stream: S,
-) -> std::io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let hello: Hello = read_frame(&mut stream).await?;
-    if hello.version != CONTROL_VERSION {
-        let error = ControlError::new(
-            ErrorCode::VersionMismatch,
-            format!(
-                "control protocol mismatch: the client speaks v{}, this daemon speaks v{}. \
-                 Restart the daemon so both are the same build",
-                hello.version, CONTROL_VERSION
-            ),
-        );
-        write_frame(&mut stream, &Response::Error(error)).await?;
-        return linger(&mut stream).await;
-    }
-    if !tokens_match(&hello.token, &token) {
-        let error = ControlError::new(
-            ErrorCode::Unauthorized,
-            format!(
-                "control token mismatch: re-read {} from this datadir",
-                transport::TOKEN_FILE
-            ),
-        );
-        write_frame(&mut stream, &Response::Error(error)).await?;
-        return linger(&mut stream).await;
-    }
-    write_frame(&mut stream, &Response::Ready).await?;
-
-    let request: Request = read_frame(&mut stream).await?;
-    let mut out = Frames { stream };
-    let (outcome, result) = match dispatch(&node, request, &mut out).await {
-        Ok(outcome) => (outcome, out.end().await),
-        Err(error) => (Outcome::default(), out.error(error).await),
-    };
-    let mut stream = out.stream;
-    linger(&mut stream).await?;
-    drop(stream);
-    // The daemon comes down only once its answer has landed, so `synch daemon
-    // stop` reports what happened instead of losing the connection under itself.
-    if outcome.stop_daemon {
-        let _ = stop.send(());
-    }
-    result
 }
 
-/// Waits for the client to hang up before the connection is dropped.
-///
-/// Closing a Windows named-pipe server handle can discard bytes the client
-/// has not read yet, so the last frames of a response are only safely
-/// delivered once the *client* has closed. The wait is bounded: a client that
-/// never hangs up costs one idle task for the timeout and no more.
-async fn linger<S>(stream: &mut S) -> std::io::Result<()>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut scratch = [0u8; 1];
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        tokio::io::AsyncReadExt::read(stream, &mut scratch),
-    )
-    .await;
-    Ok(())
-}
-
-/// The response side of one connection.
-struct Frames<S> {
-    stream: S,
-}
-
-impl<S: AsyncWrite + Unpin> Frames<S> {
-    async fn line(&mut self, text: impl Into<String>) -> std::io::Result<()> {
-        write_frame(&mut self.stream, &Response::Line(text.into())).await
-    }
-
-    async fn chunk(&mut self, bytes: Vec<u8>) -> std::io::Result<()> {
-        write_frame(&mut self.stream, &Response::Chunk(bytes)).await
-    }
-
-    async fn progress(&mut self, text: impl Into<String>) -> std::io::Result<()> {
-        write_frame(&mut self.stream, &Response::Progress(text.into())).await
-    }
-
-    async fn entry(&mut self, info: EntryInfo) -> std::io::Result<()> {
-        write_frame(&mut self.stream, &Response::Entry(Box::new(info))).await
-    }
-
-    async fn end(&mut self) -> std::io::Result<()> {
-        write_frame(&mut self.stream, &Response::End).await
-    }
-
-    async fn ready(&mut self) -> std::io::Result<()> {
-        write_frame(&mut self.stream, &Response::Ready).await
-    }
-
-    async fn error(&mut self, error: ControlError) -> std::io::Result<()> {
-        write_frame(&mut self.stream, &Response::Error(error)).await
-    }
-}
-
-impl<S: AsyncRead + Unpin> Frames<S> {
-    /// Reads the next frame of a client-streamed payload
-    /// ([`Request::TreePut`]).
-    ///
-    /// A connection that ends mid-payload reads as an abort rather than as an
-    /// end: a truncated body must never be mistaken for a complete object.
-    async fn upload(&mut self) -> std::result::Result<Upload, ControlError> {
-        match read_frame::<Upload, _>(&mut self.stream).await {
-            Ok(frame) => Ok(frame),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(Upload::Abort(
-                "the client closed the connection mid-payload".into(),
-            )),
-            Err(e) => Err(e.into()),
+impl Interceptor for Authenticate {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let claimed = request
+            .metadata()
+            .get(VERSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u32>().ok());
+        if claimed != Some(CONTROL_VERSION) {
+            return Err(ControlError::new(
+                ErrorCode::VersionMismatch,
+                format!(
+                    "control protocol mismatch: the client speaks v{}, this daemon speaks v{}. \
+                     Restart the daemon so both are the same build",
+                    claimed
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    CONTROL_VERSION
+                ),
+            )
+            .into());
+        }
+        let presented = request
+            .metadata()
+            .get_bin(TOKEN_HEADER)
+            .and_then(|value| value.to_bytes().ok());
+        match presented {
+            Some(bytes) if tokens_match(&bytes, &self.token) => Ok(request),
+            _ => Err(ControlError::new(
+                ErrorCode::Unauthorized,
+                format!(
+                    "control token mismatch: re-read {} from this datadir",
+                    transport::TOKEN_FILE
+                ),
+            )
+            .into()),
         }
     }
 }
 
-/// What handling a request leaves for the connection to do afterwards.
-#[derive(Debug, Default, Clone, Copy)]
-struct Outcome {
-    /// `synch daemon stop`: bring the daemon down once this response is out.
-    stop_daemon: bool,
+/// The service the daemon exposes.
+#[derive(Debug)]
+struct ControlService {
+    node: Node,
+    stop: broadcast::Sender<()>,
 }
 
-type Handled = std::result::Result<Outcome, ControlError>;
+/// Brings the daemon down once the response it is attached to has been
+/// delivered.
+///
+/// `synch daemon stop` has to report what happened, so the stop is tied to the
+/// life of the answer rather than sent from the handler that produced it.
+#[derive(Debug)]
+struct StopOnDrop(broadcast::Sender<()>);
 
-/// What a helper that only writes frames returns.
-type Done = std::result::Result<(), ControlError>;
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
 
-/// Serves one request.
-async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
-    node: &Node,
-    request: Request,
-    out: &mut Frames<S>,
-) -> Handled {
-    let mut outcome = Outcome::default();
-    match request {
-        Request::Id => {
+/// A command's output, plus whatever the command left for the connection to do
+/// once it has all been read.
+#[derive(Debug)]
+pub struct RunStream {
+    inner: ReceiverStream<Result<pb::Frame, Status>>,
+    /// Dropped with the stream, once tonic has delivered the last frame.
+    stop: Option<StopOnDrop>,
+}
+
+impl Stream for RunStream {
+    type Item = Result<pb::Frame, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl Drop for RunStream {
+    /// tonic drops the response stream once it has delivered every frame, so
+    /// this is the moment a `daemon stop` has been answered.
+    fn drop(&mut self) {
+        drop(self.stop.take());
+    }
+}
+
+/// The stream every other streaming call answers with.
+type Items<T> = ReceiverStream<Result<T, Status>>;
+
+#[tonic::async_trait]
+impl Control for ControlService {
+    type RunStream = RunStream;
+    type ListStream = Items<pb::Entry>;
+    type ReadStream = Items<pb::Chunk>;
+    type PutStream = Items<pb::Written>;
+
+    async fn run(
+        &self,
+        request: Request<pb::Command>,
+    ) -> Result<Response<Self::RunStream>, Status> {
+        let command = request
+            .into_inner()
+            .kind
+            .ok_or_else(|| Status::from(ControlError::invalid("the request named no command")))?;
+        // Known before the command runs, so the answer and the shutdown it
+        // triggers are wired together rather than raced.
+        let stops = matches!(command, Command::DaemonStop(_));
+        let (tx, rx) = mpsc::channel(SEND_AHEAD);
+        let node = self.node.clone();
+        let stopping = self.stop.subscribe();
+        tokio::spawn(async move {
+            let failed = {
+                let mut out = Frames { tx: tx.clone() };
+                until_stopped(stopping, dispatch(&node, command, &mut out)).await
+            };
+            if let Err(error) = failed {
+                let _ = tx.send(Err(error.into())).await;
+            }
+        });
+        Ok(Response::new(RunStream {
+            inner: ReceiverStream::new(rx),
+            stop: stops.then(|| StopOnDrop(self.stop.clone())),
+        }))
+    }
+
+    async fn list(
+        &self,
+        request: Request<pb::ListRequest>,
+    ) -> Result<Response<Self::ListStream>, Status> {
+        let request = request.into_inner();
+        let policy = parse_policy(request.policy.as_deref())?;
+        let node = self.node.clone();
+        let listing = node
+            .unified_listing(
+                &request.space,
+                &request.prefix,
+                request.start_after.as_deref(),
+                request.limit.map(|n| n as usize),
+            )
+            .map_err(ControlError::from)?;
+        let (tx, rx) = mpsc::channel(SEND_AHEAD);
+        let mut stopping = self.stop.subscribe();
+        tokio::spawn(async move {
+            for set in &listing {
+                // A listing of a large space outlives a stop otherwise.
+                if stopping.try_recv() != Err(broadcast::error::TryRecvError::Empty) {
+                    let _ = tx.send(Err(stopped().into())).await;
+                    return;
+                }
+                if !set.exists() {
+                    // Every publisher has tombstoned it: the path has left the
+                    // tree, so the tree does not list it.
+                    continue;
+                }
+                // A listing has no way to answer one path with an error, so a
+                // path the policy refuses is left out rather than reported with
+                // one side's metadata. Resolving that path still says exactly
+                // what is wrong.
+                let Ok(row) = node.resolve_set(set, &policy) else {
+                    continue;
+                };
+                if tx.send(Ok(entry_info(&row, set).into())).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn resolve(
+        &self,
+        request: Request<pb::ResolveRequest>,
+    ) -> Result<Response<pb::Entry>, Status> {
+        let request = request.into_inner();
+        let policy = parse_policy(request.policy.as_deref())?;
+        let set = self
+            .node
+            .versions(&request.space, &request.path)
+            .map_err(ControlError::from)?;
+        let row = self
+            .node
+            .resolve_set(&set, &policy)
+            .map_err(ControlError::from)?;
+        Ok(Response::new(entry_info(&row, &set).into()))
+    }
+
+    async fn read(
+        &self,
+        request: Request<pb::ReadRequest>,
+    ) -> Result<Response<Self::ReadStream>, Status> {
+        let request = request.into_inner();
+        let policy = parse_policy(request.policy.as_deref())?;
+        let node = self.node.clone();
+        // Resolved before the response opens, so "no provider for the content"
+        // or a strict policy's refusal is the call's own answer rather than a
+        // stream that dies after the caller has committed to a success.
+        let range = node
+            .prepare_range(
+                &request.space,
+                &request.path,
+                &policy,
+                request.start,
+                request.len,
+            )
+            .await
+            .map_err(ControlError::from)?;
+        let (tx, rx) = mpsc::channel(SEND_AHEAD);
+        let stopping = self.stop.subscribe();
+        tokio::spawn(async move {
+            let read = async {
+                let mut out = Bytes::Chunks(&tx);
+                stream_range(&node, &mut out, range).await
+            };
+            if let Err(error) = until_stopped(stopping, read).await {
+                let _ = tx.send(Err(error.into())).await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    /// Receives a streamed write and publishes it (§7.1, §9.4).
+    ///
+    /// The recovery gate is taken before a byte is written, for the reason
+    /// `scan` takes it before hashing: a node that cannot publish would
+    /// otherwise accept the upload, write it into the space, and lose it
+    /// (§3.4). Taking it before the response opens is what lets the refusal
+    /// reach a client that has not started streaming yet.
+    async fn put(
+        &self,
+        request: Request<Streaming<pb::PutRequest>>,
+    ) -> Result<Response<Self::PutStream>, Status> {
+        let mut incoming = request.into_inner();
+        let header = match incoming.message().await?.and_then(|first| first.part) {
+            Some(PutPart::Header(header)) => header,
+            _ => return Err(ControlError::invalid("a write opens with its space and path").into()),
+        };
+        self.node.ensure_publishable().map_err(ControlError::from)?;
+        let adoption = self
+            .node
+            .open_adoption(&header.space, &header.path)
+            .map_err(ControlError::from)?;
+
+        let (tx, rx) = mpsc::channel(1);
+        let node = self.node.clone();
+        let mut stopping = self.stop.subscribe();
+        tokio::spawn(async move {
+            // A write the daemon gives up on is one it keeps nothing of: the
+            // staging file goes with the dropped `Adoption`, exactly as an
+            // abandoned upload's does.
+            let written = tokio::select! {
+                written = receive(&node, incoming, adoption, &header) => written,
+                _ = stopping.recv() => Err(stopped()),
+            };
+            match written {
+                Ok(written) => {
+                    let _ = tx.send(Ok(written)).await;
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error.into())).await;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn get_config(
+        &self,
+        request: Request<pb::GetConfigRequest>,
+    ) -> Result<Response<pb::GetConfigResponse>, Status> {
+        let request = request.into_inner();
+        let key = gateway_config_key(&request.key)?;
+        let records = match self.node.store().config(key).map_err(ControlError::from)? {
+            Some(value) => value.lines().map(str::to_string).collect(),
+            None => Vec::new(),
+        };
+        Ok(Response::new(pb::GetConfigResponse { records }))
+    }
+
+    async fn append_config(
+        &self,
+        request: Request<pb::AppendConfigRequest>,
+    ) -> Result<Response<pb::AppendConfigResponse>, Status> {
+        let request = request.into_inner();
+        let key = gateway_config_key(&request.key)?;
+        if request.record.contains('\n') {
+            return Err(ControlError::invalid(
+                "a config record is one line: newlines separate records",
+            )
+            .into());
+        }
+        self.node
+            .store()
+            .append_config(key, &request.record)
+            .map_err(ControlError::from)?;
+        Ok(Response::new(pb::AppendConfigResponse {}))
+    }
+}
+
+/// The output side of a running command.
+#[derive(Debug)]
+struct Frames {
+    tx: mpsc::Sender<Result<pb::Frame, Status>>,
+}
+
+impl Frames {
+    async fn line(&mut self, text: impl Into<String>) -> Done {
+        self.send(pb::frame::Payload::Line(text.into())).await
+    }
+
+    async fn chunk(&mut self, bytes: Vec<u8>) -> Done {
+        self.send(pb::frame::Payload::Chunk(bytes)).await
+    }
+
+    async fn progress(&mut self, text: impl Into<String>) -> Done {
+        self.send(pb::frame::Payload::Progress(text.into())).await
+    }
+
+    async fn send(&mut self, payload: pb::frame::Payload) -> Done {
+        self.tx
+            .send(Ok(pb::Frame {
+                payload: Some(payload),
+            }))
+            .await
+            .map_err(|_| gone())
+    }
+}
+
+/// Where a streamed byte payload goes: into a command's output, or into a
+/// structured read's own stream.
+enum Bytes<'a> {
+    Frames(&'a mut Frames),
+    Chunks(&'a mpsc::Sender<Result<pb::Chunk, Status>>),
+}
+
+impl Bytes<'_> {
+    async fn chunk(&mut self, bytes: Vec<u8>) -> Done {
+        match self {
+            Bytes::Frames(frames) => frames.chunk(bytes).await,
+            Bytes::Chunks(tx) => tx
+                .send(Ok(pb::Chunk { data: bytes }))
+                .await
+                .map_err(|_| gone()),
+        }
+    }
+}
+
+/// The daemon is stopping, which ends the work it was doing for a client.
+fn stopped() -> ControlError {
+    ControlError::new(
+        ErrorCode::Unavailable,
+        "the daemon is shutting down; this request did not finish",
+    )
+}
+
+/// The client stopped reading, which ends the work being done for it.
+fn gone() -> ControlError {
+    ControlError::new(
+        ErrorCode::Unavailable,
+        "the client stopped reading the response",
+    )
+}
+
+/// What a helper that only writes output returns.
+type Done = Result<(), ControlError>;
+
+/// Serves one CLI subcommand.
+async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
+    match command {
+        Command::Id(pb::Id {}) => {
             out.line(format!("origin: {}", node.origin())).await?;
             for key in node.device_keys()? {
                 out.line(format!(
@@ -286,7 +642,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
         }
 
-        Request::KeyLs => {
+        Command::KeyLs(pb::KeyLs {}) => {
             // §3.4 step 3: the switch-over judgement is "have my peers picked
             // up the new binding yet?", which this node cannot answer from its
             // own view of DNS. So each reachable peer is asked what it holds
@@ -322,7 +678,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::KeyRotate => {
+        Command::KeyRotate(pb::KeyRotate {}) => {
             let plan = node.rotate_key()?;
             out.line(format!("generated device key {}", plan.new_key.to_z32()))
                 .await?;
@@ -339,7 +695,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::KeyActivate { key, bind } => {
+        Command::KeyActivate(pb::KeyActivate { key, bind }) => {
             let key = parse_key(&key)?;
             let bind = bind
                 .map(|text| {
@@ -390,7 +746,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::KeyRetire { key } => {
+        Command::KeyRetire(pb::KeyRetire { key }) => {
             let key = parse_key(&key)?;
             node.retire_key(&key).await?;
             out.line(format!(
@@ -400,11 +756,11 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
         }
 
-        Request::Recover { wait, gap } => recover(node, out, wait, gap).await?,
+        Command::Recover(pb::Recover { wait, gap }) => recover(node, out, wait, gap).await?,
 
         // Status is the glance, doctor is the examination: two commands with
         // the same output would make one of them a lie of emphasis.
-        Request::DaemonStatus => {
+        Command::DaemonStatus(pb::DaemonStatus {}) => {
             let origin = node.origin();
             out.line(format!(
                 "origin {origin} · signing as {}",
@@ -468,7 +824,14 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 .await?;
         }
 
-        Request::Doctor { rebuild: false } => {
+        Command::Doctor(pb::Doctor { rebuild }) => {
+            if rebuild {
+                // A rebuild re-materializes every leaf of every origin's trie.
+                let rebuilding = node.clone();
+                let n = offload(move || Ok(rebuilding.rebuild_views()?)).await?;
+                out.line(format!("rebuilt {n} derived rows from the trie"))
+                    .await?;
+            }
             // The examination asks the trie whether each origin's root is held
             // whole — a full walk the first time it is asked of a root — and
             // counts every entry of every space to do it.
@@ -478,33 +841,17 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::Doctor { rebuild: true } => {
-            // A rebuild re-materializes every leaf of every origin's trie.
-            let rebuilding = node.clone();
-            let n = offload(move || Ok(rebuilding.rebuild_views()?)).await?;
-            out.line(format!("rebuilt {n} derived rows from the trie"))
-                .await?;
-            // The examination asks the trie whether each origin's root is held
-            // whole — a full walk the first time it is asked of a root — and
-            // counts every entry of every space to do it.
-            let examining = node.clone();
-            for line in offload(move || render::doctor(&examining)).await? {
-                out.line(line).await?;
-            }
-        }
-
-        Request::DaemonStop => {
+        Command::DaemonStop(pb::DaemonStop {}) => {
             out.line("stopping").await?;
-            outcome.stop_daemon = true;
         }
 
-        Request::TrustAdd {
+        Command::TrustAdd(pb::TrustAdd {
             key,
             name,
             domain,
             note,
             addr,
-        } => {
+        }) => {
             let key = parse_key(&key)?;
             let origin =
                 node.trust_add(key, name.as_deref(), domain.as_deref(), note.as_deref())?;
@@ -518,7 +865,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 .await?;
         }
 
-        Request::TrustRebind { origin, key } => {
+        Command::TrustRebind(pb::TrustRebind { origin, key }) => {
             let origin = parse_origin(&origin)?;
             let key = parse_key(&key)?;
             let earlier: Vec<String> = node
@@ -543,7 +890,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::TrustRm { origin, key } => {
+        Command::TrustRm(pb::TrustRm { origin, key }) => {
             let origin = parse_origin(&origin)?;
             match key {
                 Some(key) => {
@@ -573,7 +920,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::TrustLs => {
+        Command::TrustLs(pb::TrustLs {}) => {
             let now = now_ns();
             for binding in node.store().bindings()? {
                 out.line(format!(
@@ -604,7 +951,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::DomainAdd { domain } => {
+        Command::DomainAdd(pb::DomainAdd { domain }) => {
             node.add_domain(&domain)?;
             out.line(format!("added {domain}")).await?;
             // Lenient: the add stands even when the first refresh fails —
@@ -613,7 +960,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             refresh_domains(node, out, Some(&domain), false).await?;
         }
 
-        Request::DomainRm { domain } => {
+        Command::DomainRm(pb::DomainRm { domain }) => {
             if !node.remove_domain(&domain)? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
@@ -624,7 +971,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 .await?;
         }
 
-        Request::DomainLs => {
+        Command::DomainLs(pb::DomainLs {}) => {
             let domains = node.domain_health()?;
             if domains.is_empty() {
                 out.progress("(no membership domains configured; static trust only)")
@@ -637,11 +984,11 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
 
         // Strict: a failed refresh is a failed command. Scripts and
         // monitoring read the exit code, not the prose.
-        Request::DomainRefresh { domain } => {
+        Command::DomainRefresh(pb::DomainRefresh { domain }) => {
             refresh_domains(node, out, domain.as_deref(), true).await?
         }
 
-        Request::Peers => {
+        Command::Peers(pb::Peers {}) => {
             let now = now_ns();
             let seen = node.store().peers_seen()?;
             if seen.is_empty() {
@@ -669,7 +1016,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::SpaceAdd { id, path } => {
+        Command::SpaceAdd(pb::SpaceAdd { id, path }) => {
             // A typo'd path used to become a fresh empty directory with no
             // signal; creating it is a feature, doing so silently was not.
             let created = !std::path::Path::new(&path).is_dir();
@@ -681,7 +1028,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::SpaceLs => {
+        Command::SpaceLs(pb::SpaceLs {}) => {
             let spaces = node.store().spaces()?;
             if spaces.is_empty() {
                 out.progress("(no local spaces; add one with `synch space add`)")
@@ -693,7 +1040,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::SpaceRm { id } => {
+        Command::SpaceRm(pb::SpaceRm { id }) => {
             // Unpublishing a space scans its whole prefix out of the trie.
             let removing = node.clone();
             let removed_id = id.clone();
@@ -707,15 +1054,15 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 .await?;
         }
 
-        Request::Scan => {
+        Command::Scan(pb::Scan {}) => {
             // Refuse before hashing rather than after: a scan records what it
             // hashed, so a scan whose publish is refused would leave the node
             // believing it had published files it never did (§3.4).
             node.ensure_publishable()?;
             // Hashing a tree is long and blocking, so it runs off the runtime
             // — the daemon keeps serving other requests — and each space is
-            // reported as a Progress frame while the scan is still going.
-            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+            // reported as a progress message while the scan is still going.
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
             let scanning = {
                 let node = node.clone();
                 tokio::task::spawn_blocking(move || {
@@ -760,7 +1107,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::Ls { reference, all } => {
+        Command::Ls(pb::Ls { reference, all }) => {
             let reference = parse_reference(&reference)?;
             // An unknown space and an empty listing print the same nothing,
             // and only one of them is fine: silence must mean "empty", never
@@ -771,7 +1118,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
             match &reference.origin {
                 // The origin-prefixed form lists exactly one origin's view,
-                // which is the old per-origin listing (§9.2).
+                // which is the per-origin listing (§9.2).
                 Some(origin) => {
                     // Unlimited, so the query is the size of the space.
                     let store = node.store().clone();
@@ -810,7 +1157,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::Status { reference } => {
+        Command::Status(pb::Status { reference }) => {
             let (space, path) = match reference {
                 Some(text) => {
                     let reference = parse_reference(&text)?;
@@ -850,12 +1197,12 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::Cat {
+        Command::Cat(pb::Cat {
             reference,
             range,
             from,
             strict,
-        } => {
+        }) => {
             let reference = parse_reference(&reference)?;
             let policy = policy_for(&reference, from.as_deref(), strict)?;
             let range = match &range {
@@ -866,38 +1213,32 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                     end: None,
                 },
             };
-            stream_entry(
-                node,
-                out,
-                &reference.space,
-                &reference.path,
-                &policy,
-                range.start,
-                range.length(),
-            )
-            .await?;
+            let prepared = node
+                .prepare_range(
+                    &reference.space,
+                    &reference.path,
+                    &policy,
+                    range.start,
+                    range.length(),
+                )
+                .await?;
+            stream_range(node, &mut Bytes::Frames(out), prepared).await?;
         }
 
-        Request::Get {
+        Command::Get(pb::Get {
             reference,
             from,
             strict,
-        } => {
+        }) => {
             let reference = parse_reference(&reference)?;
             let policy = policy_for(&reference, from.as_deref(), strict)?;
-            stream_entry(
-                node,
-                out,
-                &reference.space,
-                &reference.path,
-                &policy,
-                0,
-                None,
-            )
-            .await?;
+            let prepared = node
+                .prepare_range(&reference.space, &reference.path, &policy, 0, None)
+                .await?;
+            stream_range(node, &mut Bytes::Frames(out), prepared).await?;
         }
 
-        Request::Take { reference } => {
+        Command::Take(pb::Take { reference }) => {
             let reference = parse_reference(&reference)?;
             let origin = reference.origin.clone().ok_or_else(|| {
                 ControlError::invalid("take needs an explicit <origin>:<space>/<path>")
@@ -948,7 +1289,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::Log { reference } => {
+        Command::Log(pb::Log { reference }) => {
             let reference = parse_reference(&reference)?;
             if reference.path.is_empty() {
                 return Err(ControlError::invalid("log needs a path, not just a space"));
@@ -958,12 +1299,12 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::Compare {
+        Command::Compare(pb::Compare {
             reference,
             from,
             to,
             json,
-        } => {
+        }) => {
             let reference = parse_reference(&reference)?;
             // Origins are named by --from/--to, never on the reference itself:
             // an origin-pinned reference would be a third, contradictory way to
@@ -994,11 +1335,11 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::MirrorAdd {
+        Command::MirrorAdd(pb::MirrorAdd {
             space,
             path,
             policy,
-        } => {
+        }) => {
             let policy = parse_policy(policy.as_deref())?;
             let stored = node.add_mirror(&space, &path, &policy)?;
             out.line(format!("mirroring {space} into {stored} ({policy})"))
@@ -1014,7 +1355,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::MirrorRm { path } => {
+        Command::MirrorRm(pb::MirrorRm { path }) => {
             if !node.remove_mirror(&path)? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
@@ -1024,7 +1365,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             out.line("removed").await?;
         }
 
-        Request::MirrorLs => {
+        Command::MirrorLs(pb::MirrorLs {}) => {
             let mirrors = node.store().mirrors()?;
             if mirrors.is_empty() {
                 out.progress("(no mirrors configured)").await?;
@@ -1040,7 +1381,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::MirrorSync => {
+        Command::MirrorSync(pb::MirrorSync {}) => {
             // One mirror at a time, so the report of each arrives while the
             // next is still being materialized.
             for mirror in node.store().mirrors()? {
@@ -1075,13 +1416,13 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::PinAdd { target } => {
+        Command::PinAdd(pb::PinAdd { target }) => {
             let (root, size) = pin_target(node, &target)?;
             node.pin_object(&root, size).await?;
             out.line(format!("pinned {root}")).await?;
         }
 
-        Request::PinRm { target } => {
+        Command::PinRm(pb::PinRm { target }) => {
             let (root, _) = pin_target(node, &target)?;
             if !node.store().set_pinned(&root, false)? {
                 return Err(ControlError::new(
@@ -1092,7 +1433,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             out.line(format!("unpinned {root}")).await?;
         }
 
-        Request::PinLs => {
+        Command::PinLs(pb::PinLs {}) => {
             let pinned = node.store().pinned_blobs()?;
             if pinned.is_empty() {
                 out.progress("(nothing pinned)").await?;
@@ -1119,73 +1460,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
 
-        Request::TreeList {
-            space,
-            prefix,
-            start_after,
-            limit,
-            policy,
-        } => {
-            let policy = parse_policy(policy.as_deref())?;
-            let listing = node.unified_listing(
-                &space,
-                &prefix,
-                start_after.as_deref(),
-                limit.map(|n| n as usize),
-            )?;
-            for set in &listing {
-                if !set.exists() {
-                    // Every publisher has tombstoned it: the path has left the
-                    // tree, so the tree does not list it.
-                    continue;
-                }
-                // A listing has no way to answer one path with an error, so a
-                // path the policy refuses is left out rather than reported with
-                // one side's metadata. `TreeResolve` of that path still says
-                // exactly what is wrong.
-                let Ok(row) = node.resolve_set(set, &policy) else {
-                    continue;
-                };
-                out.entry(entry_info(&row, set)).await?;
-            }
-        }
-
-        Request::TreeResolve {
-            space,
-            path,
-            policy,
-        } => {
-            let policy = parse_policy(policy.as_deref())?;
-            let set = node.versions(&space, &path)?;
-            let row = node.resolve_set(&set, &policy)?;
-            out.entry(entry_info(&row, &set)).await?;
-        }
-
-        Request::TreeRead {
-            space,
-            path,
-            policy,
-            start,
-            len,
-        } => {
-            let policy = parse_policy(policy.as_deref())?;
-            stream_entry(node, out, &space, &path, &policy, start, len).await?;
-        }
-
-        Request::TreePut { space, path } => {
-            put_stream(node, out, &space, &path).await?;
-        }
-
-        Request::ConfigGet { key } => {
-            let key = gateway_config_key(&key)?;
-            if let Some(value) = node.store().config(key)? {
-                for record in value.lines() {
-                    out.line(record).await?;
-                }
-            }
-        }
-
-        Request::SyncNow => {
+        Command::SyncNow(pb::SyncNow {}) => {
             let peers = node.dialable_peers()?;
             if peers.is_empty() {
                 out.line("no dialable peers: nothing to sync with").await?;
@@ -1249,61 +1524,66 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 ));
             }
         }
-
-        Request::ConfigAppend { key, record } => {
-            let key = gateway_config_key(&key)?;
-            if record.contains('\n') {
-                return Err(ControlError::invalid(
-                    "a config record is one line: newlines separate records",
-                ));
-            }
-            node.store().append_config(key, &record)?;
-            out.line(format!("appended to {key}")).await?;
-        }
     }
-    Ok(outcome)
+    Ok(())
 }
 
-/// Receives a streamed write and publishes it (§7.1, §9.4).
-///
-/// The recovery gate is taken before a byte is written, for the reason `scan`
-/// takes it before hashing: a node that cannot publish would otherwise accept
-/// the upload, write it into the space, and lose it (§3.4).
-async fn put_stream<S: AsyncRead + AsyncWrite + Unpin>(
+/// Consumes an upload, commits it, and publishes what it wrote (§7.1, §9.4).
+async fn receive(
     node: &Node,
-    out: &mut Frames<S>,
-    space: &str,
-    path: &str,
-) -> Done {
-    node.ensure_publishable()?;
-    let mut adoption = node.open_adoption(space, path)?;
-    // The gates are taken before the ack, so a refusal reaches the client
-    // while it is still listening. A client that streamed first would race
-    // the refusal against its own writes and could lose it to the transport
-    // (Windows named pipes discard unread frames when the server hangs up).
-    out.ready().await?;
-    loop {
-        match out.upload().await? {
+    mut incoming: Streaming<pb::PutRequest>,
+    mut adoption: synch_engine::Adoption,
+    header: &pb::PutHeader,
+) -> Result<pb::Written, ControlError> {
+    let mut committed = false;
+    while !committed {
+        let part = match incoming.message().await {
+            Ok(Some(request)) => request.part,
+            // The client stopped sending without committing. That is an
+            // abandoned write however it came about — a dropped handle, a
+            // process that died — and the staging file goes with the dropped
+            // `Adoption`: a partly received body must never be mistaken for a
+            // complete object.
+            Ok(None) => {
+                return Err(ControlError::invalid(format!(
+                    "the write was abandoned after {} byte(s): it was never committed",
+                    adoption.written()
+                )))
+            }
+            // The same, with the transport's account of what went wrong.
+            Err(status) => {
+                return Err(ControlError::invalid(format!(
+                    "the write was abandoned after {} byte(s): {}",
+                    adoption.written(),
+                    status.message()
+                )))
+            }
+        };
+        match part {
             // Each piece is a write to the staging file, so it goes off the
             // runtime: the upload is the size of the object, and the worker
             // thread polling this connection is also serving every other one.
             // The staging handle travels into the blocking pool and back.
-            Upload::Chunk(bytes) => {
+            Some(PutPart::Chunk(bytes)) => {
                 adoption = offload(move || {
                     adoption.write(&bytes)?;
                     Ok(adoption)
                 })
                 .await?;
             }
-            Upload::End => break,
-            // The staging file goes with the dropped `Adoption`; the space is
-            // left exactly as it was.
-            Upload::Abort(why) => {
+            Some(PutPart::Commit(pb::Commit {})) => committed = true,
+            Some(PutPart::Abort(why)) => {
                 return Err(ControlError::invalid(format!(
                     "the write was abandoned after {} byte(s): {why}",
                     adoption.written()
                 )))
             }
+            Some(PutPart::Header(_)) => {
+                return Err(ControlError::invalid(
+                    "a write names its space and path once",
+                ))
+            }
+            None => continue,
         }
     }
     // The commit fsyncs the payload and renames it into place.
@@ -1314,14 +1594,15 @@ async fn put_stream<S: AsyncRead + AsyncWrite + Unpin>(
     // does — the entry it reports has to be one peers can already see.
     node.scan_publish_push().await?;
     let ours = VersionPolicy::Origin(node.origin().clone());
-    let set = node.versions(space, path)?;
+    let set = node.versions(&header.space, &header.path)?;
     let row = node.resolve_set(&set, &ours)?;
-    out.line(format!("wrote {}", target.display())).await?;
-    out.entry(entry_info(&row, &set)).await?;
-    Ok(())
+    Ok(pb::Written {
+        path: target.display().to_string(),
+        entry: Some(entry_info(&row, &set).into()),
+    })
 }
 
-/// Renders one selected entry as the metadata frame a structured client reads.
+/// Renders one selected entry as the metadata a structured client reads.
 fn entry_info(row: &EntryRow, set: &VersionSet) -> EntryInfo {
     EntryInfo {
         origin: row.origin.canonical(),
@@ -1344,7 +1625,7 @@ fn entry_info(row: &EntryRow, set: &VersionSet) -> EntryInfo {
 /// client that could name any key could read one row to reach another. `s3.` is
 /// the whole of the fence, and it is checked here rather than at each call site
 /// so there is one place to be wrong.
-fn gateway_config_key(key: &str) -> std::result::Result<&str, ControlError> {
+fn gateway_config_key(key: &str) -> Result<&str, ControlError> {
     if key.starts_with("s3.") && key.len() > 3 {
         Ok(key)
     } else {
@@ -1354,21 +1635,16 @@ fn gateway_config_key(key: &str) -> std::result::Result<&str, ControlError> {
     }
 }
 
-/// Streams a verified byte range out of the CAS as `Chunk` frames.
+/// Streams a verified byte range out of the CAS.
 ///
-/// The fetch runs first, so every byte is verified against the object's bao
-/// tree before it is committed; the read then walks the window in
+/// The fetch has already run, so every byte is verified against the object's
+/// bao tree before it is committed; the read then walks the window in
 /// [`CHUNK_SIZE`] pieces, so neither process ever holds the whole payload.
-async fn stream_entry<S: AsyncWrite + Unpin>(
+async fn stream_range(
     node: &Node,
-    out: &mut Frames<S>,
-    space: &str,
-    path: &str,
-    policy: &VersionPolicy,
-    start: u64,
-    len: Option<u64>,
+    out: &mut Bytes<'_>,
+    range: synch_engine::PreparedRange,
 ) -> Done {
-    let range = node.prepare_range(space, path, policy, start, len).await?;
     let mut offset = range.start;
     while offset < range.end {
         let take = (CHUNK_SIZE as u64).min(range.end - offset);
@@ -1387,18 +1663,13 @@ async fn stream_entry<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Runs `synch recover`, streaming a line per collection round (§3.4, §9.3).
+/// Runs `synch recover`, reporting each collection round (§3.4, §9.3).
 ///
 /// The quiesce is an hour by default, so it must not look like a hung command:
 /// each round reports what it reached and how much of the wait is left. The
 /// recovery itself runs as a task, and a client that walks away takes it down
 /// with it — the floor is set once, deliberately, or not at all.
-async fn recover<S: AsyncWrite + Unpin>(
-    node: &Node,
-    out: &mut Frames<S>,
-    wait: Option<String>,
-    gap: Option<u64>,
-) -> Done {
+async fn recover(node: &Node, out: &mut Frames, wait: Option<String>, gap: Option<u64>) -> Done {
     let mut options = node.recovery_options();
     if let Some(text) = &wait {
         options.wait = crate::cli::parse_duration(text)
@@ -1428,20 +1699,18 @@ async fn recover<S: AsyncWrite + Unpin>(
     ))
     .await?;
 
-    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-    let recovering = {
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    // Cancelled with this call rather than detached: an hour of collection is
+    // worth nobody's time once whoever asked for it has gone — the client hung
+    // up mid-quiesce, or the daemon is stopping.
+    let mut recovering = Cancelling({
         let node = node.clone();
         tokio::spawn(async move { node.recover(options, progress_tx).await })
-    };
+    });
     while let Some(update) = progress_rx.recv().await {
-        if let Err(e) = out.progress(update.to_string()).await {
-            // The client hung up mid-quiesce: stop the collection rather than
-            // finish an hour of it for nobody.
-            recovering.abort();
-            return Err(e.into());
-        }
+        out.progress(update.to_string()).await?;
     }
-    let report = recovering
+    let report = (&mut recovering.0)
         .await
         .map_err(|e| ControlError::internal(format!("the recovery task failed: {e}")))??;
 
@@ -1482,7 +1751,7 @@ async fn recover<S: AsyncWrite + Unpin>(
 ///
 /// An unknown space and an empty one print the same nothing; this is what
 /// keeps that silence meaning "empty" rather than "misspelled".
-fn ensure_known_space(node: &Node, space: &str) -> std::result::Result<(), ControlError> {
+fn ensure_known_space(node: &Node, space: &str) -> Result<(), ControlError> {
     if node.store().spaces()?.iter().any(|s| s.id == space)
         || node.store().known_spaces()?.iter().any(|s| s == space)
     {
@@ -1495,7 +1764,7 @@ fn ensure_known_space(node: &Node, space: &str) -> std::result::Result<(), Contr
 }
 
 /// Refuses an origin this node holds no binding for and is not itself.
-fn ensure_known_origin(node: &Node, origin: &OriginId) -> std::result::Result<(), ControlError> {
+fn ensure_known_origin(node: &Node, origin: &OriginId) -> Result<(), ControlError> {
     if node.origin() == origin || node.store().bindings()?.iter().any(|b| &b.origin == origin) {
         return Ok(());
     }
@@ -1505,9 +1774,9 @@ fn ensure_known_origin(node: &Node, origin: &OriginId) -> std::result::Result<()
     ))
 }
 
-async fn refresh_domains<S: AsyncWrite + Unpin>(
+async fn refresh_domains(
     node: &Node,
-    out: &mut Frames<S>,
+    out: &mut Frames,
     domain: Option<&str>,
     strict: bool,
 ) -> Done {
@@ -1600,16 +1869,16 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn parse_key(text: &str) -> std::result::Result<NodeId, ControlError> {
+fn parse_key(text: &str) -> Result<NodeId, ControlError> {
     NodeId::from_z32(text)
         .map_err(|_| ControlError::invalid(format!("{text} is not a z-base-32 device key")))
 }
 
-fn parse_origin(text: &str) -> std::result::Result<OriginId, ControlError> {
+fn parse_origin(text: &str) -> Result<OriginId, ControlError> {
     OriginId::from_str(text).map_err(|e| ControlError::invalid(e.to_string()))
 }
 
-fn parse_reference(text: &str) -> std::result::Result<EntryRef, ControlError> {
+fn parse_reference(text: &str) -> Result<EntryRef, ControlError> {
     text.parse()
         .map_err(|e: synch_engine::EngineError| ControlError::from(e))
 }
@@ -1624,7 +1893,7 @@ fn policy_for(
     reference: &EntryRef,
     from: Option<&str>,
     strict: bool,
-) -> std::result::Result<VersionPolicy, ControlError> {
+) -> Result<VersionPolicy, ControlError> {
     if let Some(origin) = &reference.origin {
         if from.is_some() {
             return Err(ControlError::invalid(
@@ -1649,7 +1918,7 @@ fn policy_for(
 }
 
 /// Parses a stored or typed version policy, defaulting to `newest`.
-fn parse_policy(text: Option<&str>) -> std::result::Result<VersionPolicy, ControlError> {
+fn parse_policy(text: Option<&str>) -> Result<VersionPolicy, ControlError> {
     match text {
         None => Ok(VersionPolicy::Newest),
         Some(text) => text
@@ -1665,7 +1934,7 @@ fn parse_policy(text: Option<&str>) -> std::result::Result<VersionPolicy, Contro
 /// the reading policy picks — the same selection every other read goes
 /// through, so a pin and a `synch cat` of the same reference always mean the
 /// same object. An `<origin>:` prefix pins that origin's version.
-fn pin_target(node: &Node, text: &str) -> std::result::Result<(Hash, Option<u64>), ControlError> {
+fn pin_target(node: &Node, text: &str) -> Result<(Hash, Option<u64>), ControlError> {
     if let Ok(root) = Hash::from_str(text) {
         return Ok((root, None));
     }

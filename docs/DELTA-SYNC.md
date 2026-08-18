@@ -269,8 +269,8 @@ Whatever remains after round 2 goes to the ordinary `fetch_groups` machinery
 untouched: fanout split, `SliceEnd` re-planning, per-group verification,
 bitmap commits. `FetchReport` carries `promoted: ChunkRanges` and a
 `reused: Vec<(Donor, ChunkRanges)>` breakdown of which donor supplied what, so
-callers (and `synch mirror sync` progress lines over the control socket's
-`Progress` frames) can say "reused 98.9 GB, fetched 1.1 GB".
+callers (and `synch mirror sync` progress reports over the control service)
+can say "reused 98.9 GB, fetched 1.1 GB".
 
 If round 1 shows nothing in common — an encrypted container re-keyed, a
 compressed archive rebuilt — the entire delta attempt has cost one ~381 KB

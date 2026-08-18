@@ -2,7 +2,7 @@
 //!
 //! The gateway exposes a subset of the S3 HTTP API so existing S3 tooling can
 //! read and write a cluster without knowing anything about it. **It is a
-//! control-socket client of the daemon and nothing more** (§9.1): it never
+//! control client of the daemon and nothing more** (§9.1): it never
 //! opens the database, never binds an iroh endpoint, and holds no persistent
 //! state of its own. Every operation is a daemon request — reads stream the
 //! socket's `Chunk` frames straight into the HTTP response, writes stream the

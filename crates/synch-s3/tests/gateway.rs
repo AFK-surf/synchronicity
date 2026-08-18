@@ -355,7 +355,7 @@ async fn get_head_list_and_range_round_trip() {
     harness.stop().await;
 }
 
-/// An object far larger than one control-socket chunk crosses the gateway in
+/// An object far larger than one control-protocol chunk crosses the gateway in
 /// both directions without either process holding it (§9.4). Byte-exactness at
 /// this size is the observable half of that; the bounded channel and the
 /// daemon's staging file are the mechanism.

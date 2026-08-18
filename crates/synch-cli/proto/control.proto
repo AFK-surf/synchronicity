@@ -1,0 +1,482 @@
+syntax = "proto3";
+
+// The local control protocol (§9.3).
+//
+// One gRPC service, served by the daemon over the local transport and reached
+// by the CLI and by the S3 gateway. Two surfaces share it: `Run` answers a CLI
+// subcommand in rendered text (§9.2), and the typed calls beside it answer a
+// program that needs the data itself (§9.4).
+package synch.control.v1;
+
+// The daemon's local control surface.
+service Control {
+  // Runs one CLI subcommand, streaming its output back as it is produced.
+  //
+  // The command's arguments travel as the text the user typed and are parsed
+  // by the daemon, so a parse failure comes back as an ordinary coded error.
+  rpc Run(Command) returns (stream Frame);
+
+  // The unified listing under a prefix, resolved by a policy (§8): one entry
+  // per path the policy selects.
+  //
+  // Paths the policy refuses — divergent under `strict`, unpublished by the
+  // pinned origin under `origin=` — are left out rather than answered with one
+  // side's metadata; a direct Resolve of such a path still says what is wrong.
+  rpc List(ListRequest) returns (stream Entry);
+
+  // The version a policy selects for one path, with no content fetched — what
+  // HeadObject answers from (§9.4).
+  rpc Resolve(ResolveRequest) returns (Entry);
+
+  // A verified byte range of the version a policy selects.
+  rpc Read(ReadRequest) returns (stream Chunk);
+
+  // A streamed write into one of this node's own spaces (§7.1, §9.4).
+  //
+  // The first message carries the header; the daemon takes its gates —
+  // publishability, a resolvable target — before it answers, so the response
+  // headers are the client's cue to start streaming and a refusal arrives as
+  // the coded error it is. Chunks follow, and the write is published only on
+  // an explicit commit. Nothing is buffered whole at either end.
+  rpc Put(stream PutRequest) returns (stream Written);
+
+  // Reads a config value from the `s3.*` namespace.
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+
+  // Appends one record to a config value in the `s3.*` namespace.
+  //
+  // Append, never replace: the gateway's bucket map and access keys are lists
+  // that more than one process reads and writes, and a read-modify-write of
+  // the whole list loses whichever concurrent edit commits first. One atomic
+  // append cannot.
+  rpc AppendConfig(AppendConfigRequest) returns (AppendConfigResponse);
+}
+
+// ---- the CLI surface (§9.2) -------------------------------------------------
+
+// One CLI subcommand.
+message Command {
+  oneof kind {
+    // `synch id`
+    Id id = 1;
+    // `synch key rotate`
+    KeyRotate key_rotate = 2;
+    // `synch key activate <key> [--bind <addr>]`
+    KeyActivate key_activate = 3;
+    // `synch key retire <key>`
+    KeyRetire key_retire = 4;
+    // `synch key ls`
+    KeyLs key_ls = 5;
+    // `synch daemon status`
+    DaemonStatus daemon_status = 6;
+    // `synch daemon stop`
+    DaemonStop daemon_stop = 7;
+    // `synch trust add`
+    TrustAdd trust_add = 8;
+    // `synch trust rebind <origin> <key>`
+    TrustRebind trust_rebind = 9;
+    // `synch trust rm <origin> [--key <key>]`
+    TrustRm trust_rm = 10;
+    // `synch trust ls`
+    TrustLs trust_ls = 11;
+    // `synch domain add <domain>`
+    DomainAdd domain_add = 12;
+    // `synch domain rm <domain>`
+    DomainRm domain_rm = 13;
+    // `synch domain ls`
+    DomainLs domain_ls = 14;
+    // `synch domain refresh [<domain>]`
+    DomainRefresh domain_refresh = 15;
+    // `synch peers`
+    Peers peers = 16;
+    // `synch space add <id> <path>`
+    SpaceAdd space_add = 17;
+    // `synch space ls`
+    SpaceLs space_ls = 18;
+    // `synch space rm <id>`
+    SpaceRm space_rm = 19;
+    // `synch ls [<origin>:]<space>[/<dir>]`
+    Ls ls = 20;
+    // `synch status [<space>[/<path>]]`
+    Status status = 21;
+    // `synch cat [<origin>:]<space>/<path>`
+    Cat cat = 22;
+    // `synch get [<origin>:]<space>/<path>`
+    Get get = 23;
+    // `synch take <origin>:<space>/<path>`
+    Take take = 24;
+    // `synch log [<origin>:]<space>/<path>`
+    Log log = 25;
+    // `synch compare <space>[/<dir>] --to <origin> [--from <origin>]`
+    Compare compare = 26;
+    // `synch mirror add <space> <dir> [--policy ...]`
+    MirrorAdd mirror_add = 27;
+    // `synch mirror rm <dir>`
+    MirrorRm mirror_rm = 28;
+    // `synch mirror ls`
+    MirrorLs mirror_ls = 29;
+    // `synch mirror sync`
+    MirrorSync mirror_sync = 30;
+    // `synch pin add <root>|<space>/<path>`
+    PinAdd pin_add = 31;
+    // `synch pin rm <root>|<space>/<path>`
+    PinRm pin_rm = 32;
+    // `synch pin ls`
+    PinLs pin_ls = 33;
+    // `synch recover [--wait <dur>] [--gap <n>]`
+    Recover recover = 34;
+    // `synch doctor`
+    Doctor doctor = 35;
+    // `synch scan`
+    Scan scan = 36;
+    // `synch sync`
+    SyncNow sync_now = 37;
+  }
+}
+
+// One piece of a running command's output.
+message Frame {
+  oneof payload {
+    // One line of ordinary output.
+    string line = 1;
+    // A piece of a byte payload (`cat`, `get`).
+    bytes chunk = 2;
+    // A progress report the CLI renders and discards (`scan`, `mirror sync`).
+    string progress = 3;
+  }
+}
+
+message Id {}
+
+message KeyRotate {}
+
+message KeyActivate {
+  // The z-base-32 device key to switch signing to.
+  string key = 1;
+  // The address the new key's endpoint binds, `HOST:PORT`.
+  //
+  // Unset takes an ephemeral port on the configured interface. A
+  // static-address deployment names the next address here — the old one stays
+  // with the retiring endpoint until `key retire` frees it.
+  optional string bind = 2;
+}
+
+message KeyRetire {
+  // The z-base-32 device key to drop.
+  string key = 1;
+}
+
+message KeyLs {}
+
+message DaemonStatus {}
+
+message DaemonStop {}
+
+message TrustAdd {
+  // The peer's z-base-32 device key.
+  string key = 1;
+  // The name to bind it under.
+  optional string name = 2;
+  // The membership domain for the named origin.
+  optional string domain = 3;
+  // A note for `synch trust ls`.
+  optional string note = 4;
+  // A direct address to remember for dialing.
+  optional string addr = 5;
+}
+
+message TrustRebind {
+  // The origin to rebind.
+  string origin = 1;
+  // Its new z-base-32 device key.
+  string key = 2;
+}
+
+message TrustRm {
+  // The origin to stop trusting.
+  string origin = 1;
+  // Drop only this key's binding, keeping the origin's others (§3.4: the
+  // cleanup step after a rotation window closes).
+  optional string key = 2;
+}
+
+message TrustLs {}
+
+message DomainAdd {
+  // The membership domain.
+  string domain = 1;
+}
+
+message DomainRm {
+  // The membership domain.
+  string domain = 1;
+}
+
+message DomainLs {}
+
+message DomainRefresh {
+  // The one domain to refresh, or unset for every configured domain.
+  optional string domain = 1;
+}
+
+message Peers {}
+
+message SpaceAdd {
+  // The space id.
+  string id = 1;
+  // The local directory, already made absolute by the client.
+  string path = 2;
+}
+
+message SpaceLs {}
+
+message SpaceRm {
+  // The space id.
+  string id = 1;
+}
+
+message Ls {
+  // The entry reference. Without an origin, the unified tree (§8).
+  string reference = 1;
+  // Show every version of every path, with its attestors.
+  bool all = 2;
+}
+
+message Status {
+  // The reference, or unset for every known space.
+  optional string reference = 1;
+}
+
+message Cat {
+  // The entry reference.
+  string reference = 1;
+  // A byte range, as `START..END`, `START..`, or `..END`.
+  optional string range = 2;
+  // `--from <origin>`: read that origin's version.
+  optional string from = 3;
+  // `--strict`: refuse a divergent path.
+  bool strict = 4;
+}
+
+message Get {
+  // The entry reference.
+  string reference = 1;
+  // `--from <origin>`: fetch that origin's version.
+  optional string from = 2;
+  // `--strict`: refuse a divergent path.
+  bool strict = 3;
+}
+
+message Take {
+  // The entry reference.
+  string reference = 1;
+}
+
+message Log {
+  // The entry reference.
+  string reference = 1;
+}
+
+message Compare {
+  // The space and optional directory to compare, as `<space>[/<dir>]`.
+  string reference = 1;
+  // The baseline origin; unset means this node's own origin.
+  optional string from = 2;
+  // The target origin to compare against. Required.
+  string to = 3;
+  // Emit machine-readable JSON instead of the status listing.
+  bool json = 4;
+}
+
+message MirrorAdd {
+  // The space of the unified tree to materialize.
+  string space = 1;
+  // The local directory, already made absolute by the client.
+  string path = 2;
+  // The version policy, as the user typed it (§8).
+  optional string policy = 3;
+}
+
+message MirrorRm {
+  // The local directory, already made absolute by the client.
+  string path = 1;
+}
+
+message MirrorLs {}
+
+message MirrorSync {}
+
+message PinAdd {
+  // A hex object root, or a `<space>/<path>` whose selected version's root is
+  // pinned (§8).
+  string target = 1;
+}
+
+message PinRm {
+  // A hex object root, or a `<space>/<path>` whose selected version's root is
+  // unpinned (§8).
+  string target = 1;
+}
+
+message PinLs {}
+
+message Recover {
+  // How long to collect peer summaries, as the user typed it.
+  optional string wait = 1;
+  // How far above the highest observed seq to resume publishing.
+  optional uint64 gap = 2;
+}
+
+message Doctor {
+  // Rebuild the derived views from the authoritative trie first.
+  bool rebuild = 1;
+}
+
+message Scan {}
+
+// One push-pull exchange with every dialable peer, now.
+//
+// Anti-entropy runs on its jittered interval and owes nobody an early round;
+// this is the operator saying "I am watching, do one now" — after a publish
+// they want a peer to see, or in a script that would otherwise poll `status`
+// until the interval elapses.
+message SyncNow {}
+
+// ---- the structured surface (§9.4) ------------------------------------------
+
+// What an entry describes.
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_FILE = 1;
+  ENTRY_KIND_DIR = 2;
+  ENTRY_KIND_SYMLINK = 3;
+  ENTRY_KIND_TOMBSTONE = 4;
+}
+
+// One entry of the unified tree (§8).
+//
+// The metadata half of a read: what a listing renders and what HeadObject
+// answers from, with no content fetched. The content root travels as the 32
+// raw bytes it is, so a caller that renders it — an S3 ETag, say — does its
+// own formatting.
+message Entry {
+  // The origin whose assertion the policy selected, canonically rendered.
+  string origin = 1;
+  // The space the entry lives in.
+  string space = 2;
+  // The path within the space.
+  string path = 3;
+  // What the entry describes.
+  EntryKind kind = 4;
+  // The content length in bytes.
+  uint64 size = 5;
+  // The selected origin's observed mtime, in unix nanoseconds.
+  int64 mtime_ns = 6;
+  // The object root, for files.
+  optional bytes content = 7;
+  // The origin trie seq this version was published at.
+  uint64 seq = 8;
+  // The link target, for a symlink.
+  optional string symlink_target = 9;
+  // How many versions the path carries in the unified tree (§8). One means
+  // every publisher agrees; more means the selection above chose a side.
+  uint32 versions = 10;
+}
+
+// A piece of a byte payload.
+message Chunk {
+  bytes data = 1;
+}
+
+message ListRequest {
+  // The space of the unified tree.
+  string space = 1;
+  // The path prefix to list under, empty for the whole space.
+  string prefix = 2;
+  // Resume after this path, exclusive — a listing cursor.
+  optional string start_after = 3;
+  // At most this many paths, before the policy filters them.
+  optional uint64 limit = 4;
+  // The version policy, as `newest`, `origin=<id>`, or `strict`.
+  optional string policy = 5;
+}
+
+message ResolveRequest {
+  // The space of the unified tree.
+  string space = 1;
+  // The path within the space.
+  string path = 2;
+  // The version policy, as `newest`, `origin=<id>`, or `strict`.
+  optional string policy = 3;
+}
+
+message ReadRequest {
+  // The space of the unified tree.
+  string space = 1;
+  // The path within the space.
+  string path = 2;
+  // The version policy, as `newest`, `origin=<id>`, or `strict`.
+  optional string policy = 3;
+  // The first byte to read.
+  uint64 start = 4;
+  // How many bytes, or unset to the end of the object.
+  optional uint64 len = 5;
+}
+
+message PutRequest {
+  oneof part {
+    // The first message: what is being written and where.
+    PutHeader header = 1;
+    // A piece of the payload.
+    bytes chunk = 2;
+    // The client is abandoning the write and the daemon must keep nothing.
+    //
+    // A truncated HTTP body is the case that matters, and it is why the
+    // commit below is a message rather than the end of the stream: a partly
+    // received object must never be indistinguishable from a complete one, or
+    // it gets published as the client's own assertion.
+    string abort = 3;
+    // The payload is complete and the daemon may publish it.
+    //
+    // Nothing else commits. A client that stops sending — an abandoned write,
+    // a dropped handle, a process that died — ends the stream without one, and
+    // the daemon keeps nothing.
+    Commit commit = 4;
+  }
+}
+
+message Commit {}
+
+message PutHeader {
+  // The space to write into.
+  string space = 1;
+  // The path within the space.
+  string path = 2;
+}
+
+// The result of a completed write.
+message Written {
+  // The file the payload landed in, as the daemon sees it.
+  string path = 1;
+  // The published entry.
+  Entry entry = 2;
+}
+
+message GetConfigRequest {
+  // The config key, which must be in the `s3.` namespace.
+  string key = 1;
+}
+
+message GetConfigResponse {
+  // The stored records, one per line of the value.
+  repeated string records = 1;
+}
+
+message AppendConfigRequest {
+  // The config key, which must be in the `s3.` namespace.
+  string key = 1;
+  // The record to append. One line: newlines separate records.
+  string record = 2;
+}
+
+message AppendConfigResponse {}

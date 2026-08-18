@@ -3,7 +3,7 @@
 //! Three commands touch the data directory directly: `synch init`, which creates
 //! it before any daemon can exist; `synch id set`, which names a key-identified
 //! node while the daemon is stopped; and `synch daemon run`, which *is* the
-//! daemon. Every other command is a control-socket request to a running daemon
+//! daemon. Every other command is a control-service call to a running daemon
 //! (§9.1) — there is no in-process fallback.
 
 use std::{
@@ -21,7 +21,7 @@ use crate::{
         Cli, Command, DaemonCommand, DomainCommand, IdCommand, KeyCommand, MirrorCommand,
         PinCommand, SpaceCommand, TrustCommand,
     },
-    control::{proto::Response, transport, Client, Request},
+    control::{proto::pb, transport, Client, Command as Cmd, Frame},
     daemon,
 };
 
@@ -107,14 +107,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             command: DaemonCommand::Run,
         } => daemon::run(node_config(&cli)?).await,
         _ => {
-            let request = to_request(&cli)?;
-            deliver(&data_dir, &cli, request).await
+            let command = to_command(&cli)?;
+            deliver(&data_dir, &cli, command).await
         }
     }
 }
 
-/// Translates a parsed command into its control-socket request.
-fn to_request(cli: &Cli) -> Result<Request> {
+/// Translates a parsed command into the one the control service takes.
+fn to_command(cli: &Cli) -> Result<Cmd> {
     Ok(match &cli.command {
         Command::Init { .. } => unreachable!("handled before dispatch"),
         Command::Id {
@@ -125,23 +125,23 @@ fn to_request(cli: &Cli) -> Result<Request> {
         } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Status,
-        } => Request::DaemonStatus,
+        } => Cmd::DaemonStatus(pb::DaemonStatus {}),
         Command::Daemon {
             command: DaemonCommand::Stop,
-        } => Request::DaemonStop,
+        } => Cmd::DaemonStop(pb::DaemonStop {}),
 
-        Command::Id { command: None } => Request::Id,
+        Command::Id { command: None } => Cmd::Id(pb::Id {}),
 
         Command::Key { command } => match command {
-            KeyCommand::Rotate => Request::KeyRotate,
+            KeyCommand::Rotate => Cmd::KeyRotate(pb::KeyRotate {}),
             // The global --bind names the new endpoint's address; every other
-            // request ignores it, and `daemon run` never reaches here.
-            KeyCommand::Activate { key } => Request::KeyActivate {
+            // command ignores it, and `daemon run` never reaches here.
+            KeyCommand::Activate { key } => Cmd::KeyActivate(pb::KeyActivate {
                 key: key.clone(),
                 bind: cli.bind.clone(),
-            },
-            KeyCommand::Retire { key } => Request::KeyRetire { key: key.clone() },
-            KeyCommand::Ls => Request::KeyLs,
+            }),
+            KeyCommand::Retire { key } => Cmd::KeyRetire(pb::KeyRetire { key: key.clone() }),
+            KeyCommand::Ls => Cmd::KeyLs(pb::KeyLs {}),
         },
 
         Command::Trust { command } => match command {
@@ -167,50 +167,50 @@ fn to_request(cli: &Cli) -> Result<Request> {
                     }
                     None => (name.clone(), domain.clone()),
                 };
-                Request::TrustAdd {
+                Cmd::TrustAdd(pb::TrustAdd {
                     key: key.clone(),
                     name,
                     domain,
                     note: note.clone(),
                     addr: addr.clone(),
-                }
+                })
             }
-            TrustCommand::Rebind { origin, key } => Request::TrustRebind {
+            TrustCommand::Rebind { origin, key } => Cmd::TrustRebind(pb::TrustRebind {
                 origin: origin.clone(),
                 key: key.clone(),
-            },
-            TrustCommand::Rm { origin, key } => Request::TrustRm {
+            }),
+            TrustCommand::Rm { origin, key } => Cmd::TrustRm(pb::TrustRm {
                 origin: origin.clone(),
                 key: key.clone(),
-            },
-            TrustCommand::Ls => Request::TrustLs,
+            }),
+            TrustCommand::Ls => Cmd::TrustLs(pb::TrustLs {}),
         },
 
         Command::Domain { command } => match command {
-            DomainCommand::Add { domain } => Request::DomainAdd {
+            DomainCommand::Add { domain } => Cmd::DomainAdd(pb::DomainAdd {
                 domain: domain.clone(),
-            },
-            DomainCommand::Rm { domain } => Request::DomainRm {
+            }),
+            DomainCommand::Rm { domain } => Cmd::DomainRm(pb::DomainRm {
                 domain: domain.clone(),
-            },
-            DomainCommand::Ls => Request::DomainLs,
-            DomainCommand::Refresh { domain } => Request::DomainRefresh {
+            }),
+            DomainCommand::Ls => Cmd::DomainLs(pb::DomainLs {}),
+            DomainCommand::Refresh { domain } => Cmd::DomainRefresh(pb::DomainRefresh {
                 domain: domain.clone(),
-            },
+            }),
         },
 
-        Command::Peers => Request::Peers,
-        Command::Sync => Request::SyncNow,
+        Command::Peers => Cmd::Peers(pb::Peers {}),
+        Command::Sync => Cmd::SyncNow(pb::SyncNow {}),
 
         Command::Space { command } => match command {
             // The daemon's working directory is its own; a relative path is
             // resolved against the caller's before it crosses the socket.
-            SpaceCommand::Add { id, path } => Request::SpaceAdd {
+            SpaceCommand::Add { id, path } => Cmd::SpaceAdd(pb::SpaceAdd {
                 id: id.clone(),
                 path: absolute(path)?,
-            },
-            SpaceCommand::Ls => Request::SpaceLs,
-            SpaceCommand::Rm { id } => Request::SpaceRm { id: id.clone() },
+            }),
+            SpaceCommand::Ls => Cmd::SpaceLs(pb::SpaceLs {}),
+            SpaceCommand::Rm { id } => Cmd::SpaceRm(pb::SpaceRm { id: id.clone() }),
         },
 
         Command::Mirror { command } => match command {
@@ -218,93 +218,93 @@ fn to_request(cli: &Cli) -> Result<Request> {
                 space,
                 path,
                 policy,
-            } => Request::MirrorAdd {
+            } => Cmd::MirrorAdd(pb::MirrorAdd {
                 space: space.clone(),
                 path: absolute(path)?,
                 policy: policy.clone(),
-            },
-            MirrorCommand::Rm { path } => Request::MirrorRm {
+            }),
+            MirrorCommand::Rm { path } => Cmd::MirrorRm(pb::MirrorRm {
                 path: absolute(path)?,
-            },
-            MirrorCommand::Ls => Request::MirrorLs,
-            MirrorCommand::Sync => Request::MirrorSync,
+            }),
+            MirrorCommand::Ls => Cmd::MirrorLs(pb::MirrorLs {}),
+            MirrorCommand::Sync => Cmd::MirrorSync(pb::MirrorSync {}),
         },
 
         Command::Pin { command } => match command {
-            PinCommand::Add { target } => Request::PinAdd {
+            PinCommand::Add { target } => Cmd::PinAdd(pb::PinAdd {
                 target: target.clone(),
-            },
-            PinCommand::Rm { target } => Request::PinRm {
+            }),
+            PinCommand::Rm { target } => Cmd::PinRm(pb::PinRm {
                 target: target.clone(),
-            },
-            PinCommand::Ls => Request::PinLs,
+            }),
+            PinCommand::Ls => Cmd::PinLs(pb::PinLs {}),
         },
 
-        Command::Ls { reference, all } => Request::Ls {
+        Command::Ls { reference, all } => Cmd::Ls(pb::Ls {
             reference: reference.clone(),
             all: *all,
-        },
-        Command::Status { reference } => Request::Status {
+        }),
+        Command::Status { reference } => Cmd::Status(pb::Status {
             reference: reference.clone(),
-        },
+        }),
         Command::Cat {
             reference,
             range,
             from,
             strict,
-        } => Request::Cat {
+        } => Cmd::Cat(pb::Cat {
             reference: reference.clone(),
             range: range.clone(),
             from: from.clone(),
             strict: *strict,
-        },
+        }),
         Command::Get {
             reference,
             from,
             strict,
             ..
-        } => Request::Get {
+        } => Cmd::Get(pb::Get {
             reference: reference.clone(),
             from: from.clone(),
             strict: *strict,
-        },
-        Command::Take { reference } => Request::Take {
+        }),
+        Command::Take { reference } => Cmd::Take(pb::Take {
             reference: reference.clone(),
-        },
-        Command::Log { reference } => Request::Log {
+        }),
+        Command::Log { reference } => Cmd::Log(pb::Log {
             reference: reference.clone(),
-        },
+        }),
         Command::Compare {
             reference,
             to,
             from,
             json,
-        } => Request::Compare {
+        } => Cmd::Compare(pb::Compare {
             reference: reference.clone(),
             from: from.clone(),
             to: to.clone(),
             json: *json,
-        },
+        }),
         Command::Recover { wait, gap } => {
             // Parsed here as well as on the daemon, so a typo fails before a
             // connection is made rather than an hour into a quiesce.
             if let Some(wait) = wait {
                 crate::cli::parse_duration(wait).context("--wait")?;
             }
-            Request::Recover {
+            Cmd::Recover(pb::Recover {
                 wait: wait.clone(),
                 gap: *gap,
-            }
+            })
         }
-        Command::Doctor { rebuild } => Request::Doctor { rebuild: *rebuild },
-        Command::Scan => Request::Scan,
+        Command::Doctor { rebuild } => Cmd::Doctor(pb::Doctor { rebuild: *rebuild }),
+        Command::Scan => Cmd::Scan(pb::Scan {}),
     })
 }
 
-/// Sends the request and renders the response stream.
-async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
+/// Sends the command and renders its output.
+async fn deliver(data_dir: &Path, cli: &Cli, command: Cmd) -> Result<()> {
     let mut client = Client::connect(data_dir).await?;
-    client.send(&request).await?;
+    let mut frames = client.run(command).await?;
 
     // `get` is the one command whose payload lands in a file rather than on
     // stdout, so it needs the destination the caller named.
@@ -324,9 +324,9 @@ async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
         // there alone instead of truncating it.
         let mut file: Option<std::fs::File> = None;
         let mut written = 0u64;
-        while let Some(response) = client.next().await? {
-            match response {
-                Response::Chunk(bytes) => {
+        while let Some(frame) = frames.next().await? {
+            match frame {
+                Frame::Chunk(bytes) => {
                     let file = match &mut file {
                         Some(file) => file,
                         None => file.insert(create(&target)?),
@@ -334,13 +334,8 @@ async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
                     file.write_all(&bytes)?;
                     written += bytes.len() as u64;
                 }
-                Response::Line(text) => println!("{text}"),
-                Response::Progress(text) => eprintln!("{text}"),
-                // No CLI command asks for structured entries: the `Entry`
-                // frame answers the gateway's requests (§9.4), and the CLI's
-                // listings arrive already rendered as `Line`s.
-                Response::Entry(_) => {}
-                Response::Ready | Response::End | Response::Error(_) => {}
+                Frame::Line(text) => println!("{text}"),
+                Frame::Progress(text) => eprintln!("{text}"),
             }
         }
         // An empty entry is still an entry: it arrives as no chunks at all.
@@ -355,17 +350,15 @@ async fn deliver(data_dir: &Path, cli: &Cli, request: Request) -> Result<()> {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    while let Some(response) = client.next().await? {
-        match response {
-            Response::Line(text) => {
+    while let Some(frame) = frames.next().await? {
+        match frame {
+            Frame::Line(text) => {
                 writeln!(out, "{text}")?;
             }
-            Response::Chunk(bytes) => out.write_all(&bytes)?,
+            Frame::Chunk(bytes) => out.write_all(&bytes)?,
             // Progress is rendered and discarded: it is not the command's
             // output, just what it is doing while producing it.
-            Response::Progress(text) => eprintln!("{text}"),
-            Response::Entry(_) => {}
-            Response::Ready | Response::End | Response::Error(_) => {}
+            Frame::Progress(text) => eprintln!("{text}"),
         }
     }
     out.flush()?;
@@ -389,8 +382,8 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    fn request_for(args: &[&str]) -> Result<Request> {
-        to_request(&Cli::parse_from(args))
+    fn command_for(args: &[&str]) -> Result<Cmd> {
+        to_command(&Cli::parse_from(args))
     }
 
     /// Origins are spelled `name@domain` everywhere else, so `--as` takes
@@ -398,7 +391,7 @@ mod tests {
     /// member-label regex.
     #[test]
     fn trust_add_accepts_the_origin_form() {
-        let request = request_for(&[
+        let command = command_for(&[
             "synch",
             "trust",
             "add",
@@ -408,18 +401,18 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            request,
-            Request::TrustAdd {
+            command,
+            Cmd::TrustAdd(pb::TrustAdd {
                 key: "abc".into(),
                 name: Some("nas".into()),
                 domain: Some("cluster.example.com".into()),
                 note: None,
                 addr: None,
-            }
+            })
         );
 
         // A bare label with a separate --domain is unchanged.
-        let request = request_for(&[
+        let command = command_for(&[
             "synch",
             "trust",
             "add",
@@ -431,18 +424,18 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            request,
-            Request::TrustAdd {
+            command,
+            Cmd::TrustAdd(pb::TrustAdd {
                 key: "abc".into(),
                 name: Some("nas".into()),
                 domain: Some("x.example".into()),
                 note: None,
                 addr: None,
-            }
+            })
         );
 
         // Two domains that disagree are an error, not a silent pick.
-        let err = request_for(&[
+        let err = command_for(&[
             "synch",
             "trust",
             "add",
