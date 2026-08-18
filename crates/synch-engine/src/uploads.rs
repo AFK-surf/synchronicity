@@ -48,6 +48,18 @@ pub struct PartStaging {
     pub file: String,
 }
 
+/// What a delete did, and what it left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deleted {
+    /// Whether there was a local copy to remove.
+    pub removed: bool,
+    /// Whether some origin still publishes a live entry for the path.
+    ///
+    /// True means the delete did what it could and the key is still readable:
+    /// another origin asserts it, and only that origin can retract it (§8).
+    pub still_published: bool,
+}
+
 /// What a completion produced.
 #[derive(Debug, Clone)]
 pub struct CompletedUpload {
@@ -242,6 +254,47 @@ impl Node {
             root,
             size: assembled,
             replayed: false,
+        })
+    }
+
+    /// Removes this node's copy of a path and publishes its tombstone (§8,
+    /// §9.4).
+    ///
+    /// The delete half of `PutObject`, and it obeys the same rule: a write
+    /// publishes *this node's own view*, because the version model has no way
+    /// to publish anyone else's. So this removes our copy and asserts our
+    /// tombstone, and that is the whole of what a delete can mean here. If
+    /// another origin still publishes the path, the path is still in the
+    /// unified tree afterwards — with one fewer version — and the caller is
+    /// told so rather than left to discover it on the next read.
+    ///
+    /// Removing nothing is not a failure. S3 makes `DeleteObject` idempotent
+    /// and tooling leans on it hard (`rm -f`, retried deletes, `rm` of a key a
+    /// concurrent writer already removed), so a path that is already absent
+    /// here is a delete that has already happened.
+    pub async fn delete_object(&self, space: &str, path: &str) -> Result<Deleted> {
+        // Before touching the file, not after: a node that cannot publish would
+        // otherwise unlink the local copy and be unable to tell anyone (§3.4),
+        // which loses data — the tombstone that would have justified the
+        // removal never gets signed.
+        self.ensure_publishable()?;
+        let node = self.clone();
+        let (space_owned, path_owned) = (space.to_string(), path.to_string());
+        let removed =
+            crate::blocking::offload(move || node.adopt_deletion(&space_owned, &path_owned))
+                .await?
+                .is_some();
+
+        // The ordinary indexing pipeline turns the missing file into a
+        // tombstone: the deletion sweep stages the `f:` key as `None` and the
+        // publish signs it, exactly as an `rm` in the space directory would.
+        if removed {
+            self.scan_publish_push().await?;
+        }
+        let set = self.versions(space, path)?;
+        Ok(Deleted {
+            removed,
+            still_published: set.exists(),
         })
     }
 

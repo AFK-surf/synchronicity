@@ -720,6 +720,22 @@ impl Control for ControlService {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
+    async fn delete(
+        &self,
+        request: Request<pb::DeleteRequest>,
+    ) -> Result<Response<pb::DeleteResponse>, Status> {
+        let request = request.into_inner();
+        let node = self.served.node()?.clone();
+        let deleted = node
+            .delete_object(&request.space, &request.path)
+            .await
+            .map_err(ControlError::from)?;
+        Ok(Response::new(pb::DeleteResponse {
+            removed: deleted.removed,
+            still_published: deleted.still_published,
+        }))
+    }
+
     async fn complete_upload(
         &self,
         request: Request<pb::CompleteUploadRequest>,

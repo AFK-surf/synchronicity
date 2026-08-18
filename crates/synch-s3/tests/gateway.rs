@@ -729,13 +729,19 @@ async fn deferred_operations_report_not_implemented() {
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
+    // Deleting a *bucket* is not a thing HTTP may do: a bucket is a mapping the
+    // operator made.
+    let response = http.delete(harness.url("/my-media")).send().await.unwrap();
+    assert_eq!(response.status(), 501);
+    assert!(response.text().await.unwrap().contains("NotImplemented"));
+    // Neither is the batch delete, which is its own API.
     let response = http
-        .delete(harness.url("/my-media/notes.txt"))
+        .post(harness.url("/my-media?delete"))
+        .body("<Delete><Object><Key>notes.txt</Key></Object></Delete>")
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 501);
-    assert!(response.text().await.unwrap().contains("NotImplemented"));
     harness.stop().await;
 }
 
@@ -1522,5 +1528,179 @@ async fn headers_that_relocate_the_payload_are_refused() {
         .await
         .unwrap();
     assert_eq!(source.as_ref(), b"twenty-five bytes here!!!");
+    harness.stop().await;
+}
+
+// ---- DeleteObject (§8, §9.4) -----------------------------------------------
+
+/// A delete removes the local copy and publishes a tombstone, and the key
+/// leaves the tree — listings, reads and all.
+#[tokio::test]
+async fn delete_object_removes_the_file_and_tombstones_the_key() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    harness.publish("notes.txt", b"delete me");
+    harness.publish("keep.txt", b"but not me");
+    let http = client();
+
+    // It is there first, or the test proves nothing.
+    let response = http
+        .get(harness.url("/my-media/notes.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = http
+        .delete(harness.url("/my-media/notes.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert!(
+        response.bytes().await.unwrap().is_empty(),
+        "204 carries no body"
+    );
+
+    // Gone from the space directory...
+    assert!(!harness.space_path.join("notes.txt").exists());
+    // ...gone to a reader...
+    let response = http
+        .get(harness.url("/my-media/notes.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let response = http
+        .head(harness.url("/my-media/notes.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    // ...gone from the listing, without taking its neighbour with it.
+    let listed = http
+        .get(harness.url("/my-media?list-type=2"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!listed.contains("<Key>notes.txt</Key>"), "{listed}");
+    assert!(listed.contains("<Key>keep.txt</Key>"), "{listed}");
+
+    // And it is a published tombstone, not just a missing file: the entry this
+    // node asserts for the path says deleted.
+    let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
+    let set = harness.node.versions("media", "notes.txt").unwrap();
+    let row = harness.node.resolve_set(&set, &ours).unwrap();
+    assert_eq!(row.kind, synch_core::EntryKind::Tombstone);
+    harness.stop().await;
+}
+
+/// Deleting a key that is not there succeeds, because S3 says so and every
+/// `rm -f`, retry and concurrent-delete race depends on it.
+#[tokio::test]
+async fn delete_object_is_idempotent() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    harness.publish("once.txt", b"here");
+    let http = client();
+
+    for _ in 0..3 {
+        let response = http
+            .delete(harness.url("/my-media/once.txt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+    }
+    // A key that never existed at all is the same answer.
+    let response = http
+        .delete(harness.url("/my-media/never-existed.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    harness.stop().await;
+}
+
+/// A delete is a publish, so a node that cannot publish must refuse it rather
+/// than unlink the file and be unable to tell anyone (§3.4).
+#[tokio::test]
+async fn delete_object_is_refused_while_the_node_is_in_recovery() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    // Written into the space but deliberately not published: recovery is the
+    // state of a node that holds no head of its own, so publishing first would
+    // settle the question and take the node out of it.
+    write_into(&harness.space_path, "notes.txt", b"still here");
+    // A peer advertising a head this node has no history for is what puts it
+    // into recovery, the same way the write test does it.
+    harness
+        .node
+        .store()
+        .record_observed_head(
+            harness.node.origin(),
+            100,
+            &synch_core::Hash([7u8; 32]),
+            true,
+            None,
+            synch_core::now_ns(),
+        )
+        .unwrap();
+    let http = client();
+
+    let response = http
+        .delete(harness.url("/my-media/notes.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("ServiceUnavailable"));
+    // The file is still here: refusing has to mean nothing happened, or the
+    // refusal loses the data it was protecting.
+    assert!(harness.space_path.join("notes.txt").exists());
+    harness.stop().await;
+}
+
+/// A delete round-trips against a write: PUT, DELETE, PUT again.
+#[tokio::test]
+async fn a_key_can_be_rewritten_after_it_is_deleted() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+
+    for body in [b"first".as_slice(), b"second".as_slice()] {
+        let response = http
+            .put(harness.url("/my-media/cycle.txt"))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let got = http
+            .get(harness.url("/my-media/cycle.txt"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), body);
+
+        let response = http
+            .delete(harness.url("/my-media/cycle.txt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+        let response = http
+            .get(harness.url("/my-media/cycle.txt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+    }
     harness.stop().await;
 }

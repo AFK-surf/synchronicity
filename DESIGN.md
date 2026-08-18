@@ -1492,6 +1492,22 @@ through both directions **without either process buffering more than a chunk**.
   - `PutObject` — writes into the local space directory, then runs the normal
     ingest pipeline (hash → CAS → stage entry, §7.1); responds once durably staged,
     with the head publish following the usual batching.
+  - `DeleteObject` — removes this node's copy and publishes its tombstone
+    through the ordinary indexing pipeline, exactly as an `rm` in the space
+    directory would (§8). It obeys the same rule a write does: a delete
+    publishes *this node's own view*, because the version model cannot publish
+    anyone else's. So if another origin still asserts the key, the key is still
+    readable afterwards with one fewer version, and only that origin can retract
+    its own — which is what `synch take` of a tombstone is for. S3 has no status
+    for "deleted my version of it", and inventing one would break every client
+    that treats `rm` as a loop over keys, so the answer is the `204` S3 promises
+    and the surviving publishers are logged. Idempotent: a key that is already
+    absent here is a delete that has already happened, which is what `rm -f`,
+    retried deletes, and losing a race to a concurrent writer all rely on. The
+    recovery gate is taken *before* the unlink, not after: a node that cannot
+    publish would otherwise remove the file and be unable to tell anyone (§3.4),
+    which loses the data outright — the tombstone that justified the removal
+    never gets signed.
   - **Multipart upload** — `CreateMultipartUpload`, `UploadPart`,
     `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`,
     `ListMultipartUploads`. Not optional in practice: Mountpoint for Amazon S3
@@ -1550,9 +1566,10 @@ through both directions **without either process buffering more than a chunk**.
   denylist and not an allowlist: it only has to name the headers whose absence
   produces a *wrong object*, which is a closed set, where an allowlist has to
   know every header every SDK sends before it can let a working client through.
-- **Not in v1**: DeleteObject (maps naturally to a tombstone publish — first in
-  line for v1.1), CopyObject and UploadPartCopy, bucket versioning APIs,
-  presigned URLs.
+- **Not in v1**: `DeleteObjects` (the batch delete, which is its own API and its
+  own body format), CopyObject and UploadPartCopy, DeleteBucket — a bucket is a
+  mapping the operator made, not a thing HTTP may unmake — bucket versioning
+  APIs, presigned URLs.
 
 ---
 

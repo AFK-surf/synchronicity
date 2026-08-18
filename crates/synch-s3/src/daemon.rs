@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use axum::body::Body;
 use synch_cli::control::{
     proto::{pb, CHUNK_SIZE},
-    Client, Command, CompletedUpload, EntryInfo, Frame, OpenUpload, RecordedPart, UploadRef,
+    Client, Command, CompletedUpload, Deleted, EntryInfo, Frame, OpenUpload, RecordedPart,
+    UploadRef,
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
@@ -245,6 +246,11 @@ impl Daemon {
             put.chunk(rest).await?;
         }
         Ok(put.finish().await?.entry)
+    }
+
+    /// Removes this node's copy of a path and publishes its tombstone (§8).
+    pub async fn delete(&self, space: &str, path: &str) -> S3Result<Deleted> {
+        Ok(self.connect().await?.delete(space, path).await?)
     }
 
     /// Opens a multipart upload and returns its id (§9.4).

@@ -145,6 +145,22 @@ impl Client {
         Ok(Put { parts, written })
     }
 
+    /// Removes this node's copy of a path and publishes its tombstone.
+    pub async fn delete(&mut self, space: &str, path: &str) -> Result<Deleted, ControlError> {
+        let response = self
+            .inner
+            .delete(pb::DeleteRequest {
+                space: space.to_string(),
+                path: path.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(Deleted {
+            removed: response.removed,
+            still_published: response.still_published,
+        })
+    }
+
     /// Opens a multipart upload and returns its id (§9.4).
     pub async fn create_upload(&mut self, space: &str, path: &str) -> Result<String, ControlError> {
         Ok(self
@@ -580,4 +596,13 @@ fn hash_from(bytes: &[u8], what: &str) -> Result<Hash, ControlError> {
         .try_into()
         .map_err(|_| ControlError::internal(format!("the daemon sent a malformed {what}")))?;
     Ok(Hash::from(array))
+}
+
+/// What a delete did, and what it left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deleted {
+    /// Whether there was a local copy to remove.
+    pub removed: bool,
+    /// Whether some origin still publishes a live entry for the path (§8).
+    pub still_published: bool,
 }

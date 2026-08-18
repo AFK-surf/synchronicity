@@ -228,6 +228,12 @@ the selected version and ETags are that version's BLAKE3 root in hex, quoted. A
 `strict` bucket answers a divergent key with `409 Conflict` naming the
 versions.
 
+`DELETE` removes this node's copy and publishes a tombstone, the same thing an
+`rm` in the space directory does — so, like a write, it publishes our own view.
+A key another origin still publishes stays readable until that origin tombstones
+it too, and the gateway says so in its log rather than in a status code S3 has
+no room for.
+
 Multipart upload is supported, which is what makes the gateway writable from
 [Mountpoint for Amazon S3](https://github.com/awslabs/mountpoint-s3) — it wraps
 every write in one, whatever the file's size. The upload lives in the daemon, so

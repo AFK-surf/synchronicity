@@ -214,10 +214,47 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
         (&Method::GET, false) => get_object(gateway, &bucket, key, &headers, false).await,
         (&Method::HEAD, false) => get_object(gateway, &bucket, key, &headers, true).await,
         (&Method::PUT, false) => put_object(gateway, &bucket, key, &headers, body).await,
-        (&Method::DELETE, _) => Err(S3Error::not_implemented("DeleteObject")),
+        (&Method::DELETE, false) => delete_object(gateway, &bucket, key).await,
+        // A bucket is a mapping the operator made, not a thing HTTP may
+        // unmake: deleting one here would leave a space nobody serves and an
+        // operator who never asked for that.
+        (&Method::DELETE, true) => Err(S3Error::not_implemented("DeleteBucket")),
         (&Method::POST, _) => Err(S3Error::not_implemented("this operation")),
         _ => Err(S3Error::not_implemented("this operation")),
     }
+}
+
+/// `DeleteObject` (§8, §9.4).
+///
+/// A delete publishes this node's own view, exactly as a write does: our copy
+/// goes and our tombstone is signed. That is the whole of what a delete can
+/// mean in the version model, and it has one consequence worth being explicit
+/// about — if another origin still publishes the key, the key is still
+/// readable afterwards. S3 has no status for "deleted my version of it", and
+/// inventing one would break every client that treats `rm` as a loop over
+/// keys, so the answer is the `204` S3 promises and the surviving publishers
+/// are logged.
+async fn delete_object(gateway: &Gateway, bucket: &Bucket, key: &str) -> S3Result<Response> {
+    if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
+        tracing::warn!("{warning}");
+    }
+    let deleted = gateway
+        .daemon
+        .delete(&bucket.space, key)
+        .await
+        .map_err(|e| e.with_key(key))?;
+    if deleted.still_published {
+        tracing::warn!(
+            bucket = %bucket.name,
+            key,
+            "deleted this node's version, but another origin still publishes the key: \
+             it stays readable until every publisher tombstones it (§8)"
+        );
+    }
+    // 204 whether or not there was anything here to remove. S3 makes
+    // `DeleteObject` idempotent and tooling leans on it: a retried delete, an
+    // `rm -f`, or a key a concurrent writer already took is not an error.
+    Ok((StatusCode::NO_CONTENT).into_response())
 }
 
 /// Headers that change what an object *is*, which this gateway does not honor.

@@ -54,5 +54,5 @@ pub use scanner::{Adoption, CloneKind, ScanReport};
 pub use synch_net::dns::RekorPolicy;
 pub use synch_store::{Donor, ProvenSubtree, Selection, Version, VersionPolicy, VersionSet};
 pub use tree::reference_of;
-pub use uploads::{CompletedUpload, PartStaging, DEFAULT_UPLOAD_TTL};
+pub use uploads::{CompletedUpload, Deleted, PartStaging, DEFAULT_UPLOAD_TTL};
 pub use watcher::SpaceWatcher;

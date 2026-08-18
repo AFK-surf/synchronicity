@@ -74,6 +74,15 @@ service Control {
   // which is what lets the client start sending.
   rpc UploadPart(stream UploadPartRequest) returns (stream UploadPartResponse);
 
+  // Removes this node's copy of a path and publishes its tombstone (§8, §9.4).
+  //
+  // A delete publishes this node's own view, exactly as a write does — the
+  // version model cannot publish anyone else's. The response says whether there
+  // was a copy here to remove, and whether some other origin still publishes
+  // the path, which is a thing the caller has to be able to find out without
+  // reading the key back.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
   // Assembles the named parts, publishes the object, and returns its root.
   //
   // Retry-safe: a completion that already ran is answered from the result it
@@ -569,6 +578,21 @@ message UploadRef {
   string space = 2;
   // The path the upload must be against.
   string path = 3;
+}
+
+message DeleteRequest {
+  // The space to delete from.
+  string space = 1;
+  // The path within the space.
+  string path = 2;
+}
+
+message DeleteResponse {
+  // False when there was no local copy, which a delete treats as success.
+  bool removed = 1;
+  // True when some origin still publishes a live entry for the path, so the
+  // key remains readable through the unified tree (§8).
+  bool still_published = 2;
 }
 
 message CreateUploadRequest {
