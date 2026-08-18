@@ -147,6 +147,14 @@ impl Certificate {
                 });
             }
         }
+        // And nothing after the extensions block inside tbsCertificate. The
+        // rule the comment above claims — "applied at every level rather than
+        // only the outer one" — was not in fact applied at this level:
+        // `optional` restores its position on a mismatch and `next` never
+        // checks for a remainder, so a *second* `[3]` TLV sat there unread,
+        // carrying a second subjectAltName or a second chain extension that
+        // the exactly-one rules below never saw.
+        tbs.finish("the tbsCertificate")?;
 
         // Exactly one subjectAltName, or none. RFC 5280 says an extension
         // appears at most once, and taking the *first* of two would let a
@@ -676,6 +684,70 @@ mod tests {
         ];
         der.extend_from_slice(&[0x11; 64]);
         der
+    }
+
+    /// A second `[3]` block inside `tbsCertificate` is refused, not skipped.
+    ///
+    /// The exactly-one rules for subjectAltName and the chain extension read
+    /// the extension *list*, so a second `[3]` TLV carrying its own list is a
+    /// way past them that never touches them. `optional` restores its
+    /// position on a mismatch and `next` never checks for a remainder, so
+    /// before `tbs.finish` the second block simply sat there unread: the
+    /// certificate meant one thing here and another to any reader that took
+    /// the last block, which for the extension carrying the zone name is the
+    /// whole game.
+    #[test]
+    fn a_second_extensions_block_inside_the_tbs_is_refused() {
+        let spec = SelfSigned {
+            common_name: "synchronicity zone key",
+            dns_name: "sync.example",
+            spki: &spki(),
+            serial: &[0x01, 0x02, 0x03],
+            not_before: x509_time(1_760_000_000),
+            not_after: x509_time(4_900_000_000),
+            extensions: &[],
+        };
+        let sign = |_: &[u8]| vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+
+        // The honest certificate parses, so the assertion below is about the
+        // second block and not about the builder.
+        let good = spec.build(sign);
+        let cert = Certificate::parse(&good).expect("the honest certificate parses");
+        assert_eq!(cert.single_dns_name().unwrap().to_string(), "sync.example.");
+
+        // The same tbs with a second [3] appended, naming a different zone.
+        let smuggled = tlv(
+            0xa3,
+            &tlv(
+                0x30,
+                &extension(
+                    OID_SUBJECT_ALT_NAME,
+                    false,
+                    &tlv(0x30, &tlv(0x82, b"attacker.example")),
+                ),
+            ),
+        );
+        // Strip the outer SEQUENCE header off the tbs, append, re-wrap.
+        let tbs = spec.tbs();
+        let header = match tbs[1] {
+            n if n < 0x80 => 2,
+            n => 2 + usize::from(n & 0x7f),
+        };
+        let body = tlv(0x30, &[&tbs[header..], &smuggled[..]].concat());
+        let forged = tlv(
+            0x30,
+            &[
+                body,
+                algorithm_identifier(),
+                tlv(
+                    0x03,
+                    &[0x00, 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
+                ),
+            ]
+            .concat(),
+        );
+        let error = Certificate::parse(&forged).expect_err("a second [3] must not parse");
+        assert!(error.to_string().contains("tbsCertificate"), "{error}");
     }
 
     #[test]
