@@ -18,7 +18,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use synch_core::{
-    now_ns, proof_nodes_upper_bound, BlobMessage, ChunkRanges, Hash, MAX_PROOF_NODES, MAX_RANGES,
+    now_ns, proof_window, BlobMessage, ChunkRanges, Hash, MAX_PROOF_NODES, MAX_RANGES,
     MAX_SLICE_GROUPS,
 };
 use synch_store::{Proven, Store};
@@ -26,66 +26,16 @@ use synch_store::{Proven, Store};
 use crate::{
     endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
-    frame::{read_bytes, read_frame, write_bytes, write_frame},
+    frame::{read_bytes_stalled, read_frame, read_frame_stalled, write_bytes, write_frame},
 };
 
-/// How many consecutive empty windows a provider may answer with before a
-/// fetch gives up on it and lets the caller try someone else.
+/// How many empty windows a provider may answer with before a fetch gives up
+/// on it and lets the caller try someone else.
+///
+/// Counted across the whole walk rather than consecutively: a provider that
+/// serves one group and then answers empty forever must not get to keep the
+/// fetch alive by never missing twice in a row.
 const MAX_BARREN_WINDOWS: u32 = 4;
-
-/// The largest prefix of `remaining` whose proof fits one exchange.
-///
-/// Sized by [`proof_nodes_upper_bound`], so a provider holding everything asked
-/// for still comes in under [`MAX_PROOF_NODES`] and never truncates. Ranges are
-/// taken whole where they fit and split where they do not, and the count is
-/// clamped to [`MAX_RANGES`] so the set operations under it stay cheap on both
-/// sides (§12).
-///
-/// Public because a caller walking a large region in rounds has to cut it the
-/// same way: what fits depends on the level and on how fragmented the ranges
-/// are — a contiguous run costs one node per subtree plus a root path, a
-/// scattered set costs a root path each — so any second answer to "how much per
-/// round?" would disagree with this one.
-pub fn proof_window(remaining: &ChunkRanges, level: u8) -> ChunkRanges {
-    let mut taken: Vec<synch_core::GroupRange> = Vec::new();
-    for range in remaining.ranges.iter().take(MAX_RANGES) {
-        let candidate = ChunkRanges::from_ranges(taken.iter().copied().chain([*range]));
-        if proof_nodes_upper_bound(&candidate, level) <= MAX_PROOF_NODES {
-            taken.push(*range);
-            continue;
-        }
-        // This range does not fit whole. Take as much of its head as does,
-        // which is at worst nothing — in which case the window is what we have.
-        let mut lo = range.start;
-        let mut hi = range.end;
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            let probe = ChunkRanges::from_ranges(
-                taken
-                    .iter()
-                    .copied()
-                    .chain([synch_core::GroupRange::new(range.start, mid)]),
-            );
-            if proof_nodes_upper_bound(&probe, level) <= MAX_PROOF_NODES {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        if lo > range.start {
-            taken.push(synch_core::GroupRange::new(range.start, lo));
-        }
-        break;
-    }
-    if taken.is_empty() {
-        // Even one group does not fit the budget, which only happens for a
-        // degenerate level; ask for a single group so the walk still advances.
-        if let Some(first) = remaining.ranges.first() {
-            taken.push(synch_core::GroupRange::new(first.start, first.start + 1));
-        }
-    }
-    ChunkRanges::from_ranges(taken)
-}
 
 /// Validates what a provider says it served, before any set operation reads it.
 ///
@@ -245,8 +195,6 @@ impl BlobProtocol {
 #[derive(Debug, Clone)]
 pub struct BlobClient {
     connection: Connection,
-    /// How long any one exchange on this connection may wait for its answer.
-    deadline: std::time::Duration,
 }
 
 /// A received slice, together with what the provider actually served.
@@ -281,18 +229,28 @@ pub struct ProofOutcome {
 impl BlobClient {
     /// Wraps an established `sync/blob/1` connection.
     pub fn new(connection: Connection) -> Self {
-        BlobClient {
-            connection,
-            deadline: REQUEST_TIMEOUT,
-        }
+        BlobClient { connection }
     }
 
-    /// The same client under a deadline of the caller's choosing, for tests
-    /// that need a stall to be reported in milliseconds rather than minutes.
-    #[cfg(test)]
-    pub(crate) fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
-        self.deadline = deadline;
-        self
+    /// Opens a stream and writes one request, under the exchange deadline.
+    ///
+    /// The deadline covers setup only: the request is one small bounded
+    /// frame, so a total bound on this phase can never cut a transfer short.
+    /// The answer is another story — a slice can be megabytes trickling over
+    /// a slow link — so reading it is bounded by silence, never by duration
+    /// (`read_bytes_stalled`).
+    async fn request(
+        &self,
+        message: &BlobMessage,
+        what: &'static str,
+    ) -> Result<iroh::endpoint::RecvStream, NetError> {
+        under_deadline(REQUEST_TIMEOUT, what, async {
+            let (mut send, recv) = self.connection.open_bi().await?;
+            write_frame(&mut send, message).await?;
+            let _ = send.finish();
+            Ok(recv)
+        })
+        .await
     }
 
     /// The peer's device key.
@@ -302,26 +260,21 @@ impl BlobClient {
 
     /// Requests a verified slice.
     pub async fn get_slice(&self, root: Hash, ranges: &ChunkRanges) -> Result<Slice, NetError> {
-        under_deadline(self.deadline, "a slice request", async {
-            let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(
-                &mut send,
+        let mut recv = self
+            .request(
                 &BlobMessage::GetSlice {
                     root,
                     ranges: ranges.clone(),
                 },
+                "a slice request",
             )
             .await?;
-            let _ = send.finish();
-
-            let encoded = read_bytes(&mut recv).await?;
-            let served = match read_frame::<BlobMessage>(&mut recv).await? {
-                BlobMessage::SliceEnd { served } => check_served(served, ranges)?,
-                _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
-            };
-            Ok(Slice { encoded, served })
-        })
-        .await
+        let encoded = read_bytes_stalled(&mut recv).await?;
+        let served = match read_frame_stalled::<BlobMessage>(&mut recv).await? {
+            BlobMessage::SliceEnd { served } => check_served(served, ranges)?,
+            _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
+        };
+        Ok(Slice { encoded, served })
     }
 
     /// Requests the tree over a range, without its bytes.
@@ -331,27 +284,22 @@ impl BlobClient {
         ranges: &ChunkRanges,
         level: u8,
     ) -> Result<Proof, NetError> {
-        under_deadline(self.deadline, "a proof request", async {
-            let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(
-                &mut send,
+        let mut recv = self
+            .request(
                 &BlobMessage::GetProof {
                     root,
                     ranges: ranges.clone(),
                     level,
                 },
+                "a proof request",
             )
             .await?;
-            let _ = send.finish();
-
-            let encoded = read_bytes(&mut recv).await?;
-            let served = match read_frame::<BlobMessage>(&mut recv).await? {
-                BlobMessage::ProofEnd { served } => check_served(served, ranges)?,
-                _ => return Err(NetError::Unexpected("expected ProofEnd".into())),
-            };
-            Ok(Proof { encoded, served })
-        })
-        .await
+        let encoded = read_bytes_stalled(&mut recv).await?;
+        let served = match read_frame_stalled::<BlobMessage>(&mut recv).await? {
+            BlobMessage::ProofEnd { served } => check_served(served, ranges)?,
+            _ => return Err(NetError::Unexpected("expected ProofEnd".into())),
+        };
+        Ok(Proof { encoded, served })
     }
 
     /// Requests the tree over a range and commits it to the local CAS,
@@ -396,7 +344,7 @@ impl BlobClient {
             // `requested ∩ what it holds` — which we cannot know — a subset
             // never costs more than the whole. Sizing the window to fit
             // assuming a full holder therefore fits for every holder.
-            let window = proof_window(&remaining, level);
+            let window = proof_window(&remaining, level, MAX_PROOF_NODES);
             let proof = self.get_proof(root, &window, level).await?;
             // Already clamped to the window by `check_served`.
             let served = proof.served.clone();
@@ -426,7 +374,6 @@ impl BlobClient {
                 }
                 continue;
             }
-            barren = 0;
             let store = store.clone();
             let encoded = proof.encoded;
             let for_store = served.clone();
@@ -475,7 +422,6 @@ impl BlobClient {
                 }
                 continue;
             }
-            barren = 0;
             // Committing a window decodes it against the object root and
             // writes both the sparse payload and its outboard, then fsyncs
             // them before the bitmap advances — the heaviest disk work a fetch
@@ -497,22 +443,22 @@ impl BlobClient {
 mod tests {
     use super::*;
     use crate::testing::{bare_endpoint, StalledPeer};
-    use synch_core::{GroupRange, AD_SPAN_LEVEL, ALPN_BLOB, CHUNK_GROUP_SIZE, MAX_PROOF_NODES};
+    use synch_core::{ALPN_BLOB, CHUNK_GROUP_SIZE, MAX_PROOF_NODES};
 
     /// A peer that keeps the session open and answers nothing fails the
     /// request instead of holding the fetch forever.
     ///
-    /// `STREAM_TIMEOUT` bounds what this node does for a peer; the deadline
-    /// here bounds what a peer can do to this node, and the windowed fetches
-    /// above apply it once per window so a long walk is never cut short for
-    /// making steady progress.
+    /// The read bound is silence, not duration: a provider steadily trickling
+    /// a large slice over a slow link re-arms the clock with every read, while
+    /// one that has stopped sending entirely is cut off in one bound however
+    /// large the object (`STALL_TIMEOUT`, shortened to milliseconds under
+    /// `cfg(test)` so this does not take minutes).
     #[tokio::test]
     async fn a_peer_that_answers_nothing_fails_a_slice_and_a_proof() {
         let peer = StalledPeer::bind(ALPN_BLOB).await;
         let dialer = bare_endpoint(ALPN_BLOB).await;
         let connection = dialer.connect(peer.addr.clone(), ALPN_BLOB).await.unwrap();
-        let client =
-            BlobClient::new(connection).with_deadline(std::time::Duration::from_millis(100));
+        let client = BlobClient::new(connection);
         let patience = std::time::Duration::from_secs(10);
         let root = Hash::new(b"object");
         let ranges = ChunkRanges::single(0, 4);
@@ -521,12 +467,12 @@ mod tests {
             .await
             .expect("a slice request must not hang")
             .expect_err("a stalled peer serves no slice");
-        assert!(slice.to_string().contains("went unanswered"), "{slice}");
+        assert!(slice.to_string().contains("sent nothing"), "{slice}");
         let proof = tokio::time::timeout(patience, client.get_proof(root, &ranges, 0))
             .await
             .expect("a proof request must not hang")
             .expect_err("a stalled peer serves no proof");
-        assert!(proof.to_string().contains("went unanswered"), "{proof}");
+        assert!(proof.to_string().contains("sent nothing"), "{proof}");
 
         dialer.close().await;
         peer.shutdown().await;
@@ -553,7 +499,7 @@ mod tests {
         let root = provider_store.ingest_bytes(&bytes, now_ns()).unwrap();
         let groups = synch_core::group_count(size);
         assert_eq!(
-            proof_window(&ChunkRanges::single(0, groups), 0).count(),
+            proof_window(&ChunkRanges::single(0, groups), 0, MAX_PROOF_NODES).count(),
             groups
         );
 
@@ -623,41 +569,5 @@ mod tests {
         peer.abort();
         dialer.close().await;
         endpoint.close().await;
-    }
-
-    /// The requester sizes each window so the provider never truncates.
-    ///
-    /// This is what replaced a pair of compensating mechanisms: a provider that
-    /// threw away a truncated walk and repeated it over the ranges that fit, and
-    /// a requester-side round-trip ceiling built from three magic constants.
-    /// Neither is needed once the split is predictable.
-    #[test]
-    fn a_proof_window_always_fits_one_exchange() {
-        let groups_in = |bytes: u64| bytes / CHUNK_GROUP_SIZE;
-        let hundred_gb = ChunkRanges::single(0, groups_in(100_000_000_000));
-
-        // The span-level round of a 100 GB object fits in one exchange whole —
-        // that is the property the whole descent rests on.
-        let span = proof_window(&hundred_gb, AD_SPAN_LEVEL);
-        assert_eq!(span, hundred_gb, "a span round must not be split");
-        assert!(proof_nodes_upper_bound(&span, AD_SPAN_LEVEL) <= MAX_PROOF_NODES);
-
-        // The leaf round of the same object does not, so it is split — and each
-        // window still fits.
-        let leaf = proof_window(&hundred_gb, 0);
-        assert!(!leaf.is_empty() && leaf != hundred_gb);
-        assert!(proof_nodes_upper_bound(&leaf, 0) <= MAX_PROOF_NODES);
-
-        // Fragmentation costs a root path per range, and the window shrinks to
-        // suit rather than overrunning the budget.
-        let scattered =
-            ChunkRanges::from_ranges((0..1000u64).map(|i| GroupRange::new(i * 1024, i * 1024 + 1)));
-        let window = proof_window(&scattered, 0);
-        assert!(!window.is_empty());
-        assert!(proof_nodes_upper_bound(&window, 0) <= MAX_PROOF_NODES);
-
-        // Degenerate inputs still advance rather than returning nothing.
-        assert!(proof_window(&ChunkRanges::empty(), 0).is_empty());
-        assert!(!proof_window(&ChunkRanges::single(0, 1), 63).is_empty());
     }
 }

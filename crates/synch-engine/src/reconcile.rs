@@ -742,9 +742,17 @@ impl HeadSink for Syncer {
             .map_err(to_net)
     }
 
-    fn offer_head(&self, head: &SignedHead, now: i64) -> std::result::Result<(), NetError> {
+    fn offer_head(
+        &self,
+        head: &SignedHead,
+        now: i64,
+    ) -> std::result::Result<synch_net::OfferOutcome, NetError> {
         Syncer::offer_head(self, head, now)
-            .map(|_| ())
+            .map(|outcome| match outcome {
+                HeadOutcome::Pending => synch_net::OfferOutcome::Pending,
+                HeadOutcome::Completed => synch_net::OfferOutcome::Completed,
+                _ => synch_net::OfferOutcome::Unadopted,
+            })
             .map_err(to_net)
     }
 

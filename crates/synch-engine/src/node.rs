@@ -97,6 +97,9 @@ struct NodeInner {
     /// Rung when a space is added or removed, so the watcher re-registers
     /// without waiting for the next filesystem hint (§7.1).
     spaces_changed: Arc<tokio::sync::Notify>,
+    /// The receiving end of the endpoint's adopted-pending-head channel
+    /// (§5.3). `Option` so the fetch loop can take it exactly once.
+    pending_push: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<(NodeId, OriginId)>>>,
 }
 
 /// What mirror passes believe about the file at one target, and the stat
@@ -308,6 +311,10 @@ impl Node {
         let mirror_wake = Arc::new(tokio::sync::Notify::new());
         let syncer = Syncer::new(store.clone()).on_change(Some(mirror_wake.clone()));
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
+        // Pushed heads we adopt as pending arrive here, so their tries can be
+        // fetched from the pusher without waiting for a periodic round (§5.3).
+        let (pending_push_tx, pending_push_rx) = tokio::sync::mpsc::channel(64);
+        config.net.on_pending = Some(pending_push_tx);
         let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
         let node = Node {
@@ -329,6 +336,7 @@ impl Node {
                 mirror_wake,
                 mirror_lock: tokio::sync::Mutex::new(()),
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
+                pending_push: std::sync::Mutex::new(Some(pending_push_rx)),
             }),
         };
         // A batch that was still buffered when the process died was never
@@ -606,6 +614,17 @@ impl Node {
         self.inner.dns_wake.clone()
     }
 
+    /// Takes the adopted-pending-head receiver, once (§5.3).
+    pub(crate) fn pending_push_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<(NodeId, OriginId)>> {
+        self.inner
+            .pending_push
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     /// The bell that wakes the standing mirror loop (§7.2).
     pub(crate) fn mirror_wake(&self) -> Arc<tokio::sync::Notify> {
         self.inner.mirror_wake.clone()
@@ -665,18 +684,32 @@ impl Node {
 
     /// The seq this node's next publish will carry.
     ///
-    /// Normally one past the current head, or 1 for a node that has never
-    /// published. A node that came back from key loss also carries a durable
-    /// publishing floor (§3.4), and the floor only ever raises the seq: it is
-    /// what keeps a recovered node above the history its peers still hold,
-    /// across restarts.
+    /// One past the highest head this node holds for its own origin in either
+    /// slot, or 1 for a node that has never published. The pending slot
+    /// counts: a peer can relay an older head of ours back to us — signed by
+    /// a key of ours that is still bound, which is exactly the §3.4 recovery
+    /// shape — and a publish that only looked at the complete slot could mint
+    /// the same seq with a different root, after which the (seq, root)
+    /// ordering could put the relayed head on top and roll `entries` back.
+    /// Publishing above the pending head instead makes `try_promote` drop it.
+    /// A node that came back from key loss also carries a durable publishing
+    /// floor (§3.4), and the floor only ever raises the seq: it is what keeps
+    /// a recovered node above the history its peers still hold, across
+    /// restarts.
     pub fn next_seq(&self) -> Result<u64> {
         let next = self
             .store()
             .complete_head(self.origin())?
             .map(|h| h.seq + 1)
             .unwrap_or(1);
-        Ok(next.max(self.store().publish_floor()?.unwrap_or(0)))
+        let pending_next = self
+            .store()
+            .pending_head(self.origin())?
+            .map(|h| h.seq + 1)
+            .unwrap_or(1);
+        Ok(next
+            .max(pending_next)
+            .max(self.store().publish_floor()?.unwrap_or(0)))
     }
 
     /// Applies staged changes as one new signed root (§7.1).
@@ -721,7 +754,16 @@ impl Node {
                     return Ok(None);
                 }
 
-                let seq = previous.as_ref().map(|h| h.seq + 1).unwrap_or(1).max(floor);
+                // The seq must clear the pending slot too, not just the
+                // complete one — see `next_seq` for what a relayed head of
+                // our own origin does to a publish that only beats complete.
+                let pending_next = txn.pending_head(&origin)?.map(|h| h.seq + 1).unwrap_or(1);
+                let seq = previous
+                    .as_ref()
+                    .map(|h| h.seq + 1)
+                    .unwrap_or(1)
+                    .max(pending_next)
+                    .max(floor);
                 let head = SignedHead::sign(&secret, origin.clone(), seq, root, now);
                 // No explicit history writes: `put_head` records the signature
                 // it is pointing at, and the head being displaced recorded its
@@ -1137,6 +1179,81 @@ mod tests {
             .is_none());
         // Both roots are retained as history.
         assert_eq!(node.store().head_history(node.origin()).unwrap().len(), 2);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_publish_clears_a_relayed_own_head_in_the_pending_slot() {
+        let dir = node_dir();
+        let node = spawn(dir.path(), None).await;
+        let entry = synch_core::FileEntry::file(3, 0, Hash::new(b"c"), 1);
+        let first = node
+            .publish(&[(
+                node.key_for("s", "a.txt").unwrap(),
+                Some(postcard::to_stdvec(&entry).unwrap()),
+            )])
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.seq, 1);
+
+        // A peer relays a head of our own origin back to us — signed by our
+        // own still-bound key, which is the §3.4 recovery shape — at a seq
+        // past our complete slot. Its trie is one we do not hold (built on a
+        // scratch store here), so it sits in the pending slot.
+        let scratch_dir = node_dir();
+        let scratch = Store::open(scratch_dir.path()).unwrap();
+        let scratch_trie = Trie::new(&scratch);
+        let relayed_root = scratch_trie
+            .insert(
+                Hash::EMPTY,
+                &node.key_for("s", "z.txt").unwrap(),
+                &postcard::to_stdvec(&entry).unwrap(),
+            )
+            .unwrap();
+        let relayed = SignedHead::sign(
+            &node.secret(),
+            node.origin().clone(),
+            2,
+            relayed_root,
+            now_ns(),
+        );
+        let outcome = node.syncer().offer_head(&relayed, now_ns()).unwrap();
+        assert_eq!(outcome, crate::HeadOutcome::Pending);
+
+        // The next publish must clear the pending head's seq, or the (seq,
+        // root) ordering could put the relayed head back on top and roll
+        // `entries` back to it.
+        assert_eq!(node.next_seq().unwrap(), 3);
+        let second = node
+            .publish(&[(
+                node.key_for("s", "b.txt").unwrap(),
+                Some(postcard::to_stdvec(&entry).unwrap()),
+            )])
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.seq, 3);
+
+        // The relayed head's trie arriving — the same inserts, into our store
+        // — must not install it over the newer publish: promotion drops it.
+        let trie = Trie::new(node.store().as_ref());
+        let rebuilt = trie
+            .insert(
+                Hash::EMPTY,
+                &node.key_for("s", "z.txt").unwrap(),
+                &postcard::to_stdvec(&entry).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(rebuilt, relayed_root);
+        assert!(!node.syncer().try_promote(node.origin(), now_ns()).unwrap());
+        assert_eq!(
+            node.store()
+                .complete_head(node.origin())
+                .unwrap()
+                .unwrap()
+                .seq,
+            3
+        );
+        assert!(node.store().pending_head(node.origin()).unwrap().is_none());
         node.shutdown().await.unwrap();
     }
 

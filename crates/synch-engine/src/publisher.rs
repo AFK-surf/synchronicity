@@ -174,7 +174,10 @@ impl Node {
         // await point where that meant a batch taken out of the buffer and
         // never put back.
         let node = self.clone();
-        let head = crate::blocking::offload(move || match node.publish(&batch) {
+        // The deep-stack worker, not the pool: inserting a batch recurses one
+        // frame per nibble of each key, and a legal key is long enough to
+        // overflow the stack a blocking-pool thread runs with.
+        let head = crate::blocking::offload_deep(move || match node.publish(&batch) {
             Ok(head) => Ok(head),
             Err(e) => {
                 node.publisher().restage(batch);

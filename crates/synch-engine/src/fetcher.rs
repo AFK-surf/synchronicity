@@ -49,6 +49,49 @@ fn median_latency(providers: &[Provider]) -> i64 {
     measured[mid - 1] + (measured[mid] - measured[mid - 1]) / 2
 }
 
+/// Ranks candidates by latency, then coverage, then *randomly* — which is
+/// what §6.4 specifies and what a deterministic tiebreak quietly undid.
+/// Ordering the tail by canonical origin makes every node in the cluster
+/// choose the same provider first for any object whose holders are
+/// unmeasured, which is precisely the load concentration the random tiebreak
+/// exists to prevent.
+///
+/// An unmeasured peer sorts into the middle rather than behind every measured
+/// one: a fast new local mirror must not sit behind a peer measured at
+/// 400 ms with nothing able to measure it until something else happened to
+/// pick it — a peer with no measurement is unknown, not slow.
+fn rank_providers(providers: &mut [Provider]) {
+    let mut draw = synch_core::xorshift_seed();
+    for provider in providers.iter_mut() {
+        provider.tiebreak = synch_core::xorshift_next(&mut draw);
+    }
+    let unmeasured = median_latency(providers);
+    providers.sort_by(|a, b| {
+        let rank = |p: &Provider| {
+            if p.latency_us == 0 {
+                unmeasured
+            } else {
+                p.latency_us
+            }
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then(b.claims.count().cmp(&a.claims.count()))
+            .then(a.tiebreak.cmp(&b.tiebreak))
+    });
+}
+
+/// True when an exchange failed because of *our* disk, not the provider.
+///
+/// The failure penalty exists to demote peers that waste our dials; a local
+/// I/O fault says nothing about the peer that answered us.
+fn is_local_fault(e: &synch_net::NetError) -> bool {
+    matches!(
+        e,
+        synch_net::NetError::Store(synch_store::StoreError::Io(_))
+    )
+}
+
 /// What a failed dial contributes to a peer's latency EWMA.
 ///
 /// A fixed penalty, not the elapsed time: a dial that fails *fast* — connection
@@ -57,19 +100,6 @@ fn median_latency(providers: &[Provider]) -> i64 {
 /// latency, and smoothed by the EWMA, so one failure demotes sharply and a few
 /// successes earn the rank back.
 const FAILURE_PENALTY_US: i64 = 30_000_000;
-
-/// A cheap non-cryptographic random state, seeded from the clock.
-fn jitter_state() -> u64 {
-    (synch_core::now_ns() as u64) ^ 0x9e37_79b9_7f4a_7c15
-}
-
-/// xorshift64*, for tiebreaks. Nothing here needs a real generator.
-fn next_random(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
 
 /// A byte window of an object that is present and verified locally.
 ///
@@ -182,69 +212,56 @@ impl Node {
         let peers = self.store().peers_seen()?;
         let mut out = Vec::new();
         for (origin, ad) in self.store().providers_for_range(root, start, end)? {
-            if &origin == self.origin() {
-                continue;
+            if let Some(provider) = self.provider_from_ad(&origin, &ad, &peers, now)? {
+                out.push(provider);
             }
-            let keys = self.store().keys_for_origin(&origin, now)?;
-            if keys.is_empty() {
-                // No live binding: we could not dial them even if we wanted to.
-                continue;
-            }
-            let claims = ChunkRanges::from_ranges(
-                ad.state
-                    .spans
-                    .iter()
-                    .map(|&(s, e)| groups_for_byte_range(s, e)),
-            );
-            let latency_us = keys
-                .iter()
-                .filter_map(|k| {
-                    peers
-                        .iter()
-                        .find(|p| &p.node_id == k)
-                        .map(|p| p.latency_ewma_us)
-                })
-                .filter(|l| *l > 0)
-                .min()
-                .unwrap_or(0);
-            out.push(Provider {
-                origin,
-                keys,
-                claims,
-                latency_us,
-                tiebreak: 0,
-            });
         }
-        // Rank by latency, then coverage, then *randomly* — which is what §6.4
-        // specifies and what a deterministic tiebreak quietly undid. Ordering
-        // the tail by canonical origin makes every node in the cluster choose
-        // the same provider first for any object whose holders are unmeasured,
-        // which is precisely the load concentration the random tiebreak exists
-        // to prevent.
-        //
-        // An unmeasured peer sorts into the middle rather than behind every
-        // measured one. `i64::MAX / 2` put a fast new local mirror behind a peer
-        // measured at 400 ms, and nothing would measure it until something else
-        // happened to pick it — a peer with no measurement is unknown, not slow.
-        let mut rng = jitter_state();
-        for provider in out.iter_mut() {
-            provider.tiebreak = next_random(&mut rng);
-        }
-        let unmeasured = median_latency(&out);
-        out.sort_by(|a, b| {
-            let rank = |p: &Provider| {
-                if p.latency_us == 0 {
-                    unmeasured
-                } else {
-                    p.latency_us
-                }
-            };
-            rank(a)
-                .cmp(&rank(b))
-                .then(b.claims.count().cmp(&a.claims.count()))
-                .then(a.tiebreak.cmp(&b.tiebreak))
-        });
+        rank_providers(&mut out);
         Ok(out)
+    }
+
+    /// Shapes one advertisement into a ranked candidate: the keys it can be
+    /// dialed on, the groups its spans claim, and the best latency measured
+    /// to any of those keys. An ad whose origin has no live binding yields no
+    /// candidate — we could not dial it even if we wanted to.
+    fn provider_from_ad(
+        &self,
+        origin: &OriginId,
+        ad: &synch_core::BlobAd,
+        peers: &[synch_store::PeerSeen],
+        now: i64,
+    ) -> Result<Option<Provider>> {
+        if origin == self.origin() {
+            return Ok(None);
+        }
+        let keys = self.store().keys_for_origin(origin, now)?;
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let claims = ChunkRanges::from_ranges(
+            ad.state
+                .spans
+                .iter()
+                .map(|&(s, e)| groups_for_byte_range(s, e)),
+        );
+        let latency_us = keys
+            .iter()
+            .filter_map(|k| {
+                peers
+                    .iter()
+                    .find(|p| &p.node_id == k)
+                    .map(|p| p.latency_ewma_us)
+            })
+            .filter(|l| *l > 0)
+            .min()
+            .unwrap_or(0);
+        Ok(Some(Provider {
+            origin: origin.clone(),
+            keys,
+            claims,
+            latency_us,
+            tiebreak: 0,
+        }))
     }
 
     /// Fetches the chunk groups covering `[start, end)` of an object.
@@ -632,7 +649,7 @@ impl Node {
             // about bytes it is about to fetch anyway. The size of an exchange
             // is the provider's window sizer's answer, asked here rather than
             // guessed, so the two cannot disagree about where a round ends.
-            let batch = synch_net::proof_window(&left, 0);
+            let batch = synch_core::proof_window(&left, 0, synch_core::MAX_PROOF_NODES);
             left = left.difference(&batch);
             let round = self.fetch_proofs(root, size, &batch, 0, report).await?;
             if round.is_empty() {
@@ -758,15 +775,35 @@ impl Node {
             };
             let started = std::time::Instant::now();
             match self.net().connect_blob(addr).await {
-                Ok(client) => {
-                    let outcome = client
-                        .fetch_proof_into(self.store(), *root, size, ask, level)
-                        .await?;
-                    let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
-                    return Ok(outcome);
+                Ok(client) => match client
+                    .fetch_proof_into(self.store(), *root, size, ask, level)
+                    .await
+                {
+                    Ok(outcome) => {
+                        let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
+                        // An empty answer is not a sync: recording it as one
+                        // would let a provider that serves nothing keep a
+                        // shining latency.
+                        if !outcome.served.is_empty() {
+                            self.store().record_peer_sync(key, now_ns(), elapsed)?;
+                        }
+                        return Ok(outcome);
+                    }
+                    Err(e) => {
+                        if !is_local_fault(&e) {
+                            let _ =
+                                self.store()
+                                    .record_peer_failure(key, now_ns(), FAILURE_PENALTY_US);
+                        }
+                        last_error = Some(e);
+                    }
+                },
+                Err(e) => {
+                    let _ = self
+                        .store()
+                        .record_peer_failure(key, now_ns(), FAILURE_PENALTY_US);
+                    last_error = Some(e);
                 }
-                Err(e) => last_error = Some(e),
             }
         }
         Err(match last_error {
@@ -970,18 +1007,34 @@ impl Node {
             };
             let started = std::time::Instant::now();
             match self.net().connect_blob(addr).await {
-                Ok(client) => {
-                    let got = client.fetch_into(self.store(), *root, size, ask).await?;
-                    let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
-                    return Ok(got);
-                }
+                Ok(client) => match client.fetch_into(self.store(), *root, size, ask).await {
+                    Ok(got) => {
+                        let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
+                        // An empty answer is not a sync: recording it as one
+                        // would let a provider that serves nothing keep a
+                        // shining latency.
+                        if !got.is_empty() {
+                            self.store().record_peer_sync(key, now_ns(), elapsed)?;
+                        }
+                        return Ok(got);
+                    }
+                    Err(e) => {
+                        // A failed exchange demotes the peer just like a
+                        // failed dial — unless the fault was our own disk.
+                        if !is_local_fault(&e) {
+                            let _ =
+                                self.store()
+                                    .record_peer_failure(key, now_ns(), FAILURE_PENALTY_US);
+                        }
+                        last_error = Some(e);
+                    }
+                },
                 Err(e) => {
-                    // A failed dial has to move the EWMA, or ranking is a
-                    // one-way ratchet: latency was recorded only on success, so
-                    // a peer that was once fast and is now a black hole kept its
-                    // low EWMA and was therefore selected first on every
-                    // subsequent fetch, forever, with nothing able to demote it.
+                    // Every failure has to move the EWMA, or ranking is a
+                    // one-way ratchet: a peer that was once fast and is now a
+                    // black hole keeps its low EWMA and is selected first on
+                    // every subsequent fetch, forever, with nothing able to
+                    // demote it.
                     let _ = self
                         .store()
                         .record_peer_failure(key, now_ns(), FAILURE_PENALTY_US);

@@ -58,6 +58,57 @@ pub fn proof_nodes_upper_bound(ranges: &ChunkRanges, level: u8) -> u64 {
     subtrees.saturating_add((ranges.range_count() as u64).saturating_mul(MAX_PATH))
 }
 
+/// The largest prefix of `remaining` whose proof fits one exchange.
+///
+/// Sized by [`proof_nodes_upper_bound`], so a provider holding everything asked
+/// for still comes in under `budget` and never truncates. Ranges are taken
+/// whole where they fit and split where they do not, and the count is clamped
+/// to [`MAX_RANGES`] so the set operations under it stay cheap on both sides
+/// (§12). Both ends of a proof exchange size windows with this: the requester
+/// so its ask fits one frame, the provider so a fragmented local copy — whose
+/// intersection with the request has more ranges than the request did — still
+/// answers with the longest prefix that fits rather than refusing.
+pub fn proof_window(remaining: &ChunkRanges, level: u8, budget: u64) -> ChunkRanges {
+    let mut taken: Vec<GroupRange> = Vec::new();
+    for range in remaining.ranges.iter().take(MAX_RANGES) {
+        let candidate = ChunkRanges::from_ranges(taken.iter().copied().chain([*range]));
+        if proof_nodes_upper_bound(&candidate, level) <= budget {
+            taken.push(*range);
+            continue;
+        }
+        // This range does not fit whole. Take as much of its head as does,
+        // which is at worst nothing — in which case the window is what we have.
+        let mut lo = range.start;
+        let mut hi = range.end;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let probe = ChunkRanges::from_ranges(
+                taken
+                    .iter()
+                    .copied()
+                    .chain([GroupRange::new(range.start, mid)]),
+            );
+            if proof_nodes_upper_bound(&probe, level) <= budget {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if lo > range.start {
+            taken.push(GroupRange::new(range.start, lo));
+        }
+        break;
+    }
+    if taken.is_empty() {
+        // Even one group does not fit the budget, which only happens for a
+        // degenerate level; ask for a single group so the walk still advances.
+        if let Some(first) = remaining.ranges.first() {
+            taken.push(GroupRange::new(first.start, first.start + 1));
+        }
+    }
+    ChunkRanges::from_ranges(taken)
+}
+
 /// How many heads or head summaries one message may carry (§5.1).
 ///
 /// The counterpart of [`MAX_BATCH`] for the head-gossip messages, which had no
@@ -486,6 +537,38 @@ mod tests {
 
     use super::*;
     use crate::record::BlobAd;
+
+    /// A window sized by the bound always fits one exchange, and the split is
+    /// what a fragmented provider answers with too.
+    #[test]
+    fn a_proof_window_always_fits_one_exchange() {
+        let groups_in = |bytes: u64| bytes / crate::CHUNK_GROUP_SIZE;
+        let hundred_gb = ChunkRanges::single(0, groups_in(100_000_000_000));
+
+        // The span-level round of a 100 GB object fits in one exchange whole —
+        // that is the property the whole descent rests on.
+        let span = proof_window(&hundred_gb, crate::AD_SPAN_LEVEL, MAX_PROOF_NODES);
+        assert_eq!(span, hundred_gb, "a span round must not be split");
+        assert!(proof_nodes_upper_bound(&span, crate::AD_SPAN_LEVEL) <= MAX_PROOF_NODES);
+
+        // The leaf round of the same object does not, so it is split — and each
+        // window still fits.
+        let leaf = proof_window(&hundred_gb, 0, MAX_PROOF_NODES);
+        assert!(!leaf.is_empty() && leaf != hundred_gb);
+        assert!(proof_nodes_upper_bound(&leaf, 0) <= MAX_PROOF_NODES);
+
+        // Fragmentation costs a root path per range, and the window shrinks to
+        // suit rather than overrunning the budget.
+        let scattered =
+            ChunkRanges::from_ranges((0..1000u64).map(|i| GroupRange::new(i * 1024, i * 1024 + 1)));
+        let window = proof_window(&scattered, 0, MAX_PROOF_NODES);
+        assert!(!window.is_empty());
+        assert!(proof_nodes_upper_bound(&window, 0) <= MAX_PROOF_NODES);
+
+        // Degenerate inputs still advance rather than returning nothing.
+        assert!(proof_window(&ChunkRanges::empty(), 0, MAX_PROOF_NODES).is_empty());
+        assert!(!proof_window(&ChunkRanges::single(0, 1), 63, MAX_PROOF_NODES).is_empty());
+    }
 
     #[test]
     fn mpt_messages_round_trip() {

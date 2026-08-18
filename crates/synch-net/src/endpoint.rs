@@ -126,6 +126,12 @@ pub struct NetOptions {
     /// changed, and anything materializing it — mirrors — should look again.
     /// The endpoint only rings the bell.
     pub heads: Option<Arc<dyn crate::HeadSink>>,
+    /// Receives `(pusher, origin)` whenever a pushed head is adopted as
+    /// pending (§5.3): the head names a trie this node does not hold, and the
+    /// pusher certainly does, so the engine fetches it from there directly.
+    /// The endpoint only hands the pair over; the fetch belongs to the layer
+    /// that owns head state.
+    pub on_pending: Option<tokio::sync::mpsc::Sender<(synch_core::NodeId, synch_core::OriginId)>>,
 }
 
 impl NetOptions {
@@ -141,6 +147,7 @@ impl NetOptions {
             dht_publish_direct_addrs: false,
             on_unknown_key: None,
             heads: None,
+            on_pending: None,
         }
     }
 }
@@ -232,7 +239,11 @@ impl crate::HeadSink for RefuseHeads {
         Ok(())
     }
 
-    fn offer_head(&self, _head: &synch_core::SignedHead, _now: i64) -> Result<(), NetError> {
+    fn offer_head(
+        &self,
+        _head: &synch_core::SignedHead,
+        _now: i64,
+    ) -> Result<crate::mpt::OfferOutcome, NetError> {
         Err(NetError::Unexpected(
             "this endpoint has no reconciler and cannot adopt heads".into(),
         ))
@@ -334,7 +345,8 @@ impl Net {
                         .clone()
                         .unwrap_or_else(|| Arc::new(RefuseHeads) as Arc<dyn crate::HeadSink>),
                 )
-                .on_unknown_key(options.on_unknown_key.clone()),
+                .on_unknown_key(options.on_unknown_key.clone())
+                .on_pending(options.on_pending.clone()),
             )
             .accept(
                 ALPN_BLOB,
@@ -445,7 +457,11 @@ impl Net {
     /// A session the peer closed — a lapsed binding, a restart — or one that
     /// idled out is dropped here rather than handed out, so the caller dials
     /// again instead of failing on a dead connection.
-    fn live(&self, id: &NodeId, alpn: &'static [u8]) -> Option<Connection> {
+    ///
+    /// Unlike [`Net::connect_mpt`] this performs no trust re-check: it hands
+    /// out an existing session, so the caller must have satisfied itself
+    /// about the peer's binding already.
+    pub fn live(&self, id: &NodeId, alpn: &'static [u8]) -> Option<Connection> {
         let mut dialed = self.dialed();
         match dialed.get(&(*id, alpn)) {
             Some(connection) if connection.close_reason().is_none() => Some(connection.clone()),

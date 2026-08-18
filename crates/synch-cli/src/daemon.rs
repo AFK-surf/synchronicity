@@ -63,6 +63,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let aae = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
         node.run_anti_entropy(shutdown).await
     });
+    // The other half of the reactive path: heads pushed to us that we adopt
+    // as pending get their tries fetched from the pusher at once (§5.3).
+    let pushed = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+        node.run_pushed_fetches(shutdown).await
+    });
     let scanner = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
         node.run_scanner(shutdown).await
     });
@@ -123,6 +128,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let _ = tokio::join!(
         control,
         aae,
+        pushed,
         scanner,
         watcher,
         maintenance,

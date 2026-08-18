@@ -656,13 +656,16 @@ Properties:
 
 ### 5.3 Anti-entropy scheduling
 
-- **Reactive**: local publishes (§7) and received newer heads are pushed (`HeadPush`)
-  to all currently connected peers immediately. This gives sub-second propagation on
-  connected clusters and epidemic spread (each infected node pushes onward).
+- **Reactive**: a local publish (§7) is pushed (`HeadPush`) to every peer the node
+  already holds a live `sync/mpt/1` session with — one hop, never a dial, so a
+  publish never stalls on peers that are away. A node that adopts a pushed head as
+  pending fetches its trie straight from the pusher, the one peer that certainly
+  holds it. This gives sub-second propagation among peers that are already talking.
 - **Periodic**: every `aae_interval` (default 30s with ±50% jitter), pick one random
   trusted peer, connect if needed, run a full `Hello` push-pull exchange. This repairs
-  anything the reactive path missed (dropped connections, simultaneous partitions) and
-  is the mechanism that guarantees convergence.
+  anything the reactive path missed (a peer with no live session at publish time,
+  dropped connections, simultaneous partitions) and is the mechanism that guarantees
+  convergence.
 - **On-connect**: an mpt session (`sync/mpt/1`) begins with a `Hello` exchange, and
   each ALPN's session is held open and reused across requests for as long as it is
   live. The two are independent: `Hello` exists only on the mpt ALPN, and the blob
@@ -1139,6 +1142,15 @@ WAL mode, `synchronous=NORMAL`, all access through one mutex-guarded connection 
 the invariant that matters is that every multi-step state change (head flips,
 publish batches) is a single transaction and no partial state is ever observable;
 read concurrency is deliberately traded away for that simplicity.
+
+`synchronous=NORMAL` is a deliberate durability trade: a power loss can take the
+last committed transactions with it — a publish the node already signed and pushed.
+The protocol absorbs this rather than the schema: the republish after restart reuses
+the lost head's seq, peers that adopted the lost head keep its signature in
+`head_history` as fork evidence (§4.4), and the two roots are a same-seq fork that
+the origin's next publish supersedes — convergence resumes there, at worst one
+publish late. What a node must never do is lose a head *silently to itself*: the
+publish floor (§3.4) covers the recovery case where the database is gone entirely.
 
 **Blocking work never runs on the runtime.** The store and the CAS are
 synchronous by design — `synch-store` has no async runtime dependency at all —

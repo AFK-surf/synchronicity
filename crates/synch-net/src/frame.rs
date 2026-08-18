@@ -47,6 +47,71 @@ pub async fn read_bytes(recv: &mut RecvStream) -> Result<Vec<u8>, NetError> {
     Ok(buf)
 }
 
+/// How long a frame read may go without a single byte arriving before the
+/// peer is declared stalled.
+///
+/// This bounds silence, never duration: a slow provider trickling a large
+/// slice over a long transfer re-arms the clock with every read, while a peer
+/// that has stopped sending entirely is cut off in one bound however large
+/// the frame. Sized above the serve side's own request budget (120 s in
+/// `sync/blob/1`), so a provider still busy encoding a window never reads as
+/// stalled.
+#[cfg(not(test))]
+pub const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+/// The test build cannot wait minutes for a stall to be declared.
+#[cfg(test)]
+pub const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Reads one length-framed postcard message, bounding silence (§12).
+///
+/// Same frame as [`read_frame`], except every read underneath it carries
+/// [`STALL_TIMEOUT`]: a peer that sends a length prefix and then nothing
+/// would otherwise hold the future — and the task and stream behind it —
+/// indefinitely.
+pub async fn read_frame_stalled<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, NetError> {
+    let bytes = read_bytes_stalled(recv).await?;
+    postcard::from_bytes(&bytes).map_err(|e| NetError::Decode(e.to_string()))
+}
+
+/// Reads one length-framed raw payload, bounding silence (§12).
+pub async fn read_bytes_stalled(recv: &mut RecvStream) -> Result<Vec<u8>, NetError> {
+    let mut header = [0u8; 4];
+    read_exact_stalled(recv, &mut header).await?;
+    let len = u32::from_le_bytes(header) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(NetError::FrameTooLarge(len));
+    }
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        read_exact_stalled(recv, &mut buf).await?;
+    }
+    Ok(buf)
+}
+
+/// Fills `buf`, failing when no byte arrives for [`STALL_TIMEOUT`].
+async fn read_exact_stalled(recv: &mut RecvStream, buf: &mut [u8]) -> Result<(), NetError> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match tokio::time::timeout(STALL_TIMEOUT, recv.read(&mut buf[filled..])).await {
+            Ok(Ok(Some(bytes))) => filled += bytes,
+            Ok(Ok(None)) => {
+                return Err(NetError::Read(format!(
+                    "stream ended {filled} bytes into a {}-byte frame",
+                    buf.len()
+                )))
+            }
+            Ok(Err(e)) => return Err(NetError::Read(e.to_string())),
+            Err(_) => {
+                return Err(NetError::Read(format!(
+                    "peer sent nothing for {}s mid-frame",
+                    STALL_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use synch_core::{MptMessage, MAX_FRAME_LEN};

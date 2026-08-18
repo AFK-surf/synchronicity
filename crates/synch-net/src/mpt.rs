@@ -48,13 +48,26 @@ pub trait HeadSink: Send + Sync + std::fmt::Debug + 'static {
     ) -> Result<(), NetError>;
 
     /// Offers a head for adoption under the §5.2 acceptance rule.
-    fn offer_head(&self, head: &SignedHead, now: i64) -> Result<(), NetError>;
+    fn offer_head(&self, head: &SignedHead, now: i64) -> Result<OfferOutcome, NetError>;
 
     /// The full signed heads for the origins a peer asked about (§5.1).
     ///
     /// Only heads this node can back with a servable trie: what a peer does
     /// with one is fetch the trie under it from us.
     fn heads_for(&self, origins: &[OriginId]) -> Result<Vec<SignedHead>, NetError>;
+}
+
+/// How an offered head landed — the part of the §5.2 acceptance rule the
+/// wire layer itself acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferOutcome {
+    /// Rejected, or no newer than what is held: nothing follows from it.
+    Unadopted,
+    /// Adopted straight into the complete slot: nothing left to fetch.
+    Completed,
+    /// Adopted into the pending slot: the trie under it is not held yet, and
+    /// whoever sent the head just demonstrated it is.
+    Pending,
 }
 
 /// How often a live session refreshes the sighting it recorded at accept.
@@ -66,6 +79,7 @@ pub struct MptProtocol {
     store: Arc<Store>,
     heads: Arc<dyn HeadSink>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
+    on_pending: Option<tokio::sync::mpsc::Sender<(NodeId, OriginId)>>,
 }
 
 impl MptProtocol {
@@ -75,6 +89,7 @@ impl MptProtocol {
             store,
             heads,
             on_unknown_key: None,
+            on_pending: None,
         }
     }
 
@@ -85,6 +100,22 @@ impl MptProtocol {
     /// refusal a trigger for an immediate DNS re-resolution.
     pub fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
         self.on_unknown_key = wake;
+        self
+    }
+
+    /// Hands adopted-but-unfetched heads to whoever fetches them (§5.3).
+    ///
+    /// A pushed head we adopt as pending names a trie this node does not
+    /// hold, and the peer that pushed it just demonstrated it does — so the
+    /// pair (pusher, origin) goes down this channel and the engine fetches
+    /// the trie straight from the pusher. `try_send` at the producer: a stuck
+    /// consumer only delays convergence to the next periodic round, it must
+    /// never back up into the accept loop.
+    pub fn on_pending(
+        mut self,
+        fetched: Option<tokio::sync::mpsc::Sender<(NodeId, OriginId)>>,
+    ) -> Self {
+        self.on_pending = fetched;
         self
     }
 
@@ -187,24 +218,39 @@ impl MptProtocol {
                         // may promote the head — which walks the trie and
                         // re-materializes the changed leaves in one
                         // transaction (§5.2).
+                        //
+                        // One head that fails is contained to its origin: a
+                        // batch is a list of independent offers, and aborting
+                        // it at the first failure would let one bad head
+                        // block every head behind it.
                         let sink = self.heads.clone();
-                        crate::blocking::offload(move || {
-                            for head in heads {
+                        let adopted = crate::blocking::offload(move || {
+                            let mut adopted = Vec::new();
+                            for head in &heads {
                                 // Per origin, like the dial side: one origin
                                 // publishing something this node cannot apply
                                 // must not stop the exchange, which still owes
                                 // this peer an answer to its `HeadsWant`.
-                                if let Err(e) = sink.offer_head(&head, now_ns()) {
-                                    tracing::warn!(
-                                        origin = %head.origin,
-                                        error = %e,
-                                        "origin left behind: its pushed head could not be applied"
-                                    );
+                                match sink.offer_head(head, now_ns()) {
+                                    Ok(OfferOutcome::Pending) => adopted.push(head.origin.clone()),
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            origin = %head.origin,
+                                            error = %e,
+                                            "origin left behind: its pushed head could not be applied"
+                                        );
+                                    }
                                 }
                             }
-                            Ok(())
+                            Ok::<Vec<OriginId>, NetError>(adopted)
                         })
                         .await?;
+                        if let Some(fetched) = &self.on_pending {
+                            for origin in adopted {
+                                let _ = fetched.try_send((peer, origin));
+                            }
+                        }
                     }
                     other => return Err(unexpected("Heads", &other)),
                 }
@@ -225,7 +271,16 @@ impl MptProtocol {
             MptMessage::HeadPush { head } => {
                 let sink = self.heads.clone();
                 let pushed = head.clone();
-                crate::blocking::offload(move || sink.offer_head(&pushed, now_ns())).await?;
+                let outcome =
+                    crate::blocking::offload(move || sink.offer_head(&pushed, now_ns())).await?;
+                // Adopted but not held: fetch the trie from the pusher, the
+                // one peer that certainly has it, rather than waiting for a
+                // periodic round to happen onto it (§5.3).
+                if outcome == OfferOutcome::Pending {
+                    if let Some(fetched) = &self.on_pending {
+                        let _ = fetched.try_send((peer, head.origin.clone()));
+                    }
+                }
                 tracing::debug!(origin = %head.origin, "head pushed to us");
                 // The ack tells the pusher we processed it; an empty Heads is
                 // the smallest well-typed acknowledgement in the schema.
@@ -474,7 +529,10 @@ impl MptClient {
             write_frame(&mut send, &MptMessage::HeadsWant { origins: want }).await?;
 
             let received = match read_frame::<MptMessage>(&mut recv).await? {
-                MptMessage::Heads { heads } => heads,
+                MptMessage::Heads { heads } => {
+                    check_heads(heads.len(), "a Heads response")?;
+                    heads
+                }
                 MptMessage::Error { reason } => return Err(NetError::Unexpected(reason)),
                 other => return Err(unexpected("Heads", &other)),
             };
@@ -640,7 +698,7 @@ mod tests {
             Ok(())
         }
 
-        fn offer_head(&self, head: &SignedHead, _now: i64) -> Result<(), NetError> {
+        fn offer_head(&self, head: &SignedHead, _now: i64) -> Result<OfferOutcome, NetError> {
             self.offered
                 .lock()
                 .expect("the lock")
@@ -648,7 +706,7 @@ mod tests {
             if head.origin == self.refuse {
                 return Err(NetError::Unexpected("this origin cannot be applied".into()));
             }
-            Ok(())
+            Ok(OfferOutcome::Unadopted)
         }
 
         fn heads_for(&self, origins: &[OriginId]) -> Result<Vec<SignedHead>, NetError> {

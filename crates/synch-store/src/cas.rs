@@ -50,11 +50,60 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
 /// Flushes a directory entry (a rename or create) to stable storage so the file
 /// is findable after a crash, not just its contents. A no-op on platforms that
 /// cannot open a directory as a file.
-fn fsync_parent(path: &std::path::Path) {
+pub(crate) fn fsync_parent(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
             let _ = dir.sync_all();
         }
+    }
+}
+
+/// Creates the shard directory a blob path lives in, if it is missing, and
+/// flushes the CAS directory so the new shard entry itself survives a crash.
+pub(crate) fn create_shard_dir(file_path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = file_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+            fsync_parent(parent);
+        }
+    }
+    Ok(())
+}
+
+/// True if the open handle still names the live directory entry at `path`.
+///
+/// This is the check that keeps a fetch from committing over a file GC has
+/// already unlinked: a resumed partial download holds open files whose index
+/// row the collector may have swept mid-write, and committing then would
+/// record verified groups over bytes nothing can name. On unix the comparison
+/// is by device and inode; elsewhere it falls back to the path existing and
+/// agreeing on length.
+pub(crate) fn file_still_live(file: &File, path: &std::path::Path) -> bool {
+    let (Ok(open), Ok(on_disk)) = (file.metadata(), std::fs::metadata(path)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        open.dev() == on_disk.dev() && open.ino() == on_disk.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        open.len() == on_disk.len()
+    }
+}
+
+/// Maps a slice-decode failure: a hash mismatch or a truncated stream is the
+/// *provider's* content failing verification, but an underlying I/O error is
+/// this node's own disk, and reporting it as a verification failure would
+/// blame (and penalize) the peer for a local fault.
+fn decode_error(root: &Hash, e: bao_tree::io::DecodeError) -> StoreError {
+    match e {
+        bao_tree::io::DecodeError::Io(io) => StoreError::Io(io),
+        other => StoreError::Verification {
+            root: *root,
+            reason: other.to_string(),
+        },
     }
 }
 
@@ -485,9 +534,7 @@ impl Store {
         };
 
         let target = self.blob_path(&root);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        create_shard_dir(&target)?;
         std::fs::rename(&staging, &target)?;
         // Flush the payload contents, the outboard, and the directory entries
         // before the index row claims this blob is complete. Checked, like the
@@ -503,9 +550,7 @@ impl Store {
 
     fn write_payload(&self, root: &Hash, data: &[u8], outboard: &[u8]) -> Result<()> {
         let path = self.blob_path(root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        create_shard_dir(&path)?;
         write_and_sync(&path, data)?;
         write_and_sync(&self.outboard_path(root), outboard)?;
         Ok(())
@@ -933,18 +978,13 @@ impl Store {
                 buffer.as_mut_slice(),
                 MemOutboard(outboard),
             )
-            .map_err(|e| StoreError::Verification {
-                root: *root,
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| decode_error(root, e))?;
             self.commit_groups(root, size, &served, Some(buffer), now)?;
             return Ok(served);
         }
 
         let payload_path = self.blob_path(root);
-        if let Some(parent) = payload_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        create_shard_dir(&payload_path)?;
         let payload = OpenOptions::new()
             .read(true)
             .write(true)
@@ -954,8 +994,8 @@ impl Store {
         // Grown to fit the *window*, never to the claimed size, and never
         // shrunk.
         //
-        // Never shrunk, because sizing a file down on the strength of a claim is
-        // how an understated entry used to destroy verified groups — bytes gone,
+        // Never shrunk, because sizing a file down on the strength of a claim
+        // would let an understated entry destroy verified groups — bytes gone,
         // bitmap bits intact, the node advertising a group it could no longer
         // serve ([`grow_to`], `docs/DELTA-SYNC.md` §6).
         //
@@ -975,6 +1015,9 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(self.outboard_path(root))?;
+        // Kept beside the handle the decode consumes: a read-write clone is
+        // what the flush and the liveness check below run against.
+        let outboard_for_sync = outboard_file.try_clone()?;
         let outboard = PreOrderOutboard {
             root: root_hash,
             tree,
@@ -987,37 +1030,57 @@ impl Store {
             DataFile(payload),
             outboard,
         )
-        .map_err(|e| StoreError::Verification {
-            root: *root,
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| decode_error(root, e))?;
 
         // Persist the verified groups (payload and outboard) before the bitmap
         // in the index advances to cover them — otherwise a crash could leave
-        // the index claiming groups the disk never received.
-        // Both flushes are checked. Swallowing them meant an EIO or ENOSPC on
-        // flush let the bitmap advance over data that never reached stable
-        // storage — the exact inversion of the ordering this block exists to
-        // enforce. `try_clone` is likewise no longer allowed to fail silently:
-        // it fails under fd exhaustion, which is precisely when the machine is
-        // least able to afford an unflushed commit.
-        let payload = payload_for_sync.ok_or_else(|| StoreError::Verification {
-            root: *root,
-            reason: "could not duplicate the payload handle to flush it".into(),
+        // the index claiming groups the disk never received. Both flushes are
+        // checked: an EIO or ENOSPC on flush must not let the bitmap advance
+        // over data that never reached stable storage — the exact inversion of
+        // the ordering this block exists to enforce. The `try_clone` is checked
+        // for the same reason: it fails under fd exhaustion, which is precisely
+        // when the machine is least able to afford an unflushed commit.
+        let payload = payload_for_sync.ok_or_else(|| {
+            StoreError::Io(std::io::Error::other(
+                "could not duplicate the payload handle to flush it",
+            ))
         })?;
         fsync_file(&payload)?;
-        // Reopened for *write* to flush it. `File::open` hands back a read-only
-        // handle, and Windows refuses `FlushFileBuffers` on one with
-        // ERROR_ACCESS_DENIED — which went unnoticed while the result was
-        // discarded, and became a hard failure the moment these flushes started
-        // being checked. Unix does not care either way.
-        fsync_file(
-            &OpenOptions::new()
-                .write(true)
-                .open(self.outboard_path(root))?,
-        )?;
+        // Flushed through the read-write clone rather than a fresh `File::open`:
+        // Windows refuses `FlushFileBuffers` on a read-only handle with
+        // ERROR_ACCESS_DENIED, and a clone flushes the same file the decode
+        // wrote, which a reopened path would not guarantee.
+        fsync_file(&outboard_for_sync)?;
+
+        // The collector may have swept this object's row and unlinked both
+        // files while the decode ran: a resumed partial fetch holds its files
+        // open across windows, and eligibility is decided from the row. A
+        // commit over an unlinked file would record verified groups over bytes
+        // nothing can name, so the write fails here and the fetch starts the
+        // object over.
+        if !file_still_live(&payload, &payload_path)
+            || !file_still_live(&outboard_for_sync, &self.outboard_path(root))
+        {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("the files for {root} were collected mid-write"),
+            )));
+        }
 
         let commit = self.commit_groups(root, size, &served, None, now)?;
+        // The same guard once more, after the commit: an unlink that threaded
+        // the gap between the check above and the commit must not leave the
+        // row claiming groups over a file nothing can name. The row and files
+        // go together, and the fetch starts the object over.
+        if !file_still_live(&payload, &payload_path)
+            || !file_still_live(&outboard_for_sync, &self.outboard_path(root))
+        {
+            let _ = self.delete_blob(root);
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("the files for {root} were collected mid-commit"),
+            )));
+        }
         self.trim_to_size(root, commit);
         Ok(served)
     }
@@ -1566,5 +1629,29 @@ mod tests {
                 .expect("the walk is bounded by the bitmap, not by the claim"),
             held
         );
+    }
+
+    #[test]
+    fn a_handle_names_only_the_live_directory_entry() {
+        // The mid-write collection guard: an open handle "is" the file at its
+        // path only while the directory entry still names the same inode.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        std::fs::write(&path, b"one").unwrap();
+
+        let live = OpenOptions::new().read(true).open(&path).unwrap();
+        assert!(file_still_live(&live, &path));
+
+        // Replaced by a new file at the same path: the handle names the
+        // unlinked inode, not the entry.
+        let replaced = OpenOptions::new().read(true).open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(!file_still_live(&replaced, &path));
+        std::fs::write(&path, b"two").unwrap();
+        assert!(!file_still_live(&replaced, &path));
+
+        // And a fresh handle agrees with the fresh entry again.
+        let live = OpenOptions::new().read(true).open(&path).unwrap();
+        assert!(file_still_live(&live, &path));
     }
 }

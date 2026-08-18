@@ -27,3 +27,14 @@ where
 {
     synch_core::offload(f).await
 }
+
+/// Runs a blocking operation that recurses with key depth on a dedicated
+/// big-stack thread — see [`synch_core::offload_deep`] for why the pool's
+/// ordinary stack is not enough for a maximal trie key.
+pub(crate) async fn offload_deep<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    synch_core::offload_deep(f).await
+}

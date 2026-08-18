@@ -177,6 +177,8 @@ impl Store {
 
     fn init(&self) -> Result<()> {
         let mut conn = self.conn();
+        // No foreign keys are declared, so this enforces nothing; it is set so
+        // that any future schema that declares one gets enforcement by default.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // WAL keeps readers off the writer's back; NORMAL is the §10 setting.
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -558,7 +560,9 @@ pub(crate) fn migrate(conn: &mut Connection, chain: &[Migration]) -> Result<u32>
     for version in found..target {
         let tx = conn.transaction()?;
         match &chain[version as usize] {
-            Migration::Sql(sql) => tx.execute_batch(sql)?,
+            Migration::Sql(sql) => tx.execute_batch(sql).map_err(|e| {
+                StoreError::invalid(format!("migration to version {}: {e}", version + 1))
+            })?,
             Migration::Rust { name, run } => run(&tx).map_err(|e| {
                 StoreError::invalid(format!(
                     "migration to version {} ({name}): {e}",

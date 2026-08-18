@@ -478,29 +478,6 @@ impl Store {
 
     // ---- materialization from a trie diff ---------------------------------
 
-    /// Rewrites `entries` and `blob_providers` for one origin from the diff
-    /// between two roots (§5.2).
-    ///
-    /// Only touched subtrees are visited, so the cost is proportional to the
-    /// change rather than to the size of the trie. Runs in one transaction so
-    /// the derived views never show a half-applied head.
-    pub fn materialize_diff(
-        &self,
-        origin: &OriginId,
-        old_root: Hash,
-        new_root: Hash,
-    ) -> Result<usize> {
-        let changes: Vec<ResolvedChange> = Trie::new(self).diff_resolved(old_root, new_root)?;
-        let count = changes.len();
-        self.with_tx(|tx| {
-            for change in &changes {
-                apply_change(tx, origin, change)?;
-            }
-            Ok(())
-        })?;
-        Ok(count)
-    }
-
     /// Rebuilds `entries` and `blob_providers` for one origin from scratch
     /// (`synch doctor --rebuild`).
     pub fn rematerialize(&self, origin: &OriginId, root: Hash) -> Result<usize> {
@@ -1038,6 +1015,14 @@ mod tests {
         OriginId::named(name, "x.example").unwrap()
     }
 
+    /// Applies a root diff to the derived views, inside one transaction the
+    /// way the head-flip paths do.
+    fn materialize(store: &Store, origin: &OriginId, old: Hash, new: Hash) -> usize {
+        store
+            .transaction(|txn| txn.materialize_diff(origin, old, new))
+            .unwrap()
+    }
+
     #[test]
     fn entries_round_trip() {
         let (_d, store) = store();
@@ -1103,7 +1088,7 @@ mod tests {
             )
             .unwrap();
         let peer = origin("laptop");
-        store.materialize_diff(&peer, Hash::EMPTY, root).unwrap();
+        materialize(&store, &peer, Hash::EMPTY, root);
         assert_eq!(
             store
                 .entry(&peer, "media", "c.txt")
@@ -1285,7 +1270,9 @@ mod tests {
                 &postcard::to_stdvec(&ad).unwrap(),
             )
             .unwrap();
-        store.materialize_diff(&o, Hash::EMPTY, after).unwrap();
+        store
+            .transaction(|txn| txn.materialize_diff(&o, Hash::EMPTY, after))
+            .unwrap();
 
         let providers = store.providers(&root).unwrap();
         assert_eq!(providers.len(), 1);
@@ -1316,7 +1303,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(store.materialize_diff(&o, Hash::EMPTY, root).unwrap(), 2);
+        assert_eq!(materialize(&store, &o, Hash::EMPTY, root), 2);
         let row = store.entry(&o, "media", "clip.mp4").unwrap().unwrap();
         assert_eq!(row.size, 42);
         assert_eq!(store.providers(&Hash::new(b"content")).unwrap().len(), 1);
@@ -1325,7 +1312,7 @@ mod tests {
         let root2 = trie
             .remove(root, &file_key("media", "clip.mp4").unwrap())
             .unwrap();
-        assert_eq!(store.materialize_diff(&o, root, root2).unwrap(), 1);
+        assert_eq!(materialize(&store, &o, root, root2), 1);
         assert!(store.entry(&o, "media", "clip.mp4").unwrap().is_none());
         // The blob ad is untouched by the file deletion.
         assert_eq!(store.providers(&Hash::new(b"content")).unwrap().len(), 1);
@@ -1347,7 +1334,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        store.materialize_diff(&o, Hash::EMPTY, root).unwrap();
+        materialize(&store, &o, Hash::EMPTY, root);
         assert_eq!(
             store
                 .list_entries(Some(&o), "s", "", None, None)

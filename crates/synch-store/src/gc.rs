@@ -98,26 +98,59 @@ impl Store {
     /// chunk — each taking the single write connection and appending a WAL
     /// frame, so gateway range reads and mirror materialization would serialize
     /// against publishes and GC — and an object nothing references is by
-    /// construction not being read through the tree. `read_range` used to touch
-    /// the row anyway, which cost exactly that and quietly inverted the
-    /// retention semantics: with it a hot object is never collected, without it
-    /// it is. Every write path already stamps the column, so nothing else was
-    /// needed to keep this true.
+    /// construction not being read through the tree. Reads therefore never
+    /// extend an object's life; pins and the retention window alone decide.
+    ///
+    /// Eligibility — unreferenced, unpinned, untouched since `before` — is
+    /// decided again inside each delete's own transaction, because the
+    /// candidate list walked here is a snapshot and a fetch or pin can land
+    /// between it and the delete.
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
-        let referenced = self.referenced_content()?;
-        let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
         let mut stats = GcStats::default();
         for blob in self.blobs()? {
-            if referenced.contains(&blob.root) || pinned.contains(&blob.root) {
-                continue;
-            }
             if blob.last_access >= before {
                 continue;
             }
-            self.delete_blob(&blob.root)?;
-            stats.blobs += 1;
+            if self.delete_blob_if_eligible(&blob.root, before)? {
+                stats.blobs += 1;
+            }
         }
         Ok(stats)
+    }
+
+    /// Deletes an object's row and files if — re-checked inside the delete's
+    /// own transaction — it is still unreferenced, unpinned, and untouched
+    /// since `before`.
+    ///
+    /// The candidate list a collector walks is a snapshot, and a fetch or a
+    /// pin can land between the snapshot and the delete; re-deciding inside
+    /// the transaction is what keeps the sweep from deleting out from under
+    /// either. Returns whether the delete happened.
+    fn delete_blob_if_eligible(&self, root: &Hash, before: i64) -> Result<bool> {
+        let deleted = self.with_immediate_tx(|tx| {
+            let eligible = tx.query_row(
+                "SELECT COUNT(*) FROM blobs b
+                 WHERE b.root = ?1 AND b.pinned = 0 AND b.last_access < ?2
+                   AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.content = ?1)",
+                params![root.as_bytes().to_vec(), before],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            if eligible {
+                tx.execute(
+                    "DELETE FROM blobs WHERE root = ?1",
+                    params![root.as_bytes().to_vec()],
+                )?;
+            }
+            Ok(eligible)
+        })?;
+        if deleted {
+            // Row first, files second — the ordering [`Store::delete_blob`]
+            // documents: a crash here costs disk until the next sweep, never a
+            // row that lies.
+            let _ = std::fs::remove_file(self.blob_path(root));
+            let _ = std::fs::remove_file(self.outboard_path(root));
+        }
+        Ok(deleted)
     }
 
     /// Removes CAS files that no `blobs` row accounts for.
@@ -361,11 +394,14 @@ fn sweep_unmarked(
 #[cfg(test)]
 mod tests {
     use iroh_base::SecretKey;
-    use synch_core::{file_key, FileEntry, OriginId, SignedHead};
+    use synch_core::{
+        file_key, group_count, ChunkRanges, FileEntry, OriginId, SignedHead, CHUNK_GROUP_SIZE,
+    };
     use synch_mpt::NodeStore;
 
     use super::*;
     use crate::heads::Slot;
+    use crate::StoreError;
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -844,5 +880,131 @@ mod tests {
         // The content sweep took the row and its files together, so the file
         // sweep behind it finds nothing left over.
         assert_eq!(stats.orphans, 0);
+    }
+
+    #[test]
+    fn a_collection_mid_fetch_fails_the_write_instead_of_bricking_the_object() {
+        // A partial fetch holds its payload and outboard open across the
+        // decode while the collector decides eligibility from the row, so the
+        // row can be swept and the files unlinked mid-write. The write must
+        // then fail with a plain I/O error — recording the groups would leave
+        // a bitmap claiming bytes nothing can name, and reporting the
+        // provider's content at fault would punish it for a local event.
+        let (_d, provider) = store();
+        let bytes: Vec<u8> = (0..32 * CHUNK_GROUP_SIZE)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let all = ChunkRanges::single(0, group_count(size));
+
+        let (_d2, fetcher) = store();
+        // A partial row from an earlier window, with a stale access stamp: the
+        // object a resumed fetch is accumulating, which the eligibility
+        // re-check finds swept-able throughout the write that follows.
+        let first = ChunkRanges::from_ranges([synch_core::GroupRange::new(0, 1)]);
+        let (encoded, served) = provider.encode_slice(&root, &first).unwrap();
+        fetcher
+            .write_slice(&root, size, &served, &encoded, 0)
+            .unwrap();
+        assert!(fetcher.blob(&root).unwrap().is_some());
+        // The rest of the object is the window the resumed fetch writes next.
+        let rest = all.difference(&first);
+        let (encoded, served) = provider.encode_slice(&root, &rest).unwrap();
+
+        let fetcher = std::sync::Arc::new(fetcher);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let collector = {
+            let fetcher = fetcher.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Slow on purpose: the sweep landing *during* a write —
+                    // not between two — is what this exercises, and the row
+                    // exists the whole time either way.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    let _ = fetcher.delete_blob_if_eligible(&root, 100);
+                }
+            })
+        };
+
+        let mut collected_mid_write = false;
+        for _ in 0..200 {
+            match fetcher.write_slice(&root, size, &served, &encoded, 0) {
+                Ok(_) => {}
+                // A mid-write collection surfaces as a local I/O error —
+                // which kind depends on the filesystem: the guard reports
+                // NotFound where an unlinked inode keeps taking writes, and
+                // the write itself fails first where it does not.
+                Err(StoreError::Io(_)) => {
+                    collected_mid_write = true;
+                    break;
+                }
+                Err(e) => {
+                    panic!("a collection mid-write must surface as a local I/O error, not {e}")
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        collector.join().unwrap();
+        assert!(
+            collected_mid_write,
+            "the sweep never landed mid-write, so the guard went untested"
+        );
+
+        // The invariant after any interleaving: no row claims groups whose
+        // payload file is gone.
+        if fetcher.blob(&root).unwrap().is_some() {
+            assert!(
+                fetcher.blob_path(&root).exists(),
+                "the row outlived its payload"
+            );
+        }
+
+        // With the sweep over, the same write lands and the object reads back.
+        let (encoded, served) = provider.encode_slice(&root, &all).unwrap();
+        fetcher
+            .write_slice(&root, size, &served, &encoded, 0)
+            .unwrap();
+        assert_eq!(fetcher.read_range(&root, 0, size).unwrap(), bytes);
+    }
+
+    #[test]
+    fn eligibility_is_decided_again_inside_the_delete() {
+        // The candidate list a collector walks is a snapshot; the delete
+        // re-decides inside its own transaction, so an object that became
+        // pinned, referenced, or freshly touched after the snapshot survives.
+        let (_d, store) = store();
+        let root = store
+            .ingest_bytes(&vec![7u8; 4 * CHUNK_GROUP_SIZE as usize], 0)
+            .unwrap();
+        assert!(store.delete_blob_if_eligible(&root, 100).unwrap());
+
+        let root = store
+            .ingest_bytes(&vec![7u8; 4 * CHUNK_GROUP_SIZE as usize], 0)
+            .unwrap();
+        store.set_pinned(&root, true).unwrap();
+        assert!(!store.delete_blob_if_eligible(&root, 100).unwrap());
+        store.set_pinned(&root, false).unwrap();
+
+        // Touched inside the window.
+        assert!(!store.delete_blob_if_eligible(&root, 0).unwrap());
+
+        // Referenced by an entry.
+        let o = origin();
+        let trie = Trie::new(&store);
+        let entry = FileEntry::file(4 * CHUNK_GROUP_SIZE, 0, root, 1);
+        let root2 = trie
+            .insert(
+                Hash::EMPTY,
+                &file_key("s", "b").unwrap(),
+                &postcard::to_stdvec(&entry).unwrap(),
+            )
+            .unwrap();
+        store
+            .transaction(|txn| txn.materialize_diff(&o, Hash::EMPTY, root2))
+            .unwrap();
+        assert!(!store.delete_blob_if_eligible(&root, 100).unwrap());
+        assert!(store.blob_path(&root).exists());
     }
 }

@@ -1,10 +1,12 @@
 //! Anti-entropy scheduling (§5.3).
 //!
-//! Reactive: local publishes and newly accepted heads are pushed to every
-//! reachable peer immediately, which gives sub-second propagation and epidemic
-//! spread. Periodic: every `aae_interval` (±50 % jitter) one random trusted
-//! peer gets a full `Hello` push-pull exchange, which repairs anything the
-//! reactive path missed and is the mechanism that guarantees convergence.
+//! Reactive: local publishes are pushed over every already-live session, and
+//! a node adopting a pushed head as pending fetches its trie straight from
+//! the pusher, which gives sub-second propagation among peers that are
+//! already talking. Periodic: every `aae_interval` (±50 % jitter) one random
+//! trusted peer gets a full `Hello` push-pull exchange, which repairs
+//! anything the reactive path missed and is the mechanism that guarantees
+//! convergence.
 
 use std::time::Duration;
 
@@ -68,7 +70,8 @@ impl Node {
             return Ok(RoundReport::default());
         }
         let mut report = RoundReport::default();
-        let start = (jitter_seed() % peers.len() as u64) as usize;
+        let mut draw = synch_core::xorshift_seed();
+        let start = (synch_core::xorshift_next(&mut draw) % peers.len() as u64) as usize;
         for offset in 0..peers.len() {
             let peer = peers[(start + offset) % peers.len()];
             match self.sync_with_peer(&peer).await {
@@ -86,39 +89,83 @@ impl Node {
         Ok(report)
     }
 
-    /// Pushes a head to every reachable peer (§5.3, reactive path).
+    /// Pushes a head to every peer this node already holds a live session
+    /// with (§5.3, reactive path).
     ///
-    /// All of them at once. Each push is bounded by a dial timeout and a request
-    /// deadline, so a peer that has gone dark costs seconds — but sequentially
-    /// those seconds add up across the membership and a publish waits for all of
-    /// them before it returns. Run together, one slow peer costs one deadline
-    /// rather than delaying every peer behind it.
+    /// Live sessions only, and no dialing: a publish must not stall on peers
+    /// that are away — each dead address costs a dial timeout — because the
+    /// periodic round reaches them anyway. The pushes that do go out run
+    /// together, so one slow session delays nobody else, and a failed push
+    /// costs a debug log: the same periodic round is the repair.
     pub async fn push_head(&self, head: &SignedHead) -> Result<usize> {
-        let peers = self.dialable_peers()?;
-        let mut targets = Vec::with_capacity(peers.len());
-        for peer in peers {
-            let addr = self
-                .peer_addr(&peer)?
-                .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
-            targets.push((peer, addr));
-        }
-        let results = crate::join::futures_join(targets.into_iter().map(|(peer, addr)| async move {
-            match self.net().connect_mpt(addr).await {
-                Ok(client) => match client.push_head(head).await {
+        let mut pushes = Vec::new();
+        for peer in self.dialable_peers()? {
+            let Some(connection) = self.net().live(&peer, synch_core::ALPN_MPT) else {
+                continue;
+            };
+            let client = synch_net::MptClient::new(connection);
+            let head = head.clone();
+            pushes.push(async move {
+                let peer = client.remote_id();
+                match client.push_head(&head).await {
                     Ok(()) => true,
                     Err(e) => {
                         tracing::debug!(peer = %peer.fmt_short(), error = %e, "head push failed");
                         false
                     }
-                },
-                Err(e) => {
-                    tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
-                    false
+                }
+            });
+        }
+        Ok(crate::join::futures_join(pushes)
+            .await
+            .into_iter()
+            .filter(|pushed| *pushed)
+            .count())
+    }
+
+    /// Fetches the tries of pushed heads this node adopted as pending,
+    /// straight from the pusher (§5.3, reactive path).
+    ///
+    /// A pushed head arrives without its trie: the head names a root this
+    /// node does not hold, and the pusher just demonstrated it does. Each
+    /// notification is one (pusher, origin) pair; a fetch that fails — the
+    /// pusher went away between the push and the fetch — is left for the
+    /// next periodic round to repair.
+    pub async fn run_pushed_fetches(&self, shutdown: impl std::future::Future<Output = ()>) {
+        let mut shutdown = std::pin::pin!(shutdown);
+        let Some(mut rx) = self.pending_push_receiver() else {
+            return shutdown.await;
+        };
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => return,
+                got = rx.recv() => {
+                    let Some((peer, origin)) = got else { return };
+                    let addr = match self.peer_addr(&peer) {
+                        Ok(Some(addr)) => addr,
+                        Ok(None) => iroh::EndpointAddr::new(peer),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "peer address lookup failed");
+                            continue;
+                        }
+                    };
+                    let client = match self.net().connect_mpt(addr).await {
+                        Ok(client) => client,
+                        Err(e) => {
+                            tracing::debug!(peer = %peer.fmt_short(), error = %e, "pusher unreachable");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = self.syncer().fetch_pending(&client, &origin).await {
+                        tracing::debug!(
+                            origin = %origin,
+                            error = %e,
+                            "fetching a pushed head failed"
+                        );
+                    }
                 }
             }
-        }))
-        .await;
-        Ok(results.into_iter().filter(|pushed| *pushed).count())
+        }
     }
 
     /// Scans, publishes, and pushes the resulting head in one step.
@@ -290,17 +337,9 @@ impl Node {
 pub fn jittered(base: Duration) -> Duration {
     let base_ms = base.as_millis().max(1) as u64;
     let spread = base_ms; // ±50 % is a full base-width window centered on base
-    let offset = jitter_seed() % spread.max(1);
+    let mut draw = synch_core::xorshift_seed();
+    let offset = synch_core::xorshift_next(&mut draw) % spread.max(1);
     Duration::from_millis(base_ms / 2 + offset)
-}
-
-/// A cheap non-cryptographic source of jitter, seeded from the clock.
-fn jitter_seed() -> u64 {
-    let mut state = (now_ns() as u64) ^ 0x9e37_79b9_7f4a_7c15;
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    state
 }
 
 #[cfg(test)]

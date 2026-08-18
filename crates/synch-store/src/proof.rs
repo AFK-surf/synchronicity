@@ -540,14 +540,16 @@ impl Store {
     /// The budget is a parameter rather than a constant read from
     /// `synch_core`. It is a *frame* bound — how much of an answer fits one
     /// exchange — and the frame belongs to the layer that writes it, so
-    /// `synch-net` supplies `MAX_PROOF_NODES` at the call site. The tell that
-    /// it wanted to be a parameter was already here: this used to be a public
-    /// wrapper over a private `encode_proof_bounded` whose only reason to exist
-    /// was "so that the clamping can be exercised without a 128 GB object". The
-    /// test-only variant is now the real one.
+    /// `synch-net` supplies `MAX_PROOF_NODES` at the call site. Keeping it a
+    /// parameter also lets tests exercise the clamping without a 128 GB
+    /// object.
     ///
-    /// An over-budget request is refused rather than truncated; see the walk
-    /// below for why that is safe once the requester sizes its own windows.
+    /// What the walk covers is `requested ∩ what this node holds`, and the
+    /// intersection with a fragmented local copy can have *more* ranges than
+    /// the request did — each disjoint range costs a root path — so a
+    /// well-sized request can still overrun the budget here. The answer is the
+    /// longest whole-range prefix that fits, reported in `served`; the
+    /// requester already walks whatever a `served` does not cover.
     pub fn encode_proof(
         &self,
         root: &Hash,
@@ -573,32 +575,21 @@ impl Store {
             tree,
             data: DataFile(File::open(self.outboard_path(root))?),
         };
-        let (proof, truncated) = walk_proof(root, blob.size, &wanted, level, budget, |node| {
+        let served = synch_core::proof_window(&wanted, level, budget);
+        let (proof, truncated) = walk_proof(root, blob.size, &served, level, budget, |node| {
             load_from_outboard(&outboard, root, node)
         })?;
-        // A truncated walk is now a refused request, not a partial answer.
-        //
-        // The requester sizes its window from `proof_nodes_upper_bound` so that
-        // a provider holding *everything* it asked for still fits the budget,
-        // and this walk covers `requested ∩ what we hold`, which is a subset of
-        // that and so cannot cost more. Overrunning therefore means the request
-        // was not sized by a conforming requester, and the answer is to say so
-        // rather than to serve a prefix.
-        //
-        // This is what let the second walk go. The old shape shipped a
-        // truncated answer, so the two sides had to be made to agree about
-        // where it stopped — done by discarding the work and walking the whole
-        // thing again over the ranges that fit, at up to `MAX_PROOF_NODES`
-        // random 64-byte outboard reads for a ~50-byte request.
+        // Unreachable in practice: the window above is sized by
+        // `proof_nodes_upper_bound`, which over-counts the nodes a walk emits,
+        // so a window that fits the bound cannot overrun the walk's budget.
         if let Some(at) = truncated {
             return Err(StoreError::Verification {
                 root: *root,
                 reason: format!(
-                    "a proof over these ranges at level {level} exceeds the {budget}-node                      budget (stopped at group {at}); the requester must split the request"
+                    "a proof over these ranges at level {level} exceeds the {budget}-node budget (stopped at group {at}); the requester must split the request"
                 ),
             });
         }
-        let served = wanted;
 
         let mut encoded = Vec::with_capacity(proof.nodes.len() * PROOF_NODE_LEN);
         for (_, pair) in &proof.nodes {
@@ -712,6 +703,16 @@ impl Store {
             // stable storage. The handle is open for writing, which is what
             // Windows requires of a flush.
             fsync_file(&outboard.data.0)?;
+            // The same mid-write collection guard as `write_slice`: the row
+            // may have been swept and the outboard unlinked while the proof
+            // was being verified, and committing then would record a tree over
+            // a file nothing can name.
+            if !crate::cas::file_still_live(&outboard.data.0, &self.outboard_path(root)) {
+                return Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("the outboard for {root} was collected mid-write"),
+                )));
+            }
             // The row is what later passes read the object's size and bitmap
             // out of. A proof commits no bytes, so an object first met this way
             // is recorded as held-nothing rather than not held at all — and the
@@ -922,10 +923,10 @@ impl Store {
             // Everything from here on writes, and everything that decides
             // *whether* to write is above: the comparison happens strictly
             // before a byte of this run lands in the payload. Judging after
-            // writing — as an earlier shape of this did — means a run that
-            // turns out not to match has already overwritten whatever was at
-            // those offsets, and a group another writer had just verified into
-            // the bitmap becomes a bit that lies (§6.2).
+            // writing would mean a run that turns out not to match has already
+            // overwritten whatever was at those offsets, and a group another
+            // writer had just verified into the bitmap becomes a bit that lies
+            // (§6.2).
 
             // The nodes *under* the run come across as well, or the groups this
             // pass gains could be held and not served (§3.4, §6.3).
@@ -965,7 +966,32 @@ impl Store {
         sink.outboard.sync()?;
         fsync_file(&sink.payload.0)?;
         fsync_file(&sink.outboard.data.0)?;
+        // The same mid-write collection guard as `write_slice`: a partial
+        // promotion holds its files open across runs while the collector
+        // decides eligibility from the row, so the row can be gone — and the
+        // files unlinked — by the time the last run lands.
+        if !crate::cas::file_still_live(&sink.payload.0, &self.blob_path(root))
+            || !crate::cas::file_still_live(&sink.outboard.data.0, &self.outboard_path(root))
+        {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("the files for {root} were collected mid-promotion"),
+            )));
+        }
         let commit = self.commit_groups(root, size, &promoted, None, now)?;
+        // And once more after the commit: an unlink that threaded the gap
+        // between the check above and the commit must not leave the row
+        // claiming groups over a file nothing can name. The row and files go
+        // together, and the promotion starts over.
+        if !crate::cas::file_still_live(&sink.payload.0, &self.blob_path(root))
+            || !crate::cas::file_still_live(&sink.outboard.data.0, &self.outboard_path(root))
+        {
+            let _ = self.delete_blob(root);
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("the files for {root} were collected mid-commit"),
+            )));
+        }
         drop(sink);
         self.trim_to_size(root, commit);
         Ok(promoted)
@@ -1035,9 +1061,7 @@ impl Store {
     /// a commit that settled the length.)
     fn open_sink(&self, root: &Hash, tree: BaoTree) -> Result<Sink> {
         let payload_path = self.blob_path(root);
-        if let Some(parent) = payload_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        crate::cas::create_shard_dir(&payload_path)?;
         let payload = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1064,9 +1088,7 @@ impl Store {
     /// hands a peer's assertion straight to `set_len`.
     fn open_sparse_outboard(&self, root: &Hash, reach: u64) -> Result<File> {
         let path = self.outboard_path(root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        crate::cas::create_shard_dir(&path)?;
         let outboard = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2088,25 +2110,30 @@ mod tests {
     /// A proof is clamped to one window like a slice, and `served` is where the
     /// next request starts.
     #[test]
-    fn an_over_budget_proof_is_refused_rather_than_truncated() {
-        // The provider used to serve a prefix and report where it stopped,
-        // which meant the two sides had to be made to agree about the cut —
-        // done by discarding the walk and repeating it over the ranges that
-        // fit. Now the requester sizes its window from
-        // `proof_nodes_upper_bound` so a full holder still fits, this walk
-        // covers a subset of that and so cannot cost more, and an over-budget
-        // request means a non-conforming requester.
+    fn an_over_budget_proof_serves_the_prefix_that_fits() {
+        // The walk covers `requested ∩ what the provider holds`, which a
+        // fragmented local copy can make *more* expensive than the request the
+        // window was sized for — so the provider answers with the longest
+        // whole-range prefix that fits and reports it, rather than refusing.
         let (_d, provider) = store();
         let bytes = data(40 * GROUP);
         let size = bytes.len() as u64;
         let root = provider.ingest_bytes(&bytes, 0).unwrap();
         let all = ChunkRanges::single(0, group_count(size));
 
-        // A budget far below what a leaf-level proof of the whole object needs.
-        let err = provider
-            .encode_proof(&root, &all, 0, 12)
-            .expect_err("an over-budget request must be refused");
-        assert!(err.to_string().contains("budget"), "{err}");
+        // A budget far below what a leaf-level proof of the whole object
+        // needs: the answer is a prefix, and `served` says how far it got.
+        let (encoded, served) = provider.encode_proof(&root, &all, 0, 12).unwrap();
+        assert!(!served.is_empty(), "some prefix always fits one exchange");
+        assert!(
+            synch_core::proof_nodes_upper_bound(&served, 0) <= 12 + 64,
+            "what was served fits the budget"
+        );
+        let (_d2, fetcher) = store();
+        let proven = fetcher
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert!(!proven.is_empty());
 
         // Sized to the budget, the same request is served whole — and what
         // comes back verifies and covers exactly what was asked for.
@@ -2115,7 +2142,7 @@ mod tests {
         let (encoded, served) = provider.encode_proof(&root, &window, 0, 128).unwrap();
         assert_eq!(served, window, "a sized window is never short");
 
-        let (_d2, fetcher) = store();
+        let (_d3, fetcher) = store();
         let proven = fetcher
             .write_proof(&root, size, &served, 0, &encoded, 0)
             .unwrap();
@@ -2125,6 +2152,51 @@ mod tests {
         let rest = all.difference(&served);
         let (_, next) = provider.encode_proof(&root, &rest, 0, 4096).unwrap();
         assert_eq!(next.ranges[0].start, served.ranges[0].end);
+    }
+
+    /// A holder whose bitmap is fragmented serves a prefix, not an error.
+    #[test]
+    fn a_fragmented_holder_serves_the_proof_prefix_that_fits() {
+        // Intersecting the request with a fragmented bitmap multiplies the
+        // range count, and each disjoint range costs a root path: a request
+        // sized for a full holder then overruns the budget. The holder serves
+        // the longest prefix that fits and reports it in `served` — being
+        // dropped from a descent for fragmenting is what the alternative did.
+        let (_d, provider) = store();
+        let bytes = data(64 * GROUP);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let all = ChunkRanges::single(0, group_count(size));
+        // Keep every fourth group: the intersection with a whole-object
+        // request is 16 disjoint ranges.
+        let sparse = ChunkRanges::from_ranges(
+            (0..group_count(size))
+                .step_by(4)
+                .map(|g| GroupRange::new(g, g + 1)),
+        );
+        let slice = provider.encode_slice(&root, &sparse).unwrap();
+
+        let (_d2, fragmented) = store();
+        fragmented
+            .write_slice(&root, size, &slice.1, &slice.0, 0)
+            .unwrap();
+
+        // A budget a whole-holder's answer would fit comfortably.
+        let budget = synch_core::proof_nodes_upper_bound(&all, 0);
+        let (encoded, served) = fragmented.encode_proof(&root, &all, 0, budget).unwrap();
+        assert!(!served.is_empty());
+        assert!(
+            served.range_count() < sparse.range_count(),
+            "the fragmented answer is a strict prefix: {served:?}"
+        );
+        // Every range served is one the holder actually holds, and the proof
+        // verifies against them.
+        assert!(served.difference(&sparse).is_empty());
+        let (_d3, fetcher) = store();
+        let proven = fetcher
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert!(!proven.is_empty());
     }
 
     /// A partial holder can serve proofs for what it has, and says so.

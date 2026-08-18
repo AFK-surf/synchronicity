@@ -85,7 +85,7 @@ impl Node {
             .put_head(Slot::Complete, &head, now_ns(), now_ns())
             .unwrap();
         self.store
-            .materialize_diff(&self.origin, old, root)
+            .transaction(|txn| txn.materialize_diff(&self.origin, old, root))
             .unwrap();
         head
     }

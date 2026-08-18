@@ -149,9 +149,31 @@ impl Store {
     /// earlier publish already used, which is exactly the collision the gap
     /// exists to avoid.
     pub fn raise_publish_floor(&self, seq: u64) -> Result<u64> {
-        let effective = self.publish_floor()?.unwrap_or(0).max(seq);
-        self.set_config(FLOOR_KEY, &effective.to_string())?;
-        Ok(effective)
+        // Read and write inside one immediate transaction: the floor is
+        // monotonic, and a read-modify-write that released the connection
+        // between the two could lose a concurrent raise.
+        self.with_immediate_tx(|tx| {
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM config WHERE key = ?1",
+                    params![FLOOR_KEY],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let current = current
+                .map(|text| {
+                    text.parse::<u64>()
+                        .map_err(|_| StoreError::column("config.publish_floor", text))
+                })
+                .transpose()?;
+            let effective = current.unwrap_or(0).max(seq);
+            tx.execute(
+                "INSERT INTO config (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![FLOOR_KEY, effective.to_string()],
+            )?;
+            Ok(effective)
+        })
     }
 }
 

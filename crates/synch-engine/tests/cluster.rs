@@ -1312,3 +1312,68 @@ async fn a_provider_hint_for_an_unbound_origin_is_not_stored() {
         "the origin we could not dial is not: {learned:?}"
     );
 }
+
+/// §5.3: a head pushed over a live session is adopted as pending, and the
+/// follower fetches its trie straight from the pusher without any pull.
+#[tokio::test]
+async fn a_pushed_head_is_fetched_from_the_pusher() {
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    introduce(&[&nas, &laptop]);
+
+    nas.node.add_space("media", nas.space.path()).unwrap();
+    std::fs::write(nas.space.path().join("clip.txt"), b"take one").unwrap();
+    nas.node.scan_publish_push().await.unwrap();
+
+    // The reactive fetch loop, as the daemon would run it.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let follower = laptop.node.clone();
+    let fetch_loop = tokio::spawn(async move {
+        follower
+            .run_pushed_fetches(async {
+                let _ = rx.await;
+            })
+            .await;
+    });
+
+    // A session the publisher dialed is the one a push travels: without one
+    // the push goes nowhere and the periodic round carries the head instead.
+    nas.node
+        .sync_with_peer(&laptop.node.node_id())
+        .await
+        .unwrap();
+
+    std::fs::write(nas.space.path().join("clip.txt"), b"take two").unwrap();
+    let head = nas.node.scan_publish_push().await.unwrap().unwrap();
+
+    for _ in 0..500 {
+        if laptop
+            .node
+            .store()
+            .complete_head(nas.node.origin())
+            .unwrap()
+            .as_ref()
+            == Some(&head)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        laptop
+            .node
+            .store()
+            .complete_head(nas.node.origin())
+            .unwrap(),
+        Some(head),
+        "the pushed head's trie must arrive from the pusher, unpulled"
+    );
+
+    tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), fetch_loop)
+        .await
+        .expect("the fetch loop must stop promptly")
+        .unwrap();
+    nas.node.shutdown().await.unwrap();
+    laptop.node.shutdown().await.unwrap();
+}

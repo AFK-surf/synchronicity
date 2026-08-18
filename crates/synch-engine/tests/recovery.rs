@@ -172,6 +172,12 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
     recovered.shutdown().await.unwrap();
     let recovered = open(data.path(), None).await;
     assert_eq!(recovered.next_seq().unwrap(), 1_003);
+    // A restart moves the endpoint, and the peer's record of the address
+    // catches up through discovery; here, by hand.
+    laptop
+        .node
+        .remember_peer(&recovered.net().direct_addr())
+        .unwrap();
 
     // Publishing resumes strictly above everything the peer advertised, by the
     // gap, and the peer accepts it under the ordinary acceptance rule.
@@ -179,8 +185,8 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
     assert_eq!(head.seq, 1_003);
     head.verify_signature().unwrap();
     assert_eq!(head.signed_by, recovered.node_id());
-    // The push carries the head; the pull that follows completes its trie and
-    // flips the peer's complete slot (§5.2).
+    // The pull completes the head's trie and flips the peer's complete slot
+    // (§5.2).
     laptop
         .node
         .sync_with_peer(&recovered.node_id())

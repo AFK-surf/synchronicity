@@ -298,6 +298,10 @@ impl MissingWalk {
         max: usize,
     ) -> Result<Missing, MptError> {
         let mut missing = Missing::default();
+        // Two nodes in one batch may reference the same out-of-line value —
+        // structural sharing is exactly that — and the hash is reported once:
+        // a duplicate asks the peer for the same bytes twice in one request.
+        let mut values_seen: HashSet<Hash> = HashSet::new();
         while let Some((reference, hash)) = self.frontier.pop() {
             if missing.len() >= max {
                 self.frontier.push((reference, hash));
@@ -335,6 +339,9 @@ impl MissingWalk {
             // value-only failure, and `note_complete` vouched for the root.
             let mut awaiting_values = false;
             for value_hash in node.value_hashes() {
+                if !values_seen.insert(value_hash) {
+                    continue;
+                }
                 if !trie.has_value_raw(&value_hash)? {
                     missing.values.push(value_hash);
                     awaiting_values = true;
@@ -454,16 +461,19 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         let nibbles = Nibbles::from_bytes(key);
         let mut rest = nibbles.as_slice();
         let mut current = root_opt(root);
-        // Every iteration consumes at least one nibble except the last, so this
-        // is bounded by the key length — but only once an empty extension
-        // prefix is impossible. `hash_of_encoded` rejects those now; the guard
-        // stays because `get` is the one descent with no stack to bound it, and
-        // a chain of zero-progress nodes would otherwise turn one lookup into
-        // one store read per node.
+        // Every hop consumes at least one nibble (an empty extension prefix is
+        // rejected both here and at the ingest boundary), so a valid key of
+        // `MAX_KEY_LEN` bytes resolves in at most `MAX_DEPTH_NIBBLES` hops —
+        // plus one step that loads the root. The structural walks agree:
+        // `collect`/`diff` still examine a position *at* `MAX_DEPTH_NIBBLES`
+        // and prune only below it, so a value at exactly that depth is
+        // readable here too. The guard exists because `get` is the one descent
+        // with no explicit stack to bound it: a chain of zero-progress nodes
+        // would otherwise turn one lookup into one store read per node.
         let mut steps = 0usize;
         loop {
             steps += 1;
-            if steps > MAX_DEPTH_NIBBLES {
+            if steps > MAX_DEPTH_NIBBLES + 1 {
                 return Err(MptError::NonCanonical(
                     "lookup descended further than any valid key is long".into(),
                 ));
@@ -1107,6 +1117,75 @@ mod tests {
         assert_eq!(missing.values.len(), 1);
         assert!(!t.is_complete(root).unwrap());
         assert!(matches!(t.get(root, b"k"), Err(MptError::MissingValue(_))));
+    }
+
+    #[test]
+    fn a_shared_value_is_reported_missing_once() {
+        // Two keys holding the same out-of-line value is one value hash
+        // referenced from two leaves; the missing walk names it once.
+        let s = MemStore::new();
+        let t = trie(&s);
+        let big = vec![9u8; 500];
+        let mut root = Hash::EMPTY;
+        for key in [b"a".as_slice(), b"b".as_slice()] {
+            root = t.insert(root, key, &big).unwrap();
+        }
+        assert_eq!(s.value_count(), 1);
+        s.retain(&s.node_hashes(), &[]);
+        let missing = t.missing(root, 100).unwrap();
+        assert_eq!(missing.nodes.len(), 0);
+        assert_eq!(
+            missing.values.len(),
+            1,
+            "the shared value is missing once, not once per referencing leaf: {:?}",
+            missing.values
+        );
+    }
+
+    /// A branch-per-nibble chain of `depth` levels with a value at the bottom:
+    /// the shape a maximally uncompressible key produces, built node by node
+    /// because inserting the keys to force it costs quadratic time.
+    fn branch_chain(store: &MemStore, depth: usize) -> Hash {
+        let mut hash = {
+            let node = TrieNode::leaf(Nibbles::new(), crate::ValueRef::Inline(vec![1]));
+            let encoded = node.encode();
+            let hash = crate::node::hash_encoded(node.tag(), &encoded);
+            store.put_node(&hash, &encoded).unwrap();
+            hash
+        };
+        for _ in 0..depth {
+            let mut children = NO_CHILDREN;
+            children[0] = Some(hash);
+            let node = TrieNode::Branch {
+                children,
+                // A second occupant, or the branch would not be canonical.
+                value: Some(crate::ValueRef::Inline(vec![2])),
+            };
+            let encoded = node.encode();
+            let hash_next = crate::node::hash_encoded(node.tag(), &encoded);
+            store.put_node(&hash_next, &encoded).unwrap();
+            hash = hash_next;
+        }
+        hash
+    }
+
+    #[test]
+    fn get_reads_a_value_at_exactly_the_depth_bound() {
+        // A legal key is `MAX_KEY_LEN` bytes — `MAX_DEPTH_NIBBLES` nibbles —
+        // and a value can sit at exactly that depth. The readers agree there:
+        // the structural walks examine a position at the bound and prune only
+        // below it, so `get` must reach it too.
+        let s = MemStore::new();
+        let t = trie(&s);
+        let root = branch_chain(&s, MAX_DEPTH_NIBBLES);
+        let key = vec![0u8; MAX_KEY_LEN];
+        assert_eq!(t.get(root, &key).unwrap(), Some(vec![1]));
+
+        // A key past the length bound descends past the step bound, and that
+        // still errors rather than walking on.
+        let root = branch_chain(&s, MAX_DEPTH_NIBBLES + 2);
+        let key = vec![0u8; MAX_KEY_LEN + 1];
+        assert!(matches!(t.get(root, &key), Err(MptError::NonCanonical(_))));
     }
 
     #[test]

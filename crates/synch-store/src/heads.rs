@@ -735,6 +735,51 @@ mod tests {
     }
 
     #[test]
+    fn pruning_never_deletes_the_row_a_current_head_points_at() {
+        // The current-head exemption is decided inside the delete transaction:
+        // a head flip that lands between the prune's survey and its deletes
+        // must protect the row the new slot points at. The race itself needs
+        // two threads to even occur, so this drives many interleavings and then
+        // checks the invariant that must hold after every one of them.
+        let (_d, store) = store();
+        let store = std::sync::Arc::new(store);
+        let key = SecretKey::generate();
+        let origin = origin();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let writer = {
+            let store = store.clone();
+            let origin = origin.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut seq = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    seq += 1;
+                    // An old `created_at`, so the prune side considers the row
+                    // doomed by age; the slot flip is what must exempt it.
+                    let head = SignedHead::sign(&key, origin.clone(), seq, Hash([7u8; 32]), 1);
+                    store.put_head(Slot::Complete, &head, 0, 0).unwrap();
+                }
+            })
+        };
+        for _ in 0..200 {
+            store.prune_history_before(&origin, 100).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+
+        let current = store.complete_head(&origin).unwrap().unwrap();
+        assert!(
+            store
+                .head_history(&origin)
+                .unwrap()
+                .iter()
+                .any(|h| h.seq == current.seq && h.root == current.root),
+            "the row the complete slot points at survived the prunes"
+        );
+    }
+
+    #[test]
     fn history_pruning_and_retained_roots() {
         let (_d, store) = store();
         let key = SecretKey::generate();

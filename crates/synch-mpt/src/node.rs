@@ -150,13 +150,18 @@ impl TrieNode {
     /// - An **oversized inline value** is 128 bytes by construction
     ///   ([`INLINE_VALUE_MAX`]); decoded, it is bounded only by the frame, so a
     ///   peer could put 16 MiB in a single node and have every diff clone it.
-    /// - An **under-occupied branch** and an **extension above a non-branch**
-    ///   are read consistently, so they corrupt nothing — but they give one
-    ///   key/value map several distinct roots, which is exactly what structural
-    ///   sharing and the reference-pruning walk rely on not happening.
+    /// - An **under-occupied branch** is read consistently, so it corrupts
+    ///   nothing — but it gives one key/value map several distinct roots, which
+    ///   is exactly what structural sharing and the reference-pruning walk rely
+    ///   on not happening.
     ///
-    /// The extension-above-a-branch half of the invariant needs the child node,
-    /// which this cannot load; it is checked where the structure is walked.
+    /// The extension-above-a-branch half of the §4.3 shape rule needs the child
+    /// node, which a per-node check cannot load — and it is not enforced at
+    /// walk time either: a peer-built extension chain walks safely (every
+    /// reader descends it consistently), and the cost is only that such a trie
+    /// is non-canonical, i.e. it shares no structure with the canonical trie of
+    /// the same map. The write path never produces the shape; the readers
+    /// tolerate it.
     pub fn check_invariants(&self) -> Result<(), MptError> {
         let non_canonical = |what: &str| Err(MptError::NonCanonical(what.to_string()));
         let check_value = |value: &ValueRef| match value {
