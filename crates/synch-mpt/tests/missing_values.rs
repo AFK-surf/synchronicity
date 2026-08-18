@@ -78,3 +78,57 @@ fn a_value_that_arrives_lets_the_walk_finish() {
     assert!(walk.is_exhausted(), "the walk drains once the value lands");
     assert!(trie.is_complete(root).unwrap());
 }
+
+/// One batch asks for a shared out-of-line value once, not once per node that
+/// references it.
+///
+/// Structural sharing makes a repeat ordinary: two keys carrying the same
+/// payload reference one `trie_values` row from two different leaves. The node
+/// side of the walk is deduplicated by `seen`; the value side was not, so a
+/// single `GetValues` request named the same hash several times. The responder
+/// answers per requested hash, and `take_served` refuses a repeated payload as
+/// a protocol violation — a `NetError`, which `is_origin_fault` does not
+/// contain — so the *whole* exchange ended for every origin, blaming an honest
+/// peer for answering exactly what it was asked. Deterministic, so it repeated
+/// on every retry.
+#[test]
+fn one_batch_asks_for_a_shared_value_once() {
+    let store = MemStore::new();
+    let trie = Trie::new(&store);
+    let shared = vec![4u8; 300];
+    let mut root = Hash::EMPTY;
+    for key in [b"f:s/alpha".as_slice(), b"f:s/beta", b"f:s/gamma"] {
+        root = trie.insert(root, key, &shared).unwrap();
+    }
+    assert!(trie.is_complete(root).unwrap());
+    store.retain(&store.node_hashes(), &[]);
+
+    let mut walk = MissingWalk::new(root);
+    let mut asked: Vec<Hash> = Vec::new();
+    loop {
+        let batch = walk.next_batch(&trie, 256).unwrap();
+        if batch.is_empty() {
+            if walk.is_exhausted() {
+                break;
+            }
+            walk.resume();
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for hash in &batch.values {
+            assert!(
+                seen.insert(*hash),
+                "one batch named {hash} twice: the responder answers per \
+                 requested hash and take_served refuses the repeat"
+            );
+        }
+        asked.extend(batch.values.iter().copied());
+        // The peer has nothing to give, so the walk must keep asking — which is
+        // what makes the duplicate reachable in the first place.
+        if asked.len() > 8 {
+            break;
+        }
+        walk.resume();
+    }
+    assert!(!asked.is_empty(), "the shared value is asked for");
+}

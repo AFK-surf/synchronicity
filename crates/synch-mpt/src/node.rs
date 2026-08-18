@@ -155,8 +155,12 @@ impl TrieNode {
     ///   key/value map several distinct roots, which is exactly what structural
     ///   sharing and the reference-pruning walk rely on not happening.
     ///
-    /// The extension-above-a-branch half of the invariant needs the child node,
-    /// which this cannot load; it is checked where the structure is walked.
+    /// Two halves of this need more than one node and are therefore checked
+    /// where the structure is walked and where values arrive, not here:
+    /// **an extension above a non-branch** needs the child node
+    /// ([`crate::MissingWalk::next_batch`]), and **an out-of-line value small
+    /// enough to be inline** needs the payload, which only the fetch that
+    /// carries it has seen.
     pub fn check_invariants(&self) -> Result<(), MptError> {
         let non_canonical = |what: &str| Err(MptError::NonCanonical(what.to_string()));
         let check_value = |value: &ValueRef| match value {

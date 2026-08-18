@@ -284,11 +284,23 @@ pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) ->
         .into_iter()
         .filter(|(s, e)| s < e)
         .map(|(s, e)| {
-            // Clamp to the object size *before* rounding the end up, so the
-            // outward round can never overflow u64 for an `e` within one
-            // granularity of u64::MAX.
+            // Clamp to the object size *before* rounding the end up, so an `e`
+            // far past the object cannot overflow on the way out.
+            //
+            // That leaves the case where `size` itself is within one
+            // granularity of `u64::MAX`, where the round-up still overflows —
+            // so it is done on the group index and multiplied back with a
+            // checked step rather than asserted away. No verifying write can
+            // produce such a row (a ~2^50-group claim survives no chaining
+            // value), which is why this is cheap insurance rather than a live
+            // path, but a comment claiming it *cannot* happen is worse than the
+            // arithmetic that makes sure it does not.
             let s = (s / AD_SPAN_GRANULARITY) * AD_SPAN_GRANULARITY;
-            let e = e.min(size).div_ceil(AD_SPAN_GRANULARITY) * AD_SPAN_GRANULARITY;
+            let e = e
+                .min(size)
+                .div_ceil(AD_SPAN_GRANULARITY)
+                .checked_mul(AD_SPAN_GRANULARITY)
+                .unwrap_or(size);
             (s.min(size), e.min(size).max(s.min(size)))
         })
         .filter(|(s, e)| s < e)

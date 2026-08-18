@@ -201,9 +201,16 @@ CREATE TABLE mirrors (
 );
 -- Plain INSERT, not INSERT OR REPLACE. The key moves from
 -- (origin_id, space) to local_path, so two v3 mirrors that pointed at one
--- directory collapse here — and the survivor's sweep then deletes the other
--- origin's materialized files. Failing loudly is the right outcome for an
--- ambiguous upgrade: the operator picks which mirror that directory is.
+-- directory would collide here — and the survivor's sweep would then delete
+-- the other origin's materialized files. Failing loudly is the right outcome
+-- for an ambiguous upgrade.
+--
+-- Worth knowing before reading that as an operator trap it is not: there has
+-- never been a released build whose chain stopped at v3. v1 through v8 landed
+-- in one commit, so a fresh database replays v1 — which creates an empty
+-- `mirrors` — and reaches this SELECT with no rows to collide. A database that
+-- could fail here would have to be hand-built at v3, and `Store::open` is the
+-- only way in, so recovering it means hand-editing either way.
 INSERT INTO mirrors (local_path, space, policy)
   SELECT local_path, space, 'origin=' || origin_id FROM mirrors_v3;
 DROP TABLE mirrors_v3;

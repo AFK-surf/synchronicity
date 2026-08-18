@@ -26,6 +26,14 @@ fn offer_bytes(bytes: &[u8]) -> Result<Hash, MptError> {
     TrieNode::hash_of_encoded(bytes)
 }
 
+/// Stores a node the way a peer's `Nodes` response would.
+fn plant(store: &MemStore, node: &TrieNode) -> Hash {
+    let encoded = node.encode();
+    let hash = TrieNode::hash_of_encoded(&encoded).expect("accepted at the boundary");
+    store.put_node(&hash, &encoded).unwrap();
+    hash
+}
+
 #[test]
 fn an_empty_ext_prefix_is_refused() {
     let leaf = TrieNode::Leaf {
@@ -152,4 +160,63 @@ fn an_odd_depth_value_still_fails_closed() {
         trie.diff(Hash::EMPTY, root),
         Err(MptError::OddDepthValue)
     ));
+}
+
+/// An extension above anything but a branch is refused where the structure is
+/// walked, which is what `check_invariants` says happens.
+///
+/// The invariant is documented on `TrieNode::Ext` and the doc on
+/// `check_invariants` promised it was "checked where the structure is walked".
+/// Nothing checked it. Such a node reads correctly through `get`, `iter` and
+/// `diff` — so it corrupts nothing — but it produces a different root for the
+/// same one-key map, which falsifies the canonical-root property the crate
+/// documents and silently disables both structural sharing across roots and
+/// the `reference == Some(hash)` pruning in `MissingWalk::since`.
+#[test]
+fn an_extension_above_a_non_branch_is_refused_by_the_walk() {
+    use synch_mpt::MissingWalk;
+
+    for (name, child) in [
+        (
+            "leaf",
+            TrieNode::Leaf {
+                key_rest: Nibbles::from_nibbles(&[1, 2]),
+                value: ValueRef::Inline(b"v".to_vec()),
+            },
+        ),
+        (
+            "ext",
+            TrieNode::Ext {
+                prefix: Nibbles::from_nibbles(&[3]),
+                child: Hash::new(b"whatever"),
+            },
+        ),
+    ] {
+        let store = MemStore::new();
+        let child_hash = plant(&store, &child);
+        let root = plant(
+            &store,
+            &TrieNode::Ext {
+                prefix: Nibbles::from_nibbles(&[0]),
+                child: child_hash,
+            },
+        );
+
+        // The node itself still passes the single-node checks: the shape is
+        // only visible with the child in hand.
+        assert!(TrieNode::hash_of_encoded(&child.encode()).is_ok());
+
+        let trie = Trie::new(&store);
+        let mut walk = MissingWalk::new(root);
+        let err = walk
+            .next_batch(&trie, 256)
+            .expect_err("an ext above a {name} must be refused");
+        assert!(
+            err.to_string().contains("not a branch"),
+            "ext above {name}: {err}"
+        );
+
+        // And so the trie is never declared complete, so no head over it flips.
+        assert!(trie.is_complete(root).is_err(), "ext above {name}");
+    }
 }

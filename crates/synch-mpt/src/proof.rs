@@ -5,6 +5,17 @@
 //! root hash and the proof, nothing else, which is what lets a holder of one
 //! signed head answer for one key without shipping a whole trie — the
 //! capability partial replication (§13) is built on.
+//!
+//! **Not on any wire.** This module is behind the off-by-default `proofs`
+//! feature and has no caller in the workspace; no `MptMessage` carries a
+//! `Proof`, so nothing here decodes peer-supplied input today. Two things
+//! follow, and both have been mistaken for defects. `verify` bounds its input
+//! only by what the caller already materialized, which is correct while the
+//! caller is local and is the first thing to revisit if this is ever put on a
+//! wire. And `synch_core::MAX_PROOF_NODES` is *not* the bound it is missing:
+//! that constant sizes **bao hash-tree slice proofs** in the blob path
+//! (`synch-net`'s `GetProof`), a different structure for a different purpose.
+//! Partial replication is what would make this live; §13 is where that is.
 
 use serde::{Deserialize, Serialize};
 use synch_core::Hash;

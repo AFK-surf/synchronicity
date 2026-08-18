@@ -459,16 +459,26 @@ impl Syncer {
                 let store = self.store.clone();
                 let requested = missing.nodes.clone();
                 learned += crate::blocking::offload(move || {
-                    take_served(
-                        &requested,
-                        &response.nodes,
-                        "node",
-                        |bytes| TrieNode::hash_of_encoded(bytes).ok(),
-                        |expected| NetError::NodeHashMismatch { expected },
-                        |hash, bytes| {
-                            Ok(synch_mpt::NodeStore::put_node(store.as_ref(), hash, bytes)?)
-                        },
-                    )
+                    // One transaction per batch, not one per node. Written
+                    // through the `Store`, each `put_node` is a bare `execute`
+                    // in autocommit — its own transaction, its own acquisition
+                    // of the one write connection, its own WAL frame — so a
+                    // `MAX_BATCH` response cost up to 256 of them, and a cold
+                    // bootstrap of an n-node trie cost n. Measured at 3.8x on
+                    // 10 240 puts. The batch is also atomic this way, which is
+                    // what §10 asks of a multi-step write; nothing is lost by a
+                    // rollback either, since trie nodes are content-addressed
+                    // and simply re-fetched.
+                    store.transaction(|txn| {
+                        take_served(
+                            &requested,
+                            &response.nodes,
+                            "node",
+                            |bytes| TrieNode::hash_of_encoded(bytes).ok(),
+                            |expected| NetError::NodeHashMismatch { expected },
+                            |hash, bytes| Ok(synch_mpt::NodeStore::put_node(txn, hash, bytes)?),
+                        )
+                    })
                 })
                 .await?;
             }
@@ -477,20 +487,49 @@ impl Syncer {
                 let store = self.store.clone();
                 let requested = missing.values.clone();
                 learned += crate::blocking::offload(move || {
-                    take_served(
-                        &requested,
-                        &response.values,
-                        "value",
-                        |bytes| Some(synch_core::Hash::new(bytes)),
-                        |expected| NetError::ValueHashMismatch { expected },
-                        |hash, bytes| {
-                            Ok(synch_mpt::NodeStore::put_value(
-                                store.as_ref(),
-                                hash,
-                                bytes,
-                            )?)
-                        },
-                    )
+                    // One transaction per batch, as for nodes above.
+                    store.transaction(|txn| {
+                        take_served(
+                            &requested,
+                            &response.values,
+                            "value",
+                            |bytes| Some(synch_core::Hash::new(bytes)),
+                            |expected| NetError::ValueHashMismatch { expected },
+                            |hash, bytes| {
+                                // A value small enough to be inline must *be*
+                                // inline. `ValueRef::for_value` is what makes that
+                                // true of everything this node builds, and nothing
+                                // made it true of what arrives: `check_invariants`
+                                // rejects an oversized inline value and had no rule
+                                // the other way, because the payload is not in the
+                                // node. This is the first place both are in hand.
+                                //
+                                // Left unchecked it is a second root for the same
+                                // key/value map — the thing structural sharing and
+                                // the reference-pruning walk rest on not happening
+                                // — plus an extra round trip and an extra
+                                // `trie_values` row per leaf, at the publisher's
+                                // choosing.
+                                //
+                                // An `MptError`, not a `NetError`: the serving peer
+                                // relayed exactly what the origin published, so
+                                // this fails that origin and no other (§12). The
+                                // value is not stored, so the walk keeps asking and
+                                // `MAX_UNPRODUCTIVE_ROUNDS` retires the head.
+                                if bytes.len() <= synch_core::INLINE_VALUE_MAX {
+                                    return Err(EngineError::Mpt(
+                                        synch_mpt::MptError::NonCanonical(format!(
+                                        "out-of-line value {hash} is {} bytes, at or under the \
+                                         {}-byte inline ceiling",
+                                        bytes.len(),
+                                        synch_core::INLINE_VALUE_MAX,
+                                    )),
+                                    ));
+                                }
+                                Ok(synch_mpt::NodeStore::put_value(txn, hash, bytes)?)
+                            },
+                        )
+                    })
                 })
                 .await?;
             }

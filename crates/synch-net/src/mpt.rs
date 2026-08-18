@@ -241,7 +241,18 @@ impl MptProtocol {
                 let (nodes, missing) = crate::blocking::offload(move || {
                     let mut nodes = Vec::new();
                     let mut missing = Vec::new();
+                    // One answer per *distinct* hash. A requester may only ask
+                    // once — `take_served` refuses a repeated payload as a
+                    // protocol violation and ends the exchange — so answering a
+                    // duplicated request literally would make this node look
+                    // hostile for a fault on the asking side. Deduplicating
+                    // here also stops a repeated hash from turning one bounded
+                    // batch into `MAX_BATCH` copies of the same payload.
+                    let mut answered = std::collections::HashSet::new();
                     for hash in hashes {
+                        if !answered.insert(hash) {
+                            continue;
+                        }
                         match store.get_node(&hash)? {
                             Some(data) => nodes.push((hash, data)),
                             None => missing.push(hash),
@@ -255,11 +266,25 @@ impl MptProtocol {
             }
             MptMessage::GetValues { hashes } => {
                 check_batch(hashes.len())?;
+                // The answer is bounded in bytes as well as in count, but not
+                // here — by what a trie value can be. `AdState` decodes bounded
+                // at `MAX_AD_SPANS` and `coalesce_spans` truncates to the same
+                // cap on the publish side, so a `b:` record is ~20 KB at worst;
+                // a `FileEntry` is small, because the path lives in the *key*
+                // and keys are capped at `MAX_KEY_LEN`. `MAX_BATCH` of either
+                // is a few MiB against a 16 MiB frame. What a value cannot be
+                // is unbounded: nothing larger than a frame can have arrived to
+                // be stored in the first place.
                 let store = self.store().clone();
                 let (values, missing) = crate::blocking::offload(move || {
                     let mut values = Vec::new();
                     let mut missing = Vec::new();
+                    // One answer per distinct hash, as `GetNodes` above.
+                    let mut answered = std::collections::HashSet::new();
                     for hash in hashes {
+                        if !answered.insert(hash) {
+                            continue;
+                        }
                         match store.get_value(&hash)? {
                             Some(data) => values.push((hash, data)),
                             None => missing.push(hash),
@@ -308,6 +333,12 @@ impl MptProtocol {
     }
 }
 
+/// A backstop behind the decode-time bound.
+///
+/// `MptMessage` refuses an over-long field while deserializing, which is what
+/// actually caps the cost — this cannot normally fire. It is kept so the
+/// responder still states its own contract, and so removing a `#[serde(...)]`
+/// attribute does not silently remove the cap with it.
 fn check_batch(len: usize) -> Result<(), NetError> {
     if len > MAX_BATCH {
         return Err(NetError::Unexpected(format!(
@@ -333,6 +364,7 @@ fn check_batch(len: usize) -> Result<(), NetError> {
 /// The bound is generous next to any real cluster: §12 sizes membership at
 /// N ≤ 100 origins, so a legitimate exchange names tens of heads, not
 /// thousands.
+/// A backstop behind the decode-time bound, as [`check_batch`] is.
 fn check_heads(len: usize, what: &str) -> Result<(), NetError> {
     if len > MAX_HEADS_PER_MESSAGE {
         return Err(NetError::Unexpected(format!(
@@ -752,6 +784,12 @@ mod tests {
     /// Hints are unverified by design, but taking one still costs a row and
     /// nothing in the answer vouches that the origins in it exist — so the
     /// length is checked the way every other batch message's is.
+    ///
+    /// The refusal now happens *while decoding* (`MptMessage`'s per-field
+    /// bounds) rather than on the materialized `Vec`, so the failure is a
+    /// decode error rather than the handler's own message. That is the point:
+    /// the post-hoc check spent the whole cost of the message before it could
+    /// look at the length.
     #[tokio::test]
     async fn a_provider_answer_past_the_bound_is_refused() {
         let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS + 1)
@@ -767,11 +805,10 @@ mod tests {
         let connection = dialer.connect(peer.addr.clone(), ALPN_MPT).await.unwrap();
         let client = MptClient::new(connection);
 
-        let err = client
+        client
             .find_providers(Hash::new(b"object"))
             .await
             .expect_err("an over-long answer is refused");
-        assert!(err.to_string().contains("exceeds"), "{err}");
 
         // One ad short of the bound is an ordinary answer.
         let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS)
