@@ -1083,4 +1083,66 @@ mod tests {
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
     }
+    /// A batch answer is bounded in bytes, not only in hashes.
+    ///
+    /// Two halves. A full legal batch of ceiling-sized values fits one frame and
+    /// is served whole — that is what `MAX_TRIE_VALUE_LEN` buys. And a store that
+    /// holds something larger than the ceiling, as one written before the ceiling
+    /// existed does, still cannot be made to build an answer past the frame: the
+    /// budget is applied while the answer is assembled rather than discovered by
+    /// `write_frame` after the whole message has been serialized. A short answer
+    /// is ordinary — the requester's walk defers what it asked for and re-offers
+    /// whatever did not come back.
+    #[tokio::test]
+    async fn a_values_answer_is_bounded_in_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+
+        let plant = |len: usize, tag: u64| {
+            let mut payload = vec![0u8; len];
+            payload[..8].copy_from_slice(&tag.to_le_bytes());
+            let hash = Hash::new(&payload);
+            synch_mpt::NodeStore::put_value(store.as_ref(), &hash, &payload).unwrap();
+            hash
+        };
+
+        // A full batch at the value ceiling.
+        let at_ceiling: Vec<Hash> = (0..MAX_BATCH as u64)
+            .map(|i| plant(synch_core::MAX_TRIE_VALUE_LEN, i))
+            .collect();
+        // And three values from before the ceiling, each a quarter of the budget.
+        let oversized: Vec<Hash> = (0..3u64)
+            .map(|i| plant(ANSWER_BYTE_BUDGET / 2, 1_000 + i))
+            .collect();
+
+        let (server, client, _client_dir) =
+            trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
+        let mpt = client.connect_mpt(server.direct_addr()).await.unwrap();
+
+        let answer = mpt.get_values(&at_ceiling).await.unwrap();
+        assert_eq!(
+            answer.values.len(),
+            MAX_BATCH,
+            "a full batch at the ceiling is served whole"
+        );
+        assert!(answer.missing.is_empty());
+
+        let answer = mpt.get_values(&oversized).await.unwrap();
+        let bytes: usize = answer.values.iter().map(|(_, v)| v.len()).sum();
+        assert!(bytes <= ANSWER_BYTE_BUDGET, "{bytes} bytes served");
+        assert!(!answer.values.is_empty(), "and it is not empty");
+        assert!(
+            answer.values.len() < oversized.len(),
+            "the budget bit: {} of {}",
+            answer.values.len(),
+            oversized.len()
+        );
+        for (hash, payload) in &answer.values {
+            assert_eq!(&Hash::new(payload), hash);
+            assert!(oversized.contains(hash));
+        }
+
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
 }

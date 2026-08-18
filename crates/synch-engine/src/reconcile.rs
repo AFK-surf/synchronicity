@@ -899,6 +899,12 @@ impl Syncer {
 /// and which error names it, so the checks live here rather than in two loops
 /// that have to be kept in step.
 ///
+/// The third check is now a backstop rather than the bound it was: `Nodes.nodes`
+/// and `Values.values` are capped at [`MAX_BATCH`] *while decoding*, so a
+/// response cannot carry more entries than the request carried hashes. It stays
+/// because the containment set is what enforces it either way, and because a
+/// repeat must not count as progress even if one arrives.
+///
 /// Returns how many were stored.
 fn take_served(
     requested: &[synch_core::Hash],

@@ -551,6 +551,77 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
     follower.net.shutdown().await.unwrap();
 }
 
+/// An origin that publishes a value in the wrong representation is retired by the
+/// §5.2 abandonment rule, not left for the TTL sweep.
+///
+/// The rule is that a value small enough to be inline must *be* inline: the
+/// alternative gives one key/value map two roots, which is what structural
+/// sharing rests on not happening. The rule was right and its stated consequence
+/// was not — it returned an error from inside the batch transaction, which rolled
+/// back the legitimate values with it and propagated out of `fetch_pending`, so
+/// `learned == 0` was never reached and `MAX_UNPRODUCTIVE_ROUNDS` could not fire
+/// for this fault at all. The only escape was `pending_head_ttl`, thirty
+/// anti-entropy intervals later, and the head held `head_floor` for all of it.
+#[tokio::test]
+async fn a_value_in_the_wrong_representation_retires_its_head() {
+    let publisher = Node::spawn("nas").await;
+    let follower = Node::spawn("laptop").await;
+    trust_each_other(&[&publisher, &follower]);
+
+    // A trie the publisher can serve whole, whose one leaf points at an
+    // out-of-line payload small enough that it should have been inline. Planted
+    // rather than inserted: `ValueRef::for_value` makes this unrepresentable
+    // through the write path, which is why the check lives at ingest.
+    let small = b"short enough to be inline".to_vec();
+    assert!(small.len() <= synch_core::INLINE_VALUE_MAX);
+    let value_hash = Hash::new(&small);
+    synch_mpt::NodeStore::put_value(publisher.store.as_ref(), &value_hash, &small).unwrap();
+    let leaf = synch_mpt::TrieNode::Leaf {
+        key_rest: synch_mpt::Nibbles::from_bytes(&synch_core::file_key("media", "a.txt").unwrap()),
+        value: synch_mpt::ValueRef::Hash(value_hash),
+    };
+    let encoded = leaf.encode();
+    let root = synch_mpt::TrieNode::hash_of_encoded(&encoded).unwrap();
+    synch_mpt::NodeStore::put_node(publisher.store.as_ref(), &root, &encoded).unwrap();
+
+    let head = SignedHead::sign(
+        &publisher.secret,
+        publisher.origin.clone(),
+        7,
+        root,
+        now_ns(),
+    );
+    let syncer = Syncer::new(follower.store.clone());
+    assert!(syncer.offer_head(&head, now_ns()).unwrap().accepted());
+
+    let client = follower
+        .net
+        .connect_mpt(publisher.net.direct_addr())
+        .await
+        .unwrap();
+    // The node arrives; the value is refused each round, which is no progress,
+    // so the head is retired by the counter rather than by the clock.
+    let outcome = syncer
+        .fetch_pending(&client, &publisher.origin)
+        .await
+        .unwrap();
+    assert_eq!(outcome, FetchOutcome::Abandoned);
+    assert_eq!(
+        follower.store.pending_head(&publisher.origin).unwrap(),
+        None,
+        "and the head stops holding the floor"
+    );
+    assert!(
+        synch_mpt::NodeStore::get_value(follower.store.as_ref(), &value_hash)
+            .unwrap()
+            .is_none(),
+        "the value itself was never stored"
+    );
+
+    publisher.net.shutdown().await.unwrap();
+    follower.net.shutdown().await.unwrap();
+}
+
 fn count_nodes(store: &Store) -> usize {
     store.trie_stats().unwrap().nodes
 }

@@ -669,6 +669,27 @@ Properties:
     committed batch and the promotion that would have followed leaves a head that
     neither path revisits — holding the floor while sitting on every byte it
     needs.
+  - A head whose trie is wholly present and whose *promotion* this node's own
+    rules refuse — an undecodable `f:` record, say — never keeps the slot it was
+    written into: the offer that wrote it retires it again, leaving the head in
+    `head_history` as evidence and dropping the floor back to what this node can
+    serve. Left in place it looked to the TTL rule like a head one promotion away
+    from complete, which it is not, and the cycle that followed (abandon, re-adopt,
+    fail, abandon) cost a full promotion diff under the write lock every round.
+
+Abandonment names the head it is abandoning. All three rules reach their verdict
+on a snapshot — after several network round trips, or after a trie walk — and the
+slot is written by any concurrent `offer_head`, so a delete that took *whatever
+occupies the slot* could discard a strictly newer head that arrived in between.
+
+The `seq` a local publish carries is derived from **everything this node has
+recorded for its own origin** — both slots and the retained history — not from the
+complete slot alone. A database restored from a backup still holds a complete
+head, so §3.4's key-loss recovery does not cover it, and deriving the next seq
+from that slot alone lets the node sign a second root at a seq its own history
+already names. Both roots are valid and bound, so every peer takes the greater
+under the rule above — and if that is the older root, this node's own `entries`
+are rolled back to it everywhere.
 
 ### 5.3 Anti-entropy scheduling
 
@@ -772,7 +793,14 @@ Consequences:
   (fetching different ranges from different peers in parallel) falls out naturally.
   Span summaries are **hints, not promises**: the fetcher learns exact availability
   from `SliceEnd` and re-plans, so a stale ad costs one wasted round-trip, never
-  correctness.
+  correctness. They are hints in one direction only, though: spans round *inward*
+  to the granularity, so a holder advertises the largest aligned run it can
+  actually serve and never a byte more. Over-reporting sends a fetcher to a
+  provider that cannot serve, while under-reporting costs at most a re-fetch — and
+  because "I hold all of this" is read off the spans, rounding outward made a node
+  holding one 8 MiB window of a 10 MiB object claim the whole object, which is not
+  a hint but a wrong answer. The cost is that a partial holder advertises in whole
+  16 MiB units, so the first slice window of a span buys no advertisement.
 - Cost model: availability metadata is ~1 trie record per (object, holder). For the
   §14 media example, 40 k objects ≈ 40 k ads per holding node — the same order as
   the `f:` namespace itself, and consistent with the §12 quota.
@@ -798,7 +826,11 @@ The fetcher:
 
 1. Resolves providers from `blob_providers`, ranks them (recent latency EWMA, then
    random tiebreak), and splits the wanted range across up to `fetch_fanout` (default 3)
-   providers.
+   providers — each getting a contiguous share **of what it claims**, taken in rank
+   order so nothing is handed to two of them. Cutting the range positionally and
+   handing piece *i* to provider *i* is only an assignment if every provider claims
+   the whole object: two peers holding complementary halves are each handed the half
+   they do not have.
 2. Streams and verifies groups as they arrive; verified groups are committed to the
    CAS and the completeness bitmap immediately (progress survives restarts).
 3. Re-plans on provider failure: a provider that cannot help is dropped from the
