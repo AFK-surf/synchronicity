@@ -246,11 +246,30 @@ only other `Some(..)` writers are `apply_member_set` itself and `synch peer add`
 successful connections pass `None`, which `COALESCE` preserves; nothing prunes
 `peers_seen`.
 
-**Correction that changes the fix**: the proposed gate on this-answer bindings
-does *not* work — `refresh_dns_bindings` runs first, so the hostile answer's own
-bindings contain the key and a this-answer gate is satisfied. No binding-based
-gate helps. The defect is that `peers_seen.last_addr` is global and unscoped, so
-**the address must be scoped to its source domain**, not the gate tightened.
+**Correction that changed the fix**: the originally proposed gate on
+this-answer bindings does *not* work — `refresh_dns_bindings` runs first, so
+the hostile answer's own bindings contain the key and a this-answer gate is
+satisfied.
+
+**Fix (applied)**: the hint is applied only when the answering domain is the
+key's **sole live source** — every live binding for that key is a DNS binding
+from this same domain. The hostile answer binding the key itself is what makes
+the this-answer gate useless and is exactly what makes this one fire: two
+domains now vouch for the key, so neither one's dialing data is used and
+discovery answers instead. That is the same posture §3.2 already takes toward
+an ambiguous key, and a statically-bound key is likewise not a DNS answer's to
+repoint.
+
+Chosen over scoping `peers_seen.last_addr` by source domain, which the review
+suggested: that needs a schema migration and leaves the "which of two hints do
+I dial" question unanswered, where sole-source answers it — neither. Covered by
+`a_second_domain_cannot_repoint_a_key_the_first_one_vouches_for`, verified to
+fail without the gate.
+
+Still true and not addressed: nothing prunes `peers_seen`, and no successful
+connection writes a real address back, so any hint that does land is permanent.
+That is now only reachable from a key's sole vouching domain, which is a party
+already trusted to say who the members are.
 
 ### M3. One membership domain's refresh stalls every other domain into lapsing
 

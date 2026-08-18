@@ -457,11 +457,37 @@ impl Node {
         // it. And each field is read as the one thing it means, so an `addr=`
         // value cannot fall through into a relay URL this node then makes
         // outbound requests to.
+        //
+        // **And only when this domain is the key's sole live source.** "Holds
+        // a live binding" is not enough on its own: `peers_seen.last_addr` is
+        // keyed on `node_id` alone and overwrites, nothing prunes it, and no
+        // successful connection ever writes a real address back — every other
+        // writer passes `None`, which `COALESCE` preserves. So a second
+        // configured membership domain naming a key this node already trusts
+        // would repoint every future dial of it, permanently, through an
+        // answer that is genuinely DNSSEC-valid for *that* domain. Gating on
+        // this answer's own bindings would not help: `refresh_dns_bindings`
+        // ran first and has no cross-domain conflict check, so the hostile
+        // answer binds the key itself and any this-answer test passes.
+        //
+        // Sole-source is the test that holds, and it is the same posture §3.2
+        // already takes towards an ambiguous key: when two domains both vouch
+        // for one key there is no way to say which one's dialing data is
+        // right, so neither is used and discovery answers instead. A key bound
+        // statically is likewise not a DNS answer's to repoint.
         for (key_bytes, hints) in &set.hints {
             let Ok(key) = NodeId::from_bytes(key_bytes) else {
                 continue;
             };
             if !self.store().is_trusted_key(&key, now)? {
+                continue;
+            }
+            if !self.hint_source_is_sole(&key, &set.domain, now)? {
+                tracing::debug!(
+                    domain = %set.domain,
+                    "a dial hint was ignored: the key it names is also live from \
+                     another source, so which hint is right cannot be decided"
+                );
                 continue;
             }
             let mut addr = iroh::EndpointAddr::new(key);
@@ -699,6 +725,22 @@ impl Node {
             });
         }
         Ok(out)
+    }
+
+    /// Whether `domain` is the only live source vouching for `key`.
+    ///
+    /// True when every live binding for the key is a DNS binding from this
+    /// same domain. A live binding from another domain, or a static one, makes
+    /// it false: the key is not this answer's alone to supply dialing data
+    /// for.
+    fn hint_source_is_sole(&self, key: &NodeId, domain: &str, now: i64) -> Result<bool> {
+        let bindings = self.store().bindings_for_key(key)?;
+        let clock = self.store().trust_instant(now)?;
+        let mut live = bindings.iter().filter(|b| b.is_live(clock)).peekable();
+        if live.peek().is_none() {
+            return Ok(false);
+        }
+        Ok(live.all(|b| b.source == BindingSource::Dns && b.domain.as_deref() == Some(domain)))
     }
 
     fn note_dns_attempt(&self, domain: &str, now: i64, ttl: Duration) {
@@ -1050,6 +1092,69 @@ mod tests {
             )]
         );
         node.shutdown().await.unwrap();
+    }
+
+    /// A second membership domain cannot repoint a key the first one vouches
+    /// for.
+    ///
+    /// `peers_seen.last_addr` is keyed on `node_id` alone and overwrites;
+    /// nothing prunes the table and no successful connection writes a real
+    /// address back, so a hint that lands is permanent. A node configured with
+    /// two domains would therefore let either of them steer every future dial
+    /// of any key the other trusts — through an answer that is genuinely
+    /// DNSSEC-valid for the domain that served it, so no signature check
+    /// catches it.
+    ///
+    /// Gating on the *answer's own* bindings does not help:
+    /// `refresh_dns_bindings` runs first and has no cross-domain conflict
+    /// check, so the hostile answer binds the key itself and any this-answer
+    /// test passes. Sole-source is the test that holds.
+    #[tokio::test]
+    async fn a_second_domain_cannot_repoint_a_key_the_first_one_vouches_for() {
+        let (_d, node) = node().await;
+        let shared = SecretKey::generate().public();
+        let now = now_ns();
+
+        // Domain A vouches for the key and supplies its address.
+        let a = MemberSet::from_records(
+            "a.example",
+            &[format!(
+                "v=sync1 id=nas nk={} addr=192.0.2.7:4433",
+                shared.to_z32()
+            )],
+        )
+        .unwrap();
+        node.apply_member_set(&a, Duration::from_secs(300), now)
+            .unwrap();
+        let first = node.peer_addr(&shared).unwrap().expect("A's hint applies");
+        assert_eq!(first.ip_addrs().count(), 1);
+
+        // Domain B names the same key and points it somewhere else. The
+        // answer is well-formed and would be validly signed for b.example.
+        let b = MemberSet::from_records(
+            "b.example",
+            &[format!(
+                "v=sync1 id=nas nk={} addr=198.51.100.66:9999 relay=https://attacker.example",
+                shared.to_z32()
+            )],
+        )
+        .unwrap();
+        node.apply_member_set(&b, Duration::from_secs(300), now)
+            .unwrap();
+
+        // The recorded address is untouched: two domains vouch for this key
+        // now, so neither one's dialing data is used.
+        let after = node.peer_addr(&shared).unwrap().expect("A's hint stands");
+        assert_eq!(
+            after.ip_addrs().collect::<Vec<_>>(),
+            first.ip_addrs().collect::<Vec<_>>(),
+            "a second domain must not repoint a key the first one vouches for"
+        );
+        assert_eq!(
+            after.relay_urls().count(),
+            0,
+            "and must not add a relay this node would then dial through"
+        );
     }
 
     #[tokio::test]
