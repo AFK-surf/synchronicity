@@ -1601,12 +1601,17 @@ tampering mirror produces material that fails verification" a structural
 property rather than a claim about the fetch.
 
 Everything below the root refreshes on its own. The root itself is a build:
-`crates/synch-net` embeds `root.json` version 15 as `EMBEDDED_TUF_ROOT`, the
-control plane ships the byte-identical file at
-`priv/tuf/sigstore_tuf_root.json`, and the walk starts at whatever version
-that file declares — so the floor and the anchor cannot disagree. Raising the
-floor is a release note: a client below it has nothing to bridge the gap and
-keeps its pins rather than guessing.
+`crates/synch-net` embeds `root.json` version 15 as `EMBEDDED_TUF_ROOT`, and
+the walk starts at whatever version that file declares — so the floor and the
+anchor cannot disagree. Raising the floor is a release note: a client below it
+has nothing to bridge the gap and keeps its pins rather than guessing.
+
+The control plane ships no TUF root, because it walks no repository: what it
+needs is the *trusted root* the walk would have produced, and it ships that
+directly at `priv/tuf/sigstore_trusted_root.json` (§10.3). It carried a
+byte-identical copy of the TUF root for a while, which nothing read — a file
+whose only effect was to suggest, to anyone who found it, that the control
+plane anchored a walk somewhere.
 
 `SYNCH_TUF` / `--tuf` (client) and `--tuf` (monitor) name a different
 repository. These are mirror knobs, not trust knobs — whatever they name is

@@ -305,8 +305,17 @@ The tiers suite exists because the two sides once composed the SAN differently
 and put a client-accepted entry in the silent bin; this re-opens that door with
 no compile error and no test failure.
 
-**Fix**: gate `validate` behind `cfg(any(test, feature = "sim"))` — the pattern
-already used for `DnssecChain::encode` — and add `#[non_exhaustive]`.
+**Fix (applied)**: `validate` is behind `cfg(any(test, feature = "sim"))` — the
+pattern already used for `DnssecChain::encode` — with `authorize` and the
+module's own callers going through an ungated `validate_inner`. `Authorized`
+is `#[non_exhaustive]`, so every field stays readable and another crate cannot
+build one by struct literal. Verified from outside the crate: a `synch-monitor`
+test fabricating an `Authorized` fails to compile with `E0639`.
+
+Note for anyone repeating this: gating a public item breaks any intra-doc link
+to it, because `cargo doc` resolves the *sim-off* configuration and CI runs
+rustdoc with `-D warnings`. `chain.rs`'s reference to `[`validate`]` had to
+become plain text.
 
 ### M6. The cross-language conformance fixture pins the one chain shape no deployment produces
 
@@ -348,7 +357,18 @@ the container with `CP_ROLE=primary`. The grep never matches and the check alway
 passes. Reintroducing the `.dockerignore` regression it was written for leaves CI
 green. Its comment describes a `tuf-refresh` job that migration v8 removed.
 
-**Fix**: assert the file directly in the image.
+**Fix (applied)**: the check now searches the image filesystem for
+`sigstore_trusted_root.json` instead of grepping container logs for a string
+only external mode can produce. Searched by name rather than at a fixed path,
+since `priv_dir/1` resolves through `code:priv_dir(controlplane)` and the
+location inside an erlang-shipment is the release layout's business — pinning
+one is how the original check came to match nothing.
+
+Two neighbours fixed with it: the Dockerfile comment named `tuf/anchor.gleam`
+(no such module — it is `tuf/trusted_root.gleam`) and the wrong file, and the
+control plane's copy of `sigstore_tuf_root.json` is deleted. Nothing read it;
+§10.2 described it as anchoring "the walk" while the next paragraph says the
+control plane walks no repository.
 
 ### M8. Two load-bearing bindings have no test at all
 
