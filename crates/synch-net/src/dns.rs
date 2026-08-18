@@ -2825,13 +2825,20 @@ mod tests {
         hickory_resolver::proto::dnssec::rdata::DNSKEY,
         hickory_resolver::proto::dnssec::DnssecSigner,
     ) {
-        for _ in 0..200_000 {
+        // A key tag is 16 bits, so a given one turns up about once every
+        // 65_536 draws and the *expected* cost is that, whatever the ceiling.
+        // The ceiling is only a runaway guard, and it has to sit far enough
+        // above the mean that an unlucky run is not a failing test: at 200_000
+        // draws — three times the mean — a geometric tail leaves a 1-in-21
+        // chance of finding nothing, which is a flake, not a guard.
+        const DRAWS: usize = 4_000_000;
+        for _ in 0..DRAWS {
             let pair = p256_at(origin);
             if pair.0.calculate_key_tag().ok() == Some(tag) {
                 return pair;
             }
         }
-        panic!("no P-256 key with tag {tag} in 200_000 draws");
+        panic!("no P-256 key with tag {tag} in {DRAWS} draws");
     }
 
     fn signed_txt(
