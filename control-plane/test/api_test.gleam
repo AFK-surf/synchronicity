@@ -1,5 +1,6 @@
 import api/auth_api
 import api/router
+import auth/google
 import auth/session
 import dns/name as dns_name
 import dns/serve
@@ -106,6 +107,51 @@ fn published_nks(h: Harness) -> List(String) {
   input.txt_names
   |> list.flat_map(fn(t) { t.members })
   |> list.map(fn(m) { m.nk_z32 })
+}
+
+/// The same harness with different sign-in configuration, which is all
+/// `/api/auth/methods` reports on.
+fn with_auth(
+  h: Harness,
+  change: fn(auth_api.AuthContext) -> auth_api.AuthContext,
+) -> Harness {
+  let assert Some(auth) = h.ctx.auth
+  Harness(..h, ctx: router.Context(..h.ctx, auth: Some(change(auth))))
+}
+
+pub fn auth_methods_lists_only_configured_test() {
+  let h = harness()
+  let read = fn(h) {
+    simulate.read_body(call(h, simulate.request(Get, "/api/auth/methods")))
+  }
+  // Nothing configured: no OAuth client, no org SSO, log-only mail — and
+  // magic links offered regardless, because they are the only way in.
+  let bare = read(h)
+  assert string.contains(bare, "\"google\":false")
+  assert string.contains(bare, "\"github\":false")
+  assert string.contains(bare, "\"oidc\":false")
+  assert string.contains(bare, "\"magic_link\":true")
+  // With a provider that works, log-only mail stops being offered: it
+  // would take the address and send nothing.
+  let with_google =
+    with_auth(h, fn(auth) {
+      auth_api.AuthContext(..auth, google: Some(google.provider("gid", "gsec")))
+    })
+  let oauth_only = read(with_google)
+  assert string.contains(oauth_only, "\"google\":true")
+  assert string.contains(oauth_only, "\"github\":false")
+  assert string.contains(oauth_only, "\"magic_link\":false")
+  // Configured mail is offered beside it.
+  let mailing =
+    with_auth(with_google, fn(auth) {
+      auth_api.AuthContext(
+        ..auth,
+        mail: mailer.Smtp("smtp.test", 587, "u", "p", "cp@test"),
+      )
+    })
+  let both = read(mailing)
+  assert string.contains(both, "\"google\":true")
+  assert string.contains(both, "\"magic_link\":true")
 }
 
 pub fn unauthenticated_api_test() {

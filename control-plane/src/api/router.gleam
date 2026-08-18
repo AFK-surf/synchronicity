@@ -89,6 +89,9 @@ fn primary_routes(req: Request, auth: AuthContext) -> Response {
     ["auth", "magic", "redeem"], Get -> auth_api.magic_redeem(req, auth)
     ["api", "logout"], Post -> auth_api.logout(req, auth)
     ["api", "me"], Get -> auth_api.me(req, auth)
+    // Anonymous by necessity: the login screen asks it before a session
+    // exists, to draw only the methods this deployment has configured.
+    ["api", "auth", "methods"], Get -> auth_api.methods(auth)
 
     ["api", "orgs"], Post -> {
       use live <- with_session(req, auth)

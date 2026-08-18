@@ -139,6 +139,16 @@ pub fn for_org_slug(
   from_row(lookup)
 }
 
+/// Whether any org has SSO configured at all, which is all the login
+/// screen needs to decide whether to offer the org sign-in box. A
+/// boolean and no more: no slug is enumerable through it.
+pub fn any_configured(conn: Connection) -> Bool {
+  case sqlite.query(conn, "SELECT EXISTS(SELECT 1 FROM oidc_providers)", []) {
+    Ok([[VInt(1)]]) -> True
+    _ -> False
+  }
+}
+
 /// Loads a provider by its id (callback path).
 pub fn by_id(
   conn: Connection,

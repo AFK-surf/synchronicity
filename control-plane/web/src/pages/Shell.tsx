@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link, Outlet, useNavigate, useParams } from 'react-router'
-import { get, send, setCsrf, type Me } from '../lib/api'
+import { get, send, setCsrf, type AuthMethods, type Me } from '../lib/api'
 
 export function useMe() {
   return useQuery({
@@ -10,6 +10,16 @@ export function useMe() {
       setCsrf(me.csrf)
       return me
     },
+  })
+}
+
+// Configuration, not session state: it answers before anyone signs in,
+// and it cannot change while the page is open.
+export function useAuthMethods() {
+  return useQuery({
+    queryKey: ['auth-methods'],
+    queryFn: () => get<AuthMethods>('/api/auth/methods'),
+    staleTime: Infinity,
   })
 }
 

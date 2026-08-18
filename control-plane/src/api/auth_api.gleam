@@ -358,6 +358,33 @@ pub fn logout(req: Request, ctx: AuthContext) -> Response {
   })
 }
 
+/// Which sign-in methods this deployment can actually complete, so the
+/// login and settings screens offer only those. Answered without a
+/// session — the login page asks before anyone has one — and so it
+/// carries booleans and nothing else: no client ids, no org slugs,
+/// nothing that says who has an account here.
+pub fn methods(ctx: AuthContext) -> Response {
+  with_db(ctx, fn(conn) {
+    let google_on = option.is_some(ctx.google)
+    let github_on = option.is_some(ctx.github)
+    let oidc_on = oidc.any_configured(conn)
+    // Log-only mail takes the address and sends nothing, so it is not a
+    // method to offer beside working ones. Left alone on the page it is
+    // still the way in: the operator reads the link off the service log,
+    // which beats a login screen with nothing on it.
+    let magic_on =
+      mailer.delivers(ctx.mail) || !{ google_on || github_on || oidc_on }
+    json.object([
+      #("google", json.bool(google_on)),
+      #("github", json.bool(github_on)),
+      #("magic_link", json.bool(magic_on)),
+      #("oidc", json.bool(oidc_on)),
+    ])
+    |> json.to_string
+    |> wisp.json_response(200)
+  })
+}
+
 pub fn me(req: Request, ctx: AuthContext) -> Response {
   with_db(ctx, fn(conn) {
     use live <- middleware.require_session(req, conn)

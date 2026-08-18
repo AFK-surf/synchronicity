@@ -58,6 +58,16 @@ export interface Me {
   orgs: OrgRef[]
 }
 
+// Which sign-in methods this deployment has configured. The login and
+// settings screens offer only the ones that are true; the rest would
+// answer "provider not configured" if anyone reached them.
+export interface AuthMethods {
+  google: boolean
+  github: boolean
+  magic_link: boolean
+  oidc: boolean
+}
+
 export interface OrgRef {
   id: string
   slug: string

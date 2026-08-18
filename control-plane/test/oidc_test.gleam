@@ -1,9 +1,11 @@
 import auth/oauth
 import auth/oidc
+import fixtures.{fresh_conn}
 import gleam/bit_array
 import gleam/json
 import gleam/option.{None, Some}
 import gleam/string
+import store/sqlite
 
 fn discovery_doc(issuer: String) -> String {
   json.object([
@@ -114,4 +116,20 @@ pub fn identity_from_tokens_validates_and_distrusts_email_test() {
 
 fn json_b64(payload: String) -> String {
   bit_array.base64_url_encode(<<payload:utf8>>, False)
+}
+
+/// The login screen asks whether to draw the org sign-in box at all.
+pub fn any_configured_test() {
+  let conn = fresh_conn()
+  assert oidc.any_configured(conn) == False
+  let assert Ok(_) =
+    sqlite.script(
+      conn,
+      "INSERT INTO orgs VALUES ('o1', 'acme', 'Acme', 0);
+       INSERT INTO oidc_providers VALUES ('p1', 'o1', 'https://id.example.com',
+         'client-1', 'secret', 'https://id.example.com/authorize',
+         'https://id.example.com/token', NULL, 0);",
+    )
+  assert oidc.any_configured(conn) == True
+  sqlite.close(conn)
 }
