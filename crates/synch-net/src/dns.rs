@@ -389,13 +389,15 @@ pub enum CpRecordError {
     /// The record had no `url=` field.
     #[error("record has no url= field")]
     MissingUrl,
-    /// The `url=` field was not an `https://` origin.
+    /// The `url=` field was not an `https://` or `http://` origin.
     ///
-    /// Plaintext is refused rather than downgraded: the record is a redirect
-    /// target for a connection that carries a device-key proof, so the
-    /// transport under it is not negotiable. `SYNCH_CLOUD_URL` is where a test
-    /// deployment says otherwise, deliberately outside the zone.
-    #[error("url= must be an https:// endpoint: {0}")]
+    /// A shape refusal, not a transport policy: what makes the redirect target
+    /// safe to follow is the zone-key gate above it, not the scheme — the value
+    /// is one the logged, DNSSEC-validated zone chose to publish. `https://` is
+    /// what a zone reachable from the open internet should publish, since the
+    /// attach connection carries a device-key proof; `http://` is for endpoints
+    /// whose transport is guarded another way, like a loopback testnet.
+    #[error("url= must be an https:// or http:// endpoint: {0}")]
     BadUrl(String),
     /// A field appeared more than once.
     #[error("duplicate field {0}=")]
@@ -427,7 +429,10 @@ pub fn parse_control_plane_record(text: &str) -> Result<ControlPlaneRecord, CpRe
     }
     let url = url.ok_or(CpRecordError::MissingUrl)?;
     let trimmed = url.trim_end_matches('/');
-    if !trimmed.starts_with("https://") || trimmed.len() <= "https://".len() {
+    let has_origin = ["https://", "http://"]
+        .iter()
+        .any(|scheme| trimmed.starts_with(scheme) && trimmed.len() > scheme.len());
+    if !has_origin {
         return Err(CpRecordError::BadUrl(url));
     }
     Ok(ControlPlaneRecord {
@@ -1080,11 +1085,12 @@ impl DnssecResolver {
         // the proof set applies the same rule: a control plane mid-upgrade can
         // leave an old-format record beside a current one.
         //
-        // `url=` is checked only for an `https://` origin (see
-        // `parse_control_plane_record`) and is otherwise an opaque redirect
-        // target. That is acceptable *because* the zone key that published it is
-        // gated above: a value this record carries is one the logged zone key
-        // chose to publish, and WebPKI TLS on the WSS connection sits on top.
+        // `url=` is checked only for shape — an `https://` or `http://` origin
+        // (see `parse_control_plane_record`) — and is otherwise an opaque
+        // redirect target. That is acceptable *because* the zone key that
+        // published it is gated above: a value this record carries is one the
+        // logged zone key chose to publish, and on an `https://` endpoint
+        // WebPKI TLS on the WSS connection sits on top of that.
         let mut refusal = None;
         for record in &validated.records {
             match parse_control_plane_record(record) {
@@ -2678,9 +2684,17 @@ mod tests {
             parse_control_plane_record("v=synccp1 url=a url=b").unwrap_err(),
             CpRecordError::Duplicate("url")
         );
-        // The record redirects a connection carrying a device-key proof, so
-        // plaintext is a refusal rather than a downgrade.
-        for bad in ["http://sync.example", "https://", "sync.example"] {
+        // A plaintext endpoint is accepted: what guards the redirect target is
+        // the zone-key gate, not the scheme (see `parse_control_plane_record`).
+        assert_eq!(
+            parse_control_plane_record("v=synccp1 url=http://127.0.0.1:8510").unwrap(),
+            ControlPlaneRecord {
+                url: "http://127.0.0.1:8510".into()
+            }
+        );
+        // What is refused is anything that is not an origin: a bare scheme or
+        // a schemeless host.
+        for bad in ["https://", "http://", "sync.example"] {
             assert!(
                 matches!(
                     parse_control_plane_record(&format!("v=synccp1 url={bad}")),
