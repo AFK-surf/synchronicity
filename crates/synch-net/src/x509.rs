@@ -127,11 +127,7 @@ impl Certificate {
             // without touching them. Same rule as the trailing bytes after the
             // certificate, applied at every level rather than only the outer
             // one.
-            let mut wrapper = Der::new(bytes);
-            let mut list = wrapper.sequence("Extensions")?;
-            if !wrapper.is_empty() {
-                return Err(X509Error::new("bytes after the Extensions sequence"));
-            }
+            let mut list = Der::new(bytes).only_sequence("the Extensions sequence")?;
             while !list.is_empty() {
                 let mut ext = list.sequence("Extension")?;
                 let oid = ext.tagged(0x06, "extnID")?.to_vec();
@@ -143,9 +139,7 @@ impl Certificate {
                     None => false,
                 };
                 let value = ext.tagged(0x04, "extnValue")?.to_vec();
-                if !ext.is_empty() {
-                    return Err(X509Error::new("bytes after an extension's extnValue"));
-                }
+                ext.finish("an extension's extnValue")?;
                 extensions.push(Extension {
                     oid,
                     critical,
@@ -275,11 +269,7 @@ fn parse_san(value: &[u8]) -> Result<Vec<String>, X509Error> {
     // One GeneralNames sequence, with nothing after it — see the same rule in
     // `Certificate::parse`: a second sequence here is a second set of names
     // this parser would never see.
-    let mut wrapper = Der::new(value);
-    let mut list = wrapper.sequence("GeneralNames")?;
-    if !wrapper.is_empty() {
-        return Err(X509Error::new("bytes after the subjectAltName sequence"));
-    }
+    let mut list = Der::new(value).only_sequence("the subjectAltName sequence")?;
     while !list.is_empty() {
         let (tag, body) = list.next("GeneralName")?;
         if tag == 0x82 {
@@ -631,6 +621,34 @@ impl<'a> Der<'a> {
     /// A reader over the next element's contents, which must be a SEQUENCE.
     pub fn sequence(&mut self, what: &str) -> Result<Der<'a>, X509Error> {
         Ok(Der::new(self.tagged(0x30, what)?))
+    }
+
+    /// The SEQUENCE this reader holds, and **nothing after it**.
+    ///
+    /// For a wrapper defined to contain exactly one member: the `[3]` around
+    /// `Extensions`, the OCTET STRING around `GeneralNames`. Reading the first
+    /// element and dropping whatever follows is how a second copy — a second
+    /// SAN, a second chain extension — sits inside a Merkle leaf where this
+    /// parser cannot see it, defeating the exactly-one rules without touching
+    /// them. Go's `crypto/x509` has the same laxity and will log such a
+    /// certificate; OpenSSL refuses it outright. So readers disagree about
+    /// those bytes, and this one refuses them.
+    ///
+    /// A combinator rather than an `is_empty()` at each call site, because the
+    /// sites are what get forgotten: the rule belongs to the shape, and the
+    /// next wrapper somebody adds gets it without knowing to ask.
+    pub fn only_sequence(mut self, what: &str) -> Result<Der<'a>, X509Error> {
+        let inner = self.sequence(what)?;
+        self.finish(what)?;
+        Ok(inner)
+    }
+
+    /// Asserts this reader is exhausted — every member accounted for.
+    pub fn finish(&self, what: &str) -> Result<(), X509Error> {
+        match self.is_empty() {
+            true => Ok(()),
+            false => Err(X509Error::new(format!("bytes after {what}"))),
+        }
     }
 
     /// The next SEQUENCE including its own header — for members carried
