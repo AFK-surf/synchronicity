@@ -683,10 +683,23 @@ impl Store {
             // business creating a payload file the size of an object this node
             // holds nothing of — that file is the business of whatever first
             // puts a byte in it.
+            //
+            // And only as far as this proof's own nodes reach, not as far as
+            // the claimed length's tree would: `size` came off a trie entry and
+            // nothing has verified it, so growing to `tree.outboard_size()`
+            // turned a 32 TiB claim into a 128 GiB file that nothing reclaims.
+            // The nodes below are the whole of what is about to be written.
+            let reach = proof
+                .nodes
+                .iter()
+                .filter_map(|(node, _)| tree.pre_order_offset(*node))
+                .map(|offset| (offset + 1) * PROOF_NODE_LEN as u64)
+                .max()
+                .unwrap_or(0);
             let mut outboard = PreOrderOutboard {
                 root: blake3::Hash::from_bytes(root.0),
                 tree,
-                data: DataFile(self.open_sparse_outboard(root, tree)?),
+                data: DataFile(self.open_sparse_outboard(root, reach)?),
             };
             for (node, pair) in &proof.nodes {
                 let left = blake3::Hash::from_bytes(pair[..32].try_into().expect("32 of 64"));
@@ -923,8 +936,13 @@ impl Store {
             }
             let sink = match &mut sink {
                 Some(sink) => sink,
-                slot => slot.insert(self.open_sink(root, size, tree)?),
+                slot => slot.insert(self.open_sink(root, tree)?),
             };
+            // Grown to the end of the run about to land in it, exactly as
+            // `write_slice` grows to the end of the window it is about to
+            // verify — never to the claimed size, which no proof has
+            // established.
+            crate::cas::grow_to(&sink.payload.0, end_byte)?;
             if let Err(e) = copy_run(&donor.payload, &mut sink.payload, start_byte, end_byte) {
                 tracing::debug!(donor = %donor.root, error = %e, "donor payload not copied");
                 continue;
@@ -996,10 +1014,26 @@ impl Store {
     /// Opens (creating if need be) the sparse payload and outboard of an object
     /// this node is accumulating.
     ///
-    /// `size` is still a claim here, so the files are only ever grown to fit it
-    /// ([`Store::trim_to_size`] is the one place either is made smaller, after a
-    /// commit that settled the length).
-    fn open_sink(&self, root: &Hash, size: u64, tree: BaoTree) -> Result<Sink> {
+    /// Neither file is sized to the object here, because at this point the
+    /// object's length is a peer's claim off a trie entry and nothing has
+    /// verified it: `walk_proof` verifies the tree's *shape*, never its length,
+    /// and `settle_size` has no row to argue with the first time a root is met.
+    /// A `size` of 32 TiB therefore used to buy a 32 TiB sparse payload and a
+    /// 128 GiB sparse outboard from every node that attempted the fetch, with
+    /// nothing to reclaim them: `trim_to_size` runs only on a commit that
+    /// completes an object, `gc_orphans` skips roots that have a row, and
+    /// `gc_content` skips referenced roots — the attacker's own entry being the
+    /// reference. `write_slice` has refused to do this since the same attack was
+    /// closed there (`crate::cas`, `docs/DELTA-SYNC.md` §6); the delta path was
+    /// written later and did not inherit the rule.
+    ///
+    /// Each run grows the payload to its own end before it is copied, and
+    /// `PreOrderOutboard::save` extends the outboard as it writes — which is
+    /// why `write_slice` does not grow the outboard at all. So a real object
+    /// still fills out normally, one verified run at a time.
+    /// ([`Store::trim_to_size`] is the one place either is made smaller, after
+    /// a commit that settled the length.)
+    fn open_sink(&self, root: &Hash, tree: BaoTree) -> Result<Sink> {
         let payload_path = self.blob_path(root);
         if let Some(parent) = payload_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1010,20 +1044,25 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&payload_path)?;
-        crate::cas::grow_to(&payload, size)?;
         Ok(Sink {
             payload: DataFile(payload),
             outboard: PreOrderOutboard {
                 root: blake3::Hash::from_bytes(root.0),
                 tree,
-                data: DataFile(self.open_sparse_outboard(root, tree)?),
+                data: DataFile(self.open_sparse_outboard(root, 0)?),
             },
         })
     }
 
     /// Opens (creating if need be) just the sparse outboard, for a proof that
     /// has a tree to record and no bytes to put under it.
-    fn open_sparse_outboard(&self, root: &Hash, tree: BaoTree) -> Result<File> {
+    ///
+    /// `reach` is the first byte past the last node this operation will write,
+    /// which is the only length the file may be grown to on the strength of an
+    /// unverified size — the outboard's `window_end_bytes`. The tree's full
+    /// `outboard_size()` is a function of the claimed length, so growing to it
+    /// hands a peer's assertion straight to `set_len`.
+    fn open_sparse_outboard(&self, root: &Hash, reach: u64) -> Result<File> {
         let path = self.outboard_path(root);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1034,7 +1073,7 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        crate::cas::grow_to(&outboard, tree.outboard_size())?;
+        crate::cas::grow_to(&outboard, reach)?;
         Ok(outboard)
     }
 }
@@ -1359,6 +1398,83 @@ mod tests {
         // The appended spans lie past the donor's end, so it cannot speak to
         // them at all rather than answering wrongly.
         assert_eq!(donor_cvs[4], None);
+    }
+
+    /// Neither delta-sync file is grown to a length no proof established.
+    ///
+    /// `size` reaches these paths off a trie entry, and nothing has verified it:
+    /// `walk_proof` verifies the tree's shape, not its length, and `settle_size`
+    /// has no row to argue with the first time a root is met. So an entry
+    /// claiming 32 TiB for any root used to buy a 128 GiB sparse outboard from
+    /// `write_proof` and a 32 TiB sparse payload from `promote` on every node
+    /// that tried — and nothing reclaims either: `trim_to_size` runs only on a
+    /// commit that completes an object, `gc_orphans` skips roots with a row, and
+    /// `gc_content` skips referenced roots, the attacker's own entry being the
+    /// reference. `write_slice` has refused this since the same attack was
+    /// closed there; both files are now bounded the same way, by what the
+    /// operation in hand actually reaches.
+    #[test]
+    fn a_size_claim_cannot_grow_the_delta_sync_files_past_what_is_written() {
+        let (_d1, provider) = store();
+        let (_d2, victim) = store();
+
+        // A proof of one group says nothing about the rest of the tree, so the
+        // outboard it writes is a handful of pairs — not the whole tree of an
+        // object this node holds nothing of.
+        let bytes = data(1024 * GROUP);
+        let size = bytes.len() as u64;
+        let root = provider.ingest_bytes(&bytes, 0).unwrap();
+        let one = ChunkRanges::single(0, 1);
+        let (encoded, served) = provider
+            .encode_proof(&root, &one, 0, MAX_PROOF_NODES)
+            .unwrap();
+        victim
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        let written = std::fs::metadata(victim.outboard_path(&root))
+            .unwrap()
+            .len();
+        let whole_tree = Store::tree(size).outboard_size();
+        assert_eq!(
+            written,
+            (encoded.len() / PROOF_NODE_LEN) as u64 * PROOF_NODE_LEN as u64,
+            "the outboard is exactly the nodes this proof carried"
+        );
+        assert!(
+            written < whole_tree / 4,
+            "and nothing like the tree of the claimed length: {written} vs {whole_tree}"
+        );
+
+        // A promotion writes the runs it matched and no more, so the payload
+        // ends where the last promoted byte does rather than at the claimed
+        // length.
+        let old = data(16 * GROUP);
+        let mut new = old.clone();
+        // Only the last group differs, so every group under it is promoted and
+        // the tail is left for the network.
+        new[15 * GROUP + 7] ^= 0xff;
+        let old_root = victim.ingest_bytes(&old, 0).unwrap();
+        let new_root = provider.ingest_bytes(&new, 0).unwrap();
+        let new_size = new.len() as u64;
+        let all = ChunkRanges::single(0, group_count(new_size));
+        let (encoded, served) = provider
+            .encode_proof(&new_root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
+        let proven = victim
+            .write_proof(&new_root, new_size, &served, 0, &encoded, 0)
+            .unwrap();
+        let promoted = victim.promote(&Donor(old_root), &proven, 0).unwrap();
+        assert_eq!(promoted, ChunkRanges::single(0, 15));
+
+        let reach = promoted.ranges.last().unwrap().end * CHUNK_GROUP_SIZE;
+        assert_eq!(
+            std::fs::metadata(victim.blob_path(&new_root))
+                .unwrap()
+                .len(),
+            reach,
+            "the payload reaches the last promoted byte, not the claimed size"
+        );
+        assert!(reach < new_size);
     }
 
     /// The whole flow at store level: prove, compare, promote, and fetch only

@@ -870,7 +870,28 @@ impl Node {
     /// Hints are unverified: they are fed back through the ordinary ranking so
     /// a wrong one costs a dial and nothing else, and every byte is still
     /// checked against the object root.
+    ///
+    /// Two things bound what one unresolvable root can cost. The walk stops at
+    /// the first peer that names a provider, rather than asking everybody for
+    /// hints it already has; and a root that nobody could name is remembered as
+    /// a miss and left alone for a while (§6.3). Without either, a root nobody
+    /// holds — an origin publishing `f:` records whose content hashes name
+    /// nothing — is re-planned by every mirror pass and re-dials every peer in
+    /// the cluster on each one, sequentially, so the victim's mirror can be
+    /// made never to finish a pass and never to do the work it exists for.
+    /// The miss expires, so a root that is published later is still picked up,
+    /// and a root a local ad covers never reaches this at all.
     async fn ask_peers_for_providers(&self, root: &Hash, size: u64) -> Result<Vec<Provider>> {
+        if self.provider_discovery_backed_off(root, now_ns()) {
+            tracing::debug!(root = %root, "provider discovery backed off; not dialling");
+            let known = self.providers_for(root, 0, size.max(1))?;
+            if !known.is_empty() {
+                // An ad reached this node some other way — head replication, or
+                // another fetch's hints — so the miss is stale.
+                self.clear_provider_miss(root);
+            }
+            return Ok(known);
+        }
         let mut learned = 0;
         for peer in self.dialable_peers()? {
             let addr = self
@@ -916,11 +937,22 @@ impl Node {
                 Ok(stored)
             })
             .await?;
+            // One peer that knows a holder is the answer; the rest of the
+            // cluster has nothing to add that this fetch needs.
+            if learned > 0 {
+                break;
+            }
         }
         if learned > 0 {
             tracing::debug!(hints = learned, "learned providers from peers");
         }
-        self.providers_for(root, 0, size.max(1))
+        let found = self.providers_for(root, 0, size.max(1))?;
+        if found.is_empty() {
+            self.note_provider_miss(root, now_ns());
+        } else {
+            self.clear_provider_miss(root);
+        }
+        Ok(found)
     }
 
     async fn fetch_from(
@@ -1229,6 +1261,188 @@ mod tests {
             })
             .unwrap();
         (origin, key)
+    }
+
+    /// A peer that answers `FindProviders` with a canned answer per root, and
+    /// counts what it was asked.
+    struct CountingPeer {
+        origin: OriginId,
+        key: synch_core::NodeId,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        endpoint: iroh::Endpoint,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl CountingPeer {
+        /// Binds one that answers `known` with an ad for `holder` and every
+        /// other root with nothing.
+        async fn bind(name: &str, known: Hash, holder: OriginId) -> CountingPeer {
+            let secret = iroh_base::SecretKey::generate();
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                .secret_key(secret.clone())
+                .relay_mode(iroh::endpoint::RelayMode::Disabled)
+                .clear_address_lookup()
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+                .unwrap()
+                .alpns(vec![synch_core::ALPN_MPT.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let serving = endpoint.clone();
+            let counter = hits.clone();
+            let task = tokio::spawn(async move {
+                while let Some(incoming) = serving.accept().await {
+                    let Ok(connection) = incoming.await else {
+                        continue;
+                    };
+                    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                        let Ok(request) =
+                            synch_net::frame::read_frame::<synch_core::MptMessage>(&mut recv).await
+                        else {
+                            break;
+                        };
+                        let synch_core::MptMessage::FindProviders { object_root } = request else {
+                            break;
+                        };
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let ads = if object_root == known {
+                            vec![(holder.clone(), BlobAd::complete(1000))]
+                        } else {
+                            Vec::new()
+                        };
+                        let _ = synch_net::frame::write_frame(
+                            &mut send,
+                            &synch_core::MptMessage::Providers { ads },
+                        )
+                        .await;
+                        let _ = send.finish();
+                    }
+                }
+            });
+            CountingPeer {
+                origin: OriginId::named(name, "x.example").unwrap(),
+                key: secret.public(),
+                hits,
+                endpoint,
+                task,
+            }
+        }
+
+        fn asked(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Makes the node trust this peer and know where to reach it.
+        fn known_to(&self, node: &Node) {
+            node.store()
+                .put_binding(&Binding {
+                    origin: self.origin.clone(),
+                    node_id: self.key,
+                    source: BindingSource::Static,
+                    domain: None,
+                    note: None,
+                    added_at: 0,
+                    expires_at: None,
+                })
+                .unwrap();
+            let addr = iroh::EndpointAddr::from_parts(
+                self.endpoint.id(),
+                self.endpoint
+                    .bound_sockets()
+                    .into_iter()
+                    .map(iroh::TransportAddr::Ip),
+            );
+            node.store()
+                .record_peer_seen(&self.key, Some(&crate::node::encode_addr(&addr)), now_ns())
+                .unwrap();
+        }
+
+        async fn shutdown(self) {
+            self.task.abort();
+            self.endpoint.close().await;
+        }
+    }
+
+    /// Provider discovery stops at the first answer and backs off after a
+    /// fruitless round.
+    ///
+    /// Discovery is entered whenever no local ad covers a root, and it used to
+    /// walk *every* dialable peer with no early exit and remember nothing. A
+    /// content root nobody holds — an origin publishing `f:` records whose
+    /// content hashes name nothing — was therefore re-planned by every mirror
+    /// pass and re-dialled the whole cluster on each one, so the victim's
+    /// mirror could be kept from ever completing a pass. `trust rm` does not
+    /// help: what has been published is retained for `root_retention` (§6.3).
+    #[tokio::test]
+    async fn provider_discovery_stops_early_and_then_backs_off() {
+        let (_d, node) = node().await;
+        let held = Hash::new(b"an object somebody holds");
+        let unheld = Hash::new(b"an object nobody holds");
+        let (holder, _) = trust(&node, "holder");
+        let first = CountingPeer::bind("peer-a", held, holder.clone()).await;
+        let second = CountingPeer::bind("peer-b", held, holder.clone()).await;
+        first.known_to(&node);
+        second.known_to(&node);
+
+        // One peer names a holder, so the rest of the cluster is not asked.
+        let found = node.ask_peers_for_providers(&held, 1000).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].origin, holder);
+        assert_eq!(
+            first.asked() + second.asked(),
+            1,
+            "the walk stops at the first peer that answers"
+        );
+        assert!(!node.provider_discovery_backed_off(&held, now_ns()));
+
+        // A root nobody can name costs one round of the cluster, once.
+        let before = first.asked() + second.asked();
+        assert!(node
+            .ask_peers_for_providers(&unheld, 1000)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            first.asked() + second.asked() - before,
+            2,
+            "every peer is asked when none of them knows"
+        );
+        assert!(node.provider_discovery_backed_off(&unheld, now_ns()));
+
+        let after = first.asked() + second.asked();
+        for _ in 0..5 {
+            assert!(node
+                .ask_peers_for_providers(&unheld, 1000)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(
+            first.asked() + second.asked(),
+            after,
+            "and asking again dials nobody while the miss is warm"
+        );
+
+        // The miss is a delay, not a verdict: it lets go on its own, and a
+        // root that turns out to be held clears it outright.
+        let past_it = now_ns() + 2 * crate::node::PROVIDER_MISS_MAX_BACKOFF.as_nanos() as i64;
+        assert!(!node.provider_discovery_backed_off(&unheld, past_it));
+        node.store()
+            .put_provider(&unheld, &holder, &BlobAd::complete(1000))
+            .unwrap();
+        assert_eq!(
+            node.ask_peers_for_providers(&unheld, 1000)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!node.provider_discovery_backed_off(&unheld, now_ns()));
+
+        first.shutdown().await;
+        second.shutdown().await;
     }
 
     #[tokio::test]

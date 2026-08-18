@@ -21,7 +21,7 @@ pub use path::{normalize_native_path, normalize_path, PathError, MAX_KEY_LEN};
 pub use record::{
     blob_key, blob_prefix, dir_prefix, file_key, manifest_key, parse_blob_key, parse_file_key,
     space_prefix, validate_space, AdState, BlobAd, ChunkFormat, ChunkParams, EntryKind, FileEntry,
-    KeyError, NodeManifest, SpaceInfo, AD_SPAN_GRANULARITY, RECORD_VERSION,
+    KeyError, NodeManifest, SpaceInfo, AD_SPAN_GRANULARITY, MAX_AD_SPANS, RECORD_VERSION,
 };
 pub use wire::{
     proof_nodes_upper_bound, BlobMessage, ChunkRanges, GroupRange, MptMessage, ALPN_BLOB, ALPN_MPT,

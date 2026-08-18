@@ -18,6 +18,15 @@ use crate::{
 
 /// Directory under the data dir holding blob payloads and outboards (§6.2).
 pub const CAS_DIR: &str = "store";
+/// Directory under the CAS root holding half-written ingests (§7.1).
+///
+/// Its own directory, not the CAS root beside the shards. A staging file in the
+/// root is a *regular file* where the orphan sweep expects a shard directory,
+/// which made `read_dir` on it fail with `NotADirectory` and killed the sweep
+/// permanently — and only that sweep could have removed the file. Under a name
+/// of its own the sweep has one rule about one place, and the CAS root holds
+/// nothing but directories by construction.
+pub const STAGING_DIR: &str = "incoming";
 /// The database file name (§10).
 pub const DB_FILE: &str = "synchronicity.db";
 
@@ -185,6 +194,12 @@ impl Store {
     /// The CAS root directory.
     pub fn cas_dir(&self) -> PathBuf {
         self.data_dir.join(CAS_DIR)
+    }
+
+    /// The directory ingests stream into before renaming onto a content
+    /// address (§7.1).
+    pub fn staging_dir(&self) -> PathBuf {
+        self.cas_dir().join(STAGING_DIR)
     }
 
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {

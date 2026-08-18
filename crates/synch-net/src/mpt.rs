@@ -275,8 +275,18 @@ impl MptProtocol {
                 // Hints are unverified — content is hash-verified regardless,
                 // so a wrong hint only wastes a dial (§5.1) — and bounded, so
                 // one small request cannot buy the asker an unbounded table of
-                // rows to write.
-                let mut ads = self.store().providers(&object_root)?;
+                // rows to write. The bound is applied by the query and by the
+                // decode of each row's spans, not by the `truncate` below: a
+                // cap after the work is not a cap on the work (§12).
+                //
+                // On the blocking pool with every other database read. This
+                // and `GetBindings` were the two handlers left running SQLite
+                // on a runtime worker, and this one takes the single global
+                // connection mutex to do it, so its cost was borne by every
+                // other connection and timer in the process.
+                let store = self.store().clone();
+                let mut ads =
+                    crate::blocking::offload(move || Ok(store.providers(&object_root)?)).await?;
                 ads.truncate(MAX_PROVIDER_ADS);
                 write_frame(send, &MptMessage::Providers { ads }).await?;
                 Ok(())
@@ -286,7 +296,11 @@ impl MptProtocol {
                 // lapsed binding is exactly what the asker wants to know is
                 // gone (§3.4). Informational within the trusted cluster: the
                 // caller is already an authorized member (§3.2, §12).
-                let keys = self.store().keys_for_origin(&origin, now_ns())?;
+                let store = self.store().clone();
+                let asked = origin.clone();
+                let keys =
+                    crate::blocking::offload(move || Ok(store.keys_for_origin(&asked, now_ns())?))
+                        .await?;
                 write_frame(send, &MptMessage::BindingsFor { origin, keys }).await?;
                 Ok(())
             }
@@ -762,6 +776,81 @@ mod tests {
         dialer.close().await;
         peer.shutdown().await;
         honest.shutdown().await;
+    }
+
+    /// The provider handler does not run SQLite on a runtime worker.
+    ///
+    /// `FindProviders` and `GetBindings` were the two handlers left running the
+    /// store inline, and this one takes the single global connection mutex and
+    /// decodes every row's spans under it. On a busy store that is an unbounded
+    /// wait on a worker that also drives every other connection, timer and
+    /// control request in the process (§10, §12).
+    ///
+    /// Measured by the runtime's own clock. The stream is opened *before* the
+    /// store is made busy, so the per-stream binding check — a single bounded
+    /// row read, and inline by design — is already behind us when the request
+    /// body lands. What is left on the worker is the handler, and a handler that
+    /// blocks it cannot poll the deadline below until the store comes free.
+    #[tokio::test]
+    async fn find_providers_never_blocks_the_runtime_on_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let root = Hash::new(b"an object someone advertises");
+        store
+            .put_provider(
+                &root,
+                &OriginId::named("holder", "x.example").unwrap(),
+                &BlobAd::complete(1000),
+            )
+            .unwrap();
+        let (server, client, _client_dir) =
+            trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
+        let mpt = client.connect_mpt(server.direct_addr()).await.unwrap();
+
+        // The header of a `FindProviders`, and nothing else yet: the server has
+        // accepted the stream, checked the binding, and is waiting on the body.
+        let body = postcard::to_stdvec(&MptMessage::FindProviders { object_root: root }).unwrap();
+        let (mut send, mut recv) = mpt.connection().open_bi().await.unwrap();
+        send.write_all(&(body.len() as u32).to_le_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Now a writer takes the one connection, as a publish or a GC pass does.
+        const HELD: std::time::Duration = std::time::Duration::from_millis(2_000);
+        const PATIENCE: std::time::Duration = std::time::Duration::from_millis(400);
+        let busy = store.clone();
+        let holding = std::thread::spawn(move || {
+            busy.transaction(|_txn| -> Result<(), synch_store::StoreError> {
+                std::thread::sleep(HELD);
+                Ok(())
+            })
+            .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        send.write_all(&body).await.unwrap();
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(PATIENCE, crate::frame::read_bytes(&mut recv)).await;
+        assert!(
+            answer.is_err(),
+            "the answer waits on the store, which is busy"
+        );
+        assert!(
+            started.elapsed() < HELD / 2,
+            "the runtime kept its own timers running: {:?}",
+            started.elapsed()
+        );
+
+        holding.join().unwrap();
+        // And once the store is free the answer comes back.
+        let ads = tokio::time::timeout(HELD, mpt.find_providers(root))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ads.len(), 1);
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
     }
 
     /// One origin the serve side cannot apply does not end the exchange.

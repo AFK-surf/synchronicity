@@ -53,6 +53,18 @@ struct NodeInner {
     /// The batch between staging and one signed root (§7.1).
     publisher: Publisher,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
+    /// Content roots that provider discovery has failed to resolve, and when
+    /// each may be asked about again (§6.3).
+    ///
+    /// Discovery walks every dialable peer, and it is entered whenever no local
+    /// ad covers a root — so a root nobody holds is re-planned by every mirror
+    /// pass and re-dials the whole cluster, forever. An origin publishing `f:`
+    /// records whose content hashes name nothing therefore starves the victim's
+    /// mirror of the passes that would have done real work, and `trust rm` does
+    /// not clear it because what has already been published is retained for
+    /// `root_retention`. The entries expire, so a root that later becomes
+    /// available is picked up.
+    provider_misses: std::sync::Mutex<std::collections::HashMap<Hash, ProviderMiss>>,
     /// What the running mirror passes believe about the file at each target
     /// path, and the stat that belief is anchored to — so a quiet pass can
     /// skip re-hashing every file it has already written or read
@@ -121,6 +133,33 @@ impl MirrorWrite {
         })
     }
 }
+
+/// A content root discovery could not resolve, and how long to leave it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderMiss {
+    /// When this root may be asked about again, in unix nanoseconds.
+    pub(crate) until: i64,
+    /// How many discovery rounds have come back with nothing, which is what
+    /// the backoff doubles on.
+    pub(crate) misses: u32,
+}
+
+/// How long a root nobody could name a provider for is left alone before the
+/// next attempt, doubling per failure up to [`PROVIDER_MISS_MAX_BACKOFF`].
+pub(crate) const PROVIDER_MISS_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The ceiling on that backoff. Bounded rather than permanent: a root nobody
+/// holds today may be published tomorrow, and a negative cache that never
+/// lets go is a worse fault than the polling it replaced.
+pub(crate) const PROVIDER_MISS_MAX_BACKOFF: std::time::Duration =
+    std::time::Duration::from_secs(3600);
+
+/// How many roots the negative cache remembers.
+///
+/// It is fed by what other origins publish, so it needs a bound of its own; the
+/// entry nearest to expiring is the one dropped, since it is the one whose
+/// suppression is worth least.
+pub(crate) const MAX_PROVIDER_MISSES: usize = 4096;
 
 /// What `init` created.
 #[derive(Debug, Clone)]
@@ -282,6 +321,7 @@ impl Node {
                 config,
                 publisher,
                 ad_clock: std::sync::Mutex::new(Default::default()),
+                provider_misses: std::sync::Mutex::new(Default::default()),
                 mirror_writes: std::sync::Mutex::new(Default::default()),
                 dns: std::sync::Mutex::new(Default::default()),
                 dns_resolver: std::sync::Mutex::new(Default::default()),
@@ -837,6 +877,57 @@ impl Node {
             }
             Some(_) => Ok(false),
         }
+    }
+
+    /// True if provider discovery for this root is still backed off (§6.3).
+    ///
+    /// Asked before dialling anybody. Callers reach discovery only when no
+    /// local ad covers the root, so a root that becomes available through
+    /// ordinary head replication is fetched without ever consulting this.
+    pub(crate) fn provider_discovery_backed_off(&self, root: &Hash, now: i64) -> bool {
+        self.provider_misses()
+            .get(root)
+            .is_some_and(|miss| now < miss.until)
+    }
+
+    /// Records that discovery found nobody for this root, doubling the wait.
+    pub(crate) fn note_provider_miss(&self, root: &Hash, now: i64) {
+        let mut misses = self.provider_misses();
+        let previous = misses.get(root).map(|m| m.misses).unwrap_or(0);
+        let backoff = PROVIDER_MISS_BACKOFF
+            .saturating_mul(1u32 << previous.min(16))
+            .min(PROVIDER_MISS_MAX_BACKOFF);
+        let entry = ProviderMiss {
+            until: now.saturating_add(backoff.as_nanos() as i64),
+            misses: previous.saturating_add(1),
+        };
+        if misses.len() >= MAX_PROVIDER_MISSES && !misses.contains_key(root) {
+            misses.retain(|_, miss| now < miss.until);
+            if misses.len() >= MAX_PROVIDER_MISSES {
+                if let Some(soonest) = misses
+                    .iter()
+                    .min_by_key(|(_, miss)| miss.until)
+                    .map(|(root, _)| *root)
+                {
+                    misses.remove(&soonest);
+                }
+            }
+        }
+        misses.insert(*root, entry);
+    }
+
+    /// Forgets a miss, because somebody turned out to hold the root after all.
+    pub(crate) fn clear_provider_miss(&self, root: &Hash) {
+        self.provider_misses().remove(root);
+    }
+
+    fn provider_misses(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<Hash, ProviderMiss>> {
+        self.inner
+            .provider_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The published `b:` ad we currently advertise for an object.

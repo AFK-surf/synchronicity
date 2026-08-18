@@ -17,7 +17,7 @@ pub mod views;
 pub use bindings::{Binding, BindingSource};
 pub use cas::{BlobRow, BLOCK_SIZE};
 pub use clock::ClockStatus;
-pub use db::{DeviceKey, KeyState, Store, Txn, CAS_DIR, DB_FILE};
+pub use db::{DeviceKey, KeyState, Store, Txn, CAS_DIR, DB_FILE, STAGING_DIR};
 pub use error::{Result, StoreError};
 pub use gc::{GcStats, TrieStats};
 pub use heads::{Equivocation, Slot, StoredHead};

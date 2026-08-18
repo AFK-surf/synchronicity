@@ -134,14 +134,94 @@ impl FileEntry {
 /// `blob_providers` table as a `complete` column beside the spans. Completeness
 /// is a question you ask of the spans and the size, not a second thing to keep
 /// in step with them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdState {
     /// Held `[start, end)` byte spans.
     pub spans: Vec<(u64, u64)>,
 }
 
+/// The most spans one advertisement may carry, on the wire or in memory.
+///
+/// A `b:` record is a trie value, bounded only by `MAX_FRAME_LEN` (16 MiB), and
+/// a span is sixteen bytes — so an origin can publish one record naming a
+/// million spans, and every peer that materializes it, and every peer that
+/// answers `FindProviders` for it, decodes the lot. §12 promises to cap the
+/// cost of any single extreme message; without this the cap was applied after
+/// the decode, which is after the allocation it was meant to bound.
+///
+/// Generous next to anything honest: spans are 16 MiB-granular runs of held
+/// bytes, a fetch walks windows in order, and `coalesce_spans` merges what
+/// touches, so a real partial holder publishes a handful. What is over the cap
+/// is dropped rather than merged across the gaps between runs, because merging
+/// would claim bytes the holder does not have — over-reporting availability
+/// sends a fetcher to a provider that cannot serve it, while under-reporting
+/// costs at most a re-fetch (§6.3).
+pub const MAX_AD_SPANS: usize = 1024;
+
 /// Granularity at which partial spans are coalesced before publishing (§4.2).
 pub const AD_SPAN_GRANULARITY: u64 = 16 * 1024 * 1024;
+
+/// Decodes the span list under the [`MAX_AD_SPANS`] cap.
+///
+/// The cap is applied *during* the decode, not after it: the point is that the
+/// unbounded vector never exists, and a `Vec<(u64, u64)>` that has already been
+/// deserialized has already cost what it was supposed to be denied. Spans past
+/// the cap are read and dropped, so the rest of the record still decodes.
+impl<'de> Deserialize<'de> for AdState {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// The struct shape [`AdState`] serializes as, with the field bounded.
+        /// Written out rather than hand-decoding a sequence so a
+        /// self-describing format still sees a struct with a `spans` field.
+        #[derive(Deserialize)]
+        struct Wire {
+            spans: BoundedSpans,
+        }
+        Wire::deserialize(deserializer).map(|wire| AdState {
+            spans: wire.spans.spans,
+        })
+    }
+}
+
+/// A span list that stops collecting at [`MAX_AD_SPANS`].
+struct BoundedSpans {
+    spans: Vec<(u64, u64)>,
+}
+
+impl<'de> Deserialize<'de> for BoundedSpans {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = BoundedSpans;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a list of byte spans")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<BoundedSpans, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut spans: Vec<(u64, u64)> = Vec::new();
+                while let Some(span) = seq.next_element::<(u64, u64)>()? {
+                    // Truncating the tail keeps the claim a subset of what was
+                    // published, which is the direction that costs a re-fetch
+                    // rather than a wasted dial.
+                    if spans.len() < MAX_AD_SPANS {
+                        spans.push(span);
+                    }
+                }
+                Ok(BoundedSpans { spans })
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
+}
 
 /// "I hold (part of) this object", stored under `b:<32-byte object root>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +301,10 @@ pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) ->
             _ => out.push((s, e)),
         }
     }
+    // The same cap the decode applies, so what this node publishes is what a
+    // peer will keep of it. Dropped from the tail, never merged across the
+    // gaps: a merge would advertise bytes this node does not hold.
+    out.truncate(MAX_AD_SPANS);
     out
 }
 
@@ -455,6 +539,53 @@ mod tests {
         };
         let bytes = postcard::to_stdvec(&m).unwrap();
         assert_eq!(postcard::from_bytes::<NodeManifest>(&bytes).unwrap(), m);
+    }
+
+    /// A record naming a million spans decodes to at most the cap.
+    ///
+    /// `spans` is a bare `Vec` on the wire and a `b:` record is a trie value
+    /// bounded only by `MAX_FRAME_LEN`, so one 16 MiB record names on the order
+    /// of a million spans — 128 MB of allocation and decode for whoever
+    /// materializes it or answers `FindProviders` over it. The cap has to apply
+    /// during the decode, since a vector that has been deserialized has already
+    /// cost what the cap exists to deny (§12).
+    #[test]
+    fn an_extreme_span_list_is_capped_as_it_decodes() {
+        let g = AD_SPAN_GRANULARITY;
+        let spans: Vec<(u64, u64)> = (0..(MAX_AD_SPANS as u64 + 500))
+            .map(|i| (i * 2 * g, i * 2 * g + g))
+            .collect();
+        let claimed = spans.len();
+        // Encoded by hand, because the constructors coalesce and cap: this is
+        // what a hostile origin puts in the trie.
+        let record = BlobAd {
+            v: RECORD_VERSION,
+            size: u64::MAX,
+            state: AdState {
+                spans: spans.clone(),
+            },
+        };
+        let bytes = postcard::to_stdvec(&record).unwrap();
+        let decoded: BlobAd = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.state.spans.len(), MAX_AD_SPANS);
+        assert!(MAX_AD_SPANS < claimed);
+        // The kept spans are the published ones, untouched: what is over the
+        // cap is dropped, never merged across the gaps, so the ad claims less
+        // than was published rather than more.
+        assert_eq!(decoded.state.spans, spans[..MAX_AD_SPANS]);
+        assert!(!decoded.is_complete());
+
+        // The same cap on the way out, so what this node publishes survives a
+        // peer's decode unchanged.
+        let ours = BlobAd::partial(u64::MAX, spans);
+        assert_eq!(ours.state.spans.len(), MAX_AD_SPANS);
+
+        // An ordinary ad is untouched by any of it.
+        let honest = BlobAd::partial(10 * g, [(0, 2 * g)]);
+        assert_eq!(
+            postcard::from_bytes::<BlobAd>(&postcard::to_stdvec(&honest).unwrap()).unwrap(),
+            honest
+        );
     }
 
     #[test]
