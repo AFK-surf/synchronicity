@@ -138,7 +138,7 @@ fn prepend_option(acc: List(b), value: Option(a), make: fn(a) -> b) -> List(b) {
 /// one way keeps the fixtures stable.
 ///
 /// Named `san_name` and not `fqdn` because it produces the opposite of an
-/// FQDN, and the old name said so backwards.
+/// FQDN: a relative name, with the root label dropped.
 pub fn san_name(apex: String) -> String {
   case string.ends_with(apex, ".") {
     True -> string.drop_end(apex, 1)

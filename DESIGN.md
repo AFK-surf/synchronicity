@@ -156,9 +156,9 @@ A remote node is **trusted** iff at least one of the following holds:
    The resolver queries `_synchronicity.<domain> TXT` and accepts records of the form:
 
    ```
-   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=nas    nk=<z-base32 device key> apex=cp.example.com"
-   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key> apex=cp.example.com"
-   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key> apex=cp.example.com"  ; rotation window
+   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=nas    nk=<z-base32 device key> apex=example.com"
+   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key> apex=example.com"
+   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key> apex=example.com"  ; rotation window
    ```
 
    Each record binds one device key to the origin named by `id=`. The `id` field is

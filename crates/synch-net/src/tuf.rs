@@ -41,7 +41,7 @@ use std::{
 
 use ring::signature;
 
-use crate::rekor::{base64_encode, sha256, LogKeys};
+use crate::rekor::{base64_encode, sha256, LogKey, LogKeys};
 
 /// The target the chain has to authenticate for any of this to matter.
 pub const TRUSTED_ROOT_TARGET: &str = "trusted_root.json";
@@ -225,9 +225,8 @@ pub struct PinState {
 impl PinState {
     /// The state a build starts from: the embedded root, nothing accepted.
     ///
-    /// `trusted_root` is empty here — a client that has never completed an
-    /// update runs on [`EMBEDDED_TRUSTED_ROOT`], the bootstrap snapshot,
-    /// exactly as it did before this module existed.
+    /// `trusted_root` is empty here: a client that has never completed an
+    /// update runs on [`EMBEDDED_TRUSTED_ROOT`], the bootstrap snapshot.
     pub fn embedded() -> PinState {
         PinState::anchored(EMBEDDED_TUF_ROOT.as_bytes())
     }
@@ -668,32 +667,42 @@ pub fn tlogs(trusted_root: &[u8]) -> Result<Vec<Tlog>, TufError> {
         .ok_or_else(|| bad("tlogs is not an array".into()))?;
     let mut logs = Vec::with_capacity(entries.len());
     for tlog in entries {
-        let raw = tlog["publicKey"]["rawBytes"]
-            .as_str()
-            .ok_or_else(|| bad("a tlog has no publicKey.rawBytes".into()))?;
-        let spki = base64_decode(raw).map_err(|_| bad("a tlog key is not base64".into()))?;
-        let base_url = tlog["baseUrl"]
-            .as_str()
-            .ok_or_else(|| bad("a tlog has no baseUrl".into()))?;
-        // A window that will not parse is not a reason to drop the log —
-        // its key is still pinned — but it must not read as *currently*
-        // valid, so an unparseable start is treated as "not yet".
+        // **An entry this build cannot read is skipped, not fatal**, and the
+        // difference is the whole update story. Sigstore adds shards; one of
+        // them will eventually carry a shape written after this binary — a key
+        // on a curve it does not know, a `validFor` a protobuf-JSON encoder
+        // spelled differently, a field that moved. Refusing the file for it
+        // stops pin refresh *globally and permanently*, for every zone, until
+        // a new build ships — which is exactly the "a rotation becomes a client
+        // upgrade" outcome §10 exists to remove, reached with no adversary at
+        // all. Skipping keeps the shards this build does understand, and the
+        // empty-set refusal below is the backstop for when none is left.
+        let Some(raw) = tlog["publicKey"]["rawBytes"].as_str() else {
+            continue;
+        };
+        let Ok(spki) = base64_decode(raw) else {
+            continue;
+        };
+        // The key has to be one this build can actually verify a checkpoint
+        // with, or pinning it is pinning nothing.
+        if LogKey::from_spki(&spki).is_err() {
+            continue;
+        }
+        let Some(base_url) = tlog["baseUrl"].as_str() else {
+            continue;
+        };
+        // A window that will not parse is not a reason to drop the log — its
+        // key is still pinned — but it must not read as *currently* valid, so
+        // an unparseable start is treated as "not yet" and an unparseable end
+        // as "already closed".
         let when = &tlog["publicKey"]["validFor"];
         let valid_from = match when.get("start") {
             None => 0,
-            Some(start) => start
-                .as_str()
-                .and_then(parse_rfc3339)
-                .ok_or_else(|| bad("a tlog's validFor.start is not RFC 3339".into()))?,
+            Some(start) => start.as_str().and_then(parse_rfc3339).unwrap_or(i64::MAX),
         };
-        let valid_until = match when.get("end") {
-            None => None,
-            Some(end) => Some(
-                end.as_str()
-                    .and_then(parse_rfc3339)
-                    .ok_or_else(|| bad("a tlog's validFor.end is not RFC 3339".into()))?,
-            ),
-        };
+        let valid_until = when
+            .get("end")
+            .map(|end| end.as_str().and_then(parse_rfc3339).unwrap_or(0));
         logs.push(Tlog {
             base_url: base_url.trim_end_matches('/').to_string(),
             log_id: sha256(&spki),
@@ -705,8 +714,12 @@ pub fn tlogs(trusted_root: &[u8]) -> Result<Vec<Tlog>, TufError> {
     if logs.is_empty() {
         // Adopting an empty pin set would silently refuse every zone from
         // then on. §10.2's whole posture is that TUF trouble is never worse
-        // than not having asked, so this is trouble, not an update.
-        return Err(bad("it names no transparency logs".into()));
+        // than not having asked, so this is trouble, not an update. This is
+        // also the backstop for the skipping above: a trusted root whose every
+        // entry is unreadable moves nothing, rather than moving to nothing.
+        return Err(bad(
+            "it names no transparency logs this build can read".into()
+        ));
     }
     Ok(logs)
 }
@@ -1678,10 +1691,55 @@ mod tests {
         assert!(matches!(tlogs(b"not json"), Err(TufError::Malformed(_))));
         // A log with a key but nowhere to reach it is half an answer, and
         // the half that is missing is the one this change exists to supply.
+        // Skipped like any other unreadable entry — and since it is the only
+        // one, the file names nothing this build can use.
         assert!(matches!(
             tlogs(br#"{"tlogs":[{"publicKey":{"rawBytes":"MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244="}}]}"#),
             Err(TufError::Malformed(_))
         ));
+    }
+
+    /// One entry this build cannot read must not cost the ones it can.
+    ///
+    /// Sigstore will eventually publish a shard in a shape written after this
+    /// binary — a key on a curve it does not know, a field spelled another
+    /// way. Refusing the whole trusted root for it would stop pin refresh
+    /// globally and permanently, for every zone, until a new build shipped:
+    /// the "a rotation becomes a client upgrade" outcome §10 exists to remove,
+    /// reached with no adversary at all.
+    #[test]
+    fn an_unreadable_shard_is_skipped_and_the_readable_ones_survive() {
+        let p256 = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==";
+        let root = serde_json::json!({"tlogs": [
+            // A curve this build does not verify with.
+            {"baseUrl": "https://p384.example", "publicKey": {"rawBytes":
+                "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEnl6ZQFT3z9Xk3gGmNCEnhZAcuP0Ib3Yl                 Cn0nOxKMOxYOs+7t1EytzHnjvUvJcVZLzGGyEXFYVCPmVXOImk7VkRz0hkK+9tJm                 ovNXeqXHtNc4DmMfDsJrbYbHNGiBTsMD",
+                "validFor": {"start": "2021-01-12T11:53:27Z"}}},
+            // A window a future encoder spelled as a number.
+            {"baseUrl": "https://odd.example", "publicKey": {"rawBytes": p256,
+                "validFor": {"start": 1610452407}}},
+            // No baseUrl at all.
+            {"publicKey": {"rawBytes": p256, "validFor": {"start": "2021-01-12T11:53:27Z"}}},
+            // And one this build reads perfectly well.
+            {"baseUrl": "https://good.example", "publicKey": {"rawBytes": p256,
+                "validFor": {"start": "2021-01-12T11:53:27Z"}}},
+        ]})
+        .to_string();
+
+        let logs = tlogs(root.as_bytes()).expect("the readable shard survives");
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert!(logs
+            .iter()
+            .any(|log| log.base_url == "https://good.example"));
+        // The one with an unparseable window is *pinned* — a proof under its
+        // key still verifies — but reads as not yet in service, so nothing
+        // selects it.
+        let odd = logs
+            .iter()
+            .find(|log| log.base_url == "https://odd.example")
+            .expect("its key is still pinned");
+        assert!(!odd.valid_at(1_800_000_000));
+        assert!(tlog_keys(root.as_bytes()).is_ok());
     }
 
     /// A trusted root with three shards: one closed, one open, one not yet.

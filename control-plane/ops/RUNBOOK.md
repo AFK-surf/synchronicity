@@ -74,8 +74,6 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_REKOR_KEY` | primary | file pinning the log's verification key — exactly one, PEM or base64 SPKI; unset, it comes from the same trusted-root entry as the endpoint |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query` |
-| `CP_TUF_URL` | primary | Sigstore TUF repository this service follows to find the log shard in service, default `https://tuf-repo-cdn.sigstore.dev` |
-| `CP_TUF_ROOT` | primary | `root.json` this service anchors TUF verification on; defaults to `priv/tuf/sigstore_tuf_root.json`, the root the client embeds |
 
 > **Why the database gets its own directory.** Each SQLite connection
 > runs in a `csqlite` worker sandboxed (Landlock on Linux, `unveil`/
@@ -128,11 +126,10 @@ secrets.** Protect the replication bucket accordingly.
 
    **Which log it submits to is discovered, not compiled in.** The shard
    in service and its verification key both come out of the
-   `trusted_root.json` this service stores (see "TUF freshness" below), so a
-   Sigstore rotation is a refresh away rather than a release away. On a host
-   that has never fetched, this command does that fetch first; a
-   deployment with no egress to `CP_TUF_URL` names the log itself with
-   `CP_REKOR_URL` and `CP_REKOR_KEY` together.
+   `trusted_root.json` this service **ships** in `priv/tuf` (see "Log
+   directory" below), so this step needs no egress beyond the log itself. A
+   deployment naming its own log sets `CP_REKOR_URL` and `CP_REKOR_KEY`
+   together.
 
    **It needs the DS to be live first.** The entry carries the DNSSEC
    chain from the apex's DS up to the root, which is what lets a monitor
@@ -160,27 +157,19 @@ secrets.** Protect the replication bucket accordingly.
    key tag down. Your own record of what you published is the only thing
    that distinguishes a report you caused from one you did not.
 
-**TUF metadata needs no command.** The primary walks `CP_TUF_URL` on its
-own — at boot when nothing is stored, and hourly once the stored timestamp
-is within three days of expiring — the way TUF consistent snapshots are
-meant to be walked: timestamp names the snapshot, the snapshot names the
-targets, the targets name `trusted_root.json` by digest. Every file is
-stored verbatim (docs/REKOR-ZONE-KEY.md §10). That file is what this
-service reads to decide **where to submit** (step 3), so a Sigstore shard
-rotation costs a refresh rather than a release. It does not touch the
-zone: clients walk Sigstore's repository themselves for their own log
-pins, and no record depends on this.
+**The log directory needs no command and no egress.** Which shard this
+service submits to, and which key checks the proof that comes back, come out
+of `priv/tuf/sigstore_trusted_root.json` — shipped with the image, byte-identical
+to the directory the client embeds (docs/REKOR-ZONE-KEY.md §10.3). Nothing
+about it touches the zone, and clients pin their own log keys from their own
+walk of Sigstore's repository, so a directory this service got wrong yields a
+proof clients refuse rather than a proof they wrongly accept.
 
-Because that decision is one no client can re-check, this service verifies
-the chain itself before storing it — signatures over canonical JSON, role
-thresholds, expiries and monotonicity, anchored on
-`priv/tuf/sigstore_tuf_root.json`, the same root the client embeds — and
-refuses anything that does not check out, keeping whatever was already
-stored. `CP_TUF_ROOT` names a different anchor for a deployment running
-its own TUF repository. In an air-gapped deployment the material arrives
-the way everything does: `rekor-publish` fetches on demand when the stored
-material cannot name a log, so running the ceremony on the egress host
-leaves the couriered database carrying it.
+When Sigstore opens the next shard, this service keeps naming the old one
+until it is redeployed, and says so: `rekor-publish` fails naming the missing
+shard and the external-mode watcher logs it each tick. `CP_REKOR_URL` and
+`CP_REKOR_KEY` name a log outright in the meantime. Air-gapped deployments
+need nothing special here — there is nothing to fetch.
 
 4. Start the primary (systemd unit in `ops/systemd/`). First boot
    migrates the DB, writes zone metadata and publishes the (empty) zone.
@@ -330,15 +319,11 @@ control plane itself with
   first run reports only what you did not know. The keys it records are
   bookkeeping about what it has already told you, **not** a trust list:
   an attacker's key is recorded once reported, the same as yours.
-- **TUF freshness** (docs/REKOR-ZONE-KEY.md §10): the primary's refresh
-  job keeps this service's idea of which transparency-log shard is in
-  service current, with no operator involvement.
-  `/healthz` reports `tuf_root_version` and `tuf_timestamp_expires_at`; an
-  expiry that stops moving means the hourly refetch is failing — check
-  egress to `CP_TUF_URL`. It is not urgent: expired material keeps naming
-  the same shard, and it only bites when Sigstore actually rotates. It
-  does not affect clients at all — they follow Sigstore's repository
-  themselves.
+- **Log directory** (docs/REKOR-ZONE-KEY.md §10.3): which transparency-log
+  shard this service submits to ships with the image and moves on a deploy.
+  Nothing to monitor and nothing to keep fresh; the signal that it has gone
+  stale is `rekor-publish` refusing, naming the shard it cannot find. It does
+  not affect clients at all — they follow Sigstore's repository themselves.
 - **Backups**: the litestream bucket *is* the database backup. The key
   file is backed up offline from the ceremony. Those two artifacts
   restore the whole service.

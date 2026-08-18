@@ -57,7 +57,13 @@ fn tag_fold(bytes: BitArray, index: Int, acc: Int) -> Int {
 }
 
 /// SHA-256 DS digest: hash(owner wire form || DNSKEY rdata).
-fn ds_digest(apex: Name, dnskey_rdata: BitArray) -> BitArray {
+///
+/// Public because `rekor/chain` checks, before publishing, that each link's
+/// DNSKEY RRset really is covered by the DS its parent signed — the same
+/// question `chain.rs`'s `covers` asks of a chain it is reading. One
+/// implementation of the digest, so the publisher and the reader cannot come
+/// to different answers about the same delegation.
+pub fn ds_digest(apex: Name, dnskey_rdata: BitArray) -> BitArray {
   crypto.hash(
     crypto.Sha256,
     bit_array.concat([name.encode(apex), dnskey_rdata]),

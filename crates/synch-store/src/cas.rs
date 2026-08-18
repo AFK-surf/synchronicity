@@ -166,10 +166,10 @@ pub(crate) struct Settlement {
 ///    honest root forever (§5.1, §6.2).
 /// 3. It yields *completely*, including the bits already held.
 ///
-/// Rule 3 used to refuse a claim that changed the object's group count while
-/// any group was held, on the reasoning that a changed count changes the shape
-/// of the tree and so no slice for it could have verified. That reasoning is
-/// wrong, and it inverted the rule it was protecting. bao splits at the largest
+/// Rule 3 does *not* refuse a claim that changes the object's group count
+/// while a group is held. The tempting reasoning — a changed count changes the
+/// shape of the tree, so no slice for it could have verified — is wrong, and
+/// inverts the rule it would be protecting. bao splits at the largest
 /// power of two below the chunk count, so every size in one bracket shares a
 /// left subtree: 20 groups and 24 groups both split at 16, and a slice covering
 /// groups 0..16 verifies identically under either — the right sibling's
@@ -954,9 +954,9 @@ impl Store {
         // Grown to fit the *window*, never to the claimed size, and never
         // shrunk.
         //
-        // Never shrunk, because sizing a file down on the strength of a claim is
-        // how an understated entry used to destroy verified groups — bytes gone,
-        // bitmap bits intact, the node advertising a group it could no longer
+        // Never shrunk, because sizing a file down on the strength of a claim
+        // is how an understated entry destroys verified groups — bytes gone,
+        // bitmap bits intact, the node advertising a group it can no longer
         // serve ([`grow_to`], `docs/DELTA-SYNC.md` §6).
         //
         // Never to the claimed size, because `size` is a peer's assertion off an
@@ -1203,7 +1203,7 @@ mod tests {
         assert_eq!(root.as_bytes(), blake3::hash(&bytes).as_bytes());
         assert_eq!(store.read_all(&root).unwrap(), bytes);
         // No staging files left behind, and none in the CAS root: a regular
-        // file there is what used to break the orphan sweep.
+        // file there breaks the orphan sweep.
         let staged: Vec<_> = std::fs::read_dir(store.staging_dir())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1425,12 +1425,12 @@ mod tests {
     /// A size claim racing a commit that completes the object never wins.
     ///
     /// Whether a claimed length may stand is a read of the row followed by a
-    /// write of it, and every committer used to make that decision on a snapshot
-    /// taken before it did its work. Two writers of one root — the honest one
-    /// finishing the object, the other carrying an entry's overstatement of it —
-    /// could each look, each see a row no group attested to yet, and each go
-    /// ahead; whichever committed second wrote its size over the other's. When
-    /// that was the claim, the row ended `complete` under a length no byte on
+    /// write of it, and a committer deciding on a snapshot taken before it did
+    /// its work loses the race. Two writers of one root — the honest one
+    /// finishing the object, the other carrying an entry's overstatement of it
+    /// — each look, each see a row no group attested to yet, and each go ahead;
+    /// whichever commits second writes its size over the other's. When that is
+    /// the claim, the row ends `complete` under a length no byte on
     /// the disk supports: attested from then on, so `read_all` failed, every
     /// honest writer was refused "size mismatch" for good, and the entry that
     /// named the root kept the collector off it. Now the decision is made inside
@@ -1471,13 +1471,14 @@ mod tests {
     /// A peer that understates an object's size cannot destroy bytes this node
     /// has already verified.
     ///
-    /// The claim arrives before the decode that would disprove it, and the
-    /// payload used to be `set_len` to it on the way past: a node holding group
-    /// 5 of a nine-group object, met by an entry claiming three groups, had
-    /// group 5's bytes truncated away while its bitmap bit survived. The row
-    /// then advertised a group the node could not serve, every read of it failed
-    /// with an unexpected end of file, every later fetch skipped it as already
-    /// held, and nothing short of deleting the object recovered. Nothing is
+    /// The claim arrives before the decode that would disprove it, so
+    /// `set_len`-ing the payload to it on the way past would truncate verified
+    /// bytes: a node holding group 5 of a nine-group object, met by an entry
+    /// claiming three groups, loses group 5's bytes while its bitmap bit
+    /// survives. The row then advertises a group the node cannot serve, every
+    /// read of it fails with an unexpected end of file, every later fetch skips
+    /// it as already held, and nothing short of deleting the object recovers.
+    /// Nothing is
     /// resized on the strength of a size nobody has proved — the file only ever
     /// grows until a commit settles the length (§6.2, `docs/DELTA-SYNC.md` §6).
     #[test]

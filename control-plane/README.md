@@ -36,16 +36,16 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   chain to collect before then. A self-hosted, Rekor-v2-compatible log
   works via `CP_REKOR_KEY`.
   See [docs/REKOR-ZONE-KEY.md](../docs/REKOR-ZONE-KEY.md) §2, §3, §5.
-- It **follows Sigstore's TUF metadata** (a supervised job fetches at boot
-  when nothing is stored, and hourly once the stored timestamp nears
-  expiry) to learn which
-  transparency log shard is in service, so a Sigstore rotation costs a
-  refresh rather than a release. It **verifies that metadata itself** before
-  storing it — the same workflow the client runs, against the same anchor
-  (`priv/tuf/sigstore_tuf_root.json`) — because that decision is one no
-  client is in a position to re-check. Nothing in the zone depends on it:
-  clients read Sigstore's repository themselves for their own pins
-  (docs/REKOR-ZONE-KEY.md §10).
+- It learns which transparency log shard is in service from
+  **`priv/tuf/sigstore_trusted_root.json`**, the directory it ships,
+  byte-identical to the one the client embeds. It walks no TUF repository:
+  nothing about this material reaches a client — they pin their own log keys
+  from their own walk — so getting it wrong yields a proof clients refuse and
+  a zone that fails closed, never a trust bypass. A Sigstore shard rotation
+  therefore costs this service a deploy, which it can pay and a NAS daemon
+  cannot; that asymmetry is why the client still walks and this side does not
+  (docs/REKOR-ZONE-KEY.md §10.3). `CP_REKOR_URL` + `CP_REKOR_KEY` name a log
+  outright.
 - Each org has **networks**; a network is one synchronicity cluster and
   owns one membership name: `_synchronicity.<network>.<org>.<base>`.
 - A **device** is one `id=` label plus its keys. Key rotation follows
@@ -235,8 +235,6 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key — a PEM `PUBLIC KEY` block or one base64 SubjectPublicKeyInfo, `#` starting a comment. Exactly one key: this service submits to one log and stores the proof under that log's id. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
-| `CP_TUF_URL` | primary | Sigstore TUF repository this service follows to find the transparency-log shard in service. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched automatically — at boot when nothing is stored, and hourly once the stored timestamp is within three days of expiring. |
-| `CP_TUF_ROOT` | primary | The `root.json` TUF verification anchors on. Defaults to `priv/tuf/sigstore_tuf_root.json`, byte-identical to the root the client embeds. Set it — together with `CP_TUF_URL` — for a deployment running its own TUF repository; a repository whose root this service does not hold is one none of whose files it can check. |
 
 Day-2 operations (replicas, key ceremony, backups) live in
 `ops/RUNBOOK.md`.

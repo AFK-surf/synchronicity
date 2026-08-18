@@ -16,8 +16,8 @@
 //! check in `serve`: one indexed row, on a path that runs before a request is
 //! even read, where the handoff would cost more than the work. Everything a
 //! *request* costs is offloaded, including the two metadata handlers —
-//! `FindProviders` and `GetBindings` — that used to be judged small enough to
-//! run here: `providers` holds the one connection mutex across a row loop and a
+//! `FindProviders` and `GetBindings`, which look small enough to run here and
+//! are not: `providers` holds the one connection mutex across a row loop and a
 //! postcard decode per row, which is not a bounded lookup at all when an origin
 //! chooses what is in those rows (§12).
 

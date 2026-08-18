@@ -286,8 +286,8 @@ impl Node {
     /// Pins an object, fetching it first when it is not held whole (§9.2).
     ///
     /// A pin is a promise that these bytes stay available here, and a promise
-    /// about bytes this node does not hold starts by getting them: pinning
-    /// metadata-only content used to mark nothing and say so to no one. The
+    /// about bytes this node does not hold starts by getting them, or pinning
+    /// metadata-only content marks nothing and says so to no one. The
     /// size travels with the entry the pin was resolved from; a bare root
     /// nobody holds even partially has no size to fetch by, and is refused
     /// rather than half-promised.
@@ -1620,10 +1620,10 @@ mod tests {
 
     /// An object of no bytes needs no provider.
     ///
-    /// It used to need one and never find it: an empty object counts as one
-    /// chunk group, nothing encodes for that group, so every window came back
-    /// served-nothing and the fetch gave up — which is how `synch cat` and
-    /// mirrors of empty files reported that nobody could serve them.
+    /// Requiring one means never finding it: an empty object counts as one
+    /// chunk group, nothing encodes for that group, so every window comes back
+    /// served-nothing and the fetch gives up — which is how `synch cat` and
+    /// mirrors of empty files come to report that nobody can serve them.
     #[tokio::test]
     async fn an_empty_object_needs_no_provider() {
         let (_d, node) = node().await;

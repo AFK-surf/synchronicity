@@ -145,7 +145,7 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                     println!("warning: {warning}");
                 }
                 // Mapping a bucket before its space first syncs is legal;
-                // mapping one onto a typo used to look exactly the same.
+                // mapping one onto a typo would otherwise look the same.
                 if !daemon.space_known(&bucket.space).await? {
                     println!(
                         "warning: no origin publishes {} yet; the bucket serves nothing until one does",

@@ -129,11 +129,11 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     Ok(conn) -> {
       let now = now_unix()
       // The log is resolved on every tick rather than captured at boot: this
-      // process is meant to run for months, and Sigstore opening the next
-      // shard should cost a TUF refresh, not a restart. Failing to resolve
-      // is a log line like every other failure here — the claim already in
-      // the zone keeps verifying while it is unresolvable.
-      let result = case client.discover(conn, now) {
+      // Read at the moment of use rather than at boot, so a deploy carrying
+      // a newer trusted root takes effect on the next tick. Failing to
+      // resolve is a log line like every other failure here — the claim
+      // already in the zone keeps verifying while it is unresolvable.
+      let result = case client.discover(now) {
         Error(why) -> {
           io.println_error("zonekey-watch: no transparency log: " <> why)
           Quiet
@@ -335,6 +335,16 @@ fn observe_once(
       && rr.name == zone
     })
     |> list.map(fn(rr) { rr.rdata })
+    // The same keys the *claim* can name, and for the same reason. A key
+    // without the Zone Key flag, or carrying RFC 5011's REVOKE bit, signs
+    // nothing and is excluded from the set an entry claims
+    // (`rekor/chain.claimable`, `chain.rs`'s `usable_signer`). Recording one
+    // here anyway makes `covered` unreachable: `stamp_covered` stamps only
+    // keys a stored record claims, `log_if_new` requires every stored key to
+    // be stamped, and a key no claim can contain is never stamped — so the
+    // watcher would re-collect the chain and re-submit a byte-identical entry
+    // every tick, forever.
+    |> list.filter(chain.claimable)
   case rdatas {
     [] ->
       Error(

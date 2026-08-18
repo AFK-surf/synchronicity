@@ -7,6 +7,7 @@ import fixtures.{demo_conn, nk}
 import gleam/bit_array
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/string
 import store/sqlite
 import zone/build
 import zone/model.{type ZoneInput, Member, NsHost, TxtName, ZoneInput, ZoneMeta}
@@ -349,4 +350,39 @@ pub fn a_staged_zone_serves_both_keys_under_one_valid_signature_test() {
     100,
     signature,
   )
+}
+
+/// A dialing hint cannot smuggle a second field into a member's record.
+///
+/// The client splits a record on `str::split_whitespace` — Unicode
+/// whitespace, not the four ASCII spellings — so any of these characters
+/// inside a hint makes the client read a field the member wrote. The sharp
+/// one is a second `apex=`: the answer then names two control planes, which
+/// is a refusal, so one member's hint partitions their whole network.
+///
+/// Asserted as a class rather than as the cases that were found, because the
+/// list of ways to spell a separator is exactly what cannot be enumerated.
+pub fn a_hint_cannot_carry_a_field_separator_test() {
+  // Every hint shape this design actually publishes.
+  assert build.valid_hint("1.2.3.4:9000")
+  assert build.valid_hint("[2001:db8::1]:9000")
+  assert build.valid_hint("https://relay.example.com:443/")
+  assert build.valid_hint("")
+
+  // Everything the client would split on, ASCII and not.
+  let separators = [
+    " ", "\t", "\n", "\r", "\u{000B}", "\u{000C}", "\u{0085}", "\u{00A0}",
+    "\u{1680}", "\u{2000}", "\u{2028}", "\u{2029}", "\u{3000}",
+  ]
+  list.each(separators, fn(ws) {
+    assert !build.valid_hint("1.2.3.4:9000" <> ws <> "apex=evil.example.com")
+    assert !build.valid_hint(ws)
+  })
+
+  // And the quote, which survives the client but not the provider round-trip.
+  assert !build.valid_hint("1.2.3.4:9000\"")
+
+  // The provider's length ceiling still applies.
+  assert !build.valid_hint(string.repeat("a", 256))
+  assert build.valid_hint(string.repeat("a", 255))
 }

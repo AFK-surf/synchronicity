@@ -709,9 +709,15 @@ pub fn require_rekor_omits_members_until_a_key_is_logged_test() {
   )
 }
 
-/// The armed gate holds membership TXT back until something has been logged,
-/// and keeps publishing the declaration while it does — the watcher needs that
-/// record on the wire to build a chain at all.
+/// The armed gate holds membership TXT back until the key the provider is
+/// actually serving has been logged, and keeps publishing the declaration
+/// while it does — the watcher needs that record on the wire to build a chain
+/// at all.
+///
+/// The gate asks about the *observed* keys rather than whether anything has
+/// ever been logged, which is what makes it still a gate after the first
+/// publish: a provider that later rotates to an unlogged key is held back
+/// again, instead of riding on a record about a key it no longer uses.
 pub fn require_rekor_keeps_the_declaration_and_drops_members_on_the_wire_test() {
   let conn = external_conn()
   use <- fixtures.with_gate_armed
@@ -730,9 +736,18 @@ pub fn require_rekor_keeps_the_declaration_and_drops_members_on_the_wire_test() 
   assert !list.contains(names, member)
   assert list.contains(names, "_synchronicity-transparency.sync.test")
 
+  // The watcher sees the provider's key on the validated wire...
   let key = keys.dnskey_rdata(keys.generate())
+  let digest = crypto.hash(crypto.Sha256, key)
   let assert Ok(Nil) =
-    record_covering(conn, "create", [crypto.hash(crypto.Sha256, key)])
+    state.record_observed(conn, [#(digest, keys.key_tag(key), key)], 2500)
+  // ...and it is still held back until that key is the one on the record.
+  let other = keys.dnskey_rdata(keys.generate())
+  let assert Ok(Nil) =
+    record_covering(conn, "rollover", [crypto.hash(crypto.Sha256, other)])
+  assert !list.contains(applied_names(conn, prov, created, 2800), member)
+  // Logging the key it actually serves opens the gate.
+  let assert Ok(Nil) = record_covering(conn, "create", [digest])
   assert list.contains(applied_names(conn, prov, created, 3000), member)
   sqlite.close(conn)
 }

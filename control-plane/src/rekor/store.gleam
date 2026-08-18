@@ -52,6 +52,15 @@ pub type Record {
 /// the checkpoint and audit path change while the entry — payload,
 /// signature, index — stays exactly what it was.
 pub fn put(conn: Connection, record: Record) -> Result(Nil, sqlite.Error) {
+  // One transaction, because this is an INSERT, a DELETE and one INSERT per
+  // claimed key, and the states in between are not merely stale — they are
+  // *wrong in a way that reads as fact*. A crash after the DELETE leaves a
+  // record with no key rows, and both questions the rest of the service asks
+  // then answer "this key was never logged": `covered` refuses every publish
+  // the gate guards, and `servable` quietly stops serving the proof at
+  // `_synchronicity-rekor.<apex>` while the row explaining it still exists.
+  use <- sqlite.transaction(conn, fn(e) { e })
+
   use _ <- result.try(
     sqlite.exec(
       conn,

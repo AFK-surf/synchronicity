@@ -49,13 +49,12 @@ const NOW: i64 = 1_800_000_000;
 
 // ------------------------------------------------------- real-chain fixtures
 
-/// The checked-in Sigstore metadata both suites are asserted against.
-///
-/// It lives beside the Gleam tests because those can only read files from
-/// their own tree; this side reaches across for it deliberately, exactly as
-/// the proof fixture does.
+/// The checked-in Sigstore metadata this suite is asserted against: roots 13
+/// through 15, timestamp, snapshot, targets and `trusted_root.json`, as the
+/// repository served them, with `meta.txt` recording when and what they
+/// verify to.
 fn fixture_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../control-plane/test/fixtures/tuf")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tuf")
 }
 
 fn fixture(name: &str) -> Vec<u8> {

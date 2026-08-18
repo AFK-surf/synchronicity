@@ -1451,10 +1451,15 @@ fn p256_spki_stub() -> Vec<u8> {
 /// Each of these is a second spelling of a value that already had one, and
 /// for bytes sitting in a public log that is the whole problem: the leaf
 /// must mean the same thing to this reader and to an auditor reading it with
-/// anything else. Go's `crypto/x509` — which Rekor itself calls — refuses
-/// all of them, so the public log would not have taken such a certificate;
-/// relying on that would be keeping this design's invariant in somebody
-/// else's parser.
+/// anything else.
+///
+/// **And the log does not do this for us.** Go's `crypto/x509` — which Rekor
+/// itself calls — accepts a nested second sequence and silently drops it, the
+/// same way an unguarded reader here would: `cryptobyte`'s `ReadASN1` aliases
+/// its receiver, so the wrapper's remainder is discarded rather than refused.
+/// OpenSSL rejects the certificate outright. So the readers in the world
+/// disagree about these bytes, Rekor will log them, and the invariant has to
+/// live here rather than in somebody else's parser.
 #[test]
 fn a_certificate_with_two_readings_is_refused() {
     use synch_net::x509::{Certificate, SelfSigned, OID_SUBJECT_ALT_NAME};
@@ -1511,6 +1516,12 @@ fn a_certificate_with_two_readings_is_refused() {
         parsed.extension(OID_SUBJECT_ALT_NAME).is_some(),
         "a single extension is unaffected"
     );
+
+    // The *nested* second spelling — one extension whose value holds two
+    // GeneralNames sequences — is refused too, and is covered where
+    // `parse_san` is reachable directly (`x509::tests`). The builder here
+    // always emits its own SAN, so this path would be caught by the
+    // exactly-one rule above before the nested one could fire.
 }
 
 /// One record cannot turn a refresh into a scan.

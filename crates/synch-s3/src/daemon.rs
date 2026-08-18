@@ -81,7 +81,8 @@ impl Daemon {
     ///
     /// `bucket add` warns on false rather than refusing: mapping a bucket
     /// before its space first syncs is a legitimate order of operations, but
-    /// doing it to a typo'd id used to be indistinguishable from success.
+    /// doing it to a typo'd id would otherwise be indistinguishable from
+    /// success.
     pub async fn space_known(&self, space: &str) -> S3Result<bool> {
         match self
             .lines(Command::Status(pb::Status {

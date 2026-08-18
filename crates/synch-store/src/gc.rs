@@ -37,13 +37,13 @@ impl Store {
     ///
     /// The whole pass — the retained roots, the mark walk, the candidate
     /// snapshot and the deletes — runs inside **one** immediate transaction.
-    /// That is not tidiness; splitting it is a data-loss bug. Each of those
-    /// steps used to take the connection mutex separately, and the mark walk
-    /// released it between every node read, so a writer could commit in the
-    /// gap. A publish is one transaction that writes new trie nodes *and* the
-    /// head row: landing between the mark and the snapshot, its nodes were
-    /// absent from the mark set and present in the candidate list, so the sweep
-    /// deleted them while the head row survived pointing at them. The trie is
+    /// That is not tidiness; splitting it is a data-loss bug. Taking the
+    /// connection mutex per step — with the mark walk releasing it between node
+    /// reads — lets a writer commit in the gap. A publish is one transaction
+    /// that writes new trie nodes *and* the head row: landing between the mark
+    /// and the snapshot, its nodes are absent from the mark set and present in
+    /// the candidate list, so the sweep deletes them while the head row
+    /// survives pointing at them. The trie is
     /// authoritative and `entries` cannot regenerate it, so the node's own
     /// published root became permanently unservable — and `publish` then called
     /// `note_complete` on it, so the store went on advertising that it could
@@ -78,8 +78,8 @@ impl Store {
         // The memo may only vouch for roots the sweep just marked from. A root
         // that fell out of the retained set has had its nodes taken, and a memo
         // entry for it would be a standing lie about what this node can serve —
-        // but dropping the *whole* memo, which is what this used to do, throws
-        // away the answer §5.1 exists to avoid recomputing on every `Hello`.
+        // but dropping the *whole* memo would throw away the answer §5.1
+        // exists to avoid recomputing on every `Hello`.
         self.retain_complete_roots(&roots.into_iter().collect());
         Ok(stats)
     }
@@ -98,11 +98,11 @@ impl Store {
     /// chunk — each taking the single write connection and appending a WAL
     /// frame, so gateway range reads and mirror materialization would serialize
     /// against publishes and GC — and an object nothing references is by
-    /// construction not being read through the tree. `read_range` used to touch
-    /// the row anyway, which cost exactly that and quietly inverted the
-    /// retention semantics: with it a hot object is never collected, without it
-    /// it is. Every write path already stamps the column, so nothing else was
-    /// needed to keep this true.
+    /// construction not being read through the tree. `read_range` therefore
+    /// does not touch the row: doing so would cost exactly that and quietly
+    /// invert the retention semantics — with it a hot object is never
+    /// collected, without it it is. Every write path stamps the column, which
+    /// is all this needs.
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
         let referenced = self.referenced_content()?;
         let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
@@ -137,10 +137,10 @@ impl Store {
     ///
     /// Nothing in the CAS root but a directory is descended into. That is not
     /// defensiveness: `read_dir` on a regular file fails with `NotADirectory`,
-    /// not `NotFound`, so a single stray file in the root — which is exactly
-    /// what a leaked staging file used to be — made this return an error on
-    /// every pass from then on. `maintenance_pass` reported failure forever and
-    /// no orphan was ever swept again, including the file causing it.
+    /// not `NotFound`, so a single stray file in the root — a leaked staging
+    /// file, say — would make this return an error on every pass from then on.
+    /// `maintenance_pass` would report failure forever and no orphan would be
+    /// swept again, including the file causing it.
     ///
     /// Returns how many files went.
     pub fn gc_orphans(&self, before: i64) -> Result<usize> {
@@ -574,12 +574,12 @@ mod tests {
 
     /// A leaked staging file is reclaimed, and never kills the sweep.
     ///
-    /// `ingest_file` used to stage into the CAS root itself, where the outer
-    /// `read_dir` of the orphan sweep meets it as a *regular file*: `read_dir`
-    /// on one fails with `NotADirectory`, which is not the `NotFound` the sweep
-    /// tolerated, so the whole pass returned an error — permanently, since only
-    /// this sweep could have removed the file and `cas_root_of` refuses the
-    /// name anyway. Every ingest that fails after the stream leaves one, and
+    /// Staging into the CAS root itself puts a *regular file* where the outer
+    /// `read_dir` of the orphan sweep meets it: `read_dir` on one fails with
+    /// `NotADirectory` rather than `NotFound`, so the whole pass returns an
+    /// error — permanently, since only this sweep could remove the file and
+    /// `cas_root_of` refuses the name anyway. Every ingest that fails after the
+    /// stream leaves one, and
     /// each is a whole object of disk.
     #[test]
     fn a_staging_file_in_the_cas_root_is_reclaimed_rather_than_breaking_the_sweep() {
@@ -723,10 +723,10 @@ mod tests {
     /// Forks at seqs *above* the complete head are bounded too.
     ///
     /// An origin can sign two roots at each of a thousand far-future seqs and
-    /// never serve any of the tries, so the complete slot never advances. The
-    /// exemption used to ask whether the complete head had passed the forked
-    /// seq, which for those rows is never, so they were permanent — mark roots
-    /// for GC included, and `trust rm` did not touch them. A retained head at a
+    /// never serve any of the tries, so the complete slot never advances. An
+    /// exemption asking whether the complete head had passed the forked seq
+    /// would never fire for those rows, making them permanent — mark roots for
+    /// GC included, and out of `trust rm`'s reach. A retained head at a
     /// *higher* seq is the same proof that the origin moved on, and an origin
     /// flooding future seqs supplies it by the thousand: only the single highest
     /// forked seq is left without one.

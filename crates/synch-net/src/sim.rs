@@ -67,6 +67,20 @@ pub struct SimZone {
     /// A harness that could not express the forgery could not test the
     /// defense.
     pub impersonate: Option<(Name, Vec<String>)>,
+    /// TXT records appended to the membership answer **after signing**, at
+    /// the queried name, in a class the RRSIG does not cover.
+    ///
+    /// This is the other forgery available to anyone who can add a record to
+    /// a response — an on-path attacker against a plaintext DoH endpoint, or
+    /// the resolver itself. It costs nothing to mount: hickory groups RRsets
+    /// by `(name, record_type)` and stamps its verdict on every member, while
+    /// the signed-data construction filters by class and drops these — so the
+    /// honest RRSIG still verifies and the spliced record comes back marked
+    /// `Proof::Secure` having been signed by nobody.
+    ///
+    /// The defense is `dns::covered_by_signed_data`, and it is only testable
+    /// if the harness can put an unsigned record inside a validated answer.
+    pub splice_foreign_class: Vec<String>,
 }
 
 impl SimZone {
@@ -129,6 +143,7 @@ impl SimZone {
             extra_dnskeys: Vec::new(),
             txt_signer: None,
             impersonate: None,
+            splice_foreign_class: Vec::new(),
         }
     }
 
@@ -640,6 +655,20 @@ impl SimZone {
             ));
         }
         response.add_answers(set.records(true).cloned());
+        // Spliced in *after* signing and outside the RecordSet entirely, at
+        // the queried name but in another class: the record an attacker adds
+        // to a response, covered by no signature in it.
+        if !self.splice_foreign_class.is_empty() && *query.name() == self.txt_name() {
+            for text in &self.splice_foreign_class {
+                let mut record = Record::from_rdata(
+                    self.txt_name(),
+                    self.ttl,
+                    RData::TXT(TXT::new(vec![text.clone()])),
+                );
+                record.dns_class = DNSClass::CH;
+                response.add_answer(record);
+            }
+        }
         response
     }
 

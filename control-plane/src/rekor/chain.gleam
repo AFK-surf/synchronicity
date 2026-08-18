@@ -55,20 +55,36 @@
 //// them from a public resolver itself, and so can anyone. It is not
 //// attribution, and nothing downstream may be written as though it were.
 ////
-//// No signature is checked here: RRsets are copied into the certificate
-//// verbatim and every reader — client and monitor alike — verifies them
-//// itself, so a lying resolver produces an entry that fails validation
-//// everywhere, which is a publish that gets refused rather than a proof
-//// anybody accepts. What *is* checked is every structural rule a reader
-//// applies — owner names, the ladder's shape, the declaration's RRSIG
-//// labels and signer, reconstructible DNSKEY rdata — because a chain that
-//// breaks one of those is a chain no reader can verify, and finding that out
-//// at publish time is the difference between an error an operator reads and a
-//// zone that stops resolving.
+//// **No signature is verified here, and that is a real limit rather than a
+//// formality.** RRsets are copied into the certificate verbatim and every
+//// reader — client and monitor alike — verifies them itself; the RRSIG walk
+//// lives in `crates/synch-net/src/chain.rs` and this service does not
+//// duplicate it. So a resolver that returns *well-formed but wrong* bytes
+//// produces an entry that verifies nowhere — and a Merkle leaf cannot be
+//// withdrawn, so the cost of noticing late is permanent and public.
+////
+//// What is checked here is therefore everything that can be checked without
+//// a signature, chosen to match what a reader turns on:
+////
+////   - owner names, class and type on every record copied into a link;
+////   - the ladder's shape: declaration below a signing zone that contains
+////     the apex, proper-ancestor steps, terminating at the root;
+////   - the declaration's *text*, its RRSIG label count (wildcard) and its
+////     signer;
+////   - reconstructible DNSKEY rdata, and a claimed set that excludes
+////     non-zone-key and REVOKE'd keys;
+////   - that each link's DNSKEY RRset is actually covered by the DS its
+////     parent published, by recomputing the digest.
+////
+//// What remains unchecked is exactly the signatures, and the failure it
+//// leaves reachable is a resolver that serves individually valid RRsets
+//// which do not verify under one another. Do not read the list above as
+//// "the entry is valid"; read it as "the entry is not obviously invalid".
 
 import dns/name.{type Name}
 import dns/rdata
 import dns/wire
+import dnssec/keys
 import envoy
 import gleam/bit_array
 import gleam/http
@@ -134,13 +150,20 @@ pub fn collect(
 /// The bottom link: the apex's own `_synchronicity-transparency` TXT RRset
 /// and the RRSIG the signing zone made over it.
 ///
-/// Two rules a reader enforces are enforced here as well, because a
-/// declaration that breaks either makes the whole entry unverifiable
-/// (`crates/synch-net/src/chain.rs`, `verify_declaration`): an RRSIG covering
-/// fewer labels than its owner has was expanded from a wildcard, so the zone
-/// never published a declaration of its own, and an RRSIG whose signer is not
-/// the signing zone was made by somebody the chain does not claim holds the
-/// record.
+/// Three rules a reader enforces are enforced here as well, because a
+/// declaration that breaks any of them makes the whole entry unverifiable
+/// (`crates/synch-net/src/chain.rs`, `verify_declaration`) — and *that* is a
+/// permanent, public, irreversible write to an append-only log, so the place
+/// to notice is here, while an operator is still watching:
+///
+/// - the TXT RRset must actually read `v=sync1 transparency`. A reader checks
+///   the text rather than counting records, so an unrelated TXT sitting at
+///   this name is not consent — and a zone that has not published its
+///   declaration yet answers with something, not nothing;
+/// - an RRSIG covering fewer labels than its owner has was expanded from a
+///   wildcard, so the zone never published a declaration of its own;
+/// - an RRSIG whose signer is not the signing zone was made by somebody the
+///   chain does not claim holds the record.
 fn declaration_link(
   resolver: Resolver,
   apex: Name,
@@ -149,8 +172,52 @@ fn declaration_link(
   let owner = [rdata.transparency_label, ..apex]
   use answers <- result.try(resolver.query(owner, wire.type_txt))
   use rrs <- result.try(rrset_of(answers, owner, wire.type_txt))
+  use Nil <- result.try(check_declares(answers, owner))
   use Nil <- result.try(check_declaration_sigs(answers, owner, signing_zone))
   Ok(Link(name.to_string(owner), rrs))
+}
+
+/// Whether some TXT at `owner` carries the declaration text.
+///
+/// A TXT record is a sequence of character-strings and its text is their
+/// concatenation, so a declaration a provider split across chunks still reads
+/// as one — the same reading `chain.rs`'s `declares` gives it.
+fn check_declares(answers: List(wire.Rr), owner: Name) -> Result(Nil, String) {
+  let declared =
+    answers
+    |> list.filter(fn(rr) { owned(rr, owner, wire.type_txt) })
+    |> list.any(fn(rr) { txt_text(rr.rdata) == rdata.transparency_text })
+  case declared {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        "the TXT RRset at "
+        <> name.to_string(owner)
+        <> " does not read \""
+        <> rdata.transparency_text
+        <> "\" — has the zone published its declaration yet? Every reader "
+        <> "checks this text, so an entry carrying anything else verifies nowhere",
+      )
+  }
+}
+
+/// The text of a TXT rdata: its character-strings, concatenated.
+fn txt_text(rd: BitArray) -> String {
+  txt_chunks(rd, <<>>) |> bit_array.to_string |> result.unwrap("")
+}
+
+fn txt_chunks(rd: BitArray, acc: BitArray) -> BitArray {
+  case rd {
+    <<len:int-size(8), rest:bits>> -> {
+      let bytes = bit_array.slice(rest, 0, len)
+      let tail = bit_array.slice(rest, len, bit_array.byte_size(rest) - len)
+      case bytes, tail {
+        Ok(bytes), Ok(tail) -> txt_chunks(tail, bit_array.concat([acc, bytes]))
+        _, _ -> acc
+      }
+    }
+    _ -> acc
+  }
 }
 
 fn check_declaration_sigs(
@@ -214,9 +281,15 @@ fn rrsig_labels_and_signer(rrsig_rdata: BitArray) -> Result(#(Int, Name), Nil) {
 /// it can check the things that are cheap to get wrong and impossible to
 /// notice afterwards: that the declaration sits below a signing zone that
 /// contains the apex, that the ladder climbs from that zone to the **root**,
-/// and that each link carries the RRsets its position requires. Every shape
-/// rule a reader applies is applied here, so a publish that cannot be
-/// verified fails while an operator is still watching it.
+/// and that each link carries the RRsets its position requires.
+///
+/// **This is the shape half only.** The content rules a reader also applies —
+/// the declaration's text, and the DS actually covering a key in the RRset —
+/// are enforced where the records are collected (`declaration_link`,
+/// `check_ds_covers`), because they need the answers rather than the encoded
+/// links. Between them they cover every non-cryptographic rule a reader
+/// turns on; the signatures remain this service's blind spot, and the module
+/// docs say what that leaves reachable.
 ///
 /// A ladder link's parent is a *proper ancestor* of the link below it, not
 /// its one-label parent name: zone cuts cross as many labels as a delegation
@@ -326,7 +399,9 @@ fn zone_link(
       )
     _ -> Ok(Nil)
   })
-  use ds <- result.try(rrset(resolver, zone, type_ds))
+  use ds_answers <- result.try(resolver.query(zone, type_ds))
+  use ds <- result.try(rrset_of(ds_answers, zone, type_ds))
+  use Nil <- result.try(check_ds_covers(zone, keys_answers, ds_answers))
   Ok(#(Link(name.to_string(zone), bit_array.concat([keys_rrs, ds])), rdatas))
 }
 
@@ -337,7 +412,7 @@ fn zone_link(
 /// withdrawn. Neither is part of the authorized set, and a reader's chain walk
 /// excludes both — so a claim naming one would describe a set no client
 /// derives.
-fn claimable(rd: BitArray) -> Bool {
+pub fn claimable(rd: BitArray) -> Bool {
   case rd {
     <<flags:int-size(16), _:bits>> ->
       int.bitwise_and(flags, zone_key_flag) != 0
@@ -417,11 +492,15 @@ fn zone_cut_link(
   resolver: Resolver,
   zone: Name,
 ) -> Result(Result(Link, Nil), String) {
-  use ds <- result.try(maybe_rrset(resolver, zone, type_ds))
-  use keys <- result.try(maybe_rrset(resolver, zone, wire.type_dnskey))
+  use ds_answers <- result.try(resolver.query(zone, type_ds))
+  use key_answers <- result.try(resolver.query(zone, wire.type_dnskey))
+  use ds <- result.try(maybe_rrset_of(ds_answers, zone, type_ds))
+  use keys <- result.try(maybe_rrset_of(key_answers, zone, wire.type_dnskey))
   case ds, keys {
-    Ok(ds), Ok(keys) ->
+    Ok(ds), Ok(keys) -> {
+      use Nil <- result.try(check_ds_covers(zone, key_answers, ds_answers))
       Ok(Ok(Link(name.to_string(zone), bit_array.concat([keys, ds]))))
+    }
     Error(Nil), Error(Nil) -> Ok(Error(Nil))
     Ok(_), Error(Nil) ->
       Error(
@@ -434,6 +513,59 @@ fn zone_cut_link(
         name.to_string(zone)
         <> " answers a DNSKEY RRset but its parent holds no DS for it, so"
         <> " the delegation is insecure and the chain breaks there",
+      )
+  }
+}
+
+/// Whether some claimable DNSKEY at `zone` is covered by a DS in the same
+/// link — the check `chain.rs`'s `covers` makes of every ladder link below
+/// the top, made here before anything is written to a public log.
+///
+/// This is the rule a resolver breaks by *answering incompletely*: a DS RRset
+/// from before a rollover, a DNSKEY RRset from after it, and the two describe
+/// different keys. Both RRsets are individually signed and individually
+/// valid, so nothing else in this collector notices — and the entry that
+/// results is one every client refuses and every monitor files as tier B,
+/// permanently, because a Merkle leaf cannot be withdrawn.
+///
+/// SHA-256 and SHA-384 only, matching the reader: a chain that can only be
+/// followed through SHA-1 is one it declines to follow.
+fn check_ds_covers(
+  zone: Name,
+  key_answers: List(wire.Rr),
+  ds_answers: List(wire.Rr),
+) -> Result(Nil, String) {
+  let digests =
+    ds_answers
+    |> list.filter(fn(rr) { owned(rr, zone, type_ds) })
+    |> list.filter_map(fn(rr) {
+      case rr.rdata {
+        <<_tag:int-size(16), _alg:int-size(8), 2:int-size(8), digest:bits>> ->
+          Ok(digest)
+        <<_tag:int-size(16), _alg:int-size(8), 4:int-size(8), digest:bits>> ->
+          Ok(digest)
+        _ -> Error(Nil)
+      }
+    })
+  let covered =
+    key_answers
+    |> list.filter(fn(rr) { owned(rr, zone, wire.type_dnskey) })
+    |> list.map(fn(rr) { rr.rdata })
+    |> list.filter(claimable)
+    |> list.any(fn(rd) {
+      let want = keys.ds_digest(zone, rd)
+      list.any(digests, fn(got) { got == want })
+    })
+  case covered {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        "no usable DNSKEY at "
+        <> name.to_string(zone)
+        <> " is covered by a DS its parent published (SHA-256 or SHA-384) — "
+        <> "the DS and DNSKEY RRsets this resolver answered describe different "
+        <> "keys, so the chain would not walk at any reader. Is a rollover in "
+        <> "flight, or has the new DS finished propagating?",
       )
   }
 }
@@ -455,12 +587,11 @@ fn rrset(
 /// `rrset`, but absence is an answer: `Error(Nil)` for a name that has no
 /// RRset of this type at all. An RRset that is *there* and unsigned is still
 /// a failure, because a link cannot carry it.
-fn maybe_rrset(
-  resolver: Resolver,
+fn maybe_rrset_of(
+  answers: List(wire.Rr),
   zone: Name,
   rtype: Int,
 ) -> Result(Result(BitArray, Nil), String) {
-  use answers <- result.try(resolver.query(zone, rtype))
   case list.any(answers, fn(rr) { owned(rr, zone, rtype) }) {
     False -> Ok(Error(Nil))
     True -> rrset_of(answers, zone, rtype) |> result.map(Ok)

@@ -1068,8 +1068,8 @@ mod tests {
         // The stat quick check is (size, mtime, file_id). A same-size rewrite
         // landing within the filesystem's timestamp granularity leaves all
         // three identical — forced here with set_times, which is what a
-        // coarse-clock kernel does on its own — and used to be silently
-        // never published. Within the racy window the bytes speak instead.
+        // coarse-clock kernel does on its own — so the quick check alone would
+        // never publish it. Within the racy window the bytes speak instead.
         let (_d, space, node) = node_with_space().await;
         let path = space.path().join("rolling.txt");
         std::fs::write(&path, b"revision 1").unwrap();

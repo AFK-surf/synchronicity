@@ -167,9 +167,8 @@ async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
         // `off` on purpose: under `require` the apex sandwich in `apex_of`
-        // happens to block this too, which is what hid the hole. The signer
-        // rule has to stand on its own, so it is tested where nothing else
-        // is holding the door.
+        // happens to block this too. The signer rule has to stand on its own,
+        // so it is tested where nothing else is holding the door.
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
@@ -198,5 +197,68 @@ async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
         .member_set("cluster.example")
         .await
         .expect_err("a forged membership answer must not bind anything");
+    server.abort();
+}
+
+/// A record spliced into a validated answer in another class binds nothing.
+///
+/// The forgery is one added record, available to anyone on the path of a
+/// plaintext DoH endpoint and to the resolver itself — the party §4.4 of
+/// docs/REKOR-ZONE-KEY.md describes and, until this test existed, wrongly
+/// called an availability-only threat.
+///
+/// It works against a validator that reads `Proof::Secure` as "this record is
+/// signed", because hickory groups RRsets by `(name, record_type)` and stamps
+/// its verdict on the whole group, while the signed-data construction filters
+/// by class and drops the intruder. The honest RRSIG still verifies, so
+/// *nothing else in the pipeline notices*: the zone key is the real one, its
+/// transparency proof is the real one, and the chain walks. Only the
+/// acceptance rule stands between the spliced record and a full read/write
+/// binding — which is why `dns::covered_by_signed_data` matches the
+/// verifier's `(name, type, class)` triple exactly rather than approximately.
+#[tokio::test]
+async fn a_record_spliced_in_another_class_is_signed_by_nobody() {
+    let nas = SecretKey::generate().public();
+    let attacker = SecretKey::generate().public();
+    let mut zone = SimZone::new(
+        "cluster.example",
+        vec![format!("v=sync1 id=nas nk={}", nas.to_z32())],
+    );
+    zone.splice_foreign_class = vec![format!("v=sync1 id=evil nk={}", attacker.to_z32())];
+    let anchor = anchor_file(&zone.anchor_record());
+    let (url, server) = zone.serve().await;
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        doh_url: Some(url),
+        trust_anchor: Some(anchor.path().to_path_buf()),
+        // `off` deliberately: the transparency requirement is *no* defense
+        // here — it covers the zone key, which really did sign the real
+        // RRset — so the acceptance rule has to hold with nothing behind it.
+        rekor: Some(RekorPolicy::Off),
+        rekor_key: None,
+        rekor_state: None,
+        tuf_url: None,
+        no_tuf: true,
+        tuf_root: None,
+    })
+    .unwrap();
+
+    let validated = resolver
+        .lookup_txt("cluster.example")
+        .await
+        .expect("the honest RRset still validates");
+    assert_eq!(
+        validated.records.len(),
+        1,
+        "an unsigned record reached the validated set: {:?}",
+        validated.records
+    );
+
+    let (set, _ttl) = resolver.member_set("cluster.example").await.unwrap();
+    assert_eq!(set.bindings.len(), 1, "{set:?}");
+    assert!(
+        set.bindings.iter().all(|(_, key)| *key != attacker),
+        "a spliced record bound a key the zone never published: {set:?}"
+    );
     server.abort();
 }

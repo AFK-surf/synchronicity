@@ -687,9 +687,9 @@ impl Node {
     /// Refuses while this node is in key-loss recovery (§3.4): the head it
     /// would mint carries a seq every peer rejects.
     /// One SQLite transaction, as §10 requires: "trie writes, head, history,
-    /// and materialization commit together or not at all". A crash between any
-    /// two of those steps used to be able to leave a head whose trie was
-    /// half-written, or a head slot the derived views did not agree with.
+    /// and materialization commit together or not at all". Without that, a
+    /// crash between any two of those steps leaves a head whose trie is
+    /// half-written, or a head slot the derived views do not agree with.
     pub fn publish(&self, staged: &[StagedChange]) -> Result<Option<SignedHead>> {
         if staged.is_empty() {
             return Ok(None);
@@ -1299,8 +1299,8 @@ mod tests {
         // §10: trie writes, head, history and materialization commit together
         // or not at all. A record the materializer cannot decode fails the
         // last of those steps, after the trie has been written, the head
-        // signed, and both history rows inserted — exactly the window a crash
-        // used to be able to land in.
+        // signed, and both history rows inserted — exactly the window an
+        // untransacted publish would let a crash land in.
         let dir = node_dir();
         let space = tempfile::tempdir().unwrap();
         let node = spawn(dir.path(), None).await;

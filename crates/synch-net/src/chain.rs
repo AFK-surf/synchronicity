@@ -1096,13 +1096,11 @@ mod tests {
 
     /// Names are normalized, never trimmed.
     ///
-    /// This is the rule whose absence broke the central invariant: the client
-    /// compared a certificate's SAN to the observed apex by trimming trailing
-    /// dots, so `victim.example..` compared equal to `victim.example.` and was
-    /// accepted — while the monitor, which parsed the SAN, could not read it
-    /// at all and filed the entry in the silent bin. Every client accepts, no
-    /// monitor alerts. Parsing rejects the spelling outright, on both sides,
-    /// because both now go through one place.
+    /// Trimming makes `victim.example..` compare equal to `victim.example.`
+    /// while a parser refuses to read it at all — a client accepting what a
+    /// monitor files in the silent bin, which is the divergence the tiering
+    /// exists to prevent. Both sides go through one parser, and it rejects
+    /// the spelling outright.
     #[test]
     fn a_name_that_is_not_a_name_equals_nothing() {
         let good = parse_name("victim.example.").expect("a name");

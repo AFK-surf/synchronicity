@@ -21,7 +21,6 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import provider/state as provider_state
 import store/pool
-import tuf/store as tuf_store
 import wisp.{type Request, type Response}
 import zone/model
 
@@ -222,27 +221,13 @@ fn with_session(
 
 fn healthz(serving: Serving) -> Response {
   let looked =
-    pool.with_connection(serving.pool, fn(conn) {
-      #(model.health(conn), tuf_store.get(conn))
-    })
+    pool.with_connection(serving.pool, fn(conn) { model.health(conn) })
   case looked {
-    Ok(#(Ok(#(serial, expires)), tuf)) ->
+    Ok(Ok(#(serial, expires))) ->
       json.object([
         #("status", json.string("ok")),
         #("soa_serial", json.int(serial)),
         #("sig_expires_at", json.int(expires)),
-        // The stored TUF material (docs/REKOR-ZONE-KEY.md §10.3): the
-        // timestamp expiry and root version, so an operator can see a
-        // service that has quietly stopped refetching and is heading for a
-        // stale idea of which log shard is in service. Absent material is
-        // reported as absent, not as unhealthy.
-        ..case tuf {
-          Ok(Ok(material)) -> [
-            #("tuf_root_version", json.int(material.root_version)),
-            #("tuf_timestamp_expires_at", json.int(material.timestamp_expires)),
-          ]
-          _ -> []
-        }
       ])
       |> json.to_string
       |> wisp.json_response(200)
@@ -278,6 +263,28 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
         Error(Nil) -> False
       }
       let logged = list.filter(keys, fn(key) { key.logged_at != option.None })
+      let provider_fields = case state {
+        Ok(s) -> [
+          #("provider", json.string(s.provider)),
+          #("provider_zone_id", json.string(s.provider_zone_id)),
+          #(
+            "provider_last_synced_serial",
+            json.nullable(s.last_synced_serial, json.int),
+          ),
+          #("provider_last_ok_at", json.nullable(s.last_ok_at, json.int)),
+          #("provider_last_error", json.nullable(s.last_error, json.string)),
+          #("provider_last_error_at", json.nullable(s.last_error_at, json.int)),
+          #(
+            "provider_last_failures",
+            json.nullable(s.last_failures, json.string),
+          ),
+          #(
+            "provider_last_partial_at",
+            json.nullable(s.last_partial_at, json.int),
+          ),
+        ]
+        Error(Nil) -> [#("provider", json.string("never synced"))]
+      }
       json.object([
         #("status", json.string("ok")),
         #("mode", json.string("external")),
@@ -294,31 +301,7 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
             json.int,
           ),
         ),
-        ..case state {
-          Ok(s) -> [
-            #("provider", json.string(s.provider)),
-            #("provider_zone_id", json.string(s.provider_zone_id)),
-            #(
-              "provider_last_synced_serial",
-              json.nullable(s.last_synced_serial, json.int),
-            ),
-            #("provider_last_ok_at", json.nullable(s.last_ok_at, json.int)),
-            #("provider_last_error", json.nullable(s.last_error, json.string)),
-            #(
-              "provider_last_error_at",
-              json.nullable(s.last_error_at, json.int),
-            ),
-            #(
-              "provider_last_failures",
-              json.nullable(s.last_failures, json.string),
-            ),
-            #(
-              "provider_last_partial_at",
-              json.nullable(s.last_partial_at, json.int),
-            ),
-          ]
-          Error(Nil) -> [#("provider", json.string("never synced"))]
-        }
+        ..provider_fields
       ])
       |> json.to_string
       |> wisp.json_response(200)

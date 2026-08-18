@@ -180,10 +180,8 @@ pub fn run(
       crypto.Sha256,
       statement.pae(statement.dsse_payload_type, statement_bytes),
     )
-  let submission = Submission(digest, signature, certificate)
-  use logged <- result.try(
-    log.submit(submission) |> result.map_error(LogUnavailable),
-  )
+  let sub = Submission(digest, signature, certificate)
+  use logged <- result.try(log.submit(sub) |> result.map_error(LogUnavailable))
 
   let record =
     Proof(
@@ -206,6 +204,28 @@ pub fn run(
   use verified <- result.try(
     verify_entry(record, apex) |> result.map_error(Unverified),
   )
+  // And that what came back is what went out. Everything above re-derives
+  // from the log's own response, which establishes that the entry is
+  // *internally* sound and in the tree — not that it is the entry this
+  // ceremony submitted. A log that returned a different leaf carrying the
+  // same statement, signed by a key of its own and carrying a chain of its
+  // own, would satisfy every check above and then be stored, served, and
+  // reused verbatim on every later refresh. Comparing the three bytes we
+  // built closes that without trusting the log for anything.
+  use Nil <- result.try(case proof.parse_body(record.canonicalized_body) {
+    Ok(#(digest, signature, certificate))
+      if digest == sub.digest
+      && signature == sub.signature
+      && certificate == sub.certificate
+    -> Ok(Nil)
+    _ ->
+      Error(
+        Unverified(proof.Binding(
+          "the log returned an entry that is not the one submitted: its digest, "
+          <> "signature or certificate differs from the bytes this ceremony built",
+        )),
+      )
+  })
   use _ <- result.try(
     proof.verify_against_log(record, log_key.0, log_key.1)
     |> result.map_error(Unverified),

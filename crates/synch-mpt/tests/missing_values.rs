@@ -1,5 +1,5 @@
-//! Audit finding F4 (fixed) — a missing out-of-line value was reported once,
-//! after which the walk declared itself exhausted.
+//! A missing out-of-line value must not be reported once and then leave the
+//! walk declaring itself exhausted.
 //!
 //! `MissingWalk::next_batch` pushes a missing *node* onto both `missing.nodes`
 //! and `self.deferred`, so `resume()` re-queues it. A missing *value* went to

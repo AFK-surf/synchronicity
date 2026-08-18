@@ -505,8 +505,8 @@ impl Store {
     /// (`synch doctor --rebuild`).
     pub fn rematerialize(&self, origin: &OriginId, root: Hash) -> Result<usize> {
         // One transaction, because the intermediate state is destructive. The
-        // two deletes each used to autocommit and the diff was computed outside
-        // any transaction, so `entries` was observably empty for the whole
+        // Letting the two deletes autocommit and computing the diff outside
+        // any transaction leaves `entries` observably empty for the whole
         // rebuild — and a mirror pass reading `unified_listing` in that window
         // builds an empty `known` set and its sweep unlinks the user's files.
         self.transaction(|txn| {

@@ -95,8 +95,8 @@ pub fn create_device(
     _, Error(Nil), _ -> refused(build.InvalidNk(nk))
     // Refused here as well as at publish. A membership record is
     // whitespace-separated key=value pairs, so a hint carrying whitespace
-    // is extra fields rather than one value — and the client's parser is
-    // last-wins for apex=, so it can override a field the operator set.
+    // is extra fields rather than one value — and a second apex= makes the
+    // client refuse the whole record.
     _, _, False -> refused(bad_hint(relay, addr))
     True, Ok(nk_bytes), True ->
       with_db(ctx, fn(conn) {

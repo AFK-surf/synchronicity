@@ -385,13 +385,13 @@ impl BlobClient {
             // The window is the *requester's* to choose, and it is chosen so
             // the provider never has to truncate.
             //
-            // It used to be the provider's: the whole remainder was offered,
-            // `ProofEnd` reported how much came back, and neither side could
-            // tell an honest short answer from a provider dribbling one node
-            // per round trip. The provider threw away a truncated walk and
-            // *walked the whole thing again* over the ranges that fit, so both
-            // sides would agree node for node. That existed only because the
-            // split was unpredictable. It is not: the cost of a walk is bounded
+            // Leaving it to the provider — offering the whole remainder and
+            // letting `ProofEnd` report how much came back — makes an honest
+            // short answer indistinguishable from a provider dribbling one
+            // node per round trip, and forces the provider to discard a
+            // truncated walk and redo it over the ranges that fit so both
+            // sides agree node for node. All of that assumes the split is
+            // unpredictable. It is not: the cost of a walk is bounded
             // by its ranges and level, and while the provider walks
             // `requested ∩ what it holds` — which we cannot know — a subset
             // never costs more than the whole. Sizing the window to fit
@@ -534,13 +534,13 @@ mod tests {
 
     /// A provider dribbling one group per answer cannot hold a descent open.
     ///
-    /// `remaining` used to retire only what came back, so a provider serving a
-    /// valid proof of a single group per exchange reset the barren counter every
-    /// time, `MAX_BARREN_WINDOWS` never fired, and the deadline is per exchange
-    /// — one round trip per group of the object, each costing the victim an
-    /// outboard write, an fsync and an immediate transaction on its one write
-    /// connection. The slice path always retired the whole window
-    /// (`docs/DELTA-SYNC.md` §3.3); the proof path now does too.
+    /// Retiring only what came back would let a provider serving a valid
+    /// proof of a single group per exchange reset the barren counter every
+    /// time: `MAX_BARREN_WINDOWS` never fires, and the deadline is per
+    /// exchange — one round trip per group of the object, each costing the
+    /// victim an outboard write, an fsync and an immediate transaction on its
+    /// one write connection. So the whole window is retired either way, on
+    /// this path as on the slice path (`docs/DELTA-SYNC.md` §3.3).
     #[tokio::test]
     async fn a_provider_serving_one_group_at_a_time_cannot_stretch_a_descent() {
         let provider_dir = tempfile::tempdir().unwrap();

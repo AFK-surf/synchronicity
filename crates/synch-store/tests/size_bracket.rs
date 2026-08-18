@@ -1,5 +1,5 @@
-//! Audit finding F3 (fixed) — a wrong size inside one power-of-two bracket
-//! verifies against the tree, and used to brick the root permanently.
+//! A wrong size inside one power-of-two bracket verifies against the tree,
+//! and must not be allowed to brick the root.
 //!
 //! DESIGN.md and `docs/DELTA-SYNC.md` §6 both rested on the claim that
 //! "anything that changes the object's group count changes the shape of its

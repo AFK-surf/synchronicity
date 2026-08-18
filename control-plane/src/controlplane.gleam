@@ -40,7 +40,6 @@ import gleam/result
 import gleam/string
 import jobs/provider_sync
 import jobs/resign
-import jobs/tuf_refresh
 import jobs/zonekey_watch
 import mist
 import provider/bunny
@@ -54,7 +53,6 @@ import store/migrate
 import store/pool
 import store/sqlite
 import tools/seed
-import tuf/fetch as tuf_fetch
 import wisp/wisp_mist
 import zone/model
 import zone/publish
@@ -189,16 +187,11 @@ fn rekor_publish(
   use csk <- result.try(keys.load(key_file))
   use conn <- result.try(open_primary_db(cfg))
   let now = now_unix()
-  // Which shard to submit to comes out of the stored TUF material, so a
-  // ceremony run after Sigstore rotates goes to the new log without a
-  // release. On a control plane that has never fetched, this fetches.
-  let tuf_source = tuf_fetch.url()
-  use target <- result.try(client.resolve(
-    conn,
-    tuf_fetch.http(tuf_source),
-    tuf_source,
-    now,
-  ))
+  // Which shard to submit to comes out of the trusted root this build ships.
+  // A ceremony run after Sigstore opens the next shard needs a deploy — or
+  // CP_REKOR_URL and CP_REKOR_KEY, which name a log outright — and says so
+  // rather than submitting into a closed one.
+  use target <- result.try(client.discover(now))
   let claim = case forced_action {
     // The retiring subject is the CSK being taken out of service — the one
     // key this deployment ever put in the zone.
@@ -479,7 +472,6 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
     ))
     |> sup.add(mist.supervised(http))
     |> sup.add(resign.supervised(cfg.db_path, csk))
-    |> sup.add(tuf_refresh.supervised(cfg.db_path))
     |> sup.start
     |> result.map_error(fn(_) { "could not start supervision tree" }),
   )
@@ -573,7 +565,6 @@ fn serve_external(
       4,
     ))
     |> sup.add(mist.supervised(http))
-    |> sup.add(tuf_refresh.supervised(cfg.db_path))
     |> sup.add(provider_sync.supervised(
       sync_name,
       cfg.db_path,

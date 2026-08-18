@@ -1,14 +1,14 @@
-//! Audit finding F1 (fixed) — a trie DAG fans out exponentially in `diff`, but
-//! not in the fetch that admits it.
+//! A trie DAG fans out exponentially in `diff`, but not in the fetch that
+//! admits it.
 //!
 //! Nothing canonicalises a peer's node graph, and a branch may point all
 //! sixteen children at the same hash. `MissingWalk` deduplicates on hash, so
 //! such a structure is `k + 1` nodes on the wire and `is_complete` answers yes.
-//! `diff_walk` walks *positions*, so it used to expand into 16^k paths — one
-//! SQLite read each, one `Change` per leaf visit — inside the promotion
-//! transaction, holding the write lock. Measured before the fix: k = 6 is
-//! 7 nodes on the wire, 16 777 216 changes, 155 s. `MAX_DEPTH_NIBBLES` bounds
-//! depth, not breadth, so it was no defence.
+//! `diff_walk` walks *positions*, so without a bound it expands into 16^k
+//! paths — one SQLite read each, one `Change` per leaf visit — inside the
+//! promotion transaction, holding the write lock. Measured: k = 6 is 7 nodes
+//! on the wire, 16 777 216 changes, 155 s. `MAX_DEPTH_NIBBLES` bounds depth,
+//! not breadth, so it is no defence.
 //!
 //! Note what such a structure *is*: a valid trie describing 16^k entries in
 //! k + 1 nodes. There is no local check that calls it malformed, because it is
@@ -62,8 +62,8 @@ fn fanout_bomb(store: &MemStore, k: usize) -> Hash {
 
 #[test]
 fn a_fanout_bomb_is_refused_rather_than_walked() {
-    // k = 6 was 16.7M changes and 155 s before the fix. The walk now stops
-    // inside the bounded floor instead, so this test runs in milliseconds.
+    // Unbounded, k = 6 is 16.7M changes and 155 s. The walk stops inside the
+    // bounded floor instead, so this test runs in milliseconds.
     let store = MemStore::new();
     let root = fanout_bomb(&store, 6);
     let trie = Trie::new(&store);

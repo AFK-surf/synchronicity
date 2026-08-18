@@ -251,11 +251,34 @@ fn omit_members(conn: Connection) -> Result(Bool, String) {
   case gate.required() {
     False -> Ok(False)
     True ->
-      rekor_store.any_verified(conn)
-      |> result.map(fn(any) { !any })
-      |> result.map_error(fn(e) {
-        "reading rekor records: " <> string.inspect(e)
-      })
+      // **The live keys, not "has anything ever been logged".** Serve mode's
+      // gate asks whether the *active CSK* is claimed by a verified record
+      // (`gate.check` → `store.covered`, by rdata digest); this is the
+      // external-mode analogue and asks the same question. A gate that asked
+      // only whether *some* record existed would arm once, at the first
+      // publish, and never again — so a provider that later rotated to an
+      // unlogged key would keep getting membership TXT published while every
+      // `require` client failed closed on it.
+      //
+      // Every observed key, because in external mode the provider holds the
+      // keys and this service cannot tell which of them signs a given answer:
+      // whichever one does, a client demands a proof for *that* one. This is
+      // the same bar `zonekey_watch` uses to decide it has nothing to do, so
+      // the two cannot disagree about whether a zone is covered.
+      //
+      // No observed keys at all is the bootstrap case and still holds
+      // membership back: nothing is known to be logged yet.
+      case state.observed_keys(conn) {
+        Error(e) -> Error("reading observed zone keys: " <> string.inspect(e))
+        Ok([]) -> Ok(True)
+        Ok(observed) ->
+          observed
+          |> list.try_map(fn(key) { rekor_store.covered(conn, key.key_sha256) })
+          |> result.map(fn(flags) { !list.all(flags, fn(ok) { ok }) })
+          |> result.map_error(fn(e) {
+            "reading rekor records: " <> string.inspect(e)
+          })
+      }
   }
 }
 

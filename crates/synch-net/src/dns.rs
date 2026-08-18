@@ -153,16 +153,8 @@ fn candidates_to_verify(mut candidates: Vec<rekor::RekorProof>) -> Vec<rekor::Re
 /// domain can ask for at the minimum TTL, and this is where it stops.
 const MAX_PROOF_CANDIDATES: usize = 4;
 
-/// The most control-plane apexes one membership answer will send a client
-/// looking for proofs under.
-///
-/// Ordered by how many records name each, so the apex the answer mostly agrees
-/// on is tried first and a stray record costs one extra pair of lookups rather
-/// than the domain.
-const MAX_APEX_CANDIDATES: usize = 3;
-
-/// The control-plane apexes a validated membership answer names, each checked
-/// at both ends, most-attested first.
+/// The control-plane apex a validated membership answer names, checked at
+/// both ends.
 ///
 /// An apex has to sit between the domain being resolved and the zone that
 /// signed the answer:
@@ -176,35 +168,37 @@ const MAX_APEX_CANDIDATES: usize = 3;
 /// watching this one. The upper bound is what stops it pointing outside the
 /// zone that actually vouched for the answer.
 ///
-/// **A record that names an unusable apex, or one the rest of the set does not,
-/// is a rejected record and not a rejected answer.** That is the rule every
-/// neighbouring reader already applies — to member records, and to the proof
-/// records this apex leads to — and it belongs here most of all, because the
-/// realistic cause is not an attacker but ordinary operations: a stale record
-/// left by a decommissioned control plane, a migration in flight, two control
-/// planes sharing one signing zone. Failing the whole answer on one of those
-/// fails *every* refresh for the domain, and under `Require` the cached
-/// bindings then expire and the domain is partitioned until a human deletes a
-/// TXT record. Anyone able to add a record to the membership name could add
-/// their own device key instead — the transparency layer covers the zone key,
-/// not the record set — so refusing the readable subset buys nothing.
+/// **The records of one answer must agree, and one apex is all a client will
+/// look under.** The apex is part of the owner name — membership lives at
+/// `_synchronicity.<network>.<org>.<apex>` — so records naming two different
+/// apexes are records at two different names, and a client that queried one of
+/// them has not read the other. The cases that look like they need a candidate
+/// list (a decommissioned control plane's leftovers, a migration in flight,
+/// two control planes inside one signing zone) all relocate the owner name
+/// along with the apex, so none of them puts two apexes in one answer.
 ///
-/// A hard failure survives for the one case that has no readable subset: no
-/// record names a usable apex at all.
-fn apexes_of(domain: &str, signing_zone: &Name, records: &[String]) -> Result<Vec<Name>, NetError> {
+/// A zone can still be *hand-authored* into disagreeing, and then this refuses
+/// rather than trying each in turn. That is the honest answer: an answer whose
+/// records disagree about which control plane covers them is misconfigured in
+/// a way no amount of guessing resolves, and trying every reading multiplies
+/// the lookups a single refresh costs — which is the budget `parts_claimed`
+/// bounds on the assumption it is spent once.
+///
+/// A record naming an *unusable* apex is still only a rejected record: that is
+/// the rule every neighbouring reader applies, and the realistic cause is a
+/// member editing their own dialing hint rather than an attacker.
+fn apex_of(domain: &str, signing_zone: &Name, records: &[String]) -> Result<Name, NetError> {
     let mut owner = Name::from_utf8(domain).map_err(|e| NetError::Dns(format!("{domain}: {e}")))?;
     owner.set_fqdn(true);
     let owner = owner.to_lowercase();
 
-    // Counted rather than collected, so "most of the set says this" is what
-    // decides the order.
-    let mut attested: BTreeMap<Name, usize> = BTreeMap::new();
-    for named in records
+    let mut named: Option<Name> = None;
+    for text in records
         .iter()
         .filter_map(|record| parse_record(record).ok())
         .filter_map(|record| record.apex)
     {
-        let Ok(mut apex) = Name::from_utf8(&named) else {
+        let Ok(mut apex) = Name::from_utf8(&text) else {
             continue;
         };
         apex.set_fqdn(true);
@@ -212,22 +206,24 @@ fn apexes_of(domain: &str, signing_zone: &Name, records: &[String]) -> Result<Ve
         if !apex.zone_of(&owner) || !signing_zone.zone_of(&apex) {
             continue;
         }
-        *attested.entry(apex).or_default() += 1;
+        match &named {
+            Some(first) if *first != apex => {
+                return Err(NetError::Dns(format!(
+                    "{domain}: its records name two control-plane apexes, {first} \
+                     and {apex} — one answer is covered by one control plane, and \
+                     which of them this is cannot be guessed"
+                )))
+            }
+            _ => named = Some(apex),
+        }
     }
-    if attested.is_empty() {
-        return Err(NetError::Dns(format!(
+    named.ok_or_else(|| {
+        NetError::Dns(format!(
             "{domain}: no membership record names an apex= inside {signing_zone} \
              that contains it, so there is nowhere to look for its transparency \
              records"
-        )));
-    }
-    let mut ordered: Vec<(Name, usize)> = attested.into_iter().collect();
-    // Descending by attestation, then by name: a tie has to resolve the same
-    // way on every client, or two nodes reading one zone disagree about which
-    // control plane they belong to.
-    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    ordered.truncate(MAX_APEX_CANDIDATES);
-    Ok(ordered.into_iter().map(|(apex, _)| apex).collect())
+        ))
+    })
 }
 
 /// Clamps a TTL into the §3.2 window.
@@ -333,7 +329,7 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
             // two things about its control plane says nothing, and every other
             // field this parser turns on is read that way. (Nothing security
             // rests on it — the control plane validates hints before it renders
-            // them, and `apexes_of` bounds every apex at both ends regardless —
+            // them, and `apex_of` bounds the apex at both ends regardless —
             // it is one parser reading one format one way.)
             "apex" => {
                 if apex.is_some() {
@@ -522,10 +518,12 @@ impl MemberSet {
 /// Parses and normalizes a DoH endpoint URL.
 ///
 /// `https://` or `http://`, host required, query path defaulting to
-/// `/dns-query`. Plaintext is not the security hole it looks like: the
-/// answers are DNSSEC-validated in process exactly as on the UDP-53 default
-/// path, so http costs query privacy and a denial lever — the same things
-/// UDP already concedes — and nothing about integrity.
+/// `/dns-query`. Plaintext concedes what UDP-53 always conceded: query
+/// privacy and a denial lever. It concedes integrity only as far as the
+/// validation below it is sound — and that is a real qualifier, not a
+/// formality: a party who can add a record to a response is answered by
+/// [`covered_by_signed_data`] and nothing else. Prefer `https://` and treat
+/// the in-process validation as the last line rather than the only one.
 fn doh_url(url: &str) -> Result<reqwest::Url, NetError> {
     let bad = |why: String| NetError::Dns(format!("DoH endpoint {url}: {why}"));
     let mut parsed = reqwest::Url::parse(url).map_err(|e| bad(e.to_string()))?;
@@ -985,7 +983,7 @@ impl DnssecResolver {
             // control planes inside one signing zone would otherwise have to
             // share a single record name — and, on the publishing side, delete
             // each other's records forever.
-            let apexes = apexes_of(&domain, &signing_zone, &validated.records)?;
+            let apex = apex_of(&domain, &signing_zone, &validated.records)?;
             // The pin set is refreshed *before* the proof is verified, so a
             // proof from a shard Sigstore added since this build shipped
             // verifies in the same refresh that learned about it (§10.2).
@@ -1023,23 +1021,11 @@ impl DnssecResolver {
                     "Sigstore's TUF repository did not update the pin set; the current pins stand"
                 ),
             }
-            // Each apex the answer attests, most-attested first, until one
-            // yields a verified proof. A stale `apex=` beside a live one names a
-            // control plane with no usable proof, which costs a pair of lookups
-            // rather than the domain (see `apexes_of`).
-            let mut refusal = None;
-            for apex in &apexes {
-                match self.verify_zone_key(&domain, apex, &validated).await {
-                    Ok(_) => {
-                        refusal = None;
-                        break;
-                    }
-                    Err(e) => refusal = Some(e),
-                }
-            }
-            if let Some(e) = refusal {
-                return Err(e);
-            }
+            // One apex, one verification. `apex_of` has already refused an
+            // answer that names none or names two, so there is no branch here
+            // in which the requirement goes unchecked — a straight line rather
+            // than an invariant about how many times a loop ran.
+            self.verify_zone_key(&domain, &apex, &validated).await?;
         }
         let set = MemberSet::from_records(&domain, &validated.records)?;
         Ok((set, validated.ttl))
@@ -1359,7 +1345,7 @@ fn signing_key_rdata(
     // RRSIG whose signer does not enclose this zone is an off-path
     // signature and must not authorize anything here.
     let dnskey_rrsig_encloses = dnskey_answers.iter().any(|record| {
-        if record.name != *signing_zone || !record.proof.is_secure() {
+        if !covered_by_signed_data(record, signing_zone) {
             return false;
         }
         let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = &record.data else {
@@ -1389,7 +1375,7 @@ fn signing_key_rdata(
 
     let mut matched: Option<Vec<u8>> = None;
     for record in dnskey_answers {
-        if record.name != *signing_zone || !record.proof.is_secure() {
+        if !covered_by_signed_data(record, signing_zone) {
             continue;
         }
         let RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)) = &record.data else {
@@ -1821,9 +1807,9 @@ impl hickory_resolver::net::xfer::DnsHandle for DohHandle {
 /// stand until their grace runs out, and nothing false is ever accepted. It is
 /// reachable by anyone who can add a record to a response, including an on-path
 /// attacker against a plaintext DoH endpoint. It is a bug in the dependency's
-/// signature-selection logic and cannot be fixed from this side; what *is*
-/// fixed from this side is the other half of the same quirk — hickory's choice
-/// of *which* RRSIG is the signer no longer decides which zone key must carry a
+/// signature-selection logic and cannot be fixed from this side. What this
+/// side does close is the other half of the same quirk: hickory's choice of
+/// *which* RRSIG is the signer does not decide which zone key must carry a
 /// transparency proof (see [`ValidatedTxt::rrsigs`]).
 fn strip_off_path_rrsigs(response: &mut hickory_resolver::proto::op::DnsResponse) {
     drop_off_path_rrsigs(&mut response.answers);
@@ -1847,6 +1833,37 @@ fn rrsig_signer_encloses_owner(record: &Record) -> bool {
     }
 }
 
+/// Whether a record is one the RRSIG that validated its group actually
+/// **covers** — the question `Proof::Secure` looks like it answers and does
+/// not.
+///
+/// hickory groups an answer into RRsets by `(name, record_type)` and nothing
+/// else (`DnssecDnsHandle::verify_rrsets`, with a standing `TODO: support
+/// non-IN classes?`), then stamps the verdict onto *every* record in the
+/// group. The signed-data construction, meanwhile, filters by
+/// `(dns_class, type_covered, name)` (`TBS::new`) and builds its `RecordSet`
+/// hard-coded to class IN. So a record of another class is dropped from the
+/// bytes the signature is checked over — the honest RRSIG still verifies —
+/// and comes back marked `Secure` anyway.
+///
+/// A record spliced into a DoH response as class CH therefore arrives
+/// "DNSSEC-validated" while being signed by nobody. On the membership path
+/// that is a full read/write binding for a key the zone never published, from
+/// one added record, and it survives `--rekor require` untouched: the
+/// transparency proof covers the zone *key*, which really did sign the real
+/// RRset.
+///
+/// The rule this function states, and the reason it exists as a named
+/// predicate rather than three more `&&`s at four call sites: **the set of
+/// records accepted must be exactly the set the verifier canonicalizes.**
+/// hickory's is `(name, type, class)`; so is this. Matching it by
+/// construction is what keeps the next unmodelled dimension from being the
+/// next vulnerability.
+fn covered_by_signed_data(record: &Record, owner: &Name) -> bool {
+    use hickory_resolver::proto::rr::DNSClass;
+    record.name == *owner && record.dns_class == DNSClass::IN && record.proof.is_secure()
+}
+
 /// Applies the fail-closed §3.2 record checks to one answer set.
 ///
 /// Shared by both backends so the acceptance rule cannot drift between
@@ -1859,7 +1876,7 @@ fn secure_txt(
 ) -> Result<ValidatedTxt, NetError> {
     use hickory_resolver::proto::{
         dnssec::rdata::DNSSECRData,
-        rr::{RData, RecordType},
+        rr::{DNSClass, RData, RecordType},
     };
 
     let mut qname = hickory_resolver::proto::rr::Name::from_utf8(name)
@@ -1879,7 +1896,7 @@ fn secure_txt(
     // before anything is bound to it, so a chosen RRSIG that does not verify
     // under a secure DNSKEY of the signing zone refuses the answer.
     let signed_by = answers.iter().find_map(|record| {
-        if record.name != qname || !record.proof.is_secure() {
+        if !covered_by_signed_data(record, &qname) {
             return None;
         }
         let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
@@ -1934,6 +1951,13 @@ fn secure_txt(
         // bind attacker keys into the member set. Only records owned by the
         // queried name count.
         if record.name != qname {
+            continue;
+        }
+        // And of the class the signature covers. See `covered_by_signed_data`:
+        // a record of another class is one the RRSIG's own canonicalization
+        // drops, so it is *not* signed — but hickory stamps the whole group
+        // `Secure` regardless, and accepting it here is a membership forgery.
+        if record.dns_class != DNSClass::IN {
             continue;
         }
         // Only the records this answer is *made of* have to carry a proof.
@@ -2520,91 +2544,80 @@ mod tests {
         );
     }
 
-    /// Every apex the answer names is tried, and one stale record does not sink
-    /// a readable set.
+    /// One answer names one control-plane apex, bounded at both ends.
     ///
     /// An apex has to *contain* the membership domain — the control plane
-    /// publishes membership at `_synchronicity.<network>.<org>.<apex>` — so the
-    /// candidates are ancestors of the domain, which are totally ordered.
+    /// publishes membership at `_synchronicity.<network>.<org>.<apex>` — so
+    /// the apex is part of the owner name, and two apexes in one answer means
+    /// two records at names a client cannot both have queried. That is a
+    /// hand-authored zone contradicting itself, and it is refused rather than
+    /// tried each way: guessing multiplies the lookups one refresh costs, and
+    /// no reading of a self-contradicting answer is the right one.
     #[test]
-    fn every_agreeing_apex_is_offered_and_a_stale_one_does_not_sink_the_set() {
+    fn one_answer_names_one_apex_and_disagreement_is_refused() {
         let k = key();
         let domain = "net.org.cp.example.com";
         let signing_zone = Name::from_utf8("example.com.").unwrap();
         let named = |apex: &str| format!("v=sync1 id=nas nk={} apex={apex}", k.to_z32());
         let live = named("cp.example.com");
-        let stale = named("org.cp.example.com");
+        let other = named("org.cp.example.com");
+        let expected = Name::from_utf8("cp.example.com.").unwrap();
 
-        // One record, one apex.
+        // One record, and many records agreeing, name one apex.
         assert_eq!(
-            apexes_of(domain, &signing_zone, std::slice::from_ref(&live)).unwrap(),
-            vec![Name::from_utf8("cp.example.com.").unwrap()]
+            apex_of(domain, &signing_zone, std::slice::from_ref(&live)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            apex_of(domain, &signing_zone, &[live.clone(), live.clone()]).unwrap(),
+            expected
         );
 
-        // A disagreeing record adds a candidate rather than failing the answer,
-        // and the order is decided by the records themselves — never by the
-        // order an untrusted transport put them in.
-        let both = apexes_of(
-            domain,
-            &signing_zone,
-            &[live.clone(), live.clone(), stale.clone()],
-        )
-        .unwrap();
-        assert_eq!(
-            both,
-            vec![
-                Name::from_utf8("cp.example.com.").unwrap(),
-                Name::from_utf8("org.cp.example.com.").unwrap()
-            ],
-            "the apex most of the set names comes first"
-        );
-        assert_eq!(
-            apexes_of(domain, &signing_zone, &[stale.clone(), live.clone(), live]).unwrap(),
-            both,
-            "answer order decides nothing"
-        );
+        // Two usable apexes in one answer is a refusal, whichever order the
+        // untrusted transport put them in.
+        for records in [
+            vec![live.clone(), other.clone()],
+            vec![other.clone(), live.clone()],
+        ] {
+            let error = apex_of(domain, &signing_zone, &records)
+                .expect_err("an answer naming two apexes must be refused");
+            assert!(
+                error.to_string().contains("two control-plane apexes"),
+                "refused for the wrong reason: {error}"
+            );
+        }
 
         // An apex outside the signing zone, or one that does not contain the
-        // domain, is a rejected record — not a candidate and not a failure.
+        // domain, or one that is not a name, is a rejected *record* — the
+        // realistic cause is a member editing their own dialing hint.
         let outside = named("cp.other.example");
         let sibling = named("sibling.example.com");
         let unparseable = named("cp..example.com");
         assert_eq!(
-            apexes_of(
+            apex_of(
                 domain,
                 &signing_zone,
                 &[
-                    stale.clone(),
+                    live.clone(),
                     outside.clone(),
                     sibling.clone(),
                     unparseable.clone()
                 ]
             )
             .unwrap(),
-            vec![Name::from_utf8("org.cp.example.com.").unwrap()]
+            expected
         );
 
-        // The hard failure survives for the one case with no readable subset.
+        // And no usable apex at all is a refusal naming what is missing.
         for records in [
             vec![],
             vec![format!("v=sync1 id=nas nk={}", k.to_z32())],
             vec![outside, sibling, unparseable],
         ] {
-            let error = apexes_of(domain, &signing_zone, &records)
-                .expect_err("no usable apex is a refusal");
+            let error =
+                apex_of(domain, &signing_zone, &records).expect_err("no usable apex is a refusal");
             assert!(error.to_string().contains("no membership record names"));
         }
-
-        // And the work one answer can ask for is bounded, however many distinct
-        // apexes it names.
-        let deep = "n0.n1.n2.n3.n4.n5.n6.n7.n8.example.com";
-        // Every proper ancestor of `deep` inside the signing zone: eight
-        // distinct, usable apexes, all of which the answer names.
-        let many: Vec<String> = (1..9).map(|n| named(&deep[n * 3..])).collect();
-        assert_eq!(
-            apexes_of(deep, &signing_zone, &many).unwrap().len(),
-            MAX_APEX_CANDIDATES
-        );
     }
 
     /// The persisted clock floor cannot run away from the real clock.
