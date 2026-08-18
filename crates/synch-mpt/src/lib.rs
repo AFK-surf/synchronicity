@@ -31,6 +31,7 @@ pub mod node;
 /// build has to keep correct.
 #[cfg(feature = "proofs")]
 pub mod proof;
+pub mod scope;
 pub mod store;
 pub mod trie;
 
@@ -40,5 +41,6 @@ pub use nibbles::{common_prefix_len, Nibbles};
 pub use node::{TrieNode, ValueRef, BRANCH_TAG, EXT_TAG, LEAF_TAG};
 #[cfg(feature = "proofs")]
 pub use proof::Proof;
+pub use scope::Scope;
 pub use store::{MemStore, NodeStore};
 pub use trie::{root_opt, Entry, Missing, MissingWalk, Reachable, Trie};

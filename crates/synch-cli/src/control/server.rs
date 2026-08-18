@@ -1188,6 +1188,88 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
+        Command::DelegateAdd(pb::DelegateAdd {
+            key,
+            spaces,
+            until,
+            note,
+        }) => {
+            let subject = parse_key(&key)?;
+            let ttl = match until.as_deref() {
+                Some(text) => crate::cli::parse_duration(text)
+                    .map_err(|e| ControlError::invalid(e.to_string()))?,
+                None => DEFAULT_DELEGATION_TTL,
+            };
+            let not_after = now_ns().saturating_add(ttl.as_nanos().min(i64::MAX as u128) as i64);
+            let change = node.delegate_add(subject, &spaces, not_after, note.as_deref())?;
+            let head = node.publish(&[change])?;
+            out.line(format!(
+                "delegated {} for {}",
+                subject.to_z32(),
+                crate::render::remaining(not_after, now_ns())
+            ))
+            .await?;
+            for space in &spaces {
+                out.line(format!("  {space}")).await?;
+            }
+            if let Some(head) = head {
+                out.line(format!("published at seq {}", head.seq)).await?;
+            }
+            // What the subject will and will not see, said at the moment the
+            // operator can still choose otherwise.
+            out.line(format!(
+                "this node will serve it a projection of every trie covering {}, \
+                 and nothing else — it will not learn that any other space exists",
+                spaces.join(", ")
+            ))
+            .await?;
+        }
+
+        Command::DelegateRm(pb::DelegateRm { key }) => {
+            let subject = parse_key(&key)?;
+            let change = node.delegate_remove(&subject)?;
+            let head = node.publish(&[change])?;
+            out.line(format!("removed the delegation of {}", subject.to_z32()))
+                .await?;
+            if let Some(head) = head {
+                out.line(format!(
+                    "published at seq {} — every reachable peer within one push",
+                    head.seq
+                ))
+                .await?;
+            }
+        }
+
+        Command::DelegateLs(pb::DelegateLs {}) => {
+            let now = now_ns();
+            let own = node.origin().clone();
+            let mut any = false;
+            for binding in node.delegations()? {
+                any = true;
+                let issuer = binding
+                    .issuer
+                    .as_ref()
+                    .map(|i| match i == &own {
+                        true => "this node".to_string(),
+                        false => i.canonical(),
+                    })
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                out.line(format!(
+                    "{} {:<28} {:<10} ← {issuer}",
+                    binding.node_id.to_z32(),
+                    binding.spaces.join(","),
+                    match binding.expires_at {
+                        Some(at) => crate::render::remaining(at, now),
+                        None => "never".to_string(),
+                    },
+                ))
+                .await?;
+            }
+            if !any {
+                out.line("no delegations").await?;
+            }
+        }
+
         Command::DomainSet(pb::DomainSet { domain }) => {
             {
                 let domain = domain.clone();
@@ -2318,6 +2400,15 @@ fn policy_for(
         (None, false) => Ok(VersionPolicy::Newest),
     }
 }
+/// How long a delegation lasts when `--until` is not given.
+///
+/// Expiry has one job here (§3.5): bounding how long a member that was
+/// partitioned when a delegation was withdrawn can go on honoring it.
+/// Revocation is a deletion that propagates on the ordinary push, so on a
+/// connected cluster this number never comes into it — it is the backstop for
+/// the case where the push cannot arrive.
+const DEFAULT_DELEGATION_TTL: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Parses a stored or typed version policy, defaulting to `newest`.
 fn parse_policy(text: Option<&str>) -> Result<VersionPolicy, ControlError> {

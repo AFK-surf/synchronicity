@@ -21,7 +21,7 @@ use std::{
 };
 
 use synch_core::{now_ns, Hash, HeadSummary, OriginId, SignedHead, MAX_BATCH};
-use synch_mpt::{Trie, TrieNode};
+use synch_mpt::{Scope, Trie, TrieNode};
 use synch_store::{Slot, Store};
 
 use synch_net::{HeadSink, MptClient, NetError};
@@ -538,6 +538,8 @@ impl Syncer {
     /// permanently refused, whatever happened to be in the slot, and left the
     /// head that actually failed unrecorded.
     pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<Promotion> {
+        let read_scope = self.store.local_trie_scope()?;
+        let publish_scope = self.store.publish_scope(origin, now)?;
         // What the transaction judged, for the fault arm: it rolls back, so the
         // head cannot be recovered from the slot afterwards.
         let judged: std::cell::RefCell<Option<Verdict>> = std::cell::RefCell::new(None);
@@ -608,8 +610,40 @@ impl Syncer {
             // current one, the last of those is a whole cold trie transfer thrown
             // away.
             let trie = Trie::new(txn);
-            if !trie.is_complete(pending.head.root)? {
+            // Completeness is a property of a root *and* a scope: what has to
+            // be present is what this node may read, not what the origin
+            // published (§5.5).
+            if !trie.is_complete_scoped(pending.head.root, &read_scope)? {
                 return Ok(Promotion::Waiting);
+            }
+            // A delegated origin's trie must hold nothing outside the spaces
+            // it was delegated, and a head whose trie does is refused whole
+            // rather than materialized in part (§3.5): a filtered subset would
+            // leave this node's contents disagreeing with the root the origin
+            // signed, and every peer filtering independently would disagree
+            // with every other. The origin stalls, `doctor` names the key, and
+            // no other origin is affected.
+            //
+            // Below `supersedes` for the reason the walk above is: this
+            // descends the trie too, and a head the complete slot has already
+            // overtaken should pay for neither.
+            //
+            // Cheap despite reading like a scan: the check descends only where
+            // the boundary is unresolved, so it visits the spine and stops.
+            if let Some(spaces) = &publish_scope {
+                let scope = Scope::of(&synch_core::publish_prefixes(spaces));
+                if let Some(key) = trie.first_key_outside(pending.head.root, &scope)? {
+                    tracing::warn!(
+                        origin = %origin,
+                        seq = pending.head.seq,
+                        key = %synch_mpt::Nibbles::from_nibbles(&key)
+                            .to_bytes()
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                            .unwrap_or_else(|| "<partial>".to_string()),
+                        "refusing a delegated origin's head: it publishes outside its spaces"
+                    );
+                    return Ok(Promotion::Waiting);
+                }
             }
             // The displaced head is already retained: `put_head` recorded its
             // signature when it took the slot. Recording it again here would be
@@ -685,16 +719,29 @@ impl Syncer {
         let reference = {
             let store = self.store.clone();
             let origin = origin.clone();
+            let reference_scope = self.store.local_trie_scope()?;
             crate::blocking::offload(move || {
                 let trie = Trie::new(store.as_ref());
                 Ok(match store.complete_head(&origin)? {
-                    Some(head) if trie.is_complete(head.root)? => Some(head.root),
+                    // "Held whole" means held whole *within this scope*: the
+                    // walk never commits part of a subtree it is inside, so
+                    // every boundary it holds is a scope edge and pruning
+                    // against it stays sound.
+                    Some(head) if trie.is_complete_scoped(head.root, &reference_scope)? => {
+                        Some(head.root)
+                    }
                     _ => None,
                 })
             })
             .await?
         };
-        let mut walk = synch_mpt::MissingWalk::since(reference, pending.root);
+        // Everything below is confined to what this node may read (§8). For a
+        // rooted member that is the whole keyspace and the walk is unchanged;
+        // for a delegated one it stops at the boundary rather than asking for
+        // what it would be refused, which is why an out-of-scope request is
+        // evidence of probing rather than of a race.
+        let scope = self.store.local_trie_scope()?;
+        let mut walk = synch_mpt::MissingWalk::scoped(reference, pending.root, scope.clone());
         let mut unproductive = 0u32;
         loop {
             // One walk across the whole fetch, resumed rather than restarted:
@@ -720,9 +767,9 @@ impl Syncer {
 
             let mut learned = 0usize;
             if !missing.nodes.is_empty() {
-                let response = client.get_nodes(&missing.nodes).await?;
+                let response = client.get_nodes(pending.root, &missing.nodes).await?;
                 let store = self.store.clone();
-                let requested = missing.nodes.clone();
+                let requested: Vec<Hash> = missing.nodes.iter().map(|(_, hash)| *hash).collect();
                 learned += crate::blocking::offload(move || {
                     // One transaction per batch, not one per node. Written
                     // through the `Store`, each `put_node` is a bare `execute`
@@ -751,9 +798,9 @@ impl Syncer {
                 .await?;
             }
             if !missing.values.is_empty() {
-                let response = client.get_values(&missing.values).await?;
+                let response = client.get_values(pending.root, &missing.values).await?;
                 let store = self.store.clone();
-                let requested = missing.values.clone();
+                let requested: Vec<Hash> = missing.values.iter().map(|(_, hash)| *hash).collect();
                 learned += crate::blocking::offload(move || {
                     // One transaction per batch, as for nodes above.
                     store.transaction(|txn| {
@@ -893,7 +940,7 @@ impl Syncer {
         let syncer = self.clone();
         let origin = origin.clone();
         let promoted = crate::blocking::offload(move || {
-            synch_mpt::NodeStore::note_complete(store.as_ref(), &pending.root)?;
+            synch_mpt::NodeStore::note_complete(store.as_ref(), &scope.memo_key(pending.root))?;
             syncer.try_promote(&origin, now_ns())
         })
         .await?;
@@ -912,8 +959,9 @@ impl Syncer {
     /// peers say its origin had got without adopting anything.
     pub async fn observe_with(&self, client: &MptClient) -> Result<Vec<HeadSummary>> {
         let ours = self.summaries_off_runtime().await?;
+        let declared = self.declared_scope(client.remote_id())?;
         let exchange = client
-            .head_exchange(ours, |_theirs| (Vec::new(), Vec::new()))
+            .head_exchange(ours, declared, |_theirs| (Vec::new(), Vec::new()))
             .await?;
         let syncer = self.clone();
         let peer = client.remote_id();
@@ -962,6 +1010,33 @@ impl Syncer {
         .await
     }
 
+    /// What this node will serve the peer it is dialing (§5.5).
+    ///
+    /// A dialer declares the scope of the peer it is calling, exactly as a
+    /// responder does, so the direction of the dial makes no difference to what
+    /// either side may read.
+    fn declared_scope(&self, peer: synch_core::NodeId) -> Result<Option<Vec<String>>> {
+        Ok(self.store.publish_scope_of_key(&peer, now_ns())?)
+    }
+
+    /// Adopts the scope a peer declared for us, clearing anything memoized
+    /// against the old one.
+    ///
+    /// Narrowing or widening, a change makes every completeness answer
+    /// computed under the previous scope an answer to a different question, so
+    /// the memo goes with it. It is keyed by scope as well as root, so nothing
+    /// stale can be read back — this only avoids a table of answers nobody
+    /// will ask for again.
+    fn adopt_scope(&self, scope: Option<&[String]>) -> Result<()> {
+        if self.store.set_local_scope(scope)? {
+            tracing::info!(
+                spaces = ?scope,
+                "adopting the read scope a peer declared"
+            );
+        }
+        Ok(())
+    }
+
     /// Runs one full `Hello` push-pull exchange with a peer, then fetches
     /// whatever it advertised that we do not have (§5.2, §5.3).
     pub async fn sync_with(&self, client: &MptClient) -> Result<SyncReport> {
@@ -976,8 +1051,9 @@ impl Syncer {
         let (ours, servable) = self.advertisement_off_runtime().await?;
 
         let mut report = SyncReport::default();
+        let declared = self.declared_scope(client.remote_id())?;
         let theirs = client
-            .head_exchange(ours.clone(), |theirs| {
+            .head_exchange(ours.clone(), declared, |theirs| {
                 // Both slots may be advertised per origin, so the comparison is
                 // against the best summary either side has for it, never the
                 // first one that happens to match. Indexed once rather than
@@ -1002,6 +1078,16 @@ impl Syncer {
                 (push, wanted_origins(theirs, &ours))
             })
             .await?;
+
+        // What the peer says it will serve us. Adopted before anything is
+        // fetched, so the very first walk of this session is already confined
+        // to it — which is how a delegated node comes to be able to read the
+        // trie its own scope is published in (§8).
+        {
+            let syncer = self.clone();
+            let scope = theirs.scope.clone();
+            crate::blocking::offload(move || syncer.adopt_scope(scope.as_deref())).await?;
+        }
 
         // Every exchange is also an observation of what peers hold for our own
         // origin, which is what `synch recover` reads (§3.4).
@@ -1405,6 +1491,8 @@ mod tests {
                 node_id: key.public(),
                 source: BindingSource::Static,
                 domain: None,
+                issuer: None,
+                spaces: Vec::new(),
                 note: None,
                 added_at: 0,
                 expires_at: None,
@@ -1571,6 +1659,8 @@ mod tests {
                     node_id: key.public(),
                     source: BindingSource::Static,
                     domain: None,
+                    issuer: None,
+                    spaces: Vec::new(),
                     note: None,
                     added_at: 0,
                     expires_at: None,
@@ -1735,6 +1825,8 @@ mod tests {
                 node_id: rotated.public(),
                 source: BindingSource::Dns,
                 domain: Some("x.example".into()),
+                issuer: None,
+                spaces: Vec::new(),
                 note: None,
                 added_at: 0,
                 expires_at: Some(expiry),
@@ -1980,6 +2072,8 @@ mod containment_tests {
                 node_id: key.public(),
                 source: BindingSource::Static,
                 domain: None,
+                issuer: None,
+                spaces: Vec::new(),
                 note: None,
                 added_at: 0,
                 expires_at: None,

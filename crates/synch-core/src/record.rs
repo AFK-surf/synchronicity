@@ -16,6 +16,15 @@ pub const PREFIX_FILE: u8 = b'f';
 pub const PREFIX_BLOB: u8 = b'b';
 /// The `m:` key prefix: node manifest.
 pub const PREFIX_MANIFEST: u8 = b'm';
+/// The `d:` key prefix: a delegation this origin has issued (§3.5).
+pub const PREFIX_DELEGATION: u8 = b'd';
+
+/// The most spaces one [`Delegation`] may name.
+///
+/// A delegation is a restriction, so a list long enough to be unreadable is
+/// already the wrong shape — and the record is replicated to every member, so
+/// the bound is what keeps one issuer from growing everybody's trie.
+pub const MAX_DELEGATION_SPACES: usize = 32;
 
 /// What a [`FileEntry`] describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,11 +344,17 @@ pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) ->
     out
 }
 
-/// A space advertised in a [`NodeManifest`].
+/// What an origin advertises about one space, published under
+/// `m:space/<space-id>`.
+///
+/// One record per space rather than a list inside the manifest, because the
+/// redaction boundary is a key prefix (§8): a delegate is served the spaces it
+/// was granted and learns nothing of the rest, and a single leaf holding every
+/// space's name and count could not be shown to it at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceInfo {
-    /// The space id.
-    pub id: String,
+    /// Schema version.
+    pub v: u8,
     /// A human description.
     pub description: String,
     /// How many entries the origin published for this space.
@@ -347,16 +362,69 @@ pub struct SpaceInfo {
 }
 
 /// Node info published under `m:self`.
+///
+/// Carries nothing space-specific: what a node advertises about its spaces
+/// lives under `m:space/<id>`, one record each, so that it can be redacted per
+/// space (§8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeManifest {
     /// Schema version.
     pub v: u8,
     /// Human-friendly node name.
     pub name: String,
-    /// Advertised spaces.
-    pub spaces: Vec<SpaceInfo>,
     /// Software identification, e.g. `synchronicity/0.1.0`.
     pub software: String,
+}
+
+/// A delegation this origin has issued, published under `d:<device key>`
+/// (§3.5).
+///
+/// The delegated key *is* the trie key, which settles three things at once:
+/// re-issuing is an update rather than a second record, revoking is a deletion
+/// of the obvious key, and the accept-time question is a direct lookup. The
+/// issuer is implicit — the record sits in the issuer's trie — so there is no
+/// issuer field to check, and none to forge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delegation {
+    /// Schema version.
+    pub v: u8,
+    /// The spaces the subject may read and publish into. Closed list, at most
+    /// [`MAX_DELEGATION_SPACES`], never a wildcard.
+    pub spaces: Vec<String>,
+    /// When the delegation stops being honored, in unix nanoseconds.
+    pub not_after: i64,
+    /// A note for `trust ls` and `doctor`.
+    pub note: Option<String>,
+}
+
+impl Delegation {
+    /// True if this record is well-formed enough to grant anything.
+    ///
+    /// Fail-closed, unlike the same question asked of an `f:` or `b:` record:
+    /// a file entry this node cannot read loses a row, while a delegation it
+    /// cannot read would otherwise grant whatever the caller assumed.
+    pub fn is_well_formed(&self) -> bool {
+        !self.spaces.is_empty()
+            && self.spaces.len() <= MAX_DELEGATION_SPACES
+            && self.spaces.iter().all(|s| validate_space(s).is_ok())
+            && {
+                let mut sorted: Vec<&String> = self.spaces.iter().collect();
+                sorted.sort();
+                let before = sorted.len();
+                sorted.dedup();
+                sorted.len() == before
+            }
+    }
+
+    /// True if this delegation is dated live at `now`.
+    ///
+    /// An instant no trust decision may be dated by ([`crate::clock_is_trusted`])
+    /// dates nothing: a node whose clock cannot place it reads as holding no
+    /// delegated trust rather than as holding all of it, exactly as it treats
+    /// DNS bindings.
+    pub fn is_live(&self, now: i64) -> bool {
+        crate::clock_is_trusted(now) && now < self.not_after
+    }
 }
 
 /// Error building or parsing a trie key.
@@ -482,6 +550,95 @@ pub fn manifest_key() -> Vec<u8> {
     key
 }
 
+/// The trie key `m:space/<space-id>`.
+pub fn space_info_key(space: &str) -> Result<Vec<u8>, KeyError> {
+    validate_space(space)?;
+    let mut key = vec![PREFIX_MANIFEST, b':'];
+    key.extend_from_slice(b"space/");
+    key.extend_from_slice(space.as_bytes());
+    Ok(key)
+}
+
+/// Parses `m:space/<space-id>`.
+pub fn parse_space_info_key(key: &[u8]) -> Result<String, KeyError> {
+    let prefix = b"m:space/";
+    if key.len() <= prefix.len() || !key.starts_with(prefix) {
+        return Err(KeyError::Malformed);
+    }
+    let space = std::str::from_utf8(&key[prefix.len()..]).map_err(|_| KeyError::Malformed)?;
+    validate_space(space)?;
+    Ok(space.to_string())
+}
+
+/// Builds the trie key `d:<32-byte device key>`.
+pub fn delegation_key(subject: &crate::NodeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(34);
+    key.push(PREFIX_DELEGATION);
+    key.push(b':');
+    key.extend_from_slice(subject.as_bytes());
+    key
+}
+
+/// Parses `d:<32-byte device key>`.
+pub fn parse_delegation_key(key: &[u8]) -> Result<crate::NodeId, KeyError> {
+    if key.len() != 34 || key[0] != PREFIX_DELEGATION || key[1] != b':' {
+        return Err(KeyError::Malformed);
+    }
+    let bytes: [u8; 32] = key[2..].try_into().map_err(|_| KeyError::Malformed)?;
+    crate::NodeId::from_bytes(&bytes).map_err(|_| KeyError::Malformed)
+}
+
+/// The `d:` prefix used for range scans over an origin's delegations.
+pub fn delegation_prefix() -> Vec<u8> {
+    vec![PREFIX_DELEGATION, b':']
+}
+
+/// The trie key prefixes a peer delegated `spaces` may be *served* (§8).
+///
+/// Everything a delegate is entitled to see, expressed as key prefixes,
+/// because that is the only shape the redaction boundary can take:
+/// authorization is a statement about *where* a node sits, and the walk on
+/// both sides tests exactly this list.
+///
+/// `b:` is deliberately absent. A delegate learns object availability through
+/// `FindProviders`, the path §5.1 already provides for a node holding no ads
+/// for a root it wants — which makes the `b:` namespace not merely filtered
+/// for a delegate but invisible, down to how many objects an origin holds.
+pub fn scope_prefixes(spaces: &[String]) -> Vec<Vec<u8>> {
+    let mut out = vec![manifest_key(), delegation_prefix()];
+    for space in spaces {
+        if let Ok(prefix) = space_prefix(space) {
+            out.push(prefix);
+        }
+        if let Ok(key) = space_info_key(space) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+/// The trie key prefixes a delegated origin may *publish* under (§7).
+///
+/// Not the same set as what it may read, and the difference is in both
+/// directions. `b:` is here because a delegate that holds content must be able
+/// to advertise it, or no member could fetch from it and the swarm loses a
+/// source for bytes the delegate legitimately has. `d:` is not, because a
+/// delegation is exactly what a delegate may not issue — R1 already means
+/// nobody would read one, and refusing the head keeps the rule visible at the
+/// point it is broken rather than silently ignored.
+pub fn publish_prefixes(spaces: &[String]) -> Vec<Vec<u8>> {
+    let mut out = vec![manifest_key(), blob_prefix()];
+    for space in spaces {
+        if let Ok(prefix) = space_prefix(space) {
+            out.push(prefix);
+        }
+        if let Ok(key) = space_info_key(space) {
+            out.push(key);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,15 +714,27 @@ mod tests {
         let m = NodeManifest {
             v: RECORD_VERSION,
             name: "nas".into(),
-            spaces: vec![SpaceInfo {
-                id: "media".into(),
-                description: "movies".into(),
-                entry_count: 40_000,
-            }],
             software: "synchronicity/0.1.0".into(),
         };
         let bytes = postcard::to_stdvec(&m).unwrap();
         assert_eq!(postcard::from_bytes::<NodeManifest>(&bytes).unwrap(), m);
+
+        let info = SpaceInfo {
+            v: RECORD_VERSION,
+            description: "movies".into(),
+            entry_count: 40_000,
+        };
+        let bytes = postcard::to_stdvec(&info).unwrap();
+        assert_eq!(postcard::from_bytes::<SpaceInfo>(&bytes).unwrap(), info);
+
+        let d = Delegation {
+            v: RECORD_VERSION,
+            spaces: vec!["photos".into(), "incoming".into()],
+            not_after: 1_800_000_000_000_000_000,
+            note: Some("zeynep's phone".into()),
+        };
+        let bytes = postcard::to_stdvec(&d).unwrap();
+        assert_eq!(postcard::from_bytes::<Delegation>(&bytes).unwrap(), d);
     }
 
     /// A record naming a million spans decodes to at most the cap.

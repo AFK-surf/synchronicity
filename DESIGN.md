@@ -451,6 +451,86 @@ until the origin returns and republishes. The alternative — trusting unbound
 signatures — would trade a temporary availability gap for a forgery hole, and is
 rejected.
 
+### 3.5 Delegated space-restricted trust
+
+A member whose key is already rooted — static or DNSSEC (§3.2) — may admit
+one other device key to the cluster, confined to a named list of spaces. It does so
+by publishing a record into its own trie:
+
+```rust
+// key: d:<32-byte device key>   — the delegated key IS the trie key
+struct Delegation {
+    v: u8,
+    spaces: Vec<String>,   // closed list, ≤ 32, distinct, never a wildcard
+    not_after: i64,        // unix nanos
+    note: Option<String>,
+}
+```
+
+There is **no credential**. Nothing is handed to the subject and nothing is
+presented by it: the record is signed by the head that carries it, replicated by
+mptsync, and materialized into the `bindings` table with `source = 'delegated'`
+exactly as an `f:` record is materialized into `entries` — derived state, written in
+the same transaction as the head flip. A delegate is admitted because every member
+has read the record, so the accept path (§3.2) is unchanged and asks the same
+question it always did.
+
+Keying by the delegated key settles three things at once: re-issuing is an update
+rather than a second record, revoking is a deletion of the obvious key, and the
+accept-time question is a direct lookup. The issuer is implicit — the record sits in
+the issuer's trie — so there is no issuer field to check, and none to forge.
+
+**One level, and it is structural.** A delegation is honored only from an origin
+holding a live *rooted* binding, and a delegation only ever produces a `delegated`
+binding. So a delegate's own `d:` records are read by nobody: depth 2 fails on a
+lookup in the reader's own binding table, not on a depth counter a publisher could
+set, and not in an order-dependent way. A delegate additionally cannot publish `d:`
+at all (§7), so the rule is refused where it is broken rather than silently ignored.
+
+**Scope is a projection, both ways.** The list bounds what the delegate may publish
+under its own origin *and* what it may read of everyone else's — and outside it,
+data is not refused but never sent (§8). A space is a cluster-wide namespace, so
+delegating `photos` grants every member's `photos`: it has to, because the unified
+tree (§8) merges across origins by `(space, path)`, and a per-origin grant would
+describe a view no mirror policy could render.
+
+**A delegation binds `OriginId::Key` only.** If it could name a `Named` origin, any
+member could delegate `nas@cluster.example.com` and squat a label the DNS zone
+controls — a hijack with no DNSSEC compromise behind it. The trie key *is* the device
+key, so there is no field in which to name anything else. Delegates therefore do not
+rotate; they are re-issued, which is the right lifecycle for something that expires
+in days.
+
+**Revocation is deletion.** `synch delegate rm <key>` removes the trie key and
+publishes. §4.2's account of why tombstones are not what makes deletion propagate
+applies unchanged: tries are single-writer and replicated whole, so a deleted key
+vanishes from the new root and the diff surfaces it, even to peers partitioned for
+years. There is no revocation state to retain and nothing to expire. Propagation is
+epidemic, so a partitioned member honors a withdrawn delegation until it syncs;
+`not_after` is the hard bound on that, and it is the only job expiry has here.
+
+**Derived trust cannot outlive its source.** A delegated binding is live only while
+the issuing origin's own rooted binding is live, evaluated on read rather than
+stamped on write — so `synch trust rm nas` and `nas`'s TXT record lapsing each cut
+off `nas`'s delegates in the same instant they cut off `nas`. Without this, removal
+has a hole exactly where it matters most, and the hole is invisible: the delegate
+keeps syncing and nothing says why. The clock rules are inherited unchanged — every
+delegated binding is gated by `clock_is_trusted`, so a node that cannot date a
+decision honors no delegation, and static trust remains the escape hatch that
+consults no clock.
+
+Two rooted origins may delegate the same key with different lists; each vouches
+independently and the effective scope is the union, which is how the binding table
+already treats a key held by both `static` and `dns`. `issuer` is therefore part of
+the row's identity (§10).
+
+This is the first transitive trust in the system, and §3.2's "there is no transitive
+trust" is spent knowingly. What it buys is bounded: a rooted member already reads
+every space and can hand over its own device secret invisibly and forever, so
+delegation does not open a path that was closed — it replaces an unbounded, unlogged,
+unexpiring one with a path that is scoped, dated, bound to a named key, and published
+in the issuer's own trie where `synch delegate ls` on any node can read it.
+
 ---
 
 ## 4. Data model
@@ -464,7 +544,9 @@ single prefix byte:
 |--------|--------------------------------------|----------------|----------------------------------|
 | `f:`   | `f:<space-id>/<utf8 relative path>`  | `FileEntry`    | this origin's copy of a file     |
 | `b:`   | `b:<32-byte object root hash>`       | `BlobAd`       | "I hold (part of) this object"   |
-| `m:`   | `m:self`                             | `NodeManifest` | node info: name, spaces, version |
+| `m:`   | `m:self`                             | `NodeManifest` | node info: name, software        |
+| `m:`   | `m:space/<space-id>`                 | `SpaceInfo`    | what this origin says about one space |
+| `d:`   | `d:<32-byte device key>`             | `Delegation`   | a delegation this origin has issued (§3.5) |
 
 Paths are UTF-8, NFC-normalized, `/`-separated, no leading slash, no `.`/`..`
 components. Because the MPT compresses shared prefixes, the `f:` namespace naturally
@@ -474,6 +556,14 @@ mirrors directory structure, and a directory listing is a range scan over
 A **space** is a named sync root (like a Syncthing folder): a user configures
 `synch space add photos ~/Pictures`, and that subtree is indexed under `f:photos/...`.
 Spaces are the unit of sharing policy and of local materialization.
+
+The keyspace is laid out so that **the redaction boundary falls on key prefixes**,
+which §8 depends on: a peer delegated a space is served the subtrees under
+`f:<space>/` and `m:space/<space>` and nothing else, and a prefix is the only shape
+that boundary can take. `m:self` therefore carries no per-space information — a leaf
+value cannot be partly redacted, so a single manifest listing every space could be
+shown to a delegate not at all. Any new record type is checked against this rule at
+design time, because retrofitting it costs a migration and a cluster-wide republish.
 
 ### 4.2 Records
 
@@ -507,8 +597,20 @@ enum AdState {
 struct NodeManifest {
     v: u8,
     name: String,             // human-friendly node name
-    spaces: Vec<SpaceInfo>,   // advertised spaces: id, description, entry count
     software: String,         // "synchronicity/0.1.0"
+}
+
+struct SpaceInfo {            // one per space, under m:space/<space-id>
+    v: u8,
+    description: String,
+    entry_count: u64,
+}
+
+struct Delegation {           // under d:<32-byte device key> (§3.5)
+    v: u8,
+    spaces: Vec<String>,      // closed list, <= 32, distinct, never a wildcard
+    not_after: i64,
+    note: Option<String>,
 }
 ```
 
@@ -615,7 +717,10 @@ ALPN: `sync/mpt/1`. All messages are length-framed `postcard` on QUIC streams.
 
 ```rust
 // bidirectional stream 0 on connect: head gossip (push-pull)
-Hello      { proto: u16, heads: Vec<HeadSummary> }      // HeadSummary = (origin: OriginId, seq, root,
+Hello      { proto: u16, heads: Vec<HeadSummary>,
+             scope: Option<Vec<String>> }               // the spaces the sender will serve this peer,
+                                                        //   None for everything (§5.5)
+                                                        // HeadSummary = (origin: OriginId, seq, root,
                                                         //   complete: bool)  — "complete" = I hold the
                                                         //   full trie under this root and can serve it;
                                                         //   a signed head alone proves nothing about that
@@ -623,10 +728,13 @@ HeadsWant  { origins: Vec<OriginId> }                   // "yours is newer, send
 Heads      { heads: Vec<SignedHead> }
 HeadPush   { head: SignedHead }                         // reactive: sent on any head change
 
-// one bidirectional stream per fetch batch:
-GetNodes   { hashes: Vec<Hash> }                        // ≤ 256 per batch
+// one bidirectional stream per fetch batch. Each want carries the nibble
+// position it claims, which is what a responder authorizes on (§5.5): a hash
+// carries no position and none can be recovered from it, since structural
+// sharing lets one node sit under several prefixes.
+GetNodes   { root: Hash, wants: Vec<(Nibbles, Hash)> }  // ≤ 256, ≤ 64 KiB of paths
 Nodes      { nodes: Vec<(Hash, Bytes)>, missing: Vec<Hash> }
-GetValues  { hashes: Vec<Hash> }                        // out-of-line ValueRef payloads
+GetValues  { root: Hash, wants: Vec<(Nibbles, Hash)> }  // out-of-line ValueRef payloads
 Values     { values: Vec<(Hash, Bytes)>, missing: Vec<Hash> }
 
 // provider hints for cold caches: a node holding an object root whose ads it has
@@ -836,6 +944,70 @@ that failed verification leaves behind — and the staging files of ingests that
 never finished, using the content retention horizon as
 the cutoff, so a payload written moments before its row, or an ingest still
 streaming, is never mistaken for a leftover.
+
+### 5.5 Scoped replication
+
+A delegated node (§3.5) must not see the metadata of a space it was not delegated —
+not the paths, not the sizes, not that the space exists. Tries are replicated whole,
+and a signed root spans every space, so this is a property of what a *responder*
+hands over.
+
+**Redaction is free at the node boundary.** A `Branch` already carries the hashes of
+all sixteen children, so withholding a subtree means declining to send its nodes: the
+parent that *was* sent already commits to it, and the delegate recomputes the signed
+root exactly as it would from a whole trie. No proof format, no new verification rule
+— every node is checked against the hash it was reached by, which §5.2 already does.
+The boundary is therefore the child hash inside the last in-scope node, never the
+first out-of-scope node: an `Ext` above an undelegated space spells that space's name
+in its prefix, so it is the node that must not travel.
+
+**A hash cannot be authorized; a position can.** Refusing out-of-scope *hashes* is
+unsound twice over. The delegate legitimately holds the hashes it must not expand —
+they are inside the branch node that makes the root verify — so possession cannot be
+what qualifies it. And structural sharing means one node hash may sit under several
+prefixes, so a node-to-prefix index is many-valued and "is *any* position in scope?"
+is the wrong question. So `GetNodes`/`GetValues` carry the position each hash is
+claimed to occupy: the responder descends that path from a root *it* holds and
+compares the path against the peer's scope. A fabricated root fails at the first
+step, and a lie about the position resolves to whatever genuinely sits there, which
+is in scope by construction. Between rooted peers the path is carried and ignored.
+
+**Both sides prune.** The fetch walk stops at the boundary rather than asking for
+what it would be refused, so an out-of-scope request is not a race — an honest walk
+never generates one — and is logged as the probe it is. The scoped walk is also what
+the head-promotion diff runs under, since a node reading under a scope holds only
+that part of the trie.
+
+**`complete` becomes scope-relative.** A delegate never holds a foreign trie whole,
+so it advertises `complete: false` for every origin but its own and drops out of the
+swarm as a source for foreign metadata, which is correct — it could not serve it. The
+§5.2 reference-root pruning survives, restricted: "held whole" becomes "held whole
+within scope", and its soundness condition holds because the walk never commits part
+of a subtree it is *inside* — every boundary it holds is a scope edge. The
+completeness memo is keyed by root *and* scope, so widening a scope re-derives rather
+than inherits.
+
+**Learning the scope.** A delegate's scope lives in the delegating origin's trie,
+which it cannot read until it knows its scope. So the peer serving it says, in the
+`Hello` that opens every session. Adopting a peer's word costs nothing: every
+responder enforces the same scope on every request independently, so a wrong or stale
+value can only make a node ask for *less* than it is entitled to.
+
+**`b:` is not served to a delegate at all.** Ads are keyed by content hash, so the
+shape of that subtree would leak how many objects an origin holds. A delegate learns
+availability through `FindProviders` instead — the path §5.1 already provides for a
+node holding no ads for a root it wants — which makes the namespace invisible rather
+than merely filtered. A delegate still *publishes* `b:` for content it holds, or no
+member could fetch from it.
+
+**What remains visible**, stated exactly: the existence and count of sibling subtrees
+along the spine, and one nibble of discrimination each, since a branch on the path to
+a granted space necessarily says which of its sixteen slots are occupied. Where a
+granted space's name shares a prefix with another's, the shared prefix is on the spine
+legitimately and the discriminating nibble is all that is added. Nothing else: no
+names, no paths, no sizes, no mtimes, no content hashes, no counts. Driving even that
+to zero would mean hashing trie keys so prefixes carry no meaning, which would destroy
+the range-scan property §4.1 is built on.
 
 ---
 
@@ -1433,14 +1605,17 @@ CREATE TABLE identity_history (
 CREATE TABLE bindings (
   origin_id    TEXT NOT NULL,
   node_id      BLOB NOT NULL,            -- bound device key (32 bytes)
-  source       TEXT NOT NULL,            -- 'static' | 'dns'
-  domain       TEXT NOT NULL DEFAULT '', -- the membership domain, '' if static
+  source       TEXT NOT NULL,            -- 'static' | 'dns' | 'delegated'
+  domain       TEXT NOT NULL DEFAULT '', -- the membership domain, '' if not dns
+  issuer       TEXT NOT NULL DEFAULT '', -- for delegated source: the vouching origin
+  spaces       TEXT,                     -- for delegated source: newline-separated space ids
   note         TEXT,
   added_at     INTEGER NOT NULL,
   expires_at   INTEGER,                  -- NULL for static
-  PRIMARY KEY (origin_id, node_id, source, domain)
+  PRIMARY KEY (origin_id, node_id, source, domain, issuer)
 );
-CREATE INDEX bindings_by_key ON bindings (node_id);   -- connection-accept lookup
+CREATE INDEX bindings_by_key    ON bindings (node_id);   -- connection-accept lookup
+CREATE INDEX bindings_by_issuer ON bindings (issuer);    -- the §3.5 cascade
 
 -- mptsync
 -- A slot is a *pointer* at a signed head, not a copy of one: the signature,
@@ -1591,8 +1766,18 @@ CI (GitHub Actions):
 
 - **Transport**: iroh QUIC — encrypted, mutually authenticated by NodeId. No plaintext
   path exists.
-- **Authorization**: binary, membership-based (§3.2). Enforced on accept and per-origin
-  on every head/record. A trusted peer relaying data for an untrusted origin is ignored.
+- **Authorization**: membership-based (§3.2), enforced on accept and per-origin on
+  every head/record; a trusted peer relaying data for an untrusted origin is ignored.
+  Binary for members, and space-scoped for delegates (§3.5): a delegated key may read
+  and publish only within its list, enforced at four points — the trie serve (by
+  position, §5.5), the blob serve (by whether a granted path names the content), the
+  head promotion of the delegated origin (its trie must hold nothing outside the
+  list), and the ordinary accept gate, which is unchanged because a delegated binding
+  is a binding. What delegation does *not* do is constrain the members that issue it:
+  a rooted member is unrestricted by construction, so any of them may delegate any
+  space. That power is not created by delegation — a member already reads every space
+  and can hand over its device secret — but delegation is what makes an exercise of it
+  bounded, dated and published where `synch delegate ls` on any node can read it.
 - **Data integrity**: three independent hash-verification layers — trie nodes verified
   against requested hashes, heads verified against origin signatures, content verified
   against object roots per 16 KiB group. A compromised peer can withhold, but never
@@ -1700,8 +1885,9 @@ CI (GitHub Actions):
   this node cannot apply fails *its own origin* and no other: the head does not
   flip, the exchange carries on, and the count of origins left behind is in the
   sync report.
-- **Privacy**: metadata (paths, sizes, mtimes) is visible to *all* members — inherent
-  to omnipresence. Content is fetched on demand, so bytes only land where requested or
+- **Privacy**: metadata (paths, sizes, mtimes) is visible to all *members* — inherent
+  to omnipresence — and to a *delegate* only within the spaces it was delegated, which
+  §5.5 enforces by never sending the rest and states the exact residue of. Content is fetched on demand, so bytes only land where requested or
   mirrored. At-rest encryption of the CAS and DB is delegated to OS disk encryption in
   v1 (noted in §13).
 
@@ -1709,7 +1895,9 @@ CI (GitHub Actions):
 
 ## 13. Future work (explicit non-v1)
 
-- Read-only membership tier and per-space ACLs.
+- Per-space ACLs on *rooted* members. §3.5 confines a delegated node to a space
+  list; it does not confine the members that issue delegations, and a rooted member
+  is unrestricted by construction.
 - Rotation continuity attestation: cryptographically distinguishing a legitimate key
   rotation from a domain-level rebinding (e.g. an old-key cross-signed rotation log).
   Still not v1. Note that the transparency layer shipped since (§12,
@@ -1718,8 +1906,9 @@ CI (GitHub Actions):
   *distinguishable* — so this remains the thing that would let a client tell the
   two apart on its own, without a monitor and without an operator's records.
 - Encrypted spaces (per-space content keys; metadata padding).
-- Partial trie replication for very large clusters (the proof machinery in §4.3
-  already permits it).
+- Partial trie replication *for scale*. §5.5 ships the mechanism, driven by
+  delegation rather than by cluster size; pointing it at very large clusters is a
+  policy question that has not been answered.
 - Smarter placement policies ("keep ≥ 2 replicas of every object cluster-wide"),
   built on the same `BlobAd` availability data.
 - Optional platform-specific mounts (FUSE/WinFsp/NFSv3-loopback) as *plugins*,

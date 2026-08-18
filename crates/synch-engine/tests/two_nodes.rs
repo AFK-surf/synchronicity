@@ -101,6 +101,8 @@ fn trust(store: &Store, origin: &OriginId, key: &synch_core::NodeId) {
             node_id: *key,
             source: BindingSource::Static,
             domain: None,
+            issuer: None,
+            spaces: Vec::new(),
             note: None,
             added_at: 0,
             expires_at: None,
@@ -362,7 +364,9 @@ async fn untrusted_peers_are_refused() {
         .await
         .unwrap();
     // The handshake may complete, but the server refuses to serve anything.
-    let result = client.get_nodes(&[Hash::new(b"anything")]).await;
+    let result = client
+        .get_nodes(Hash::EMPTY, &[(Vec::new(), Hash::new(b"anything"))])
+        .await;
     assert!(result.is_err(), "an untrusted peer must not be served");
 
     server.net.shutdown().await.unwrap();
@@ -400,7 +404,10 @@ async fn requests_to_a_peer_share_one_session() {
         "a second request must not open a second session"
     );
     // Both really are usable, not just equal.
-    second.get_nodes(&[Hash::new(b"nothing")]).await.unwrap();
+    second
+        .get_nodes(Hash::EMPTY, &[(Vec::new(), Hash::new(b"nothing"))])
+        .await
+        .unwrap();
 
     // A session that has gone is not handed out again: the next request dials.
     first.connection().close(0u32.into(), b"done");
@@ -414,7 +421,10 @@ async fn requests_to_a_peer_share_one_session() {
         first.connection().stable_id(),
         "a closed session must be replaced, not reused"
     );
-    third.get_nodes(&[Hash::new(b"nothing")]).await.unwrap();
+    third
+        .get_nodes(Hash::EMPTY, &[(Vec::new(), Hash::new(b"nothing"))])
+        .await
+        .unwrap();
 
     // The two ALPNs are separate sessions, so the metadata one is untouched by
     // a content dial.

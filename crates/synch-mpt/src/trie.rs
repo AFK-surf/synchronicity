@@ -8,6 +8,7 @@ use crate::{
     error::MptError,
     nibbles::{common_prefix_len, Nibbles},
     node::{TrieNode, ValueRef, NO_CHILDREN},
+    scope::Scope,
     store::NodeStore,
 };
 
@@ -200,10 +201,15 @@ pub fn root_opt(root: Hash) -> Option<Hash> {
 /// The set of hashes referenced by a root but absent from the store.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Missing {
-    /// Trie nodes that must be fetched.
-    pub nodes: Vec<Hash>,
-    /// Out-of-line values that must be fetched.
-    pub values: Vec<Hash>,
+    /// Trie nodes that must be fetched, each with the nibble path it occupies.
+    ///
+    /// The path travels with the request because that is what a responder
+    /// authorizes on (§8): a hash carries no position, and none can be
+    /// recovered from it.
+    pub nodes: Vec<(Vec<u8>, Hash)>,
+    /// Out-of-line values that must be fetched, each with the nibble path of
+    /// the node that holds it.
+    pub values: Vec<(Vec<u8>, Hash)>,
 }
 
 impl Missing {
@@ -220,6 +226,10 @@ impl Missing {
 
 /// A key/value pair as yielded by iteration and range scans.
 pub type Entry = (Vec<u8>, Vec<u8>);
+
+/// One position on the frontier: where a wanted node sits, what is wanted,
+/// and what stands at the same position in the reference trie.
+type Position = (Option<Hash>, Hash, Vec<u8>);
 
 /// The §5.2 frontier, as a walk that keeps its place.
 ///
@@ -244,16 +254,23 @@ pub type Entry = (Vec<u8>, Vec<u8>);
 /// than the tree (§5.2).
 #[derive(Debug)]
 pub struct MissingWalk {
-    /// `(the hash at this position in the reference trie, the hash wanted, the
-    /// nibble depth of the position)`.
-    frontier: Vec<(Option<Hash>, Hash, usize)>,
+    /// `(the hash at this position in the reference trie, the hash wanted,
+    /// the nibble path of the position)`.
+    frontier: Vec<Position>,
     seen: HashSet<Hash>,
     /// Reported absent and awaiting the caller's fetch, so they can be
     /// revisited — and their children discovered — once they land.
-    deferred: Vec<(Option<Hash>, Hash, usize)>,
+    deferred: Vec<Position>,
     /// Children of extension nodes that were not yet present when their parent
     /// was walked, and so must be checked for being branches when they arrive.
     must_be_branch: HashSet<Hash>,
+    /// The part of the keyspace this walk may descend into (§8).
+    ///
+    /// A scoped walk stops at the boundary rather than asking for what it
+    /// would be refused: the peer serving it applies the same predicate, so an
+    /// out-of-scope request is not a race but a probe, and an honest walk
+    /// never makes one.
+    scope: Scope,
 }
 
 impl MissingWalk {
@@ -269,15 +286,30 @@ impl MissingWalk {
     /// wrong reference would have the walk skip subtrees it does not hold, and
     /// report a trie complete that it cannot serve.
     pub fn since(known_complete: Option<Hash>, root: Hash) -> MissingWalk {
+        MissingWalk::scoped(known_complete, root, Scope::full())
+    }
+
+    /// The same walk, confined to `scope`.
+    ///
+    /// Pruning against the reference root survives the confinement, and its
+    /// soundness condition with it: a hash matching one in a trie held whole
+    /// *within this scope* is a subtree held whole within this scope, because
+    /// the walk never commits part of a subtree it is inside — every boundary
+    /// it stops at is a scope edge.
+    pub fn scoped(known_complete: Option<Hash>, root: Hash, scope: Scope) -> MissingWalk {
         let frontier = match root_opt(root) {
             None => Vec::new(),
-            Some(root) => vec![(known_complete.and_then(root_opt), root, 0usize)],
+            Some(root) if scope.admits_path(&[]) => {
+                vec![(known_complete.and_then(root_opt), root, Vec::new())]
+            }
+            Some(_) => Vec::new(),
         };
         MissingWalk {
             frontier,
             seen: HashSet::new(),
             deferred: Vec::new(),
             must_be_branch: HashSet::new(),
+            scope,
         }
     }
 
@@ -291,9 +323,9 @@ impl MissingWalk {
     /// are reported again, which is what lets a caller notice it is making no
     /// progress.
     pub fn resume(&mut self) {
-        for entry in self.deferred.drain(..) {
-            self.seen.remove(&entry.1);
-            self.frontier.push(entry);
+        for (reference, hash, path) in self.deferred.drain(..) {
+            self.seen.remove(&hash);
+            self.frontier.push((reference, hash, path));
         }
     }
 
@@ -317,9 +349,9 @@ impl MissingWalk {
         // next round has to be reported again, or the unproductive counter that
         // §5.2's abandonment clause rests on would never fire.
         let mut asked: HashSet<Hash> = HashSet::new();
-        while let Some((reference, hash, depth)) = self.frontier.pop() {
+        while let Some((reference, hash, path)) = self.frontier.pop() {
             if missing.len() >= max {
-                self.frontier.push((reference, hash, depth));
+                self.frontier.push((reference, hash, path));
                 break;
             }
             // The depth bound every *walk* in this crate carries, applied to the
@@ -346,10 +378,11 @@ impl MissingWalk {
             // beyond what it uploads (§12 puts that under `synch trust rm`).
             //
             // An `MptError`, so it fails that origin and not the peer relaying it.
-            if depth > MAX_DEPTH_NIBBLES {
+            if path.len() > MAX_DEPTH_NIBBLES {
                 return Err(MptError::NonCanonical(format!(
-                    "a trie node sits at nibble depth {depth}, past the \
-                     {MAX_DEPTH_NIBBLES} any valid key reaches"
+                    "a trie node sits at nibble depth {}, past the \
+                     {MAX_DEPTH_NIBBLES} any valid key reaches",
+                    path.len()
                 )));
             }
             // The same hash in a trie held whole: this subtree is already here,
@@ -361,8 +394,8 @@ impl MissingWalk {
                 continue;
             }
             let Some(data) = trie.load_raw(&hash)? else {
-                missing.nodes.push(hash);
-                self.deferred.push((reference, hash, depth));
+                missing.nodes.push((path.clone(), hash));
+                self.deferred.push((reference, hash, path));
                 continue;
             };
             let node = TrieNode::decode(&data)?;
@@ -411,30 +444,30 @@ impl MissingWalk {
                     .transpose()?,
                 None => None,
             };
-            // How far into the key a child of this node sits: a branch spends
-            // one nibble on the child index, an extension spends its whole
-            // prefix, and a leaf has no children. A leaf's *value* sits at the
-            // end of its own run, which is the position a key would have to be
-            // that long to name.
-            let step = match &node {
-                TrieNode::Branch { .. } => 1,
-                TrieNode::Ext { prefix, .. } => prefix.len(),
-                TrieNode::Leaf { key_rest, .. } => {
-                    if depth.saturating_add(key_rest.len()) > MAX_DEPTH_NIBBLES {
-                        return Err(MptError::NonCanonical(format!(
-                            "a trie value sits at nibble depth {}, past the \
-                             {MAX_DEPTH_NIBBLES} any valid key reaches",
-                            depth.saturating_add(key_rest.len())
-                        )));
-                    }
-                    0
+            // A leaf's *value* sits at the end of its own run, which is the
+            // position a key would have to be that long to name — and a leaf
+            // has no children, so nothing below charges the depth this node
+            // reaches. Checked here or not at all.
+            if let TrieNode::Leaf { key_rest, .. } = &node {
+                let depth = path.len().saturating_add(key_rest.len());
+                if depth > MAX_DEPTH_NIBBLES {
+                    return Err(MptError::NonCanonical(format!(
+                        "a trie value sits at nibble depth {depth}, past the \
+                         {MAX_DEPTH_NIBBLES} any valid key reaches"
+                    )));
                 }
-            };
-            self.frontier.extend(
-                paired_children(reference_node.as_ref(), &node)
-                    .into_iter()
-                    .map(|(r, h)| (r, h, depth.saturating_add(step))),
-            );
+            }
+            for (child_reference, child, step) in paired_children(reference_node.as_ref(), &node) {
+                let mut child_path = path.clone();
+                child_path.extend_from_slice(&step);
+                // The boundary: a child leading out of scope is not descended
+                // and not asked for. Its hash stays committed by the node just
+                // walked, which is what keeps the root verifiable without it.
+                if !self.scope.admits_path(&child_path) {
+                    continue;
+                }
+                self.frontier.push((child_reference, child, child_path));
+            }
             // A node whose out-of-line values have not arrived is not done
             // with, so it is deferred alongside the nodes that never loaded at
             // all. Reporting the value once and moving on would have the walk
@@ -452,12 +485,12 @@ impl MissingWalk {
                     // about *this* node being done with.
                     awaiting_values = true;
                     if asked.insert(value_hash) {
-                        missing.values.push(value_hash);
+                        missing.values.push((path.clone(), value_hash));
                     }
                 }
             }
             if awaiting_values {
-                self.deferred.push((reference, hash, depth));
+                self.deferred.push((reference, hash, path));
             }
         }
         Ok(missing)
@@ -471,7 +504,15 @@ impl MissingWalk {
 /// else the children are walked with no reference, which costs traversal and
 /// never correctness — pruning is an optimization, and declining to prune is
 /// always safe.
-fn paired_children(reference: Option<&TrieNode>, node: &TrieNode) -> Vec<(Option<Hash>, Hash)> {
+/// Each child is returned with the nibbles that lead to it from this node —
+/// one nibble for a branch slot, the whole prefix for an extension — so the
+/// walk can accumulate the position of everything it descends into. That
+/// position is what a scoped fetch is authorized on (§8), and it is a function
+/// of the node shape alone, so it costs the walk nothing to keep.
+fn paired_children(
+    reference: Option<&TrieNode>,
+    node: &TrieNode,
+) -> Vec<(Option<Hash>, Hash, Vec<u8>)> {
     match (reference, node) {
         (
             Some(TrieNode::Branch {
@@ -481,7 +522,7 @@ fn paired_children(reference: Option<&TrieNode>, node: &TrieNode) -> Vec<(Option
         ) => children
             .iter()
             .enumerate()
-            .filter_map(|(i, child)| child.map(|child| (theirs[i], child)))
+            .filter_map(|(i, child)| child.map(|child| (theirs[i], child, vec![i as u8])))
             .collect(),
         (
             Some(TrieNode::Ext {
@@ -489,12 +530,18 @@ fn paired_children(reference: Option<&TrieNode>, node: &TrieNode) -> Vec<(Option
                 child: their_child,
             }),
             TrieNode::Ext { prefix, child },
-        ) if their_prefix == prefix => vec![(Some(*their_child), *child)],
-        (_, node) => node
-            .child_hashes()
-            .into_iter()
-            .map(|child| (None, child))
+        ) if their_prefix == prefix => {
+            vec![(Some(*their_child), *child, prefix.as_slice().to_vec())]
+        }
+        (_, TrieNode::Branch { children, .. }) => children
+            .iter()
+            .enumerate()
+            .filter_map(|(i, child)| child.map(|child| (None, child, vec![i as u8])))
             .collect(),
+        (_, TrieNode::Ext { prefix, child }) => {
+            vec![(None, *child, prefix.as_slice().to_vec())]
+        }
+        (_, TrieNode::Leaf { .. }) => Vec::new(),
     }
 }
 
@@ -1192,14 +1239,183 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// cannot become incomplete: no node is ever rewritten under an existing
     /// hash, and GC marks from every head a root can be reached through.
     pub fn is_complete(&self, root: Hash) -> Result<bool, MptError> {
-        if Self::wrap(self.store.is_known_complete(&root))? {
+        self.is_complete_scoped(root, &Scope::full())
+    }
+
+    /// True if everything under `root` *that `scope` admits* is present.
+    ///
+    /// Completeness is a property of a root and a scope together, not of a
+    /// root alone: a trie held whole within one grant is not held whole within
+    /// a wider one. The memo is keyed by both, so widening a scope re-derives
+    /// the answer instead of inheriting a narrower one.
+    pub fn is_complete_scoped(&self, root: Hash, scope: &Scope) -> Result<bool, MptError> {
+        let memo = scope.memo_key(root);
+        if Self::wrap(self.store.is_known_complete(&memo))? {
             return Ok(true);
         }
-        let complete = self.missing(root, 1)?.is_empty();
+        let complete = MissingWalk::scoped(None, root, scope.clone())
+            .next_batch(self, 1)?
+            .is_empty();
         if complete {
-            Self::wrap(self.store.note_complete(&root))?;
+            Self::wrap(self.store.note_complete(&memo))?;
         }
         Ok(complete)
+    }
+
+    /// Resolves claimed positions against `root`, returning what actually
+    /// stands at each one.
+    ///
+    /// This is the responder's half of a scoped fetch (§8). The caller says
+    /// where it believes a node sits; this descends from a root the responder
+    /// itself holds and reports what is really there, so a position cannot be
+    /// claimed into existence — a fabricated root fails at the first step,
+    /// because the descent reads this store and nothing else.
+    ///
+    /// Resolved as one merged descent over the sorted paths, sharing the work
+    /// of every prefix two wants have in common. A batch is the frontier of a
+    /// single walk, so nearly all of it is shared: the cost is close to the
+    /// depth of the trie plus the size of the batch, rather than their
+    /// product.
+    pub fn resolve_paths(
+        &self,
+        root: Hash,
+        paths: &[Vec<u8>],
+    ) -> Result<Vec<Option<Hash>>, MptError> {
+        let mut order: Vec<usize> = (0..paths.len()).collect();
+        order.sort_by(|&a, &b| paths[a].cmp(&paths[b]));
+
+        let mut out = vec![None; paths.len()];
+        // The previous descent, as `(nibbles consumed, hash standing there)`,
+        // together with the path it was walked along. Retained between wants
+        // so a shared prefix is walked once.
+        let mut trail: Vec<(usize, Hash)> = Vec::new();
+        let mut walked: Vec<u8> = Vec::new();
+        for &index in &order {
+            let path = &paths[index];
+            // Rewind to the deepest point of the previous descent that this
+            // path still agrees with.
+            while let Some(&(depth, _)) = trail.last() {
+                if depth <= path.len() && walked[..depth] == path[..depth] {
+                    break;
+                }
+                trail.pop();
+            }
+            let (mut consumed, mut current) = match trail.last() {
+                Some(&(depth, hash)) => (depth, Some(hash)),
+                None => (0, root_opt(root)),
+            };
+            let resolved = loop {
+                let Some(hash) = current else { break None };
+                if consumed == path.len() {
+                    break Some(hash);
+                }
+                let Some(data) = self.load_raw(&hash)? else {
+                    break None;
+                };
+                match TrieNode::decode(&data)? {
+                    TrieNode::Branch { children, .. } => {
+                        let slot = path[consumed] as usize;
+                        if slot >= 16 {
+                            break None;
+                        }
+                        current = children[slot];
+                        consumed += 1;
+                    }
+                    TrieNode::Ext { prefix, child } => {
+                        let prefix = prefix.as_slice();
+                        if path.len() - consumed < prefix.len()
+                            || &path[consumed..consumed + prefix.len()] != prefix
+                        {
+                            break None;
+                        }
+                        current = Some(child);
+                        consumed += prefix.len();
+                    }
+                    // A leaf holds no positions below itself, so a path that
+                    // continues past one names nothing.
+                    TrieNode::Leaf { .. } => break None,
+                }
+                if let Some(hash) = current {
+                    trail.push((consumed, hash));
+                }
+            };
+            out[index] = resolved;
+            walked.clear();
+            walked.extend_from_slice(path);
+        }
+        Ok(out)
+    }
+
+    /// The first key under `root` that `scope` does not admit, if there is one.
+    ///
+    /// This is the publish-scope question (§7): a delegated origin's trie must
+    /// hold nothing outside the spaces it was delegated, and a head whose trie
+    /// does is refused whole rather than materialized in part.
+    ///
+    /// Cheap, despite sounding like a full scan. The walk descends only where
+    /// the boundary is still unresolved — a position already *inside* a
+    /// granted prefix cannot lead out of it, so its subtree is skipped
+    /// outright, and a position outside one is the answer. What actually gets
+    /// visited is the spine: on the order of the trie's depth times the number
+    /// of granted prefixes, whatever the trie holds below them.
+    ///
+    /// A node that is absent locally stops that branch rather than raising:
+    /// this is asked of a trie about to be promoted, where absence has already
+    /// been settled by the fetch.
+    pub fn first_key_outside(
+        &self,
+        root: Hash,
+        scope: &Scope,
+    ) -> Result<Option<Vec<u8>>, MptError> {
+        if scope.is_full() {
+            return Ok(None);
+        }
+        let mut stack = match root_opt(root) {
+            None => return Ok(None),
+            Some(hash) => vec![(hash, Vec::<u8>::new())],
+        };
+        while let Some((hash, path)) = stack.pop() {
+            if scope.contains_subtree(&path) {
+                continue;
+            }
+            let Some(data) = self.load_raw(&hash)? else {
+                continue;
+            };
+            match TrieNode::decode(&data)? {
+                TrieNode::Leaf { key_rest, .. } => {
+                    let mut key = path;
+                    key.extend_from_slice(key_rest.as_slice());
+                    if !scope.admits_key_path(&key) {
+                        return Ok(Some(key));
+                    }
+                }
+                TrieNode::Ext { prefix, child } => {
+                    let mut child_path = path;
+                    child_path.extend_from_slice(prefix.as_slice());
+                    if !scope.admits_path(&child_path) {
+                        return Ok(Some(child_path));
+                    }
+                    stack.push((child, child_path));
+                }
+                TrieNode::Branch { children, value } => {
+                    // A branch may itself carry a value, and that value's key
+                    // is the branch's own position.
+                    if value.is_some() && !scope.admits_key_path(&path) {
+                        return Ok(Some(path.clone()));
+                    }
+                    for (slot, child) in children.iter().enumerate() {
+                        let Some(child) = child else { continue };
+                        let mut child_path = path.clone();
+                        child_path.push(slot as u8);
+                        if !scope.admits_path(&child_path) {
+                            return Ok(Some(child_path));
+                        }
+                        stack.push((*child, child_path));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Everything reachable from `root`, for mark-and-sweep GC (§5.4).
@@ -1504,6 +1720,162 @@ mod tests {
             t.insert(Hash::EMPTY, &key, b"v"),
             Err(MptError::KeyTooLong(_))
         ));
+    }
+    /// The boundary case the whole scoped design rests on.
+    ///
+    /// A walk confined to one space must ask for the spine — which is what
+    /// makes the signed root recomputable — and must never ask for a sibling
+    /// subtree, whose hash it nonetheless holds.
+    #[test]
+    fn a_scoped_walk_asks_for_the_spine_and_never_the_sibling() {
+        let source = MemStore::new();
+        let trie = Trie::new(&source);
+        let mut root = Hash::EMPTY;
+        for key in [
+            b"f:photos/a.jpg".as_slice(),
+            b"f:photos/b.jpg".as_slice(),
+            b"f:finance/q3.pdf".as_slice(),
+            b"f:finance/q4.pdf".as_slice(),
+        ] {
+            root = trie.insert(root, key, key).unwrap();
+        }
+
+        // Everything the scoped walk would ever fetch, from an empty store.
+        let empty = MemStore::new();
+        let scope = Scope::of(&[b"f:photos/".to_vec()]);
+        let mut walk = MissingWalk::scoped(None, root, scope.clone());
+        let mut wanted: Vec<(Vec<u8>, Hash)> = Vec::new();
+        loop {
+            let batch = { MissingWalk::next_batch(&mut walk, &Trie::new(&empty), 64).unwrap() };
+            if batch.is_empty() {
+                break;
+            }
+            for (path, hash) in &batch.nodes {
+                wanted.push((path.clone(), *hash));
+                let bytes = source.get_node(hash).unwrap().unwrap();
+                empty.put_node(hash, &bytes).unwrap();
+            }
+            for (_, hash) in &batch.values {
+                let bytes = source.get_value(hash).unwrap().unwrap();
+                empty.put_value(hash, &bytes).unwrap();
+            }
+            walk.resume();
+        }
+
+        assert!(!wanted.is_empty(), "the walk fetched nothing at all");
+        // Every position asked for is one the scope admits — an honest walk
+        // never generates a request its peer would refuse.
+        for (path, _) in &wanted {
+            assert!(
+                scope.admits_path(path),
+                "the walk asked for a position outside its scope"
+            );
+        }
+        // The granted space is wholly present; the withheld one is not.
+        let scoped = Trie::new(&empty);
+        assert_eq!(
+            scoped.get(root, b"f:photos/a.jpg").unwrap().as_deref(),
+            Some(b"f:photos/a.jpg".as_slice())
+        );
+        assert!(scoped.get(root, b"f:finance/q3.pdf").is_err());
+        // And the walk considers itself done: complete *within its scope*,
+        // while plainly not holding the trie whole.
+        assert!(scoped.is_complete_scoped(root, &scope).unwrap());
+        assert!(!scoped.is_complete(root).unwrap());
+    }
+
+    /// Position, not hash, is what a scoped fetch may be authorized on.
+    ///
+    /// A position is always a *node boundary*, because both sides derive it by
+    /// descending the structure — a branch slot or an extension's whole
+    /// prefix. A path that stops partway through an extension names nothing,
+    /// which is what makes a fabricated position unresolvable rather than
+    /// merely wrong.
+    #[test]
+    fn a_claimed_position_resolves_to_what_is_really_there() {
+        let source = MemStore::new();
+        let trie = Trie::new(&source);
+        let mut root = Hash::EMPTY;
+        for key in [
+            b"f:photos/a.jpg".as_slice(),
+            b"f:photos/b.jpg".as_slice(),
+            b"f:finance/q3.pdf".as_slice(),
+        ] {
+            root = trie.insert(root, key, key).unwrap();
+        }
+
+        // The positions a real walk emits, paired with the hashes it claims
+        // for them. This is exactly what a request carries.
+        let empty = MemStore::new();
+        let mut walk = MissingWalk::new(root);
+        let mut wants: Vec<(Vec<u8>, Hash)> = Vec::new();
+        loop {
+            let batch = MissingWalk::next_batch(&mut walk, &Trie::new(&empty), 64).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for (path, hash) in &batch.nodes {
+                wants.push((path.clone(), *hash));
+                let bytes = source.get_node(hash).unwrap().unwrap();
+                empty.put_node(hash, &bytes).unwrap();
+            }
+            for (_, hash) in &batch.values {
+                let bytes = source.get_value(hash).unwrap().unwrap();
+                empty.put_value(hash, &bytes).unwrap();
+            }
+            walk.resume();
+        }
+        assert!(wants.len() > 1, "the trie is too small to be a test");
+
+        // Every position the walk claimed resolves, on the server's own copy,
+        // to exactly the hash it claimed.
+        let paths: Vec<Vec<u8>> = wants.iter().map(|(p, _)| p.clone()).collect();
+        let resolved = trie.resolve_paths(root, &paths).unwrap();
+        for (i, (_, claimed)) in wants.iter().enumerate() {
+            assert_eq!(
+                resolved[i],
+                Some(*claimed),
+                "a real position did not resolve"
+            );
+        }
+
+        // A position that names nothing resolves to nothing, so a hash cannot
+        // be reached by claiming a place for it.
+        let nowhere = Nibbles::from_bytes(b"zzzz").as_slice().to_vec();
+        assert_eq!(trie.resolve_paths(root, &[nowhere]).unwrap()[0], None);
+
+        // The merged descent must agree with resolving each path alone:
+        // sharing prefixes between wants is an optimization and must never
+        // become an answer.
+        for (i, path) in paths.iter().enumerate() {
+            let alone = trie
+                .resolve_paths(root, std::slice::from_ref(path))
+                .unwrap();
+            assert_eq!(resolved[i], alone[0], "batching changed an answer");
+        }
+    }
+
+    /// A delegated origin publishing outside its spaces is caught, and caught
+    /// by walking the spine rather than the trie.
+    #[test]
+    fn a_key_outside_the_scope_is_found() {
+        let store = MemStore::new();
+        let trie = Trie::new(&store);
+        let mut root = Hash::EMPTY;
+        for key in [b"f:photos/a.jpg".as_slice(), b"f:photos/b.jpg".as_slice()] {
+            root = trie.insert(root, key, key).unwrap();
+        }
+        let scope = Scope::of(&[b"f:photos/".to_vec()]);
+        assert_eq!(trie.first_key_outside(root, &scope).unwrap(), None);
+
+        // One record outside the grant, and the whole head is refusable.
+        let root = trie.insert(root, b"f:finance/q3.pdf", b"x").unwrap();
+        let offending = trie.first_key_outside(root, &scope).unwrap();
+        assert!(offending.is_some(), "an out-of-scope key went unnoticed");
+        assert!(!scope.admits_path(&offending.unwrap()));
+
+        // A full scope has nothing to find, however the trie is shaped.
+        assert_eq!(trie.first_key_outside(root, &Scope::full()).unwrap(), None);
     }
 }
 

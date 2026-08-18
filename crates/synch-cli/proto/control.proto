@@ -138,6 +138,12 @@ message Command {
     CloudDisable cloud_disable = 39;
     // `synch cloud status`
     CloudStatus cloud_status = 40;
+    // `synch delegate add <key> --space <id> [--until <dur>] [--note <text>]`
+    DelegateAdd delegate_add = 41;
+    // `synch delegate rm <key>`
+    DelegateRm delegate_rm = 42;
+    // `synch delegate ls`
+    DelegateLs delegate_ls = 43;
   }
 }
 
@@ -201,6 +207,25 @@ message TrustRm {
 }
 
 message TrustLs {}
+
+message DelegateAdd {
+  // The subject's z-base-32 device key.
+  string key = 1;
+  // The spaces the delegation covers. At least one, never a wildcard.
+  repeated string spaces = 2;
+  // How long the delegation lasts, as a duration string. Unset takes the
+  // default.
+  optional string until = 3;
+  // A note for `trust ls` and `doctor`.
+  optional string note = 4;
+}
+
+message DelegateRm {
+  // The subject's z-base-32 device key.
+  string key = 1;
+}
+
+message DelegateLs {}
 
 message DomainSet {
   // The zone that will name this node (DESIGN.md 3.1).

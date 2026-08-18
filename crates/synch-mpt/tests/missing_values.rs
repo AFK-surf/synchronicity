@@ -115,14 +115,14 @@ fn one_batch_asks_for_a_shared_value_once() {
             continue;
         }
         let mut seen = std::collections::HashSet::new();
-        for hash in &batch.values {
+        for (_path, hash) in &batch.values {
             assert!(
                 seen.insert(*hash),
                 "one batch named {hash} twice: the responder answers per \
                  requested hash and take_served refuses the repeat"
             );
         }
-        asked.extend(batch.values.iter().copied());
+        asked.extend(batch.values.iter().map(|(_, hash)| *hash));
         // The peer has nothing to give, so the walk must keep asking — which is
         // what makes the duplicate reachable in the first place.
         if asked.len() > 8 {
