@@ -687,9 +687,16 @@ impl Node {
             return Ok(None);
         }
         if target.is_dir() {
+            // The path stays in the log and out of the message. This error
+            // reaches an S3 client verbatim, and the daemon's on-disk layout —
+            // the operator's home, the space roots — is not something a client
+            // that guessed a key is owed.
+            tracing::warn!(
+                target = %target.display(),
+                "refusing to remove a directory as if it were an object"
+            );
             return Err(EngineError::invalid(format!(
-                "{} is a directory here; refusing to remove it",
-                target.display()
+                "{space_id}/{path} is a directory here; refusing to remove it"
             )));
         }
         std::fs::remove_file(&target)?;
@@ -736,7 +743,6 @@ impl Node {
         // A no-op on POSIX, where none of those parse as anything but `Normal`.
         // The mirror's `unsafe_name` already refuses these on the way out; this
         // is the way in.
-        let target = PathBuf::from(&space.local_path).join(&normalized);
         if Path::new(&normalized)
             .components()
             .any(|part| !matches!(part, std::path::Component::Normal(_)))
@@ -745,7 +751,18 @@ impl Node {
                 "path {path} is not a plain relative path on this platform"
             )));
         }
-        Ok(target)
+        // Lexical safety is still not enough. A space root is canonicalized when
+        // it is added but its *interior* never is, so a symlinked directory
+        // inside the space resolves through to wherever it points, and the write
+        // or the delete lands outside every space as whatever uid the daemon
+        // runs as. The mirror loop has always checked this; every other writer
+        // needs the same check, and a deletion needs it as much as a write does.
+        if crate::mirror::escapes_via_symlink(Path::new(&space.local_path), &normalized) {
+            return Err(EngineError::invalid(format!(
+                "{space_id}/{path} resolves through a symlinked directory and would leave the space"
+            )));
+        }
+        Ok(PathBuf::from(&space.local_path).join(&normalized))
     }
 }
 
@@ -2241,6 +2258,44 @@ mod tests {
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 0);
         assert!(head.is_none());
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use crate::{Node, NodeConfig};
+
+    /// A symlinked directory inside a space is not a way out of it.
+    ///
+    /// A space root is canonicalized when it is added; its interior never is.
+    /// Without the ancestor check a client that can name a key can write and
+    /// delete anywhere the daemon's uid reaches — `~/.ssh/authorized_keys`, a
+    /// systemd user unit — through an ordinary `photos -> /mnt/nas` link.
+    #[tokio::test]
+    async fn a_symlinked_directory_cannot_be_written_or_deleted_through() {
+        let data = tempfile::tempdir().unwrap();
+        let space = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"not yours").unwrap();
+        Node::init(data.path(), None).unwrap();
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        node.add_space("media", space.path()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), space.path().join("escape")).unwrap();
+
+        assert!(node.open_adoption("media", "escape/secret").is_err());
+        assert!(node.adopt_deletion("media", "escape/secret").is_err());
+        assert!(node
+            .adopt_deletion("media", "escape/nested/deep.txt")
+            .is_err());
+        // The file outside the space is untouched by all of that.
+        assert_eq!(
+            std::fs::read(outside.path().join("secret")).unwrap(),
+            b"not yours"
+        );
+        // An ordinary path in the same space still works, and so does a
+        // symlink that *is* the final component rather than an ancestor.
+        assert!(node.open_adoption("media", "ordinary.txt").is_ok());
         node.shutdown().await.unwrap();
     }
 }

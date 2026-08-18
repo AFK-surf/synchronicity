@@ -983,6 +983,8 @@ mod tests {
         assert_eq!(percent_decode("plain"), "plain");
         // A truncated escape is passed through rather than dropped.
         assert_eq!(percent_decode("a%"), "a%");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%zz"), "%zz");
         // `+` is a literal in a URI, not a space. Decoding it aliased `a+b` onto
         // `a b`, so one key silently overwrote the other and the `+` key could
         // not be addressed; compliant clients send `%2B`.
