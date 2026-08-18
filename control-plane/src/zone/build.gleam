@@ -298,13 +298,24 @@ fn validate_members(members: List(model.Member)) -> Result(Nil, BuildError) {
 /// changing its shape.
 ///
 /// The record grammar is whitespace-separated `key=value` pairs, so a hint
-/// containing whitespace is not one value but two fields — and a second
-/// `apex=` makes the client refuse the record outright
-/// (`RecordError::Duplicate`), which is a member breaking their own network's
-/// answer. A quote breaks the provider round-trip instead:
-/// Cloudflare returns TXT content in presentation form, and the reconciler
-/// folds it by splitting on `"`, so a quoted value comes back as something
-/// other than what was sent and the diff churns forever.
+/// containing whitespace is not one value but two fields — and the client
+/// then reads a field the member wrote where the operator's belongs. A second
+/// `apex=` is the sharp one: it makes the answer name two control planes,
+/// which is a refusal, so one member's dialing hint partitions their whole
+/// network. A quote breaks the provider round-trip instead: Cloudflare
+/// returns TXT content in presentation form and the reconciler folds it by
+/// splitting on `"`, so a quoted value comes back as something other than
+/// what was sent and the diff churns forever.
+///
+/// **An allowlist, because the denylist could not be finished.** The client
+/// splits on `str::split_whitespace`, which is *Unicode* whitespace: vertical
+/// tab, form feed, NEL, no-break space, line separator and more. Excluding
+/// the four ASCII ones let U+000B, U+000C, U+0085, U+00A0 and U+2028 through,
+/// each of them a field separator at the client — a list that cannot be
+/// completed by adding cases, because the next spelling is always one nobody
+/// thought of. Printable ASCII minus space and quote is the set that cannot
+/// separate a field or break the round-trip, and it holds every hint this
+/// design has: `1.2.3.4:9000`, `[::1]:9000`, `https://relay.example:443/`.
 ///
 /// The length bound is about the provider ceiling: Cloudflare refuses a TXT
 /// record past 4096 wire-format bytes, and one oversized member record makes
@@ -315,11 +326,12 @@ fn validate_members(members: List(model.Member)) -> Result(Nil, BuildError) {
 /// member from rewriting the record their whole network is answered with.
 pub fn valid_hint(hint: String) -> Bool {
   string.length(hint) <= 255
-  && !string.contains(hint, " ")
-  && !string.contains(hint, "\t")
-  && !string.contains(hint, "\n")
-  && !string.contains(hint, "\r")
-  && !string.contains(hint, "\"")
+  && string.to_utf_codepoints(hint)
+  |> list.all(fn(point) {
+    let code = string.utf_codepoint_to_int(point)
+    // 0x21..=0x7E is printable ASCII without space; 0x22 is `"`.
+    code >= 0x21 && code <= 0x7E && code != 0x22
+  })
 }
 
 /// Sorts full RRsets canonically — publish stores them in chain order.
