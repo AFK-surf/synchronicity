@@ -644,12 +644,11 @@ impl Store {
     /// A sweep takes the nodes of every root it did not mark from, so a memo
     /// entry for one of those becomes a standing lie: `Hello` would go on
     /// advertising a trie this node can no longer serve. Dropping the whole
-    /// memo is the safe version of that and was what this used to do — but the
-    /// memo is exactly the answer §5.1 exists to avoid recomputing on every
-    /// exchange, and GC runs every five minutes against a thirty-second
-    /// anti-entropy interval, so clearing it wholesale gave the cost back on
-    /// roughly one round in ten, forever. Retaining the marked roots keeps the
-    /// optimization and the honesty.
+    /// memo is the safe version of that — but the memo is exactly the answer
+    /// §5.1 exists to avoid recomputing on every exchange, and GC runs every
+    /// five minutes against a thirty-second anti-entropy interval, so clearing
+    /// it wholesale gives the cost back on roughly one round in ten, forever.
+    /// Retaining the marked roots keeps the optimization and the honesty.
     pub fn retain_complete_roots(&self, keep: &std::collections::HashSet<Hash>) {
         self.complete_roots().retain(|root| keep.contains(root));
     }

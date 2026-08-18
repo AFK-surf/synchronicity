@@ -1,6 +1,6 @@
-//! Audit findings F9 and F10 (fixed) — `TrieNode::hash_of_encoded` is the
-//! single trust boundary for peer-supplied nodes, and it accepted structures
-//! the trie's own documented invariants forbid.
+//! `TrieNode::hash_of_encoded` is the single trust boundary for peer-supplied
+//! nodes, so it must refuse structures the trie's own documented invariants
+//! forbid.
 //!
 //! F10 was the serious one: an empty `Ext` prefix made `get` and every
 //! structural walk disagree about the same root, so a head promoted cleanly

@@ -339,11 +339,11 @@ fn observe_once(
     // without the Zone Key flag, or carrying RFC 5011's REVOKE bit, signs
     // nothing and is excluded from the set an entry claims
     // (`rekor/chain.claimable`, `chain.rs`'s `usable_signer`). Recording one
-    // here anyway made `covered` unreachable forever: `stamp_covered` only
-    // stamps keys a stored record claims, `log_if_new` requires every stored
-    // key to be stamped, and a key no claim can contain is never stamped. The
-    // watcher then re-collected the chain and re-submitted a byte-identical
-    // entry every tick, for the life of the deployment.
+    // here anyway makes `covered` unreachable: `stamp_covered` stamps only
+    // keys a stored record claims, `log_if_new` requires every stored key to
+    // be stamped, and a key no claim can contain is never stamped — so the
+    // watcher would re-collect the chain and re-submit a byte-identical entry
+    // every tick, forever.
     |> list.filter(chain.claimable)
   case rdatas {
     [] ->

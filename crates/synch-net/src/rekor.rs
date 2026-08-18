@@ -2081,9 +2081,9 @@ mod tests {
         // signature over the note body up to and including its final
         // newline.
         //
-        // It is also the regression test for the *shape* of that parse: a
-        // real checkpoint carries four signature lines, the log's own plus
-        // three witness cosignatures. This design interprets cosignatures not
+        // It also pins the *shape* of that parse: a real checkpoint carries
+        // four signature lines, the log's own plus three witness
+        // cosignatures. This design interprets cosignatures not
         // at all (§8.2), but narrowing the parser to a single signature would
         // reject every checkpoint the production log serves. `verify_signature`
         // scans the list and needs exactly one line to match a pinned key.
@@ -2148,10 +2148,10 @@ mod tests {
             .verify_under(&embedded)
             .expect("the log's own line verifies under a pinned key");
 
-        // Rename the note's origin, leaving every signature untouched. The
-        // signatures no longer cover these bytes, so this is only half the
-        // point; the other half is that the log's line no longer *names* the
-        // origin either, and that half is checked before any signature is.
+        // Rename the note's origin, leaving every signature untouched. Two
+        // things then fail, and the order matters: the log's line does not
+        // *name* this origin, which is checked before any signature is, and
+        // the signatures do not cover these bytes either.
         let renamed = String::from_utf8_lossy(note).replacen(
             "log2025-1.rekor.sigstore.dev\n",
             "log2025-1.rekor.sigstore.dev.dev.2\n",
@@ -2186,8 +2186,8 @@ mod tests {
     ///
     /// For Ed25519 the note key id is `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`,
     /// so the hint is a checkable statement that this key belongs to this
-    /// origin — the origin↔key binding, sitting in the note all along and
-    /// previously discarded at parse. Sigstore's P-256 logs publish SHA-256 over
+    /// origin — the origin↔key binding, carried in the note itself.
+    /// Sigstore's P-256 logs publish SHA-256 over
     /// the SubjectPublicKeyInfo instead, so no derivation is right for that arm
     /// and none is claimed.
     #[test]

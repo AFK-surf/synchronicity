@@ -127,13 +127,12 @@ impl FileEntry {
 /// How much of an object a holder has: the byte spans it holds, coalesced at
 /// 16 MiB granularity.
 ///
-/// One representation, not two. There used to be a `Complete` variant beside
-/// `Partial`, and it was exactly `Partial { spans: [(0, size)] }` — every
-/// consumer had to branch on the distinction to arrive back at the same answer,
-/// six sites of it, and the same duplication was carried into the
-/// `blob_providers` table as a `complete` column beside the spans. Completeness
-/// is a question you ask of the spans and the size, not a second thing to keep
-/// in step with them.
+/// One representation, not two. A `Complete` variant beside `Partial` would
+/// be exactly `Partial { spans: [(0, size)] }`, so every consumer would branch
+/// on the distinction to arrive back at the same answer, and the
+/// `blob_providers` table would carry the same duplication as a `complete`
+/// column beside the spans. Completeness is a question you ask of the spans
+/// and the size, not a second thing to keep in step with them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdState {
     /// Held `[start, end)` byte spans.

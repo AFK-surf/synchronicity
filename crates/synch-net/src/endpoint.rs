@@ -23,9 +23,9 @@ use crate::{
 /// How long a dial may take before the peer is reported unreachable.
 ///
 /// Generous enough for hole-punching and a relay fallback; bounded so a dead
-/// address costs seconds, not the 30–60 s QUIC would spend retrying — every
-/// stale binding used to stall `sync`, `take`, and each head push for that
-/// long, silently.
+/// address costs seconds, not the 30–60 s QUIC would spend retrying, which a
+/// stale binding would otherwise charge to `sync`, `take` and every head push,
+/// silently.
 pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long one request may wait for its answer before the peer is treated as

@@ -1036,6 +1036,11 @@ and the state file records it: a run whose surface differs from the one the
 file was written under is refused rather than silently re-classifying old
 findings against new trust.
 
+`--rekor-key` replaces the *keys* and nothing else — the endpoints still come
+from the trusted root in force — so it requires `--log` beside it, and a run
+without one is refused at startup rather than failing every shard and exiting
+30 forever. `--log` is a reachability knob, not part of the recorded surface.
+
 **One monitor process covers one trust surface.** Both flags *replace* rather
 than union — the same different-universe semantics they have on the client — so
 a single process cannot cover an ICANN-rooted population and a
@@ -1433,8 +1438,7 @@ interoperation but cannot be made to misbehave on demand.
   suites: the chain extension and a whole Gleam-built certificate the Rust
   parser reads. This is
   what keeps a hand-rolled DER reader and OTP's ASN.1 encoder from agreeing
-  with themselves rather than with each other. It caught a real bug on its
-  first run — the Rust OID constants encoded `2.25` as 40×1+25.
+  with themselves rather than with each other.
 
 **What no fixture can catch.** The `int32` OID constraint in §2.2 was invisible
 to every test here, and would have been invisible to any test built the same
@@ -1446,26 +1450,30 @@ tolerances — and the mitigation is equally specific: before changing anything
 about the certificate's shape, submit one and read the status code. Rejected
 submissions are not logged, so bisecting against the real log is free.
 
-The same session turned up a second trap worth naming, because it is a
-*plausible* wrong answer rather than an obvious one: Rekor's
+A second trap is worth naming because it is a *plausible* wrong answer
+rather than an obvious one: Rekor's
 `TransparencyLogEntry.logId.keyId` is the C2SP note key id,
 `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`, not `SHA-256(DER SPKI)`. Both are 32
 bytes, both arrive in the same JSON response within a few fields of each
 other, and substituting one for the other yields a proof that matches no pin
-and fails as "unknown log" — which reads like a misconfigured client. The
-production code was always right (it derives the id from the *pinned* key,
-never from anything the server said); only the submission driver was wrong.
-Both `rekor::LogKeys` and `rekor/proof.log_id` now say so where somebody
-would look, and `tuf::tlogs` derives the id from `publicKey.rawBytes` rather
-than reading the `logId.keyId` sitting beside it in the trusted root.
+and fails as "unknown log" — which reads like a misconfigured client. Every
+log id in this tree is therefore derived from a key we hold, never from
+anything a server said: `rekor::LogKeys` and `rekor/proof.log_id` say so where
+somebody would look, and `tuf::tlogs` derives the id from
+`publicKey.rawBytes` rather than reading the `logId.keyId` sitting beside it
+in the trusted root.
 
 **Both chain shapes, always.** `SimDelegation` builds a synthetic
 root → TLD → apex ladder with real DS records and its own anchor, beside the
-degenerate self-anchored chain a `--dnssec-anchor` deployment produces. Until
-it existed, every sim test ran on the one-link shape — so the suites asserting
-the invariant "over every shape the two sides could disagree about" were
-exercising a single branch of the validator, and a divergence that only
-appears once a chain has a parent to climb to was invisible. A test asserts
+degenerate self-anchored chain the harness can also build. (No *deployment*
+produces that second shape: `rekor/chain.check_ladder` requires a chain to
+terminate at the root and `ancestor_links` always appends a root link, so a
+privately-anchored control plane must anchor at a zone spelled `.` or run
+`--rekor off`. The shape is a validator branch worth covering, not a
+deployment worth describing.) A suite running on one shape would assert the
+invariant "over every shape the two sides could disagree about" while
+exercising a single branch of the validator, and a divergence that appears
+only once a chain has a parent to climb to would be invisible. A test asserts
 both shapes are present and structurally different, so the coverage cannot
 quietly collapse back.
 

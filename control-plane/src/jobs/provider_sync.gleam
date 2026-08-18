@@ -254,12 +254,11 @@ fn omit_members(conn: Connection) -> Result(Bool, String) {
       // **The live keys, not "has anything ever been logged".** Serve mode's
       // gate asks whether the *active CSK* is claimed by a verified record
       // (`gate.check` → `store.covered`, by rdata digest); this is the
-      // external-mode analogue and has to ask the same question. Asking
-      // `any_verified` instead armed the gate exactly once, at the very first
-      // publish, and disarmed it permanently afterwards — so a provider that
-      // later rotated to a key nobody had logged kept getting its membership
-      // TXT published, and every `require` client failed closed on an answer
-      // this service had already decided was fine.
+      // external-mode analogue and asks the same question. A gate that asked
+      // only whether *some* record existed would arm once, at the first
+      // publish, and never again — so a provider that later rotated to an
+      // unlogged key would keep getting membership TXT published while every
+      // `require` client failed closed on it.
       //
       // Every observed key, because in external mode the provider holds the
       // keys and this service cannot tell which of them signs a given answer:

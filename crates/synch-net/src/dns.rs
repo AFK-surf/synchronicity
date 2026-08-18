@@ -525,11 +525,9 @@ impl MemberSet {
 /// `/dns-query`. Plaintext concedes what UDP-53 always conceded: query
 /// privacy and a denial lever. It concedes integrity only as far as the
 /// validation below it is sound — and that is a real qualifier, not a
-/// formality. A party who can add a record to a response reaches
-/// [`covered_by_signed_data`], and the one time this code took hickory's
-/// `Proof::Secure` for "this record is signed", a spliced class-CH TXT was a
-/// full membership forgery. Prefer `https://` and treat the in-process
-/// validation as the last line rather than the only one.
+/// formality: a party who can add a record to a response is answered by
+/// [`covered_by_signed_data`] and nothing else. Prefer `https://` and treat
+/// the in-process validation as the last line rather than the only one.
 fn doh_url(url: &str) -> Result<reqwest::Url, NetError> {
     let bad = |why: String| NetError::Dns(format!("DoH endpoint {url}: {why}"));
     let mut parsed = reqwest::Url::parse(url).map_err(|e| bad(e.to_string()))?;
@@ -1839,9 +1837,9 @@ impl hickory_resolver::net::xfer::DnsHandle for DohHandle {
 /// stand until their grace runs out, and nothing false is ever accepted. It is
 /// reachable by anyone who can add a record to a response, including an on-path
 /// attacker against a plaintext DoH endpoint. It is a bug in the dependency's
-/// signature-selection logic and cannot be fixed from this side; what *is*
-/// fixed from this side is the other half of the same quirk — hickory's choice
-/// of *which* RRSIG is the signer no longer decides which zone key must carry a
+/// signature-selection logic and cannot be fixed from this side. What this
+/// side does close is the other half of the same quirk: hickory's choice of
+/// *which* RRSIG is the signer does not decide which zone key must carry a
 /// transparency proof (see [`ValidatedTxt::rrsigs`]).
 fn strip_off_path_rrsigs(response: &mut hickory_resolver::proto::op::DnsResponse) {
     drop_off_path_rrsigs(&mut response.answers);

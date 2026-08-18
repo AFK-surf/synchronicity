@@ -540,11 +540,8 @@ impl Store {
     /// The budget is a parameter rather than a constant read from
     /// `synch_core`. It is a *frame* bound — how much of an answer fits one
     /// exchange — and the frame belongs to the layer that writes it, so
-    /// `synch-net` supplies `MAX_PROOF_NODES` at the call site. The tell that
-    /// it wanted to be a parameter was already here: this used to be a public
-    /// wrapper over a private `encode_proof_bounded` whose only reason to exist
-    /// was "so that the clamping can be exercised without a 128 GB object". The
-    /// test-only variant is now the real one.
+    /// `synch-net` supplies `MAX_PROOF_NODES` at the call site — which also
+    /// means the clamping can be exercised without a 128 GB object.
     ///
     /// An over-budget request is refused rather than truncated; see the walk
     /// below for why that is safe once the requester sizes its own windows.
@@ -813,15 +810,13 @@ impl Store {
     pub fn promote(&self, donor: &Donor, proven: &Proven, now: i64) -> Result<ChunkRanges> {
         // The object and its length come off the proof itself.
         //
-        // They used to be passed alongside it and checked for agreement, and
-        // `DELTA-SYNC.md` §3.1 presented that as a security property. It was
-        // not one: tracing every construction site, `write_proof` builds
-        // `Proven` from its own arguments and `Proven::none` from the caller's
-        // locals, and `promote` was then handed those same locals again — no
-        // peer-supplied value ever reached `proven.root` or `proven.size`
-        // independently of what the caller already had. The check could only
-        // ever catch a caller mixing up two objects, which is what taking the
-        // values from one place makes unrepresentable instead.
+        // Passing them alongside it and checking for agreement is not the
+        // security property it looks like: `write_proof` builds `Proven` from
+        // its own arguments and `Proven::none` from the caller's locals, so no
+        // peer-supplied value reaches `proven.root` or `proven.size`
+        // independently of what the caller already had. Such a check could
+        // only catch a caller mixing up two objects — which taking the values
+        // from one place makes unrepresentable instead.
         //
         // The real protection is elsewhere and unaffected: `walk_proof`
         // recomputes every chaining value to the root, so a proof of another
@@ -1018,14 +1013,13 @@ impl Store {
     /// object's length is a peer's claim off a trie entry and nothing has
     /// verified it: `walk_proof` verifies the tree's *shape*, never its length,
     /// and `settle_size` has no row to argue with the first time a root is met.
-    /// A `size` of 32 TiB therefore used to buy a 32 TiB sparse payload and a
-    /// 128 GiB sparse outboard from every node that attempted the fetch, with
-    /// nothing to reclaim them: `trim_to_size` runs only on a commit that
-    /// completes an object, `gc_orphans` skips roots that have a row, and
-    /// `gc_content` skips referenced roots — the attacker's own entry being the
-    /// reference. `write_slice` has refused to do this since the same attack was
-    /// closed there (`crate::cas`, `docs/DELTA-SYNC.md` §6); the delta path was
-    /// written later and did not inherit the rule.
+    /// Sizing them here would let a `size` of 32 TiB buy a 32 TiB sparse
+    /// payload and a 128 GiB sparse outboard from every node that attempted
+    /// the fetch, with nothing to reclaim them: `trim_to_size` runs only on a
+    /// commit that completes an object, `gc_orphans` skips roots that have a
+    /// row, and `gc_content` skips referenced roots — the attacker's own entry
+    /// being the reference. `write_slice` refuses this for the same reason
+    /// (`crate::cas`, `docs/DELTA-SYNC.md` §6).
     ///
     /// Each run grows the payload to its own end before it is copied, and
     /// `PreOrderOutboard::save` extends the outboard as it writes — which is
@@ -1404,15 +1398,15 @@ mod tests {
     ///
     /// `size` reaches these paths off a trie entry, and nothing has verified it:
     /// `walk_proof` verifies the tree's shape, not its length, and `settle_size`
-    /// has no row to argue with the first time a root is met. So an entry
-    /// claiming 32 TiB for any root used to buy a 128 GiB sparse outboard from
-    /// `write_proof` and a 32 TiB sparse payload from `promote` on every node
-    /// that tried — and nothing reclaims either: `trim_to_size` runs only on a
-    /// commit that completes an object, `gc_orphans` skips roots with a row, and
-    /// `gc_content` skips referenced roots, the attacker's own entry being the
-    /// reference. `write_slice` has refused this since the same attack was
-    /// closed there; both files are now bounded the same way, by what the
-    /// operation in hand actually reaches.
+    /// has no row to argue with the first time a root is met. An entry
+    /// claiming 32 TiB for any root would otherwise buy a 128 GiB sparse
+    /// outboard from `write_proof` and a 32 TiB sparse payload from `promote`
+    /// on every node that tried — and nothing reclaims either: `trim_to_size`
+    /// runs only on a commit that completes an object, `gc_orphans` skips
+    /// roots with a row, and `gc_content` skips referenced roots, the
+    /// attacker's own entry being the reference. `write_slice` refuses this
+    /// too; both files are bounded the same way, by what the operation in hand
+    /// actually reaches.
     #[test]
     fn a_size_claim_cannot_grow_the_delta_sync_files_past_what_is_written() {
         let (_d1, provider) = store();
@@ -1743,9 +1737,8 @@ mod tests {
     fn a_proof_is_spent_on_the_object_it_was_taken_for() {
         // `promote` reads the object and its length off the proof rather than
         // taking them alongside it, so "spending a proof on the wrong object"
-        // is no longer a thing a caller can express — which is what the pair of
-        // checks that used to guard it could only ever catch. The guarantee
-        // that matters is unchanged and lives in `walk_proof`: a proof only
+        // is not a thing a caller can express. The guarantee that matters
+        // lives in `walk_proof`: a proof only
         // verifies against the root it was taken for, so it can never be turned
         // into bytes for a different object.
         let (_d1, provider) = store();
@@ -1908,15 +1901,15 @@ mod tests {
 
     /// A size claim racing a write that completes the object cannot brick it.
     ///
-    /// Both committers used to decide whether a claimed size could stand by
-    /// reading the row *before* doing their work: an honest `write_slice`
-    /// finishing an object and a `write_proof` carrying an entry's overstatement
-    /// of it could each look, each see a row no group attested to yet, and each
-    /// go ahead. Whichever committed second wrote its size over the other's, and
-    /// when that was the liar the row ended `complete` under a length no byte on
-    /// the disk supports — attested from then on, so every honest writer was
-    /// refused "size mismatch" for good, `read_all` failed, and the entry that
-    /// named the root kept the collector off it. The decision now happens inside
+    /// Deciding whether a claimed size can stand by reading the row *before*
+    /// doing the work loses the race: an honest `write_slice` finishing an
+    /// object and a `write_proof` carrying an entry's overstatement of it each
+    /// look, each see a row no group attested to yet, and each go ahead.
+    /// Whichever commits second writes its size over the other's, and when
+    /// that is the liar the row ends `complete` under a length no byte on the
+    /// disk supports — attested from then on, so every honest writer is
+    /// refused "size mismatch" for good, `read_all` fails, and the entry that
+    /// named the root keeps the collector off it. The decision happens inside
     /// the same transaction as the bitmap union, so one of the two loses and it
     /// is always the claim.
     ///
@@ -1970,11 +1963,11 @@ mod tests {
     ///
     /// An object's tree is the same shape for every size inside its last 16 KiB
     /// chunk group, so an entry that overstates an honest root by a hundred bytes
-    /// yields a proof that verifies against that root perfectly well. The row
-    /// it leaves behind used to record the lie, and every honest writer of the
-    /// same root afterwards — from any origin, on any node that touched the
-    /// path — was refused with "size mismatch" for good, with nothing to
-    /// collect the row because the honest entry still named it.
+    /// yields a proof that verifies against that root perfectly well. If the
+    /// row it leaves behind recorded the lie, every honest writer of the same
+    /// root afterwards — from any origin, on any node that touched the path —
+    /// would be refused with "size mismatch" for good, with nothing to collect
+    /// the row because the honest entry still names it.
     #[test]
     fn an_overstated_size_does_not_brick_a_root() {
         let (_d1, provider) = store();
@@ -2089,10 +2082,10 @@ mod tests {
     /// next request starts.
     #[test]
     fn an_over_budget_proof_is_refused_rather_than_truncated() {
-        // The provider used to serve a prefix and report where it stopped,
-        // which meant the two sides had to be made to agree about the cut —
-        // done by discarding the walk and repeating it over the ranges that
-        // fit. Now the requester sizes its window from
+        // Serving a prefix and reporting where it stopped would mean making
+        // the two sides agree about the cut — by discarding the walk and
+        // repeating it over the ranges that fit. Instead the requester sizes
+        // its window from
         // `proof_nodes_upper_bound` so a full holder still fits, this walk
         // covers a subset of that and so cannot cost more, and an over-budget
         // request means a non-conforming requester.

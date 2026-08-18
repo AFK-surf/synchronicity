@@ -225,9 +225,8 @@ pub struct PinState {
 impl PinState {
     /// The state a build starts from: the embedded root, nothing accepted.
     ///
-    /// `trusted_root` is empty here — a client that has never completed an
-    /// update runs on [`EMBEDDED_TRUSTED_ROOT`], the bootstrap snapshot,
-    /// exactly as it did before this module existed.
+    /// `trusted_root` is empty here: a client that has never completed an
+    /// update runs on [`EMBEDDED_TRUSTED_ROOT`], the bootstrap snapshot.
     pub fn embedded() -> PinState {
         PinState::anchored(EMBEDDED_TUF_ROOT.as_bytes())
     }

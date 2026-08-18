@@ -167,9 +167,8 @@ async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
         // `off` on purpose: under `require` the apex sandwich in `apex_of`
-        // happens to block this too, which is what hid the hole. The signer
-        // rule has to stand on its own, so it is tested where nothing else
-        // is holding the door.
+        // happens to block this too. The signer rule has to stand on its own,
+        // so it is tested where nothing else is holding the door.
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,

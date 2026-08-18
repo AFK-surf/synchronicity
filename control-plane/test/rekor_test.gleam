@@ -436,7 +436,7 @@ pub fn fake_resolver_serving(dnskey_rds: List(BitArray)) -> chain.Resolver {
         )
       // The declaration, spelled the way every reader checks for it. A
       // fixture answering something else here builds a chain that verifies
-      // nowhere — which is what these fixtures used to do, silently.
+      // nowhere, and does it silently.
       w if w == wire.type_txt ->
         Ok([
           wire.Rr(
