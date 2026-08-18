@@ -180,7 +180,13 @@ pub struct ValidChain {
 /// Produced only by [`authorize`], and that is the point: the apex here has
 /// been *parsed*, so no caller can hand the chain walk a string that means
 /// one thing to a comparison and another to a name parser.
+///
+/// `#[non_exhaustive]` is what makes that a property rather than a comment.
+/// Every field is public and stays readable, but another crate cannot build
+/// one by struct literal — which it could, and which would let a monitor
+/// assemble an `Authorized` that no chain walk ever produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Authorized {
     /// The apex, parsed and normalized from the certificate's single
     /// `dNSName` SAN — the control plane's *name*.
@@ -232,7 +238,7 @@ pub fn authorize(
             DnssecChain::decode(value).map_err(|e| ChainError::Malformed(e.to_string()))?
         }
     };
-    let (proven_keys, signing_zone, chain) = validate(&carried, &apex, anchors)?;
+    let (proven_keys, signing_zone, chain) = validate_inner(&carried, &apex, anchors)?;
     Ok(Authorized {
         apex,
         signing_zone,
@@ -280,7 +286,24 @@ pub fn parse_name(text: &str) -> Result<Name, ChainError> {
 /// the apex's own keys signed the declaration sitting under them. That last
 /// step is what makes the entry the zone's statement instead of a passer-by's
 /// copy of public records (see the module docs).
+/// Behind the harness gate, and deliberately. A caller that supplies its own
+/// apex is a caller that can be handed one the certificate does not carry,
+/// which is precisely the split [`authorize`] exists to close: it parses the
+/// apex out of the certificate itself, so the client and the monitor cannot
+/// come to different answers about the same entry. The tiers suite exists
+/// because those two once composed the SAN differently and put a
+/// client-accepted entry in the silent bin. Only the chain tests want the
+/// looser form, and they run with `sim` on.
+#[cfg(any(test, feature = "sim"))]
 pub fn validate(
+    chain: &DnssecChain,
+    apex: &Name,
+    anchors: &TrustAnchors,
+) -> Result<(Vec<Vec<u8>>, Name, ValidChain), ChainError> {
+    validate_inner(chain, apex, anchors)
+}
+
+fn validate_inner(
     chain: &DnssecChain,
     apex: &Name,
     anchors: &TrustAnchors,
@@ -368,7 +391,7 @@ pub fn validate(
 /// collect — on its own it is not a reason to believe an entry, and a caller
 /// that could reach it directly would be able to skip the declaration and
 /// resurrect exactly the claim-about-a-stranger's-zone problem the
-/// declaration exists to close. [`validate`] is the only caller.
+/// declaration exists to close. `validate_inner` is the only caller.
 fn walk_ladder<'a>(
     ladder: &'a [ParsedLink],
     anchors: &TrustAnchors,
