@@ -822,9 +822,9 @@ impl Store {
     /// Deletes an object's payload, outboard, and index row.
     ///
     /// Unconditional: for callers that have already decided, such as an
-    /// explicit `synch rm`. GC goes through
-    /// [`Store::delete_blob_if_collectable`] instead, which re-checks the
-    /// predicate against the same transaction that does the delete.
+    /// explicit `synch rm`. GC goes through `delete_blob_if_collectable`
+    /// instead, which re-checks the predicate against the same transaction that
+    /// does the delete.
     pub fn delete_blob(&self, root: &Hash) -> Result<()> {
         // Row first, bytes second. The reverse order leaves the dangerous
         // orphan: a crash between the unlink and the delete leaves a row saying
