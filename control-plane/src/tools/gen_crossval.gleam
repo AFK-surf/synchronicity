@@ -7,6 +7,7 @@
 //// Two implementations of one DER format drift silently unless something
 //// outside both of them holds the bytes still. These are those bytes.
 
+import dns/name
 import dnssec/keys
 import gleam/io
 import gleam/option.{Some}
@@ -14,6 +15,22 @@ import rekor/cert
 import simplifile
 
 const dir = "test/fixtures/rekor/crossval/"
+
+/// The DNSKEY rdata the DS-digest fixture is taken over.
+///
+/// A fixed, boring key: what is being pinned is the *digest construction*
+/// (lowercased owner name in wire form, then the rdata, then the hash), not
+/// anything about the key. Both digest types are written, because `covers`
+/// on the Rust side dispatches on the type and the publisher has to agree
+/// with it on both arms — the SHA-384 one was dead code until it was pinned.
+pub fn ds_digest_key() -> BitArray {
+  <<257:int-size(16), 3:int-size(8), 13:int-size(8), 7:size(512)>>
+}
+
+/// The zone the DS-digest fixture is taken over — mixed case deliberately,
+/// since the construction lowercases and a reader that does not would pass
+/// every same-case test.
+pub const ds_digest_zone = "Sync.Test."
 
 /// `n` bytes of `i * 7 mod 256`, which is a permutation (7 is odd, so it
 /// generates Z/256) — every byte value appears before any repeats, and a
@@ -76,4 +93,13 @@ pub fn main() {
       Some(links),
     ),
   )
+
+  // The DS digests, both types, over one fixed key at a mixed-case owner.
+  // `chain.rs`'s `covers` recomputes these to decide whether a delegation
+  // walks, and `rekor/chain.check_ds_covers` recomputes them to decide
+  // whether a chain is publishable — two implementations of one hash input,
+  // with nothing outside either of them holding it still until now.
+  let assert Ok(zone) = name.parse(ds_digest_zone)
+  write("ds-digest-sha256.bin", keys.ds_digest(zone, ds_digest_key()))
+  write("ds-digest-sha384.bin", keys.ds_digest_384(zone, ds_digest_key()))
 }

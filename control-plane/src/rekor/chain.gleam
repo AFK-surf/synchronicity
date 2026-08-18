@@ -535,15 +535,20 @@ fn check_ds_covers(
   key_answers: List(wire.Rr),
   ds_answers: List(wire.Rr),
 ) -> Result(Nil, String) {
+  // The digest type travels with the digest. Pooling both types and
+  // comparing every one against a single hash makes the SHA-384 arm dead —
+  // 48 bytes never equal 32 — so a zone whose parent publishes only a type-4
+  // DS fails here unconditionally, while `chain.rs`'s `covers` dispatches on
+  // the type and follows it happily.
   let digests =
     ds_answers
     |> list.filter(fn(rr) { owned(rr, zone, type_ds) })
     |> list.filter_map(fn(rr) {
       case rr.rdata {
         <<_tag:int-size(16), _alg:int-size(8), 2:int-size(8), digest:bits>> ->
-          Ok(digest)
+          Ok(#(2, digest))
         <<_tag:int-size(16), _alg:int-size(8), 4:int-size(8), digest:bits>> ->
-          Ok(digest)
+          Ok(#(4, digest))
         _ -> Error(Nil)
       }
     })
@@ -553,8 +558,13 @@ fn check_ds_covers(
     |> list.map(fn(rr) { rr.rdata })
     |> list.filter(claimable)
     |> list.any(fn(rd) {
-      let want = keys.ds_digest(zone, rd)
-      list.any(digests, fn(got) { got == want })
+      list.any(digests, fn(entry) {
+        let #(digest_type, got) = entry
+        case digest_type {
+          4 -> got == keys.ds_digest_384(zone, rd)
+          _ -> got == keys.ds_digest(zone, rd)
+        }
+      })
     })
   case covered {
     True -> Ok(Nil)

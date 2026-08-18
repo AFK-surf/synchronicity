@@ -800,6 +800,23 @@ fn covers(ds: &[Record], zone: &Name, dnskey_rdata: &[u8]) -> bool {
 }
 
 /// RFC 4034 §5.1.4: `SHA-256(canonical owner name || DNSKEY rdata)`.
+///
+/// Reachable from the harness so the conformance fixture can pin the
+/// construction across the two implementations of it: the control plane
+/// recomputes this to decide whether a chain is publishable, and a
+/// disagreement about the input — the lowercasing, the root label — would
+/// otherwise surface only as a delegation one side refuses to walk.
+#[cfg(any(test, feature = "sim"))]
+pub fn ds_digest_sha256_for_tests(zone: &Name, dnskey_rdata: &[u8]) -> Vec<u8> {
+    ds_digest_sha256(zone, dnskey_rdata)
+}
+
+/// The same, for RFC 4509 digest type 4.
+#[cfg(any(test, feature = "sim"))]
+pub fn ds_digest_sha384_for_tests(zone: &Name, dnskey_rdata: &[u8]) -> Vec<u8> {
+    ds_digest_sha384(zone, dnskey_rdata)
+}
+
 fn ds_digest_sha256(zone: &Name, dnskey_rdata: &[u8]) -> Vec<u8> {
     crate::rekor::sha256(&ds_input(zone, dnskey_rdata)).to_vec()
 }

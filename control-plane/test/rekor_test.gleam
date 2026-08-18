@@ -481,6 +481,32 @@ pub fn ds_rr(zone: name.Name, dnskey_rds: List(BitArray)) -> wire.Rr {
   )
 }
 
+/// The same delegation published with an RFC 4509 digest type 4 (SHA-384).
+///
+/// A registrar that offers only this is a delegation the reader follows —
+/// `chain.rs`'s `covers` dispatches on the digest type — so the publisher has
+/// to follow it too.
+pub fn ds_rr_384(zone: name.Name, dnskey_rds: List(BitArray)) -> wire.Rr {
+  let rd = case dnskey_rds {
+    [first, ..] -> first
+    [] -> <<257:int-size(16), 3:int-size(8), 13:int-size(8), 0:size(512)>>
+  }
+  let algorithm = case rd {
+    <<_flags:int-size(16), _proto:int-size(8), alg:int-size(8), _:bits>> -> alg
+    _ -> 13
+  }
+  wire.Rr(
+    zone,
+    chain.type_ds,
+    wire.class_in,
+    3600,
+    bit_array.concat([
+      <<keys.key_tag(rd):int-size(16), algorithm:int-size(8), 4:int-size(8)>>,
+      keys.ds_digest_384(zone, rd),
+    ]),
+  )
+}
+
 /// A resolver with nothing to say — the DS is not live in the parent yet,
 /// which is the one failure the inverted ceremony makes common.
 fn silent_resolver() -> chain.Resolver {
@@ -830,6 +856,28 @@ fn chunks(rdata: BitArray) -> Result(String, Nil) {
 pub fn the_chain_extension_encodes_the_crossval_bytes_test() {
   assert cert.encode_chain(gen_crossval.links())
     == fixture("crossval/chain.der")
+}
+
+/// The DS digest construction, both types, held still across the boundary.
+///
+/// `chain.rs`'s `covers` recomputes these to decide whether a delegation
+/// walks; `rekor/chain.check_ds_covers` recomputes them to decide whether a
+/// chain is publishable. Two implementations of one hash input — lowercased
+/// owner name in wire form, then the DNSKEY rdata — and until this fixture
+/// nothing outside either of them held it still. The SHA-384 arm was in fact
+/// dead on this side: both digest types were pooled and compared against the
+/// SHA-256 hash, so a 48-byte digest could never match and a zone delegated
+/// only that way was unpublishable.
+pub fn the_ds_digests_match_the_crossval_bytes_test() {
+  let assert Ok(zone) = name.parse(gen_crossval.ds_digest_zone)
+  let rd = gen_crossval.ds_digest_key()
+  assert keys.ds_digest(zone, rd) == fixture("crossval/ds-digest-sha256.bin")
+  assert keys.ds_digest_384(zone, rd)
+    == fixture("crossval/ds-digest-sha384.bin")
+  // The owner name is mixed case in the fixture, so this also pins the
+  // lowercasing that both constructions depend on.
+  let assert Ok(lower) = name.parse("sync.test.")
+  assert keys.ds_digest_384(lower, rd) == keys.ds_digest_384(zone, rd)
 }
 
 /// The long-form DER lengths, which the fixture reaches only because two of
@@ -1799,6 +1847,72 @@ pub fn a_ds_that_covers_no_served_key_is_refused_test() {
       }
     })
   let assert Error(why) = chain.collect(resolver, apex, apex)
+  assert string.contains(why, "covered by a DS")
+}
+
+/// A delegation whose parent publishes only a SHA-384 DS still collects.
+///
+/// The digest type has to travel with the digest. Pooling both types and
+/// comparing every one against a single SHA-256 hash makes the type-4 arm
+/// dead — 48 bytes never equal 32 — so a zone delegated this way failed
+/// `check_ds_covers` unconditionally, at every ancestor cut, while
+/// `chain.rs`'s `covers` follows it happily. In external mode that was a
+/// permanent `omit_members` for a zone that is merely unusual.
+pub fn a_delegation_published_with_a_sha384_ds_still_collects_test() {
+  let assert Ok(apex) = name.parse("sync.test.")
+  let rd = keys.dnskey_rdata(keys.generate())
+  let resolver =
+    chain.Resolver(query: fn(zone, rtype) {
+      case rtype == wire.type_txt {
+        True ->
+          Ok([
+            wire.Rr(
+              zone,
+              wire.type_txt,
+              wire.class_in,
+              300,
+              rdata.txt(rdata.transparency_text),
+            ),
+            fake_rrsig(zone, wire.type_txt),
+          ])
+        False ->
+          case rtype == wire.type_dnskey {
+            True -> Ok(dnskey_rrs(zone, [rd]))
+            // Type 4 and nothing else, which is what a registrar offering
+            // only SHA-384 leaves in the parent.
+            False ->
+              Ok([ds_rr_384(zone, [rd]), fake_rrsig(zone, chain.type_ds)])
+          }
+      }
+    })
+  let assert Ok(_) = chain.collect(resolver, apex, apex)
+
+  // And it is still a real check: a type-4 DS over a key the zone does not
+  // serve is refused, so the fix widened what is accepted, not what passes.
+  let other = keys.dnskey_rdata(keys.generate())
+  let wrong =
+    chain.Resolver(query: fn(zone, rtype) {
+      case rtype == wire.type_txt {
+        True ->
+          Ok([
+            wire.Rr(
+              zone,
+              wire.type_txt,
+              wire.class_in,
+              300,
+              rdata.txt(rdata.transparency_text),
+            ),
+            fake_rrsig(zone, wire.type_txt),
+          ])
+        False ->
+          case rtype == wire.type_dnskey {
+            True -> Ok(dnskey_rrs(zone, [rd]))
+            False ->
+              Ok([ds_rr_384(zone, [other]), fake_rrsig(zone, chain.type_ds)])
+          }
+      }
+    })
+  let assert Error(why) = chain.collect(wrong, apex, apex)
   assert string.contains(why, "covered by a DS")
 }
 

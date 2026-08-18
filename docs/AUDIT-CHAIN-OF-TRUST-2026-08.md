@@ -256,7 +256,24 @@ zone then runs indefinitely on a withheld set, publishing no new device. This is
 therefore the finding that bounds how long H3's shield can be load-bearing, and
 the one worth fixing first in this section.
 
-**Fix**: add `ds_digest_384` and dispatch per digest type.
+**Fix (applied)**: `keys.ds_digest_384` added and `check_ds_covers` now keeps
+the digest type with the digest, dispatching per type the way `covers` does.
+Both digests are also pinned in the shared crossval fixture
+(`ds-digest-sha256.bin`, `ds-digest-sha384.bin`) and asserted from each side,
+so the construction is held still across the boundary rather than recomputed
+independently — this was one of the two formats M6 identifies as unpinned, and
+it is the one that drifted. Covered by
+`a_delegation_published_with_a_sha384_ds_still_collects_test` (which also
+asserts a type-4 DS over an unserved key is still refused),
+`the_ds_digests_match_the_crossval_bytes_test`, and Rust's
+`the_ds_digests_match_the_control_planes`.
+
+Note on what the fixture pins: the mixed-case owner name pins the control
+plane's lowercasing, since `name.encode` folds case itself. It does not pin
+the client's — hickory folds case when it parses a `Name`, so `ds_input`'s
+`to_lowercase` is belt-and-braces there and removing it leaves the suite
+green. What is pinned is that both sides land on the same bytes for the same
+delegation.
 
 ### M5. The client/monitor coupling invariant is enforced by comment, not by type
 
@@ -298,8 +315,9 @@ builds a chain. So `chain.rrset_of`'s output (770 lines of collection and RR
 packing) has no cross-language artifact.
 
 Correction: six of the eight duplicated formats *are* two-way pinned. Only the DS
-digest and the trusted-root reader are unpinned — and those are precisely the two
-that drifted (M4, and the reader-policy divergence below).
+digest and the trusted-root reader were unpinned — and those are precisely the two
+that drifted (M4, and the reader-policy divergence below). The DS digest is now
+pinned as part of M4's fix, which leaves the trusted-root reader.
 
 **Fix**: have `gen_crossval` emit a chain collected by `rekor/chain.gleam` from a
 seeded zone, and have a Rust test run `chain::authorize` over it.
