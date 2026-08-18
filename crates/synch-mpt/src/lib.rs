@@ -34,7 +34,7 @@ pub mod proof;
 pub mod store;
 pub mod trie;
 
-pub use diff::{Change, ChangeKind, ResolvedChange};
+pub use diff::{Change, ChangeKind, ChangeView, ResolvedChange};
 pub use error::MptError;
 pub use nibbles::{common_prefix_len, Nibbles};
 pub use node::{TrieNode, ValueRef, BRANCH_TAG, EXT_TAG, LEAF_TAG};

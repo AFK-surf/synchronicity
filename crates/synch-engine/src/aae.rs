@@ -374,7 +374,13 @@ impl Node {
                     continue;
                 }
                 Ok(false) => false,
-                Err(e) => {
+                // Only a fault in what the *origin* published condemns its head.
+                // A `SQLITE_BUSY` from another process, a full disk, an I/O
+                // error — this used to read all of them as "poisoned" and
+                // abandon a head whose trie may be wholly present, so a busy
+                // gateway holding a write for six seconds cost an origin its
+                // floor and another round to get it back.
+                Err(e) if crate::reconcile::is_origin_fault(&e) => {
                     tracing::warn!(
                         origin = %origin,
                         seq = stored.head.seq,
@@ -382,6 +388,15 @@ impl Node {
                         "origin left behind: its pending head cannot be materialized"
                     );
                     true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        origin = %origin,
+                        seq = stored.head.seq,
+                        error = %e,
+                        "could not decide a pending head this pass; leaving it where it is"
+                    );
+                    continue;
                 }
             };
 

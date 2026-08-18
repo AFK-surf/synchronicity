@@ -53,14 +53,30 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// lexicographic key order.
     pub fn diff(&self, old_root: Hash, new_root: Hash) -> Result<Vec<Change>, MptError> {
         let mut out = Vec::new();
+        self.diff_each(old_root, new_root, |change| {
+            out.push(change);
+            Ok(())
+        })?;
+        out.sort_by(|x, y| x.key.cmp(&y.key));
+        Ok(out)
+    }
+
+    /// Diffs two roots, handing each [`Change`] to `emit` as it is found.
+    ///
+    /// Unordered, unlike [`Trie::diff`]: sorting needs the whole set in memory,
+    /// which is the thing a streaming walk exists not to need.
+    pub fn diff_each(
+        &self,
+        old_root: Hash,
+        new_root: Hash,
+        mut emit: impl FnMut(Change) -> Result<(), MptError>,
+    ) -> Result<(), MptError> {
         if old_root == new_root {
-            return Ok(out);
+            return Ok(());
         }
         let a = self.cursor_at(root_opt(old_root))?;
         let b = self.cursor_at(root_opt(new_root))?;
-        self.diff_walk(a, b, &mut out)?;
-        out.sort_by(|x, y| x.key.cmp(&y.key));
-        Ok(out)
+        self.diff_walk(a, b, &mut emit)
     }
 
     /// Walks both tries in lockstep with an explicit heap stack.
@@ -73,7 +89,12 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// the frames live on the heap and the descent stops at
     /// [`MAX_DEPTH_NIBBLES`] — past which no key short enough to be valid can
     /// begin (§12).
-    fn diff_walk(&self, a: Cursor, b: Cursor, out: &mut Vec<Change>) -> Result<(), MptError> {
+    fn diff_walk(
+        &self,
+        a: Cursor,
+        b: Cursor,
+        emit: &mut dyn FnMut(Change) -> Result<(), MptError>,
+    ) -> Result<(), MptError> {
         let mut path: Vec<u8> = Vec::new();
         let mut stack: Vec<(Frame, Cursor)> = Vec::new();
         // Keeps the diff proportional to the two tries. This runs inside the
@@ -81,7 +102,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         // walk here is a cluster-wide outage rather than a slow query.
         let mut guard = FanoutGuard::default();
 
-        if !self.enter(&a, &b, &path, out)? {
+        if !self.enter(&a, &b, &path, emit)? {
             return Ok(());
         }
         stack.push((Frame { cursor: a, next: 0 }, b));
@@ -110,7 +131,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
             }
             path.push(nibble);
             guard.visit()?;
-            if self.enter(&ca, &cb, &path, out)? {
+            if self.enter(&ca, &cb, &path, emit)? {
                 stack.push((
                     Frame {
                         cursor: ca,
@@ -132,7 +153,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         a: &Cursor,
         b: &Cursor,
         path: &[u8],
-        out: &mut Vec<Change>,
+        emit: &mut dyn FnMut(Change) -> Result<(), MptError>,
     ) -> Result<bool, MptError> {
         match (a.node_ref(), b.node_ref()) {
             (None, None) => return Ok(false),
@@ -146,16 +167,19 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
             let key = Nibbles::from_nibbles(path)
                 .to_bytes()
                 .ok_or(MptError::OddDepthValue)?;
-            out.push(Change {
+            emit(Change {
                 key,
                 old: va.cloned(),
                 new: vb.cloned(),
-            });
+            })?;
         }
         Ok(true)
     }
 
     /// Diffs two roots and resolves every value to bytes.
+    ///
+    /// Materializes the whole set, which is what makes it the wrong shape for
+    /// applying a promotion: see [`Trie::for_each_resolved_change`].
     pub fn diff_resolved(
         &self,
         old_root: Hash,
@@ -171,6 +195,62 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
                 })
             })
             .collect()
+    }
+
+    /// Streams the diff, resolving one value at a time, and reports how many
+    /// changes were handed over.
+    ///
+    /// This is what a head promotion applies, and the difference from
+    /// [`Trie::diff_resolved`] is a bound rather than a style. `FanoutGuard`
+    /// caps a structural walk at `WALK_POSITION_CEILING` *positions*, which is
+    /// a bound on the walk's work and says nothing about the bytes hanging off
+    /// it: a trie can put one large value at very many positions and still come
+    /// in well under the ceiling — six canonical nodes describe 65 536
+    /// positions — so collecting `Vec<ResolvedChange>` first meant resolving
+    /// that payload once per position, into memory, inside the transaction the
+    /// flip runs in. An allocation failure there is an abort rather than an
+    /// `Err`, so the per-origin containment §12 promises never runs, and the
+    /// pending head is durable: the next start reproduces it.
+    ///
+    /// Only the **new** side is resolved. The old side decides nothing but
+    /// whether the change is a deletion, which its presence already says, and
+    /// resolving it doubled the reads and the peak for a value nothing reads.
+    pub fn for_each_resolved_change<E, F>(
+        &self,
+        old_root: Hash,
+        new_root: Hash,
+        mut apply: F,
+    ) -> Result<usize, E>
+    where
+        E: From<MptError>,
+        F: FnMut(ChangeView<'_>) -> Result<(), E>,
+    {
+        let mut count = 0usize;
+        let mut stopped: Option<E> = None;
+        let walked = self.diff_each(old_root, new_root, |change| {
+            let new = change.new.as_ref().map(|v| self.resolve(v)).transpose()?;
+            let view = ChangeView {
+                key: &change.key,
+                kind: change.kind(),
+                new: new.as_deref(),
+            };
+            match apply(view) {
+                Ok(()) => {
+                    count += 1;
+                    Ok(())
+                }
+                Err(e) => {
+                    stopped = Some(e);
+                    Err(MptError::WalkStopped)
+                }
+            }
+        });
+        // The caller's own error, not the sentinel that carried it out.
+        if let Some(e) = stopped {
+            return Err(e);
+        }
+        walked?;
+        Ok(count)
     }
 }
 
@@ -202,6 +282,21 @@ fn same_value(a: Option<&ValueRef>, b: Option<&ValueRef>) -> bool {
     }
 }
 
+/// One change as a promotion applies it: the key, what kind of change it is,
+/// and the new value's bytes.
+///
+/// Borrowed, and missing the old side on purpose — see
+/// [`Trie::for_each_resolved_change`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeView<'a> {
+    /// The key.
+    pub key: &'a [u8],
+    /// Whether the key was added, changed, or deleted.
+    pub kind: ChangeKind,
+    /// The value under the new root, absent for a deletion.
+    pub new: Option<&'a [u8]>,
+}
+
 /// A [`Change`] with both sides resolved to bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedChange {
@@ -228,6 +323,50 @@ impl ResolvedChange {
 mod tests {
     use super::*;
     use crate::store::MemStore;
+
+    /// The streaming diff hands each change over as it is found, so a caller
+    /// that stops sees the rest of the walk not happen.
+    ///
+    /// This is the property that bounds the peak: `diff_resolved` materializes
+    /// every changed value before the caller sees any of them, and a trie can
+    /// put one large value at very many positions while staying well inside the
+    /// walk's position ceiling. Applying one at a time is what keeps the head
+    /// flip's memory proportional to the largest single value rather than to
+    /// their sum.
+    #[test]
+    fn resolved_changes_are_streamed_and_stop_where_the_caller_stops() {
+        let s = MemStore::new();
+        let t = Trie::new(&s);
+        let mut root = Hash::EMPTY;
+        for i in 0..64u8 {
+            root = t.insert(root, &[i], b"v").unwrap();
+        }
+
+        let mut seen = 0usize;
+        let stopped: Result<usize, MptError> =
+            t.for_each_resolved_change(Hash::EMPTY, root, |_change| {
+                seen += 1;
+                Err(MptError::OddDepthValue)
+            });
+        assert!(matches!(stopped, Err(MptError::OddDepthValue)));
+        assert_eq!(seen, 1, "the walk stopped at the first refusal");
+
+        // And a caller that takes everything sees every change exactly once,
+        // with only the new side resolved.
+        let mut keys = Vec::new();
+        let count: usize = t
+            .for_each_resolved_change(Hash::EMPTY, root, |change| {
+                assert_eq!(change.kind, ChangeKind::Added);
+                assert_eq!(change.new, Some(b"v".as_slice()));
+                keys.push(change.key.to_vec());
+                Ok::<(), MptError>(())
+            })
+            .unwrap();
+        assert_eq!(count, 64);
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 64);
+    }
 
     #[test]
     fn diff_of_equal_roots_is_empty() {

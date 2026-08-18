@@ -81,11 +81,14 @@ impl Node {
             .unwrap()
             .map(|h| h.root)
             .unwrap_or(Hash::EMPTY);
+        // One transaction, as every production writer of the complete slot
+        // does it: the head and the views it derives commit together (§5.2).
         self.store
-            .put_head(Slot::Complete, &head, now_ns(), now_ns())
-            .unwrap();
-        self.store
-            .materialize_diff(&self.origin, old, root)
+            .transaction(|txn| -> Result<(), synch_store::StoreError> {
+                txn.put_head(Slot::Complete, &head, now_ns(), now_ns())?;
+                txn.materialize_diff(&self.origin, old, root)?;
+                Ok(())
+            })
             .unwrap();
         head
     }

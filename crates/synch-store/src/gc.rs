@@ -334,13 +334,17 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
 /// (§5.4). Pending heads must be in the mark set or GC would eat an in-progress
 /// bootstrap.
 ///
-/// One table, not a union across two, and for the reason
-/// [`Store::retained_roots`] gives: `put_head` writes the signature to
+/// One table, not a union across two: `put_head` writes the signature to
 /// `head_history` before the slot points at it, and both delete paths refuse to
 /// remove a row a slot still names, so every current head's root is here by
 /// construction. The union returned the same set — but stating the mark set
 /// twice, in two places, is how the two come to disagree.
-fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
+///
+/// And one *function*, for the same reason. [`Store::retained_roots`] used to
+/// carry a second copy of this query; the sweep ran this one and the sweep's
+/// test asserted on that one, so a change to either would have been invisible
+/// to the other until an audit found them.
+pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
     let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut out = Vec::new();

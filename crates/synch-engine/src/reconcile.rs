@@ -223,7 +223,22 @@ impl Syncer {
         let Some(own) = self.store.self_origin()? else {
             return Ok(None);
         };
-        for summary in summaries.iter().filter(|s| s.origin == own) {
+        // The greatest summary for our origin, and only that one. What the row
+        // records is a maximum — `record_observed_head` keeps the higher of what
+        // is stored and what arrives — so offering it each of a message's
+        // summaries in turn wrote the same answer many times over.
+        //
+        // That was the cost, not the semantics. A `Hello` may carry
+        // `MAX_HEADS_PER_MESSAGE` summaries, summaries are unauthenticated by
+        // design (§3.4), and our own origin is public — so a peer could set
+        // every one of them to it and buy thousands of autocommit writes on the
+        // store's single write connection for one message, repeatable per
+        // stream. Picking the maximum first makes it one.
+        let best = summaries
+            .iter()
+            .filter(|s| s.origin == own)
+            .max_by_key(|s| s.order_key());
+        if let Some(summary) = best {
             if self.store.record_observed_head(
                 &own,
                 summary.seq,
@@ -321,10 +336,38 @@ impl Syncer {
         if !outcome.accepted() {
             return Ok(outcome);
         }
-        if self.try_promote(&head.origin, now)? {
-            Ok(HeadOutcome::Completed)
-        } else {
-            Ok(HeadOutcome::Pending)
+        match self.try_promote(&head.origin, now) {
+            Ok(true) => Ok(HeadOutcome::Completed),
+            Ok(false) => Ok(HeadOutcome::Pending),
+            // A head whose trie is here and whose promotion this node's own
+            // rules refuse — an undecodable `f:` record, a node that breaks a
+            // structural invariant — does not get to keep the slot it was just
+            // written into. `head_floor` is the best of both slots, so leaving
+            // it there holds the floor above every servable head for the origin
+            // until the `pending_head_ttl` sweep takes it, and the sweep then
+            // drops it and the next exchange re-adopts it: an adopt/fail/expire
+            // cycle whose every turn is a full promotion diff under the write
+            // lock. Retiring it here leaves the *evidence* — `record_history`
+            // already committed, so the head stays provable — while the floor
+            // falls back to what this node can actually serve.
+            //
+            // Compare-and-clear, and only for a fault in what the origin
+            // published: a transient store failure is not a verdict about a
+            // head, and the head to retire is the one just judged.
+            Err(e) if is_origin_fault(&e) => {
+                let dropped =
+                    self.store
+                        .clear_head_at(&head.origin, Slot::Pending, head.seq, &head.root)?;
+                tracing::warn!(
+                    origin = %head.origin,
+                    seq = head.seq,
+                    dropped,
+                    error = %e,
+                    "origin left behind: a head this node cannot materialize does not hold the floor"
+                );
+                Err(e)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -480,7 +523,10 @@ impl Syncer {
                             "node",
                             |bytes| TrieNode::hash_of_encoded(bytes).ok(),
                             |expected| NetError::NodeHashMismatch { expected },
-                            |hash, bytes| Ok(synch_mpt::NodeStore::put_node(txn, hash, bytes)?),
+                            |hash, bytes| {
+                                synch_mpt::NodeStore::put_node(txn, hash, bytes)?;
+                                Ok(true)
+                            },
                         )
                     })
                 })
@@ -500,14 +546,19 @@ impl Syncer {
                             |bytes| Some(synch_core::Hash::new(bytes)),
                             |expected| NetError::ValueHashMismatch { expected },
                             |hash, bytes| {
-                                // A value small enough to be inline must *be*
-                                // inline. `ValueRef::for_value` is what makes that
-                                // true of everything this node builds, and nothing
-                                // made it true of what arrives: `check_invariants`
-                                // rejects an oversized inline value and had no rule
-                                // the other way, because the payload is not in the
-                                // node. This is the first place both are in hand.
+                                // Two bounds on what an origin may put in a
+                                // value, and both are refusals of *that origin's*
+                                // data rather than of the peer relaying it — the
+                                // serving peer sent exactly what it was asked for
+                                // (§12).
                                 //
+                                // A value small enough to be inline must *be*
+                                // inline. `ValueRef::for_value` makes that true of
+                                // everything this node builds, and nothing made it
+                                // true of what arrives: `check_invariants` rejects
+                                // an oversized inline value and had no rule the
+                                // other way, because the payload is not in the
+                                // node. This is the first place both are in hand.
                                 // Left unchecked it is a second root for the same
                                 // key/value map — the thing structural sharing and
                                 // the reference-pruning walk rest on not happening
@@ -515,22 +566,45 @@ impl Syncer {
                                 // `trie_values` row per leaf, at the publisher's
                                 // choosing.
                                 //
-                                // An `MptError`, not a `NetError`: the serving peer
-                                // relayed exactly what the origin published, so
-                                // this fails that origin and no other (§12). The
-                                // value is not stored, so the walk keeps asking and
-                                // `MAX_UNPRODUCTIVE_ROUNDS` retires the head.
+                                // And a value has an upper bound at last
+                                // (`MAX_TRIE_VALUE_LEN`): the key side was bounded
+                                // three ways and this side by the frame alone, at
+                                // 16 MiB each with no limit on how many, which is
+                                // what let one small trie cost every peer
+                                // gigabytes to serve and terabytes to materialize.
+                                //
+                                // *Refused*, not raised. Returning an error here
+                                // rolled the whole batch back — losing the
+                                // legitimate values in it — and propagated out of
+                                // `fetch_pending` through `?`, so `learned == 0`
+                                // was never reached, `unproductive` never advanced,
+                                // and the `MAX_UNPRODUCTIVE_ROUNDS` escape the
+                                // comment claimed could not fire for this fault at
+                                // all: the head sat holding `head_floor` until the
+                                // `pending_head_ttl` sweep took it, thirty times
+                                // longer. Skipping the value leaves the walk asking
+                                // for it and the counter counting, which is what
+                                // the rule was always meant to do.
                                 if bytes.len() <= synch_core::INLINE_VALUE_MAX {
-                                    return Err(EngineError::Mpt(
-                                        synch_mpt::MptError::NonCanonical(format!(
-                                        "out-of-line value {hash} is {} bytes, at or under the \
-                                         {}-byte inline ceiling",
-                                        bytes.len(),
-                                        synch_core::INLINE_VALUE_MAX,
-                                    )),
-                                    ));
+                                    tracing::warn!(
+                                        %hash,
+                                        len = bytes.len(),
+                                        ceiling = synch_core::INLINE_VALUE_MAX,
+                                        "refusing an out-of-line value small enough to be inline"
+                                    );
+                                    return Ok(false);
                                 }
-                                Ok(synch_mpt::NodeStore::put_value(txn, hash, bytes)?)
+                                if bytes.len() > synch_core::MAX_TRIE_VALUE_LEN {
+                                    tracing::warn!(
+                                        %hash,
+                                        len = bytes.len(),
+                                        ceiling = synch_core::MAX_TRIE_VALUE_LEN,
+                                        "refusing a trie value past the size ceiling"
+                                    );
+                                    return Ok(false);
+                                }
+                                synch_mpt::NodeStore::put_value(txn, hash, bytes)?;
+                                Ok(true)
                             },
                         )
                     })
@@ -832,7 +906,7 @@ fn take_served(
     what: &str,
     hash_of: impl Fn(&[u8]) -> Option<synch_core::Hash>,
     mismatch: impl Fn(synch_core::Hash) -> NetError,
-    put: impl Fn(&synch_core::Hash, &[u8]) -> Result<()>,
+    put: impl Fn(&synch_core::Hash, &[u8]) -> Result<bool>,
 ) -> Result<usize> {
     // A wanted hash can be asked for once and so may be answered once. The set
     // is built from the request, never from the response, so the peer cannot
@@ -853,8 +927,15 @@ fn take_served(
         if hash_of(bytes) != Some(*hash) {
             return Err(EngineError::Net(mismatch(*hash)));
         }
-        put(hash, bytes)?;
-        stored += 1;
+        // `put` decides whether the payload is one this node will keep: a rule
+        // about what the *origin* published — a value small enough to be inline,
+        // or one past the size ceiling — refuses the payload without failing the
+        // batch. Refused payloads are not progress, so the unproductive counter
+        // still runs and the head is retired by the §5.2 rule rather than by the
+        // TTL sweep half an hour later.
+        if put(hash, bytes)? {
+            stored += 1;
+        }
     }
     Ok(stored)
 }
@@ -910,15 +991,54 @@ fn to_net(error: EngineError) -> NetError {
 }
 
 /// True if a failure is about *one origin's* replicated data rather than about
-/// the peer or the connection.
+/// this node, the peer, or the connection.
 ///
-/// A record that will not decode, or a trie operation that will not complete
-/// over it, is a fault in what some origin published — durable, and reproduced
-/// on every exchange that reaches it. A protocol violation
-/// ([`NetError::NodeHashMismatch`]) or a broken stream is about the peer we are
-/// talking to, and still ends the exchange.
-fn is_origin_fault(error: &EngineError) -> bool {
-    matches!(error, EngineError::Store(_) | EngineError::Mpt(_))
+/// Three kinds of failure reach this, and only one of them is an origin's.
+///
+/// - **An origin's**: a record that will not decode, a node that breaks a
+///   structural invariant, a value at a depth no key reaches. Durable,
+///   reproduced on every exchange that reaches it, and *contained* — one member
+///   publishing something this node cannot apply must not stop it converging
+///   with every other origin the same peer serves (§12).
+/// - **The peer's**: a protocol violation or a broken stream. Ends the exchange.
+/// - **Ours**: `SQLITE_BUSY` from another process, a full disk, an I/O error.
+///   These used to be contained too, because `StoreError` spans both categories
+///   and this matched the whole enum — so a full disk logged "origin left
+///   behind: its published data could not be applied" once per origin, blamed a
+///   member for a local fault, and reported the round a success. They propagate
+///   now, which is what puts them where an operator will see them.
+///
+/// [`EngineError::Blocking`] and [`EngineError::Io`] were already excluded, so
+/// the split was intended; this completes it inside `StoreError` and `MptError`.
+pub(crate) fn is_origin_fault(error: &EngineError) -> bool {
+    match error {
+        EngineError::Store(e) => is_origin_store_fault(e),
+        EngineError::Mpt(e) => is_origin_mpt_fault(e),
+        _ => false,
+    }
+}
+
+/// Whether a store failure is about replicated data rather than about this
+/// node's own disk or database.
+fn is_origin_store_fault(error: &synch_store::StoreError) -> bool {
+    match error {
+        // What a peer published, read back and refused.
+        synch_store::StoreError::Decode(_)
+        | synch_store::StoreError::Column { .. }
+        | synch_store::StoreError::Invalid(_) => true,
+        synch_store::StoreError::Mpt(e) => is_origin_mpt_fault(e),
+        // Ours: the database, the filesystem, or an object this node holds.
+        _ => false,
+    }
+}
+
+/// Whether a trie failure is about the structure a peer served rather than
+/// about the store under it.
+fn is_origin_mpt_fault(error: &synch_mpt::MptError) -> bool {
+    !matches!(
+        error,
+        synch_mpt::MptError::Store(_) | synch_mpt::MptError::WalkStopped
+    )
 }
 
 /// Logs a contained per-origin failure and records it in the report.
@@ -1184,7 +1304,7 @@ mod tests {
                 |expected| NetError::ValueHashMismatch { expected },
                 |hash, _| {
                     stored.borrow_mut().push(*hash);
-                    Ok(())
+                    Ok(true)
                 },
             )
         };
@@ -1230,7 +1350,7 @@ mod tests {
                 |expected| NetError::ValueHashMismatch { expected },
                 |hash, _| {
                     stored.borrow_mut().push(*hash);
-                    Ok(())
+                    Ok(true)
                 },
             )
         };
@@ -1521,5 +1641,141 @@ mod tests {
         assert!(store.entry(&origin, "s", "poisoned").unwrap().is_none());
         // And the entry the *complete* head materialized is still there.
         assert!(store.entry(&origin, "s", "a").unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use iroh_base::SecretKey;
+    use synch_core::{file_key, FileEntry, Hash, OriginId, SignedHead};
+    use synch_store::{Binding, BindingSource, Slot, Store};
+
+    use super::*;
+
+    fn setup() -> (tempfile::TempDir, Arc<Store>, SecretKey, OriginId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let key = SecretKey::generate();
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        store
+            .put_binding(&Binding {
+                origin: origin.clone(),
+                node_id: key.public(),
+                source: BindingSource::Static,
+                domain: None,
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+        (dir, store, key, origin)
+    }
+
+    /// A head this node cannot materialize does not keep the pending slot.
+    ///
+    /// `head_floor` is the best of both slots, so a poisoned head sitting there
+    /// holds the floor above every servable head for its origin — and the
+    /// maintenance sweep then drops it and the next exchange re-adopts it,
+    /// paying a full promotion diff under the write lock every round until an
+    /// operator intervenes. The evidence stays: the head is in `head_history`
+    /// either way.
+    #[test]
+    fn a_head_that_cannot_be_materialized_does_not_hold_the_floor() {
+        let (_d, store, key, origin) = setup();
+        let syncer = Syncer::new(store.clone());
+        let trie = Trie::new(store.as_ref());
+
+        // A canonical trie whose one `f:` value is not a `FileEntry`.
+        let poisoned = trie
+            .insert(Hash::EMPTY, &file_key("s", "a.txt").unwrap(), &[0xffu8; 8])
+            .unwrap();
+        let head = SignedHead::sign(&key, origin.clone(), 5, poisoned, 0);
+        let err = syncer
+            .offer_head(&head, 0)
+            .expect_err("the record cannot be materialized");
+        assert!(err.to_string().contains("corrupt record"), "{err}");
+
+        assert_eq!(store.pending_head(&origin).unwrap(), None);
+        assert_eq!(store.complete_head(&origin).unwrap(), None);
+        assert_eq!(store.head_floor(&origin).unwrap(), None);
+        assert_eq!(
+            store.head_history(&origin).unwrap().len(),
+            1,
+            "the head is still provable history"
+        );
+
+        // And a lesser head this node *can* serve is adoptable again, which the
+        // held floor would have refused.
+        let good = trie
+            .insert(
+                Hash::EMPTY,
+                &file_key("s", "a.txt").unwrap(),
+                &postcard::to_stdvec(&FileEntry::file(1, 0, Hash::new(b"c"), 1)).unwrap(),
+            )
+            .unwrap();
+        let servable = SignedHead::sign(&key, origin.clone(), 4, good, 0);
+        assert_eq!(
+            syncer.offer_head(&servable, 0).unwrap(),
+            HeadOutcome::Completed
+        );
+    }
+
+    /// Abandoning a head names the head being abandoned.
+    ///
+    /// `clear_head` deletes whatever occupies the slot, and both abandonment
+    /// paths reach their verdict on a snapshot taken before several network
+    /// round trips or a trie walk. A newer head accepted in that window went
+    /// with the old one's verdict.
+    #[test]
+    fn clearing_a_slot_leaves_a_head_that_arrived_since() {
+        let (_d, store, key, origin) = setup();
+        let stale = SignedHead::sign(&key, origin.clone(), 1, Hash([1u8; 32]), 0);
+        let fresh = SignedHead::sign(&key, origin.clone(), 2, Hash([2u8; 32]), 0);
+        store.put_head(Slot::Pending, &stale, 0, 0).unwrap();
+
+        // The slot moves on while a fetch is between round trips.
+        store.put_head(Slot::Pending, &fresh, 0, 0).unwrap();
+
+        assert!(
+            !store
+                .clear_head_at(&origin, Slot::Pending, stale.seq, &stale.root)
+                .unwrap(),
+            "the verdict was about a head the slot no longer holds"
+        );
+        assert_eq!(store.pending_head(&origin).unwrap(), Some(fresh.clone()));
+
+        // And the head it *is* about goes.
+        assert!(store
+            .clear_head_at(&origin, Slot::Pending, fresh.seq, &fresh.root)
+            .unwrap());
+        assert_eq!(store.pending_head(&origin).unwrap(), None);
+    }
+
+    /// Our own next seq is above everything this node has ever recorded for the
+    /// origin, not just above the complete slot.
+    #[test]
+    fn the_next_own_seq_clears_the_pending_slot_and_the_history() {
+        let (_d, store, key, origin) = setup();
+        store.set_self_origin(&origin).unwrap();
+        assert_eq!(store.next_own_seq(&origin).unwrap(), 1);
+
+        // A peer relays one of our own heads back, at a seq the complete slot
+        // knows nothing about. This is the §3.4 recovery shape, and it is what a
+        // restored backup meets.
+        let relayed = SignedHead::sign(&key, origin.clone(), 9, Hash([9u8; 32]), 0);
+        assert_eq!(
+            Syncer::new(store.clone()).offer_head(&relayed, 0).unwrap(),
+            HeadOutcome::Pending
+        );
+        assert_eq!(store.complete_head(&origin).unwrap(), None);
+        assert_eq!(
+            store.next_own_seq(&origin).unwrap(),
+            10,
+            "the pending slot and the history both count"
+        );
+
+        // Even once the pending slot is cleared, the retained history still does.
+        store.clear_head(&origin, Slot::Pending).unwrap();
+        assert_eq!(store.next_own_seq(&origin).unwrap(), 10);
     }
 }

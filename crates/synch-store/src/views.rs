@@ -9,7 +9,7 @@ use synch_core::{
     parse_blob_key, parse_file_key, AdState, BlobAd, EntryKind, FileEntry, Hash, OriginId,
     MAX_PROVIDER_ADS,
 };
-use synch_mpt::{ChangeKind, ResolvedChange, Trie};
+use synch_mpt::{ChangeKind, ChangeView, Trie};
 
 use crate::{
     db::{hash_column, origin_column, Store, Txn},
@@ -485,23 +485,6 @@ impl Store {
     /// Only touched subtrees are visited, so the cost is proportional to the
     /// change rather than to the size of the trie. Runs in one transaction so
     /// the derived views never show a half-applied head.
-    pub fn materialize_diff(
-        &self,
-        origin: &OriginId,
-        old_root: Hash,
-        new_root: Hash,
-    ) -> Result<usize> {
-        let changes: Vec<ResolvedChange> = Trie::new(self).diff_resolved(old_root, new_root)?;
-        let count = changes.len();
-        self.with_tx(|tx| {
-            for change in &changes {
-                apply_change(tx, origin, change)?;
-            }
-            Ok(())
-        })?;
-        Ok(count)
-    }
-
     /// Rebuilds `entries` and `blob_providers` for one origin from scratch
     /// (`synch doctor --rebuild`).
     pub fn rematerialize(&self, origin: &OriginId, root: Hash) -> Result<usize> {
@@ -880,11 +863,14 @@ impl Txn<'_> {
         old_root: Hash,
         new_root: Hash,
     ) -> Result<usize> {
-        let changes: Vec<ResolvedChange> = Trie::new(self).diff_resolved(old_root, new_root)?;
-        for change in &changes {
-            apply_change(self.conn(), origin, change)?;
-        }
-        Ok(changes.len())
+        // Streamed, not collected. The walk's position ceiling bounds how many
+        // changes there can be and says nothing about how large each one is, so
+        // building the whole resolved set first meant holding every changed
+        // value in memory at once — inside the transaction the head flip runs
+        // in ([`Trie::for_each_resolved_change`]).
+        Trie::new(self).for_each_resolved_change(old_root, new_root, |change| {
+            apply_change(self.conn(), origin, &change)
+        })
     }
 
     /// Deletes every entry row for an origin, inside the transaction.
@@ -907,9 +893,9 @@ impl Txn<'_> {
 fn apply_change(
     tx: &rusqlite::Connection,
     origin: &OriginId,
-    change: &ResolvedChange,
+    change: &ChangeView<'_>,
 ) -> Result<()> {
-    let key = &change.key;
+    let key = change.key;
     if key.first() == Some(&synch_core::record::PREFIX_FILE) {
         let Ok((space, path)) = parse_file_key(key) else {
             // A key we cannot parse is a peer's problem, not ours: skip it
@@ -917,7 +903,7 @@ fn apply_change(
             tracing::debug!(origin = %origin, "skipping unparseable f: key");
             return Ok(());
         };
-        match change.kind() {
+        match change.kind {
             ChangeKind::Deleted => {
                 tx.execute(
                     "DELETE FROM entries WHERE origin_id = ?1 AND space = ?2 AND path = ?3",
@@ -925,7 +911,7 @@ fn apply_change(
                 )?;
             }
             _ => {
-                let bytes = change.new.as_ref().expect("non-delete change has a value");
+                let bytes = change.new.expect("non-delete change has a value");
                 let entry: FileEntry = postcard::from_bytes(bytes)
                     .map_err(|e| StoreError::Decode(format!("f: record: {e}")))?;
                 put_entry_in(tx, origin, &space, &path, &entry)?;
@@ -936,7 +922,7 @@ fn apply_change(
             tracing::debug!(origin = %origin, "skipping unparseable b: key");
             return Ok(());
         };
-        match change.kind() {
+        match change.kind {
             ChangeKind::Deleted => {
                 tx.execute(
                     "DELETE FROM blob_providers WHERE object_root = ?1 AND origin_id = ?2",
@@ -944,7 +930,7 @@ fn apply_change(
                 )?;
             }
             _ => {
-                let bytes = change.new.as_ref().expect("non-delete change has a value");
+                let bytes = change.new.expect("non-delete change has a value");
                 let ad: BlobAd = postcard::from_bytes(bytes)
                     .map_err(|e| StoreError::Decode(format!("b: record: {e}")))?;
                 put_provider_in(tx, &root, origin, &ad)?;
@@ -1104,7 +1090,9 @@ mod tests {
             )
             .unwrap();
         let peer = origin("laptop");
-        store.materialize_diff(&peer, Hash::EMPTY, root).unwrap();
+        store
+            .transaction(|txn| txn.materialize_diff(&peer, Hash::EMPTY, root))
+            .unwrap();
         assert_eq!(
             store
                 .entry(&peer, "media", "c.txt")
@@ -1286,7 +1274,9 @@ mod tests {
                 &postcard::to_stdvec(&ad).unwrap(),
             )
             .unwrap();
-        store.materialize_diff(&o, Hash::EMPTY, after).unwrap();
+        store
+            .transaction(|txn| txn.materialize_diff(&o, Hash::EMPTY, after))
+            .unwrap();
 
         let providers = store.providers(&root).unwrap();
         assert_eq!(providers.len(), 1);
@@ -1317,7 +1307,12 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(store.materialize_diff(&o, Hash::EMPTY, root).unwrap(), 2);
+        assert_eq!(
+            store
+                .transaction(|txn| txn.materialize_diff(&o, Hash::EMPTY, root))
+                .unwrap(),
+            2
+        );
         let row = store.entry(&o, "media", "clip.mp4").unwrap().unwrap();
         assert_eq!(row.size, 42);
         assert_eq!(store.providers(&Hash::new(b"content")).unwrap().len(), 1);
@@ -1326,7 +1321,12 @@ mod tests {
         let root2 = trie
             .remove(root, &file_key("media", "clip.mp4").unwrap())
             .unwrap();
-        assert_eq!(store.materialize_diff(&o, root, root2).unwrap(), 1);
+        assert_eq!(
+            store
+                .transaction(|txn| txn.materialize_diff(&o, root, root2))
+                .unwrap(),
+            1
+        );
         assert!(store.entry(&o, "media", "clip.mp4").unwrap().is_none());
         // The blob ad is untouched by the file deletion.
         assert_eq!(store.providers(&Hash::new(b"content")).unwrap().len(), 1);
@@ -1348,7 +1348,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        store.materialize_diff(&o, Hash::EMPTY, root).unwrap();
+        store
+            .transaction(|txn| txn.materialize_diff(&o, Hash::EMPTY, root))
+            .unwrap();
         assert_eq!(
             store
                 .list_entries(Some(&o), "s", "", None, None)

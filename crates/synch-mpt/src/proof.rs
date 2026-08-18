@@ -64,11 +64,25 @@ impl Proof {
 impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// Builds a Merkle proof for `key` against `root`.
     pub fn prove(&self, root: Hash, key: &[u8]) -> Result<Proof, MptError> {
+        if key.len() > synch_core::MAX_KEY_LEN {
+            return Err(MptError::KeyTooLong(key.len()));
+        }
         let nibbles = Nibbles::from_bytes(key);
         let mut rest = nibbles.as_slice();
         let mut current = root_opt(root);
         let mut proof = Proof::default();
+        // The same bound `Trie::get` descends under, and for the same reason:
+        // a value placed past the depth any valid key reaches is invisible to
+        // every structural walk, so answering about it here would put the two
+        // readers into disagreement.
+        let mut steps = 0usize;
         loop {
+            steps += 1;
+            if steps > crate::trie::MAX_DEPTH_NIBBLES + 1 {
+                return Err(MptError::NonCanonical(
+                    "proof descended further than any valid key is long".into(),
+                ));
+            }
             let Some(hash) = current else {
                 return Ok(proof);
             };

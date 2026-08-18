@@ -282,6 +282,7 @@ impl MptProtocol {
                 let (nodes, missing) = crate::blocking::offload(move || {
                     let mut nodes = Vec::new();
                     let mut missing = Vec::new();
+                    let mut budget = ANSWER_BYTE_BUDGET;
                     // One answer per *distinct* hash. A requester may only ask
                     // once — `take_served` refuses a repeated payload as a
                     // protocol violation and ends the exchange — so answering a
@@ -295,7 +296,25 @@ impl MptProtocol {
                             continue;
                         }
                         match store.get_node(&hash)? {
-                            Some(data) => nodes.push((hash, data)),
+                            Some(data) => {
+                                // A short answer is an ordinary answer: the
+                                // requester's walk defers everything it asked
+                                // for and re-offers what did not come back
+                                // (`MissingWalk::resume`). What is not ordinary
+                                // is discovering the frame is too large *after*
+                                // building it — `write_frame` serializes the
+                                // whole message before it can check
+                                // `MAX_FRAME_LEN`, so the cap has to be applied
+                                // while the answer is being assembled.
+                                match budget.checked_sub(data.len()) {
+                                    Some(left) => {
+                                        budget = left;
+                                        nodes.push((hash, data));
+                                    }
+                                    None if nodes.is_empty() => nodes.push((hash, data)),
+                                    None => break,
+                                }
+                            }
                             None => missing.push(hash),
                         }
                     }
@@ -307,19 +326,19 @@ impl MptProtocol {
             }
             MptMessage::GetValues { hashes } => {
                 check_batch(hashes.len())?;
-                // The answer is bounded in bytes as well as in count, but not
-                // here — by what a trie value can be. `AdState` decodes bounded
-                // at `MAX_AD_SPANS` and `coalesce_spans` truncates to the same
-                // cap on the publish side, so a `b:` record is ~20 KB at worst;
-                // a `FileEntry` is small, because the path lives in the *key*
-                // and keys are capped at `MAX_KEY_LEN`. `MAX_BATCH` of either
-                // is a few MiB against a 16 MiB frame. What a value cannot be
-                // is unbounded: nothing larger than a frame can have arrived to
-                // be stored in the first place.
+                // Bounded in bytes as well as in count, and *here*. The count
+                // cap alone was never a cost cap: a value is arbitrary bytes,
+                // so `MAX_BATCH` of them is whatever the origin that published
+                // them chose. This handler used to reason that a `b:` record is
+                // ~20 KB and a `FileEntry` small — true of honest records, and
+                // a claim about record shapes rather than an enforced bound.
+                // `MAX_TRIE_VALUE_LEN` is the enforced one now, and the budget
+                // below is what keeps even a full batch of them inside a frame.
                 let store = self.store().clone();
                 let (values, missing) = crate::blocking::offload(move || {
                     let mut values = Vec::new();
                     let mut missing = Vec::new();
+                    let mut budget = ANSWER_BYTE_BUDGET;
                     // One answer per distinct hash, as `GetNodes` above.
                     let mut answered = std::collections::HashSet::new();
                     for hash in hashes {
@@ -327,7 +346,18 @@ impl MptProtocol {
                             continue;
                         }
                         match store.get_value(&hash)? {
-                            Some(data) => values.push((hash, data)),
+                            Some(data) => match budget.checked_sub(data.len()) {
+                                Some(left) => {
+                                    budget = left;
+                                    values.push((hash, data));
+                                }
+                                // One payload always goes, whatever its size:
+                                // a stored value larger than the whole budget
+                                // predates the ceiling, and answering nothing
+                                // would stall the requester's walk forever.
+                                None if values.is_empty() => values.push((hash, data)),
+                                None => break,
+                            },
                             None => missing.push(hash),
                         }
                     }
@@ -373,6 +403,19 @@ impl MptProtocol {
         }
     }
 }
+
+/// How many payload bytes one `Nodes` or `Values` answer may carry.
+///
+/// The request is capped at [`MAX_BATCH`] hashes; the answer it draws was capped
+/// only by [`MAX_FRAME_LEN`](synch_core::MAX_FRAME_LEN), and discovered to
+/// overrun it only *after* `write_frame` had serialized the whole message —
+/// which is to say after the responder had already allocated it twice. Applied
+/// while the answer is assembled, it is a bound on the work as well as on the
+/// wire (§12).
+///
+/// Half a frame, so the postcard framing and the `missing` list have room and a
+/// short answer is never produced for lack of a few hundred bytes.
+const ANSWER_BYTE_BUDGET: usize = synch_core::MAX_FRAME_LEN / 2;
 
 /// A backstop behind the decode-time bound.
 ///

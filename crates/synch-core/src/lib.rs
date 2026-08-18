@@ -58,6 +58,34 @@ pub const INLINE_BLOB_MAX: u64 = 16 * 1024;
 /// Values at or below this size are inlined in trie nodes (§4.3).
 pub const INLINE_VALUE_MAX: usize = 128;
 
+/// The largest a trie value may be, inline or out of line (§4.3, §12).
+///
+/// The key side of the trie is bounded three ways — [`MAX_KEY_LEN`] on insert,
+/// twice that in nibbles at decode, and [`MAX_DEPTH_NIBBLES`] on every walk. The
+/// value side had none: `check_invariants` bounds `ValueRef::Inline` at
+/// [`INLINE_VALUE_MAX`] and says nothing about `ValueRef::Hash`, and the fetch
+/// that carries the payload only enforced the *lower* edge (a value small enough
+/// to be inline must be inline). So a value was bounded by the frame, at 16 MiB
+/// each and no limit on how many.
+///
+/// That is the enabler for two costs a §12 "sanity bound on any single message"
+/// is supposed to cap. A `GetValues` answer is `MAX_BATCH` payloads built in
+/// memory and serialized whole, so 256 × 16 MiB is gigabytes of allocation for
+/// an 8 KB request. And the promotion diff resolves a value per changed
+/// position, so a canonical six-node trie whose one leaf carries a 16 MiB
+/// payload — legal, cheap to publish, and well inside the walk's position
+/// ceiling — resolves to terabytes.
+///
+/// Generous next to anything the system produces: the largest legitimate value
+/// is a `b:` record, whose span list is capped at
+/// [`MAX_AD_SPANS`](crate::MAX_AD_SPANS) and comes to ~20 KB; a `FileEntry` is
+/// small because the path lives in the *key*. At this ceiling a full
+/// `MAX_BATCH` answer is 8 MiB, half a frame.
+///
+/// [`MAX_KEY_LEN`]: crate::MAX_KEY_LEN
+/// [`MAX_DEPTH_NIBBLES`]: https://docs.rs/synch-mpt
+pub const MAX_TRIE_VALUE_LEN: usize = 32 * 1024;
+
 /// The earliest wall-clock reading a trust decision may be evaluated at
 /// (§3.2): 2025-01-01T00:00:00Z, in unix nanoseconds.
 ///

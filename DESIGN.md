@@ -1474,8 +1474,16 @@ CI (GitHub Actions):
   radius) and ages out with normal retention; `synch doctor` lists origins whose
   data is held without a live binding. What remains are sanity bounds that
   cap the cost of any *single* malformed or extreme message: `GetNodes`/`GetValues`
-  batches are capped at 256 hashes, and trie keys are bounded to 4 KiB (so ingest
-  depth ≤ ~8 K nibbles). A `GetSlice` is bounded the same way, on both axes: at
+  batches are capped at 256 hashes *and* at half a frame of payload, because a
+  count alone bounds nothing when the payloads are the publishing origin's to
+  choose; trie keys are bounded to 4 KiB and trie values to 32 KiB; and the fetch
+  that ingests a peer's trie stops descending at the ~8 K nibbles a 4 KiB key
+  reaches. That last one is a bound on the *path*, and the key bound does not
+  imply it: the node encoding caps one node's nibble run, so without it a member
+  could hang an arbitrarily large graph below the depth any key reaches — pulled,
+  committed, vouched for by `is_complete`, reflected in no `entries` row, and
+  marked by every GC pass thereafter. A `GetSlice` is bounded the same way, on
+  both axes: at
   most 512 groups are encoded per exchange (§6.4), and at most 4 096 ranges are
   accepted in one request, because the range set operations are quadratic in the
   number of ranges. Trust does not extend to the *shape* of replicated
