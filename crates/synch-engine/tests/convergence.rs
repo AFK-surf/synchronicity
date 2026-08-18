@@ -18,22 +18,27 @@
 //! case: applying the fork cap as an acceptance rule would leave a node that
 //! met the greatest root of a storm late never taking it.
 //!
-//! Note what the propagation step here deliberately is *not*. It gossips a
-//! node's `head_floor` — the maximum over both slots — because that is the
-//! right stimulus for the property above: the join is about a node's current
-//! maximum. The wire does something narrower (`heads_for` serves the *complete*
-//! slot only, and `sync_with` pushes off `complete_head`), and every root here
+//! Two harnesses, because the rule and the decision are two things.
+//!
+//! `heads_converge_whatever_order_they_arrive_in` gossips a node's `head_floor`
+//! — the maximum over both slots — because that is the right stimulus for the
+//! property above: the join is about a node's current maximum. Every root there
 //! is fabricated, so everything sits in the pending slot and no promotion runs.
-//! That is a scope boundary, not an oversight, but it does mean the acceptance
-//! rule is what this covers and the push/pull *decision* is not. That half is
-//! covered over real endpoints with real tries in `cluster.rs` — see
-//! `convergence_survives_a_partition`, where a node that knows nothing pulls an
-//! origin through one `anti_entropy_round`.
+//! That covers the *acceptance rule* and nothing else.
+//!
+//! `the_push_pull_decision_converges_over_real_slots` covers the part the wire
+//! actually runs, which is narrower in two ways: `heads_for` serves the
+//! **complete** slot only, and `sync_with` pushes off `complete_head` rather
+//! than off whichever summary was advertised. Every root there is a real trie,
+//! so promotion runs, the complete slot moves, and "converged" is checked as
+//! *servable* — the trie is here and the derived `entries` agree with the head —
+//! rather than merely known. That half used to be covered by nothing, and the
+//! decision is what a later audit found reading the store once per advertised
+//! origin on a runtime worker.
 //!
 //! Still outstanding from §11: the live duplex transport, partitions and
-//! message loss as first-class events, interleaved *publishes* (these heads are
-//! signed up front), and convergence of the tries under the heads rather than
-//! of the heads alone. This asserts head convergence.
+//! message loss as first-class events, and interleaved *publishes* (the heads
+//! here are minted up front).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -261,5 +266,219 @@ fn one_case(seed: u64) {
 fn heads_converge_whatever_order_they_arrive_in() {
     for seed in 0..10 {
         one_case(seed);
+    }
+}
+
+/// The same convergence property, gossiped the way the *protocol* gossips.
+///
+/// `one_case` above offers each node's `head_floor` — the maximum over both
+/// slots — which is the right stimulus for the acceptance rule and is not what
+/// the wire does. The wire is narrower in two ways that matter: `heads_for`
+/// serves the **complete** slot only, and `sync_with` pushes off `complete_head`
+/// rather than off whichever summary was advertised. So the push/pull *decision*
+/// — which origins each side asks for, and which heads it offers — was covered
+/// by nothing here, and the harness noted that as a scope boundary.
+///
+/// It is covered now, because the decision is the part that was quietly reading
+/// the store per advertised origin and had to be rewritten. Every root below is
+/// a real trie this node can serve, so promotion runs, the complete slot moves,
+/// and both narrowings are exercised: a node that has adopted a head but cannot
+/// serve it does not offer it, and a node that can serve an older root still
+/// advertises that.
+///
+/// What this still is not is a live duplex transport with partitions as
+/// first-class events (DESIGN §11). It is the decision over real slots and real
+/// tries, which is the half that was missing.
+#[test]
+fn the_push_pull_decision_converges_over_real_slots() {
+    for seed in 0..8 {
+        wire_case(seed);
+    }
+}
+
+/// One randomized case over the real push/pull decision.
+fn wire_case(seed: u64) {
+    use synch_core::{file_key, FileEntry, HeadSummary};
+    use synch_mpt::Trie;
+
+    let mut rng = Rng::new(seed);
+    let key = SecretKey::generate();
+    let origins: Vec<OriginId> = ["nas", "laptop", "vps"]
+        .iter()
+        .map(|name| OriginId::named(name, "x.example").expect("an origin"))
+        .collect();
+
+    let count = 3 + rng.below(3);
+    let nodes: Vec<Node> = (0..count).map(|_| node(&key, &origins)).collect();
+
+    // A published head is a head whose trie exists, so each one is built in the
+    // store of the node that "published" it and nowhere else. Peers have to pull
+    // the nodes to be able to serve it on, exactly as they do over the wire.
+    let entry = |n: u64| {
+        postcard::to_stdvec(&FileEntry::file(n, 0, Hash::new(&n.to_le_bytes()), 1)).expect("encode")
+    };
+    /// A published head and how many leaves its trie holds.
+    struct Published {
+        head: SignedHead,
+        leaves: usize,
+    }
+    let mut published: Vec<Published> = Vec::new();
+    for (i, origin) in origins.iter().enumerate() {
+        // One origin per publisher, and a couple of successive heads each, so
+        // the pull side has to choose the greater and the push side has to stop
+        // offering the lesser.
+        let at = i % count;
+        let mut root = Hash::EMPTY;
+        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for seq in 1..=(1 + rng.below(3) as u64) {
+            let key_bytes = file_key("media", &format!("{origin}-{seq}.bin")).expect("a key");
+            let value = entry(seq);
+            leaves.push((key_bytes.clone(), value.clone()));
+            root = Trie::new(nodes[at].store.as_ref())
+                .insert(root, &key_bytes, &value)
+                .expect("the insert");
+            let head = SignedHead::sign(&key, origin.clone(), seq, root, 0);
+            nodes[at]
+                .store
+                .put_head(synch_store::Slot::Complete, &head, 0, 0)
+                .expect("the slot");
+            nodes[at]
+                .store
+                .transaction(|txn| txn.materialize_diff(origin, Hash::EMPTY, root))
+                .expect("the views");
+            published.push(Published {
+                head,
+                leaves: leaves.len(),
+            });
+        }
+    }
+
+    // One exchange, in the shape `sync_with` runs it: both sides advertise what
+    // `local_summaries` says, each decides what to push and what to want, the
+    // pushed heads go through `offer_head`, and the wanted origins are answered
+    // out of `heads_for` — the complete slot only.
+    let exchange = |from: usize, to: usize, nodes: &[Node]| {
+        let ours = nodes[from].syncer.local_summaries().expect("summaries");
+        let theirs = nodes[to].syncer.local_summaries().expect("summaries");
+        let best = |set: &[HeadSummary], origin: &OriginId| {
+            set.iter()
+                .filter(|s| &s.origin == origin)
+                .map(|s| s.order_key())
+                .max()
+        };
+
+        // Push: every complete head that beats what the peer advertised.
+        for stored in nodes[from]
+            .store
+            .all_heads(synch_store::Slot::Complete)
+            .expect("the slots")
+        {
+            let head = stored.head;
+            if best(&theirs, &head.origin).is_none_or(|peer| (head.seq, head.root.0) > peer) {
+                // Applying it needs the trie, so the receiver first pulls
+                // whatever the sender can serve: content-addressed nodes, from
+                // any peer that holds them (§5.2).
+                copy_trie(&nodes[from], &nodes[to], head.root);
+                let _ = nodes[to].syncer.offer_head(&head, 0);
+            }
+        }
+        // Pull: every origin the peer is ahead on, answered from its complete
+        // slot alone.
+        let want: Vec<OriginId> = theirs
+            .iter()
+            .filter(|s| best(&ours, &s.origin).is_none_or(|mine| s.order_key() > mine))
+            .map(|s| s.origin.clone())
+            .collect();
+        for head in nodes[to].syncer.heads_for(&want).expect("heads_for") {
+            copy_trie(&nodes[to], &nodes[from], head.root);
+            let _ = nodes[from].syncer.offer_head(&head, 0);
+        }
+    };
+
+    // Random rounds, then an all-pairs sweep so what has to reach everybody
+    // provably does.
+    for _ in 0..count {
+        for i in 0..count {
+            let mut j = rng.below(count);
+            if j == i {
+                j = (j + 1) % count;
+            }
+            exchange(i, j, &nodes);
+        }
+    }
+    for i in 0..count {
+        for j in 0..count {
+            if i != j {
+                exchange(i, j, &nodes);
+            }
+        }
+    }
+
+    for origin in &origins {
+        let expected = published
+            .iter()
+            .filter(|p| &p.head.origin == origin)
+            .map(|p| (p.head.seq, p.head.root))
+            .max_by_key(|(seq, root)| (*seq, root.0))
+            .expect("every origin published");
+        for (i, holder) in nodes.iter().enumerate() {
+            let complete = holder
+                .store
+                .complete_head(origin)
+                .expect("the slot")
+                .unwrap_or_else(|| panic!("seed {seed}: node {i} holds no head for {origin}"));
+            assert_eq!(
+                (complete.seq, complete.root),
+                expected,
+                "seed {seed}: node {i} settled elsewhere for {origin}"
+            );
+            // Converged means servable, not merely known: the trie under the
+            // head is here, so this node can hand it to the next one.
+            assert!(
+                synch_mpt::Trie::new(holder.store.as_ref())
+                    .is_complete(complete.root)
+                    .expect("completeness"),
+                "seed {seed}: node {i} holds a head for {origin} it cannot serve"
+            );
+            // And the derived view agrees with the head, which is what the
+            // unified tree, mirrors and the gateway read.
+            let leaves = published
+                .iter()
+                .filter(|p| p.head.root == complete.root)
+                .map(|p| p.leaves)
+                .max()
+                .expect("the published head");
+            assert_eq!(
+                holder
+                    .store
+                    .list_entries(Some(origin), "media", "", None, None)
+                    .expect("the entries")
+                    .len(),
+                leaves,
+                "seed {seed}: node {i}'s entries do not match the head it holds"
+            );
+        }
+    }
+}
+
+/// Copies every trie node and value under `root` from one store to another.
+///
+/// Stands in for `GetNodes`/`GetValues` without a transport: the fetch's job is
+/// to make the receiver able to *serve* the root, and this is that outcome. The
+/// walk itself is covered over real endpoints in `two_nodes.rs`.
+fn copy_trie(from: &Node, to: &Node, root: Hash) {
+    use synch_mpt::NodeStore;
+    let reachable = synch_mpt::Trie::new(from.store.as_ref())
+        .reachable(root)
+        .expect("the reachable set");
+    for hash in reachable.nodes {
+        if let Some(bytes) = NodeStore::get_node(from.store.as_ref(), &hash).expect("a node") {
+            NodeStore::put_node(to.store.as_ref(), &hash, &bytes).expect("the put");
+        }
+    }
+    for hash in reachable.values {
+        if let Some(bytes) = NodeStore::get_value(from.store.as_ref(), &hash).expect("a value") {
+            NodeStore::put_value(to.store.as_ref(), &hash, &bytes).expect("the put");
+        }
     }
 }
