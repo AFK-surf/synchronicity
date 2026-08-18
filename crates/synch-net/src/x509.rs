@@ -119,7 +119,19 @@ impl Certificate {
         let _ = tbs.optional(0x82);
         let mut extensions = Vec::new();
         if let Some(bytes) = tbs.optional(0xa3) {
-            let mut list = Der::new(bytes).sequence("Extensions")?;
+            // The `[3]` wrapper holds one `Extensions` SEQUENCE and nothing
+            // else. Reading the first and discarding the remainder is how a
+            // *second* SEQUENCE — with a second subjectAltName, or a second
+            // chain extension — becomes invisible to this parser while sitting
+            // inside the leaf, which defeats the exactly-one rules below
+            // without touching them. Same rule as the trailing bytes after the
+            // certificate, applied at every level rather than only the outer
+            // one.
+            let mut wrapper = Der::new(bytes);
+            let mut list = wrapper.sequence("Extensions")?;
+            if !wrapper.is_empty() {
+                return Err(X509Error::new("bytes after the Extensions sequence"));
+            }
             while !list.is_empty() {
                 let mut ext = list.sequence("Extension")?;
                 let oid = ext.tagged(0x06, "extnID")?.to_vec();
@@ -131,6 +143,9 @@ impl Certificate {
                     None => false,
                 };
                 let value = ext.tagged(0x04, "extnValue")?.to_vec();
+                if !ext.is_empty() {
+                    return Err(X509Error::new("bytes after an extension's extnValue"));
+                }
                 extensions.push(Extension {
                     oid,
                     critical,
@@ -206,6 +221,26 @@ impl Certificate {
                 )))
             }
         };
+        // The SAN must be the name *spelled canonically*, not merely a string
+        // that parses to it.
+        //
+        // This is the one field the whole certificate exists to carry: the
+        // apex is written into the Merkle leaf so that anyone reading the log
+        // can index it (docs/REKOR-ZONE-KEY.md §2.1). `Name::from_utf8` reads
+        // DNS *presentation* format, where `CLUSTER.EXAMPLE` and
+        // `clus\ter.example` are both `cluster.example.` — so an attacker who
+        // has taken the delegation can mint an entry that this client accepts
+        // for `cluster.example` while the leaf contains no such string. Every
+        // reader that indexes the log by byte pattern rather than by this
+        // parser — a `grep`, a CT-style indexer, an operator watching for
+        // their own apex — misses it. The entry is accepted and unfindable,
+        // which is the exact shape §4.2.1 forbids: a client must enforce
+        // whatever property makes an entry discoverable, or an attacker
+        // simply omits it.
+        //
+        // So the bytes have to be the canonical presentation of the name they
+        // decode to. A trailing dot is the one tolerated difference, because
+        // it is the same name written absolute.
         let mut name = Name::from_utf8(text)
             .map_err(|e| X509Error::new(format!("the dNSName SAN {text:?} is not a name: {e}")))?;
         name.set_fqdn(true);
@@ -217,7 +252,16 @@ impl Certificate {
                 "the dNSName SAN is the DNS root, which is not a zone this design logs",
             ));
         }
-        Ok(name.to_lowercase())
+        let name = name.to_lowercase();
+        let canonical = name.to_string();
+        if text.as_str() != canonical.trim_end_matches('.') && text.as_str() != canonical {
+            return Err(X509Error::new(format!(
+                "the dNSName SAN is spelled {text:?}, not {:?} — a log entry has to \
+                 carry its apex the way a reader indexing the log would search for it",
+                canonical.trim_end_matches('.')
+            )));
+        }
+        Ok(name)
     }
 }
 
@@ -228,7 +272,14 @@ impl Certificate {
 /// parse rule with no security content.
 fn parse_san(value: &[u8]) -> Result<Vec<String>, X509Error> {
     let mut names = Vec::new();
-    let mut list = Der::new(value).sequence("GeneralNames")?;
+    // One GeneralNames sequence, with nothing after it — see the same rule in
+    // `Certificate::parse`: a second sequence here is a second set of names
+    // this parser would never see.
+    let mut wrapper = Der::new(value);
+    let mut list = wrapper.sequence("GeneralNames")?;
+    if !wrapper.is_empty() {
+        return Err(X509Error::new("bytes after the subjectAltName sequence"));
+    }
     while !list.is_empty() {
         let (tag, body) = list.next("GeneralName")?;
         if tag == 0x82 {
@@ -693,14 +744,60 @@ mod tests {
                 "{bad:?} must not be a usable SAN"
             );
         }
-        // Spellings that *are* one name normalize to one value.
+        // The absolute and relative spellings of one name are the same name,
+        // and both are canonical.
         let canonical = with("sync.example.").single_dns_name().unwrap();
-        for same in ["sync.example", "SYNC.EXAMPLE.", "Sync.Example"] {
-            assert_eq!(with(same).single_dns_name().unwrap(), canonical, "{same}");
+        assert_eq!(with("sync.example").single_dns_name().unwrap(), canonical);
+        // But a spelling that merely *parses* to the name is refused, because
+        // the SAN is the string a reader indexing the log searches for. An
+        // attacker who has taken the delegation could otherwise mint an entry
+        // this client accepts for `sync.example` whose leaf contains no such
+        // text — accepted and unfindable, which is the shape §4.2.1 forbids.
+        for evasion in ["SYNC.EXAMPLE.", "Sync.Example", "syn\\c.example"] {
+            let error = with(evasion)
+                .single_dns_name()
+                .expect_err("a non-canonical spelling of the apex must be refused");
+            assert!(
+                error.to_string().contains("is spelled"),
+                "{evasion:?} refused for the wrong reason: {error}"
+            );
         }
+        // And the evasion really does parse to the name it would have hidden.
+        assert_eq!(
+            Name::from_utf8("syn\\c.example").unwrap().to_lowercase(),
+            Name::from_utf8("sync.example").unwrap().to_lowercase(),
+        );
         // Not a suffix match: a certificate for the parent is not a
         // certificate for the child, however tempting the substring is.
         assert_ne!(with("example.").single_dns_name().unwrap(), canonical);
+    }
+
+    /// A second `GeneralNames` sequence inside one subjectAltName is refused.
+    ///
+    /// The exactly-one-*extension* rule never fires here — there is one
+    /// extension — so without the wrapper check a reader takes the first
+    /// sequence and drops the rest, seeing one name while the leaf carries
+    /// two. Go accepts this shape (its `cryptobyte` reads alias the receiver,
+    /// so the remainder is discarded rather than refused), which means Rekor
+    /// will log it; OpenSSL rejects the certificate outright. Readers in the
+    /// world disagree about these bytes, so this one refuses them.
+    #[test]
+    fn a_second_general_names_sequence_is_refused() {
+        let one = tlv(0x82, b"sync.example");
+        let other = tlv(0x82, b"attacker.example");
+        // The honest shape reads as one name.
+        assert_eq!(
+            parse_san(&tlv(0x30, &one)).unwrap(),
+            vec!["sync.example".to_string()]
+        );
+        // Two sequences, back to back, inside one extnValue.
+        let mut doubled = tlv(0x30, &one);
+        doubled.extend_from_slice(&tlv(0x30, &other));
+        let error = parse_san(&doubled).expect_err("a second sequence must be refused");
+        assert!(
+            error.to_string().contains("bytes after"),
+            "refused for the wrong reason: {error}"
+        );
     }
 
     #[test]

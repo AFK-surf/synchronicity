@@ -434,18 +434,50 @@ pub fn fake_resolver_serving(dnskey_rds: List(BitArray)) -> chain.Resolver {
             [rrsig],
           ),
         )
-      _ ->
+      // The declaration, spelled the way every reader checks for it. A
+      // fixture answering something else here builds a chain that verifies
+      // nowhere — which is what these fixtures used to do, silently.
+      w if w == wire.type_txt ->
         Ok([
-          wire.Rr(zone, rtype, wire.class_in, 3600, <<
-            1234:int-size(16),
-            13:int-size(8),
-            2:int-size(8),
-            9:size(256),
-          >>),
+          wire.Rr(
+            zone,
+            wire.type_txt,
+            wire.class_in,
+            300,
+            rdata.txt(rdata.transparency_text),
+          ),
           rrsig,
         ])
+      // And a DS that actually covers a key the zone serves, rather than a
+      // constant. The publisher checks this before writing to the log, so a
+      // fixture with an unrelated digest is a fixture of a chain no client
+      // would walk.
+      _ -> Ok([ds_rr(zone, dnskey_rds), rrsig])
     }
   })
+}
+
+/// A DS RRset covering the first key of `dnskey_rds`, as its parent would
+/// publish it: `<tag> <algorithm> 2 <sha256(owner ‖ rdata)>`.
+pub fn ds_rr(zone: name.Name, dnskey_rds: List(BitArray)) -> wire.Rr {
+  let rd = case dnskey_rds {
+    [first, ..] -> first
+    [] -> <<257:int-size(16), 3:int-size(8), 13:int-size(8), 0:size(512)>>
+  }
+  let algorithm = case rd {
+    <<_flags:int-size(16), _proto:int-size(8), alg:int-size(8), _:bits>> -> alg
+    _ -> 13
+  }
+  wire.Rr(
+    zone,
+    chain.type_ds,
+    wire.class_in,
+    3600,
+    bit_array.concat([
+      <<keys.key_tag(rd):int-size(16), algorithm:int-size(8), 2:int-size(8)>>,
+      keys.ds_digest(zone, rd),
+    ]),
+  )
 }
 
 /// A resolver with nothing to say — the DS is not live in the parent yet,
@@ -1244,16 +1276,11 @@ fn delegation_resolver(
           False -> Ok([])
         }
       _, True, True -> Ok(dnskey_rrs(zone, [dnskey_rd]))
+      // A DS that really covers the key this zone serves — the relation the
+      // publisher checks before writing to a public log, and the one a
+      // reader's ladder walk turns on.
       _, False, True ->
-        Ok([
-          wire.Rr(zone, chain.type_ds, wire.class_in, 3600, <<
-            1234:int-size(16),
-            13:int-size(8),
-            2:int-size(8),
-            9:size(256),
-          >>),
-          fake_rrsig(zone, chain.type_ds),
-        ])
+        Ok([ds_rr(zone, [dnskey_rd]), fake_rrsig(zone, chain.type_ds)])
       _, _, False -> Ok([])
     }
   })
@@ -1622,9 +1649,14 @@ fn dnskey_rrs(zone: name.Name, rdatas: List(BitArray)) -> List(wire.Rr) {
 /// One tick is three DNSKEY queries at the signing zone: two for the
 /// corroborated observation, one for the chain the claim carries. The mailbox
 /// is preloaded in that order.
+/// `ds_key` is the key the apex's DS covers — a key present in every
+/// scripted answer, so the delegation the collector checks is intact across
+/// the whole sequence rather than only on the tick that happened to observe
+/// it.
 fn split_resolver(
   zone: name.Name,
   answers: process.Subject(List(BitArray)),
+  ds_key: BitArray,
 ) -> chain.Resolver {
   chain.Resolver(query: fn(qzone, rtype) {
     let rrsig = fake_rrsig(qzone, rtype)
@@ -1637,17 +1669,47 @@ fn split_resolver(
         Ok(dnskey_rrs(qzone, rdatas))
       }
       False ->
-        Ok([
-          wire.Rr(qzone, rtype, wire.class_in, 3600, <<
-            1234:int-size(16),
-            13:int-size(8),
-            2:int-size(8),
-            9:size(256),
-          >>),
-          rrsig,
-        ])
+        case rtype == wire.type_txt {
+          // The declaration, spelled the way every reader checks for it.
+          True ->
+            Ok([
+              wire.Rr(
+                qzone,
+                wire.type_txt,
+                wire.class_in,
+                300,
+                rdata.txt(rdata.transparency_text),
+              ),
+              rrsig,
+            ])
+          // A DS covering whatever key this zone is currently serving. The
+          // subject is drained by the observation reads, so the DS is built
+          // from the zone's own key rather than a constant that covers
+          // nothing.
+          // Every other name answers as a signed zone would: its own DNSKEY
+          // RRset, and a DS covering a key that RRset actually holds.
+          False ->
+            case rtype == wire.type_dnskey {
+              True -> Ok(dnskey_rrs(qzone, [dnskey_for(qzone)]))
+              False ->
+                case qzone == zone {
+                  True -> Ok([ds_rr(qzone, [ds_key]), rrsig])
+                  False -> Ok([ds_rr(qzone, [dnskey_for(qzone)]), rrsig])
+                }
+            }
+        }
     }
   })
+}
+
+/// A stable per-zone DNSKEY rdata for fixtures that need a DS to cover
+/// *something* without consuming a scripted answer.
+fn dnskey_for(zone: name.Name) -> BitArray {
+  bit_array.concat([
+    <<257:int-size(16), 3:int-size(8), 13:int-size(8)>>,
+    crypto.hash(crypto.Sha256, bit_array.from_string(name.to_string(zone))),
+    crypto.hash(crypto.Sha256, bit_array.from_string(name.to_string(zone))),
+  ])
 }
 
 pub fn the_watcher_waits_quietly_for_the_declaration_test() {
@@ -1667,6 +1729,79 @@ pub fn the_watcher_waits_quietly_for_the_declaration_test() {
   sqlite.close(conn)
 }
 
+/// A declaration that does not read `v=sync1 transparency` stops the publish.
+///
+/// Every reader checks the *text* rather than counting records, so an entry
+/// whose bottom link carries anything else verifies at no client and
+/// classifies tier B at every monitor. Publishing is a permanent, public,
+/// irreversible write, so the place to find this out is here.
+pub fn a_declaration_that_says_nothing_is_refused_test() {
+  let assert Ok(apex) = name.parse("sync.test.")
+  let rd = keys.dnskey_rdata(keys.generate())
+  let resolver =
+    chain.Resolver(query: fn(zone, rtype) {
+      case rtype == wire.type_txt {
+        // A TXT at the right name saying the wrong thing — a leftover record,
+        // or a zone that has not published its declaration yet.
+        True ->
+          Ok([
+            wire.Rr(
+              zone,
+              wire.type_txt,
+              wire.class_in,
+              300,
+              rdata.txt("v=spf1 -all"),
+            ),
+            fake_rrsig(zone, wire.type_txt),
+          ])
+        False ->
+          case rtype == wire.type_dnskey {
+            True -> Ok(dnskey_rrs(zone, [rd]))
+            False -> Ok([ds_rr(zone, [rd]), fake_rrsig(zone, chain.type_ds)])
+          }
+      }
+    })
+  let assert Error(why) = chain.collect(resolver, apex, apex)
+  assert string.contains(why, "v=sync1 transparency")
+}
+
+/// A DS that covers none of the keys the zone serves stops the publish.
+///
+/// Both RRsets are individually well-formed and individually signed, so
+/// nothing else in the collector notices — this is what a rollover caught
+/// mid-propagation looks like from a resolver, and the chain it produces
+/// walks at no reader.
+pub fn a_ds_that_covers_no_served_key_is_refused_test() {
+  let assert Ok(apex) = name.parse("sync.test.")
+  let served = keys.dnskey_rdata(keys.generate())
+  let other = keys.dnskey_rdata(keys.generate())
+  let resolver =
+    chain.Resolver(query: fn(zone, rtype) {
+      case rtype == wire.type_txt {
+        True ->
+          Ok([
+            wire.Rr(
+              zone,
+              wire.type_txt,
+              wire.class_in,
+              300,
+              rdata.txt(rdata.transparency_text),
+            ),
+            fake_rrsig(zone, wire.type_txt),
+          ])
+        False ->
+          case rtype == wire.type_dnskey {
+            True -> Ok(dnskey_rrs(zone, [served]))
+            // The parent's DS names a key this zone does not serve.
+            False ->
+              Ok([ds_rr(zone, [other]), fake_rrsig(zone, chain.type_ds)])
+          }
+      }
+    })
+  let assert Error(why) = chain.collect(resolver, apex, apex)
+  assert string.contains(why, "covered by a DS")
+}
+
 pub fn the_watcher_stamps_only_keys_the_claim_covers_test() {
   let conn = fixtures.fresh_conn()
   let assert Ok(apex) = name.parse("sync.test.")
@@ -1681,7 +1816,7 @@ pub fn the_watcher_stamps_only_keys_the_claim_covers_test() {
   process.send(answers, [a, b])
   process.send(answers, [a, b])
   process.send(answers, [a])
-  let resolver = split_resolver(apex, answers)
+  let resolver = split_resolver(apex, answers, a)
   let submits = process.new_subject()
   let #(inner, spki, point) = fake_log(keys.generate())
   let log =
@@ -1744,7 +1879,7 @@ pub fn the_watcher_will_not_act_on_an_unconfirmed_answer_test() {
   // Then an answer that says {B}, contradicted by the read beside it.
   process.send(answers, [b])
   process.send(answers, [a])
-  let resolver = split_resolver(apex, answers)
+  let resolver = split_resolver(apex, answers, a)
   let #(log, spki, point) = fake_log(keys.generate())
   let tick = fn(now) {
     zonekey_watch.run_once_with(

@@ -1031,18 +1031,32 @@ impl DnssecResolver {
             // yields a verified proof. A stale `apex=` beside a live one names a
             // control plane with no usable proof, which costs a pair of lookups
             // rather than the domain (see `apexes_of`).
+            // Verified, or refused — never "the loop did not run". Tracking
+            // acceptance rather than the absence of a refusal is what makes
+            // an empty candidate list a refusal *by construction*: with
+            // `refusal`-only bookkeeping, zero iterations fell through to the
+            // member set with no proof checked at all, under `Require`. That
+            // is unreachable today because `apexes_of` refuses an empty set —
+            // but the design's central requirement should not rest on a
+            // caller invariant asserted in another function.
+            let mut verified = false;
             let mut refusal = None;
             for apex in &apexes {
                 match self.verify_zone_key(&domain, apex, &validated).await {
                     Ok(_) => {
-                        refusal = None;
+                        verified = true;
                         break;
                     }
                     Err(e) => refusal = Some(e),
                 }
             }
-            if let Some(e) = refusal {
-                return Err(e);
+            if !verified {
+                return Err(refusal.unwrap_or_else(|| {
+                    NetError::Dns(format!(
+                        "{domain}: no apex to check the zone key against, so the \
+                         transparency requirement could not be met"
+                    ))
+                }));
             }
         }
         let set = MemberSet::from_records(&domain, &validated.records)?;
