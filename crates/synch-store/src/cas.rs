@@ -451,13 +451,20 @@ impl Store {
         let mut outboard = vec![0u8; tree.outboard_size() as usize];
         // Stream the file once, teeing into a staging file in the CAS so the
         // payload lands without a second read.
-        std::fs::create_dir_all(self.cas_dir())?;
+        //
+        // Into the staging directory, never the CAS root: the root holds shard
+        // directories, and a regular file among them stopped
+        // [`Store::gc_orphans`] dead — `read_dir` on a file is `NotADirectory`,
+        // which the sweep took as a hard error, so one leaked staging file
+        // disabled orphan collection on that node forever. The sweep is also
+        // what reclaims these, which is why they have a place of their own.
+        std::fs::create_dir_all(self.staging_dir())?;
         // Unique per ingest, not just per process: two concurrent ingests
         // (a scan and a control-socket `put`, or parallel space scans) must not
         // share one staging file, or each would truncate the other's stream and
         // rename a corrupt payload into place under a correct-looking root.
-        let staging = self.cas_dir().join(format!(
-            "incoming-{}-{}.tmp",
+        let staging = self.staging_dir().join(format!(
+            "{}-{}.tmp",
             std::process::id(),
             STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
@@ -1195,13 +1202,19 @@ mod tests {
         assert_eq!(size, bytes.len() as u64);
         assert_eq!(root.as_bytes(), blake3::hash(&bytes).as_bytes());
         assert_eq!(store.read_all(&root).unwrap(), bytes);
-        // No staging files left behind.
-        let leftovers: Vec<_> = std::fs::read_dir(store.cas_dir())
+        // No staging files left behind, and none in the CAS root: a regular
+        // file there is what used to break the orphan sweep.
+        let staged: Vec<_> = std::fs::read_dir(store.staging_dir())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("incoming-"))
             .collect();
-        assert!(leftovers.is_empty());
+        assert!(staged.is_empty());
+        let in_root: Vec<_> = std::fs::read_dir(store.cas_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert!(in_root.is_empty(), "the CAS root holds only directories");
     }
 
     #[test]

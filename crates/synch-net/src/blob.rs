@@ -388,28 +388,42 @@ impl BlobClient {
             // It used to be the provider's: the whole remainder was offered,
             // `ProofEnd` reported how much came back, and neither side could
             // tell an honest short answer from a provider dribbling one node
-            // per round trip. That needed two separate patches — the provider
-            // threw away a truncated walk and *walked the whole thing again*
-            // over the ranges that fit, so both sides would agree node for
-            // node, and the requester carried a heuristic ceiling of three
-            // magic constants to bound the number of round trips. Both existed
-            // only because the split was unpredictable. It is not: the cost of
-            // a walk is bounded by its ranges and level, and while the provider
-            // walks `requested ∩ what it holds` — which we cannot know — a
-            // subset never costs more than the whole. Sizing the window to fit
+            // per round trip. The provider threw away a truncated walk and
+            // *walked the whole thing again* over the ranges that fit, so both
+            // sides would agree node for node. That existed only because the
+            // split was unpredictable. It is not: the cost of a walk is bounded
+            // by its ranges and level, and while the provider walks
+            // `requested ∩ what it holds` — which we cannot know — a subset
+            // never costs more than the whole. Sizing the window to fit
             // assuming a full holder therefore fits for every holder.
             let window = proof_window(&remaining, level);
             let proof = self.get_proof(root, &window, level).await?;
             // Already clamped to the window by `check_served`.
             let served = proof.served.clone();
+            // The window is retired either way, exactly as `fetch_into` retires
+            // a slice window, and that is what puts a ceiling on the exchange:
+            // one round trip per window, `ceil(ranges / window)` of them, rather
+            // than one per *group the provider felt like serving*.
+            //
+            // Retiring only what came back left no ceiling at all. A provider
+            // answering each request with a valid proof of a single group is
+            // never barren, so `MAX_BARREN_WINDOWS` never fires and the deadline
+            // is per exchange — so the loop ran once per group of the object,
+            // millions of times for a large one, and each turn cost the victim
+            // an outboard write, an fsync and an immediate transaction on its
+            // one write connection (`docs/DELTA-SYNC.md` §3.3).
+            //
+            // Nothing honest needs a second look at a window: a partial holder
+            // answers `requested ∩ held` for the whole of it in one walk, and
+            // what it did not hold this time it will not hold on the next ask
+            // either. Ranges it left behind stay in the caller's `remaining`
+            // through `out.served`, so another provider still gets asked.
+            remaining = remaining.difference(&window);
             if served.is_empty() {
                 barren += 1;
                 if barren >= MAX_BARREN_WINDOWS {
                     break;
                 }
-                // Nothing came back for this window, and asking again would
-                // only repeat the round trip.
-                remaining = remaining.difference(&window);
                 continue;
             }
             barren = 0;
@@ -420,7 +434,6 @@ impl BlobClient {
                 Ok(store.write_proof(&root, size, &for_store, level, &encoded, now_ns())?)
             })
             .await?;
-            remaining = remaining.difference(&served);
             out.served = out.served.union(&served);
             out.proven.absorb(proven)?;
         }
@@ -517,6 +530,99 @@ mod tests {
 
         dialer.close().await;
         peer.shutdown().await;
+    }
+
+    /// A provider dribbling one group per answer cannot hold a descent open.
+    ///
+    /// `remaining` used to retire only what came back, so a provider serving a
+    /// valid proof of a single group per exchange reset the barren counter every
+    /// time, `MAX_BARREN_WINDOWS` never fired, and the deadline is per exchange
+    /// — one round trip per group of the object, each costing the victim an
+    /// outboard write, an fsync and an immediate transaction on its one write
+    /// connection. The slice path always retired the whole window
+    /// (`docs/DELTA-SYNC.md` §3.3); the proof path now does too.
+    #[tokio::test]
+    async fn a_provider_serving_one_group_at_a_time_cannot_stretch_a_descent() {
+        let provider_dir = tempfile::tempdir().unwrap();
+        let provider_store =
+            std::sync::Arc::new(synch_store::Store::open(provider_dir.path()).unwrap());
+        // Sixty-four groups, all of which one proof window covers, so the
+        // ceiling under test is the only thing that can end the loop.
+        let size = 64 * CHUNK_GROUP_SIZE;
+        let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let root = provider_store.ingest_bytes(&bytes, now_ns()).unwrap();
+        let groups = synch_core::group_count(size);
+        assert_eq!(
+            proof_window(&ChunkRanges::single(0, groups), 0).count(),
+            groups
+        );
+
+        // A peer that answers every proof request with the lowest group asked
+        // for, and nothing else. Every answer is valid, so nothing else about
+        // it looks hostile.
+        let endpoint = bare_endpoint(ALPN_BLOB).await;
+        let addr = crate::testing::direct_addr(&endpoint);
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let serving = endpoint.clone();
+        let counter = asked.clone();
+        let store_for_peer = provider_store.clone();
+        let peer = tokio::spawn(async move {
+            while let Some(incoming) = serving.accept().await {
+                let Ok(connection) = incoming.await else {
+                    continue;
+                };
+                while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                    let Ok(request) = read_frame::<BlobMessage>(&mut recv).await else {
+                        break;
+                    };
+                    let BlobMessage::GetProof {
+                        root,
+                        ranges,
+                        level,
+                    } = request
+                    else {
+                        break;
+                    };
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let first = ranges.ranges.first().copied().expect("a non-empty request");
+                    let one = ChunkRanges::single(first.start, first.start + 1);
+                    let (encoded, served) = store_for_peer
+                        .encode_proof(&root, &one, level, MAX_PROOF_NODES)
+                        .expect("the provider holds the object");
+                    write_bytes(&mut send, &encoded).await.unwrap();
+                    write_frame(&mut send, &BlobMessage::ProofEnd { served })
+                        .await
+                        .unwrap();
+                    let _ = send.finish();
+                }
+            }
+        });
+
+        let fetcher_dir = tempfile::tempdir().unwrap();
+        let fetcher = std::sync::Arc::new(synch_store::Store::open(fetcher_dir.path()).unwrap());
+        let dialer = bare_endpoint(ALPN_BLOB).await;
+        let connection = dialer.connect(addr, ALPN_BLOB).await.unwrap();
+        let client = BlobClient::new(connection);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.fetch_proof_into(&fetcher, root, size, &ChunkRanges::single(0, groups), 0),
+        )
+        .await
+        .expect("the descent must not run for one round trip per group")
+        .unwrap();
+
+        // One window was asked for, and one window is what the exchange cost —
+        // whatever the provider chose to put in it.
+        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            outcome.served.count(),
+            1,
+            "and what it served is what we got"
+        );
+
+        peer.abort();
+        dialer.close().await;
+        endpoint.close().await;
     }
 
     /// The requester sizes each window so the provider never truncates.

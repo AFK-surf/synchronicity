@@ -7,6 +7,7 @@
 use rusqlite::{params, OptionalExtension};
 use synch_core::{
     parse_blob_key, parse_file_key, AdState, BlobAd, EntryKind, FileEntry, Hash, OriginId,
+    MAX_PROVIDER_ADS,
 };
 use synch_mpt::{ChangeKind, ResolvedChange, Trie};
 
@@ -396,35 +397,59 @@ impl Store {
 
     /// "Who can serve this object?" — answered locally, with no round trip
     /// (§6.3).
+    ///
+    /// At most [`MAX_PROVIDER_ADS`] rows, bounded in SQL rather than by the
+    /// caller. `FindProviders` answers out of this and truncated afterwards,
+    /// which bounds what goes on the wire and nothing else: the rows were all
+    /// read, and each one's spans decoded, before the truncation could apply
+    /// (§12). Membership is a hundred origins, so the limit cannot bite an
+    /// honest cluster, and the ordering it cuts against is deterministic.
+    ///
+    /// The connection guard is released before any of it is decoded. It is the
+    /// single global write mutex, and holding it across a per-row postcard
+    /// decode let one small request — a `FindProviders` for a root some origin
+    /// published a pathological `b:` record for — stall every other writer in
+    /// the process for as long as the decode took.
     pub fn providers(&self, root: &Hash) -> Result<Vec<(OriginId, BlobAd)>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT origin_id, size, complete, spans FROM blob_providers
-             WHERE object_root = ?1 ORDER BY complete DESC, origin_id",
-        )?;
-        let rows = stmt.query_map(params![root.as_bytes().to_vec()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<Vec<u8>>>(3)?,
-            ))
-        })?;
+        let encoded = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(
+                "SELECT origin_id, size, complete, spans FROM blob_providers
+                 WHERE object_root = ?1 ORDER BY complete DESC, origin_id
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                params![root.as_bytes().to_vec(), MAX_PROVIDER_ADS as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         let mut out = Vec::new();
-        for row in rows {
-            let (origin, size, complete, spans) = row?;
+        for (origin, size, complete, spans) in encoded {
             // `complete` is the legacy duplicate of "the spans cover the whole
             // object" and is still written for older readers; the spans are
             // authoritative. A row written as complete before v11 carries no
             // spans, so it is reconstituted from the size.
-            let spans: Vec<(u64, u64)> = match spans {
+            // Decoded as an [`AdState`], whose own `Deserialize` stops at
+            // `MAX_AD_SPANS` — the column is that struct's one field, so the
+            // bytes are the same either way and the cap comes for free. Reading
+            // it as a bare `Vec` was what let a row hold millions of spans.
+            let state: AdState = match spans {
                 Some(bytes) => {
                     postcard::from_bytes(&bytes).map_err(|e| StoreError::Decode(e.to_string()))?
                 }
-                None if complete != 0 && size > 0 => vec![(0, size as u64)],
-                None => Vec::new(),
+                None if complete != 0 && size > 0 => AdState {
+                    spans: vec![(0, size as u64)],
+                },
+                None => AdState { spans: Vec::new() },
             };
-            let state = AdState { spans };
             out.push((
                 origin_column(origin, "blob_providers.origin_id")?,
                 BlobAd {
@@ -1204,6 +1229,67 @@ mod tests {
 
         store.delete_provider(&root, &origin("nas")).unwrap();
         assert_eq!(store.providers(&root).unwrap().len(), 1);
+    }
+
+    /// The provider read is bounded by the query, not by the caller.
+    ///
+    /// `FindProviders` truncates its answer to `MAX_PROVIDER_ADS`, but that
+    /// happens after every row has been read and every row's spans decoded —
+    /// under the single global connection mutex. The bound belongs in the SQL,
+    /// where it costs the reader nothing to enforce (§12).
+    #[test]
+    fn a_provider_read_stops_at_the_advertised_bound() {
+        let (_d, store) = store();
+        let root = Hash::new(b"a popular object");
+        for i in 0..MAX_PROVIDER_ADS + 64 {
+            store
+                .put_provider(
+                    &root,
+                    &origin(&format!("holder{i:04}")),
+                    &BlobAd::complete(10),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.providers(&root).unwrap().len(), MAX_PROVIDER_ADS);
+        assert_eq!(
+            store.providers_for_range(&root, 0, 10).unwrap().len(),
+            MAX_PROVIDER_ADS
+        );
+    }
+
+    /// A `b:` record naming a million spans lands as a bounded row.
+    ///
+    /// The record is a trie value, so it is bounded only by `MAX_FRAME_LEN` —
+    /// and materialization is where an origin's published bytes become this
+    /// node's memory. The cap is applied by the ad's own decode, so the row it
+    /// writes is already bounded and every later read of it is too.
+    #[test]
+    fn a_pathological_ad_materializes_to_a_bounded_row() {
+        let (_d, store) = store();
+        let o = origin("nas");
+        let trie = Trie::new(&store);
+        let g = AD_SPAN_GRANULARITY;
+        let root = Hash::new(b"an object");
+        let spans: Vec<(u64, u64)> = (0..(synch_core::MAX_AD_SPANS as u64 + 500))
+            .map(|i| (i * 2 * g, i * 2 * g + g))
+            .collect();
+        let ad = BlobAd {
+            v: synch_core::RECORD_VERSION,
+            size: u64::MAX,
+            state: AdState { spans },
+        };
+        let after = trie
+            .insert(
+                Hash::EMPTY,
+                &synch_core::blob_key(&root),
+                &postcard::to_stdvec(&ad).unwrap(),
+            )
+            .unwrap();
+        store.materialize_diff(&o, Hash::EMPTY, after).unwrap();
+
+        let providers = store.providers(&root).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].1.state.spans.len(), synch_core::MAX_AD_SPANS);
     }
 
     #[test]

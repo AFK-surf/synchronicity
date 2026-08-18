@@ -12,8 +12,14 @@
 //! them; a head offer walks a trie in SQLite. All of it is blocking and bounded
 //! by object or tree size rather than by anything the runtime can interrupt, so
 //! a single large transfer served inline would stall every other connection
-//! this node has. Bounded metadata lookups stay inline, where the handoff would
-//! cost more than the work.
+//! this node has. What stays inline is the per-connection and per-stream binding
+//! check in `serve`: one indexed row, on a path that runs before a request is
+//! even read, where the handoff would cost more than the work. Everything a
+//! *request* costs is offloaded, including the two metadata handlers —
+//! `FindProviders` and `GetBindings` — that used to be judged small enough to
+//! run here: `providers` holds the one connection mutex across a row loop and a
+//! postcard decode per row, which is not a bounded lookup at all when an origin
+//! chooses what is in those rows (§12).
 
 use crate::error::NetError;
 

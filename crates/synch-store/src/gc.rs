@@ -130,19 +130,31 @@ impl Store {
     /// A file counts as orphaned only once its own mtime is older than the same
     /// retention horizon `gc_content` uses. Payload and outboard are created
     /// before the row that describes them, so inside that window a file with no
-    /// row is a write in progress, not a leftover. Anything in the CAS
+    /// row is a write in progress, not a leftover. Anything in a shard
     /// directory that is not named for an object is left alone.
+    ///
+    /// Half-written ingests go with them, by way of [`Store::gc_staging`].
+    ///
+    /// Nothing in the CAS root but a directory is descended into. That is not
+    /// defensiveness: `read_dir` on a regular file fails with `NotADirectory`,
+    /// not `NotFound`, so a single stray file in the root — which is exactly
+    /// what a leaked staging file used to be — made this return an error on
+    /// every pass from then on. `maintenance_pass` reported failure forever and
+    /// no orphan was ever swept again, including the file causing it.
     ///
     /// Returns how many files went.
     pub fn gc_orphans(&self, before: i64) -> Result<usize> {
-        let mut swept = 0;
+        let mut swept = self.gc_staging(before)?;
         let shards = match std::fs::read_dir(self.cas_dir()) {
             Ok(shards) => shards,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(swept),
             Err(e) => return Err(e.into()),
         };
         for shard in shards {
             let shard = shard?.path();
+            if !shard.is_dir() || shard == self.staging_dir() {
+                continue;
+            }
             let files = match std::fs::read_dir(&shard) {
                 Ok(files) => files,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -167,6 +179,35 @@ impl Store {
                 }
             }
         }
+        Ok(swept)
+    }
+
+    /// Removes staging files no ingest is still writing.
+    ///
+    /// [`Store::ingest_file`] streams into a staging file and renames it onto
+    /// its content address, so one left behind is a whole object of disk that
+    /// nothing else will ever reclaim — it is not named for an object, so
+    /// `cas_root_of` says nothing about it and the orphan sweep above passes
+    /// over it. It is not a crash-only leak either: the `create_dir_all` and
+    /// the `rename` that follow the stream can both fail (ENOSPC, which is
+    /// precisely when reclaiming matters), and a panic inside the hashing
+    /// unwinds straight past the cleanup in the error arm. Every leak is larger
+    /// than [`INLINE_BLOB_MAX`](synch_core::INLINE_BLOB_MAX) by construction,
+    /// since smaller files never take this path.
+    ///
+    /// Age is the same horizon the rest of GC uses, read off the file's own
+    /// mtime: an ingest in progress is writing to it, so it is younger than the
+    /// window and stays. Files written by an older build, which staged into the
+    /// CAS root under an `incoming-` name, are taken from there as well —
+    /// nothing else would.
+    ///
+    /// Returns how many files went.
+    pub fn gc_staging(&self, before: i64) -> Result<usize> {
+        // The staging directory holds staging files and nothing else, so every
+        // stale file in it goes; the CAS root holds shard directories, so only
+        // the names an older build staged there do.
+        let mut swept = sweep_stale_files(&self.staging_dir(), before, &|_| true)?;
+        swept += sweep_stale_files(&self.cas_dir(), before, &is_legacy_staging)?;
         Ok(swept)
     }
 
@@ -223,6 +264,46 @@ fn cas_root_of(path: &std::path::Path) -> Option<Hash> {
     let stem = name.strip_suffix(".obao").unwrap_or(name);
     let bytes = hex::decode(stem).ok()?;
     Hash::from_slice(&bytes).ok()
+}
+
+/// True for the staging names an older build wrote into the CAS root itself,
+/// before staging got a directory of its own.
+fn is_legacy_staging(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("incoming-") && name.ends_with(".tmp"))
+}
+
+/// Removes the regular files directly in `dir` that `wanted` names and that
+/// nothing has touched since `before`. A directory that is not there holds no
+/// stale files.
+fn sweep_stale_files(
+    dir: &std::path::Path,
+    before: i64,
+    wanted: &dyn Fn(&std::path::Path) -> bool,
+) -> Result<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let mut swept = 0;
+    for entry in entries {
+        let path = entry?.path();
+        if !wanted(&path) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || mtime_nanos(&meta).is_none_or(|at| at >= before) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            swept += 1;
+        }
+    }
+    Ok(swept)
 }
 
 /// A file's modification time in unix nanoseconds, if it has one this side of
@@ -491,6 +572,41 @@ mod tests {
         assert_eq!(store.gc(0).unwrap().orphans, 0);
     }
 
+    /// A leaked staging file is reclaimed, and never kills the sweep.
+    ///
+    /// `ingest_file` used to stage into the CAS root itself, where the outer
+    /// `read_dir` of the orphan sweep meets it as a *regular file*: `read_dir`
+    /// on one fails with `NotADirectory`, which is not the `NotFound` the sweep
+    /// tolerated, so the whole pass returned an error — permanently, since only
+    /// this sweep could have removed the file and `cas_root_of` refuses the
+    /// name anyway. Every ingest that fails after the stream leaves one, and
+    /// each is a whole object of disk.
+    #[test]
+    fn a_staging_file_in_the_cas_root_is_reclaimed_rather_than_breaking_the_sweep() {
+        let (_d, store) = store();
+        let live = store.ingest_bytes(&vec![7u8; 100_000], 0).unwrap();
+        // Exactly what an older build left behind, in the place it left it.
+        let legacy = store.cas_dir().join("incoming-1234-0.tmp");
+        std::fs::write(&legacy, vec![1u8; 100_000]).unwrap();
+        // And what this one leaves: a staging file in the staging directory.
+        std::fs::create_dir_all(store.staging_dir()).unwrap();
+        let staged = store.staging_dir().join("1234-1.tmp");
+        std::fs::write(&staged, vec![2u8; 100_000]).unwrap();
+
+        // Inside the window both are ingests that may still be running, and the
+        // sweep completes rather than failing on the file in the root.
+        assert_eq!(store.gc_orphans(0).unwrap(), 0);
+        assert!(legacy.exists() && staged.exists());
+
+        // Past it, both are reclaimed — and the object with a row is untouched.
+        let horizon = synch_core::now_ns() + 60 * 1_000_000_000;
+        assert_eq!(store.gc_orphans(horizon).unwrap(), 2);
+        assert!(!legacy.exists() && !staged.exists());
+        assert!(store.blob_path(&live).exists());
+        // The staging directory itself is not mistaken for a shard.
+        assert!(store.staging_dir().is_dir());
+    }
+
     #[test]
     fn history_pruning_keeps_the_current_heads_and_fork_evidence() {
         // §5.4 prunes old roots by retention; §3.4 and §4.4 make same-seq
@@ -555,6 +671,137 @@ mod tests {
             .map(|h| h.seq)
             .collect();
         assert_eq!(kept, vec![2], "only the current head is left");
+    }
+
+    /// An origin that is merely *alive* does not pin its old forks.
+    ///
+    /// The rule is that the origin published past the forked seq and the head
+    /// that did so is itself older than retention. Reading "the head that did
+    /// so" off the complete slot asked a different question — is the head we
+    /// hold *now* old? — so an origin publishing once per retention window kept
+    /// every fork it had ever signed, and every trie node under those roots,
+    /// alive on every peer forever.
+    #[test]
+    fn a_live_origin_does_not_pin_its_old_forks() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let day = 24 * 3600 * 1_000_000_000i64;
+        let long_ago = 1_000 * day;
+        let now = long_ago + 100 * day;
+
+        // A fork a hundred days ago, and ordinary history just past it.
+        for root in [1u8, 2u8] {
+            let head = SignedHead::sign(&key, origin(), 5, Hash([root; 32]), 0);
+            store.record_history(&head, long_ago).unwrap();
+        }
+        for seq in 6..10u64 {
+            let head = SignedHead::sign(&key, origin(), seq, Hash([seq as u8 + 50; 32]), 0);
+            store.record_history(&head, long_ago).unwrap();
+        }
+        // And a head taken today, which holds the complete slot.
+        let current = SignedHead::sign(&key, origin(), 20, Hash([99u8; 32]), 0);
+        store.put_head(Slot::Complete, &current, now, now).unwrap();
+
+        // A seven-day window: everything but today's head is out of it, and the
+        // heads at 6..9 are the origin on record past the fork.
+        assert_eq!(
+            store
+                .prune_history_before(&origin(), now - 7 * day)
+                .unwrap(),
+            6
+        );
+        let kept: Vec<u64> = store
+            .head_history(&origin())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.seq)
+            .collect();
+        assert_eq!(kept, vec![20], "only the current head is left");
+        assert!(store.equivocations().unwrap().is_empty());
+    }
+
+    /// Forks at seqs *above* the complete head are bounded too.
+    ///
+    /// An origin can sign two roots at each of a thousand far-future seqs and
+    /// never serve any of the tries, so the complete slot never advances. The
+    /// exemption used to ask whether the complete head had passed the forked
+    /// seq, which for those rows is never, so they were permanent — mark roots
+    /// for GC included, and `trust rm` did not touch them. A retained head at a
+    /// *higher* seq is the same proof that the origin moved on, and an origin
+    /// flooding future seqs supplies it by the thousand: only the single highest
+    /// forked seq is left without one.
+    #[test]
+    fn forks_above_the_complete_head_are_bounded_by_the_origin_own_flood() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let real = SignedHead::sign(&key, origin(), 100, Hash([7u8; 32]), 0);
+        store.put_head(Slot::Complete, &real, 1_000, 1_000).unwrap();
+
+        // Two roots at each of two hundred far-future seqs, none of them ever
+        // completing, so the complete slot stays at 100.
+        for seq in 1_000_000..1_000_200u64 {
+            for root in 0..2u8 {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&seq.to_le_bytes());
+                bytes[8] = root;
+                let head = SignedHead::sign(&key, origin(), seq, Hash(bytes), 0);
+                store.record_history(&head, 1_000).unwrap();
+            }
+        }
+        // The highest of them holds the pending slot, as `offer_head` would
+        // have left it.
+        let mut top = [0u8; 32];
+        top[..8].copy_from_slice(&1_000_199u64.to_le_bytes());
+        top[8] = 1;
+        let pending = SignedHead::sign(&key, origin(), 1_000_199, Hash(top), 0);
+        store
+            .put_head(Slot::Pending, &pending, 1_000, 1_000)
+            .unwrap();
+        assert_eq!(store.head_history(&origin()).unwrap().len(), 401);
+
+        // A horizon past every row takes every forked seq the origin itself
+        // published past: 199 of the 200.
+        assert_eq!(store.prune_history_before(&origin(), 10_000).unwrap(), 398);
+        // What is left is the two slots and the one forked seq nothing stands
+        // above — still two roots, so the equivocation is still provable.
+        let left = store.head_history(&origin()).unwrap();
+        assert_eq!(left.len(), 3);
+        assert_eq!(store.equivocations().unwrap().len(), 1);
+        assert_eq!(store.equivocations().unwrap()[0].heads.len(), 2);
+        assert_eq!(store.complete_head(&origin()).unwrap(), Some(real));
+        assert_eq!(store.pending_head(&origin()).unwrap(), Some(pending));
+        // And a second pass finds nothing more, rather than oscillating.
+        assert_eq!(store.prune_history_before(&origin(), 10_000).unwrap(), 0);
+    }
+
+    /// A fork is never pruned down to a single root.
+    ///
+    /// One root at a seq proves nothing; the pair is the evidence. So a forked
+    /// seq is taken whole or left whole, even when only some of its rows are
+    /// past the window.
+    #[test]
+    fn fork_evidence_is_pruned_whole_or_not_at_all() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let old = SignedHead::sign(&key, origin(), 2, Hash([2u8; 32]), 0);
+        let recent = SignedHead::sign(&key, origin(), 2, Hash([3u8; 32]), 0);
+        let past = SignedHead::sign(&key, origin(), 3, Hash([4u8; 32]), 0);
+        store.record_history(&old, 100).unwrap();
+        store.record_history(&recent, 900).unwrap();
+        store.record_history(&past, 100).unwrap();
+
+        // The origin is on record past the fork and one of the two roots is out
+        // of the window — but taking it alone would leave a row that proves
+        // nothing, so both stay. The head at seq 3 stays with them: it is the
+        // proof the origin moved past the fork, and a pass that took it would
+        // leave a fork nothing could ever retire.
+        assert_eq!(store.prune_history_before(&origin(), 500).unwrap(), 0);
+        assert_eq!(store.equivocations().unwrap().len(), 1);
+        // Once both roots are past the window, the fork and its witness go
+        // together.
+        assert_eq!(store.prune_history_before(&origin(), 1_000).unwrap(), 3);
+        assert!(store.equivocations().unwrap().is_empty());
+        assert!(store.head_history(&origin()).unwrap().is_empty());
     }
 
     #[test]

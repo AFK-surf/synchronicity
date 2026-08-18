@@ -686,9 +686,10 @@ bootstrap), sweep unmarked
 `trie_nodes`/`trie_values`. Runs incrementally in the maintenance loop.
 
 The same pass sweeps CAS files that no `blobs` row accounts for — what a fetch
-that failed verification leaves behind — using the content retention horizon as
-the cutoff, so a payload written moments before its row is never mistaken for a
-leftover.
+that failed verification leaves behind — and the staging files of ingests that
+never finished, using the content retention horizon as
+the cutoff, so a payload written moments before its row, or an ingest still
+streaming, is never mistaken for a leftover.
 
 ---
 
@@ -720,6 +721,10 @@ reimplementing.
 
 - Blob payloads live as flat files in the data dir: `store/<hex[0..2]>/<hex>` plus
   `store/<hex>.obao` for the outboard. Small blobs (≤ 16 KiB) are inlined in SQLite.
+  An ingest streams into `store/incoming/` and renames onto its content address, so
+  the shard directories only ever hold whole objects and the CAS root only ever
+  holds directories — a regular file among the shards is what the orphan sweep
+  descends into and fails on (§5.4).
 - All *index* metadata — sizes, completeness bitmaps (which chunk groups of a partially
   fetched object are present and verified), refcounts, pin state — is in SQLite (§10).
 - Partial objects are first-class: the completeness bitmap tracks verified groups, and

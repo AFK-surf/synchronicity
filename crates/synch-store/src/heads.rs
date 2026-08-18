@@ -194,12 +194,16 @@ impl Store {
     /// How many distinct roots an origin has retained at one seq.
     ///
     /// Two is equivocation and is evidence worth keeping (§4.4). An unbounded
-    /// number is a member signing forever at one seq, which the retention rule
+    /// number is a member signing forever at one seq, which retention alone
     /// cannot clear: same-seq forks are *exempt* from `root_retention` until the
     /// origin publishes past that seq, and an attacker simply never does. Every
     /// row is verified and bound, so nothing upstream rejects them, and
     /// `equivocations()` re-reads the whole set per pair, so `doctor` and each
-    /// GC pass go quadratic in the storm.
+    /// GC pass go quadratic in the storm. What bounds the width is
+    /// [`Txn::trim_forks`], which *evicts* the lowest-ordered rows at a seq
+    /// rather than refusing the head that would widen it — acceptance is the
+    /// one thing convergence rests on and may never depend on how many roots
+    /// happened to arrive first.
     pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
         Ok(self.conn().query_row(
             "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
@@ -296,12 +300,32 @@ impl Store {
     /// - **Anything newer than `before`**, which is the retention window
     ///   itself.
     ///
+    /// "Published past the forked seq" is read off the *retained history*, not
+    /// off the complete slot, and that is the difference between a bounded rule
+    /// and an open one. Reading it off the complete head asked whether the head
+    /// this node holds *now* is older than retention, so any origin publishing
+    /// once per `root_retention` pinned every fork row it had ever signed —
+    /// and every trie node reachable from those roots, since retained roots are
+    /// GC mark roots. It was open at the other end too: a fork at a seq *above*
+    /// the complete head never satisfied `current_seq > seq`, so an origin
+    /// signing two roots at each of a thousand far-future seqs and serving none
+    /// of the tries made every one of those rows permanent, `trust rm` and all.
+    /// A retained head at a *higher* seq is the same proof that the origin
+    /// moved on, it is what an origin flooding future seqs supplies by the
+    /// thousand, and only the single highest forked seq is left without one.
+    ///
+    /// Fork evidence goes all at once or not at all: a seq pruned down to one
+    /// root is a row that no longer proves anything, so a forked seq is taken
+    /// only when every root at it is prunable — none of them current, all of
+    /// them past the window — and the row that proves the origin moved past it
+    /// waits for the fork rather than being taken ahead of them.
+    /// [`Txn::trim_forks`] bounds the width of a fork on the way in; this
+    /// bounds how long one lives.
+    ///
     /// Age is `recorded_at`: when *this node* took the row. `created_at` is
     /// signed but is the signer's own unclamped choice, so keying retention on
     /// it would let an origin date a head at the end of time and make both the
     /// row and every trie node reachable from its root permanent here (§5.4).
-    /// The same goes for the complete head, whose `received_at` is what says
-    /// whether the cluster has visibly moved past a fork.
     ///
     /// Returns how many rows were dropped.
     pub fn prune_history_before(&self, origin: &OriginId, before: i64) -> Result<usize> {
@@ -312,29 +336,74 @@ impl Store {
         self.with_immediate_tx(|tx| {
             let complete = head_in(tx, origin, Slot::Complete)?;
             let pending = head_in(tx, origin, Slot::Pending)?;
-            let current_seq = complete.as_ref().map(|h| h.head.seq).unwrap_or(0);
-            let current_recorded = complete.as_ref().map(|h| h.received_at).unwrap_or(i64::MIN);
-            // A seq with more than one retained root is a fork, and both sides
-            // of it are evidence.
-            let forked = forked_seqs_in(tx, origin)?;
-            let moved_past_forks = current_recorded < before;
-
-            let mut pruned = 0;
-            for (seq, root, recorded_at) in history_receipts_in(tx, origin)? {
-                if recorded_at >= before {
-                    continue;
-                }
-                let is_current = [
+            // One snapshot for the whole decision, so a fork and the rows that
+            // prove the origin moved past it are judged against the same set.
+            let receipts = history_receipts_in(tx, origin)?;
+            let is_current = |seq: u64, root: &Hash| {
+                [
                     complete.as_ref().map(|c| &c.head),
                     pending.as_ref().map(|p| &p.head),
                 ]
                 .into_iter()
                 .flatten()
-                .any(|h| h.seq == seq && h.root == root);
-                if is_current {
+                .any(|h| h.seq == seq && h.root == *root)
+            };
+            // A seq with more than one retained root is a fork, and every side
+            // of it is evidence. The exemption lifts for a forked seq only when
+            // the origin is on record past it — a retained row at a higher seq,
+            // itself older than the window — and every root at the seq can go
+            // in the same pass, so the proof is never left half standing.
+            let forked = forked_seqs_in(tx, origin)?;
+            // The highest seq the origin is on record at with a row older than
+            // the window: every forked seq below it has been published past.
+            let moved_past_below = receipts
+                .iter()
+                .filter(|(_, _, recorded_at)| *recorded_at < before)
+                .map(|(seq, _, _)| *seq)
+                .max();
+            // The seqs holding a root this pass may not take — current, or
+            // still inside the window — which is what makes their fork
+            // all-or-nothing.
+            let pinned: std::collections::HashSet<u64> = receipts
+                .iter()
+                .filter(|(seq, root, recorded_at)| *recorded_at >= before || is_current(*seq, root))
+                .map(|(seq, _, _)| *seq)
+                .collect();
+            let expired = |seq: u64| {
+                moved_past_below.is_some_and(|highest| seq < highest) && !pinned.contains(&seq)
+            };
+            // While a fork is exempt, so is the lowest head the origin is on
+            // record at above it. That row is the *proof* the origin moved past
+            // the fork, and it is older than the window, so an ordinary pass
+            // would take it — leaving a fork that nothing can ever retire,
+            // which is the shape of the bug this rule replaces. It stays until
+            // the fork it speaks about can go with it.
+            let witnesses: std::collections::HashSet<u64> = forked
+                .iter()
+                .copied()
+                .filter(|seq| !expired(*seq))
+                .filter_map(|seq| {
+                    receipts
+                        .iter()
+                        .filter(|(s, _, recorded_at)| *s > seq && *recorded_at < before)
+                        .map(|(s, _, _)| *s)
+                        .min()
+                })
+                .collect();
+
+            let mut pruned = 0;
+            for (seq, root, recorded_at) in &receipts {
+                let (seq, recorded_at) = (*seq, *recorded_at);
+                if recorded_at >= before {
                     continue;
                 }
-                if forked.contains(&seq) && !(current_seq > seq && moved_past_forks) {
+                if is_current(seq, root) {
+                    continue;
+                }
+                if forked.contains(&seq) && !expired(seq) {
+                    continue;
+                }
+                if witnesses.contains(&seq) {
                     continue;
                 }
                 // The exemption again, as a condition of the delete rather
@@ -440,15 +509,38 @@ impl Txn<'_> {
         )? as usize)
     }
 
-    /// True if this exact head is already retained, so re-offering one already
-    /// on record is never mistaken for widening the fork.
-    pub fn head_history_has(&self, origin: &OriginId, seq: u64, root: &Hash) -> Result<bool> {
-        Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM head_history
-             WHERE origin_id = ?1 AND seq = ?2 AND root = ?3",
-            params![origin.canonical(), seq as i64, root.as_bytes().to_vec()],
-            |row| row.get::<_, i64>(0),
-        )? > 0)
+    /// Bounds the retained fork at one seq to `keep` roots, evicting the
+    /// lowest-ordered ones, and reports how many rows went.
+    ///
+    /// A retention bound, never an acceptance rule. Same-seq forks are exempt
+    /// from `root_retention` until the origin publishes past the forked seq, so
+    /// an origin signing forever at one seq would otherwise buy permanent
+    /// growth on every peer. Refusing the incoming head instead is what the
+    /// acceptance rule may not do: which roots a peer saw first would then
+    /// decide which head it holds, and two honest peers fed the same set in
+    /// different orders would settle on different heads and refuse each other
+    /// forever. Evicting keeps the *greatest* `keep` roots at the seq, which is
+    /// the same set on every peer whatever the arrival order, and always leaves
+    /// the two that prove the equivocation (§4.4) as long as `keep >= 2`.
+    ///
+    /// A row a slot points at is never evicted: since v11 `heads` names a
+    /// `head_history` row and every head read joins the two, so a slot whose row
+    /// went would be a head that can no longer be read. Same guard, and for the
+    /// same reason, as [`Store::prune_history_before`]'s.
+    pub fn trim_forks(&self, origin: &OriginId, seq: u64, keep: usize) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM head_history
+              WHERE origin_id = ?1 AND seq = ?2
+                AND root NOT IN (
+                      SELECT root FROM head_history
+                       WHERE origin_id = ?1 AND seq = ?2
+                       ORDER BY root DESC LIMIT ?3)
+                AND NOT EXISTS (
+                      SELECT 1 FROM heads h
+                       WHERE h.origin_id = ?1 AND h.seq = ?2
+                         AND h.root = head_history.root)",
+            params![origin.canonical(), seq as i64, keep as i64],
+        )?)
     }
 }
 

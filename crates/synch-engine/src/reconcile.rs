@@ -28,10 +28,20 @@ use crate::error::{EngineError, Result};
 /// How many distinct roots one origin may have retained at a single seq.
 ///
 /// Two is what proves equivocation (§4.4), and the proof is the reason those
-/// rows are exempt from ordinary retention. Past that the rows add no evidence
-/// and cannot be pruned, so an origin signing at one seq forever would grow
-/// every peer's `head_history` without bound. A little headroom over two, so a
-/// genuinely confused origin is recorded rather than truncated at the minimum.
+/// rows are exempt from ordinary retention. Past that the rows add no evidence,
+/// so an origin signing at one seq forever would grow every peer's
+/// `head_history` without bound. A little headroom over two, so a genuinely
+/// confused origin is recorded rather than truncated at the minimum.
+///
+/// A bound on what is *retained*, never on what is accepted. Refusing a head
+/// because the fork was already wide enough made acceptance depend on arrival
+/// order and so destroyed the `(seq, root)` maximum §5.2 converges to: an
+/// origin signing nine roots at one seq left two honest peers holding different
+/// heads, according to which of the nine each saw first, and each then refused
+/// the other's forever.
+/// The cap is applied by evicting the lowest-ordered retained roots at the seq
+/// instead ([`synch_store::Txn::trim_forks`]), which is the same set on every
+/// peer however the roots arrived.
 pub const MAX_RETAINED_FORKS: usize = 8;
 
 /// How many full fetch rounds may make no progress before the pending head is
@@ -50,14 +60,6 @@ pub enum HeadOutcome {
     Unbound,
     /// The head is not strictly greater than what we already hold.
     NotNewer,
-    /// The origin already has [`MAX_RETAINED_FORKS`] roots on record at this
-    /// seq, and this is another one (§4.4).
-    ///
-    /// Refused outright rather than retained: past the cap a further root is no
-    /// more evidence than the two that already prove the equivocation, and the
-    /// rows it would add are exempt from retention until the origin publishes
-    /// past the forked seq — which an origin flooding one seq never does.
-    ForkFlood,
     /// The head was adopted as pending and its trie must be fetched.
     Pending,
     /// The head was adopted and its trie was already present, so the complete
@@ -251,25 +253,6 @@ impl Syncer {
         // the pending slot, so the lower one clobbered the higher and the
         // higher survived only in `head_history` with nothing to re-drive it.
         let outcome = self.store.transaction(|txn| -> Result<HeadOutcome> {
-            // Same-seq forks are exempt from `root_retention` until the
-            // origin publishes past the forked seq, so a member signing an
-            // unlimited number of roots at one seq would buy permanent,
-            // unprunable growth on every peer, surviving even `trust rm`.
-            // Two roots prove the equivocation; past the cap the head is
-            // refused before anything is written. Suppressing only its
-            // history row would not do: `put_head` records the history the
-            // slot points at, so a head that reaches the slot always brings
-            // its row with it.
-            if txn.fork_width(&head.origin, head.seq)? >= MAX_RETAINED_FORKS
-                && !txn.head_history_has(&head.origin, head.seq, &head.root)?
-            {
-                tracing::warn!(
-                    origin = %head.origin,
-                    seq = head.seq,
-                    "refusing further same-seq forks: equivocation is already proven"
-                );
-                return Ok(HeadOutcome::ForkFlood);
-            }
             // Verified heads are provable history and fork evidence even
             // when they lose the ordering comparison, so they are retained
             // either way (§4.4).
@@ -279,12 +262,39 @@ impl Syncer {
             //    Strictly greater on seq alone would not converge: two
             //    peers receiving different same-seq heads in different
             //    orders would diverge permanently.
+            //
+            //    Nothing else may stand in front of this comparison. It is
+            //    the join that makes head selection order-independent, so a
+            //    head that beats the floor reaches the pending slot however
+            //    many roots the origin has already signed at this seq — the
+            //    width of the fork is a storage question, answered below,
+            //    after the ordering has been settled.
             let floor = txn.head_floor(&head.origin)?;
-            if !head.supersedes(floor.as_ref()) {
-                return Ok(HeadOutcome::NotNewer);
+            let outcome = if head.supersedes(floor.as_ref()) {
+                txn.put_head(Slot::Pending, head, now, now)?;
+                HeadOutcome::Pending
+            } else {
+                HeadOutcome::NotNewer
+            };
+
+            // Same-seq forks are exempt from `root_retention` until the
+            // origin publishes past the forked seq, so a member signing an
+            // unlimited number of roots at one seq would otherwise buy
+            // permanent growth on every peer, surviving even `trust rm`.
+            // Two roots prove the equivocation; past the cap the *lowest*
+            // roots at the seq are evicted, which leaves every peer holding
+            // the same [`MAX_RETAINED_FORKS`] greatest roots whatever order
+            // they arrived in, and never touches the row a slot points at.
+            let evicted = txn.trim_forks(&head.origin, head.seq, MAX_RETAINED_FORKS)?;
+            if evicted > 0 {
+                tracing::warn!(
+                    origin = %head.origin,
+                    seq = head.seq,
+                    evicted,
+                    "same-seq forks past the cap evicted: equivocation is already proven"
+                );
             }
-            txn.put_head(Slot::Pending, head, now, now)?;
-            Ok(HeadOutcome::Pending)
+            Ok(outcome)
         })?;
         if !outcome.accepted() {
             return Ok(outcome);
@@ -633,9 +643,7 @@ impl Syncer {
                     report.heads_accepted += 1;
                     report.tries_completed += 1;
                 }
-                HeadOutcome::BadSignature | HeadOutcome::Unbound | HeadOutcome::ForkFlood => {
-                    report.heads_rejected += 1
-                }
+                HeadOutcome::BadSignature | HeadOutcome::Unbound => report.heads_rejected += 1,
                 HeadOutcome::NotNewer => {}
             }
         }
@@ -873,18 +881,19 @@ mod tests {
         assert_eq!(store.complete_head(&origin).unwrap(), None);
     }
 
-    /// A member signing endlessly at one seq stops being recorded.
+    /// A member signing endlessly at one seq stops being *retained* — and is
+    /// never refused.
     ///
     /// Same-seq forks outlive `root_retention` until the origin publishes past
-    /// the forked seq, which an origin flooding one seq never does. Two roots
-    /// prove the equivocation; past the cap the head is refused before anything
-    /// is written, so neither the history nor the slot grows.
+    /// the forked seq, which an origin flooding one seq never does, so the
+    /// width has to be bounded somewhere. It is bounded by eviction, not by
+    /// refusal: the greatest root at the seq always wins the slot, so the
+    /// answer does not depend on which roots arrived first.
     #[test]
-    fn same_seq_forks_stop_being_taken_at_the_cap() {
+    fn same_seq_forks_are_evicted_at_the_cap_and_never_refused() {
         let (_d, store, key, origin) = setup();
         let syncer = Syncer::new(store.clone());
-        // Ascending roots, so each one supersedes the last and would be adopted
-        // on its merits were the fork not already proven.
+        // Ascending roots, so each one supersedes the last.
         for i in 1..=MAX_RETAINED_FORKS as u8 {
             let head = SignedHead::sign(&key, origin.clone(), 1, Hash([i; 32]), 0);
             assert!(
@@ -894,6 +903,8 @@ mod tests {
         }
         assert_eq!(store.fork_width(&origin, 1).unwrap(), MAX_RETAINED_FORKS);
 
+        // Past the cap the heads keep being accepted on their merits, and the
+        // retained set stays at the cap by dropping its lowest roots.
         for i in 1..=4u8 {
             let flood = SignedHead::sign(
                 &key,
@@ -902,25 +913,111 @@ mod tests {
                 Hash([MAX_RETAINED_FORKS as u8 + i; 32]),
                 0,
             );
-            assert_eq!(
-                syncer.offer_head(&flood, 0).unwrap(),
-                HeadOutcome::ForkFlood
-            );
+            assert_eq!(syncer.offer_head(&flood, 0).unwrap(), HeadOutcome::Pending);
         }
         assert_eq!(
             store.fork_width(&origin, 1).unwrap(),
             MAX_RETAINED_FORKS,
             "the retained set stops at the cap"
         );
+        let retained: Vec<u8> = store
+            .head_history(&origin)
+            .unwrap()
+            .iter()
+            .filter(|h| h.seq == 1)
+            .map(|h| h.root.0[0])
+            .collect();
+        assert_eq!(
+            retained,
+            (5..=12u8).rev().collect::<Vec<_>>(),
+            "the greatest roots are what is kept, whatever arrived first"
+        );
         assert_eq!(
             store.head_floor(&origin).unwrap().unwrap().1,
-            Hash([MAX_RETAINED_FORKS as u8; 32]),
-            "and no refused fork reached a slot"
+            Hash([MAX_RETAINED_FORKS as u8 + 4; 32]),
+            "and the greatest root of all holds the slot"
         );
+        // The evidence a fork exists is still there.
+        assert_eq!(store.equivocations().unwrap().len(), 1);
 
         // A head at a later seq is the origin moving on, and is taken normally.
         let next = SignedHead::sign(&key, origin.clone(), 2, Hash([1u8; 32]), 0);
         assert!(syncer.offer_head(&next, 0).unwrap().accepted());
+    }
+
+    /// The same head set, offered in any order, settles on the same head.
+    ///
+    /// This is the join-semilattice §5.2 rests on, and the fork cap used to
+    /// break it: the ninth root at a seq was refused, so a node that met the
+    /// greatest root early kept it and a node that met it tenth never took it,
+    /// and the two then refused each other's heads forever. Acceptance is now
+    /// decided by `supersedes` alone, so the greatest `(seq, root)` wins from
+    /// every arrival order.
+    #[test]
+    fn arrival_order_cannot_change_which_head_a_node_settles_on() {
+        let roots: Vec<u8> = (1..=9).collect();
+        let key = SecretKey::generate();
+        let origin = OriginId::named("nas", "x.example").unwrap();
+        let heads: Vec<SignedHead> = roots
+            .iter()
+            .map(|i| SignedHead::sign(&key, origin.clone(), 1, Hash([*i; 32]), 0))
+            .collect();
+
+        // Ascending, descending, and the shape the repro used: the greatest
+        // root first, so every later offer loses the comparison.
+        let mut orders: Vec<Vec<usize>> = vec![
+            (0..heads.len()).collect(),
+            (0..heads.len()).rev().collect(),
+            std::iter::once(heads.len() - 1)
+                .chain(0..heads.len() - 1)
+                .collect(),
+        ];
+        // And a handful of shuffles, so this is not three hand-picked cases.
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..8 {
+            let mut order: Vec<usize> = (0..heads.len()).collect();
+            for i in (1..order.len()).rev() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                order.swap(i, (state >> 33) as usize % (i + 1));
+            }
+            orders.push(order);
+        }
+
+        let mut settled = Vec::new();
+        let mut dirs = Vec::new();
+        for order in &orders {
+            // One node per arrival order, each with the one key bound.
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(dir.path()).unwrap());
+            store
+                .put_binding(&Binding {
+                    origin: origin.clone(),
+                    node_id: key.public(),
+                    source: BindingSource::Static,
+                    domain: None,
+                    note: None,
+                    added_at: 0,
+                    expires_at: None,
+                })
+                .unwrap();
+            let syncer = Syncer::new(store.clone());
+            for i in order {
+                assert!(
+                    matches!(
+                        syncer.offer_head(&heads[*i], 0).unwrap(),
+                        HeadOutcome::Pending | HeadOutcome::Completed | HeadOutcome::NotNewer
+                    ),
+                    "every offer is judged on the ordering rule alone"
+                );
+            }
+            settled.push(store.head_floor(&origin).unwrap().unwrap());
+            dirs.push(dir);
+        }
+        assert!(
+            settled.windows(2).all(|w| w[0] == w[1]),
+            "every arrival order settles on the same head: {settled:?}"
+        );
+        assert_eq!(settled[0], (1, Hash([9u8; 32])));
     }
 
     /// A peer may only answer with what it was asked for.
