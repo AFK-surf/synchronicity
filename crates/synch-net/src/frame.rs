@@ -6,9 +6,9 @@
 //! What that bounds, precisely: one *stream's* buffer, not a node's memory. The
 //! buffer is sized from the declared length before the body is read, so a peer
 //! that declares 16 MiB and sends nothing has named a 16 MiB allocation for
-//! four bytes of traffic, on every stream it opens
-//! ([`MAX_CONCURRENT_STREAMS`](crate::serve::MAX_CONCURRENT_STREAMS) of them
-//! per connection, and connections are not themselves capped). The reason that
+//! four bytes of traffic, on every stream it opens (`MAX_CONCURRENT_STREAMS`
+//! of them per connection, and connections are not themselves capped). The
+//! reason that
 //! is not the amplification it looks like is `alloc_zeroed`: at this size it is
 //! served by `mmap`, so the pages are not committed until they are written and
 //! an attacker pays for only what it actually sends — measured at ~6 MB
