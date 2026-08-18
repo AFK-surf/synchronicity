@@ -172,6 +172,34 @@ impl KnownKeys {
         self.apexes()
             .any(|watched| watched.zone_of(apex) || apex.zone_of(&watched))
     }
+
+    /// The watched names this set holds that `covered` does not already watch.
+    ///
+    /// The question a resumed run has to ask before trusting its recorded
+    /// positions: those positions were produced under `covered`, and an entry
+    /// naming an apex outside it was stepped over rather than classified. A
+    /// name that `covered` already `watches` is not a widening — it is what
+    /// the auto-insert does when it records the apex of an entry it just
+    /// reported, and that entry was reported precisely *because* the old set
+    /// matched it. Anything else moves the boundary and leaves everything
+    /// behind the position permanently unread.
+    ///
+    /// Compared through `watches` rather than by string equality for that
+    /// reason: set difference over the literal names would call every
+    /// auto-inserted subdomain a coverage change and refuse a run that lost
+    /// nothing.
+    pub fn widening_over(&self, covered: &[String]) -> Vec<String> {
+        let old = KnownKeys {
+            keys: covered
+                .iter()
+                .map(|name| (name.clone(), Vec::new()))
+                .collect(),
+        };
+        self.apexes()
+            .filter(|apex| !old.watches(apex))
+            .map(|apex| apex.to_string())
+            .collect()
+    }
 }
 
 /// One key of a proven set, as an operator needs to see it.

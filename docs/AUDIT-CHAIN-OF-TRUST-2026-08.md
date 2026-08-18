@@ -86,9 +86,26 @@ coverage widens forward while the same hole stays open behind. The documented
 onboarding recipe (`docs/REKOR-ZONE-KEY.md:1546-1559`) is `--from-index <n>
 --allow-gap`, so real deployments start deep in the log.
 
-**Fix**: persist the watched apex set beside `TrustSurface` and treat an addition
-as a surface change — reset that log's `next_index`, or refuse the run naming the
-new apex and the index it would skip.
+**Fix (applied)**: the state now records `watched`, the apex set the stored
+positions actually cover, and a run whose list has widened since is refused,
+naming the new apexes and the index each log stands at. `--allow-gap` accepts
+it, `--from-index 0` re-reads — the same escape and the same wording the
+`--from-index` guard already uses, because it is the same event ("these entries
+are permanently unread") arriving through the state file instead of the command
+line.
+
+`watched` is deliberately not part of `TrustSurface`: a surface change
+invalidates recorded *verdicts*, this invalidates recorded *coverage*, and the
+remedies differ. The comparison runs through `watches` rather than set
+difference over the literal names, so the auto-insert at `:626-629` does not
+trip it — a name the old list already watched in either direction was matched
+by the set in force when those entries were read, so nothing was skipped.
+String equality there would refuse a run that lost nothing, which the test
+asserts by mutation. A state file predating the field is treated as covering
+what it currently watches; refusing every upgrade would name a gap no run can
+close anyway.
+
+Covered by `a_watch_list_that_widened_since_the_last_walk_is_a_gap`.
 
 ### H2. The provider reconciler never re-reads the provider once converged
 
