@@ -1905,3 +1905,70 @@ async fn aborting_an_unknown_upload_is_not_a_success() {
     assert!(response.text().await.unwrap().contains("NoSuchUpload"));
     harness.stop().await;
 }
+
+/// A delete publishes a tombstone even when no `local_files` row backs the path.
+///
+/// The tombstone comes from the scanner's deletion sweep, which walks
+/// `local_files` — so relying on that alone meant a path whose row was missing
+/// produced no tombstone at all, and this node's *live* assertion for the key
+/// stayed in its signed root for good, with the gateway answering `204`.
+#[tokio::test]
+async fn delete_object_tombstones_a_path_with_no_local_row() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    harness.publish("orphaned.txt", b"published once");
+    let http = client();
+
+    // The published entry, with its row taken out from under it — which is what
+    // `reconcile_local_files` does after an interrupted publish.
+    harness
+        .node
+        .store()
+        .remove_local_file("media", "orphaned.txt")
+        .unwrap();
+
+    let response = http
+        .delete(harness.url("/my-media/orphaned.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+
+    // Not merely absent from the disk: tombstoned in what this node publishes.
+    let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
+    let set = harness.node.versions("media", "orphaned.txt").unwrap();
+    let row = harness.node.resolve_set(&set, &ours).unwrap();
+    assert_eq!(
+        row.kind,
+        synch_core::EntryKind::Tombstone,
+        "the delete left a live assertion published"
+    );
+    let response = http
+        .get(harness.url("/my-media/orphaned.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    harness.stop().await;
+}
+
+/// A delete whose file is already gone still publishes the tombstone.
+#[tokio::test]
+async fn delete_object_publishes_even_when_the_file_is_already_gone() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    harness.publish("vanished.txt", b"here for now");
+    // Removed behind the daemon's back, as an out-of-band `rm` would.
+    std::fs::remove_file(harness.space_path.join("vanished.txt")).unwrap();
+
+    let response = client()
+        .delete(harness.url("/my-media/vanished.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+
+    let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
+    let set = harness.node.versions("media", "vanished.txt").unwrap();
+    let row = harness.node.resolve_set(&set, &ours).unwrap();
+    assert_eq!(row.kind, synch_core::EntryKind::Tombstone);
+    harness.stop().await;
+}

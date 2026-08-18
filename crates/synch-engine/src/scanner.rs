@@ -820,7 +820,16 @@ impl Adoption {
             std::process::id(),
             synch_core::now_ns()
         ));
-        let file = std::fs::File::create(&staging)?;
+        // Read *and* write: the payload is written here, and a multipart
+        // completion reads it straight back to take the object's root before
+        // the rename. `File::create` alone is write-only, and the read then
+        // fails with `EBADF` on a file this very process is holding open.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&staging)?;
         Ok(Adoption {
             target,
             staging,
@@ -920,6 +929,27 @@ impl Adoption {
         self.written
     }
 
+    /// The object root of what has been staged so far.
+    ///
+    /// What a multipart completion answers with. Taking the root here rather
+    /// than reading it back off the published entry is the difference between
+    /// describing the bytes this call assembled and describing whatever the
+    /// tree holds for that key by the time the scan reaches it — which a
+    /// concurrent write to the same key wins.
+    pub fn hash_staged(&mut self) -> Result<synch_core::Hash> {
+        use std::io::{Seek, Write};
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.flush()?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let root = synch_core::hash_reader(std::io::BufReader::new(file.try_clone()?))?;
+        // The handle is left at the end, where an append expects it.
+        file.seek(std::io::SeekFrom::End(0))?;
+        Ok(root)
+    }
+
     /// Appends a whole file to the staging payload (§9.4).
     ///
     /// What assembles a multipart upload: each part is its own staged payload,
@@ -944,6 +974,10 @@ impl Adoption {
             .file
             .as_mut()
             .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        // `written` advances as the bytes move, not once at the end: a failure
+        // part-way through still leaves the staging file longer than it was,
+        // and a `written` that under-counts it makes every later size check —
+        // and every error message quoting it — wrong.
         let mut moved = 0u64;
         #[cfg(target_os = "linux")]
         while moved < len {
@@ -956,8 +990,18 @@ impl Adoption {
                 // being written under us, or the filesystem refuses to say
                 // more. The fallback below reads it and reports the real error.
                 Ok(0) => break,
-                Ok(count) => moved += count as u64,
-                Err(_) => break,
+                Ok(count) => {
+                    moved += count as u64;
+                    self.written += count as u64;
+                }
+                // Swallowed only as a signal to fall back — `EXDEV` and
+                // `ENOSYS` are the expected ones — but logged, because an
+                // `ENOSPC` on the destination would otherwise be reported by
+                // the fallback as whatever it happens to hit next.
+                Err(e) => {
+                    tracing::debug!(error = %e, "copy_file_range unavailable; copying by hand");
+                    break;
+                }
             }
         }
         if moved < len {
@@ -972,9 +1016,9 @@ impl Adoption {
                 src.read_exact(piece)?;
                 dest.write_all(piece)?;
                 moved += take as u64;
+                self.written += take as u64;
             }
         }
-        self.written += moved;
         Ok(moved)
     }
 

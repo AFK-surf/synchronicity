@@ -88,6 +88,22 @@ impl Node {
     /// row is the thing that may be lost, and a lost row leaves a directory the
     /// sweeper collects rather than a pointer into nothing.
     pub fn create_upload(&self, space: &str, path: &str, _target: &Path) -> Result<String> {
+        // A key the scanner would skip can never become an object, and finding
+        // that out at completion — after the client has streamed gigabytes and
+        // the parts have been consumed — is the worst possible moment for it.
+        let space_row = self
+            .store()
+            .space(space)?
+            .ok_or_else(|| EngineError::not_found(format!("space {space}")))?;
+        let normalized =
+            synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
+        if crate::ignore::IgnoreSet::for_space(Path::new(&space_row.local_path))?
+            .is_ignored(&normalized, false)
+        {
+            return Err(EngineError::invalid(format!(
+                "{space}/{path} matches an ignore rule, so it could never be published"
+            )));
+        }
         let id = new_upload_id();
         let dir = self.store().upload_dir(&id);
         std::fs::create_dir_all(&dir)?;
@@ -218,41 +234,53 @@ impl Node {
         // One blocking closure for the whole assembly: `copy_file_range` is a
         // syscall per part and the fallback is a read/write loop, and neither
         // belongs on a runtime worker that is also polling every other
-        // connection.
-        let assembled = crate::blocking::offload(move || {
+        // connection. The root is taken here, from the bytes that were actually
+        // written, rather than read back out of the tree afterwards — a
+        // read-back describes whatever the tree holds by then, which a
+        // concurrent write to the same key wins.
+        let (root, size) = crate::blocking::offload(move || {
             let mut adoption = Adoption::at(&target)?;
             for source in &sources {
                 adoption.append_file(source)?;
             }
             let written = adoption.written();
+            let root = adoption.hash_staged()?;
             adoption.commit()?;
-            Ok(written)
+            Ok((root, written))
         })
         .await?;
 
-        // The parts go before the publish, not after: the ingest pipeline is
-        // about to tee the payload into the CAS, and holding the parts across
-        // that makes the peak three copies of the object where two will do.
+        // Past here the object is in the space and this node *will* publish it
+        // — the watcher picks it up even if nothing below runs. So the result is
+        // recorded before anything else can fail, and the parts are unlinked
+        // only once nothing is left that could send the caller back. Unlinking
+        // them any earlier, for the peak-disk saving it buys, leaves rows naming
+        // payloads that are gone: every retry then dies on a missing file
+        // instead of being told what was actually wrong.
+        self.store()
+            .finish_complete(upload, &root, size, synch_core::now_ns())?;
         for part in &chosen {
             let _ = std::fs::remove_file(dir.join(&part.file));
         }
+        let _ = std::fs::remove_dir_all(&dir);
 
         // The ordinary indexing pipeline takes it from here — hash, CAS, stage,
         // publish — exactly as a `PutObject` does, so a completed upload is a
-        // version like any other.
-        self.scan_publish_push().await?;
-        let ours = synch_store::VersionPolicy::Origin(self.origin().clone());
-        let set = self.versions(space, path)?;
-        let row = self.resolve_set(&set, &ours)?;
-        let root = row
-            .content
-            .ok_or_else(|| EngineError::invalid("the assembled object published no root"))?;
-        self.store()
-            .finish_complete(upload, &root, assembled, synch_core::now_ns())?;
-        let _ = std::fs::remove_dir_all(&dir);
+        // version like any other. A failure here is *not* a failed completion:
+        // the object is committed and the answer recorded, and the next scan
+        // publishes it. Reporting failure would tell the client to retry an
+        // upload that has already landed.
+        if let Err(e) = self.scan_publish_push().await {
+            tracing::warn!(
+                upload,
+                error = %e,
+                "the completed object is in the space but this publish failed; \
+                 the next scan will pick it up"
+            );
+        }
         Ok(CompletedUpload {
             root,
-            size: assembled,
+            size,
             replayed: false,
         })
     }
@@ -285,16 +313,64 @@ impl Node {
                 .await?
                 .is_some();
 
-        // The ordinary indexing pipeline turns the missing file into a
-        // tombstone: the deletion sweep stages the `f:` key as `None` and the
-        // publish signs it, exactly as an `rm` in the space directory would.
-        if removed {
-            self.scan_publish_push().await?;
-        }
+        // Unconditionally, and not only when a file was removed. The tombstone
+        // comes from the scanner's deletion sweep, which walks `local_files`
+        // rows, so a path whose file was already gone — removed out of band
+        // while the daemon was down — would otherwise never be published as
+        // deleted at all. An unchanged tree stages nothing, so being wrong here
+        // costs one stat pass.
+        self.scan_publish_push().await?;
+
+        // The sweep tombstones what it can see, and what it can see is
+        // `local_files`. If our own entry is *still live* after that, the sweep
+        // never saw the path — so the tombstone is staged here, from the trie
+        // rather than from the row that is missing. A row goes missing more
+        // easily than it looks: `reconcile_local_files` drops any the current
+        // head does not corroborate, and the control socket answers before the
+        // startup scan has finished. Without this the delete returns `204` and
+        // leaves this node asserting the key, signed, to every peer, with no
+        // later scan or restart able to notice.
+        let mine = synch_store::VersionPolicy::Origin(self.origin().clone());
         let set = self.versions(space, path)?;
+        if self
+            .resolve_set(&set, &mine)
+            .is_ok_and(|row| row.kind != synch_core::EntryKind::Tombstone)
+        {
+            tracing::warn!(
+                space,
+                path,
+                "no local record backed this path; tombstoning it from the trie"
+            );
+            // The same tombstone the sweep would have staged: a *record*, not a
+            // removal. Staging `None` retires the key outright, which is what
+            // expiring a tombstone means — the path would read as "never
+            // existed" rather than "deleted at seq N", and peers would lose the
+            // assertion that tells them to stop serving their own copies.
+            let previous = self
+                .store()
+                .entry(self.origin(), space, path)?
+                .and_then(|entry| entry.content);
+            let tombstone =
+                synch_core::FileEntry::tombstone(synch_core::now_ns(), self.next_seq()?, previous);
+            let encoded =
+                postcard::to_stdvec(&tombstone).map_err(|e| EngineError::Record(e.to_string()))?;
+            self.stage([(synch_core::file_key(space, path)?, Some(encoded))]);
+            self.flush_staged().await?;
+        }
+
+        // Whether the key survives is a question about *other* origins. Our own
+        // entry is a tombstone by now, or was never there; counting it would
+        // report every ordinary delete as one somebody else is still
+        // publishing, which is the opposite of the warning it exists to give.
+        let ours = self.origin();
+        let set = self.versions(space, path)?;
+        let still_published = set
+            .entries
+            .iter()
+            .any(|entry| entry.origin != *ours && entry.kind != synch_core::EntryKind::Tombstone);
         Ok(Deleted {
             removed,
-            still_published: set.exists(),
+            still_published,
         })
     }
 
@@ -354,11 +430,14 @@ impl Node {
     /// inside a directory that is very much still live, so no directory-level
     /// sweep would ever see them.
     pub fn sweep_uploads(&self, ttl: std::time::Duration) -> Result<usize> {
-        let cutoff = synch_core::now_ns().saturating_sub(ttl.as_nanos() as i64);
+        let ttl_ns = i64::try_from(ttl.as_nanos()).unwrap_or(i64::MAX);
+        let cutoff = synch_core::now_ns().saturating_sub(ttl_ns);
         let mut collected = 0;
         for id in self.store().uploads_before(cutoff)? {
             // `abort_upload` refuses while a completion holds the latch, which
-            // is what should happen: an assembly in flight is not abandoned.
+            // is what should happen: an assembly in flight is not abandoned. A
+            // latch nothing is behind any more ages out on its own and is
+            // collected on a later pass.
             match self.store().abort_upload(&id) {
                 Ok(true) => {
                     let _ = std::fs::remove_dir_all(self.store().upload_dir(&id));
@@ -377,27 +456,49 @@ impl Node {
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
             if !live.contains(&name) {
-                // A directory with no row: either a crash between the two, or a
-                // row already swept. The grace window is what keeps this off a
-                // directory `create_upload` made a moment ago.
-                if older_than(&entry.path(), ORPHAN_GRACE) {
-                    let _ = std::fs::remove_dir_all(entry.path());
-                    collected += 1;
+                // Either a crash between the mkdir and the row, or a row already
+                // swept. The grace window keeps this off a directory
+                // `create_upload` made a moment ago. A stray *file* here is
+                // removed as one: `remove_dir_all` refuses it, and nothing else
+                // would ever come back for it.
+                if older_than(&path, ORPHAN_GRACE) {
+                    let removed = if path.is_dir() {
+                        std::fs::remove_dir_all(&path).is_ok()
+                    } else {
+                        std::fs::remove_file(&path).is_ok()
+                    };
+                    if removed {
+                        collected += 1;
+                    }
                 }
                 continue;
             }
-            let named: std::collections::HashSet<String> = self
-                .store()
-                .upload_parts(&name)?
-                .into_iter()
-                .map(|part| part.file)
-                .collect();
-            let Ok(payloads) = std::fs::read_dir(entry.path()) else {
+            // One bad row must not end the pass: everything else in this loop is
+            // best-effort, and a sweep that gives up on the first oddity leaves
+            // every later upload uncollected forever.
+            let named: std::collections::HashSet<String> = match self.store().upload_parts(&name) {
+                Ok(parts) => parts.into_iter().map(|part| part.file).collect(),
+                Err(e) => {
+                    tracing::debug!(upload = %name, error = %e, "parts not readable; not swept");
+                    continue;
+                }
+            };
+            let Ok(payloads) = std::fs::read_dir(&path) else {
                 continue;
             };
             for payload in payloads.flatten() {
                 let file = payload.file_name().to_string_lossy().into_owned();
+                // An `Adoption`'s own staging file lives in this directory while
+                // a part is still streaming, under a dot-prefixed name no row
+                // will ever mention. It is not an orphan — it is a write in
+                // progress, and a client that paused for longer than the grace
+                // window would find its part unlinked from under an open handle
+                // and fail for a reason it could do nothing about.
+                if file.starts_with('.') {
+                    continue;
+                }
                 if !named.contains(&file) && older_than(&payload.path(), ORPHAN_GRACE) {
                     let _ = std::fs::remove_file(payload.path());
                     collected += 1;
@@ -452,9 +553,9 @@ fn choose_parts<'a>(
         return Err(EngineError::invalid("a completion names no parts"));
     }
     // Order first, then existence, then sizes — and all of each before any of
-    // the next. Checking a part's size before noticing that a *later* part was
-    // never uploaded reports the wrong problem: the client would shrink a part
-    // that was fine and retry into the same failure.
+    // the next. Reporting a part as too small when a *later* part was never
+    // uploaded sends the client to shrink a part that was fine, and it retries
+    // into the same failure.
     let mut previous = 0;
     for (number, _) in wanted {
         if *number <= previous {
@@ -599,5 +700,108 @@ mod tests {
         assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
         assert_ne!(id, new_upload_id());
+    }
+}
+
+#[cfg(test)]
+mod sweeper_tests {
+    use super::*;
+    use crate::{Node, NodeConfig};
+
+    async fn node_with_space() -> (tempfile::TempDir, tempfile::TempDir, Node) {
+        let data = tempfile::tempdir().unwrap();
+        let space = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        node.add_space("media", space.path()).unwrap();
+        (data, space, node)
+    }
+
+    /// The sweeper collects what nobody is coming back for, and nothing else.
+    #[tokio::test]
+    async fn the_sweeper_collects_only_what_is_abandoned() {
+        let (_d, _s, node) = node_with_space().await;
+        let target = node.upload_target("media", "a.bin").unwrap();
+        let id = node.create_upload("media", "a.bin", &target).unwrap();
+
+        assert_eq!(node.sweep_uploads(std::time::Duration::ZERO).unwrap(), 1);
+        assert!(node.store().upload(&id).unwrap().is_none());
+        assert!(!node.store().upload_dir(&id).exists());
+
+        // A live upload with a long TTL is left alone.
+        let id = node.create_upload("media", "b.bin", &target).unwrap();
+        assert_eq!(node.sweep_uploads(DEFAULT_UPLOAD_TTL).unwrap(), 0);
+        assert!(node.store().upload(&id).unwrap().is_some());
+        node.shutdown().await.unwrap();
+    }
+
+    /// A part still streaming is not an orphan.
+    ///
+    /// An `Adoption`'s staging file lives in the upload directory under a
+    /// dot-prefixed name no row will ever mention. Collecting it would unlink a
+    /// part from under an open handle, and the client would see a failure it
+    /// could do nothing about.
+    #[tokio::test]
+    async fn the_sweeper_leaves_a_write_in_progress_alone() {
+        let (_d, _s, node) = node_with_space().await;
+        let target = node.upload_target("media", "a.bin").unwrap();
+        let id = node.create_upload("media", "a.bin", &target).unwrap();
+        let staging = node.open_part(&id, "media", "a.bin", 1).unwrap();
+        let mut adoption = crate::scanner::Adoption::at(&staging.path).unwrap();
+        adoption.write(b"still arriving").unwrap();
+
+        node.sweep_uploads(DEFAULT_UPLOAD_TTL).unwrap();
+        let part = node.commit_part(staging, adoption).unwrap();
+        assert_eq!(part.size, 14);
+        assert_eq!(node.store().upload_parts(&id).unwrap().len(), 1);
+        node.shutdown().await.unwrap();
+    }
+
+    /// A key the scanner would skip is refused before the client streams.
+    #[tokio::test]
+    async fn an_unpublishable_key_is_refused_at_creation() {
+        let (_d, _s, node) = node_with_space().await;
+        let target = node.upload_target("media", "notes.tmp").unwrap();
+        assert!(
+            node.create_upload("media", "notes.tmp", &target).is_err(),
+            "an ignored key was accepted"
+        );
+        let target = node.upload_target("media", "notes.txt").unwrap();
+        assert!(node.create_upload("media", "notes.txt", &target).is_ok());
+        node.shutdown().await.unwrap();
+    }
+
+    /// A completion answers with the root of the bytes it assembled.
+    #[tokio::test]
+    async fn a_completion_hashes_what_it_assembled() {
+        let (_d, space, node) = node_with_space().await;
+        let target = node.upload_target("media", "joined.bin").unwrap();
+        let id = node.create_upload("media", "joined.bin", &target).unwrap();
+
+        let head = vec![7u8; MIN_PART_SIZE as usize];
+        let tail = b"and the tail".to_vec();
+        for (number, bytes) in [(1u32, &head), (2u32, &tail)] {
+            let staging = node.open_part(&id, "media", "joined.bin", number).unwrap();
+            let mut adoption = crate::scanner::Adoption::at(&staging.path).unwrap();
+            adoption.write(bytes).unwrap();
+            node.commit_part(staging, adoption).unwrap();
+        }
+        let done = node
+            .complete_upload(&id, "media", "joined.bin", &[(1, None), (2, None)])
+            .await
+            .unwrap();
+
+        let mut expected = head.clone();
+        expected.extend_from_slice(&tail);
+        assert_eq!(done.size, expected.len() as u64);
+        assert_eq!(done.root, synch_core::Hash::new(&expected));
+        assert_eq!(
+            std::fs::read(space.path().join("joined.bin")).unwrap(),
+            expected
+        );
+        // The parts and their directory go once the answer is recorded.
+        assert!(!node.store().upload_dir(&id).exists());
+        assert!(node.store().upload_parts(&id).unwrap().is_empty());
+        node.shutdown().await.unwrap();
     }
 }
