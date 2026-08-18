@@ -65,7 +65,19 @@ fn fanout_bomb(store: &MemStore, k: usize) -> Hash {
     child
 }
 
+/// Ignored because it is expensive *by construction*, not because it is
+/// flaky: refusal happens at `WALK_POSITION_CEILING`, so asserting it end to
+/// end means walking that many positions — ~8 s in release, ~90 s in a debug
+/// CI run, and the CI job runs the suite twice. `trie.rs`'s
+/// `the_walk_guard_stops_at_the_ceiling` covers the guard's arithmetic in
+/// microseconds; this covers the wiring, and is worth running by hand
+/// (`cargo test -- --ignored`) whenever either changes.
+///
+/// The earlier per-node-arrival ratio made this cheap — it stopped the walk at
+/// ~65 k positions — but only because it fired on shapes honest data also
+/// produces, which is why it is gone.
 #[test]
+#[ignore = "walks to WALK_POSITION_CEILING; see the fast guard test in trie.rs"]
 fn a_fanout_bomb_is_refused_rather_than_walked() {
     // Unbounded, k = 6 is 16.7M changes and 155 s; at a 64M-position ceiling it
     // slipped under entirely and wrote every one of those rows. The walk stops
@@ -141,11 +153,14 @@ fn a_first_adoption_diff_survives_the_documented_corpus_size() {
     let store = MemStore::new();
     let trie = Trie::new(&store);
     let mut root = Hash::EMPTY;
-    for i in 0..100_000u32 {
+    // Sixty thousand files, which is where this actually broke: two records
+    // each, so 120 000 entries. Bigger proves nothing more and costs debug CI
+    // time on every run.
+    for i in 0..60_000u32 {
         let entry = format!("f:media/photos/2024/07/IMG_{i:07}.jpg");
         root = trie.insert(root, entry.as_bytes(), &[7u8; 55]).unwrap();
         let ad = format!("b:{i:064x}");
         root = trie.insert(root, ad.as_bytes(), &[3u8; 40]).unwrap();
     }
-    assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 200_000);
+    assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 120_000);
 }

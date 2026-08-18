@@ -1412,3 +1412,27 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// The guard stops a walk at exactly the ceiling.
+    ///
+    /// Driven directly, in microseconds. Proving the same thing through `diff`
+    /// costs a real fan-out DAG expanded to `WALK_POSITION_CEILING` positions,
+    /// which is ~8 s in release and ~90 s in a debug CI run — see
+    /// `fanout_bomb.rs`, where that end-to-end assertion lives behind
+    /// `#[ignore]`. This is the arithmetic; that one is the wiring.
+    #[test]
+    fn the_walk_guard_stops_at_the_ceiling() {
+        let mut guard = FanoutGuard::default();
+        for i in 0..WALK_POSITION_CEILING {
+            guard
+                .visit()
+                .unwrap_or_else(|e| panic!("refused at position {i}, under the ceiling: {e}"));
+        }
+        let err = guard.visit().expect_err("the ceiling must be enforced");
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
+}
