@@ -237,10 +237,77 @@ impl GroupRange {
 }
 
 /// A set of chunk-group ranges, in 16 KiB group units (§6.4).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ChunkRanges {
     /// Sorted, non-overlapping ranges.
     pub ranges: Vec<GroupRange>,
+}
+
+/// Decoding stops at [`MAX_RANGES`] rather than checking afterwards.
+///
+/// Both sides refuse a range set past [`MAX_RANGES`], because the set
+/// operations under it are quadratic in the number of ranges — but the check
+/// ran on the already-materialized `Vec`. A `GroupRange` of two zeroes is two
+/// postcard bytes, so a frame at [`MAX_FRAME_LEN`] decoded to ~8.4 million
+/// elements, ~134 MB resident, before anything looked at the length: an eightfold
+/// heap amplification over the frame the reader had already accepted, per
+/// stream, on both `GetSlice` and `GetProof`.
+///
+/// Refusing outright rather than truncating: unlike a `BlobAd`'s spans, where a
+/// short tail is a weaker claim and costs a re-fetch, a truncated *request* is a
+/// different request, and a truncated `served` would silently overstate what a
+/// provider withheld.
+impl<'de> Deserialize<'de> for ChunkRanges {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            ranges: BoundedRanges,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(ChunkRanges {
+            ranges: raw.ranges.0,
+        })
+    }
+}
+
+/// A range list that refuses to grow past [`MAX_RANGES`] while decoding.
+struct BoundedRanges(Vec<GroupRange>);
+
+impl<'de> Deserialize<'de> for BoundedRanges {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = BoundedRanges;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "at most {MAX_RANGES} chunk-group ranges")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<BoundedRanges, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                // Never `with_capacity(size_hint)`: the hint is the peer's.
+                let mut ranges: Vec<GroupRange> = Vec::new();
+                while let Some(range) = seq.next_element::<GroupRange>()? {
+                    if ranges.len() >= MAX_RANGES {
+                        return Err(serde::de::Error::custom(format!(
+                            "a range set past the {MAX_RANGES} limit"
+                        )));
+                    }
+                    ranges.push(range);
+                }
+                Ok(BoundedRanges(ranges))
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
 }
 
 impl ChunkRanges {

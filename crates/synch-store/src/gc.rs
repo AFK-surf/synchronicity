@@ -57,14 +57,20 @@ impl Store {
                 let conn = txn.conn();
                 let roots = retained_roots_in(conn)?;
                 stats.roots_marked = roots.len();
+                // One accumulating mark set across every retained root, not one
+                // walk per root. Successive roots of an origin share all but
+                // the path that changed, so walking each into its own set made
+                // the pass cost a store read per node *per root* — and
+                // `head_history` holds a row per publish for `root_retention`,
+                // so that multiplier is in the thousands for a node that
+                // publishes steadily. All of it inside the immediate
+                // transaction below, which holds the one write connection.
                 let trie = Trie::new(txn);
-                let mut nodes = HashSet::new();
-                let mut values = HashSet::new();
+                let mut marked = synch_mpt::Reachable::default();
                 for root in &roots {
-                    let reachable = trie.reachable(*root)?;
-                    nodes.extend(reachable.nodes);
-                    values.extend(reachable.values);
+                    trie.reach_into(*root, &mut marked)?;
                 }
+                let (nodes, values) = (marked.nodes, marked.values);
                 // Deleted set-wise rather than row by row: the old loop pulled
                 // every hash into a `Vec` and issued one
                 // `DELETE ... WHERE hash = ?` per unreferenced row, which on a
@@ -107,15 +113,23 @@ impl Store {
         let referenced = self.referenced_content()?;
         let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
         let mut stats = GcStats::default();
-        for blob in self.blobs()? {
-            if referenced.contains(&blob.root) || pinned.contains(&blob.root) {
+        // The three reads above are a snapshot and the delete is a fourth
+        // statement, so a pin or a resumed fetch landing in between would
+        // otherwise be decided against by a snapshot older than it is. They
+        // stay as a cheap pre-filter — they keep the pass from opening a
+        // transaction per row — and `delete_blob_if_collectable` re-reads the
+        // predicate inside the transaction that does the delete, which is what
+        // actually decides.
+        for candidate in self.blob_candidates()? {
+            if referenced.contains(&candidate.root) || pinned.contains(&candidate.root) {
                 continue;
             }
-            if blob.last_access >= before {
+            if candidate.last_access >= before {
                 continue;
             }
-            self.delete_blob(&blob.root)?;
-            stats.blobs += 1;
+            if self.delete_blob_if_collectable(&candidate.root, before)? {
+                stats.blobs += 1;
+            }
         }
         Ok(stats)
     }
@@ -319,8 +333,15 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
 /// Every origin's complete and pending heads plus retained history roots
 /// (§5.4). Pending heads must be in the mark set or GC would eat an in-progress
 /// bootstrap.
+///
+/// One table, not a union across two, and for the reason
+/// [`Store::retained_roots`] gives: `put_head` writes the signature to
+/// `head_history` before the slot points at it, and both delete paths refuse to
+/// remove a row a slot still names, so every current head's root is here by
+/// construction. The union returned the same set — but stating the mark set
+/// twice, in two places, is how the two come to disagree.
 fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
-    let mut stmt = conn.prepare("SELECT root FROM heads UNION SELECT root FROM head_history")?;
+    let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut out = Vec::new();
     for row in rows {

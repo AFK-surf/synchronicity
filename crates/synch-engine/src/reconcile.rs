@@ -44,8 +44,14 @@ use crate::error::{EngineError, Result};
 /// peer however the roots arrived.
 pub const MAX_RETAINED_FORKS: usize = 8;
 
-/// How many full fetch rounds may make no progress before the pending head is
-/// abandoned and head selection re-runs (§5.2).
+/// How many fetch rounds against one peer may make no progress before the
+/// pending head is abandoned and head selection re-runs (§5.2).
+///
+/// Per fetch, not across every advertiser: the counter lives in the loop that
+/// asks, so it only ever counts against a peer that was actually asked. A
+/// pending head no peer advertises at or above is never fetched at all and so
+/// never counted — that case is the maintenance pass's `pending_head_ttl`
+/// sweep, and the two together are what §5.2 means by no wedging.
 pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
 
 /// What happened when a head was offered.
@@ -170,6 +176,22 @@ impl Syncer {
                 .cmp(&b.origin)
                 .then(a.order_key().cmp(&b.order_key()))
         });
+        // The wire caps a head-carrying message at `MAX_HEADS_PER_MESSAGE`, and
+        // the responder and the dialer both refuse one that overruns it — so a
+        // node that built a longer list than it is allowed to send would fail
+        // every exchange in both directions, permanently, with nothing to
+        // repair it. Heads are never deleted when trust is removed, so the list
+        // only grows. §12 sizes membership two orders of magnitude below the
+        // cap, so this trims nothing in any real cluster; it is here so the
+        // request this node makes is always one it is allowed to make.
+        if out.len() > synch_core::MAX_HEADS_PER_MESSAGE {
+            tracing::warn!(
+                summaries = out.len(),
+                cap = synch_core::MAX_HEADS_PER_MESSAGE,
+                "more origins than one Hello can carry: advertising the lowest-sorting prefix"
+            );
+            out.truncate(synch_core::MAX_HEADS_PER_MESSAGE);
+        }
         Ok(out)
     }
 
@@ -679,12 +701,22 @@ impl Syncer {
 /// Verifies one batch of what a peer served and commits it, refusing anything
 /// that was not asked for.
 ///
-/// Two things are checked and both are containment: a payload has to hash to the
-/// hash it was requested by, and it has to be one of the hashes this walk asked
-/// for. Without the second, a peer answering every request with `missing` plus
-/// one self-consistent pair of its own counts as progress on every round — the
-/// unproductive counter never fires, the fetch loop never ends, and the junk
-/// lands in the trie tables.
+/// Three things are checked and all three are containment: a payload has to hash
+/// to the hash it was requested by, it has to be one of the hashes this walk
+/// asked for, and it may appear only once. Without the second, a peer answering
+/// every request with `missing` plus one self-consistent pair of its own counts
+/// as progress on every round — the unproductive counter never fires, the fetch
+/// loop never ends, and the junk lands in the trie tables.
+///
+/// The third is what bounds the answer's *size*. A request is capped at
+/// [`MAX_BATCH`] hashes, but the response it draws was capped only by the frame
+/// length: a peer could answer 256 wanted hashes with a 16 MiB frame repeating
+/// one of them, every entry passing both other checks, and each repeat costs an
+/// autocommit `INSERT OR IGNORE` on the store's single write connection — so a
+/// cheap request bought six figures of serialized statements, blocking every
+/// other database user in the process. Counting repeats as `learned` also
+/// defeated the [`MAX_UNPRODUCTIVE_ROUNDS`] escape, since a peer serving one
+/// real node and 10^5 copies of it makes progress forever.
 ///
 /// Nodes and values differ only in how a payload is hashed, where it is stored
 /// and which error names it, so the checks live here rather than in two loops
@@ -699,11 +731,19 @@ fn take_served(
     mismatch: impl Fn(synch_core::Hash) -> NetError,
     put: impl Fn(&synch_core::Hash, &[u8]) -> Result<()>,
 ) -> Result<usize> {
+    // A wanted hash can be asked for once and so may be answered once. The set
+    // is built from the request, never from the response, so the peer cannot
+    // grow it.
+    let mut outstanding: std::collections::HashSet<synch_core::Hash> =
+        requested.iter().copied().collect();
     let mut stored = 0usize;
     for (hash, bytes) in served {
-        if !requested.contains(hash) {
+        // `remove` is the containment check and the repeat check at once: a
+        // hash that was never asked for is not in the set, and one already
+        // served has been taken out of it.
+        if !outstanding.remove(hash) {
             return Err(EngineError::Net(NetError::Unexpected(format!(
-                "peer served unrequested trie {what} {hash}"
+                "peer served unrequested or repeated trie {what} {hash}"
             ))));
         }
         // A malicious or corrupt peer can withhold, never inject.
@@ -1062,6 +1102,58 @@ mod tests {
             Err(EngineError::Net(NetError::ValueHashMismatch { .. }))
         ));
         assert_eq!(*stored.borrow(), vec![unrequested]);
+    }
+
+    /// A peer may answer each wanted hash once.
+    ///
+    /// Containment alone bounds *which* hashes may come back, not how many
+    /// times: a request capped at `MAX_BATCH` drew a response capped only by
+    /// the frame length, so one wanted node repeated to fill 16 MiB passed
+    /// every check and cost an autocommit insert apiece on the store's single
+    /// write connection. Counting the repeats as progress also defeated
+    /// `MAX_UNPRODUCTIVE_ROUNDS`, so a peer serving one real node and a
+    /// hundred thousand copies of it never looked stuck.
+    #[test]
+    fn a_peer_may_not_answer_the_same_hash_twice() {
+        let payload = b"a node that really was asked for".to_vec();
+        let wanted = Hash::new(&payload);
+        let stored = std::cell::RefCell::new(Vec::new());
+        let take = |requested: &[Hash], served: &[(Hash, Vec<u8>)]| {
+            take_served(
+                requested,
+                served,
+                "value",
+                |bytes| Some(Hash::new(bytes)),
+                |expected| NetError::ValueHashMismatch { expected },
+                |hash, _| {
+                    stored.borrow_mut().push(*hash);
+                    Ok(())
+                },
+            )
+        };
+
+        let err = take(
+            &[wanted],
+            &[(wanted, payload.clone()), (wanted, payload.clone())],
+        )
+        .expect_err("a repeat is refused");
+        assert!(err.to_string().contains("repeated"), "{err}");
+        // The first copy was taken before the second was seen; what matters is
+        // that the answer does not run past the request.
+        assert_eq!(*stored.borrow(), vec![wanted]);
+
+        // The honest shape — every wanted hash at most once — still passes.
+        stored.borrow_mut().clear();
+        let other = b"a second wanted node".to_vec();
+        let other_hash = Hash::new(&other);
+        assert_eq!(
+            take(
+                &[wanted, other_hash],
+                &[(wanted, payload), (other_hash, other)]
+            )
+            .unwrap(),
+            2
+        );
     }
 
     #[test]

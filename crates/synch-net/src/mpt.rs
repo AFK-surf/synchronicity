@@ -474,7 +474,18 @@ impl MptClient {
             write_frame(&mut send, &MptMessage::HeadsWant { origins: want }).await?;
 
             let received = match read_frame::<MptMessage>(&mut recv).await? {
-                MptMessage::Heads { heads } => heads,
+                MptMessage::Heads { heads } => {
+                    // The answer to our own `HeadsWant` is bounded like every
+                    // other head-carrying message. It was the one that was not:
+                    // the responder caps its `Hello`, its `Heads` push and its
+                    // `HeadsWant`, and this side caps the `Hello` it reads back
+                    // — but a peer could answer a want-list of one origin with
+                    // a full frame of heads, and `sync_with` offers every one
+                    // of them, at an Ed25519 verification and a `head_history`
+                    // insert apiece. Same rule as `Providers` on this side.
+                    check_heads(heads.len(), "a Heads answer")?;
+                    heads
+                }
                 MptMessage::Error { reason } => return Err(NetError::Unexpected(reason)),
                 other => return Err(unexpected("Heads", &other)),
             };
@@ -598,7 +609,15 @@ impl MptClient {
                 MptMessage::BindingsFor {
                     origin: answered,
                     keys,
-                } if &answered == origin => Ok(keys),
+                } if &answered == origin => {
+                    // Bounded like every other list off the wire. A `NodeId`
+                    // decodes through `VerifyingKey::from_bytes`, an Edwards
+                    // point decompression apiece, so an unbounded answer buys
+                    // seconds of curve arithmetic for one small request — the
+                    // same shape `Providers` is capped against just below.
+                    check_heads(keys.len(), "a BindingsFor answer")?;
+                    Ok(keys)
+                }
                 MptMessage::BindingsFor {
                     origin: answered, ..
                 } => Err(NetError::Unexpected(format!(

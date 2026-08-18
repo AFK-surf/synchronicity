@@ -18,7 +18,7 @@
 //! refresh lags furthest.
 
 use iroh_base::SecretKey;
-use synch_core::{now_ns, NodeId, OriginId, SignedHead};
+use synch_core::{now_ns, Hash, NodeId, OriginId, SignedHead};
 use synch_net::Net;
 use synch_store::{Binding, BindingSource, DeviceKey, KeyState, Slot};
 
@@ -201,36 +201,64 @@ impl Node {
         }
         let net = Net::bind(self.store().clone(), held.secret.clone(), options).await?;
 
-        // The node must be able to verify its own heads after a restart, which
-        // means holding a binding for the key that signs them. This is its own
-        // locally generated key, not a claim from the network.
-        self.store().put_binding(&Binding {
-            origin: self.origin().clone(),
+        // Everything a rotation changes lands in one transaction, for the same
+        // reason a publish does (§10): the binding, the two key states, and the
+        // re-signed head are one atomic move of this node's identity.
+        //
+        // As separate autocommit statements this had two failure modes. The two
+        // key-state updates could be interrupted between them, leaving no
+        // active key at all — `Node::open` then refuses to start, and the
+        // command that would repair it needs a running daemon. And the head was
+        // built from `current_root()` and `next_seq()` read outside any
+        // transaction, while the publisher runs as an independent task that
+        // takes no lock this path holds: a publish committing between those two
+        // reads made activation sign `(publish_seq + 1, OLD_ROOT)` into the
+        // complete slot, so `entries` held the new root's state while the head
+        // named the old one — and `push_head` then handed that head to the whole
+        // membership, where every peer materialized a rollback of the batch that
+        // had just been published.
+        let origin = self.origin().clone();
+        let secret = held.secret.clone();
+        let now = now_ns();
+        let binding = Binding {
+            origin: origin.clone(),
             node_id: *new_key,
             source: BindingSource::Static,
-            domain: self.origin().domain().map(str::to_string),
+            domain: origin.domain().map(str::to_string),
             note: Some("self".into()),
-            added_at: now_ns(),
+            added_at: now,
             expires_at: None,
-        })?;
-        self.store()
-            .set_device_key_state(&previous_key, KeyState::Retiring)?;
-        self.store()
-            .set_device_key_state(new_key, KeyState::Active)?;
-        self.swap_active_endpoint(held.secret.clone(), net);
+        };
+        let floor = self.store().publish_floor()?.unwrap_or(0);
+        let head = self.store().transaction(|txn| -> Result<SignedHead> {
+            // The node must be able to verify its own heads after a restart,
+            // which means holding a binding for the key that signs them. This
+            // is its own locally generated key, not a claim from the network.
+            txn.put_binding(&binding)?;
+            txn.set_device_key_state(&previous_key, KeyState::Retiring)?;
+            txn.set_device_key_state(new_key, KeyState::Active)?;
 
-        // Re-sign the current root as a new head under the new key. The data is
-        // untouched: only the signer changes, and seq still moves forward so
-        // peers accept it under the ordinary (seq, root) rule.
-        let root = self.current_root()?;
-        let seq = self.next_seq()?;
-        let head = SignedHead::sign(&held.secret, self.origin().clone(), seq, root, now_ns());
-        // `put_head` retains the signature; the displaced head retained its own
-        // when it took the slot (§10, v11).
-        self.store()
-            .put_head(Slot::Complete, &head, now_ns(), now_ns())?;
+            // Re-sign the current root as a new head under the new key. The
+            // data is untouched: only the signer changes, and seq still moves
+            // forward so peers accept it under the ordinary (seq, root) rule.
+            // Both come from the snapshot the flip is written against, exactly
+            // as `publish` reads them.
+            let previous = txn.complete_head(&origin)?;
+            let root = previous.as_ref().map(|h| h.root).unwrap_or(Hash::EMPTY);
+            let seq = previous.as_ref().map(|h| h.seq + 1).unwrap_or(1).max(floor);
+            let head = SignedHead::sign(&secret, origin.clone(), seq, root, now);
+            // `put_head` retains the signature; the displaced head retained its
+            // own when it took the slot (§10, v11).
+            txn.put_head(Slot::Complete, &head, now, now)?;
+            // The root does not move, so the diff is empty — but running it is
+            // what keeps every complete-slot writer to the same rule, rather
+            // than leaving this one relying on a root it did not read here.
+            txn.materialize_diff(&origin, root, head.root)?;
+            Ok(head)
+        })?;
+        self.swap_active_endpoint(held.secret.clone(), net);
         tracing::info!(
-            seq,
+            seq = head.seq,
             key = %new_key.to_z32(),
             "activated a new device key and re-signed the head"
         );

@@ -465,9 +465,19 @@ fn load_from_outboard<R: ReadAt>(
 /// pair its parent holds.
 ///
 /// Chaining values are only ever half of somebody's pair, which is exactly why
-/// the object's own root is not one: it carries BLAKE3's root flag, and a
+/// the object's own *address* is not one: it carries BLAKE3's root flag, and a
 /// subtree of another object could never equal it (`docs/DELTA-SYNC.md` §2).
-/// Asking for the whole object therefore answers `None` rather than the root.
+/// The donor's whole tree still *has* a chaining value, though — the ordinary,
+/// unflagged join of its root pair — and that is what those same bytes carry
+/// when they sit as a subtree of a larger object.
+///
+/// Returning `None` there instead cost a donor its most valuable answer. A
+/// donor whose group count is exactly the span the round asks about is whole
+/// for exactly one span — its own — and is not whole for any other, so every
+/// span failed: `promoted` came back empty, the zero-match exit skipped the
+/// leaf round, and an object grown from a donor of exactly the span size
+/// re-fetched all of itself. `promote` still pins the extent, since it checks
+/// the proven subtree's byte range against the donor's.
 fn cv_at<R: ReadAt>(
     root: &Hash,
     outboard: &PreOrderOutboard<R>,
@@ -478,7 +488,17 @@ fn cv_at<R: ReadAt>(
     let mut node = Subtree::root_of(&outboard.tree, groups);
     loop {
         if node.start == start && node.span == span {
-            return Ok(None);
+            // The whole of this object, as a subtree of some larger one.
+            let Some(_) = node.children() else {
+                // A single-group object has no pair to join: its group *is* the
+                // tree, and the only hash the outboard holds for it is the
+                // root-flagged address.
+                return Ok(None);
+            };
+            let pair = load_from_outboard(outboard, root, &node.node)?;
+            let left = Cv(pair[..32].try_into().expect("32 of 64 bytes"));
+            let right = Cv(pair[32..].try_into().expect("32 of 64 bytes"));
+            return Ok(Some(join_cvs(&left, &right)));
         }
         let Some((left, right)) = node.children() else {
             return Ok(None);
@@ -1191,6 +1211,49 @@ mod tests {
 
     fn data(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 31 + 7) as u8).collect()
+    }
+
+    /// A donor that is exactly as wide as the span being asked about still
+    /// vouches for it.
+    ///
+    /// The span a delta round asks about is a power of two, so a donor whose
+    /// group count is exactly that power is whole for precisely one span — its
+    /// own — and for no other. Answering `None` there meant such a donor
+    /// vouched for nothing at all: every span of the new object failed, nothing
+    /// was promoted, and the object that had been extended by one group
+    /// re-fetched all of itself.
+    #[test]
+    fn a_donor_the_width_of_the_span_vouches_for_its_whole_tree() {
+        let (_dir, store) = store();
+        let bytes = data(16 * GROUP);
+        let donor = store.ingest_bytes(&bytes, 0).unwrap();
+
+        // Its whole tree, as a subtree of something larger: the unflagged join
+        // of the root pair, which is what those bytes hash to when they are not
+        // the whole object.
+        let mut nodes = Vec::new();
+        let expected = recompute(
+            &bytes,
+            Subtree::root_of(&Store::tree(bytes.len() as u64), 16),
+            &mut nodes,
+        );
+        assert_eq!(
+            store.subtree_cvs(&donor, &[(0, 16)]).unwrap(),
+            vec![Some(expected)],
+            "the donor's whole tree has a chaining value like any other subtree"
+        );
+
+        // And it is not the object's address, which carries the root flag.
+        assert_ne!(expected.0, donor.0);
+
+        // Narrower spans inside it keep answering as they did.
+        assert!(store.subtree_cvs(&donor, &[(0, 8)]).unwrap()[0].is_some());
+        assert!(store.subtree_cvs(&donor, &[(8, 8)]).unwrap()[0].is_some());
+
+        // A single-group object is the one case with no pair to join: its group
+        // is the tree, and the only hash the outboard holds is the address.
+        let tiny = store.ingest_bytes(&data(GROUP), 0).unwrap();
+        assert_eq!(store.subtree_cvs(&tiny, &[(0, 1)]).unwrap(), vec![None]);
     }
 
     /// Recomputes a subtree's chaining value and every interior pair under it

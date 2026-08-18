@@ -1,17 +1,23 @@
 //! Anti-entropy scheduling (§5.3).
 //!
-//! Reactive: local publishes and newly accepted heads are pushed to every
-//! reachable peer immediately, which gives sub-second propagation and epidemic
-//! spread. Periodic: every `aae_interval` (±50 % jitter) one random trusted
-//! peer gets a full `Hello` push-pull exchange, which repairs anything the
-//! reactive path missed and is the mechanism that guarantees convergence.
+//! Reactive: a local publish is pushed to every trusted peer immediately —
+//! the whole membership, not just current connections — which gives sub-second
+//! propagation on a connected cluster. A head *received* from a peer is not
+//! relayed onward; at the §12 sizes the publisher's own fan-out already reaches
+//! everyone it can reach, so the pull path below is what covers a member the
+//! origin cannot dial. Periodic: every `aae_interval` (±50 % jitter) one random
+//! trusted peer gets a full `Hello` push-pull exchange, which repairs anything
+//! the reactive path missed and is the mechanism that guarantees convergence.
 
 use std::time::Duration;
 
 use crate::reconcile::SyncReport;
 use synch_core::{now_ns, NodeId, SignedHead};
 
-use crate::{error::Result, node::Node};
+use crate::{
+    error::{EngineError, Result},
+    node::Node,
+};
 
 /// The outcome of one anti-entropy round.
 #[derive(Debug, Clone, Default)]
@@ -26,13 +32,32 @@ pub struct RoundReport {
 
 impl Node {
     /// Runs one `Hello` push-pull exchange with a specific peer.
+    ///
+    /// Bounded as a whole, not only per exchange. `synch-net` puts a deadline on
+    /// every request, but how many requests one `sync_with` issues is the
+    /// peer's to choose — one `fetch_pending` per head it hands back, each
+    /// looping to [`MAX_UNPRODUCTIVE_ROUNDS`], plus a pass over every pending
+    /// head — so per-request deadlines compose into no bound at all. A peer
+    /// answering just inside each one held this loop indefinitely, and
+    /// `anti_entropy_round` returns on the first success, so no other peer was
+    /// reached and no pending trie was fetched for as long as it kept that up.
+    ///
+    /// [`MAX_UNPRODUCTIVE_ROUNDS`]: crate::reconcile::MAX_UNPRODUCTIVE_ROUNDS
     pub async fn sync_with_peer(&self, node_id: &NodeId) -> Result<SyncReport> {
         let addr = self
             .peer_addr(node_id)?
             .unwrap_or_else(|| iroh::EndpointAddr::new(*node_id));
         let started = std::time::Instant::now();
         let client = self.net().connect_mpt(addr).await?;
-        let report = self.syncer().sync_with(&client).await?;
+        let budget = self.config().sync_round_budget;
+        let report = tokio::time::timeout(budget, self.syncer().sync_with(&client))
+            .await
+            .map_err(|_| {
+                EngineError::invalid(format!(
+                    "the sync round with {} outran its {budget:?} budget",
+                    node_id.fmt_short()
+                ))
+            })??;
         let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
         self.store().record_peer_sync(node_id, now_ns(), elapsed)?;
         Ok(report)
@@ -86,7 +111,7 @@ impl Node {
         Ok(report)
     }
 
-    /// Pushes a head to every reachable peer (§5.3, reactive path).
+    /// Pushes a head to every trusted peer (§5.3, reactive path).
     ///
     /// All of them at once. Each push is bounded by a dial timeout and a request
     /// deadline, so a peer that has gone dark costs seconds — but sequentially
@@ -209,6 +234,13 @@ impl Node {
             tracing::info!(expired, "dns bindings lapsed");
         }
         self.expire_tombstones()?;
+        // Before the abandonment sweep, not after: a pending head whose trie is
+        // already here should flip rather than sit, and the sweep skips exactly
+        // those.
+        let promoted = self.promote_ready_pending_heads()?;
+        if promoted > 0 {
+            tracing::info!(promoted, "pending heads whose tries were already here");
+        }
         let abandoned = self.abandon_stale_pending_heads(now)?;
         if abandoned > 0 {
             tracing::info!(abandoned, "pending heads nobody could serve");
@@ -244,6 +276,30 @@ impl Node {
             );
         }
         Ok(stats)
+    }
+
+    /// Promotes pending heads whose trie is already wholly here (§5.2).
+    ///
+    /// `try_promote` runs from exactly two places: an *accepted* offer, and the
+    /// end of a successful `fetch_pending`. Neither covers a pending head that
+    /// became complete without either happening — a crash between the last
+    /// batch of trie nodes committing and the promotion that would have
+    /// followed leaves precisely that. The head then holds `head_floor` above
+    /// every older head a peer could serve, so nothing else is adopted for that
+    /// origin either, and `abandon_stale_pending_heads` deliberately steps over
+    /// it because its trie *is* here. It is one promotion away from complete,
+    /// as that comment says — this is what performs it when no exchange will.
+    ///
+    /// Returns how many were promoted.
+    fn promote_ready_pending_heads(&self) -> Result<usize> {
+        let syncer = self.syncer();
+        let mut promoted = 0;
+        for stored in self.store().all_heads(synch_store::Slot::Pending)? {
+            if syncer.try_promote(&stored.head.origin, now_ns())? {
+                promoted += 1;
+            }
+        }
+        Ok(promoted)
     }
 
     /// Clears pending heads that have sat past `pending_head_ttl` with an
@@ -444,8 +500,11 @@ mod tests {
             .put_head(Slot::Pending, &fresh, now, 0)
             .unwrap();
 
-        // And an old pending head whose trie *is* here: one promotion away
-        // from complete, not stranded.
+        // And an old pending head whose trie *is* here. The abandonment sweep
+        // steps over it — it is one promotion away from complete, not stranded
+        // — and the promotion pass ahead of it performs that promotion, which
+        // is what keeps "not stranded" from meaning "left in the pending slot
+        // forever holding the floor above every servable head".
         let held_origin = synch_core::OriginId::named("vps", "x.example").unwrap();
         node.store()
             .put_binding(&Binding {
@@ -477,7 +536,16 @@ mod tests {
             node.store().pending_head(&fresh_origin).unwrap(),
             Some(fresh)
         );
-        assert_eq!(node.store().pending_head(&held_origin).unwrap(), Some(held));
+        assert_eq!(
+            node.store().pending_head(&held_origin).unwrap(),
+            None,
+            "a pending head whose trie is here is promoted, not left sitting"
+        );
+        assert_eq!(
+            node.store().complete_head(&held_origin).unwrap(),
+            Some(held),
+            "and what it is promoted into is the complete slot"
+        );
 
         // With the floor dropped, the older head a peer can actually serve is
         // adopted rather than refused.

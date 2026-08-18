@@ -621,7 +621,9 @@ impl Node {
         let unsettled = {
             let node = self.clone();
             let donors = donors.to_vec();
-            crate::blocking::offload(move || node.unsettled_spans(&donors, &leftover)).await?
+            let wanted = wanted.clone();
+            crate::blocking::offload(move || node.unsettled_spans(&donors, &leftover, &wanted))
+                .await?
         };
         let mut left = unsettled;
         while !left.is_empty() {
@@ -658,7 +660,12 @@ impl Node {
     /// says nothing, and the groups under it descend.
     ///
     /// Blocking: one outboard walk per span per donor.
-    fn unsettled_spans(&self, donors: &[Donor], leftover: &Proven) -> Result<ChunkRanges> {
+    fn unsettled_spans(
+        &self,
+        donors: &[Donor],
+        leftover: &Proven,
+        wanted: &ChunkRanges,
+    ) -> Result<ChunkRanges> {
         let mut out = ChunkRanges::empty();
         let mut whole: Vec<ProvenSubtree> = Vec::new();
         for subtree in &leftover.subtrees {
@@ -682,12 +689,20 @@ impl Node {
             if donor.root() == leftover.root {
                 continue;
             }
-            for (index, cv) in self
-                .store()
-                .subtree_cvs(&donor.root(), &spans)?
-                .iter()
-                .enumerate()
-            {
+            // Same rule as promotion: a donor that errors has nothing to say,
+            // and saying so must not fail the fetch.
+            let cvs = match self.store().subtree_cvs(&donor.root(), &spans) {
+                Ok(cvs) => cvs,
+                Err(e) => {
+                    tracing::debug!(
+                        donor = %donor.root(),
+                        error = %e,
+                        "a donor could not be read for the leaf round"
+                    );
+                    continue;
+                }
+            };
+            for (index, cv) in cvs.iter().enumerate() {
                 comparable[index] |= cv.is_some();
             }
         }
@@ -696,7 +711,12 @@ impl Node {
                 out = out.union(&ChunkRanges::from_ranges([subtree.range()]));
             }
         }
-        Ok(out)
+        // Spans are whole 16 MiB subtrees, so a span that merely *overlaps*
+        // what this fetch wants was being descended in full — buying a leaf
+        // proof, and a round trip, for groups already in the bitmap, which
+        // `promote` then discards. Clipping costs nothing and is what makes a
+        // resumed fetch's second round proportional to what is still missing.
+        Ok(out.intersect(wanted))
     }
 
     /// Collects proofs for `ranges` from whoever will serve them.
@@ -759,11 +779,14 @@ impl Node {
             let started = std::time::Instant::now();
             match self.net().connect_blob(addr).await {
                 Ok(client) => {
+                    // The dial, for the same reason as the slice path above: a
+                    // proof descent is also a walk of as many windows as the
+                    // range needs.
+                    let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
+                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
                     let outcome = client
                         .fetch_proof_into(self.store(), *root, size, ask, level)
                         .await?;
-                    let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
                     return Ok(outcome);
                 }
                 Err(e) => last_error = Some(e),
@@ -823,7 +846,25 @@ impl Node {
             if donor.root() == *root {
                 continue;
             }
-            let got = self.store().promote(donor, proven, now_ns())?;
+            // A donor that errors is a donor with nothing to give, exactly like
+            // one that matched nothing. Nothing in the descent may fail the
+            // fetch — that is the rule the rest of this path already keeps, and
+            // the proof rounds keep it per provider — but this call propagated,
+            // so a raced size settlement or an ENOSPC while copying a subtree
+            // failed a fetch that the ordinary slice path would have completed
+            // over the network.
+            let got = match self.store().promote(donor, proven, now_ns()) {
+                Ok(got) => got,
+                Err(e) => {
+                    tracing::debug!(
+                        root = %root,
+                        donor = %donor.root(),
+                        error = %e,
+                        "a donor could not be promoted from: leaving its groups to the fetch"
+                    );
+                    continue;
+                }
+            };
             if got.is_empty() {
                 continue;
             }
@@ -971,9 +1012,17 @@ impl Node {
             let started = std::time::Instant::now();
             match self.net().connect_blob(addr).await {
                 Ok(client) => {
-                    let got = client.fetch_into(self.store(), *root, size, ask).await?;
+                    // Timed at the dial, not around the transfer. `fetch_into`
+                    // walks the provider's whole share one window at a time, so
+                    // timing it measured *how much was asked of the peer*, not
+                    // how quick the peer is — a provider that successfully
+                    // served a gigabyte recorded tens of seconds, worse than
+                    // `FAILURE_PENALTY_US`, and so was ranked below a peer whose
+                    // dial was refused. The ranking inverted under exactly the
+                    // load it exists to spread.
                     let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
                     self.store().record_peer_sync(key, now_ns(), elapsed)?;
+                    let got = client.fetch_into(self.store(), *root, size, ask).await?;
                     return Ok(got);
                 }
                 Err(e) => {
@@ -1749,7 +1798,10 @@ mod tests {
             ],
         };
 
-        let unsettled = node.unsettled_spans(&[Donor(donor)], &round_one).unwrap();
+        let all = ChunkRanges::single(0, 20);
+        let unsettled = node
+            .unsettled_spans(&[Donor(donor)], &round_one, &all)
+            .unwrap();
         assert_eq!(
             unsettled,
             ChunkRanges::from_ranges([
@@ -1761,8 +1813,25 @@ mod tests {
 
         // With no donor at all, round two has nothing to look inside but that
         // right edge — the whole of the rest goes straight to the fetch.
-        let unsettled = node.unsettled_spans(&[], &round_one).unwrap();
+        let unsettled = node.unsettled_spans(&[], &round_one, &all).unwrap();
         assert_eq!(unsettled, ChunkRanges::single(16, 20));
+
+        // Spans are whole subtrees, so one that merely overlaps what this fetch
+        // wants would otherwise be descended in full — buying a leaf proof, and
+        // a round trip, for groups already held. The result is clipped to what
+        // was asked for.
+        let wanted = ChunkRanges::single(5, 18);
+        let unsettled = node
+            .unsettled_spans(&[Donor(donor)], &round_one, &wanted)
+            .unwrap();
+        assert_eq!(
+            unsettled,
+            ChunkRanges::from_ranges([
+                synch_core::GroupRange::new(5, 8),
+                synch_core::GroupRange::new(16, 18),
+            ]),
+            "round two looks only inside what is still wanted"
+        );
         node.shutdown().await.unwrap();
     }
 

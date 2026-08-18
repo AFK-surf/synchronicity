@@ -1499,8 +1499,20 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 match outcome {
                     Ok(report) => {
                         reached += 1;
+                        // §12 makes an origin this node cannot apply fail that
+                        // origin and no other, and says the count of origins
+                        // left behind is in the sync report. It was counted and
+                        // never printed, so the one visible sign of a peer
+                        // publishing something unapplicable was a `warn!` line
+                        // in the daemon log. Only shown when non-zero: a healthy
+                        // sync should not grow a column of zeroes.
+                        let left_behind = if report.heads_failed > 0 {
+                            format!(" · {} origin(s) left behind", report.heads_failed)
+                        } else {
+                            String::new()
+                        };
                         out.line(format!(
-                            "{name} ({})  accepted {} head(s) · completed {} origin trie(s) · pushed {}",
+                            "{name} ({})  accepted {} head(s) · completed {} origin trie(s) · pushed {}{left_behind}",
                             peer.fmt_short(),
                             report.heads_accepted,
                             report.tries_completed,

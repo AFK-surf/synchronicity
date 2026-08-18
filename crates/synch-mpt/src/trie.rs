@@ -969,8 +969,31 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// from a partially fetched pending head without failing.
     pub fn reachable(&self, root: Hash) -> Result<Reachable, MptError> {
         let mut out = Reachable::default();
+        self.reach_into(root, &mut out)?;
+        Ok(out)
+    }
+
+    /// The same walk, accumulating into a mark set that already holds what
+    /// earlier roots reached.
+    ///
+    /// Marking a store means walking every retained root, and successive roots
+    /// of one origin share all but the path that changed — that is the whole
+    /// point of the content-addressed node store (§4.3). Walked one at a time
+    /// into fresh sets, GC therefore re-read the entire trie once per retained
+    /// root: `head_history` keeps a row per publish for `root_retention`
+    /// (7 days), so a node publishing steadily accumulates thousands of roots,
+    /// and the pass is a store read per node per root — all of it inside the
+    /// single `BEGIN IMMEDIATE` that holds the one write connection, every five
+    /// minutes. Sharing the visited set collapses that to one walk of the live
+    /// node set plus each root's own delta, which is what §5.4's "runs
+    /// incrementally" means.
+    ///
+    /// A hash already in `out.nodes` has had its subtree walked by definition —
+    /// a node's children are a function of the node — so skipping it is exactly
+    /// the dedup the single-root walk already does against itself.
+    pub fn reach_into(&self, root: Hash, out: &mut Reachable) -> Result<(), MptError> {
         let mut frontier = match root_opt(root) {
-            None => return Ok(out),
+            None => return Ok(()),
             Some(h) => vec![h],
         };
         while let Some(hash) = frontier.pop() {
@@ -984,7 +1007,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
             frontier.extend(node.child_hashes());
             out.values.extend(node.value_hashes());
         }
-        Ok(out)
+        Ok(())
     }
 }
 

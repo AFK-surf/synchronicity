@@ -257,24 +257,37 @@ impl Node {
             }
             OriginId::Key(_) => {}
         }
-        store.set_self_origin(&origin)?;
-        store.remove_binding(&previous, &node_id, BindingSource::Static)?;
-        store.put_binding(&Binding {
-            origin: origin.clone(),
-            node_id,
-            source: BindingSource::Static,
-            domain: None,
-            note: Some("self".into()),
-            added_at: now_ns(),
-            expires_at: None,
+        // One transaction, as §10 requires of every multi-step state change.
+        // As seven autocommit writes, a crash after the head slots were cleared
+        // but before the views were left `entries` rows for an origin with no
+        // head in either slot — and nothing removes those: `rebuild_views`
+        // iterates the complete slots, so an origin with neither is never
+        // visited, and the command refuses to run twice. The unified tree reads
+        // `entries` regardless of heads, so every path stayed duplicated under
+        // both identities, in every mirror, permanently.
+        let adopted = origin.clone();
+        let now = now_ns();
+        store.transaction(|txn| -> Result<()> {
+            txn.set_self_origin(&adopted)?;
+            txn.remove_binding(&previous, &node_id, BindingSource::Static)?;
+            txn.put_binding(&Binding {
+                origin: adopted.clone(),
+                node_id,
+                source: BindingSource::Static,
+                domain: None,
+                note: Some("self".into()),
+                added_at: now,
+                expires_at: None,
+            })?;
+            // Drop the key-origin view so the unified tree does not keep a
+            // second copy of every path under the old name. Blobs stay; the
+            // next scan republishes them under the new origin.
+            txn.clear_head(&previous, Slot::Complete)?;
+            txn.clear_head(&previous, Slot::Pending)?;
+            txn.delete_origin_entries(&previous)?;
+            txn.delete_origin_providers(&previous)?;
+            Ok(())
         })?;
-        // Drop the key-origin view so the unified tree does not keep a second
-        // copy of every path under the old name. Blobs stay; the next scan
-        // republishes them under the new origin.
-        store.clear_head(&previous, Slot::Complete)?;
-        store.clear_head(&previous, Slot::Pending)?;
-        store.delete_origin_entries(&previous)?;
-        store.delete_origin_providers(&previous)?;
         Ok(AdoptOriginReport {
             previous,
             origin,

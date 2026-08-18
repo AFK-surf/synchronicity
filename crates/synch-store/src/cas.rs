@@ -68,6 +68,21 @@ fn write_and_sync(path: &std::path::Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// A blob index row without its payload: what a sweep or a report needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobSummary {
+    /// The object root.
+    pub root: Hash,
+    /// The object size in bytes.
+    pub size: u64,
+    /// True if every group is present and verified.
+    pub complete: bool,
+    /// True if the blob is pinned against GC.
+    pub pinned: bool,
+    /// When the blob was last written to, in unix nanoseconds.
+    pub last_access: i64,
+}
+
 /// A row of the local blob index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobRow {
@@ -656,6 +671,43 @@ impl Store {
         }))
     }
 
+    /// Every locally held object, as the columns a sweep or a report reads.
+    ///
+    /// [`Store::blobs`] returns whole rows, which means `inline` — up to
+    /// [`INLINE_BLOB_MAX`] per row — and `bitmap`. Neither GC nor `synch
+    /// doctor` looks at either: they read the root, the completeness flag, the
+    /// pin state and `last_access`. Pulling the payloads anyway made a pass
+    /// over a store of many small objects allocate the inlined half of the CAS,
+    /// every five minutes and again on every doctor run, and drop all of it.
+    pub fn blob_candidates(&self) -> Result<Vec<BlobSummary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT root, size, complete, pinned, last_access FROM blobs
+             ORDER BY last_access DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (root, size, complete, pinned, last_access) = row?;
+            out.push(BlobSummary {
+                root: hash_column(root, "blobs.root")?,
+                size: size as u64,
+                complete: complete != 0,
+                pinned: pinned != 0,
+                last_access,
+            });
+        }
+        Ok(out)
+    }
+
     /// Every locally held object.
     pub fn blobs(&self) -> Result<Vec<BlobRow>> {
         let conn = self.conn();
@@ -726,15 +778,71 @@ impl Store {
         Ok(out)
     }
 
+    /// Deletes an object, but only if it is still a GC candidate.
+    ///
+    /// The predicate is re-read inside an immediate transaction rather than
+    /// trusted from the caller's snapshot, and the unlinks happen only if the
+    /// commit says the row was still deletable. `gc_content` reads the
+    /// referenced set, the pinned set and the candidate rows as three separate
+    /// statements and then deletes in a fourth, which is exactly the split
+    /// [`Store::gc_trie`] documents as a data-loss bug: a `synch pin`, or a
+    /// resumed fetch's first commit, landing in the gap was decided against by
+    /// a snapshot taken before it existed. The pin case is the plain one — the
+    /// command reports success and the object is unlinked moments later — and
+    /// the fetch case is worse, because `commit_groups` then re-inserts a row
+    /// whose bitmap claims groups whose bytes went to an unlinked inode, which
+    /// the node advertises and nothing ever re-verifies.
+    ///
+    /// The unlinks cannot join the transaction — SQLite rolls back, `unlink`
+    /// does not — so they stay after the commit, in the order
+    /// [`Store::delete_blob`] explains.
+    ///
+    /// Returns whether the object was deleted.
+    pub(crate) fn delete_blob_if_collectable(&self, root: &Hash, before: i64) -> Result<bool> {
+        let deleted = self.with_immediate_tx(|tx| {
+            let rows = tx.execute(
+                "DELETE FROM blobs
+                   WHERE root = ?1
+                     AND pinned = 0
+                     AND last_access < ?2
+                     AND NOT EXISTS (
+                       SELECT 1 FROM entries WHERE entries.content = blobs.root
+                     )",
+                params![root.as_bytes().to_vec(), before],
+            )?;
+            Ok(rows > 0)
+        })?;
+        if deleted {
+            let _ = std::fs::remove_file(self.blob_path(root));
+            let _ = std::fs::remove_file(self.outboard_path(root));
+        }
+        Ok(deleted)
+    }
+
     /// Deletes an object's payload, outboard, and index row.
+    ///
+    /// Unconditional: for callers that have already decided, such as an
+    /// explicit `synch rm`. GC goes through
+    /// [`Store::delete_blob_if_collectable`] instead, which re-checks the
+    /// predicate against the same transaction that does the delete.
     pub fn delete_blob(&self, root: &Hash) -> Result<()> {
         // Row first, bytes second. The reverse order leaves the dangerous
         // orphan: a crash between the unlink and the delete leaves a row saying
         // `complete=1` with no bytes behind it, so `has_complete_blob` keeps
         // answering yes, `local_ad` keeps advertising the object to peers, and
         // reads fail with a raw io error rather than `MissingBlob`. This way a
-        // crash leaves the opposite — files with no row — which costs disk
-        // until the next sweep and never lies to anyone.
+        // crash usually leaves the opposite — files with no row — which costs
+        // disk until the next sweep and never lies to anyone.
+        //
+        // Usually, not always: the ordering is comparative, not a guarantee.
+        // Under `journal_mode=WAL` with `synchronous=NORMAL` the row delete is
+        // not fsynced at commit, so a power loss can roll it back while the
+        // unlink survives, producing the bad state anyway. What makes that
+        // tolerable rather than a durability bug is that it self-heals: a blob
+        // only reaches here because it was unreferenced, unpinned and cold, and
+        // a restored row still is, so the next `gc_content` pass deletes it
+        // again. The window is one GC interval, on an object nothing in the
+        // tree references.
         self.conn().execute(
             "DELETE FROM blobs WHERE root = ?1",
             params![root.as_bytes().to_vec()],
@@ -1006,6 +1114,16 @@ impl Store {
             reason: "could not duplicate the payload handle to flush it".into(),
         })?;
         fsync_file(&payload)?;
+        // The directory entries too, not only the contents. Both files are
+        // opened `create(true)`, so the first window of a fetch creates them —
+        // and `fsync` promises the bytes, not that the name they hang from
+        // survives. The mainstream Linux filesystems do persist a new file's
+        // dirent on its own `fsync`, so this is defence in depth rather than a
+        // live hole, but the two other creation sites here (`ingest_file` and
+        // `write_and_sync`) both do it, and unlike the orphan case a lost name
+        // under an advanced bitmap never self-heals: the row goes on claiming
+        // groups whose bytes are unreachable.
+        fsync_parent(&payload_path);
         // Reopened for *write* to flush it. `File::open` hands back a read-only
         // handle, and Windows refuses `FlushFileBuffers` on one with
         // ERROR_ACCESS_DENIED — which went unnoticed while the result was
@@ -1016,6 +1134,7 @@ impl Store {
                 .write(true)
                 .open(self.outboard_path(root))?,
         )?;
+        fsync_parent(&self.outboard_path(root));
 
         let commit = self.commit_groups(root, size, &served, None, now)?;
         self.trim_to_size(root, commit);

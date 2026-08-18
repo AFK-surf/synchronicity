@@ -420,11 +420,7 @@ impl Store {
 
     /// Marks a device key as retiring or active.
     pub fn set_device_key_state(&self, node_id: &NodeId, state: KeyState) -> Result<()> {
-        self.conn().execute(
-            "UPDATE device_keys SET state = ?2 WHERE node_id = ?1",
-            params![node_id.as_bytes().to_vec(), state.as_str()],
-        )?;
-        Ok(())
+        set_device_key_state_in(&self.conn(), node_id, state)
     }
 
     /// Deletes a retired device key's secret (§3.4 step 4).
@@ -455,6 +451,37 @@ impl Txn<'_> {
     pub(crate) fn conn(&self) -> &Connection {
         self.tx
     }
+
+    /// Sets this node's own [`OriginId`], inside the transaction.
+    pub fn set_self_origin(&self, origin: &OriginId) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO config (key, value) VALUES ('self_origin_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![origin.canonical()],
+        )?;
+        Ok(())
+    }
+
+    /// Marks a device key as retiring or active, inside the transaction.
+    ///
+    /// A rotation moves two keys' states and must move both or neither: §3.4
+    /// says exactly one key is active at any moment, and nothing in the schema
+    /// enforces it. As two autocommit statements, a crash or a `BUSY` between
+    /// them left the retiring key retired and the incoming key still staged —
+    /// zero active keys, so [`Store::active_device_key`] answers `None` and the
+    /// daemon refuses to open, which is also the only way to run the command
+    /// that would repair it.
+    pub fn set_device_key_state(&self, node_id: &NodeId, state: KeyState) -> Result<()> {
+        set_device_key_state_in(self.conn(), node_id, state)
+    }
+}
+
+fn set_device_key_state_in(conn: &Connection, node_id: &NodeId, state: KeyState) -> Result<()> {
+    conn.execute(
+        "UPDATE device_keys SET state = ?2 WHERE node_id = ?1",
+        params![node_id.as_bytes().to_vec(), state.as_str()],
+    )?;
+    Ok(())
 }
 
 impl NodeStore for Txn<'_> {
@@ -629,14 +656,6 @@ impl Store {
         self.complete_roots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Forgets which roots are known complete.
-    ///
-    /// For the paths that remove trie state wholesale, where the honest answer
-    /// is to make the store earn every answer again.
-    pub fn forget_complete_roots(&self) {
-        self.complete_roots().clear();
     }
 
     /// Keeps only the memo entries for roots still in the retained set.

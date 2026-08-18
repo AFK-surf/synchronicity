@@ -406,9 +406,19 @@ fn v10_groups_as_ranges(tx: &Transaction<'_>) -> Result<()> {
 /// The duplication then had to be patched around: retention needed an explicit
 /// exemption so it would not delete the history rows shadowing the current
 /// heads, and the GC mark set was a `UNION` across both tables. With `heads`
-/// holding only `(seq, root)` and the signature living in one place, the
-/// exemption becomes referential integrity rather than a special case, and the
-/// mark set is one table.
+/// holding only `(seq, root)` and the signature living in one place, the mark
+/// set is one table and the exemption is a single referential rule instead of a
+/// special case per table.
+///
+/// A *rule*, not a declared constraint: no `FOREIGN KEY` is stated here, so
+/// `PRAGMA foreign_keys=ON` enforces nothing over it. What holds the pointer up
+/// is that `put_head_in` writes the `head_history` row before the slot names
+/// it, and that both `DELETE FROM head_history` sites carry a
+/// `NOT EXISTS (SELECT 1 FROM heads …)` guard. Those are the only writers, so
+/// the invariant is sound — but it is sound by review rather than by
+/// construction, and the failure mode if a history row ever did go missing is
+/// silent: `HEAD_JOIN` is an inner join, so the head reads back as absent, and a
+/// node whose complete head reads as absent restarts its origin at seq 1.
 ///
 /// The backfill is `INSERT OR IGNORE` first so that a head whose history row
 /// was somehow missing does not lose its signature to the rebuild.

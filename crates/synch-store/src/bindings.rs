@@ -75,27 +75,62 @@ impl Binding {
     }
 }
 
+/// Inserts or refreshes a binding on whichever connection is handed in.
+fn put_binding_in(conn: &rusqlite::Connection, binding: &Binding) -> Result<()> {
+    conn.execute(
+        "INSERT INTO bindings (origin_id, node_id, source, domain, note, added_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(origin_id, node_id, source) DO UPDATE SET
+           domain = excluded.domain,
+           note = COALESCE(excluded.note, bindings.note),
+           expires_at = excluded.expires_at",
+        params![
+            binding.origin.canonical(),
+            binding.node_id.as_bytes().to_vec(),
+            binding.source.as_str(),
+            binding.domain,
+            binding.note,
+            binding.added_at,
+            binding.expires_at,
+        ],
+    )?;
+    Ok(())
+}
+
+impl crate::db::Txn<'_> {
+    /// Removes one binding, inside the transaction.
+    pub fn remove_binding(
+        &self,
+        origin: &OriginId,
+        node_id: &NodeId,
+        source: BindingSource,
+    ) -> Result<bool> {
+        let n = self.conn().execute(
+            "DELETE FROM bindings WHERE origin_id = ?1 AND node_id = ?2 AND source = ?3",
+            params![
+                origin.canonical(),
+                node_id.as_bytes().to_vec(),
+                source.as_str()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Inserts or refreshes a binding, inside the transaction.
+    ///
+    /// A key rotation writes the incoming key's self-binding and the two key
+    /// states together: a binding without the state change is a key the node
+    /// trusts but will not sign with, and the reverse is a key it signs with
+    /// and cannot verify after a restart.
+    pub fn put_binding(&self, binding: &Binding) -> Result<()> {
+        put_binding_in(self.conn(), binding)
+    }
+}
+
 impl Store {
     /// Inserts or refreshes a binding.
     pub fn put_binding(&self, binding: &Binding) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO bindings (origin_id, node_id, source, domain, note, added_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(origin_id, node_id, source) DO UPDATE SET
-               domain = excluded.domain,
-               note = COALESCE(excluded.note, bindings.note),
-               expires_at = excluded.expires_at",
-            params![
-                binding.origin.canonical(),
-                binding.node_id.as_bytes().to_vec(),
-                binding.source.as_str(),
-                binding.domain,
-                binding.note,
-                binding.added_at,
-                binding.expires_at,
-            ],
-        )?;
-        Ok(())
+        put_binding_in(&self.conn(), binding)
     }
 
     /// Removes one binding.

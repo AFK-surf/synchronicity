@@ -645,20 +645,40 @@ Properties:
   including nodes that are neither `O` nor the peer that told us about `H`.
   Hierarchy-agnostic in practice: a laptop that heard about a NAS's update from a VPS
   can pull the trie nodes from either.
-- **No wedging on unservable heads**: if every candidate provider persistently
-  returns `missing` for wanted nodes (default: 3 full rounds across all advertisers —
-  possible when a head was relayed but its trie never fully propagated, or when a
-  serving peer GC'd a root out of retention mid-fetch), the pending head is
-  **abandoned** and head selection re-runs, typically re-targeting the origin's
-  newest complete-advertised head. Structural sharing makes the restart cost
-  proportional to what actually changed, not to what was already fetched — this is
-  also the recovery path for the laggard-vs-GC race (§5.4).
+- **No wedging on unservable heads**, by three rules with disjoint triggers,
+  because no one of them reaches the others' cases:
+  - If a peer being fetched from persistently returns `missing` for wanted nodes
+    (default: 3 rounds within one fetch — possible when a head was relayed but its
+    trie never fully propagated, or when a serving peer GC'd a root out of
+    retention mid-fetch), the pending head is **abandoned** and head selection
+    re-runs, typically re-targeting the origin's newest complete-advertised head.
+    Structural sharing makes the restart cost proportional to what actually
+    changed, not to what was already fetched — this is also the recovery path for
+    the laggard-vs-GC race (§5.4). The counter lives in the fetch, so it only
+    counts against a peer a fetch was actually attempted against.
+  - If *no* peer advertises a complete head at or above the pending one, no fetch
+    is ever attempted and that counter never runs. Such a head still holds
+    `head_floor` above every servable head for its origin, so the maintenance
+    pass abandons it after `pending_head_ttl` (default 900 s, thirty anti-entropy
+    intervals). This is the case a publisher going offline between its push and
+    anyone's fetch produces.
+  - A pending head whose trie *is* wholly present is promoted by the same pass
+    rather than abandoned. Promotion otherwise happens only on an accepted offer
+    or at the end of a successful fetch, and a crash between a fetch's last
+    committed batch and the promotion that would have followed leaves a head that
+    neither path revisits — holding the floor while sitting on every byte it
+    needs.
 
 ### 5.3 Anti-entropy scheduling
 
-- **Reactive**: local publishes (§7) and received newer heads are pushed (`HeadPush`)
-  to all currently connected peers immediately. This gives sub-second propagation on
-  connected clusters and epidemic spread (each infected node pushes onward).
+- **Reactive**: a local publish (§7) is pushed (`HeadPush`) to *every* trusted
+  peer immediately — dialling the ones not already connected, all concurrently —
+  which gives sub-second propagation on connected clusters. Pushing to the whole
+  membership rather than to current connections is what makes a second hop
+  unnecessary at the N ≤ 100 §12 sizes: the publisher already reaches everyone it
+  can reach. A received head is *not* relayed onward, so a member reachable from
+  some peer but not from the origin learns of it on its next pull rather than by
+  epidemic spread.
 - **Periodic**: every `aae_interval` (default 30s with ±50% jitter), pick one random
   trusted peer, connect if needed, run a full `Hello` push-pull exchange. This repairs
   anything the reactive path missed (dropped connections, simultaneous partitions) and

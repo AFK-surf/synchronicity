@@ -43,6 +43,17 @@ use crate::{
 /// How long `synch recover` collects peer summaries by default (§3.4).
 pub const DEFAULT_RECOVERY_QUIESCE: Duration = Duration::from_secs(3600);
 
+/// How far past this node's own next seq one recovery may lift the publishing
+/// floor (§3.4).
+///
+/// The floor is derived from what peers *say*, is durable, only ever rises, and
+/// has no lowering command — so an unauthenticated claim acted on once would
+/// otherwise be able to retire an origin for good. A cluster's seqs advance by
+/// one per publish, so a gap of this size already covers any real divergence
+/// between what this node last held and what its peers have seen since;
+/// anything past it is a claim to be clamped and logged rather than obeyed.
+pub const MAX_RECOVERY_STEP: u64 = 1_000_000;
+
 /// How far above the highest observed seq publishing resumes, by default
 /// (§3.4).
 pub const DEFAULT_SEQ_GAP: u64 = 1_000;
@@ -366,10 +377,37 @@ impl Node {
 
         // Never below what this node would publish anyway, and never below a
         // floor already in force.
+        //
+        // And never further above it than a plausible history could reach. The
+        // observed seq is an *unauthenticated* summary — §3.4 accepts that any
+        // member can assert a huge one and hold a fresh node in recovery, since
+        // an operator reads the claim and its attribution and judges it. What
+        // that reasoning does not cover is this floor, which is durable, only
+        // ever rises, and has no command to lower it: a single absurd claim,
+        // acted on once by the operator running the documented remedy, would
+        // retire the origin permanently. Capping the *step* leaves the
+        // transient half exactly as §3.4 describes it while keeping one bad
+        // claim from being unrecoverable — a genuinely higher peer seq is
+        // reached in as many recoveries as it takes, each one visible.
+        let next = self.next_seq()?;
+        let ceiling = next.saturating_add(MAX_RECOVERY_STEP);
+        if observed.seq > ceiling {
+            tracing::warn!(
+                origin = %self.origin(),
+                observed = observed.seq,
+                ceiling,
+                claimed_by = observed
+                    .claimed_by
+                    .map(|k| k.fmt_short().to_string())
+                    .unwrap_or_default(),
+                "a peer advertises a seq no plausible history reaches: clamping the floor"
+            );
+        }
         let floor = observed
             .seq
+            .min(ceiling)
             .saturating_add(options.gap)
-            .max(self.next_seq()?);
+            .max(next);
         let floor = self.store().raise_publish_floor(floor)?;
         report.floor = Some(floor);
         tracing::info!(

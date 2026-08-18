@@ -68,6 +68,20 @@ pub struct NodeConfig {
     /// peer holding the trie has had many rounds to serve it, short enough that
     /// an origin is not stranded for an afternoon.
     pub pending_head_ttl: Duration,
+    /// How long one anti-entropy round with one peer may take in total (§5.3).
+    ///
+    /// `synch-net` deadlines every individual request, but a round issues as
+    /// many as the peer's answers call for — one trie fetch per head it hands
+    /// back, each of those looping until it stops making progress — so the
+    /// per-request deadlines bound no round. A peer answering each request just
+    /// inside its deadline could therefore hold the periodic loop for as long
+    /// as it liked, and since a round returns on its first success, no other
+    /// peer was reached while it did.
+    ///
+    /// Ten anti-entropy intervals at the defaults: far more than a real round
+    /// needs even on a cold bootstrap, since a round that runs out of budget
+    /// resumes from everything it already committed.
+    pub sync_round_budget: Duration,
     /// How long old roots are retained (§5.4).
     pub root_retention: Duration,
     /// How long this node's own tombstones are kept before a later root drops
@@ -102,6 +116,7 @@ impl NodeConfig {
             fetch_fanout: 3,
             delta_min_size: synch_core::AD_SPAN_GRANULARITY,
             pending_head_ttl: Duration::from_secs(900),
+            sync_round_budget: Duration::from_secs(300),
             root_retention: Duration::from_secs(7 * 24 * 3600),
             tombstone_ttl: Duration::from_secs(90 * 24 * 3600),
             recovery_quiesce: crate::recovery::DEFAULT_RECOVERY_QUIESCE,
@@ -148,6 +163,7 @@ mod tests {
         assert_eq!(config.fetch_fanout, 3);
         assert_eq!(config.delta_min_size, 16 * 1024 * 1024);
         assert_eq!(config.pending_head_ttl, Duration::from_secs(900));
+        assert_eq!(config.sync_round_budget, Duration::from_secs(300));
         assert_eq!(config.root_retention, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(config.tombstone_ttl, Duration::from_secs(90 * 24 * 3600));
         assert_eq!(config.recovery_quiesce, Duration::from_secs(3600));
