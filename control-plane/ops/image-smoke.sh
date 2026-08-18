@@ -153,6 +153,18 @@ if docker logs "$CONTAINER" 2>&1 | grep -q "filesystem unconfined"; then
 fi
 ok "csqlite workers sandbox themselves under the default runtime profile"
 
+# The TUF anchor is a tracked source file riding the shipment
+# (priv/tuf/, COPYed in by the shipment stage); when the build drops it —
+# a broadened .dockerignore once did — the service still boots and serves
+# and every check above still passes, but tuf-refresh can never anchor,
+# which kills Rekor discovery for `rekor-publish` and the external-mode
+# key watcher. The job ticks at boot on a fresh database, so the failure
+# line is already in the logs; no network is needed for it to appear.
+if docker logs "$CONTAINER" 2>&1 | grep -q "priv/tuf is missing from this build"; then
+  logs_and_fail "the TUF anchor did not ship in the image (priv/tuf missing)"
+fi
+ok "the TUF anchor ships in priv/tuf"
+
 # --- the shipped SPA ---------------------------------------------------
 #
 # priv/web is copied in from a separate build stage; when that breaks the

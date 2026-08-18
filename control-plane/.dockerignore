@@ -1,6 +1,14 @@
 # Everything the image builds for itself, plus what it never needs.
+#
+# priv/ is excluded piecemeal, not wholesale: priv/csqlite and priv/web
+# are build outputs (gitignored, rebuilt in-stage — a host-built csqlite
+# could be the wrong architecture), but priv/tuf is a tracked source
+# file, the TUF anchor the shipment stage COPYs in. Excluding all of
+# priv/ once shipped an image with no anchor, which is a boot-time
+# "priv/tuf is missing from this build" and no Rekor discovery.
 build/
-priv/
+priv/csqlite
+priv/web/
 web/node_modules/
 web/dist/
 e2e/
