@@ -289,10 +289,16 @@ control plane itself with
   # walks the log from entry 0, and the production shard has ~10^8 entries
   # in it. Take the current tree size from the checkpoint and subtract
   # however far back you want to look.
+  # --allow-gap is required alongside it, and says so: --from-index skips a
+  # stretch of the log no run will ever classify, which is a real loss of
+  # coverage and is stated rather than defaulted.
   size=$(curl -sS https://log2025-1.rekor.sigstore.dev/api/v2/checkpoint | sed -n 2p)
-  synch-monitor --state /var/lib/synch-monitor/state.json \
-                --from-index "$((size - 200000))"
+  synch-monitor run --state /var/lib/synch-monitor/state.json \
+                    --from-index "$((size - 200000))" --allow-gap
   ```
+
+  `run` is the subcommand and is not optional — without it the binary exits 2
+  on a usage error, having walked nothing.
 
   Then install the unit and timer beside it — `ops/systemd/
   synch-monitor.{service,timer}` — which run it hourly from the recorded

@@ -290,6 +290,54 @@ pub fn checkpoints_parse_or_are_refused_test() {
     >>)
 }
 
+@external(erlang, "cp_crypto_ffi", "ecdsa_sign_der")
+fn ecdsa_sign_der(message: BitArray, private: BitArray) -> BitArray
+
+/// A P-256 checkpoint signature verifies in **either** ECDSA encoding.
+///
+/// Sigstore signs its notes in DER, and a DER signature can never satisfy a
+/// fixed-width `r || s` verifier. Accepting only the fixed form here meant
+/// that the day Sigstore serves a P-256-keyed shard, `rekor-publish` writes
+/// the entry to the public log and then rejects the proof the log hands back
+/// — a zone that can never satisfy its own publish gate, over an encoding
+/// difference. The Rust client accepts both; so does this side.
+///
+/// Both fixtures in this repo come from the Ed25519 shard, which is exactly
+/// why this case has to be built rather than captured.
+pub fn a_p256_checkpoint_verifies_in_either_ecdsa_encoding_test() {
+  let keys.Csk(private, public) = keys.generate()
+  let note =
+    "log.example\n7\n" <> "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+  let signed = <<note:utf8>>
+
+  // The signature Sigstore actually produces: ASN.1/DER, ~70 bytes.
+  let der = ecdsa_sign_der(signed, private)
+  assert bit_array.byte_size(der) > 64
+  // And the same signature written the fixed-width way.
+  let raw = ecdsa_sign_raw(signed, private)
+  assert bit_array.byte_size(raw) == 64
+
+  // A note carrying each, with the four-byte key hint every signature line
+  // is prefixed with.
+  let line = fn(signature: BitArray) {
+    let blob = bit_array.base64_encode(<<0, 0, 0, 0, signature:bits>>, True)
+    <<note:utf8, "\n\u{2014} log.example ":utf8, blob:utf8, "\n":utf8>>
+  }
+
+  let assert Ok(with_der) = proof.parse_checkpoint(line(der))
+  let assert Ok(Nil) = proof.verify_checkpoint(with_der, public)
+
+  let assert Ok(with_raw) = proof.parse_checkpoint(line(raw))
+  let assert Ok(Nil) = proof.verify_checkpoint(with_raw, public)
+
+  // And a signature by some other key still fails, in both encodings, so the
+  // acceptance above is not simply a verifier that says yes.
+  let keys.Csk(other, _) = keys.generate()
+  let assert Ok(forged) =
+    proof.parse_checkpoint(line(ecdsa_sign_der(signed, other)))
+  let assert Error(_) = proof.verify_checkpoint(forged, public)
+}
+
 // ---------------------------------------------------------------- publishing
 
 /// A resolver that answers with structurally correct but cryptographically
@@ -530,6 +578,33 @@ pub fn publish_gate_refuses_an_unlogged_key_test() {
   let #(log, spki, point) = fake_log(keys.generate())
   let assert Ok(_) = publish_run(conn, apex, csk, log, #(spki, point), 1000)
   let assert Ok(_) = publish.publish(conn, csk, 1000, "test")
+  sqlite.close(conn)
+}
+
+/// The gate must never turn a transparency gap into a DNS outage.
+///
+/// A boot emission re-emits what is already in the database, so like the
+/// hourly re-sign it says nothing new and is ungated. Gating it meant that a
+/// primary whose key was not yet logged failed `prepare_primary`, halted, and
+/// never started the nameserver at all — taking the re-sign job that exists to
+/// keep the zone resolvable down with it, and leaving a greenfield zone with
+/// no way to boot.
+pub fn a_boot_emission_is_ungated_but_widening_is_not_test() {
+  let conn = fixtures.fresh_conn()
+  let csk = fixtures.zone_boot(conn)
+  let key_tag = keys.key_tag(keys.dnskey_rdata(csk))
+
+  use <- fixtures.with_gate_armed
+  // What `prepare_primary` runs at boot: the zone comes up.
+  let assert Ok(_) = publish.publish_resign(conn, csk, 1000, "system:boot")
+  // And keeps coming up, so a restart weeks later is not a landmine.
+  let assert Ok(_) = publish.publish_resign(conn, csk, 2000, "system:boot")
+
+  // But the gate is untouched where it matters: emitting new content under
+  // an unlogged key is still refused, naming the key.
+  let assert Error(publish.NoRekorRecord(refused)) =
+    publish.publish(conn, csk, 1000, "test")
+  assert refused == key_tag
   sqlite.close(conn)
 }
 

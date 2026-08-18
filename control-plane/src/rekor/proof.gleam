@@ -490,14 +490,14 @@ pub fn parse_checkpoint(bytes: BitArray) -> Result(Checkpoint, ProofError) {
   }
 }
 
-@external(erlang, "cp_crypto_ffi", "ecdsa_verify_raw")
-fn ecdsa_verify_raw(
+@external(erlang, "cp_crypto_ffi", "ecdsa_verify_any_safe")
+fn ecdsa_verify_any(
   message: BitArray,
   signature: BitArray,
   public: BitArray,
 ) -> Bool
 
-@external(erlang, "cp_crypto_ffi", "ed25519_verify")
+@external(erlang, "cp_crypto_ffi", "ed25519_verify_safe")
 fn ed25519_verify(
   message: BitArray,
   signature: BitArray,
@@ -507,12 +507,29 @@ fn ed25519_verify(
 /// Verifies that the pinned log key signed this checkpoint.
 ///
 /// The algorithm follows the key, never the endpoint: a 64-byte point is an
-/// uncompressed P-256 key whose checkpoint signatures are raw `r||s`, and a
-/// 32-byte point is Ed25519. Sigstore's shards have used both, and which one
-/// a given log signs with is a property of the key the trusted root names
-/// beside it (`tuf/trusted_root`) rather than something this build knows in
-/// advance. One matching signature line is enough — the other signature
-/// lines beside it are parsed and simply not our key.
+/// uncompressed P-256 key and a 32-byte point is Ed25519. Sigstore's shards
+/// have used both, and which one a given log signs with is a property of the
+/// key the trusted root names beside it (`tuf/trusted_root`) rather than
+/// something this build knows in advance.
+///
+/// **Both ECDSA encodings are accepted, and that is not laxity.** A P-256
+/// signature travels either as IEEE P1363's fixed 64-byte `r || s` or as
+/// ASN.1/DER, and Sigstore signs its notes in DER — the live
+/// `rekor.sigstore.dev` signature is 70 bytes opening `30 44 02 20`. A DER
+/// signature can never satisfy a fixed-width verifier, so taking only `r || s`
+/// here would mean that on the day Sigstore serves a P-256-keyed shard this
+/// service POSTs an entry to the public log and then refuses the proof the log
+/// returns for it — leaving a zone that can never satisfy its own publish
+/// gate. The client accepts both for the same reason
+/// (`crates/synch-net/src/rekor.rs`, `LogKey::verify`), and either encoding of
+/// a valid signature is a valid signature by that key.
+///
+/// The verifiers are the `_safe` forms because a checkpoint is remote input:
+/// `crypto:verify/5` raises rather than answering `false` for a signature it
+/// cannot parse, and an unparseable signature line is a refusal, not a fault.
+///
+/// One matching signature line is enough — the other signature lines beside it
+/// are parsed and simply not our key.
 pub fn verify_checkpoint(
   checkpoint: Checkpoint,
   log_public: BitArray,
@@ -520,7 +537,7 @@ pub fn verify_checkpoint(
   let signed =
     list.any(checkpoint.signatures, fn(pair) {
       case bit_array.byte_size(log_public) {
-        64 -> ecdsa_verify_raw(checkpoint.signed, pair.1, log_public)
+        64 -> ecdsa_verify_any(checkpoint.signed, pair.1, log_public)
         32 -> ed25519_verify(checkpoint.signed, pair.1, log_public)
         _ -> False
       }

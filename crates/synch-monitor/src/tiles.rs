@@ -478,6 +478,14 @@ impl<'a, S: TileSource> Tree<'a, S> {
     }
 
     /// The bytes of a hash tile.
+    ///
+    /// The width check is not bookkeeping. A hash tile is `width` hashes of 32
+    /// bytes and every reader downstream — [`fold`] above all — is written for
+    /// exactly that shape, so a tile of any other length is refused *here*,
+    /// where the length the tree expects is still in hand. `tile_bytes` returns
+    /// what the log served, verbatim, and only its 404-recovery path passes
+    /// through `cut`; so without this, a body of the wrong length reaches
+    /// `fold` unexamined.
     async fn hash_tile(&self, tile_level: u32, index: u64) -> Result<Vec<u8>, MonitorError> {
         let width = self.width(tile_level, index);
         if width == 0 {
@@ -486,8 +494,19 @@ impl<'a, S: TileSource> Tree<'a, S> {
                 self.size
             )));
         }
-        self.tile_bytes(&tile_level.to_string(), tile_level, index, width)
-            .await
+        let data = self
+            .tile_bytes(&tile_level.to_string(), tile_level, index, width)
+            .await?;
+        let expected = (width as usize) * 32;
+        if data.len() != expected {
+            return Err(MonitorError::Tile(format!(
+                "hash tile {tile_level}/{index} is {} bytes, not the {expected} a \
+                 {width}-hash tile holds at tree size {}",
+                data.len(),
+                self.size
+            )));
+        }
+        Ok(data)
     }
 
     /// The hash of the complete subtree at `(level, index)`.
@@ -513,7 +532,13 @@ impl<'a, S: TileSource> Tree<'a, S> {
                 "node ({level},{index}) is past the end of tile {tile_level}/{tile_index}"
             ))
         })?;
-        Ok(fold(slice))
+        fold(slice).ok_or_else(|| {
+            MonitorError::Tile(format!(
+                "node ({level},{index}) spans {} bytes of tile {tile_level}/{tile_index}, \
+                 which is not a run of complete-subtree hashes",
+                slice.len()
+            ))
+        })
     }
 
     /// The Merkle tree hash over leaves `[lo, hi)`.
@@ -757,7 +782,14 @@ impl<'a, S: TileSource> Tree<'a, S> {
                 256 => {
                     let data = self.hash_tile(level, at).await?;
                     let parent = self.stored_hash(8 * (level + 1), at).await?;
-                    if fold(&data) != parent {
+                    let folded = fold(&data).ok_or_else(|| {
+                        MonitorError::Tile(format!(
+                            "hash tile {level}/{at} is {} bytes, which is not a run of \
+                             complete-subtree hashes",
+                            data.len()
+                        ))
+                    })?;
+                    if folded != parent {
                         return Err(MonitorError::Tile(format!(
                             "hash tile {level}/{at} does not fold to the node its parent \
                              tile stores for it: the log is serving tiles that do not \
@@ -832,14 +864,27 @@ pub struct BundleRequest {
 }
 
 /// A tile's internal node: the hash of a contiguous run of its base hashes.
-fn fold(data: &[u8]) -> [u8; 32] {
+///
+/// `None` for a run that is not `32 · 2^k` bytes, and that total-ness is the
+/// point rather than a courtesy. The halving recursion below only terminates
+/// on such a run: any other length — 0, 100, 8191 — halves down to an empty
+/// slice and calls itself on it forever, which is a stack overflow rather than
+/// a panic and so cannot be caught, unwound or reported. The input is a tile
+/// body chosen by the log being audited, so a partial function here hands the
+/// audited party a way to abort its auditor. [`Tree::hash_tile`] refuses a
+/// mis-sized tile before it reaches this, and this refuses one anyway.
+fn fold(data: &[u8]) -> Option<[u8; 32]> {
     if data.len() == 32 {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(data);
-        return hash;
+        return Some(hash);
+    }
+    let count = data.len() / 32;
+    if !data.len().is_multiple_of(32) || count == 0 || !count.is_power_of_two() {
+        return None;
     }
     let half = data.len() / 2;
-    node_hash(&fold(&data[..half]), &fold(&data[half..]))
+    Some(node_hash(&fold(&data[..half])?, &fold(&data[half..])?))
 }
 
 /// The largest power of two strictly less than `n` — RFC 6962's split.
@@ -1195,6 +1240,95 @@ mod tests {
             .verify_leaf(300, b"entry 300", root)
             .await
             .expect("and the honest body must still verify");
+    }
+
+    /// A log that serves one level-0 hash tile at a length no tile ever has.
+    ///
+    /// Everything else is honest, which is the whole difficulty: in a tree
+    /// this size the root recomputation reads level-1 and never opens this
+    /// tile, so the checkpoint, the root and any consistency prefix all agree
+    /// before the mis-sized body is ever looked at.
+    struct ShortHashTile {
+        honest: MemoryLog,
+        keep: usize,
+    }
+
+    impl TileSource for ShortHashTile {
+        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+            let served = self.honest.fetch(path).await?;
+            match (served, path.starts_with("api/v2/tile/0/")) {
+                (Some(mut data), true) => {
+                    data.truncate(self.keep);
+                    Ok(Some(data))
+                }
+                (served, _) => Ok(served),
+            }
+        }
+
+        async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
+            self.honest.checkpoint_size().await
+        }
+    }
+
+    /// A mis-sized hash tile is refused, and — the part that matters — it is
+    /// *refused* rather than folded.
+    ///
+    /// `fold` halves its input until it reaches 32 bytes, so a length that is
+    /// not `32 · 2^k` recurses until the stack is gone. That is not a panic:
+    /// it aborts the process, uncatchably, taking with it every finding the
+    /// run had already classified — including from earlier shards — and
+    /// exiting 134 rather than the 30 the exit-code contract promises for a
+    /// run that could not finish. The audited party would be choosing when
+    /// its auditor dies.
+    #[tokio::test]
+    async fn a_hash_tile_of_the_wrong_length_is_refused_not_folded() {
+        let honest = log(600);
+        let root = Tree::new(&honest, 600, 1).root().await.unwrap();
+
+        // 100 bytes: not a multiple of 32, and it halves to 50, 25, 12, 6, 3,
+        // 1, 0 — the run that never terminates.
+        for keep in [100, 0, 96, 33] {
+            let short = ShortHashTile {
+                honest: log(600),
+                keep,
+            };
+            let tree = Tree::new(&short, 600, 1);
+            let Err(error) = tree.verify_leaf(300, b"entry 300", root).await else {
+                panic!("a tile of {keep} bytes is not a run of hashes and must be refused")
+            };
+            assert!(
+                format!("{error}").contains("hash tile"),
+                "the refusal should name the tile, got: {error}"
+            );
+        }
+
+        // And the honest log still verifies, so the check is not simply
+        // refusing everything.
+        Tree::new(&honest, 600, 1)
+            .verify_leaf(300, b"entry 300", root)
+            .await
+            .expect("the honest tile still verifies");
+    }
+
+    /// `fold` is total: no input makes it diverge, and only complete-subtree
+    /// runs produce a hash.
+    #[test]
+    fn fold_is_total() {
+        assert!(fold(&[]).is_none());
+        assert!(fold(&[0u8; 31]).is_none());
+        assert!(fold(&[0u8; 33]).is_none());
+        assert!(fold(&[0u8; 96]).is_none(), "three hashes is not a subtree");
+        assert!(fold(&[0u8; 100]).is_none());
+        assert!(fold(&[0u8; 8191]).is_none());
+        assert!(fold(&[0u8; 32]).is_some());
+        assert!(fold(&[0u8; 64]).is_some());
+        assert!(fold(&[0u8; 256 * 32]).is_some());
+        // The shape it is actually asked for, against the reference: two
+        // leaves fold to the node over them.
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let mut pair = a.to_vec();
+        pair.extend_from_slice(&b);
+        assert_eq!(fold(&pair), Some(node_hash(&a, &b)));
     }
 
     #[tokio::test]

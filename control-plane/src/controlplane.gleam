@@ -285,8 +285,25 @@ fn prepare_primary(cfg: Config) -> Result(keys.Csk, String) {
     publish.set_ns_hosts(conn, cfg.ns_hosts)
     |> result.map_error(fn(e) { "setting ns hosts: " <> string.inspect(e) }),
   )
+  // Ungated, for exactly the reason `publish_resign` is ungated: a boot
+  // emission says nothing new. It re-emits the records already in the
+  // database — the ones clients have been accepting — with fresh RRSIG
+  // windows, so refusing it withholds no unlogged key from anybody.
+  //
+  // Gating it instead made a transparency gap a *total DNS outage*, which is
+  // the one outcome `publish_resign`'s own reasoning rules out. The failure
+  // reaches `run_or_die` and halts the process, so with `CP_REKOR_REQUIRE`
+  // armed the nameserver never starts — and the hourly resign job that exists
+  // to keep the zone resolvable while an operator runs `rekor-publish` never
+  // runs either, because there is no process for it to run in. It also left a
+  // greenfield zone unbootable: the gate wants a logged key, logging wants a
+  // live DS, and nothing can serve the zone in between.
+  //
+  // The gate is unaffected where it matters. Every `Widening` emission — a
+  // device added, a network created, a key promoted — still goes through
+  // `publish_in_tx` and is still refused under an unlogged key.
   use _ <- result.try(
-    publish.publish(conn, csk, now_unix(), "system:boot")
+    publish.publish_resign(conn, csk, now_unix(), "system:boot")
     |> result.map_error(fn(e) { "publishing zone: " <> string.inspect(e) }),
   )
   sqlite.close(conn)
