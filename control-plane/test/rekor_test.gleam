@@ -30,6 +30,7 @@ import rekor/publish as rekor_publish
 import rekor/statement
 import rekor/store
 import simplifile
+import tuf/trusted_root
 import store/sqlite
 import tools/gen_crossval
 import zone/build
@@ -1970,3 +1971,26 @@ pub fn a_zone_with_no_usable_key_has_nothing_to_claim_test() {
   let assert Error(why) = chain.collect(resolver, apex, apex)
   assert string.contains(why, "usable zone key")
 }
+
+/// The trusted root this service ships is byte-identical to the one the
+/// client embeds.
+///
+/// It answers "which shard do I submit to, and which key checks what comes
+/// back", while a client independently pins the keys it will accept. The two
+/// are only guaranteed to agree because they are the same bytes — and if they
+/// drift, this side writes entries whose `log_id` no client pins, which is a
+/// zone that fails closed at every client. Same rule the TUF anchor already
+/// has beside it.
+pub fn the_shipped_trusted_root_is_the_clients_test() {
+  let assert Ok(dir) = priv_dir("tuf")
+  let assert Ok(ours) = simplifile.read_bits(dir <> "/" <> trusted_root.file)
+  let assert Ok(theirs) =
+    simplifile.read_bits("../crates/synch-net/src/sigstore_trusted_root.json")
+  assert ours == theirs
+  // And it names a log this build can actually use.
+  let assert Ok(logs) = trusted_root.tlogs(ours)
+  assert logs != []
+}
+
+@external(erlang, "cp_sys_ffi", "priv_dir")
+fn priv_dir(sub: String) -> Result(String, Nil)

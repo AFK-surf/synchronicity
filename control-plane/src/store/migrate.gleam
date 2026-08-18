@@ -62,8 +62,22 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7]
+  [v1, v2, v3, v4, v5, v6, v7, v8]
 }
+
+/// V8: `tuf_material` goes.
+///
+/// This service no longer walks Sigstore's TUF repository. The directory it
+/// needs — which shard to submit to, and the key that checks the proof coming
+/// back — ships in `priv/tuf/sigstore_trusted_root.json` and moves on a
+/// deploy, so there is nothing to store between fetches.
+///
+/// Dropping the table rather than leaving it: a table nothing reads is a
+/// question every future reader has to answer, and the answer would be
+/// "material from a mechanism that was removed".
+const v8 = "
+DROP TABLE IF EXISTS tuf_material;
+"
 
 /// V5: `tuf_material` stops keeping the root chain.
 ///

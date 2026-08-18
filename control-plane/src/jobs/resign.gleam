@@ -2,10 +2,9 @@
 //// soonest RRSIG expiry is inside the refresh window (default 7 days of a
 //// 14-day validity). Replicas therefore have days of slack, not minutes.
 ////
-//// The other half of what §10.3 asks of a primary — keeping this service's
-//// own TUF material young — is `jobs/tuf_refresh`, a sibling rather than a
-//// leg of this job, because the external-mode tree has no re-sign job for
-//// it to ride along with.
+//// Keeping this service's idea of Sigstore's log directory current is not a
+//// job at all: the directory ships in `priv/tuf` and moves on a deploy
+//// (`tuf/trusted_root`).
 
 import dnssec/keys.{type Csk}
 import gleam/erlang/process.{type Subject}

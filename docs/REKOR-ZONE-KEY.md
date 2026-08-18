@@ -756,7 +756,6 @@ the requirement onto a key that signed nothing.
 | `CP_REKOR_KEY` | primary | Optional file pinning a self-hosted log's verification key. Absent, the key is the one the trusted root names beside the endpoint — one key, not the client's whole pinned set, because this side submits to exactly one log and verifies what that log returns. Redirecting `CP_REKOR_URL` to a log the trusted root does not name, without naming the matching key here, is refused up front rather than storing something clients would reject. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
 | `CP_REKOR_REQUIRE` | primary | `true` arms the publish gate of §5.3. Off by default, because the rollout publishes before it enforces (§7). Serve mode refuses the zone; external mode still publishes the declaration, owner marker and proofs so the watcher can log, and omits membership TXT until a verified record exists. |
-| `CP_TUF_URL` | primary | The Sigstore TUF repository this service follows to find the log shard in service (§10.3). Default `https://tuf-repo-cdn.sigstore.dev`. |
 | `CP_SIGNING_ZONE` | primary, external only | The DNS zone the provider actually hosts, when it is not the apex — a control plane at `sync.example.com` served out of `example.com` sets it to `example.com`. Defaults to `CP_BASE_DOMAIN`, and must be a name that *contains* it; boot refuses anything else, and refuses the variable outright in serve mode, where this service is the authoritative nameserver for its own apex and the two are the same by construction. It decides where a chain's ladder starts; proof records still live at the apex (§2). |
 
 Every one of these is read at its use site rather than through boot
@@ -845,7 +844,7 @@ CREATE TABLE rekor_records (
 ```
 
 It arrives whole, in the control plane's migration **v3** — the same step that
-adds `tuf_material` for §10.3. There is no
+adds nothing else. There is no
 intermediate shape of this table in any database that exists: the work landed
 over several migrations while it was being written, and those were squashed
 into one before release. So there is no "before" to migrate from, and nothing
@@ -905,8 +904,7 @@ unsaid, because each is the kind of thing a reader may assume is present:
   not written.
 - *"`/healthz` reports `rekor_verified_at` and the log index."* It does not.
   `/healthz` reports the SOA serial, the soonest RRSIG expiry, and — when
-  there is stored TUF material — `tuf_root_version` and
-  `tuf_timestamp_expires_at` (§10.3). Nothing about `rekor_records` is
+  nothing else. Nothing about `rekor_records` is
   exposed there at all. An operator checks transparency state with
   `rekor-publish` (which prints it) or by reading `rekor_records`.
 - *"`/api/zone/rekor` serves the proof for air-gapped mode."* It does not;
@@ -1604,7 +1602,7 @@ more; `timestamp.json`, which names the snapshot version;
 which names the target's digest; and
 `targets/<sha256>.trusted_root.json`. **It checks nothing** — collecting is
 one step and verifying is the next (`tuf::fetch_metadata` then `tuf::update`;
-`tuf/fetch` then `tuf/verify` on the Gleam side), which is what keeps "a
+on the client side), which is what keeps "a
 tampering mirror produces material that fails verification" a structural
 property rather than a claim about the fetch.
 
@@ -1616,10 +1614,10 @@ that file declares — so the floor and the anchor cannot disagree. Raising the
 floor is a release note: a client below it has nothing to bridge the gap and
 keeps its pins rather than guessing.
 
-`SYNCH_TUF` / `--tuf` (client), `--tuf` (monitor) and `CP_TUF_URL` name a
-different repository; `CP_TUF_ROOT` replaces the control plane's anchor for a
-deployment running its own Sigstore. These are mirror knobs, not trust knobs —
-whatever they name is still checked against the anchor in force.
+`SYNCH_TUF` / `--tuf` (client) and `--tuf` (monitor) name a different
+repository. These are mirror knobs, not trust knobs — whatever they name is
+still checked against the anchor in force. The control plane has no such knob,
+because it walks no repository (§10.3).
 
 ### 10.2 Client rules
 
@@ -1740,57 +1738,50 @@ Two rules preserve the availability posture, and they are load-bearing:
 Failure classes get their own errors and `synch doctor` copy, but none of
 them fails a refresh: TUF trouble is never worse than not having asked.
 
-### 10.3 Control plane: fetch, verify, store
+### 10.3 Control plane: the directory ships
 
-The control plane reads the repository for one thing — §10.6's question of
-which log shard it submits to, and which key checks the proof that comes
-back. It publishes nothing about TUF into the zone; clients do their own
-reading.
+The control plane needs Sigstore's directory for one thing — §10.6's question
+of which log shard it submits to, and which key checks the proof that comes
+back. **It does not walk the TUF repository to get it.** The directory ships
+in `priv/tuf/sigstore_trusted_root.json`, byte-identical to the client's
+`EMBEDDED_TRUSTED_ROOT`, beside the TUF root that was already there.
 
-- `CP_TUF_URL` (default `https://tuf-repo-cdn.sigstore.dev`) names the
-  repository; the primary walks it and stores the files verbatim in a
-  `tuf_material` table with their versions and the timestamp expiry. The root
-  chain is not stored: every walk starts from the anchor in `priv/tuf`, so a
-  copy would be bytes nobody reads.
-- **The CP verifies what it stores** (`tuf/verify`), running the same
-  workflow the client runs against the same anchor —
-  `priv/tuf/sigstore_tuf_root.json`, byte-identical to `EMBEDDED_TUF_ROOT`.
-  Root chain endorsed by both the old root and the new, thresholds counted
-  over *distinct* keys, signatures checked over canonical JSON, expiries,
-  monotonicity against what is stored, and the target's digest. Nothing that
-  fails is stored, so whatever was stored before keeps being used.
+The reason is what the material can and cannot reach. Nothing about it enters
+the zone; clients pin their own log keys from their own walk of the
+repository, verified against their own embedded root. So a directory this
+service got *wrong* — by any means, hostile or accidental — produces a stored
+proof whose `log_id` no client pins, which is `UnknownLog` at every client
+and a zone that fails closed. Loud, local, and not a trust bypass.
 
-  This matters here more than anywhere else, because the decision it feeds is
-  the one nobody downstream re-checks. A mirror that beat TLS could otherwise
-  point a control plane at a log nobody monitors, have its forged proof
-  believed, and satisfy `CP_REKOR_REQUIRE` on the way past. Clients would
-  still refuse the zone — the forged log matches no pin of theirs — so it was
-  a fail-closed denial rather than a silent compromise, but "loud at the
-  client" is not "checked at the source".
+That makes fetching it a question of convenience rather than of security, and
+convenience is not worth what a fetch costs here. A fetched-and-verified copy
+bought a better error *location*: a hostile mirror was caught at ingestion
+rather than at the client. It cost a second complete TUF client — canonical
+JSON, threshold counting, root rotation, RFC 3339, byte and time bounds, a
+table, a migration and a supervised job — in a second language, which is
+~2,900 lines whose only job was to re-derive an answer the client re-derives
+anyway. Six of this design's known defects lived in it. And a
+fetched-and-*unverified* copy is worse than either: it makes TLS
+load-bearing for the first time in this design, for the same answer.
 
-  What keeps the two implementations honest is the shared fixture
-  (`control-plane/test/fixtures/tuf`): one checked-in copy of the real
-  Sigstore chain that *both* verifiers must walk to the real pin set.
-  Canonical JSON is checked a third way on top of that — against digests from
-  an implementation in neither language — because two implementations that
-  share an author can be wrong together.
+The asymmetry with §10.2 is deliberate and is the whole argument. A client
+daemon runs on somebody's NAS and cannot be redeployed when Sigstore opens a
+shard, so it walks the repository. This service ships as a container image
+with a release pipeline, so it can pay a deploy — the same cost `--no-tuf`
+already carries on the client side and which §10.4 calls acceptable there.
 
-  What verification does **not** do is gate use. Stored material that has
-  since expired keeps naming the log: expiry gates updates, never operation
-  (§10.2), so it is checked at ingestion, where refusing costs nothing but a
-  retry.
-- The refresh job (`jobs/tuf_refresh`) fetches when nothing is stored —
-  at boot, so a fresh control plane can name a shard within seconds — and
-  refetches hourly once the stored timestamp is within 3 days of expiry,
-  in both primary modes. It does not republish the zone — no record
-  depends on this. There is no on-demand command and none is needed:
-  `rekor-publish` itself fetches first when the stored material cannot
-  name a log, so the air-gapped ceremony on its egress host leaves the
-  couriered database carrying the material, as with everything else.
-- `/healthz` reports the stored timestamp expiry and root version, as
-  `tuf_timestamp_expires_at` and `tuf_root_version`, so an operator can see a
-  service heading for a stale idea of which shard is in service. Absent
-  material is reported by their absence, not as unhealthy.
+What that costs, stated exactly: when Sigstore opens the next shard, this
+service keeps naming the old one until it is redeployed. The failure is loud
+and local — `trusted_root.current` finds no shard whose window contains now,
+`rekor-publish` fails naming that, and the external-mode watcher logs it every
+tick. `CP_REKOR_URL` + `CP_REKOR_KEY` name a log outright in the meantime, as
+they always have. What it does *not* do is degrade quietly: nothing about
+zone serving reads this material, so a stale directory cannot make a zone
+resolve wrongly, only make the next `rekor-publish` refuse.
+
+The shipped file is asserted byte-identical to the client's in the test suite,
+because the two agreeing is the point: a shard this service picks is a shard
+clients' own pins cover.
 
 ### 10.4 What this changes about §4.1 and §8
 
@@ -1863,6 +1854,6 @@ picks and the client has to verify what comes back.
 
 | Component | Where it gets the log | Override |
 |---|---|---|
-| Control plane | the stored `trusted_root.json` in `tuf_material`, read at the moment of use — so the 15-minute external-mode key watcher picks up a rotation without a restart. With nothing stored, `rekor-publish` fetches first. | `CP_REKOR_URL` + `CP_REKOR_KEY`, together, for a self-hosted log |
+| Control plane | the `trusted_root.json` it ships in `priv/tuf`, read at the moment of use — so a deploy carrying a newer one takes effect on the next tick (§10.3) | `CP_REKOR_URL` + `CP_REKOR_KEY`, together, for a self-hosted log |
 | Client | never talks to a log at all: a proof arrives inside the zone (§1) | — |
 | `synch-monitor` | the trusted root in force, persisted in `rekor-pins.json` beside its state file | `--log`, `--rekor-key`, `--no-tuf` |

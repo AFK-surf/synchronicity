@@ -1,7 +1,7 @@
 //// The external DNS provider, as the reconciler needs it: list the TXT
 //// records you hold below the apex, apply this change set.
 ////
-//// A record-of-functions, like `rekor/client.Log` and `tuf/fetch.Repo`:
+//// A record-of-functions, like `rekor/client.Log`:
 //// tests drive the reconciler with an in-memory fake, the real legs
 //// (`provider/cloudflare`, `provider/bunny`) build the HTTP half, and
 //// `log_only` is the mailer-style dry-run for an operator who wants to see

@@ -21,7 +21,6 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import provider/state as provider_state
 import store/pool
-import tuf/store as tuf_store
 import wisp.{type Request, type Response}
 import zone/model
 
@@ -223,26 +222,14 @@ fn with_session(
 fn healthz(serving: Serving) -> Response {
   let looked =
     pool.with_connection(serving.pool, fn(conn) {
-      #(model.health(conn), tuf_store.get(conn))
+      model.health(conn)
     })
   case looked {
-    Ok(#(Ok(#(serial, expires)), tuf)) ->
+    Ok(Ok(#(serial, expires))) ->
       json.object([
         #("status", json.string("ok")),
         #("soa_serial", json.int(serial)),
         #("sig_expires_at", json.int(expires)),
-        // The stored TUF material (docs/REKOR-ZONE-KEY.md §10.3): the
-        // timestamp expiry and root version, so an operator can see a
-        // service that has quietly stopped refetching and is heading for a
-        // stale idea of which log shard is in service. Absent material is
-        // reported as absent, not as unhealthy.
-        ..case tuf {
-          Ok(Ok(material)) -> [
-            #("tuf_root_version", json.int(material.root_version)),
-            #("tuf_timestamp_expires_at", json.int(material.timestamp_expires)),
-          ]
-          _ -> []
-        }
       ])
       |> json.to_string
       |> wisp.json_response(200)
@@ -266,11 +253,10 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
         provider_state.get(conn),
         provider_state.observed_keys(conn),
         provider_state.oldest_unlogged_age(conn, now),
-        tuf_store.get(conn),
       )
     })
   case looked {
-    Ok(#(Ok(meta), Ok(state), Ok(keys), unlogged_age, tuf)) -> {
+    Ok(#(Ok(meta), Ok(state), Ok(keys), unlogged_age)) -> {
       let synced = case state {
         Ok(s) ->
           s.last_synced_serial == option.Some(meta.soa_serial)
@@ -279,19 +265,6 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
         Error(Nil) -> False
       }
       let logged = list.filter(keys, fn(key) { key.logged_at != option.None })
-      // The same TUF material serve mode reports, for the same reason and
-      // with more of it: the refresh job runs in both primary modes (§10.3),
-      // external mode is where the 15-minute key watcher reads the shard at
-      // the moment of use, and an operator whose stored material has gone
-      // stale has no other way to see it. Absent material is reported by its
-      // absence, not as unhealthy.
-      let tuf_fields = case tuf {
-        Ok(Ok(material)) -> [
-          #("tuf_root_version", json.int(material.root_version)),
-          #("tuf_timestamp_expires_at", json.int(material.timestamp_expires)),
-        ]
-        _ -> []
-      }
       let provider_fields = case state {
         Ok(s) -> [
           #("provider", json.string(s.provider)),
@@ -330,7 +303,7 @@ fn healthz_external(zone_pool: pool.Pool) -> Response {
             json.int,
           ),
         ),
-        ..list.append(provider_fields, tuf_fields)
+        ..provider_fields
       ])
       |> json.to_string
       |> wisp.json_response(200)

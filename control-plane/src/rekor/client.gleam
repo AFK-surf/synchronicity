@@ -15,11 +15,11 @@
 //// (the Merkle leaf preimage), the inclusion proof and the signed
 //// checkpoint.
 ////
-//// *Which* log that is, and which key its checkpoints are signed with, are
-//// not compiled in: [`discover`] reads both out of the `trusted_root.json`
-//// this service fetches from Sigstore (§10). The endpoint follows Sigstore
-//// for the same reason clients' pins do — a shard rotation should cost a TUF
-//// refresh, not a release.
+//// *Which* log that is, and which key its checkpoints are signed with, come
+//// from the `trusted_root.json` this service ships in `priv/tuf` — the same
+//// directory the client embeds. It is read at the moment of use rather than
+//// at boot, so a deploy carrying a newer one takes effect on the next tick
+//// (§10.3).
 
 import envoy
 import gleam/bit_array
@@ -35,9 +35,7 @@ import gleam/result
 import gleam/string
 import rekor/proof
 import simplifile
-import store/sqlite.{type Connection}
-import tuf/fetch
-import tuf/store as tuf_store
+
 import tuf/trusted_root
 
 /// What is submitted for one entry: the SHA-256 of the DSSE PAE, the DER
@@ -95,10 +93,11 @@ pub type Target {
 /// - `CP_REKOR_KEY` replaces the key entirely — the self-hosted or simulated
 ///   log case, where no trusted root has anything to say.
 ///
-/// With neither set and no material stored, this fails rather than guessing
-/// a hostname: `jobs/tuf_refresh` fetches at boot and hourly from there, and
-/// [`resolve`] fetches on the spot for the callers that can.
-pub fn discover(conn: Connection, now: Int) -> Result(Target, String) {
+/// With neither set, the answer comes from the trusted root this build ships
+/// (`tuf/trusted_root.shipped`). If that names no shard whose window contains
+/// now — Sigstore has rotated and this image has not been redeployed — this
+/// fails saying so rather than guessing a hostname.
+pub fn discover(now: Int) -> Result(Target, String) {
   let override_url = envoy.get("CP_REKOR_URL") |> option.from_result
   use override_key <- result.try(case envoy.get("CP_REKOR_KEY") {
     Error(Nil) -> Ok(None)
@@ -109,7 +108,7 @@ pub fn discover(conn: Connection, now: Int) -> Result(Target, String) {
     // service has no other way to know about, so nothing else is consulted.
     Some(url), Some(key) -> Ok(Target(trusted_root.strip_slash(url), key))
     _, _ -> {
-      use logs <- result.try(stored_tlogs(conn))
+      use logs <- result.try(shipped_tlogs())
       use log <- result.try(case override_url {
         Some(url) -> trusted_root.for_url(logs, url)
         None -> trusted_root.current(logs, now)
@@ -123,57 +122,10 @@ pub fn discover(conn: Connection, now: Int) -> Result(Target, String) {
   }
 }
 
-/// [`discover`], refetching the TUF material once if it cannot answer.
-///
-/// A refresh is the only thing that can change discovery's answer: it is what
-/// puts the directory there on a control plane that has never fetched, and
-/// what moves it on when Sigstore opens a shard this copy has not heard
-/// about. So a failure to discover is worth one fetch — and if that fetch
-/// fails too, both reasons are reported, because "no material" and "no
-/// egress" are different problems with different fixes.
-///
-/// For the callers that can afford a network round trip on a bad day:
-/// `rekor-publish` is a ceremony with egress by assumption. The background
-/// loops call [`discover`] alone and let `jobs/tuf_refresh` do the fetching,
-/// so a quarter-hourly tick never turns into a quarter-hourly fetch.
-pub fn resolve(
-  conn: Connection,
-  repo: fetch.Repo,
-  source: String,
-  now: Int,
-) -> Result(Target, String) {
-  case discover(conn, now) {
-    Ok(target) -> Ok(target)
-    Error(why) ->
-      case fetch.refresh(conn, repo, source, now) {
-        Ok(_) -> discover(conn, now)
-        Error(fetch_failed) ->
-          Error(
-            why
-            <> " (refetching "
-            <> source
-            <> " failed too: "
-            <> fetch_failed
-            <> ")",
-          )
-      }
-  }
-}
-
-/// The logs the stored `trusted_root.json` names.
-fn stored_tlogs(conn: Connection) -> Result(List(trusted_root.Tlog), String) {
-  use stored <- result.try(
-    tuf_store.get(conn)
-    |> result.map_error(fn(e) { "reading tuf_material: " <> string.inspect(e) }),
-  )
-  use material <- result.try(
-    stored
-    |> result.replace_error(
-      "no TUF material stored yet — the refresh job fetches at boot and "
-      <> "hourly; or name the log with CP_REKOR_URL and CP_REKOR_KEY",
-    ),
-  )
-  trusted_root.tlogs(material.trusted_root)
+/// The logs the shipped `trusted_root.json` names.
+fn shipped_tlogs() -> Result(List(trusted_root.Tlog), String) {
+  use bytes <- result.try(trusted_root.shipped())
+  trusted_root.tlogs(bytes)
 }
 
 /// Reads a pinned log key file (`CP_REKOR_KEY`): the DER

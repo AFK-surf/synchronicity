@@ -535,7 +535,7 @@ served serial) are absent rather than faked.
 ### 5.1 Interface
 
 House record-of-functions style, exactly as `rekor/client.Log` and
-`tuf/fetch.Repo` — a single-constructor type holding function fields, real
+`rekor/client.Log` — a single-constructor type holding function fields, real
 HTTP legs built at the edge, fakes supplied inline in tests:
 
 ```gleam
@@ -740,7 +740,7 @@ runs the same steps minus the decommissioning.
   but the exact-NSEC guarantees of serve mode are not preserved.
 - **Egress and credentials on the primary.** The control plane now holds
   a DNS-write credential and calls provider APIs continuously —
-  consistent with the existing `tuf/fetch` egress posture, but a bigger
+  consistent with the existing egress posture, but a bigger
   secret than any it holds today. Zone-scoped tokens where the provider
   offers them (Cloudflare yes, Bunny no).
 
