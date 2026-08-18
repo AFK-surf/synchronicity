@@ -423,16 +423,25 @@ should be dropped from the finding.
 **Fix**: put the numbers in the shared fixture's `meta.txt` and assert both sides
 against it.
 
-### M10. The design document describes a multi-apex walk the code refuses
+### M10. The design document described a multi-apex walk the code refuses — **fixed (doc)**
 
-`docs/REKOR-ZONE-KEY.md:566-573` says each usable apex "is tried in turn,
+`docs/REKOR-ZONE-KEY.md:566-573` said each usable apex "is tried in turn,
 most-attested first and bounded, rather than the whole answer failing".
 `crates/synch-net/src/dns.rs:206-215` is a hard refusal. The function's own
-rustdoc at `:169-189` rebuts the design doc using the design doc's exact examples,
-and `:1024` says "One apex, one verification." The code is right; the
-authoritative document is wrong, in a repo whose stated method is to carry the
-security argument in prose. Residue: `candidates_to_verify` is a function whose
-entire body is `truncate(4)`, carrying 15 lines of justification.
+rustdoc at `:169-189` rebutted the design doc using the design doc's exact
+examples, and `:1024` says "One apex, one verification." The code is right; the
+authoritative document was wrong, in a repo whose stated method is to carry the
+security argument in prose.
+
+**Fixed** in the document, not the code: the passage now says a second usable
+apex at one name is a refusal and why — the cases that look like they need a
+candidate list all relocate the owner name along with the apex, and trying
+several in turn would let whichever one an attacker can publish decide the
+answer. It also separates `MAX_PROOF_CANDIDATES`, which bounds a genuinely
+tried-in-turn list of *proofs* at a single apex and is a different question.
+That last point is the residue the finding noted: `candidates_to_verify` is a
+function whose entire body is `truncate(4)` carrying 15 lines of
+justification, and it now has a doc that agrees with it.
 
 ### M11. Shard retirement can never be revocation
 

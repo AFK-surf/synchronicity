@@ -563,14 +563,24 @@ round-trip count, and §6 prices what that costs:
 3. `_synchronicity-rekor.<apex> TXT` — the proof records, at an apex the
    membership answer named, which must sit between the signing zone and the
    domain being resolved. A proof spanning several records continues at
-   `_synchronicity-rekor-<n>.<apex>`, bounded by `MAX_PROOF_PARTS`. Where the
-   answer's records name **more than one** usable apex — a stale record from a
-   decommissioned control plane, a migration in flight — each is tried in turn,
-   most-attested first and bounded, rather than the whole answer failing: that
-   is the same "one unreadable record must not sink a readable one" rule the
-   member records and the proof records already get, and without it one stale
-   TXT partitions a domain until a human deletes it. Only an answer where *no*
-   record names a usable apex is a refusal.
+   `_synchronicity-rekor-<n>.<apex>`, bounded by `MAX_PROOF_PARTS`. An answer
+   whose records name **more than one** usable apex is a **refusal**, not a
+   list to try in turn: one answer is covered by one control plane, and which
+   of them it is cannot be guessed. The cases that look like they need a
+   candidate list — a decommissioned control plane's leftovers, a migration in
+   flight, two control planes inside one signing zone — all relocate the owner
+   name along with the apex, so none of them produces two apexes at one name;
+   and trying several in turn would let whichever one an attacker can get
+   published decide the answer, which is the opposite of what "most-attested
+   first" sounds like it buys. The "one unreadable record must not sink a
+   readable one" rule applies *within* the member records and the proof
+   records, where the records are independent — the apex is not one of
+   several, it is the thing that says whose records these are. See `apex_of`
+   and `member_set` in `crates/synch-net/src/dns.rs`: "One apex, one
+   verification."
+
+   (`MAX_PROOF_CANDIDATES` bounds the *proof* candidates at a single apex.
+   That list is genuinely tried in turn, and is a different question.)
 
 Before step 3, and off the DNS transport entirely, the pin set may be
 refreshed from Sigstore's TUF repository — at most once a day, so this is not
