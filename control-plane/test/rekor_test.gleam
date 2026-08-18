@@ -1160,6 +1160,14 @@ pub fn a_proof_needing_more_parts_than_a_reader_fetches_is_refused_test() {
   // And what fits is unaffected: the fixture is a handful of parts.
   let assert Ok(records) = proof.to_txt(base)
   assert list.length(records) <= proof.max_parts
+
+  // Against the shared fixture, not against itself. Both suites asserted
+  // their own constant to their own constant, which passes however far apart
+  // the two have drifted — and the direction that matters is invisible:
+  // raising this on the publishing side alone truncates every longer proof
+  // client-side, permanently and silently, while lowering it fails loudly
+  // here at publish time.
+  assert int.to_string(proof.max_parts) == meta("max_proof_parts")
 }
 
 /// The gate asks whether a row exists; a client asks whether the proof name

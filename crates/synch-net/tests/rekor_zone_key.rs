@@ -797,6 +797,16 @@ fn the_shared_fixture_decodes_and_verifies() {
         "the audit path is a flat run of 32-byte hashes"
     );
     assert_eq!(proof.log_index.to_string(), fixture_field("log_index"));
+    // The part ceiling, which is a *coupling* rather than a property of this
+    // entry: raising it on the publishing side alone silently truncates every
+    // proof past the old limit, client-side and permanently, while lowering it
+    // there fails loudly at publish time. The invisible direction is the one
+    // that matters, and neither suite could see it while each compared its own
+    // constant to itself.
+    assert_eq!(
+        synch_net::rekor::MAX_PROOF_PARTS.to_string(),
+        fixture_field("max_proof_parts"),
+    );
     // Re-encoding is byte-identical: the format has exactly one rendering.
     assert_eq!(proof.encode().unwrap(), fixture("proof.bin"));
 
@@ -1003,11 +1013,17 @@ fn regenerate_the_shared_fixture() {
     write_file(
         "meta.txt",
         format!(
-            "apex={}\nkey_tag={}\nlog_index={}\naction={}\n",
+            // `max_proof_parts` is not about this entry. It is one number
+            // that has to be the same on both sides — the publisher refuses
+            // to emit more parts than it, the client stops reading at it —
+            // and until it landed here each suite asserted its own constant
+            // against itself, which passes however far apart the two drift.
+            "apex={}\nkey_tag={}\nlog_index={}\naction={}\nmax_proof_parts={}\n",
             zone.apex(),
             zone.key_tag(),
             proof.log_index,
             statement.action,
+            synch_net::rekor::MAX_PROOF_PARTS,
         )
         .as_bytes(),
     );

@@ -460,8 +460,19 @@ Correction: `PROOF_CHUNK_CHARS`/`txt_chunk_chars` is *not* a coupling —
 `assemble_group` concatenates without inspecting chunk length — so that pair
 should be dropped from the finding.
 
-**Fix**: put the numbers in the shared fixture's `meta.txt` and assert both sides
-against it.
+**Fix (applied)**: `max_proof_parts` is now a field in the shared fixture's
+`meta.txt`, written by the Rust regenerator from `MAX_PROOF_PARTS` and asserted
+by both suites against the file rather than against their own constant.
+Verified in both directions: raising either side alone now fails.
+
+The `PROOF_CHUNK_CHARS`/`txt_chunk_chars` pair is deliberately **not** pinned.
+The challenge pass showed it is not a coupling at all — `assemble_group`
+concatenates chunk payloads without inspecting their length and `decode_group`
+checks only the group digest, so either constant can move independently with no
+interop effect. Pinning it would assert a relationship that does not exist. The
+part-name derivation (`dns.rs:127` vs `build.gleam:175`) is a real pair and is
+still unpinned; closing it needs a rendered `sync1p` record in the fixture,
+which is a larger piece of work than this one.
 
 ### M10. The design document described a multi-apex walk the code refuses — **fixed (doc)**
 
