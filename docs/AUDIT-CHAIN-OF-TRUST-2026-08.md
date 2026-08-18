@@ -458,11 +458,13 @@ revocation claim and state plainly that a leaked shard key is unrecoverable.
   `synch-monitor` consequently pulls 307 packages including a QUIC relay, UPnP
   and SQLite. Extracting `crates/synch-trust` halves the graph and strengthens
   rather than weakens the shared-validator property. Build hygiene, not behaviour.
-- **`Certificate::parse` never exhausts `tbsCertificate`** (`x509.rs:105-148`), so
-  a second `[3]` extensions block is silently dropped and the exactly-one-SAN and
-  exactly-one-chain-extension rules never fire on it. The comment at `:122-128`
-  claims the rule is applied at every level. Both readers use the same parser, so
-  no tier split — one line (`tbs.finish(...)`) closes it.
+- ~~**`Certificate::parse` never exhausts `tbsCertificate`**~~ **fixed.** A
+  second `[3]` extensions block was silently dropped, so the exactly-one-SAN and
+  exactly-one-chain-extension rules never fired on it — while the comment beside
+  them claimed the rule was applied at every level. `tbs.finish(...)` closes it;
+  `a_second_extensions_block_inside_the_tbs_is_refused` builds a certificate with
+  a smuggled second block naming a different zone and is verified to fail without
+  the fix.
 - **Quadratic proof reassembly.** `assemble_group` (`rekor.rs:410-448`) rescans
   every part for every claimed total; the candidate cap runs *after*. Measured at
   938,074,384 iterations / ~0.9 s of CPU on the async task with no
@@ -479,14 +481,17 @@ revocation claim and state plainly that a leaked shard key is unrecoverable.
   there (the field is singular). The file contradicts itself at `:1889-1893`.
   During a double-signature rollover a transport that controls answer ordering
   deterministically picks which key must carry a proof.
-- **A wildcard watch entry parses and watches almost nothing.** Measured:
-  `*.example.com` watches `example.com` and up, and *nothing* below — including
-  `cp.example.com`. `unwatchable` lets it through and the startup echo prints it
-  verbatim. Same silent-nothing failure `check_watch_list` was written to refuse.
-- **`ds_fields` hardcodes digest type 2** (`chain.rs:839-846`), so the monitor's
-  report line — deliberately the first and longest field, for registrar
-  comparison — is wrong for a signing zone whose parent publishes only SHA-384.
-  Narrower than filed: primary mode hands the operator the type-2 DS itself.
+- ~~**A wildcard watch entry parses and watches almost nothing**~~ **fixed.**
+  Measured: `*.example.com` watched `example.com` and up and *nothing* below,
+  including `cp.example.com` — the ordinary shape of both a control plane and a
+  takeover. `unwatchable` now refuses it, with an error saying to watch the apex
+  itself, which already covers the whole delegation path in both directions.
+- ~~**`ds_fields` hardcodes digest type 2**~~ **fixed.** The report line exists
+  to be compared against a registrar, and a registrar shows whichever digest type
+  the delegation uses — `covers` accepts both. `ds_fields_sha384` is now reported
+  beside it, in the JSON as an additive `ds_sha384` field and in the human line,
+  on the same reasoning the line's own doc gives: one an operator has to re-run a
+  tool to complete is one they will not act on.
 - **`ParsedLink::parse` accepts DNS name compression pointers**, contradicting the
   documented uncompressed-only format. Verified: a backward pointer resolves and
   passes the owner check. Harmless here, but a third-party monitor written to the

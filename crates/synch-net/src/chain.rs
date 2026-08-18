@@ -885,6 +885,24 @@ pub fn ds_fields(zone: &Name, dnskey_rdata: &[u8]) -> String {
     )
 }
 
+/// The same over RFC 4509 digest type 4 (SHA-384).
+///
+/// Reported beside the type-2 line rather than instead of it, because the
+/// line exists to be *compared against a registrar* and a registrar shows
+/// whichever type the delegation actually uses. `covers` accepts both, so a
+/// zone delegated with a SHA-384 DS is ordinary; a report offering only the
+/// type-2 digest sends its reader looking for a string their registrar will
+/// never show, at the moment they are trying to decide whether an entry is
+/// their own rotation or somebody else's.
+pub fn ds_fields_sha384(zone: &Name, dnskey_rdata: &[u8]) -> String {
+    format!(
+        "{} {} 4 {}",
+        key_tag(dnskey_rdata),
+        dnskey_rdata.get(3).copied().unwrap_or(0),
+        hex::encode(ds_digest_sha384(zone, dnskey_rdata))
+    )
+}
+
 /// Serializes records as the uncompressed wire run a [`ChainLink`] carries.
 ///
 /// Uncompressed and nothing else: a Merkle leaf has no DNS message for a
