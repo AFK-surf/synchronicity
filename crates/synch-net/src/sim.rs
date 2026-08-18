@@ -1336,9 +1336,9 @@ impl SimTufKey {
             .as_ref()
             .to_vec();
         let key = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).expect("key load");
-        let mut spki = vec![
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ];
+        // The same prefix `LogKey::from_spki` strips back off, named once
+        // there rather than spelled out again here.
+        let mut spki = crate::rekor::ED25519_SPKI_PREFIX.to_vec();
         spki.extend_from_slice(ring::signature::KeyPair::public_key(&key).as_ref());
         SimTufKey {
             pkcs8,
@@ -1527,13 +1527,13 @@ fn sign_p256_der(pkcs8: &[u8], message: &[u8]) -> Vec<u8> {
 }
 
 /// A DER SubjectPublicKeyInfo around a raw uncompressed P-256 point.
+///
+/// The real one. A private copy of the same 27 bytes lived here, which is
+/// exactly the shape that drifts: the harness mints the keys the parser is
+/// then asserted against, so a divergence between the two would make the
+/// suite agree with itself about a format neither one gets right.
 fn p256_spki(point: &[u8]) -> Vec<u8> {
-    let mut der = vec![
-        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
-        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-    ];
-    der.extend_from_slice(point);
-    der
+    crate::rekor::p256_spki(point)
 }
 
 /// The canonical wire form of a name: lowercase labels, length-prefixed,

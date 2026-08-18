@@ -602,13 +602,20 @@ revocation claim and state plainly that a leaked shard key is unrecoverable.
   a stated consistency check, not a link in the trust chain. (Two reviewer errors:
   P-256 is forced by the `keyDetails` refusal, not by this check, and the docs do
   not oversell it.)
-- **The P-256 SPKI prefix is duplicated at five sites**, not two. Drift risk is
-  closed by the real-entry test; cosmetic.
-- **`sim` is enabled for every workspace *test* build.** Disproved in part: `cargo
-  doc --workspace --no-deps` in CI does compile the sim-off configuration, so a
-  compile error cannot ship. Residual: that pass exits 0 on `dead_code`/
-  `unused_imports`, and clippy `-D warnings` never runs against sim-off. Add
-  `cargo clippy --workspace --lib`.
+- ~~**The P-256 SPKI prefix is duplicated at five sites**~~ **fixed.** Named
+  once in `rekor.rs` (`P256_SPKI_PREFIX`, `ED25519_SPKI_PREFIX`) and used from
+  all of them; `sim.rs`'s private `p256_spki` now delegates to the real one.
+  Drift risk was already closed by the real-entry test — this is about a reader
+  having to compare 27 hex bytes by eye to check that two sites agree. The one
+  literal left is in a parser test, where writing the bytes out is the point.
+- ~~**`sim` is enabled for every workspace *test* build**~~ **fixed.** The
+  headline was disproved by the challenge pass — `cargo doc --workspace
+  --no-deps` does compile the sim-off configuration, so a compile error cannot
+  ship. The residual was real: that pass exits 0 on `dead_code`/`unused_imports`
+  because rustdoc's `-D warnings` denies rustdoc lints rather than rustc's, and
+  clippy never saw the shipped configuration at all. CI now runs `cargo clippy
+  --workspace --lib -- -D warnings`, which resolves `sim` off. It passes on the
+  current tree, so it guards rather than fixes.
 - **The multi-total reassembly reading** is justified by a rollover case that
   cannot occur — but a chunk-size change *does* produce two totals in one group
   from an honest publisher, which the machinery survives. Reduce to fixing the

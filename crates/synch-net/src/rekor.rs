@@ -1485,6 +1485,24 @@ impl LogKeys {
     }
 }
 
+/// The DER SubjectPublicKeyInfo prefix for an uncompressed P-256 point:
+/// the `id-ecPublicKey` / `prime256v1` algorithm identifier, the bit-string
+/// header, and the `0x04` uncompressed-point tag.
+///
+/// One definition. It was written out three times in this file and again in
+/// `sim.rs`, and "the sites are what get forgotten" is the whole argument for
+/// naming it: a reader checking whether two of them agree has to compare 27
+/// hex bytes by eye.
+pub(crate) const P256_SPKI_PREFIX: &[u8] = &[
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+];
+
+/// The same for an Ed25519 key.
+pub(crate) const ED25519_SPKI_PREFIX: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
 impl LogKey {
     /// Parses a DER SubjectPublicKeyInfo holding a P-256 or Ed25519 key.
     ///
@@ -1492,13 +1510,6 @@ impl LogKey {
     /// refused, rather than a general ASN.1 reader parsing whatever it is
     /// handed. The `id` is SHA-256 over the DER bytes exactly as given.
     pub fn from_spki(der: &[u8]) -> Result<LogKey, ProofError> {
-        const P256_SPKI_PREFIX: &[u8] = &[
-            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
-            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-        ];
-        const ED25519_SPKI_PREFIX: &[u8] = &[
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ];
         let id = sha256(der);
         if let Some(point) = der.strip_prefix(P256_SPKI_PREFIX) {
             if point.len() == 64 {
@@ -1567,10 +1578,6 @@ fn verify_ecdsa_p256_asn1(
 /// `prime256v1` plus the bit-string header and the `0x04` uncompressed-point
 /// tag — the same 27 bytes [`LogKey::from_spki`] strips back off.
 pub fn p256_spki(point: &[u8]) -> Vec<u8> {
-    const P256_SPKI_PREFIX: &[u8] = &[
-        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
-        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-    ];
     let mut der = Vec::with_capacity(P256_SPKI_PREFIX.len() + point.len());
     der.extend_from_slice(P256_SPKI_PREFIX);
     der.extend_from_slice(point);
