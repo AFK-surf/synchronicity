@@ -222,7 +222,10 @@ impl Node {
         // nothing and reaps nothing, and says so — membership stops being
         // extended, which is loud in `doctor` rather than silent here.
         if synch_core::clock_is_trusted(now) {
-            self.store().advance_trust_floor(now)?;
+            contained(
+                "advancing the trust floor",
+                self.store().advance_trust_floor(now),
+            );
         } else {
             tracing::warn!(
                 reading = now,
@@ -230,28 +233,19 @@ impl Node {
                  none is expired until it is set (see `synch doctor`)"
             );
         }
-        let expired = self.store().expire_bindings(now)?;
-        if expired > 0 {
-            tracing::info!(expired, "dns bindings lapsed");
+        if let Some(expired) = contained("expiring bindings", self.store().expire_bindings(now)) {
+            if expired > 0 {
+                tracing::info!(expired, "dns bindings lapsed");
+            }
         }
-        self.expire_tombstones()?;
-        // Before the abandonment sweep, not after: a pending head whose trie is
-        // already here should flip rather than sit, and the sweep skips exactly
-        // those.
-        let promoted = self.promote_ready_pending_heads()?;
-        if promoted > 0 {
-            tracing::info!(promoted, "pending heads whose tries were already here");
-        }
-        let abandoned = self.abandon_stale_pending_heads(now)?;
-        if abandoned > 0 {
-            tracing::info!(abandoned, "pending heads nobody could serve");
-        }
+        contained("expiring tombstones", self.expire_tombstones());
+        self.sweep_pending_heads(now);
         // Ads for objects content GC has since dropped. Staged before the
         // content sweep below rather than after, so a root that goes this pass
         // is retired next pass rather than lingering an interval — and so the
         // ad and the payload never disagree in the direction that has peers
         // dialling us for bytes we no longer have (§6.3).
-        self.retire_ads()?;
+        contained("retiring ads", self.retire_ads());
 
         let retention = self
             .config()
@@ -261,7 +255,14 @@ impl Node {
         let before = now.saturating_sub(retention);
         let mut pruned = 0;
         for origin in self.store().history_origins()? {
-            pruned += self.store().prune_history_before(&origin, before)?;
+            // Per origin, so one origin's history cannot stop another's from
+            // being pruned — and so the trie sweep below still runs.
+            if let Some(n) = contained(
+                "pruning history",
+                self.store().prune_history_before(&origin, before),
+            ) {
+                pruned += n;
+            }
         }
         if pruned > 0 {
             tracing::info!(pruned, "old roots dropped out of retention");
@@ -279,64 +280,135 @@ impl Node {
         Ok(stats)
     }
 
-    /// Promotes pending heads whose trie is already wholly here (§5.2).
+    /// Decides what becomes of every pending head: promote it, abandon it, or
+    /// leave it to the fetch that is still working on it (§5.2).
     ///
-    /// `try_promote` runs from exactly two places: an *accepted* offer, and the
-    /// end of a successful `fetch_pending`. Neither covers a pending head that
-    /// became complete without either happening — a crash between the last
-    /// batch of trie nodes committing and the promotion that would have
-    /// followed leaves precisely that. The head then holds `head_floor` above
-    /// every older head a peer could serve, so nothing else is adopted for that
-    /// origin either, and `abandon_stale_pending_heads` deliberately steps over
-    /// it because its trie *is* here. It is one promotion away from complete,
-    /// as that comment says — this is what performs it when no exchange will.
+    /// One pass over the slots rather than two, and — the part that matters —
+    /// **contained per origin**. Every step here can fail on data one origin
+    /// published: `try_promote` ends in `materialize_diff`, which raises on a
+    /// record that will not decode, and `is_complete` raises on a node graph
+    /// the structural guard refuses. Propagating either aborted the whole
+    /// maintenance pass, so nothing after it ran — not the abandonment sweep,
+    /// not ad retirement, not history pruning, and not `gc()`. A single member
+    /// publishing one undecodable `f:` value therefore disabled garbage
+    /// collection on every peer that adopted the head, permanently and
+    /// silently, with a `warn!` every five minutes as the only trace. That is
+    /// the opposite of what §12 promises: "a record this node cannot apply
+    /// fails its own origin and no other".
     ///
-    /// Returns how many were promoted.
-    fn promote_ready_pending_heads(&self) -> Result<usize> {
-        let syncer = self.syncer();
-        let mut promoted = 0;
-        for stored in self.store().all_heads(synch_store::Slot::Pending)? {
-            if syncer.try_promote(&stored.head.origin, now_ns())? {
-                promoted += 1;
-            }
-        }
-        Ok(promoted)
-    }
-
-    /// Clears pending heads that have sat past `pending_head_ttl` with an
-    /// incomplete trie (§5.2).
+    /// Three outcomes per head:
     ///
-    /// `head_floor` is the best of both slots, so a pending head nobody can
-    /// serve holds the floor above every servable head for that origin: the
-    /// node refuses a peer's older complete head and materializes nothing.
-    /// Dropping the head drops the floor, and the older head becomes adoptable
-    /// on the next exchange. A head whose trie *is* here is left alone — it is
-    /// one promotion away from complete, not stranded.
-    ///
-    /// Returns how many were cleared.
-    fn abandon_stale_pending_heads(&self, now: i64) -> Result<usize> {
+    /// - **Promoted**, when its trie is wholly here. `try_promote` otherwise
+    ///   runs only from an accepted offer and from the end of a successful
+    ///   fetch, and neither covers a crash between the last committed batch of
+    ///   trie nodes and the promotion that would have followed.
+    /// - **Abandoned**, when nobody has served it past `pending_head_ttl`, or
+    ///   when promoting it *failed*. The second case is new and it is the
+    ///   escape a poisoned head needs: `head_floor` is the best of both slots,
+    ///   so a pending head holds the floor above every servable head for its
+    ///   origin, and a head whose trie is complete but whose promotion cannot
+    ///   succeed is stepped over by the TTL rule below for exactly the reason
+    ///   that rule exists — it looks like it is one promotion away. It is not,
+    ///   and it would hold that origin hostage forever.
+    /// - **Left alone**, when a fetch is still working on it.
+    fn sweep_pending_heads(&self, now: i64) {
         let ttl = self
             .config()
             .pending_head_ttl
             .as_nanos()
             .min(i64::MAX as u128) as i64;
         let before = now.saturating_sub(ttl);
+        let syncer = self.syncer();
         let trie = synch_mpt::Trie::new(self.store().as_ref());
-        let mut cleared = 0;
-        for stored in self.store().all_heads(synch_store::Slot::Pending)? {
-            if stored.received_at > before || trie.is_complete(stored.head.root)? {
+
+        let Some(pending) = contained(
+            "listing pending heads",
+            self.store().all_heads(synch_store::Slot::Pending),
+        ) else {
+            return;
+        };
+
+        let (mut promoted, mut abandoned) = (0usize, 0usize);
+        for stored in pending {
+            let origin = &stored.head.origin;
+            let outcome = syncer.try_promote(origin, now);
+            let poisoned = match outcome {
+                Ok(true) => {
+                    promoted += 1;
+                    continue;
+                }
+                Ok(false) => false,
+                Err(e) => {
+                    tracing::warn!(
+                        origin = %origin,
+                        seq = stored.head.seq,
+                        error = %e,
+                        "origin left behind: its pending head cannot be materialized"
+                    );
+                    true
+                }
+            };
+
+            // `is_complete` walks a peer's node graph, so it can raise on its
+            // own; a head whose completeness cannot even be decided is in the
+            // same position as one whose promotion failed.
+            let complete = match trie.is_complete(stored.head.root) {
+                Ok(complete) => complete,
+                Err(e) => {
+                    tracing::warn!(
+                        origin = %origin,
+                        error = %e,
+                        "origin left behind: its pending trie cannot be walked"
+                    );
+                    true
+                }
+            };
+
+            let stale = stored.received_at <= before && !complete;
+            if !poisoned && !stale {
                 continue;
             }
             tracing::warn!(
-                origin = %stored.head.origin,
+                origin = %origin,
                 seq = stored.head.seq,
-                "abandoning a pending head nobody has served"
+                poisoned,
+                "abandoning a pending head"
             );
-            self.store()
-                .clear_head(&stored.head.origin, synch_store::Slot::Pending)?;
-            cleared += 1;
+            if contained(
+                "clearing a pending head",
+                self.store().clear_head(origin, synch_store::Slot::Pending),
+            )
+            .is_some()
+            {
+                abandoned += 1;
+            }
         }
-        Ok(cleared)
+        if promoted > 0 {
+            tracing::info!(promoted, "pending heads whose tries were already here");
+        }
+        if abandoned > 0 {
+            tracing::info!(abandoned, "pending heads dropped");
+        }
+    }
+}
+
+/// Runs one maintenance step, reporting a failure rather than propagating it.
+///
+/// The pass is a sequence of independent sweeps over shared state, and its
+/// later steps — ad retirement, history pruning, the trie and content sweeps —
+/// are the ones that reclaim disk. Letting an earlier step's failure abort the
+/// pass means a fault in *one* origin's data stops garbage collection for the
+/// whole node, on every pass, forever. `gc_orphans` already documents that
+/// hazard for itself ("`maintenance_pass` would report failure forever and no
+/// orphan would be swept again"); this applies the same rule to the steps
+/// ahead of it.
+fn contained<T, E: std::fmt::Display>(what: &str, result: std::result::Result<T, E>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!(step = what, %error, "a maintenance step failed; the pass continues");
+            None
+        }
     }
 }
 
@@ -555,6 +627,87 @@ mod tests {
             .offer_head(&servable, now)
             .unwrap()
             .accepted());
+        node.shutdown().await.unwrap();
+    }
+
+    /// A pending head this node cannot materialize fails its own origin and
+    /// nothing else — GC in particular still runs (§12).
+    ///
+    /// `maintenance_pass` used to `?` out of `promote_ready_pending_heads`, so
+    /// one member publishing a structurally perfect trie with a single `f:`
+    /// value that is not a `FileEntry` aborted the whole pass on every peer
+    /// that adopted the head. Nothing after it ever ran again: no abandonment
+    /// sweep, no ad retirement, no history pruning, no trie or content sweep.
+    /// Permanent, silent apart from a `warn!`, and ~200 bytes to trigger.
+    ///
+    /// The head also has to stop holding `head_floor`: its trie *is* complete,
+    /// so the TTL rule steps over it as "one promotion away", which it is not.
+    #[tokio::test]
+    async fn a_head_that_cannot_be_materialized_does_not_stop_the_pass() {
+        use synch_core::{file_key, Hash, SignedHead};
+        use synch_store::{Binding, BindingSource, Slot};
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::Node::init(dir.path(), None).unwrap();
+        let node = crate::Node::open(NodeConfig::loopback(dir.path()))
+            .await
+            .unwrap();
+
+        let key = iroh_base::SecretKey::generate();
+        let origin = synch_core::OriginId::named("rogue", "x.example").unwrap();
+        node.store()
+            .put_binding(&Binding {
+                origin: origin.clone(),
+                node_id: key.public(),
+                source: BindingSource::Static,
+                domain: None,
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+
+        // A canonical one-leaf trie whose `f:` record will not decode.
+        let trie = synch_mpt::Trie::new(node.store().as_ref());
+        let root = trie
+            .insert(Hash::EMPTY, &file_key("s", "a.txt").unwrap(), &[0xffu8; 8])
+            .unwrap();
+        assert!(trie.is_complete(root).unwrap(), "the trie is wholly here");
+        let head = SignedHead::sign(&key, origin.clone(), 1, root, 0);
+        node.store()
+            .put_head(Slot::Pending, &head, now_ns(), 0)
+            .unwrap();
+
+        // Junk in the trie tables that only a sweep removes.
+        let junk = Hash::new(b"junk");
+        synch_mpt::NodeStore::put_value(node.store().as_ref(), &junk, b"junk").unwrap();
+
+        node.maintenance_pass()
+            .expect("one origin's undecodable record must not fail the pass");
+
+        // The sweep ran.
+        assert!(
+            synch_mpt::NodeStore::get_value(node.store().as_ref(), &junk)
+                .unwrap()
+                .is_none(),
+            "gc did not run"
+        );
+        // And the head stopped holding the origin hostage.
+        assert_eq!(
+            node.store().pending_head(&origin).unwrap(),
+            None,
+            "a head whose promotion cannot succeed must not hold head_floor"
+        );
+        assert_eq!(node.store().complete_head(&origin).unwrap(), None);
+
+        // With the floor dropped, an older head a peer can actually serve is
+        // adoptable again.
+        let servable = SignedHead::sign(&key, origin.clone(), 1, Hash::EMPTY, 0);
+        assert!(crate::Syncer::new(node.store().clone())
+            .offer_head(&servable, now_ns())
+            .unwrap()
+            .accepted());
+
         node.shutdown().await.unwrap();
     }
 

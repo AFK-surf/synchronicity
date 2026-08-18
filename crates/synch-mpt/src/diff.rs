@@ -96,8 +96,20 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
             stack[top].0.next += 1;
             let ca = self.cursor_child(&stack[top].0.cursor, nibble)?;
             let cb = self.cursor_child(&stack[top].1, nibble)?;
+            // Charged only where something is actually there, exactly as
+            // `collect` charges only a non-empty child. A branch node has
+            // sixteen slots and an ordinary trie leaves most of them empty, so
+            // billing all sixteen made the guard measure *frames entered*
+            // rather than positions visited — sixteen times the cost per real
+            // position, against the same ceiling the scan walk is measured by.
+            // At §14's one-`f:`-and-one-`b:`-per-file shape that refused the
+            // first-adoption diff of ~57 k files, well inside the 100 k initial
+            // index §7.1 names.
+            if ca.is_empty() && cb.is_empty() {
+                continue;
+            }
             path.push(nibble);
-            guard.visit(ca.identity().into_iter().chain(cb.identity()))?;
+            guard.visit()?;
             if self.enter(&ca, &cb, &path, out)? {
                 stack.push((
                     Frame {

@@ -12,15 +12,19 @@
 //!
 //! Note what such a structure *is*: a valid trie describing 16^k entries in
 //! k + 1 nodes. There is no local check that calls it malformed, because it is
-//! not — so the defence is not a structural rule but a proportionality one. A
-//! walk may visit only so many positions per distinct node it has actually
-//! reached (`FanoutGuard`), which honest data never approaches and this exceeds
-//! by orders of magnitude.
+//! not — and, crucially, nothing about its *shape* distinguishes it from honest
+//! data. Give sixty thousand keys under dense structured paths one identical
+//! value and content addressing collapses the whole lower trie to about ten
+//! distinct nodes carrying sixty thousand positions: an ordinary
+//! `Trie::insert` corpus that is structurally a fan-out DAG. A guard that
+//! measured positions per *distinct node reached* refused that corpus, which is
+//! why the bound is now on work alone (`FanoutGuard`,
+//! `WALK_POSITION_CEILING`).
 //!
-//! Deduplicating positions by node hash is the obvious defence and is wrong:
-//! one leaf legitimately sits at as many positions as there are keys carrying
-//! its value, so pruning repeats silently drops keys. `scan_pagination` catches
-//! it.
+//! Deduplicating positions by node hash is the other obvious defence and is
+//! also wrong: one leaf legitimately sits at as many positions as there are
+//! keys carrying its value, so pruning repeats silently drops keys.
+//! `scan_pagination` catches it.
 
 use synch_core::Hash;
 use synch_mpt::{node::hash_encoded, MemStore, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
@@ -61,10 +65,23 @@ fn fanout_bomb(store: &MemStore, k: usize) -> Hash {
     child
 }
 
+/// Ignored because it is expensive *by construction*, not because it is
+/// flaky: refusal happens at `WALK_POSITION_CEILING`, so asserting it end to
+/// end means walking that many positions — ~8 s in release, ~90 s in a debug
+/// CI run, and the CI job runs the suite twice. `trie.rs`'s
+/// `the_walk_guard_stops_at_the_ceiling` covers the guard's arithmetic in
+/// microseconds; this covers the wiring, and is worth running by hand
+/// (`cargo test -- --ignored`) whenever either changes.
+///
+/// The earlier per-node-arrival ratio made this cheap — it stopped the walk at
+/// ~65 k positions — but only because it fired on shapes honest data also
+/// produces, which is why it is gone.
 #[test]
+#[ignore = "walks to WALK_POSITION_CEILING; see the fast guard test in trie.rs"]
 fn a_fanout_bomb_is_refused_rather_than_walked() {
-    // Unbounded, k = 6 is 16.7M changes and 155 s. The walk stops inside the
-    // bounded floor instead, so this test runs in milliseconds.
+    // Unbounded, k = 6 is 16.7M changes and 155 s; at a 64M-position ceiling it
+    // slipped under entirely and wrote every one of those rows. The walk stops
+    // at the ceiling instead.
     let store = MemStore::new();
     let root = fanout_bomb(&store, 6);
     let trie = Trie::new(&store);
@@ -80,13 +97,13 @@ fn a_fanout_bomb_is_refused_rather_than_walked() {
         .diff(Hash::EMPTY, root)
         .expect_err("a 16^6-position walk must be refused");
     assert!(
-        err.to_string().contains("no key set can produce"),
+        err.to_string().contains("exceeded"),
         "unexpected error: {err}"
     );
 
     // Scanning is bounded the same way; `collect` walks positions alike.
     let err = trie.iter(root).expect_err("iteration must be refused too");
-    assert!(err.to_string().contains("no key set can produce"), "{err}");
+    assert!(err.to_string().contains("exceeded"), "{err}");
 }
 
 #[test]
@@ -94,14 +111,56 @@ fn an_honest_trie_is_nowhere_near_the_bound() {
     // The guard must not fire on real data, including the shape that most
     // stresses it: many distinct keys all carrying one value, so a single leaf
     // node is shared across every one of their positions.
+    //
+    // Sixty thousand, not two thousand. This corpus collapses to ~10 distinct
+    // nodes — structurally a fan-out DAG, built by ordinary inserts — and the
+    // previous per-node-arrival ratio refused it at ~65 k positions, while this
+    // test passed thirty times below the break and asserted the opposite.
     let store = MemStore::new();
     let trie = Trie::new(&store);
     let mut root = Hash::EMPTY;
-    for i in 0..2000u16 {
+    for i in 0..60_000u32 {
         root = trie
-            .insert(root, format!("f:space/dir{i:04}/file").as_bytes(), b"v")
+            .insert(
+                root,
+                format!("f:space/{i:08}/file").as_bytes(),
+                b"entry-value",
+            )
             .unwrap();
     }
-    assert_eq!(trie.iter(root).unwrap().len(), 2000);
-    assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 2000);
+    // Reachable from the final root — not `node_count`, which also holds every
+    // intermediate root the 60 000 inserts passed through.
+    let reachable = trie.reachable(root).unwrap().nodes.len();
+    assert!(
+        reachable < 100,
+        "the corpus really is a DAG: {reachable} nodes"
+    );
+    assert_eq!(trie.iter(root).unwrap().len(), 60_000);
+    assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 60_000);
+}
+
+/// First adoption of an origin diffs from `Hash::EMPTY`, and that must survive
+/// a corpus the size §7.1 names.
+///
+/// The guard used to be charged once per *nibble slot* of every frame entered —
+/// all sixteen, before checking whether either side had anything there — so it
+/// measured frames rather than positions and billed sixteen times the real
+/// cost. At §14's one-`f:`-and-one-`b:`-per-file shape that refused the
+/// first-adoption diff at ~57 k files, inside the 100 k initial index §7.1
+/// names, and `doctor --rebuild` was dead for the same origin.
+#[test]
+fn a_first_adoption_diff_survives_the_documented_corpus_size() {
+    let store = MemStore::new();
+    let trie = Trie::new(&store);
+    let mut root = Hash::EMPTY;
+    // Sixty thousand files, which is where this actually broke: two records
+    // each, so 120 000 entries. Bigger proves nothing more and costs debug CI
+    // time on every run.
+    for i in 0..60_000u32 {
+        let entry = format!("f:media/photos/2024/07/IMG_{i:07}.jpg");
+        root = trie.insert(root, entry.as_bytes(), &[7u8; 55]).unwrap();
+        let ad = format!("b:{i:064x}");
+        root = trie.insert(root, ad.as_bytes(), &[3u8; 40]).unwrap();
+    }
+    assert_eq!(trie.diff(Hash::EMPTY, root).unwrap().len(), 120_000);
 }

@@ -603,6 +603,13 @@ impl Store {
         // was not sized by a conforming requester, and the answer is to say so
         // rather than to serve a prefix.
         //
+        // Refusing *after* walking is not the amplification it reads as: the
+        // budget is checked before each node is loaded, so an over-budget
+        // request costs at most `budget` loads — strictly less than a
+        // conforming maximal request, which does the same loads and then
+        // serialises and sends the result. The §12 sanity bound on this message
+        // is enforced, and it is enforced by `budget`, not by this check.
+        //
         // Refusing is also what keeps this to a single walk. Serving a
         // truncated answer would mean making the two sides agree about where it
         // stopped — done by discarding the work and walking the whole thing
@@ -732,11 +739,29 @@ impl Store {
             // stable storage. The handle is open for writing, which is what
             // Windows requires of a flush.
             fsync_file(&outboard.data.0)?;
+            crate::cas::fsync_parent(&self.outboard_path(root));
             // The row is what later passes read the object's size and bitmap
             // out of. A proof commits no bytes, so an object first met this way
-            // is recorded as held-nothing rather than not held at all — and the
-            // recording is a union of nothing, so a fetch that raced this proof
-            // into the same root does not have its groups erased by it.
+            // is recorded as held-nothing rather than not held at all.
+            //
+            // What that recording does *not* do is leave an in-flight fetch
+            // alone. This used to claim it did — "a union of nothing, so a
+            // fetch that raced this proof into the same root does not have its
+            // groups erased by it" — and that is false: the union is not the
+            // only thing `commit_groups` acts on. It also settles the size, and
+            // a claim that moves the object's *group count* resets the bitmap
+            // (`settle_size`, rule 3), so a proof carrying a wrong size erases
+            // whatever a concurrent fetch had verified. Sixty-four bytes on the
+            // wire, repeatable, and reachable from any origin that publishes a
+            // false `f:` size for a root a peer is fetching.
+            //
+            // That is a documented, accepted cost rather than a defect — the
+            // same erasure is reachable through the ordinary slice path, and
+            // `docs/DELTA-SYNC.md` §6 states the trade: an unattested size
+            // yields to the next writer so that an overstated entry cannot
+            // brick a root forever, and the price is a re-fetch of what was
+            // held. It is written down here because a comment claiming the
+            // opposite is what would keep the next reader from finding it.
             //
             // The size in that row is a claim off an entry, not something this
             // proof established: an object's tree is the same shape for every
@@ -983,6 +1008,15 @@ impl Store {
         sink.outboard.sync()?;
         fsync_file(&sink.payload.0)?;
         fsync_file(&sink.outboard.data.0)?;
+        // The directory entries too. `open_sink` creates both files with
+        // `create(true)`, so a promotion into a root this node held nothing of
+        // is what puts their names in the shard directory, and `fsync` promises
+        // the bytes rather than the name. `write_slice` states the reason it
+        // does the same: unlike an orphaned file, a lost *name* under an
+        // advanced bitmap never self-heals — the row goes on claiming groups
+        // whose bytes are unreachable.
+        crate::cas::fsync_parent(&self.blob_path(root));
+        crate::cas::fsync_parent(&self.outboard_path(root));
         let commit = self.commit_groups(root, size, &promoted, None, now)?;
         drop(sink);
         self.trim_to_size(root, commit);

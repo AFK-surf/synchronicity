@@ -126,6 +126,58 @@ pub const MAX_RANGES: usize = 4096;
 /// origin, so a legitimate answer names tens.
 pub const MAX_PROVIDER_ADS: usize = 256;
 
+/// Decodes a `Vec` that refuses to grow past `N` elements, rather than checking
+/// its length once it is already in memory.
+///
+/// Every `MptMessage` field with a documented cap uses this, for the reason
+/// [`ChunkRanges`]'s own decoder gives: a check on the materialized `Vec` comes
+/// too late. Both halves of that mattered here. The *memory* is the obvious
+/// half — a 16 MiB frame is ~524 000 `NodeId`s or ~117 000 `SignedHead`s, all
+/// resident before a length check can look at them. The *CPU* is the half that
+/// actually hurt: a `NodeId` decodes through an Edwards decompression, so
+/// deserializing that frame cost 2.4 s of runtime-worker time — measured —
+/// before `check_heads` could reject it, and the decode runs inline on the
+/// connection task rather than on the blocking pool. §12 promises "sanity
+/// bounds that cap the cost of any *single* malformed or extreme message"; a
+/// cap that fires after the work is not one.
+///
+/// Refused outright rather than truncated: a truncated request is a different
+/// request, and a truncated answer silently misreports what a peer served.
+fn bounded_vec<'de, D, T, const N: usize>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Visitor<T, const N: usize>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>, const N: usize> serde::de::Visitor<'de> for Visitor<T, N> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "at most {N} elements")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Vec<T>, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            // Never `with_capacity(size_hint)`: the hint is the peer's.
+            let mut out: Vec<T> = Vec::new();
+            while let Some(item) = seq.next_element::<T>()? {
+                if out.len() >= N {
+                    return Err(serde::de::Error::custom(format!(
+                        "a sequence past the {N} limit"
+                    )));
+                }
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(Visitor::<T, N>(std::marker::PhantomData))
+}
+
 /// A message on the `sync/mpt/1` ALPN (§5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MptMessage {
@@ -134,16 +186,19 @@ pub enum MptMessage {
         /// Protocol version.
         proto: u16,
         /// The sender's head summaries.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_HEADS_PER_MESSAGE>")]
         heads: Vec<HeadSummary>,
     },
     /// "Yours is newer, send the full signed heads for these origins."
     HeadsWant {
         /// Origins whose full signed heads are wanted.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_HEADS_PER_MESSAGE>")]
         origins: Vec<OriginId>,
     },
     /// Full signed heads, in response to `HeadsWant` or `Hello`.
     Heads {
         /// The signed heads.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_HEADS_PER_MESSAGE>")]
         heads: Vec<SignedHead>,
     },
     /// Reactive push, sent on any head change (§5.3).
@@ -154,25 +209,31 @@ pub enum MptMessage {
     /// Request trie nodes by hash. At most [`MAX_BATCH`] per batch.
     GetNodes {
         /// The wanted node hashes.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         hashes: Vec<Hash>,
     },
     /// Trie nodes, plus the subset the responder did not have.
     Nodes {
         /// `(hash, encoded node)` pairs.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         nodes: Vec<(Hash, Vec<u8>)>,
         /// Hashes the responder did not have.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         missing: Vec<Hash>,
     },
     /// Request out-of-line trie value payloads by hash.
     GetValues {
         /// The wanted value hashes.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         hashes: Vec<Hash>,
     },
     /// Out-of-line trie values, plus the subset the responder did not have.
     Values {
         /// `(hash, value bytes)` pairs.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         values: Vec<(Hash, Vec<u8>)>,
         /// Hashes the responder did not have.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         missing: Vec<Hash>,
     },
     /// Ask a peer which origins advertise an object. Hints are unverified (§5.1).
@@ -183,6 +244,7 @@ pub enum MptMessage {
     /// Unverified provider hints. At most [`MAX_PROVIDER_ADS`] per answer.
     Providers {
         /// `(origin, ad)` pairs.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_PROVIDER_ADS>")]
         ads: Vec<(OriginId, BlobAd)>,
     },
     /// An error response, used instead of dropping a stream silently.
@@ -208,6 +270,7 @@ pub enum MptMessage {
         /// The origin asked about.
         origin: OriginId,
         /// The bound device keys, in the peer's own order.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_HEADS_PER_MESSAGE>")]
         keys: Vec<NodeId>,
     },
 }
@@ -400,6 +463,18 @@ impl ChunkRanges {
     /// a `SliceEnd`/`ProofEnd` is bounded only by the frame, so a provider
     /// could answer with a million singleton ranges and make the requester
     /// spend that on a set operation it runs on a runtime worker.
+    /// The groups in both sets.
+    ///
+    /// Two properties this has that callers rely on, stated because one of them
+    /// is load-bearing at a trust boundary and neither is obvious from the
+    /// signature. Every emitted group is in *both* inputs, because each output
+    /// range is the overlap of an actual pair — so the result is a subset of
+    /// `other` **whatever order `self` arrived in**. That is what makes
+    /// `check_served` safe against a provider's unsorted `served`: containment
+    /// is structural, not a consequence of sortedness. And the result is
+    /// normalized, because it is built through [`ChunkRanges::from_ranges`], so
+    /// a malformed input cannot propagate past here. A malformed `self` can
+    /// make the answer too *small* — which costs a retry — never too large.
     pub fn intersect(&self, other: &ChunkRanges) -> ChunkRanges {
         let mut out = Vec::new();
         let (mut i, mut j) = (0usize, 0usize);
@@ -696,5 +771,77 @@ mod tests {
         assert!(!r.covers(0, 3));
         assert!(r.covers(9, 9), "an empty window is covered by anything");
         assert!(!ChunkRanges::empty().overlaps(0, u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod bounded_decode_tests {
+    use super::*;
+
+    /// Every capped field refuses an over-long sequence *while decoding*, not
+    /// after.
+    ///
+    /// The responder's `check_heads`/`check_batch` calls run after
+    /// `read_frame` has already deserialized the message, so a 16 MiB frame of
+    /// `SignedHead`s or `NodeId`s bought the sender hundreds of milliseconds to
+    /// seconds of the victim's runtime-worker time — a `NodeId` decodes through
+    /// an Edwards decompression — for the price of an upload. The cap now
+    /// fires on element `N + 1`.
+    /// postcard collapses a visitor's custom message into its own opaque
+    /// `Serde Deserialization Error`, so the assertion is that decoding fails
+    /// at all; `a_message_at_the_cap_still_decodes` is the control that says
+    /// the failure is the cap and not the encoding.
+    fn refuses_past(bytes: &[u8]) {
+        assert!(
+            postcard::from_bytes::<MptMessage>(bytes).is_err(),
+            "a sequence past its cap must not decode"
+        );
+    }
+
+    #[test]
+    fn a_heads_summary_list_past_the_cap_is_refused_while_decoding() {
+        let heads: Vec<HeadSummary> = (0..MAX_HEADS_PER_MESSAGE + 1)
+            .map(|i| HeadSummary {
+                origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
+                seq: i as u64,
+                root: Hash([0u8; 32]),
+                complete: false,
+            })
+            .collect();
+        let bytes = postcard::to_stdvec(&MptMessage::Hello { proto: 1, heads }).unwrap();
+        refuses_past(&bytes);
+    }
+
+    #[test]
+    fn a_node_batch_past_the_cap_is_refused_while_decoding() {
+        let hashes: Vec<Hash> = (0..MAX_BATCH + 1).map(|i| Hash([i as u8; 32])).collect();
+        let bytes = postcard::to_stdvec(&MptMessage::GetNodes { hashes }).unwrap();
+        refuses_past(&bytes);
+
+        let hashes: Vec<Hash> = (0..MAX_BATCH + 1).map(|i| Hash([i as u8; 32])).collect();
+        let bytes = postcard::to_stdvec(&MptMessage::GetValues { hashes }).unwrap();
+        refuses_past(&bytes);
+    }
+
+    #[test]
+    fn a_bindings_answer_past_the_cap_is_refused_while_decoding() {
+        let keys = vec![iroh_base::SecretKey::generate().public(); MAX_HEADS_PER_MESSAGE + 1];
+        let bytes = postcard::to_stdvec(&MptMessage::BindingsFor {
+            origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
+            keys,
+        })
+        .unwrap();
+        refuses_past(&bytes);
+    }
+
+    #[test]
+    fn a_message_at_the_cap_still_decodes() {
+        let hashes: Vec<Hash> = (0..MAX_BATCH).map(|i| Hash([i as u8; 32])).collect();
+        let bytes = postcard::to_stdvec(&MptMessage::GetNodes {
+            hashes: hashes.clone(),
+        })
+        .unwrap();
+        let decoded: MptMessage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, MptMessage::GetNodes { hashes });
     }
 }

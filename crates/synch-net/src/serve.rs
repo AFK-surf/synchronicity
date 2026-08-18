@@ -26,8 +26,15 @@ use synch_store::Store;
 /// open more connections — while bounding throughput: the work behind a request
 /// runs on the blocking pool, so a connection serializing its streams cannot
 /// accept the next one while a window is being built, and §6.3's swarm
-/// behaviour does not survive a client that pipelines. The semaphore is the real
-/// bound, and it is per connection.
+/// behaviour does not survive a client that pipelines.
+///
+/// Per connection, and only per connection — nothing caps how many connections
+/// one peer opens, so this is not a bound on a node's concurrent work. It is
+/// not meant to be: reaching this code at all requires a live binding, and §12
+/// places a member that opens connections abusively under `synch trust rm`
+/// rather than under a rate limiter. What this does bound is the cost of one
+/// connection, which is what keeps an ordinary peer's pipelining from being
+/// mistaken for that.
 pub(crate) const MAX_CONCURRENT_STREAMS: usize = 8;
 
 /// How long one request may take, start to finish.

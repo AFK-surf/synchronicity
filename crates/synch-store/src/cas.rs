@@ -50,7 +50,7 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
 /// Flushes a directory entry (a rename or create) to stable storage so the file
 /// is findable after a crash, not just its contents. A no-op on platforms that
 /// cannot open a directory as a file.
-fn fsync_parent(path: &std::path::Path) {
+pub(crate) fn fsync_parent(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
             let _ = dir.sync_all();
@@ -58,12 +58,55 @@ fn fsync_parent(path: &std::path::Path) {
     }
 }
 
-/// Writes a file and flushes it (contents and directory entry) to stable
+/// Writes a file whole and flushes it (contents and directory entry) to stable
 /// storage before returning.
-fn write_and_sync(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(data)?;
-    fsync_file(&file)?;
+///
+/// Staged and renamed, never written in place. `File::create` truncates first,
+/// and the object this replaces may already be held complete: re-ingesting
+/// content the CAS already has is routine, not exotic — a duplicate file
+/// anywhere in a scanned tree, the scanner's racily-clean re-ingest, an
+/// explicit re-`put` — and for a large object the window between the truncate
+/// and the last byte is the length of the whole write. A power loss inside it
+/// left the object with its `complete = 1` row intact and a truncated outboard
+/// behind it: still advertised by `local_ad`, still `has_complete_blob`, but
+/// every `encode_slice` and `read_range` failing verification, with GC unable
+/// to reclaim a row an entry references and nothing anywhere re-verifying. The
+/// payload beside it already staged and renamed ([`Store::ingest_file`]); this
+/// is the same rule applied to the file that describes it.
+///
+/// The staging file lives in the staging directory, which [`Store::gc_staging`]
+/// sweeps by age, so a crash between the write and the rename leaks nothing
+/// permanently.
+fn write_and_sync(
+    staging_dir: &std::path::Path,
+    path: &std::path::Path,
+    data: &[u8],
+) -> Result<()> {
+    std::fs::create_dir_all(staging_dir)?;
+    let staging = staging_dir.join(format!(
+        "{}-{}.tmp",
+        std::process::id(),
+        STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let write = || -> Result<()> {
+        let mut file = File::create(&staging)?;
+        file.write_all(data)?;
+        fsync_file(&file)?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // `rename` is atomic within a filesystem: a reader sees either the whole
+    // old file or the whole new one, never a truncated prefix of either.
+    if let Err(e) = std::fs::rename(&staging, path) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e.into());
+    }
     fsync_parent(path);
     Ok(())
 }
@@ -511,18 +554,15 @@ impl Store {
         // Windows refuses `FlushFileBuffers` on a read-only handle.
         fsync_file(&OpenOptions::new().write(true).open(&target)?)?;
         fsync_parent(&target);
-        write_and_sync(&self.outboard_path(&root), &outboard)?;
+        write_and_sync(&self.staging_dir(), &self.outboard_path(&root), &outboard)?;
         self.write_blob_row(&root, size, true, None, None, now)?;
         Ok((root, size))
     }
 
     fn write_payload(&self, root: &Hash, data: &[u8], outboard: &[u8]) -> Result<()> {
-        let path = self.blob_path(root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        write_and_sync(&path, data)?;
-        write_and_sync(&self.outboard_path(root), outboard)?;
+        let staging = self.staging_dir();
+        write_and_sync(&staging, &self.blob_path(root), data)?;
+        write_and_sync(&staging, &self.outboard_path(root), outboard)?;
         Ok(())
     }
 
@@ -800,23 +840,38 @@ impl Store {
     ///
     /// Returns whether the object was deleted.
     pub(crate) fn delete_blob_if_collectable(&self, root: &Hash, before: i64) -> Result<bool> {
-        let deleted = self.with_immediate_tx(|tx| {
-            let rows = tx.execute(
-                "DELETE FROM blobs
-                   WHERE root = ?1
-                     AND pinned = 0
-                     AND last_access < ?2
-                     AND NOT EXISTS (
-                       SELECT 1 FROM entries WHERE entries.content = blobs.root
-                     )",
-                params![root.as_bytes().to_vec(), before],
-            )?;
-            Ok(rows > 0)
-        })?;
+        // The connection guard is held across the unlinks, not just across the
+        // transaction. Releasing it at the commit leaves a window in which
+        // `write_slice`/`promote` can insert a fresh row for this root — a
+        // resumed fetch of an object that had gone cold — after which the
+        // unlinks below take the bytes out from under it. What that leaves is
+        // the state `delete_blob` calls the dangerous orphan: `complete`/bitmap
+        // set with no payload, advertised by `local_ad`, failing every read,
+        // and self-healing never, because the new row is warm so `gc_content`
+        // skips it and `gc_orphans` only removes files that have *no* row.
+        //
+        // Every writer of a blob row goes through this same mutex, so holding
+        // it for two `unlink` syscalls is what makes the row delete and the
+        // unlink one step from any other writer's point of view.
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows = tx.execute(
+            "DELETE FROM blobs
+               WHERE root = ?1
+                 AND pinned = 0
+                 AND last_access < ?2
+                 AND NOT EXISTS (
+                   SELECT 1 FROM entries WHERE entries.content = blobs.root
+                 )",
+            params![root.as_bytes().to_vec(), before],
+        )?;
+        tx.commit()?;
+        let deleted = rows > 0;
         if deleted {
             let _ = std::fs::remove_file(self.blob_path(root));
             let _ = std::fs::remove_file(self.outboard_path(root));
         }
+        drop(conn);
         Ok(deleted)
     }
 
@@ -844,12 +899,18 @@ impl Store {
         // a restored row still is, so the next `gc_content` pass deletes it
         // again. The window is one GC interval, on an object nothing in the
         // tree references.
-        self.conn().execute(
+        // The guard spans the unlinks for the same reason
+        // `delete_blob_if_collectable` holds it: a writer committing a row for
+        // this root between the delete and the unlinks would be left with a row
+        // whose bytes are gone.
+        let conn = self.conn();
+        conn.execute(
             "DELETE FROM blobs WHERE root = ?1",
             params![root.as_bytes().to_vec()],
         )?;
         let _ = std::fs::remove_file(self.blob_path(root));
         let _ = std::fs::remove_file(self.outboard_path(root));
+        drop(conn);
         Ok(())
     }
 
@@ -1486,6 +1547,41 @@ mod tests {
         assert_eq!(root.as_bytes(), blake3::hash(b"").as_bytes());
         assert_eq!(store.read_all(&root).unwrap(), Vec::<u8>::new());
         assert!(store.local_ad(&root).unwrap().unwrap().is_complete());
+    }
+
+    /// Re-ingesting content already held complete never leaves the outboard
+    /// truncated, because it is staged and renamed rather than written in
+    /// place.
+    ///
+    /// `write_and_sync` used to `File::create` the outboard — which truncates —
+    /// on a path that may already describe a complete object. Re-ingesting held
+    /// content is routine (a duplicate file in a scanned tree, the scanner's
+    /// racily-clean re-ingest, an explicit re-`put`), so a power loss inside
+    /// that write left `complete = 1` beside a short outboard: still
+    /// advertised, unreadable, unreclaimable, and never re-verified. This
+    /// asserts the invariant the rename buys — the file is never observably
+    /// shorter than a whole outboard — and that the object still reads after a
+    /// second ingest.
+    #[test]
+    fn re_ingesting_held_content_never_truncates_the_outboard() {
+        let (dir, store) = store();
+        let data = data(200_000);
+        let root = store.ingest_bytes(&data, 1).unwrap();
+        let outboard = store.outboard_path(&root);
+        let full = std::fs::metadata(&outboard).unwrap().len();
+        assert!(full > 0, "a multi-group object has an outboard");
+
+        // Ingest the same bytes again, as a duplicate file in a scan does.
+        assert_eq!(store.ingest_bytes(&data, 2).unwrap(), root);
+        assert_eq!(std::fs::metadata(&outboard).unwrap().len(), full);
+        assert_eq!(store.read_all(&root).unwrap(), data);
+
+        // No staging file is left behind by a successful write.
+        let staged: Vec<_> = std::fs::read_dir(store.staging_dir())
+            .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(staged.is_empty(), "staging left behind: {staged:?}");
+        drop(dir);
     }
 
     #[test]

@@ -48,7 +48,7 @@ impl Store {
     /// published root becomes permanently unservable — and `publish` then calls
     /// `note_complete` on it, so the store goes on advertising that it can
     /// serve it. The same window eats a peer's in-flight bootstrap, since
-    /// `fetch_pending` commits each batch as its own write and `reachable`
+    /// `fetch_pending` commits one batch per transaction and `reachable`
     /// silently skips missing children.
     pub fn gc_trie(&self) -> Result<GcStats> {
         let mut stats = GcStats::default();

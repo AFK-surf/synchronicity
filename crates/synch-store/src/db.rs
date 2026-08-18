@@ -107,6 +107,70 @@ pub struct DeviceKey {
     pub created_at: i64,
 }
 
+/// Whether this thread is inside a [`Store::transaction`] scope.
+///
+/// [`Store::transaction`] holds the connection `MutexGuard` for the whole of
+/// its closure and `std::sync::Mutex` is not reentrant, so any `Store` method
+/// called from inside that closure blocks the thread against a lock it is
+/// itself holding. Nothing prevented it: the `Store` handle is in scope at
+/// every call site (`self.store.transaction(|txn| …)`), `Txn` deliberately
+/// exposes a narrower surface than `Store` — no `blob`, no `pinned_blobs`, no
+/// `prune_history_before` — so reaching for the wrong one is easy, and the
+/// compiler has nothing to say about it.
+///
+/// What makes that worth ten lines of guard is the failure mode. A deadlock is
+/// not a panic: the thread simply stops, so a test that exercised the path
+/// would hang until the harness timed out rather than fail with a location.
+/// This turns it into a named assertion, in debug and test builds only.
+#[cfg(debug_assertions)]
+mod reentry {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Marks the calling thread as inside a transaction until it is dropped.
+    pub(super) struct Scope;
+
+    impl Scope {
+        pub(super) fn enter() -> Scope {
+            DEPTH.with(|d| d.set(d.get() + 1));
+            Scope
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+
+    pub(super) fn active() -> bool {
+        DEPTH.with(|d| d.get()) > 0
+    }
+}
+
+#[cfg(not(debug_assertions))]
+mod reentry {
+    pub(super) struct Scope;
+
+    impl Scope {
+        pub(super) fn enter() -> Scope {
+            Scope
+        }
+    }
+
+    pub(super) fn active() -> bool {
+        false
+    }
+}
+
+/// Whether this thread is inside a transaction scope.
+fn in_transaction() -> bool {
+    reentry::active()
+}
+
 /// The node's metadata store.
 ///
 /// All writes funnel through one mutex-guarded connection, which is how the
@@ -203,6 +267,12 @@ impl Store {
     }
 
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
+        debug_assert!(
+            !in_transaction(),
+            "Store::conn() was called from inside a transaction. The connection \
+             mutex is not reentrant, so this deadlocks: use the `Txn` the closure \
+             was handed, not the `Store` it came from."
+        );
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -216,6 +286,7 @@ impl Store {
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
         let conn = self.conn();
+        let _scope = reentry::Scope::enter();
         let tx = conn.unchecked_transaction()?;
         let out = f(&tx)?;
         tx.commit()?;
@@ -242,6 +313,7 @@ impl Store {
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.conn();
+        let _scope = reentry::Scope::enter();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let out = f(&tx)?;
         tx.commit()?;
@@ -281,6 +353,7 @@ impl Store {
         E: From<StoreError>,
     {
         let mut conn = self.conn();
+        let _scope = reentry::Scope::enter();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(StoreError::from)?;
@@ -1345,5 +1418,45 @@ mod tests {
             store.config("schema_version").unwrap().as_deref(),
             Some(SCHEMA_VERSION.to_string().as_str())
         );
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod reentry_tests {
+    use super::*;
+
+    /// Reaching for the `Store` inside a transaction closure is a deadlock, and
+    /// the guard makes it a named panic instead.
+    ///
+    /// `Store::transaction` holds the one connection `MutexGuard` for the whole
+    /// closure, and `std::sync::Mutex` is not reentrant. Nothing in the type
+    /// system stops `self.store().blob(root)` being written where `txn` was
+    /// meant — and because the result is a hang rather than a panic, a test
+    /// covering such a path would time out rather than report a location.
+    #[test]
+    #[should_panic(expected = "inside a transaction")]
+    fn using_the_store_inside_a_transaction_panics_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let _: Result<()> = store.transaction(|_txn| {
+            // The mistake: `store`, not `_txn`.
+            let _ = store.config("schema_version")?;
+            Ok(())
+        });
+    }
+
+    /// And the ordinary shape is unaffected, including after a transaction has
+    /// finished — the scope must not leak past its closure.
+    #[test]
+    fn the_guard_does_not_fire_outside_a_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .transaction(|txn| -> Result<()> {
+                txn.set_self_origin(&OriginId::Key(iroh_base::SecretKey::generate().public()))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.self_origin().unwrap().is_some());
     }
 }

@@ -25,40 +25,17 @@ use crate::{
 pub(crate) enum Cursor {
     /// Nothing is stored at this position.
     Empty,
-    /// A node, with the hash it was loaded from when the position is a whole
-    /// stored node rather than the virtual remainder of a compressed one.
+    /// A node. A cursor may sit part-way through a compressed node, in which
+    /// case this is the virtual remainder rather than a whole stored one.
     At {
-        /// The stored node's hash, or `None` part-way through a compressed node.
-        ///
-        /// This is a walk's identity for the position. Two positions carrying
-        /// the same hash have the same subtree beneath them, which is what lets
-        /// a walk over a peer's node *graph* — a DAG, not a tree — avoid
-        /// re-descending a subtree it has already covered.
-        hash: Option<Hash>,
         /// The node itself.
         node: TrieNode,
     },
 }
 
 impl Cursor {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         matches!(self, Cursor::Empty)
-    }
-
-    /// The identity of this position, for walk memoization, or `None` when the
-    /// position has none.
-    ///
-    /// A cursor part-way through a compressed node is *not* identified: the
-    /// synthetic remainder it carries depends on the path taken into it, so two
-    /// unrelated positions would otherwise collide under one key and a walk
-    /// would prune a subtree it had never visited. Those positions need no
-    /// memo — they are bounded by the node's own nibble run, which
-    /// [`TrieNode::hash_of_encoded`] caps at `MAX_KEY_LEN * 2`.
-    pub(crate) fn identity(&self) -> Option<PositionId> {
-        match self {
-            Cursor::Empty => Some(PositionId::Empty),
-            Cursor::At { hash, .. } => hash.map(PositionId::Node),
-        }
     }
 
     pub(crate) fn value_ref(&self) -> Option<&ValueRef> {
@@ -88,33 +65,28 @@ impl Cursor {
 /// following it down.
 pub const MAX_DEPTH_NIBBLES: usize = MAX_KEY_LEN * 2;
 
-/// What identifies a walk position, when anything does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PositionId {
-    /// Nothing is stored here.
-    Empty,
-    /// A stored node.
-    Node(Hash),
-}
-
-/// How many times one distinct stored node may be arrived at.
+/// An absolute ceiling on the positions any one structural walk may visit.
 ///
-/// Structural sharing makes this greater than one for honest data — two keys
-/// whose suffixes and values coincide share a leaf — but only by a small
-/// factor, because sharing requires the subtries to be *identical*. The case
-/// this exists to catch misses by orders of magnitude.
-const WALK_REVISIT_RATIO: usize = 16;
+/// This is the whole bound, and it is a bound on *work* rather than a guess at
+/// which shapes are honest. Both numbers that set it are measured:
+///
+/// - **What honest data costs.** §14's shape — one `f:` record and one `b:` ad
+///   per file — walks ~5.2 positions per entry, so 200 000 files (400 000
+///   entries) is ~2.1 M positions. A trie of identical placeholder files, the
+///   densest legitimate shape, walks ~11 positions per entry. This ceiling
+///   therefore carries ~1.5 M entries, an order of magnitude past the 100 k
+///   initial index §7.1 names and well past §12's sizes.
+/// - **What a refused walk costs.** A fan-out DAG expands until it is stopped,
+///   so the ceiling *is* the worst case: ~8 s of walking, inside the promotion
+///   transaction, once, after which the head fails its own origin and no other
+///   (§12). Raising it is not free — at 64 M a nine-node bomb cost 63 s to
+///   refuse, and a seven-node one slipped under entirely and wrote 16.7 M rows.
+///
+/// The consequence worth stating plainly: this caps how large a trie any origin
+/// can have materialized here. That is a deliberate limit, not an accident.
+const WALK_POSITION_CEILING: usize = 8_000_000;
 
-/// A floor below which the ratio is not applied, so small tries are never
-/// refused for being lopsided. Also the bounded worst case: a walk that is
-/// going to be refused does at most this much work first.
-const WALK_REVISIT_FLOOR: usize = 65_536;
-
-/// An absolute ceiling on positions of every kind, as a backstop for the
-/// compressed-node traversal the ratio deliberately does not count.
-const WALK_POSITION_CEILING: usize = 64_000_000;
-
-/// Keeps a structural walk proportional to the trie it is walking.
+/// Keeps a structural walk proportional to the work it is allowed to do.
 ///
 /// A walk over trie *structure* descends positions, and a peer's node graph is
 /// a DAG rather than a tree: nothing stops a branch pointing all sixteen
@@ -128,55 +100,69 @@ const WALK_POSITION_CEILING: usize = 64_000_000;
 /// positions as there are keys with that value, so pruning repeats silently
 /// drops keys from `scan` and changes from `diff`.
 ///
-/// What separates the two cases is how often a *stored node* is arrived at. A
-/// walk over an honest trie reaches each stored node about once — sharing makes
-/// it a few times, never many, because sharing requires whole subtries to
-/// coincide. A fan-out DAG holds its node count still while arrivals multiply,
-/// so it blows the ratio immediately.
-///
-/// Only positions that *are* a stored node are counted against it. A cursor
-/// part-way through a compressed node has no hash, and there are legitimately
-/// many of those — one per nibble of the run — so counting them measured depth
-/// rather than fan-out and refused ordinary tries. They are bounded instead by
-/// the per-node nibble cap and by [`WALK_POSITION_CEILING`].
+/// Neither is classifying the shape. This guard used to carry a second rule —
+/// arrivals at stored nodes, capped at a multiple of the *distinct* node count
+/// — on the theory that an honest walk reaches each stored node about once
+/// because sharing requires whole subtries to coincide. That theory is false,
+/// and content addressing is why: give sixty thousand keys under dense
+/// structured paths one identical value and every leaf *is* the same node, so
+/// the whole lower trie collapses to about ten distinct nodes carrying sixty
+/// thousand positions. That is an ordinary `Trie::insert` corpus — a tree of
+/// identical placeholder files — and it blew the ratio by the same margin a
+/// fan-out bomb does. The two cases are not separable by this measurement, so
+/// the walk is bounded by how much work it does and nothing else.
 #[derive(Debug, Default)]
 pub(crate) struct FanoutGuard {
     /// Positions of every kind, against the absolute ceiling.
     positions: usize,
-    /// Positions that are a whole stored node, against the ratio.
-    arrivals: usize,
-    nodes: HashSet<Hash>,
 }
 
 impl FanoutGuard {
-    /// Records one visited position, failing if the walk has outrun the trie.
-    pub(crate) fn visit(
-        &mut self,
-        ids: impl IntoIterator<Item = PositionId>,
-    ) -> Result<(), MptError> {
+    /// Records one visited position, failing if the walk has outrun its budget.
+    pub(crate) fn visit(&mut self) -> Result<(), MptError> {
         self.positions += 1;
         if self.positions > WALK_POSITION_CEILING {
             return Err(MptError::NonCanonical(format!(
                 "structural walk exceeded {WALK_POSITION_CEILING} positions"
             )));
         }
-        for id in ids {
-            if let PositionId::Node(hash) = id {
-                self.arrivals += 1;
-                self.nodes.insert(hash);
-            }
-        }
-        let allowed = WALK_REVISIT_FLOOR.max(self.nodes.len().saturating_mul(WALK_REVISIT_RATIO));
-        if self.arrivals > allowed {
-            return Err(MptError::NonCanonical(format!(
-                "structural walk arrived at {} node positions over {} distinct nodes, \
-                 which no key set can produce",
-                self.arrivals,
-                self.nodes.len()
-            )));
-        }
         Ok(())
     }
+}
+
+/// One level of an insert's descent: how the level above was entered, so the
+/// path can be rebuilt once the changed subtree below it is known.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum InsertFrame {
+    /// An extension whose prefix the key matched whole.
+    Ext { prefix: Nibbles },
+    /// A branch entered through `idx`.
+    Branch {
+        children: [Option<Hash>; 16],
+        value: Option<ValueRef>,
+        idx: usize,
+    },
+}
+
+/// One level of a removal's descent. Carries the level's own hash as well, so
+/// an unchanged child can be answered with the node that is already stored
+/// rather than an identical rebuild.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum RemoveFrame {
+    Ext {
+        hash: Hash,
+        prefix: Nibbles,
+        child: Hash,
+    },
+    Branch {
+        hash: Hash,
+        children: [Option<Hash>; 16],
+        value: Option<ValueRef>,
+        idx: usize,
+        child: Hash,
+    },
 }
 
 /// One level of an explicit walk stack: the cursor at that level, and which
@@ -249,6 +235,9 @@ pub struct MissingWalk {
     /// Reported absent and awaiting the caller's fetch, so they can be
     /// revisited — and their children discovered — once they land.
     deferred: Vec<(Option<Hash>, Hash)>,
+    /// Children of extension nodes that were not yet present when their parent
+    /// was walked, and so must be checked for being branches when they arrive.
+    must_be_branch: HashSet<Hash>,
 }
 
 impl MissingWalk {
@@ -272,6 +261,7 @@ impl MissingWalk {
             frontier,
             seen: HashSet::new(),
             deferred: Vec::new(),
+            must_be_branch: HashSet::new(),
         }
     }
 
@@ -298,6 +288,19 @@ impl MissingWalk {
         max: usize,
     ) -> Result<Missing, MptError> {
         let mut missing = Missing::default();
+        // One request may ask for a hash once. Structural sharing makes a
+        // repeat ordinary rather than exotic — two keys whose values coincide
+        // reference the same out-of-line payload from two different nodes — and
+        // the node side is deduplicated by `seen` while this was not, so a
+        // single batch asked for one hash several times. The responder answers
+        // per requested hash, and `take_served` treats the second copy as a
+        // protocol violation and ends the *whole* exchange, for every origin,
+        // blaming an honest peer for answering exactly what it was asked.
+        //
+        // Local to the batch, never across batches: a value still absent on the
+        // next round has to be reported again, or the unproductive counter that
+        // §5.2's abandonment clause rests on would never fire.
+        let mut asked: HashSet<Hash> = HashSet::new();
         while let Some((reference, hash)) = self.frontier.pop() {
             if missing.len() >= max {
                 self.frontier.push((reference, hash));
@@ -317,6 +320,44 @@ impl MissingWalk {
                 continue;
             };
             let node = TrieNode::decode(&data)?;
+            // The half of the extension invariant `check_invariants` cannot
+            // reach: an `Ext` must sit above a `Branch`, and that needs the
+            // child node. `node.rs` documents it as "checked where the
+            // structure is walked" — this is that check, and until it existed
+            // the sentence was false. An `Ext` above a `Leaf` or another `Ext`
+            // reads correctly through `get`, `iter` and `diff`, so it corrupts
+            // nothing; what it does is give one key/value map several distinct
+            // roots, which is precisely what structural sharing and the
+            // reference pruning below rely on not happening. An origin serving
+            // non-collapsed shapes makes every peer's incremental sync cost the
+            // whole tree.
+            //
+            // Raised as an `MptError`, so it fails its own origin and no other
+            // (§12): the relaying peer served exactly what it was asked for.
+            if self.must_be_branch.remove(&hash) && !matches!(node, TrieNode::Branch { .. }) {
+                return Err(MptError::NonCanonical(format!(
+                    "node {hash} sits under an extension but is not a branch"
+                )));
+            }
+            if let TrieNode::Ext { child, .. } = &node {
+                // Recorded for when the child is popped, and checked now if it
+                // is already here — a node graph is a DAG, so the child may
+                // have been visited under some other parent already and `seen`
+                // would keep it from being revisited.
+                match trie.load_raw(child)? {
+                    Some(bytes)
+                        if !matches!(TrieNode::decode(&bytes)?, TrieNode::Branch { .. }) =>
+                    {
+                        return Err(MptError::NonCanonical(format!(
+                            "node {child} sits under an extension but is not a branch"
+                        )));
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.must_be_branch.insert(*child);
+                    }
+                }
+            }
             let reference_node = match reference {
                 Some(reference) => trie
                     .load_raw(&reference)?
@@ -338,8 +379,13 @@ impl MissingWalk {
             let mut awaiting_values = false;
             for value_hash in node.value_hashes() {
                 if !trie.has_value_raw(&value_hash)? {
-                    missing.values.push(value_hash);
+                    // Deferred whether or not this batch has already asked for
+                    // it: another node reporting the same payload says nothing
+                    // about *this* node being done with.
                     awaiting_values = true;
+                    if asked.insert(value_hash) {
+                        missing.values.push(value_hash);
+                    }
                 }
             }
             if awaiting_values {
@@ -543,113 +589,171 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         Ok(root)
     }
 
+    /// Descends to the one position an insert changes, then rebuilds the path
+    /// above it — with the path on the heap.
+    ///
+    /// This used to recurse, one frame per trie level, mutually with
+    /// `insert_into`. `insert` accepts keys up to `MAX_KEY_LEN` (§12), which is
+    /// 8 192 nibbles, and the store runs on `spawn_blocking`'s 2 MiB stacks: a
+    /// tree ~500 directories deep — a 4 013-byte key, comfortably inside the
+    /// bound — overflowed and *aborted the process* rather than returning an
+    /// error, mid-publish, with the batch restaged so the next start did it
+    /// again. Every peer-facing walk in this crate was already converted to a
+    /// heap stack for exactly this reason (`diff_walk`, `collect`); the write
+    /// path was the one that was not, and it is reachable from any local
+    /// directory tree and from an authenticated S3 `PUT` key.
     fn insert_at(
         &self,
         node: Option<Hash>,
         key: &[u8],
         value: &ValueRef,
     ) -> Result<Hash, MptError> {
-        match node {
-            None => self.put(&TrieNode::leaf(Nibbles::from_nibbles(key), value.clone())),
-            Some(hash) => {
-                let node = self.load(&hash)?;
-                self.insert_into(node, key, value)
+        let mut stack: Vec<InsertFrame> = Vec::new();
+        let mut cursor = node;
+        let mut rest = key;
+
+        // Descend to the position that actually changes, remembering how each
+        // level was entered so it can be rebuilt on the way back up.
+        let mut built = loop {
+            let Some(hash) = cursor else {
+                break self.put(&TrieNode::leaf(Nibbles::from_nibbles(rest), value.clone()))?;
+            };
+            match self.load(&hash)? {
+                TrieNode::Ext { prefix, child } => {
+                    let p = prefix.as_slice();
+                    let cp = common_prefix_len(p, rest);
+                    if cp == p.len() {
+                        stack.push(InsertFrame::Ext {
+                            prefix: prefix.clone(),
+                        });
+                        cursor = Some(child);
+                        rest = &rest[cp..];
+                        continue;
+                    }
+                    break self.split_ext(&prefix, child, rest, value)?;
+                }
+                TrieNode::Branch {
+                    children,
+                    value: branch_value,
+                } => {
+                    if rest.is_empty() {
+                        break self.put(&TrieNode::Branch {
+                            children,
+                            value: Some(value.clone()),
+                        })?;
+                    }
+                    let idx = rest[0] as usize;
+                    let next = children[idx];
+                    stack.push(InsertFrame::Branch {
+                        children,
+                        value: branch_value,
+                        idx,
+                    });
+                    cursor = next;
+                    rest = &rest[1..];
+                }
+                node @ TrieNode::Leaf { .. } => break self.split_leaf(node, rest, value)?,
             }
+        };
+
+        while let Some(frame) = stack.pop() {
+            built = match frame {
+                InsertFrame::Ext { prefix } => self.put(&TrieNode::ext(prefix, built))?,
+                InsertFrame::Branch {
+                    mut children,
+                    value,
+                    idx,
+                } => {
+                    children[idx] = Some(built);
+                    self.put(&TrieNode::Branch { children, value })?
+                }
+            };
         }
+        Ok(built)
     }
 
-    fn insert_into(&self, node: TrieNode, key: &[u8], value: &ValueRef) -> Result<Hash, MptError> {
-        match node {
-            TrieNode::Leaf {
-                key_rest,
-                value: old,
-            } => {
-                let k = key_rest.as_slice();
-                if k == key {
-                    return self.put(&TrieNode::leaf(key_rest.clone(), value.clone()));
-                }
-                let cp = common_prefix_len(k, key);
-                let mut children = NO_CHILDREN;
-                let mut branch_value = None;
-
-                let existing = &k[cp..];
-                if existing.is_empty() {
-                    branch_value = Some(old);
-                } else {
-                    let child =
-                        self.put(&TrieNode::leaf(Nibbles::from_nibbles(&existing[1..]), old))?;
-                    children[existing[0] as usize] = Some(child);
-                }
-
-                let inserted = &key[cp..];
-                if inserted.is_empty() {
-                    branch_value = Some(value.clone());
-                } else {
-                    let child = self.put(&TrieNode::leaf(
-                        Nibbles::from_nibbles(&inserted[1..]),
-                        value.clone(),
-                    ))?;
-                    children[inserted[0] as usize] = Some(child);
-                }
-
-                let branch = self.put(&TrieNode::Branch {
-                    children,
-                    value: branch_value,
-                })?;
-                self.wrap_in_ext(&key[..cp], branch)
-            }
-            TrieNode::Ext { prefix, child } => {
-                let p = prefix.as_slice();
-                let cp = common_prefix_len(p, key);
-                if cp == p.len() {
-                    let new_child = self.insert_at(Some(child), &key[cp..], value)?;
-                    return self.put(&TrieNode::ext(prefix.clone(), new_child));
-                }
-                let mut children = NO_CHILDREN;
-                let mut branch_value = None;
-
-                let existing = &p[cp..];
-                let down = if existing.len() > 1 {
-                    self.put(&TrieNode::ext(Nibbles::from_nibbles(&existing[1..]), child))?
-                } else {
-                    child
-                };
-                children[existing[0] as usize] = Some(down);
-
-                let inserted = &key[cp..];
-                if inserted.is_empty() {
-                    branch_value = Some(value.clone());
-                } else {
-                    let leaf = self.put(&TrieNode::leaf(
-                        Nibbles::from_nibbles(&inserted[1..]),
-                        value.clone(),
-                    ))?;
-                    children[inserted[0] as usize] = Some(leaf);
-                }
-
-                let branch = self.put(&TrieNode::Branch {
-                    children,
-                    value: branch_value,
-                })?;
-                self.wrap_in_ext(&key[..cp], branch)
-            }
-            TrieNode::Branch {
-                mut children,
-                value: mut branch_value,
-            } => {
-                if key.is_empty() {
-                    branch_value = Some(value.clone());
-                } else {
-                    let idx = key[0] as usize;
-                    let new_child = self.insert_at(children[idx], &key[1..], value)?;
-                    children[idx] = Some(new_child);
-                }
-                self.put(&TrieNode::Branch {
-                    children,
-                    value: branch_value,
-                })
-            }
+    /// Splits a leaf that shares only part of its key with the one being
+    /// inserted, returning the hash of the replacement subtree.
+    fn split_leaf(&self, leaf: TrieNode, key: &[u8], value: &ValueRef) -> Result<Hash, MptError> {
+        let TrieNode::Leaf {
+            key_rest,
+            value: old,
+        } = leaf
+        else {
+            unreachable!("split_leaf is only called with a leaf")
+        };
+        let k = key_rest.as_slice();
+        if k == key {
+            return self.put(&TrieNode::leaf(key_rest.clone(), value.clone()));
         }
+        let cp = common_prefix_len(k, key);
+        let mut children = NO_CHILDREN;
+        let mut branch_value = None;
+
+        let existing = &k[cp..];
+        if existing.is_empty() {
+            branch_value = Some(old);
+        } else {
+            let child = self.put(&TrieNode::leaf(Nibbles::from_nibbles(&existing[1..]), old))?;
+            children[existing[0] as usize] = Some(child);
+        }
+
+        let inserted = &key[cp..];
+        if inserted.is_empty() {
+            branch_value = Some(value.clone());
+        } else {
+            let child = self.put(&TrieNode::leaf(
+                Nibbles::from_nibbles(&inserted[1..]),
+                value.clone(),
+            ))?;
+            children[inserted[0] as usize] = Some(child);
+        }
+
+        let branch = self.put(&TrieNode::Branch {
+            children,
+            value: branch_value,
+        })?;
+        self.wrap_in_ext(&key[..cp], branch)
+    }
+
+    /// Splits an extension whose prefix diverges from the key being inserted,
+    /// returning the hash of the replacement subtree.
+    fn split_ext(
+        &self,
+        prefix: &Nibbles,
+        child: Hash,
+        key: &[u8],
+        value: &ValueRef,
+    ) -> Result<Hash, MptError> {
+        let p = prefix.as_slice();
+        let cp = common_prefix_len(p, key);
+        let mut children = NO_CHILDREN;
+        let mut branch_value = None;
+
+        let existing = &p[cp..];
+        let down = if existing.len() > 1 {
+            self.put(&TrieNode::ext(Nibbles::from_nibbles(&existing[1..]), child))?
+        } else {
+            child
+        };
+        children[existing[0] as usize] = Some(down);
+
+        let inserted = &key[cp..];
+        if inserted.is_empty() {
+            branch_value = Some(value.clone());
+        } else {
+            let leaf = self.put(&TrieNode::leaf(
+                Nibbles::from_nibbles(&inserted[1..]),
+                value.clone(),
+            ))?;
+            children[inserted[0] as usize] = Some(leaf);
+        }
+
+        let branch = self.put(&TrieNode::Branch {
+            children,
+            value: branch_value,
+        })?;
+        self.wrap_in_ext(&key[..cp], branch)
     }
 
     fn wrap_in_ext(&self, prefix: &[u8], child: Hash) -> Result<Hash, MptError> {
@@ -682,49 +786,91 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         }
     }
 
+    /// The removal counterpart of [`Trie::insert_at`], on the same heap stack
+    /// and for the same reason: one recursion frame per trie level aborted the
+    /// process on a deep tree rather than returning an error.
     fn remove_at(&self, hash: Hash, key: &[u8]) -> Result<Option<Hash>, MptError> {
-        let node = self.load(&hash)?;
-        match node {
-            TrieNode::Leaf { ref key_rest, .. } => {
-                if key_rest.as_slice() == key {
-                    Ok(None)
-                } else {
-                    Ok(Some(hash))
+        let mut stack: Vec<RemoveFrame> = Vec::new();
+        let mut cursor = hash;
+        let mut rest = key;
+
+        let mut result: Option<Hash> = loop {
+            match self.load(&cursor)? {
+                TrieNode::Leaf { ref key_rest, .. } => {
+                    break if key_rest.as_slice() == rest {
+                        None
+                    } else {
+                        Some(cursor)
+                    };
                 }
-            }
-            TrieNode::Ext { ref prefix, child } => {
-                let p = prefix.as_slice();
-                if !key.starts_with(p) {
-                    return Ok(Some(hash));
-                }
-                match self.remove_at(child, &key[p.len()..])? {
-                    None => Ok(None),
-                    Some(new_child) if new_child == child => Ok(Some(hash)),
-                    Some(new_child) => Ok(Some(self.merge_down(p, new_child)?)),
-                }
-            }
-            TrieNode::Branch {
-                mut children,
-                value,
-            } => {
-                if key.is_empty() {
-                    if value.is_none() {
-                        return Ok(Some(hash));
+                TrieNode::Ext { prefix, child } => {
+                    let p = prefix.as_slice();
+                    if !rest.starts_with(p) {
+                        break Some(cursor);
                     }
-                    return self.collapse(children, None);
+                    rest = &rest[p.len()..];
+                    stack.push(RemoveFrame::Ext {
+                        hash: cursor,
+                        prefix: prefix.clone(),
+                        child,
+                    });
+                    cursor = child;
                 }
-                let idx = key[0] as usize;
-                let Some(child) = children[idx] else {
-                    return Ok(Some(hash));
-                };
-                let new_child = self.remove_at(child, &key[1..])?;
-                if new_child == Some(child) {
-                    return Ok(Some(hash));
+                TrieNode::Branch { children, value } => {
+                    if rest.is_empty() {
+                        if value.is_none() {
+                            break Some(cursor);
+                        }
+                        break self.collapse(children, None)?;
+                    }
+                    let idx = rest[0] as usize;
+                    let Some(child) = children[idx] else {
+                        break Some(cursor);
+                    };
+                    rest = &rest[1..];
+                    stack.push(RemoveFrame::Branch {
+                        hash: cursor,
+                        children,
+                        value,
+                        idx,
+                        child,
+                    });
+                    cursor = child;
                 }
-                children[idx] = new_child;
-                self.collapse(children, value)
             }
+        };
+
+        // Unwind. A level whose child came back unchanged is itself unchanged,
+        // which is what keeps removing an absent key from rewriting the path
+        // and so from producing a second root for one key/value map.
+        while let Some(frame) = stack.pop() {
+            result = match frame {
+                RemoveFrame::Ext {
+                    hash,
+                    prefix,
+                    child,
+                } => match result {
+                    None => None,
+                    Some(new_child) if new_child == child => Some(hash),
+                    Some(new_child) => Some(self.merge_down(prefix.as_slice(), new_child)?),
+                },
+                RemoveFrame::Branch {
+                    hash,
+                    mut children,
+                    value,
+                    idx,
+                    child,
+                } => {
+                    if result == Some(child) {
+                        Some(hash)
+                    } else {
+                        children[idx] = result;
+                        self.collapse(children, value)?
+                    }
+                }
+            };
         }
+        Ok(result)
     }
 
     /// Pushes `prefix` down into `child`, preserving canonical form: an
@@ -769,7 +915,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         match hash {
             None => Ok(Cursor::Empty),
             Some(h) => Ok(Cursor::At {
-                hash: Some(h),
                 node: self.load(&h)?,
             }),
         }
@@ -787,7 +932,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
                 }
                 // Part-way through a compressed node: no stored hash of its own.
                 Ok(Cursor::At {
-                    hash: None,
                     node: TrieNode::leaf(Nibbles::from_nibbles(&k[1..]), value.clone()),
                 })
             }
@@ -800,7 +944,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
                     self.cursor_at(Some(*child))
                 } else {
                     Ok(Cursor::At {
-                        hash: None,
                         node: TrieNode::ext(Nibbles::from_nibbles(&p[1..]), *child),
                     })
                 }
@@ -896,7 +1039,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
                 path.pop();
                 continue;
             }
-            guard.visit(child.identity())?;
+            guard.visit()?;
             self.take_value(&child, path, after_bytes.as_deref(), limit, out)?;
             stack.push(Frame {
                 cursor: child,
@@ -1267,5 +1410,29 @@ mod tests {
             t.insert(Hash::EMPTY, &key, b"v"),
             Err(MptError::KeyTooLong(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// The guard stops a walk at exactly the ceiling.
+    ///
+    /// Driven directly, in microseconds. Proving the same thing through `diff`
+    /// costs a real fan-out DAG expanded to `WALK_POSITION_CEILING` positions,
+    /// which is ~8 s in release and ~90 s in a debug CI run — see
+    /// `fanout_bomb.rs`, where that end-to-end assertion lives behind
+    /// `#[ignore]`. This is the arithmetic; that one is the wiring.
+    #[test]
+    fn the_walk_guard_stops_at_the_ceiling() {
+        let mut guard = FanoutGuard::default();
+        for i in 0..WALK_POSITION_CEILING {
+            guard
+                .visit()
+                .unwrap_or_else(|e| panic!("refused at position {i}, under the ceiling: {e}"));
+        }
+        let err = guard.visit().expect_err("the ceiling must be enforced");
+        assert!(err.to_string().contains("exceeded"), "{err}");
     }
 }

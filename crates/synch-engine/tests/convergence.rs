@@ -18,6 +18,18 @@
 //! case: applying the fork cap as an acceptance rule would leave a node that
 //! met the greatest root of a storm late never taking it.
 //!
+//! Note what the propagation step here deliberately is *not*. It gossips a
+//! node's `head_floor` — the maximum over both slots — because that is the
+//! right stimulus for the property above: the join is about a node's current
+//! maximum. The wire does something narrower (`heads_for` serves the *complete*
+//! slot only, and `sync_with` pushes off `complete_head`), and every root here
+//! is fabricated, so everything sits in the pending slot and no promotion runs.
+//! That is a scope boundary, not an oversight, but it does mean the acceptance
+//! rule is what this covers and the push/pull *decision* is not. That half is
+//! covered over real endpoints with real tries in `cluster.rs` — see
+//! `convergence_survives_a_partition`, where a node that knows nothing pulls an
+//! origin through one `anti_entropy_round`.
+//!
 //! Still outstanding from §11: the live duplex transport, partitions and
 //! message loss as first-class events, interleaved *publishes* (these heads are
 //! signed up front), and convergence of the tries under the heads rather than
