@@ -422,8 +422,29 @@ the monitor never reads the statement, so the claimed monitor-silence scenario
 does not occur. It remains cheap defence in depth against a shard with broken
 ingest validation. Low.
 
-**Fix**: parameterise the tiers `Shape` with a separate chain zone — one shape
-covers `:726` and `chain.rs:470` together.
+**Fix (applied)**: both checks now have tests, and both are mutation-verified
+— deleting either now fails the workspace, where before it did not.
+
+`rekor.rs:726` is covered by `an_entry_whose_chain_proves_another_signing_zone_is_refused`
+in the tiers suite: an honest entry for an apex, offered for an answer signed
+by a name *inside* that apex. Every upstream guard passes — both names are
+ancestors-or-equal of the domain, and two ancestors of one name are comparable
+but need not be equal — so this check is the only thing that fires. `Shape`
+gained a separate `observed_signer`, since every `ZoneKey` in the tree setting
+`signing_zone` equal to the apex was what made the check unreachable.
+
+`chain.rs:470` is covered by `a_declaration_signed_under_another_zones_name_is_refused`,
+which needed a new sim knob — nothing in the tree could build an RRSIG whose
+signer name was not the zone's own. `SimZone::signer_named` builds one with a
+*fresh* key on purpose: the name comparison runs before the signature check, so
+matching the key would only test the two together.
+
+Not done: `rekor.rs:750`, the third check mutation testing found untested. The
+challenge pass showed it is cryptographically redundant given the attribution
+check above it — the body is parsed from the same bytes the leaf commits to, so
+the served statement is already pinned to the leaf by ECDSA alone. It is cheap
+defence in depth against a shard with broken ingest validation, and a test for
+it would assert a property nothing can currently violate.
 
 ### M9. `MAX_PROOF_PARTS` is one number written twice, pinned by nothing
 
