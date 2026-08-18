@@ -45,6 +45,16 @@ pub fn send(
   }
 }
 
+/// Whether mail actually leaves the building. Log-only mail is a
+/// development convenience — the message goes to the service's stdout —
+/// so a feature that depends on the user receiving it is not on offer.
+pub fn delivers(mailer: Mailer) -> Bool {
+  case mailer {
+    Smtp(..) -> True
+    LogOnly -> False
+  }
+}
+
 pub fn describe(mailer: Mailer) -> String {
   case mailer {
     Smtp(host, port, _, _, from) ->

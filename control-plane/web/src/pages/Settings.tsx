@@ -8,7 +8,7 @@ import {
   type MemberRow,
   type OidcConfig,
 } from '../lib/api'
-import { ErrorNote, useMe } from './Shell'
+import { ErrorNote, useAuthMethods, useMe } from './Shell'
 
 export function Settings() {
   const { slug = '' } = useParams()
@@ -283,6 +283,15 @@ function Audit({ slug }: { slug: string }) {
 
 function LinkedIdentities() {
   const linked = new URLSearchParams(window.location.search).get('linked')
+  const { data: methods } = useAuthMethods()
+  // Only the providers this deployment configured can be linked; the rest
+  // would send the user to a "provider not configured" page.
+  const linkable = [
+    { key: 'google', label: 'Link Google', on: methods?.google },
+    { key: 'github', label: 'Link GitHub', on: methods?.github },
+  ].filter((provider) => provider.on)
+  if (linkable.length === 0) return null
+
   return (
     <section>
       <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-neutral-400">
@@ -297,18 +306,15 @@ function LinkedIdentities() {
         Link another sign-in method to this account:
       </p>
       <div className="mt-2 flex gap-2">
-        <a
-          href="/auth/start/google?link=1"
-          className="rounded border border-neutral-700 px-3 py-1.5 text-sm hover:bg-neutral-800"
-        >
-          Link Google
-        </a>
-        <a
-          href="/auth/start/github?link=1"
-          className="rounded border border-neutral-700 px-3 py-1.5 text-sm hover:bg-neutral-800"
-        >
-          Link GitHub
-        </a>
+        {linkable.map((provider) => (
+          <a
+            key={provider.key}
+            href={`/auth/start/${provider.key}?link=1`}
+            className="rounded border border-neutral-700 px-3 py-1.5 text-sm hover:bg-neutral-800"
+          >
+            {provider.label}
+          </a>
+        ))}
       </div>
     </section>
   )

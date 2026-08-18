@@ -55,7 +55,12 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   every publish.
 - Sign-in: Google, GitHub, per-org custom OIDC (never auto-linked —
   org-controlled issuers can't capture existing accounts), and email
-  magic links.
+  magic links. The login and settings screens offer only what this
+  deployment has configured — `GET /api/auth/methods` is what they ask,
+  and it answers booleans to anyone, since the login page needs it before
+  a session exists. Magic links stay on the page when nothing else is
+  configured, mail relay or not: an empty login screen is worse than a
+  link the operator reads off the service log.
 
 ## Stack
 
@@ -222,14 +227,14 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_BUNNY_API_URL` | primary | Bunny API base URL override; default empty means the real endpoint. |
 | `CP_PUBLIC_URL` | primary | External base URL for links and OAuth callbacks. Default `http://127.0.0.1:<http-port>`. |
 | `CP_SESSION_SECRET` | primary | Required on the primary, ≥32 characters. Signs session cookies. |
-| `CP_SMTP_HOST` | primary | SMTP hostname. Absent means log-only magic-link mail. |
+| `CP_SMTP_HOST` | primary | SMTP hostname. Absent means log-only magic-link mail, and the login page stops offering the form unless no other sign-in method is configured. |
 | `CP_SMTP_PORT` | primary | SMTP port. Default `587`. Used only when `CP_SMTP_HOST` is set. |
 | `CP_SMTP_USER` | primary | SMTP username. Default empty. |
 | `CP_SMTP_PASS` | primary | SMTP password. Default empty. |
 | `CP_SMTP_FROM` | primary | Required when `CP_SMTP_HOST` is set. Envelope From. |
-| `CP_GOOGLE_CLIENT_ID` | primary | Google OAuth client id. Both id and secret must be set to enable Google sign-in. |
+| `CP_GOOGLE_CLIENT_ID` | primary | Google OAuth client id. Both id and secret must be set to enable Google sign-in; unset, it is hidden from the login and settings screens. |
 | `CP_GOOGLE_CLIENT_SECRET` | primary | Google OAuth client secret. |
-| `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in. |
+| `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in; unset, it is hidden from the login and settings screens. |
 | `CP_GITHUB_CLIENT_SECRET` | primary | GitHub OAuth client secret. |
 | `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Unset — the normal case — the shard in service is read from the stored `trusted_root.json`, so a Sigstore rotation costs a metadata refresh and not a release. |
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key — a PEM `PUBLIC KEY` block or one base64 SubjectPublicKeyInfo, `#` starting a comment. Exactly one key: this service submits to one log and stores the proof under that log's id. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
