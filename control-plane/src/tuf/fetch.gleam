@@ -67,18 +67,34 @@ const root_ceiling = 200
 
 /// The most bytes one TUF file may be — the same 8 MiB the client applies
 /// (`MAX_TUF_BYTES`, crates/synch-net/src/dns.rs). Sigstore's files are tens
-/// of kilobytes; this is the bound that makes a repository unable to charge
-/// this service arbitrary memory for material it has not verified yet.
+/// of kilobytes.
+///
+/// **This is a bound on what is accepted, not on what is allocated**, and the
+/// difference is worth stating because the obvious reading is wrong.
+/// `gleam_httpc` returns a fully materialised body, so `spend` runs after the
+/// bytes are already in memory: a repository answering with an endless body
+/// exhausts the VM before this constant is consulted. The client reads
+/// through a capped stream precisely so its own cap means something
+/// (`dns.rs`: "a cap applied to the result of `bytes()` is a bound on
+/// nothing").
+///
+/// What does bound this side today is `max_walk_ms` and the aggregate below —
+/// time and accepted volume, not peak memory. Closing it properly needs a
+/// streaming HTTP client on this leg; doing it by hand would mean restating
+/// the TLS options `gleam_httpc` configures, and getting *those* wrong is a
+/// worse failure than the one being fixed. Left as the follow-up it is rather
+/// than described as a guarantee it is not.
 pub const max_file_bytes = 8_388_608
 
-/// The most bytes one whole walk may take, across the root chain and the four
-/// files below it.
+/// The most bytes one whole walk may accept, across the root chain and the
+/// four files below it — the same 8 MiB ceiling the client applies, rather
+/// than the 4× larger number this used to carry for no stated reason.
 ///
 /// A per-file cap alone bounds nothing here: the root chain probes up to
 /// `root_ceiling` versions and holds every one of them until the gate below
 /// runs, so the product of the two is what a hostile mirror would get to
 /// allocate. Real material is a fraction of this.
-pub const max_walk_bytes = 33_554_432
+pub const max_walk_bytes = 8_388_608
 
 /// A TUF repository, as the two operations this needs.
 ///
@@ -162,7 +178,7 @@ pub fn refresh(
     anchored.version,
     anchored.version,
     [],
-    Budget(0),
+    new_budget(),
   ))
   use #(root_version, _) <- result.try(case list.last(roots) {
     Ok(head) -> Ok(head)
@@ -260,16 +276,17 @@ pub fn refresh(
   // material would advance this service's versions past material clients
   // structurally refuse, and the failure would surface days later as proofs
   // from a log nobody pins.
-  use logs <- result.try(
+  // Note what is *not* gated here: whether any shard's window is open right
+  // now. Expiry gates updates, never operation (§10.2), and a window is the
+  // same kind of fact — during a staged rotation the next shard's window may
+  // start in the future while the previous one has ended, and refusing to
+  // store then is refusing the very update that teaches this service the new
+  // shard. `discover` asks that question at the moment of use, where it
+  // belongs, and the Rust client's `update` has never asked it at all.
+  use _logs <- result.try(
     trusted_root.tlogs(trusted_root)
     |> result.map_error(fn(why) {
       "refusing a trusted root no client could use: " <> why
-    }),
-  )
-  use _ <- result.try(
-    trusted_root.current(logs, now)
-    |> result.map_error(fn(why) {
-      "refusing a trusted root with no log to submit to: " <> why
     }),
   )
 
@@ -336,8 +353,24 @@ pub const trusted_root_target = verify.trusted_root_target
 /// Threaded rather than global because it has to be: every fetch in one
 /// refresh shares the bound, and none of them may be trusted until the
 /// verification gate below has run over all of them.
+/// The most wall-clock time one whole walk may take.
+///
+/// A per-request timeout is not a bound on a walk, and the arithmetic is the
+/// point: `gleam_httpc` defaults to 30 s per request and `root_chain` probes
+/// up to `root_ceiling` versions, so a mirror answering every probe just
+/// inside the timeout costs ~1.7 hours per attempt. The refresh job re-arms
+/// only after `run_once` returns, so that is a refresh that has effectively
+/// stopped — stored material ages past its timestamp expiry and this service
+/// keeps submitting into whichever shard it last knew, which is the silent
+/// failure §10.6 exists to prevent. `rekor-publish` walks the same path and
+/// blocks an operator standing at a terminal.
+///
+/// The client applies the same bound for the same reason (`tuf.rs`'s
+/// `MAX_WALK_TIME`).
+pub const max_walk_ms = 120_000
+
 type Budget {
-  Budget(used: Int)
+  Budget(used: Int, deadline: Int)
 }
 
 /// Walks `<version>.root.json` upward from `version` until the repository
@@ -390,11 +423,28 @@ fn fetch(
 }
 
 /// Charges one fetched file against the caps, or refuses it.
+/// A fresh budget: no bytes spent, and a deadline `max_walk_ms` out.
+fn new_budget() -> Budget {
+  Budget(used: 0, deadline: now_ms() + max_walk_ms)
+}
+
+@external(erlang, "cp_sys_ffi", "monotonic_ms")
+fn now_ms() -> Int
+
 fn spend(
   budget: Budget,
   path: String,
   bytes: BitArray,
 ) -> Result(Budget, String) {
+  use Nil <- result.try(case now_ms() > budget.deadline {
+    True ->
+      Error(
+        "this refresh has been walking for longer than "
+        <> int.to_string(max_walk_ms / 1000)
+        <> " seconds; abandoning it with the material in force left standing",
+      )
+    False -> Ok(Nil)
+  })
   let size = bit_array.byte_size(bytes)
   let used = budget.used + size
   case size > max_file_bytes, used > max_walk_bytes {
@@ -415,7 +465,7 @@ fn spend(
         <> int.to_string(max_walk_bytes)
         <> "-byte limit for one walk",
       )
-    False, False -> Ok(Budget(used))
+    False, False -> Ok(Budget(..budget, used: used))
   }
 }
 

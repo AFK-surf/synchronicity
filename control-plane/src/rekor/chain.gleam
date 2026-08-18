@@ -412,7 +412,7 @@ fn zone_link(
 /// withdrawn. Neither is part of the authorized set, and a reader's chain walk
 /// excludes both — so a claim naming one would describe a set no client
 /// derives.
-fn claimable(rd: BitArray) -> Bool {
+pub fn claimable(rd: BitArray) -> Bool {
   case rd {
     <<flags:int-size(16), _:bits>> ->
       int.bitwise_and(flags, zone_key_flag) != 0

@@ -247,18 +247,29 @@ pub fn a_refresh_refuses_a_tampered_target_test() {
   sqlite.close(conn)
 }
 
-/// The material verifies and is still refused: a trusted root naming no log
-/// in service leaves this service with nowhere to submit and clients with a
-/// pin set they refuse, so storing it would advance the versions past what any
-/// client will follow and go quiet for days.
-pub fn a_refresh_refuses_a_trusted_root_with_no_log_in_service_test() {
+/// Material that verifies is stored even when no shard's window is open at
+/// the moment it arrives — the question of *which shard is in service* is
+/// asked at the moment of use, not at ingestion.
+///
+/// Refusing to store it was the wrong shape twice over. Expiry gates updates
+/// and never operation (§10.2), and a validity window is the same kind of
+/// fact: during a staged rotation the next shard's window starts in the
+/// future while the previous one has ended, and refusing then rejects the
+/// very update that would teach this service the new shard — permanently,
+/// since nothing else advances the stored versions. The client's `update` has
+/// never applied such a gate, so this side was also refusing material the
+/// clients it serves would accept.
+pub fn a_refresh_stores_material_whose_shards_are_all_closed_test() {
   let conn = fixtures.fresh_conn()
   // An instant before the first shard opened. Nothing has expired, so the
-  // whole chain verifies; the contents are what is unusable.
-  let assert Error(why) =
-    fetch.refresh(conn, fake_repo(), "https://tuf.test", 1)
-  assert string.contains(why, "no log to submit to")
-  assert tuf_store.get(conn) == Ok(Error(Nil))
+  // whole chain verifies; only the windows are unhelpful.
+  let assert Ok(_) = fetch.refresh(conn, fake_repo(), "https://tuf.test", 1)
+  let assert Ok(Ok(stored)) = tuf_store.get(conn)
+  // And the unanswerable question is still unanswerable — asked where it is
+  // actually needed, with an error naming the fix.
+  let assert Ok(logs) = trusted_root.tlogs(stored.trusted_root)
+  let assert Error(why) = trusted_root.current(logs, 1)
+  assert string.contains(why, "no transparency log in service")
   sqlite.close(conn)
 }
 

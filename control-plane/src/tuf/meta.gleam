@@ -17,6 +17,7 @@ import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
+import gleam/list
 import gleam/result
 import gleam/string
 
@@ -96,8 +97,29 @@ pub fn read_target(
     )
     decode.success(#(digest, length))
   }
-  json.parse(text, decoder)
-  |> result.replace_error("targets.json names no " <> name <> " with a sha256")
+  use #(digest, length) <- result.try(
+    json.parse(text, decoder)
+    |> result.replace_error("targets.json names no " <> name <> " with a sha256"),
+  )
+  // The digest is interpolated straight into the path the next fetch asks
+  // for, out of a file nothing has verified yet. `verify` recomputes it over
+  // the bytes that come back, so this is not a signature bypass — but an
+  // unvalidated string steering a request at the repository host is a
+  // capability with no purpose, and the client validates the same field
+  // before building the same path (`tuf.rs`). One shape, both sides.
+  case
+    string.length(digest) == 64
+    && string.to_graphemes(digest)
+    |> list.all(fn(c) { string.contains("0123456789abcdefABCDEF", c) })
+  {
+    True -> Ok(#(string.lowercase(digest), length))
+    False ->
+      Error(
+        "targets.json names "
+        <> name
+        <> " by something that is not a SHA-256 digest",
+      )
+  }
 }
 
 fn utf8(bytes: BitArray, what: String) -> Result(String, String) {
@@ -132,6 +154,12 @@ pub fn parse_rfc3339(text: String) -> Result(Int, Nil) {
       && day <= 31
       && hour <= 23
       && minute <= 59
+      // Bounded like every other field, and like the client's own parser
+      // (`tuf.rs`'s `parse_rfc3339`). 60 admits the leap second RFC 3339
+      // permits; anything past it is a timestamp neither side should read the
+      // same way, and an expiry the two implementations disagree about is a
+      // signature one accepts and the other does not.
+      && second <= 60
     {
       True -> Ok(Nil)
       False -> Error(Nil)

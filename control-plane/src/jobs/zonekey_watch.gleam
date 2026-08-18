@@ -335,6 +335,16 @@ fn observe_once(
       && rr.name == zone
     })
     |> list.map(fn(rr) { rr.rdata })
+    // The same keys the *claim* can name, and for the same reason. A key
+    // without the Zone Key flag, or carrying RFC 5011's REVOKE bit, signs
+    // nothing and is excluded from the set an entry claims
+    // (`rekor/chain.claimable`, `chain.rs`'s `usable_signer`). Recording one
+    // here anyway made `covered` unreachable forever: `stamp_covered` only
+    // stamps keys a stored record claims, `log_if_new` requires every stored
+    // key to be stamped, and a key no claim can contain is never stamped. The
+    // watcher then re-collected the chain and re-submitted a byte-identical
+    // entry every tick, for the life of the deployment.
+    |> list.filter(chain.claimable)
   case rdatas {
     [] ->
       Error(

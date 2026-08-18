@@ -55,12 +55,13 @@ pub type BuildError {
   /// shape of the record it sits in.
   ///
   /// A membership record is whitespace-separated `key=value` pairs, and
-  /// these two are the only free-form values in it. The client's parser is
-  /// last-wins for `apex=`, so a hint spelling `x apex=other.example`
-  /// injects an apex that overrides the real one. Clients fail closed on
-  /// that, but a member who can set their own dialing hint should not be
-  /// able to break their network's membership answer — nor to push a record
-  /// past a provider's TXT size limit, which wedges the reconciler.
+  /// these two are the only free-form values in it. A hint spelling
+  /// `x apex=other.example` therefore smuggles a second `apex=` field into a
+  /// record the operator wrote. The client refuses a record carrying two
+  /// (`RecordError::Duplicate`), so the effect is a refusal rather than an
+  /// override — but a member who can set their own dialing hint should not be
+  /// able to break their network's membership answer at all, nor to push a
+  /// record past a provider's TXT size limit, which wedges the reconciler.
   InvalidHint(String)
 }
 
@@ -297,9 +298,10 @@ fn validate_members(members: List(model.Member)) -> Result(Nil, BuildError) {
 /// changing its shape.
 ///
 /// The record grammar is whitespace-separated `key=value` pairs, so a hint
-/// containing whitespace is not one value but two fields — and the client's
-/// parser is last-wins for `apex=`, so the second one can override a field
-/// the operator set. A quote breaks the provider round-trip instead:
+/// containing whitespace is not one value but two fields — and a second
+/// `apex=` makes the client refuse the record outright
+/// (`RecordError::Duplicate`), which is a member breaking their own network's
+/// answer. A quote breaks the provider round-trip instead:
 /// Cloudflare returns TXT content in presentation form, and the reconciler
 /// folds it by splitting on `"`, so a quoted value comes back as something
 /// other than what was sent and the diff churns forever.
