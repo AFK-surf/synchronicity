@@ -88,6 +88,10 @@ pub type Error {
   Protocol
   /// priv/csqlite is missing: build it (make -C csqlite).
   MissingBinary
+  /// The binary is there but the OS would not start it — a process or
+  /// descriptor limit is the usual reason, since every open connection owns
+  /// one csqlite process for as long as it is held.
+  SpawnFailed
 }
 
 const rpc_timeout_ms = 60_000
@@ -107,7 +111,7 @@ pub fn open(path: String, mode: Mode) -> Result(Connection, Error) {
   ))
   use port <- result.try(result.replace_error(
     port_open(exe, [dirname(path)]),
-    MissingBinary,
+    SpawnFailed,
   ))
   let conn = Connection(port)
   let mode_byte = case mode {

@@ -773,10 +773,11 @@ const ROOT_CEILING: u64 = 200;
 ///
 /// A per-response cap is not a bound on a walk: [`fetch_metadata`] holds every
 /// root it collects until [`update`] can chain them, and a mirror that answers
-/// the whole per-response allowance to all [`ROOT_CEILING`] root probes turns a
-/// daily refresh into more than a gigabyte resident. This is the aggregate, and
-/// it is generous against the real repository: Sigstore's `targets.json` is the
-/// only large file at a few hundred KiB, and its roots are tens of KiB apiece.
+/// the whole per-response allowance to every root probe the ceiling permits
+/// turns a daily refresh into more than a gigabyte resident. This is the
+/// aggregate, and it is generous against the real repository: Sigstore's
+/// `targets.json` is the only large file at a few hundred KiB, and its roots
+/// are tens of KiB apiece.
 pub const MAX_WALK_BYTES: usize = 8 * 1024 * 1024;
 
 /// The longest one walk may take, end to end.

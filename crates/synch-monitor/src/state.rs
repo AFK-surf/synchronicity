@@ -203,24 +203,20 @@ impl MonitorState {
     /// exists and is empty — the state a monitor cannot tell from "never read
     /// anything".
     ///
-    /// The temporary carries this process's id and a nanosecond stamp because
-    /// two runs over one state file are an ordinary operator mistake (a cron
-    /// job that overlaps its predecessor). One fixed `.tmp` name lets them
-    /// rename each other's partial bytes over the real file, which is the
-    /// exact accident the rename dance exists to prevent.
+    /// The temporary is unique to this write because two saves over one state
+    /// file are an ordinary operator mistake (a cron job that overlaps its
+    /// predecessor). One shared `.tmp` name lets them rename each other's
+    /// partial bytes over the real file, which is the exact accident the
+    /// rename dance exists to prevent. A process id and a clock reading are
+    /// not enough on their own: two writes from one process can read the same
+    /// nanosecond on a coarse clock, so a sequence number separates them.
     pub fn save(&self, path: &std::path::Path) -> Result<(), MonitorError> {
         use std::io::Write;
 
         let json =
             serde_json::to_vec_pretty(self).map_err(|e| MonitorError::State(e.to_string()))?;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mut name = path.file_name().unwrap_or_default().to_os_string();
-        name.push(format!(".{}.{stamp}.tmp", std::process::id()));
         let directory = path.parent().unwrap_or(std::path::Path::new("."));
-        let temporary = directory.join(name);
+        let temporary = unique_temporary(path);
 
         let write = |temporary: &std::path::Path| -> std::io::Result<()> {
             let mut file = std::fs::File::create(temporary)?;
@@ -233,7 +229,11 @@ impl MonitorState {
         }
         if let Err(e) = std::fs::rename(&temporary, path) {
             let _ = std::fs::remove_file(&temporary);
-            return Err(MonitorError::State(format!("{}: {e}", path.display())));
+            return Err(MonitorError::State(format!(
+                "{} -> {}: {e}",
+                temporary.display(),
+                path.display()
+            )));
         }
         // A directory that cannot be flushed is not a failed save: the bytes
         // are on the device and the rename is in the log. Nothing to say.
@@ -257,6 +257,34 @@ impl MonitorState {
     pub fn is_fresh(&self) -> bool {
         self.logs.values().all(LogPosition::is_fresh)
     }
+}
+
+/// A temporary path beside `path`, unique to this write.
+///
+/// A process id and a clock reading are not enough on their own: two writes
+/// from one process can read the same nanosecond on a coarse clock, and two
+/// saves that agree on a temporary rename each other's partial bytes over the
+/// target. The sequence number is what separates them.
+fn unique_temporary(path: &std::path::Path) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    temporary_at(path, nanos)
+}
+
+/// The naming proper, at a caller-supplied clock reading.
+///
+/// The reading is a parameter so the uniqueness that does not depend on the
+/// clock can be asserted without one: hold `nanos` still and the names must
+/// still differ.
+fn temporary_at(path: &std::path::Path, nanos: u128) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{nanos}.{sequence}.tmp", std::process::id()));
+    path.with_file_name(name)
 }
 
 #[cfg(test)]
@@ -382,5 +410,26 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(left, ["monitor.json"]);
+    }
+
+    /// The same property as above, asserted without depending on the clock.
+    ///
+    /// Whether two saves collide otherwise turns on the platform's clock
+    /// granularity, so on a fine-grained one the concurrent test can pass
+    /// against a name that is not in fact unique. This pins it directly.
+    #[test]
+    fn a_temporary_is_unique_to_its_write() {
+        let path = std::path::Path::new("/tmp/monitor.json");
+        // One frozen clock reading for every call, which is the case a coarse
+        // clock produces and a fine one hides.
+        let names: std::collections::BTreeSet<_> =
+            (0..64).map(|_| temporary_at(path, 1_760_000_000)).collect();
+        assert_eq!(names.len(), 64, "two writes agreed on a temporary");
+        for name in &names {
+            assert_eq!(name.parent(), path.parent());
+            let name = name.file_name().unwrap().to_string_lossy().to_string();
+            assert!(name.starts_with("monitor.json."), "{name}");
+            assert!(name.ends_with(".tmp"), "{name}");
+        }
     }
 }

@@ -788,7 +788,7 @@ impl<'a, S: TileSource> Tree<'a, S> {
     /// served as its own resource, and the root recomputation over a
     /// production tree reads no level-0 tile at all. So the comparison is made
     /// against a tile that has first been folded up to a node the checkpoint
-    /// committed to ([`Tree::authenticate_tile`]).
+    /// committed to (`Tree::authenticate_tile`).
     ///
     /// **Cost.** The fetch budget is the same as the unauthenticated
     /// comparison's: one level-0 hash tile per 256 entries, cached, plus one

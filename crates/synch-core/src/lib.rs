@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn the_epoch_is_not_a_trustworthy_instant() {
-        // The whole M3 failure is `now = 0` passing an expiry check: at zero
+        // The failure this guards is `now = 0` passing an expiry check: at zero
         // nothing has ever expired. A clock that reads at or before the epoch
         // has to be refused rather than believed.
         assert!(!clock_is_trusted(0));
