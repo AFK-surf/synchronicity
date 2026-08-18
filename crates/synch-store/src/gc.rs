@@ -158,7 +158,7 @@ impl Store {
     /// unlink — a row claiming verified groups whose bytes are gone.
     ///
     /// So the decision and the unlink are one step under one guard, and the
-    /// writer's own mark is part of the decision ([`Store::lease_write`]).
+    /// writer's own mark is part of the decision (`Store::lease_write`).
     /// Anything in a shard directory that is not named for an object is left
     /// alone.
     ///
