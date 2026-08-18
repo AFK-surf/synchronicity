@@ -31,12 +31,11 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import simplifile
 import gleam/string
 import rekor/proof
+import simplifile
 
 /// One transparency log the trusted root names.
-
 /// The file inside `priv/tuf` holding Sigstore's trusted root.
 pub const file = "sigstore_trusted_root.json"
 

@@ -181,9 +181,7 @@ pub fn run(
       statement.pae(statement.dsse_payload_type, statement_bytes),
     )
   let sub = Submission(digest, signature, certificate)
-  use logged <- result.try(
-    log.submit(sub) |> result.map_error(LogUnavailable),
-  )
+  use logged <- result.try(log.submit(sub) |> result.map_error(LogUnavailable))
 
   let record =
     Proof(

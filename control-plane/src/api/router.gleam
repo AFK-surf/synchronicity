@@ -221,9 +221,7 @@ fn with_session(
 
 fn healthz(serving: Serving) -> Response {
   let looked =
-    pool.with_connection(serving.pool, fn(conn) {
-      model.health(conn)
-    })
+    pool.with_connection(serving.pool, fn(conn) { model.health(conn) })
   case looked {
     Ok(Ok(#(serial, expires))) ->
       json.object([

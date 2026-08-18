@@ -30,9 +30,9 @@ import rekor/publish as rekor_publish
 import rekor/statement
 import rekor/store
 import simplifile
-import tuf/trusted_root
 import store/sqlite
 import tools/gen_crossval
+import tuf/trusted_root
 import zone/build
 import zone/model.{Member, NsHost, TxtName, ZoneInput, ZoneMeta}
 import zone/publish
@@ -1794,8 +1794,7 @@ pub fn a_ds_that_covers_no_served_key_is_refused_test() {
           case rtype == wire.type_dnskey {
             True -> Ok(dnskey_rrs(zone, [served]))
             // The parent's DS names a key this zone does not serve.
-            False ->
-              Ok([ds_rr(zone, [other]), fake_rrsig(zone, chain.type_ds)])
+            False -> Ok([ds_rr(zone, [other]), fake_rrsig(zone, chain.type_ds)])
           }
       }
     })

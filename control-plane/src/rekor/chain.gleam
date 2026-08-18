@@ -82,9 +82,9 @@
 //// "the entry is valid"; read it as "the entry is not obviously invalid".
 
 import dns/name.{type Name}
-import dnssec/keys
 import dns/rdata
 import dns/wire
+import dnssec/keys
 import envoy
 import gleam/bit_array
 import gleam/http
