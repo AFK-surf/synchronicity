@@ -19,7 +19,18 @@ defect the suite does not catch.
 
 Findings are listed by severity. Each names the smallest change that closes it.
 Where the challenge pass corrected a finding, the correction is recorded inline —
-in three cases it changes what the fix should be.
+in three cases it changed what the fix should be.
+
+**Most of them are now fixed**, in the same branch as this report, and each
+entry says so. Where a fix differs from what the finding proposed, the entry
+says why: two proposed fixes did not work (one would not have stopped its own
+attack, one would have handed an attacker a way to wedge the monitor's
+alerting), and one first attempt opened a worse hole than the bug — a
+name-shaped shield that froze revoked devices' records — which a review caught
+before it merged. What remains unfixed is listed at the end of each entry with
+the reason, and is mostly work that is larger than the finding: a crate split, a
+cross-language chain fixture, a schema change, and one design decision about
+whether shard retirement can ever be revocation.
 
 ---
 
