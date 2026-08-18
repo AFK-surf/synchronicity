@@ -4071,6 +4071,7 @@ dependencies = [
  "iroh-base",
  "notify",
  "postcard",
+ "ring",
  "rustix",
  "serde",
  "serde_json",

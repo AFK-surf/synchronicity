@@ -1823,12 +1823,14 @@ CREATE TABLE observed_heads (origin_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
 -- state is open -> completing -> completed; a completed row remembers its
 -- result so a retried CompleteMultipartUpload replays it rather than reporting
 -- an upload that no longer exists.
-CREATE TABLE s3_uploads (id TEXT PRIMARY KEY,  -- the UploadId: hex, never base64
+CREATE TABLE s3_uploads (id TEXT PRIMARY KEY,  -- the UploadId: 32 random hex
                          space TEXT NOT NULL, path TEXT NOT NULL,
+                         principal TEXT,           -- the access key that opened it
                          created_ns INTEGER NOT NULL,
                          state TEXT NOT NULL
                            CHECK (state IN ('open','completing','completed')),
                          etag BLOB, size INTEGER,   -- the result, once completed
+                         latched_ns INTEGER,        -- when a completion took the latch
                          completed_ns INTEGER);
 CREATE INDEX s3_uploads_by_age ON s3_uploads (created_ns);
 CREATE INDEX s3_uploads_by_target ON s3_uploads (space, path);
@@ -1841,6 +1843,7 @@ CREATE TABLE s3_upload_parts (upload TEXT NOT NULL
                               file TEXT NOT NULL,        -- name within the upload dir
                               size INTEGER NOT NULL,
                               root BLOB NOT NULL,        -- the part's own blake3 root
+                              created_ns INTEGER NOT NULL,
                               PRIMARY KEY (upload, number));
 ```
 

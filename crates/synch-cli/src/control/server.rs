@@ -664,7 +664,11 @@ impl Control for ControlService {
             .upload_target(&request.space, &request.path)
             .map_err(ControlError::from)?;
         let (space, path) = (request.space.clone(), request.path.clone());
-        let id = offload(move || Ok(node.create_upload(&space, &path, &target)?)).await?;
+        let principal = principal(&request.principal);
+        let id = offload(move || {
+            Ok(node.create_upload(&space, &path, principal.as_deref(), &target)?)
+        })
+        .await?;
         Ok(Response::new(pb::CreateUploadResponse { upload_id: id }))
     }
 
@@ -694,6 +698,7 @@ impl Control for ControlService {
                 &reference.upload_id,
                 &reference.space,
                 &reference.path,
+                principal(&reference.principal).as_deref(),
                 header.number,
             )
             .map_err(ControlError::from)?;
@@ -764,14 +769,25 @@ impl Control for ControlService {
             };
             named.push((part.number, root));
         }
-        let completed = node
-            .complete_upload(
-                &reference.upload_id,
-                &reference.space,
-                &reference.path,
-                &named,
-            )
+        // Spawned, not awaited in place. A completion runs a full assembly and a
+        // publish, and the caller's socket timing out mid-way is routine — and
+        // would drop this future, leaving the latch set with no error path to
+        // clear it and an assembly still running on a blocking thread that
+        // nothing is waiting for. Detaching it means the state machine always
+        // reaches one of its ends, whatever the client does.
+        let (upload_id, space, path) = (
+            reference.upload_id.clone(),
+            reference.space.clone(),
+            reference.path.clone(),
+        );
+        let principal = principal(&reference.principal);
+        let completing = tokio::spawn(async move {
+            node.complete_upload(&upload_id, &space, &path, principal.as_deref(), &named)
+                .await
+        });
+        let completed = completing
             .await
+            .map_err(|e| ControlError::internal(format!("the completion did not finish: {e}")))?
             .map_err(ControlError::from)?;
         Ok(Response::new(pb::CompleteUploadResponse {
             etag: completed.root.as_bytes().to_vec(),
@@ -787,7 +803,12 @@ impl Control for ControlService {
         let reference = request.into_inner().upload.unwrap_or_default();
         let node = self.served.node()?.clone();
         let existed = offload(move || {
-            Ok(node.abort_upload(&reference.upload_id, &reference.space, &reference.path)?)
+            Ok(node.abort_upload(
+                &reference.upload_id,
+                &reference.space,
+                &reference.path,
+                principal(&reference.principal).as_deref(),
+            )?)
         })
         .await?;
         Ok(Response::new(pb::AbortUploadResponse { existed }))
@@ -801,8 +822,14 @@ impl Control for ControlService {
     ) -> Result<Response<Self::ListUploadsStream>, Status> {
         let request = request.into_inner();
         let node = self.served.node()?.clone();
-        let uploads =
-            offload(move || Ok(node.open_uploads(&request.space, &request.prefix)?)).await?;
+        let uploads = offload(move || {
+            Ok(node.open_uploads(
+                &request.space,
+                &request.prefix,
+                principal(&request.principal).as_deref(),
+            )?)
+        })
+        .await?;
         let stream = tokio_stream::iter(uploads.into_iter().map(|upload| {
             Ok(pb::UploadInfo {
                 upload_id: upload.id,
@@ -822,7 +849,12 @@ impl Control for ControlService {
         let reference = request.into_inner().upload.unwrap_or_default();
         let node = self.served.node()?.clone();
         let parts = offload(move || {
-            Ok(node.upload_parts(&reference.upload_id, &reference.space, &reference.path)?)
+            Ok(node.upload_parts(
+                &reference.upload_id,
+                &reference.space,
+                &reference.path,
+                principal(&reference.principal).as_deref(),
+            )?)
         })
         .await?;
         let stream = tokio_stream::iter(parts.into_iter().map(|part| {
@@ -830,6 +862,7 @@ impl Control for ControlService {
                 number: part.number,
                 size: part.size,
                 root: part.root.as_bytes().to_vec(),
+                created_ns: part.created_ns,
             })
         }));
         Ok(Response::new(Box::pin(stream)))
@@ -2341,6 +2374,15 @@ async fn receive(
     })
 }
 
+/// Reads a principal off the wire.
+///
+/// Empty means anonymous, which is a principal in its own right — every
+/// anonymous caller shares one, and on a loopback-only gateway that is the
+/// intended shape rather than a gap.
+fn principal(wire: &str) -> Option<String> {
+    Some(wire).filter(|p| !p.is_empty()).map(str::to_string)
+}
+
 /// Consumes one part of a multipart upload and records it (§9.4).
 async fn receive_part(
     node: &Node,
@@ -2362,6 +2404,7 @@ async fn receive_part(
         number: part.number,
         size: part.size,
         root: part.root.as_bytes().to_vec(),
+        created_ns: part.created_ns,
     })
 }
 

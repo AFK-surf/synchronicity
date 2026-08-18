@@ -254,8 +254,17 @@ impl Daemon {
     }
 
     /// Opens a multipart upload and returns its id (§9.4).
-    pub async fn create_upload(&self, space: &str, path: &str) -> S3Result<String> {
-        Ok(self.connect().await?.create_upload(space, path).await?)
+    pub async fn create_upload(
+        &self,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> S3Result<String> {
+        Ok(self
+            .connect()
+            .await?
+            .create_upload(space, path, principal)
+            .await?)
     }
 
     /// Streams one part of an upload, returning what the daemon recorded.
@@ -312,8 +321,17 @@ impl Daemon {
     }
 
     /// Every upload still accepting parts under a prefix.
-    pub async fn list_uploads(&self, space: &str, prefix: &str) -> S3Result<Vec<OpenUpload>> {
-        Ok(self.connect().await?.list_uploads(space, prefix).await?)
+    pub async fn list_uploads(
+        &self,
+        space: &str,
+        prefix: &str,
+        principal: Option<&str>,
+    ) -> S3Result<Vec<OpenUpload>> {
+        Ok(self
+            .connect()
+            .await?
+            .list_uploads(space, prefix, principal)
+            .await?)
     }
 
     /// Every part recorded for one upload, in part-number order.

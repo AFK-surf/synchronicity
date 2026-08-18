@@ -35,6 +35,29 @@ use crate::{
 /// does not hold its bytes forever.
 pub const DEFAULT_UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
 
+/// How long a completion may hold the latch before another may steal it.
+///
+/// A completion whose caller went away — a client socket timing out mid-
+/// assembly is routine, and the assembly then runs on to the end on a blocking
+/// thread nobody is waiting on — leaves the latch set with no error path to
+/// clear it. Without a steal the upload can never be completed, aborted, or
+/// swept: every one of those refuses a latched row. An hour is far longer than
+/// any assembly and far shorter than the TTL.
+pub const LATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How many uploads may be open at once, in total.
+///
+/// The data dir carries the database, the CAS and this node's signing key, so
+/// an unbounded number of open uploads is not "S3 writes get slow" — it is the
+/// node losing the disk it needs to publish, or recover, at all.
+pub const MAX_OPEN_UPLOADS: u64 = 10_000;
+
+/// How many uploads one access key may hold open at once.
+pub const MAX_OPEN_UPLOADS_PER_PRINCIPAL: u64 = 1_000;
+
+/// How many bytes all staged parts may hold before new ones are refused.
+pub const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+
 /// Where a part's payload is being staged, and what it will be recorded as.
 #[derive(Debug, Clone)]
 pub struct PartStaging {
@@ -87,7 +110,13 @@ impl Node {
     /// is the ordering the "a part row implies bytes" invariant rests on: the
     /// row is the thing that may be lost, and a lost row leaves a directory the
     /// sweeper collects rather than a pointer into nothing.
-    pub fn create_upload(&self, space: &str, path: &str, _target: &Path) -> Result<String> {
+    pub fn create_upload(
+        &self,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+        _target: &Path,
+    ) -> Result<String> {
         // A key the scanner would skip can never become an object, and finding
         // that out at completion — after the client has streamed gigabytes and
         // the parts have been consumed — is the worst possible moment for it.
@@ -104,14 +133,42 @@ impl Node {
                 "{space}/{path} matches an ignore rule, so it could never be published"
             )));
         }
-        let id = new_upload_id();
+        self.check_upload_capacity(principal)?;
+        let id = new_upload_id()?;
         let dir = self.store().upload_dir(&id);
         std::fs::create_dir_all(&dir)?;
         fsync_dir(&dir);
         fsync_dir(&self.store().uploads_dir());
         self.store()
-            .create_upload(&id, space, path, synch_core::now_ns())?;
+            .create_upload(&id, space, path, principal, synch_core::now_ns())?;
         Ok(id)
+    }
+
+    /// Refuses a new upload when the node is already holding as much as it will.
+    ///
+    /// The only bound there is on what a client may make this node carry. The
+    /// data dir holds the database, the CAS and this node's signing key, so an
+    /// unbounded staging area is not "S3 writes get slow" — it is the node
+    /// losing the disk it needs to publish, or recover, at all.
+    fn check_upload_capacity(&self, principal: Option<&str>) -> Result<()> {
+        let (total, mine) = self.store().open_upload_counts(principal)?;
+        if total >= MAX_OPEN_UPLOADS {
+            return Err(EngineError::invalid(format!(
+                "this node is already holding {MAX_OPEN_UPLOADS} open multipart uploads"
+            )));
+        }
+        if mine >= MAX_OPEN_UPLOADS_PER_PRINCIPAL {
+            return Err(EngineError::invalid(format!(
+                "you already hold {MAX_OPEN_UPLOADS_PER_PRINCIPAL} open multipart uploads"
+            )));
+        }
+        let staged = self.store().staged_bytes()?;
+        if staged >= MAX_STAGED_BYTES {
+            return Err(EngineError::invalid(format!(
+                "multipart staging is already holding {staged} byte(s)"
+            )));
+        }
+        Ok(())
     }
 
     /// Checks an upload will still take this part, and says where to stage it.
@@ -125,6 +182,7 @@ impl Node {
         upload: &str,
         space: &str,
         path: &str,
+        principal: Option<&str>,
         number: u32,
     ) -> Result<PartStaging> {
         if number == 0 || number > MAX_PART_NUMBER {
@@ -132,7 +190,13 @@ impl Node {
                 "part number {number} is outside 1..={MAX_PART_NUMBER}"
             )));
         }
-        let record = self.upload_for(upload, space, path)?;
+        let staged = self.store().staged_bytes()?;
+        if staged >= MAX_STAGED_BYTES {
+            return Err(EngineError::invalid(format!(
+                "multipart staging is already holding {staged} byte(s)"
+            )));
+        }
+        let record = self.upload_for(upload, space, path, principal)?;
         if record.state != UploadState::Open {
             return Err(EngineError::invalid(format!(
                 "upload {upload} is no longer accepting parts"
@@ -171,6 +235,7 @@ impl Node {
             file: staging.file,
             size,
             root,
+            created_ns: synch_core::now_ns(),
         };
         // A superseded attempt is left on disk deliberately: a completion may
         // already hold it open, and the sweeper collects payloads no row names.
@@ -184,10 +249,15 @@ impl Node {
         upload: &str,
         space: &str,
         path: &str,
+        principal: Option<&str>,
         parts: &[(u32, Option<Hash>)],
     ) -> Result<CompletedUpload> {
-        self.upload_for(upload, space, path)?;
-        let start = self.store().begin_complete(upload)?;
+        self.upload_for(upload, space, path, principal)?;
+        let start = self.store().begin_complete(
+            upload,
+            synch_core::now_ns(),
+            LATCH_TIMEOUT.as_nanos().try_into().unwrap_or(i64::MAX),
+        )?;
         let (recorded_space, recorded_path, available) = match start {
             // A retried completion. The client never saw the first answer, so
             // it gets that answer rather than being told its upload is gone.
@@ -375,8 +445,14 @@ impl Node {
     }
 
     /// Drops an upload and everything staged for it.
-    pub fn abort_upload(&self, upload: &str, space: &str, path: &str) -> Result<bool> {
-        match self.upload_for(upload, space, path) {
+    pub fn abort_upload(
+        &self,
+        upload: &str,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> Result<bool> {
+        match self.upload_for(upload, space, path, principal) {
             Ok(_) => {}
             // An abort of something that is not there is a success: it is not
             // there, which is what the caller asked for.
@@ -391,13 +467,24 @@ impl Node {
     }
 
     /// Every upload still accepting parts under a prefix.
-    pub fn open_uploads(&self, space: &str, prefix: &str) -> Result<Vec<synch_store::Upload>> {
-        Ok(self.store().open_uploads(space, prefix)?)
+    pub fn open_uploads(
+        &self,
+        space: &str,
+        prefix: &str,
+        principal: Option<&str>,
+    ) -> Result<Vec<synch_store::Upload>> {
+        Ok(self.store().open_uploads(space, prefix, principal)?)
     }
 
     /// Every part recorded for one upload.
-    pub fn upload_parts(&self, upload: &str, space: &str, path: &str) -> Result<Vec<UploadPart>> {
-        self.upload_for(upload, space, path)?;
+    pub fn upload_parts(
+        &self,
+        upload: &str,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> Result<Vec<UploadPart>> {
+        self.upload_for(upload, space, path, principal)?;
         Ok(self.store().upload_parts(upload)?)
     }
 
@@ -408,12 +495,22 @@ impl Node {
     /// upload into a path it never named — and since two buckets may map to one
     /// space, the comparison has to be on the space and path rather than on the
     /// bucket the request arrived at.
-    fn upload_for(&self, upload: &str, space: &str, path: &str) -> Result<synch_store::Upload> {
+    fn upload_for(
+        &self,
+        upload: &str,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> Result<synch_store::Upload> {
         let record = self
             .store()
             .upload(upload)?
             .ok_or_else(|| EngineError::not_found(format!("upload {upload}")))?;
-        if record.space != space || record.path != path {
+        // Same answer for the wrong key and the wrong principal, and
+        // deliberately: "no such upload" is all an unauthorized caller learns,
+        // where "wrong owner" would confirm the id it guessed is real.
+        if record.space != space || record.path != path || record.principal.as_deref() != principal
+        {
             return Err(EngineError::not_found(format!(
                 "upload {upload} is not against {space}/{path}"
             )));
@@ -596,16 +693,29 @@ fn choose_parts<'a>(
     Ok(chosen)
 }
 
-/// A fresh upload id: 32 hex characters.
+/// A fresh upload id: 32 hex characters, from the system CSPRNG.
 ///
-/// Hex, never base64. The id travels as a query parameter, and this gateway's
-/// URI decoding turns `+` into a space — a base64 id would break the first time
-/// a client sent one unencoded.
-fn new_upload_id() -> String {
-    format!("{}{}", nonce(), nonce())
+/// It has to be *unguessable*, not merely unique. An id is what authorizes a
+/// caller to add parts to an upload and to complete it, so an id derived from a
+/// clock, a counter and a pid — all of them observable or bounded — is a
+/// password an attacker can search. 128 bits from the OS is the whole of the
+/// defence.
+///
+/// Hex, never base64: the id travels as a query parameter, and `+` has no
+/// business needing an escape in one.
+fn new_upload_id() -> Result<String> {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| EngineError::invalid("the system random source is unavailable"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Sixteen hex characters of process-local uniqueness.
+///
+/// A tiebreaker for a filename inside an already-authorized directory, and
+/// nothing else — it is not, and must not become, a secret.
 fn nonce() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -634,6 +744,7 @@ mod tests {
             file: format!("{number}"),
             size,
             root: Hash::new(&number.to_le_bytes()),
+            created_ns: 0,
         }
     }
 
@@ -694,12 +805,16 @@ mod tests {
         assert!(choose_parts(&named(&[1, 2]), &available).is_err());
     }
 
+    /// Ids have to be unguessable, not merely unique: an id is what authorizes
+    /// adding parts to an upload and completing it.
     #[test]
-    fn upload_ids_are_hex() {
-        let id = new_upload_id();
+    fn upload_ids_are_random_hex() {
+        let id = new_upload_id().unwrap();
         assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
-        assert_ne!(id, new_upload_id());
+        let ids: std::collections::HashSet<String> =
+            (0..256).map(|_| new_upload_id().unwrap()).collect();
+        assert_eq!(ids.len(), 256);
     }
 }
 
@@ -722,14 +837,14 @@ mod sweeper_tests {
     async fn the_sweeper_collects_only_what_is_abandoned() {
         let (_d, _s, node) = node_with_space().await;
         let target = node.upload_target("media", "a.bin").unwrap();
-        let id = node.create_upload("media", "a.bin", &target).unwrap();
+        let id = node.create_upload("media", "a.bin", None, &target).unwrap();
 
         assert_eq!(node.sweep_uploads(std::time::Duration::ZERO).unwrap(), 1);
         assert!(node.store().upload(&id).unwrap().is_none());
         assert!(!node.store().upload_dir(&id).exists());
 
         // A live upload with a long TTL is left alone.
-        let id = node.create_upload("media", "b.bin", &target).unwrap();
+        let id = node.create_upload("media", "b.bin", None, &target).unwrap();
         assert_eq!(node.sweep_uploads(DEFAULT_UPLOAD_TTL).unwrap(), 0);
         assert!(node.store().upload(&id).unwrap().is_some());
         node.shutdown().await.unwrap();
@@ -745,8 +860,8 @@ mod sweeper_tests {
     async fn the_sweeper_leaves_a_write_in_progress_alone() {
         let (_d, _s, node) = node_with_space().await;
         let target = node.upload_target("media", "a.bin").unwrap();
-        let id = node.create_upload("media", "a.bin", &target).unwrap();
-        let staging = node.open_part(&id, "media", "a.bin", 1).unwrap();
+        let id = node.create_upload("media", "a.bin", None, &target).unwrap();
+        let staging = node.open_part(&id, "media", "a.bin", None, 1).unwrap();
         let mut adoption = crate::scanner::Adoption::at(&staging.path).unwrap();
         adoption.write(b"still arriving").unwrap();
 
@@ -763,11 +878,14 @@ mod sweeper_tests {
         let (_d, _s, node) = node_with_space().await;
         let target = node.upload_target("media", "notes.tmp").unwrap();
         assert!(
-            node.create_upload("media", "notes.tmp", &target).is_err(),
+            node.create_upload("media", "notes.tmp", None, &target)
+                .is_err(),
             "an ignored key was accepted"
         );
         let target = node.upload_target("media", "notes.txt").unwrap();
-        assert!(node.create_upload("media", "notes.txt", &target).is_ok());
+        assert!(node
+            .create_upload("media", "notes.txt", None, &target)
+            .is_ok());
         node.shutdown().await.unwrap();
     }
 
@@ -776,18 +894,22 @@ mod sweeper_tests {
     async fn a_completion_hashes_what_it_assembled() {
         let (_d, space, node) = node_with_space().await;
         let target = node.upload_target("media", "joined.bin").unwrap();
-        let id = node.create_upload("media", "joined.bin", &target).unwrap();
+        let id = node
+            .create_upload("media", "joined.bin", None, &target)
+            .unwrap();
 
         let head = vec![7u8; MIN_PART_SIZE as usize];
         let tail = b"and the tail".to_vec();
         for (number, bytes) in [(1u32, &head), (2u32, &tail)] {
-            let staging = node.open_part(&id, "media", "joined.bin", number).unwrap();
+            let staging = node
+                .open_part(&id, "media", "joined.bin", None, number)
+                .unwrap();
             let mut adoption = crate::scanner::Adoption::at(&staging.path).unwrap();
             adoption.write(bytes).unwrap();
             node.commit_part(staging, adoption).unwrap();
         }
         let done = node
-            .complete_upload(&id, "media", "joined.bin", &[(1, None), (2, None)])
+            .complete_upload(&id, "media", "joined.bin", None, &[(1, None), (2, None)])
             .await
             .unwrap();
 
@@ -802,6 +924,56 @@ mod sweeper_tests {
         // The parts and their directory go once the answer is recorded.
         assert!(!node.store().upload_dir(&id).exists());
         assert!(node.store().upload_parts(&id).unwrap().is_empty());
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use crate::{Node, NodeConfig};
+
+    /// An upload id is a bearer token for one key *and* one principal.
+    #[tokio::test]
+    async fn another_principal_cannot_touch_an_upload() {
+        let data = tempfile::tempdir().unwrap();
+        let space = tempfile::tempdir().unwrap();
+        Node::init(data.path(), None).unwrap();
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        node.add_space("media", space.path()).unwrap();
+        let target = node.upload_target("media", "a.bin").unwrap();
+        let id = node
+            .create_upload("media", "a.bin", Some("AKIA1"), &target)
+            .unwrap();
+
+        // The owner can.
+        assert!(node
+            .open_part(&id, "media", "a.bin", Some("AKIA1"), 1)
+            .is_ok());
+        // Nobody else can, whichever way they hold it wrong — and they are all
+        // told the same thing, so a guessed id is never confirmed as real.
+        for wrong in [Some("AKIA2"), None] {
+            assert!(node.open_part(&id, "media", "a.bin", wrong, 1).is_err());
+            assert!(node.upload_parts(&id, "media", "a.bin", wrong).is_err());
+            assert!(!node.abort_upload(&id, "media", "a.bin", wrong).unwrap());
+        }
+        // And not by naming a different key either.
+        assert!(node
+            .open_part(&id, "media", "elsewhere.bin", Some("AKIA1"), 1)
+            .is_err());
+        // A listing shows it to its owner and to nobody else.
+        assert_eq!(
+            node.open_uploads("media", "", Some("AKIA1")).unwrap().len(),
+            1
+        );
+        assert!(node
+            .open_uploads("media", "", Some("AKIA2"))
+            .unwrap()
+            .is_empty());
+        assert!(node.open_uploads("media", "", None).unwrap().is_empty());
+        // The upload is untouched by all of that.
+        assert!(node
+            .abort_upload(&id, "media", "a.bin", Some("AKIA1"))
+            .unwrap());
         node.shutdown().await.unwrap();
     }
 }

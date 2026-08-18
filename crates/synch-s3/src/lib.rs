@@ -144,7 +144,12 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
     // key with a space, Unicode, or reserved character, so every such request
     // would fail with SignatureDoesNotMatch. (Query params are already handled
     // this way — decoded in `parse_query`, re-encoded once in `canonical_request`.)
-    auth::verify(
+    // The authenticated key is kept, not discarded. Every multipart call is
+    // scoped by it: an upload id authorizes adding parts and completing, so
+    // without an owner recorded beside it any key holder who can see an id can
+    // overwrite and complete another client's upload — and what this node then
+    // signs and broadcasts is content of their choosing.
+    let principal = auth::verify(
         &gateway.auth,
         &SignedRequest {
             method: parts.method.as_str(),
@@ -155,6 +160,7 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
         },
         now_unix_secs(),
     )?;
+    let principal = principal.as_deref();
 
     // Path-style addressing: /<bucket>/<key...>
     let trimmed = path.trim_start_matches('/');
@@ -200,19 +206,27 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
     }
     match (&parts.method, upload_id, initiating) {
         (&Method::POST, None, true) if !key.is_empty() => {
-            return create_upload(gateway, &bucket, key, &headers).await
+            return create_upload(gateway, &bucket, key, principal, &headers).await
         }
         (&Method::GET, None, true) if key.is_empty() => {
-            return list_uploads(gateway, &bucket, &query).await
+            return list_uploads(gateway, &bucket, principal, &query).await
         }
         (&Method::PUT, Some(id), _) => {
-            return upload_part(gateway, &bucket, key, &id, &query, &headers, body).await
+            let reference = UploadRef::new(&id, &bucket.space, key, principal);
+            let number: u32 = param(&query, "partNumber")
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| S3Error::invalid("partNumber must be a number in 1..=10000"))?;
+            return upload_part(gateway, reference, number, &headers, body).await;
         }
         (&Method::POST, Some(id), _) => {
-            return complete_upload(gateway, &bucket, key, &id, &headers, body).await
+            return complete_upload(gateway, &bucket, key, &id, principal, &headers, body).await
         }
-        (&Method::GET, Some(id), _) => return list_parts(gateway, &bucket, key, &id, &query).await,
-        (&Method::DELETE, Some(id), _) => return abort_upload(gateway, &bucket, key, &id).await,
+        (&Method::GET, Some(id), _) => {
+            return list_parts(gateway, &bucket, key, &id, principal, &query).await
+        }
+        (&Method::DELETE, Some(id), _) => {
+            return abort_upload(gateway, &bucket, key, &id, principal).await
+        }
         _ => {}
     }
 
@@ -341,6 +355,7 @@ async fn create_upload(
     gateway: &Gateway,
     bucket: &Bucket,
     key: &str,
+    principal: Option<&str>,
     headers: &BTreeMap<String, String>,
 ) -> S3Result<Response> {
     // Refused at creation rather than at the first part: a client that names a
@@ -349,7 +364,10 @@ async fn create_upload(
     if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
         tracing::warn!("{warning}");
     }
-    let upload_id = gateway.daemon.create_upload(&bucket.space, key).await?;
+    let upload_id = gateway
+        .daemon
+        .create_upload(&bucket.space, key, principal)
+        .await?;
     Ok(xml_response(
         StatusCode::OK,
         xml::initiate_upload_xml(&bucket.name, key, &upload_id),
@@ -359,10 +377,8 @@ async fn create_upload(
 /// `UploadPart`.
 async fn upload_part(
     gateway: &Gateway,
-    bucket: &Bucket,
-    key: &str,
-    upload_id: &str,
-    query: &[(String, String)],
+    reference: UploadRef,
+    number: u32,
     headers: &BTreeMap<String, String>,
     body: Body,
 ) -> S3Result<Response> {
@@ -370,16 +386,13 @@ async fn upload_part(
     // header is what stops it being answered as an ordinary part upload of the
     // empty body a copy request carries.
     check_headers(headers)?;
-    let number: u32 = param(query, "partNumber")
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(|| S3Error::invalid("partNumber must be a number"))?;
-    let reference = UploadRef::new(upload_id, &bucket.space, key);
+    let upload_id = reference.upload_id.clone();
     let (body, fault) = payload(headers, body)?;
     let part = gateway
         .daemon
         .upload_part(reference, number, body)
         .await
-        .map_err(|e| fault.explain(e).about_upload(upload_id))?;
+        .map_err(|e| fault.explain(e).about_upload(&upload_id))?;
 
     let mut response = HeaderMap::new();
     insert(&mut response, header::ETAG, &quoted(&part.root.to_hex()));
@@ -392,6 +405,7 @@ async fn complete_upload(
     bucket: &Bucket,
     key: &str,
     upload_id: &str,
+    principal: Option<&str>,
     headers: &BTreeMap<String, String>,
     body: Body,
 ) -> S3Result<Response> {
@@ -415,7 +429,7 @@ async fn complete_upload(
         .map(|part| (part.number, parse_root(&part.etag)))
         .collect();
 
-    let reference = UploadRef::new(upload_id, &bucket.space, key);
+    let reference = UploadRef::new(upload_id, &bucket.space, key, principal);
     // The completion is attempted before anything is inspected, and the daemon
     // does the validating: it is what publishes, so it is what has to be sure.
     // Asking it first is also what makes a *retried* completion work — the
@@ -525,10 +539,11 @@ async fn abort_upload(
     bucket: &Bucket,
     key: &str,
     upload_id: &str,
+    principal: Option<&str>,
 ) -> S3Result<Response> {
     let existed = gateway
         .daemon
-        .abort_upload(UploadRef::new(upload_id, &bucket.space, key))
+        .abort_upload(UploadRef::new(upload_id, &bucket.space, key, principal))
         .await
         .map_err(|e| e.about_upload(upload_id))?;
     // S3 answers an abort of an upload that is not there with `NoSuchUpload`,
@@ -546,6 +561,7 @@ async fn list_parts(
     bucket: &Bucket,
     key: &str,
     upload_id: &str,
+    principal: Option<&str>,
     query: &[(String, String)],
 ) -> S3Result<Response> {
     let marker: u32 = param(query, "part-number-marker")
@@ -557,7 +573,7 @@ async fn list_parts(
         .clamp(1, DEFAULT_MAX_KEYS);
     let recorded = gateway
         .daemon
-        .list_parts(UploadRef::new(upload_id, &bucket.space, key))
+        .list_parts(UploadRef::new(upload_id, &bucket.space, key, principal))
         .await
         .map_err(|e| e.about_upload(upload_id))?;
     let after: Vec<_> = recorded
@@ -572,6 +588,7 @@ async fn list_parts(
             number: part.number,
             size: part.size,
             etag: quoted(&part.root.to_hex()),
+            last_modified: format_timestamp(part.created_ns),
         })
         .collect();
     Ok(xml_response(
@@ -592,6 +609,7 @@ async fn list_parts(
 async fn list_uploads(
     gateway: &Gateway,
     bucket: &Bucket,
+    principal: Option<&str>,
     query: &[(String, String)],
 ) -> S3Result<Response> {
     let prefix = param(query, "prefix").unwrap_or_default();
@@ -605,7 +623,10 @@ async fn list_uploads(
     let key_marker = param(query, "key-marker").unwrap_or_default();
     let upload_marker = param(query, "upload-id-marker").unwrap_or_default();
 
-    let open = gateway.daemon.list_uploads(&bucket.space, &prefix).await?;
+    let open = gateway
+        .daemon
+        .list_uploads(&bucket.space, &prefix, principal)
+        .await?;
     // The daemon lists in `(path, id)` order, which is the order the cursor is
     // defined in, so resuming is a matter of dropping everything at or before
     // where the last page ended.

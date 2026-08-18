@@ -578,6 +578,12 @@ message UploadRef {
   string space = 2;
   // The path the upload must be against.
   string path = 3;
+  // The access key that opened the upload, empty when the gateway is anonymous.
+  //
+  // Checked like the key is: an upload id authorizes adding parts and
+  // completing, so an id that leaked — or was guessed — must not be enough on
+  // its own.
+  string principal = 4;
 }
 
 message DeleteRequest {
@@ -600,6 +606,8 @@ message CreateUploadRequest {
   string space = 1;
   // The path within the space.
   string path = 2;
+  // The access key opening it, empty when the gateway is anonymous.
+  string principal = 3;
 }
 
 message CreateUploadResponse {
@@ -634,6 +642,8 @@ message UploadPartResponse {
   uint64 size = 2;
   // Its own object root, which is the ETag the client is given.
   bytes root = 3;
+  // When it was recorded, unix nanoseconds.
+  int64 created_ns = 4;
 }
 
 message CompleteUploadRequest {
@@ -681,6 +691,9 @@ message ListUploadsRequest {
   string space = 1;
   // The path prefix to list under, empty for the whole space.
   string prefix = 2;
+  // Only uploads this access key opened. An upload id is a bearer token, so a
+  // listing that named everyone's would make it a public one.
+  string principal = 3;
 }
 
 message UploadInfo {
@@ -704,4 +717,6 @@ message PartInfo {
   uint64 size = 2;
   // Its own object root.
   bytes root = 3;
+  // When it was recorded, unix nanoseconds.
+  int64 created_ns = 4;
 }

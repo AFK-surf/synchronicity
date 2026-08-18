@@ -167,6 +167,8 @@ pub struct ListedPart {
     pub size: u64,
     /// Its ETag, already quoted.
     pub etag: String,
+    /// When it was uploaded, RFC 3339.
+    pub last_modified: String,
 }
 
 /// Renders a `ListPartsResult` (§9.4).
@@ -200,6 +202,10 @@ pub fn list_parts_xml(
     for part in parts {
         xml.push_str("<Part>");
         xml.push_str(&format!("<PartNumber>{}</PartNumber>", part.number));
+        xml.push_str(&format!(
+            "<LastModified>{}</LastModified>",
+            escape(&part.last_modified)
+        ));
         xml.push_str(&format!("<ETag>{}</ETag>", escape(&part.etag)));
         xml.push_str(&format!("<Size>{}</Size>", part.size));
         xml.push_str("</Part>");
@@ -619,6 +625,7 @@ mod tests {
             number: 1,
             size: 5,
             etag: "\"a\"".into(),
+            last_modified: "1970-01-01T00:00:00.000Z".into(),
         }];
         let xml = list_parts_xml("media", "k", "u", &parts, 1000, 0, true);
         assert!(

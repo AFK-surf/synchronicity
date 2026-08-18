@@ -162,12 +162,18 @@ impl Client {
     }
 
     /// Opens a multipart upload and returns its id (§9.4).
-    pub async fn create_upload(&mut self, space: &str, path: &str) -> Result<String, ControlError> {
+    pub async fn create_upload(
+        &mut self,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> Result<String, ControlError> {
         Ok(self
             .inner
             .create_upload(pb::CreateUploadRequest {
                 space: space.to_string(),
                 path: path.to_string(),
+                principal: principal.unwrap_or_default().to_string(),
             })
             .await?
             .into_inner()
@@ -249,12 +255,14 @@ impl Client {
         &mut self,
         space: &str,
         prefix: &str,
+        principal: Option<&str>,
     ) -> Result<Vec<OpenUpload>, ControlError> {
         let mut stream = self
             .inner
             .list_uploads(pb::ListUploadsRequest {
                 space: space.to_string(),
                 prefix: prefix.to_string(),
+                principal: principal.unwrap_or_default().to_string(),
             })
             .await?
             .into_inner();
@@ -287,6 +295,7 @@ impl Client {
                 number: part.number,
                 size: part.size,
                 root: hash_from(&part.root, "part root")?,
+                created_ns: part.created_ns,
             });
         }
         Ok(out)
@@ -473,15 +482,23 @@ pub struct UploadRef {
     pub space: String,
     /// The path it must be against.
     pub path: String,
+    /// The access key that must own it, or `None` when the gateway is anonymous.
+    pub principal: Option<String>,
 }
 
 impl UploadRef {
-    /// Names an upload against a key.
-    pub fn new(upload_id: impl Into<String>, space: &str, path: &str) -> UploadRef {
+    /// Names an upload against a key, and the principal that must own it.
+    pub fn new(
+        upload_id: impl Into<String>,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> UploadRef {
         UploadRef {
             upload_id: upload_id.into(),
             space: space.to_string(),
             path: path.to_string(),
+            principal: principal.map(str::to_string),
         }
     }
 
@@ -490,6 +507,7 @@ impl UploadRef {
             upload_id: self.upload_id,
             space: self.space,
             path: self.path,
+            principal: self.principal.unwrap_or_default(),
         }
     }
 }
@@ -536,6 +554,7 @@ impl PartUpload {
             number: recorded.number,
             size: recorded.size,
             root: hash_from(&recorded.root, "part root")?,
+            created_ns: recorded.created_ns,
         })
     }
 
@@ -566,6 +585,8 @@ pub struct RecordedPart {
     pub size: u64,
     /// Its own object root, which is the ETag the client is given.
     pub root: Hash,
+    /// When it was recorded, unix nanoseconds.
+    pub created_ns: i64,
 }
 
 /// One upload still accepting parts.

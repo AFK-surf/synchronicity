@@ -1972,3 +1972,155 @@ async fn delete_object_publishes_even_when_the_file_is_already_gone() {
     assert_eq!(row.kind, synch_core::EntryKind::Tombstone);
     harness.stop().await;
 }
+
+/// Signs requests as one access key, for the cross-principal test.
+struct Signer<'a> {
+    key: &'a AccessKey,
+    base: String,
+    host: String,
+}
+
+impl<'a> Signer<'a> {
+    fn new(key: &'a AccessKey, harness: &Harness) -> Signer<'a> {
+        Signer {
+            key,
+            base: harness.base.clone(),
+            host: harness.base.trim_start_matches("http://").to_string(),
+        }
+    }
+
+    /// Sends one signed request and returns the response.
+    async fn send(&self, method: &str, target: &str, body: Vec<u8>) -> reqwest::Response {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let amz_date = synch_s3::auth::format_amz_date(now);
+        let scope_date = amz_date[..8].to_string();
+        let (path, query_text) = match target.split_once('?') {
+            Some((path, query)) => (path, query),
+            None => (target, ""),
+        };
+        let query: Vec<(String, String)> = query_text
+            .split('&')
+            .filter(|p| !p.is_empty())
+            .map(|pair| match pair.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (pair.to_string(), String::new()),
+            })
+            .collect();
+        let headers: std::collections::BTreeMap<String, String> = [
+            ("host".to_string(), self.host.clone()),
+            ("x-amz-date".to_string(), amz_date.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let header = synch_s3::auth::SigV4Header {
+            access_key: self.key.id.clone(),
+            date: scope_date.clone(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+            signed_headers: vec!["host".into(), "x-amz-date".into()],
+            signature: String::new(),
+        };
+        let request = synch_s3::auth::SignedRequest {
+            method,
+            path,
+            query: &query,
+            headers: &headers,
+            payload_hash: synch_s3::auth::UNSIGNED_PAYLOAD,
+        };
+        let signature =
+            synch_s3::auth::expected_signature(&self.key.secret, &header, &amz_date, &request);
+        let id = &self.key.id;
+        client()
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("{}{target}", self.base),
+            )
+            .header("host", &self.host)
+            .header("x-amz-date", &amz_date)
+            .header("x-amz-content-sha256", synch_s3::auth::UNSIGNED_PAYLOAD)
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={id}/{scope_date}/us-east-1/s3/aws4_request, \
+                     SignedHeaders=host;x-amz-date, Signature={signature}"
+                ),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn get(&self, target: &str) -> String {
+        self.send("GET", target, Vec::new())
+            .await
+            .text()
+            .await
+            .unwrap()
+    }
+
+    async fn post(&self, target: &str, body: Vec<u8>) -> String {
+        self.send("POST", target, body).await.text().await.unwrap()
+    }
+
+    async fn status(&self, method: &str, target: &str) -> u16 {
+        self.send(method, target, Vec::new())
+            .await
+            .status()
+            .as_u16()
+    }
+}
+
+/// One client's upload id is not another client's to use.
+///
+/// The listing used to hand every open upload's id to every caller, which made
+/// the id — the only thing authorizing a part upload or a completion — public.
+/// Any key holder could then overwrite another client's parts and complete
+/// them, publishing content of their choosing under this node's signature.
+#[tokio::test]
+async fn uploads_are_scoped_to_the_key_that_opened_them() {
+    let keys = vec![
+        AccessKey {
+            id: "AKIAALICE".into(),
+            secret: "alicesecretalicesecretalicesecret".into(),
+        },
+        AccessKey {
+            id: "AKIAMALLORY".into(),
+            secret: "mallorysecretmallorysecretmallory".into(),
+        },
+    ];
+    let harness = Harness::start(AuthMode::SigV4(keys.clone())).await;
+    let alice = Signer::new(&keys[0], &harness);
+    let mallory = Signer::new(&keys[1], &harness);
+
+    let body = alice.post("/my-media/alice.bin?uploads", Vec::new()).await;
+    let upload = element(&body, "UploadId");
+
+    // Alice sees her own upload; Mallory's listing is empty.
+    assert!(alice.get("/my-media?uploads").await.contains(&upload));
+    assert!(!mallory.get("/my-media?uploads").await.contains(&upload));
+
+    // And Mallory cannot use the id even holding it: every way of asking is the
+    // same answer, so a guessed id is never confirmed as real.
+    for (method, path) in [
+        (
+            "PUT",
+            format!("/my-media/alice.bin?partNumber=1&uploadId={upload}"),
+        ),
+        ("GET", format!("/my-media/alice.bin?uploadId={upload}")),
+        ("DELETE", format!("/my-media/alice.bin?uploadId={upload}")),
+    ] {
+        let status = mallory.status(method, &path).await;
+        assert_eq!(status, 404, "{method} {path}");
+    }
+
+    // Alice's upload is untouched, and still hers to finish.
+    let parts = alice
+        .get(&format!("/my-media/alice.bin?uploadId={upload}"))
+        .await;
+    assert!(parts.contains("<ListPartsResult"), "{parts}");
+    harness.stop().await;
+}
