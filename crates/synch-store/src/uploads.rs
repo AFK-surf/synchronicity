@@ -324,8 +324,8 @@ impl Store {
     /// the latch would let a part land in between, so the assembly would use a
     /// list the row no longer describes; taking the latch first and reading
     /// after is the same race with the steps swapped. `BEGIN IMMEDIATE` — what
-    /// [`Store::with_immediate_tx`] takes — is what makes the pair atomic
-    /// against another daemon-side caller and against another process.
+    /// this crate's immediate-transaction helper takes — is what makes the pair
+    /// atomic against another daemon-side caller and against another process.
     ///
     /// A row already `completed` comes back as `Err(AlreadyCompleted)` carrying
     /// its remembered answer, which is a retried completion, not a failure.

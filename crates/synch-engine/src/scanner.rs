@@ -2306,7 +2306,13 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+/// The symlink-escape guard, exercised where a symlink can be made.
+///
+/// `escapes_via_symlink` itself is cross-platform — `symlink_metadata` reports a
+/// reparse point on Windows as readily as a symlink on Unix — but *creating*
+/// one to test against is not: Windows needs a separate API and, ordinarily,
+/// privileges the CI runner does not have.
+#[cfg(all(test, unix))]
 mod escape_tests {
     use crate::{Node, NodeConfig};
 
