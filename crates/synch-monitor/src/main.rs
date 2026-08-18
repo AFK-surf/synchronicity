@@ -397,9 +397,13 @@ fn check_watch_list(known: &KnownKeys, state_path: &Path) -> Result<(), MonitorE
     let unwatchable = known.unwatchable();
     if !unwatchable.is_empty() {
         return Err(MonitorError::State(format!(
-            "{} watches {} entr{} that are not domain names ({}) — an entry that \
-             does not parse can never match a certificate, so it watches nothing \
-             and this monitor would report no alarm whatever the log held",
+            "{} watches {} entr{} that cannot match a certificate ({}) — a name \
+             that does not parse never matches one, and a wildcard matches only \
+             its own ancestors, so neither covers `cp.<apex>`: the ordinary \
+             shape of both a control plane and a takeover. Either way the entry \
+             watches nothing and this monitor would report no alarm whatever the \
+             log held. Watch the apex itself; it already covers every name on \
+             its delegation path",
             state_path.display(),
             unwatchable.len(),
             match unwatchable.len() {
@@ -1281,6 +1285,21 @@ mod tests {
         // A list of names is accepted.
         check_watch_list(&watching("cluster.example.com"), path)
             .expect("a domain name is a watchable apex");
+
+        // A wildcard parses — the label is legal — and then watches only its
+        // own ancestors: measured, `*.example.com` matches `example.com` and
+        // matches neither `cp.example.com` nor `a.b.example.com`. That is the
+        // same silent-nothing this guard exists to refuse, reached through a
+        // spelling that looks broader rather than narrower.
+        let wild = watching("*.example.com");
+        assert!(wild.watches(&synch_net::chain::parse_name("example.com").unwrap()));
+        assert!(!wild.watches(&synch_net::chain::parse_name("cp.example.com").unwrap()));
+        let error = check_watch_list(&wild, path).expect_err("a wildcard watches nothing useful");
+        assert!(error.to_string().contains("wildcard"), "{error}");
+
+        // And the apex itself is the thing that actually covers both.
+        let apex = watching("example.com");
+        assert!(apex.watches(&synch_net::chain::parse_name("cp.example.com").unwrap()));
     }
 
     /// A watch list that widened since the positions were recorded is a

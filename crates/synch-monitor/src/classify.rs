@@ -133,7 +133,7 @@ impl KnownKeys {
     pub fn unwatchable(&self) -> Vec<&str> {
         self.keys
             .keys()
-            .filter(|apex| chain::parse_name(apex).is_err())
+            .filter(|apex| chain::parse_name(apex).is_err() || is_wildcard(apex))
             .map(String::as_str)
             .collect()
     }
@@ -202,6 +202,25 @@ impl KnownKeys {
     }
 }
 
+/// Whether a watch entry is spelled as a wildcard.
+///
+/// `*.example.com` parses — the label is legal in a name — so it survives the
+/// parse check, and it then watches its *ancestors* and itself and nothing
+/// else. Measured: it matches `example.com`, and matches neither
+/// `cp.example.com` nor `a.b.example.com`. `cp.<apex>` is the ordinary shape
+/// of both a legitimate control plane and a takeover, so the entry an
+/// operator wrote to widen their coverage narrows it to almost nothing, and
+/// the startup line prints the string back looking exactly as intended.
+///
+/// A watch list is not a matcher — `watches` already covers every name on the
+/// delegation path in both directions, so the apex alone is strictly broader
+/// than any wildcard spelling of it. There is no reading under which this
+/// entry does what whoever typed it meant, which is what makes refusing it
+/// right rather than merely strict.
+fn is_wildcard(apex: &str) -> bool {
+    apex.starts_with("*.") || apex == "*"
+}
+
 /// One key of a proven set, as an operator needs to see it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorizedKey {
@@ -214,7 +233,19 @@ pub struct AuthorizedKey {
     /// without believing anything this entry says. Only the DS-covered key
     /// of a split-key zone will match the registrar; the rest are the ZSKs
     /// the chain proved under it.
+    ///
+    /// Digest type 2 (SHA-256), which is what this project's own tooling
+    /// hands an operator. A delegation may legitimately use type 4 instead —
+    /// `chain::covers` accepts both — so `ds_sha384` carries that spelling
+    /// beside it rather than sending the reader looking for a string their
+    /// registrar will never show.
     pub ds: String,
+    /// The same key as an RFC 4509 digest type 4 (SHA-384) DS.
+    ///
+    /// Additive: the field is new, `ds` keeps its meaning, and a consumer
+    /// reading only `ds` is unaffected.
+    #[serde(default)]
+    pub ds_sha384: String,
 }
 
 /// One classified leaf.
@@ -250,7 +281,18 @@ impl Finding {
             false => self
                 .keys
                 .iter()
-                .map(|key| format!("keyTag {} DS {} rdata {}", key.key_tag, key.ds, key.sha256))
+                .map(|key| {
+                    // Both digest types. This line exists to be compared
+                    // against a registrar, the registrar shows whichever type
+                    // the delegation uses, and the argument above — a line
+                    // they have to re-run a tool to complete is a line they
+                    // will not act on — applies to a SHA-384 delegation
+                    // exactly as much as to a SHA-256 one.
+                    format!(
+                        "keyTag {} DS {} | DS {} rdata {}",
+                        key.key_tag, key.ds, key.ds_sha384, key.sha256
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" | "),
         };
@@ -316,6 +358,7 @@ pub fn classify(
                     key_tag: chain::key_tag(rdata),
                     sha256: hex::encode(sha256(rdata)),
                     ds: chain::ds_fields(&authorized.signing_zone, rdata),
+                    ds_sha384: chain::ds_fields_sha384(&authorized.signing_zone, rdata),
                 })
                 .collect();
             let served_by = match authorized.signing_zone == apex {
