@@ -116,6 +116,250 @@ pub fn list_buckets_xml(names: &[String]) -> String {
     xml
 }
 
+/// Renders an `InitiateMultipartUploadResult` (§9.4).
+pub fn initiate_upload_xml(bucket: &str, key: &str, upload_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId>\
+         </InitiateMultipartUploadResult>",
+        escape(bucket),
+        escape(key),
+        escape(upload_id)
+    )
+}
+
+/// Renders a `CompleteMultipartUploadResult` (§9.4).
+///
+/// `Location` is the key's URL. Clients read it back, and some log it, so it is
+/// rendered rather than left out — but the gateway has no idea what host it is
+/// reached at, so it is the path form, which is what a path-style client asked
+/// on anyway.
+pub fn complete_upload_xml(bucket: &str, key: &str, etag: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>\
+         </CompleteMultipartUploadResult>",
+        escape(bucket),
+        escape(key),
+        escape(bucket),
+        escape(key),
+        escape(etag)
+    )
+}
+
+/// One part in a `ListPartsResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedPart {
+    /// The part number.
+    pub number: u32,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its ETag, already quoted.
+    pub etag: String,
+}
+
+/// Renders a `ListPartsResult` (§9.4).
+///
+/// Paginated like every other listing, because `aws s3api list-parts` walks the
+/// markers whether or not there are 10 000 parts to walk.
+pub fn list_parts_xml(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[ListedPart],
+    max_parts: usize,
+    marker: u32,
+    truncated: bool,
+) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    xml.push_str("<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    xml.push_str(&format!("<Bucket>{}</Bucket>", escape(bucket)));
+    xml.push_str(&format!("<Key>{}</Key>", escape(key)));
+    xml.push_str(&format!("<UploadId>{}</UploadId>", escape(upload_id)));
+    xml.push_str(&format!("<PartNumberMarker>{marker}</PartNumberMarker>"));
+    xml.push_str(&format!("<MaxParts>{max_parts}</MaxParts>"));
+    xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+    if let Some(last) = parts.last().filter(|_| truncated) {
+        xml.push_str(&format!(
+            "<NextPartNumberMarker>{}</NextPartNumberMarker>",
+            last.number
+        ));
+    }
+    xml.push_str("<StorageClass>STANDARD</StorageClass>");
+    for part in parts {
+        xml.push_str("<Part>");
+        xml.push_str(&format!("<PartNumber>{}</PartNumber>", part.number));
+        xml.push_str(&format!("<ETag>{}</ETag>", escape(&part.etag)));
+        xml.push_str(&format!("<Size>{}</Size>", part.size));
+        xml.push_str("</Part>");
+    }
+    xml.push_str("</ListPartsResult>");
+    xml
+}
+
+/// One upload in a `ListMultipartUploadsResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedUpload {
+    /// The key it will publish to.
+    pub key: String,
+    /// The upload id.
+    pub upload_id: String,
+    /// When it was created, RFC 3339.
+    pub initiated: String,
+}
+
+/// Renders a `ListMultipartUploadsResult` (§9.4).
+pub fn list_uploads_xml(
+    bucket: &str,
+    prefix: &str,
+    uploads: &[ListedUpload],
+    max_uploads: usize,
+    truncated: bool,
+) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    xml.push_str("<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    xml.push_str(&format!("<Bucket>{}</Bucket>", escape(bucket)));
+    xml.push_str(&format!("<Prefix>{}</Prefix>", escape(prefix)));
+    xml.push_str("<KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker>");
+    xml.push_str(&format!("<MaxUploads>{max_uploads}</MaxUploads>"));
+    xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+    if let Some(last) = uploads.last().filter(|_| truncated) {
+        xml.push_str(&format!(
+            "<NextKeyMarker>{}</NextKeyMarker><NextUploadIdMarker>{}</NextUploadIdMarker>",
+            escape(&last.key),
+            escape(&last.upload_id)
+        ));
+    }
+    for upload in uploads {
+        xml.push_str("<Upload>");
+        xml.push_str(&format!("<Key>{}</Key>", escape(&upload.key)));
+        xml.push_str(&format!(
+            "<UploadId>{}</UploadId>",
+            escape(&upload.upload_id)
+        ));
+        xml.push_str(&format!(
+            "<Initiated>{}</Initiated>",
+            escape(&upload.initiated)
+        ));
+        xml.push_str("<StorageClass>STANDARD</StorageClass>");
+        xml.push_str("</Upload>");
+    }
+    xml.push_str("</ListMultipartUploadsResult>");
+    xml
+}
+
+/// The most bytes a `CompleteMultipartUpload` body may carry.
+///
+/// Derived rather than quoted from S3's figure, which assumes 32-hex MD5
+/// ETags: this gateway's are 64-hex blake3 roots, quoted and then XML-escaped
+/// by whatever echoes them back, so a legitimate 10 000-part completion runs
+/// past S3's number. 256 bytes a part leaves room for that and for the
+/// checksum elements clients add.
+pub const MAX_COMPLETE_BODY: usize = 10_000 * 256;
+
+/// One part a `CompleteMultipartUpload` body named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestedPart {
+    /// The part number the client named.
+    pub number: u32,
+    /// The ETag it expects that part to have, unquoted.
+    pub etag: String,
+}
+
+/// Reads the `CompleteMultipartUpload` request body.
+///
+/// A deliberately small pull parser rather than a dependency, and a suspicious
+/// one: the body is attacker-controlled, so a `DOCTYPE` or an entity — the
+/// shapes an XXE turns on — is refused outright rather than expanded, and
+/// anything this gateway does not recognize is skipped rather than guessed at.
+pub fn parse_complete_upload(body: &str) -> Result<Vec<RequestedPart>, String> {
+    if body.len() > MAX_COMPLETE_BODY {
+        return Err(format!(
+            "the completion body is larger than the {MAX_COMPLETE_BODY}-byte maximum"
+        ));
+    }
+    // An entity reference cannot appear in a document this gateway would
+    // produce and has no legitimate use in one it accepts, so both the
+    // declaration and any use of one end the parse.
+    if body.contains("<!DOCTYPE") || body.contains("<!ENTITY") {
+        return Err("the completion body carries a document type declaration".into());
+    }
+    let mut parts = Vec::new();
+    let mut number: Option<u32> = None;
+    let mut etag: Option<String> = None;
+    for (tag, text) in Elements::new(body) {
+        match tag {
+            "PartNumber" => number = text.trim().parse().ok(),
+            "ETag" => etag = Some(unescape(text.trim()).trim_matches('"').to_string()),
+            // The close of a part is what commits the pair, so a `<Part>` that
+            // named only one of them is a malformed body rather than a part
+            // with a default in it.
+            "/Part" => match (number.take(), etag.take()) {
+                (Some(number), Some(etag)) => parts.push(RequestedPart { number, etag }),
+                _ => return Err("a <Part> named no number or no ETag".into()),
+            },
+            _ => {}
+        }
+        if parts.len() > 10_000 {
+            return Err("the completion names more than 10000 parts".into());
+        }
+    }
+    if parts.is_empty() {
+        return Err("the completion names no parts".into());
+    }
+    Ok(parts)
+}
+
+/// Walks a document as `(tag, text-until-the-next-tag)` pairs.
+///
+/// Enough for the one body shape this gateway reads, and nothing more: no
+/// attributes, no namespaces, no nesting model. A close tag is reported with
+/// its leading slash, which is what lets the caller see where a `<Part>` ends.
+struct Elements<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Elements<'a> {
+    fn new(body: &'a str) -> Elements<'a> {
+        Elements { rest: body }
+    }
+}
+
+impl<'a> Iterator for Elements<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<(&'a str, &'a str)> {
+        loop {
+            let open = self.rest.find('<')?;
+            let close = self.rest[open..].find('>')? + open;
+            let tag = &self.rest[open + 1..close];
+            self.rest = &self.rest[close + 1..];
+            // Declarations, comments and processing instructions carry no text
+            // this parser wants.
+            if tag.starts_with('?') || tag.starts_with('!') {
+                continue;
+            }
+            let tag = tag.trim_end_matches('/').trim();
+            let text = match self.rest.find('<') {
+                Some(next) => &self.rest[..next],
+                None => self.rest,
+            };
+            return Some((tag, text));
+        }
+    }
+}
+
+/// Reverses [`escape`], for text read back off the wire.
+fn unescape(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 /// Formats unix nanoseconds as the RFC 3339 timestamp S3 clients expect.
 pub fn format_timestamp(nanos: i64) -> String {
     // A small civil-from-days conversion keeps the gateway free of a date
@@ -225,6 +469,73 @@ mod tests {
         let xml = list_buckets_xml(&["a".into(), "b".into()]);
         assert!(xml.contains("<Name>a</Name>"), "{xml}");
         assert!(xml.contains("<Name>b</Name>"), "{xml}");
+    }
+
+    #[test]
+    fn completion_bodies_parse() {
+        let body = "<CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>&quot;abc&quot;</ETag></Part>\
+            <Part><PartNumber>2</PartNumber><ETag>\"def\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        let parts = parse_complete_upload(body).unwrap();
+        assert_eq!(parts.len(), 2);
+        // Quotes come off however they were spelled, escaped or not.
+        assert_eq!(parts[0].etag, "abc");
+        assert_eq!(parts[1].etag, "def");
+        assert_eq!(parts[1].number, 2);
+    }
+
+    #[test]
+    fn unknown_elements_are_skipped_but_broken_parts_are_not() {
+        // A checksum element the gateway does not read must not derail the parse.
+        let body = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+            <ChecksumCRC32C>aaaa</ChecksumCRC32C><ETag>\"a\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        assert_eq!(parse_complete_upload(body).unwrap().len(), 1);
+        // A part missing half of itself is a malformed body, not a default.
+        let broken = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part>\
+            </CompleteMultipartUpload>";
+        assert!(parse_complete_upload(broken).is_err());
+        assert!(parse_complete_upload("<CompleteMultipartUpload/>").is_err());
+    }
+
+    #[test]
+    fn hostile_completion_bodies_are_refused() {
+        let xxe = "<!DOCTYPE foo [<!ENTITY x SYSTEM \"file:///etc/passwd\">]>\
+            <CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+            <ETag>&x;</ETag></Part></CompleteMultipartUpload>";
+        assert!(parse_complete_upload(xxe).is_err());
+        // The cap is on the body, before anything is parsed out of it.
+        let huge = format!("<a>{}</a>", "x".repeat(MAX_COMPLETE_BODY));
+        assert!(parse_complete_upload(&huge).is_err());
+    }
+
+    #[test]
+    fn multipart_results_render() {
+        let xml = initiate_upload_xml("media", "a/b.bin", "deadbeef");
+        assert!(xml.contains("<UploadId>deadbeef</UploadId>"), "{xml}");
+        let xml = complete_upload_xml("media", "a/b.bin", "\"abc\"");
+        assert!(xml.contains("<Location>/media/a/b.bin</Location>"), "{xml}");
+        assert!(xml.contains("<ETag>&quot;abc&quot;</ETag>"), "{xml}");
+        let parts = [ListedPart {
+            number: 1,
+            size: 5,
+            etag: "\"a\"".into(),
+        }];
+        let xml = list_parts_xml("media", "k", "u", &parts, 1000, 0, true);
+        assert!(
+            xml.contains("<NextPartNumberMarker>1</NextPartNumberMarker>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<PartNumber>1</PartNumber>"), "{xml}");
+        let uploads = [ListedUpload {
+            key: "k".into(),
+            upload_id: "u".into(),
+            initiated: "1970-01-01T00:00:00.000Z".into(),
+        }];
+        let xml = list_uploads_xml("media", "", &uploads, 1000, false);
+        assert!(xml.contains("<UploadId>u</UploadId>"), "{xml}");
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
     }
 
     #[test]

@@ -30,8 +30,8 @@ use crate::{
                 self,
                 control_server::{Control, ControlServer},
             },
-            tokens_match, Command, ControlError, EntryInfo, ErrorCode, PutPart, CHUNK_SIZE,
-            CONTROL_VERSION, MAX_MESSAGE_LEN, TOKEN_HEADER, VERSION_HEADER,
+            tokens_match, Command, ControlError, EntryInfo, ErrorCode, PutPart, UploadPartPart,
+            CHUNK_SIZE, CONTROL_VERSION, MAX_MESSAGE_LEN, TOKEN_HEADER, VERSION_HEADER,
         },
         transport::{self, Accepted, Listener},
     },
@@ -644,6 +644,179 @@ impl Control for ControlService {
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    // ---- multipart upload (§9.4) -----------------------------------------
+
+    async fn create_upload(
+        &self,
+        request: Request<pb::CreateUploadRequest>,
+    ) -> Result<Response<pb::CreateUploadResponse>, Status> {
+        let request = request.into_inner();
+        // The publish gate first: a node that cannot publish cannot finish this
+        // upload, and telling the client now is better than telling it after it
+        // has streamed the object (§3.4).
+        let node = self.served.node()?.clone();
+        node.ensure_publishable().map_err(ControlError::from)?;
+        // The target is resolved now, so a path outside every space, or one
+        // `normalize_path` refuses, fails here rather than after the bytes.
+        let target = node
+            .upload_target(&request.space, &request.path)
+            .map_err(ControlError::from)?;
+        let (space, path) = (request.space.clone(), request.path.clone());
+        let id = offload(move || Ok(node.create_upload(&space, &path, &target)?)).await?;
+        Ok(Response::new(pb::CreateUploadResponse { upload_id: id }))
+    }
+
+    type UploadPartStream =
+        Pin<Box<dyn Stream<Item = Result<pb::UploadPartResponse, Status>> + Send>>;
+
+    async fn upload_part(
+        &self,
+        request: Request<Streaming<pb::UploadPartRequest>>,
+    ) -> Result<Response<Self::UploadPartStream>, Status> {
+        let mut incoming = request.into_inner();
+        let header = match incoming.message().await?.and_then(|first| first.part) {
+            Some(UploadPartPart::Header(header)) => header,
+            _ => {
+                return Err(ControlError::invalid("a part opens with its upload and number").into())
+            }
+        };
+        let reference = header.upload.unwrap_or_default();
+        // No publish gate: a part publishes nothing. What it does need is an
+        // upload that is still open and a part number S3 defines, both taken
+        // before the response opens so a refusal reaches a client that has not
+        // started streaming yet.
+        let staging = self
+            .served
+            .node()?
+            .open_part(
+                &reference.upload_id,
+                &reference.space,
+                &reference.path,
+                header.number,
+            )
+            .map_err(ControlError::from)?;
+
+        let (tx, rx) = mpsc::channel(1);
+        let node = self.served.node()?.clone();
+        let mut stopping = self.stop.subscribe();
+        tokio::spawn(async move {
+            // A part the daemon gives up on is one it keeps nothing of: the
+            // staging file goes with the dropped `Adoption`.
+            let recorded = tokio::select! {
+                recorded = receive_part(&node, incoming, staging) => recorded,
+                _ = stopping.recv() => Err(stopped()),
+            };
+            match recorded {
+                Ok(part) => {
+                    let _ = tx.send(Ok(part)).await;
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error.into())).await;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn complete_upload(
+        &self,
+        request: Request<pb::CompleteUploadRequest>,
+    ) -> Result<Response<pb::CompleteUploadResponse>, Status> {
+        let request = request.into_inner();
+        let reference = request.upload.unwrap_or_default();
+        // Taken again here, not only at creation: an upload may have been open
+        // for days, and a node that entered recovery in the meantime must not
+        // publish what it collected before (§3.4).
+        let node = self.served.node()?.clone();
+        node.ensure_publishable().map_err(ControlError::from)?;
+        let mut named = Vec::with_capacity(request.parts.len());
+        for part in &request.parts {
+            let root = match part.root.len() {
+                0 => None,
+                32 => Some(Hash::from(
+                    <[u8; 32]>::try_from(part.root.as_slice()).expect("32"),
+                )),
+                other => {
+                    return Err(ControlError::invalid(format!(
+                        "part {} named a {other}-byte root",
+                        part.number
+                    ))
+                    .into())
+                }
+            };
+            named.push((part.number, root));
+        }
+        let completed = node
+            .complete_upload(
+                &reference.upload_id,
+                &reference.space,
+                &reference.path,
+                &named,
+            )
+            .await
+            .map_err(ControlError::from)?;
+        Ok(Response::new(pb::CompleteUploadResponse {
+            etag: completed.root.as_bytes().to_vec(),
+            size: completed.size,
+            replayed: completed.replayed,
+        }))
+    }
+
+    async fn abort_upload(
+        &self,
+        request: Request<pb::AbortUploadRequest>,
+    ) -> Result<Response<pb::AbortUploadResponse>, Status> {
+        let reference = request.into_inner().upload.unwrap_or_default();
+        let node = self.served.node()?.clone();
+        let existed = offload(move || {
+            Ok(node.abort_upload(&reference.upload_id, &reference.space, &reference.path)?)
+        })
+        .await?;
+        Ok(Response::new(pb::AbortUploadResponse { existed }))
+    }
+
+    type ListUploadsStream = Pin<Box<dyn Stream<Item = Result<pb::UploadInfo, Status>> + Send>>;
+
+    async fn list_uploads(
+        &self,
+        request: Request<pb::ListUploadsRequest>,
+    ) -> Result<Response<Self::ListUploadsStream>, Status> {
+        let request = request.into_inner();
+        let node = self.served.node()?.clone();
+        let uploads =
+            offload(move || Ok(node.open_uploads(&request.space, &request.prefix)?)).await?;
+        let stream = tokio_stream::iter(uploads.into_iter().map(|upload| {
+            Ok(pb::UploadInfo {
+                upload_id: upload.id,
+                path: upload.path,
+                created_ns: upload.created_ns,
+            })
+        }));
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    type ListPartsStream = Pin<Box<dyn Stream<Item = Result<pb::PartInfo, Status>> + Send>>;
+
+    async fn list_parts(
+        &self,
+        request: Request<pb::ListPartsRequest>,
+    ) -> Result<Response<Self::ListPartsStream>, Status> {
+        let reference = request.into_inner().upload.unwrap_or_default();
+        let node = self.served.node()?.clone();
+        let parts = offload(move || {
+            Ok(node.upload_parts(&reference.upload_id, &reference.space, &reference.path)?)
+        })
+        .await?;
+        let stream = tokio_stream::iter(parts.into_iter().map(|part| {
+            Ok(pb::PartInfo {
+                number: part.number,
+                size: part.size,
+                root: part.root.as_bytes().to_vec(),
+            })
+        }));
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn get_config(
@@ -2048,29 +2221,40 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
     Ok(())
 }
 
-/// Consumes an upload, commits it, and publishes what it wrote (§7.1, §9.4).
-async fn receive(
-    node: &Node,
-    mut incoming: Streaming<pb::PutRequest>,
+/// One message of a streamed write, whichever call carries it.
+///
+/// `Put` and `UploadPart` differ only in where the payload lands and what
+/// happens once it is whole; the loop that receives it is the same loop, and
+/// the rules it enforces — nothing is kept without an explicit commit, a
+/// second header is a protocol error — are the same rules.
+enum Piece {
+    Chunk(Vec<u8>),
+    Commit,
+    Abort(String),
+    Header,
+}
+
+/// Streams a payload into a staging file, returning it once the client commits.
+///
+/// The client stopping without committing is a failure, not an end: a partly
+/// received body must never be indistinguishable from a complete one, because
+/// what this node does with a complete one is sign it and broadcast it.
+async fn drain<T>(
+    mut incoming: Streaming<T>,
     mut adoption: synch_engine::Adoption,
-    header: &pb::PutHeader,
-) -> Result<pb::Written, ControlError> {
-    let mut committed = false;
-    while !committed {
-        let part = match incoming.message().await {
-            Ok(Some(request)) => request.part,
-            // The client stopped sending without committing. That is an
-            // abandoned write however it came about — a dropped handle, a
-            // process that died — and the staging file goes with the dropped
-            // `Adoption`: a partly received body must never be mistaken for a
-            // complete object.
+    mut classify: impl FnMut(T) -> Option<Piece>,
+) -> Result<synch_engine::Adoption, ControlError> {
+    loop {
+        let message = match incoming.message().await {
+            Ok(Some(message)) => message,
+            // A dropped handle, a process that died, a truncated body: however
+            // it came about, the staging file goes with the dropped `Adoption`.
             Ok(None) => {
                 return Err(ControlError::invalid(format!(
                     "the write was abandoned after {} byte(s): it was never committed",
                     adoption.written()
                 )))
             }
-            // The same, with the transport's account of what went wrong.
             Err(status) => {
                 return Err(ControlError::invalid(format!(
                     "the write was abandoned after {} byte(s): {}",
@@ -2079,26 +2263,25 @@ async fn receive(
                 )))
             }
         };
-        match part {
+        match classify(message) {
             // Each piece is a write to the staging file, so it goes off the
-            // runtime: the upload is the size of the object, and the worker
+            // runtime: the upload is the size of the payload, and the worker
             // thread polling this connection is also serving every other one.
-            // The staging handle travels into the blocking pool and back.
-            Some(PutPart::Chunk(bytes)) => {
+            Some(Piece::Chunk(bytes)) => {
                 adoption = offload(move || {
                     adoption.write(&bytes)?;
                     Ok(adoption)
                 })
                 .await?;
             }
-            Some(PutPart::Commit(pb::Commit {})) => committed = true,
-            Some(PutPart::Abort(why)) => {
+            Some(Piece::Commit) => return Ok(adoption),
+            Some(Piece::Abort(why)) => {
                 return Err(ControlError::invalid(format!(
                     "the write was abandoned after {} byte(s): {why}",
                     adoption.written()
                 )))
             }
-            Some(PutPart::Header(_)) => {
+            Some(Piece::Header) => {
                 return Err(ControlError::invalid(
                     "a write names its space and path once",
                 ))
@@ -2106,6 +2289,23 @@ async fn receive(
             None => continue,
         }
     }
+}
+
+/// Consumes an upload, commits it, and publishes what it wrote (§7.1, §9.4).
+async fn receive(
+    node: &Node,
+    incoming: Streaming<pb::PutRequest>,
+    adoption: synch_engine::Adoption,
+    header: &pb::PutHeader,
+) -> Result<pb::Written, ControlError> {
+    let adoption = drain(incoming, adoption, |request| match request.part {
+        Some(PutPart::Chunk(bytes)) => Some(Piece::Chunk(bytes)),
+        Some(PutPart::Commit(pb::Commit {})) => Some(Piece::Commit),
+        Some(PutPart::Abort(why)) => Some(Piece::Abort(why)),
+        Some(PutPart::Header(_)) => Some(Piece::Header),
+        None => None,
+    })
+    .await?;
     // The commit fsyncs the payload and renames it into place.
     let target = offload(move || Ok(adoption.commit()?)).await?;
 
@@ -2122,6 +2322,30 @@ async fn receive(
     Ok(pb::Written {
         path: target.display().to_string(),
         entry: Some(entry_info(&row, &set).into()),
+    })
+}
+
+/// Consumes one part of a multipart upload and records it (§9.4).
+async fn receive_part(
+    node: &Node,
+    incoming: Streaming<pb::UploadPartRequest>,
+    staging: synch_engine::PartStaging,
+) -> Result<pb::UploadPartResponse, ControlError> {
+    let adoption = synch_engine::Adoption::at(&staging.path)?;
+    let adoption = drain(incoming, adoption, |request| match request.part {
+        Some(UploadPartPart::Chunk(bytes)) => Some(Piece::Chunk(bytes)),
+        Some(UploadPartPart::Commit(pb::Commit {})) => Some(Piece::Commit),
+        Some(UploadPartPart::Abort(why)) => Some(Piece::Abort(why)),
+        Some(UploadPartPart::Header(_)) => Some(Piece::Header),
+        None => None,
+    })
+    .await?;
+    let node = node.clone();
+    let part = offload(move || Ok(node.commit_part(staging, adoption)?)).await?;
+    Ok(pb::UploadPartResponse {
+        number: part.number,
+        size: part.size,
+        root: part.root.as_bytes().to_vec(),
     })
 }
 

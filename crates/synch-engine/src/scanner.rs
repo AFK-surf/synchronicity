@@ -714,7 +714,7 @@ impl Node {
     /// only ever write inside a space this node indexes, because outside one
     /// nothing would publish the adoption and the write would be a silent
     /// no-op with a filesystem side effect.
-    fn adoption_target(&self, space_id: &str, path: &str) -> Result<PathBuf> {
+    pub(crate) fn adoption_target(&self, space_id: &str, path: &str) -> Result<PathBuf> {
         let space = self
             .store()
             .space(space_id)?
@@ -748,6 +748,13 @@ impl Node {
         Ok(target)
     }
 }
+
+/// How much an [`Adoption::append_file`] fallback moves per read/write pair.
+///
+/// Only reached on a filesystem without `copy_file_range`, where the cost is a
+/// bounce through user space and the buffer is the whole of what this process
+/// holds of a part.
+const APPEND_CHUNK: u64 = 1024 * 1024;
 
 /// The suffix a streamed write's staging file carries.
 ///
@@ -894,6 +901,64 @@ impl Adoption {
     /// How many bytes have arrived so far.
     pub fn written(&self) -> u64 {
         self.written
+    }
+
+    /// Appends a whole file to the staging payload (§9.4).
+    ///
+    /// What assembles a multipart upload: each part is its own staged payload,
+    /// and completing the upload is this call once per part in ascending
+    /// order. The bytes move inside the kernel — `copy_file_range` shares
+    /// extents outright on a filesystem that can, and copies without a bounce
+    /// through user space on one that cannot — so a 50 GiB object assembled
+    /// from 8 MiB parts never passes through this process.
+    ///
+    /// `FICLONE` is deliberately not used here even though [`Adoption::cloning`]
+    /// prefers it: it is a *whole file* clone that replaces the destination,
+    /// which is the one thing an append must not do. The range form needs
+    /// block-aligned offsets that arbitrary part sizes do not have.
+    ///
+    /// Blocking, like every other method here — the caller runs it off the
+    /// runtime.
+    pub fn append_file(&mut self, source: &Path) -> Result<u64> {
+        use std::io::{Read, Seek, Write};
+        let mut src = std::fs::File::open(source)?;
+        let len = src.metadata()?.len();
+        let dest = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        let mut moved = 0u64;
+        #[cfg(target_os = "linux")]
+        while moved < len {
+            let take = usize::try_from(len - moved).unwrap_or(usize::MAX);
+            // `None` for both offsets advances each file's own cursor, which is
+            // exactly the append semantics wanted: the destination cursor is
+            // already at the end of everything appended so far.
+            match rustix::fs::copy_file_range(&src, None, &*dest, None, take) {
+                // Short of the length the metadata reported: the source is
+                // being written under us, or the filesystem refuses to say
+                // more. The fallback below reads it and reports the real error.
+                Ok(0) => break,
+                Ok(count) => moved += count as u64,
+                Err(_) => break,
+            }
+        }
+        if moved < len {
+            // `copy_file_range` may have consumed part of the source already,
+            // so the fallback resumes from where it stopped rather than from
+            // the start.
+            src.seek(std::io::SeekFrom::Start(moved))?;
+            let mut buffer = vec![0u8; APPEND_CHUNK.min(len - moved) as usize];
+            while moved < len {
+                let take = (APPEND_CHUNK.min(len - moved)) as usize;
+                let piece = &mut buffer[..take];
+                src.read_exact(piece)?;
+                dest.write_all(piece)?;
+                moved += take as u64;
+            }
+        }
+        self.written += moved;
+        Ok(moved)
     }
 
     /// Flushes the payload and moves it into place, returning the target.

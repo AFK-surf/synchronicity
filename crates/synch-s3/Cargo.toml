@@ -22,7 +22,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
+crc.workspace = true
 hex.workspace = true
 hmac.workspace = true
 sha2.workspace = true
@@ -36,7 +38,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 blake3.workspace = true
+crc.workspace = true
 reqwest.workspace = true
 synch-engine.workspace = true
 # `sim` turns on the pre-main TLS provider install (`synch_net::tls`) this

@@ -20,6 +20,7 @@
 
 pub mod auth;
 pub mod buckets;
+pub mod chunked;
 pub mod daemon;
 pub mod error;
 pub mod xml;
@@ -33,7 +34,7 @@ use axum::{
     response::{IntoResponse, Response},
     Router,
 };
-use synch_cli::control::EntryInfo;
+use synch_cli::control::{EntryInfo, UploadRef};
 use synch_core::EntryKind;
 
 use crate::{
@@ -46,6 +47,15 @@ use crate::{
 
 /// The default `max-keys` for a listing.
 pub const DEFAULT_MAX_KEYS: usize = 1000;
+
+/// The smallest a multipart part may be when it is not the last one: S3's
+/// 5 MiB.
+///
+/// Restated here rather than imported: the gateway depends on neither the store
+/// nor the engine (§9.1), and this is the one number it needs to name the
+/// difference between `EntityTooSmall` and an ordinary short final part. The
+/// daemon enforces the same bound on its own side, which is where it binds.
+pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// The gateway's shared state: a daemon to ask, and how to authenticate the
 /// clients asking.
@@ -167,6 +177,31 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
 
     let bucket = buckets::find(&gateway.daemon, bucket_name).await?;
 
+    // Multipart routing comes first, because every one of these requests would
+    // otherwise land on an existing arm and be answered as something else: a
+    // `GET /b?uploads` reads as a listing whose unknown parameter is ignored, a
+    // `PUT /b/k?partNumber=1&uploadId=U` reads as a plain PutObject, and both
+    // would report success for an operation that never happened.
+    let upload_id = param(&query, "uploadId").filter(|id| !id.is_empty());
+    let initiating = query.iter().any(|(k, _)| k == "uploads");
+    match (&parts.method, upload_id, initiating) {
+        (&Method::POST, None, true) if !key.is_empty() => {
+            return create_upload(gateway, &bucket, key).await
+        }
+        (&Method::GET, None, true) if key.is_empty() => {
+            return list_uploads(gateway, &bucket, &query).await
+        }
+        (&Method::PUT, Some(id), _) => {
+            return upload_part(gateway, &bucket, key, &id, &query, &headers, body).await
+        }
+        (&Method::POST, Some(id), _) => {
+            return complete_upload(gateway, &bucket, key, &id, body).await
+        }
+        (&Method::GET, Some(id), _) => return list_parts(gateway, &bucket, key, &id, &query).await,
+        (&Method::DELETE, Some(id), _) => return abort_upload(gateway, &bucket, key, &id).await,
+        _ => {}
+    }
+
     match (&parts.method, key.is_empty()) {
         // Buckets are mapped by the operator, not minted over HTTP — but SDK
         // write paths (rclone's among them) probe with CreateBucket and
@@ -178,11 +213,310 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
         (&Method::GET, true) => list_objects(gateway, &bucket, &query).await,
         (&Method::GET, false) => get_object(gateway, &bucket, key, &headers, false).await,
         (&Method::HEAD, false) => get_object(gateway, &bucket, key, &headers, true).await,
-        (&Method::PUT, false) => put_object(gateway, &bucket, key, body).await,
+        (&Method::PUT, false) => put_object(gateway, &bucket, key, &headers, body).await,
         (&Method::DELETE, _) => Err(S3Error::not_implemented("DeleteObject")),
-        (&Method::POST, _) => Err(S3Error::not_implemented("multipart upload")),
+        (&Method::POST, _) => Err(S3Error::not_implemented("this operation")),
         _ => Err(S3Error::not_implemented("this operation")),
     }
+}
+
+/// Headers that change what an object *is*, which this gateway does not honor.
+///
+/// Ignoring a header is only safe when it does not change the answer. These
+/// change it entirely: `x-amz-rename-source` and `x-amz-copy-source` say the
+/// payload is somewhere else, and a gateway that reads the (empty) body instead
+/// writes an empty object and reports `200`. Mountpoint's `rename` is exactly
+/// that request, so a silently-ignored header turned `mv a b` into a truncation
+/// of `b` and a `a` that never went away.
+///
+/// A denylist and not an allowlist: an allowlist has to know every header every
+/// SDK sends before it can let a working client through, and gets that wrong in
+/// the direction of breaking things that work. This list only has to name the
+/// headers whose absence produces a *wrong object*, which is a closed set.
+const REFUSED_HEADERS: &[&str] = &[
+    "x-amz-copy-source",
+    "x-amz-rename-source",
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-website-redirect-location",
+];
+
+/// Refuses a request carrying a header that would make the answer a lie.
+fn check_headers(headers: &BTreeMap<String, String>) -> S3Result<()> {
+    for name in REFUSED_HEADERS {
+        if headers.contains_key(*name) {
+            return Err(S3Error::not_implemented(&format!("the {name} header")));
+        }
+    }
+    Ok(())
+}
+
+/// Unwraps a request body that arrived `aws-chunked`, if it did.
+///
+/// Both write paths take it, because both can receive one: mountpoint sends
+/// `--upload-checksums crc32c` by default, and every upload it makes is framed.
+fn payload(headers: &BTreeMap<String, String>, body: Body) -> S3Result<Body> {
+    let declared = headers.get("x-amz-content-sha256").map(String::as_str);
+    let framing = chunked::framing(declared.unwrap_or(auth::UNSIGNED_PAYLOAD))?;
+    let length = headers
+        .get("x-amz-decoded-content-length")
+        .and_then(|v| v.parse::<u64>().ok());
+    Ok(chunked::decode(body, framing, length))
+}
+
+/// `CreateMultipartUpload`.
+async fn create_upload(gateway: &Gateway, bucket: &Bucket, key: &str) -> S3Result<Response> {
+    if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
+        tracing::warn!("{warning}");
+    }
+    let upload_id = gateway.daemon.create_upload(&bucket.space, key).await?;
+    Ok(xml_response(
+        StatusCode::OK,
+        xml::initiate_upload_xml(&bucket.name, key, &upload_id),
+    ))
+}
+
+/// `UploadPart`.
+async fn upload_part(
+    gateway: &Gateway,
+    bucket: &Bucket,
+    key: &str,
+    upload_id: &str,
+    query: &[(String, String)],
+    headers: &BTreeMap<String, String>,
+    body: Body,
+) -> S3Result<Response> {
+    // `UploadPartCopy` is this request plus `x-amz-copy-source`. Refusing the
+    // header is what stops it being answered as an ordinary part upload of the
+    // empty body a copy request carries.
+    check_headers(headers)?;
+    let number: u32 = param(query, "partNumber")
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| S3Error::invalid("partNumber must be a number"))?;
+    let reference = UploadRef::new(upload_id, &bucket.space, key);
+    let part = gateway
+        .daemon
+        .upload_part(reference, number, payload(headers, body)?)
+        .await
+        .map_err(|e| e.about_upload(upload_id))?;
+
+    let mut response = HeaderMap::new();
+    insert(&mut response, header::ETAG, &quoted(&part.root.to_hex()));
+    Ok((StatusCode::OK, response).into_response())
+}
+
+/// `CompleteMultipartUpload`.
+async fn complete_upload(
+    gateway: &Gateway,
+    bucket: &Bucket,
+    key: &str,
+    upload_id: &str,
+    body: Body,
+) -> S3Result<Response> {
+    let bytes = axum::body::to_bytes(body, xml::MAX_COMPLETE_BODY)
+        .await
+        .map_err(|_| S3Error::malformed_xml("the completion body could not be read"))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| S3Error::malformed_xml("the completion body is not text"))?;
+    let requested = xml::parse_complete_upload(text).map_err(S3Error::malformed_xml)?;
+    let named: Vec<(u32, Option<synch_core::Hash>)> = requested
+        .iter()
+        .map(|part| (part.number, parse_root(&part.etag)))
+        .collect();
+
+    let reference = UploadRef::new(upload_id, &bucket.space, key);
+    // The completion is attempted before anything is inspected, and the daemon
+    // does the validating: it is what publishes, so it is what has to be sure.
+    // Asking it first is also what makes a *retried* completion work — the
+    // upload has no parts left to inspect by then, and the daemon answers from
+    // the result it recorded.
+    let completed = match gateway
+        .daemon
+        .complete_upload(reference.clone(), &named)
+        .await
+    {
+        Ok(completed) => completed,
+        // The daemon has one way to say "you asked wrong", and S3 clients
+        // branch on which wrong it was: shrink a part, re-upload a part, or
+        // start over. The parts are still there — a refused completion reopens
+        // the upload — so the precise answer can be worked out here, where the
+        // S3 vocabulary is.
+        Err(e) if e.status == StatusCode::BAD_REQUEST => {
+            return Err(diagnose(gateway, reference, upload_id, &requested, e).await)
+        }
+        Err(e) => return Err(e.about_upload(upload_id)),
+    };
+    Ok(xml_response(
+        StatusCode::OK,
+        xml::complete_upload_xml(&bucket.name, key, &quoted(&completed.etag.to_hex())),
+    ))
+}
+
+/// Works out which S3 error a refused completion deserves.
+///
+/// Falls back to the daemon's own answer when nothing here explains it: a
+/// diagnosis that cannot find the fault must not invent one.
+async fn diagnose(
+    gateway: &Gateway,
+    reference: UploadRef,
+    upload_id: &str,
+    requested: &[xml::RequestedPart],
+    reported: S3Error,
+) -> S3Error {
+    let recorded = match gateway.daemon.list_parts(reference).await {
+        Ok(recorded) => recorded,
+        Err(e) => return e.about_upload(upload_id),
+    };
+    match validate_parts(requested, &recorded) {
+        Err(precise) => precise,
+        Ok(()) => reported,
+    }
+}
+
+/// Restates a refused completion in S3's vocabulary.
+///
+/// The checks are in the order the daemon makes them, and the order matters:
+/// reporting a part as too small when a *later* part was never uploaded sends
+/// the client to shrink a part that was fine.
+fn validate_parts(
+    requested: &[xml::RequestedPart],
+    recorded: &[synch_cli::control::RecordedPart],
+) -> S3Result<()> {
+    let mut previous = 0;
+    for part in requested {
+        if part.number <= previous {
+            return Err(S3Error::invalid_part_order());
+        }
+        previous = part.number;
+    }
+    let mut found = Vec::with_capacity(requested.len());
+    for part in requested {
+        let had = recorded
+            .iter()
+            .find(|had| had.number == part.number)
+            .ok_or_else(|| {
+                S3Error::invalid_part(format!("part {} was never uploaded", part.number))
+            })?;
+        if !part.etag.is_empty() && !part.etag.eq_ignore_ascii_case(&had.root.to_hex()) {
+            return Err(S3Error::invalid_part(format!(
+                "part {} does not have the ETag the completion named",
+                part.number
+            )));
+        }
+        found.push(had);
+    }
+    for had in found.iter().take(found.len().saturating_sub(1)) {
+        if had.size < MIN_PART_SIZE {
+            return Err(S3Error::entity_too_small(format!(
+                "part {} is {} byte(s); only the last part may be under {MIN_PART_SIZE}",
+                had.number, had.size
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reads a part ETag back as the root it is, or `None` if it is not one.
+///
+/// A client that echoes an ETag this gateway never issued gets the check
+/// skipped rather than a parse failure: the daemon still refuses a part that is
+/// not there, and inventing a root out of an unparseable ETag would refuse a
+/// part that is.
+fn parse_root(etag: &str) -> Option<synch_core::Hash> {
+    let bytes = hex::decode(etag.trim_matches('"')).ok()?;
+    let array: [u8; 32] = bytes.try_into().ok()?;
+    Some(synch_core::Hash::from(array))
+}
+
+/// `AbortMultipartUpload`.
+async fn abort_upload(
+    gateway: &Gateway,
+    bucket: &Bucket,
+    key: &str,
+    upload_id: &str,
+) -> S3Result<Response> {
+    gateway
+        .daemon
+        .abort_upload(UploadRef::new(upload_id, &bucket.space, key))
+        .await
+        .map_err(|e| e.about_upload(upload_id))?;
+    Ok((StatusCode::NO_CONTENT).into_response())
+}
+
+/// `ListParts`.
+async fn list_parts(
+    gateway: &Gateway,
+    bucket: &Bucket,
+    key: &str,
+    upload_id: &str,
+    query: &[(String, String)],
+) -> S3Result<Response> {
+    let marker: u32 = param(query, "part-number-marker")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let max_parts = param(query, "max-parts")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_KEYS)
+        .clamp(1, DEFAULT_MAX_KEYS);
+    let recorded = gateway
+        .daemon
+        .list_parts(UploadRef::new(upload_id, &bucket.space, key))
+        .await
+        .map_err(|e| e.about_upload(upload_id))?;
+    let after: Vec<_> = recorded
+        .into_iter()
+        .filter(|part| part.number > marker)
+        .collect();
+    let truncated = after.len() > max_parts;
+    let page: Vec<xml::ListedPart> = after
+        .into_iter()
+        .take(max_parts)
+        .map(|part| xml::ListedPart {
+            number: part.number,
+            size: part.size,
+            etag: quoted(&part.root.to_hex()),
+        })
+        .collect();
+    Ok(xml_response(
+        StatusCode::OK,
+        xml::list_parts_xml(
+            &bucket.name,
+            key,
+            upload_id,
+            &page,
+            max_parts,
+            marker,
+            truncated,
+        ),
+    ))
+}
+
+/// `ListMultipartUploads`.
+async fn list_uploads(
+    gateway: &Gateway,
+    bucket: &Bucket,
+    query: &[(String, String)],
+) -> S3Result<Response> {
+    let prefix = param(query, "prefix").unwrap_or_default();
+    let max_uploads = param(query, "max-uploads")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_KEYS)
+        .clamp(1, DEFAULT_MAX_KEYS);
+    let open = gateway.daemon.list_uploads(&bucket.space, &prefix).await?;
+    let truncated = open.len() > max_uploads;
+    let page: Vec<xml::ListedUpload> = open
+        .into_iter()
+        .take(max_uploads)
+        .map(|upload| xml::ListedUpload {
+            key: upload.path,
+            upload_id: upload.upload_id,
+            initiated: format_timestamp(upload.created_ns),
+        })
+        .collect();
+    Ok(xml_response(
+        StatusCode::OK,
+        xml::list_uploads_xml(&bucket.name, &prefix, &page, max_uploads, truncated),
+    ))
 }
 
 async fn list_objects(
@@ -368,8 +702,13 @@ async fn put_object(
     gateway: &Gateway,
     bucket: &Bucket,
     key: &str,
+    headers: &BTreeMap<String, String>,
     body: Body,
 ) -> S3Result<Response> {
+    // A header that says the payload is somewhere else makes reading the body
+    // the wrong thing to do, so the request is refused rather than answered
+    // with an object built from the body it does not have.
+    check_headers(headers)?;
     // §9.4: a write is always a publish of the local node's own view — the
     // version model forbids publishing someone else's — so every bucket is
     // writable. A bucket pinned to a foreign origin still accepts the write,
@@ -384,7 +723,7 @@ async fn put_object(
     // one this process hashed from a copy it kept.
     let published: EntryInfo = gateway
         .daemon
-        .put(&bucket.space, key, body)
+        .put(&bucket.space, key, payload(headers, body)?)
         .await
         .map_err(|e| e.with_key(key))?;
 

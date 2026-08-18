@@ -25,7 +25,10 @@ pub mod pb {
     tonic::include_proto!("synch.control.v1");
 }
 
-pub use pb::{command::Kind as Command, frame::Payload as Frame, put_request::Part as PutPart};
+pub use pb::{
+    command::Kind as Command, frame::Payload as Frame, put_request::Part as PutPart,
+    upload_part_request::Part as UploadPartPart,
+};
 
 /// The control protocol version.
 ///
@@ -34,7 +37,12 @@ pub use pb::{command::Kind as Command, frame::Payload as Frame, put_request::Par
 /// keeps a field addition readable, but it cannot make a daemon that has learnt
 /// a new command out of one that has not. It is bumped whenever the meaning of
 /// an existing request changes, and travels as a header on every call.
-pub const CONTROL_VERSION: u32 = 1;
+///
+/// v2 added the multipart upload calls (§9.4). A field addition would not have
+/// needed a bump, but a *call* addition does: an old daemon answers a new one
+/// with a bare gRPC `Unimplemented`, which reaches the client as an internal
+/// error rather than as the "restart the daemon" a version mismatch says.
+pub const CONTROL_VERSION: u32 = 2;
 
 /// How many payload bytes one chunk carries.
 ///

@@ -950,3 +950,577 @@ fn urlencode(value: &str) -> String {
         })
         .collect()
 }
+
+// ---- multipart upload (§9.4) -----------------------------------------------
+
+/// Pulls an element's text out of a response body, for the few fields these
+/// tests read back.
+fn element(xml: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml
+        .find(&open)
+        .unwrap_or_else(|| panic!("no <{tag}> in {xml}"))
+        + open.len();
+    let end = xml[start..].find(&close).expect("unclosed element") + start;
+    xml[start..end].to_string()
+}
+
+/// Builds the body a `CompleteMultipartUpload` carries.
+fn completion(parts: &[(u32, String)]) -> String {
+    let mut body = String::from("<CompleteMultipartUpload>");
+    for (number, etag) in parts {
+        body.push_str(&format!(
+            "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    body.push_str("</CompleteMultipartUpload>");
+    body
+}
+
+/// Creates an upload and returns its id.
+async fn create_upload(http: &reqwest::Client, harness: &Harness, key: &str) -> String {
+    let response = http
+        .post(harness.url(&format!("/my-media/{key}?uploads")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    element(&response.text().await.unwrap(), "UploadId")
+}
+
+/// Uploads one part and returns the ETag the gateway answered with.
+async fn upload_part(
+    http: &reqwest::Client,
+    harness: &Harness,
+    key: &str,
+    upload: &str,
+    number: u32,
+    body: Vec<u8>,
+) -> String {
+    let response = http
+        .put(harness.url(&format!(
+            "/my-media/{key}?partNumber={number}&uploadId={upload}"
+        )))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "part {number} was refused");
+    response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The whole multipart round trip, out of order and byte-exact.
+///
+/// Out-of-order parts are the case that matters: every SDK that fans parts out
+/// concurrently delivers them in whatever order the network settled on, and the
+/// object is defined by the part *numbers*, not by arrival.
+#[tokio::test]
+async fn multipart_upload_assembles_parts_in_order() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+
+    // Two parts over the 5 MiB minimum and a short tail, which is the shape S3
+    // permits and the one a real upload has.
+    let first: Vec<u8> = (0..6_000_000u32).map(|i| (i % 251) as u8).collect();
+    let second: Vec<u8> = (0..5_500_000u32).map(|i| (i % 241) as u8).collect();
+    let third: Vec<u8> = b"the short final part".to_vec();
+
+    let upload = create_upload(&http, &harness, "big/assembled.bin").await;
+
+    // Uploaded 3, 1, 2 — the completion is what puts them in order.
+    let etag3 = upload_part(
+        &http,
+        &harness,
+        "big/assembled.bin",
+        &upload,
+        3,
+        third.clone(),
+    )
+    .await;
+    let etag1 = upload_part(
+        &http,
+        &harness,
+        "big/assembled.bin",
+        &upload,
+        1,
+        first.clone(),
+    )
+    .await;
+    let etag2 = upload_part(
+        &http,
+        &harness,
+        "big/assembled.bin",
+        &upload,
+        2,
+        second.clone(),
+    )
+    .await;
+
+    let response = http
+        .post(harness.url(&format!("/my-media/big/assembled.bin?uploadId={upload}")))
+        .body(completion(&[(1, etag1), (2, etag2), (3, etag3)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert_eq!(element(&body, "Key"), "big/assembled.bin");
+    let etag = element(&body, "ETag");
+
+    // The object reads back as the concatenation, and the ETag it was given is
+    // the root of exactly those bytes.
+    let mut expected = first.clone();
+    expected.extend_from_slice(&second);
+    expected.extend_from_slice(&third);
+    let response = http
+        .get(harness.url("/my-media/big/assembled.bin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        expected.as_slice()
+    );
+    let root = blake3::hash(&expected);
+    assert_eq!(etag, format!("&quot;{}&quot;", root.to_hex()));
+
+    // And it is a published entry like any other, not a file that only the
+    // gateway can see.
+    let listed = http
+        .get(harness.url("/my-media?list-type=2&prefix=big/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(listed.contains("<Key>big/assembled.bin</Key>"), "{listed}");
+    harness.stop().await;
+}
+
+/// A single-part upload is the shape mountpoint-s3 uses for *every* file it
+/// writes, so it has to work and it has to publish a live mtime.
+#[tokio::test]
+async fn a_single_part_upload_publishes_like_a_put() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let before = synch_core::now_ns();
+
+    let upload = create_upload(&http, &harness, "small.txt").await;
+    let etag = upload_part(&http, &harness, "small.txt", &upload, 1, b"tiny".to_vec()).await;
+    let response = http
+        .post(harness.url(&format!("/my-media/small.txt?uploadId={upload}")))
+        .body(completion(&[(1, etag)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = http
+        .get(harness.url("/my-media/small.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"tiny");
+
+    // The published mtime is the completion's, not some part's: §8 orders
+    // versions by it, so a completion that published an old one would lose to
+    // content it supersedes.
+    let entry = harness
+        .daemon
+        .resolve("media", "small.txt", "newest")
+        .await
+        .unwrap();
+    assert!(entry.mtime_ns >= before, "{} < {before}", entry.mtime_ns);
+    harness.stop().await;
+}
+
+/// Every way a completion can be wrong gets the code S3 defines for it, because
+/// clients branch on them: shrink a part, re-upload a part, or start over.
+#[tokio::test]
+async fn completion_errors_are_distinguishable() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let key = "errors.bin";
+    let upload = create_upload(&http, &harness, key).await;
+    // One part over the minimum and one under it, so each failure mode can be
+    // provoked without tripping another first.
+    let big = vec![7u8; 5 * 1024 * 1024 + 16];
+    let small = vec![9u8; 1024];
+    let etag1 = upload_part(&http, &harness, key, &upload, 1, big).await;
+    let etag2 = upload_part(&http, &harness, key, &upload, 2, small).await;
+
+    let complete = |body: String| {
+        let http = http.clone();
+        let url = harness.url(&format!("/my-media/{key}?uploadId={upload}"));
+        async move { http.post(url).body(body).send().await.unwrap() }
+    };
+
+    // A part that was never uploaded — reported as missing even though part 2
+    // is also too small to be an interior part.
+    let response = complete(completion(&[
+        (1, etag1.clone()),
+        (2, etag2.clone()),
+        (9, etag2.clone()),
+    ]))
+    .await;
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("InvalidPart"), "{body}");
+    assert!(!body.contains("EntityTooSmall"), "{body}");
+
+    // Parts named out of order.
+    let response = complete(completion(&[(2, etag2.clone()), (1, etag1.clone())])).await;
+    assert_eq!(response.status(), 400);
+    assert!(response.text().await.unwrap().contains("InvalidPartOrder"));
+
+    // An interior part under the 5 MiB minimum; the last one is exempt.
+    let response = complete(completion(&[(2, etag2.clone()), (3, etag2.clone())])).await;
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("InvalidPart"), "{body}");
+    let response = complete(completion(&[(1, etag1.clone()), (2, etag2.clone())])).await;
+    assert_eq!(response.status(), 200, "a short *final* part is legal");
+
+    harness.stop().await;
+}
+
+/// An interior part under the minimum is `EntityTooSmall`, on its own upload so
+/// the completion above does not consume it.
+#[tokio::test]
+async fn an_interior_part_under_the_minimum_is_refused() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let key = "short-interior.bin";
+    let upload = create_upload(&http, &harness, key).await;
+    let etag1 = upload_part(&http, &harness, key, &upload, 1, vec![1u8; 1024]).await;
+    let etag2 = upload_part(&http, &harness, key, &upload, 2, vec![2u8; 1024]).await;
+
+    let response = http
+        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .body(completion(&[(1, etag1.clone()), (2, etag2)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(response.text().await.unwrap().contains("EntityTooSmall"));
+
+    // An ETag that does not match what is actually there.
+    let response = http
+        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .body(completion(&[(
+            1,
+            format!("&quot;{}&quot;", "0".repeat(64)),
+        )]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(response.text().await.unwrap().contains("InvalidPart"));
+
+    // A body that is not a completion at all.
+    let response = http
+        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .body("<nonsense/>".to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(response.text().await.unwrap().contains("MalformedXML"));
+
+    // Every one of those was recoverable: the upload is still open, and the
+    // completion the client fixes goes through.
+    let response = http
+        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .body(completion(&[(1, etag1)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    harness.stop().await;
+}
+
+/// An unknown upload is `NoSuchUpload`, not `NoSuchKey` — and an id is a bearer
+/// token for one key, so quoting it against another is the same answer.
+#[tokio::test]
+async fn an_upload_id_names_one_key() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let upload = create_upload(&http, &harness, "mine.txt").await;
+
+    let response = http
+        .post(harness.url(&format!("/my-media/someone-elses.txt?uploadId={upload}")))
+        .body(completion(&[(1, "\"a\"".into())]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert!(response.text().await.unwrap().contains("NoSuchUpload"));
+
+    // A part quoted against the wrong key is refused before any bytes land.
+    let response = http
+        .put(harness.url(&format!(
+            "/my-media/someone-elses.txt?partNumber=1&uploadId={upload}"
+        )))
+        .body(vec![0u8; 16])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    let response = http
+        .get(harness.url("/my-media/mine.txt?uploadId=deadbeefdeadbeefdeadbeefdeadbeef"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert!(response.text().await.unwrap().contains("NoSuchUpload"));
+    harness.stop().await;
+}
+
+/// Listing, aborting, and what an abort leaves behind (nothing).
+#[tokio::test]
+async fn uploads_and_parts_list_and_abort() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let key = "listed.bin";
+    let upload = create_upload(&http, &harness, key).await;
+    upload_part(&http, &harness, key, &upload, 1, vec![1u8; 32]).await;
+    upload_part(&http, &harness, key, &upload, 2, vec![2u8; 64]).await;
+
+    let listed = http
+        .get(harness.url("/my-media?uploads"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        listed.contains(&format!("<UploadId>{upload}</UploadId>")),
+        "{listed}"
+    );
+    assert!(listed.contains("<Key>listed.bin</Key>"), "{listed}");
+
+    let parts = http
+        .get(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(parts.contains("<PartNumber>1</PartNumber>"), "{parts}");
+    assert!(parts.contains("<Size>64</Size>"), "{parts}");
+
+    let response = http
+        .delete(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+
+    // Gone, and its staged bytes with it.
+    let response = http
+        .get(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let listed = http
+        .get(harness.url("/my-media?uploads"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!listed.contains(&upload), "{listed}");
+    // Nothing was published: an abort is not a write.
+    let response = http
+        .get(harness.url(&format!("/my-media/{key}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    harness.stop().await;
+}
+
+/// A re-uploaded part replaces the first attempt rather than joining it.
+#[tokio::test]
+async fn a_re_uploaded_part_wins() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let key = "rewritten.txt";
+    let upload = create_upload(&http, &harness, key).await;
+
+    upload_part(&http, &harness, key, &upload, 1, b"first attempt".to_vec()).await;
+    let second = upload_part(&http, &harness, key, &upload, 1, b"second attempt".to_vec()).await;
+
+    let response = http
+        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .body(completion(&[(1, second)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = http
+        .get(harness.url(&format!("/my-media/{key}")))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"second attempt");
+    harness.stop().await;
+}
+
+/// A retried completion replays its answer instead of reporting an upload that
+/// no longer exists.
+///
+/// Every S3 client retries a completion it did not see the response to, and the
+/// object is already published by then — so "no such upload" would be a lie
+/// that makes the client report a failed write of a file that is right there.
+#[tokio::test]
+async fn a_retried_completion_replays_its_answer() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let key = "retried.txt";
+    let upload = create_upload(&http, &harness, key).await;
+    let etag = upload_part(&http, &harness, key, &upload, 1, b"once".to_vec()).await;
+
+    let first = http
+        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .body(completion(&[(1, etag.clone())]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let first_etag = element(&first.text().await.unwrap(), "ETag");
+
+    let again = http
+        .post(harness.url(&format!("/my-media/{key}?uploadId={upload}")))
+        .body(completion(&[(1, etag)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    assert_eq!(element(&again.text().await.unwrap(), "ETag"), first_etag);
+    harness.stop().await;
+}
+
+/// An `aws-chunked` body is unwrapped rather than stored as its own framing.
+///
+/// Mountpoint sends `--upload-checksums crc32c` by default, so this is what its
+/// every upload looks like on the wire. A gateway that stored the framing would
+/// hash the framing, and the corruption would be undetectable downstream.
+#[tokio::test]
+async fn chunked_bodies_are_decoded_and_their_checksums_checked() {
+    use base64::Engine;
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    let payload = b"the payload, not the framing".to_vec();
+
+    let crc = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(&payload);
+    let digest = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+    let framed = format!(
+        "{:x}\r\n{}\r\n0\r\nx-amz-checksum-crc32c:{digest}\r\n\r\n",
+        payload.len(),
+        String::from_utf8(payload.clone()).unwrap()
+    );
+
+    let response = http
+        .put(harness.url("/my-media/framed.txt"))
+        .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+        .header("x-amz-decoded-content-length", payload.len().to_string())
+        .header("content-encoding", "aws-chunked")
+        .body(framed.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let stored = http
+        .get(harness.url("/my-media/framed.txt"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(stored.as_ref(), payload.as_slice());
+
+    // A checksum that does not match the payload fails the write rather than
+    // publishing bytes the client already knows are wrong.
+    let bad = framed.replace(&digest, "AAAAAA==");
+    let response = http
+        .put(harness.url("/my-media/corrupt.txt"))
+        .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+        .header("x-amz-decoded-content-length", payload.len().to_string())
+        .body(bad)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error() || response.status().is_server_error());
+    let response = http
+        .get(harness.url("/my-media/corrupt.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        404,
+        "a failed checksum published an object"
+    );
+    harness.stop().await;
+}
+
+/// A header that says the payload is somewhere else is refused, not ignored.
+///
+/// This is the mountpoint `rename` bug: `PUT` + `x-amz-rename-source` with an
+/// empty body used to answer `200`, creating a truncated destination and
+/// leaving the source in place, and the client recorded the rename as done.
+#[tokio::test]
+async fn headers_that_relocate_the_payload_are_refused() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    harness.publish("source.txt", b"twenty-five bytes here!!!");
+    let http = client();
+
+    for header in ["x-amz-rename-source", "x-amz-copy-source"] {
+        let response = http
+            .put(harness.url("/my-media/destination.txt"))
+            .header(header, "/my-media/source.txt")
+            .body(Vec::new())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 501, "{header} was not refused");
+        assert!(response.text().await.unwrap().contains("NotImplemented"));
+    }
+
+    // Nothing was created, and the source is untouched.
+    let response = http
+        .get(harness.url("/my-media/destination.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let source = http
+        .get(harness.url("/my-media/source.txt"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(source.as_ref(), b"twenty-five bytes here!!!");
+    harness.stop().await;
+}

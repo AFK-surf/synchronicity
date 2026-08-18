@@ -50,6 +50,45 @@ service Control {
   // the whole list loses whichever concurrent edit commits first. One atomic
   // append cannot.
   rpc AppendConfig(AppendConfigRequest) returns (AppendConfigResponse);
+
+  // ---- multipart upload (§9.4) ---------------------------------------------
+  //
+  // A multipart upload outlives every request in it, and the gateway holds no
+  // state, so the daemon is the only place it can live. Every call names the
+  // space and path as well as the upload id: an id is a bearer token for one
+  // key, and a request that quotes it against a different key is answered as
+  // though the upload did not exist.
+
+  // Opens a multipart upload and returns its id.
+  rpc CreateUpload(CreateUploadRequest) returns (CreateUploadResponse);
+
+  // Streams one part into an open upload.
+  //
+  // The same shape as Put, for the same reasons and one more. The header comes
+  // first so the gates are taken before a byte is sent, and the part is
+  // recorded only on an explicit commit, so a truncated part is never mistaken
+  // for a whole one. The *response* is a stream carrying exactly one message
+  // because it has to be: a unary response is not sent until the call ends, so
+  // a client streaming a payload would be waiting for a reply that is waiting
+  // for the payload. The stream's headers arrive as soon as the gates pass,
+  // which is what lets the client start sending.
+  rpc UploadPart(stream UploadPartRequest) returns (stream UploadPartResponse);
+
+  // Assembles the named parts, publishes the object, and returns its root.
+  //
+  // Retry-safe: a completion that already ran is answered from the result it
+  // recorded rather than reported as an upload that no longer exists, because
+  // a client that never saw the response cannot tell the two apart.
+  rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
+
+  // Drops an upload and everything staged for it.
+  rpc AbortUpload(AbortUploadRequest) returns (AbortUploadResponse);
+
+  // Every upload still accepting parts under a prefix.
+  rpc ListUploads(ListUploadsRequest) returns (stream UploadInfo);
+
+  // Every part recorded for one upload, in part-number order.
+  rpc ListParts(ListPartsRequest) returns (stream PartInfo);
 }
 
 // ---- the CLI surface (§9.2) -------------------------------------------------
@@ -515,3 +554,130 @@ message AppendConfigRequest {
 }
 
 message AppendConfigResponse {}
+
+// ---- multipart upload (§9.4) ------------------------------------------------
+
+// Which upload, and the key it must belong to.
+//
+// The pair travels on every call rather than the id alone. An upload id names
+// one key, and answering a request that quotes it against another key would let
+// a client complete an upload into a path it never named.
+message UploadRef {
+  // The upload id, as CreateUpload returned it.
+  string upload_id = 1;
+  // The space the upload must be against.
+  string space = 2;
+  // The path the upload must be against.
+  string path = 3;
+}
+
+message CreateUploadRequest {
+  // The space to write into.
+  string space = 1;
+  // The path within the space.
+  string path = 2;
+}
+
+message CreateUploadResponse {
+  // The upload id, hex — never base64, whose `+` a URI decoder would eat.
+  string upload_id = 1;
+}
+
+message UploadPartRequest {
+  oneof part {
+    // The first message: which upload, and which part of it.
+    UploadPartHeader header = 1;
+    // A piece of the part's payload.
+    bytes chunk = 2;
+    // The client is abandoning this part and the daemon must keep nothing.
+    string abort = 3;
+    // The part is complete and the daemon may record it.
+    Commit commit = 4;
+  }
+}
+
+message UploadPartHeader {
+  // Which upload this part belongs to.
+  UploadRef upload = 1;
+  // The part number, 1..=10000.
+  uint32 number = 2;
+}
+
+message UploadPartResponse {
+  // The part number recorded.
+  uint32 number = 1;
+  // How many bytes it carries.
+  uint64 size = 2;
+  // Its own object root, which is the ETag the client is given.
+  bytes root = 3;
+}
+
+message CompleteUploadRequest {
+  // Which upload to complete.
+  UploadRef upload = 1;
+  // The parts to assemble, ascending. Parts the client leaves out are
+  // discarded, which is what S3 promises.
+  repeated CompletionPart parts = 2;
+}
+
+// One part a completion named.
+message CompletionPart {
+  // The part number.
+  uint32 number = 1;
+  // The root the client believes that part has, or empty not to check.
+  //
+  // Checked by the daemon rather than taken on trust from the gateway: the
+  // daemon is what publishes, so it is what has to be sure the object it
+  // assembles is the object the client thinks it uploaded.
+  bytes root = 2;
+}
+
+message CompleteUploadResponse {
+  // The assembled object's root.
+  bytes etag = 1;
+  // Its size in bytes.
+  uint64 size = 2;
+  // True when this answered a retry from the recorded result rather than
+  // assembling anything.
+  bool replayed = 3;
+}
+
+message AbortUploadRequest {
+  // Which upload to drop.
+  UploadRef upload = 1;
+}
+
+message AbortUploadResponse {
+  // False when there was no such upload, which an abort treats as success.
+  bool existed = 1;
+}
+
+message ListUploadsRequest {
+  // The space to list uploads in.
+  string space = 1;
+  // The path prefix to list under, empty for the whole space.
+  string prefix = 2;
+}
+
+message UploadInfo {
+  // The upload id.
+  string upload_id = 1;
+  // The path it will publish to.
+  string path = 2;
+  // When it was created, unix nanoseconds.
+  int64 created_ns = 3;
+}
+
+message ListPartsRequest {
+  // Which upload to list the parts of.
+  UploadRef upload = 1;
+}
+
+message PartInfo {
+  // The part number.
+  uint32 number = 1;
+  // How many bytes it carries.
+  uint64 size = 2;
+  // Its own object root.
+  bytes root = 3;
+}
