@@ -180,9 +180,16 @@ async fn two_nodes_converge_and_content_transfers() {
         .await
         .unwrap();
     let all = ChunkRanges::single(0, synch_core::group_count(payload_large.len() as u64));
-    blob.fetch_into(&follower.store, big_root, payload_large.len() as u64, &all)
-        .await
-        .unwrap();
+    let mut got = ChunkRanges::empty();
+    blob.fetch_into(
+        &follower.store,
+        big_root,
+        payload_large.len() as u64,
+        &all,
+        &mut got,
+    )
+    .await
+    .unwrap();
     assert_eq!(follower.store.read_all(&big_root).unwrap(), payload_large);
 
     // And a range read of an object the follower only partially holds.
@@ -193,11 +200,13 @@ async fn two_nodes_converge_and_content_transfers() {
         .content
         .unwrap();
     let one_group = ChunkRanges::single(0, 1);
+    let mut got_small = ChunkRanges::empty();
     blob.fetch_into(
         &follower.store,
         small_root,
         payload_small.len() as u64,
         &one_group,
+        &mut got_small,
     )
     .await
     .unwrap();
@@ -576,8 +585,8 @@ async fn an_object_larger_than_one_frame_transfers() {
         .await
         .unwrap();
     let all = ChunkRanges::single(0, synch_core::group_count(payload.len() as u64));
-    let got = blob
-        .fetch_into(&follower.store, root, payload.len() as u64, &all)
+    let mut got = ChunkRanges::empty();
+    blob.fetch_into(&follower.store, root, payload.len() as u64, &all, &mut got)
         .await
         .unwrap();
     assert_eq!(got.count(), synch_core::group_count(payload.len() as u64));

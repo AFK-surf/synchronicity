@@ -1306,6 +1306,7 @@ CREATE TABLE blob_providers (
   spans       BLOB,                      -- coalesced 16 MiB-granularity byte spans when partial
   PRIMARY KEY (object_root, origin_id)
 );
+CREATE INDEX blob_providers_by_origin ON blob_providers (origin_id);
 
 -- local content store index
 CREATE TABLE blobs (

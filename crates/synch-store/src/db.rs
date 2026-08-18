@@ -191,6 +191,52 @@ pub struct Store {
     /// exchange. Process-local and rebuilt on demand: losing it costs one
     /// walk, never correctness.
     complete_roots: Mutex<std::collections::HashSet<Hash>>,
+    /// Objects a CAS write is currently between its first byte and its commit.
+    ///
+    /// The collector and the writers agree about *rows* — every blob row goes
+    /// through the one connection — and did not agree about *bytes*.
+    /// `write_slice` and `write_proof` do all their file IO with no lock held
+    /// (creating, growing, decoding, two fsyncs and two parent fsyncs) and only
+    /// then take the connection to commit the bitmap. So a sweep could decide an
+    /// object was collectable, delete its row, unlink its files, and have the
+    /// writer's commit land *after* the unlinks — leaving a row that claims
+    /// verified groups with no payload behind them. That state advertises the
+    /// object to the whole membership through `local_ad`, fails every read, and
+    /// self-heals never: `gc_content` skips it because an entry names it,
+    /// `gc_orphans` skips it because it *has* a row, and `write_slice`
+    /// early-returns when the row says complete.
+    ///
+    /// `delete_blob_if_collectable` held its guard across the unlinks to close
+    /// exactly this window and could not: holding it only forces the writer's
+    /// commit to land later, which is the wrong side. What was missing is a fact
+    /// the collector could read — "somebody is writing this object" — so here it
+    /// is. Held for the whole write, consulted by both sweeps under the
+    /// connection guard, and in memory because the CAS has one writer process:
+    /// the daemon.
+    writing: Mutex<std::collections::HashMap<Hash, usize>>,
+}
+
+/// Marks an object as being written, until dropped.
+///
+/// A count rather than a flag: two fetches of one root — a mirror pass and a
+/// `synch cat`, say — overlap legitimately, and the first to finish must not
+/// clear the mark the second is relying on.
+#[derive(Debug)]
+pub struct WriteLease<'a> {
+    store: &'a Store,
+    root: Hash,
+}
+
+impl Drop for WriteLease<'_> {
+    fn drop(&mut self) {
+        let mut writing = self.store.writing();
+        if let Some(count) = writing.get_mut(&self.root) {
+            *count -= 1;
+            if *count == 0 {
+                writing.remove(&self.root);
+            }
+        }
+    }
 }
 
 /// How many roots the completeness memo holds before it is dropped wholesale.
@@ -217,6 +263,7 @@ impl Store {
             conn: Mutex::new(conn),
             data_dir,
             complete_roots: Mutex::new(std::collections::HashSet::new()),
+            writing: Mutex::new(std::collections::HashMap::new()),
         };
         store.init()?;
         // WAL/SHM sidecars are created by `init` (WAL mode); tighten them too.
@@ -234,6 +281,7 @@ impl Store {
             conn: Mutex::new(Connection::open_in_memory()?),
             data_dir,
             complete_roots: Mutex::new(std::collections::HashSet::new()),
+            writing: Mutex::new(std::collections::HashMap::new()),
         };
         store.init()?;
         Ok(store)
@@ -739,6 +787,33 @@ impl Store {
         self.complete_roots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn writing(&self) -> MutexGuard<'_, std::collections::HashMap<Hash, usize>> {
+        self.writing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Marks `root` as being written until the returned lease is dropped.
+    ///
+    /// Taken *before* the first byte and held past the commit, which is what
+    /// makes the mark meaningful: a sweep that reads it while holding the
+    /// connection guard either sees the mark — and leaves the object alone — or
+    /// runs entirely before the writer started, in which case the writer opens
+    /// the payload fresh and its row describes what it actually wrote.
+    pub(crate) fn lease_write(&self, root: &Hash) -> WriteLease<'_> {
+        *self.writing().entry(*root).or_insert(0) += 1;
+        WriteLease {
+            store: self,
+            root: *root,
+        }
+    }
+
+    /// True if a CAS write is in flight for `root`.
+    ///
+    /// Read by both sweeps while they hold the connection guard, so the answer
+    /// cannot go stale between the decision and the unlink.
+    pub(crate) fn is_being_written(&self, root: &Hash) -> bool {
+        self.writing().contains_key(root)
     }
 
     /// Keeps only the memo entries for roots still in the retained set.

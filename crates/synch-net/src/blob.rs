@@ -365,8 +365,19 @@ impl BlobClient {
     /// range is walked window by window; each is verified and committed as it
     /// arrives, so an interrupted descent keeps what it proved.
     ///
-    /// Returns the proven subtrees and the ranges they cover — which may be
-    /// less than was asked for, when the provider holds less than that.
+    /// Accumulates into `out`, which the caller owns, and reports how the
+    /// descent ended.
+    ///
+    /// The accumulator is the caller's because a failure part-way through must
+    /// not throw away what was already proven. It used to: a `?` on a later
+    /// window discarded the whole `ProofOutcome`, including every
+    /// `ProvenSubtree` — and a `ProvenSubtree` is the only thing `Store::promote`
+    /// can act on, since nothing reads the committed outboard nodes back into
+    /// one. So the doc claim that "an interrupted descent keeps what it proved"
+    /// was true of the *store* and false of the caller: a provider stalling on
+    /// window 31 of 32 lost the other 30, and a reproducibly slow provider that
+    /// ranks first turned the descent into a full transfer with no line saying
+    /// so.
     pub async fn fetch_proof_into(
         &self,
         store: &Arc<Store>,
@@ -374,12 +385,9 @@ impl BlobClient {
         size: u64,
         ranges: &ChunkRanges,
         level: u8,
-    ) -> Result<ProofOutcome, NetError> {
+        out: &mut ProofOutcome,
+    ) -> Result<(), NetError> {
         let mut remaining = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
-        let mut out = ProofOutcome {
-            proven: Proven::none(root, size),
-            served: ChunkRanges::empty(),
-        };
         let mut barren = 0u32;
         while !remaining.is_empty() {
             // The window is the *requester's* to choose, and it is chosen so
@@ -438,7 +446,7 @@ impl BlobClient {
             out.served = out.served.union(&served);
             out.proven.absorb(proven)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Requests a slice and commits it to the local CAS, verifying every group
@@ -449,15 +457,19 @@ impl BlobClient {
     /// covered — which is what lets an object bigger than one frame transfer at
     /// all. Each window is committed as it arrives, so an interrupted fetch
     /// keeps everything it verified.
+    /// Accumulates into `got`, which the caller owns, so a failure part-way
+    /// through does not lose the windows already committed: the groups are in the
+    /// bitmap either way, and a caller that had to rediscover that asked another
+    /// provider for bytes this node already held and re-decoded them.
     pub async fn fetch_into(
         &self,
         store: &Arc<Store>,
         root: Hash,
         size: u64,
         ranges: &ChunkRanges,
-    ) -> Result<ChunkRanges, NetError> {
+        got: &mut ChunkRanges,
+    ) -> Result<(), NetError> {
         let mut remaining = ChunkRanges::from_ranges(ranges.ranges.iter().copied());
-        let mut got = ChunkRanges::empty();
         let mut barren = 0u32;
         while !remaining.is_empty() {
             let window = remaining.take(MAX_SLICE_GROUPS);
@@ -488,9 +500,9 @@ impl BlobClient {
                 Ok(store.write_slice(&root, size, &served, &encoded, now_ns())?)
             })
             .await?;
-            got = got.union(&written);
+            *got = got.union(&written);
         }
-        Ok(got)
+        Ok(())
     }
 }
 
@@ -604,9 +616,20 @@ mod tests {
         let dialer = bare_endpoint(ALPN_BLOB).await;
         let connection = dialer.connect(addr, ALPN_BLOB).await.unwrap();
         let client = BlobClient::new(connection);
-        let outcome = tokio::time::timeout(
+        let mut outcome = ProofOutcome {
+            proven: Proven::none(root, size),
+            served: ChunkRanges::empty(),
+        };
+        tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            client.fetch_proof_into(&fetcher, root, size, &ChunkRanges::single(0, groups), 0),
+            client.fetch_proof_into(
+                &fetcher,
+                root,
+                size,
+                &ChunkRanges::single(0, groups),
+                0,
+                &mut outcome,
+            ),
         )
         .await
         .expect("the descent must not run for one round trip per group")

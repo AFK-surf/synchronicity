@@ -73,6 +73,7 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "history records local receipt",
         run: v12_history_recorded_at,
     },
+    Migration::Sql(V13_PROVIDERS_BY_ORIGIN),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -476,6 +477,19 @@ fn v12_history_recorded_at(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// v13 — `blob_providers` is indexed by origin as well as by object.
+///
+/// `PRIMARY KEY (object_root, origin_id)` serves "who advertises this object?"
+/// and nothing serves "what does this origin advertise?", which is a full table
+/// scan over *objects × advertising origins*. Two readers ask it:
+/// `provider_roots_for_origin`, once per maintenance pass, and
+/// `delete_origin_providers`, once per origin inside `doctor --rebuild`'s write
+/// transaction — so the rebuild was one scan per origin, holding the write
+/// connection throughout. `entries` has had both a covering primary key and a
+/// secondary index from the start; this table got neither.
+const V13_PROVIDERS_BY_ORIGIN: &str =
+    "CREATE INDEX blob_providers_by_origin ON blob_providers (origin_id);";
+
 /// The §10 schema as the design document states it — the shape replaying the
 /// whole chain must produce.
 ///
@@ -544,6 +558,7 @@ CREATE TABLE blob_providers (
   spans       BLOB,
   PRIMARY KEY (object_root, origin_id)
 );
+CREATE INDEX blob_providers_by_origin ON blob_providers (origin_id);
 CREATE TABLE blobs (
   root        BLOB PRIMARY KEY,
   size        INTEGER NOT NULL,
