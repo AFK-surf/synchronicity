@@ -1,4 +1,6 @@
+import api/agent
 import api/auth_api
+import api/browse_api
 import api/router
 import auth/google
 import auth/session
@@ -8,6 +10,7 @@ import dns/wire
 import email/mailer
 import exception
 import fixtures.{nk, now_unix, tmp_db}
+import gleam/erlang/process
 import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
 import gleam/list
@@ -68,6 +71,7 @@ fn harness_sized(pool_size: Int) -> Harness {
       "ds",
       Some(auth),
       router.ServingZone(serve.Serving(dns_pool, apex)),
+      None,
     ),
     db_path,
     token,
@@ -152,6 +156,158 @@ pub fn auth_methods_lists_only_configured_test() {
   let both = read(mailing)
   assert string.contains(both, "\"google\":true")
   assert string.contains(both, "\"magic_link\":true")
+}
+
+/// With `CP_BROWSE` off the browse routes do not exist. Not mounted and
+/// refusing — absent, the same answer a replica gives for the whole product
+/// API, so a deployment that has not turned the feature on has no surface to
+/// have got wrong.
+pub fn browse_routes_are_absent_unless_the_feature_is_on_test() {
+  let h = harness()
+  let assert Ok(_) =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    )
+    |> fn(r) {
+      case r.status {
+        200 -> Ok(Nil)
+        _ -> Error(Nil)
+      }
+    }
+  let assert Ok(_) =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    )
+    |> fn(r) {
+      case r.status {
+        200 -> Ok(Nil)
+        _ -> Error(Nil)
+      }
+    }
+  for_each_browse_route(fn(method, path) {
+    let resp = case method {
+      Get -> call(h, authed(h, Get, path))
+      _ ->
+        call_json(h, method, path, json.object([#("enabled", json.bool(True))]))
+    }
+    assert resp.status == 404
+  })
+}
+
+/// Every route the feature adds, so a new one cannot be added without
+/// deciding what it does with the feature off.
+fn for_each_browse_route(check: fn(http.Method, String) -> Nil) -> Nil {
+  let base = "/api/orgs/acme/networks/prod/browse"
+  check(Get, base)
+  check(Get, base <> "/ls?space=media&path=")
+  check(Get, base <> "/stat?space=media&path=a.txt")
+  check(Put, base <> "/enabled")
+}
+
+/// With it on: the org's switch is off until an admin flips it, flipping it
+/// is audited, and a network nobody has attached to answers honestly rather
+/// than emptily.
+pub fn the_org_switch_gates_browsing_test() {
+  let h = harness()
+  let name = process.new_name("cp_agents_test")
+  let assert Ok(_) = agent.start(name)
+  let ctx =
+    router.Context(
+      ..h.ctx,
+      browse: Some(browse_api.Browse(name, "https://cp.test/agent/v1/attach")),
+    )
+  let browsing = Harness(..h, ctx: ctx)
+  let assert Ok(_) =
+    call_json(
+      browsing,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    )
+    |> fn(r) {
+      case r.status {
+        200 -> Ok(Nil)
+        _ -> Error(Nil)
+      }
+    }
+  let assert Ok(_) =
+    call_json(
+      browsing,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    )
+    |> fn(r) {
+      case r.status {
+        200 -> Ok(Nil)
+        _ -> Error(Nil)
+      }
+    }
+
+  // Off by default, and a listing against a disabled network says so rather
+  // than answering empty.
+  let status =
+    call(browsing, authed(browsing, Get, "/api/orgs/acme/networks/prod/browse"))
+  assert status.status == 200
+  assert string.contains(simulate.read_body(status), "\"enabled\":false")
+  let listing =
+    call(
+      browsing,
+      authed(
+        browsing,
+        Get,
+        "/api/orgs/acme/networks/prod/browse/ls?space=media&path=",
+      ),
+    )
+  assert listing.status == 409
+
+  // The admin flips it. Not a zone change: no soa_serial in the answer.
+  let flipped =
+    call_json(
+      browsing,
+      Put,
+      "/api/orgs/acme/networks/prod/browse/enabled",
+      json.object([#("enabled", json.bool(True))]),
+    )
+  assert flipped.status == 200
+  assert !string.contains(simulate.read_body(flipped), "soa_serial")
+
+  // Enabled but with nothing attached, which is the other half of the
+  // two-key opt-in and reads differently from "disabled".
+  let listing =
+    call(
+      browsing,
+      authed(
+        browsing,
+        Get,
+        "/api/orgs/acme/networks/prod/browse/ls?space=media&path=",
+      ),
+    )
+  assert listing.status == 503
+  assert string.contains(simulate.read_body(listing), "no-device-attached")
+
+  // And the flip is in the audit trail the org already reads.
+  let conn = read_db(browsing)
+  let assert Ok([[sqlite.Text(action)]]) =
+    sqlite.query(
+      conn,
+      "SELECT action FROM audit_log WHERE action LIKE 'browse.%'",
+      [],
+    )
+  sqlite.close(conn)
+  assert action == "browse.enable"
 }
 
 pub fn unauthenticated_api_test() {
@@ -681,7 +837,7 @@ pub fn mutation_visible_to_dns_immediately_test() {
   // The DNS path reads the same database the mutation committed to: the
   // device's membership record resolves on the very next query, through
   // the same pooled serving path the real servers use.
-  let assert router.Context(_, _, _, router.ServingZone(serving)) = h.ctx
+  let assert router.Context(_, _, _, router.ServingZone(serving), _) = h.ctx
   let assert Ok(qname) =
     dns_name.parse("_synchronicity.prod.snaporg.sync.test.")
   let question = <<
@@ -731,7 +887,7 @@ pub fn with_db_discards_conn_on_panic_test() {
   // close stands between a panicking handler and a csqlite process
   // holding the write lock for the life of the HTTP connection.
   let h = harness()
-  let assert router.Context(_, _, Some(auth), _) = h.ctx
+  let assert router.Context(_, _, Some(auth), _, _) = h.ctx
   let _ =
     exception.rescue(fn() {
       auth_api.with_db(auth, fn(conn) {

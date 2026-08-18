@@ -1,0 +1,396 @@
+//// The browse API: what a dashboard reads, relayed from an attached daemon.
+////
+//// Primary only, GET only, and never a byte of file content stored here.
+//// Every route resolves its org and network on a pooled connection, hands
+//// that connection back, and only then talks to a daemon — a round trip to
+//// somebody's LAN is far too long to hold a connection across.
+////
+//// Space and path travel as query parameters, never path segments: a file
+//// path may contain anything, which is the same lesson the S3 gateway learnt
+//// when it stopped putting keys through the CLI's text parser.
+
+import api/agent.{type Session}
+import api/auth_api.{type AuthContext}
+import api/common.{Admin, Member, audit, check_org, db_error, ok_json}
+import api/middleware.{error_json, now_unix}
+import auth/session.{type Session as UserSession}
+import gleam/dynamic/decode
+import gleam/erlang/process.{type Name}
+import gleam/json.{type Json}
+import gleam/list
+import gleam/result
+import store/pool
+import store/sqlite.{type Connection, Int as VInt, Text}
+import wisp.{type Request, type Response}
+
+/// What a browse route needs beyond the ordinary API context: where the live
+/// sessions are.
+pub type Browse {
+  Browse(registry: Name(agent.Msg), attach_url: String)
+}
+
+/// The durable facts a browse call turns on.
+type Network {
+  Network(org_id: String, network_id: String, enabled: Bool)
+}
+
+// -- status ------------------------------------------------------------------
+
+/// Whether browsing is on for this network, and which daemons are attached.
+///
+/// The observability surface for the feature: attach count, per-session
+/// spaces, protocol version, attach time.
+pub fn status(
+  ctx: AuthContext,
+  browse: Browse,
+  live: UserSession,
+  slug: String,
+  network: String,
+) -> Response {
+  use net <- with_network(ctx, live, slug, network, Member)
+  let sessions = attached(browse, net)
+  ok_json(
+    json.object([
+      #("enabled", json.bool(net.enabled)),
+      #("devices", json.array(sessions, agent.session_json)),
+      #("attach_url", json.string(browse.attach_url)),
+    ]),
+  )
+}
+
+// -- listing -----------------------------------------------------------------
+
+/// One directory of the unified tree.
+pub fn ls(
+  req: Request,
+  ctx: AuthContext,
+  browse: Browse,
+  live: UserSession,
+  slug: String,
+  network: String,
+) -> Response {
+  use net <- with_network(ctx, live, slug, network, Member)
+  let space = query(req, "space")
+  let path = query(req, "path")
+  use session <- serving(browse, net, space)
+  let question =
+    agent.Ls(space, path, query(req, "cursor"), query(req, "all") == "1")
+  case agent.ask(session, question) {
+    Ok(agent.Listing(entries, cursor)) ->
+      ok_json(
+        json.object([
+          #("device", json.string(session.label)),
+          #("space", json.string(space)),
+          #("path", json.string(path)),
+          #("entries", json.array(entries, entry_json)),
+          #("cursor", json.string(cursor)),
+        ]),
+      )
+    Ok(_) ->
+      error_json(502, "internal", "the daemon answered the wrong question")
+    Error(refusal) -> relayed(refusal)
+  }
+}
+
+/// Every version of one path, with its attestors — the version inspector.
+pub fn stat(
+  req: Request,
+  ctx: AuthContext,
+  browse: Browse,
+  live: UserSession,
+  slug: String,
+  network: String,
+) -> Response {
+  use net <- with_network(ctx, live, slug, network, Member)
+  let space = query(req, "space")
+  let path = query(req, "path")
+  use session <- serving(browse, net, space)
+  case agent.ask(session, agent.Stat(space, path)) {
+    Ok(agent.Versions(versions)) ->
+      ok_json(
+        json.object([
+          #("device", json.string(session.label)),
+          #("space", json.string(space)),
+          #("path", json.string(path)),
+          #("versions", json.array(versions, version_json)),
+        ]),
+      )
+    Ok(_) ->
+      error_json(502, "internal", "the daemon answered the wrong question")
+    Error(refusal) -> relayed(refusal)
+  }
+}
+
+// -- the org's switch --------------------------------------------------------
+
+/// Turns browsing on or off for one network.
+///
+/// Not a zone change: the apex record is deployment-wide, and this is a
+/// serving-side decision the control plane enforces the instant it changes —
+/// which is why turning it off drops the network's live sessions in the same
+/// request rather than waiting out a TTL.
+pub fn set_enabled(
+  req: Request,
+  ctx: AuthContext,
+  browse: Browse,
+  live: UserSession,
+  slug: String,
+  network: String,
+) -> Response {
+  let decoder = {
+    use enabled <- decode.field("enabled", decode.bool)
+    decode.success(enabled)
+  }
+  use enabled <- common.body_decoder(req, decoder)
+  use net <- with_network(ctx, live, slug, network, Admin)
+  let written =
+    pool.with_connection(ctx.pool, fn(conn) {
+      common.transaction(conn, fn() {
+        case
+          sqlite.exec(
+            conn,
+            "UPDATE networks SET browse_enabled = ? WHERE id = ?",
+            [
+              VInt(case enabled {
+                True -> 1
+                False -> 0
+              }),
+              Text(net.network_id),
+            ],
+          )
+        {
+          Ok(_) ->
+            audit(
+              conn,
+              live.user_id,
+              net.org_id,
+              case enabled {
+                True -> "browse.enable"
+                False -> "browse.disable"
+              },
+              json.object([#("network", json.string(network))]),
+            )
+            |> result.replace(Nil)
+            |> result.map_error(fn(_) { db_error() })
+          Error(e) -> Error(common.constraint_response(e))
+        }
+      })
+    })
+  case written {
+    Ok(Ok(Nil)) -> {
+      // After the commit, and unconditionally on the off path: a session that
+      // outlived the switch would keep answering for a network the org has
+      // just said may not be browsed.
+      case enabled {
+        False ->
+          agent.drop_network(
+            process.named_subject(browse.registry),
+            net.network_id,
+          )
+        True -> Nil
+      }
+      ok_json(
+        json.object([
+          #("ok", json.bool(True)),
+          #("enabled", json.bool(enabled)),
+        ]),
+      )
+    }
+    Ok(Error(refusal)) -> refusal
+    Error(_) -> db_error()
+  }
+}
+
+// -- plumbing ----------------------------------------------------------------
+
+/// Resolves the org, the role floor and the network, giving the connection
+/// back before `next` runs.
+fn with_network(
+  ctx: AuthContext,
+  live: UserSession,
+  slug: String,
+  network: String,
+  minimum: common.Role,
+  next: fn(Network) -> Response,
+) -> Response {
+  let looked =
+    pool.with_connection(ctx.pool, fn(conn) {
+      resolve(conn, slug, network, live.user_id, minimum)
+    })
+  case looked {
+    Ok(Ok(net)) -> next(net)
+    Ok(Error(refusal)) -> refusal
+    Error(_) -> db_error()
+  }
+}
+
+fn resolve(
+  conn: Connection,
+  slug: String,
+  network: String,
+  user_id: String,
+  minimum: common.Role,
+) -> Result(Network, Response) {
+  use #(org_id, _role) <- result.try(check_org(conn, slug, user_id, minimum))
+  case
+    sqlite.query(
+      conn,
+      "SELECT id, browse_enabled FROM networks WHERE org_id = ? AND name = ?",
+      [Text(org_id), Text(network)],
+    )
+  {
+    Ok([[Text(network_id), VInt(enabled)]]) ->
+      Ok(Network(org_id, network_id, enabled != 0))
+    Ok(_) -> Error(error_json(404, "not_found", "no such network"))
+    Error(_) -> Error(db_error())
+  }
+}
+
+/// The sessions attached for a network, or none when browsing is off — a
+/// disabled network has nothing attached to it as far as this API is
+/// concerned, whatever a stale connection might still be holding open.
+fn attached(browse: Browse, net: Network) -> List(Session) {
+  case net.enabled {
+    False -> []
+    True ->
+      agent.sessions_for(process.named_subject(browse.registry), net.network_id)
+  }
+}
+
+/// Picks the daemon that will answer, and refuses honestly when none can.
+///
+/// Both ends enforce the space allowlist: the daemon re-checks it on every
+/// frame, and this refuses a space no attached daemon exposed — so neither
+/// side has to trust the other to have done it.
+fn serving(
+  browse: Browse,
+  net: Network,
+  space: String,
+  next: fn(Session) -> Response,
+) -> Response {
+  case net.enabled, space {
+    False, _ ->
+      error_json(
+        409,
+        "browse-disabled",
+        "file browsing is not enabled for this network",
+      )
+    _, "" -> error_json(400, "bad_request", "space= is required")
+    True, _ ->
+      case list.filter(attached(browse, net), agent.exposes(_, space)) {
+        [session, ..] -> next(session)
+        [] ->
+          error_json(
+            503,
+            "no-device-attached",
+            "no attached daemon exposes " <> space,
+          )
+      }
+  }
+}
+
+/// The facts a download needs, resolved the same way every other route
+/// resolves them: the same RBAC, the same 404 for a network the caller cannot
+/// see, and the same connection handed back before anything slow happens.
+///
+/// It exists because the download route lives below wisp — it streams, and
+/// wisp has no streaming body — so it cannot use the continuation form above.
+pub fn for_download(
+  db: pool.Pool,
+  user_id: String,
+  slug: String,
+  network: String,
+) -> Result(#(String, String, Bool), Nil) {
+  case
+    pool.with_connection(db, fn(conn) {
+      resolve(conn, slug, network, user_id, Member)
+    })
+  {
+    Ok(Ok(net)) -> Ok(#(net.org_id, net.network_id, net.enabled))
+    _ -> Error(Nil)
+  }
+}
+
+/// The registry a browse context addresses.
+pub fn registry(browse: Browse) -> process.Subject(agent.Msg) {
+  process.named_subject(browse.registry)
+}
+
+/// A daemon's coded refusal, as an HTTP status a browser can act on.
+fn relayed(refusal: agent.Refusal) -> Response {
+  let status = case refusal.code {
+    "not-found" -> 404
+    "invalid" -> 400
+    "divergent" -> 409
+    "unavailable" -> 503
+    _ -> 502
+  }
+  error_json(status, refusal.code, refusal.message)
+}
+
+fn query(req: Request, key: String) -> String {
+  wisp.get_query(req) |> list.key_find(key) |> result.unwrap("")
+}
+
+fn entry_json(entry: agent.Entry) -> Json {
+  json.object([
+    #("name", json.string(entry.name)),
+    #("path", json.string(entry.path)),
+    #("kind", json.string(entry.kind)),
+    #("size", json.int(entry.size)),
+    #("mtime_ns", json.int(entry.mtime_ns)),
+    #("versions", json.int(entry.versions)),
+    #("origin", json.string(entry.origin)),
+    #("root", json.string(entry.root)),
+    #("all", json.array(entry.all, version_json)),
+  ])
+}
+
+fn version_json(version: agent.Version) -> Json {
+  json.object([
+    #("root", json.string(version.root)),
+    #("kind", json.string(version.kind)),
+    #("symlink_target", json.string(version.symlink_target)),
+    #("size", json.int(version.size)),
+    #("mtime_ns", json.int(version.mtime_ns)),
+    #("seq", json.int(version.seq)),
+    #("attestors", json.array(version.attestors, json.string)),
+  ])
+}
+
+/// Records one download in the org's audit trail.
+///
+/// The row names the user, the network, the space, the path, the version root
+/// served and the bytes that reached the client — enough to answer "who read
+/// what" from the same table and the same UI the org already reads.
+pub fn audit_download(
+  db: pool.Pool,
+  user_id: String,
+  org_id: String,
+  network: String,
+  space: String,
+  path: String,
+  root: String,
+  bytes: Int,
+  outcome: String,
+) -> Nil {
+  let _ =
+    pool.with_connection(db, fn(conn) {
+      audit(
+        conn,
+        user_id,
+        org_id,
+        "browse.download",
+        json.object([
+          #("network", json.string(network)),
+          #("space", json.string(space)),
+          #("path", json.string(path)),
+          #("root", json.string(root)),
+          #("bytes", json.int(bytes)),
+          #("outcome", json.string(outcome)),
+          #("at", json.int(now_unix())),
+        ]),
+      )
+    })
+  Nil
+}

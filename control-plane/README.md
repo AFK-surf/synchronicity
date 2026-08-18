@@ -61,6 +61,16 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   a session exists. Magic links stay on the page when nothing else is
   configured, mail relay or not: an empty login screen is worse than a
   link the operator reads off the service log.
+- **Cloud browse** (`CP_BROWSE=on`, off by default) lets the dashboard read
+  a cluster's files. Nodes are unreachable from here, so the connection is
+  one they open: a daemon with `synch cloud enable --space <id>` discovers
+  this deployment from `_synchronicity-cp.<apex>` in the zone it already
+  DNSSEC-validates, dials out over WSS, and proves itself with the device
+  key this service already publishes. It is read-only by construction — the
+  tunnel encodes no write opcode and the API is GET-only — and fail-closed
+  twice over: an org admin must enable browsing for the network *and* a node
+  operator must name the spaces. File bytes pass through this service's
+  memory in bounded chunks and are never stored.
 
 ## Stack
 
@@ -239,6 +249,7 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Unset — the normal case — the shard in service is read from the stored `trusted_root.json`, so a Sigstore rotation costs a metadata refresh and not a release. |
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key — a PEM `PUBLIC KEY` block or one base64 SubjectPublicKeyInfo, `#` starting a comment. Exactly one key: this service submits to one log and stores the proof under that log's id. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
+| `CP_BROWSE` | primary | `on` or `off` (the default). `on` mounts the daemon attach endpoint at `/agent/v1/attach`, the read-only browse API, and publishes `_synchronicity-cp.<base> TXT "v=synccp1 url=<CP_PUBLIC_URL>"` at the apex so a daemon finds this deployment from the zone it already validates. Requires `CP_PUBLIC_URL` — the record names it and attaching daemons sign their proof over it — and is refused on a replica. Per-network enablement is a separate switch (`PUT /api/orgs/:slug/networks/:net/browse/enabled`, admin) that is off for every network until an org admin turns it on, and never reaches DNS. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
 
 Day-2 operations (replicas, key ceremony, backups) live in

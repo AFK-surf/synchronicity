@@ -2,6 +2,7 @@
 //// nameservers are and which membership records each network publishes.
 //// Everything downstream (build, sign, serve) is pure functions of this.
 
+import config
 import dns/name.{type Name}
 import dns/rdata
 import dnssec/keys
@@ -67,6 +68,13 @@ pub type ZoneInput {
     /// reported rather than silent when it is not, because a cap nobody is
     /// told about is how a zone quietly stops covering a live key.
     rekor_shed: Int,
+    /// The attach endpoint the apex publishes (`_synchronicity-cp`), or `""`
+    /// when `CP_BROWSE` is off and the name does not exist at all.
+    ///
+    /// A deployment fact and not a policy: it says *this base's control plane
+    /// attaches here*, never which network may be browsed. Which network may
+    /// is `networks.browse_enabled`, enforced at the endpoint.
+    browse_url: String,
   )
 }
 
@@ -98,7 +106,14 @@ pub fn read(conn: Connection) -> Result(ZoneInput, ModelError) {
   use txt_names <- result.try(read_txt_names(conn, meta.apex))
   use live_keys <- result.try(live_keys(conn, meta))
   use #(rekor_proofs, shed) <- result.try(read_rekor_proofs(conn, live_keys))
-  Ok(ZoneInput(meta, ns_hosts, txt_names, rekor_proofs, shed))
+  Ok(ZoneInput(
+    meta,
+    ns_hosts,
+    txt_names,
+    rekor_proofs,
+    shed,
+    config.browse_endpoint(),
+  ))
 }
 
 /// The digests of the DNSKEY rdata this zone currently publishes — what the

@@ -108,8 +108,23 @@ pub fn render_gated(
       ttl_declaration,
       rdata.transparency_text,
     )
+  // Conditional, unlike the declaration: with the feature off there is no
+  // endpoint to name, and the reconciler removes the record as it removes any
+  // other record the desired set stopped containing.
+  let browse = case input.browse_url {
+    "" -> []
+    url -> [
+      Record(
+        rdata.browse_label <> "." <> apex,
+        provider.Txt,
+        ttl_data,
+        rdata.synccp1_text(url),
+      ),
+    ]
+  }
   Ok(sort(
     [diff.owner_record(apex), transparency, ..members]
+    |> list.append(browse)
     |> list.append(rekor),
   ))
 }

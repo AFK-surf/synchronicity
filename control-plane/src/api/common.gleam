@@ -54,6 +54,25 @@ pub fn require_org(
   minimum: Role,
   next: fn(String, Role) -> Response,
 ) -> Response {
+  case check_org(conn, slug, user_id, minimum) {
+    Ok(#(org_id, role)) -> next(org_id, role)
+    Error(refusal) -> refusal
+  }
+}
+
+/// `require_org` for a caller that must hand its connection back before it
+/// does its work.
+///
+/// The browse API is that caller: its work is a round trip to a daemon on
+/// somebody's LAN, and holding a pooled connection across one would put the
+/// whole pool behind the slowest cluster on the internet — the same reasoning
+/// `router.with_session` spells out for sessions.
+pub fn check_org(
+  conn: Connection,
+  slug: String,
+  user_id: String,
+  minimum: Role,
+) -> Result(#(String, Role), Response) {
   let lookup =
     sqlite.query(
       conn,
@@ -67,18 +86,18 @@ pub fn require_org(
       case role_from_string(role_text) {
         Ok(role) ->
           case rank(role) >= rank(minimum) {
-            True -> next(org_id, role)
+            True -> Ok(#(org_id, role))
             False ->
-              error_json(
+              Error(error_json(
                 403,
                 "forbidden",
                 "requires " <> role_to_string(minimum) <> " role",
-              )
+              ))
           }
-        Error(Nil) -> error_json(500, "internal", "corrupt role")
+        Error(Nil) -> Error(error_json(500, "internal", "corrupt role"))
       }
-    Ok(_) -> error_json(404, "not_found", "no such org")
-    Error(_) -> db_error()
+    Ok(_) -> Error(error_json(404, "not_found", "no such org"))
+    Error(_) -> Error(db_error())
   }
 }
 

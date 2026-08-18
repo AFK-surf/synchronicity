@@ -18,7 +18,10 @@
 ////   seed-admin <email>    first-user bootstrap: print a one-time magic link
 ////   migrate-check         replay the migration chain against a scratch DB
 
+import api/agent
 import api/auth_api
+import api/browse_api
+import api/edge
 import api/router
 import auth/github
 import auth/google
@@ -303,6 +306,20 @@ fn prepare_primary(cfg: Config) -> Result(keys.Csk, String) {
   Ok(csk)
 }
 
+/// The browse surface a deployment offers, or `option.None` with `CP_BROWSE`
+/// off — which is how every route, the tunnel and the apex record disappear
+/// together rather than one of them being left behind.
+fn browse_surface(
+  cfg: Config,
+  agents: process.Name(agent.Msg),
+) -> option.Option(browse_api.Browse) {
+  case cfg.browse {
+    True ->
+      option.Some(browse_api.Browse(agents, agent.attach_url(cfg.public_url)))
+    False -> option.None
+  }
+}
+
 fn serve() -> Result(Nil, String) {
   use cfg <- result.try(config.load())
   case cfg.role, cfg.dns_mode {
@@ -352,6 +369,7 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       keys.ds_line(meta.apex, meta.dnskey_public),
       option.None,
       router.ServingZone(serving),
+      option.None,
     )
   let handler = fn(req) { router.handle(req, ctx) }
   let http =
@@ -410,9 +428,11 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   let api_name = process.new_name("cp_api_pool")
   let dns_name = process.new_name("cp_dns_pool")
   let udp_name = process.new_name("cp_udp_server")
+  let agents_name = process.new_name("cp_agents")
   let api_pool = pool.handle(api_name, db.primary_pragmas)
   let dns_pool = pool.handle(dns_name, db.read_pragmas)
   let serving = dns_serve.Serving(dns_pool, apex)
+  let browse = browse_surface(cfg, agents_name)
   let auth =
     auth_api.AuthContext(
       api_pool,
@@ -432,10 +452,12 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       keys.ds_line(apex, csk.public),
       option.Some(auth),
       router.ServingZone(serving),
+      browse,
     )
   let handler = fn(req) { router.handle(req, ctx) }
   let http =
     wisp_mist.handler(handler, cfg.session_secret)
+    |> edge.handler(edge.surface(browse, api_pool, cfg.session_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)
@@ -470,6 +492,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
       cfg.dns_listen.port,
       serving,
     ))
+    |> sup.add(agent.supervised(agents_name))
     |> sup.add(mist.supervised(http))
     |> sup.add(resign.supervised(cfg.db_path, csk))
     |> sup.start
@@ -529,7 +552,9 @@ fn serve_external(
   io.println("mailer: " <> mailer.describe(mail))
   let api_name = process.new_name("cp_api_pool")
   let sync_name = process.new_name("cp_provider_sync")
+  let agents_name = process.new_name("cp_agents")
   let api_pool = pool.handle(api_name, db.primary_pragmas)
+  let browse = browse_surface(cfg, agents_name)
   let auth =
     auth_api.AuthContext(
       api_pool,
@@ -547,10 +572,17 @@ fn serve_external(
       fn() { provider_sync.poke(sync_name) },
     )
   let ctx =
-    router.Context("", "", option.Some(auth), router.ExternalZone(api_pool))
+    router.Context(
+      "",
+      "",
+      option.Some(auth),
+      router.ExternalZone(api_pool),
+      browse,
+    )
   let handler = fn(req) { router.handle(req, ctx) }
   let http =
     wisp_mist.handler(handler, cfg.session_secret)
+    |> edge.handler(edge.surface(browse, api_pool, cfg.session_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)
@@ -564,6 +596,7 @@ fn serve_external(
       db.primary_pragmas,
       4,
     ))
+    |> sup.add(agent.supervised(agents_name))
     |> sup.add(mist.supervised(http))
     |> sup.add(provider_sync.supervised(
       sync_name,

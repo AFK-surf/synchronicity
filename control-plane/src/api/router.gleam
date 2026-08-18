@@ -7,6 +7,7 @@
 //// (router, middleware, common, static — static serves files, not an API).
 
 import api/auth_api.{type AuthContext}
+import api/browse_api.{type Browse}
 import api/devices_api
 import api/middleware
 import api/networks_api
@@ -44,6 +45,10 @@ pub type Context {
     /// needs no reload signal: every checkout reopens the database file,
     /// so an atomically renamed replacement is picked up on next use.
     zone: ZoneSurface,
+    /// Where the attached daemons are, with `CP_BROWSE=on`. Absent is how
+    /// the feature is off: the routes are not mounted at all, rather than
+    /// mounted and refusing.
+    browse: Option(Browse),
   )
 }
 
@@ -66,7 +71,7 @@ pub fn handle(req: Request, ctx: Context) -> Response {
       }
     ["auth", ..] | ["api", ..] ->
       case ctx.auth {
-        Some(auth) -> primary_routes(req, auth)
+        Some(auth) -> primary_routes(req, auth, ctx.browse)
         None -> wisp.not_found()
       }
     _ ->
@@ -78,7 +83,11 @@ pub fn handle(req: Request, ctx: Context) -> Response {
   }
 }
 
-fn primary_routes(req: Request, auth: AuthContext) -> Response {
+fn primary_routes(
+  req: Request,
+  auth: AuthContext,
+  browse: Option(Browse),
+) -> Response {
   case wisp.path_segments(req), req.method {
     ["auth", "oidc", org_slug], Get -> auth_api.oidc_start(req, auth, org_slug)
     ["auth", "callback", "oidc"], Get -> auth_api.oidc_callback(req, auth)
@@ -163,6 +172,27 @@ fn primary_routes(req: Request, auth: AuthContext) -> Response {
       networks_api.unassign_device(auth, live, slug, net, dev)
     }
 
+    ["api", "orgs", slug, "networks", net, "browse"], Get ->
+      with_browse(browse, fn(browse) {
+        use live <- with_session(req, auth)
+        browse_api.status(auth, browse, live, slug, net)
+      })
+    ["api", "orgs", slug, "networks", net, "browse", "ls"], Get ->
+      with_browse(browse, fn(browse) {
+        use live <- with_session(req, auth)
+        browse_api.ls(req, auth, browse, live, slug, net)
+      })
+    ["api", "orgs", slug, "networks", net, "browse", "stat"], Get ->
+      with_browse(browse, fn(browse) {
+        use live <- with_session(req, auth)
+        browse_api.stat(req, auth, browse, live, slug, net)
+      })
+    ["api", "orgs", slug, "networks", net, "browse", "enabled"], Put ->
+      with_browse(browse, fn(browse) {
+        use live <- with_session(req, auth)
+        browse_api.set_enabled(req, auth, browse, live, slug, net)
+      })
+
     ["api", "orgs", slug, "devices"], Get -> {
       use live <- with_session(req, auth)
       devices_api.list_devices(auth, live, slug)
@@ -189,10 +219,23 @@ fn primary_routes(req: Request, auth: AuthContext) -> Response {
     }
     ["api", "orgs", slug, "devices", dev, "keys", key, "revoke"], Post -> {
       use live <- with_session(req, auth)
-      devices_api.revoke_key(auth, live, slug, dev, key)
+      devices_api.revoke_key(auth, browse, live, slug, dev, key)
     }
 
     _, _ -> wisp.not_found()
+  }
+}
+
+/// The browse surface, or the 404 a deployment with `CP_BROWSE` off gives —
+/// the same answer a replica gives for the whole product API, and for the
+/// same reason: the route does not exist here.
+fn with_browse(
+  browse: Option(Browse),
+  next: fn(Browse) -> Response,
+) -> Response {
+  case browse {
+    Some(browse) -> next(browse)
+    None -> wisp.not_found()
   }
 }
 
