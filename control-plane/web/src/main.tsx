@@ -8,6 +8,7 @@ import { Login } from './pages/Login'
 import { InviteAccept } from './pages/InviteAccept'
 import { OrgHome } from './pages/OrgHome'
 import { NetworkDetail } from './pages/NetworkDetail'
+import { NetworkFiles } from './pages/NetworkFiles'
 import { Settings } from './pages/Settings'
 
 const queryClient = new QueryClient({
@@ -26,6 +27,10 @@ createRoot(document.getElementById('root')!).render(
             <Route path="pick" element={<OrgHome pick />} />
             <Route path="o/:slug" element={<OrgHome />} />
             <Route path="o/:slug/networks/:name" element={<NetworkDetail />} />
+            <Route
+              path="o/:slug/networks/:name/files"
+              element={<NetworkFiles />}
+            />
             <Route path="o/:slug/settings" element={<Settings />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />

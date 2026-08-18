@@ -140,3 +140,68 @@ export interface OidcConfig {
   token_endpoint: string
   discovered_at: number
 }
+
+// -- cloud browse -----------------------------------------------------------
+
+export interface BrowseDevice {
+  session: string
+  device: string
+  origin: string
+  spaces: string[]
+  protocol: number
+  attached_at: number
+}
+
+export interface BrowseStatus {
+  enabled: boolean
+  devices: BrowseDevice[]
+  attach_url: string
+}
+
+export interface BrowseVersion {
+  root: string
+  kind: string
+  symlink_target: string
+  size: number
+  mtime_ns: number
+  seq: number
+  attestors: string[]
+}
+
+export interface BrowseEntry {
+  name: string
+  path: string
+  kind: 'dir' | 'file' | 'symlink' | 'tombstone'
+  size: number
+  mtime_ns: number
+  versions: number
+  origin: string
+  root: string
+  all: BrowseVersion[]
+}
+
+export interface BrowseListing {
+  device: string
+  space: string
+  path: string
+  entries: BrowseEntry[]
+  cursor: string
+}
+
+export interface BrowseVersions {
+  device: string
+  space: string
+  path: string
+  versions: BrowseVersion[]
+}
+
+// Space and path are query parameters, never path segments: a file path may
+// contain anything, including the separators a route would split on.
+export function browseQuery(params: Record<string, string>): string {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== '') query.set(key, value)
+  }
+  const rendered = query.toString()
+  return rendered === '' ? '' : `?${rendered}`
+}

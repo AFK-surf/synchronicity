@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useParams } from 'react-router'
+import { Link, useParams } from 'react-router'
 import {
   get,
   send,
@@ -39,6 +39,14 @@ export function NetworkDetail() {
 
   return (
     <div className="space-y-8">
+      <nav className="text-sm">
+        <Link
+          to={`/o/${slug}/networks/${name}/files`}
+          className="text-teal-300 hover:underline"
+        >
+          Files →
+        </Link>
+      </nav>
       <ZoneStatus data={data} />
       <DeviceTable
         slug={slug}
