@@ -75,6 +75,47 @@ where
 /// spinning on the peers it is polling.
 const POLL_FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a stopping daemon waits for its calls to finish before it closes
+/// their connections anyway.
+///
+/// Every handler already ends itself when the stop arrives, so this is only the
+/// window their last frame flushes through — the backstop for one that cannot
+/// end itself, not a budget anything is expected to spend. The daemon's exit
+/// waits on it, so it is small on purpose: `synch daemon stop` competes with
+/// every other shutdown task for the operator's patience.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Runs a handler's work, giving it up when the daemon starts stopping.
+///
+/// A call must not be able to hold the shutdown open: `synch recover` waits an
+/// hour by default, and a gateway read lasts as long as its HTTP client cares
+/// to keep reading. Both would otherwise still be running — and still being
+/// waited for — long after the operator asked the daemon to stop.
+async fn until_stopped<F>(mut stopping: broadcast::Receiver<()>, work: F) -> Done
+where
+    F: std::future::Future<Output = Done>,
+{
+    tokio::select! {
+        done = work => done,
+        _ = stopping.recv() => Err(stopped()),
+    }
+}
+
+/// A spawned task that is cancelled when the handle goes out of scope.
+///
+/// Dropping a [`tokio::task::JoinHandle`] detaches its task instead of ending
+/// it, which is the wrong default for work that exists only to answer one
+/// call: a handler that is cancelled — the client hung up, the daemon is
+/// stopping — would leave it running against a node that is being shut down.
+#[derive(Debug)]
+struct Cancelling<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Cancelling<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The control server: a bound listener plus the node it serves.
 ///
 /// Binding is separate from running so a daemon can report that it is (or is
@@ -87,9 +128,12 @@ pub struct Server {
     stop: broadcast::Sender<()>,
     /// Subscribed at bind time, not at run time: a stop sent between the two
     /// would otherwise be sent to nobody and the server would wait forever.
+    /// One receiver per job that has to react to it.
     stopping: broadcast::Receiver<()>,
-    /// The same, for the loop that owns the listener.
+    /// The loop that owns the listener.
     accepting: broadcast::Receiver<()>,
+    /// The bound on how long the drain that follows may take.
+    draining: broadcast::Receiver<()>,
 }
 
 impl Server {
@@ -104,6 +148,7 @@ impl Server {
         let token = Arc::new(transport::write_token(&data_dir)?);
         let stopping = stop.subscribe();
         let accepting = stop.subscribe();
+        let draining = stop.subscribe();
         Ok(Server {
             node,
             listener,
@@ -111,6 +156,7 @@ impl Server {
             stop,
             stopping,
             accepting,
+            draining,
         })
     }
 
@@ -122,8 +168,11 @@ impl Server {
     /// Serves until `stop` fires — which `synch daemon stop` does by sending on
     /// the same channel.
     ///
-    /// The shutdown is graceful: a response already on its way out reaches its
-    /// client before the connection carrying it closes.
+    /// The shutdown drains rather than severs: a response on its way out
+    /// reaches its client before the connection carrying it closes. Draining is
+    /// bounded twice over — each handler gives up when the stop arrives, and a
+    /// grace period caps whatever that misses — so `run` returns, and the
+    /// daemon exits, however long the call it was serving would have taken.
     pub async fn run(self) -> std::io::Result<()> {
         let Server {
             node,
@@ -132,6 +181,7 @@ impl Server {
             stop,
             mut stopping,
             mut accepting,
+            mut draining,
         } = self;
 
         let (connections, incoming) = mpsc::channel::<std::io::Result<Accepted>>(ACCEPT_BACKLOG);
@@ -149,7 +199,9 @@ impl Server {
                     },
                 }
             }
-            // Dropping the listener is what takes the socket file with it.
+            // Handed back rather than dropped: the socket file goes with it,
+            // and it must outlive the drain below.
+            listener
         });
 
         let service = InterceptedService::new(
@@ -162,15 +214,40 @@ impl Server {
             Authenticate { token },
         );
 
-        let served = tonic::transport::Server::builder()
-            .add_service(service)
-            .serve_with_incoming_shutdown(ReceiverStream::new(incoming), async move {
-                let _ = stopping.recv().await;
-            })
-            .await;
+        // Scoped, so that whichever way the drain ends the server future is
+        // dropped here rather than left pinned. Giving up on it is not the same
+        // as ending it: it owns the connection tasks and the receiving half of
+        // `incoming`, and leaving it alive would strand the accept loop below
+        // in a send nobody will ever read.
+        let served = {
+            let serving = tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(ReceiverStream::new(incoming), async move {
+                    let _ = stopping.recv().await;
+                });
+            tokio::pin!(serving);
+            tokio::select! {
+                served = &mut serving => served,
+                _ = async {
+                    let _ = draining.recv().await;
+                    tokio::time::sleep(DRAIN_GRACE).await;
+                } => {
+                    tracing::warn!(
+                        "a control call was still running {}s after the stop; closing anyway",
+                        DRAIN_GRACE.as_secs()
+                    );
+                    Ok(())
+                }
+            }
+        };
 
-        let _ = accepts.await;
+        // The token goes first and the socket last, so the two are never both
+        // available to a replacement daemon: while `control.token` exists this
+        // socket is still bound, and a `Listener::bind` for this datadir is
+        // refused until the last of it is gone. The other order lets a
+        // replacement bind, mint its own token, and have this process delete it.
         transport::remove_token(&node.config().data_dir);
+        drop(accepts.await);
         served.map_err(std::io::Error::other)
     }
 }
@@ -289,10 +366,11 @@ impl Control for ControlService {
         let stops = matches!(command, Command::DaemonStop(_));
         let (tx, rx) = mpsc::channel(SEND_AHEAD);
         let node = self.node.clone();
+        let stopping = self.stop.subscribe();
         tokio::spawn(async move {
             let failed = {
                 let mut out = Frames { tx: tx.clone() };
-                dispatch(&node, command, &mut out).await
+                until_stopped(stopping, dispatch(&node, command, &mut out)).await
             };
             if let Err(error) = failed {
                 let _ = tx.send(Err(error.into())).await;
@@ -320,8 +398,14 @@ impl Control for ControlService {
             )
             .map_err(ControlError::from)?;
         let (tx, rx) = mpsc::channel(SEND_AHEAD);
+        let mut stopping = self.stop.subscribe();
         tokio::spawn(async move {
             for set in &listing {
+                // A listing of a large space outlives a stop otherwise.
+                if stopping.try_recv() != Err(broadcast::error::TryRecvError::Empty) {
+                    let _ = tx.send(Err(stopped().into())).await;
+                    return;
+                }
                 if !set.exists() {
                     // Every publisher has tombstoned it: the path has left the
                     // tree, so the tree does not list it.
@@ -380,9 +464,13 @@ impl Control for ControlService {
             .await
             .map_err(ControlError::from)?;
         let (tx, rx) = mpsc::channel(SEND_AHEAD);
+        let stopping = self.stop.subscribe();
         tokio::spawn(async move {
-            let mut out = Bytes::Chunks(&tx);
-            if let Err(error) = stream_range(&node, &mut out, range).await {
+            let read = async {
+                let mut out = Bytes::Chunks(&tx);
+                stream_range(&node, &mut out, range).await
+            };
+            if let Err(error) = until_stopped(stopping, read).await {
                 let _ = tx.send(Err(error.into())).await;
             }
         });
@@ -413,8 +501,16 @@ impl Control for ControlService {
 
         let (tx, rx) = mpsc::channel(1);
         let node = self.node.clone();
+        let mut stopping = self.stop.subscribe();
         tokio::spawn(async move {
-            match receive(&node, incoming, adoption, &header).await {
+            // A write the daemon gives up on is one it keeps nothing of: the
+            // staging file goes with the dropped `Adoption`, exactly as an
+            // abandoned upload's does.
+            let written = tokio::select! {
+                written = receive(&node, incoming, adoption, &header) => written,
+                _ = stopping.recv() => Err(stopped()),
+            };
+            match written {
                 Ok(written) => {
                     let _ = tx.send(Ok(written)).await;
                 }
@@ -505,6 +601,14 @@ impl Bytes<'_> {
                 .map_err(|_| gone()),
         }
     }
+}
+
+/// The daemon is stopping, which ends the work it was doing for a client.
+fn stopped() -> ControlError {
+    ControlError::new(
+        ErrorCode::Unavailable,
+        "the daemon is shutting down; this request did not finish",
+    )
 }
 
 /// The client stopped reading, which ends the work being done for it.
@@ -1431,15 +1535,22 @@ async fn receive(
     mut adoption: synch_engine::Adoption,
     header: &pb::PutHeader,
 ) -> Result<pb::Written, ControlError> {
-    loop {
+    let mut committed = false;
+    while !committed {
         let part = match incoming.message().await {
             Ok(Some(request)) => request.part,
-            // Half-closing is what commits: the client has said there is no
-            // more payload.
-            Ok(None) => break,
-            // The connection went away mid-payload. The staging file goes with
-            // the dropped `Adoption`; a truncated body must never be mistaken
-            // for a complete object.
+            // The client stopped sending without committing. That is an
+            // abandoned write however it came about — a dropped handle, a
+            // process that died — and the staging file goes with the dropped
+            // `Adoption`: a partly received body must never be mistaken for a
+            // complete object.
+            Ok(None) => {
+                return Err(ControlError::invalid(format!(
+                    "the write was abandoned after {} byte(s): it was never committed",
+                    adoption.written()
+                )))
+            }
+            // The same, with the transport's account of what went wrong.
             Err(status) => {
                 return Err(ControlError::invalid(format!(
                     "the write was abandoned after {} byte(s): {}",
@@ -1460,6 +1571,7 @@ async fn receive(
                 })
                 .await?;
             }
+            Some(PutPart::Commit(pb::Commit {})) => committed = true,
             Some(PutPart::Abort(why)) => {
                 return Err(ControlError::invalid(format!(
                     "the write was abandoned after {} byte(s): {why}",
@@ -1588,19 +1700,17 @@ async fn recover(node: &Node, out: &mut Frames, wait: Option<String>, gap: Optio
     .await?;
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-    let recovering = {
+    // Cancelled with this call rather than detached: an hour of collection is
+    // worth nobody's time once whoever asked for it has gone — the client hung
+    // up mid-quiesce, or the daemon is stopping.
+    let mut recovering = Cancelling({
         let node = node.clone();
         tokio::spawn(async move { node.recover(options, progress_tx).await })
-    };
+    });
     while let Some(update) = progress_rx.recv().await {
-        if let Err(e) = out.progress(update.to_string()).await {
-            // The client hung up mid-quiesce: stop the collection rather than
-            // finish an hour of it for nobody.
-            recovering.abort();
-            return Err(e);
-        }
+        out.progress(update.to_string()).await?;
     }
-    let report = recovering
+    let report = (&mut recovering.0)
         .await
         .map_err(|e| ControlError::internal(format!("the recovery task failed: {e}")))??;
 

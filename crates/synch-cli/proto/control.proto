@@ -36,9 +36,8 @@ service Control {
   // The first message carries the header; the daemon takes its gates —
   // publishability, a resolvable target — before it answers, so the response
   // headers are the client's cue to start streaming and a refusal arrives as
-  // the coded error it is. Chunks follow until the client either half-closes,
-  // which commits, or sends an abort, which keeps nothing. Nothing is buffered
-  // whole at either end.
+  // the coded error it is. Chunks follow, and the write is published only on
+  // an explicit commit. Nothing is buffered whole at either end.
   rpc Put(stream PutRequest) returns (stream Written);
 
   // Reads a config value from the `s3.*` namespace.
@@ -432,13 +431,21 @@ message PutRequest {
     bytes chunk = 2;
     // The client is abandoning the write and the daemon must keep nothing.
     //
-    // A truncated HTTP body is the case that matters: half-closing the stream
-    // commits, so without a way to say so a partly received object would be
-    // indistinguishable from a complete one and would get published as the
-    // client's own assertion.
+    // A truncated HTTP body is the case that matters, and it is why the
+    // commit below is a message rather than the end of the stream: a partly
+    // received object must never be indistinguishable from a complete one, or
+    // it gets published as the client's own assertion.
     string abort = 3;
+    // The payload is complete and the daemon may publish it.
+    //
+    // Nothing else commits. A client that stops sending — an abandoned write,
+    // a dropped handle, a process that died — ends the stream without one, and
+    // the daemon keeps nothing.
+    Commit commit = 4;
   }
 }
+
+message Commit {}
 
 message PutHeader {
   // The space to write into.

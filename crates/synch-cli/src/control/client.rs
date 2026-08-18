@@ -247,8 +247,11 @@ impl Put {
 
     /// Completes the write and returns the published entry.
     pub async fn finish(mut self) -> Result<Written, ControlError> {
-        // Half-closing is what commits: the daemon has the whole payload only
-        // once the client says there is no more of it.
+        // The commit is a message of its own, so that every other way this
+        // handle can end — an early `?`, a cancelled future, a process that
+        // died — leaves the daemon with a payload it was never told to keep.
+        self.send(super::proto::PutPart::Commit(pb::Commit {}))
+            .await?;
         drop(self.parts);
         let written = self
             .written

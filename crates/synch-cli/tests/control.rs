@@ -1634,6 +1634,159 @@ async fn the_token_is_regenerated_on_every_start() {
     daemon.shutdown().await;
 }
 
+/// A call in flight must not be able to hold the daemon up: `synch recover`
+/// waits an hour by default, and the operator who asked the daemon to stop is
+/// not agreeing to wait it out (§9.1).
+#[tokio::test]
+async fn a_long_call_does_not_hold_the_shutdown_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+
+    // An hour-long quiesce, still running when the stop arrives.
+    let mut client = Client::connect(data_dir).await.unwrap();
+    let mut frames = client
+        .run(Command::Recover(pb::Recover {
+            wait: Some("1h".into()),
+            gap: None,
+        }))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(30), frames.next())
+        .await
+        .expect("the quiesce reports as it goes")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(first, Frame::Line(_) | Frame::Progress(_)));
+
+    let _ = daemon.stop.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(30), daemon.served)
+        .await
+        .expect("the server must come down while a call is still running")
+        .unwrap()
+        .unwrap();
+
+    // The client is told why its call ended, rather than left holding a
+    // connection to a daemon that is gone.
+    let ended = loop {
+        match frames.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("an interrupted call must not report success"),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(ended.code, ErrorCode::Unavailable, "{ended}");
+
+    // And the datadir is left clean, so the next daemon starts from nothing.
+    // Only Unix leaves anything behind to check: a named pipe has no on-disk
+    // presence, and goes with the process that owned it.
+    #[cfg(unix)]
+    assert!(!synch_cli::control::transport::socket_path(data_dir).exists());
+    assert!(!synch_cli::control::transport::token_path(data_dir).exists());
+    daemon.node.shutdown().await.unwrap();
+}
+
+/// The token must not outlive the socket: while `control.token` is readable,
+/// this datadir's socket is still bound, so a replacement daemon is refused
+/// rather than allowed to mint a token the outgoing one then deletes.
+#[tokio::test]
+async fn a_replacement_daemon_is_refused_until_the_last_of_the_old_one_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+
+    // While the old daemon is up, binding a second one for the datadir fails —
+    // and its token is still the one a client would present.
+    let taken = Server::bind(daemon.node.clone(), broadcast::channel(1).0)
+        .await
+        .expect_err("a second daemon for one datadir is refused");
+    assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse, "{taken}");
+    assert!(synch_cli::control::transport::token_path(data_dir).exists());
+
+    daemon.shutdown().await;
+
+    // Once it has finished, both are gone together and the next daemon binds.
+    #[cfg(unix)]
+    assert!(!synch_cli::control::transport::socket_path(data_dir).exists());
+    assert!(!synch_cli::control::transport::token_path(data_dir).exists());
+    let replacement = Daemon::reopen(data_dir).await;
+    assert!(lines(data_dir, Command::Id(pb::Id {}))
+        .await
+        .contains("nas@cluster.example"));
+    replacement.shutdown().await;
+}
+
+/// A write is published only when the client says so. A handle that goes out
+/// of scope — an early `?`, a cancelled future, a process that died — must
+/// leave the space exactly as it was, however much of the payload arrived
+/// (§9.4).
+#[tokio::test]
+async fn a_dropped_write_publishes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let space = space_with(&[("kept.txt", b"kept")]);
+    let daemon = Daemon::start(dir.path()).await;
+    let data_dir = dir.path();
+    lines(
+        data_dir,
+        Command::SpaceAdd(pb::SpaceAdd {
+            id: "media".into(),
+            path: space.path().to_string_lossy().into_owned(),
+        }),
+    )
+    .await;
+    lines(data_dir, Command::Scan(pb::Scan {})).await;
+
+    {
+        let mut client = Client::connect(data_dir).await.unwrap();
+        let mut put = client.put("media", "uploads/half.bin").await.unwrap();
+        for _ in 0..4 {
+            put.chunk(vec![7u8; 200_000]).await.unwrap();
+        }
+        // No `finish`, no `abort`: just gone.
+    }
+
+    // The daemon keeps nothing: no entry, no staging file, and the space is
+    // untouched.
+    assert_eq!(
+        resolve(
+            data_dir,
+            pb::ResolveRequest {
+                space: "media".into(),
+                path: "uploads/half.bin".into(),
+                policy: None,
+            }
+        )
+        .await
+        .unwrap_err(),
+        ErrorCode::NotFound
+    );
+    assert!(!space.path().join("uploads/half.bin").exists());
+
+    // The daemon notices the abandonment on its own schedule, so this waits for
+    // the staging file to go rather than assuming it has already gone: what the
+    // test is about is that nothing is *left*, not when the sweep happens.
+    let staging = space.path().join("uploads");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let left = loop {
+        let mut left: Vec<String> = std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        if left.is_empty() || std::time::Instant::now() > deadline {
+            break left;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(left.is_empty(), "no staging file remains: {left:?}");
+    assert_eq!(
+        std::fs::read(space.path().join("kept.txt")).unwrap(),
+        b"kept"
+    );
+
+    daemon.shutdown().await;
+}
+
 #[tokio::test]
 async fn take_adopts_a_peers_deletion_over_the_socket() {
     // §8: `synch take` of a tombstone version deletes our local copy and

@@ -136,6 +136,25 @@ impl Node {
     /// next flush retries it. A failed *push* does not fail the flush: the head
     /// is published, and peers pick it up at the next anti-entropy round.
     pub async fn flush_staged(&self) -> Result<Option<SignedHead>> {
+        let head = self.publish_staged().await?;
+        if let Some(head) = &head {
+            if let Err(e) = self.push_head(head).await {
+                tracing::debug!(error = %e, "could not push the new head");
+            }
+            // This node's own origin's tree just moved, and mirrors follow
+            // the unified tree — which includes it.
+            self.mirror_wake().notify_one();
+        }
+        Ok(head)
+    }
+
+    /// Publishes everything staged so far as one new signed root, without
+    /// telling anybody about it.
+    ///
+    /// The half of a flush that is this node's own business. Peers learn the
+    /// head from the push in [`Node::flush_staged`], or from the next
+    /// anti-entropy round if nobody pushes it.
+    async fn publish_staged(&self) -> Result<Option<SignedHead>> {
         let batch = self.publisher().take();
         if batch.is_empty() {
             return Ok(None);
@@ -163,14 +182,6 @@ impl Node {
             }
         })
         .await?;
-        if let Some(head) = &head {
-            if let Err(e) = self.push_head(head).await {
-                tracing::debug!(error = %e, "could not push the new head");
-            }
-            // This node's own origin's tree just moved, and mirrors follow
-            // the unified tree — which includes it.
-            self.mirror_wake().notify_one();
-        }
         Ok(head)
     }
 
@@ -202,11 +213,19 @@ impl Node {
         }
     }
 
+    /// Publishes whatever is still buffered, on the way out (§7.1).
+    ///
+    /// Published but not pushed. The batch must not be stranded — that is what
+    /// this is for — but telling peers means dialing them, and a peer that
+    /// accepts and then says nothing would hold the whole daemon open for its
+    /// request deadline while an operator waits on `synch daemon stop`. The
+    /// head is durable either way, and peers pick it up at the next
+    /// anti-entropy round.
     async fn flush_on_stop(&self) {
         if self.publisher().pending() == 0 {
             return;
         }
-        if let Err(e) = self.flush_staged().await {
+        if let Err(e) = self.publish_staged().await {
             tracing::warn!(error = %e, "the last batch could not be published");
         }
     }
