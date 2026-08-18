@@ -35,10 +35,12 @@ fn now_unix() -> Int
 /// between two ticks is a dead tunnel dressed as a slow one.
 const watchdog_ms = 60_000
 
-/// What one download needs to know about itself, for the audit row.
+/// What one download needs to know about itself: the audit row it will write,
+/// and the slot it has to give back.
 type Download {
   Download(
     db: Pool,
+    registry: Subject(agent.Msg),
     user_id: String,
     org_id: String,
     network: String,
@@ -76,16 +78,32 @@ pub fn handle(
     "space= and path= are required",
   )
 
+  let registry = browse_api.registry(browse)
   let attached =
-    agent.sessions_for(browse_api.registry(browse), network_id)
+    agent.sessions_for(registry, network_id)
     |> list.filter(agent.exposes(_, space))
   use first <- pick(attached)
+
+  // A read is a same-origin GET with cookies and needs no CSRF token, so a
+  // hostile page can start one from an `img` tag. The cap is what stops it
+  // starting a hundred.
+  use Nil <- require(
+    agent.claim_stream(registry, user_id),
+    429,
+    "too many downloads open at once (limit "
+      <> int.to_string(agent.streams_per_user())
+      <> ")",
+  )
 
   // Two tunnel steps. The resolve pins the version to its content root and
   // names the origins currently holding it; the read is then addressed *by
   // root*, so a publish landing in between cannot swap the bytes mid-download.
+  let download = Download(db, registry, user_id, org_id, network, space, path)
   case agent.ask(first, agent.Resolve(space, path, from)) {
-    Error(refusal) -> refused(status_of(refusal.code), refusal.message)
+    Error(refusal) -> {
+      agent.release_stream(registry, user_id)
+      refused(status_of(refusal.code), refusal.message)
+    }
     Ok(agent.Resolved(_origin, root, size, _seq, holders)) -> {
       // Holders first, then anyone: a non-holder still answers correctly, its
       // blob fetcher pulling the missing ranges from peers bao-verified. One
@@ -95,27 +113,23 @@ pub fn handle(
         None -> first
       }
       case wanted_range(req, size) {
-        Error(Nil) ->
+        Error(Nil) -> {
+          agent.release_stream(registry, user_id)
           refused(
             416,
             "that Range is not satisfiable for a "
               <> int.to_string(size)
               <> "-byte object",
           )
+        }
         Ok(#(start, length, partial)) ->
-          stream(
-            req,
-            session,
-            Download(db, user_id, org_id, network, space, path),
-            root,
-            size,
-            start,
-            length,
-            partial,
-          )
+          stream(req, session, download, root, size, start, length, partial)
       }
     }
-    Ok(_) -> refused(502, "the daemon answered the wrong question")
+    Ok(_) -> {
+      agent.release_stream(registry, user_id)
+      refused(502, "the daemon answered the wrong question")
+    }
   }
 }
 
@@ -198,6 +212,7 @@ fn stream(
 }
 
 fn record(download: Download, relay: Relay, outcome: String) -> Nil {
+  agent.release_stream(download.registry, download.user_id)
   browse_api.audit_download(
     download.db,
     download.user_id,

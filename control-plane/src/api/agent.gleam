@@ -66,6 +66,20 @@ const query_timeout = 15_000
 /// How long a download waits for the next frame before giving up.
 const stream_timeout = 60_000
 
+/// How many downloads one user may have open at once.
+///
+/// Reads are same-origin GETs with cookies and need no CSRF token, so a
+/// hostile page can start one with an `img` tag. The cap is what stops it
+/// quietly draining an operator's upstream with a hundred of them.
+const stream_cap = 4
+
+/// How long a claimed stream slot may go unreleased before it is reclaimed.
+///
+/// Every path through the relay releases its slot, so this only catches a
+/// relay process that died without running either of them — a bound on a leak
+/// rather than a mechanism anything relies on.
+const stream_lease = 3600
+
 // -- what an attached daemon is ---------------------------------------------
 
 /// One attached daemon, as everything outside this module sees it.
@@ -195,10 +209,19 @@ pub type Msg {
   DropNetwork(network_id: String)
   /// A device key was revoked: any session standing on it goes with it.
   DropKey(key_id: String)
+  /// One user is opening a download; answered `False` at the cap.
+  ClaimStream(user_id: String, reply: Subject(Bool))
+  /// One user's download ended, however it ended.
+  ReleaseStream(user_id: String)
 }
 
 type Registry {
-  Registry(sessions: List(Session), nonces: List(#(String, Int)))
+  Registry(
+    sessions: List(Session),
+    nonces: List(#(String, Int)),
+    /// One entry per download in flight: whose it is, and when it started.
+    streams: List(#(String, Int)),
+  )
 }
 
 /// A supervised registry, addressed by name so a browse handler can reach it
@@ -215,7 +238,7 @@ pub fn supervised(name: Name(Msg)) -> supervision.ChildSpecification(Nil) {
 pub fn start(
   name: Name(Msg),
 ) -> Result(actor.Started(Subject(Msg)), actor.StartError) {
-  actor.new(Registry([], []))
+  actor.new(Registry([], [], []))
   |> actor.on_message(handle_registry)
   |> actor.named(name)
   |> actor.start
@@ -280,6 +303,36 @@ fn handle_registry(state: Registry, message: Msg) -> actor.Next(Registry, Msg) {
       list.each(going, close)
       actor.continue(Registry(..state, sessions: staying))
     }
+    ClaimStream(user_id, reply) -> {
+      let held =
+        list.filter(state.streams, fn(pair) { pair.1 + stream_lease > now })
+      let mine = list.filter(held, fn(pair) { pair.0 == user_id })
+      case list.length(mine) < stream_cap {
+        True -> {
+          process.send(reply, True)
+          actor.continue(Registry(..state, streams: [#(user_id, now), ..held]))
+        }
+        False -> {
+          process.send(reply, False)
+          actor.continue(Registry(..state, streams: held))
+        }
+      }
+    }
+    ReleaseStream(user_id) ->
+      actor.continue(
+        Registry(..state, streams: release(state.streams, user_id)),
+      )
+  }
+}
+
+/// Drops one of a user's slots, keeping their others.
+fn release(
+  streams: List(#(String, Int)),
+  user_id: String,
+) -> List(#(String, Int)) {
+  case list.split_while(streams, fn(pair) { pair.0 != user_id }) {
+    #(before, [_, ..after]) -> list.append(before, after)
+    #(all, []) -> all
   }
 }
 
@@ -312,6 +365,23 @@ pub fn drop_network(registry: Subject(Msg), network_id: String) -> Nil {
 /// Drops every session standing on one device key, used when it is revoked.
 pub fn drop_key(registry: Subject(Msg), key_id: String) -> Nil {
   process.send(registry, DropKey(key_id))
+}
+
+/// Takes one of a user's download slots, or says the cap is reached.
+pub fn claim_stream(registry: Subject(Msg), user_id: String) -> Bool {
+  let reply = process.new_subject()
+  process.send(registry, ClaimStream(user_id, reply))
+  process.receive(reply, 2000) |> result.unwrap(False)
+}
+
+/// Gives one back. Every path out of a relay calls this.
+pub fn release_stream(registry: Subject(Msg), user_id: String) -> Nil {
+  process.send(registry, ReleaseStream(user_id))
+}
+
+/// How many downloads one user may have open at once.
+pub fn streams_per_user() -> Int {
+  stream_cap
 }
 
 /// Asks one attached daemon a question and waits for its answer.

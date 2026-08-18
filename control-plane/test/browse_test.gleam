@@ -240,6 +240,24 @@ pub fn a_space_nobody_exposed_is_not_servable_test() {
   assert !agent.exposes(nas, "private")
 }
 
+/// Reads are same-origin GETs with cookies and no CSRF token, so a hostile
+/// page can start one with an `img` tag. The cap is what bounds how many.
+pub fn one_user_may_not_open_unbounded_downloads_test() {
+  let name = process.new_name("cp_agents_cap_test")
+  let assert Ok(started) = agent.start(name)
+  let registry = started.data
+  let taken =
+    list.repeat(Nil, agent.streams_per_user())
+    |> list.map(fn(_) { agent.claim_stream(registry, "u1") })
+  assert list.all(taken, fn(ok) { ok })
+  assert !agent.claim_stream(registry, "u1")
+  // The cap is per user, not global: one greedy tab does not stop everybody.
+  assert agent.claim_stream(registry, "u2")
+  // And a finished download gives its slot back.
+  agent.release_stream(registry, "u1")
+  assert agent.claim_stream(registry, "u1")
+}
+
 fn txt_text(rd: BitArray) -> Result(String, Nil) {
   case rd {
     <<len:size(8), rest:bits>> -> {
