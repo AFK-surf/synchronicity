@@ -116,6 +116,15 @@ pub fn list_buckets_xml(names: &[String]) -> String {
     xml
 }
 
+/// The `Initiator`/`Owner` pair every multipart listing carries.
+///
+/// S3 models these as the IAM identity behind the upload. This gateway has one
+/// identity — the node — and says so rather than leaving the elements out,
+/// because `aws s3api` prints an incomplete record when they are missing.
+const OWNERSHIP: &str = "<Initiator><ID>synchronicity</ID>\
+     <DisplayName>synchronicity</DisplayName></Initiator>\
+     <Owner><ID>synchronicity</ID><DisplayName>synchronicity</DisplayName></Owner>";
+
 /// Renders an `InitiateMultipartUploadResult` (§9.4).
 pub fn initiate_upload_xml(bucket: &str, key: &str, upload_id: &str) -> String {
     format!(
@@ -181,13 +190,13 @@ pub fn list_parts_xml(
     xml.push_str(&format!("<PartNumberMarker>{marker}</PartNumberMarker>"));
     xml.push_str(&format!("<MaxParts>{max_parts}</MaxParts>"));
     xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
-    if let Some(last) = parts.last().filter(|_| truncated) {
-        xml.push_str(&format!(
-            "<NextPartNumberMarker>{}</NextPartNumberMarker>",
-            last.number
-        ));
-    }
-    xml.push_str("<StorageClass>STANDARD</StorageClass>");
+    // Always emitted, `0` when the listing ends here — S3 does, and a client
+    // that reads the field unconditionally should not have to special-case us.
+    xml.push_str(&format!(
+        "<NextPartNumberMarker>{}</NextPartNumberMarker>",
+        parts.last().filter(|_| truncated).map_or(0, |p| p.number)
+    ));
+    xml.push_str(&format!("<StorageClass>STANDARD</StorageClass>{OWNERSHIP}"));
     for part in parts {
         xml.push_str("<Part>");
         xml.push_str(&format!("<PartNumber>{}</PartNumber>", part.number));
@@ -214,6 +223,7 @@ pub struct ListedUpload {
 pub fn list_uploads_xml(
     bucket: &str,
     prefix: &str,
+    markers: (&str, &str),
     uploads: &[ListedUpload],
     max_uploads: usize,
     truncated: bool,
@@ -222,7 +232,11 @@ pub fn list_uploads_xml(
     xml.push_str("<ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     xml.push_str(&format!("<Bucket>{}</Bucket>", escape(bucket)));
     xml.push_str(&format!("<Prefix>{}</Prefix>", escape(prefix)));
-    xml.push_str("<KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker>");
+    xml.push_str(&format!(
+        "<KeyMarker>{}</KeyMarker><UploadIdMarker>{}</UploadIdMarker>",
+        escape(markers.0),
+        escape(markers.1)
+    ));
     xml.push_str(&format!("<MaxUploads>{max_uploads}</MaxUploads>"));
     xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
     if let Some(last) = uploads.last().filter(|_| truncated) {
@@ -289,14 +303,40 @@ pub fn parse_complete_upload(body: &str) -> Result<Vec<RequestedPart>, String> {
     let mut parts = Vec::new();
     let mut number: Option<u32> = None;
     let mut etag: Option<String> = None;
-    for (tag, text) in Elements::new(body) {
-        match tag {
-            "PartNumber" => number = text.trim().parse().ok(),
-            "ETag" => etag = Some(unescape(text.trim()).trim_matches('"').to_string()),
+    for element in Elements::new(body) {
+        let text = element.text;
+        match (element.closing, element.name) {
+            (false, "PartNumber") => {
+                let value = text.trim();
+                // Digits only: `str::parse` would take `+5` as 5, and a client
+                // that spelled a part number that way disagrees with this
+                // gateway about something worth finding out now.
+                if value.is_empty() || !value.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(format!("{value:?} is not a part number"));
+                }
+                let parsed: u32 = value
+                    .parse()
+                    .map_err(|_| format!("{value:?} is not a part number"))?;
+                if parsed == 0 || parsed > 10_000 {
+                    return Err(format!("part number {parsed} is outside 1..=10000"));
+                }
+                number = Some(parsed);
+            }
+            // An `<ETag>` that is present but is not a root this gateway could
+            // have issued is a malformed body, not an absence of opinion.
+            // Reading it as "no opinion" silently turns off the one check the
+            // element exists for.
+            (false, "ETag") => {
+                let value = unescape(text.trim()).trim_matches('"').to_string();
+                if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(format!("{value:?} is not an ETag this gateway issued"));
+                }
+                etag = Some(value);
+            }
             // The close of a part is what commits the pair, so a `<Part>` that
             // named only one of them is a malformed body rather than a part
             // with a default in it.
-            "/Part" => match (number.take(), etag.take()) {
+            (true, "Part") => match (number.take(), etag.take()) {
                 (Some(number), Some(etag)) => parts.push(RequestedPart { number, etag }),
                 _ => return Err("a <Part> named no number or no ETag".into()),
             },
@@ -312,11 +352,24 @@ pub fn parse_complete_upload(body: &str) -> Result<Vec<RequestedPart>, String> {
     Ok(parts)
 }
 
-/// Walks a document as `(tag, text-until-the-next-tag)` pairs.
+/// One element start or end, with the text that follows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Element<'a> {
+    /// The local name, with any namespace prefix removed.
+    name: &'a str,
+    /// True for a closing tag.
+    closing: bool,
+    /// The text between this tag and the next one.
+    text: &'a str,
+}
+
+/// Walks a document as elements and the text that follows them.
 ///
 /// Enough for the one body shape this gateway reads, and nothing more: no
-/// attributes, no namespaces, no nesting model. A close tag is reported with
-/// its leading slash, which is what lets the caller see where a `<Part>` ends.
+/// attribute values, no namespace resolution, no nesting model. What it does
+/// have to get right is that `<Part foo="bar">` and `<s3:PartNumber>` are the
+/// elements they say they are — both are legal S3, and both would otherwise
+/// read as unrecognized and turn a valid completion into `MalformedXML`.
 struct Elements<'a> {
     rest: &'a str,
 }
@@ -328,9 +381,9 @@ impl<'a> Elements<'a> {
 }
 
 impl<'a> Iterator for Elements<'a> {
-    type Item = (&'a str, &'a str);
+    type Item = Element<'a>;
 
-    fn next(&mut self) -> Option<(&'a str, &'a str)> {
+    fn next(&mut self) -> Option<Element<'a>> {
         loop {
             let open = self.rest.find('<')?;
             let close = self.rest[open..].find('>')? + open;
@@ -341,12 +394,23 @@ impl<'a> Iterator for Elements<'a> {
             if tag.starts_with('?') || tag.starts_with('!') {
                 continue;
             }
-            let tag = tag.trim_end_matches('/').trim();
+            let token = tag
+                .split([' ', '\t', '\r', '\n'])
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('/');
+            let closing = token.starts_with('/');
+            let bare = token.trim_start_matches('/');
+            let name = bare.rsplit_once(':').map_or(bare, |(_, local)| local);
             let text = match self.rest.find('<') {
                 Some(next) => &self.rest[..next],
                 None => self.rest,
             };
-            return Some((tag, text));
+            return Some(Element {
+                name,
+                closing,
+                text,
+            });
         }
     }
 }
@@ -473,25 +537,54 @@ mod tests {
 
     #[test]
     fn completion_bodies_parse() {
-        let body = "<CompleteMultipartUpload>\
-            <Part><PartNumber>1</PartNumber><ETag>&quot;abc&quot;</ETag></Part>\
-            <Part><PartNumber>2</PartNumber><ETag>\"def\"</ETag></Part>\
-            </CompleteMultipartUpload>";
-        let parts = parse_complete_upload(body).unwrap();
+        const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>&quot;{A}&quot;</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>\"{B}\"</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let parts = parse_complete_upload(&body).unwrap();
         assert_eq!(parts.len(), 2);
         // Quotes come off however they were spelled, escaped or not.
-        assert_eq!(parts[0].etag, "abc");
-        assert_eq!(parts[1].etag, "def");
+        assert_eq!(parts[0].etag, A);
+        assert_eq!(parts[1].etag, B);
         assert_eq!(parts[1].number, 2);
+
+        // Namespaces and attributes are legal S3 and must not read as
+        // unrecognized elements.
+        let decorated = format!(
+            "<s3:CompleteMultipartUpload xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <s3:Part foo=\"bar\"><s3:PartNumber>7</s3:PartNumber>\
+             <s3:ETag>\"{A}\"</s3:ETag></s3:Part></s3:CompleteMultipartUpload>"
+        );
+        let parts = parse_complete_upload(&decorated).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].number, 7);
     }
 
     #[test]
     fn unknown_elements_are_skipped_but_broken_parts_are_not() {
         // A checksum element the gateway does not read must not derail the parse.
-        let body = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
-            <ChecksumCRC32C>aaaa</ChecksumCRC32C><ETag>\"a\"</ETag></Part>\
-            </CompleteMultipartUpload>";
-        assert_eq!(parse_complete_upload(body).unwrap().len(), 1);
+        let root = "c".repeat(64);
+        let body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+             <ChecksumCRC32C>aaaa</ChecksumCRC32C><ETag>\"{root}\"</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        assert_eq!(parse_complete_upload(&body).unwrap().len(), 1);
+        // An ETag this gateway could never have issued is a malformed body, not
+        // an absence of opinion — reading it as "no opinion" silently turns off
+        // the one check the element exists for.
+        assert!(parse_complete_upload(&body.replace(&root, "abc")).is_err());
+        assert!(parse_complete_upload(&body.replace(&format!("\"{root}\""), "")).is_err());
+        // Part numbers outside S3's range, or spelled oddly, are refused where
+        // they are read.
+        for bad in ["0", "10001", "-1", "+5", ""] {
+            let body = body.replace("<PartNumber>1<", &format!("<PartNumber>{bad}<"));
+            assert!(parse_complete_upload(&body).is_err(), "{bad}");
+        }
         // A part missing half of itself is a malformed body, not a default.
         let broken = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part>\
             </CompleteMultipartUpload>";
@@ -505,6 +598,11 @@ mod tests {
             <CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
             <ETag>&x;</ETag></Part></CompleteMultipartUpload>";
         assert!(parse_complete_upload(xxe).is_err());
+        // The guard is belt-and-braces: there is no entity table to expand
+        // into, so a lower-case declaration that slips past the substring check
+        // still yields the literal text and fails as a malformed ETag rather
+        // than reading a file.
+        assert!(parse_complete_upload(&xxe.replace("<!DOCTYPE", "<!doctype")).is_err());
         // The cap is on the body, before anything is parsed out of it.
         let huge = format!("<a>{}</a>", "x".repeat(MAX_COMPLETE_BODY));
         assert!(parse_complete_upload(&huge).is_err());
@@ -533,7 +631,7 @@ mod tests {
             upload_id: "u".into(),
             initiated: "1970-01-01T00:00:00.000Z".into(),
         }];
-        let xml = list_uploads_xml("media", "", &uploads, 1000, false);
+        let xml = list_uploads_xml("media", "", ("", ""), &uploads, 1000, false);
         assert!(xml.contains("<UploadId>u</UploadId>"), "{xml}");
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
     }

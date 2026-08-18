@@ -184,9 +184,23 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
     // would report success for an operation that never happened.
     let upload_id = param(&query, "uploadId").filter(|id| !id.is_empty());
     let initiating = query.iter().any(|(k, _)| k == "uploads");
+    // A `partNumber` with no upload to attach it to is not a request this
+    // gateway can answer, and answering it as something else is how a part
+    // becomes the whole object behind a `200`. A proxy that mangled the query,
+    // an SDK that dropped it on a retry, and an empty `uploadId=` all land here.
+    if upload_id.is_none() && param(&query, "partNumber").is_some() {
+        return Err(match parts.method {
+            // S3 does serve one part of a multipart object this way. This
+            // gateway stores the assembled object and not its parts, so it has
+            // nothing to serve — and saying so beats returning the whole object
+            // as though it were the part that was asked for.
+            Method::GET | Method::HEAD => S3Error::not_implemented("reading a single part"),
+            _ => S3Error::invalid("partNumber names a part of an upload, so it needs an uploadId"),
+        });
+    }
     match (&parts.method, upload_id, initiating) {
         (&Method::POST, None, true) if !key.is_empty() => {
-            return create_upload(gateway, &bucket, key).await
+            return create_upload(gateway, &bucket, key, &headers).await
         }
         (&Method::GET, None, true) if key.is_empty() => {
             return list_uploads(gateway, &bucket, &query).await
@@ -195,7 +209,7 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
             return upload_part(gateway, &bucket, key, &id, &query, &headers, body).await
         }
         (&Method::POST, Some(id), _) => {
-            return complete_upload(gateway, &bucket, key, &id, body).await
+            return complete_upload(gateway, &bucket, key, &id, &headers, body).await
         }
         (&Method::GET, Some(id), _) => return list_parts(gateway, &bucket, key, &id, &query).await,
         (&Method::DELETE, Some(id), _) => return abort_upload(gateway, &bucket, key, &id).await,
@@ -214,11 +228,16 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
         (&Method::GET, false) => get_object(gateway, &bucket, key, &headers, false).await,
         (&Method::HEAD, false) => get_object(gateway, &bucket, key, &headers, true).await,
         (&Method::PUT, false) => put_object(gateway, &bucket, key, &headers, body).await,
-        (&Method::DELETE, false) => delete_object(gateway, &bucket, key).await,
+        (&Method::DELETE, false) => delete_object(gateway, &bucket, key, &headers).await,
         // A bucket is a mapping the operator made, not a thing HTTP may
         // unmake: deleting one here would leave a space nobody serves and an
         // operator who never asked for that.
         (&Method::DELETE, true) => Err(S3Error::not_implemented("DeleteBucket")),
+        // `?delete` is the batch delete: its own API, its own body format, and
+        // worth naming so an operator reading the error knows what to reach for.
+        (&Method::POST, _) if query.iter().any(|(k, _)| k == "delete") => {
+            Err(S3Error::not_implemented("DeleteObjects, the batch delete"))
+        }
         (&Method::POST, _) => Err(S3Error::not_implemented("this operation")),
         _ => Err(S3Error::not_implemented("this operation")),
     }
@@ -234,7 +253,13 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
 /// inventing one would break every client that treats `rm` as a loop over
 /// keys, so the answer is the `204` S3 promises and the surviving publishers
 /// are logged.
-async fn delete_object(gateway: &Gateway, bucket: &Bucket, key: &str) -> S3Result<Response> {
+async fn delete_object(
+    gateway: &Gateway,
+    bucket: &Bucket,
+    key: &str,
+    headers: &BTreeMap<String, String>,
+) -> S3Result<Response> {
+    check_headers(headers)?;
     if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
         tracing::warn!("{warning}");
     }
@@ -312,7 +337,15 @@ fn payload(
 }
 
 /// `CreateMultipartUpload`.
-async fn create_upload(gateway: &Gateway, bucket: &Bucket, key: &str) -> S3Result<Response> {
+async fn create_upload(
+    gateway: &Gateway,
+    bucket: &Bucket,
+    key: &str,
+    headers: &BTreeMap<String, String>,
+) -> S3Result<Response> {
+    // Refused at creation rather than at the first part: a client that names a
+    // header this gateway will not honor should find out before it streams.
+    check_headers(headers)?;
     if let Some(warning) = bucket.foreign_pin_warning(gateway.origin()) {
         tracing::warn!("{warning}");
     }
@@ -359,11 +392,21 @@ async fn complete_upload(
     bucket: &Bucket,
     key: &str,
     upload_id: &str,
+    headers: &BTreeMap<String, String>,
     body: Body,
 ) -> S3Result<Response> {
+    check_headers(headers)?;
+    // Through the same unwrapping every other body takes. A completion body is
+    // small, but nothing stops a client framing it — and a chunk boundary
+    // landing mid-tag would corrupt the part list rather than fail.
+    let (body, fault) = payload(headers, body)?;
     let bytes = axum::body::to_bytes(body, xml::MAX_COMPLETE_BODY)
         .await
-        .map_err(|_| S3Error::malformed_xml("the completion body could not be read"))?;
+        .map_err(|e| {
+            fault.explain(S3Error::malformed_xml(format!(
+                "the completion body could not be read: {e}"
+            )))
+        })?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| S3Error::malformed_xml("the completion body is not text"))?;
     let requested = xml::parse_complete_upload(text).map_err(S3Error::malformed_xml)?;
@@ -483,11 +526,17 @@ async fn abort_upload(
     key: &str,
     upload_id: &str,
 ) -> S3Result<Response> {
-    gateway
+    let existed = gateway
         .daemon
         .abort_upload(UploadRef::new(upload_id, &bucket.space, key))
         .await
         .map_err(|e| e.about_upload(upload_id))?;
+    // S3 answers an abort of an upload that is not there with `NoSuchUpload`,
+    // and clients use exactly that to tell "my abort worked" from "I was
+    // quoting an id that never existed".
+    if !existed {
+        return Err(S3Error::no_such_upload(upload_id));
+    }
     Ok((StatusCode::NO_CONTENT).into_response())
 }
 
@@ -550,9 +599,25 @@ async fn list_uploads(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_KEYS)
         .clamp(1, DEFAULT_MAX_KEYS);
+    // The markers are a `(key, upload-id)` cursor, and honoring them is not
+    // optional once `IsTruncated` has been said: a paginator handed a marker it
+    // re-sends, against a page that ignores it, loops forever.
+    let key_marker = param(query, "key-marker").unwrap_or_default();
+    let upload_marker = param(query, "upload-id-marker").unwrap_or_default();
+
     let open = gateway.daemon.list_uploads(&bucket.space, &prefix).await?;
-    let truncated = open.len() > max_uploads;
-    let page: Vec<xml::ListedUpload> = open
+    // The daemon lists in `(path, id)` order, which is the order the cursor is
+    // defined in, so resuming is a matter of dropping everything at or before
+    // where the last page ended.
+    let after: Vec<_> = open
+        .into_iter()
+        .filter(|upload| {
+            (upload.path.as_str(), upload.upload_id.as_str())
+                > (key_marker.as_str(), upload_marker.as_str())
+        })
+        .collect();
+    let truncated = after.len() > max_uploads;
+    let page: Vec<xml::ListedUpload> = after
         .into_iter()
         .take(max_uploads)
         .map(|upload| xml::ListedUpload {
@@ -563,7 +628,14 @@ async fn list_uploads(
         .collect();
     Ok(xml_response(
         StatusCode::OK,
-        xml::list_uploads_xml(&bucket.name, &prefix, &page, max_uploads, truncated),
+        xml::list_uploads_xml(
+            &bucket.name,
+            &prefix,
+            (&key_marker, &upload_marker),
+            &page,
+            max_uploads,
+            truncated,
+        ),
     ))
 }
 

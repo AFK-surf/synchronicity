@@ -1264,7 +1264,7 @@ async fn an_upload_id_names_one_key() {
 
     let response = http
         .post(harness.url(&format!("/my-media/someone-elses.txt?uploadId={upload}")))
-        .body(completion(&[(1, "\"a\"".into())]))
+        .body(completion(&[(1, format!("\"{}\"", "a".repeat(64)))]))
         .send()
         .await
         .unwrap();
@@ -1818,5 +1818,90 @@ async fn a_failed_trailer_checksum_is_reported_as_bad_digest() {
         .await
         .unwrap();
     assert_eq!(response.status(), 404);
+    harness.stop().await;
+}
+
+/// A `partNumber` with no upload to attach it to is refused, not treated as a
+/// whole-object write.
+#[tokio::test]
+async fn a_part_number_without_an_upload_is_refused() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+
+    for query in ["?partNumber=3", "?partNumber=3&uploadId="] {
+        let response = http
+            .put(harness.url(&format!("/my-media/whole.bin{query}")))
+            .body(vec![7u8; 64])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{query}");
+        assert!(response.text().await.unwrap().contains("InvalidArgument"));
+    }
+    // And nothing was written under the key.
+    let response = http
+        .get(harness.url("/my-media/whole.bin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    harness.stop().await;
+}
+
+/// `ListMultipartUploads` honours the cursor it hands out.
+///
+/// Saying `IsTruncated` and then ignoring the markers on the next request
+/// returns the identical page forever, and every SDK paginator loops on it.
+#[tokio::test]
+async fn listing_uploads_paginates() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let http = client();
+    for i in 0..5 {
+        create_upload(&http, &harness, &format!("many/{i:02}.bin")).await;
+    }
+
+    let page = |marker: String| {
+        let http = http.clone();
+        let url = harness.url(&format!("/my-media?uploads&max-uploads=2{marker}"));
+        async move { http.get(url).send().await.unwrap().text().await.unwrap() }
+    };
+
+    let first = page(String::new()).await;
+    assert!(first.contains("<IsTruncated>true</IsTruncated>"), "{first}");
+    assert!(first.contains("<Key>many/00.bin</Key>"), "{first}");
+    assert!(first.contains("<Key>many/01.bin</Key>"), "{first}");
+    assert!(!first.contains("<Key>many/02.bin</Key>"), "{first}");
+
+    // The cursor it handed back moves the listing on rather than repeating it.
+    let marker = element(&first, "NextKeyMarker");
+    let id_marker = element(&first, "NextUploadIdMarker");
+    let second = page(format!("&key-marker={marker}&upload-id-marker={id_marker}")).await;
+    assert!(!second.contains("<Key>many/00.bin</Key>"), "{second}");
+    assert!(second.contains("<Key>many/02.bin</Key>"), "{second}");
+
+    // Walking to the end terminates.
+    let mut seen = 2;
+    let mut body = second;
+    while element(&body, "IsTruncated") == "true" {
+        let marker = element(&body, "NextKeyMarker");
+        let id_marker = element(&body, "NextUploadIdMarker");
+        body = page(format!("&key-marker={marker}&upload-id-marker={id_marker}")).await;
+        seen += body.matches("<Upload>").count();
+        assert!(seen <= 5, "the listing did not terminate");
+    }
+    harness.stop().await;
+}
+
+/// An abort of an upload that is not there is `NoSuchUpload`, not success.
+#[tokio::test]
+async fn aborting_an_unknown_upload_is_not_a_success() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    let response = client()
+        .delete(harness.url("/my-media/x.bin?uploadId=deadbeefdeadbeefdeadbeefdeadbeef"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert!(response.text().await.unwrap().contains("NoSuchUpload"));
     harness.stop().await;
 }
