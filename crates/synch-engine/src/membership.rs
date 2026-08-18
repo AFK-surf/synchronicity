@@ -9,6 +9,21 @@ use synch_net::dns::{
 };
 use synch_store::{Binding, BindingSource, ClockStatus, Equivocation};
 
+/// How long one domain's membership refresh may take before the pass moves on.
+///
+/// `refresh_these` walks the due domains **serially**, and they are unrelated
+/// to one another: a binding lapses at `ttl + DEFAULT_TRUST_GRACE` from its
+/// own last good refresh, whether or not its zone was the one that stalled.
+/// The floor on that is `MIN_TTL + DEFAULT_TRUST_GRACE` — sixteen minutes —
+/// so the deadline has to be a small fraction of it for the queue behind a
+/// slow zone to still be served.
+///
+/// Ninety seconds is well above what an honest `member_set` costs even under
+/// `Require` (up to 18 validated lookups, each bounded by the transport's own
+/// per-exchange timeout) and far below the lapse window. A zone that exceeds
+/// it costs itself its own refresh, and nothing else.
+const REFRESH_DEADLINE: Duration = Duration::from_secs(90);
+
 use crate::{
     error::{EngineError, Result},
     node::Node,
@@ -637,7 +652,35 @@ impl Node {
             // Stamped before the lookup runs, so a resolver that hangs or fails
             // cannot be retried in a tight loop.
             self.note_dns_attempt(domain, now, MIN_TTL);
-            let result = match self.refresh_domain(resolver, domain, now).await {
+            // Bounded, because this loop is serial and the domains in it are
+            // unrelated. One `member_set` under `Require` issues up to 18
+            // validated lookups — membership TXT, DNSKEY, and the proof
+            // records — each of which recurses, and the transport's own
+            // timeout applies per exchange rather than to the whole thing. A
+            // zone that answers slowly enough therefore spends every other
+            // domain's refresh budget, and their bindings lapse at
+            // `ttl + DEFAULT_TRUST_GRACE` whether or not their own zone was
+            // ever asked. `rekor.rs` names this exact failure and closes only
+            // the part-count multiplier: "the threat model's attacker *is*
+            // the zone, so 'it would only be hurting itself' does not hold."
+            //
+            // The deadline is per domain and well inside that lapse window,
+            // so a hostile or merely broken zone costs itself its own refresh
+            // and nothing else. Timing out is an ordinary refresh failure:
+            // cached bindings keep their expiry and only the retry moves.
+            let result = match tokio::time::timeout(
+                REFRESH_DEADLINE,
+                self.refresh_domain(resolver, domain, now),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(synch_net::NetError::Dns(format!(
+                    "{domain}: membership refresh exceeded {}s and was abandoned so the \
+                     other domains due in this pass could run; cached bindings are kept",
+                    REFRESH_DEADLINE.as_secs()
+                ))
+                .into())
+            }) {
                 Ok(refresh) => {
                     self.note_dns_attempt(domain, now, refresh.ttl);
                     self.note_dns_outcome(domain, now, None);
@@ -1304,6 +1347,77 @@ mod tests {
                 Ok((set, ttl))
             })
         }
+    }
+
+    /// One domain that never answers does not spend the whole pass.
+    ///
+    /// `refresh_these` is serial and the domains in it are unrelated, so
+    /// without a per-domain deadline a zone that answers slowly enough
+    /// consumes every other domain's refresh budget — and their bindings
+    /// lapse at `ttl + DEFAULT_TRUST_GRACE` from their *own* last good
+    /// refresh, whether or not their zone was ever asked. The threat model's
+    /// attacker is the zone, so "it would only be hurting itself" does not
+    /// hold.
+    #[tokio::test(start_paused = true)]
+    async fn one_stalling_domain_does_not_spend_the_whole_pass() {
+        #[derive(Debug)]
+        struct Stalling {
+            good: Vec<String>,
+        }
+        impl MemberResolver for Stalling {
+            fn resolve_members<'a>(
+                &'a self,
+                domain: &'a str,
+            ) -> synch_net::dns::MemberSetFuture<'a> {
+                let records = self.good.clone();
+                Box::pin(async move {
+                    if domain == "slow.example" {
+                        // Never answers. With `start_paused` the runtime
+                        // auto-advances, so this costs no wall clock — the
+                        // deadline is what ends it, not the sleep.
+                        tokio::time::sleep(Duration::from_secs(86_400)).await;
+                    }
+                    let set = MemberSet::from_records(domain, &records)?;
+                    Ok((set, MIN_TTL))
+                })
+            }
+        }
+
+        let (_d, node) = node().await;
+        let nas = SecretKey::generate().public();
+        let resolver = Stalling {
+            good: vec![format!("v=sync1 id=nas nk={}", nas.to_z32())],
+        };
+
+        let started = tokio::time::Instant::now();
+        let outcomes = node
+            .refresh_these(
+                &resolver,
+                &["slow.example".to_string(), "fast.example".to_string()],
+                now_ns(),
+            )
+            .await
+            .expect("the pass itself must not fail");
+
+        // The stalling domain is reported as a failure and named.
+        assert_eq!(outcomes.len(), 2);
+        let slow = outcomes
+            .iter()
+            .find(|o| o.domain == "slow.example")
+            .unwrap();
+        let why = slow.result.as_ref().expect_err("it never answered");
+        assert!(why.contains("slow.example"), "{why}");
+        assert!(why.contains("abandoned"), "{why}");
+
+        // And the domain behind it in the queue was still resolved.
+        let fast = outcomes
+            .iter()
+            .find(|o| o.domain == "fast.example")
+            .unwrap();
+        assert!(fast.result.is_ok(), "{:?}", fast.result);
+
+        // The pass ended on the deadline, not on the stall.
+        assert!(started.elapsed() < REFRESH_DEADLINE * 2);
     }
 
     #[tokio::test]
