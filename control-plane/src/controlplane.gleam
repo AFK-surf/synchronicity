@@ -601,7 +601,11 @@ fn serve_external(
       4,
     ))
     |> sup.add(agent.supervised(agents_name))
-    |> sup.add(mist.supervised(http))
+    // The jobs before the listener, and the order is load-bearing: children
+    // start in the order they are added, `provider_sync` registers its name
+    // inside its own initialiser, and every mutating API request pokes that
+    // name after its transaction commits. Accepting HTTP first leaves a
+    // window in which a committed revocation cannot reach the reconciler.
     |> sup.add(provider_sync.supervised(
       sync_name,
       cfg.db_path,
@@ -620,6 +624,7 @@ fn serve_external(
       chain.doh_validating(chain.resolver_url()),
       sync_name,
     ))
+    |> sup.add(mist.supervised(http))
     |> sup.start
     |> result.map_error(fn(_) { "could not start supervision tree" }),
   )

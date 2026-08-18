@@ -7,6 +7,7 @@ import gleam/crypto
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/otp/static_supervisor as sup
 import jobs/provider_sync
 import jobs/zonekey_watch
 import provider/bunny
@@ -18,6 +19,8 @@ import provider/provider.{
 import provider/state
 import rekor/client
 import rekor/store as rekor_store
+import store/db
+import store/migrate
 import store/sqlite
 import zone/build
 import zone/model.{type ZoneInput, Member, TxtName, ZoneInput, ZoneMeta}
@@ -25,7 +28,7 @@ import zone/publish
 import zone/render_external
 
 import dns/name
-import fixtures
+import fixtures.{tmp_db}
 import gleam/int
 import gleam/string
 import rekor_test
@@ -321,12 +324,14 @@ pub fn published_members_survive_a_pass_the_gate_withheld_test() {
 
   // The withheld set is what the ungated render produced, so the published
   // member is in it and survives.
-  let assert Ok(gated) = diff.diff_gated(gated_desired, published, [member])
+  let assert Ok(gated) =
+    diff.diff_gated(gated_desired, published, [member], adopted: False)
   assert gated.delete == []
 
   // And the distinction is real: the same desired set with nothing withheld
   // means the last device was revoked, which must still delete.
-  let assert Ok(revoked) = diff.diff_gated(gated_desired, published, [])
+  let assert Ok(revoked) =
+    diff.diff_gated(gated_desired, published, [], adopted: False)
   assert list.map(revoked.delete, fn(e) { e.record.name })
     == ["_synchronicity.prod.acme.sync.test"]
 }
@@ -361,7 +366,8 @@ pub fn the_gate_shields_withheld_records_not_membership_shaped_names_test() {
   let gated_desired = [diff.owner_record("sync.test")]
 
   // The gate is armed and `live` is what this pass rendered and held back.
-  let assert Ok(changes) = diff.diff_gated(gated_desired, existing, [live])
+  let assert Ok(changes) =
+    diff.diff_gated(gated_desired, existing, [live], adopted: False)
   let deleted =
     list.sort(
       list.map(changes.delete, fn(e) { e.record.value }),
@@ -385,7 +391,8 @@ pub fn the_gate_does_not_shield_anything_but_membership_test() {
     diff.owner_record("sync.test"),
     Record("_synchronicity-rekor.sync.test", provider.Txt, 60, "sync1p new"),
   ]
-  let assert Ok(changes) = diff.diff_gated(desired_now, existing, [member])
+  let assert Ok(changes) =
+    diff.diff_gated(desired_now, existing, [member], adopted: False)
   let deleted =
     list.sort(list.map(changes.delete, fn(e) { e.record.name }), string.compare)
   assert deleted == ["_synchronicity-rekor.sync.test", "_unrelated.sync.test"]
@@ -541,7 +548,13 @@ fn broken_provider(reason: String) -> Provider {
 
 /// A migrated external-mode database with one member record.
 fn external_conn() -> sqlite.Connection {
-  let conn = fixtures.fresh_conn()
+  external_conn_at(fixtures.tmp_db())
+}
+
+/// The same at a named path, for a test that hands the path to a job.
+fn external_conn_at(path: String) -> sqlite.Connection {
+  let assert Ok(conn) = db.open_primary(path)
+  let assert Ok(_) = migrate.migrate(conn)
   let assert Ok(Nil) = publish.ensure_meta_external(conn, "sync.test")
   let assert Ok(_) =
     sqlite.script(
@@ -660,7 +673,7 @@ pub fn drift_introduced_at_the_provider_is_repaired_without_a_local_change_test(
   provider_sync.run_once_with(
     conn,
     fake_provider([owner, forged], calls),
-    "p",
+    "log-only",
     "z1",
     2000 + 901,
   )
@@ -1061,4 +1074,246 @@ pub fn record_logged_stamps_only_the_named_keys_test() {
 
 fn string_contains(haystack: String, needle: String) -> Bool {
   string.contains(haystack, needle)
+}
+
+// -------------------------------------------------- the reconciler's actor
+
+/// A poke at a name nothing is registered under is a no-op, not a crash.
+///
+/// `process.send` to a `NamedSubject` is
+/// `let assert Ok(pid) = named(name) as "Sending to unregistered name"` — it
+/// raises. The caller is `zone_mutation`, *after* its transaction has
+/// committed and *before* the response is built, so a raise there turns a
+/// committed revocation into a 500 whose follow-up work (dropping the revoked
+/// key's live tunnels) never runs, while the row is already revoked so the
+/// retry answers 404. Two windows reach it: boot, before the reconciler has
+/// registered its name, and any restart of the reconciler.
+pub fn a_poke_at_no_reconciler_is_a_no_op_test() {
+  let missing = process.new_name("t_absent_reconciler")
+  let assert Error(Nil) = process.named(missing)
+  // The assertion is that this line returns at all.
+  provider_sync.poke(missing)
+  let assert Error(Nil) = process.named(missing)
+}
+
+/// A poke does not fork a second sweep timer chain.
+///
+/// `handle` re-arms after a `Tick`, and a poke arrives at the same named
+/// subject. Handled as a `Tick` it would arm an additional timer that is
+/// never cancelled — one per poke, for the life of the process — so the
+/// steady-state sweep rate becomes one pass per interval per poke ever
+/// received. Any authenticated member can drive that by editing a device in
+/// a loop, and a revocation's own poke then queues behind the backlog.
+///
+/// Measured rather than reasoned: the sweep interval is named here so the
+/// chain is observable in a test. Ten pokes at the head of the window; with
+/// the bug the passes over the window are ~11 per interval instead of one.
+/// The bound is deliberately loose (pokes and boot tick included, plus one
+/// interval of slack) so it fails on the defect and not on scheduling jitter.
+pub fn a_poke_does_not_fork_a_second_sweep_timer_test() {
+  let path = tmp_db()
+  let conn = external_conn_at(path)
+  sqlite.close(conn)
+  let calls = process.new_subject()
+  let name = process.new_name("t_reconciler_timer")
+  let assert Ok(_) =
+    sup.new(sup.OneForOne)
+    |> sup.restart_tolerance(intensity: 10, period: 5)
+    |> sup.add(provider_sync.supervised_every(
+      name,
+      path,
+      counting_provider(calls),
+      "log-only",
+      "z1",
+      100,
+    ))
+    |> sup.start
+
+  // Ten pokes inside the first interval.
+  list.each(list.repeat(Nil, 10), fn(_) { provider_sync.poke(name) })
+  process.sleep(1000)
+  let passes = drain_passes(calls, 0)
+
+  // One boot tick + ten pokes + about ten timer ticks over the second, so
+  // roughly twenty-one. Eleven concurrent chains would be about a hundred
+  // and twenty. The bounds are loose enough that scheduling jitter cannot
+  // reach either of them.
+  assert passes >= 11
+  assert passes < 60
+}
+
+/// Counts every pass by reporting one message per `list` call, and then
+/// fails.
+///
+/// The failure is what makes the count a count. A converged reconciler
+/// short-circuits on its stored hash and makes no provider call at all, so a
+/// provider that succeeded would be listed once and never again; a pass that
+/// ends in `record_error` leaves `last_error` set, which `fresh` requires to
+/// be `None`, so every subsequent pass lists.
+fn counting_provider(calls: process.Subject(String)) -> Provider {
+  Provider(
+    list: fn() {
+      process.send(calls, "pass")
+      Error("counting")
+    },
+    apply: fn(_changes) { Error("counting") },
+    describe: "counting",
+  )
+}
+
+fn drain_passes(calls: process.Subject(String), seen: Int) -> Int {
+  case process.receive(calls, 0) {
+    Ok(_) -> drain_passes(calls, seen + 1)
+    Error(Nil) -> seen
+  }
+}
+
+/// A marker overwritten after convergence is drift, not a foreign apex.
+///
+/// Both refusal arms of `diff_gated` return before `create` is computed, so a
+/// reconciler that has lost its marker cannot re-assert one. Whoever holds
+/// the provider API token — the party the ownership rule exists to defend
+/// against — overwrites `_synchronicity-owner.<apex>` with one write, and
+/// every pass afterwards refuses: no create, no replace, and above all no
+/// delete, so a revocation committed in the product never reaches the wire.
+///
+/// The guard's real subject is a *first* sync against an apex somebody else
+/// is using, and that case is asserted below to still refuse.
+pub fn a_marker_changed_after_convergence_is_repaired_test() {
+  let conn = external_conn()
+  let calls = process.new_subject()
+  let _owner = Existing("m", diff.owner_record("sync.test"))
+
+  // Converge, so the deployment has an applied set for this provider+zone.
+  provider_sync.run_once_with(
+    conn,
+    fake_provider([], calls),
+    "log-only",
+    "z1",
+    2000,
+  )
+  let assert Ok("list") = process.receive(calls, 100)
+  let assert Ok("apply " <> _) = process.receive(calls, 100)
+  let assert Ok(Ok(before)) = state.get(conn)
+  assert before.last_error == None
+
+  // The token holder rewrites the marker's value and plants a record.
+  let hijacked =
+    Existing(
+      "m",
+      Record(
+        "_synchronicity-owner.sync.test",
+        provider.Txt,
+        300,
+        "heritage=someone-else",
+      ),
+    )
+  let forged =
+    Existing(
+      "f",
+      Record(
+        "_synchronicity.prod.acme.sync.test",
+        provider.Txt,
+        300,
+        "v=sync1 id=evil nk=" <> fixtures.nk() <> " apex=sync.test",
+      ),
+    )
+  provider_sync.run_once_with(
+    conn,
+    fake_provider([hijacked, forged], calls),
+    "log-only",
+    "z1",
+    2000 + 901,
+  )
+  let assert Ok("list") = process.receive(calls, 100)
+  // The pass proceeds: the marker is re-created and the forgery deleted.
+  let assert Ok("apply " <> applied) = process.receive(calls, 100)
+  assert string.ends_with(applied, "/2")
+  let assert Ok(Ok(after)) = state.get(conn)
+  assert after.last_error == None
+  sqlite.close(conn)
+
+  // And a deployment that has never applied anything still refuses, which is
+  // the case the rule was written for.
+  let fresh = external_conn()
+  provider_sync.run_once_with(
+    fresh,
+    fake_provider([hijacked], calls),
+    "log-only",
+    "z1",
+    2000,
+  )
+  let assert Ok("list") = process.receive(calls, 100)
+  let assert Error(Nil) = process.receive(calls, 100)
+  let assert Ok(Ok(refused)) = state.get(fresh)
+  let assert Some(reason) = refused.last_error
+  assert string_contains(reason, "conflict")
+  sqlite.close(fresh)
+}
+
+/// A device edited while the gate is armed keeps its published record.
+///
+/// Byte equality alone shields only what did not change, so the gate turned a
+/// replace into a delete: the old record removed, the new one withheld, and
+/// the device out of the zone entirely until the gate disarmed. The trigger is
+/// an ordinary dashboard edit, with the gate armed by somebody else's routine
+/// key rotation.
+pub fn a_device_edited_while_the_gate_is_armed_keeps_its_record_test() {
+  let nk = fixtures.nk()
+  let owner = "_synchronicity.prod.acme.sync.test"
+  let published =
+    Existing(
+      "d1",
+      Record(
+        owner,
+        provider.Txt,
+        300,
+        "v=sync1 id=nas nk=" <> nk <> " apex=sync.test",
+      ),
+    )
+  let marker = Existing("m", diff.owner_record("sync.test"))
+  // The gate is armed, so the desired set carries no membership at all; the
+  // ungated render — the withheld set — carries the *edited* record.
+  let gated = [diff.owner_record("sync.test")]
+  let edited =
+    Record(
+      owner,
+      provider.Txt,
+      300,
+      "v=sync1 id=nas nk="
+        <> nk
+        <> " relay=https://relay.example apex=sync.test",
+    )
+  let assert Ok(changes) =
+    diff.diff_gated(gated, [marker, published], [edited], adopted: True)
+  assert changes.delete == []
+
+  // A revoked device is still deleted: nothing in the withheld set names it.
+  let assert Ok(revoked) =
+    diff.diff_gated(gated, [marker, published], [], adopted: True)
+  assert list.map(revoked.delete, fn(e) { e.record.value })
+    == [published.record.value]
+
+  // And a forgery that copies the label and key to change the hints does not
+  // ride in on the fallback: it doubles the identity, so neither record is
+  // shielded by it and the forgery is deleted, while the genuine one stays
+  // shielded by value.
+  let forgery =
+    Existing(
+      "f",
+      Record(
+        owner,
+        provider.Txt,
+        300,
+        "v=sync1 id=nas nk=" <> nk <> " addr=198.51.100.9:9999 apex=sync.test",
+      ),
+    )
+  let assert Ok(both) =
+    diff.diff_gated(
+      gated,
+      [marker, published, forgery],
+      [published.record],
+      adopted: True,
+    )
+  assert list.map(both.delete, fn(e) { e.id }) == ["f"]
 }
