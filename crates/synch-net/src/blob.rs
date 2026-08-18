@@ -93,15 +93,15 @@ pub fn proof_window(remaining: &ChunkRanges, level: u8) -> ChunkRanges {
 ///
 /// - **Range count.** The provider side rejects a request past [`MAX_RANGES`]
 ///   because the set operations under it are quadratic in the number of ranges
-///   and the asker would not be paying for them (§12). The same is true in
-///   reverse and was not checked: `served` is decoded from a frame, so a
-///   provider could answer with a million singleton ranges, and the requester
-///   intersects it on a runtime worker.
+///   and the asker would not be paying for them (§12). The same holds in
+///   reverse: `served` is decoded from a frame, so a provider could answer with
+///   a million singleton ranges, and the requester intersects it on a runtime
+///   worker.
 /// - **Containment.** A provider can only have served what was asked for.
 ///   Anything outside the request is at best noise the requester would union
-///   into its progress, and the slice path fed it straight to `write_slice`
-///   while the proof path already intersected it away — an asymmetry with no
-///   reason behind it.
+///   into its progress, and at worst a claim carried straight into
+///   `write_slice` — so the slice path and the proof path both intersect it
+///   away here, rather than one of them.
 fn check_served(served: ChunkRanges, requested: &ChunkRanges) -> Result<ChunkRanges, NetError> {
     if served.range_count() > MAX_RANGES {
         return Err(NetError::Unexpected(format!(
@@ -405,13 +405,14 @@ impl BlobClient {
             // one round trip per window, `ceil(ranges / window)` of them, rather
             // than one per *group the provider felt like serving*.
             //
-            // Retiring only what came back left no ceiling at all. A provider
-            // answering each request with a valid proof of a single group is
-            // never barren, so `MAX_BARREN_WINDOWS` never fires and the deadline
-            // is per exchange — so the loop ran once per group of the object,
-            // millions of times for a large one, and each turn cost the victim
-            // an outboard write, an fsync and an immediate transaction on its
-            // one write connection (`docs/DELTA-SYNC.md` §3.3).
+            // Retiring only what came back would leave no ceiling at all. A
+            // provider answering each request with a valid proof of a single
+            // group is never barren, so `MAX_BARREN_WINDOWS` never fires and
+            // the deadline is per exchange — the loop would run once per group
+            // of the object, millions of times for a large one, and each turn
+            // would cost the victim an outboard write, an fsync and an
+            // immediate transaction on its one write connection
+            // (`docs/DELTA-SYNC.md` §3.3).
             //
             // Nothing honest needs a second look at a window: a partial holder
             // answers `requested ∩ held` for the whole of it in one walk, and
@@ -627,10 +628,9 @@ mod tests {
 
     /// The requester sizes each window so the provider never truncates.
     ///
-    /// This is what replaced a pair of compensating mechanisms: a provider that
-    /// threw away a truncated walk and repeated it over the ranges that fit, and
-    /// a requester-side round-trip ceiling built from three magic constants.
-    /// Neither is needed once the split is predictable.
+    /// A predictable split is what bounds a descent at `ceil(ranges / window)`
+    /// exchanges without either side having to signal or compensate for a walk
+    /// that overran the frame.
     #[test]
     fn a_proof_window_always_fits_one_exchange() {
         let groups_in = |bytes: u64| bytes / CHUNK_GROUP_SIZE;

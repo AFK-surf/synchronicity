@@ -302,14 +302,14 @@ impl Store {
     ///
     /// "Published past the forked seq" is read off the *retained history*, not
     /// off the complete slot, and that is the difference between a bounded rule
-    /// and an open one. Reading it off the complete head asked whether the head
+    /// and an open one. Reading it off the complete head asks whether the head
     /// this node holds *now* is older than retention, so any origin publishing
-    /// once per `root_retention` pinned every fork row it had ever signed —
-    /// and every trie node reachable from those roots, since retained roots are
-    /// GC mark roots. It was open at the other end too: a fork at a seq *above*
-    /// the complete head never satisfied `current_seq > seq`, so an origin
-    /// signing two roots at each of a thousand far-future seqs and serving none
-    /// of the tries made every one of those rows permanent, `trust rm` and all.
+    /// once per `root_retention` pins every fork row it has ever signed — and
+    /// every trie node reachable from those roots, since retained roots are GC
+    /// mark roots. It is open at the other end too: a fork at a seq *above* the
+    /// complete head never satisfies `current_seq > seq`, so an origin signing
+    /// two roots at each of a thousand far-future seqs and serving none of the
+    /// tries makes every one of those rows permanent, `trust rm` and all.
     /// A retained head at a *higher* seq is the same proof that the origin
     /// moved on, it is what an origin flooding future seqs supplies by the
     /// thousand, and only the single highest forked seq is left without one.
@@ -375,9 +375,8 @@ impl Store {
             // While a fork is exempt, so is the lowest head the origin is on
             // record at above it. That row is the *proof* the origin moved past
             // the fork, and it is older than the window, so an ordinary pass
-            // would take it — leaving a fork that nothing can ever retire,
-            // which is the shape of the bug this rule replaces. It stays until
-            // the fork it speaks about can go with it.
+            // would take it — leaving a fork that nothing can ever retire. It
+            // stays until the fork it speaks about can go with it.
             let witnesses: std::collections::HashSet<u64> = forked
                 .iter()
                 .copied()
@@ -519,14 +518,23 @@ impl Txn<'_> {
     /// acceptance rule may not do: which roots a peer saw first would then
     /// decide which head it holds, and two honest peers fed the same set in
     /// different orders would settle on different heads and refuse each other
-    /// forever. Evicting keeps the *greatest* `keep` roots at the seq, which is
-    /// the same set on every peer whatever the arrival order, and always leaves
-    /// the two that prove the equivocation (§4.4) as long as `keep >= 2`.
+    /// forever. Evicting keeps the *greatest* `keep` roots at the seq, and
+    /// always leaves the two that prove the equivocation (§4.4) as long as
+    /// `keep >= 2`.
     ///
     /// A row a slot points at is never evicted: since v11 `heads` names a
     /// `head_history` row and every head read joins the two, so a slot whose row
     /// went would be a head that can no longer be read. Same guard, and for the
     /// same reason, as [`Store::prune_history_before`]'s.
+    ///
+    /// That guard is also the one way the retained set is *not* identical on
+    /// every peer: it is the greatest `keep` roots plus whatever a slot still
+    /// names, and which roots reached a slot depends on the order they arrived
+    /// in. The deviation is bounded by the number of slots, so a peer retains at
+    /// most `keep + 2` roots at a seq and the retention bound holds. Nothing
+    /// reads across it — `head_floor` reads `heads`, never this table — so head
+    /// selection stays order-independent; what can differ between two peers is a
+    /// `doctor` fork line and one root's subtree staying in the GC mark set.
     pub fn trim_forks(&self, origin: &OriginId, seq: u64, keep: usize) -> Result<usize> {
         Ok(self.conn().execute(
             "DELETE FROM head_history
@@ -618,10 +626,17 @@ fn put_head_in(
 ) -> Result<()> {
     // The signature goes to `head_history` and the slot points at it. Writing
     // it here is what makes the pointer sound for *every* caller, so no caller
-    // has to remember to record history alongside — which is what the old
-    // record-on-arrival-and-again-on-displacement pair of rules was doing by
-    // hand, redundantly, at seven call sites.
+    // has to remember to record history alongside — a rule that would
+    // otherwise have to be kept by hand, redundantly, at every call site.
     record_history_in(conn, head, received_at)?;
+    // A `seq` past `i64::MAX` would bind as a negative integer and invert every
+    // SQL ordering over `heads` and `head_history` — silently, and for good,
+    // since the row it corrupts is the one head selection reads. Nothing
+    // honest reaches it (`record_observed_head` refuses such a claim and the
+    // publish floor is capped), so this is the backstop that keeps the column's
+    // domain equal to the type's.
+    let seq = i64::try_from(head.seq)
+        .map_err(|_| StoreError::column("heads.seq", "past the representable range"))?;
     conn.execute(
         "INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -631,7 +646,7 @@ fn put_head_in(
         params![
             head.origin.canonical(),
             slot.as_str(),
-            head.seq as i64,
+            seq,
             head.root.as_bytes().to_vec(),
             received_at,
             verified_at,
@@ -645,13 +660,15 @@ fn record_history_in(
     head: &SignedHead,
     recorded_at: i64,
 ) -> Result<()> {
+    let seq = i64::try_from(head.seq)
+        .map_err(|_| StoreError::column("head_history.seq", "past the representable range"))?;
     conn.execute(
         "INSERT OR IGNORE INTO head_history
            (origin_id, seq, root, created_at, signed_by, sig, recorded_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             head.origin.canonical(),
-            head.seq as i64,
+            seq,
             head.root.as_bytes().to_vec(),
             head.created_at,
             head.signed_by.as_bytes().to_vec(),
@@ -750,8 +767,7 @@ mod tests {
 
         // Seven distinct roots: five recorded directly, plus the two the slots
         // point at — which `put_head` retains, so they are here by
-        // construction rather than needing the union `retained_roots` used to
-        // take across both tables.
+        // construction rather than needing a union across both tables.
         let roots = store.retained_roots().unwrap();
         assert_eq!(roots.len(), 7);
         assert!(roots.contains(&Hash([6u8; 32])));

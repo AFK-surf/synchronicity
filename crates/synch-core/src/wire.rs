@@ -39,10 +39,10 @@ pub const MAX_BATCH: usize = 256;
 /// address. So `n + ranges * 64` bounds it.
 ///
 /// The looser `2n + ranges * 64` would be simpler and is wrong in a way that
-/// matters now that the provider *refuses* an over-budget request rather than
-/// truncating: it puts the span-level round of a 100 GB object — about 5 960
-/// subtrees, which `MAX_PROOF_NODES` was sized to carry in one exchange — over
-/// the budget, and would split the one round the whole descent depends on
+/// matters, because the provider *refuses* an over-budget request rather than
+/// truncating it: it puts the span-level round of a 100 GB object — about
+/// 5 960 subtrees, which `MAX_PROOF_NODES` is sized to carry in one exchange —
+/// over the budget, and would split the one round the whole descent depends on
 /// being atomic.
 ///
 /// This is what lets the requester size a window so the provider never has to
@@ -60,11 +60,11 @@ pub fn proof_nodes_upper_bound(ranges: &ChunkRanges, level: u8) -> u64 {
 
 /// How many heads or head summaries one message may carry (§5.1).
 ///
-/// The counterpart of [`MAX_BATCH`] for the head-gossip messages, which had no
-/// bound at all and are the costlier of the two: each `SignedHead` in a `Heads`
-/// frame buys an Ed25519 verification and a `head_history` insert, and each
-/// origin in a `HeadsWant` buys a query. Bounded only by the frame, one 16 MiB
-/// message was worth six figures of both.
+/// The counterpart of [`MAX_BATCH`] for the head-gossip messages, which need a
+/// bound of their own and are the costlier of the two: each `SignedHead` in a
+/// `Heads` frame buys an Ed25519 verification and a `head_history` insert, and
+/// each origin in a `HeadsWant` buys a query. Bounded only by the frame, one
+/// 16 MiB message is worth six figures of both.
 ///
 /// §12 sizes a cluster at N ≤ 100 origins and one head per origin per slot, so
 /// a legitimate exchange names tens; this leaves two orders of magnitude of
@@ -237,10 +237,77 @@ impl GroupRange {
 }
 
 /// A set of chunk-group ranges, in 16 KiB group units (§6.4).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ChunkRanges {
     /// Sorted, non-overlapping ranges.
     pub ranges: Vec<GroupRange>,
+}
+
+/// Decoding stops at [`MAX_RANGES`] rather than checking afterwards.
+///
+/// Both sides refuse a range set past [`MAX_RANGES`], because the set
+/// operations under it are quadratic in the number of ranges — and a check on
+/// the already-materialized `Vec` comes too late. A `GroupRange` of two zeroes
+/// is two postcard bytes, so a frame at [`MAX_FRAME_LEN`] decodes to ~8.4
+/// million elements, ~134 MB resident, before anything can look at the length:
+/// an eightfold heap amplification over the frame the reader has already
+/// accepted, per stream, on both `GetSlice` and `GetProof`.
+///
+/// Refusing outright rather than truncating: unlike a `BlobAd`'s spans, where a
+/// short tail is a weaker claim and costs a re-fetch, a truncated *request* is a
+/// different request, and a truncated `served` would silently overstate what a
+/// provider withheld.
+impl<'de> Deserialize<'de> for ChunkRanges {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            ranges: BoundedRanges,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(ChunkRanges {
+            ranges: raw.ranges.0,
+        })
+    }
+}
+
+/// A range list that refuses to grow past [`MAX_RANGES`] while decoding.
+struct BoundedRanges(Vec<GroupRange>);
+
+impl<'de> Deserialize<'de> for BoundedRanges {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = BoundedRanges;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "at most {MAX_RANGES} chunk-group ranges")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<BoundedRanges, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                // Never `with_capacity(size_hint)`: the hint is the peer's.
+                let mut ranges: Vec<GroupRange> = Vec::new();
+                while let Some(range) = seq.next_element::<GroupRange>()? {
+                    if ranges.len() >= MAX_RANGES {
+                        return Err(serde::de::Error::custom(format!(
+                            "a range set past the {MAX_RANGES} limit"
+                        )));
+                    }
+                    ranges.push(range);
+                }
+                Ok(BoundedRanges(ranges))
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
 }
 
 impl ChunkRanges {
@@ -328,11 +395,11 @@ impl ChunkRanges {
     /// The intersection of two sets.
     ///
     /// A linear merge over both sides, which the sorted-and-disjoint invariant
-    /// permits and the nested loop this replaced did not exploit. The
+    /// permits — a nested loop over the same two sets costs `n * m`. The
     /// difference matters because a range set arrives off the wire: `served` in
     /// a `SliceEnd`/`ProofEnd` is bounded only by the frame, so a provider
     /// could answer with a million singleton ranges and make the requester
-    /// spend `n * m` on a set operation the requester runs on a runtime worker.
+    /// spend that on a set operation it runs on a runtime worker.
     pub fn intersect(&self, other: &ChunkRanges) -> ChunkRanges {
         let mut out = Vec::new();
         let (mut i, mut j) = (0usize, 0usize);

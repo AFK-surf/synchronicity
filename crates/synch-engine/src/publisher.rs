@@ -170,8 +170,8 @@ impl Node {
         // the await would be skipped entirely if this future were dropped
         // first. It can be: control connections are spawned detached
         // (`control::Server::run`), so a `daemon stop` landing mid-flush drops
-        // one wherever it happens to be parked, and this used to be the one
-        // await point where that meant a batch taken out of the buffer and
+        // one wherever it happens to be parked, and this is the one await point
+        // where that would otherwise mean a batch taken out of the buffer and
         // never put back.
         let node = self.clone();
         let head = crate::blocking::offload(move || match node.publish(&batch) {

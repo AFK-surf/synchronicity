@@ -130,10 +130,12 @@ ProofEnd  { served: ChunkRanges }
   allocation. Counting groups instead would defeat the point: a 512-group window
   would turn the span-level round of a 100 GB object into twelve thousand round
   trips. `ProofEnd` reports how far the provider got; the requester walks on
-  from there (§6.4 shape). When the budget cuts a walk short the provider
-  re-walks the ranges that fit and sends exactly those, so both sides agree on
-  the answer node for node rather than the requester having to guess which
-  prefix it received. The *number* of windows one exchange may take is capped
+  from there (§6.4 shape). The requester sizes each window from
+  `proof_nodes_upper_bound` so that a provider holding everything it asked for
+  still fits the budget — and since a provider walks `requested ∩ what it
+  holds`, a subset can never cost more. An over-budget request is therefore not
+  a conforming requester's, and the provider refuses it rather than serving a
+  prefix both sides would then have to agree about. The *number* of windows one exchange may take is capped
   too: a provider serving one group per window is not barren — it is making
   progress, an RTT at a time — and without a ceiling it could hold a descent
   open for one round trip per group of the object.
@@ -156,8 +158,10 @@ ProofEnd  { served: ChunkRanges }
   it is a fact about where the object ends, so a proof spent under a shorter
   size hands out whole-looking subtrees the object does not end after — promote
   them and the row is complete at a fraction of its length, unreadable and
-  refusing every honest writer of the rest. `promote` refuses a proof whose root
-  or size is not the one it was asked to fill.
+  refusing every honest writer of the rest. Both therefore travel *inside*
+  `Proven` rather than alongside it: `promote` reads the object and its length
+  off the proof, so spending one on another object is not something a caller can
+  express.
 
 ### 3.2 Donors: CAS objects, and only CAS objects
 
@@ -468,7 +472,7 @@ costs the size of the change.
 | Proof verification fails | Provider dropped for the exchange (as with a bad slice); next candidate tried; delta abandoned for this object if none remain. |
 | A proof offered for the wrong object, or at the wrong length | The root and the size travel with the proof (§3.1), so a proof only ever verifies against the object it was taken for and is spent at the length it was taken at. |
 | An entry understates a root's size by less than a group | The tail group is not promoted: its extent under the claim is shorter than under the donor, so the run a chaining value attests is not the run that would be copied, and promotion refuses it. The groups before it promote normally, and the honest writer of the real length is not refused by what the claim left behind. |
-| An entry overstates a root's size | The row records the claim, and the next writer with a different one replaces it — a size is only settled once the final group is held, because no earlier group's chaining value depends on it. The claim can only ever be wrong within the last 16 KiB group: anything that changes the object's group count changes the shape of its tree, so no proof or slice for it would verify. |
+| An entry overstates a root's size | The row records the claim, and the next writer with a different one replaces it — a size is only settled once the final group is held, because no earlier group's chaining value depends on it. No *verifying* proof or slice can be produced under a claim that changes the object's group count, since the group count fixes the shape of the tree. The claim can still be recorded: a size is only ever a claim until a group attests to it, so a cross-bracket claim replaces an unattested one and `settle_size` resets the bitmap with it, because bits verified under one tree shape say nothing under another. That costs a re-fetch of what was held, never a wrong byte, and is the accepted price of letting an unattested size yield to the next writer. |
 | An entry **under**states a root's size | Refused before anything is written. Nothing is resized on the strength of an unproved length — the payload and outboard only ever grow until a commit settles the size — so a claim short enough to contradict groups already in the bitmap is rejected, and the bytes, the bitmap and the row are exactly as they were. |
 | A size claim racing a write that completes the object | The claim loses. Whether a claimed size may stand is decided inside the same transaction as the bitmap read-union-write, so the two writers serialize: the honest one either finds the claim and replaces it, or lands first and has the claim refused against the size its final group now attests to. Before that the decision was made on a snapshot taken before the work, and the second committer overwrote the first's size — leaving the row `complete` under a length no byte on the disk supported: unreadable, refusing every honest writer for good, and pinned against the collector by the entry that named it. |
 | Donor's tree disagrees under a matched span | Span refused and left to the network; the spans around it are unaffected. |

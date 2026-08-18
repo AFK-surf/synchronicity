@@ -166,13 +166,13 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
 ///
 /// `ValueRef` has two representations for one value — inline, or a hash of an
 /// out-of-line payload — and which one a node carries is a storage decision,
-/// not part of the value. Comparing the references directly reported a change
-/// where there was none: `Inline(x)` and `Hash(blake3(x))` resolve identically.
-/// That produced no false negatives, so nothing was ever corrupted by it, but
-/// it re-materialized rows that had not changed, broke the "every reported key
-/// really differs" contract the property tests assert, and let a peer force a
-/// full re-materialization of an unchanged trie by republishing it with the
-/// representations flipped.
+/// not part of the value. Comparing the references directly would report a
+/// change where there is none: `Inline(x)` and `Hash(blake3(x))` resolve
+/// identically. That produces no false negatives, so nothing would be
+/// corrupted by it, but it would re-materialize rows that have not changed,
+/// break the "every reported key really differs" contract the property tests
+/// assert, and let a peer force a full re-materialization of an unchanged trie
+/// by republishing it with the representations flipped.
 ///
 /// Compared without touching the store: the out-of-line hash *is* the BLAKE3 of
 /// the value, so the inline side can be hashed and the two compared directly.

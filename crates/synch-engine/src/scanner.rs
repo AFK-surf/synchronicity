@@ -147,8 +147,8 @@ impl Node {
     /// the link's own (lstat) mtime and its target, so an unchanged symlink
     /// stages nothing. Republishing one every scan would defeat the property
     /// that an unchanged tree publishes no head — and, worse, leaving the row
-    /// out meant the deletion sweep never saw the path, so a removed symlink
-    /// was never tombstoned and stayed published forever.
+    /// out would hide the path from the deletion sweep, so a removed symlink
+    /// would never be tombstoned and would stay published forever.
     ///
     /// The target is the change signal, and it is carried in the row's
     /// `content` column as `blake3(target)`: content-addressing a link's
@@ -355,17 +355,17 @@ impl Node {
     /// Stages the removal of `b:` records for objects this node no longer
     /// holds (§6.3).
     ///
-    /// Nothing ever retired an availability ad. The scanner stages
-    /// `blob_key(content) -> Some(ad)` on every hash and only `f:` keys were
-    /// ever staged as `None`, so every content root this origin had ever
-    /// published stayed a leaf in its trie for good — replicated to every
+    /// An availability ad has to be retired explicitly. The scanner stages
+    /// `blob_key(content) -> Some(ad)` on every hash and stages only `f:` keys
+    /// as `None`, so without this every content root this origin has ever
+    /// published would stay a leaf in its trie for good — replicated to every
     /// member, pinned against trie GC by the head that reaches it, and
     /// accumulating one leaf per edit per file forever.
     ///
-    /// It was also a correctness problem, not only a growth one: `gc_content`
-    /// deletes a local payload once no entry references it, while the ad went
-    /// on telling every peer this node held the object. Peers kept selecting it
-    /// as a provider and kept failing.
+    /// It is a correctness problem as much as a growth one: `gc_content`
+    /// deletes a local payload once no entry references it, while a standing ad
+    /// goes on telling every peer this node holds the object, so peers keep
+    /// selecting it as a provider and keep failing.
     ///
     /// Retiring is the same shape as tombstone expiry — staged, so it costs one
     /// head like any other batch.
@@ -519,9 +519,9 @@ impl Node {
     ///
     /// The bytes-in-hand [`Node::adopt`] is what a caller with a small payload
     /// uses; this is the form that never has the payload in hand. `take` of a
-    /// multi-gigabyte file used to read the object into memory and hand the
-    /// slice over — the object is fetched into the CAS either way, so the only
-    /// thing that buffering bought was a copy the size of the file.
+    /// multi-gigabyte file would otherwise read the object into memory and hand
+    /// the slice over — the object is fetched into the CAS either way, so the
+    /// only thing that buffering buys is a copy the size of the file.
     pub async fn adopt_from(
         &self,
         origin: &synch_core::OriginId,

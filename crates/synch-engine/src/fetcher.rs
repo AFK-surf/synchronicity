@@ -390,11 +390,11 @@ impl Node {
 
         let fanout = self.config().fetch_fanout.max(1);
         // A pool, not a one-shot iterator. Advancing a single iterator across
-        // batches meant each provider was selected at most once for the whole
-        // fetch, so a provider that served its share and stayed healthy was
-        // never asked again: with one good provider and two ghosts in the first
-        // batch, the good one served a third, the ghosts failed, the iterator
-        // was exhausted, and the fetch reported failure with the holder still
+        // batches would select each provider at most once for the whole fetch,
+        // so a provider that served its share and stayed healthy would never be
+        // asked again: with one good provider and two ghosts in the first
+        // batch, the good one serves a third, the ghosts fail, the iterator is
+        // exhausted, and the fetch reports failure with the holder still
         // online. §6.4 promises the opposite — a provider that cannot help is
         // dropped and its groups are re-split across *the remainder*.
         let mut pool: Vec<Provider> = providers;
@@ -621,7 +621,9 @@ impl Node {
         let unsettled = {
             let node = self.clone();
             let donors = donors.to_vec();
-            crate::blocking::offload(move || node.unsettled_spans(&donors, &leftover)).await?
+            let wanted = wanted.clone();
+            crate::blocking::offload(move || node.unsettled_spans(&donors, &leftover, &wanted))
+                .await?
         };
         let mut left = unsettled;
         while !left.is_empty() {
@@ -658,7 +660,12 @@ impl Node {
     /// says nothing, and the groups under it descend.
     ///
     /// Blocking: one outboard walk per span per donor.
-    fn unsettled_spans(&self, donors: &[Donor], leftover: &Proven) -> Result<ChunkRanges> {
+    fn unsettled_spans(
+        &self,
+        donors: &[Donor],
+        leftover: &Proven,
+        wanted: &ChunkRanges,
+    ) -> Result<ChunkRanges> {
         let mut out = ChunkRanges::empty();
         let mut whole: Vec<ProvenSubtree> = Vec::new();
         for subtree in &leftover.subtrees {
@@ -682,12 +689,20 @@ impl Node {
             if donor.root() == leftover.root {
                 continue;
             }
-            for (index, cv) in self
-                .store()
-                .subtree_cvs(&donor.root(), &spans)?
-                .iter()
-                .enumerate()
-            {
+            // Same rule as promotion: a donor that errors has nothing to say,
+            // and saying so must not fail the fetch.
+            let cvs = match self.store().subtree_cvs(&donor.root(), &spans) {
+                Ok(cvs) => cvs,
+                Err(e) => {
+                    tracing::debug!(
+                        donor = %donor.root(),
+                        error = %e,
+                        "a donor could not be read for the leaf round"
+                    );
+                    continue;
+                }
+            };
+            for (index, cv) in cvs.iter().enumerate() {
                 comparable[index] |= cv.is_some();
             }
         }
@@ -696,7 +711,12 @@ impl Node {
                 out = out.union(&ChunkRanges::from_ranges([subtree.range()]));
             }
         }
-        Ok(out)
+        // Spans are whole 16 MiB subtrees, so a span that merely *overlaps*
+        // what this fetch wants would otherwise be descended in full — buying a
+        // leaf proof, and a round trip, for groups already in the bitmap, which
+        // `promote` then discards. Clipping costs nothing and is what makes a
+        // resumed fetch's second round proportional to what is still missing.
+        Ok(out.intersect(wanted))
     }
 
     /// Collects proofs for `ranges` from whoever will serve them.
@@ -759,11 +779,14 @@ impl Node {
             let started = std::time::Instant::now();
             match self.net().connect_blob(addr).await {
                 Ok(client) => {
+                    // The dial, for the same reason as the slice path above: a
+                    // proof descent is also a walk of as many windows as the
+                    // range needs.
+                    let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
+                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
                     let outcome = client
                         .fetch_proof_into(self.store(), *root, size, ask, level)
                         .await?;
-                    let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
                     return Ok(outcome);
                 }
                 Err(e) => last_error = Some(e),
@@ -823,7 +846,25 @@ impl Node {
             if donor.root() == *root {
                 continue;
             }
-            let got = self.store().promote(donor, proven, now_ns())?;
+            // A donor that errors is a donor with nothing to give, exactly like
+            // one that matched nothing. Nothing in the descent may fail the
+            // fetch — that is the rule the rest of this path already keeps, and
+            // the proof rounds keep it per provider — but this call propagated,
+            // so a raced size settlement or an ENOSPC while copying a subtree
+            // failed a fetch that the ordinary slice path would have completed
+            // over the network.
+            let got = match self.store().promote(donor, proven, now_ns()) {
+                Ok(got) => got,
+                Err(e) => {
+                    tracing::debug!(
+                        root = %root,
+                        donor = %donor.root(),
+                        error = %e,
+                        "a donor could not be promoted from: leaving its groups to the fetch"
+                    );
+                    continue;
+                }
+            };
             if got.is_empty() {
                 continue;
             }
@@ -838,12 +879,12 @@ impl Node {
     /// Produces an object of no bytes locally, rather than fetching it.
     ///
     /// A zero-length object has nothing to transfer: no bytes, and no group a
-    /// provider could serve. Asking for one anyway is what broke empty files —
+    /// provider could serve. Asking for one anyway is what breaks empty files —
     /// [`group_count`] counts an empty object as one group so that "complete"
     /// is representable, but bao encodes nothing over an empty tree, so every
-    /// window came back served-nothing, the fetch ran out of providers with
-    /// that group still missing, and a mirror reported the path as `no
-    /// provider could serve the content` (§6.4).
+    /// window comes back served-nothing, the fetch runs out of providers with
+    /// that group still missing, and a mirror reports the path as `no provider
+    /// could serve the content` (§6.4).
     ///
     /// Nobody has to serve it. An empty object's content is settled by its
     /// size, and its root is what BLAKE3 gives for no input — so this node can
@@ -971,16 +1012,24 @@ impl Node {
             let started = std::time::Instant::now();
             match self.net().connect_blob(addr).await {
                 Ok(client) => {
-                    let got = client.fetch_into(self.store(), *root, size, ask).await?;
+                    // Timed at the dial, not around the transfer. `fetch_into`
+                    // walks the provider's whole share one window at a time, so
+                    // timing it would measure *how much was asked of the peer*,
+                    // not how quick the peer is — a provider that successfully
+                    // served a gigabyte would record tens of seconds, worse
+                    // than `FAILURE_PENALTY_US`, and so rank below a peer whose
+                    // dial was refused, inverting the ranking under exactly the
+                    // load it exists to spread.
                     let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
                     self.store().record_peer_sync(key, now_ns(), elapsed)?;
+                    let got = client.fetch_into(self.store(), *root, size, ask).await?;
                     return Ok(got);
                 }
                 Err(e) => {
                     // A failed dial has to move the EWMA, or ranking is a
-                    // one-way ratchet: latency was recorded only on success, so
-                    // a peer that was once fast and is now a black hole kept its
-                    // low EWMA and was therefore selected first on every
+                    // one-way ratchet: with latency recorded only on success, a
+                    // peer that was once fast and is now a black hole keeps its
+                    // low EWMA and is therefore selected first on every
                     // subsequent fetch, forever, with nothing able to demote it.
                     let _ = self
                         .store()
@@ -1368,11 +1417,11 @@ mod tests {
     /// Provider discovery stops at the first answer and backs off after a
     /// fruitless round.
     ///
-    /// Discovery is entered whenever no local ad covers a root, and it used to
+    /// Discovery is entered whenever no local ad covers a root, so it must not
     /// walk *every* dialable peer with no early exit and remember nothing. A
     /// content root nobody holds — an origin publishing `f:` records whose
-    /// content hashes name nothing — was therefore re-planned by every mirror
-    /// pass and re-dialled the whole cluster on each one, so the victim's
+    /// content hashes name nothing — is re-planned by every mirror pass, and
+    /// would otherwise re-dial the whole cluster on each one, so the victim's
     /// mirror could be kept from ever completing a pass. `trust rm` does not
     /// help: what has been published is retained for `root_retention` (§6.3).
     #[tokio::test]
@@ -1475,8 +1524,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_dial_demotes_a_peer_that_was_fast() {
-        // Ranking has to move in both directions. Latency was recorded only on
-        // success, so a peer that went dark kept its low EWMA and was chosen
+        // Ranking has to move in both directions. With latency recorded only
+        // on success, a peer that goes dark keeps its low EWMA and is chosen
         // first on every subsequent fetch, forever.
         let (_d, node) = node().await;
         let root = Hash::new(b"object");
@@ -1749,7 +1798,10 @@ mod tests {
             ],
         };
 
-        let unsettled = node.unsettled_spans(&[Donor(donor)], &round_one).unwrap();
+        let all = ChunkRanges::single(0, 20);
+        let unsettled = node
+            .unsettled_spans(&[Donor(donor)], &round_one, &all)
+            .unwrap();
         assert_eq!(
             unsettled,
             ChunkRanges::from_ranges([
@@ -1761,8 +1813,25 @@ mod tests {
 
         // With no donor at all, round two has nothing to look inside but that
         // right edge — the whole of the rest goes straight to the fetch.
-        let unsettled = node.unsettled_spans(&[], &round_one).unwrap();
+        let unsettled = node.unsettled_spans(&[], &round_one, &all).unwrap();
         assert_eq!(unsettled, ChunkRanges::single(16, 20));
+
+        // Spans are whole subtrees, so one that merely overlaps what this fetch
+        // wants would otherwise be descended in full — buying a leaf proof, and
+        // a round trip, for groups already held. The result is clipped to what
+        // was asked for.
+        let wanted = ChunkRanges::single(5, 18);
+        let unsettled = node
+            .unsettled_spans(&[Donor(donor)], &round_one, &wanted)
+            .unwrap();
+        assert_eq!(
+            unsettled,
+            ChunkRanges::from_ranges([
+                synch_core::GroupRange::new(5, 8),
+                synch_core::GroupRange::new(16, 18),
+            ]),
+            "round two looks only inside what is still wanted"
+        );
         node.shutdown().await.unwrap();
     }
 
@@ -1873,10 +1942,9 @@ mod tests {
             .put_provider(&root, &holder_origin, &BlobAd::complete(size))
             .unwrap();
         // Measured, and slower than every ghost, so it deterministically ranks
-        // last. It used to land there for being *unmeasured*, which no longer
-        // sorts to the back — and the tiebreak among equals is random now, by
-        // §6.4 — so the ordering this test depends on has to be stated rather
-        // than inherited.
+        // last. Being *unmeasured* does not sort to the back — and the
+        // tiebreak among equals is random, by §6.4 — so the ordering this test
+        // depends on has to be stated rather than inherited.
         node.store()
             .record_peer_sync(&holder.node_id(), 0, 100_000)
             .unwrap();

@@ -327,12 +327,14 @@ impl MissingWalk {
             self.frontier
                 .extend(paired_children(reference_node.as_ref(), &node));
             // A node whose out-of-line values have not arrived is not done
-            // with. Reporting the value once and moving on made the walk claim
-            // exhaustion over a trie it could not serve: the node loaded, so it
-            // was never deferred, and `seen` kept it from ever being revisited.
-            // The fetch loop then broke out with its unproductive counter at
-            // one, so the §5.2 abandonment clause could never fire for a
-            // value-only failure, and `note_complete` vouched for the root.
+            // with, so it is deferred alongside the nodes that never loaded at
+            // all. Reporting the value once and moving on would have the walk
+            // claim exhaustion over a trie it cannot serve: the node loads, so
+            // it is never deferred, and `seen` keeps it from ever being
+            // revisited. The fetch loop would then break out with its
+            // unproductive counter at one, so the §5.2 abandonment clause could
+            // never fire for a value-only failure, and `note_complete` would
+            // vouch for the root.
             let mut awaiting_values = false;
             for value_hash in node.value_hashes() {
                 if !trie.has_value_raw(&value_hash)? {
@@ -969,8 +971,31 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// from a partially fetched pending head without failing.
     pub fn reachable(&self, root: Hash) -> Result<Reachable, MptError> {
         let mut out = Reachable::default();
+        self.reach_into(root, &mut out)?;
+        Ok(out)
+    }
+
+    /// The same walk, accumulating into a mark set that already holds what
+    /// earlier roots reached.
+    ///
+    /// Marking a store means walking every retained root, and successive roots
+    /// of one origin share all but the path that changed — that is the whole
+    /// point of the content-addressed node store (§4.3). Walked one at a time
+    /// into fresh sets, GC would re-read the entire trie once per retained
+    /// root: `head_history` keeps a row per publish for `root_retention`
+    /// (7 days), so a node publishing steadily accumulates thousands of roots,
+    /// and the pass would be a store read per node per root — all of it inside
+    /// the single `BEGIN IMMEDIATE` that holds the one write connection, every
+    /// five minutes. Sharing the visited set collapses that to one walk of the
+    /// live node set plus each root's own delta, which is what §5.4's "runs
+    /// incrementally" means.
+    ///
+    /// A hash already in `out.nodes` has had its subtree walked by definition —
+    /// a node's children are a function of the node — so skipping it is exactly
+    /// the dedup the single-root walk already does against itself.
+    pub fn reach_into(&self, root: Hash, out: &mut Reachable) -> Result<(), MptError> {
         let mut frontier = match root_opt(root) {
-            None => return Ok(out),
+            None => return Ok(()),
             Some(h) => vec![h],
         };
         while let Some(hash) = frontier.pop() {
@@ -984,7 +1009,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
             frontier.extend(node.child_hashes());
             out.values.extend(node.value_hashes());
         }
-        Ok(out)
+        Ok(())
     }
 }
 

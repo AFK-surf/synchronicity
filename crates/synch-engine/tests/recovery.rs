@@ -204,9 +204,9 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
     laptop.node.shutdown().await.unwrap();
 }
 
-/// The regression that matters most: a genuinely new node joining a cluster
-/// that has never heard of it is *not* in recovery, and publishes at seq 1.
-/// Misdetecting this would brick every new node.
+/// A genuinely new node joining a cluster that has never heard of it is *not*
+/// in recovery, and publishes at seq 1. Misdetecting this would brick every new
+/// node.
 #[tokio::test]
 async fn a_new_node_joining_a_busy_cluster_publishes_at_seq_one() {
     let nas = spawn("nas").await;

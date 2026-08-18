@@ -15,8 +15,8 @@
 //! refuses a head for a reason other than the ordering rule breaks that, and
 //! the failure is not local — two honest peers end up on different heads and
 //! then refuse each other's forever. The wide forks below are exactly that
-//! case: the fork cap used to be applied as an acceptance rule, and a node that
-//! met the greatest root of a storm late never took it.
+//! case: applying the fork cap as an acceptance rule would leave a node that
+//! met the greatest root of a storm late never taking it.
 //!
 //! Still outstanding from §11: the live duplex transport, partitions and
 //! message loss as first-class events, interleaved *publishes* (these heads are

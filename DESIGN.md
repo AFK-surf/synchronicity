@@ -465,11 +465,12 @@ Notes:
   `newest` surfaces silently re-serve the file. The remedy for both is ending the
   divergence while it is visible — `synch take` the deletion (§8) on the holdout,
   or the holdout deletes its copy — rather than letting the TTL decide.
-- **`BlobAd` granularity — one record per object per holder.** An earlier draft
-  advertised every hash-tree node individually; that is unsound at scale: a single
-  100 GB file yields ~6.1 M leaf groups and ~12 M trie records — larger than the
-  entire per-origin metadata quota (§12) — and replicating per-chunk ad churn during
-  swarm downloads amplifies metadata O(N²) exactly when the network is busiest. The
+- **`BlobAd` granularity — one record per object per holder.** Advertising every
+  hash-tree node individually is the obvious alternative and is unsound at scale: a
+  single 100 GB file yields ~6.1 M leaf groups and ~12 M trie records — larger than
+  the entire per-origin metadata quota (§12) — and replicating per-chunk ad churn
+  during swarm downloads amplifies metadata O(N²) exactly when the network is
+  busiest. The
   any-subtree-servable property does **not** depend on per-node ads: it comes from
   bao itself (§6.1) — any holder of a verified slice necessarily also holds the
   root-path hashes needed to re-serve it. Ads therefore carry only a coarse span
@@ -622,9 +623,9 @@ Properties:
   when the trie is fully present under the new root.
 - **Bandwidth *and work* ∝ change**: unchanged subtrees are pruned at the first
   shared hash. The distinction is worth stating because getting one without the
-  other is easy and was once the case here: a walk that filters *requests* by
-  presence still descends into everything present, so bandwidth is proportional to
-  the change while CPU is proportional to the tree. Pruning traversal needs a
+  other is easy: a walk that filters *requests* by presence still descends into
+  everything present, so bandwidth is proportional to the change while CPU is
+  proportional to the tree. Pruning traversal needs a
   stronger fact than "I have this node" — a node is committed the moment it
   arrives, so a present node's children may be absent, and presence alone proves
   nothing about a subtree. The reference root `R` supplies it: hashes matching a
@@ -645,20 +646,40 @@ Properties:
   including nodes that are neither `O` nor the peer that told us about `H`.
   Hierarchy-agnostic in practice: a laptop that heard about a NAS's update from a VPS
   can pull the trie nodes from either.
-- **No wedging on unservable heads**: if every candidate provider persistently
-  returns `missing` for wanted nodes (default: 3 full rounds across all advertisers —
-  possible when a head was relayed but its trie never fully propagated, or when a
-  serving peer GC'd a root out of retention mid-fetch), the pending head is
-  **abandoned** and head selection re-runs, typically re-targeting the origin's
-  newest complete-advertised head. Structural sharing makes the restart cost
-  proportional to what actually changed, not to what was already fetched — this is
-  also the recovery path for the laggard-vs-GC race (§5.4).
+- **No wedging on unservable heads**, by three rules with disjoint triggers,
+  because no one of them reaches the others' cases:
+  - If a peer being fetched from persistently returns `missing` for wanted nodes
+    (default: 3 rounds within one fetch — possible when a head was relayed but its
+    trie never fully propagated, or when a serving peer GC'd a root out of
+    retention mid-fetch), the pending head is **abandoned** and head selection
+    re-runs, typically re-targeting the origin's newest complete-advertised head.
+    Structural sharing makes the restart cost proportional to what actually
+    changed, not to what was already fetched — this is also the recovery path for
+    the laggard-vs-GC race (§5.4). The counter lives in the fetch, so it only
+    counts against a peer a fetch was actually attempted against.
+  - If *no* peer advertises a complete head at or above the pending one, no fetch
+    is ever attempted and that counter never runs. Such a head still holds
+    `head_floor` above every servable head for its origin, so the maintenance
+    pass abandons it after `pending_head_ttl` (default 900 s, thirty anti-entropy
+    intervals). This is the case a publisher going offline between its push and
+    anyone's fetch produces.
+  - A pending head whose trie *is* wholly present is promoted by the same pass
+    rather than abandoned. Promotion otherwise happens only on an accepted offer
+    or at the end of a successful fetch, and a crash between a fetch's last
+    committed batch and the promotion that would have followed leaves a head that
+    neither path revisits — holding the floor while sitting on every byte it
+    needs.
 
 ### 5.3 Anti-entropy scheduling
 
-- **Reactive**: local publishes (§7) and received newer heads are pushed (`HeadPush`)
-  to all currently connected peers immediately. This gives sub-second propagation on
-  connected clusters and epidemic spread (each infected node pushes onward).
+- **Reactive**: a local publish (§7) is pushed (`HeadPush`) to *every* trusted
+  peer immediately — dialling the ones not already connected, all concurrently —
+  which gives sub-second propagation on connected clusters. Pushing to the whole
+  membership rather than to current connections is what makes a second hop
+  unnecessary at the N ≤ 100 §12 sizes: the publisher already reaches everyone it
+  can reach. A received head is *not* relayed onward, so a member reachable from
+  some peer but not from the origin learns of it on its next pull rather than by
+  epidemic spread.
 - **Periodic**: every `aae_interval` (default 30s with ±50% jitter), pick one random
   trusted peer, connect if needed, run a full `Hello` push-pull exchange. This repairs
   anything the reactive path missed (dropped connections, simultaneous partitions) and

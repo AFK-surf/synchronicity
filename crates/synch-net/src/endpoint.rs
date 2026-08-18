@@ -314,8 +314,9 @@ impl Net {
             .bind()
             .await
             .map_err(|e| {
-                // Name the address: "Failed to bind sockets" with no port sent
-                // an operator to `synch init` when the fix was another --bind.
+                // Name the address: "Failed to bind sockets" with no port
+                // sends an operator to `synch init` when what they need is
+                // another --bind.
                 NetError::Endpoint(match options.bind_addr {
                     Some(addr) => {
                         format!("could not bind {addr}: {e} (is the port already in use?)")

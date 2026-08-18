@@ -16,10 +16,9 @@
 //! indexed `SELECT`, one `stat` — stay inline, where the handoff costs more
 //! than the work.
 //!
-//! One helper, generic over the caller's error. There were three
-//! near-identical copies of this — one per crate that needed it — differing
-//! only in which error type they built on failure, which is what [`TaskLost`]
-//! now abstracts.
+//! One helper, generic over the caller's error. Without [`TaskLost`] each
+//! crate that needs it carries a near-identical copy, differing only in which
+//! error type it builds on failure.
 
 /// An error type that can report a blocking task the pool lost.
 ///

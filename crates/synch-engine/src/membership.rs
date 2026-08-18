@@ -817,7 +817,9 @@ impl Node {
             });
         }
 
-        let blobs = self.store().blobs()?;
+        // Only the completeness flag and the count are read, so this takes the
+        // projection rather than every inline payload in the store.
+        let blobs = self.store().blob_candidates()?;
         let complete_blobs = blobs.iter().filter(|b| b.complete).count();
 
         Ok(DoctorReport {
@@ -1009,11 +1011,12 @@ mod tests {
 
     #[tokio::test]
     async fn hints_are_applied_only_for_bound_keys_and_only_in_shape() {
-        // M6: every hint in the set was fed to `remember_peer` with no binding
-        // check, and `record_peer_seen` *replaces* `last_addr` — so one added
-        // TXT record repointed a legitimate member's recorded address. And each
-        // hint was tried as a socket address and then as a URL, so `addr=` and
-        // `relay=` meant whatever parsed.
+        // M6: a hint steers an address only for a key the set binds, and only
+        // in the shape its attribute names. `record_peer_seen` *replaces*
+        // `last_addr`, so feeding every hint to `remember_peer` with no binding
+        // check would let one added TXT record repoint a legitimate member's
+        // recorded address; trying each hint as a socket address and then as a
+        // URL would make `addr=` and `relay=` mean whatever parsed.
         let (_d, node) = node().await;
         let ambiguous = SecretKey::generate().public();
         let member = SecretKey::generate().public();
