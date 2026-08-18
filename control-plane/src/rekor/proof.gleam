@@ -95,9 +95,14 @@ pub type Checkpoint {
     root_hash: BitArray,
     /// The exact bytes the signature lines cover.
     signed: BitArray,
-    /// `(name, signature)` per line; the four-byte key hint is a selector,
-    /// never a credential, so it is dropped on the way in.
-    signatures: List(#(String, BitArray)),
+    /// `(name, key hint, signature)` per line.
+    ///
+    /// The name is kept because it is what says which line is the log
+    /// speaking about its own tree rather than a witness cosigning it, and
+    /// the hint because for Ed25519 it is a checkable statement that a key
+    /// belongs to an origin. Both are checked in `verify_checkpoint`, for the
+    /// reasons given there.
+    signatures: List(#(String, BitArray, BitArray)),
   )
 }
 
@@ -477,9 +482,12 @@ pub fn parse_checkpoint(bytes: BitArray) -> Result(Checkpoint, ProofError) {
         bit_array.base64_decode(encoded)
         |> result.replace_error(bad("a signature is not base64")),
       )
-      case bit_array.slice(blob, 4, bit_array.byte_size(blob) - 4) {
-        Ok(signature) -> Ok(#(name, signature))
-        Error(Nil) -> Error(bad("a signature is shorter than its key hint"))
+      case
+        bit_array.slice(blob, 0, 4),
+        bit_array.slice(blob, 4, bit_array.byte_size(blob) - 4)
+      {
+        Ok(hint), Ok(signature) -> Ok(#(name, hint, signature))
+        _, _ -> Error(bad("a signature is shorter than its key hint"))
       }
     }),
   )
@@ -528,6 +536,29 @@ fn ed25519_verify(
 /// `crypto:verify/5` raises rather than answering `false` for a signature it
 /// cannot parse, and an unparseable signature line is a refusal, not a fault.
 ///
+/// **Only the line whose name is the note's own origin can vouch for it.** A
+/// real Sigstore checkpoint carries the log's signature *plus* a line per
+/// witness that cosigned the tree, and in a C2SP cosigning arrangement a key
+/// signs other logs' notes as a witness. So "some pinned key signed these
+/// bytes" is not an answer to *which log this is*: an unpinned log Y's
+/// checkpoint, cosigned by pinned key X, would otherwise verify here and be
+/// stored against `log_id = id(X)` with an inclusion path into Y's tree — and
+/// the log id is the only thing that says which log an entry is in. The origin
+/// is inside the signed bytes, so requiring the signer's own name to be that
+/// origin is what makes the pinned key vouch for the tree as itself rather
+/// than as a bystander. The client enforces exactly this
+/// (`Checkpoint::verify_signature`, crates/synch-net/src/rekor.rs); this side
+/// is the one deciding whether to store a permanent record, so it enforces it
+/// too rather than relying on clients to refuse afterwards.
+///
+/// The four-byte key hint is the second half of that binding, where the
+/// algorithm makes it unambiguous: C2SP derives an Ed25519 note key id as
+/// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`, so for an Ed25519 pin the hint is
+/// a checkable statement that this key belongs to this origin. Sigstore's
+/// P-256 logs publish a `logId.keyId` that is instead SHA-256 over the
+/// SubjectPublicKeyInfo, so no single derivation is right for that arm and the
+/// hint stays what it is there — a selector, not a credential.
+///
 /// One matching signature line is enough — the other signature lines beside it
 /// are parsed and simply not our key.
 pub fn verify_checkpoint(
@@ -535,21 +566,45 @@ pub fn verify_checkpoint(
   log_public: BitArray,
 ) -> Result(Nil, ProofError) {
   let signed =
-    list.any(checkpoint.signatures, fn(pair) {
-      case bit_array.byte_size(log_public) {
-        64 -> ecdsa_verify_any(checkpoint.signed, pair.1, log_public)
-        32 -> ed25519_verify(checkpoint.signed, pair.1, log_public)
-        _ -> False
+    list.any(checkpoint.signatures, fn(line) {
+      let #(name, hint, signature) = line
+      case name == checkpoint.origin {
+        False -> False
+        True ->
+          case bit_array.byte_size(log_public) {
+            64 -> ecdsa_verify_any(checkpoint.signed, signature, log_public)
+            32 ->
+              note_hint(checkpoint.origin, log_public) == hint
+              && ed25519_verify(checkpoint.signed, signature, log_public)
+            _ -> False
+          }
       }
     })
   case signed {
     True -> Ok(Nil)
     False ->
       Error(CheckpointFailed(
-        "no signature on the checkpoint from "
+        "the checkpoint from "
         <> checkpoint.origin
-        <> " verifies under the pinned log key",
+        <> " carries no signature by "
+        <> checkpoint.origin
+        <> " itself that verifies under the pinned log key"
+        <> " (witness cosignatures beside it do not vouch for the tree)",
       ))
+  }
+}
+
+/// The four-byte C2SP note key id for `origin`, where the derivation is
+/// unambiguous: `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`, the arm C2SP numbers
+/// `0x01` (Ed25519). Only called on the 32-byte arm — see `verify_checkpoint`
+/// for why the P-256 arm claims nothing.
+fn note_hint(origin: String, public: BitArray) -> BitArray {
+  let input = bit_array.concat([<<origin:utf8, 0x0A, 0x01>>, public])
+  case bit_array.slice(crypto.hash(crypto.Sha256, input), 0, 4) {
+    Ok(hint) -> hint
+    // Unreachable: SHA-256 is 32 bytes. A value nothing can equal is the
+    // safe answer if it ever were not.
+    Error(Nil) -> <<>>
   }
 }
 

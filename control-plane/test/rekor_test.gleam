@@ -338,6 +338,49 @@ pub fn a_p256_checkpoint_verifies_in_either_ecdsa_encoding_test() {
   let assert Error(_) = proof.verify_checkpoint(forged, public)
 }
 
+/// Only the line naming the note's own origin can vouch for the tree.
+///
+/// A real checkpoint carries the log's signature plus a line per witness that
+/// cosigned it, and in a C2SP cosigning arrangement a key signs *other* logs'
+/// notes as a witness. Without this check, log Y's checkpoint cosigned by
+/// pinned key X verifies here and is stored against `log_id = id(X)` with an
+/// inclusion path into Y's tree — and the log id is the only thing that says
+/// which log an entry is in. The client refuses exactly this shape; so does
+/// this side, which is the one deciding whether to store a permanent record.
+pub fn only_the_line_naming_the_origin_vouches_for_a_checkpoint_test() {
+  let keys.Csk(private, public) = keys.generate()
+  let note =
+    "log-Y.example\n7\n" <> "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+  let signed = <<note:utf8>>
+  let signature = ecdsa_sign_der(signed, private)
+  let blob = bit_array.base64_encode(<<0, 0, 0, 0, signature:bits>>, True)
+
+  // The pinned key really did sign these bytes — but as a witness for some
+  // other log, not as log-Y speaking about its own tree.
+  let as_witness = <<
+    note:utf8, "\n\u{2014} witness-X.example ":utf8, blob:utf8, "\n":utf8,
+  >>
+  let assert Ok(cosigned) = proof.parse_checkpoint(as_witness)
+  let assert Error(_) = proof.verify_checkpoint(cosigned, public)
+
+  // The identical signature on a line that names the origin is the log
+  // vouching for itself, and is accepted.
+  let as_origin = <<
+    note:utf8, "\n\u{2014} log-Y.example ":utf8, blob:utf8, "\n":utf8,
+  >>
+  let assert Ok(own) = proof.parse_checkpoint(as_origin)
+  let assert Ok(Nil) = proof.verify_checkpoint(own, public)
+
+  // And a witness line sitting *beside* the log's own is tolerated, because
+  // every real Sigstore checkpoint carries several.
+  let both = <<
+    note:utf8, "\n\u{2014} witness-X.example ":utf8, blob:utf8,
+    "\n\u{2014} log-Y.example ":utf8, blob:utf8, "\n":utf8,
+  >>
+  let assert Ok(beside) = proof.parse_checkpoint(both)
+  let assert Ok(Nil) = proof.verify_checkpoint(beside, public)
+}
+
 // ---------------------------------------------------------------- publishing
 
 /// A resolver that answers with structurally correct but cryptographically

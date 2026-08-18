@@ -1029,8 +1029,11 @@ code, against the client's embedded root — persisting the pin state in
 `rekor-pins.json` beside its state file, the same file name under the same
 rules. That is where **both** the keys and the log's base URL come from, so a
 Sigstore shard rotation is no more an upgrade for the monitor than it is for
-a client. `--no-tuf` runs on the pins already persisted, and `--log` names an
-endpoint outright.
+a client. `--no-tuf` runs on the pins already persisted; `--rekor-key`
+*replaces* the key set and turns the walk off with it, the same "static in
+both directions" rule the client's flag has (§4.1); and `--log` names an
+endpoint outright — narrowing which shard is read, never the key set, so a run
+under it says which pinned shards it is leaving unread.
 Signature *windows* are not enforced
 (§4.2.1), and the monitor has **no clock at all** to enforce them against: an
 entry's `integratedTime` sits outside the Merkle commitment and is therefore

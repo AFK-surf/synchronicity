@@ -136,8 +136,13 @@ struct RunArgs {
     /// The log's base URL. Discovered from Sigstore's TUF repository when
     /// not given, which is how a monitor survives a shard rotation.
     ///
-    /// Naming one narrows the pinned key set to that log's key as well, so a
-    /// URL the trusted root does not pin needs --rekor-key with it.
+    /// It narrows only *which shard is read*, never the key set: the pins
+    /// stay whatever the trusted root in force names, so this run still
+    /// believes checkpoints from shards it is not reading, and an entry in one
+    /// of those is client-valid and unseen until a run without --log reads it.
+    /// Each run says so, naming the shards it skipped. A log the trusted root
+    /// does not pin at all therefore needs --rekor-key beside this, which
+    /// replaces the key set outright.
     #[arg(long, env = "SYNCH_MONITOR_LOG")]
     log: Option<String>,
 
@@ -333,6 +338,23 @@ fn anchors_in_force(path: Option<&PathBuf>) -> Result<TrustAnchors, MonitorError
 /// Labels, not material — they exist to be compared with the surface the state
 /// file records. A digest identifies an override file without the state having
 /// to carry its contents.
+/// Whether this run contacts Sigstore's TUF repository at all.
+///
+/// `--no-tuf` says so outright. `--rekor-key` says it too, and that is the
+/// half that was missing: on the client a named key file turns pin refresh off
+/// entirely (`ResolverOptions`, crates/synch-net/src/dns.rs — "a static
+/// universe is static in both directions"), and a monitor that kept walking
+/// under one would follow Sigstore's pin set behind the operator's back while
+/// reporting a surface of their key file. It also had a run reach a CDN to
+/// fetch keys it had already been told to replace.
+///
+/// The log *endpoint* still comes from the trusted root in force — the pins on
+/// disk, else the embedded bootstrap — because replacing the keys says nothing
+/// about where the log is. `--log` is the flag for that.
+fn tuf_walk_disabled(args: &RunArgs) -> bool {
+    args.no_tuf || args.rekor_key.is_some()
+}
+
 fn trust_surface(args: &RunArgs) -> Result<TrustSurface, MonitorError> {
     let digest = |path: &PathBuf| -> Result<String, MonitorError> {
         let bytes = std::fs::read(path)
@@ -454,7 +476,12 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
         Some(path) => path.clone(),
         None => discover::pins_beside(&args.state),
     };
-    let (tuf, no_tuf, log, now) = (args.tuf.clone(), args.no_tuf, args.log.clone(), now_unix());
+    let (tuf, no_tuf, log, now) = (
+        args.tuf.clone(),
+        tuf_walk_disabled(args),
+        args.log.clone(),
+        now_unix(),
+    );
     let found = tokio::task::spawn_blocking(move || {
         let repo = match no_tuf {
             true => None,
@@ -1230,5 +1257,33 @@ mod tests {
         let overridden = trust_surface(&args).unwrap();
         assert!(overridden.anchors.starts_with("sha256:"), "{overridden:?}");
         assert_ne!(default, overridden);
+    }
+
+    /// `--rekor-key` is a static universe in both directions, here as on the
+    /// client: it replaces the pin set *and* stops the walk that would keep
+    /// following Sigstore's.
+    #[test]
+    fn a_named_key_file_turns_the_tuf_walk_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = run_args(&dir.path().join("monitor.json"));
+
+        // `run_args` sets `no_tuf` so the suite never reaches a CDN; the
+        // stock shape is the one where neither flag is given.
+        args.no_tuf = false;
+        assert!(!tuf_walk_disabled(&args), "a stock run follows Sigstore");
+
+        args.no_tuf = true;
+        assert!(tuf_walk_disabled(&args));
+
+        args.no_tuf = false;
+        args.rekor_key = Some(dir.path().join("log.pub"));
+        assert!(
+            tuf_walk_disabled(&args),
+            "a run under a named key file must not go on refreshing pins from \
+             Sigstore behind the operator's back"
+        );
+
+        args.no_tuf = true;
+        assert!(tuf_walk_disabled(&args), "and both together is still off");
     }
 }
