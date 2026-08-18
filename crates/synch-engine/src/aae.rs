@@ -189,6 +189,21 @@ impl Node {
     /// the publisher turns them into one head like any other batch (§4.2).
     pub fn maintenance_pass(&self) -> Result<synch_store::GcStats> {
         let now = now_ns();
+        // The pass that reaps expiring trust is also the one that records how
+        // far the clock has got: a persisted floor is what stops a backwards
+        // step from handing back trust that already lapsed (§3.2,
+        // `synch_store::clock`). A reading that can date nothing advances
+        // nothing and reaps nothing, and says so — membership stops being
+        // extended, which is loud in `doctor` rather than silent here.
+        if synch_core::clock_is_trusted(now) {
+            self.store().advance_trust_floor(now)?;
+        } else {
+            tracing::warn!(
+                reading = now,
+                "the host clock cannot date a trust decision: no dns binding is honored and \
+                 none is expired until it is set (see `synch doctor`)"
+            );
+        }
         let expired = self.store().expire_bindings(now)?;
         if expired > 0 {
             tracing::info!(expired, "dns bindings lapsed");

@@ -402,8 +402,8 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
 
         Request::Recover { wait, gap } => recover(node, out, wait, gap).await?,
 
-        // Status is the glance, doctor is the examination: the two used to be
-        // byte-identical, which made one of them a lie of emphasis.
+        // Status is the glance, doctor is the examination: two commands with
+        // the same output would make one of them a lie of emphasis.
         Request::DaemonStatus => {
             let origin = node.origin();
             out.line(format!(
@@ -433,6 +433,29 @@ async fn dispatch<S: AsyncRead + AsyncWrite + Unpin>(
                 node.store().peers_seen()?.len()
             ))
             .await?;
+            // Which trust this daemon is actually enforcing. Every knob here
+            // is settable by environment variable, so this line is what
+            // distinguishes a `require` daemon from a `--rekor off` one.
+            out.line(format!(
+                "trust: {}",
+                render::trust_summary(&node.resolver_status())
+            ))
+            .await?;
+            let clock = node.store().clock_status(now_ns())?;
+            if !clock.trusted {
+                out.line(
+                    "CLOCK UNUSABLE: the host clock cannot date a trust decision, so no DNS \
+                     binding is honored and membership is not extended; static trust is \
+                     unaffected. Set the clock (see `synch doctor`)",
+                )
+                .await?;
+            } else if clock.stepped_back {
+                out.line(
+                    "CLOCK STEPPED BACK: trust decisions are dated by the highest reading this \
+                     node recorded, not by the current one (see `synch doctor`)",
+                )
+                .await?;
+            }
             let recovery = node.recovery_state()?;
             if recovery.in_recovery {
                 out.line(format!(
@@ -1500,24 +1523,30 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(
             .await?;
         return Ok(());
     }
-    // The daemon's own resolver settings: a refresh asked for over the socket
-    // resolves exactly the way the daemon's scheduled refreshes do.
-    let resolver = match synch_net::DnssecResolver::with_options(&node.config().dns) {
-        Ok(resolver) => resolver,
-        Err(e) => {
-            out.line(format!("no DNSSEC resolver available: {e}"))
-                .await?;
+    // The daemon's own resolver — the same object its scheduled refreshes use,
+    // not a fresh one per request. A resolver carries when it last walked the
+    // TUF repository, and that "once a day even when the repository is down"
+    // bound only holds if the resolver outlives the request (§10.2): a fresh one
+    // here would re-attempt the whole walk at 30 s per file with Sigstore
+    // unreachable, blocking the request for minutes.
+    let resolver = match node.dns_resolver() {
+        Some(resolver) => resolver,
+        None => {
+            let why = match node.resolver_status() {
+                synch_engine::ResolverStatus::Failed(why) => {
+                    format!("no DNSSEC resolver available: {why}")
+                }
+                _ => "this process runs no membership resolver".into(),
+            };
+            out.line(why.clone()).await?;
             if strict {
-                return Err(ControlError::new(
-                    ErrorCode::Unavailable,
-                    format!("no DNSSEC resolver available: {e}"),
-                ));
+                return Err(ControlError::new(ErrorCode::Unavailable, why));
             }
             return Ok(());
         }
     };
     let outcomes = node
-        .refresh_domains_named(&resolver, domain.as_deref())
+        .refresh_domains_named(resolver.as_ref(), domain.as_deref())
         .await?;
     let mut failed = 0usize;
     for outcome in &outcomes {
@@ -1531,11 +1560,23 @@ async fn refresh_domains<S: AsyncWrite + Unpin>(
                     refresh.ttl.as_secs()
                 ))
                 .await?;
+                // Lines, not progress: an ambiguity drops every binding the key
+                // would have created, so it is a result of the refresh and not
+                // a note about how it went. `synch doctor` holds it too, since
+                // the scheduled refreshes have nobody to tell.
                 for key in &refresh.ambiguous {
-                    out.progress(format!(
-                        "  ambiguous: {} appears under more than one id; \
-                         an explicit --id is required",
+                    out.line(format!(
+                        "  AMBIGUOUS: {} appears under more than one id; every binding it \
+                         would create was dropped and that member is not trusted",
                         key.to_z32()
+                    ))
+                    .await?;
+                }
+                if let Some(origin) = &refresh.self_origin_mismatch {
+                    out.line(format!(
+                        "  MISMATCH: this node's device key is published as {origin}, but it \
+                         publishes as {} — one of the two has to change or it syncs nothing",
+                        node.origin()
                     ))
                     .await?;
                 }

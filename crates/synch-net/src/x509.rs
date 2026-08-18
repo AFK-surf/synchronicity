@@ -13,16 +13,16 @@
 //!
 //! So the certificate here is a **key envelope, not a trust assertion**.
 //! Nothing validates its signature, its issuer or its validity window; it
-//! exists to carry three things — the SubjectPublicKeyInfo, the apex, and two
-//! custom extensions (see [`crate::zonecert`]) — through a field Rekor
+//! exists to carry three things — the SubjectPublicKeyInfo, the apex, and one
+//! custom extension (see [`crate::zonecert`]) — through a field Rekor
 //! serializes verbatim.
 //!
-//! This module is deliberately a *narrow* DER reader and writer rather than a
-//! general X.509 stack: it extracts a SPKI, the `dNSName` SANs and an
-//! extension by OID, and it builds the one certificate shape the control
-//! plane emits. A general parser would be a much larger attack surface for
-//! bytes an attacker chooses, and every field this design turns on is one of
-//! those three.
+//! This module is deliberately a *narrow* DER reader rather than a general
+//! X.509 stack: it extracts a SPKI, the `dNSName` SANs and an extension by
+//! OID. A general parser would be a much larger attack surface for bytes an
+//! attacker chooses, and every field this design turns on is one of those
+//! three. The writer beside it is harness-only and is not compiled into a
+//! shipped client at all — see the building section below.
 
 use std::fmt;
 
@@ -191,11 +191,11 @@ impl Certificate {
     /// for that ambiguity.
     ///
     /// Parsed, and returned parsed, because a `dNSName` that is not a DNS
-    /// name is not a SAN this design can act on — and because handing callers
-    /// a raw string is how the client and the monitor once ended up disagreeing
-    /// about whether `victim.example..` named the same zone as
-    /// `victim.example.` (see [`crate::chain::authorize`]). A name that does
-    /// not parse is refused here, once, for everybody.
+    /// name is not a SAN this design can act on — and because a raw string is
+    /// how a client and a monitor come to disagree about whether
+    /// `victim.example..` names the same zone as `victim.example.` (see
+    /// [`crate::chain::authorize`]). A name that does not parse is refused
+    /// here, once, for everybody.
     pub fn single_dns_name(&self) -> Result<Name, X509Error> {
         let text = match self.dns_names.as_slice() {
             [one] => one,
@@ -245,11 +245,14 @@ fn parse_san(value: &[u8]) -> Result<Vec<String>, X509Error> {
 // ---------------------------------------------------------------- building
 //
 // **Everything below this line is the cross-validation encoder, not the
-// production one.** Certificates that reach the public log are built by
-// `control-plane/src/cp_crypto_ffi.erl` with OTP's `public_key` — the ASN.1
-// module is the reference encoder, and a certificate an external tool cannot
-// read would defeat the point of putting it in a public log. This half is
-// reachable only from `crate::sim` and the test suites.
+// production one, and it is gated out of a shipped client.** Certificates that
+// reach the public log are built by `control-plane/src/cp_crypto_ffi.erl` with
+// OTP's `public_key` — the ASN.1 module is the reference encoder, and a
+// certificate an external tool cannot read would defeat the point of putting it
+// in a public log. This half is reachable only from `crate::sim` and the test
+// suites, so it sits behind the same `sim` feature they do: the asymmetry — a
+// client that reads DER and never writes it — is then a fact about the binary
+// rather than a claim in a comment.
 //
 // It earns its place by being a *second, independent* encoder: the shared
 // fixtures under `control-plane/test/fixtures/rekor/crossval` are written by
@@ -258,17 +261,14 @@ fn parse_san(value: &[u8]) -> Result<Vec<String>, X509Error> {
 // — a SAN that is not a name, two SAN extensions, a chain for the wrong zone.
 // Two implementations of one DER format drift silently unless something
 // outside both of them holds the bytes still; this is one of the two.
-//
-// It is not feature-gated because `sim` is not either, and a `cfg` that hid
-// it would also hide it from the crossval. What it needs instead is this
-// note, so a reader does not assume `x509::SelfSigned` ships.
 
 /// The one certificate shape this design mints.
 ///
-/// Everything here is either load-bearing (the SPKI, the SAN, the two custom
-/// extensions) or ceremony X.509 requires. The validity window is ceremony:
+/// Everything here is either load-bearing (the SPKI, the SAN, the custom
+/// extension) or ceremony X.509 requires. The validity window is ceremony:
 /// nothing on any verification path reads it, because nothing treats this
 /// certificate as a trust assertion.
+#[cfg(any(test, feature = "sim"))]
 #[derive(Debug, Clone)]
 pub struct SelfSigned<'a> {
     /// The subject and issuer common name — one string, because a
@@ -293,6 +293,7 @@ pub struct SelfSigned<'a> {
     pub extensions: &'a [(Vec<u8>, Vec<u8>)],
 }
 
+#[cfg(any(test, feature = "sim"))]
 /// An X.509 time, in the encoding its year forces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Time {
@@ -302,6 +303,7 @@ pub enum Time {
     Generalized(String),
 }
 
+#[cfg(any(test, feature = "sim"))]
 impl Time {
     fn der(&self) -> Vec<u8> {
         match self {
@@ -313,6 +315,7 @@ impl Time {
 
 /// The X.509 time for a unix timestamp, in whichever encoding RFC 5280
 /// mandates for its year.
+#[cfg(any(test, feature = "sim"))]
 pub fn x509_time(unix: i64) -> Time {
     let (year, month, day, hour, minute, second) = civil(unix);
     match (1950..=2049).contains(&year) {
@@ -326,6 +329,7 @@ pub fn x509_time(unix: i64) -> Time {
     }
 }
 
+#[cfg(any(test, feature = "sim"))]
 /// Howard Hinnant's `civil_from_days`, plus the time of day.
 fn civil(unix: i64) -> (i64, i64, i64, i64, i64, i64) {
     let days = unix.div_euclid(86_400) + 719_468;
@@ -353,6 +357,7 @@ fn civil(unix: i64) -> (i64, i64, i64, i64, i64, i64) {
     )
 }
 
+#[cfg(any(test, feature = "sim"))]
 impl SelfSigned<'_> {
     /// The `tbsCertificate` DER — the bytes the self-signature covers.
     pub fn tbs(&self) -> Vec<u8> {
@@ -411,11 +416,13 @@ impl SelfSigned<'_> {
 
 /// `AlgorithmIdentifier { ecdsa-with-SHA256 }` — no parameters, as RFC 5758
 /// requires for the ECDSA-with-SHA2 family.
+#[cfg(any(test, feature = "sim"))]
 fn algorithm_identifier() -> Vec<u8> {
     tlv(0x30, &tlv(0x06, OID_ECDSA_SHA256))
 }
 
 /// `Name ::= RDNSequence` holding one `commonName`.
+#[cfg(any(test, feature = "sim"))]
 fn rdn_common_name(cn: &str) -> Vec<u8> {
     let attribute = tlv(
         0x30,
@@ -425,6 +432,7 @@ fn rdn_common_name(cn: &str) -> Vec<u8> {
 }
 
 /// One `Extension`, with `critical` omitted when FALSE as DER requires.
+#[cfg(any(test, feature = "sim"))]
 fn extension(oid: &[u8], critical: bool, value: &[u8]) -> Vec<u8> {
     let mut body = tlv(0x06, oid);
     if critical {
@@ -435,6 +443,7 @@ fn extension(oid: &[u8], critical: bool, value: &[u8]) -> Vec<u8> {
 }
 
 /// A positive `INTEGER` from big-endian magnitude bytes.
+#[cfg(any(test, feature = "sim"))]
 pub fn integer(magnitude: &[u8]) -> Vec<u8> {
     let trimmed = match magnitude.iter().position(|b| *b != 0) {
         Some(at) => &magnitude[at..],
@@ -449,6 +458,7 @@ pub fn integer(magnitude: &[u8]) -> Vec<u8> {
 }
 
 /// A DER tag-length-value.
+#[cfg(any(test, feature = "sim"))]
 pub fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 6);
     out.push(tag);
@@ -666,10 +676,10 @@ mod tests {
 
     /// A SAN that is not a DNS name is refused here, not normalized away.
     ///
-    /// `"x.."` used to reach callers as a string and compare equal to `"x."`
-    /// under a trailing-dot trim, which is how a client-accepted entry ended
-    /// up in a monitor's silent bin (see `crate::chain::authorize`). Parsing
-    /// at the boundary means no caller ever sees the ambiguous form.
+    /// `"x.."` reaching a caller as a string would compare equal to `"x."`
+    /// under a trailing-dot trim, which is how a client-accepted entry lands in
+    /// a monitor's silent bin (see `crate::chain::authorize`). Parsing at the
+    /// boundary means no caller ever sees the ambiguous form.
     #[test]
     fn a_san_that_is_not_a_name_is_refused() {
         let with = |san: &str| Certificate {

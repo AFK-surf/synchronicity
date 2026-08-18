@@ -58,13 +58,47 @@ pub const INLINE_BLOB_MAX: u64 = 16 * 1024;
 /// Values at or below this size are inlined in trie nodes (§4.3).
 pub const INLINE_VALUE_MAX: usize = 128;
 
+/// The earliest wall-clock reading a trust decision may be evaluated at
+/// (§3.2): 2025-01-01T00:00:00Z, in unix nanoseconds.
+///
+/// Every expiry check in this system is `now < expires_at`, so the instant the
+/// check is made at decides what it means. At the epoch — a dead RTC coming up
+/// at 1970, a clock stepped backwards, a container with no time source —
+/// *nothing has ever expired*, and a node in that state would honor every
+/// binding it has ever stored, revoked members included, forever. So a reading
+/// no build of this software could honestly produce is not treated as a small
+/// number: it is treated as no reading at all, and a trust decision that
+/// cannot be dated is refused.
+///
+/// The bound is a fixed date rather than the build date because it has to be
+/// checkable from a stored constant, and it only has to be far enough forward
+/// to exclude a clock that never got set: this repository is younger than it.
+pub const MIN_TRUSTED_NS: i64 = 1_735_689_600_000_000_000;
+
 /// Returns the current unix time in nanoseconds.
+///
+/// A clock reading before the epoch comes back *negative* rather than clamped
+/// to zero, because zero is a plausible-looking instant and a broken clock
+/// must not be able to disguise itself as one. Nothing derives trust from this
+/// value directly: [`clock_is_trusted`] is what decides whether a reading can
+/// carry a trust decision, and `Store::trust_instant` is what every expiry
+/// check in the store passes through.
 pub fn now_ns() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_nanos().min(i64::MAX as u128) as i64,
-        Err(_) => 0,
+        Err(e) => -(e.duration().as_nanos().min(i64::MAX as u128) as i64),
     }
+}
+
+/// Whether `ns` is a clock reading a trust decision may be dated by (§3.2).
+///
+/// See [`MIN_TRUSTED_NS`]. A node whose clock fails this keeps its static
+/// trust — which no clock is consulted for — and honors no DNS binding at all,
+/// which is the fail-closed half of the two available answers: it refuses to
+/// extend trust rather than serving on trust it cannot date.
+pub fn clock_is_trusted(ns: i64) -> bool {
+    ns >= MIN_TRUSTED_NS
 }
 
 /// Converts a byte offset to the chunk group index containing it.
@@ -111,5 +145,18 @@ mod tests {
     #[test]
     fn now_is_positive() {
         assert!(now_ns() > 0);
+    }
+
+    #[test]
+    fn the_epoch_is_not_a_trustworthy_instant() {
+        // The failure this guards is `now = 0` passing an expiry check: at zero
+        // nothing has ever expired. A clock that reads at or before the epoch
+        // has to be refused rather than believed.
+        assert!(!clock_is_trusted(0));
+        assert!(!clock_is_trusted(-1));
+        assert!(!clock_is_trusted(MIN_TRUSTED_NS - 1));
+        assert!(clock_is_trusted(MIN_TRUSTED_NS));
+        assert!(clock_is_trusted(now_ns()), "a working clock is trusted");
+        assert!(clock_is_trusted(i64::MAX));
     }
 }

@@ -7,6 +7,7 @@ import fixtures.{demo_conn, nk}
 import gleam/bit_array
 import gleam/list
 import gleam/option.{None, Some}
+import store/sqlite
 import zone/build
 import zone/model.{type ZoneInput, Member, NsHost, TxtName, ZoneInput, ZoneMeta}
 
@@ -161,6 +162,7 @@ pub fn positive_answer_test() {
       False -> Nil
     }
   })
+  sqlite.close(conn)
 }
 
 pub fn positive_without_do_omits_rrsig_test() {
@@ -169,6 +171,7 @@ pub fn positive_without_do_omits_rrsig_test() {
   let assert Ok(msg) = wire.decode_message(query.answer(conn, apex, q))
   assert list.length(msg.answers) == 3
   assert msg.additional == []
+  sqlite.close(conn)
 }
 
 pub fn nodata_test() {
@@ -183,6 +186,7 @@ pub fn nodata_test() {
   assert list.count(types, fn(t) { t == wire.type_soa }) == 1
   assert list.count(types, fn(t) { t == wire.type_nsec }) == 1
   assert list.count(types, fn(t) { t == wire.type_rrsig }) == 2
+  sqlite.close(conn)
 }
 
 pub fn nodata_at_empty_non_terminal_test() {
@@ -202,6 +206,7 @@ pub fn nodata_at_empty_non_terminal_test() {
     |> list.filter(fn(rr) { rr.rtype == wire.type_nsec })
     |> list.map(fn(rr) { rr.name })
   assert nsec_owners == [predecessor]
+  sqlite.close(conn)
 }
 
 pub fn nxdomain_test() {
@@ -215,6 +220,7 @@ pub fn nxdomain_test() {
   assert list.count(types, fn(t) { t == wire.type_nsec }) >= 1
   assert list.count(types, fn(t) { t == wire.type_rrsig })
     == list.count(types, fn(t) { t == wire.type_nsec }) + 1
+  sqlite.close(conn)
 }
 
 pub fn out_of_zone_refused_test() {
@@ -224,6 +230,7 @@ pub fn out_of_zone_refused_test() {
   assert rcode(msg.flags) == query.rcode_refused
   assert msg.answers == []
   assert msg.authority == []
+  sqlite.close(conn)
 }
 
 pub fn dnskey_at_apex_test() {
@@ -233,6 +240,7 @@ pub fn dnskey_at_apex_test() {
   let types = list.map(msg.answers, fn(rr) { rr.rtype })
   assert list.count(types, fn(t) { t == wire.type_dnskey }) == 1
   assert list.count(types, fn(t) { t == wire.type_rrsig }) == 1
+  sqlite.close(conn)
 }
 
 pub fn udp_truncation_test() {
@@ -261,6 +269,7 @@ pub fn udp_truncation_test() {
   let fitted = query.fit_udp(q_do, with_do)
   // 1400-byte allowance: answer fits, unchanged.
   assert fitted == with_do
+  sqlite.close(conn)
 }
 
 fn rcode(flags: Int) -> Int {

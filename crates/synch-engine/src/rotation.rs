@@ -507,8 +507,12 @@ mod tests {
             format!("v=sync1 id=a nk={}", plan.new_key.to_z32()),
         ];
         let set = synch_net::MemberSet::from_records("cluster.example", &records).unwrap();
-        b.apply_member_set(&set, std::time::Duration::from_secs(300))
-            .unwrap();
+        b.apply_member_set(
+            &set,
+            std::time::Duration::from_secs(300),
+            synch_core::now_ns(),
+        )
+        .unwrap();
 
         let answers = a.peer_bindings(&a_origin).await.unwrap();
         assert!(answers[0].reachable());

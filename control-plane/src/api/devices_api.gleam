@@ -18,6 +18,7 @@ import util/id
 import wisp.{type Request, type Response}
 import zone/build
 import zone/model
+import zone/publish
 
 /// A per-member rule broken by the request itself. The code and the wording
 /// come from `common.build_refusal`, so this refusal and the publish-time one
@@ -100,7 +101,7 @@ pub fn create_device(
     True, Ok(nk_bytes), True ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, live.user_id, Member)
-        zone_mutation(conn, ctx, live.user_id, fn() {
+        zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
           let device_id = id.new()
           let work = {
             use _ <- result.try(
@@ -173,7 +174,7 @@ pub fn patch_device(
         case find_device(conn, org_id, device_id) {
           Error(Nil) -> error_json(404, "not_found", "no such device")
           Ok(_) ->
-            zone_mutation(conn, ctx, live.user_id, fn() {
+            zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
               let update =
                 sqlite.exec(
                   conn,
@@ -215,7 +216,7 @@ pub fn delete_device(
     case find_device(conn, org_id, device_id) {
       Error(Nil) -> error_json(404, "not_found", "no such device")
       Ok(label) ->
-        zone_mutation(conn, ctx, live.user_id, fn() {
+        zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
           let work = {
             use _ <- result.try(
               sqlite.exec(
@@ -290,7 +291,7 @@ pub fn add_key(
                   "a rotation window is already open — retire the old key first",
                 )
               Ok(_) ->
-                zone_mutation(conn, ctx, live.user_id, fn() {
+                zone_mutation(conn, ctx, live.user_id, publish.Widening, fn() {
                   let work = {
                     use _ <- result.try(
                       sqlite.exec(
@@ -386,7 +387,7 @@ fn key_state_change(
     case find_device(conn, org_id, device_id) {
       Error(Nil) -> error_json(404, "not_found", "no such device")
       Ok(_) ->
-        zone_mutation(conn, ctx, live.user_id, fn() {
+        zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
           let update =
             sqlite.exec(
               conn,

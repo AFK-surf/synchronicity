@@ -116,6 +116,7 @@ fn the_real_sigstore_chain_verifies_and_yields_the_pin_set() {
         timestamp_version: 0,
         snapshot_version: 0,
         targets_version: 0,
+        targets: Vec::new(),
         trusted_root: Vec::new(),
         updated_at: 0,
     };
@@ -217,6 +218,7 @@ fn walking_the_repository_finds_the_whole_chain() {
         timestamp_version: 0,
         snapshot_version: 0,
         targets_version: 0,
+        targets: Vec::new(),
         trusted_root: Vec::new(),
         updated_at: 0,
     };
@@ -704,6 +706,7 @@ fn seed_state(path: &std::path::Path, embedded_root: &std::path::Path) {
         timestamp_version: 0,
         snapshot_version: 0,
         targets_version: 0,
+        targets: Vec::new(),
         trusted_root: Vec::new(),
         updated_at: 0,
     };
@@ -996,6 +999,7 @@ async fn regenerate_the_shared_fixture() {
         timestamp_version: 0,
         snapshot_version: 0,
         targets_version: 0,
+        targets: Vec::new(),
         trusted_root: Vec::new(),
         updated_at: 0,
     };
@@ -1053,16 +1057,15 @@ async fn regenerate_the_shared_fixture() {
 
 /// A pin file naming a root this build never signed is not state.
 ///
-/// The load path used to check exactly one thing — that the version number
-/// inside the stored root equalled the version number stored beside it —
-/// which is a self-consistency test any file passes. Whatever root the file
-/// named became the client's world, and every later update chained from it,
-/// so anyone able to write one file in the data directory chose the
-/// transparency-log key set outright.
+/// Checking that the version number inside the stored root equals the version
+/// number stored beside it is a self-consistency test any file passes: whatever
+/// root the file named would become the client's world, every later update
+/// would chain from it, and anyone able to write one file in the data directory
+/// would choose the transparency-log key set outright.
 ///
-/// The state is now re-walked from the anchor the *binary* holds, so a root
-/// minted by somebody else fails to load and the client falls back to its
-/// bootstrap pins rather than adopting a stranger's universe.
+/// The state is re-walked from the anchor the *binary* holds, so a root minted
+/// by somebody else fails to load and the client falls back to its bootstrap
+/// pins rather than adopting a stranger's universe.
 #[test]
 fn a_pin_file_anchored_somewhere_else_does_not_load() {
     let dir = tempfile::tempdir().unwrap();
@@ -1106,12 +1109,11 @@ fn a_pin_file_anchored_somewhere_else_does_not_load() {
 
 /// Four independently-monotone counters need componentwise dominance.
 ///
-/// The reconciliation between the state on disk and the state in memory
-/// used to compare `(root, timestamp, snapshot, targets)` as a tuple, whose
-/// ordering is lexicographic: the root version dominated the other three
-/// outright, so a state ahead on `root` and behind on everything else read
-/// as newer. Adopting it dropped the rollback floors for those roles to the
-/// lower numbers, which is the one thing the floors exist to prevent.
+/// Comparing `(root, timestamp, snapshot, targets)` as a tuple orders them
+/// lexicographically: the root version dominates the other three outright, so
+/// a state ahead on `root` and behind on everything else reads as newer, and
+/// adopting it drops the rollback floors for those roles to the lower numbers —
+/// the one thing the floors exist to prevent.
 #[test]
 fn a_state_ahead_on_the_root_alone_does_not_outrank_one_ahead_everywhere_else() {
     let (mut repo, _log) = repo();

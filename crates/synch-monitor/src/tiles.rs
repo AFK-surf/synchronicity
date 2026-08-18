@@ -33,9 +33,25 @@
 //!   `subtree_hash(0, old_size)` is the root it persisted — that is exactly
 //!   what an RFC 6962 consistency proof establishes, obtained here directly
 //!   instead of asked for;
-//! - an entry is **included** when its body hashes to `stored_hash(0, index)`,
-//!   and the audit path this module derives walks to the checkpoint's root
-//!   under `synch_net`'s own RFC 6962 walk — the same code the client runs.
+//! - an entry is **included** when its body hashes to the leaf the level-0
+//!   hash tile stores for it *and that tile is authenticated against the
+//!   checkpoint* ([`Tree::verify_leaf`]).
+//!
+//! The second half of the third one is load-bearing. A comparison against
+//! `stored_hash(0, index)` on its own binds a body to nothing the log signed:
+//! that node lives in a level-0 hash tile fetched as its own resource, and the
+//! root recomputation over a production-sized tree reads **no level-0 tile at
+//! all** — a tree of 10⁸ leaves folds its root from three tiles, at levels 1,
+//! 2 and 3 — so essentially every interior level-0 tile is unverified. A log
+//! can serve a forged body together with the one level-0 hash covering it,
+//! leave every higher tile honest, and satisfy the comparison while the root
+//! and the consistency prefix still check out.
+//!
+//! [`Tree::verify_leaf`] closes that by authenticating the *tile*: fold its
+//! 256 hashes into the single node they are, compare that against the entry
+//! the level-1 tile holds for it, and climb — each tile checked against its
+//! parent — until a tile the checkpoint-root recomputation itself consumed.
+//! One fold per tile, memoized, so 256 entries share it.
 //!
 //! # Fetching posture
 //!
@@ -70,24 +86,56 @@ use synch_net::rekor::{leaf_hash, node_hash, sha256, Checkpoint};
 
 use crate::MonitorError;
 
-/// The largest tile this reader will accept, **derived from the format
-/// rather than guessed at**.
+/// The largest entry bundle this reader will accept, **derived from the
+/// format rather than guessed at**.
 ///
-/// A full hash tile is 256 × 32 = 8 KiB. A full entry bundle is 256 bodies,
-/// each framed by a big-endian `u16` length, so the largest one the wire
-/// format can express is `256 × (2 + 65535)` = 16,777,472 bytes. The
-/// previous bound was a round 16 MiB — 16,777,216 — which sits *256 bytes
-/// below* that, so a bundle an honest log may legitimately serve was
-/// refused. Since a refusal here is a hard error with no skip and no
-/// progress saved, a single such bundle wedged every monitor permanently,
-/// and an attacker able to land 256 consecutive maximal entries could put
-/// one there on purpose.
+/// A full entry bundle is 256 bodies, each framed by a big-endian `u16`
+/// length, so the largest one the wire format can express is
+/// `256 × (2 + 65535)` = 16,777,472 bytes — 256 bytes *above* a round 16 MiB,
+/// and a bundle an honest log may legitimately serve. Since a refusal here is
+/// a hard error with no skip and no progress saved, a bound below the
+/// format's ceiling wedges a monitor permanently on a bundle of 256 maximal
+/// entries, which an attacker able to land 256 consecutive maximal entries
+/// can arrange.
 ///
 /// The point of the bound stands: the log is the party this monitor is
 /// auditing, so it is precisely the party whose response size must not be
 /// taken on trust. It just has to be the *format's* ceiling, not a round
 /// number near it.
-const MAX_TILE_BYTES: usize = 256 * (2 + u16::MAX as usize);
+const MAX_BUNDLE_BYTES: usize = 256 * (2 + u16::MAX as usize);
+
+/// The largest hash tile this reader will accept: 256 nodes of 32 bytes.
+///
+/// A hash tile is bounded by its format at 8 KiB, so it gets the 8 KiB bound
+/// and not the entry bundle's. One cap for both resources would let a hostile
+/// log answer a hash-tile fetch with 16 MiB — times the run's concurrency,
+/// and a scan asks for hash tiles constantly — for bytes that cannot be a
+/// tile at any tree size.
+const MAX_HASH_TILE_BYTES: usize = 256 * 32;
+
+/// The largest checkpoint this reader will accept.
+///
+/// A signed note is a handful of text lines plus one signature line per
+/// signer, and a production Sigstore checkpoint carries the log's own plus
+/// one per witness that cosigned the tree. The number of witnesses is not
+/// bounded by the format, so unlike the two above this is a policy number:
+/// ~600 signature lines, far past any real witness set, and nowhere near
+/// enough to be a memory attack.
+const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
+
+/// The response cap that applies to `path`.
+///
+/// Three resources, three format ceilings: an entry bundle is megabytes, a
+/// hash tile is 8 KiB, a checkpoint is a note.
+fn cap_for(path: &str) -> usize {
+    match path.starts_with("api/v2/tile/entries/") {
+        true => MAX_BUNDLE_BYTES,
+        false => match path.starts_with("api/v2/tile/") {
+            true => MAX_HASH_TILE_BYTES,
+            false => MAX_CHECKPOINT_BYTES,
+        },
+    }
+}
 
 /// How many times a vanished partial tile is re-resolved against the log's
 /// current size before the run gives up. One pass almost always settles it —
@@ -174,13 +222,6 @@ impl HttpTiles {
         })
     }
 
-    /// The signed checkpoint, verbatim.
-    pub async fn checkpoint(&self) -> Result<Vec<u8>, MonitorError> {
-        self.fetch("api/v2/checkpoint")
-            .await?
-            .ok_or_else(|| MonitorError::Transport("the log serves no checkpoint".into()))
-    }
-
     /// One GET, with retries, never cached.
     ///
     /// [`TileSource::fetch`] adds the cache; [`TileSource::checkpoint_size`]
@@ -189,19 +230,20 @@ impl HttpTiles {
     /// one.
     async fn get(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
         let url = format!("{}/{path}", self.base);
+        let cap = cap_for(path);
         let mut delay = FIRST_RETRY_DELAY;
         let mut attempt = 1;
         loop {
             let retryable = match self.client.get(&url).send().await {
                 Ok(response) => match response.status().as_u16() {
-                    200 => match read_capped(response).await {
+                    200 => match read_capped(response, cap).await {
                         Ok(Some(body)) => return Ok(Some(body)),
                         // Over the cap is the server misbehaving, not a
                         // transient fault: retrying would just ask it to
                         // flood us again.
                         Ok(None) => {
                             return Err(MonitorError::Transport(format!(
-                                "{url}: over the {MAX_TILE_BYTES}-byte cap"
+                                "{url}: over the {cap}-byte cap"
                             )));
                         }
                         Err(e) => format!("{url}: {e}"),
@@ -226,17 +268,28 @@ impl HttpTiles {
     }
 }
 
+impl HttpTiles {
+    /// The cache, through a poisoned lock as readily as a healthy one.
+    ///
+    /// A panic while the cache was held would poison the mutex, and a
+    /// `.expect()` here would turn that into a second panic in the auditing
+    /// party's hot path — a monitor that stops on the way through a log it is
+    /// halfway across. The cache holds no invariant worth protecting: it is
+    /// path → bytes, every value re-fetchable, so the recovery is to carry on
+    /// with the map as it stands.
+    fn cached(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<Vec<u8>>>> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 impl TileSource for HttpTiles {
     async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
-        let cached = self.cache.lock().expect("tile cache").get(path).cloned();
+        let cached = self.cached().get(path).cloned();
         if let Some(hit) = cached {
             return Ok(hit);
         }
         let body = self.get(path).await?;
-        self.cache
-            .lock()
-            .expect("tile cache")
-            .insert(path.to_string(), body.clone());
+        self.cached().insert(path.to_string(), body.clone());
         Ok(body)
     }
 
@@ -252,7 +305,8 @@ impl TileSource for HttpTiles {
     }
 }
 
-/// Reads a response body, refusing to allocate past the tile cap.
+/// Reads a response body, refusing to allocate past `cap` — [`cap_for`]'s
+/// answer for the resource being fetched.
 ///
 /// `Ok(None)` means the cap was crossed. Streaming rather than `bytes()`:
 /// a monitor reads from a log it does not trust, and `bytes()` on an
@@ -264,10 +318,13 @@ impl TileSource for HttpTiles {
 ///
 /// The length check runs *before* each chunk is appended, so the buffer
 /// never exceeds the cap at all.
-async fn read_capped(mut response: reqwest::Response) -> Result<Option<Vec<u8>>, reqwest::Error> {
+async fn read_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Option<Vec<u8>>, reqwest::Error> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > MAX_TILE_BYTES {
+        if body.len() + chunk.len() > cap {
             return Ok(None);
         }
         body.extend_from_slice(&chunk);
@@ -286,6 +343,11 @@ pub struct Tree<'a, S: TileSource> {
     source: &'a S,
     size: u64,
     concurrency: usize,
+    /// The hash tiles already folded up to the checkpoint's root, by
+    /// `(tile level, index)` — see [`Tree::authenticate_tile`]. A tile holds
+    /// 256 entries, so this is what turns a per-entry cost into a per-tile
+    /// one. Per tree, because a tree is one checkpoint.
+    authenticated: Mutex<std::collections::HashSet<(u32, u64)>>,
 }
 
 impl<'a, S: TileSource> Tree<'a, S> {
@@ -295,6 +357,7 @@ impl<'a, S: TileSource> Tree<'a, S> {
             source,
             size,
             concurrency: concurrency.max(1),
+            authenticated: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -633,13 +696,127 @@ impl<'a, S: TileSource> Tree<'a, S> {
             .buffered(self.concurrency)
     }
 
-    /// Whether the entry at `index` really is the leaf the tree stored there.
+    /// Whether tile `(tile_level, index)` has already been authenticated
+    /// against this tree's checkpoint.
+    fn is_authenticated(&self, tile_level: u32, index: u64) -> bool {
+        self.authenticated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(tile_level, index))
+    }
+
+    /// Records that it has.
+    fn mark_authenticated(&self, tile_level: u32, index: u64) {
+        self.authenticated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((tile_level, index));
+    }
+
+    /// Authenticates hash tile `(tile_level, index)` against `root`.
     ///
-    /// Cheap and total: the log's own hash tile already commits to the leaf,
-    /// so a bundle body that hashes differently is a bundle the log did not
-    /// serialize, caught before anything is parsed out of it.
-    pub async fn leaf_matches(&self, index: u64, body: &[u8]) -> Result<bool, MonitorError> {
-        Ok(self.stored_hash(0, index).await? == leaf_hash(body))
+    /// A full tile is 256 complete-subtree hashes, and folding them is the
+    /// single node at the base level of the tile above — so the tile is
+    /// checked by comparing that fold against the entry its parent tile holds
+    /// for it, and the parent is checked the same way, up to a tile the root
+    /// recomputation itself consumed.
+    ///
+    /// A **frontier** tile is where the climb stops, because it needs no
+    /// parent. Every hash a partial tile stores is a maximal complete subtree
+    /// of the frontier, so the decomposition `subtree_hash(0, size)` walks
+    /// exactly those hashes — recomputing the root from the tiles *is* the
+    /// check on them. Nor can any of them be covered from somewhere else: a
+    /// decomposition part spanning a whole 256-node run would require the tile
+    /// to be full.
+    ///
+    /// Memoized per tree, which is what keeps the cost per *tile* rather than
+    /// per entry.
+    async fn authenticate_tile(
+        &self,
+        tile_level: u32,
+        index: u64,
+        root: [u8; 32],
+    ) -> Result<(), MonitorError> {
+        // Climb to the first tile that is already authenticated, or to the
+        // frontier tile, collecting what has to be checked on the way.
+        let mut chain = Vec::new();
+        let (mut level, mut at) = (tile_level, index);
+        while !self.is_authenticated(level, at) {
+            chain.push((level, at));
+            if self.width(level, at) != 256 {
+                break; // the frontier: pinned by the root recomputation
+            }
+            // A full tile always has a parent: its 256 nodes exist, so the
+            // tree reaches at least `(at + 1) << 8(level + 1)` leaves.
+            (level, at) = (level + 1, at / 256);
+        }
+        // Then check from the top down, so every tile is verified against a
+        // parent that has itself been verified.
+        for &(level, at) in chain.iter().rev() {
+            match self.width(level, at) {
+                256 => {
+                    let data = self.hash_tile(level, at).await?;
+                    let parent = self.stored_hash(8 * (level + 1), at).await?;
+                    if fold(&data) != parent {
+                        return Err(MonitorError::Tile(format!(
+                            "hash tile {level}/{at} does not fold to the node its parent \
+                             tile stores for it: the log is serving tiles that do not \
+                             belong to the tree it signed"
+                        )));
+                    }
+                }
+                _ => {
+                    if self.root().await? != root {
+                        return Err(MonitorError::Tile(format!(
+                            "the frontier hash tile {level}/{at} does not recompute the \
+                             checkpoint's root"
+                        )));
+                    }
+                }
+            }
+            self.mark_authenticated(level, at);
+        }
+        Ok(())
+    }
+
+    /// Binds `body` to `root` — the root of a **signed checkpoint** — as the
+    /// leaf at `index`, or fails.
+    ///
+    /// This is what makes a bundle body evidence rather than a suggestion.
+    /// Comparing the body's leaf hash against `stored_hash(0, index)` looks
+    /// equivalent and is not: that node comes out of a level-0 hash tile
+    /// served as its own resource, and the root recomputation over a
+    /// production tree reads no level-0 tile at all. So the comparison is made
+    /// against a tile that has first been folded up to a node the checkpoint
+    /// committed to (`Tree::authenticate_tile`).
+    ///
+    /// **Cost.** The fetch budget is the same as the unauthenticated
+    /// comparison's: one level-0 hash tile per 256 entries, cached, plus one
+    /// level-1 tile per 65,536 entries and one level-2 tile per 16.7 M — tiles
+    /// the root recomputation is largely reading anyway. What is added is one
+    /// 255-node fold per tile, *memoized*, so the 256 entries inside a tile
+    /// share it: about one SHA-256 compression per entry, against the ~26 an
+    /// audit path per entry would have cost.
+    pub async fn verify_leaf(
+        &self,
+        index: u64,
+        body: &[u8],
+        root: [u8; 32],
+    ) -> Result<(), MonitorError> {
+        if index >= self.size {
+            return Err(MonitorError::Tile(format!(
+                "entry {index} is outside a tree of {}",
+                self.size
+            )));
+        }
+        self.authenticate_tile(0, index / 256, root).await?;
+        match self.stored_hash(0, index).await? == leaf_hash(body) {
+            true => Ok(()),
+            false => Err(MonitorError::Tile(format!(
+                "entry {index} does not hash to the leaf the signed checkpoint \
+                 committed to"
+            ))),
+        }
     }
 }
 
@@ -788,6 +965,26 @@ mod tests {
         );
     }
 
+    /// A hash tile gets the hash tile's cap, not the entry bundle's.
+    ///
+    /// One cap for both let a hostile log answer a hash-tile fetch — which a
+    /// scan makes constantly, several in flight — with 16 MiB of bytes that
+    /// cannot be a tile at any tree size.
+    #[test]
+    fn each_resource_is_capped_at_its_own_format_ceiling() {
+        assert_eq!(cap_for("api/v2/tile/0/001"), MAX_HASH_TILE_BYTES);
+        assert_eq!(cap_for("api/v2/tile/2/x001/234.p/17"), MAX_HASH_TILE_BYTES);
+        assert_eq!(MAX_HASH_TILE_BYTES, 8 * 1024);
+        assert_eq!(cap_for("api/v2/tile/entries/001"), MAX_BUNDLE_BYTES);
+        assert_eq!(cap_for("api/v2/checkpoint"), MAX_CHECKPOINT_BYTES);
+        // The bundle cap is the format's ceiling, not a round number near it:
+        // 256 bodies, each framed by a big-endian u16.
+        assert_eq!(MAX_BUNDLE_BYTES, 256 * (2 + 65_535));
+        // Above a round 16 MiB by exactly 256 bytes, which is the margin a
+        // bundle of 256 maximal entries needs and a round bound denies it.
+        assert_eq!(MAX_BUNDLE_BYTES - 16 * 1024 * 1024, 256);
+    }
+
     #[tokio::test]
     async fn roots_recomputed_from_tiles_match_the_reference_tree() {
         // Sizes that straddle every awkward boundary: a single leaf, one
@@ -820,11 +1017,13 @@ mod tests {
                 root,
             )
             .unwrap_or_else(|e| panic!("index {index}: {e}"));
-            assert!(tree
-                .leaf_matches(index, &log.leaves[index as usize])
+            tree.verify_leaf(index, &log.leaves[index as usize], root)
                 .await
-                .unwrap());
-            assert!(!tree.leaf_matches(index, b"something else").await.unwrap());
+                .unwrap_or_else(|e| panic!("index {index}: {e}"));
+            assert!(tree
+                .verify_leaf(index, b"something else", root)
+                .await
+                .is_err());
         }
     }
 
@@ -894,16 +1093,19 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    /// A log whose hash tiles are honest and whose entry bundles are not.
+    /// A log that substitutes one entry body **and** the level-0 hash tile
+    /// entry covering it, leaving every higher hash tile alone.
     ///
-    /// This is the shape of the attack `leaf_matches` exists to catch, and
-    /// the reason the check has to run *before* the walk decides to skip an
-    /// entry: the hash tiles still commit to the real leaves, so the
-    /// checkpoint root, the consistency proof and every inclusion path
-    /// continue to verify. Only the bundle lies. A monitor that parsed the
-    /// bundle first and skipped on "does not parse" or "not a watched zone"
-    /// would drop the substituted entry without ever hashing it — silent,
-    /// while the victim's client still accepts the genuine proof.
+    /// The harness grants the adversary nothing it would not have. Rewriting
+    /// a level-0 hash tile costs exactly what rewriting an entry bundle costs
+    /// — both are static files this same party serves — so a harness that
+    /// passed hash tiles through untouched would be testing a weaker attacker
+    /// than the one in the threat model, and would pass a check that only
+    /// compares a body against a level-0 tile.
+    ///
+    /// Everything above level 8 stays honest, which is what keeps the
+    /// checkpoint root and the consistency prefix intact: the forgery is
+    /// invisible to every check except a walk to the signed root.
     struct TamperedBundles {
         honest: MemoryLog,
         at: u64,
@@ -913,26 +1115,40 @@ mod tests {
     impl TileSource for TamperedBundles {
         async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
             let served = self.honest.fetch(path).await?;
-            if !path.starts_with("api/v2/tile/entries/") {
-                // Hash tiles pass through untouched: the tree stays valid.
-                return Ok(served);
+            if path.starts_with("api/v2/tile/entries/") {
+                let mut leaves = self.honest.leaves.clone();
+                leaves[self.at as usize] = self.instead.clone();
+                let bundle = self.at / 256;
+                let width = (leaves.len() as u64).saturating_sub(bundle * 256).min(256);
+                let mut out = Vec::new();
+                for i in 0..width {
+                    let body = &leaves[(bundle * 256 + i) as usize];
+                    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                    out.extend_from_slice(body);
+                }
+                return Ok(Some(out));
             }
-            let mut leaves = self.honest.leaves.clone();
-            leaves[self.at as usize] = self.instead.clone();
-            let bundle = self.at / 256;
-            let width = (leaves.len() as u64).saturating_sub(bundle * 256).min(256);
-            let mut out = Vec::new();
-            for i in 0..width {
-                let body = &leaves[(bundle * 256 + i) as usize];
-                out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-                out.extend_from_slice(body);
+            // The level-0 hash tile holding the forged leaf's own hash, so a
+            // body-against-tile comparison agrees with the bundle.
+            let Some(mut data) = served else {
+                return Ok(None);
+            };
+            if let Some(rest) = path.strip_prefix("api/v2/tile/0/") {
+                let digits = rest.split(".p/").next().unwrap_or(rest);
+                let index = digits.split('/').fold(0u64, |acc, group| {
+                    acc * 1000 + group.trim_start_matches('x').parse::<u64>().unwrap()
+                });
+                if (index * 256..index * 256 + 256).contains(&self.at) {
+                    let offset = (self.at - index * 256) as usize * 32;
+                    data[offset..offset + 32].copy_from_slice(&leaf_hash(&self.instead));
+                }
             }
-            Ok(Some(out))
+            Ok(Some(data))
         }
     }
 
     #[tokio::test]
-    async fn a_substituted_entry_body_does_not_match_the_leaf_the_log_committed_to() {
+    async fn a_substituted_entry_body_is_refused_against_the_signed_root() {
         let honest = log(600);
         let tampered = TamperedBundles {
             honest: log(600),
@@ -942,14 +1158,22 @@ mod tests {
             instead: b"not an entry at all".to_vec(),
         };
 
-        // The tree is unchanged as far as every hash-based check can tell:
-        // same size, same root, same inclusion paths.
+        // The forgery is invisible to the root check. Leaf 300 sits inside
+        // the aligned 512-leaf subtree, whose hash the walk takes from a
+        // *level-1* tile — so the rewritten level-0 hash is never folded into
+        // the root at all, and the consistency prefix is the same story.
         let honest_tree = Tree::new(&honest, 600, 1);
         let tampered_tree = Tree::new(&tampered, 600, 1);
+        let root = honest_tree.root().await.unwrap();
         assert_eq!(
-            tampered_tree.subtree_hash(0, 600).await.unwrap(),
-            honest_tree.subtree_hash(0, 600).await.unwrap(),
-            "the hash tiles are honest, which is what makes this attack work"
+            tampered_tree.root().await.unwrap(),
+            root,
+            "the root check cannot see this substitution, which is the point"
+        );
+        assert_eq!(
+            tampered_tree.subtree_hash(0, 512).await.unwrap(),
+            honest_tree.subtree_hash(0, 512).await.unwrap(),
+            "nor can a consistency prefix over the subtree holding it"
         );
 
         // The bundle really does serve the substitute...
@@ -961,15 +1185,43 @@ mod tests {
             .1;
         assert_eq!(served, b"not an entry at all");
 
-        // ...and this is the one check that notices.
+        // ...and the body must not be accepted as the leaf the *checkpoint*
+        // committed to, however the log rewrote the tile beneath it.
         assert!(
-            !tampered_tree.leaf_matches(300, served).await.unwrap(),
-            "a body the log did not commit to must not match its leaf"
+            tampered_tree.verify_leaf(300, served, root).await.is_err(),
+            "a body the signed root does not commit to must be refused"
         );
-        assert!(
-            honest_tree.leaf_matches(300, b"entry 300").await.unwrap(),
-            "and the honest body must still match"
+        honest_tree
+            .verify_leaf(300, b"entry 300", root)
+            .await
+            .expect("and the honest body must still verify");
+    }
+
+    #[tokio::test]
+    async fn a_substituted_entry_in_the_frontier_tile_is_refused_too() {
+        // Leaf 550 sits in the *partial* level-0 tile, which has no parent
+        // tile to be folded into — the check there is that the tiles still
+        // recompute the checkpoint's root, and a rewritten frontier hash
+        // breaks exactly that.
+        let honest = log(600);
+        let tampered = TamperedBundles {
+            honest: log(600),
+            at: 550,
+            instead: b"not an entry at all".to_vec(),
+        };
+        let root = Tree::new(&honest, 600, 1).root().await.unwrap();
+        let tampered_tree = Tree::new(&tampered, 600, 1);
+        assert_ne!(
+            tampered_tree.root().await.unwrap(),
+            root,
+            "a frontier hash does reach the root"
         );
+        let served = b"not an entry at all";
+        assert!(tampered_tree.verify_leaf(550, served, root).await.is_err());
+        Tree::new(&honest, 600, 1)
+            .verify_leaf(550, b"entry 550", root)
+            .await
+            .expect("the honest frontier leaf verifies");
     }
 
     #[tokio::test]

@@ -93,6 +93,15 @@ pub fn anchor_line(apex: Name, public: BitArray) -> String {
   <> bit_array.base64_encode(public, True)
 }
 
+/// The mode the key file is created with and kept at: readable and writable
+/// by its owner and by nobody else.
+///
+/// `validate_db_path` already refuses to keep this file in the database's
+/// directory, on the grounds that a compromised worker's directory grant
+/// would cover it. Having drawn that line, the file itself must not be
+/// readable by every uid on the host.
+pub const key_file_mode = 0o600
+
 /// Writes the key file; refuses to overwrite an existing one — replacing
 /// a zone key is a rollover ceremony, not a file write.
 pub fn save(path: String, csk: Csk) -> Result(Nil, String) {
@@ -109,12 +118,30 @@ pub fn save(path: String, csk: Csk) -> Result(Nil, String) {
         <> "\npublic: "
         <> bit_array.base64_encode(csk.public, True)
         <> "\n"
-      simplifile.write(path, content)
-      |> result.map_error(fn(e) {
-        "writing " <> path <> ": " <> simplifile.describe_error(e)
-      })
+      // Three steps, in this order, because the mode has to be in force
+      // before the secret is in the file: create it empty, narrow it, then
+      // write. Writing first and chmod-ing after would leave the scalar
+      // world-readable for as long as that takes.
+      use Nil <- result.try(write(path, ""))
+      use Nil <- result.try(
+        simplifile.set_permissions_octal(path, key_file_mode)
+        |> result.map_error(fn(e) {
+          "setting permissions on "
+          <> path
+          <> ": "
+          <> simplifile.describe_error(e)
+        }),
+      )
+      write(path, content)
     }
   }
+}
+
+fn write(path: String, content: String) -> Result(Nil, String) {
+  simplifile.write(path, content)
+  |> result.map_error(fn(e) {
+    "writing " <> path <> ": " <> simplifile.describe_error(e)
+  })
 }
 
 pub fn load(path: String) -> Result(Csk, String) {

@@ -38,6 +38,25 @@ fn anchors(zone: &SimZone) -> hickory_resolver::proto::dnssec::TrustAnchors {
     hickory_resolver::proto::dnssec::TrustAnchors::from_file(file.path()).unwrap()
 }
 
+/// The chain bytes a certificate carries, having first been through the one
+/// validated door.
+///
+/// A fixture assertion is about bytes, so the extension is decoded directly —
+/// but only after [`chain::authorize`] has accepted it, which is the rule the
+/// client and the monitor both live by. There is no unvalidated accessor for a
+/// caller to reach for instead.
+fn carried_chain(
+    body: &HashedRekordBody,
+    anchors: &hickory_resolver::proto::dnssec::TrustAnchors,
+) -> synch_net::zonecert::DnssecChain {
+    chain::authorize(&body.certificate, anchors).expect("the carried chain must authorize");
+    let value = body
+        .certificate
+        .extension(OID_DNSSEC_CHAIN)
+        .expect("the certificate carries a chain");
+    synch_net::zonecert::DnssecChain::decode(value).expect("the chain decodes")
+}
+
 /// A zone whose key is logged, and the log that logged it.
 fn logged_zone() -> (SimZone, SimLog, RekorProof) {
     let zone = SimZone::new("cluster.example", member_records());
@@ -362,24 +381,17 @@ fn an_expired_chain_still_verifies_because_no_clock_is_consulted() {
     let mut log = SimLog::new("rekor.sim");
     let ancient = time::OffsetDateTime::now_utc() - time::Duration::days(900);
     let statement = zone.zone_key_statement("create");
-    let certificate = zone.certificate(&[(
-        OID_DNSSEC_CHAIN.to_vec(),
-        zone.dnssec_chain_at(ancient).encode(),
-    )]);
+    let carried = zone.dnssec_chain_at(ancient);
+    let certificate = zone.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), carried.encode())]);
     let proof = log.log_certified(&zone, &statement, &certificate);
     verify(&proof, &zone, &log).expect("an entry does not rot");
 
     // The window is genuinely in the past — the test would pass vacuously
-    // otherwise. Decoded here, because the validator keeps no record of
-    // validity windows: it has no clock to compare them against.
+    // otherwise. Read out of the chain here, because the validator keeps no
+    // record of validity windows: it has no clock to compare them against.
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-    let carried = body.dnssec_chain().unwrap();
-    chain::validate(
-        &carried,
-        &chain::parse_name(&zone.apex()).unwrap(),
-        &anchors(&zone),
-    )
-    .unwrap();
+    chain::authorize(&body.certificate, &anchors(&zone))
+        .expect("an expired chain still authorizes");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -798,8 +810,13 @@ fn the_shared_fixture_decodes_and_verifies() {
         body.certificate.single_dns_name().unwrap().to_string(),
         apex
     );
-    let chain = body.dnssec_chain().expect("the fixture carries a chain");
-    assert_eq!(chain.encode(), fixture("dnssec-chain.der"));
+    let anchor_file = write(&String::from_utf8(fixture("anchor.key")).unwrap());
+    let anchors =
+        hickory_resolver::proto::dnssec::TrustAnchors::from_file(anchor_file.path()).unwrap();
+    assert_eq!(
+        carried_chain(&body, &anchors).encode(),
+        fixture("dnssec-chain.der")
+    );
 
     let dnskey_rdata = fixture("dnskey.bin");
     // The sim signs with the zone key, so the certificate's key is that key
@@ -813,9 +830,6 @@ fn the_shared_fixture_decodes_and_verifies() {
         dnskey_rdata: &dnskey_rdata,
     };
     let logs = LogKeys::parse(&String::from_utf8(fixture("log-key.pem")).unwrap()).unwrap();
-    let anchor_file = write(&String::from_utf8(fixture("anchor.key")).unwrap());
-    let anchors =
-        hickory_resolver::proto::dnssec::TrustAnchors::from_file(anchor_file.path()).unwrap();
     let verified = rekor::verify(&proof, &key, &logs, &anchors).expect("the fixture must verify");
     assert_eq!(verified.action, fixture_field("action"));
     assert_eq!(verified.log_index, proof.log_index);
@@ -936,7 +950,10 @@ fn regenerate_the_shared_fixture() {
     // The chain the certificate actually carries, not a fresh one: RRSIG
     // signing is randomized, so re-deriving it would write bytes the entry
     // does not contain.
-    write_file("dnssec-chain.der", &body.dnssec_chain().unwrap().encode());
+    write_file(
+        "dnssec-chain.der",
+        &carried_chain(&body, &anchors(&zone)).encode(),
+    );
     write_file("checkpoint.txt", &proof.checkpoint);
     write_file("log-id.bin", &proof.log_id);
     write_file("inclusion-path.bin", &proof.inclusion_path.concat());
@@ -1376,21 +1393,19 @@ fn rrsig_expirations(chain: &synch_net::zonecert::DnssecChain) -> Vec<u64> {
     out
 }
 
-/// A P-256 log's checkpoint verifies whichever ECDSA encoding it used.
+/// A P-256 log's checkpoint verifies in whichever ECDSA encoding it carries.
 ///
-/// ECDSA signatures travel two ways — IEEE P1363's fixed 64-byte `r ‖ s`,
-/// and ASN.1/DER — and the verifier used to accept only the fixed form.
-/// Sigstore signs its notes with DER (the live `rekor.sigstore.dev`
-/// signature is 70 bytes opening `30 44 02 20`), so that log's checkpoints
-/// could never verify. It failed closed, so nothing was wrongly accepted,
-/// but the day Sigstore opens a P-256-keyed v2 shard every client would
-/// refuse every proof from it.
+/// ECDSA signatures travel two ways — IEEE P1363's fixed 64-byte `r ‖ s`, and
+/// ASN.1/DER — and Sigstore signs its notes with DER (the live
+/// `rekor.sigstore.dev` signature is 70 bytes opening `30 44 02 20`). A verifier
+/// that took only the fixed form would refuse every checkpoint from a
+/// P-256-keyed shard, closed and on a schedule: the day Sigstore opens one,
+/// every client refuses every proof from it.
 ///
-/// Nothing caught it because `SimLog` signed the fixed form too: the mock
-/// produced exactly the bytes the bug required. It signs DER now, so the
-/// assertion below is about the world rather than about ourselves — and the
-/// first half of the test says so out loud, by reading the encoding off the
-/// wire rather than trusting that the simulator changed.
+/// A simulator signing the fixed form would produce exactly the bytes such a
+/// verifier wants and prove nothing about the world, so `SimLog` signs DER — and
+/// the first half of this test says so out loud, reading the encoding off the
+/// wire rather than trusting the simulator.
 #[test]
 fn a_p256_checkpoint_verifies_in_der_which_is_what_sigstore_signs() {
     let log = SimLog::new("rekor.sim");
@@ -1468,8 +1483,8 @@ fn a_certificate_with_two_readings_is_refused() {
         "bytes after the certificate must be refused"
     );
 
-    // Two copies of the chain extension: the lookup used to take the first,
-    // so a reader taking the last would disagree about the evidence that
+    // Two copies of the chain extension. A lookup returning the first would
+    // disagree with any reader taking the last, about the very evidence that
     // decides reported-versus-silent.
     let doubled = vec![
         (

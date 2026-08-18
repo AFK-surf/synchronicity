@@ -23,10 +23,12 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   the apex in a `dNSName` SAN**: Rekor validates certificates not at all
   and copies the DER verbatim into the Merkle leaf, so the zone name lands
   where anyone reading the log can index it. Inside it rides one custom
-  extension — the DNSSEC chain from the apex's DS up to the root — which is
-  what lets a monitor confirm offline that the key really is authorized for
-  the zone the entry names. `rekor-publish`
-  collects the chain over DoH, mints the certificate, POSTs a
+  extension — the DNSSEC chain, from the zone's own signed declaration up
+  through the delegation's zone cuts to the root — which is what lets a
+  monitor confirm offline that the key really is authorized for the zone the
+  entry names. `rekor-publish` takes the apex from `CP_BASE_DOMAIN` rather
+  than the command line, because the entry names it in a public log;
+  it collects the chain over DoH, mints the certificate, POSTs a
   `hashedrekord` v0.0.2 `CreateEntryRequest` to `CP_REKOR_URL`, then
   verifies the returned entry locally (canonicalized body, inclusion,
   checkpoint, possession, the certificate's key and name bindings) before
@@ -230,7 +232,7 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in. |
 | `CP_GITHUB_CLIENT_SECRET` | primary | GitHub OAuth client secret. |
 | `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Unset — the normal case — the shard in service is read from the stored `trusted_root.json`, so a Sigstore rotation costs a metadata refresh and not a release. |
-| `CP_REKOR_KEY` | primary | File pinning the log's verification key. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
+| `CP_REKOR_KEY` | primary | File pinning the log's verification key — a PEM `PUBLIC KEY` block or one base64 SubjectPublicKeyInfo, `#` starting a comment. Exactly one key: this service submits to one log and stores the proof under that log's id. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
 | `CP_TUF_URL` | primary | Sigstore TUF repository this service follows to find the transparency-log shard in service. Default `https://tuf-repo-cdn.sigstore.dev`. Fetched automatically — at boot when nothing is stored, and hourly once the stored timestamp is within three days of expiring. |

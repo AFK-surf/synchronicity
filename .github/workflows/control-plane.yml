@@ -84,6 +84,13 @@ jobs:
             chmod +x /usr/local/bin/rebar3
             printf '#!/bin/sh\nexec /usr/local/bin/rebar3 "$@"\n' > /usr/local/bin/rebar3-28
             chmod +x /usr/local/bin/rebar3-28
+            # Every open connection owns one csqlite process and its pipes
+            # for as long as it is held, and the suite holds a good many at
+            # once. OpenBSD's default login class is tighter than the Linux
+            # runner's, and a suite that outgrows it fails partway through
+            # with a spawn error rather than anything to do with the code.
+            ulimit -n 1024 || true
+            ulimit -p 512 || true
             cd control-plane
             env CFLAGS="-O2 -I/usr/local/include" LDFLAGS="-L/usr/local/lib" gmake -C csqlite
             CSQLITE_SMOKE_REQUIRE=1 perl csqlite/smoke.pl priv/csqlite

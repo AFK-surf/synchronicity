@@ -67,6 +67,14 @@ pub fn for_keys(
   Statement(apex: name.to_string(apex), keys: keys, action: action)
 }
 
+/// One claimed key's fields, derived from the rdata alone.
+///
+/// A rdata too short to hold the four-byte DNSKEY header has `flags` and
+/// `algorithm` **0**, both of them, rather than whatever partial values could
+/// be read out of it: the two renderers commit to one byte string, so this
+/// needs one rule, and "the header is unreadable" is one fact rather than two
+/// or three. The collector refuses such a rdata before it can be claimed
+/// (`rekor/chain`), so this is the answer to a question the wire cannot ask.
 fn statement_key(rdata: BitArray) -> StatementKey {
   let #(flags, algorithm) = case rdata {
     <<flags:int-size(16), _protocol:int-size(8), algorithm:int-size(8), _:bits>> -> #(
@@ -137,15 +145,34 @@ pub fn to_json(statement: Statement) -> BitArray {
   <<text:utf8>>
 }
 
-/// A JSON string literal. Every field rendered here is a DNS name, a hex
-/// digest, or one of three fixed action words — no control characters can
-/// reach this, and the two escapes below are what JSON needs for the rest.
+/// A JSON string literal, escaped byte-for-byte the way the client's renderer
+/// escapes one (`json_string`, crates/synch-net/src/rekor.rs): quote and
+/// backslash, the three named control escapes, and `\u00xx` in lowercase hex
+/// for every other character below U+0020.
+///
+/// Every field rendered here is a DNS name, a hex digest or one of three fixed
+/// action words, so the control-character rule should be unreachable — but the
+/// two renderers commit to one byte string through a Merkle leaf, so "should
+/// be unreachable" is not a rule either of them may hold privately.
 fn quote(value: String) -> String {
   let escaped =
-    value
-    |> string.replace("\\", "\\\\")
-    |> string.replace("\"", "\\\"")
+    string.to_utf_codepoints(value)
+    |> list.map(escape_codepoint)
+    |> string.concat
   "\"" <> escaped <> "\""
+}
+
+fn escape_codepoint(codepoint: UtfCodepoint) -> String {
+  case string.utf_codepoint_to_int(codepoint) {
+    0x22 -> "\\\""
+    0x5c -> "\\\\"
+    0x0a -> "\\n"
+    0x0d -> "\\r"
+    0x09 -> "\\t"
+    code if code < 0x20 ->
+      "\\u00" <> string.pad_start(string.lowercase(int.to_base16(code)), 2, "0")
+    _ -> string.from_utf_codepoints([codepoint])
+  }
 }
 
 /// The DSSE Pre-Authentication Encoding (DSSE §2): the bytes actually

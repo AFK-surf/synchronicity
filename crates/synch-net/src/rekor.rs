@@ -86,7 +86,6 @@ use ring::{digest, signature};
 use crate::{
     chain::{self, ChainError},
     x509::Certificate,
-    zonecert::{self, DnssecChain},
 };
 
 /// The only `RekorProof` version this build accepts: the entry authorizes
@@ -169,7 +168,7 @@ pub enum ProofError {
     /// natively. It enforces this **on behalf of monitors**: an entry whose
     /// chain is absent or broken is one a monitor files as noise, so a client
     /// that accepted it would hand an attacker a key that works against
-    /// victims *and* raises no alarm (§5.5, the tier-C invariant).
+    /// victims *and* raises no alarm (§5.5, the tier-A/tier-B invariant).
     #[error("chain: {0}")]
     Chain(String),
 }
@@ -200,11 +199,16 @@ impl RekorProof {
     ///
     /// `None` for a record that does not fit it — a blob past 65535 bytes or
     /// an audit path past 255 hops. Refusing beats emitting *something*: this
-    /// format exists so two implementations agree byte for byte, and the two
-    /// used to disagree about the failure itself (this side clamped the
-    /// length and truncated the blob; the Gleam side wrapped it modulo
-    /// 65536). Two different wrong answers in a format whose whole point is
-    /// agreement is worse than no answer, so both sides now refuse.
+    /// format exists so two implementations agree byte for byte, and a
+    /// truncated or wrapped length is two implementations disagreeing about
+    /// the failure as well as about the record. Both sides refuse.
+    ///
+    /// **Publisher-side, and not compiled into the client.** The control plane
+    /// writes these records; a resolving client only ever decodes them. This
+    /// half exists as the second independent encoder the cross-validation
+    /// fixtures are held still by, so it lives behind the same gate as the rest
+    /// of the harness (see [`crate::sim`]).
+    #[cfg(any(test, feature = "sim"))]
     pub fn encode(&self) -> Option<Vec<u8>> {
         for blob in [&self.statement, &self.canonicalized_body, &self.checkpoint] {
             u16::try_from(blob.len()).ok()?;
@@ -214,6 +218,7 @@ impl RekorProof {
     }
 
     /// The encoder proper, for a record already known to fit.
+    #[cfg(any(test, feature = "sim"))]
     fn encode_unchecked(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             43 + self.statement.len()
@@ -287,6 +292,9 @@ impl RekorProof {
     /// share a name (a rollover serves two), and it is *checked* after
     /// reassembly, so chunks of different proofs cannot be spliced into
     /// something that decodes.
+    ///
+    /// Publisher-side, like [`RekorProof::encode`], and behind the same gate.
+    #[cfg(any(test, feature = "sim"))]
     pub fn to_txt(&self) -> Option<Vec<String>> {
         let encoded = self.encode()?;
         let group = hex_lower(&sha256(&encoded)[..4]);
@@ -334,36 +342,36 @@ impl RekorProof {
 /// One malformed record never sinks a readable one: each group is decided on
 /// its own, which is what lets a mid-rollover zone serve a record this build
 /// does not understand beside the one it needs.
+///
+/// **And one *added* record never sinks a complete one either.** A group is not
+/// one reading of the records at its name; it is every reading they support. A
+/// single `total` taken across the group — or a single chunk per index — hands
+/// anyone who can place one TXT record at `_synchronicity-rekor.<apex>` a free
+/// denial: they read the operator's group off public DNS and publish
+/// `sync1p <group> 9/9 …`, and a set that is otherwise whole can never complete
+/// again. So the records claiming each `total` are assembled separately, a
+/// duplicated index contributes a candidate rather than overwriting the real
+/// chunk, and the group digest — over the whole encoded proof — is still the
+/// only thing that decides acceptance. Injected records cost readings, never
+/// the answer.
 pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>> {
     use std::collections::BTreeMap;
 
-    // group -> (total, index -> chunk)
-    let mut groups: BTreeMap<String, (usize, BTreeMap<usize, String>)> = BTreeMap::new();
+    // group -> the (index, total, chunk) readings its records support.
+    let mut groups: BTreeMap<String, Vec<(usize, usize, String)>> = BTreeMap::new();
     let mut junk: Vec<ProofError> = Vec::new();
     for record in records {
         match parse_chunk(record) {
             Ok((group, index, total, chunk)) => {
-                let entry = groups.entry(group).or_insert((total, BTreeMap::new()));
-                // A group whose records disagree about how many there are is
-                // not a group; the mismatch shows up as a missing index.
-                entry.0 = entry.0.max(total);
-                entry.1.insert(index, chunk);
+                groups.entry(group).or_default().push((index, total, chunk));
             }
             Err(e) => junk.push(e),
         }
     }
 
     let mut out = Vec::new();
-    for (group, (total, chunks)) in groups {
-        if chunks.len() != total || !(1..=total).all(|i| chunks.contains_key(&i)) {
-            out.push(Err(ProofError::Malformed(format!(
-                "proof {group} is served in {total} part(s) and {} arrived",
-                chunks.len()
-            ))));
-            continue;
-        }
-        let payload: String = chunks.into_values().collect();
-        out.push(decode_group(&group, &payload));
+    for (group, parts) in groups {
+        out.push(assemble_group(&group, &parts));
     }
     // Only worth reporting when nothing reassembled: a zone mid-upgrade may
     // legitimately serve a record beside the ones that work.
@@ -373,7 +381,85 @@ pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>
     out
 }
 
+/// The most assemblies one group's records may be tried in.
+///
+/// The readings a group supports are the product of how many chunks each index
+/// has candidates for, so a set with many duplicated indices could ask for
+/// unbounded work. A complete group is one assembly; every record an attacker
+/// adds at a duplicated index doubles the count, so this is room for several
+/// injections and a bound on all of them.
+const MAX_GROUP_ASSEMBLIES: usize = 64;
+
+/// Reassembles one group, trying every reading its records support until the
+/// digest agrees.
+fn assemble_group(group: &str, parts: &[(usize, usize, String)]) -> Result<RekorProof, ProofError> {
+    // The part counts the records claim, smallest first: a complete honest set
+    // is tried before any larger count an added record invented.
+    let mut totals: Vec<usize> = parts.iter().map(|(_, total, _)| *total).collect();
+    totals.sort_unstable();
+    totals.dedup();
+
+    let mut last: Option<ProofError> = None;
+    for total in totals {
+        // Only records that agree on the count take part in its reading. A
+        // record claiming some other total is a different reading, not a hole
+        // in this one.
+        let candidates: Vec<Vec<&str>> = (1..=total)
+            .map(|index| {
+                parts
+                    .iter()
+                    .filter(|(at, claimed, _)| *at == index && *claimed == total)
+                    .map(|(_, _, chunk)| chunk.as_str())
+                    .collect()
+            })
+            .collect();
+        let missing = candidates.iter().filter(|c| c.is_empty()).count();
+        if missing > 0 {
+            last = Some(ProofError::Malformed(format!(
+                "proof {group} is served in {total} part(s) and {missing} did not arrive"
+            )));
+            continue;
+        }
+        let assemblies = candidates
+            .iter()
+            .try_fold(1usize, |product, c| product.checked_mul(c.len()))
+            .unwrap_or(usize::MAX);
+        if assemblies > MAX_GROUP_ASSEMBLIES {
+            last = Some(ProofError::Malformed(format!(
+                "proof {group} is served in {total} part(s) with {assemblies} ways \
+                 to read them, past the {MAX_GROUP_ASSEMBLIES} this build will try"
+            )));
+            continue;
+        }
+        // Every combination of one chunk per index, in a deterministic order:
+        // the assembly number read as a mixed-radix odometer over the
+        // per-index candidate lists.
+        for assembly in 0..assemblies {
+            let mut rest = assembly;
+            let payload: String = candidates
+                .iter()
+                .map(|chunks| {
+                    let choice = rest % chunks.len();
+                    rest /= chunks.len();
+                    chunks[choice]
+                })
+                .collect();
+            match decode_group(group, &payload) {
+                Ok(proof) => return Ok(proof),
+                Err(e) => last = Some(e),
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        ProofError::Malformed(format!("proof {group} is served in no parts at all"))
+    }))
+}
+
 /// Which part a record is, for a publisher deciding where to put it.
+///
+/// Publisher-side: a client derives the name it asks for from the index it
+/// wants, never the other way round.
+#[cfg(any(test, feature = "sim"))]
 pub fn part_index_of(record: &str) -> Option<usize> {
     parse_chunk(record).ok().map(|(_, index, _, _)| index)
 }
@@ -772,20 +858,6 @@ impl HashedRekordBody {
             certificate_der,
         })
     }
-
-    /// The DNSSEC chain the certificate carries, decoded.
-    ///
-    /// [`ChainError::Absent`] when the extension is not there at all — the
-    /// distinction matters, because an absent chain is a hard client refusal
-    /// while a *broken* one is the same refusal with a different story.
-    pub fn dnssec_chain(&self) -> Result<DnssecChain, ChainError> {
-        match self.certificate.extension(zonecert::OID_DNSSEC_CHAIN) {
-            None => Err(ChainError::Absent),
-            Some(value) => {
-                DnssecChain::decode(value).map_err(|e| ChainError::Malformed(e.to_string()))
-            }
-        }
-    }
 }
 
 /// One key of a Statement's claimed set.
@@ -828,16 +900,29 @@ impl ZoneKeyStatement {
     /// The Statement for a key set, from the DNSKEY rdatas themselves —
     /// tag, algorithm, flags and digest are all derived, and the canonical
     /// order is applied here.
+    ///
+    /// A DNSKEY rdata is `flags(2) protocol(1) algorithm(1) key`, so anything
+    /// under four bytes has no complete header to read. **Such an rdata renders
+    /// as `flags: 0, algorithm: 0` — both zero together, never one real value
+    /// beside one invented one** — and the Gleam publisher renders it the same
+    /// way. Deriving each field on its own would let a three-byte rdata come out
+    /// as `flags: 258, algorithm: 0` here and all-zero there, and the Statement
+    /// is the artifact the two sides have to agree on byte for byte. Nothing
+    /// legitimate reaches it either way: the chain walk's rdatas come out of
+    /// parsed DNSKEY records, which cannot be shorter than their fixed header.
     pub fn for_keys(apex: &str, rdatas: &[Vec<u8>], action: &str) -> ZoneKeyStatement {
         let mut keys: Vec<StatementKey> = rdatas
             .iter()
             .map(|rdata| StatementKey {
                 key_tag: chain::key_tag(rdata),
-                algorithm: rdata.get(3).copied().unwrap_or(0),
-                flags: u16::from_be_bytes([
-                    rdata.first().copied().unwrap_or(0),
-                    rdata.get(1).copied().unwrap_or(0),
-                ]),
+                algorithm: match rdata.len() >= 4 {
+                    true => rdata[3],
+                    false => 0,
+                },
+                flags: match rdata.len() >= 4 {
+                    true => u16::from_be_bytes([rdata[0], rdata[1]]),
+                    false => 0,
+                },
                 sha256: hex_lower(&sha256(rdata)),
             })
             .collect();
@@ -854,6 +939,10 @@ impl ZoneKeyStatement {
     /// Field order is fixed and there is no whitespace: the signature and
     /// the leaf hash are over these exact bytes, so "equivalent JSON" is not
     /// equivalent at all.
+    ///
+    /// Publisher-side: a client parses a Statement out of a proof and never
+    /// writes one, so this is behind the harness gate (see [`crate::sim`]).
+    #[cfg(any(test, feature = "sim"))]
     pub fn to_json(&self) -> Vec<u8> {
         let mut out = String::new();
         out.push_str("{\"_type\":");
@@ -1055,17 +1144,31 @@ pub struct Checkpoint {
     pub root_hash: [u8; 32],
     /// The exact bytes the signatures cover.
     signed: Vec<u8>,
-    /// `(name, signature)` per signature line; the four-byte key hint is a
-    /// selector, never a credential, so it is dropped here.
+    /// One entry per signature line: the key name it claims, its four-byte key
+    /// hint, and the signature itself.
     ///
     /// **This is a list, and it must stay one.** A real Sigstore checkpoint
     /// carries the log's own signature *plus* a line per witness that
     /// cosigned the tree — the checked-in fixtures have four. This design
-    /// does not interpret those lines in any way, but it has to tolerate
+    /// does not interpret cosignatures in any way, but it has to tolerate
     /// them: narrowing the parser to a single signature would reject every
-    /// checkpoint the production log actually serves. Verification scans the
-    /// list for one that a pinned key signed and ignores the rest.
-    signatures: Vec<(String, Vec<u8>)>,
+    /// checkpoint the production log actually serves.
+    ///
+    /// The *name* is kept because it is what says which line is the log
+    /// speaking about its own tree, and the hint because it is the one field
+    /// that binds a key to an origin (see [`Checkpoint::verify_signature`]).
+    signatures: Vec<Signature>,
+}
+
+/// One signature line of a signed note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Signature {
+    /// The key name the line claims to be.
+    name: String,
+    /// The four-byte key hint the signature blob is prefixed with.
+    hint: [u8; 4],
+    /// The signature over the note's signed bytes.
+    signature: Vec<u8>,
 }
 
 impl Checkpoint {
@@ -1104,7 +1207,13 @@ impl Checkpoint {
             if blob.len() <= 4 {
                 return Err(bad("a signature is shorter than its key hint"));
             }
-            signatures.push((name.to_string(), blob[4..].to_vec()));
+            let mut hint = [0u8; 4];
+            hint.copy_from_slice(&blob[..4]);
+            signatures.push(Signature {
+                name: name.to_string(),
+                hint,
+                signature: blob[4..].to_vec(),
+            });
         }
         if signatures.is_empty() {
             return Err(bad("no signature lines"));
@@ -1118,7 +1227,8 @@ impl Checkpoint {
         })
     }
 
-    /// Verifies that some pinned key signed this checkpoint.
+    /// Verifies that some pinned key signed this checkpoint **as the log this
+    /// note says it is**.
     ///
     /// The public entry point a monitor uses: a client reaches the same check
     /// through [`verify`], but a monitor holds a checkpoint on its own and
@@ -1131,27 +1241,50 @@ impl Checkpoint {
         {
             true => Ok(()),
             false => Err(ProofError::Checkpoint(format!(
-                "no signature on the checkpoint from {} verifies under a pinned log key",
-                self.origin
+                "no signature on the checkpoint from {} verifies under a pinned \
+                 log key naming {}",
+                self.origin, self.origin
             ))),
         }
     }
 
-    /// Verifies that the pinned log key signed this checkpoint.
+    /// Verifies that the pinned log key signed this note **as its own origin**.
     ///
-    /// Scans every signature line, because the log's own is one among
-    /// several: witnesses cosign the same note and their lines sit beside it.
-    /// A line that verifies under no pinned key is simply not ours.
+    /// Only the line whose name equals the note's `origin` counts. Witness
+    /// lines sit beside it and are tolerated — a real Sigstore checkpoint
+    /// carries three — but they are never the line that decides, and that
+    /// distinction is the whole check.
+    ///
+    /// A signature that verifies is not by itself an answer to *which log this
+    /// is*. In a C2SP cosigning arrangement a key signs other logs' notes as a
+    /// witness, so "some pinned key signed these bytes" would let an unpinned
+    /// log Y's checkpoint — cosigned by pinned key X — travel with
+    /// `log_id = id(X)` and an inclusion path into Y's tree, and the only check
+    /// that says which log an entry is in would pass while looking intact. The
+    /// origin is inside the signed bytes; requiring the *signer's own name* to
+    /// be that origin is what makes the pinned key vouch for the tree as
+    /// itself rather than as a bystander.
+    ///
+    /// The four-byte key hint is the second half of that binding, where the
+    /// algorithm makes it unambiguous: C2SP derives an Ed25519 note key id as
+    /// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`, so for an Ed25519 pin the hint
+    /// is a checkable statement that this key belongs to this origin, and it is
+    /// checked. Sigstore's P-256 logs publish a `logId.keyId` that is instead
+    /// SHA-256 over the SubjectPublicKeyInfo, so no single derivation is right
+    /// for that arm and the hint stays what it is there — a selector, not a
+    /// credential.
     fn verify_signature(&self, key: &LogKey) -> Result<(), ProofError> {
-        let signed = self
-            .signatures
-            .iter()
-            .any(|(_, signature)| key.verify(&self.signed, signature).is_ok());
+        let signed = self.signatures.iter().any(|line| {
+            line.name == self.origin
+                && key.note_hint(&self.origin).is_none_or(|id| id == line.hint)
+                && key.verify(&self.signed, &line.signature).is_ok()
+        });
         match signed {
             true => Ok(()),
             false => Err(ProofError::Checkpoint(format!(
-                "no signature on the checkpoint from {} verifies under the pinned log key",
-                self.origin
+                "the checkpoint from {} carries no signature by {} itself that \
+                 verifies under the pinned log key",
+                self.origin, self.origin
             ))),
         }
     }
@@ -1180,22 +1313,41 @@ impl LogKey {
     /// Verifies a checkpoint signature, accepting **either** ECDSA encoding.
     ///
     /// An ECDSA signature travels two ways — IEEE P1363's fixed 64-byte
-    /// `r ‖ s`, and ASN.1/DER — and this only tried the fixed form. Sigstore
-    /// signs its notes with DER: the live `rekor.sigstore.dev` signature is
-    /// 70 bytes opening `30 44 02 20`, an unmistakable DER header. A DER
-    /// signature can never satisfy a fixed-width verifier, so that log's
-    /// checkpoints could not verify at all.
-    ///
-    /// It failed *closed*, so nothing was ever wrongly accepted. But it is a
-    /// latent outage on a schedule: the day Sigstore opens a P-256-keyed v2
-    /// shard, every client refuses every proof from it with a "checkpoint"
-    /// error that reads like a misconfigured pin set. Ed25519 has one
-    /// encoding and needed no such choice, which is why the only real
-    /// checkpoint fixtures — both from the Ed25519 shard — never showed it.
+    /// `r ‖ s`, and ASN.1/DER — and Sigstore signs its notes with DER: the live
+    /// `rekor.sigstore.dev` signature is 70 bytes opening `30 44 02 20`, an
+    /// unmistakable DER header. A DER signature can never satisfy a
+    /// fixed-width verifier, so a verifier that took only one encoding would
+    /// refuse every proof from a P-256-keyed shard with a "checkpoint" error
+    /// that reads like a misconfigured pin set. Ed25519 has one encoding, which
+    /// is why the only real checkpoint fixtures — both from the Ed25519 shard —
+    /// exercise none of this.
     ///
     /// Accepting both is not a weakening: either encoding of a valid
     /// signature is a valid signature by that key, and nothing here treats a
     /// signature as unique.
+    /// The four-byte C2SP note key id this key has for `origin`, where the
+    /// derivation is unambiguous.
+    ///
+    /// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)` truncated to four bytes, which
+    /// is the id a signed note's key hint carries — for Ed25519, the arm C2SP
+    /// numbers `0x01`. `None` for a P-256 key: Sigstore publishes SHA-256 over
+    /// the whole SubjectPublicKeyInfo as that arm's `logId.keyId`, so there is
+    /// no one derivation to check a hint against and nothing is claimed.
+    fn note_hint(&self, origin: &str) -> Option<[u8; 4]> {
+        match self.algorithm {
+            LogKeyAlgorithm::EcdsaP256Sha256 => None,
+            LogKeyAlgorithm::Ed25519 => {
+                let mut input = Vec::with_capacity(origin.len() + 34);
+                input.extend_from_slice(origin.as_bytes());
+                input.push(0x0a);
+                input.push(0x01);
+                input.extend_from_slice(&self.point);
+                let digest = sha256(&input);
+                Some([digest[0], digest[1], digest[2], digest[3]])
+            }
+        }
+    }
+
     fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), ProofError> {
         let algorithms: &[&dyn signature::VerificationAlgorithm] = match self.algorithm {
             LogKeyAlgorithm::EcdsaP256Sha256 => &[
@@ -1233,8 +1385,7 @@ impl LogKey {
 /// trusted root shows the same split — it agrees with us for the P-256 log
 /// and disagrees for the Ed25519 one — which is why [`crate::tuf::tlogs`]
 /// derives the id from `publicKey.rawBytes` and deliberately never reads the
-/// `logId.keyId` beside it. (Found the hard way while driving a live
-/// submission; the control plane's `rekor/proof.log_id` was right all along.)
+/// `logId.keyId` beside it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogKeys {
     keys: Vec<LogKey>,
@@ -1505,6 +1656,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// Appends a JSON string literal, escaping what JSON requires escaped.
+///
+/// Part of the canonical Statement *writer*, which is publisher-side.
+#[cfg(any(test, feature = "sim"))]
 fn json_string(out: &mut String, value: &str) {
     out.push('"');
     for c in value.chars() {
@@ -1810,6 +1964,26 @@ mod tests {
         // same bytes.
         let swapped = ZoneKeyStatement::for_keys("sync.example.", &[zsk, ksk], "rollover");
         assert_eq!(swapped.to_json(), statement.to_json());
+
+        // An rdata with no complete header renders `flags` and `algorithm` as
+        // zero *together*, which is the rule the Gleam publisher follows over
+        // the same bytes. Deriving each field on its own would put `flags: 258,
+        // algorithm: 0` in one canonical Statement and all-zero in the other,
+        // and the Statement is what the two sides have to agree on byte for
+        // byte. (Nothing legitimate gets here: the chain walk's rdatas come out
+        // of parsed DNSKEY records, which carry their own header.)
+        for stub in [vec![], vec![0x01], vec![0x01, 0x02], vec![0x01, 0x02, 0x03]] {
+            let derived =
+                ZoneKeyStatement::for_keys("sync.example.", std::slice::from_ref(&stub), "create");
+            let [only] = derived.keys.as_slice() else {
+                panic!("one rdata, one key");
+            };
+            assert_eq!(
+                (only.flags, only.algorithm),
+                (0, 0),
+                "{stub:?} has no header to read, so neither field is invented"
+            );
+        }
     }
 
     #[test]
@@ -1929,6 +2103,194 @@ mod tests {
                 .iter()
                 .any(|key| tampered.verify_signature(key).is_ok()),
             "a tampered checkpoint must not verify"
+        );
+    }
+
+    /// Only the log's *own* signature line counts, not any line a pinned key
+    /// happens to have signed.
+    ///
+    /// A checkpoint carries the log's signature plus one per witness that
+    /// cosigned the tree. "Some pinned key signed these bytes" is not an answer
+    /// to *which log this is*: in a C2SP cosigning arrangement a key signs other
+    /// logs' notes as a witness, so an unpinned log Y's checkpoint cosigned by
+    /// pinned key X could travel with `log_id = id(X)` and an inclusion path into
+    /// Y's tree, and the only check that says which log an entry is in would pass.
+    /// The origin is inside the signed bytes, so requiring the signer's own name
+    /// to *be* that origin is what binds the key to the log.
+    #[test]
+    fn only_the_line_naming_the_origin_can_vouch_for_a_checkpoint() {
+        // A real note, a real Ed25519 Sigstore key, four signature lines: the
+        // log's own plus three witness cosignatures.
+        let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
+        let checkpoint = Checkpoint::parse(note).expect("a real checkpoint parses");
+        let embedded = LogKeys::embedded();
+        checkpoint
+            .verify_under(&embedded)
+            .expect("the log's own line verifies under a pinned key");
+
+        // Rename the note's origin, leaving every signature untouched. The
+        // signatures no longer cover these bytes, so this is only half the
+        // point; the other half is that the log's line no longer *names* the
+        // origin either, and that half is checked before any signature is.
+        let renamed = String::from_utf8_lossy(note).replacen(
+            "log2025-1.rekor.sigstore.dev\n",
+            "log2025-1.rekor.sigstore.dev.dev.2\n",
+            1,
+        );
+        let renamed = Checkpoint::parse(renamed.as_bytes()).expect("still a note");
+        assert!(renamed.verify_under(&embedded).is_err());
+
+        // And the load-bearing case: the *witness* lines, which are genuine
+        // signatures over these exact bytes by keys with names of their own.
+        // Rewritten as the note's origin they would each be "a signature that
+        // verifies" under whatever key made them — so a pinned key in a witness
+        // role must not be able to vouch for a log it merely cosigned. Here the
+        // log's own line is removed and only witness lines remain: nothing
+        // verifies, whatever their names say.
+        let text = String::from_utf8_lossy(note);
+        let without_own: String = text
+            .lines()
+            .filter(|line| !line.starts_with("\u{2014} log2025-1.rekor.sigstore.dev "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let witnessed = Checkpoint::parse(without_own.as_bytes()).expect("witness lines parse");
+        assert_eq!(witnessed.signatures.len(), 3);
+        assert!(
+            witnessed.verify_under(&embedded).is_err(),
+            "cosignatures are tolerated and never authoritative"
+        );
+    }
+
+    /// The four-byte key hint is checked where C2SP makes the derivation
+    /// unambiguous.
+    ///
+    /// For Ed25519 the note key id is `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`,
+    /// so the hint is a checkable statement that this key belongs to this
+    /// origin — the origin↔key binding, sitting in the note all along and
+    /// previously discarded at parse. Sigstore's P-256 logs publish SHA-256 over
+    /// the SubjectPublicKeyInfo instead, so no derivation is right for that arm
+    /// and none is claimed.
+    #[test]
+    fn the_note_key_hint_is_checked_for_the_algorithm_that_defines_it() {
+        let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
+        let checkpoint = Checkpoint::parse(note).expect("a real checkpoint parses");
+        let ed25519 = LogKeys::embedded()
+            .keys()
+            .iter()
+            .find(|key| key.algorithm == LogKeyAlgorithm::Ed25519)
+            .expect("the embedded set has an Ed25519 shard")
+            .clone();
+
+        // The real hint on the log's own line is the C2SP id, exactly.
+        let own = checkpoint
+            .signatures
+            .iter()
+            .find(|line| line.name == checkpoint.origin)
+            .expect("the log signs its own note");
+        assert_eq!(
+            ed25519.note_hint(&checkpoint.origin),
+            Some(own.hint),
+            "the hint is SHA-256(origin || 0x0A || 0x01 || raw32) truncated"
+        );
+
+        // A different origin derives a different id, which is the binding.
+        assert_ne!(
+            ed25519.note_hint("other.log.example"),
+            Some(own.hint),
+            "the id would say nothing about the origin if it did not depend on it"
+        );
+
+        // A line whose hint is not that id does not verify, even though the
+        // signature bytes beside it are the log's own.
+        let mut tampered = checkpoint.clone();
+        for line in &mut tampered.signatures {
+            line.hint[0] ^= 0x01;
+        }
+        assert!(tampered.verify_signature(&ed25519).is_err());
+
+        // Nothing is claimed for P-256, where Sigstore's own id is a different
+        // derivation entirely.
+        let p256 = LogKeys::embedded()
+            .keys()
+            .iter()
+            .find(|key| key.algorithm == LogKeyAlgorithm::EcdsaP256Sha256)
+            .expect("the embedded set has a P-256 shard")
+            .clone();
+        assert_eq!(p256.note_hint(&checkpoint.origin), None);
+    }
+
+    /// One record added at the proof name cannot deny a group that is complete.
+    ///
+    /// Anyone who can place a TXT record at `_synchronicity-rekor.<apex>` reads
+    /// the operator's group off public DNS. A single `total` taken across the
+    /// group, or a single chunk per index, made that a free and permanent denial:
+    /// publish `sync1p <group> 9/9 …` and the set can never complete again, or
+    /// `1/5 <junk>` and the real chunk 1 is overwritten. A group is every reading
+    /// its records support, and the group digest still decides acceptance.
+    #[test]
+    fn one_added_record_cannot_deny_a_complete_group() {
+        let big = RekorProof {
+            statement: vec![b'x'; 3000],
+            canonicalized_body: vec![b'y'; 3000],
+            ..proof()
+        };
+        let records = big.to_txt().expect("encodes");
+        let total = records.len();
+        assert!(total > 1);
+        let group = records[0].split_whitespace().nth(1).unwrap().to_string();
+        let reassembles = |records: &[String]| {
+            proofs_from_txt(records)
+                .into_iter()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        };
+
+        // A record claiming a part count nobody else does.
+        let mut inflated = records.clone();
+        inflated.push(format!("{PROOF_TXT_PREFIX} {group} 9/9 AAAA"));
+        assert_eq!(
+            reassembles(&inflated),
+            vec![big.clone()],
+            "a raised total is one more reading, not a hole in the real one"
+        );
+
+        // A duplicate of a real index, carrying junk.
+        let mut overwritten = records.clone();
+        overwritten.push(format!("{PROOF_TXT_PREFIX} {group} 1/{total} AAAA"));
+        assert_eq!(
+            reassembles(&overwritten),
+            vec![big.clone()],
+            "a duplicated index is another candidate chunk, not a replacement"
+        );
+
+        // Both at once, and a duplicate of the *last* index too.
+        let mut everything = overwritten.clone();
+        everything.push(format!("{PROOF_TXT_PREFIX} {group} 9/9 AAAA"));
+        everything.push(format!("{PROOF_TXT_PREFIX} {group} {total}/{total} AAAA"));
+        assert_eq!(reassembles(&everything), vec![big.clone()]);
+
+        // A genuinely incomplete group is still refused, and says which part
+        // count it was reading when it gave up.
+        let missing = &records[1..];
+        let refusal = proofs_from_txt(missing);
+        assert!(
+            matches!(&refusal[0], Err(ProofError::Malformed(why)) if why.contains("did not arrive")),
+            "{refusal:?}"
+        );
+
+        // And the readings one group can ask for are bounded, so padding the
+        // name is denial-by-cost rather than unbounded work.
+        let mut flooded = records.clone();
+        for n in 0..40 {
+            flooded.push(format!(
+                "{PROOF_TXT_PREFIX} {group} {}/{total} AAAA{n}",
+                (n % total) + 1
+            ));
+        }
+        let flood = proofs_from_txt(&flooded);
+        assert!(
+            matches!(&flood[0], Err(ProofError::Malformed(why)) if why.contains("ways")),
+            "{flood:?}"
         );
     }
 

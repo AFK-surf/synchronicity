@@ -247,6 +247,81 @@ pub fn a_refresh_refuses_a_tampered_target_test() {
   sqlite.close(conn)
 }
 
+/// The material verifies and is still refused: a trusted root naming no log
+/// in service leaves this service with nowhere to submit and clients with a
+/// pin set they refuse, so storing it would advance the versions past what any
+/// client will follow and go quiet for days.
+pub fn a_refresh_refuses_a_trusted_root_with_no_log_in_service_test() {
+  let conn = fixtures.fresh_conn()
+  // An instant before the first shard opened. Nothing has expired, so the
+  // whole chain verifies; the contents are what is unusable.
+  let assert Error(why) =
+    fetch.refresh(conn, fake_repo(), "https://tuf.test", 1)
+  assert string.contains(why, "no log to submit to")
+  assert tuf_store.get(conn) == Ok(Error(Nil))
+  sqlite.close(conn)
+}
+
+/// A repository does not get to charge this service arbitrary memory for
+/// material it has not verified yet.
+pub fn a_refresh_refuses_an_oversized_file_test() {
+  let conn = fixtures.fresh_conn()
+  let honest = fake_repo()
+  let huge = <<0:size(67_108_872)>>
+  let fat =
+    fetch.Repo(get: fn(path) {
+      case path == "timestamp.json" {
+        True -> Ok(Some(huge))
+        False -> honest.get(path)
+      }
+    })
+  let assert Error(why) =
+    fetch.refresh(conn, fat, "https://tuf.test", number("verify_at"))
+  assert string.contains(why, "limit for one TUF file")
+  assert tuf_store.get(conn) == Ok(Error(Nil))
+  sqlite.close(conn)
+}
+
+/// And the per-file cap alone is not a bound: the root chain probes up to two
+/// hundred versions and holds every one of them until the gate runs, so a
+/// mirror answering every probe with a file just inside the file cap would be
+/// two orders of magnitude past what the walk is allowed to hold.
+pub fn a_refresh_refuses_a_walk_past_the_total_budget_test() {
+  let conn = fixtures.fresh_conn()
+  let assert Ok(floor) = fetch.root_floor()
+  // Each probe answers a root that parses and declares the version it was
+  // asked for — the walk's own checks pass, so the budget is the only thing
+  // that can stop it.
+  let endless =
+    fetch.Repo(get: fn(path) {
+      case string.split_once(path, ".root.json") {
+        Ok(#(version, "")) -> {
+          let assert Ok(version) = int.parse(version)
+          Ok(Some(padded_root(version, 4_194_304)))
+        }
+        _ -> Ok(None)
+      }
+    })
+  let assert Error(why) =
+    fetch.refresh(conn, endless, "https://tuf.test", number("verify_at"))
+  assert string.contains(why, "limit for one walk")
+  // Comfortably before the version ceiling: the byte budget is what stopped
+  // the walk, not the 200-version one.
+  assert fetch.max_walk_bytes / 4_194_304 < floor + 200
+  assert tuf_store.get(conn) == Ok(Error(Nil))
+  sqlite.close(conn)
+}
+
+/// A root that reads as TUF metadata for `version`, padded with whitespace to
+/// `size` bytes.
+fn padded_root(version: Int, size: Int) -> BitArray {
+  let head =
+    "{\"signed\":{\"_type\":\"root\",\"version\":"
+    <> int.to_string(version)
+    <> ",\"expires\":\"2099-01-01T00:00:00Z\"},\"signatures\":[]}"
+  <<head:utf8, string.repeat(" ", size - string.length(head)):utf8>>
+}
+
 pub fn refetching_is_due_only_near_expiry_test() {
   let conn = fixtures.fresh_conn()
   // No material at all is always due: with nothing stored, this service
@@ -468,15 +543,15 @@ pub fn a_mirror_that_rewrites_the_target_and_its_digest_is_refused_test() {
   // The attack §10.6 created and `tuf/verify` closes, in one test.
   //
   // A mirror that beats TLS serves its own `trusted_root.json` — naming a
-  // transparency log it controls — *and* rewrites `targets.json` so the
-  // digest and length match it. Every check this side used to perform then
-  // passes: the structure is right, the versions agree, nothing regresses,
-  // and the target hashes to exactly what the metadata says. Stored, that
-  // file would have told `rekor/client.discover` to submit the zone-key
-  // claim into a log nobody monitors.
+  // transparency log it controls — *and* rewrites `targets.json` so the digest
+  // and length match it. Every structural check then passes: the shape is
+  // right, the versions agree, nothing regresses, and the target hashes to
+  // exactly what the metadata says. Stored, that file would tell
+  // `rekor/client.discover` to submit the zone-key claim into a log nobody
+  // monitors.
   //
   // What refuses it is the signature over `targets.json`, which the mirror
-  // cannot produce, and which nothing on this side used to check.
+  // cannot produce.
   let forged = <<"{\"tlogs\":[{\"baseUrl\":\"https://evil.test\"}]}":utf8>>
   let digest =
     string.lowercase(

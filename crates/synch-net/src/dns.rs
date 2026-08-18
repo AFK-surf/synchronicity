@@ -13,6 +13,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    path::Path,
     pin::Pin,
     time::Duration,
 };
@@ -44,15 +45,24 @@ pub const RECORD_VERSION_TAG: &str = "sync1";
 pub const MIN_TTL: Duration = Duration::from_secs(60);
 /// Upper clamp on the re-resolution interval (§3.2).
 pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Extra grace before a binding that vanished from DNS expires (§3.2).
-pub const DEFAULT_TRUST_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// The control plane's zone-key watch cadence
+/// (`control-plane/src/jobs/zonekey_watch.gleam`): how long a rotated provider
+/// key can sit unnoticed.
+const CONTROL_PLANE_WATCH_CADENCE: Duration = Duration::from_secs(300);
+/// The log round trip and the reconciler pass that follow the observation.
+const CONTROL_PLANE_LOG_ROUND_TRIP: Duration = Duration::from_secs(60);
+/// The TTL the control plane publishes proof records with
+/// (`control-plane/src/zone/render_external.gleam`): how long a resolver may
+/// still be serving the proof set from before the rotation.
+const CONTROL_PLANE_PROOF_TTL: Duration = Duration::from_secs(300);
 
 /// The longest a control plane in external mode can take to get a rotated
-/// provider key onto the public record and visible to a client: its key-watch
-/// cadence, a minute for the log round trip and the reconciler, and the TTL it
-/// publishes proof records with — 300 + 60 + 300 as those constants stand in
-/// `control-plane/src/jobs/zonekey_watch.gleam` and
-/// `control-plane/src/zone/render_external.gleam`.
+/// provider key onto the public record and visible to a client — the sum of the
+/// three delays above, spelled as a sum so the arithmetic is checkable here
+/// even though the terms themselves live in the control plane's source. (There
+/// is no way to pin them across the language boundary from this side; the
+/// control plane's own suite is where those three numbers are held still.)
 ///
 /// It is named here because this is the half that pays for it. A refresh under
 /// [`RekorPolicy::Require`] fails closed for that whole window — the answer
@@ -60,7 +70,31 @@ pub const DEFAULT_TRUST_GRACE: Duration = Duration::from_secs(10 * 60);
 /// from before the rotation — and the bindings a client already has must
 /// outlive it, or an ordinary provider rotation costs member bindings instead
 /// of a few refreshes.
-pub const CONTROL_PLANE_REPUBLISH_WINDOW: Duration = Duration::from_secs(660);
+pub const CONTROL_PLANE_REPUBLISH_WINDOW: Duration = Duration::from_secs(
+    CONTROL_PLANE_WATCH_CADENCE.as_secs()
+        + CONTROL_PLANE_LOG_ROUND_TRIP.as_secs()
+        + CONTROL_PLANE_PROOF_TTL.as_secs(),
+);
+
+/// Extra grace before a binding that vanished from DNS expires (§3.2).
+///
+/// **The grace alone has to cover [`CONTROL_PLANE_REPUBLISH_WINDOW`], with no
+/// help from the TTL.** A binding expires at
+/// `<last successful refresh> + ttl + grace` (`membership::refresh`), and the
+/// refresh cadence *is* the TTL — so at the moment a provider starts signing
+/// with an un-logged key, the last refresh is already up to a whole TTL old and
+/// the TTL term is spent. What is left is the grace, and it is the whole margin:
+/// with `ttl + grace` credited instead, a rotation beginning in the last minute
+/// before a scheduled refresh dropped every DNS-sourced binding for the domain
+/// at once — every peer refusing every other peer, mirrors and gateway stalled —
+/// until a refresh succeeded again.
+///
+/// Fifteen minutes is that window plus four minutes of headroom. The cost is
+/// paid on the other side of the same trade: a record deleted from the zone
+/// stays trusted for a grace period longer, so revocation through record
+/// deletion is correspondingly slower (and is why deletion is not the design's
+/// revocation mechanism — §3.4 is).
+pub const DEFAULT_TRUST_GRACE: Duration = Duration::from_secs(15 * 60);
 
 /// The DoH endpoint used when none is configured.
 pub const DEFAULT_DOH_URL: &str = "https://1.1.1.1/dns-query";
@@ -97,12 +131,40 @@ pub fn rekor_part_query_name(zone: &str, index: usize) -> String {
     }
 }
 
-/// The control-plane apex a validated membership answer names, checked at
-/// both ends.
+/// The candidates one refresh will actually verify, in the order they are
+/// tried.
 ///
-/// Every record in the answer must agree — a set that named two apexes would
-/// be pointing a client at two different control planes for one domain — and
-/// the name has to sit between the domain being resolved and the zone that
+/// Capped, because the work is not free. Each `rekor::verify` walks a
+/// delegation ladder of attacker-chosen RRSIGs, and sixteen names of validated
+/// TXT can reassemble into many groups; without a bound, how many walks one
+/// zone can ask a resolver for per refresh is set by the zone. A legitimate
+/// zone serves one, or two across a rollover.
+fn candidates_to_verify(mut candidates: Vec<rekor::RekorProof>) -> Vec<rekor::RekorProof> {
+    candidates.truncate(MAX_PROOF_CANDIDATES);
+    candidates
+}
+
+/// The most reassembled proofs one refresh will verify.
+///
+/// Sixteen names of validated TXT reassemble into many candidate groups, and
+/// every candidate is a full verification: a Merkle walk, a checkpoint
+/// signature, and a delegation ladder of RRSIGs the zone chose. A legitimate
+/// zone publishes one, or two across a rollover; the rest is work a hostile
+/// domain can ask for at the minimum TTL, and this is where it stops.
+const MAX_PROOF_CANDIDATES: usize = 4;
+
+/// The most control-plane apexes one membership answer will send a client
+/// looking for proofs under.
+///
+/// Ordered by how many records name each, so the apex the answer mostly agrees
+/// on is tried first and a stray record costs one extra pair of lookups rather
+/// than the domain.
+const MAX_APEX_CANDIDATES: usize = 3;
+
+/// The control-plane apexes a validated membership answer names, each checked
+/// at both ends, most-attested first.
+///
+/// An apex has to sit between the domain being resolved and the zone that
 /// signed the answer:
 ///
 /// ```text
@@ -113,42 +175,59 @@ pub fn rekor_part_query_name(zone: &str, index: usize) -> String {
 /// control plane for a *sibling* namespace, whose monitor would never be
 /// watching this one. The upper bound is what stops it pointing outside the
 /// zone that actually vouched for the answer.
-fn apex_of(domain: &str, signing_zone: &Name, records: &[String]) -> Result<Name, NetError> {
-    let named: Vec<String> = records
+///
+/// **A record that names an unusable apex, or one the rest of the set does not,
+/// is a rejected record and not a rejected answer.** That is the rule every
+/// neighbouring reader already applies — to member records, and to the proof
+/// records this apex leads to — and it belongs here most of all, because the
+/// realistic cause is not an attacker but ordinary operations: a stale record
+/// left by a decommissioned control plane, a migration in flight, two control
+/// planes sharing one signing zone. Failing the whole answer on one of those
+/// fails *every* refresh for the domain, and under `Require` the cached
+/// bindings then expire and the domain is partitioned until a human deletes a
+/// TXT record. Anyone able to add a record to the membership name could add
+/// their own device key instead — the transparency layer covers the zone key,
+/// not the record set — so refusing the readable subset buys nothing.
+///
+/// A hard failure survives for the one case that has no readable subset: no
+/// record names a usable apex at all.
+fn apexes_of(domain: &str, signing_zone: &Name, records: &[String]) -> Result<Vec<Name>, NetError> {
+    let mut owner = Name::from_utf8(domain).map_err(|e| NetError::Dns(format!("{domain}: {e}")))?;
+    owner.set_fqdn(true);
+    let owner = owner.to_lowercase();
+
+    // Counted rather than collected, so "most of the set says this" is what
+    // decides the order.
+    let mut attested: BTreeMap<Name, usize> = BTreeMap::new();
+    for named in records
         .iter()
         .filter_map(|record| parse_record(record).ok())
         .filter_map(|record| record.apex)
-        .collect();
-    let Some(first) = named.first() else {
+    {
+        let Ok(mut apex) = Name::from_utf8(&named) else {
+            continue;
+        };
+        apex.set_fqdn(true);
+        let apex = apex.to_lowercase();
+        if !apex.zone_of(&owner) || !signing_zone.zone_of(&apex) {
+            continue;
+        }
+        *attested.entry(apex).or_default() += 1;
+    }
+    if attested.is_empty() {
         return Err(NetError::Dns(format!(
-            "{domain}: no membership record names an apex= to find its \
-             transparency records under"
-        )));
-    };
-    if named.iter().any(|other| other != first) {
-        return Err(NetError::Dns(format!(
-            "{domain}: the membership records name more than one apex"
+            "{domain}: no membership record names an apex= inside {signing_zone} \
+             that contains it, so there is nowhere to look for its transparency \
+             records"
         )));
     }
-    let mut apex =
-        Name::from_utf8(first).map_err(|e| NetError::Dns(format!("apex {first}: {e}")))?;
-    apex.set_fqdn(true);
-    let apex = apex.to_lowercase();
-
-    let mut owner = Name::from_utf8(domain).map_err(|e| NetError::Dns(format!("{domain}: {e}")))?;
-    owner.set_fqdn(true);
-    if !apex.zone_of(&owner.to_lowercase()) {
-        return Err(NetError::Dns(format!(
-            "{domain}: the records name apex {apex}, which does not contain it"
-        )));
-    }
-    if !signing_zone.zone_of(&apex) {
-        return Err(NetError::Dns(format!(
-            "{domain}: the records name apex {apex}, which is outside {signing_zone}, \
-             the zone that signed the answer"
-        )));
-    }
-    Ok(apex)
+    let mut ordered: Vec<(Name, usize)> = attested.into_iter().collect();
+    // Descending by attestation, then by name: a tie has to resolve the same
+    // way on every client, or two nodes reading one zone disagree about which
+    // control plane they belong to.
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ordered.truncate(MAX_APEX_CANDIDATES);
+    Ok(ordered.into_iter().map(|(apex, _)| apex).collect())
 }
 
 /// Clamps a TTL into the §3.2 window.
@@ -250,7 +329,18 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
             }
             "relay" => relay = Some(value.to_string()),
             "addr" => addr = Some(value.to_string()),
-            "apex" => apex = Some(value.to_ascii_lowercase()),
+            // Rejected on duplication, like `nk` and `id`: a record that says
+            // two things about its control plane says nothing, and every other
+            // field this parser turns on is read that way. (Nothing security
+            // rests on it — the control plane validates hints before it renders
+            // them, and `apexes_of` bounds every apex at both ends regardless —
+            // it is one parser reading one format one way.)
+            "apex" => {
+                if apex.is_some() {
+                    return Err(RecordError::Duplicate("apex"));
+                }
+                apex = Some(value.to_ascii_lowercase());
+            }
             _ => {}
         }
     }
@@ -262,6 +352,33 @@ pub fn parse_record(text: &str) -> Result<MemberRecord, RecordError> {
         addr,
         apex,
     })
+}
+
+/// One dialing hint a membership record published (§3.3), with the field it
+/// came from.
+///
+/// Typed rather than a bare string, because the two fields do not mean the same
+/// thing and only this parser knows which is which. `relay=` names a URL this
+/// node will make outbound requests to; `addr=` names an address it will dial
+/// directly. Flattened into one list, a `relay=` value shaped like `ip:port` is
+/// indistinguishable from an `addr=` value downstream, so however carefully a
+/// consumer validates *shape* it cannot enforce *meaning* — the field name is
+/// the only place the meaning exists, and it is here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DialHint {
+    /// A `relay=` value: where to reach the key through a relay.
+    Relay(String),
+    /// An `addr=` value: a direct address for the key.
+    Addr(String),
+}
+
+impl DialHint {
+    /// The value as the record spelled it, whichever field it was.
+    pub fn value(&self) -> &str {
+        match self {
+            DialHint::Relay(text) | DialHint::Addr(text) => text,
+        }
+    }
 }
 
 /// The validated membership set for one domain.
@@ -278,7 +395,7 @@ pub struct MemberSet {
     /// Records that could not be parsed, with the reason, for `synch doctor`.
     pub rejected: Vec<(String, RecordError)>,
     /// Dialing hints, by device key (§3.3).
-    pub hints: BTreeMap<[u8; 32], Vec<String>>,
+    pub hints: BTreeMap<[u8; 32], Vec<DialHint>>,
 }
 
 impl MemberSet {
@@ -312,17 +429,32 @@ impl MemberSet {
             .collect();
 
         let mut bindings = Vec::new();
-        let mut hints: BTreeMap<[u8; 32], Vec<String>> = BTreeMap::new();
+        let mut hints: BTreeMap<[u8; 32], Vec<DialHint>> = BTreeMap::new();
         for record in &parsed {
             let key_bytes = *record.node_key.as_bytes();
-            for hint in [record.relay.as_ref(), record.addr.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                hints.entry(key_bytes).or_default().push(hint.clone());
-            }
+            // Nothing is harvested from a record whose key is ambiguous. The
+            // rule above says every binding such a key would create is dropped,
+            // and a dialing hint is part of what the record creates: collecting
+            // hints first made one added record both drop a member's binding and
+            // name where to reach that member's key, which is a record that was
+            // refused deciding an outbound connection.
             if ambiguous.contains(&key_bytes) {
                 continue;
+            }
+            for hint in [
+                record
+                    .relay
+                    .as_ref()
+                    .map(|text| DialHint::Relay(text.clone())),
+                record
+                    .addr
+                    .as_ref()
+                    .map(|text| DialHint::Addr(text.clone())),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                hints.entry(key_bytes).or_default().push(hint);
             }
             let origin = record.origin(&domain)?;
             let binding = (origin, record.node_key);
@@ -379,7 +511,7 @@ impl MemberSet {
     }
 
     /// Dialing hints published for a device key (§3.3).
-    pub fn hints_for(&self, key: &NodeId) -> &[String] {
+    pub fn hints_for(&self, key: &NodeId) -> &[DialHint] {
         self.hints
             .get(key.as_bytes())
             .map(Vec::as_slice)
@@ -473,6 +605,32 @@ impl Pins {
     }
 }
 
+/// Reads persisted pin state, saying so when a file is there and unusable.
+///
+/// Falling back to the build-time pin set is the right direction — a client
+/// that refused to start over a damaged cache would be the availability
+/// coupling §10.2 forbids — but it discards every update ever accepted, so it
+/// is not something to do silently. "No file" is a fresh install and is
+/// unremarkable; "a file that does not verify against this binary's anchor" is
+/// either a truncated write, a build with a different `--tuf-root`, or somebody
+/// rewriting the pin set, and an operator has to be able to see it.
+fn load_pin_state(path: &Path, anchor: &[u8]) -> Option<PinState> {
+    match PinState::load_anchored(path, anchor) {
+        Some(state) => Some(state),
+        None => {
+            if path.exists() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "the transparency pin state does not verify against this build's \
+                     TUF root and was not loaded; starting from the embedded \
+                     bootstrap pins and re-learning on the next walk"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Where the pin set is refreshed from (§10.2).
 ///
 /// Held as an `Option`, and `None` — `--no-tuf`, or an explicit
@@ -501,7 +659,22 @@ impl std::fmt::Debug for DnssecResolver {
 pub struct ValidatedTxt {
     /// The TXT strings, one per record.
     pub records: Vec<String>,
-    /// How long the answer may be cached, clamped to the §3.2 window.
+    /// How long the answer may be cached: the §3.2 window, and never past the
+    /// point where the RRSIG covering it stops being valid.
+    ///
+    /// The second bound is what keeps a replay from *renewing* trust. A
+    /// correctly signed answer stays correctly signed for its whole RRSIG
+    /// window — days to weeks at a managed provider — and the Rekor proof
+    /// covers the zone *key*, not the record set, so nothing inside the answer
+    /// distinguishes today's records from a copy of last week's. Since removing
+    /// a record is how a zone stops saying something, and the transport is
+    /// explicitly untrusted, a replay whose TTL was taken at face value would
+    /// push a deleted member's binding out afresh on every refresh, for as long
+    /// as the attacker cared to keep replaying.
+    ///
+    /// Capped at the signature's own expiration, each replay of one answer buys
+    /// strictly less than the last, the total is bounded by a lifetime the zone
+    /// itself chose and signed, and past it hickory refuses the answer outright.
     pub ttl: Duration,
     /// The zone whose RRSIG covered this answer, as the signature named it —
     /// checked to enclose the queried name before the answer was accepted
@@ -515,6 +688,10 @@ pub struct ValidatedTxt {
     pub rrsig: RRSIG,
     /// The TXT RRset that `rrsig` covers, for that re-verification.
     pub txt_rrset: Vec<Record>,
+    /// When the signature over this answer stops being valid, seconds since
+    /// the epoch — the ceiling on how long anything derived from the answer
+    /// may be believed. See [`Self::ttl`].
+    pub expires_at: u64,
 }
 
 /// How the resolver reaches the DNS and whom it ultimately trusts (§3.2).
@@ -670,7 +847,7 @@ impl DnssecResolver {
                 let state = options
                     .rekor_state
                     .as_deref()
-                    .and_then(|path| PinState::load_anchored(path, &anchor))
+                    .and_then(|path| load_pin_state(path, &anchor))
                     .unwrap_or_else(|| PinState::anchored(&anchor));
                 Pins::Tuf {
                     keys: state.log_keys().unwrap_or_else(LogKeys::embedded),
@@ -742,13 +919,38 @@ impl DnssecResolver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Whether the last *successful* pin refresh is old enough that a failure
+    /// is a standing condition rather than one bad walk.
+    ///
+    /// A client that has never accepted an update reads as overdue, and that is
+    /// the intent: it is running on the pin set its build shipped with, which is
+    /// the state a refreshable pin set exists to leave behind.
+    fn pin_refresh_overdue(&self) -> bool {
+        let Pins::Tuf { state, .. } = &*self.pins() else {
+            return false;
+        };
+        let updated_at = state.updated_at;
+        now_unix(updated_at)
+            .is_some_and(|now| now > updated_at.saturating_add(PIN_REFRESH_STALE_AFTER))
+    }
+
     /// Resolves `_synchronicity.<domain> TXT`, discarding anything that does
     /// not validate.
     pub async fn lookup_txt(&self, domain: &str) -> Result<ValidatedTxt, NetError> {
         let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
         let name = query_name(&domain);
         let response = self.lookup(&name, RecordType::TXT).await?;
-        secure_txt(&name, &response.answers)
+        self.validated_txt(&name, &response.answers)
+    }
+
+    /// Applies the §3.2 acceptance rules to one answer, holding the TTL it
+    /// yields to the signature's own expiration.
+    fn validated_txt(
+        &self,
+        name: &str,
+        answers: &[hickory_resolver::proto::rr::Record],
+    ) -> Result<ValidatedTxt, NetError> {
+        secure_txt(name, answers, now_unix(0))
     }
 
     /// Resolves and applies the §3.2 rules in one step.
@@ -762,7 +964,7 @@ impl DnssecResolver {
         let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
         let name = query_name(&domain);
         let response = self.lookup(&name, RecordType::TXT).await?;
-        let validated = secure_txt(&name, &response.answers)?;
+        let validated = self.validated_txt(&name, &response.answers)?;
         if self.rekor == RekorPolicy::Require {
             // The zone that signed the answer. Every record this client goes
             // on to fetch hangs off it, because it is the only name the
@@ -773,17 +975,17 @@ impl DnssecResolver {
             // It comes out of `secure_txt`, which already held it to
             // RFC 4035 §5.3.1 before returning: a signer that does not
             // enclose the queried name never reaches this line. The live
-            // DNSKEY is identified later by verifying this RRSIG, not by
-            // treating the 16-bit tag as a key id.
+            // DNSKEYs are identified later by verifying the answer's own
+            // RRSIGs, not by treating a 16-bit tag as a key id.
             let signing_zone = validated.signer.clone();
             // Where the control plane's transparency records live. Taken
             // from the answer this client just DNSSEC-validated, and then
-            // held to both ends: it must contain the domain being resolved
-            // and be contained by the zone that signed it. Two control
-            // planes inside one signing zone would otherwise have to share a
-            // single record name — and, on the publishing side, delete each
-            // other's records forever.
-            let apex = apex_of(&domain, &signing_zone, &validated.records)?;
+            // held to both ends: an apex must contain the domain being
+            // resolved and be contained by the zone that signed it. Two
+            // control planes inside one signing zone would otherwise have to
+            // share a single record name — and, on the publishing side, delete
+            // each other's records forever.
+            let apexes = apexes_of(&domain, &signing_zone, &validated.records)?;
             // The pin set is refreshed *before* the proof is verified, so a
             // proof from a shard Sigstore added since this build shipped
             // verifies in the same refresh that learned about it (§10.2).
@@ -803,12 +1005,41 @@ impl DnssecResolver {
                     "transparency-log pin set updated from Sigstore's TUF repository"
                 ),
                 Ok(_) => {}
+                // A failure that has been going on far longer than the refresh
+                // interval is not the same event as one failure. The pins are
+                // frozen — at what a walk last established, or at the build's
+                // bootstrap snapshot if none ever has — and a client running on
+                // frozen pins will refuse every proof from the day Sigstore
+                // rotates a shard. That is an operator's problem to see, so it
+                // is a warning rather than a line only `--verbose` prints.
+                Err(e) if self.pin_refresh_overdue() => tracing::warn!(
+                    error = %e,
+                    stale_after = PIN_REFRESH_STALE_AFTER,
+                    "Sigstore's TUF repository has not updated the pin set in far \
+                     longer than the refresh interval; the pins in force are frozen"
+                ),
                 Err(e) => tracing::debug!(
                     error = %e,
                     "Sigstore's TUF repository did not update the pin set; the current pins stand"
                 ),
             }
-            self.verify_zone_key(&domain, &apex, &validated).await?;
+            // Each apex the answer attests, most-attested first, until one
+            // yields a verified proof. A stale `apex=` beside a live one names a
+            // control plane with no usable proof, which costs a pair of lookups
+            // rather than the domain (see `apexes_of`).
+            let mut refusal = None;
+            for apex in &apexes {
+                match self.verify_zone_key(&domain, apex, &validated).await {
+                    Ok(_) => {
+                        refusal = None;
+                        break;
+                    }
+                    Err(e) => refusal = Some(e),
+                }
+            }
+            if let Some(e) = refusal {
+                return Err(e);
+            }
         }
         let set = MemberSet::from_records(&domain, &validated.records)?;
         Ok((set, validated.ttl))
@@ -865,9 +1096,9 @@ impl DnssecResolver {
         };
         let metadata = self.walk_tuf(&source, from_root).await?;
 
-        // The state is re-read from disk under the lock rather than trusted
-        // from memory: two resolvers in one data directory share one file,
-        // and monotonicity is a property of the file, not of a process.
+        // The state is re-read from disk rather than trusted from memory: two
+        // resolvers in one data directory share one file, and monotonicity is a
+        // property of the file, not of a process.
         let mut pins = self.pins();
         let Pins::Tuf {
             keys,
@@ -880,15 +1111,17 @@ impl DnssecResolver {
             return Ok(None);
         };
         // Whichever of the two is further along, whole: a state is a
-        // coherent set — the root bytes, the trusted-root bytes and the
-        // versions that describe them — so taking the newer *state* is
+        // coherent set — the root bytes, the targets and trusted-root bytes and
+        // the versions that describe them — so taking the newer *state* is
         // right and taking the newer of each field would not be.
         //
         // Re-walked from this resolver's anchor, exactly as at startup: the
-        // file is shared, so it is no more trusted here than it was there.
+        // file is shared, so it is no more trusted here than it was there —
+        // both the root chain and the targets role that names the trusted root
+        // are re-verified against the anchor this binary holds.
         let current = match path
             .as_deref()
-            .and_then(|path| PinState::load_anchored(path, anchor))
+            .and_then(|path| load_pin_state(path, anchor))
         {
             Some(stored) if dominates(&stored, state) => stored,
             _ => state.clone(),
@@ -936,9 +1169,9 @@ impl DnssecResolver {
         membership: &ValidatedTxt,
     ) -> Result<VerifiedRecord, NetError> {
         let signing_zone = &membership.signer;
-        let key_tag = membership.rrsig.input().key_tag;
         let zone_text = signing_zone.to_string();
         let apex_text = apex.to_string();
+        let key_tag = membership.rrsig.input().key_tag;
         let dnskey_rdata = self
             .zone_dnskey(signing_zone, &membership.rrsig, &membership.txt_rrset)
             .await?;
@@ -956,7 +1189,7 @@ impl DnssecResolver {
         // A name that does not exist and a name that exists with no proof
         // for this key tag are the same fact to a client: this key was never
         // logged, as far as the zone is willing to say.
-        let records = match secure_txt(&name, &response.answers) {
+        let records = match self.validated_txt(&name, &response.answers) {
             Ok(validated) => validated.records,
             Err(NetError::Dns(_)) if response.answers.is_empty() => return Err(absent()),
             Err(e) => return Err(e),
@@ -989,7 +1222,7 @@ impl DnssecResolver {
             // better than a transport error naming a name the operator never
             // configured.
             if let Ok(answer) = self.lookup(&part, RecordType::TXT).await {
-                if let Ok(validated) = secure_txt(&part, &answer.answers) {
+                if let Ok(validated) = self.validated_txt(&part, &answer.answers) {
                     records.extend(validated.records);
                 }
             }
@@ -1036,6 +1269,8 @@ impl DnssecResolver {
         // set, so there is no selector on the wire — a zone can legitimately
         // serve more than one record (a retirement breadcrumb beside the
         // live claim), and membership in a verified set is what decides.
+        //
+        let candidates = candidates_to_verify(candidates);
         let mut last = None;
         for candidate in &candidates {
             match rekor::verify(candidate, &key, &self.log_keys(), &self.anchors) {
@@ -1092,6 +1327,12 @@ impl DnssecResolver {
 /// key, sign membership with the new key, and keep serving the old Rekor
 /// proof. The live key is the one whose public key verifies the RRSIG, not
 /// the first Secure DNSKEY that happens to share its tag.
+///
+/// This is also what bounds hickory's choice of *which* RRSIG it verified
+/// under: whichever signature the answer's record order put in front of the
+/// validator, the key bound here is one that demonstrably signed this exact
+/// RRset, so the transport can steer the choice among equally valid signatures
+/// and cannot steer it onto a key that signed nothing.
 ///
 /// `verify_rrsig`'s name argument is the TXT owner — the RRset being
 /// checked — not the signing zone. The signing zone is the DNSKEY owner
@@ -1225,11 +1466,11 @@ fn versions(state: &PinState) -> [u64; 4] {
 ///
 /// The four versions are independently-monotone counters, so "further along"
 /// is componentwise dominance and not the lexicographic order a tuple
-/// comparison gives. Comparing tuples let the root version dominate the
+/// comparison gives. Under a tuple comparison the root version dominates the
 /// other three outright: a state ahead on `root` but behind on
-/// timestamp/snapshot/targets read as newer, and adopting it dropped the
-/// rollback floors for those roles to the lower numbers — which is the whole
-/// thing the floors exist to prevent.
+/// timestamp/snapshot/targets would read as newer, and adopting it would drop
+/// the rollback floors for those roles to the lower numbers — which is the
+/// whole thing the floors exist to prevent.
 ///
 /// When neither state dominates the other they are not comparable, and the
 /// answer is to keep what is in memory rather than to pick by a tie-break
@@ -1241,27 +1482,63 @@ fn dominates(a: &PinState, b: &PinState) -> bool {
         .all(|(a, b)| a >= b)
 }
 
+/// How far ahead of the system clock a persisted floor may be before the floor
+/// is the thing that is wrong.
+///
+/// A floor exists to stop the clock going *backwards*, and a day of tolerance
+/// covers every reason a legitimate one could lead: a client that accepted an
+/// update from a machine whose clock was slightly ahead, an NTP correction
+/// landing between two refreshes. Nothing legitimate leads by more, and the
+/// value that matters is the one that does not: a floor of 2100 makes every
+/// refresh interval unreachable and every TUF expiry vacuous, permanently, with
+/// no error to report because from the code's point of view nothing failed.
+const MAX_CLOCK_FLOOR_LEAD: u64 = 24 * 60 * 60;
+
+/// How long a pin refresh may keep failing before a failure is worth an
+/// operator's attention.
+///
+/// A single failed walk is ordinary — a CDN hiccup, a laptop off the network —
+/// and belongs at `debug`. A week of them means the pin set is frozen, and a
+/// frozen pin set refuses every proof from the day Sigstore opens a shard the
+/// client has never heard of. "Much more than the interval" is what makes the
+/// two distinguishable rather than one noisy line.
+const PIN_REFRESH_STALE_AFTER: u64 = 7 * tuf::REFRESH_INTERVAL;
+
 /// Seconds since the epoch, for the expiry checks every TUF role carries,
-/// floored by the last state this client accepted.
+/// floored by the last state this client accepted and bounded against the
+/// clock.
 ///
-/// Two things it must not do, and used to do both.
+/// Three properties, and each one is a way the pin set can be frozen:
 ///
-/// A clock this code cannot read used to become `0`. Every expiry check is
-/// `expires > now`, so at zero *nothing has ever expired* — root, timestamp,
-/// snapshot and targets all pass. That is the wrong direction: expiry is the
-/// only bound on how old the metadata a mirror serves may be, so a clock
-/// failure removed the bound entirely. It now yields `None`, and a refresh
-/// with no trustworthy clock does not run.
-///
-/// And a clock that has been moved *backwards* — a bad NTP step, a dead RTC
-/// coming up at the epoch — would reopen the same window. `updated_at` is
-/// already persisted with every accepted state and was read back and never
-/// used; it is exactly the monotonic floor for this, so it is the floor now.
+/// - **An unreadable clock is `None`, not zero.** Every expiry check is
+///   `expires > now`, so at zero nothing has ever expired and expiry — the only
+///   bound on how old the metadata a hostile mirror may serve is — stops being a
+///   bound at all. A refresh with no trustworthy clock does not run.
+/// - **A clock moved backwards is floored** by `updated_at`, persisted with
+///   every accepted state: a bad NTP step or a dead RTC coming up at the epoch
+///   cannot reopen the same window.
+/// - **And the floor is bounded by the clock in turn.** An unbounded floor is
+///   the same freeze from the other direction: it is read from a file, so a
+///   value far in the future makes the refresh interval unreachable *and* every
+///   expiry pass, and both silently. Past the tolerance the clock wins and the
+///   floor is reported, because a floor that far out is either a corrupt file or
+///   a clock that was very wrong when an update was accepted, and neither is
+///   something to keep obeying.
 fn now_unix(floor: u64) -> Option<u64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
+    if floor > now.saturating_add(MAX_CLOCK_FLOOR_LEAD) {
+        tracing::warn!(
+            floor,
+            now,
+            "the persisted TUF timestamp is further ahead of this clock than any \
+             correction explains; using the clock, and the pin refresh will \
+             re-establish the floor"
+        );
+        return Some(now);
+    }
     Some(now.max(floor))
 }
 
@@ -1484,13 +1761,35 @@ impl hickory_resolver::net::xfer::DnsHandle for DohHandle {
 /// RFC 4035 §5.3.1: the Signer's Name MUST be the zone that contains the
 /// RRset. hickory 0.26 does not enforce this — `verify_default_rrset` looks
 /// up a DNSKEY at whatever `signer_name` the RRSIG carries (TODO on that
-/// rule) — and DoH is an untrusted transport. Extra junk must not DoS a
-/// valid answer, so a bad RRSIG is stripped rather than failing the whole
-/// message. Hickory then sees an unsigned or correctly-signed RRset and
-/// fails closed.
+/// rule) — and DoH is an untrusted transport. So an off-path signature is
+/// removed before the validator can be sent chasing a DNSKEY at a name that
+/// has no business signing this RRset.
 ///
 /// Parent signing a child DS is fine (`com.` encloses `example.com.`).
 /// `attacker.com` signing `example.com` DS/TXT/DNSKEY is not.
+///
+/// # What this does not defend against
+///
+/// **An injected RRSIG that names the real zone is a one-packet denial of the
+/// lookup, and this filter cannot stop it.** Such a record passes the enclosure
+/// test by construction — that is the whole shape of the injection — so it
+/// reaches hickory's `verify_default_rrset`, which builds one future per RRSIG
+/// and races them with `future::select_ok`. A verification that *fails* resolves
+/// `Ok(None)`, which `select_ok` counts as the winner, and the winner is then
+/// unwrapped into `Proof::Bogus` for the whole RRset. Because the junk RRSIG
+/// names the real zone it shares the real one's DNSKEY lookup and becomes ready
+/// at the same moment, so record order — which the transport chooses — decides
+/// the race.
+///
+/// The consequence is availability only, and it is fail-closed: every
+/// membership, DNSKEY and proof lookup for the name fails, the cached bindings
+/// stand until their grace runs out, and nothing false is ever accepted. It is
+/// reachable by anyone who can add a record to a response, including an on-path
+/// attacker against a plaintext DoH endpoint. It is a bug in the dependency's
+/// signature-selection logic and cannot be fixed from this side; what *is*
+/// fixed from this side is the other half of the same quirk — hickory's choice
+/// of *which* RRSIG is the signer no longer decides which zone key must carry a
+/// transparency proof (see [`ValidatedTxt::rrsigs`]).
 fn strip_off_path_rrsigs(response: &mut hickory_resolver::proto::op::DnsResponse) {
     drop_off_path_rrsigs(&mut response.answers);
     drop_off_path_rrsigs(&mut response.authorities);
@@ -1521,6 +1820,7 @@ fn rrsig_signer_encloses_owner(record: &Record) -> bool {
 fn secure_txt(
     name: &str,
     answers: &[hickory_resolver::proto::rr::Record],
+    now: Option<u64>,
 ) -> Result<ValidatedTxt, NetError> {
     use hickory_resolver::proto::{
         dnssec::rdata::DNSSECRData,
@@ -1533,8 +1833,16 @@ fn secure_txt(
 
     // Step one, and it has to be first: *who* signed this. hickory marks
     // exactly one RRSIG per RRset as the one it verified under (the rest come
-    // back `Indeterminate`), so there is at most one candidate here and an
-    // attacker cannot steer the choice by stapling extra signatures.
+    // back `Indeterminate`), so there is at most one candidate here.
+    //
+    // Which one that is follows the order the answer's records arrived in, and
+    // the untrusted transport chooses that order — so the choice is steerable
+    // among *equally valid* signatures, and during an RFC 6781
+    // double-signature rollover it decides which of the zone's keys the proof
+    // requirement lands on. It cannot be steered onto a key that did not sign:
+    // `signing_key_rdata` re-verifies this signature against the DNSKEY set
+    // before anything is bound to it, so a chosen RRSIG that does not verify
+    // under a secure DNSKEY of the signing zone refuses the answer.
     let signed_by = answers.iter().find_map(|record| {
         if record.name != qname || !record.proof.is_secure() {
             return None;
@@ -1594,13 +1902,12 @@ fn secure_txt(
             continue;
         }
         // Only the records this answer is *made of* have to carry a proof.
-        // Co-resident records of other types do not, and RRSIGs especially
-        // do not: hickory marks only the signature it verified under and
-        // returns every other one `Indeterminate`. Demanding a proof on
-        // those refused every answer during an RFC 6781 double-signature key
-        // rollover — which several managed providers run continuously — and
-        // handed anyone who could *add* a record to a response a one-packet
-        // denial of service.
+        // Co-resident records of other types do not, and RRSIGs especially do
+        // not: hickory marks only the signature it verified under and returns
+        // every other one `Indeterminate`, so demanding a proof on those would
+        // refuse every answer during an RFC 6781 double-signature key rollover —
+        // which several managed providers run continuously — and hand anyone who
+        // could *add* a record to a response a one-packet denial of service.
         if !matches!(record.data, RData::TXT(_)) {
             continue;
         }
@@ -1628,13 +1935,28 @@ fn secure_txt(
     if records.is_empty() {
         return Err(NetError::Dns(format!("{name}: no TXT records")));
     }
+
+    // The signature's own expiration is the ceiling on everything derived from
+    // this answer (see `ValidatedTxt::ttl`). Read from the RRSIG hickory
+    // verified under, which is the one whose window it checked.
+    let expires_at = u64::from(rrsig.input().sig_expiration.get());
+    let ttl = match now {
+        // No readable clock: the §3.2 window is the only bound available, and
+        // an answer whose signature has expired is one hickory has already
+        // refused, so this is not a hole so much as the absence of a second
+        // fence.
+        None => clamp_ttl(ttl),
+        Some(now) => clamp_ttl(ttl.min(Duration::from_secs(expires_at.saturating_sub(now)))),
+    };
+
     Ok(ValidatedTxt {
         records,
-        ttl: clamp_ttl(ttl),
+        ttl,
         signer,
         key_tag,
         rrsig,
         txt_rrset,
+        expires_at,
     })
 }
 
@@ -2025,15 +2347,36 @@ mod tests {
     }
 
     #[test]
-    fn hints_are_collected_per_key() {
+    fn hints_are_collected_per_key_and_keep_the_field_they_came_from() {
         let k = key();
         let records = vec![format!(
-            "v=sync1 id=nas nk={} addr=10.0.0.1:4433",
+            "v=sync1 id=nas nk={} addr=10.0.0.1:4433 relay=https://relay.example",
             k.to_z32()
         )];
         let set = MemberSet::from_records("x.example", &records).unwrap();
-        assert_eq!(set.hints_for(&k), &["10.0.0.1:4433".to_string()]);
+        assert_eq!(
+            set.hints_for(&k),
+            &[
+                DialHint::Relay("https://relay.example".into()),
+                DialHint::Addr("10.0.0.1:4433".into())
+            ]
+        );
         assert!(set.hints_for(&key()).is_empty());
+
+        // The distinction survives a value whose *shape* belongs to the other
+        // field, which is the whole reason the hint is typed: a consumer
+        // matching on shape alone would dial a relay value as an address.
+        let ambiguous = vec![format!(
+            "v=sync1 id=nas nk={} relay=10.0.0.9:4433",
+            k.to_z32()
+        )];
+        let set = MemberSet::from_records("x.example", &ambiguous).unwrap();
+        assert_eq!(
+            set.hints_for(&k),
+            &[DialHint::Relay("10.0.0.9:4433".into())],
+            "a relay= value is a relay however it is spelled"
+        );
+        assert_eq!(set.hints_for(&k)[0].value(), "10.0.0.9:4433");
     }
 
     #[test]
@@ -2055,23 +2398,218 @@ mod tests {
     /// The client's half of the timing relation the control plane states in
     /// `zone/render_external.ttl_proof`.
     ///
-    /// A binding lives for the answer's TTL plus the grace, so the tight case
-    /// is a zone served at this client's TTL floor: even then, what a client
-    /// holds has to last at least as long as the control plane needs to
-    /// re-publish after a provider rotates. The zone actually publishes
-    /// membership at 300 s, so the margin in practice is four minutes; the
-    /// floor is what has no margin, and this is what fails if either side's
-    /// constants drift apart.
+    /// **The grace alone has to cover the republish window.** A binding expires
+    /// at `<last successful refresh> + ttl + grace`, and the refresh cadence
+    /// *is* the TTL, so when a rotation starts the last refresh is already up to
+    /// a whole TTL old and the TTL term is spent. Crediting it is an off-by-one
+    /// TTL that lets an ordinary provider rotation drop every DNS-sourced
+    /// binding for a domain: with `T` the last success and `R` the moment the
+    /// provider starts signing with the un-logged key,
+    ///
+    /// ```text
+    /// survival margin = (T − R) + ttl − (window − grace),   (T − R) ∈ (−ttl, 0]
+    /// ```
+    ///
+    /// so the `ttl` term cancels and what is left is `grace − window`. That is
+    /// the relation, it has to be positive rather than merely non-negative, and
+    /// this is what fails if either side's constants drift apart.
     #[test]
     fn bindings_outlive_a_provider_rotation() {
         assert!(
-            MIN_TTL + DEFAULT_TRUST_GRACE >= CONTROL_PLANE_REPUBLISH_WINDOW,
+            DEFAULT_TRUST_GRACE > CONTROL_PLANE_REPUBLISH_WINDOW,
             "a client would drop DNS-sourced members before the control plane \
-             could re-publish: {:?} + {:?} < {:?}",
-            MIN_TTL,
-            DEFAULT_TRUST_GRACE,
-            CONTROL_PLANE_REPUBLISH_WINDOW
+             could re-publish: {DEFAULT_TRUST_GRACE:?} <= {CONTROL_PLANE_REPUBLISH_WINDOW:?}"
         );
+        // And with real headroom rather than the zero margin an equality gives:
+        // the three delays the window sums are the control plane's, so a change
+        // there must not land exactly on the boundary.
+        assert!(
+            DEFAULT_TRUST_GRACE >= CONTROL_PLANE_REPUBLISH_WINDOW + Duration::from_secs(120),
+            "the margin over the republish window is too thin to absorb any \
+             drift in the control plane's three delays"
+        );
+        // The window is the sum it says it is, so the arithmetic cannot drift
+        // from the reasoning beside it.
+        assert_eq!(
+            CONTROL_PLANE_REPUBLISH_WINDOW,
+            CONTROL_PLANE_WATCH_CADENCE + CONTROL_PLANE_LOG_ROUND_TRIP + CONTROL_PLANE_PROOF_TTL
+        );
+    }
+
+    /// A duplicated `apex=` is a rejected record, like a duplicated `nk=`.
+    #[test]
+    fn a_record_that_names_two_apexes_is_rejected() {
+        let k = key();
+        assert_eq!(
+            parse_record(&format!(
+                "v=sync1 id=nas nk={} apex=a.example apex=b.example",
+                k.to_z32()
+            ))
+            .unwrap_err(),
+            RecordError::Duplicate("apex")
+        );
+        // One is still one.
+        assert_eq!(
+            parse_record(&format!("v=sync1 id=nas nk={} apex=A.Example", k.to_z32()))
+                .unwrap()
+                .apex
+                .as_deref(),
+            Some("a.example")
+        );
+    }
+
+    /// An ambiguous key contributes no dialing hints, because it contributes no
+    /// binding.
+    ///
+    /// The malformed-set rule is that every binding such a key would create is
+    /// dropped. A hint is part of what a record creates: harvesting one from a
+    /// record whose binding was refused let a single added record both evict a
+    /// member and name where to reach that member's key.
+    #[test]
+    fn an_ambiguous_key_contributes_no_hints() {
+        let k = key();
+        let records = vec![
+            format!("v=sync1 id=nas nk={} addr=10.0.0.1:4433", k.to_z32()),
+            format!(
+                "v=sync1 id=attacker nk={} relay=https://relay.attacker.example",
+                k.to_z32()
+            ),
+        ];
+        let set = MemberSet::from_records("x.example", &records).unwrap();
+        assert_eq!(set.ambiguous_keys, vec![k]);
+        assert!(set.bindings.is_empty());
+        assert!(
+            set.hints_for(&k).is_empty(),
+            "a key with no binding has no hints either: {:?}",
+            set.hints_for(&k)
+        );
+    }
+
+    /// Every apex the answer names is tried, and one stale record does not sink
+    /// a readable set.
+    ///
+    /// An apex has to *contain* the membership domain — the control plane
+    /// publishes membership at `_synchronicity.<network>.<org>.<apex>` — so the
+    /// candidates are ancestors of the domain, which are totally ordered.
+    #[test]
+    fn every_agreeing_apex_is_offered_and_a_stale_one_does_not_sink_the_set() {
+        let k = key();
+        let domain = "net.org.cp.example.com";
+        let signing_zone = Name::from_utf8("example.com.").unwrap();
+        let named = |apex: &str| format!("v=sync1 id=nas nk={} apex={apex}", k.to_z32());
+        let live = named("cp.example.com");
+        let stale = named("org.cp.example.com");
+
+        // One record, one apex.
+        assert_eq!(
+            apexes_of(domain, &signing_zone, std::slice::from_ref(&live)).unwrap(),
+            vec![Name::from_utf8("cp.example.com.").unwrap()]
+        );
+
+        // A disagreeing record adds a candidate rather than failing the answer,
+        // and the order is decided by the records themselves — never by the
+        // order an untrusted transport put them in.
+        let both = apexes_of(
+            domain,
+            &signing_zone,
+            &[live.clone(), live.clone(), stale.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            both,
+            vec![
+                Name::from_utf8("cp.example.com.").unwrap(),
+                Name::from_utf8("org.cp.example.com.").unwrap()
+            ],
+            "the apex most of the set names comes first"
+        );
+        assert_eq!(
+            apexes_of(domain, &signing_zone, &[stale.clone(), live.clone(), live]).unwrap(),
+            both,
+            "answer order decides nothing"
+        );
+
+        // An apex outside the signing zone, or one that does not contain the
+        // domain, is a rejected record — not a candidate and not a failure.
+        let outside = named("cp.other.example");
+        let sibling = named("sibling.example.com");
+        let unparseable = named("cp..example.com");
+        assert_eq!(
+            apexes_of(
+                domain,
+                &signing_zone,
+                &[
+                    stale.clone(),
+                    outside.clone(),
+                    sibling.clone(),
+                    unparseable.clone()
+                ]
+            )
+            .unwrap(),
+            vec![Name::from_utf8("org.cp.example.com.").unwrap()]
+        );
+
+        // The hard failure survives for the one case with no readable subset.
+        for records in [
+            vec![],
+            vec![format!("v=sync1 id=nas nk={}", k.to_z32())],
+            vec![outside, sibling, unparseable],
+        ] {
+            let error = apexes_of(domain, &signing_zone, &records)
+                .expect_err("no usable apex is a refusal");
+            assert!(error.to_string().contains("no membership record names"));
+        }
+
+        // And the work one answer can ask for is bounded, however many distinct
+        // apexes it names.
+        let deep = "n0.n1.n2.n3.n4.n5.n6.n7.n8.example.com";
+        // Every proper ancestor of `deep` inside the signing zone: eight
+        // distinct, usable apexes, all of which the answer names.
+        let many: Vec<String> = (1..9).map(|n| named(&deep[n * 3..])).collect();
+        assert_eq!(
+            apexes_of(deep, &signing_zone, &many).unwrap().len(),
+            MAX_APEX_CANDIDATES
+        );
+    }
+
+    /// The persisted clock floor cannot run away from the real clock.
+    ///
+    /// `updated_at` is read from a file and floors the clock every TUF expiry
+    /// check sees, so an unbounded floor is a silent, permanent freeze: past the
+    /// refresh interval the walk never runs again and *nothing is logged at any
+    /// level*, because from the code's point of view nothing failed. It does not
+    /// take an attacker either — one successful update taken while the clock is
+    /// briefly wrong-forward burns the value in for good.
+    #[test]
+    fn the_clock_floor_is_bounded_by_the_clock() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // No floor, or one in the past: the clock is the clock.
+        assert_eq!(now_unix(0), Some(now));
+        assert_eq!(now_unix(now - 1_000), Some(now));
+
+        // A floor slightly ahead is honoured — that is what it is for.
+        let slightly = now + MAX_CLOCK_FLOOR_LEAD / 2;
+        assert_eq!(now_unix(slightly), Some(slightly));
+
+        // A floor further ahead than any correction explains is discarded, and
+        // the refresh interval stays reachable rather than becoming unreachable
+        // forever.
+        for absurd in [
+            now + MAX_CLOCK_FLOOR_LEAD * 2,
+            4_102_444_800, // 2100-01-01
+            u64::MAX,
+        ] {
+            assert_eq!(now_unix(absurd), Some(now), "floor {absurd}");
+            let after = now_unix(absurd).unwrap();
+            assert!(
+                after < absurd.saturating_add(tuf::REFRESH_INTERVAL),
+                "a walk must still become due"
+            );
+        }
     }
 
     #[test]
@@ -2132,6 +2670,87 @@ mod tests {
         assert!(
             err.to_string().contains("verifies the membership RRSIG"),
             "{err}"
+        );
+    }
+
+    /// The proofs one refresh will verify are bounded by this build, not by the
+    /// zone.
+    #[test]
+    fn the_proofs_one_refresh_verifies_are_capped() {
+        // What a zone can put at one name: sixteen parts' worth of validated
+        // TXT is many complete single-record groups.
+        let served: Vec<String> = (0u64..32)
+            .flat_map(|n| {
+                let proof = rekor::RekorProof {
+                    log_id: [7u8; 32],
+                    log_index: n,
+                    statement: b"{}".to_vec(),
+                    canonicalized_body: b"{}".to_vec(),
+                    checkpoint: "log.example\n1\nAAAA\n\n\u{2014} log.example AAAAAAAA\n"
+                        .as_bytes()
+                        .to_vec(),
+                    inclusion_path: Vec::new(),
+                };
+                proof.to_txt().expect("encodes")
+            })
+            .collect();
+        let candidates: Vec<rekor::RekorProof> = rekor::proofs_from_txt(&served)
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            candidates.len() > MAX_PROOF_CANDIDATES,
+            "the zone can offer more candidates than this build will walk"
+        );
+        assert_eq!(
+            candidates_to_verify(candidates).len(),
+            MAX_PROOF_CANDIDATES,
+            "how much verification one refresh does is this build's decision"
+        );
+    }
+
+    /// A replay cannot renew trust past the signature's own lifetime.
+    ///
+    /// `secure_txt` keeps no state across refreshes, and the Rekor proof covers
+    /// the zone *key* rather than the record set, so a correctly signed answer
+    /// replays as a unit for its whole RRSIG window — days to weeks at a managed
+    /// provider. Taking the record TTL at face value let each replay push a
+    /// binding out afresh, indefinitely, for records the zone had since removed.
+    /// The signature's own expiration is the ceiling.
+    #[test]
+    fn an_answers_ttl_never_outlives_the_signature_over_it() {
+        let zone = hickory_resolver::proto::rr::Name::from_utf8("example.").unwrap();
+        let (_, signer) = p256_at(&zone);
+        let owner =
+            hickory_resolver::proto::rr::Name::from_utf8("_synchronicity.example.").unwrap();
+        let mut answers = signed_txt(&owner, "v=sync1 id=nas nk=x", &signer);
+        for record in &mut answers {
+            record.proof = hickory_resolver::proto::dnssec::Proof::Secure;
+            record.ttl = 3600;
+        }
+        let name = "_synchronicity.example.";
+        let expires_at = u64::from(txt_rrsig(&answers).input().sig_expiration.get());
+
+        // Well inside the window: the record's own TTL decides, clamped.
+        let early = expires_at - 4 * 3600;
+        let validated = secure_txt(name, &answers, Some(early)).expect("a signed answer");
+        assert_eq!(validated.expires_at, expires_at);
+        assert_eq!(validated.ttl, Duration::from_secs(3600));
+
+        // Near the end of it: the signature decides, so a replay accepted here
+        // buys minutes rather than the hour the record claims.
+        let late = expires_at - 90;
+        let validated = secure_txt(name, &answers, Some(late)).expect("a signed answer");
+        assert_eq!(validated.ttl, Duration::from_secs(90));
+
+        // Past the end the floor takes over, and hickory has already refused the
+        // answer by then — the RRSIG window is part of what `Proof::Secure`
+        // means, so this branch exists only so the arithmetic cannot underflow.
+        assert_eq!(
+            secure_txt(name, &answers, Some(expires_at + 1))
+                .expect("a signed answer")
+                .ttl,
+            MIN_TTL
         );
     }
 

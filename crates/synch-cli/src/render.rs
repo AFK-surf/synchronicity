@@ -4,7 +4,10 @@
 //! verbatim.
 
 use synch_core::{now_ns, EntryKind};
-use synch_engine::{CompareReport, CompareStatus, EntryRef, Node, VersionPolicy, VersionSet};
+use synch_engine::{
+    CompareReport, CompareStatus, EntryRef, Node, RekorPolicy, ResolverStatus, VersionPolicy,
+    VersionSet,
+};
 use synch_store::EntryRow;
 
 use crate::control::ControlError;
@@ -164,6 +167,40 @@ pub fn domain_health(health: &synch_engine::DomainHealth, now: i64) -> String {
     line
 }
 
+/// The trust configuration in force, in one line, for `synch daemon status`.
+///
+/// The policy first, because it is the one that decides whether an answer is
+/// accepted at all, and every override after it: an override is a different
+/// universe and the operator has to be able to see which one they are in.
+pub fn trust_summary(status: &ResolverStatus) -> String {
+    match status {
+        ResolverStatus::Absent => "no membership resolver in this process".into(),
+        ResolverStatus::Failed(why) => {
+            format!("NO RESOLVER: {why} — membership cannot refresh")
+        }
+        ResolverStatus::Ready(config) => {
+            let mut parts = vec![
+                match config.rekor {
+                    RekorPolicy::Require => "rekor require".to_string(),
+                    RekorPolicy::Off => "rekor OFF".to_string(),
+                },
+                format!("doh {}", config.doh_url),
+            ];
+            parts.push(match &config.dnssec_anchor {
+                None => "anchor icann-root".into(),
+                Some(path) => format!("anchor REPLACED by {path}"),
+            });
+            parts.push(match (&config.rekor_key, &config.tuf_url) {
+                (Some(path), _) => format!("log keys pinned by {path}, tuf refresh off"),
+                (None, None) => "tuf refresh OFF".into(),
+                (None, Some(url)) => format!("tuf {url}"),
+            });
+            parts.push(format!("{} log key(s) pinned", config.log_keys.len()));
+            parts.join(" · ")
+        }
+    }
+}
+
 /// The `synch doctor` / `synch daemon status` report.
 pub fn doctor(node: &Node) -> Lines {
     let report = node.doctor()?;
@@ -177,6 +214,69 @@ pub fn doctor(node: &Node) -> Lines {
         out.push(format!("retiring: {}", addr(&net)));
     }
 
+    // The clock, before anything dated by it. An expiry check is `now <
+    // expires_at`, so a node that cannot say when it is cannot say what is
+    // still trusted — and that has to be the first thing an operator reads,
+    // not an inference from a page of bindings.
+    out.push(String::new());
+    if !report.clock.trusted {
+        out.push("CLOCK UNUSABLE (§3.2):".into());
+        out.push(format!(
+            "  the host clock reads {} ns since the epoch, which cannot date a trust decision",
+            report.clock.reading
+        ));
+        out.push(
+            "  no DNS binding is honored and membership is not extended while this holds; \
+             static trust (`synch trust add`) consults no clock and is unaffected"
+                .into(),
+        );
+        out.push("  set the system clock or give this host a time source".into());
+    } else if report.clock.stepped_back {
+        out.push("CLOCK STEPPED BACK (§3.2):".into());
+        out.push(format!(
+            "  the clock reads {} ns, behind the {} ns this node already recorded",
+            report.clock.reading, report.clock.floor
+        ));
+        out.push(
+            "  trust is dated by the higher value, so nothing that lapsed comes back; \
+             expiries will look further away than they are until the clock catches up"
+                .into(),
+        );
+    } else {
+        out.push(format!(
+            "clock: usable, floor {} ns recorded",
+            report.clock.floor
+        ));
+    }
+
+    out.push(String::new());
+    out.push(format!("trust: {}", trust_summary(&report.trust)));
+    if let ResolverStatus::Ready(config) = &report.trust {
+        if config.rekor == RekorPolicy::Off {
+            out.push(
+                "  ! zone-key transparency is off: DNSSEC alone decides, and a substituted \
+                 zone key leaves no public record"
+                    .into(),
+            );
+        }
+        if let Some(path) = &config.dnssec_anchor {
+            out.push(format!(
+                "  ! the ICANN root is replaced by {path}: nothing signed under the real root \
+                 validates on this node"
+            ));
+        }
+        if config.tuf_url.is_none() {
+            out.push(
+                "  ! TUF pin refresh is off: the log key set stops following Sigstore, so a \
+                 shard rotation needs a new build or a new key file"
+                    .into(),
+            );
+        }
+        for key in &config.log_keys {
+            out.push(format!("  log key {key}"));
+        }
+    }
+
     out.push(String::new());
     out.push("membership:".into());
     if report.domains.is_empty() {
@@ -186,6 +286,32 @@ pub fn doctor(node: &Node) -> Lines {
         for health in node.domain_health()? {
             out.push(format!("  domain {}", domain_health(&health, now)));
         }
+    }
+    // §3.2's malformed-set rule drops *every* binding an ambiguous key would
+    // create, so the member it names does not appear in `trust ls` at all. This
+    // is the only place that says why, on any refresh path.
+    for (domain, key) in &report.ambiguous {
+        out.push(format!(
+            "  AMBIGUOUS in {domain}: {} appears under more than one id",
+            key.to_z32()
+        ));
+        out.push(
+            "    every binding it would create is dropped, so that member is not trusted at \
+             all; the usual cause is one key published under two id= labels"
+                .into(),
+        );
+    }
+    for (domain, origin) in &report.self_origin_mismatch {
+        out.push(format!(
+            "  MISMATCH in {domain}: this node's device key is published as {origin}, but it \
+             publishes as {}",
+            report.origin
+        ));
+        out.push(
+            "    peers bind the published id, so nothing this node publishes is accepted \
+             until the record or `synch init --id` agrees"
+                .into(),
+        );
     }
     let now = now_ns();
     for binding in &report.bindings {

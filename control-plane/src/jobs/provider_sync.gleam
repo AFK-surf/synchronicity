@@ -245,7 +245,8 @@ fn pass(
 }
 
 /// Armed gate and no verified record: omit membership TXT. A store error
-/// fails the pass rather than guessing. The declaration still renders.
+/// fails the pass rather than guessing. The declaration still renders — the
+/// watcher needs it on the wire to build a chain at all.
 fn omit_members(conn: Connection) -> Result(Bool, String) {
   case gate.required() {
     False -> Ok(False)

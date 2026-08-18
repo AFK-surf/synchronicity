@@ -82,11 +82,35 @@ impl SimZone {
     /// The same, for a name that is already an FQDN — including the root,
     /// which `new`'s "append a dot" spelling cannot express.
     pub fn for_name(origin: Name, txt: Vec<String>) -> SimZone {
+        SimZone::keyed(origin, txt, |public| DNSKEY::from_key(public))
+    }
+
+    /// A zone whose DNSKEY carries the flags the caller names, rather than the
+    /// ordinary secure-entry-point zone key.
+    ///
+    /// The flags are what RFC 4034 §2.1.1 and RFC 5011 §2.1 turn on — a key with
+    /// no Zone Key bit may not verify an RRset, and a REVOKE-flagged key may not
+    /// be used at all — and the DNSSEC stack underneath this design reads
+    /// neither. A harness that could only mint well-flagged keys could not test
+    /// the rules.
+    pub fn with_flags(origin: &str, txt: Vec<String>, zone_key: bool, revoke: bool) -> SimZone {
+        SimZone::keyed(
+            Name::from_utf8(format!("{origin}.")).expect("origin name"),
+            txt,
+            move |public| DNSKEY::new(zone_key, true, revoke, public.to_owned()),
+        )
+    }
+
+    fn keyed(
+        origin: Name,
+        txt: Vec<String>,
+        dnskey_of: impl FnOnce(&hickory_resolver::proto::dnssec::PublicKeyBuf) -> DNSKEY,
+    ) -> SimZone {
         let algorithm = Algorithm::ECDSAP256SHA256;
         let pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).expect("keygen");
         let key = EcdsaSigningKey::from_pkcs8(&pkcs8, algorithm).expect("key load");
         let public = key.to_public_key().expect("public key");
-        let dnskey = DNSKEY::from_key(&public);
+        let dnskey = dnskey_of(&public);
         let signer = DnssecSigner::new(
             dnskey.clone(),
             Box::new(key),
@@ -111,6 +135,11 @@ impl SimZone {
     /// The apex, as an FQDN with its root dot.
     pub fn apex(&self) -> String {
         self.origin.to_string()
+    }
+
+    /// The zone key's DNSKEY, for a test that wants to serve it somewhere else.
+    pub fn dnskey(&self) -> DNSKEY {
+        self.dnskey.clone()
     }
 
     /// The zone key's DNSKEY rdata: flags, protocol, algorithm, key.
@@ -204,14 +233,19 @@ impl SimZone {
     /// — the archival case the client and the monitor must both still accept.
     pub fn dnskey_records(&self, inception: time::OffsetDateTime) -> Vec<Record> {
         let mut set = RecordSet::new(self.origin.clone(), RecordType::DNSKEY, 0);
-        set.insert(
-            Record::from_rdata(
-                self.origin.clone(),
-                self.ttl,
-                RData::DNSSEC(DNSSECRData::DNSKEY(self.dnskey.clone())),
-            ),
-            0,
-        );
+        // The zone's own key first, then whatever else it publishes at the
+        // apex: an RRset in a chain has to be the RRset the zone serves, or a
+        // test about the *other* keys of a proven set has no way to speak.
+        for dnskey in std::iter::once(&self.dnskey).chain(&self.extra_dnskeys) {
+            set.insert(
+                Record::from_rdata(
+                    self.origin.clone(),
+                    self.ttl,
+                    RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+                ),
+                0,
+            );
+        }
         let rrsig = RRSIG::from_rrset(&set, DNSClass::IN, inception, &self.signer)
             .expect("sign dnskey set");
         set.insert_rrsig(Record::from_rdata(
@@ -650,6 +684,11 @@ impl SimZone {
 /// This is that ladder, small enough to build in a test and real enough to
 /// walk: three zones, three keys, DS records signed by actual parents, and a
 /// root whose DNSKEY is the only thing a reader has to be told to trust.
+///
+/// The zone cut between the middle zone and the apex is a *parameter*, because
+/// DNS cuts are not one label each: [`SimDelegation::spanning`] delegates an
+/// apex several labels below its parent, which is the shape a label-counting
+/// ladder rule makes unencodable.
 #[doc(hidden)]
 #[allow(missing_debug_implementations)]
 pub struct SimDelegation {
@@ -662,19 +701,42 @@ pub struct SimDelegation {
 }
 
 impl SimDelegation {
-    /// A ladder terminating at `apex`, which must have exactly two labels
-    /// (`cluster.example`) so the middle zone is unambiguous.
+    /// A ladder terminating at `apex`, delegated one label at a time from its
+    /// immediate parent — the ordinary shape, e.g. `cluster.example`.
     pub fn new(apex: &str, txt: Vec<String>) -> SimDelegation {
         let apex_name = Name::from_utf8(format!("{apex}.")).expect("apex name");
-        assert_eq!(
-            apex_name.num_labels(),
-            2,
-            "a sim delegation is root → TLD → apex"
+        assert!(
+            apex_name.num_labels() >= 2,
+            "a sim delegation is root → TLD → apex, so the apex needs a parent \
+             between it and the root"
         );
+        let tld = apex_name.base_name();
+        SimDelegation::between(Name::root(), tld, apex_name, txt)
+    }
+
+    /// A ladder whose bottom cut spans **several labels**: `tld` delegates
+    /// `apex` directly, with no zone at the names in between.
+    ///
+    /// This is a perfectly ordinary DNS arrangement — `example.com` publishing
+    /// NS and DS for `cp.acme.example.com` with nothing at `acme.example.com` —
+    /// and it is the shape no label-counting ladder rule can encode: a link for
+    /// the empty non-terminal has neither DNSKEY nor DS, and omitting it breaks
+    /// a parent-name check. `apex` must be strictly below `tld`.
+    pub fn spanning(apex: &str, tld: &str, txt: Vec<String>) -> SimDelegation {
+        let apex_name = Name::from_utf8(format!("{apex}.")).expect("apex name");
+        let tld_name = Name::from_utf8(format!("{tld}.")).expect("tld name");
+        assert!(
+            tld_name.zone_of(&apex_name) && tld_name != apex_name,
+            "the delegating zone must be a proper ancestor of the apex"
+        );
+        SimDelegation::between(Name::root(), tld_name, apex_name, txt)
+    }
+
+    fn between(root: Name, tld: Name, apex: Name, txt: Vec<String>) -> SimDelegation {
         SimDelegation {
-            root: SimZone::for_name(Name::root(), Vec::new()),
-            tld: SimZone::for_name(apex_name.base_name(), Vec::new()),
-            apex: SimZone::for_name(apex_name, txt),
+            root: SimZone::for_name(root, Vec::new()),
+            tld: SimZone::for_name(tld, Vec::new()),
+            apex: SimZone::for_name(apex, txt),
         }
     }
 
@@ -749,12 +811,11 @@ impl SimLog {
     /// of the log, so its id, its PEM and every checkpoint it signs are one
     /// coherent universe a test can pin.
     ///
-    /// **Signs ASN.1/DER, because Sigstore does.** This used to sign the
-    /// fixed 64-byte `r ‖ s` form, which happened to be the only encoding
-    /// the verifier accepted — so the mock produced exactly the bytes the
-    /// bug required and the whole P-256 path was green while being unusable
-    /// against the real log. A simulator that agrees with the implementation
-    /// rather than with the world tests nothing.
+    /// **Signs ASN.1/DER, because Sigstore does.** A simulator that agrees with
+    /// the implementation rather than with the world tests nothing: signing the
+    /// fixed 64-byte `r ‖ s` form would produce exactly the bytes a
+    /// fixed-width-only verifier wants, keeping the whole P-256 path green while
+    /// it stayed unusable against the real log.
     pub fn new(origin: &str) -> SimLog {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
@@ -836,10 +897,8 @@ impl SimLog {
         );
         // **ASN.1/DER, because that is what Sigstore signs notes with** —
         // the live `rekor.sigstore.dev` signature is 70 bytes opening
-        // `30 44 02 20`. This used to sign the raw `r ‖ s` form; since
-        // the verifier only accepted that same form, the mock agreed with
-        // the bug and the whole P-256 checkpoint path was green while being
-        // unusable against the real log.
+        // `30 44 02 20`. Signing the raw `r ‖ s` form here would agree with a
+        // fixed-width-only verifier rather than with the log.
         let signature = sign_p256_der(&self.pkcs8, body.as_bytes());
         // The four-byte key hint is a selector, never a credential; the
         // verifier tries the pinned key regardless of what it says.
@@ -984,6 +1043,7 @@ impl SimTuf {
             timestamp_version: 0,
             snapshot_version: 0,
             targets_version: 0,
+            targets: Vec::new(),
             trusted_root: Vec::new(),
             updated_at: 0,
         }

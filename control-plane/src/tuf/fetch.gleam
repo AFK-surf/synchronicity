@@ -10,10 +10,13 @@
 ////
 //// So the walk is a walk — timestamp names the snapshot version, the
 //// snapshot names the targets version, the targets name the target's digest
-//// — and nothing it collects is stored until the whole chain verifies from
-//// the anchor down: signatures over canonical JSON, thresholds, expiries,
-//// monotonicity, and the target's digest. What is stored is therefore
-//// material this side has checked, not merely material it received.
+//// — and nothing it collects is stored until two gates pass. The chain must
+//// verify from the anchor down: signatures over canonical JSON, thresholds,
+//// expiries, monotonicity, and the target's digest. Then the trusted root's
+//// *contents* must be material a client could use at all — logs it can read,
+//// keys it recognises, one of them in service — because a signature makes
+//// bytes authentic and not useful. What is stored is therefore material this
+//// side has checked, not merely material it received.
 ////
 //// The repository arrives as an injected pair of functions rather than a
 //// hardwired endpoint, the same shape as `rekor/client`: everything this
@@ -26,6 +29,7 @@
 //// ingestion, where refusing costs nothing but a retry.
 
 import envoy
+import gleam/bit_array
 import gleam/http/request
 import gleam/httpc
 import gleam/int
@@ -37,6 +41,7 @@ import store/sqlite.{type Connection}
 import tuf/anchor
 import tuf/meta
 import tuf/store.{Material}
+import tuf/trusted_root
 import tuf/verify
 
 /// The oldest `root.json` version this release's clients can chain from —
@@ -59,6 +64,21 @@ pub fn root_floor() -> Result(Int, String) {
 /// up. Sigstore rotates roughly yearly; this is decades of headroom and a
 /// bound on a repository that answers 200 to everything.
 const root_ceiling = 200
+
+/// The most bytes one TUF file may be — the same 8 MiB the client applies
+/// (`MAX_TUF_BYTES`, crates/synch-net/src/dns.rs). Sigstore's files are tens
+/// of kilobytes; this is the bound that makes a repository unable to charge
+/// this service arbitrary memory for material it has not verified yet.
+pub const max_file_bytes = 8_388_608
+
+/// The most bytes one whole walk may take, across the root chain and the four
+/// files below it.
+///
+/// A per-file cap alone bounds nothing here: the root chain probes up to
+/// `root_ceiling` versions and holds every one of them until the gate below
+/// runs, so the product of the two is what a hostile mirror would get to
+/// allocate. Real material is a fraction of this.
+pub const max_walk_bytes = 33_554_432
 
 /// A TUF repository, as the two operations this needs.
 ///
@@ -137,9 +157,13 @@ pub fn refresh(
   // The root chain, from the anchor this build holds up to whatever the
   // repository last published. The walk ends at the first version the
   // repository does not have — that is how TUF says "this is current".
-  use roots <- result.try(
-    root_chain(repo, anchored.version, anchored.version, []),
-  )
+  use #(roots, budget) <- result.try(root_chain(
+    repo,
+    anchored.version,
+    anchored.version,
+    [],
+    Budget(0),
+  ))
   use #(root_version, _) <- result.try(case list.last(roots) {
     Ok(head) -> Ok(head)
     Error(Nil) ->
@@ -151,15 +175,16 @@ pub fn refresh(
   })
 
   // Consistent snapshots: each file names the version of the one below it.
-  use timestamp <- result.try(fetch(repo, "timestamp.json"))
+  use #(timestamp, budget) <- result.try(fetch(repo, "timestamp.json", budget))
   use timestamp_role <- result.try(meta.read_role(timestamp, "timestamp"))
   use snapshot_version <- result.try(meta.read_meta_version(
     timestamp,
     "snapshot.json",
   ))
-  use snapshot <- result.try(fetch(
+  use #(snapshot, budget) <- result.try(fetch(
     repo,
     int.to_string(snapshot_version) <> ".snapshot.json",
+    budget,
   ))
   use snapshot_role <- result.try(meta.read_role(snapshot, "snapshot"))
   use Nil <- result.try(agrees(
@@ -171,9 +196,10 @@ pub fn refresh(
     snapshot,
     "targets.json",
   ))
-  use targets <- result.try(fetch(
+  use #(targets, budget) <- result.try(fetch(
     repo,
     int.to_string(targets_version) <> ".targets.json",
+    budget,
   ))
   use targets_role <- result.try(meta.read_role(targets, "targets"))
   use Nil <- result.try(agrees(
@@ -190,9 +216,10 @@ pub fn refresh(
     targets,
     trusted_root_target,
   ))
-  use trusted_root <- result.try(fetch(
+  use #(trusted_root, _budget) <- result.try(fetch(
     repo,
     "targets/" <> digest <> "." <> trusted_root_target,
+    budget,
   ))
 
   // The gate. Everything above this line is a walk — it decided which files
@@ -223,6 +250,26 @@ pub fn refresh(
     )
     |> result.map_error(fn(e) {
       "refusing material that does not verify: " <> verify.describe(e)
+    }),
+  )
+
+  // The second gate: the target's *contents*. A signature makes the trusted
+  // root authentic, not usable — and the client refuses a trusted root that
+  // names no tlogs, a tlog without a `baseUrl`, or a key that is not an SPKI
+  // it recognises (`tlog_keys`, crates/synch-net/src/tuf.rs). Storing such
+  // material would advance this service's versions past material clients
+  // structurally refuse, and the failure would surface days later as proofs
+  // from a log nobody pins.
+  use logs <- result.try(
+    trusted_root.tlogs(trusted_root)
+    |> result.map_error(fn(why) {
+      "refusing a trusted root no client could use: " <> why
+    }),
+  )
+  use _ <- result.try(
+    trusted_root.current(logs, now)
+    |> result.map_error(fn(why) {
+      "refusing a trusted root with no log to submit to: " <> why
     }),
   )
 
@@ -284,14 +331,24 @@ pub const refetch_window = 259_200
 /// another.
 pub const trusted_root_target = verify.trusted_root_target
 
+/// How many bytes this walk has taken so far.
+///
+/// Threaded rather than global because it has to be: every fetch in one
+/// refresh shares the bound, and none of them may be trusted until the
+/// verification gate below has run over all of them.
+type Budget {
+  Budget(used: Int)
+}
+
 /// Walks `<version>.root.json` upward from `version` until the repository
-/// has no more, bounded relative to `floor`.
+/// has no more, bounded relative to `floor` and by the byte budget.
 fn root_chain(
   repo: Repo,
   floor: Int,
   version: Int,
   acc: List(#(Int, BitArray)),
-) -> Result(List(#(Int, BitArray)), String) {
+  budget: Budget,
+) -> Result(#(List(#(Int, BitArray)), Budget), String) {
   case version > floor + root_ceiling {
     True ->
       Error("the repository's root chain does not end; refusing to walk on")
@@ -299,22 +356,66 @@ fn root_chain(
       let path = int.to_string(version) <> ".root.json"
       use fetched <- result.try(repo.get(path))
       case fetched {
-        None -> Ok(list.reverse(acc))
+        None -> Ok(#(list.reverse(acc), budget))
         Some(bytes) -> {
+          use budget <- result.try(spend(budget, path, bytes))
           use role <- result.try(meta.read_role(bytes, "root"))
           use Nil <- result.try(agrees(path, role.version, version))
-          root_chain(repo, floor, version + 1, [#(version, bytes), ..acc])
+          root_chain(
+            repo,
+            floor,
+            version + 1,
+            [#(version, bytes), ..acc],
+            budget,
+          )
         }
       }
     }
   }
 }
 
-fn fetch(repo: Repo, path: String) -> Result(BitArray, String) {
+fn fetch(
+  repo: Repo,
+  path: String,
+  budget: Budget,
+) -> Result(#(BitArray, Budget), String) {
   use fetched <- result.try(repo.get(path))
   case fetched {
-    Some(bytes) -> Ok(bytes)
+    Some(bytes) -> {
+      use budget <- result.try(spend(budget, path, bytes))
+      Ok(#(bytes, budget))
+    }
     None -> Error("the repository has no " <> path)
+  }
+}
+
+/// Charges one fetched file against the caps, or refuses it.
+fn spend(
+  budget: Budget,
+  path: String,
+  bytes: BitArray,
+) -> Result(Budget, String) {
+  let size = bit_array.byte_size(bytes)
+  let used = budget.used + size
+  case size > max_file_bytes, used > max_walk_bytes {
+    True, _ ->
+      Error(
+        path
+        <> " is "
+        <> int.to_string(size)
+        <> " bytes, past the "
+        <> int.to_string(max_file_bytes)
+        <> "-byte limit for one TUF file",
+      )
+    _, True ->
+      Error(
+        "this refresh has fetched "
+        <> int.to_string(used)
+        <> " bytes, past the "
+        <> int.to_string(max_walk_bytes)
+        <> "-byte limit for one walk",
+      )
+    False, False -> Ok(Budget(used))
   }
 }
 

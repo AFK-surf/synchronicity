@@ -64,6 +64,16 @@ struct NodeInner {
     /// Rung when an inbound connection is refused for an unknown device key,
     /// which §3.4 makes a trigger for an immediate DNS re-resolution.
     dns_wake: Arc<tokio::sync::Notify>,
+    /// The one resolver every membership refresh in this process goes through —
+    /// the scheduled loop and every control request alike — or why there is
+    /// none.
+    ///
+    /// One, not one per request: the resolver holds when it last walked the TUF
+    /// repository, and that bound is what keeps a Sigstore outage costing one
+    /// attempt a day instead of one per command (§10.2). And a process that
+    /// could not build one refreshes nothing at all, which is a state `doctor`
+    /// and `daemon status` have to be able to name.
+    dns_resolver: std::sync::Mutex<crate::membership::ResolverSlot>,
     /// Rung when the unified tree may have changed — an accepted head flipped
     /// complete, a local publish landed, a mirror was added — so the standing
     /// mirror loop materializes it without waiting out its interval (§7.2).
@@ -274,6 +284,7 @@ impl Node {
                 ad_clock: std::sync::Mutex::new(Default::default()),
                 mirror_writes: std::sync::Mutex::new(Default::default()),
                 dns: std::sync::Mutex::new(Default::default()),
+                dns_resolver: std::sync::Mutex::new(Default::default()),
                 dns_wake,
                 mirror_wake,
                 mirror_lock: tokio::sync::Mutex::new(()),
@@ -571,6 +582,16 @@ impl Node {
     /// knows a binding is stale asks for the same re-resolution.
     pub fn trigger_dns_refresh(&self) {
         self.inner.dns_wake.notify_waiters();
+    }
+
+    /// The resolver slot every membership refresh in this process reads from.
+    pub(crate) fn dns_resolver_slot(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::membership::ResolverSlot> {
+        self.inner
+            .dns_resolver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The per-domain re-resolution schedule (§3.2).

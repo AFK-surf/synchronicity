@@ -45,7 +45,7 @@
 //! monitor draws no distinction. Nothing about being *recorded* makes a later
 //! entry look more routine.
 //!
-//! # Why tier B is silent, and why that is only safe because clients agree
+//! # Why tier B is silent, and the condition that makes it safe
 //!
 //! Tier B is where an entry goes when its chain proves nothing: absent,
 //! broken, or about some other key. Anybody may write anything into a public
@@ -61,6 +61,23 @@
 //! > **anything a client accepts is classified tier A.**
 //!
 //! Never tighten this crate's chain rule without tightening the client's.
+//!
+//! And read the proviso exactly: *no client **holding this monitor's anchor
+//! set and pin set**.* Both are per-process and both *replace* rather than
+//! union — `--dnssec-anchor` swaps the ICANN root out, `--rekor-key` swaps the
+//! pinned logs out — so one process covers one client population. A run
+//! against ICANN-rooted anchors says nothing about a population under a
+//! private anchor, and in *both* directions the mismatch produces the more
+//! comfortable answer rather than the louder one: the entry lands in tier B,
+//! exit 10, "no client would have accepted one". The one real-bytes fixture in
+//! this crate is an instance — `tests/real_entry.rs` classifies an entry that
+//! a default monitor would file tier B and that `synch-net`'s suite verifies
+//! as client-accepted, the difference being one anchor file.
+//!
+//! So the trust surface is not a detail of invocation: it is part of what a
+//! verdict *means*. The binary records it in the state file and refuses a run
+//! that changes it, because a memory of what has been reported is a memory
+//! about one population.
 
 #![deny(missing_docs)]
 

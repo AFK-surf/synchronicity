@@ -156,23 +156,32 @@ A remote node is **trusted** iff at least one of the following holds:
    The resolver queries `_synchronicity.<domain> TXT` and accepts records of the form:
 
    ```
-   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=nas    nk=<z-base32 device key>"
-   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key>"
-   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key>"  ; rotation window
+   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=nas    nk=<z-base32 device key> apex=cp.example.com"
+   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key> apex=cp.example.com"
+   _synchronicity.cluster.example.com.  300  IN  TXT  "v=sync1 id=laptop nk=<z-base32 device key> apex=cp.example.com"  ; rotation window
    ```
 
    Each record binds one device key to the origin named by `id=`. The `id` field is
    the member's stable identifier — an opaque label matching `[a-z0-9-]{1,63}`,
    case-insensitive, unique per member within the domain — and is what the data model
    keys the node by (`OriginId::Named`). The `nk` field is the *current* device key.
+   The `apex` field names the control plane whose zone-key transparency records
+   cover this answer, and the records of one answer must agree about it: it is
+   where the client looks for the proof set, held between the zone the RRSIG
+   names and the domain being resolved (docs/REKOR-ZONE-KEY.md §3). Under the
+   default `--rekor require` an answer whose records name no apex has no proof to
+   find and is refused, so a zone published without it resolves for nobody.
    **Multiple records with the same `id` and different `nk` are valid** and mean all
    listed device keys are simultaneously bound — this is the key-rotation window
    (§3.4). A record without an `id=` field is accepted for backward simplicity and
    binds `OriginId::Key(nk)` (non-rotatable, as if statically trusted).
 
    Malformed-set rules: if the same `nk` appears under two different `id=`s (or once
-   with and once without `id=`), self-detection refuses to guess — the node requires
-   an explicit `--id`, and `synch doctor` reports the ambiguity. Two different
+   with and once without `id=`), the key is ambiguous and **every binding it would
+   create is dropped** — so that member is not trusted at all and stops appearing in
+   `trust ls`. Nothing else in the system explains that, which is why `synch doctor`
+   reports the ambiguity by key and domain, on the scheduled refresh path as much as
+   on an explicit `synch domain refresh`. Two different
    machines accidentally sharing one `id=` is indistinguishable from a rotation
    window at the resolver; it manifests as *sustained* same-seq equivocation, which
    `synch doctor` diagnoses with the likely cause ("duplicate id assignment?").
@@ -202,12 +211,30 @@ A remote node is **trusted** iff at least one of the following holds:
    over the control socket, resolves the same way.
 
    Records are re-resolved on the TTL (clamped to `[60s, 24h]`). A binding that
-   disappears from DNS expires after `dns_trust_grace` (default: 1 TTL + 10 minutes)
-   to absorb propagation glitches. Adding a machine to the cluster becomes: generate
-   identity, publish one TXT record. A node learns its *own* OriginId either
-   explicitly (`synch init --id nas@cluster.example.com`) or by auto-detection —
-   finding its device key in the validated record set; explicit config wins on
-   conflict.
+   disappears from DNS expires after `dns_trust_grace` to absorb propagation
+   glitches. Adding a machine to the cluster becomes: generate identity, publish
+   one TXT record.
+
+   A node's *own* OriginId is explicit — `synch init --id nas@cluster.example.com`,
+   or the device key itself — and is never inferred from DNS: a node that read its
+   identity out of the record set would change identity whenever the zone did. The
+   record set is consulted for the opposite direction. If it binds this node's
+   device key to some *other* id, nothing this node publishes will be accepted by
+   anybody, while the node itself looks healthy — so `synch doctor` reports that
+   mismatch, and reports nothing for a key the malformed-set rule above calls
+   ambiguous, because there is no single answer to report.
+
+   **Expiry is dated, and the date is checked.** Every binding check is
+   `now < expires_at`, so the instant is an input to an authorization decision and
+   the host clock is not authenticated. A reading no build of this software could
+   produce — a dead RTC at the epoch, a container with no time source — dates
+   nothing: DNS bindings are all treated as expired, membership is not extended,
+   and `synch doctor` and `synch daemon status` say so in as many words. Static
+   trust consults no clock and keeps working, which is the escape hatch. The
+   highest trustworthy reading is persisted, and every check is floored by it, so a
+   clock stepped *backwards* cannot hand back trust that already lapsed; a large
+   forward step expires bindings early, which is the fail-closed direction and is
+   undone by the next successful refresh.
 
 Both sources feed a single `bindings` table (§10). Enforcement is at connection accept
 time and on every incoming message: connections from device keys with no live binding
@@ -230,8 +257,12 @@ nothing in synchronicity requires n0's infrastructure. None of this stack is
 trusted: a broken or hostile lookup or relay can strand a dial but never redirect
 one — the QUIC handshake authenticates the device key, and membership is enforced
 at accept. Optionally, the TXT record may carry a hint: `relay=https://...` or
-`addr=host:port`, which is fed into iroh as dialing hints. To reach a named
-origin, a node dials whichever device key(s) are currently bound to it.
+`addr=ip:port`, which is fed into iroh as dialing hints. Each field means one
+thing and is read that way: a value that is neither an `ip:port` nor an
+`http(s)://host` URL is dropped rather than retried as the other shape. And a hint
+is applied only for a key that holds a live binding, because a hint is dialing data
+about a member and a key the set does not bind is not one. To reach a named origin,
+a node dials whichever device key(s) are currently bound to it.
 
 `--dht` on `synch daemon run` adds Mainline DHT discovery alongside the
 pkarr/DNS one, off by default. It is the same signed pkarr record, stored on the
@@ -989,7 +1020,8 @@ synch mirror rm|ls|sync                      tree under a version policy (§7.2)
 synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of policy
                                              (a path pins its selected version's root)
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
-synch doctor                                 connectivity, DNSSEC, equivocation, GC stats
+synch doctor                                 connectivity, DNSSEC, equivocation, GC stats,
+                                             the trust policy in force and the clock it dates by
 ```
 
 ### 9.3 The control socket
@@ -1328,9 +1360,9 @@ CI (GitHub Actions):
   inside the zone. An attacker who has taken the registrar must therefore either log
   their key under the operator's own apex, where a monitor watching that delegation
   path reports it, or fail client validation. Covert targeted substitution stops
-  being covert. It is on by default (`--rekor off` states the opt-out), and it is
-  the reason the "knowingly accepted" framing this bullet used to end on no longer
-  describes what ships. **See [docs/REKOR-ZONE-KEY.md](docs/REKOR-ZONE-KEY.md)** for
+  being covert. It is on by default on the client side (`--rekor off` states the
+  opt-out), so domain-controller power is no longer something a deployment simply
+  accepts. **See [docs/REKOR-ZONE-KEY.md](docs/REKOR-ZONE-KEY.md)** for
   the mechanism, its threat model, and — importantly — what it still does not
   protect against: key *theft* leaves a valid record, and the monitor cannot tell
   your rotation from a substitution. It tells you a key was authorized; your own

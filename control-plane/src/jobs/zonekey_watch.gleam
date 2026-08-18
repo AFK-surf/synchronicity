@@ -3,12 +3,14 @@
 ////
 //// The provider holds the zone's private keys and rotates them on its own
 //// schedule, so the claim cannot be a ceremony an operator runs — it has
-//// to follow the wire. Every five minutes this actor resolves the apex
-//// DNSKEY RRset over DoH; when the set differs from what the last logged
-//// claim covered, it collects the chain, logs a fresh claim (signed by an
-//// ephemeral key `rekor/publish` mints and discards — attribution is not
-//// authorization), and pokes the reconciler so the `_synchronicity-rekor`
-//// record follows into the provider zone.
+//// to follow the wire. Every five minutes this actor resolves the signing
+//// zone's DNSKEY RRset over DoH — twice, and acts only on two reads that
+//// agree, because the observation is what prunes the stored key set and one
+//// bad answer must not delete a live key's proof. When the set differs from
+//// what the last logged claim covered, it collects the chain, logs a fresh
+//// claim (signed by an ephemeral key `rekor/publish` mints and discards —
+//// attribution is not authorization), and pokes the reconciler so the
+//// `_synchronicity-rekor` record follows into the provider zone.
 ////
 //// A provider that pre-publishes — the standard rotation dance, and what
 //// Cloudflare does — puts its next key in the RRset days before it signs
@@ -293,23 +295,51 @@ fn stamp_covered(conn: Connection, now: Int) -> Result(Nil, sqlite.Error) {
   state.record_logged(conn, digests, now)
 }
 
-/// The apex DNSKEY RRset as `#(sha256, tag, rdata)` per key, or why not.
+/// The signing zone's DNSKEY RRset as `#(sha256, tag, rdata)` per key, read
+/// **twice**, and only believed when the two reads agree.
+///
+/// What this observation feeds is `state.record_observed`, which *deletes* the
+/// rows for keys the answer does not contain — and those rows are what
+/// `zone/model` holds the served proofs to, so a single bad answer would
+/// delete the zone's proof records for keys that never went away. One answer
+/// is not enough to act on that. Two disagreeing reads leave the stored set
+/// alone: nothing is logged, nothing is deleted, and the next tick asks again.
 fn observe(
   resolver: chain.Resolver,
-  apex: dns_name.Name,
+  zone: dns_name.Name,
 ) -> Result(List(#(BitArray, Int, BitArray)), String) {
-  use answers <- result.try(resolver.query(apex, wire.type_dnskey))
+  use first <- result.try(observe_once(resolver, zone))
+  use second <- result.try(observe_once(resolver, zone))
+  case same_answer(first, second) {
+    True -> Ok(first)
+    False ->
+      Error(
+        "two reads of the DNSKEY RRset at "
+        <> dns_name.to_string(zone)
+        <> " disagree; acting on an unconfirmed answer would delete proofs"
+        <> " for keys that may still be live",
+      )
+  }
+}
+
+fn observe_once(
+  resolver: chain.Resolver,
+  zone: dns_name.Name,
+) -> Result(List(#(BitArray, Int, BitArray)), String) {
+  use answers <- result.try(resolver.query(zone, wire.type_dnskey))
   let rdatas =
     answers
     |> list.filter(fn(rr) {
-      rr.rtype == wire.type_dnskey && rr.class == wire.class_in
+      rr.rtype == wire.type_dnskey
+      && rr.class == wire.class_in
+      && rr.name == zone
     })
     |> list.map(fn(rr) { rr.rdata })
   case rdatas {
     [] ->
       Error(
         "no DNSKEY RRset at "
-        <> dns_name.to_string(apex)
+        <> dns_name.to_string(zone)
         <> " — is the provider zone signed and delegated yet?",
       )
     _ ->
@@ -319,6 +349,16 @@ fn observe(
         }),
       )
   }
+}
+
+fn same_answer(
+  a: List(#(BitArray, Int, BitArray)),
+  b: List(#(BitArray, Int, BitArray)),
+) -> Bool {
+  let digests = fn(keys: List(#(BitArray, Int, BitArray))) {
+    keys |> list.map(fn(key) { key.0 }) |> list.sort(bit_compare)
+  }
+  digests(a) == digests(b)
 }
 
 fn same_keys(

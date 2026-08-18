@@ -88,8 +88,10 @@ a verified Rekor log record. The proof check
    client verifies a chain it does not need").
 4. **The declaration** — the chain's bottom link is the apex's own
    `_synchronicity-transparency.<apex>` TXT RRset, signed by the keys the
-   ladder above it proved. Without it the entry would prove only public
-   records, which anyone can read out of an open resolver.
+   ladder above it proved. Publishing that record takes write access to the
+   zone, so an entry can only be built about a zone that has declared itself a
+   control plane. It bounds *which zones* an entry can be about, and says
+   nothing about who assembled the entry (§2.1).
 5. **Attribution** — the entry signature over the DSSE PAE verifies under
    the certificate's own key: the entry is what its signer made, whoever
    that is.
@@ -109,17 +111,28 @@ its private half, so a signature by that key would cost them nothing. It
 could only ever add *attribution* — the entry was made by the key's holder,
 not a bystander — never *authorization*.
 
-But attribution is not worthless, and dropping it outright would leave a
-real gap: a delegation ladder is public, so anyone could collect a zone's
-DNSKEY and DS records and mint an entry about a zone that never heard of
-them, leaving monitors unable to tell an operator's own publication from a
-stranger's. The **declaration** closes that without reaching for the
-private key. Publishing `_synchronicity-transparency.<apex>` requires write
-access to the zone, which is exactly the authority the entry claims to
-speak with — and it is an ordinary record write, so a zone whose DNSSEC
-keys live inside a managed provider can do it. That is the whole trick: the
-proof of authority moved from *holding the key* to *controlling the zone*,
-and only the second is available to a provider-managed deployment.
+What bounds the entry instead is the **declaration**, and the bound is worth
+stating precisely. A delegation ladder is public, so anyone can collect a
+zone's DNSKEY and DS records; requiring the ladder to bottom out at
+`_synchronicity-transparency.<apex>` means an entry can only be built about a
+zone that has published a record declaring itself a control plane. Publishing
+that record takes write access to the zone, and it is an ordinary record
+write — so a zone whose DNSSEC keys live inside a managed provider can do it.
+That is the trick the provider-managed case rests on: the requirement is
+*controlling the zone*, not *holding the key*.
+
+**It does not attribute an entry to the zone's operator.** Once published, the
+declaration RRset and its RRSIG are public DNS: anyone can fetch the identical
+bytes with the DO bit set and embed them in a chain of their own. So the
+property the declaration delivers is "this entry is about a zone that has
+declared itself a control plane" — it narrows entry-minting to the set of
+synchronicity control planes, and stops there. What a third party still cannot
+do is make an entry say anything *false*: the statement's key set must equal
+the set the chain proves out of the DS-covered, RRSIG-verified DNSKEY RRset, so
+the worst a replayer can log is a true claim about the zone's real keys, timed
+as they choose. Telling one's own publications apart from a stranger's true
+restatements is done against the operator's own record of what they minted
+(§5.5 of docs/REKOR-ZONE-KEY.md), which is also §8's first cost.
 
 Transparency's protection is *detectability*, not prevention. A
 rogue-but-chained key is accepted by clients and simultaneously exposed in
@@ -198,7 +211,7 @@ The residual gap is a provider that activates a key it never published. Then
 clients fail closed until the watcher notices, logs, and the new proof
 reaches the resolver a client asks — bounded by the cadence, publication, and
 the proof records' TTL, and held by §4.2's timing relation to less than the
-lifetime of the membership a client already holds. That is the correct failure
+grace a client's existing bindings carry. That is the correct failure
 direction, and §8 prices it.
 
 ## 4. Control plane: `CP_DNS_MODE=external`
@@ -261,9 +274,12 @@ are ours to publish, all of them strictly below the apex:
   before a key is logged. The declaration still renders so the watcher
   can collect a chain;
 - `_synchronicity-transparency.<apex>` TXT — the declaration (§2.1),
-  rendered unconditionally: a zone that stopped publishing it would have
-  every entry it ever logged stop verifying. At `ttl_declaration`, because
-  its twenty bytes are the same forever;
+  rendered unconditionally, because it is what makes the *next* publish
+  possible: link 0 of a chain is a signed copy of this RRset captured at
+  publish time, so entries already logged keep verifying from the copies
+  they carry, and deleting the live record breaks only chains not yet
+  collected. Rendering it always means the watcher can always collect one.
+  At `ttl_declaration`, because its twenty bytes are the same forever;
 - `_synchronicity-rekor.<apex>` TXT and its numbered parts — the v2 proof
   records, at `ttl_proof`;
 - `_synchronicity-owner.<apex>` TXT — the ownership marker the scope rule
@@ -273,19 +289,37 @@ are ours to publish, all of them strictly below the apex:
 caches nothing itself, so the only thing that TTL governs is how long the
 recursive resolver it asks keeps serving the proof set from before a provider
 rotated its keys. That interval is the tail of the window in which a `Require`
-client fails closed, and it has to fit — with the watch cadence — inside the
-lifetime of the membership that client is already holding, or an ordinary
-rotation costs member bindings rather than a few refreshes:
+client fails closed, and it has to fit inside the *grace* a client's bindings
+carry, or an ordinary rotation costs member bindings rather than a few
+refreshes:
 
 ```
-watch cadence + publish + ttl_proof  <  ttl_data + client trust grace
-300           + 60      + 300        <  300      + 600
+watch cadence + publish + ttl_proof  ≤  client trust grace
+300           + 60      + 300        ≤  900
 ```
 
-Both halves are asserted: the control plane's in `external_test.gleam`, the
-client's against `MIN_TTL` and `DEFAULT_TRUST_GRACE` in `crates/synch-net`.
-Moving any one of the five numbers fails a test rather than widening a window
-quietly.
+Both sides live in `crates/synch-net/src/dns.rs`: the sum on the left is
+`CONTROL_PLANE_REPUBLISH_WINDOW`, spelled there as a sum of its three terms, and
+the right is `DEFAULT_TRUST_GRACE`, whose own reasoning states the relation and
+is checked by a test beside it. Eleven minutes of window against fifteen minutes
+of grace: four minutes of headroom.
+
+`ttl_data` is deliberately not a term. It is tempting to add it — a client
+re-resolves on the TTL, so the answer it holds looks a TTL long — but expiry is
+anchored to the client's *last successful refresh* and the refresh cadence **is**
+the TTL, so by the time a rotation starts, the age of that last refresh has
+already consumed the TTL term: with `T` the last success and `R` the moment the
+provider starts signing with the un-logged key, `T − R ∈ (−ttl, 0]`. Crediting
+`ttl_data` claims up to a full TTL of margin a client does not have, which at the
+floor is the difference between a rotation costing a few refreshes and one
+dropping every DNS-sourced binding for the domain at once.
+
+The Rust assertion is the one that pins this. `external_test.gleam` also states a
+relation over `render_external.ttl_proof`, but it hard-codes the watch cadence and
+the client grace as literals rather than referencing either side's constants, and
+it credits `ttl_data` — so it holds the *Gleam* numbers still and says nothing
+about the client's. Moving `DEFAULT_TRUST_GRACE` fails the Rust test and leaves
+that one passing.
 
 **Everything hangs off the apex**, which is also where the client looks: it
 takes the apex from the `apex=` field of the membership answer it has already
@@ -425,9 +459,11 @@ the §3.3 loop:
    TXT follows. Extra keys stay unlogged so the next tick retries them.
    Audit row `action='zonekey.logged'`.
 
-`rekor-publish`/`rekor-retire` remain as manual ceremonies for serve mode;
-external mode's logging is continuous by construction because the subject
-key is not ours and moves without asking us.
+`rekor-publish`/`rekor-retire` remain as manual ceremonies for serve mode,
+taking a key file and reading the apex and signing zone from `CP_BASE_DOMAIN`
+and `CP_SIGNING_ZONE` like every other command — the zone a deployment speaks
+for is configuration, not an argument. External mode's logging is continuous by
+construction because the subject key is not ours and moves without asking us.
 
 ### 4.5 Eventual consistency, stated honestly
 
@@ -662,13 +698,16 @@ runs the same steps minus the decommissioning.
 
 ## 8. Costs, stated plainly
 
-- **Anyone can log an entry about any zone** (they always could log
-  *something*; the client accepts chained third-party entries too). No
-  signer identity
-  distinguishes operator entries from anyone else's — deliberately: the
-  signature is per-entry ephemeral, and
-  authorization rests entirely on the chain — which §2.1 argues is where
-  it always rested.
+- **Anyone can log a true entry about any declared control plane.** The
+  declaration and its RRSIG are public DNS, so a third party can assemble the
+  same chain and log the same statement about your key set at a time of their
+  choosing; the client accepts chained third-party entries too. No signer
+  identity separates operator entries from anyone else's — deliberately: the
+  signature is per-entry ephemeral, and authorization rests entirely on the
+  chain, which §2.1 argues is where it rests in any case. The entry cannot be
+  made to say anything untrue about the key set, so the residual cost is noise
+  aimed at the alarm: reports the operator has to check against their own
+  record of what they minted.
 - **The wire is eventually consistent.** Commit no longer equals
   publication; a reconciler pass and provider propagation sit between a
   mutation and the edge. Seconds in practice, unbounded during a provider
@@ -683,14 +722,14 @@ runs the same steps minus the decommissioning.
   that is easy to forget — the proof records' own TTL, because a client
   caches nothing itself and the recursive resolver it asks may still be
   serving the pre-rotation proof set. That is why `ttl_proof` is 300 s rather
-  than a day, and why §4.2 states the whole sum as a relation against the
-  lifetime of the bindings a client already holds: about eleven minutes of
-  fail-closed refreshes against fifteen minutes of held membership. Beyond
-  that lifetime a client does not merely fail to refresh — the maintenance
-  pass deletes its DNS-sourced bindings — so the margin is what separates a
-  rotation costing a few refreshes from one costing members. Pre-publishing
-  providers (all three, normally) make the case theoretical; the cost is
-  priced anyway.
+  than a day, and why §4.2 states the whole sum — eleven minutes — as a relation
+  against the *grace* a client's bindings carry rather than against the TTL plus
+  that grace: the TTL is consumed by the age of the client's last successful
+  refresh before the rotation even starts. Past the grace a client does not
+  merely fail to refresh — the maintenance pass deletes its DNS-sourced
+  bindings — so the margin is what separates a rotation costing a few refreshes
+  from one costing members. Pre-publishing providers (all three, normally) make
+  the case theoretical; the cost is priced anyway.
 - **Proof history is not served forever.** Only claims covering a key the zone
   currently publishes go into the zone (§4.2.1). Older claims stay in
   `rekor_records` as the operator's own record, and a monitor reporting a key
@@ -715,10 +754,12 @@ runs the same steps minus the decommissioning.
   rendering deleted, create ordering, idempotence
   (`diff(desired, desired-as-existing)` is empty); the desired-set hash's
   stability under permutation; the proof budget's shed order.
-- **The timing relation of §4.2**, on both sides: the Gleam constants in
-  `external_test.gleam`, the client's `MIN_TTL` and `DEFAULT_TRUST_GRACE`
-  against `CONTROL_PLANE_REPUBLISH_WINDOW` in `crates/synch-net`. Either
-  side drifting fails a test.
+- **The timing relation of §4.2**: the client's `DEFAULT_TRUST_GRACE` against
+  `CONTROL_PLANE_REPUBLISH_WINDOW` in `crates/synch-net`, which is the relation
+  that actually has to hold, and the Gleam constants (`ttl_proof`, `ttl_data`) in
+  `external_test.gleam`. The two client-side numbers are literals on the Gleam
+  side, so that test does not fail when they move — the Rust assertion is the one
+  that pins them.
 - **Provider legs at their pure edges**: Cloudflare's TXT presentation
   folding and Bunny's relative-name conversion as unit tests; no network
   in tests, house rule.

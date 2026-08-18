@@ -3,7 +3,6 @@
 //// provider, and the provider legs' pure edges.
 
 import dnssec/keys
-import envoy
 import gleam/crypto
 import gleam/erlang/process
 import gleam/list
@@ -18,7 +17,6 @@ import provider/provider.{
 }
 import provider/state
 import rekor/client
-import rekor/gate
 import rekor/store as rekor_store
 import store/sqlite
 import zone/build
@@ -271,19 +269,66 @@ pub fn a_proof_part_we_stopped_rendering_is_deleted_test() {
   // A proof that shrank from six parts to five leaves a record at a name the
   // renderer no longer produces. Under a structural scope it is still found,
   // which is the whole reason the scope is structural.
+  let part = fn(label: String, value: String) {
+    Record(label <> ".sync.test", provider.Txt, 60, value)
+  }
+  let publishing = [
+    diff.owner_record("sync.test"),
+    part("_synchronicity-rekor", "sync1p abcdabcd 1/5 one"),
+    part("_synchronicity-rekor-5", "sync1p abcdabcd 5/5 five"),
+  ]
   let existing =
-    as_existing([
-      diff.owner_record("sync.test"),
-      Record("_synchronicity-rekor-6.sync.test", provider.Txt, 300, "orphan"),
-    ])
-  let assert Ok(changes) = diff.diff(desired(), existing)
+    as_existing(
+      list.append(publishing, [part("_synchronicity-rekor-6", "orphan")]),
+    )
+  let assert Ok(changes) = diff.diff(publishing, existing)
   let deleted = list.map(changes.delete, fn(e) { e.record.name })
   assert deleted == ["_synchronicity-rekor-6.sync.test"]
 }
 
+pub fn published_proofs_survive_a_pass_with_none_to_publish_test() {
+  // Rendering *no* proofs is what a transparency gap looks like: no live key
+  // is covered by a verified record, so `servable` answers nothing. That is not
+  // a reason to take the zone's existing proofs out — refuse to emit, leave
+  // what is published standing, exactly as serve mode's gate does.
+  let existing =
+    as_existing([
+      diff.owner_record("sync.test"),
+      Record(
+        "_synchronicity.prod.acme.sync.test",
+        provider.Txt,
+        300,
+        "v=sync1 …",
+      ),
+      Record(
+        "_synchronicity-rekor.sync.test",
+        provider.Txt,
+        60,
+        "sync1p abcdabcd 1/1 published",
+      ),
+    ])
+  let assert Ok(changes) = diff.diff(desired(), existing)
+  assert changes.delete == []
+
+  // Everything else below the apex is still drift, and still removed.
+  let stale =
+    as_existing([
+      diff.owner_record("sync.test"),
+      Record(
+        "_synchronicity.old.acme.sync.test",
+        provider.Txt,
+        300,
+        "v=sync1 id=gone nk=stale",
+      ),
+    ])
+  let assert Ok(changes) = diff.diff(desired(), stale)
+  assert list.map(changes.delete, fn(e) { e.record.name })
+    == ["_synchronicity.old.acme.sync.test"]
+}
+
 pub fn creates_go_out_marker_first_and_proofs_last_test() {
   // Dependency order, not name order: the marker authorizes everything else,
-  // the declaration is what makes a logged claim the zone's own statement,
+  // the declaration is the bottom link of every chain this service logs,
   // membership is the product, and the proofs are the only records big enough
   // for a provider to refuse on size — so they can never be the reason a
   // device add did not land.
@@ -348,8 +393,8 @@ fn fake_provider(
 }
 
 /// A provider that refuses exactly one name and takes everything else — a
-/// proof record too big for its owner name, which is the shape that used to
-/// abort the pass before the membership records behind it.
+/// proof record too big for its owner name, which is the shape that must not
+/// take the membership records behind it down with it.
 fn picky_provider(refuses: String, calls: process.Subject(String)) -> Provider {
   Provider(
     list: fn() {
@@ -487,8 +532,8 @@ pub fn a_refused_record_does_not_hold_back_the_others_test() {
 
   provider_sync.run_once_with(conn, prov, "log-only", "z1", 2000)
   let assert Ok("list") = process.receive(calls, 100)
-  // One refused record used to abort the pass at that record, taking
-  // everything behind it with it. Every other record goes out now.
+  // One refused record is reported, not fatal: every other record still goes
+  // out, in dependency order, and the pass says which one the provider took.
   let applied = drain(calls, [])
   assert list.contains(applied, "applied _synchronicity-owner.sync.test")
   assert list.contains(applied, "applied _synchronicity-transparency.sync.test")
@@ -664,9 +709,12 @@ pub fn require_rekor_omits_members_until_a_key_is_logged_test() {
   )
 }
 
+/// The armed gate holds membership TXT back until something has been logged,
+/// and keeps publishing the declaration while it does — the watcher needs that
+/// record on the wire to build a chain at all.
 pub fn require_rekor_keeps_the_declaration_and_drops_members_on_the_wire_test() {
   let conn = external_conn()
-  envoy.set(gate.require_env, "true")
+  use <- fixtures.with_gate_armed
   let created = process.new_subject()
   let prov =
     Provider(
@@ -677,35 +725,109 @@ pub fn require_rekor_keeps_the_declaration_and_drops_members_on_the_wire_test() 
       },
       describe: "fake",
     )
-  provider_sync.run_once_with(conn, prov, "log-only", "z1", 2000)
-  let assert Ok(names) = process.receive(created, 100)
-  assert !list.contains(names, "_synchronicity.prod.acme.sync.test")
+  let member = "_synchronicity.prod.acme.sync.test"
+  let names = applied_names(conn, prov, created, 2000)
+  assert !list.contains(names, member)
   assert list.contains(names, "_synchronicity-transparency.sync.test")
 
+  let key = keys.dnskey_rdata(keys.generate())
   let assert Ok(Nil) =
-    rekor_store.put(
-      conn,
-      rekor_store.Record(
-        keyset_sha256: crypto.hash(crypto.Sha256, <<"keyset":utf8>>),
-        apex: "sync.test.",
-        action: "create",
-        statement: <<"{}":utf8>>,
-        canonicalized_body: <<0:size(512)>>,
-        log_id: <<0:size(256)>>,
-        log_index: 0,
-        checkpoint: <<>>,
-        inclusion_path: <<>>,
-        chainless: False,
-        integrated_at: 1,
-        verified_at: 1,
-        keys: [#(crypto.hash(crypto.Sha256, <<"k":utf8>>), 1)],
-      ),
-    )
-  provider_sync.run_once_with(conn, prov, "log-only", "z1", 3000)
-  let assert Ok(again) = process.receive(created, 100)
-  assert list.contains(again, "_synchronicity.prod.acme.sync.test")
-  envoy.unset(gate.require_env)
+    record_covering(conn, "create", [crypto.hash(crypto.Sha256, key)])
+  assert list.contains(applied_names(conn, prov, created, 3000), member)
   sqlite.close(conn)
+}
+
+/// A pass that has no proofs to publish must not delete the ones that are
+/// published.
+///
+/// "No servable proof" is what `rekor/store.servable` answers when no live key
+/// is covered — a transparency gap — and taking the existing proofs out of the
+/// provider zone at that moment is the one thing that makes the gap worse. The
+/// posture is serve mode's: refuse to emit, leave what is published standing.
+pub fn a_pass_with_no_proofs_leaves_the_published_ones_alone_test() {
+  let conn = external_conn()
+  let deleted = process.new_subject()
+  let existing = [
+    Existing("id-owner", diff.owner_record("sync.test")),
+    Existing(
+      "id-proof",
+      Record(
+        "_synchronicity-rekor.sync.test",
+        provider.Txt,
+        60,
+        "sync1p abcdabcd 1/1 old",
+      ),
+    ),
+    Existing(
+      "id-proof-2",
+      Record(
+        "_synchronicity-rekor-2.sync.test",
+        provider.Txt,
+        60,
+        "sync1p abcdabcd 2/2 older",
+      ),
+    ),
+  ]
+  let prov =
+    Provider(
+      list: fn() { Ok(existing) },
+      apply: fn(changes) {
+        process.send(
+          deleted,
+          list.map(changes.delete, fn(e: Existing) { e.record.name }),
+        )
+        Ok(provider.Applied(0, []))
+      },
+      describe: "fake",
+    )
+  // The database has no proof rows at all, so the desired set carries none.
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", 2000)
+  let assert Ok(names) = process.receive(deleted, 100)
+  assert names == []
+  sqlite.close(conn)
+}
+
+/// The record names one reconciler pass sends to the provider.
+///
+/// The serial is bumped first, because a pass whose desired set and serial both
+/// match what is stored short-circuits without touching the provider — which is
+/// correct, and would make every pass after the first one invisible here.
+fn applied_names(
+  conn: sqlite.Connection,
+  prov: Provider,
+  created: process.Subject(List(String)),
+  now: Int,
+) -> List(String) {
+  let assert Ok(_) = publish.publish_external(conn, now, "test")
+  provider_sync.run_once_with(conn, prov, "log-only", "z1", now)
+  let assert Ok(names) = process.receive(created, 100)
+  names
+}
+
+/// A verified record claiming exactly these key digests.
+fn record_covering(
+  conn: sqlite.Connection,
+  action: String,
+  digests: List(BitArray),
+) -> Result(Nil, sqlite.Error) {
+  rekor_store.put(
+    conn,
+    rekor_store.Record(
+      keyset_sha256: crypto.hash(crypto.Sha256, <<action:utf8>>),
+      apex: "sync.test.",
+      action: action,
+      statement: <<"{}":utf8>>,
+      canonicalized_body: <<0:size(512)>>,
+      log_id: <<0:size(256)>>,
+      log_index: 0,
+      checkpoint: <<>>,
+      inclusion_path: <<>>,
+      chainless: False,
+      integrated_at: 1,
+      verified_at: 1,
+      keys: list.map(digests, fn(digest) { #(digest, 1) }),
+    ),
+  )
 }
 
 pub fn record_logged_stamps_only_the_named_keys_test() {

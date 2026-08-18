@@ -7,6 +7,7 @@ import fixtures
 import gleam/bit_array
 import gleam/list
 import gleam/string
+import simplifile
 
 pub fn generate_shapes_test() {
   let csk = keys.generate()
@@ -49,6 +50,18 @@ pub fn save_load_round_trip_test() {
   // Overwrite is refused: a zone key replacement is a ceremony.
   let assert Error(message) = keys.save(path, keys.generate())
   assert string.contains(message, "refusing")
+}
+
+/// The private scalar is the zone's whole secret, and the key file is the only
+/// place it lives. It must not be readable by every uid on the host — the same
+/// reasoning `config.validate_db_path` already applies to where the file may
+/// sit.
+pub fn the_key_file_is_written_owner_only_test() {
+  let path = fixtures.tmp_db() <> ".key"
+  let assert Ok(Nil) = keys.save(path, keys.generate())
+  let assert Ok(info) = simplifile.file_info(path)
+  assert simplifile.file_info_permissions_octal(info) == keys.key_file_mode
+  assert keys.key_file_mode == 0o600
 }
 
 pub fn load_rejects_garbage_test() {

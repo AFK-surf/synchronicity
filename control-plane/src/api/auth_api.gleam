@@ -31,8 +31,10 @@ pub type AuthContext {
     github: Option(Provider),
     /// How a product mutation publishes the zone, injected per mode: serve
     /// mode re-signs in-transaction with the CSK; external mode bumps the
-    /// serial and re-validates, and the wire follows via the reconciler.
-    publish_in_tx: fn(Connection, Int, String) ->
+    /// serial and re-validates, and the wire follows via the reconciler. The
+    /// `Change` says whether the mutation widens what the zone claims, which
+    /// is what the transparency gate turns on.
+    publish_in_tx: fn(Connection, Int, String, publish.Change) ->
       Result(Int, publish.PublishError),
     /// Runs after a zone mutation commits — a no-op in serve mode (commit
     /// is publication), the reconciler poke in external mode. Never inside

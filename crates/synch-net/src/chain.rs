@@ -32,19 +32,31 @@
 //! DNSKEY and DS records out of the open resolver of their choice and mint an
 //! entry carrying them, without the zone's knowledge or cooperation — so a
 //! chain that proved only the key set would let anybody log a claim about
-//! anybody's zone, and a monitor could not tell an operator's own publication
-//! from a stranger's.
+//! anybody's zone.
 //!
 //! So the chain does not start at the apex. It starts one label below it, at
 //! `_synchronicity-transparency.<apex>`, whose TXT RRset is signed by the
 //! zone that holds it. That record is the operator's **declaration**: *this
 //! name is a synchronicity control plane, and its keys are meant to be found
-//! in the log*. Only somebody who can put a record into the zone can produce
-//! it, and that is precisely the authority the entry claims to speak with. It
-//! is what makes an entry the zone's own statement rather than a bystander's
-//! transcription — and, unlike signing the entry with the zone key, it asks
-//! nothing of the private key, so a zone whose DNSSEC keys live inside a
-//! managed provider can publish one with an ordinary record write.
+//! in the log*. Publishing it takes zone write, and it asks nothing of the
+//! private key, so a zone whose DNSSEC keys live inside a managed provider can
+//! publish one with an ordinary record write.
+//!
+//! **What the declaration narrows, and what it does not.** The record and its
+//! RRSIG are public DNS the moment they are published — a third party fetches
+//! the identical bytes with the DO bit set, and the publisher itself collects
+//! them that way — so producing the *chain link* takes no authority at all.
+//! What the requirement buys is therefore a narrowing of *who can mint an
+//! entry about a zone*: from any zone to any zone that has declared itself a
+//! control plane. It is not attribution. An entry carrying a valid chain is
+//! not thereby the operator's own statement rather than a bystander's
+//! transcription of public records, and nothing a monitor reads out of one
+//! says which of the two it is. What it *does* deliver is that authorization
+//! stays intact regardless: the Statement's key set must equal the
+//! chain-proven set read out of the DS-covered, RRSIG-verified DNSKEY RRset,
+//! so the worst a transcriber can log is a true statement about the victim's
+//! real keys — never a rogue key, and never a set the delegation does not
+//! authorize.
 //!
 //! # The apex and the signing zone are two different names
 //!
@@ -320,8 +332,23 @@ pub fn validate(
     // any of it.
     verify_declaration(&parsed[0], trusted, &signing_zone)?;
 
-    let proven: Vec<Vec<u8>> = trusted.iter().map(rdata_of).collect();
-    debug_assert!(!proven.is_empty(), "a verified DNSKEY set is non-empty");
+    // The proven set is the signing zone's DNSKEY RRset minus the keys that
+    // cannot be signers: a key with no Zone Key flag or with REVOKE set is one
+    // the standards say must not verify an RRset, so it is not a key the
+    // delegation authorizes and it must not be a key a Statement can claim.
+    // Whoever holds one would otherwise be able to sign a forged child DS and
+    // mint a chain that validates against the ICANN root.
+    let proven: Vec<Vec<u8>> = trusted
+        .iter()
+        .filter(|record| record_is_usable_signer(record))
+        .map(rdata_of)
+        .collect();
+    if proven.is_empty() {
+        return Err(ChainError::Structure(format!(
+            "the DNSKEY RRset at {signing_zone} holds no unrevoked zone key, so \
+             the delegation authorizes nothing"
+        )));
+    }
     Ok((
         proven,
         signing_zone,
@@ -346,13 +373,31 @@ fn walk_ladder<'a>(
     ladder: &'a [ParsedLink],
     anchors: &TrustAnchors,
 ) -> Result<(&'a [Record], String), ChainError> {
-    // Each link must be the parent of the one below it — otherwise a chain
-    // could splice an unrelated zone's DNSKEY set in beside a real DS.
+    // Each link must be a **proper ancestor** of the one below it — otherwise a
+    // chain could splice an unrelated zone's DNSKEY set in beside a real DS.
+    //
+    // A proper ancestor, and deliberately not "one label up". Zone cuts are not
+    // one label per cut: `example.com` may delegate `cp.acme.example.com`
+    // directly, with NS and DS at that name and no zone at all at
+    // `acme.example.com`. A label-counting rule gives such a deployment no
+    // valid encoding whatsoever — a link for the empty non-terminal has neither
+    // DNSKEY nor DS and fails `verify_ds_set`, and omitting it fails this
+    // check — so every client of it refuses every answer, permanently, with a
+    // diagnostic that reads like a misbuilt entry.
+    //
+    // Nothing is given up by dropping the label count, because it was never
+    // what held the ladder together: each link's DS digest is computed over
+    // `link.zone` (`covers`), each link's records must be *owned* by
+    // `link.zone` (`ParsedLink::parse`), and each RRSIG is verified with that
+    // owner name. A link inserted between two real ones therefore has to carry
+    // a DS its claimed parent actually signed for its claimed name, which is a
+    // signature the attacker does not have. The label count added nothing but
+    // the refusal of legitimate cuts.
     for pair in ladder.windows(2) {
         let (below, above) = (&pair[0], &pair[1]);
-        if below.zone.base_name() != above.zone {
+        if above.zone == below.zone || !above.zone.zone_of(&below.zone) {
             return Err(ChainError::Structure(format!(
-                "{} is not the parent of {}",
+                "{} is not an ancestor of {}",
                 above.zone, below.zone
             )));
         }
@@ -524,15 +569,57 @@ fn rdata_of(record: &Record) -> Vec<u8> {
     dnskey_rdata(key)
 }
 
-/// The wire rdata of a DNSKEY: flags, protocol 3, algorithm, public key.
+/// The wire rdata of a DNSKEY: flags, protocol, algorithm, public key.
+///
+/// The protocol byte is `3` because that is the only value RFC 4034 §2.1.2
+/// admits and the only value hickory will parse — a DNSKEY whose protocol is
+/// anything else never becomes a `DNSKEY` to reconstruct rdata from. The
+/// publisher writes the same byte from the same reasoning, so the two agree by
+/// rule rather than by copying whatever arrived.
 pub fn dnskey_rdata(key: &DNSKEY) -> Vec<u8> {
     use hickory_resolver::proto::dnssec::PublicKey;
     let mut rdata = Vec::with_capacity(4 + 64);
     rdata.extend_from_slice(&key.flags().to_be_bytes());
-    rdata.push(3);
+    rdata.push(DNSKEY_PROTOCOL);
     rdata.push(u8::from(key.public_key().algorithm()));
     rdata.extend_from_slice(key.public_key().public_bytes());
     rdata
+}
+
+/// The only DNSKEY protocol byte DNSSEC defines (RFC 4034 §2.1.2).
+pub const DNSKEY_PROTOCOL: u8 = 3;
+
+/// Whether a DNSKEY may be used as a signer, and whether it belongs in a
+/// proven key set.
+///
+/// Two rules, both from the standards and neither implemented by the DNSSEC
+/// stack underneath — hickory's `impl Verifier for DNSKEY` supplies only
+/// `algorithm()` and `key()`, so every flag is invisible to `verify_rrsig`:
+///
+/// - **RFC 4034 §2.1.1.** Bit 7 of the flags is the Zone Key flag. "If bit 7
+///   has value 0, then the DNSKEY record holds some other type of DNS public
+///   key and MUST NOT be used to verify RRSIGs that cover RRsets." A key
+///   published with flags `0x0000` is not a zone key and cannot sign.
+/// - **RFC 5011 §2.1.** Bit 8 is REVOKE. A revoked key "MUST NOT be used" —
+///   revocation is how an operator says a key is repudiated, and honoring it is
+///   the entire point of publishing one.
+///
+/// The DS-covered key of a proven RRset has its flags pinned already, because a
+/// DS digest covers the whole rdata. It is the *other* keys of that RRset that
+/// this decides: whoever holds one could otherwise sign a forged child DS and
+/// mint a chain that validates offline — forged tier-A findings against the one
+/// alarm this design exists to raise. So such keys neither sign inside a chain
+/// nor land in the set the chain proves.
+fn usable_signer(key: &DNSKEY) -> bool {
+    key.zone_key() && !key.revoke()
+}
+
+/// The same question about a record that may hold a DNSKEY.
+fn record_is_usable_signer(record: &Record) -> bool {
+    match &record.data {
+        RData::DNSSEC(DNSSECRData::DNSKEY(key)) => usable_signer(key),
+        _ => false,
+    }
 }
 
 /// The top link: a DNSKEY RRset self-signed by a key the reader anchors.
@@ -550,13 +637,15 @@ fn verify_dnskey_set<'a>(
         .dnskeys
         .iter()
         .filter(|record| match &record.data {
-            RData::DNSSEC(DNSSECRData::DNSKEY(key)) => anchors.contains(key.public_key()),
+            RData::DNSSEC(DNSSECRData::DNSKEY(key)) => {
+                usable_signer(key) && anchors.contains(key.public_key())
+            }
             _ => false,
         })
         .collect();
     if anchored.is_empty() {
         return Err(ChainError::Anchor(format!(
-            "no DNSKEY at {} is a key this reader trusts",
+            "no DNSKEY at {} is an unrevoked zone key this reader trusts",
             link.zone
         )));
     }
@@ -578,12 +667,14 @@ fn verify_dnskey_set_under<'a>(
     let matching: Vec<Record> = link
         .dnskeys
         .iter()
-        .filter(|record| covers(ds, &link.zone, &rdata_of(record)))
+        .filter(|record| {
+            record_is_usable_signer(record) && covers(ds, &link.zone, &rdata_of(record))
+        })
         .cloned()
         .collect();
     if matching.is_empty() {
         return Err(ChainError::Signature(format!(
-            "no DNSKEY at {} matches a DS from its parent",
+            "no unrevoked zone key at {} matches a DS from its parent",
             link.zone
         )));
     }
@@ -612,6 +703,17 @@ fn verify_ds_set<'a>(
     Ok(&link.ds)
 }
 
+/// The most signature verifications one RRset of one link may cost.
+///
+/// Every candidate verification re-canonicalizes the whole RRset (RFC 4034
+/// §3.1.8) before it hashes anything, and the input is a certificate an attacker
+/// chose — so the pairing of signatures against keys is quadratic work on
+/// attacker-supplied data, bounded otherwise only by the 64 KB entry frame. A
+/// legitimate link needs exactly one verification, an RFC 6781
+/// double-signature rollover two, and a zone with several algorithms a few more.
+/// This is room for all of that and a ceiling on a padded chain.
+const MAX_RRSIG_VERIFICATIONS: usize = 16;
+
 /// The one cryptographic step: some RRSIG over `rrset` verifies under some
 /// key in `keys`.
 ///
@@ -620,6 +722,10 @@ fn verify_ds_set<'a>(
 /// DNSSEC implementation — the same code the client's resolver validates live
 /// answers with. There is deliberately no second RRSIG verifier in this
 /// repository for the two to disagree about.
+///
+/// What hickory's verifier does *not* look at is the DNSKEY's flags, so
+/// [`usable_signer`] is applied here: a key that is not a zone key, or that its
+/// operator has revoked, verifies nothing in a chain.
 fn verify_rrset(
     link: &ParsedLink,
     type_covered: RecordType,
@@ -627,6 +733,7 @@ fn verify_rrset(
     sigs: &[RRSIG],
     keys: &[Record],
 ) -> Result<(), ChainError> {
+    let mut budget = MAX_RRSIG_VERIFICATIONS;
     for sig in sigs {
         if sig.input().type_covered != type_covered {
             continue;
@@ -635,9 +742,21 @@ fn verify_rrset(
             let RData::DNSSEC(DNSSECRData::DNSKEY(key)) = &record.data else {
                 continue;
             };
-            if key.calculate_key_tag().ok() != Some(sig.input().key_tag) {
+            // The two cheap filters first, so the bounded resource is spent
+            // only on pairs that could possibly verify: the flags decide
+            // whether this key may sign at all, and the tag whether this
+            // signature claims to be its.
+            if !usable_signer(key) || key.calculate_key_tag().ok() != Some(sig.input().key_tag) {
                 continue;
             }
+            if budget == 0 {
+                return Err(ChainError::Signature(format!(
+                    "the {type_covered} RRset at {} offers more than \
+                     {MAX_RRSIG_VERIFICATIONS} signature/key pairings to try",
+                    link.zone
+                )));
+            }
+            budget -= 1;
             if key
                 .verify_rrsig(&link.zone, DNSClass::IN, sig, rrset.iter())
                 .is_ok()
@@ -647,7 +766,8 @@ fn verify_rrset(
         }
     }
     Err(ChainError::Signature(format!(
-        "no RRSIG over the {type_covered} RRset at {} verifies under a trusted key",
+        "no RRSIG over the {type_covered} RRset at {} verifies under a trusted, \
+         unrevoked zone key",
         link.zone
     )))
 }
@@ -871,13 +991,29 @@ mod tests {
             Err(ChainError::Anchor(_))
         ));
 
-        // The middle link removed: `cloudflare.com.` is not a child of the
-        // root, so the ladder does not connect even though both remaining
-        // links are internally sound.
+        // The middle link removed. `cloudflare.com.` really is below the root,
+        // so the *shape* is admissible — a zone cut may span several labels —
+        // and what refuses the chain is cryptography rather than label
+        // counting: the root does not publish a DS for `cloudflare.com.`, so
+        // the link's DS RRset does not verify under the root's keys. This is
+        // the substance of the ladder rule; the label count only ever
+        // duplicated a check the DS digest already makes, while making a
+        // legitimate multi-label delegation unencodable.
         let mut spliced = original.clone();
         spliced.links.remove(1);
         assert!(matches!(
             walk_ladder(&relink(spliced.links).unwrap(), &anchors),
+            Err(ChainError::Signature(_))
+        ));
+
+        // A link that is not below the one above it at all is still refused on
+        // structure, which is the half of the rule that does the work: the
+        // ladder has to descend.
+        let mut sideways = original.clone();
+        sideways.links.remove(1);
+        sideways.links.swap(0, 1);
+        assert!(matches!(
+            walk_ladder(&relink(sideways.links).unwrap(), &anchors),
             Err(ChainError::Structure(_))
         ));
 

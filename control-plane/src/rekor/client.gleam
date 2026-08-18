@@ -278,8 +278,10 @@ fn submit_http(base: String, sub: Submission) -> Result(Entry, String) {
 ///
 /// The strings arrive base64 and the indices as decimal strings (protojson
 /// renders 64-bit integers as strings); this decodes the shape and then
-/// converts, so a malformed field is a parse error, not a crash.
-fn parse_entry(body: String) -> Result(Entry, String) {
+/// converts, so a malformed field is a parse error, not a crash. Public
+/// because it is the whole of what this module decides about a log's answer,
+/// and the suite drives it directly rather than through HTTP.
+pub fn parse_entry(body: String) -> Result(Entry, String) {
   let decoder = {
     use log_index <- decode.field("logIndex", decode.string)
     use canonicalized_body <- decode.field("canonicalizedBody", decode.string)
@@ -316,10 +318,25 @@ fn parse_entry(body: String) -> Result(Entry, String) {
     bit_array.base64_decode(body_b64)
     |> result.replace_error("canonicalizedBody is not base64"),
   )
+  // Each hash is a 32-byte SHA-256 node. Checked here because the proof
+  // format stores the path as a flat run of 32-byte hashes: a short one would
+  // be silently re-split at the wrong boundary on the way back out, so the
+  // one place to refuse it is where it arrives.
   use inclusion_path <- result.try(
     list.try_map(hashes, fn(h) {
-      bit_array.base64_decode(h)
-      |> result.replace_error("an inclusion-proof hash is not base64")
+      case bit_array.base64_decode(h) {
+        Error(Nil) -> Error("an inclusion-proof hash is not base64")
+        Ok(hash) ->
+          case bit_array.byte_size(hash) == 32 {
+            True -> Ok(hash)
+            False ->
+              Error(
+                "an inclusion-proof hash is "
+                <> int.to_string(bit_array.byte_size(hash))
+                <> " bytes, not a 32-byte SHA-256 node",
+              )
+          }
+      }
     }),
   )
   let integrated_at = result.unwrap(int.parse(integrated), 0)

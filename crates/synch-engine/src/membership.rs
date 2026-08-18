@@ -1,10 +1,13 @@
 //! DNSSEC membership domains and the `synch doctor` report (§3.2, §9.2, §12).
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
-use synch_core::{now_ns, NodeId, OriginId};
-use synch_net::dns::{clamp_ttl, MemberResolver, MemberSet, DEFAULT_TRUST_GRACE, MIN_TTL};
-use synch_store::{Binding, BindingSource, Equivocation};
+use synch_core::{clock_is_trusted, now_ns, NodeId, OriginId};
+use synch_net::dns::{
+    clamp_ttl, DialHint, MemberResolver, MemberSet, RekorPolicy, ResolverOptions, DEFAULT_DOH_URL,
+    DEFAULT_TRUST_GRACE, MIN_TTL,
+};
+use synch_store::{Binding, BindingSource, ClockStatus, Equivocation};
 
 use crate::{
     error::{EngineError, Result},
@@ -33,6 +36,24 @@ fn cooldown_ns() -> i64 {
     DNS_TRIGGER_COOLDOWN.as_nanos().min(i64::MAX as u128) as i64
 }
 
+/// The `ip:port` an `addr=` names, or `None` when it is not one.
+fn direct_address(text: &str) -> Option<SocketAddr> {
+    text.parse::<SocketAddr>().ok()
+}
+
+/// The relay base URL a `relay=` names, or `None` when it is not one.
+///
+/// A relay is a host this node makes outbound requests to, so the scheme and
+/// host are checked rather than taken on the record's word.
+fn relay_url(text: &str) -> Option<iroh::RelayUrl> {
+    let url = text.parse::<iroh::RelayUrl>().ok()?;
+    match matches!(url.scheme(), "http" | "https") && url.host_str().is_some_and(|h| !h.is_empty())
+    {
+        true => Some(url),
+        false => None,
+    }
+}
+
 /// When one configured domain is next due for re-resolution, and when it was
 /// last attempted (§3.2, §3.4).
 ///
@@ -53,6 +74,20 @@ pub struct DomainSchedule {
     /// operator responses; holding the reason here is what lets `doctor` and
     /// `domain ls` say which without a trip to the daemon log.
     pub last_error: Option<String>,
+    /// Device keys the last successful answer published under more than one
+    /// `id=`, every binding of which was dropped (§3.2).
+    ///
+    /// Held rather than printed once: the scheduled refresh path has nobody to
+    /// report to at the time, and the condition lasts until a zone is edited.
+    /// `synch doctor` reads it from here.
+    pub ambiguous: Vec<NodeId>,
+    /// The origin the last successful answer bound *this node's* device key to,
+    /// when that is not the origin this node publishes under (§3.2).
+    ///
+    /// A node publishing as `laptop@cluster.example` while the record set binds
+    /// its key to `nas@cluster.example` syncs nothing and looks healthy doing
+    /// it; this is what makes `doctor` able to say so.
+    pub self_origin_mismatch: Option<OriginId>,
 }
 
 /// What one domain's refresh attempt came to: the refresh, or why not.
@@ -86,8 +121,99 @@ pub struct DomainRefresh {
     pub ambiguous: Vec<NodeId>,
     /// TXT records that could not be parsed.
     pub rejected: usize,
+    /// The origin the answer binds this node's own device key to, when that is
+    /// not the origin this node publishes under (§3.2).
+    pub self_origin_mismatch: Option<OriginId>,
     /// How long the answer is good for.
     pub ttl: Duration,
+}
+
+/// The trust configuration a daemon's membership resolver is running with
+/// (§3.2, §4.1, §10.2).
+///
+/// Every one of these is settable by environment variable, so what a daemon
+/// enforces is not visible from its command line. `doctor` and `daemon status`
+/// print this, which is what distinguishes a `require` daemon from a
+/// `--rekor off` one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustConfig {
+    /// Whether a validated answer additionally requires a verified
+    /// transparency-log record for the zone key that signed it.
+    pub rekor: RekorPolicy,
+    /// The DNS-over-HTTP(S) endpoint in force.
+    pub doh_url: String,
+    /// Set when `--dnssec-anchor` *replaced* the ICANN root: with it, nothing
+    /// signed under the real root validates.
+    pub dnssec_anchor: Option<String>,
+    /// Set when `--rekor-key` replaced the pinned log key set, which also turns
+    /// TUF pin refresh off outright.
+    pub rekor_key: Option<String>,
+    /// The TUF repository the pin set follows, `None` when refresh is off.
+    pub tuf_url: Option<String>,
+    /// The transparency-log keys a proof is checked against right now, as the
+    /// `log_id` hex a proof names.
+    pub log_keys: Vec<String>,
+}
+
+/// The membership resolver a daemon holds, or why it holds none (§3.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ResolverStatus {
+    /// No process built one: an embedded node, or a one-shot command that runs
+    /// no DNS loop.
+    #[default]
+    Absent,
+    /// Built, with the trust configuration in force.
+    Ready(TrustConfig),
+    /// The configured options could not be built into a resolver — a
+    /// mistyped anchor path, an empty anchor file, a malformed DoH URL. No
+    /// membership refresh can run at all in this state, so bindings ossify and
+    /// then lapse a grace window later.
+    Failed(String),
+}
+
+/// The process-wide resolver and the status `doctor` reports for it.
+#[derive(Debug, Default)]
+pub(crate) struct ResolverSlot {
+    pub(crate) resolver: Option<std::sync::Arc<synch_net::DnssecResolver>>,
+    pub(crate) status: ResolverStatus,
+}
+
+impl TrustConfig {
+    /// Summarizes the options a resolver was built from, plus the pin set that
+    /// resolver actually holds.
+    pub fn of(options: &ResolverOptions, log_keys: &synch_net::rekor::LogKeys) -> TrustConfig {
+        TrustConfig {
+            rekor: options.rekor_policy(),
+            doh_url: options
+                .doh_url
+                .clone()
+                .unwrap_or_else(|| DEFAULT_DOH_URL.to_string()),
+            dnssec_anchor: options
+                .trust_anchor
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            rekor_key: options.rekor_key.as_ref().map(|p| p.display().to_string()),
+            tuf_url: match (options.no_tuf, &options.rekor_key) {
+                (true, _) | (_, Some(_)) => None,
+                (false, None) => Some(
+                    options
+                        .tuf_url
+                        .clone()
+                        .unwrap_or_else(|| synch_net::tuf::SIGSTORE_TUF_URL.to_string()),
+                ),
+            },
+            log_keys: log_keys
+                .keys()
+                .iter()
+                .map(|key| {
+                    key.id
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                })
+                .collect(),
+        }
+    }
 }
 
 /// A `synch doctor` report.
@@ -123,6 +249,21 @@ pub struct DoctorReport {
     pub unreconciled: Vec<UnreconciledHistory>,
     /// Configured membership domains.
     pub domains: Vec<String>,
+    /// Device keys a domain's answer published under more than one `id=`, whose
+    /// every binding was therefore dropped (§3.2).
+    ///
+    /// A duplicate-`id=` zone edit is the ordinary cause, and its effect is that
+    /// the member in question stops appearing in `trust ls` at all. §3.2 and
+    /// `dns.rs` both say `doctor` reports the ambiguity; this is what makes that
+    /// true on every refresh path rather than only on an explicit one.
+    pub ambiguous: Vec<(String, NodeId)>,
+    /// Domains whose answer binds this node's own device key to an origin other
+    /// than the one it publishes under (§3.2).
+    pub self_origin_mismatch: Vec<(String, OriginId)>,
+    /// What the host clock reads and whether trust can be dated by it (§3.2).
+    pub clock: ClockStatus,
+    /// The trust configuration membership resolves under, or why there is none.
+    pub trust: ResolverStatus,
     /// Trie and content storage counts.
     pub trie: synch_store::TrieStats,
     /// How many objects are held locally, and how many are complete.
@@ -147,6 +288,46 @@ pub struct HeadStatus {
 }
 
 impl Node {
+    /// Installs the one resolver this process refreshes membership through, or
+    /// records why it has none (§3.2, §10.2).
+    ///
+    /// Called once, by whatever owns the DNS loop. Every later membership
+    /// refresh — scheduled or asked for over the control socket — reads it back
+    /// with [`Node::dns_resolver`], so the daily TUF bound and the pin state
+    /// are one process's, not one request's.
+    pub fn set_dns_resolver(
+        &self,
+        resolver: std::result::Result<std::sync::Arc<synch_net::DnssecResolver>, String>,
+    ) {
+        let mut slot = self.dns_resolver_slot();
+        *slot = match resolver {
+            Ok(resolver) => {
+                let status = ResolverStatus::Ready(TrustConfig::of(
+                    &self.config().dns,
+                    &resolver.log_keys(),
+                ));
+                ResolverSlot {
+                    resolver: Some(resolver),
+                    status,
+                }
+            }
+            Err(why) => ResolverSlot {
+                resolver: None,
+                status: ResolverStatus::Failed(why),
+            },
+        };
+    }
+
+    /// The resolver membership refreshes through, if this process has one.
+    pub fn dns_resolver(&self) -> Option<std::sync::Arc<synch_net::DnssecResolver>> {
+        self.dns_resolver_slot().resolver.clone()
+    }
+
+    /// The trust configuration membership resolves under, or why there is none.
+    pub fn resolver_status(&self) -> ResolverStatus {
+        self.dns_resolver_slot().status.clone()
+    }
+
     /// The configured DNSSEC membership domains.
     pub fn domains(&self) -> Result<Vec<String>> {
         Ok(self
@@ -203,17 +384,39 @@ impl Node {
         &self,
         resolver: &dyn MemberResolver,
         domain: &str,
+        now: i64,
     ) -> Result<DomainRefresh> {
         let (set, ttl) = resolver.resolve_members(domain).await?;
-        self.apply_member_set(&set, ttl)
+        self.apply_member_set(&set, ttl, now)
     }
 
     /// Applies an already-validated member set to the bindings table.
     ///
-    /// Exposed separately so the §3.2 rules can be exercised without live DNS.
-    pub fn apply_member_set(&self, set: &MemberSet, ttl: Duration) -> Result<DomainRefresh> {
+    /// `now` is the wall-clock reading the new expiries are dated from, taken by
+    /// the caller so the §3.2 rules can be exercised without live DNS and
+    /// without a real clock.
+    ///
+    /// A reading no trust decision can be dated by refuses the whole refresh
+    /// (§3.2, and see `synch_store::clock`): extending trust to a moment this
+    /// node cannot place is the one thing worse than not extending it, and the
+    /// refusal is reported rather than logged — it reaches `domain refresh`,
+    /// `domain ls` and `doctor` as this domain's last error.
+    pub fn apply_member_set(
+        &self,
+        set: &MemberSet,
+        ttl: Duration,
+        now: i64,
+    ) -> Result<DomainRefresh> {
+        if !clock_is_trusted(now) {
+            return Err(EngineError::invalid(format!(
+                "the host clock reads {now} ns since the epoch, which cannot date a trust \
+                 decision: membership is not extended and every DNS binding is treated as \
+                 expired until the clock is set (static trust is unaffected)"
+            )));
+        }
+        let now = self.store().advance_trust_floor(now)?.max(now);
         let expires_at =
-            now_ns() + (ttl + DEFAULT_TRUST_GRACE).as_nanos().min(i64::MAX as u128) as i64;
+            now.saturating_add((ttl + DEFAULT_TRUST_GRACE).as_nanos().min(i64::MAX as u128) as i64);
         let bindings: Vec<Binding> = set
             .bindings
             .iter()
@@ -223,7 +426,7 @@ impl Node {
                 source: BindingSource::Dns,
                 domain: Some(set.domain.clone()),
                 note: None,
-                added_at: now_ns(),
+                added_at: now,
                 expires_at: Some(expires_at),
             })
             .collect();
@@ -231,16 +434,34 @@ impl Node {
 
         // Dialing hints from the record set (§3.3) are recorded as peer
         // addresses so the very first dial can succeed without discovery.
+        //
+        // A hint is dialing data attached to a *member*, so it is applied only
+        // for a key that holds a live binding: a key the answer merely mentions
+        // — one §3.2 dropped as ambiguous, say — is nobody this node will talk
+        // to, and `record_peer_seen` replaces `last_addr` rather than adding to
+        // it. And each field is read as the one thing it means, so an `addr=`
+        // value cannot fall through into a relay URL this node then makes
+        // outbound requests to.
         for (key_bytes, hints) in &set.hints {
             let Ok(key) = NodeId::from_bytes(key_bytes) else {
                 continue;
             };
+            if !self.store().is_trusted_key(&key, now)? {
+                continue;
+            }
             let mut addr = iroh::EndpointAddr::new(key);
             for hint in hints {
-                if let Ok(socket) = hint.parse() {
-                    addr = addr.with_ip_addr(socket);
-                } else if let Ok(url) = hint.parse() {
-                    addr = addr.with_relay_url(url);
+                match hint {
+                    DialHint::Addr(text) => {
+                        if let Some(socket) = direct_address(text) {
+                            addr = addr.with_ip_addr(socket);
+                        }
+                    }
+                    DialHint::Relay(text) => {
+                        if let Some(url) = relay_url(text) {
+                            addr = addr.with_relay_url(url);
+                        }
+                    }
                 }
             }
             if !addr.is_empty() {
@@ -248,11 +469,20 @@ impl Node {
             }
         }
 
+        // What the record set says this node's own key is: §3.2's malformed-set
+        // rule returns nothing for an absent or ambiguous key, so a value here
+        // that disagrees with the origin this node publishes under is a real
+        // misconfiguration — one that syncs nothing while looking healthy.
+        let self_origin_mismatch = set
+            .self_origin(&self.node_id())
+            .filter(|origin| origin != self.origin());
+
         Ok(DomainRefresh {
             domain: set.domain.clone(),
             bindings: bindings.len(),
             ambiguous: set.ambiguous_keys.clone(),
             rejected: set.rejected.len(),
+            self_origin_mismatch,
             ttl,
         })
     }
@@ -407,10 +637,11 @@ impl Node {
             // Stamped before the lookup runs, so a resolver that hangs or fails
             // cannot be retried in a tight loop.
             self.note_dns_attempt(domain, now, MIN_TTL);
-            let result = match self.refresh_domain(resolver, domain).await {
+            let result = match self.refresh_domain(resolver, domain, now).await {
                 Ok(refresh) => {
                     self.note_dns_attempt(domain, now, refresh.ttl);
                     self.note_dns_outcome(domain, now, None);
+                    self.note_dns_findings(domain, &refresh);
                     Ok(refresh)
                 }
                 Err(e) => {
@@ -447,10 +678,36 @@ impl Node {
         }
     }
 
+    /// Records what a successful answer was wrong about, for `doctor`.
+    ///
+    /// The scheduled path has nobody to stream progress lines to, and an
+    /// ambiguity or a self-origin mismatch persists until a zone is edited — so
+    /// the finding has to be held rather than printed once and dropped.
+    fn note_dns_findings(&self, domain: &str, refresh: &DomainRefresh) {
+        if !refresh.ambiguous.is_empty() {
+            tracing::warn!(
+                domain,
+                keys = refresh.ambiguous.len(),
+                "device keys published under more than one id bound nothing; see `synch doctor`"
+            );
+        }
+        if let Some(origin) = &refresh.self_origin_mismatch {
+            tracing::warn!(
+                domain,
+                %origin,
+                "this node's device key is published under a different origin than it publishes as"
+            );
+        }
+        let mut schedule = self.dns_schedule();
+        let entry = schedule.entry(domain.to_string()).or_default();
+        entry.ambiguous = refresh.ambiguous.clone();
+        entry.self_origin_mismatch = refresh.self_origin_mismatch.clone();
+    }
+
     /// Every configured domain's health: bindings held, schedule, last error.
     ///
-    /// Three failing domains used to look exactly like three healthy ones in
-    /// `doctor`; this is the difference.
+    /// The last error is what keeps three failing domains from reading like
+    /// three healthy ones in `doctor`.
     pub fn domain_health(&self) -> Result<Vec<DomainHealth>> {
         let bindings = self.store().bindings()?;
         let schedule = self.dns_schedule().clone();
@@ -477,6 +734,23 @@ impl Node {
     /// Builds the `synch doctor` report.
     pub fn doctor(&self) -> Result<DoctorReport> {
         let now = now_ns();
+        let clock = self.store().clock_status(now)?;
+        let (ambiguous, self_origin_mismatch) = {
+            let schedule = self.dns_schedule();
+            let mut ambiguous = Vec::new();
+            let mut mismatch = Vec::new();
+            for (domain, state) in schedule.iter() {
+                for key in &state.ambiguous {
+                    ambiguous.push((domain.clone(), *key));
+                }
+                if let Some(origin) = &state.self_origin_mismatch {
+                    mismatch.push((domain.clone(), origin.clone()));
+                }
+            }
+            ambiguous.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_bytes().cmp(b.1.as_bytes())));
+            mismatch.sort_by(|a, b| a.0.cmp(&b.0));
+            (ambiguous, mismatch)
+        };
         let bindings = self.store().bindings()?;
         let lapsed: Vec<Binding> = bindings
             .iter()
@@ -562,6 +836,10 @@ impl Node {
             recovery: self.recovery_state()?,
             unreconciled,
             domains: self.domains()?,
+            ambiguous,
+            self_origin_mismatch,
+            clock,
+            trust: self.resolver_status(),
             trie: self.store().trie_stats()?,
             blobs: (blobs.len(), complete_blobs),
         })
@@ -616,7 +894,7 @@ mod tests {
         ];
         let set = MemberSet::from_records("cluster.example", &records).unwrap();
         let refresh = node
-            .apply_member_set(&set, Duration::from_secs(300))
+            .apply_member_set(&set, Duration::from_secs(300), now_ns())
             .unwrap();
         assert_eq!(refresh.bindings, 2);
         assert!(refresh.ambiguous.is_empty());
@@ -647,7 +925,7 @@ mod tests {
             &[format!("v=sync1 id=nas nk={}", nas.to_z32())],
         )
         .unwrap();
-        node.apply_member_set(&set, Duration::from_secs(60))
+        node.apply_member_set(&set, Duration::from_secs(60), now_ns())
             .unwrap();
         let origin = OriginId::named("nas", "cluster.example").unwrap();
         assert!(node.store().is_bound(&origin, &nas, now_ns()).unwrap());
@@ -669,11 +947,208 @@ mod tests {
         )
         .unwrap();
         let refresh = node
-            .apply_member_set(&set, Duration::from_secs(300))
+            .apply_member_set(&set, Duration::from_secs(300), now_ns())
             .unwrap();
         assert_eq!(refresh.bindings, 0);
         assert_eq!(refresh.ambiguous, vec![key]);
         assert!(!node.store().is_trusted_key(&key, now_ns()).unwrap());
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguity_reaches_doctor_from_the_scheduled_path() {
+        // §3.2 and `dns.rs` both say `synch doctor` reports the ambiguity, so it
+        // has to hold on the path nobody is watching: the scheduled loop drops
+        // the `DomainOutcome` it gets, and an ambiguous key's member appears
+        // nowhere in `trust ls`, so a finding that lives only in an explicit
+        // refresh's output is a finding an operator never sees.
+        let (_d, node) = node().await;
+        let key = SecretKey::generate().public();
+        let resolver = FakeResolver::new(
+            vec![
+                format!("v=sync1 id=nas nk={}", key.to_z32()),
+                format!("v=sync1 id=laptop nk={}", key.to_z32()),
+            ],
+            MIN_TTL,
+        );
+        node.add_domain("cluster.example").unwrap();
+        node.refresh_due_domains(&resolver, now_ns()).await.unwrap();
+
+        let report = node.doctor().unwrap();
+        assert_eq!(
+            report.ambiguous,
+            vec![("cluster.example".to_string(), key)],
+            "the diagnosis has to be readable after the fact, not only while it happens"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_self_origin_the_records_disagree_with_is_reported() {
+        // §3.2: this node's own OriginId is explicit, never inferred — so a
+        // record set that binds this node's key to a different id is a
+        // misconfiguration that syncs nothing while looking healthy.
+        let (_d, node) = node().await;
+        let resolver = FakeResolver::new(
+            vec![format!("v=sync1 id=nas nk={}", node.node_id().to_z32())],
+            MIN_TTL,
+        );
+        node.add_domain("cluster.example").unwrap();
+        node.refresh_due_domains(&resolver, now_ns()).await.unwrap();
+
+        let report = node.doctor().unwrap();
+        assert_eq!(
+            report.self_origin_mismatch,
+            vec![(
+                "cluster.example".to_string(),
+                OriginId::named("nas", "cluster.example").unwrap()
+            )]
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hints_are_applied_only_for_bound_keys_and_only_in_shape() {
+        // M6: every hint in the set was fed to `remember_peer` with no binding
+        // check, and `record_peer_seen` *replaces* `last_addr` — so one added
+        // TXT record repointed a legitimate member's recorded address. And each
+        // hint was tried as a socket address and then as a URL, so `addr=` and
+        // `relay=` meant whatever parsed.
+        let (_d, node) = node().await;
+        let ambiguous = SecretKey::generate().public();
+        let member = SecretKey::generate().public();
+        let set = MemberSet::from_records(
+            "cluster.example",
+            &[
+                // Ambiguous: binds nothing, so its hints steer nothing.
+                format!(
+                    "v=sync1 id=nas nk={} addr=10.0.0.9:5555",
+                    ambiguous.to_z32()
+                ),
+                format!(
+                    "v=sync1 id=laptop nk={} relay=https://evil.example",
+                    ambiguous.to_z32()
+                ),
+                // A member, with one usable hint and two unusable ones.
+                format!(
+                    "v=sync1 id=member nk={} addr=192.0.2.7:4433 relay=ftp://relay.example",
+                    member.to_z32()
+                ),
+            ],
+        )
+        .unwrap();
+        let refresh = node
+            .apply_member_set(&set, Duration::from_secs(300), now_ns())
+            .unwrap();
+        assert_eq!(refresh.bindings, 1);
+
+        assert!(
+            node.peer_addr(&ambiguous).unwrap().is_none(),
+            "a key that bound nothing must not have got a dialable address"
+        );
+        let addr = node.peer_addr(&member).unwrap().unwrap();
+        assert_eq!(addr.ip_addrs().count(), 1);
+        assert_eq!(
+            addr.relay_urls().count(),
+            0,
+            "a relay hint that is not an http(s) URL is dropped, not dialed"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    /// Each field is read as the one thing it means.
+    ///
+    /// The field a hint arrived in decides how it is read, so a value that
+    /// would parse as the *other* shape does not cross over: a `relay=` this
+    /// node makes outbound requests to can never be supplied by `addr=`, and a
+    /// direct address can never be supplied by `relay=`.
+    #[test]
+    fn a_dialing_hint_means_one_thing() {
+        assert!(direct_address("192.0.2.7:4433").is_some());
+        assert!(relay_url("https://relay.example./").is_some());
+        assert!(relay_url("http://relay.example:8080").is_some());
+
+        // Neither field accepts the other's shape.
+        assert!(direct_address("https://relay.example./").is_none());
+        assert!(relay_url("192.0.2.7:4433").is_none());
+
+        // A scheme this node would not dial a relay over, a hostless URL, a
+        // bare host, a port-less address.
+        for bad in [
+            "ftp://relay.example",
+            "file:///etc/passwd",
+            "https://",
+            "relay.example",
+            "192.0.2.7",
+            "",
+        ] {
+            assert!(direct_address(bad).is_none(), "{bad} is not an address");
+            assert!(relay_url(bad).is_none(), "{bad} is not a relay");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clock_that_dates_nothing_refuses_to_extend_membership() {
+        // Every expiry check is `now < expires_at`, so a node at the epoch
+        // would honor every binding it has ever stored, revoked members
+        // included, forever. The fail-closed answer is to refuse to extend
+        // trust, loudly, rather than to date it from a number that means
+        // nothing (§3.2).
+        let (_d, node) = node().await;
+        let nas = SecretKey::generate().public();
+        let set = MemberSet::from_records(
+            "cluster.example",
+            &[format!("v=sync1 id=nas nk={}", nas.to_z32())],
+        )
+        .unwrap();
+        let refused = node
+            .apply_member_set(&set, Duration::from_secs(300), 0)
+            .expect_err("an undatable instant cannot extend trust");
+        assert!(
+            refused.to_string().contains("clock"),
+            "the operator has to be told why: {refused}"
+        );
+        let origin = OriginId::named("nas", "cluster.example").unwrap();
+        assert!(!node.store().is_bound(&origin, &nas, 0).unwrap());
+        assert!(!node.store().is_trusted_key(&nas, 0).unwrap());
+
+        // And the refusal is what `doctor` reports, not a silence.
+        let report = node.doctor().unwrap();
+        assert!(report.clock.trusted, "the test host's clock is fine");
+        assert!(!node.store().clock_status(0).unwrap().trusted);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failing_resolver_is_named_in_the_trust_report() {
+        // A daemon whose resolver could not be built refreshes nothing and
+        // otherwise looks healthy; `doctor` has to be able to say so.
+        let (_d, node) = node().await;
+        assert_eq!(node.resolver_status(), ResolverStatus::Absent);
+        assert!(node.dns_resolver().is_none());
+
+        node.set_dns_resolver(Err(
+            "trust anchor /nope: no DNSKEY records in the file".into()
+        ));
+        let report = node.doctor().unwrap();
+        match &report.trust {
+            ResolverStatus::Failed(why) => assert!(why.contains("no DNSKEY"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+
+        let resolver = std::sync::Arc::new(synch_net::DnssecResolver::with_defaults().unwrap());
+        node.set_dns_resolver(Ok(resolver.clone()));
+        assert!(node.dns_resolver().is_some());
+        match node.doctor().unwrap().trust {
+            ResolverStatus::Ready(config) => {
+                assert_eq!(config.rekor, RekorPolicy::Require);
+                assert_eq!(config.doh_url, DEFAULT_DOH_URL);
+                assert!(config.dnssec_anchor.is_none());
+                assert!(config.tuf_url.is_some(), "refresh is on by default");
+                assert!(!config.log_keys.is_empty(), "the bootstrap pins are real");
+            }
+            other => panic!("{other:?}"),
+        }
         node.shutdown().await.unwrap();
     }
 
