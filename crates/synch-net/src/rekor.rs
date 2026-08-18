@@ -1180,8 +1180,19 @@ impl Checkpoint {
     pub fn parse(bytes: &[u8]) -> Result<Checkpoint, ProofError> {
         let bad = |why: &str| ProofError::Malformed(format!("checkpoint: {why}"));
         let text = std::str::from_utf8(bytes).map_err(|_| bad("not UTF-8"))?;
+        // The **last** blank line, as Go's `sumdb/note` does
+        // (`bytes.LastIndex`). Splitting at the first is a real divergence
+        // rather than a stylistic one: the checkpoint is not covered by the
+        // leaf hash, so it is attacker-malleable in the zone's TXT, and
+        // appending `"\n— attacker <b64>\n"` to a *genuine* checkpoint makes
+        // the first blank line fall before the log's own signature line.
+        // Split there and `signed` is exactly the real note, the real
+        // signature verifies over it, and the appended block is accepted as
+        // part of the signature section. Go splits after it and refuses. Two
+        // readers disagreeing about which bytes a log signed is the thing
+        // this whole design exists to prevent.
         let split = text
-            .find("\n\n")
+            .rfind("\n\n")
             .ok_or_else(|| bad("no blank line between the note and its signatures"))?;
         let signed = &text[..split + 1];
         let mut lines = signed.lines();
@@ -2050,6 +2061,46 @@ mod tests {
                 "{broken:?} must not parse"
             );
         }
+    }
+
+    /// A genuine checkpoint with a block appended is not read as the genuine
+    /// one plus noise.
+    ///
+    /// The checkpoint is not covered by the leaf hash, so whatever sits in the
+    /// zone's TXT is attacker-malleable. Splitting the note at the *first*
+    /// blank line makes `signed` exactly the real note bytes, so the log's
+    /// real signature verifies over it and the appended block rides along as
+    /// signature lines. Go's `sumdb/note` splits at the last blank line and
+    /// refuses. Two readers disagreeing about which bytes a log signed is
+    /// exactly what this design exists to prevent.
+    #[test]
+    fn a_checkpoint_with_a_block_appended_is_not_the_one_the_log_signed() {
+        let genuine = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
+        let honest = Checkpoint::parse(genuine).expect("the real checkpoint parses");
+
+        let embedded = LogKeys::embedded();
+        let vouched = |c: &Checkpoint| {
+            embedded
+                .keys()
+                .iter()
+                .any(|k| c.verify_signature(k).is_ok())
+        };
+        assert!(vouched(&honest), "the genuine checkpoint verifies");
+
+        // The genuine bytes end in a newline, so one appended signature line
+        // creates a *second* blank line. Splitting at the first leaves
+        // `signed` as the real note, so the log's own signature is still in
+        // the signature list and still verifies — the extra line rides along
+        // as though the log had put it there. Splitting at the last, as Go
+        // does, moves the log's signature into the signed text, where no
+        // pinned key matches it any more.
+        let mut forged = genuine.to_vec();
+        forged.extend_from_slice("\n— attacker AAAAAAAA\n".as_bytes());
+        let accepted = Checkpoint::parse(&forged).is_ok_and(|c| vouched(&c));
+        assert!(
+            !accepted,
+            "a checkpoint carrying a line the log never signed must not verify"
+        );
     }
 
     #[test]
