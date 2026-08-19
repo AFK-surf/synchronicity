@@ -18,6 +18,8 @@ use rustls::crypto::ring;
 
 /// Install `ring` as the process-wide rustls [`CryptoProvider`].
 ///
+/// [`CryptoProvider`]: rustls::crypto::CryptoProvider
+///
 /// Idempotent and race-safe: a second call loses the race to install and the
 /// error is dropped, because the outcome is the same provider either way.
 pub fn install_ring_provider() {

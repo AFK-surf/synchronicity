@@ -17,8 +17,19 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// What a shipped binary's `main` does on its first line.
+///
+/// `DnssecResolver` builds a reqwest `Client`, which panics outright when no
+/// rustls provider is installed. This crate is its own workspace with no
+/// `main` of ours and no `sim` feature, so neither of the two paths
+/// `synch_net::tls` describes reaches it — the tests install it themselves.
+fn install_provider() {
+    synch_net::tls::install_ring_provider();
+}
+
 #[tokio::test]
 async fn control_plane_zone_validates_and_parses() {
+    install_provider();
     let Some(doh_url) = env("CP_DOH_URL") else {
         eprintln!("CP_DOH_URL not set; skipping (run via e2e/run.sh)");
         return;
@@ -122,6 +133,7 @@ async fn control_plane_zone_validates_and_parses() {
 /// whatever it had cached.
 #[tokio::test]
 async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
+    install_provider();
     let Some(doh_url) = env("CP_DOH_URL") else {
         eprintln!("CP_DOH_URL not set; skipping (run via e2e/run.sh)");
         return;
