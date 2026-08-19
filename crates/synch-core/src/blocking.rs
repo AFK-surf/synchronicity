@@ -87,19 +87,37 @@ pub fn blocking_is_allowed() -> bool {
     }
 }
 
-/// Panics in debug builds when blocking work is about to run on a runtime
-/// worker.
+/// Ends the process in debug builds when blocking work is about to run on a
+/// runtime worker.
 ///
-/// `what` names the operation, so the panic says which rule was broken rather
-/// than only where. Release builds pay nothing: this compiles away.
+/// `what` names the operation, so the report says which rule was broken rather
+/// than only where. Release builds pay nothing: the whole check compiles away.
+///
+/// **Why this aborts rather than panics.** A panic here fires inside whatever
+/// task happened to make the call, and tokio catches a task panic: in a
+/// detached `tokio::spawn` it kills that one task and nothing else. The
+/// consequences were measured, not guessed. `cargo test --workspace` on the
+/// commit that introduced this check printed four of these panics and reported
+/// every suite green, because libtest never sees a detached task's panic. In a
+/// debug daemon the same panic silently removed a standing loop — cloud attach,
+/// in the case that was found — and nothing restarts one. So the failure mode of
+/// a checker that unwinds is *exactly* the failure mode it was written to stop:
+/// a violation that nobody is told about.
+///
+/// A violated invariant in a debug build is not a recoverable condition, so the
+/// process ends where it happened, with the stack that got there.
 #[track_caller]
 pub fn assert_off_runtime(what: &str) {
-    debug_assert!(
-        blocking_is_allowed(),
-        "{what} ran on a multi-thread runtime worker. Blocking work belongs on the blocking pool \
-         (§10): wrap it in `blocking::offload`, or enter a `BlockingScope` if this thread really \
-         is dedicated to blocking work."
-    );
+    if cfg!(debug_assertions) && !blocking_is_allowed() {
+        eprintln!(
+            "{what} ran on a multi-thread runtime worker, at {}.\n\
+             Blocking work belongs on the blocking pool (§10): wrap it in `blocking::offload`, \
+             or enter a `BlockingScope` if this thread really is dedicated to blocking work.\n{}",
+            std::panic::Location::caller(),
+            std::backtrace::Backtrace::force_capture(),
+        );
+        std::process::abort();
+    }
 }
 
 /// An error type that can report a blocking task the pool lost.
