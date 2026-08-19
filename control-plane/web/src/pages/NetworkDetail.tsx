@@ -442,9 +442,12 @@ function AddDevice({
 
 function ConnectPanel({ domain }: { domain: string }) {
   const snippet = [
-    `# On each device — already running \`synch daemon run\` — print its key,`,
-    `# add it above, then join the domain:`,
-    `synch id`,
+    `# New device — create its identity and join this network in one step:`,
+    `synch init --domain ${domain}`,
+    `synch daemon run &`,
+    `synch id                                   # print its key, add it above`,
+    ``,
+    `# Existing device — already initialized elsewhere, just join this domain:`,
     `synch domain set ${domain}`,
     ``,
     `# Air-gapped / direct mode: point the daemon at this control plane and`,
