@@ -189,7 +189,33 @@ fn browse_enabled(role: Role, public_url: String) -> Result(Bool, String) {
             <> public_url
             <> " would send them nowhere",
           )
-        Primary, True -> Ok(True)
+        Primary, True ->
+          // The value is rendered straight into a signed apex TXT record as
+          // `v=synccp1 url=<it>`, and the client refuses anything that is not
+          // an `https://` origin and reads the record as whitespace-separated
+          // `key=value` pairs. So a `http://` URL behind a TLS terminator, or
+          // one with a space in it, publishes a record every daemon rejects —
+          // signed, cached for its TTL, and failing in the client rather than
+          // here. `build.valid_hint` exists to keep free-form values out of
+          // that grammar and did not cover this one.
+          case
+            string.starts_with(browse_endpoint(), "https://"),
+            record_safe(browse_endpoint())
+          {
+            True, True -> Ok(True)
+            False, _ ->
+              Error(
+                "CP_BROWSE=on needs CP_PUBLIC_URL to be an https:// origin: "
+                <> "daemons refuse any other scheme, so the record would be "
+                <> "published and rejected",
+              )
+            _, False ->
+              Error(
+                "CP_BROWSE=on needs a CP_PUBLIC_URL with no whitespace: the "
+                <> "attach record is whitespace-separated key=value pairs and "
+                <> "a space in the value changes what it says",
+              )
+          }
       }
     Ok(other) -> Error("CP_BROWSE must be on or off, got " <> other)
   }
@@ -201,6 +227,22 @@ fn browse_enabled(role: Role, public_url: String) -> Result(Bool, String) {
 /// deployment constant, and this module is the one place the environment is
 /// read. An empty answer means the record is not emitted at all, which is
 /// what a zone with the feature off looks like to a client.
+/// Whether a value can sit inside a `key=value` record without changing what
+/// the record says.
+///
+/// The same rule as `zone/build.valid_hint`, restated rather than imported:
+/// `zone/build` imports this module through `zone/model`, so the dependency
+/// only runs one way. Both are one sentence — printable ASCII, no space, no
+/// quote — and both exist because the record grammar is whitespace-separated.
+fn record_safe(value: String) -> Bool {
+  string.length(value) <= 255
+  && string.to_utf_codepoints(value)
+  |> list.all(fn(point) {
+    let code = string.utf_codepoint_to_int(point)
+    code >= 0x21 && code <= 0x7E && code != 0x22
+  })
+}
+
 pub fn browse_endpoint() -> String {
   case envoy.get("CP_BROWSE"), envoy.get("CP_PUBLIC_URL") {
     Ok("on"), Ok(url) -> string.trim(url)

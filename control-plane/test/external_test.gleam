@@ -1339,3 +1339,33 @@ pub fn a_device_edited_while_the_gate_is_armed_keeps_its_record_test() {
     )
   assert list.map(both.delete, fn(e) { e.id }) == ["f"]
 }
+
+/// `build.validate` re-checks the owner name's own labels, not only that it
+/// sits inside the apex.
+///
+/// The owner is `_synchronicity.<network>.<slug>.<apex>`, assembled by
+/// `model.read_txt_names` from two product columns, and `name.parse` splits on
+/// any dot inside either. `valid_dns_label` is applied at the two API handlers
+/// and nowhere else, so a row that reached the tables another way renders
+/// membership at a name that reads as somebody else's org — while this
+/// function's doc promises it re-checks every invariant the API layer
+/// enforces, which is the entire reason external mode calls it.
+pub fn the_builder_refuses_an_owner_whose_labels_the_api_would_have_test() {
+  let nk = fixtures.nk()
+  let ok = input([TxtName(member_owner(), [Member("nas", nk, "", "")])])
+  let assert Ok(_) = render_external.render(ok)
+
+  // A network named `prod.acme` under org `other`: every label is legal on
+  // its own, it sits inside the apex, and it reads as `acme`'s namespace.
+  let assert Ok(smuggled) =
+    name.parse("_synchronicity.prod.acme.other.sync.test.")
+  let bad = input([TxtName(smuggled, [Member("nas", nk, "", "")])])
+  let assert Error(build.InvalidLabel(_)) = render_external.render(bad)
+
+  // And a name that is short of the shape, for the same reason.
+  let assert Ok(shallow) = name.parse("_synchronicity.prod.sync.test.")
+  let assert Error(build.InvalidLabel(_)) =
+    render_external.render(
+      input([TxtName(shallow, [Member("nas", nk, "", "")])]),
+    )
+}

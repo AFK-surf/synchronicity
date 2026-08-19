@@ -902,3 +902,24 @@ pub fn with_db_discards_conn_on_panic_test() {
   let assert Ok(_) = sqlite.exec(conn, "ROLLBACK", [])
   sqlite.close(conn)
 }
+
+/// `/healthz` in serve mode reports the zone's signature expiry as a status,
+/// not only as a field.
+///
+/// A primary whose `resign` job has been failing serves a zone every
+/// validating resolver reads as `Bogus`. The endpoint answered 200
+/// `"status":"ok"` with `sig_expires_at` in the past, and the HTTP status is
+/// the only thing the image's HEALTHCHECK, a load balancer or an orchestrator
+/// reads.
+pub fn healthz_fails_when_the_zone_signatures_have_run_out_test() {
+  let now = now_unix()
+  // A freshly signed zone has a fortnight of life and is servable.
+  assert router.zone_is_servable(now + 14 * 86_400, now)
+  assert router.zone_is_servable(now + router.zone_health_headroom + 1, now)
+
+  // Expired, and about to expire, are both refusals — the first is a zone
+  // every validating resolver already reads as Bogus, the second is a resign
+  // job that has stopped rather than one merely between runs.
+  assert !router.zone_is_servable(now - 60, now)
+  assert !router.zone_is_servable(now + 60, now)
+}

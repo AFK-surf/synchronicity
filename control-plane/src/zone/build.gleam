@@ -257,14 +257,52 @@ pub fn validate(input: ZoneInput) -> Result(Nil, BuildError) {
   let apex = input.meta.apex
   use Nil <- result.try(
     list.try_fold(input.txt_names, Nil, fn(_, txt_name) {
-      case name.in_zone(txt_name.owner, apex) {
-        False -> Error(OwnerOutsideZone(name.to_string(txt_name.owner)))
-        True -> validate_members(txt_name.members)
+      // In the zone, **and** made of labels the API layer would have
+      // accepted. The owner is `_synchronicity.<network>.<slug>.<apex>` and
+      // `name.parse` splits on any dot inside either component, so a network
+      // named `prod.acme` under org `other` renders membership at a name that
+      // reads as org `acme`'s. `valid_dns_label` is applied at the two API
+      // handlers and nowhere else, and this function's own doc says it
+      // re-checks every product invariant the API layer enforces — which is
+      // the whole reason it exists, since external mode reaches the renderer
+      // by a different route.
+      case
+        name.in_zone(txt_name.owner, apex),
+        membership_owner_shape(txt_name.owner, apex)
+      {
+        False, _ -> Error(OwnerOutsideZone(name.to_string(txt_name.owner)))
+        _, False -> Error(InvalidLabel(name.to_string(txt_name.owner)))
+        True, True -> validate_members(txt_name.members)
       }
     }),
   )
   Ok(Nil)
 }
+
+/// Whether an owner name is the shape membership actually has:
+/// `_synchronicity.<network>.<slug>.<apex>`, three labels below the apex, the
+/// last two each a single valid DNS label.
+///
+/// `model.read_txt_names` assembles that string from two product columns and
+/// hands it to `name.parse`, which splits on any dot inside either — so a
+/// network named `prod.acme` under org `other` produces
+/// `_synchronicity.prod.acme.other.<apex>`, four labels down, reading as org
+/// `acme`'s namespace. `valid_dns_label` is applied at the two API handlers
+/// and nowhere else. This function's doc promises it re-checks every product
+/// invariant the API layer enforces, which is the whole reason external mode
+/// calls it, and the owner's own shape was the half it did not.
+fn membership_owner_shape(owner: Name, apex: Name) -> Bool {
+  case list.take(owner, list.length(owner) - list.length(apex)) {
+    [service, network, slug] ->
+      service == membership_label
+      && name.valid_dns_label(network)
+      && name.valid_dns_label(slug)
+    _ -> False
+  }
+}
+
+/// The label membership records live under, one below `<network>.<slug>`.
+const membership_label = "_synchronicity"
 
 fn validate_members(members: List(model.Member)) -> Result(Nil, BuildError) {
   // Label grammar, nk shape, and the two free-form hints.

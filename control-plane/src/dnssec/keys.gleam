@@ -90,8 +90,17 @@ pub fn ds_line(apex: Name, public: BitArray) -> String {
   name.to_string(apex) <> " IN DS " <> ds_fields(apex, public)
 }
 
-/// The DS rdata fields alone — `<tag> <algorithm> 2 <digest>`. The zone-key
-/// log entry names the key this way too, so the two cannot disagree.
+/// The DS rdata fields alone — `<tag> <algorithm> 2 <digest>`.
+///
+/// Operator-facing, and only that: this is the line handed to a registrar for
+/// a zone this service holds the key to, so digest type 2 is a choice this
+/// side gets to make rather than a format it has to match. A zone-key log
+/// entry carries no DS field at all — its Statement names each key by tag,
+/// algorithm, flags and the SHA-256 of the *rdata* — so the sentence that used
+/// to sit here, claiming the entry "names the key this way too, so the two
+/// cannot disagree", was describing a coupling that does not exist. What does
+/// have to follow both digest types is the *reader*, and `rekor/chain`'s
+/// `check_ds_covers` and `chain.rs`'s `covers` both do.
 pub fn ds_fields(apex: Name, public: BitArray) -> String {
   let rd = rdata.dnskey(flags, algorithm, public)
   int.to_string(key_tag(rd))

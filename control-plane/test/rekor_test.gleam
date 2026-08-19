@@ -11,6 +11,8 @@ import dns/name
 import dns/rdata
 import dns/wire
 import dnssec/keys
+import envoy
+import exception
 import fixtures
 import gleam/bit_array
 import gleam/crypto
@@ -25,6 +27,7 @@ import provider/state
 import rekor/cert
 import rekor/chain
 import rekor/client
+import rekor/gate
 import rekor/proof.{type Proof, Proof}
 import rekor/publish as rekor_publish
 import rekor/statement
@@ -2222,4 +2225,26 @@ pub fn the_collected_chain_matches_the_shape_the_crossval_fixture_pins_test() {
     > bit_array.byte_size(cert.encode_chain(links)) - 64
   assert bit_array.byte_size(checked_in)
     < bit_array.byte_size(cert.encode_chain(links)) + 64
+}
+
+/// The gate refuses a spelling it does not recognise rather than reading it
+/// as off.
+///
+/// `CP_REKOR_REQUIRE` decides whether this service will publish device
+/// bindings under a zone key that is not on the public record. `TRUE`, `1`,
+/// `yes` and a trailing space all used to leave it silently open, while the
+/// cosmetic `CP_BROWSE` next door refuses anything but `on`/`off`.
+pub fn the_gate_refuses_a_spelling_it_does_not_recognise_test() {
+  fixtures.gate_disarmed()
+  assert gate.required() == False
+  envoy.set(gate.require_env, "false")
+  assert gate.required() == False
+  envoy.set(gate.require_env, "true")
+  assert gate.required() == True
+  // Anything else is a refusal, not a quiet "off".
+  list.each(["TRUE", "True", "1", "yes", "on", "true "], fn(spelling) {
+    envoy.set(gate.require_env, spelling)
+    let assert Error(_) = exception.rescue(fn() { gate.required() })
+  })
+  fixtures.gate_disarmed()
 }

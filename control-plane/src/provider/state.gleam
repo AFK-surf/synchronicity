@@ -252,11 +252,18 @@ pub fn observed_keys(
 /// Replaces the observed set with what the wire answered just now: rows for
 /// keys no longer served are dropped, surviving rows keep `first_seen` and
 /// `logged_at`, new rows start unlogged.
+/// One transaction, for the reason `rekor/store.put` states about its own
+/// DELETE-then-INSERT: the states in between are not merely stale, they are
+/// wrong in a way that reads as fact. Two different readers act on this table
+/// — the reconciler's gate arms when it is empty, and `zone/model.live_keys`
+/// falls through to serving every non-retire proof record when it is — so a
+/// crash between the delete and the inserts publishes a decision nobody made.
 pub fn record_observed(
   conn: Connection,
   keys: List(#(BitArray, Int, BitArray)),
   now: Int,
 ) -> Result(Nil, sqlite.Error) {
+  use <- sqlite.transaction(conn, fn(e) { e })
   use _ <- result.try(case keys {
     [] -> sqlite.exec(conn, "DELETE FROM observed_zone_keys", [])
     _ -> {
