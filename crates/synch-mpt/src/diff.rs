@@ -60,7 +60,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     ///
     /// A node reading a trie under a scope holds only that part of it, so an
     /// unscoped diff would descend into a subtree it was never sent and fail
-    /// for a node that is absent by design rather than by fault (§8). The
+    /// for a node that is absent by design rather than by fault (§5.5). The
     /// materialization that promotion runs is therefore scoped exactly as the
     /// fetch that filled the trie was.
     pub fn diff_scoped(

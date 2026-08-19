@@ -1,5 +1,5 @@
 //! Delegated space-restricted trust, end to end over two real endpoints
-//! (§3.5, §5.5, §7).
+//! (§3.5, §5.5).
 //!
 //! The properties worth a network for: a delegate is admitted by replicated
 //! state and nothing else, it sees the spaces it was delegated and no trace of
@@ -284,7 +284,7 @@ async fn content_outside_the_delegated_spaces_is_refused() {
 }
 
 /// A delegated origin publishing outside its spaces has its head refused whole
-/// (§7).
+/// (§3.5).
 #[tokio::test]
 async fn a_delegate_publishing_outside_its_spaces_is_refused() {
     let issuer = Node::spawn(Some("nas")).await;
@@ -517,7 +517,7 @@ async fn a_delegates_own_delegations_are_honored_by_nobody() {
     syncer.sync_with(&client).await.unwrap();
 
     // Two independent reasons it comes to nothing, and the head never lands:
-    // `d:` is outside a delegate's publish scope, so the head is refused (§7).
+    // `d:` is outside a delegate's publish scope, so the head is refused (§3.5).
     assert_eq!(
         issuer
             .store

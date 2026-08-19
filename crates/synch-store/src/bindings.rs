@@ -455,7 +455,7 @@ impl Store {
             .collect())
     }
 
-    /// What part of the keyspace a peer may be served (§8).
+    /// What part of the keyspace a peer may be served (§5.5).
     ///
     /// [`Scope::full`] whenever the key holds any live *rooted* binding — a
     /// rooted member is unrestricted by construction — and otherwise the union
@@ -485,7 +485,7 @@ impl Store {
     /// The spaces a device key is confined to, or `None` when the key holds a
     /// rooted binding and is confined to nothing.
     ///
-    /// The content half of scope (§7): object roots carry no space, so a
+    /// The content half of scope (§3.5): object roots carry no space, so a
     /// delegated peer's entitlement to bytes is decided against this list.
     pub fn publish_scope_of_key(&self, node_id: &NodeId, now: i64) -> Result<Option<Vec<String>>> {
         let live: Vec<Binding> = self
@@ -505,7 +505,7 @@ impl Store {
     /// The spaces a delegated origin may publish into, or `None` when the
     /// origin is rooted and may publish anything.
     ///
-    /// This is the publish-scope question (§7), asked of the *origin* whose
+    /// This is the publish-scope question (§3.5), asked of the *origin* whose
     /// trie is being materialized rather than of a connection's peer key.
     pub fn publish_scope(&self, origin: &OriginId, now: i64) -> Result<PublishScope> {
         let live: Vec<Binding> = self
@@ -525,7 +525,7 @@ impl Store {
         Ok(PublishScope::Confined(spaces))
     }
 
-    /// The scope this node itself may read, as last declared by a peer (§8).
+    /// The scope this node itself may read, as last declared by a peer (§5.5).
     ///
     /// `None` — the default — is the whole keyspace. A delegated node cannot
     /// derive this locally before it has synced anything: its scope lives in

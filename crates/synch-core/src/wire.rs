@@ -267,7 +267,7 @@ pub enum MptMessage {
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_HEADS_PER_MESSAGE>")]
         heads: Vec<HeadSummary>,
         /// The spaces the sender will serve the peer it is talking to, or
-        /// `None` for the whole keyspace (§8).
+        /// `None` for the whole keyspace (§5.5).
         ///
         /// How a delegated node learns what it may ask for. Its scope lives in
         /// the delegating origin's trie, which it cannot read until it knows
@@ -313,7 +313,7 @@ pub enum MptMessage {
     /// structural sharing lets one node sit under several prefixes. A
     /// responder serving a scoped peer descends `path` from `root` in its own
     /// store and compares the *path* against that peer's scope; the hash is
-    /// the integrity assertion the answer is checked against on arrival (§8).
+    /// the integrity assertion the answer is checked against on arrival (§5.5).
     /// Between unscoped peers the path is carried and ignored.
     GetNodes {
         /// The root the paths are relative to. Any root the responder holds.

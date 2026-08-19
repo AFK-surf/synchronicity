@@ -210,7 +210,7 @@ impl MptProtocol {
                     sink.observe_summaries_from(peer, &heads, now_ns())?;
                     let summaries = sink.local_summaries()?;
                     // What this node will serve that peer, so a delegated one
-                    // can learn the scope it is about to walk under (§8).
+                    // can learn the scope it is about to walk under (§5.5).
                     let scope = store.publish_scope_of_key(&peer, now_ns())?;
                     Ok((summaries, scope))
                 })
@@ -481,7 +481,7 @@ const ANSWER_BYTE_BUDGET: usize = synch_core::MAX_FRAME_LEN / 2;
 /// Resolves a batch of claimed positions and returns what stands at each,
 /// refusing the whole request if any position lies outside the peer's scope.
 ///
-/// This is where a scoped peer's view is enforced (§8). The peer says where it
+/// This is where a scoped peer's view is enforced (§5.5). The peer says where it
 /// believes a node sits; this descends from a root *this* node holds and
 /// reports what is really there, so a fabricated root fails at the first step
 /// and a lie about the position simply resolves to whatever is genuinely at

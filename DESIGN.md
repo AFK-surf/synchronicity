@@ -485,11 +485,11 @@ holding a live *rooted* binding, and a delegation only ever produces a `delegate
 binding. So a delegate's own `d:` records are read by nobody: depth 2 fails on a
 lookup in the reader's own binding table, not on a depth counter a publisher could
 set, and not in an order-dependent way. A delegate additionally cannot publish `d:`
-at all (§7), so the rule is refused where it is broken rather than silently ignored.
+at all, so the rule is refused where it is broken rather than silently ignored.
 
 **Scope is a projection, both ways.** The list bounds what the delegate may publish
 under its own origin *and* what it may read of everyone else's — and outside it,
-data is not refused but never sent (§8). A space is a cluster-wide namespace, so
+data is not refused but never sent (§5.5). A space is a cluster-wide namespace, so
 delegating `photos` grants every member's `photos`: it has to, because the unified
 tree (§8) merges across origins by `(space, path)`, and a per-origin grant would
 describe a view no mirror policy could render.
@@ -568,7 +568,7 @@ A **space** is a named sync root (like a Syncthing folder): a user configures
 Spaces are the unit of sharing policy and of local materialization.
 
 The keyspace is laid out so that **the redaction boundary falls on key prefixes**,
-which §8 depends on: a peer delegated a space is served the subtrees under `f:<space>/`, that space's own
+which §5.5 depends on: a peer delegated a space is served the subtrees under `f:<space>/`, that space's own
 `m:space/<space>` record, `m:self`, and `d:` — and of every other space, nothing.
 A prefix is the only shape that boundary can take, which is why `m:space/<id>` and
 `m:self` are carried as *exact* keys rather than prefixes: used as prefixes they would

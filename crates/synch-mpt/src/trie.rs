@@ -204,7 +204,7 @@ pub struct Missing {
     /// Trie nodes that must be fetched, each with the nibble path it occupies.
     ///
     /// The path travels with the request because that is what a responder
-    /// authorizes on (§8): a hash carries no position, and none can be
+    /// authorizes on (§5.5): a hash carries no position, and none can be
     /// recovered from it.
     pub nodes: Vec<(Vec<u8>, Hash)>,
     /// Out-of-line values that must be fetched, each with the nibble path of
@@ -264,7 +264,7 @@ pub struct MissingWalk {
     /// Children of extension nodes that were not yet present when their parent
     /// was walked, and so must be checked for being branches when they arrive.
     must_be_branch: HashSet<Hash>,
-    /// The part of the keyspace this walk may descend into (§8).
+    /// The part of the keyspace this walk may descend into (§5.5).
     ///
     /// A scoped walk stops at the boundary rather than asking for what it
     /// would be refused: the peer serving it applies the same predicate, so an
@@ -515,7 +515,7 @@ impl MissingWalk {
 /// Each child is returned with the nibbles that lead to it from this node —
 /// one nibble for a branch slot, the whole prefix for an extension — so the
 /// walk can accumulate the position of everything it descends into. That
-/// position is what a scoped fetch is authorized on (§8), and it is a function
+/// position is what a scoped fetch is authorized on (§5.5), and it is a function
 /// of the node shape alone, so it costs the walk nothing to keep.
 fn paired_children(
     reference: Option<&TrieNode>,
@@ -1287,7 +1287,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// Resolves claimed positions against `root`, returning what actually
     /// stands at each one.
     ///
-    /// This is the responder's half of a scoped fetch (§8). The caller says
+    /// This is the responder's half of a scoped fetch (§5.5). The caller says
     /// where it believes a node sits; this descends from a root the responder
     /// itself holds and reports what is really there, so a position cannot be
     /// claimed into existence — a fabricated root fails at the first step,
@@ -1370,7 +1370,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
 
     /// The first key under `root` that `scope` does not admit, if there is one.
     ///
-    /// This is the publish-scope question (§7): a delegated origin's trie must
+    /// This is the publish-scope question (§3.5): a delegated origin's trie must
     /// hold nothing outside the spaces it was delegated, and a head whose trie
     /// does is refused whole rather than materialized in part.
     ///

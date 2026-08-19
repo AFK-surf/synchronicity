@@ -348,7 +348,7 @@ pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) ->
 /// `m:space/<space-id>`.
 ///
 /// One record per space rather than a list inside the manifest, because the
-/// redaction boundary is a key prefix (§8): a delegate is served the spaces it
+/// redaction boundary is a key prefix (§5.5): a delegate is served the spaces it
 /// was granted and learns nothing of the rest, and a single leaf holding every
 /// space's name and count could not be shown to it at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -365,7 +365,7 @@ pub struct SpaceInfo {
 ///
 /// Carries nothing space-specific: what a node advertises about its spaces
 /// lives under `m:space/<id>`, one record each, so that it can be redacted per
-/// space (§8).
+/// space (§5.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeManifest {
     /// Schema version.
@@ -593,7 +593,7 @@ pub fn delegation_prefix() -> Vec<u8> {
     vec![PREFIX_DELEGATION, b':']
 }
 
-/// The trie key prefixes a peer delegated `spaces` may be *served* (§8).
+/// The trie key prefixes a peer delegated `spaces` may be *served* (§5.5).
 ///
 /// Everything a delegate is entitled to see, expressed as key prefixes,
 /// because that is the only shape the redaction boundary can take:
@@ -637,7 +637,7 @@ pub struct ScopeKeys {
     pub exact: Vec<Vec<u8>>,
 }
 
-/// The trie key prefixes a delegated origin may *publish* under (§7).
+/// The trie key prefixes a delegated origin may *publish* under (§3.5).
 ///
 /// Not the same set as what it may read, and the difference is in both
 /// directions. `b:` is here because a delegate that holds content must be able

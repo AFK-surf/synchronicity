@@ -634,7 +634,7 @@ impl Store {
 
     /// True if any current entry in one of `spaces` names this content root.
     ///
-    /// The content half of a delegated peer's scope (§7). Object roots carry
+    /// The content half of a delegated peer's scope (§3.5). Object roots carry
     /// no space of their own — `GetSlice` is keyed by hash and nothing else —
     /// so entitlement to the bytes is decided by whether a granted path names
     /// them, which is what the `entries_by_content` index answers.

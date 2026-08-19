@@ -1107,7 +1107,7 @@ impl Node {
         Ok((manifest_key(), Some(bytes)))
     }
 
-    /// Builds the `m:space/<id>` records for this node's spaces (§4.2, §8).
+    /// Builds the `m:space/<id>` records for this node's spaces (§4.2, §5.5).
     pub fn space_info_changes(&self) -> Result<Vec<StagedChange>> {
         let mut out = Vec::new();
         for space in self.store().spaces()? {
@@ -1129,7 +1129,7 @@ impl Node {
         Ok((synch_core::space_info_key(space)?, None))
     }
 
-    /// Reads what an origin publishes about one space (§4.2, §8).
+    /// Reads what an origin publishes about one space (§4.2, §5.5).
     ///
     /// `None` for a space the origin does not advertise. Reading under a scope
     /// this space falls outside of is a different answer: the subtree was never

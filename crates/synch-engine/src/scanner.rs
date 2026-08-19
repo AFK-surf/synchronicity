@@ -442,7 +442,7 @@ impl Node {
             report.staged.push(self.manifest_change()?);
             // One record per space rather than a list inside the manifest, so
             // that what this node advertises about a space can be shown to a
-            // peer delegated that space and to nobody else (§8).
+            // peer delegated that space and to nobody else (§5.5).
             report.staged.extend(self.space_info_changes()?);
         }
         Ok(report)
