@@ -1473,3 +1473,76 @@ async fn the_sync_path_never_touches_the_store_on_a_runtime_worker() {
     nas.node.shutdown().await.unwrap();
     laptop.node.shutdown().await.unwrap();
 }
+
+/// A pushed head fetches its trie without waiting for the next interval.
+///
+/// §5.3's reactive path delivers a head, and a head is a pointer: `entries`,
+/// mirrors and the S3 gateway all sit behind promotion, so until the trie under
+/// it is fetched nothing a reader looks at has moved. The fetch used to wait
+/// for the receiver's own anti-entropy round — 30 s ± 50 % — which made the
+/// "sub-second propagation" the design claims true of the pointer and false of
+/// the data. The loop listens for a pending head now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pushed_head_is_followed_by_its_trie_without_waiting_for_the_interval() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
+    // Long enough that a round driven by the clock cannot be what completes
+    // this: the whole test has to finish inside a fraction of one interval.
+    let nas = spawn_with("nas", |c| c.aae_interval = Duration::from_secs(600)).await;
+    let laptop = spawn_with("laptop", |c| c.aae_interval = Duration::from_secs(600)).await;
+    {
+        let (a, b) = (nas.node.clone(), laptop.node.clone());
+        off_runtime(move || introduce_nodes(&[&a, &b])).await;
+    }
+    off_runtime({
+        let node = nas.node.clone();
+        let path = nas.space.path().to_path_buf();
+        move || node.add_space("media", &path).unwrap()
+    })
+    .await;
+    std::fs::write(nas.space.path().join("a.txt"), b"hello").unwrap();
+
+    // The follower's standing loop, which is what the bell has to reach.
+    let (stop, _) = tokio::sync::broadcast::channel::<()>(1);
+    let running = {
+        let node = laptop.node.clone();
+        let mut rx = stop.subscribe();
+        tokio::spawn(async move {
+            node.run_anti_entropy(async move {
+                let _ = rx.recv().await;
+            })
+            .await
+        })
+    };
+
+    // Publish and push. The push lands the head in the follower's pending slot;
+    // the bell is what turns that into a fetch.
+    let head = tokio::time::timeout(Duration::from_secs(30), nas.node.scan_publish_push())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a head");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let complete = loop {
+        let got = {
+            let (node, origin) = (laptop.node.clone(), nas.node.origin().clone());
+            off_runtime(move || node.store().complete_head(&origin).unwrap()).await
+        };
+        if got.is_some() || std::time::Instant::now() > deadline {
+            break got;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        complete.map(|h| h.root),
+        Some(head.root),
+        "the trie must follow the pushed head without a full interval passing"
+    );
+
+    let _ = stop.send(());
+    let _ = running.await;
+    nas.node.shutdown().await.unwrap();
+    laptop.node.shutdown().await.unwrap();
+}

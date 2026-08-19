@@ -431,8 +431,17 @@ fn v10_groups_as_ranges(tx: &Transaction<'_>) -> Result<()> {
 /// `NOT EXISTS (SELECT 1 FROM heads …)` guard. Those are the only writers, so
 /// the invariant is sound — but it is sound by review rather than by
 /// construction, and the failure mode if a history row ever did go missing is
-/// silent: `HEAD_JOIN` is an inner join, so the head reads back as absent, and a
-/// node whose complete head reads as absent restarts its origin at seq 1.
+/// silent: `HEAD_JOIN` is an inner join, so the head reads back as absent.
+///
+/// It does **not** follow that the origin restarts at seq 1, which is what this
+/// comment used to claim. `next_own_seq_in` takes `MAX(seq)` over a `UNION` of
+/// `heads` and `head_history` and floors the result with the publish floor —
+/// none of which goes through `HEAD_JOIN` — so the seq survives a lost
+/// signature. What is actually lost is the ability to *serve* or re-sign that
+/// head. Stating the hazard larger than it is has its own cost: it argues for a
+/// table-rebuild migration that a declared `FOREIGN KEY` would not even let
+/// these two `DELETE`s skip rows with, since RESTRICT would make them error
+/// where they mean to pass over.
 ///
 /// The backfill is `INSERT OR IGNORE` first so that a head whose history row
 /// was somehow missing does not lose its signature to the rebuild.

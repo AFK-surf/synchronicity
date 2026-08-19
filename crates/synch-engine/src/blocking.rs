@@ -11,7 +11,8 @@
 //! slower façade. What matters is where it runs. A worker thread hashing a
 //! 10 GB file is not polling anything: the endpoint stops answering peers, the
 //! control socket stops answering `synch status`, and the timers driving
-//! anti-entropy fire late. Short bounded lookups stay inline.
+//! anti-entropy fire late. There is no "short enough to stay inline"
+//! exception — §10 retired it, and `Store::conn` asserts it is gone.
 
 use crate::error::Result;
 

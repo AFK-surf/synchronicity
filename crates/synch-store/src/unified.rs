@@ -145,7 +145,13 @@ pub struct VersionSet {
     pub space: String,
     /// The path within the space.
     pub path: String,
-    /// The versions, in selection order: the version `newest` would pick last.
+    /// The versions in ascending selection order, greatest last.
+    ///
+    /// `newest` picks the greatest *live* one, which is not always the last:
+    /// `select` filters tombstones out of the running and this order does not,
+    /// so a deletion dated after every live version sorts last and is still not
+    /// what `newest` returns. Tombstones stay in the list because every
+    /// surface that shows a version list has to show them.
     pub versions: Vec<Version>,
     /// Every origin's entry for the path, canonically ordered.
     pub entries: Vec<EntryRow>,
@@ -298,7 +304,13 @@ impl Selection {
 /// Tombstones all collapse into one version whatever else they carry — a
 /// deletion is a deletion. A symlink is identified by its target and can never
 /// coincide with a file, because the kind is part of the key.
-type Identity = (bool, Option<[u8; 32]>, Option<String>);
+///
+/// The kind is carried whole, not as "is this a tombstone". It used to be the
+/// latter, and then the sentence above was not true of the code under it: a
+/// `Dir` (content-less by §4.2) and a `File` whose content is absent both
+/// keyed as `(false, None, None)`, so a directory and a file collapsed into
+/// one version with two attestors that read as agreeing.
+type Identity = (EntryKind, Option<[u8; 32]>, Option<String>);
 
 fn content_of(entry: &EntryRow) -> Option<Hash> {
     match entry.kind {
@@ -307,28 +319,27 @@ fn content_of(entry: &EntryRow) -> Option<Hash> {
     }
 }
 
-fn identity(entry: &EntryRow) -> Identity {
-    match entry.kind {
-        EntryKind::Tombstone => (true, None, None),
-        EntryKind::Symlink => (
-            false,
-            None,
-            Some(entry.symlink_target.clone().unwrap_or_default()),
-        ),
-        _ => (false, entry.content.map(|h| *h.as_bytes()), None),
+/// The one derivation, over the three fields any version carries, so an
+/// `EntryRow` and a `Version` cannot come to different answers about the same
+/// assertion.
+fn identity_of(
+    kind: EntryKind,
+    content: Option<Hash>,
+    symlink_target: &Option<String>,
+) -> Identity {
+    match kind {
+        EntryKind::Tombstone => (kind, None, None),
+        EntryKind::Symlink => (kind, None, Some(symlink_target.clone().unwrap_or_default())),
+        _ => (kind, content.map(|h| *h.as_bytes()), None),
     }
 }
 
+fn identity(entry: &EntryRow) -> Identity {
+    identity_of(entry.kind, entry.content, &entry.symlink_target)
+}
+
 fn identity_of_version(version: &Version) -> Identity {
-    match version.kind {
-        EntryKind::Tombstone => (true, None, None),
-        EntryKind::Symlink => (
-            false,
-            None,
-            Some(version.symlink_target.clone().unwrap_or_default()),
-        ),
-        _ => (false, version.content.map(|h| *h.as_bytes()), None),
-    }
+    identity_of(version.kind, version.content, &version.symlink_target)
 }
 
 /// The deterministic total order `newest` maximizes: `(mtime_ns, content_root,

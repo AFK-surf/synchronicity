@@ -718,6 +718,20 @@ Properties:
     pass abandons it after `pending_head_ttl` (default 900 s, thirty anti-entropy
     intervals). This is the case a publisher going offline between its push and
     anyone's fetch produces.
+
+    The clock is on the **slot**, not on the head occupying it. It used to be on
+    the head — every accepted head rewrote `heads.received_at` — and that made
+    this rule unreachable for the case it exists to cover. A node that can be
+    pushed to but cannot dial the origin, with the origin publishing faster than
+    the TTL, holds a pending head that is always strictly above every servable
+    head in the cluster and always freshly stamped: rule one never runs because
+    no fetch is attempted, rule three never runs because the trie is absent, and
+    this rule never fires because the clock keeps restarting. The node stays
+    frozen at its last complete head and advertises that stale root to everyone.
+    Occupying an empty slot starts the clock; adopting a newer head into an
+    occupied slot inherits it; a fetch that commits something restarts it, so a
+    trie that legitimately takes longer than the TTL to arrive is not swept out
+    from under the fetch filling it.
   - A pending head whose trie *is* wholly present is promoted by the same pass
     rather than abandoned. Promotion otherwise happens only on an accepted offer
     or at the end of a successful fetch, and a crash between a fetch's last
@@ -756,6 +770,16 @@ are rolled back to it everywhere.
   can reach. A received head is *not* relayed onward, so a member reachable from
   some peer but not from the origin learns of it on its next pull rather than by
   epidemic spread.
+
+  A pushed head lands in the receiver's **pending** slot — by construction, since
+  a head worth pushing names a root the receiver has never seen — and the head
+  alone moves nothing a reader looks at: `entries`, the unified tree, mirrors and
+  the S3 gateway all sit behind promotion. So the receiver's anti-entropy loop
+  waits on that adoption as well as on its interval, and dials for the trie at
+  once. Without that arm the "sub-second" above was true of the pointer and false
+  of the data, which followed up to one jittered interval (45 s) later. Rounds
+  driven this way are floored at one per 2 s, so an origin publishing in a burst
+  costs its peers one round rather than one per head.
 - **Periodic**: every `aae_interval` (default 30s with ±50% jitter), pick one random
   trusted peer, connect if needed, run a full `Hello` push-pull exchange. This repairs
   anything the reactive path missed (dropped connections, simultaneous partitions) and
@@ -1282,6 +1306,15 @@ debug builds, that it is either inside one or not on a multi-thread runtime at
 all — the same shape as the guard that made "no `Store::conn` inside a
 transaction" a named panic instead of a silent deadlock.
 
+The violation **ends the process**, and that is not severity theatre. The check
+was a `debug_assert!` first, and a panic fires inside whatever task made the
+call: tokio catches it, so in a detached `tokio::spawn` it kills one task and
+nothing else. `cargo test --workspace` on the commit that introduced the check
+printed four of these panics and reported every suite green with exit status 0,
+while in the daemon under test the same panic had silently removed a standing
+loop. A checker whose failure mode is "one task quietly disappears" reproduces
+exactly the defect it was written to stop, so this one aborts.
+
 An assertion only earns its keep where something runs it. It is silent on a
 current-thread runtime — one worker the test itself is driving is not the hazard
 — so a `#[tokio::test]` suite left at the default flavor would have been a
@@ -1293,7 +1326,22 @@ them they cover the accept/exchange/fetch/publish/maintain path, every control
 command, and every gateway verb, on the same runtime flavor the daemon binary
 starts. A test's own body drives its world synchronously — that is what a test
 thread is for — so it declares that with a `BlockingScope`, which exempts that
-one thread and leaves every runtime worker the node uses checked.
+one thread and leaves every runtime worker the node uses checked. In-crate
+`#[cfg(test)]` suites follow the same rule wherever they drive an async
+production surface; the cloud attach module is the one that had to be converted
+after the fact, and four live violations were behind it.
+
+What the check covers is `Store::conn`, so it sees blocking work that reaches
+the connection and not blocking *CPU* that never does. That is most of it —
+the scanner, the CAS, GC and mirror writes all end at a row — but not all of
+it, and the gap is real: `Proven::absorb` is pure CPU and was found by reading,
+not by the checker.
+
+Standing loops are supervised by their own liveness, not only by this rule.
+The daemon reads every loop's join result rather than discarding it: a loop that
+ends by panicking is gone for the process's lifetime, nothing restarts it, and
+a daemon that keeps answering `daemon status` while it has no publisher is worse
+than one that exits.
 
 This relocates the queue rather than removing it: the one connection mutex is
 still the bottleneck, and a long exclusive holder (a GC pass, a full publish
