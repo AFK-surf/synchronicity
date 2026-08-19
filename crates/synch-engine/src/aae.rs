@@ -416,6 +416,12 @@ impl Node {
                 // gateway holding a write for six seconds cost an origin its
                 // floor and another round to get it back.
                 Err(e) if crate::reconcile::is_origin_fault(&e) => {
+                    // The same verdict `offer_head` reaches, so it is recorded
+                    // the same way: without this the head is condemned here and
+                    // then re-judged from scratch — a full promotion diff — the
+                    // next time any peer offers it, because only the other path
+                    // was writing the memo.
+                    syncer.refuse(&stored.head);
                     tracing::warn!(
                         origin = %origin,
                         seq = stored.head.seq,

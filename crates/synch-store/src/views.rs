@@ -673,6 +673,38 @@ impl Store {
     }
 
     /// Every path the scanner has recorded for a space.
+    /// The paths one origin currently publishes as live in a space.
+    ///
+    /// Tombstones excluded: a path this origin has already deleted is not
+    /// something a later scan has to re-derive.
+    ///
+    /// Paths and nothing else, deliberately. The scanner's deletion sweep is
+    /// anchored to this, so it runs once per space per scan — and the caller
+    /// wants exactly one column. Reading it through `list_entries` instead
+    /// materialized every `EntryRow` for the space, content hash, `prev`,
+    /// symlink target and all, to keep the `path` field of each: at the 100 k
+    /// files §7.1 names that is tens of megabytes allocated and dropped on
+    /// every watcher hint.
+    pub fn published_paths(&self, origin: &OriginId, space: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        // Through `kind_to_int`, not a literal: `entries.kind` is an integer
+        // column, and comparing it against a string is not an error in SQLite —
+        // the types simply never match, so the tombstone filter would silently
+        // pass everything and every scan would re-stage a deletion it had
+        // already published.
+        let mut stmt = conn.prepare(
+            "SELECT path FROM entries
+              WHERE origin_id = ?1 AND space = ?2 AND kind != ?3
+              ORDER BY path",
+        )?;
+        let rows = stmt.query_map(
+            params![origin.canonical(), space, kind_to_int(EntryKind::Tombstone)],
+            |r| r.get::<_, String>(0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every path the scanner has indexed in a space.
     pub fn local_files(&self, space: &str) -> Result<Vec<String>> {
         let conn = self.conn();
         let mut stmt =
@@ -1537,6 +1569,51 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    /// The deletion sweep's anchor names live paths and excludes tombstones.
+    ///
+    /// The filter is the whole point of the query: a tombstoned path that came
+    /// back would be swept on every scan, re-staging a deletion this origin has
+    /// already published, forever. `entries.kind` is an integer column and
+    /// SQLite does not error on comparing one to a string — it simply never
+    /// matches — so a `kind != 'tombstone'` literal would pass everything, and
+    /// this is what catches it.
+    #[test]
+    fn published_paths_are_live_paths_of_one_origin() {
+        let (_d, store) = store();
+        let mine = OriginId::named("nas", "x.example").unwrap();
+        let theirs = OriginId::named("laptop", "x.example").unwrap();
+        store
+            .put_entry(
+                &mine,
+                "media",
+                "keep.txt",
+                &FileEntry::file(1, 0, Hash::new(b"a"), 1),
+            )
+            .unwrap();
+        store
+            .put_entry(
+                &mine,
+                "media",
+                "gone.txt",
+                &FileEntry::tombstone(0, 1, None),
+            )
+            .unwrap();
+        store
+            .put_entry(
+                &theirs,
+                "media",
+                "not-mine.txt",
+                &FileEntry::file(1, 0, Hash::new(b"b"), 1),
+            )
+            .unwrap();
+
+        assert_eq!(store.published_paths(&mine, "media").unwrap(), ["keep.txt"]);
+        assert_eq!(
+            store.published_paths(&mine, "other").unwrap(),
+            Vec::<String>::new()
         );
     }
 }

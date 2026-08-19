@@ -309,18 +309,6 @@ pub(crate) fn grow_to(file: &File, len: u64) -> Result<()> {
     Ok(())
 }
 
-/// The first byte past the last group of `served`, clamped to `size`.
-///
-/// What a window's writes can actually reach, which is the only length a file
-/// may be grown to on the strength of an unverified claim.
-fn window_end_bytes(served: &ChunkRanges, size: u64) -> u64 {
-    served
-        .ranges
-        .last()
-        .map(|r| r.end.saturating_mul(CHUNK_GROUP_SIZE).min(size))
-        .unwrap_or(0)
-}
-
 /// Encodes an object's verified groups for the `blobs.bitmap` column.
 ///
 /// Ranges, not a bit per group, despite the column's name. A bitmap costs
@@ -1178,7 +1166,6 @@ impl Store {
         // payload never gets longer than the bytes that have been proven
         // against the root, whatever the window's position. The comment above
         // already relied on that behaviour for later windows.
-        let _ = window_end_bytes(&served, size);
         let outboard_file = OpenOptions::new()
             .read(true)
             .write(true)

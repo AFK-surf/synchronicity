@@ -676,7 +676,12 @@ Properties:
     Occupying an empty slot starts the clock; adopting a newer head into an
     occupied slot inherits it; a fetch that commits something restarts it, so a
     trie that legitimately takes longer than the TTL to arrive is not swept out
-    from under the fetch filling it.
+    from under the fetch filling it — but only for the head that fetch is
+    actually about. A fetch reads the pending head once and then spends many
+    round trips on that root while `HeadPush` keeps writing the slot, so an
+    unnamed restart would let progress on one root extend the deadline of a
+    different, unservable head that had taken the slot since: the same reason
+    abandonment is compare-and-clear rather than an unconditional delete.
   - A pending head whose trie *is* wholly present is promoted by the same pass
     rather than abandoned. Promotion otherwise happens only on an accepted offer
     or at the end of a successful fetch, and a crash between a fetch's last
@@ -725,6 +730,16 @@ are rolled back to it everywhere.
   of the data, which followed up to one jittered interval (45 s) later. Rounds
   driven this way are floored at one per 2 s, so an origin publishing in a burst
   costs its peers one round rather than one per head.
+
+  The adoption signal **stores a permit**, and that is load-bearing rather than an
+  implementation detail. The loop is parked on it only *between* rounds; it spends
+  the rest of its time inside a round, dialling peers — which is exactly when the
+  pushes it needs to hear about arrive, because a publisher pushes to the whole
+  membership concurrently, so peer X's round is in flight while pushes from other
+  origins land. A signal that keeps nothing for an unparked listener is therefore
+  silent for precisely the pushes that matter, and the interval-length wait comes
+  straight back. The promotion signal that drives mirrors is the same shape for
+  the same reason.
 - **Periodic**: every `aae_interval` (default 30s with ±50% jitter), pick one random
   trusted peer, connect if needed, run a full `Hello` push-pull exchange. This repairs
   anything the reactive path missed (dropped connections, simultaneous partitions) and

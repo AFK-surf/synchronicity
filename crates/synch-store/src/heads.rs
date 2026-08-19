@@ -171,7 +171,8 @@ impl Store {
         put_head_in(&conn, slot, head, received_at, verified_at)
     }
 
-    /// Restarts the pending slot's staleness clock for an origin.
+    /// Restarts the pending slot's staleness clock, if it still holds
+    /// `(seq, root)`.
     ///
     /// Called when a fetch commits something, which is the one event that
     /// distinguishes "this slot is being filled" from "this slot is pinned by a
@@ -179,11 +180,32 @@ impl Store {
     /// when the slot went from empty to occupied, and a trie larger than
     /// `pending_head_ttl` takes to fetch would be swept mid-transfer.
     ///
-    /// Returns whether a pending slot was there to touch.
-    pub fn touch_pending(&self, origin: &OriginId, now: i64) -> Result<bool> {
+    /// Named, for the same reason [`Store::clear_head_at`] is. A fetch reads the
+    /// pending head once and then spends many round trips on that root, while
+    /// `HeadPush` writes the slot from the blocking pool throughout — so by the
+    /// time a batch commits, the slot may hold a *different* head. Touching
+    /// whatever is there turns progress on the head the fetch is about into an
+    /// extension of the sweep deadline for the head it is not, which is the
+    /// wedge the slot-scoped clock exists to break: an unservable head that
+    /// keeps being re-stamped by a fetch of something else never ages out.
+    ///
+    /// Returns whether the named head was still there to touch.
+    pub fn touch_pending_at(
+        &self,
+        origin: &OriginId,
+        seq: u64,
+        root: &Hash,
+        now: i64,
+    ) -> Result<bool> {
         let touched = self.conn().execute(
-            "UPDATE heads SET received_at = ?2 WHERE origin_id = ?1 AND slot = 'pending'",
-            params![origin.canonical(), now],
+            "UPDATE heads SET received_at = ?4
+              WHERE origin_id = ?1 AND slot = 'pending' AND seq = ?2 AND root = ?3",
+            params![
+                origin.canonical(),
+                seq as i64,
+                root.as_bytes().to_vec(),
+                now
+            ],
         )?;
         Ok(touched > 0)
     }

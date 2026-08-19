@@ -161,7 +161,7 @@ impl Syncer {
     /// build* can decode, so a node that is upgraded to understand the record
     /// should re-attempt it, and a restart is the cheapest possible expression
     /// of that.
-    fn refuse(&self, head: &SignedHead) {
+    pub(crate) fn refuse(&self, head: &SignedHead) {
         let mut refused = self
             .refused
             .lock()
@@ -381,12 +381,6 @@ impl Syncer {
         if !self.store.is_bound(&head.origin, &head.signed_by, now)? {
             return Ok(HeadOutcome::Unbound);
         }
-        // 2b. And this node must not already have judged it. Before the slot
-        // write, not after: adopting it is what would put it back above the
-        // floor and buy another promotion diff.
-        if self.is_refused(head) {
-            return Ok(HeadOutcome::Refused);
-        }
         // The ordering check and the write that acts on it are one transaction.
         // Read-then-write across two lock acquisitions would let two concurrent
         // offers — one per peer connection, all on the blocking pool — both
@@ -411,7 +405,24 @@ impl Syncer {
             //    width of the fork is a storage question, answered below,
             //    after the ordering has been settled.
             let floor = txn.head_floor(&head.origin)?;
-            let outcome = if head.supersedes(floor.as_ref()) {
+            // A head this node has already judged unpromotable is not adopted
+            // again — adopting it is what would put it back above the floor and
+            // buy another promotion diff (see `Syncer::refuse`).
+            //
+            // Checked *here* rather than before the transaction, which is where
+            // it went first. `record_history` above and `trim_forks` below are
+            // not the expensive part and are not about adoption: the first is
+            // §4.4 evidence retention, which is deliberately kept for heads
+            // that lose the ordering comparison too, and the second is the cap
+            // that keeps a member signing unbounded roots at one seq from
+            // buying permanent growth. Returning in front of both made a
+            // re-offered head stop contributing to either — including to the
+            // `heads ∪ head_history` union `next_own_seq` reads, which for a
+            // relayed head of this node's own origin is what keeps a restored
+            // backup from re-using a seq.
+            let outcome = if self.is_refused(head) {
+                HeadOutcome::Refused
+            } else if head.supersedes(floor.as_ref()) {
                 txn.put_head(Slot::Pending, head, now, now)?;
                 HeadOutcome::Pending
             } else {
@@ -442,7 +453,18 @@ impl Syncer {
         }
         if outcome == HeadOutcome::Pending {
             if let Some(wake) = &self.on_pending {
-                wake.notify_waiters();
+                // One permit no matter how often this rings, exactly as the
+                // promotion bell below does — and for the reason stated there:
+                // a wake landing mid-pass must not be lost. `notify_waiters`
+                // keeps nothing for a listener that is not currently parked,
+                // and the anti-entropy loop is only parked on this between
+                // rounds. It spends the rest of its time inside
+                // `anti_entropy_round`, dialling peers — which is precisely
+                // when the pushes it needs to hear about arrive, because a
+                // publisher pushes to the whole membership at once (§5.3). Rung
+                // that way the fetch waited for the next interval after all,
+                // for every push that landed during a round.
+                wake.notify_one();
             }
         }
         match self.try_promote(&head.origin, now) {
@@ -758,10 +780,18 @@ impl Syncer {
                 // `put_head_in`), so without this a trie that legitimately
                 // takes longer than `pending_head_ttl` to fetch would be swept
                 // out from under the fetch that is filling it.
+                //
+                // Named, because this fetch has been working on `pending.root`
+                // since before the first round trip and the slot may have moved
+                // on since: stamping whatever is there would let progress on
+                // this root hold the sweep off a head nobody can serve.
                 let store = self.store.clone();
                 let touched = origin.clone();
-                crate::blocking::offload(move || Ok(store.touch_pending(&touched, now_ns())?))
-                    .await?;
+                let (seq, root) = (pending.seq, pending.root);
+                crate::blocking::offload(move || {
+                    Ok(store.touch_pending_at(&touched, seq, &root, now_ns())?)
+                })
+                .await?;
             }
             // Everything just stored goes back on the frontier, so the nodes
             // that arrived expand into their own children.
@@ -1935,6 +1965,32 @@ mod containment_tests {
         );
     }
 
+    /// The pending bell survives a ring nobody is parked on.
+    ///
+    /// This is the whole of what the reactive fetch rests on, and the reason it
+    /// cannot be a `notify_waiters`: the anti-entropy loop is parked on this
+    /// only *between* rounds, and spends the rest of its life inside
+    /// `anti_entropy_round` dialling peers — which is exactly when the pushes
+    /// it needs to hear about land, since a publisher pushes to the whole
+    /// membership at once (§5.3). A bell that keeps nothing for an unparked
+    /// listener is a bell that is silent for every push that arrives during a
+    /// round, and the fetch waits for the next interval after all.
+    #[tokio::test]
+    async fn a_pending_head_rung_mid_round_is_not_lost() {
+        let (_d, store, key, origin) = setup();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let syncer = Syncer::new(store.clone()).on_pending(Some(wake.clone()));
+
+        // Rung with no listener parked, which is the mid-round case.
+        let head = SignedHead::sign(&key, origin.clone(), 1, Hash([1u8; 32]), 0);
+        assert_eq!(syncer.offer_head(&head, 0).unwrap(), HeadOutcome::Pending);
+
+        // A listener arriving afterwards still has to see it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
+            .await
+            .expect("a wake that landed while the loop was busy must still be there");
+    }
+
     /// The pending slot ages, not the head occupying it.
     ///
     /// `pending_head_ttl` is §5.2's only time-based escape from a floor pinned
@@ -1961,7 +2017,24 @@ mod containment_tests {
 
         // A fetch that commits something restarts it, so a trie that genuinely
         // takes longer than the TTL to arrive is not swept mid-transfer.
-        assert!(store.touch_pending(&origin, 9_500).unwrap());
+        assert!(
+            !store
+                .touch_pending_at(&origin, 1, &Hash([1u8; 32]), 9_500)
+                .unwrap(),
+            "a fetch of a head the slot has moved past must not restart the clock"
+        );
+        assert_eq!(
+            store
+                .head(&origin, Slot::Pending)
+                .unwrap()
+                .unwrap()
+                .received_at,
+            100,
+            "the slot keeps ageing while an unservable head occupies it"
+        );
+        assert!(store
+            .touch_pending_at(&origin, 2, &Hash([2u8; 32]), 9_500)
+            .unwrap());
         assert_eq!(
             store
                 .head(&origin, Slot::Pending)
@@ -1988,7 +2061,12 @@ mod containment_tests {
         );
         assert!(
             !store
-                .touch_pending(&OriginId::named("other", "x.example").unwrap(), 1)
+                .touch_pending_at(
+                    &OriginId::named("other", "x.example").unwrap(),
+                    1,
+                    &Hash([1u8; 32]),
+                    1
+                )
                 .unwrap(),
             "and there is nothing to touch for an origin with no pending head"
         );

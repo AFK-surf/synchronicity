@@ -155,13 +155,7 @@ impl Node {
         // published tree is what the sweep is anchored to; `local_files` still
         // contributes the paths this scan indexed but has not published yet.
         let mut known_paths: Vec<String> = self.store().local_files(space_id)?;
-        known_paths.extend(
-            self.store()
-                .list_entries(Some(self.origin()), space_id, "", None, None)?
-                .into_iter()
-                .filter(|row| row.kind != synch_core::EntryKind::Tombstone)
-                .map(|row| row.path),
-        );
+        known_paths.extend(self.store().published_paths(self.origin(), space_id)?);
         known_paths.sort();
         known_paths.dedup();
         for known in known_paths {
