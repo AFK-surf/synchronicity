@@ -439,12 +439,20 @@ impl BlobClient {
             let store = store.clone();
             let encoded = proof.encoded;
             let for_store = served.clone();
-            let proven = crate::blocking::offload(move || {
-                Ok(store.write_proof(&root, size, &for_store, level, &encoded, now_ns())?)
+            // The fold goes over with the write it belongs to. `absorb`
+            // deduplicates against everything proven so far, which for a
+            // multi-window object is real CPU on whatever thread runs it —
+            // and it touches no store connection, so leaving it out here put
+            // it somewhere §10's checker cannot see.
+            let mut carried = std::mem::replace(&mut out.proven, Proven::none(root, size));
+            out.proven = crate::blocking::offload(move || {
+                let proven =
+                    store.write_proof(&root, size, &for_store, level, &encoded, now_ns())?;
+                carried.absorb(proven)?;
+                Ok(carried)
             })
             .await?;
             out.served = out.served.union(&served);
-            out.proven.absorb(proven)?;
         }
         Ok(())
     }

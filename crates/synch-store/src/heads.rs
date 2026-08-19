@@ -133,9 +133,7 @@ impl Store {
     /// two slots, so a head already being fetched is not fetched again and a
     /// head older than an in-progress target is not adopted.
     pub fn head_floor(&self, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
-        let complete = self.complete_head(origin)?.map(|h| (h.seq, h.root));
-        let pending = self.pending_head(origin)?.map(|h| (h.seq, h.root));
-        Ok(best_floor(complete, pending))
+        head_floor_in(&self.conn(), origin)
     }
 
     /// Every slot for every origin.
@@ -173,13 +171,21 @@ impl Store {
         put_head_in(&conn, slot, head, received_at, verified_at)
     }
 
-    /// Clears a head slot.
-    pub fn clear_head(&self, origin: &OriginId, slot: Slot) -> Result<()> {
-        self.conn().execute(
-            "DELETE FROM heads WHERE origin_id = ?1 AND slot = ?2",
-            params![origin.canonical(), slot.as_str()],
+    /// Restarts the pending slot's staleness clock for an origin.
+    ///
+    /// Called when a fetch commits something, which is the one event that
+    /// distinguishes "this slot is being filled" from "this slot is pinned by a
+    /// head nobody serves". Without it the slot's clock would only ever be set
+    /// when the slot went from empty to occupied, and a trie larger than
+    /// `pending_head_ttl` takes to fetch would be swept mid-transfer.
+    ///
+    /// Returns whether a pending slot was there to touch.
+    pub fn touch_pending(&self, origin: &OriginId, now: i64) -> Result<bool> {
+        let touched = self.conn().execute(
+            "UPDATE heads SET received_at = ?2 WHERE origin_id = ?1 AND slot = 'pending'",
+            params![origin.canonical(), now],
         )?;
-        Ok(())
+        Ok(touched > 0)
     }
 
     /// Clears a head slot only if it still holds `(seq, root)`.
@@ -279,11 +285,7 @@ impl Store {
     /// one thing convergence rests on and may never depend on how many roots
     /// happened to arrive first.
     pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
-        Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
-            params![origin.canonical(), seq as i64],
-            |row| row.get::<_, i64>(0),
-        )? as usize)
+        fork_width_in(&self.conn(), origin, seq)
     }
 
     /// The retained history for an origin, newest first.
@@ -551,9 +553,7 @@ impl Txn<'_> {
     /// acquisitions, two concurrent offers both read the same floor, both
     /// decide they beat it, and the lower one wins the race to the slot.
     pub fn head_floor(&self, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
-        let complete = self.complete_head(origin)?.map(|h| (h.seq, h.root));
-        let pending = self.pending_head(origin)?.map(|h| (h.seq, h.root));
-        Ok(best_floor(complete, pending))
+        head_floor_in(self.conn(), origin)
     }
 
     /// The seq this node's next head for `origin` must carry, read inside the
@@ -596,11 +596,7 @@ impl Txn<'_> {
     /// How many distinct roots this origin has retained at one seq, inside the
     /// transaction. See [`Store::fork_width`].
     pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
-        Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
-            params![origin.canonical(), seq as i64],
-            |row| row.get::<_, i64>(0),
-        )? as usize)
+        fork_width_in(self.conn(), origin, seq)
     }
 
     /// Bounds the retained fork at one seq to `keep` roots, evicting the
@@ -732,12 +728,33 @@ fn put_head_in(
     // domain equal to the type's.
     let seq = i64::try_from(head.seq)
         .map_err(|_| StoreError::column("heads.seq", "past the representable range"))?;
+    // `received_at` on the pending slot ages the *slot*, not the head in it.
+    //
+    // It used to take `excluded.received_at` like every other column, and the
+    // `pending_head_ttl` sweep — §5.2's only time-based escape from a floor
+    // pinned by a head nobody can serve — reads exactly this column. So a
+    // stream of unservable heads reset the clock on every arrival and the sweep
+    // never fired. The other two anti-wedge rules do not cover that case
+    // either: `MAX_UNPRODUCTIVE_ROUNDS` needs a fetch to have been attempted,
+    // and the pending fetch is refused unless some peer advertises the head
+    // complete at or above the pending one; promotion needs the trie. A node
+    // that can be pushed to but cannot dial the origin therefore stayed frozen
+    // at its last complete head for as long as the origin kept publishing.
+    //
+    // Occupying an empty slot starts the clock; adopting a newer head into an
+    // occupied one inherits it; `touch_pending` restarts it when a fetch
+    // actually makes progress, so a large trie that is genuinely arriving is
+    // not swept out from under itself.
     conn.execute(
         "INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(origin_id, slot) DO UPDATE SET
            seq = excluded.seq, root = excluded.root,
-           received_at = excluded.received_at, verified_at = excluded.verified_at",
+           received_at = CASE
+             WHEN excluded.slot = 'pending' THEN heads.received_at
+             ELSE excluded.received_at
+           END,
+           verified_at = excluded.verified_at",
         params![
             head.origin.canonical(),
             slot.as_str(),
@@ -748,6 +765,22 @@ fn put_head_in(
         ],
     )?;
     Ok(())
+}
+
+/// The one implementation behind [`Store::head_floor`] and [`Txn::head_floor`].
+fn head_floor_in(conn: &rusqlite::Connection, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
+    let complete = head_in(conn, origin, Slot::Complete)?.map(|s| (s.head.seq, s.head.root));
+    let pending = head_in(conn, origin, Slot::Pending)?.map(|s| (s.head.seq, s.head.root));
+    Ok(best_floor(complete, pending))
+}
+
+/// The one implementation behind [`Store::fork_width`] and [`Txn::fork_width`].
+fn fork_width_in(conn: &rusqlite::Connection, origin: &OriginId, seq: u64) -> Result<usize> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
+        params![origin.canonical(), seq as i64],
+        |row| row.get::<_, i64>(0),
+    )? as usize)
 }
 
 /// The one implementation behind [`Store::next_own_seq`] and
@@ -1041,7 +1074,13 @@ mod tests {
         let key = SecretKey::generate();
         let h = SignedHead::sign(&key, origin(), 1, Hash::EMPTY, 0);
         store.put_head(Slot::Pending, &h, 0, 0).unwrap();
-        store.clear_head(&origin(), Slot::Pending).unwrap();
+        assert!(!store
+            .clear_head_at(&origin(), Slot::Pending, 1, &Hash([9u8; 32]))
+            .unwrap());
+        assert!(store.pending_head(&origin()).unwrap().is_some());
+        assert!(store
+            .clear_head_at(&origin(), Slot::Pending, 1, &Hash::EMPTY)
+            .unwrap());
         assert_eq!(store.pending_head(&origin()).unwrap(), None);
     }
 }

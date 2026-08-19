@@ -30,6 +30,16 @@ pub struct RoundReport {
     pub unreachable: usize,
 }
 
+/// The shortest gap between two anti-entropy rounds driven by a pushed head.
+///
+/// A round dials every reachable peer, so answering each push with its own
+/// round would let one origin publishing in a burst — an import, a large
+/// rename — turn one node's publishes into a dial storm across the membership.
+/// The bell is coalescing (`notify_waiters` wakes whoever is listening and
+/// keeps nothing), so a burst arriving inside the floor costs one round, not
+/// one per head.
+const REACTIVE_FLOOR: Duration = Duration::from_secs(2);
+
 impl Node {
     /// Runs one `Hello` push-pull exchange with a specific peer.
     ///
@@ -199,18 +209,43 @@ impl Node {
     }
 
     /// Runs the periodic anti-entropy loop until `shutdown` resolves.
+    /// Runs the periodic anti-entropy loop until `shutdown` resolves.
+    ///
+    /// Woken by the clock or by a head landing in the pending slot, whichever
+    /// comes first. The second is what makes reactive push mean anything: a
+    /// pushed head names a root this node has never seen, and adopting it into
+    /// the pending slot is not convergence — nothing a reader looks at moves
+    /// until the trie under it is fetched and the head promotes. Without this
+    /// arm that fetch waited for the next jittered interval, so §5.3's
+    /// sub-second propagation delivered a pointer and the data followed up to
+    /// 45 s later.
     pub async fn run_anti_entropy(&self, shutdown: impl std::future::Future<Output = ()>) {
         let shutdown = std::pin::pin!(shutdown);
         let mut shutdown = shutdown;
+        let pending = self.pending_wake();
+        let mut last = tokio::time::Instant::now() - REACTIVE_FLOOR;
         loop {
             let delay = self.next_aae_delay();
-            tokio::select! {
+            let reason = tokio::select! {
                 _ = &mut shutdown => return,
-                _ = tokio::time::sleep(delay) => {
-                    if let Err(e) = self.anti_entropy_round().await {
-                        tracing::warn!(error = %e, "anti-entropy round failed");
-                    }
+                _ = tokio::time::sleep(delay) => "the interval",
+                _ = pending.notified() => "a pushed head needing its trie",
+            };
+            // A bell that rings inside the floor is answered late rather than
+            // dropped: an origin publishing in a burst pushes once per head,
+            // and each round dials the whole membership. The interval arm is
+            // never delayed by this, because it is already longer.
+            let since = last.elapsed();
+            if since < REACTIVE_FLOOR {
+                tokio::select! {
+                    _ = &mut shutdown => return,
+                    _ = tokio::time::sleep(REACTIVE_FLOOR - since) => {}
                 }
+            }
+            tracing::trace!(reason, "anti-entropy round");
+            last = tokio::time::Instant::now();
+            if let Err(e) = self.anti_entropy_round().await {
+                tracing::warn!(error = %e, "anti-entropy round failed");
             }
         }
     }

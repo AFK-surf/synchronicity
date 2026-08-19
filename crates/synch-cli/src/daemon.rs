@@ -60,21 +60,27 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     println!("control socket: {}", server.endpoint_name());
 
     let control = tokio::spawn(server.run());
-    let aae = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
-        node.run_anti_entropy(shutdown).await
-    });
-    let scanner = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+    let aae = spawn_loop(
+        "anti-entropy",
+        &node,
+        &stop_tx,
+        |node, shutdown| async move { node.run_anti_entropy(shutdown).await },
+    );
+    let scanner = spawn_loop("scanner", &node, &stop_tx, |node, shutdown| async move {
         node.run_scanner(shutdown).await
     });
-    let watcher = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+    let watcher = spawn_loop("watcher", &node, &stop_tx, |node, shutdown| async move {
         node.run_watcher(shutdown).await
     });
-    let maintenance = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
-        node.run_maintenance(shutdown).await
-    });
+    let maintenance = spawn_loop(
+        "maintenance",
+        &node,
+        &stop_tx,
+        |node, shutdown| async move { node.run_maintenance(shutdown).await },
+    );
     // The standing mirror loop: materializes the unified tree whenever it
     // changes, and once at startup (§7.2).
-    let mirrors = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+    let mirrors = spawn_loop("mirrors", &node, &stop_tx, |node, shutdown| async move {
         node.run_mirrors(shutdown).await
     });
     // Membership is only as live as its last validated lookup: without this
@@ -82,7 +88,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // refresh, because `run_maintenance` expires bindings and nothing renews
     // them (§3.2). It also carries the §3.4 unknown-key trigger.
     let dns_resolver = resolver.clone();
-    let dns = spawn_loop(&node, &stop_tx, move |node, shutdown| async move {
+    let dns = spawn_loop("dns", &node, &stop_tx, move |node, shutdown| async move {
         match dns_resolver {
             Some(resolver) => node.run_dns(resolver.as_ref(), shutdown).await,
             None => shutdown.await,
@@ -93,12 +99,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // It shares this process's node, database handle and resolver by
     // construction, because it *is* the daemon (§9.1).
     let cloud_resolver = resolver.clone();
-    let cloud = spawn_loop(&node, &stop_tx, move |node, shutdown| async move {
+    let cloud = spawn_loop("cloud", &node, &stop_tx, move |node, shutdown| async move {
         node.run_cloud(cloud_resolver, shutdown).await
     });
     // What turns the scanner's and the watcher's staged changes into heads: one
     // batch per quiet period or per 1000 entries, whichever comes first (§7.1).
-    let publisher = spawn_loop(&node, &stop_tx, |node, shutdown| async move {
+    let publisher = spawn_loop("publisher", &node, &stop_tx, |node, shutdown| async move {
         node.run_publisher(shutdown).await
     });
 
@@ -128,7 +134,16 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // bounded by the dial timeout and the per-request deadline the network
     // layer applies, so none of them can outlive the stop by more than one
     // request.
-    let _ = tokio::join!(
+    //
+    // The results are read, not discarded. A `JoinError` here means a loop
+    // ended by panicking rather than by the stop signal — which happened at
+    // some earlier and unknown moment, since nothing restarts one and nothing
+    // else inspects the handle. The daemon went on serving without it: with no
+    // publisher nothing is ever published again, with no anti-entropy the node
+    // silently stops converging, and `daemon status` keeps answering. Ending
+    // the process with a message naming the loop is the least this can do, and
+    // the exit status is what a supervisor restarts on.
+    let outcomes = tokio::join!(
         control,
         aae,
         scanner,
@@ -139,6 +154,30 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         mirrors,
         cloud
     );
+    let named: [(&str, bool); 9] = [
+        ("control", outcomes.0.is_err()),
+        ("anti-entropy", outcomes.1.is_err()),
+        ("scanner", outcomes.2.is_err()),
+        ("watcher", outcomes.3.is_err()),
+        ("maintenance", outcomes.4.is_err()),
+        ("publisher", outcomes.5.is_err()),
+        ("dns", outcomes.6.is_err()),
+        ("mirrors", outcomes.7.is_err()),
+        ("cloud", outcomes.8.is_err()),
+    ];
+    let lost: Vec<&str> = named
+        .iter()
+        .filter(|(_, failed)| *failed)
+        .map(|(name, _)| *name)
+        .collect();
+    if !lost.is_empty() {
+        node.shutdown().await?;
+        anyhow::bail!(
+            "the {} loop(s) ended abnormally and this daemon has been running without them; \
+             restart it",
+            lost.join(", ")
+        );
+    }
     node.shutdown().await?;
     Ok(())
 }
@@ -212,6 +251,7 @@ fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::Dnssec
 
 /// Spawns one of the engine's standing loops, wired to the stop broadcast.
 fn spawn_loop<F, Fut>(
+    name: &'static str,
     node: &Node,
     stop: &broadcast::Sender<()>,
     body: F,
@@ -229,7 +269,11 @@ where
                 let _ = rx.recv().await;
             }),
         )
-        .await
+        .await;
+        // Reached only on the stop signal: every body loops until told to
+        // stop. Saying so at the moment it happens is what distinguishes an
+        // orderly end from the panic the join below reports.
+        tracing::debug!(loop_name = name, "standing loop stopped");
     })
 }
 

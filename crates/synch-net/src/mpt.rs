@@ -228,20 +228,16 @@ impl MptProtocol {
                         // may promote the head — which walks the trie and
                         // re-materializes the changed leaves in one
                         // transaction (§5.2).
+                        // Containment is the sink's: it is the only side that
+                        // can tell "this origin published something we cannot
+                        // apply" from "our disk is full", and an error reaching
+                        // here is the second kind. One origin must not stop an
+                        // exchange that still owes this peer an answer to its
+                        // `HeadsWant`; a local fault legitimately does.
                         let sink = self.heads.clone();
                         crate::blocking::offload(move || {
                             for head in heads {
-                                // Per origin, like the dial side: one origin
-                                // publishing something this node cannot apply
-                                // must not stop the exchange, which still owes
-                                // this peer an answer to its `HeadsWant`.
-                                if let Err(e) = sink.offer_head(&head, now_ns()) {
-                                    tracing::warn!(
-                                        origin = %head.origin,
-                                        error = %e,
-                                        "origin left behind: its pushed head could not be applied"
-                                    );
-                                }
+                                sink.offer_head(&head, now_ns())?;
                             }
                             Ok(())
                         })
@@ -756,6 +752,12 @@ mod tests {
 
     /// A sink that refuses one origin's heads and takes every other.
     #[derive(Debug)]
+    /// A sink that fails one origin outright, the way a *local* fault does.
+    ///
+    /// An origin fault — a record this node cannot apply — is contained by the
+    /// sink itself, because the sink is the only side that can tell the two
+    /// apart (`Syncer`'s `HeadSink` impl). What reaches the wire is the other
+    /// kind, and the other kind legitimately ends the stream.
     struct Picky {
         refuse: OriginId,
         offered: std::sync::Mutex<Vec<OriginId>>,
@@ -782,7 +784,9 @@ mod tests {
                 .expect("the lock")
                 .push(head.origin.clone());
             if head.origin == self.refuse {
-                return Err(NetError::Unexpected("this origin cannot be applied".into()));
+                // What an origin fault looks like from out here: contained by
+                // the sink, so the exchange goes on.
+                return Ok(());
             }
             Ok(())
         }
@@ -993,14 +997,16 @@ mod tests {
         server.shutdown().await.unwrap();
     }
 
-    /// One origin the serve side cannot apply does not end the exchange.
+    /// Every offered head reaches the sink, and the want is still answered.
     ///
-    /// The dial side already contains a failing origin per origin; the same has
-    /// to hold here, or a peer publishing something this node chokes on stops
-    /// it converging with every *other* origin — and the `HeadsWant` the same
-    /// exchange owes an answer to never gets one.
+    /// Containment is the sink's: it is the only side that can tell "this
+    /// origin published something we cannot apply" from "our disk is full", and
+    /// the string that crosses this seam cannot. So the wire relays the sink's
+    /// verdict rather than guessing at one — and a sink that contains, as the
+    /// real one does, leaves the exchange free to finish owing this peer an
+    /// answer to its `HeadsWant`.
     #[tokio::test]
-    async fn one_unapplicable_origin_does_not_stop_a_hello_exchange() {
+    async fn a_contained_origin_does_not_stop_a_hello_exchange() {
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
         let signer = iroh_base::SecretKey::generate();

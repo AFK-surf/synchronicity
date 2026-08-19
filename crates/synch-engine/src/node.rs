@@ -90,6 +90,9 @@ struct NodeInner {
     /// complete, a local publish landed, a mirror was added — so the standing
     /// mirror loop materializes it without waiting out its interval (§7.2).
     mirror_wake: Arc<tokio::sync::Notify>,
+    /// Rung when a head lands in the pending slot: its trie has to be fetched
+    /// and only an anti-entropy round does that.
+    pending_wake: Arc<tokio::sync::Notify>,
     /// Serializes mirror passes, whether the standing loop or `synch mirror
     /// sync` asked: two passes over one root would plan against each other's
     /// half-written state.
@@ -331,7 +334,13 @@ impl Node {
         // as the head sink the serve side reconciles through, and it is the
         // same object this node's own rounds dial with.
         let mirror_wake = Arc::new(tokio::sync::Notify::new());
-        let syncer = Syncer::new(store.clone()).on_change(Some(mirror_wake.clone()));
+        // And every head adopted as *pending* rings the anti-entropy loop: its
+        // trie is not here, and until somebody dials for it the head is a
+        // pointer no reading surface follows (§5.3).
+        let pending_wake = Arc::new(tokio::sync::Notify::new());
+        let syncer = Syncer::new(store.clone())
+            .on_change(Some(mirror_wake.clone()))
+            .on_pending(Some(pending_wake.clone()));
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
         let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
@@ -352,6 +361,7 @@ impl Node {
                 dns_resolver: std::sync::Mutex::new(Default::default()),
                 dns_wake,
                 mirror_wake,
+                pending_wake,
                 mirror_lock: tokio::sync::Mutex::new(()),
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
                 cloud: std::sync::Mutex::new(Default::default()),
@@ -635,6 +645,11 @@ impl Node {
     /// The bell that wakes the standing mirror loop (§7.2).
     pub(crate) fn mirror_wake(&self) -> Arc<tokio::sync::Notify> {
         self.inner.mirror_wake.clone()
+    }
+
+    /// The bell a head landing in the pending slot rings (§5.3).
+    pub(crate) fn pending_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.pending_wake.clone()
     }
 
     /// Serializes a mirror pass against every other pass on this node.

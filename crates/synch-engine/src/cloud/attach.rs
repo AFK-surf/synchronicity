@@ -98,7 +98,7 @@ impl Node {
         let mut shutdown = shutdown;
         let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
         loop {
-            let wanted = self.attach_targets();
+            let wanted = self.attach_targets().await;
             running.retain(|domain, task| {
                 let keep = wanted.iter().any(|d| d == domain) && !task.is_finished();
                 if !keep {
@@ -136,11 +136,21 @@ impl Node {
     /// there being no enablement to require. Empty for a node with no
     /// membership domains: there is no apex to take a control plane from, so
     /// there is nothing to discover and nothing to attach to.
-    fn attach_targets(&self) -> Vec<String> {
-        match self.cloud_settings() {
-            Ok(settings) if !settings.disabled => self.domains().unwrap_or_default(),
-            _ => Vec::new(),
-        }
+    ///
+    /// Both reads go over to the blocking pool together: this runs on the
+    /// supervisor's runtime worker once per [`SUPERVISE_INTERVAL`], and a
+    /// `config` read waits on the same connection mutex a publish batch or a GC
+    /// pass holds (§10).
+    async fn attach_targets(&self) -> Vec<String> {
+        let node = self.clone();
+        crate::blocking::offload(move || {
+            Ok(match node.cloud_settings() {
+                Ok(settings) if !settings.disabled => node.domains().unwrap_or_default(),
+                _ => Vec::new(),
+            })
+        })
+        .await
+        .unwrap_or_default()
     }
 }
 
@@ -200,7 +210,11 @@ async fn attach_once(
         .map_err(|e| EngineError::invalid(format!("{url}: {e}")))?;
     let (mut sink, mut stream) = socket.split();
 
-    let held = held_spaces(node)?;
+    // Two store reads, so they go over together (§10).
+    let held = {
+        let node = node.clone();
+        crate::blocking::offload(move || held_spaces(&node)).await?
+    };
     send(
         &mut sink,
         &Up::Hello {
@@ -930,12 +944,22 @@ fn versions_json(set: &VersionSet) -> Vec<VersionJson> {
 }
 
 /// Every version of one path, with its attestors — `synch status` as frames.
+///
+/// Answered on the blocking pool, like every other request below: these run in
+/// tasks spawned onto the daemon's runtime, and the store reads under them wait
+/// on the same connection mutex the publisher and the anti-entropy rounds do
+/// (§10).
 async fn stat(node: &Node, id: u32, space: &str, path: &str) -> Result<Up> {
-    let set = node.versions(space, path)?;
-    Ok(Up::Versions {
-        id,
-        versions: versions_json(&set),
+    let node = node.clone();
+    let (space, path) = (space.to_string(), path.to_string());
+    crate::blocking::offload(move || {
+        let set = node.versions(&space, &path)?;
+        Ok(Up::Versions {
+            id,
+            versions: versions_json(&set),
+        })
     })
+    .await
 }
 
 /// Pins a path to one content root and names who holds it.
@@ -954,34 +978,42 @@ async fn resolve(
         ),
         None => VersionPolicy::Newest,
     };
-    let row = node.resolve(space, path, &policy)?;
-    if row.kind == EntryKind::Tombstone {
-        return Err(EngineError::not_found(format!(
-            "{space}/{path} was deleted at seq {}",
-            row.seq
-        )));
-    }
-    let root = row
-        .content
-        .ok_or_else(|| EngineError::invalid(format!("{space}/{path} selects no content")))?;
-    // Straight out of the replicated `b:` records: a routing hint the control
-    // plane may act on or ignore, never a correctness input.
-    let mut holders: Vec<String> = node
-        .providers_for(&root, 0, row.size.max(1))?
-        .into_iter()
-        .map(|provider| provider.origin.canonical())
-        .collect();
-    if node.store().blob(&root)?.is_some_and(|blob| blob.complete) {
-        holders.push(node.origin().canonical());
-    }
-    Ok(Up::Resolved {
-        id,
-        origin: row.origin.canonical(),
-        root: root.to_hex().to_string(),
-        size: row.size,
-        seq: row.seq,
-        holders,
+    // One hop for the selection, the provider list and the local completeness
+    // check together: they are three reads on the connection the first one
+    // takes, and nothing between them awaits.
+    let node = node.clone();
+    let (space, path) = (space.to_string(), path.to_string());
+    crate::blocking::offload(move || {
+        let row = node.resolve(&space, &path, &policy)?;
+        if row.kind == EntryKind::Tombstone {
+            return Err(EngineError::not_found(format!(
+                "{space}/{path} was deleted at seq {}",
+                row.seq
+            )));
+        }
+        let root = row
+            .content
+            .ok_or_else(|| EngineError::invalid(format!("{space}/{path} selects no content")))?;
+        // Straight out of the replicated `b:` records: a routing hint the
+        // control plane may act on or ignore, never a correctness input.
+        let mut holders: Vec<String> = node
+            .providers_for(&root, 0, row.size.max(1))?
+            .into_iter()
+            .map(|provider| provider.origin.canonical())
+            .collect();
+        if node.store().blob(&root)?.is_some_and(|blob| blob.complete) {
+            holders.push(node.origin().canonical());
+        }
+        Ok(Up::Resolved {
+            id,
+            origin: row.origin.canonical(),
+            root: root.to_hex().to_string(),
+            size: row.size,
+            seq: row.seq,
+            holders,
+        })
     })
+    .await
 }
 
 /// Streams a byte range of a pinned content root under credit flow control.
@@ -1121,8 +1153,9 @@ mod tests {
     /// the request-id multiplexing across LS → RESOLVE → READ → PING. The
     /// attach handshake itself is `attach_once`, tested for its signing bytes
     /// against the control plane's; this covers everything downstream of it.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_answers_ls_resolve_and_read_over_the_wire() {
+        let _blocking = synch_core::BlockingScope::enter();
         let (dir, node) = node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
         // Larger than one chunk, so the CHUNK framing and the multi-chunk
@@ -1252,8 +1285,9 @@ mod tests {
 
     /// No validated record, no connection: a resolver outage degrades the
     /// feature to off, never to "attach somewhere else".
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovery_without_a_resolver_attempts_nothing() {
+        let _blocking = synch_core::BlockingScope::enter();
         let (_d, node) = node().await;
         let e = discover(&node, None, "cluster.example").await.unwrap_err();
         assert!(e.to_string().contains("no DNSSEC resolver"), "{e}");
@@ -1262,25 +1296,27 @@ mod tests {
 
     /// The task list follows the domains without being asked — the feature
     /// needs no enabling — and empties only when the operator opts out.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attach_targets_follow_the_domains_and_the_opt_out() {
+        let _blocking = synch_core::BlockingScope::enter();
         let (_d, node) = node().await;
         // No domains: nothing to attach to, tunnel or no tunnel.
-        assert!(node.attach_targets().is_empty());
+        assert!(node.attach_targets().await.is_empty());
         node.add_domain("cluster.example").unwrap();
-        assert_eq!(node.attach_targets(), ["cluster.example"]);
+        assert_eq!(node.attach_targets().await, ["cluster.example"]);
         node.disable_cloud().unwrap();
-        assert!(node.attach_targets().is_empty());
+        assert!(node.attach_targets().await.is_empty());
         node.enable_cloud().unwrap();
-        assert_eq!(node.attach_targets(), ["cluster.example"]);
+        assert_eq!(node.attach_targets().await, ["cluster.example"]);
         node.shutdown().await.unwrap();
     }
 
     /// A mirror leaves a space as local as a publish root does — its tree and
     /// its bytes are both on this node — so the attach claim names it, and a
     /// mirror-only node is routable for what it mirrors.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_claim_covers_mirrored_spaces_too() {
+        let _blocking = synch_core::BlockingScope::enter();
         let (dir, node) = node().await;
         node.add_space("docs", dir.path().join("docs")).unwrap();
         let mirror = tempfile::tempdir().unwrap();
@@ -1296,8 +1332,9 @@ mod tests {
 
     /// Credit is the whole of the read-ahead bound: with none granted, no
     /// chunk is produced, however much of the object is already local.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_read_produces_nothing_without_credit() {
+        let _blocking = synch_core::BlockingScope::enter();
         let (dir, node) = node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
         let payload = vec![7u8; MAX_CHUNK * 3];
@@ -1370,8 +1407,9 @@ mod tests {
 
     /// A directory view is a fold over the flat tree, and a subdirectory is
     /// one row however many paths sit under it.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_listing_collapses_subdirectories() {
+        let _blocking = synch_core::BlockingScope::enter();
         let (dir, node) = node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
         for path in [
@@ -1413,8 +1451,9 @@ mod tests {
     }
 
     /// Divergence is data the listing carries, not something it resolves.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_listing_reports_every_version_of_a_divergent_path() {
+        let _blocking = synch_core::BlockingScope::enter();
         let (dir, node) = node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
         for (name, content) in [("nas", b"a"), ("laptop", b"b")] {

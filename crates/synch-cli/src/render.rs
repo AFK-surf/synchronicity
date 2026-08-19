@@ -99,17 +99,16 @@ fn version_lines(set: &VersionSet) -> Vec<String> {
         .map(|version| {
             let attestors: Vec<String> = version.attestors.iter().map(|o| o.short()).collect();
             // A content-less kind is identified by its target rather than by
-            // a root (§8), so that is what the line has to show.
+            // a root (§8), so that is what the line has to show. The store
+            // words it; this only shortens a root to fit the column, because a
+            // second copy of the wording is a second copy that drifts — the
+            // two used to say "(unknown target)" and "(unknown)" for the same
+            // thing.
+            let identity = version.identity_text();
             let identity = match version.kind {
-                EntryKind::Tombstone => "(deleted)".to_string(),
-                EntryKind::Symlink => format!(
-                    "-> {}",
-                    version.symlink_target.as_deref().unwrap_or("(unknown)")
-                ),
-                _ => version
-                    .content
-                    .map(|h| h.to_hex()[..16].to_string())
-                    .unwrap_or_else(|| "(no content)".into()),
+                EntryKind::Tombstone | EntryKind::Symlink => identity,
+                _ if version.content.is_some() => identity[..16].to_string(),
+                _ => identity,
             };
             format!(
                 "    {:<18} {:<8} {:>12}  seq {:<6} {}",
