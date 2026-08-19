@@ -375,25 +375,36 @@ impl MptProtocol {
                     // the node genuinely carries it. Without the second half a
                     // scoped peer could name an in-scope node and any value
                     // hash it liked.
-                    let admitted = admit(&store, peer, root, &wants)?;
+                    //
+                    // For an unscoped peer there is nothing to authorize — any
+                    // payload this store holds may go — so it is answered by
+                    // hash exactly as it always was, and the descent that finds
+                    // the holder is not paid for at all.
+                    let holders = match store.scope_for_key(&peer, now_ns())?.is_full() {
+                        true => None,
+                        false => Some(admit(&store, peer, root, &wants)?),
+                    };
                     let mut values = Vec::new();
                     let mut missing = Vec::new();
                     let mut budget = ANSWER_BYTE_BUDGET;
                     // One answer per distinct hash, as `GetNodes` above.
                     let mut answered = std::collections::HashSet::new();
-                    for (holder, wanted) in admitted.into_iter().zip(wants.iter()) {
+                    for (i, wanted) in wants.iter().enumerate() {
                         if !answered.insert(wanted.1) {
                             continue;
                         }
-                        let carried = match holder.map(|h| store.get_node(&h)).transpose()? {
-                            Some(Some(data)) => TrieNode::decode(&data)
-                                .map(|node| node.value_hashes().contains(&wanted.1))
-                                .unwrap_or(false),
-                            _ => false,
-                        };
-                        if !carried {
-                            missing.push(wanted.1);
-                            continue;
+                        if let Some(holders) = &holders {
+                            let carried =
+                                match holders[i].map(|h| store.get_node(&h)).transpose()? {
+                                    Some(Some(data)) => TrieNode::decode(&data)
+                                        .map(|node| node.value_hashes().contains(&wanted.1))
+                                        .unwrap_or(false),
+                                    _ => false,
+                                };
+                            if !carried {
+                                missing.push(wanted.1);
+                                continue;
+                            }
                         }
                         match store.get_value(&wanted.1)? {
                             Some(data) => match budget.checked_sub(data.len()) {
@@ -1273,30 +1284,53 @@ mod tests {
         // (§5.5), so the request has to name real positions in a real trie —
         // and the wants are produced the way a requester produces them, by
         // walking a store that holds the nodes and not yet the payloads.
-        let plant = |store: &synch_store::Store, root: Hash, len: usize, tag: u64| {
-            let mut payload = vec![0u8; len];
-            payload[..8].copy_from_slice(&tag.to_le_bytes());
-            Trie::new(store)
-                .insert(
-                    root,
-                    &synch_core::file_key("s", &tag.to_string()).unwrap(),
-                    &payload,
-                )
-                .unwrap()
-        };
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let payload = |len: usize, tag: u64| {
+            let mut bytes = vec![0u8; len];
+            bytes[..8].copy_from_slice(&tag.to_le_bytes());
+            bytes
+        };
 
-        // A full batch at the value ceiling.
+        // A full batch at the value ceiling, published the ordinary way.
         let mut ceiling_root = Hash::EMPTY;
         for i in 0..MAX_BATCH as u64 {
-            ceiling_root = plant(&store, ceiling_root, synch_core::MAX_TRIE_VALUE_LEN, i);
+            ceiling_root = Trie::new(store.as_ref())
+                .insert(
+                    ceiling_root,
+                    &synch_core::file_key("s", &i.to_string()).unwrap(),
+                    &payload(synch_core::MAX_TRIE_VALUE_LEN, i),
+                )
+                .unwrap();
         }
-        // And three values from before the ceiling, each half the budget.
-        let mut oversized_root = Hash::EMPTY;
-        for i in 0..3u64 {
-            oversized_root = plant(&store, oversized_root, ANSWER_BYTE_BUDGET / 2, 1_000 + i);
+
+        // And three values from before the ceiling, each half the budget. No
+        // `insert` will make one now, which is the point: the nodes are built
+        // by hand, exactly as a store written before `MAX_TRIE_VALUE_LEN`
+        // existed still holds them.
+        let mut children = [None; 16];
+        for (i, slot) in children.iter_mut().take(3).enumerate() {
+            let bytes = payload(ANSWER_BYTE_BUDGET / 2, 1_000 + i as u64);
+            let value = Hash::new(&bytes);
+            synch_mpt::NodeStore::put_value(store.as_ref(), &value, &bytes).unwrap();
+            let leaf = synch_mpt::TrieNode::Leaf {
+                // Odd, so the branch nibble above it makes a whole number of
+                // bytes and the position names a key that could exist.
+                key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2, 3]),
+                value: synch_mpt::ValueRef::Hash(value),
+            };
+            let encoded = leaf.encode();
+            let hash = Hash::new(&encoded);
+            synch_mpt::NodeStore::put_node(store.as_ref(), &hash, &encoded).unwrap();
+            *slot = Some(hash);
         }
+        let root_node = synch_mpt::TrieNode::Branch {
+            children,
+            value: None,
+        };
+        let encoded = root_node.encode();
+        let oversized_root = Hash::new(&encoded);
+        synch_mpt::NodeStore::put_node(store.as_ref(), &oversized_root, &encoded).unwrap();
 
         // The positions a requester would name: every node, none of the values.
         let positions = |root: Hash| -> (tempfile::TempDir, Vec<(Vec<u8>, Hash)>) {

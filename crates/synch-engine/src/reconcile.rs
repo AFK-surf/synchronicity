@@ -190,6 +190,17 @@ type Verdict = (OriginId, u64, Hash, Hash);
 /// correctness rests on the memory.
 const MAX_REFUSED_HEADS: usize = 1024;
 
+/// What one side brings to a `Hello`: its summaries, the scope it will serve
+/// the peer, and the heads it can actually hand over.
+///
+/// Read in one hop off the runtime. Every field is a store read, and §10 puts
+/// those on the blocking pool — the exchange itself then needs no store at all.
+struct Advertisement {
+    summaries: Vec<HeadSummary>,
+    declared: Option<Vec<String>>,
+    servable: Vec<SignedHead>,
+}
+
 impl Syncer {
     /// Binds a syncer to a store.
     pub fn new(store: Arc<Store>) -> Self {
@@ -732,31 +743,30 @@ impl Syncer {
         // Establishing it the first time is a full walk, so it goes off the
         // runtime — as does every batch of the walk below, and every batch of
         // nodes and values committed between the round trips (§10).
-        let reference = {
+        //
+        // The scope comes back with it: everything below is confined to what
+        // this node may read (§5.5) — for a rooted member the whole keyspace
+        // and the walk is unchanged, for a delegated one a stop at the boundary
+        // rather than a request it would be refused — and reading it is a store
+        // read, which belongs on the same hop rather than on the runtime.
+        let (reference, scope) = {
             let store = self.store.clone();
             let origin = origin.clone();
-            let reference_scope = self.store.local_trie_scope()?;
             crate::blocking::offload(move || {
                 let trie = Trie::new(store.as_ref());
-                Ok(match store.complete_head(&origin)? {
+                let scope = store.local_trie_scope()?;
+                let reference = match store.complete_head(&origin)? {
                     // "Held whole" means held whole *within this scope*: the
                     // walk never commits part of a subtree it is inside, so
                     // every boundary it holds is a scope edge and pruning
                     // against it stays sound.
-                    Some(head) if trie.is_complete_scoped(head.root, &reference_scope)? => {
-                        Some(head.root)
-                    }
+                    Some(head) if trie.is_complete_scoped(head.root, &scope)? => Some(head.root),
                     _ => None,
-                })
+                };
+                Ok((reference, scope))
             })
             .await?
         };
-        // Everything below is confined to what this node may read (§5.5). For a
-        // rooted member that is the whole keyspace and the walk is unchanged;
-        // for a delegated one it stops at the boundary rather than asking for
-        // what it would be refused, which is why an out-of-scope request is
-        // evidence of probing rather than of a race.
-        let scope = self.store.local_trie_scope()?;
         let mut walk = synch_mpt::MissingWalk::scoped(reference, pending.root, scope.clone());
         let mut unproductive = 0u32;
         loop {
@@ -990,10 +1000,11 @@ impl Syncer {
     /// exchange with an empty decision, so a recovering node learns how far
     /// peers say its origin had got without adopting anything.
     pub async fn observe_with(&self, client: &MptClient) -> Result<Vec<HeadSummary>> {
-        let ours = self.summaries_off_runtime().await?;
-        let declared = self.declared_scope(client.remote_id())?;
+        let ours = self.summaries_off_runtime(client.remote_id()).await?;
         let exchange = client
-            .head_exchange(ours, declared, |_theirs| (Vec::new(), Vec::new()))
+            .head_exchange(ours.summaries, ours.declared, |_theirs| {
+                (Vec::new(), Vec::new())
+            })
             .await?;
         let syncer = self.clone();
         let peer = client.remote_id();
@@ -1017,27 +1028,40 @@ impl Syncer {
     /// Summarizing asks the trie whether each advertised root is held whole,
     /// which is a walk the first time it is asked of a root (§5.1) — not
     /// something to do on a runtime worker.
-    async fn summaries_off_runtime(&self) -> Result<Vec<HeadSummary>> {
+    async fn summaries_off_runtime(&self, peer: synch_core::NodeId) -> Result<Advertisement> {
         let syncer = self.clone();
-        crate::blocking::offload(move || syncer.local_summaries()).await
+        crate::blocking::offload(move || {
+            Ok(Advertisement {
+                summaries: syncer.local_summaries()?,
+                declared: syncer.declared_scope(peer)?,
+                servable: Vec::new(),
+            })
+        })
+        .await
     }
 
     /// What this node advertises, and the heads it can actually hand over.
     ///
     /// Read together because the push decision needs both and because the
     /// second used to be read from inside the exchange closure, on a runtime
-    /// worker. One walk per unproven root and one query per origin, once.
-    async fn advertisement_off_runtime(&self) -> Result<(Vec<HeadSummary>, Vec<SignedHead>)> {
+    /// worker. One walk per unproven root and one query per origin, once — and
+    /// the scope declaration travels with them for the same reason.
+    async fn advertisement_off_runtime(&self, peer: synch_core::NodeId) -> Result<Advertisement> {
         let syncer = self.clone();
         crate::blocking::offload(move || {
             let summaries = syncer.local_summaries()?;
+            let declared = syncer.declared_scope(peer)?;
             let servable = syncer
                 .store
                 .all_heads(Slot::Complete)?
                 .into_iter()
                 .map(|stored| stored.head)
                 .collect();
-            Ok((summaries, servable))
+            Ok(Advertisement {
+                summaries,
+                declared,
+                servable,
+            })
         })
         .await
     }
@@ -1047,6 +1071,8 @@ impl Syncer {
     /// A dialer declares the scope of the peer it is calling, exactly as a
     /// responder does, so the direction of the dial makes no difference to what
     /// either side may read.
+    ///
+    /// A store read, so it is only ever called from a blocking scope.
     fn declared_scope(&self, peer: synch_core::NodeId) -> Result<Option<Vec<String>>> {
         Ok(self.store.publish_scope_of_key(&peer, now_ns())?)
     }
@@ -1103,10 +1129,13 @@ impl Syncer {
         // the thread the endpoint and every timer in the process share (§10).
         // Nothing about the decision needs the store: it needs the heads, and
         // the heads are already being read.
-        let (ours, servable) = self.advertisement_off_runtime().await?;
+        let Advertisement {
+            summaries: ours,
+            declared,
+            servable,
+        } = self.advertisement_off_runtime(client.remote_id()).await?;
 
         let mut report = SyncReport::default();
-        let declared = self.declared_scope(client.remote_id())?;
         let theirs = client
             .head_exchange(ours.clone(), declared, |theirs| {
                 // Both slots may be advertised per origin, so the comparison is
