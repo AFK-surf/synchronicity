@@ -9,8 +9,6 @@
 //! daemon died mid-publish, and because the publisher restages a failed batch
 //! the next start did it again.
 //!
-//! Every peer-facing walk in this crate had already been converted to a heap
-//! stack for precisely this hazard (`diff_walk`, `collect`, `MissingWalk`).
 //! These run under a stack no larger than the blocking pool's, so a regression
 //! aborts this test rather than passing quietly.
 
@@ -43,60 +41,58 @@ fn nested(levels: usize, leaf: &str) -> Vec<String> {
     keys
 }
 
+/// Insert, read, and remove every key on a blocking-pool-sized stack; the
+/// descent is what overflowed, so reaching the final `Hash::EMPTY` proves the
+/// whole write path survives the depth.
+fn exercise_deep(keys: &[String]) {
+    let store = MemStore::new();
+    let trie = Trie::new(&store);
+    assert!(
+        keys.iter().all(|k| k.len() <= MAX_KEY_LEN),
+        "the corpus stays inside the key bound the API accepts"
+    );
+
+    let mut root = Hash::EMPTY;
+    for key in keys {
+        root = trie.insert(root, key.as_bytes(), b"v").unwrap();
+    }
+    assert_eq!(trie.iter(root).unwrap().len(), keys.len());
+
+    // Reads and removals descend the same depth.
+    for key in keys {
+        assert_eq!(
+            trie.get(root, key.as_bytes()).unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+    for key in keys {
+        root = trie.remove(root, key.as_bytes()).unwrap();
+    }
+    assert_eq!(root, Hash::EMPTY, "removing everything empties the trie");
+}
+
 #[test]
 fn a_deep_tree_inserts_and_removes_without_overflowing() {
-    on_a_blocking_pool_stack(|| {
-        let store = MemStore::new();
-        let trie = Trie::new(&store);
-        let keys = nested(600, "leaf");
-        assert!(
-            keys.iter().all(|k| k.len() <= MAX_KEY_LEN),
-            "the corpus stays inside the key bound the API accepts"
-        );
-
-        let mut root = Hash::EMPTY;
-        for key in &keys {
-            root = trie.insert(root, key.as_bytes(), b"v").unwrap();
-        }
-        assert_eq!(trie.iter(root).unwrap().len(), keys.len());
-
-        // Reads and removals descend the same depth.
-        for key in &keys {
-            assert_eq!(
-                trie.get(root, key.as_bytes()).unwrap().as_deref(),
-                Some(&b"v"[..])
-            );
-        }
-        for key in &keys {
-            root = trie.remove(root, key.as_bytes()).unwrap();
-        }
-        assert_eq!(root, Hash::EMPTY, "removing everything empties the trie");
-    });
+    let keys = nested(600, "leaf");
+    on_a_blocking_pool_stack(move || exercise_deep(&keys));
 }
 
 /// The longest key the API accepts, branching at every nibble — the worst case
 /// the bound permits.
 #[test]
 fn a_maximal_key_depth_inserts_and_removes_without_overflowing() {
-    on_a_blocking_pool_stack(|| {
-        let store = MemStore::new();
-        let trie = Trie::new(&store);
-        // Siblings force a branch node every few bytes, giving ~1 000 branch
-        // levels — twice the depth that used to overflow — without paying for
-        // one at every one of the 4 096 positions.
-        let base = vec![b'a'; MAX_KEY_LEN];
-        let mut root = Hash::EMPTY;
-        for cut in (16..MAX_KEY_LEN).step_by(4) {
+    let base = vec![b'a'; MAX_KEY_LEN];
+    // Siblings force a branch node every few bytes, giving ~1 000 branch
+    // levels — twice the depth that used to overflow — without paying for
+    // one at every one of the 4 096 positions.
+    let mut keys: Vec<String> = (16..MAX_KEY_LEN)
+        .step_by(4)
+        .map(|cut| {
             let mut sib = base[..cut].to_vec();
             sib.push(b'z');
-            root = trie.insert(root, &sib, b"s").unwrap();
-        }
-        root = trie.insert(root, &base, b"deep").unwrap();
-        assert_eq!(
-            trie.get(root, &base).unwrap().as_deref(),
-            Some(&b"deep"[..])
-        );
-        root = trie.remove(root, &base).unwrap();
-        assert_eq!(trie.get(root, &base).unwrap(), None);
-    });
+            String::from_utf8(sib).unwrap()
+        })
+        .collect();
+    keys.push(String::from_utf8(base).unwrap());
+    on_a_blocking_pool_stack(move || exercise_deep(&keys));
 }

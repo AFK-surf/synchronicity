@@ -101,65 +101,56 @@ mod tests {
 
     #[test]
     fn parses_a_full_reference() {
-        let r: EntryRef = "nas@cluster.example:media/talks/keynote.mp4"
-            .parse()
-            .unwrap();
-        assert_eq!(
-            r.origin,
-            Some(OriginId::named("nas", "cluster.example").unwrap())
-        );
-        assert_eq!(r.space, "media");
-        assert_eq!(r.path, "talks/keynote.mp4");
-        assert_eq!(r.render(), "nas@cluster.example:media/talks/keynote.mp4");
-    }
-
-    #[test]
-    fn parses_the_merged_view() {
-        let r: EntryRef = "media/talks".parse().unwrap();
-        assert_eq!(r.origin, None);
-        assert_eq!(r.space, "media");
-        assert_eq!(r.path, "talks");
-        assert_eq!(r.dir_prefix(), "talks/");
-        assert_eq!(r.render(), "media/talks");
-    }
-
-    #[test]
-    fn parses_a_bare_space() {
-        let r: EntryRef = "media".parse().unwrap();
-        assert!(r.is_space_root());
-        assert_eq!(r.dir_prefix(), "");
-        assert_eq!(r.render(), "media");
-    }
-
-    #[test]
-    fn key_origins_keep_their_colon() {
+        // (input, origin, space, path, render). The `key:<z32>` colon boundary
+        // is the case a misparse would misroute every address on.
         let key = iroh_base::SecretKey::generate().public();
-        let text = format!("key:{}:media/a.txt", key.to_z32());
-        let r: EntryRef = text.parse().unwrap();
-        assert_eq!(r.origin, Some(OriginId::Key(key)));
-        assert_eq!(r.space, "media");
-        assert_eq!(r.path, "a.txt");
-        assert_eq!(r.render(), text);
-    }
+        let key_text = format!("key:{}:media/a.txt", key.to_z32());
+        let cases: &[(&str, Option<OriginId>, &str, &str, &str)] = &[
+            (
+                "nas@cluster.example:media/talks/keynote.mp4",
+                Some(OriginId::named("nas", "cluster.example").unwrap()),
+                "media",
+                "talks/keynote.mp4",
+                "nas@cluster.example:media/talks/keynote.mp4",
+            ),
+            ("media/talks", None, "media", "talks", "media/talks"),
+            ("media", None, "media", "", "media"),
+            (
+                &key_text,
+                Some(OriginId::Key(key)),
+                "media",
+                "a.txt",
+                &key_text,
+            ),
+            ("media/talks/", None, "media", "talks", "media/talks"),
+            (
+                "media/cafe\u{0301}.txt",
+                None,
+                "media",
+                "caf\u{00e9}.txt",
+                "media/caf\u{00e9}.txt",
+            ),
+        ];
+        for (input, origin, space, path, render) in cases {
+            let r: EntryRef = input.parse().unwrap();
+            assert_eq!(r.origin.as_ref(), origin.as_ref(), "origin of {input}");
+            assert_eq!(r.space, *space, "space of {input}");
+            assert_eq!(r.path, *path, "path of {input}");
+            assert_eq!(r.render(), *render, "render of {input}");
+        }
+        assert_eq!(
+            "media/talks".parse::<EntryRef>().unwrap().dir_prefix(),
+            "talks/"
+        );
+        assert!("media".parse::<EntryRef>().unwrap().is_space_root());
 
-    #[test]
-    fn trailing_slashes_name_directories() {
-        let r: EntryRef = "media/talks/".parse().unwrap();
-        assert_eq!(r.path, "talks");
-        assert_eq!(r.dir_prefix(), "talks/");
-    }
-
-    #[test]
-    fn paths_are_normalized() {
-        let r: EntryRef = "media/cafe\u{0301}.txt".parse().unwrap();
-        assert_eq!(r.path, "caf\u{00e9}.txt");
-    }
-
-    #[test]
-    fn rejects_bad_references() {
-        assert!("".parse::<EntryRef>().is_err());
-        assert!("media/../escape".parse::<EntryRef>().is_err());
-        assert!("not an origin:media/a".parse::<EntryRef>().is_err());
-        assert!("nas@x.example:/media".parse::<EntryRef>().is_err());
+        for bad in [
+            "",
+            "media/../escape",
+            "not an origin:media/a",
+            "nas@x.example:/media",
+        ] {
+            assert!(bad.parse::<EntryRef>().is_err(), "{bad:?} must be rejected");
+        }
     }
 }

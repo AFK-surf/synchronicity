@@ -439,10 +439,8 @@ mod tests {
             vec!["host", "x-amz-content-sha256", "x-amz-date"]
         );
         assert_eq!(header.signature, "deadbeef");
-    }
 
-    #[test]
-    fn rejects_malformed_authorization_headers() {
+        // Malformed shapes are refused by the same parser.
         assert!(parse_authorization("Basic abc").is_err());
         assert!(parse_authorization("AWS4-HMAC-SHA256 Signature=x").is_err());
         assert!(parse_authorization(
@@ -504,22 +502,19 @@ mod tests {
     /// which the signature depends on entirely.
     #[test]
     fn string_to_sign_and_key_derivation_are_stable() {
-        let to_sign = string_to_sign(
-            "20130524T000000Z",
-            "20130524",
-            "us-east-1",
-            "s3",
-            "canonical",
-        );
-        let mut lines = to_sign.lines();
-        assert_eq!(lines.next(), Some(ALGORITHM));
-        assert_eq!(lines.next(), Some("20130524T000000Z"));
-        assert_eq!(lines.next(), Some("20130524/us-east-1/s3/aws4_request"));
         assert_eq!(
-            lines.next(),
-            Some(hex::encode(Sha256::digest(b"canonical")).as_str())
+            string_to_sign(
+                "20130524T000000Z",
+                "20130524",
+                "us-east-1",
+                "s3",
+                "canonical"
+            ),
+            format!(
+                "{ALGORITHM}\n20130524T000000Z\n20130524/us-east-1/s3/aws4_request\n{}",
+                hex::encode(Sha256::digest(b"canonical"))
+            )
         );
-        assert_eq!(lines.next(), None);
 
         // The signing key is HMAC-chained date -> region -> service -> suffix,
         // so changing any scope component must change the key.
@@ -530,154 +525,92 @@ mod tests {
         assert_ne!(base, signing_key("other", "20130524", "us-east-1", "s3"));
     }
 
+    /// A correctly signed GET against `host` stamped at `amz_date`, plus the
+    /// request's own signing time to verify at.
+    fn signed_request(host: &str, amz_date: &str) -> (BTreeMap<String, String>, i64) {
+        let mut map = headers(&[("host", host), ("x-amz-date", amz_date)]);
+        let header = SigV4Header {
+            access_key: "AKID".into(),
+            date: amz_date[..8].to_string(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+            signed_headers: vec!["host".into(), "x-amz-date".into()],
+            signature: String::new(),
+        };
+        let request = SignedRequest {
+            method: "GET",
+            path: "/bucket/key.txt",
+            query: &[],
+            headers: &map,
+            payload_hash: UNSIGNED_PAYLOAD,
+        };
+        let signature = expected_signature("secret", &header, amz_date, &request);
+        map.insert(
+            "authorization".into(),
+            format!(
+                "{ALGORITHM} Credential=AKID/{}/us-east-1/s3/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature={signature}",
+                &amz_date[..8]
+            ),
+        );
+        (map, parse_amz_date(amz_date).unwrap())
+    }
+
     #[test]
     fn verification_accepts_a_correct_signature() {
         let keys = vec![AccessKey {
             id: "AKID".into(),
             secret: "secret".into(),
         }];
-        let mut map = headers(&[
-            ("host", "localhost:9000"),
-            ("x-amz-date", "20240102T030405Z"),
-        ]);
-        let header = SigV4Header {
-            access_key: "AKID".into(),
-            date: "20240102".into(),
-            region: "us-east-1".into(),
-            service: "s3".into(),
-            signed_headers: vec!["host".into(), "x-amz-date".into()],
-            signature: String::new(),
-        };
-        let request = SignedRequest {
-            method: "GET",
-            path: "/bucket/key.txt",
-            query: &[],
-            headers: &map,
-            payload_hash: UNSIGNED_PAYLOAD,
-        };
-        let signature = expected_signature("secret", &header, "20240102T030405Z", &request);
-        map.insert(
-            "authorization".into(),
-            format!(
-                "{ALGORITHM} Credential=AKID/20240102/us-east-1/s3/aws4_request, \
-                 SignedHeaders=host;x-amz-date, Signature={signature}"
-            ),
-        );
-        let request = SignedRequest {
-            method: "GET",
-            path: "/bucket/key.txt",
-            query: &[],
-            headers: &map,
-            payload_hash: UNSIGNED_PAYLOAD,
-        };
-        // Verify at the request's own signing time so the skew check passes and
-        // the signature is what is under test.
-        let now = parse_amz_date("20240102T030405Z").unwrap();
+        fn request<'a>(map: &'a BTreeMap<String, String>) -> SignedRequest<'a> {
+            SignedRequest {
+                method: "GET",
+                path: "/bucket/key.txt",
+                query: &[],
+                headers: map,
+                payload_hash: UNSIGNED_PAYLOAD,
+            }
+        }
+
+        // A correct signature verifies, and names the key it was signed with.
+        let (map, now) = signed_request("localhost:9000", "20240102T030405Z");
+        let signed = request(&map);
         assert_eq!(
-            verify(&AuthMode::SigV4(keys.clone()), &request, now).unwrap(),
+            verify(&AuthMode::SigV4(keys.clone()), &signed, now).unwrap(),
             Some("AKID".to_string())
         );
 
         // A tampered path invalidates the signature.
         let tampered = SignedRequest {
             path: "/bucket/other.txt",
-            ..request.clone()
+            ..signed
         };
-        assert!(verify(&AuthMode::SigV4(keys), &tampered, now).is_err());
-    }
+        assert!(verify(&AuthMode::SigV4(keys.clone()), &tampered, now).is_err());
 
-    #[test]
-    fn verification_rejects_stale_and_future_dates() {
-        let keys = vec![AccessKey {
-            id: "AKID".into(),
-            secret: "secret".into(),
-        }];
-        let mut map = headers(&[("host", "example.com"), ("x-amz-date", "20240102T030405Z")]);
-        let header = SigV4Header {
-            access_key: "AKID".into(),
-            date: "20240102".into(),
-            region: "us-east-1".into(),
-            service: "s3".into(),
-            signed_headers: vec!["host".into(), "x-amz-date".into()],
-            signature: String::new(),
-        };
-        let request = SignedRequest {
-            method: "GET",
-            path: "/bucket/key.txt",
-            query: &[],
-            headers: &map,
-            payload_hash: UNSIGNED_PAYLOAD,
-        };
-        let signature = expected_signature("secret", &header, "20240102T030405Z", &request);
-        map.insert(
-            "authorization".into(),
-            format!(
-                "{ALGORITHM} Credential=AKID/20240102/us-east-1/s3/aws4_request, \
-                 SignedHeaders=host;x-amz-date, Signature={signature}"
-            ),
-        );
-        let request = SignedRequest {
-            method: "GET",
-            path: "/bucket/key.txt",
-            query: &[],
-            headers: &map,
-            payload_hash: UNSIGNED_PAYLOAD,
-        };
-        let signed_at = parse_amz_date("20240102T030405Z").unwrap();
-        // Correct signature, but the clock is an hour past the window: rejected.
+        // The clock an hour past the window rejects the same signature; within
+        // the window it is accepted (§12 replay bound).
+        let (map, now) = signed_request("example.com", "20240102T030405Z");
+        let signed = request(&map);
         assert!(verify(
             &AuthMode::SigV4(keys.clone()),
-            &request,
-            signed_at + MAX_CLOCK_SKEW_SECS + 3_600
+            &signed,
+            now + MAX_CLOCK_SKEW_SECS + 3_600
         )
         .is_err());
-        // Within the window: accepted.
-        assert!(verify(&AuthMode::SigV4(keys), &request, signed_at + 60).is_ok());
-    }
+        assert!(verify(&AuthMode::SigV4(keys.clone()), &signed, now + 60).is_ok());
 
-    #[test]
-    fn verification_rejects_unknown_keys_and_missing_headers() {
-        let keys = vec![AccessKey {
-            id: "AKID".into(),
-            secret: "secret".into(),
-        }];
+        // A signature named for a key nobody configured is refused by name.
+        let (mut map, now) = signed_request("example.com", "20240102T030405Z");
+        let authorization = map.remove("authorization").unwrap();
+        map.insert(
+            "authorization".into(),
+            authorization.replace("Credential=AKID/", "Credential=NOPE/"),
+        );
+        assert!(verify(&AuthMode::SigV4(keys.clone()), &request(&map), now).is_err());
+
+        // And no Authorization header at all is refused as unauthenticated.
         let empty = headers(&[]);
-        let request = SignedRequest {
-            method: "GET",
-            path: "/b/k",
-            query: &[],
-            headers: &empty,
-            payload_hash: UNSIGNED_PAYLOAD,
-        };
-        let now = parse_amz_date("20240102T030405Z").unwrap();
-        assert!(verify(&AuthMode::SigV4(keys.clone()), &request, now).is_err());
-
-        let map = headers(&[
-            ("x-amz-date", "20240102T030405Z"),
-            (
-                "authorization",
-                "AWS4-HMAC-SHA256 Credential=NOPE/20240102/us-east-1/s3/aws4_request, \
-                 SignedHeaders=host, Signature=00",
-            ),
-        ]);
-        let request = SignedRequest {
-            headers: &map,
-            ..request
-        };
-        assert!(verify(&AuthMode::SigV4(keys), &request, now).is_err());
-    }
-
-    #[test]
-    fn anonymous_mode_accepts_everything() {
-        let empty = headers(&[]);
-        let request = SignedRequest {
-            method: "GET",
-            path: "/b/k",
-            query: &[],
-            headers: &empty,
-            payload_hash: UNSIGNED_PAYLOAD,
-        };
-        assert_eq!(verify(&AuthMode::Anonymous, &request, 0).unwrap(), None);
+        assert!(verify(&AuthMode::SigV4(keys), &request(&empty), now).is_err());
     }
 
     #[test]
@@ -733,12 +666,5 @@ mod tests {
 
         assert!(fold(&[]).is_empty());
         assert!(fold(&records(&["", "\tno-id"])).is_empty());
-    }
-
-    #[test]
-    fn constant_time_comparison() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 }

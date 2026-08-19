@@ -374,22 +374,18 @@ mod tests {
         to_command(&Cli::parse_from(args))
     }
 
-    /// The key is the identity: there is no flag that names a peer, because a
-    /// name belongs to the zone that issues it (§3.2).
+    // The key is the identity: there is no flag that names a peer (§3.2),
+    // and clap refuses the old ones before anything reaches the daemon.
     #[test]
     fn trust_add_takes_a_key_and_nothing_that_names_it() {
         let command =
             command_for(&["synch", "trust", "add", "abc", "--note", "zeynep's laptop"]).unwrap();
-        assert_eq!(
-            command,
-            Cmd::TrustAdd(pb::TrustAdd {
-                key: "abc".into(),
-                note: Some("zeynep's laptop".into()),
-                addr: None,
-            })
-        );
-        // The flags that used to attach a name are not arguments at all now:
-        // clap refuses them before anything reaches the daemon.
+        let Cmd::TrustAdd(pb::TrustAdd { key, note, addr }) = command else {
+            panic!("expected trust add, got {command:?}");
+        };
+        assert_eq!(key, "abc");
+        assert_eq!(note.as_deref(), Some("zeynep's laptop"));
+        assert!(addr.is_none());
         assert!(Cli::try_parse_from(["synch", "trust", "add", "abc", "--as", "nas"]).is_err());
         assert!(Cli::try_parse_from(["synch", "trust", "rebind", "nas", "abc"]).is_err());
     }
@@ -411,15 +407,5 @@ mod tests {
         assert!(config.net.dht);
         assert_eq!(config.net.dht_bootstrap, ["boot.example:6881"]);
         assert!(config.net.dht_publish_direct_addrs);
-
-        let config = node_config(&Cli::parse_from([
-            "synch",
-            "--data-dir",
-            "/tmp/synch-test",
-            "daemon",
-            "run",
-        ]))
-        .unwrap();
-        assert!(!config.net.dht);
     }
 }

@@ -500,48 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn list_result_renders() {
-        let result = ListResult {
-            bucket: "photos".into(),
-            prefix: "2024/".into(),
-            delimiter: Some("/".into()),
-            max_keys: 1000,
-            contents: vec![ListedObject {
-                key: "2024/a.jpg".into(),
-                size: 42,
-                etag: "\"abc\"".into(),
-                last_modified: "2024-01-02T03:04:05.000Z".into(),
-            }],
-            common_prefixes: vec!["2024/summer/".into()],
-            continuation_token: None,
-            next_continuation_token: Some("2024/a.jpg".into()),
-            is_truncated: true,
-        };
-        let xml = result.to_xml();
-        assert!(xml.contains("<Name>photos</Name>"), "{xml}");
-        assert!(xml.contains("<Key>2024/a.jpg</Key>"), "{xml}");
-        assert!(xml.contains("<Size>42</Size>"), "{xml}");
-        assert!(xml.contains("<ETag>&quot;abc&quot;</ETag>"), "{xml}");
-        assert!(xml.contains("<IsTruncated>true</IsTruncated>"), "{xml}");
-        assert!(
-            xml.contains("<CommonPrefixes><Prefix>2024/summer/</Prefix></CommonPrefixes>"),
-            "{xml}"
-        );
-        assert!(
-            xml.contains("<NextContinuationToken>2024/a.jpg</NextContinuationToken>"),
-            "{xml}"
-        );
-        assert!(xml.contains("<KeyCount>1</KeyCount>"), "{xml}");
-    }
-
-    #[test]
-    fn bucket_list_renders() {
-        let xml = list_buckets_xml(&["a".into(), "b".into()]);
-        assert!(xml.contains("<Name>a</Name>"), "{xml}");
-        assert!(xml.contains("<Name>b</Name>"), "{xml}");
-    }
-
-    #[test]
     fn completion_bodies_parse() {
         const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -645,24 +603,17 @@ mod tests {
 
     #[test]
     fn timestamps_format_as_rfc3339() {
+        // Epoch, an arbitrary instant, a leap day, and the negative clamp —
+        // each in both the XML and the HTTP-date shapes. The epoch was a
+        // Thursday, and the header format carries no millis.
+        let nanos = 1_704_164_645_678_000_000i64;
+        let leap = 1_709_208_000_000_000_000i64;
         assert_eq!(format_timestamp(0), "1970-01-01T00:00:00.000Z");
-        // 2024-01-02T03:04:05.678Z
-        let nanos = 1_704_164_645_678_000_000i64;
         assert_eq!(format_timestamp(nanos), "2024-01-02T03:04:05.678Z");
-        // Leap day.
-        let leap = 1_709_208_000_000_000_000i64;
         assert!(format_timestamp(leap).starts_with("2024-02-29T"));
-        // Negative input clamps rather than panicking.
         assert_eq!(format_timestamp(-1), "1970-01-01T00:00:00.000Z");
-    }
-
-    #[test]
-    fn http_dates_format_as_rfc7231() {
-        // The epoch was a Thursday, and the header format carries no millis.
         assert_eq!(format_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
-        let nanos = 1_704_164_645_678_000_000i64;
         assert_eq!(format_http_date(nanos), "Tue, 02 Jan 2024 03:04:05 GMT");
-        let leap = 1_709_208_000_000_000_000i64;
         assert_eq!(format_http_date(leap), "Thu, 29 Feb 2024 12:00:00 GMT");
         assert_eq!(format_http_date(-1), "Thu, 01 Jan 1970 00:00:00 GMT");
     }

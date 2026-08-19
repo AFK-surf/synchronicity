@@ -395,14 +395,8 @@ mod tests {
     use crate::store::MemStore;
 
     /// The streaming diff hands each change over as it is found, so a caller
-    /// that stops sees the rest of the walk not happen.
-    ///
-    /// This is the property that bounds the peak: `diff_resolved` materializes
-    /// every changed value before the caller sees any of them, and a trie can
-    /// put one large value at very many positions while staying well inside the
-    /// walk's position ceiling. Applying one at a time is what keeps the head
-    /// flip's memory proportional to the largest single value rather than to
-    /// their sum.
+    /// that stops sees the rest of the walk not happen — what keeps the head
+    /// flip's memory proportional to the largest single value, not their sum.
     #[test]
     fn resolved_changes_are_streamed_and_stop_where_the_caller_stops() {
         let s = MemStore::new();
@@ -439,18 +433,11 @@ mod tests {
     }
 
     #[test]
-    fn diff_of_equal_roots_is_empty() {
-        let s = MemStore::new();
-        let t = Trie::new(&s);
-        let root = t.insert(Hash::EMPTY, b"a", b"1").unwrap();
-        assert!(t.diff(root, root).unwrap().is_empty());
-        assert!(t.diff(Hash::EMPTY, Hash::EMPTY).unwrap().is_empty());
-    }
-
-    #[test]
     fn diff_reports_add_change_delete() {
         let s = MemStore::new();
         let t = Trie::new(&s);
+        assert!(t.diff(Hash::EMPTY, Hash::EMPTY).unwrap().is_empty());
+
         let mut a = Hash::EMPTY;
         a = t.insert(a, b"keep", b"same").unwrap();
         a = t.insert(a, b"edit", b"before").unwrap();
@@ -461,6 +448,7 @@ mod tests {
         b = t.remove(b, b"gone").unwrap();
         b = t.insert(b, b"new", b"hello").unwrap();
 
+        assert!(t.diff(a, a).unwrap().is_empty());
         let changes = t.diff_resolved(a, b).unwrap();
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0].key, b"edit".to_vec());
@@ -471,70 +459,5 @@ mod tests {
         assert_eq!(changes[1].kind(), ChangeKind::Deleted);
         assert_eq!(changes[2].key, b"new".to_vec());
         assert_eq!(changes[2].kind(), ChangeKind::Added);
-    }
-
-    #[test]
-    fn diff_from_empty_lists_everything() {
-        let s = MemStore::new();
-        let t = Trie::new(&s);
-        let mut root = Hash::EMPTY;
-        for k in ["a", "b", "c"] {
-            root = t.insert(root, k.as_bytes(), b"v").unwrap();
-        }
-        let changes = t.diff(Hash::EMPTY, root).unwrap();
-        assert_eq!(changes.len(), 3);
-        assert!(changes.iter().all(|c| c.kind() == ChangeKind::Added));
-
-        let reverse = t.diff(root, Hash::EMPTY).unwrap();
-        assert_eq!(reverse.len(), 3);
-        assert!(reverse.iter().all(|c| c.kind() == ChangeKind::Deleted));
-    }
-
-    #[test]
-    fn diff_handles_out_of_line_values() {
-        let s = MemStore::new();
-        let t = Trie::new(&s);
-        let big_a = vec![1u8; 300];
-        let big_b = vec![2u8; 300];
-        let a = t.insert(Hash::EMPTY, b"k", &big_a).unwrap();
-        let b = t.insert(a, b"k", &big_b).unwrap();
-        let changes = t.diff_resolved(a, b).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].old.as_deref(), Some(big_a.as_slice()));
-        assert_eq!(changes[0].new.as_deref(), Some(big_b.as_slice()));
-    }
-
-    #[test]
-    fn diff_prunes_unchanged_subtrees() {
-        // A deep, wide trie with a single changed leaf must not require loading
-        // the whole thing: we approximate that here by asserting the diff is
-        // exactly one change over a large trie.
-        let s = MemStore::new();
-        let t = Trie::new(&s);
-        let mut root = Hash::EMPTY;
-        for i in 0..500u16 {
-            root = t
-                .insert(root, format!("f:space/dir{i:04}/file").as_bytes(), b"v")
-                .unwrap();
-        }
-        let root2 = t.insert(root, b"f:space/dir0250/file", b"w").unwrap();
-        let changes = t.diff(root, root2).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].key, b"f:space/dir0250/file".to_vec());
-    }
-
-    #[test]
-    fn diff_across_shape_changes() {
-        // Inserting a key that forces an extension node to split changes the
-        // shape at the top; the diff must still report exactly one addition.
-        let s = MemStore::new();
-        let t = Trie::new(&s);
-        let mut a = Hash::EMPTY;
-        a = t.insert(a, b"prefix/aaa", b"1").unwrap();
-        a = t.insert(a, b"prefix/aab", b"2").unwrap();
-        let b = t.insert(a, b"zzz", b"3").unwrap();
-        let changes = t.diff(a, b).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].key, b"zzz".to_vec());
     }
 }

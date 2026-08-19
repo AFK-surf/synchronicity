@@ -181,71 +181,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_defaults_apply() {
-        let set = IgnoreSet::builtin();
-        assert!(set.is_ignored(".DS_Store", false));
-        assert!(set.is_ignored("photos/.DS_Store", false));
-        assert!(set.is_ignored("notes.txt.swp", false));
-        assert!(set.is_ignored("a/b/Thumbs.db", false));
-        assert!(set.is_ignored(".syncignore", false));
-        assert!(!set.is_ignored("photos/a.jpg", false));
-    }
-
-    #[test]
-    fn anchored_patterns_only_match_at_the_root() {
-        let mut set = IgnoreSet::default();
-        set.extend(["/build"]);
-        assert!(set.is_ignored("build", true));
-        assert!(!set.is_ignored("src/build", true));
-    }
-
-    #[test]
-    fn unanchored_patterns_match_at_any_depth() {
-        let mut set = IgnoreSet::default();
-        set.extend(["target"]);
-        assert!(set.is_ignored("target", true));
-        assert!(set.is_ignored("crates/a/target", true));
-    }
-
-    #[test]
-    fn directory_only_patterns() {
-        let mut set = IgnoreSet::default();
-        set.extend(["cache/"]);
-        assert!(set.is_ignored("cache", true));
-        assert!(!set.is_ignored("cache", false));
-    }
-
-    #[test]
-    fn negation_wins_when_it_comes_later() {
-        let mut set = IgnoreSet::default();
-        set.extend(["*.log", "!keep.log"]);
-        assert!(set.is_ignored("a.log", false));
-        assert!(!set.is_ignored("keep.log", false));
-    }
-
-    #[test]
-    fn double_star_crosses_directories() {
-        let mut set = IgnoreSet::default();
-        set.extend(["/docs/**/draft.md"]);
-        assert!(set.is_ignored("docs/draft.md", false));
-        assert!(set.is_ignored("docs/a/b/draft.md", false));
-        assert!(!set.is_ignored("other/draft.md", false));
-    }
-
-    #[test]
     fn single_star_does_not_cross_directories() {
-        assert!(glob_match("a/*.txt", "a/b.txt"));
-        assert!(!glob_match("a/*.txt", "a/b/c.txt"));
-        assert!(glob_match("?.txt", "a.txt"));
-        assert!(!glob_match("?.txt", "ab.txt"));
-    }
-
-    #[test]
-    fn comments_and_blanks_are_skipped() {
-        let mut set = IgnoreSet::default();
-        set.extend(["", "  ", "# a comment", "real"]);
-        assert!(set.is_ignored("real", false));
-        assert!(!set.is_ignored("# a comment", false));
+        // (patterns, path, is_dir, expected). One row per pattern-semantics
+        // case: `*`/`?` scope, anchoring, directory-only, negation order, `**`,
+        // and blanks/comments.
+        let cases: &[(&[&str], &str, bool, bool)] = &[
+            (&["a/*.txt"], "a/b.txt", false, true),
+            (&["a/*.txt"], "a/b/c.txt", false, false),
+            (&["?.txt"], "a.txt", false, true),
+            (&["?.txt"], "ab.txt", false, false),
+            (&["/build"], "build", true, true),
+            (&["/build"], "src/build", true, false),
+            (&["target"], "target", true, true),
+            (&["target"], "crates/a/target", true, true),
+            (&["cache/"], "cache", true, true),
+            (&["cache/"], "cache", false, false),
+            (&["*.log", "!keep.log"], "a.log", false, true),
+            (&["*.log", "!keep.log"], "keep.log", false, false),
+            (&["/docs/**/draft.md"], "docs/draft.md", false, true),
+            (&["/docs/**/draft.md"], "docs/a/b/draft.md", false, true),
+            (&["/docs/**/draft.md"], "other/draft.md", false, false),
+            (&["", "  ", "# a comment", "real"], "real", false, true),
+            (
+                &["", "  ", "# a comment", "real"],
+                "# a comment",
+                false,
+                false,
+            ),
+        ];
+        for (patterns, path, is_dir, ignored) in cases {
+            let mut set = IgnoreSet::default();
+            set.extend(patterns.iter().copied());
+            assert_eq!(
+                set.is_ignored(path, *is_dir),
+                *ignored,
+                "{patterns:?} on {path}"
+            );
+        }
     }
 
     #[test]
@@ -255,8 +227,13 @@ mod tests {
         let set = IgnoreSet::for_space(dir.path()).unwrap();
         assert!(set.is_ignored("photo.raw", false));
         assert!(!set.is_ignored("important.raw", false));
-        // Built-ins still apply.
+        // Built-ins still compose under the space file (§2.4).
         assert!(set.is_ignored(".DS_Store", false));
+        assert!(set.is_ignored("photos/.DS_Store", false));
+        assert!(set.is_ignored("notes.txt.swp", false));
+        assert!(set.is_ignored("a/b/Thumbs.db", false));
+        assert!(set.is_ignored(".syncignore", false));
+        assert!(!set.is_ignored("photos/a.jpg", false));
     }
 
     /// An absent ignore file is the ordinary case; an unreadable one is not.

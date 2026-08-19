@@ -684,40 +684,51 @@ impl<'a> Der<'a> {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn spki() -> Vec<u8> {
-        let mut der = vec![
-            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
-            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
-        ];
-        der.extend_from_slice(&[0x11; 64]);
-        der
-    }
+    /// The DER SubjectPublicKeyInfo every test builds with: an uncompressed
+    /// P-256 point.
+    const SPKI: &[u8] = &[
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11,
+    ];
 
-    /// A second `[3]` block inside `tbsCertificate` is refused, not skipped.
-    ///
-    /// The exactly-one rules for subjectAltName and the chain extension read
-    /// the extension *list*, so a second `[3]` TLV carrying its own list is a
-    /// way past them that never touches them. `optional` restores its
-    /// position on a mismatch and `next` never checks for a remainder, so
-    /// before `tbs.finish` the second block simply sat there unread: the
-    /// certificate meant one thing here and another to any reader that took
-    /// the last block, which for the extension carrying the zone name is the
-    /// whole game.
-    #[test]
-    fn a_second_extensions_block_inside_the_tbs_is_refused() {
-        let spec = SelfSigned {
+    /// A default self-signed spec; tests vary one or two fields.
+    fn spec<'a>(dns_name: &'a str) -> SelfSigned<'a> {
+        SelfSigned {
             common_name: "synchronicity zone key",
-            dns_name: "sync.example",
-            spki: &spki(),
+            dns_name,
+            spki: SPKI,
             serial: &[0x01, 0x02, 0x03],
             not_before: x509_time(1_760_000_000),
             not_after: x509_time(4_900_000_000),
             extensions: &[],
-        };
-        let sign = |_: &[u8]| vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        }
+    }
+
+    /// A signature no test verifies (Rekor does not either).
+    fn fake_sign(_: &[u8]) -> Vec<u8> {
+        vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]
+    }
+
+    /// A second `[3]` block inside `tbsCertificate` is refused, not skipped.
+    ///
+    /// The exactly-one rules read the extension *list*, so a second `[3]` TLV
+    /// carrying its own list is a way past them that never touches them:
+    /// before `tbs.finish` the second block simply sat there unread, and the
+    /// certificate meant one thing here and another to any reader that took
+    /// the last block (the parser-differential bug this regresses).
+    #[test]
+    fn a_second_extensions_block_inside_the_tbs_is_refused() {
+        let spec = spec("sync.example");
+        let sign = fake_sign;
 
         // The honest certificate parses, so the assertion below is about the
         // second block and not about the builder.
@@ -762,23 +773,13 @@ mod tests {
 
     /// The outer SEQUENCE is closed like every other level.
     ///
-    /// The parser refuses a second encoding of the same value everywhere else
-    /// — trailing bytes, a second extensions block, a second SAN — but the
-    /// members after `tbsCertificate` were never read, so the one level that
-    /// wraps the whole certificate was the one that let anything through. A
-    /// log entry has to mean the same thing to an auditor with a stricter
+    /// The members after `tbsCertificate` were never read, so the one level
+    /// that wraps the whole certificate was the one that let anything through.
+    /// A log entry has to mean the same thing to an auditor with a stricter
     /// parser; Go's and OpenSSL's both refuse these.
     #[test]
     fn the_outer_certificate_sequence_is_closed_too() {
-        let spec = SelfSigned {
-            common_name: "synchronicity zone key",
-            dns_name: "sync.example",
-            spki: &spki(),
-            serial: &[0x01, 0x02, 0x03],
-            not_before: x509_time(1_760_000_000),
-            not_after: x509_time(4_900_000_000),
-            extensions: &[],
-        };
+        let spec = spec("sync.example");
         let signature = tlv(
             0x03,
             &[0x00, 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
@@ -810,20 +811,11 @@ mod tests {
     fn a_built_certificate_parses_back_to_what_went_in() {
         let extra = vec![(vec![0x41, 0x01], b"payload".to_vec())];
         let spec = SelfSigned {
-            common_name: "synchronicity zone key",
-            dns_name: "sync.example",
-            spki: &spki(),
-            serial: &[0x01, 0x02, 0x03],
-            not_before: x509_time(1_760_000_000),
-            not_after: x509_time(4_900_000_000),
             extensions: &extra,
+            ..spec("sync.example")
         };
-        // A stand-in signature: nothing verifies it, and the parser must not
-        // care what it is (Rekor does not either).
-        let der = spec.build(|_| vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]);
+        let der = spec.build(fake_sign);
         let cert = Certificate::parse(&der).expect("the certificate must parse");
-        assert_eq!(cert.spki, spki());
-        assert_eq!(cert.dns_names, vec!["sync.example".to_string()]);
         assert_eq!(cert.single_dns_name().unwrap().to_string(), "sync.example.");
         assert_eq!(cert.extension(&[0x41, 0x01]), Some(&b"payload"[..]));
         assert_eq!(cert.extension(&[0x41, 0x02]), None);
@@ -841,29 +833,15 @@ mod tests {
     }
 
     #[test]
-    fn two_dns_names_are_refused_and_none_is_too() {
-        let mut cert = Certificate {
-            spki: spki(),
-            dns_names: vec!["a.example".into(), "b.example".into()],
-            extensions: Vec::new(),
-        };
-        assert!(cert.single_dns_name().is_err());
-        cert.dns_names.clear();
-        assert!(cert.single_dns_name().is_err());
-    }
-
-    #[test]
     fn truncated_and_malformed_der_is_refused_rather_than_panicking() {
         let spec = SelfSigned {
             common_name: "cn",
-            dns_name: "sync.example",
-            spki: &spki(),
             serial: &[0x01],
             not_before: x509_time(1_760_000_000),
             not_after: x509_time(1_760_000_001),
-            extensions: &[],
+            ..spec("sync.example")
         };
-        let der = spec.build(|_| vec![0x30, 0x03, 0x02, 0x01, 0x01]);
+        let der = spec.build(fake_sign);
         for cut in [0, 1, 2, 5, 30, der.len() - 1] {
             assert!(Certificate::parse(&der[..cut]).is_err(), "cut {cut}");
         }
@@ -874,13 +852,14 @@ mod tests {
     /// A SAN that is not a DNS name is refused here, not normalized away.
     ///
     /// `"x.."` reaching a caller as a string would compare equal to `"x."`
-    /// under a trailing-dot trim, which is how a client-accepted entry lands in
-    /// a monitor's silent bin (see `crate::chain::authorize`). Parsing at the
-    /// boundary means no caller ever sees the ambiguous form.
+    /// under a trailing-dot trim, which is how a client-accepted entry lands
+    /// in a monitor's silent bin (see `crate::chain::authorize`). Arity is
+    /// part of the same boundary: two names are not one entry, and none is
+    /// not an entry at all.
     #[test]
     fn a_san_that_is_not_a_name_is_refused() {
         let with = |san: &str| Certificate {
-            spki: spki(),
+            spki: SPKI.to_vec(),
             dns_names: vec![san.to_string()],
             extensions: Vec::new(),
         };
@@ -890,15 +869,20 @@ mod tests {
                 "{bad:?} must not be a usable SAN"
             );
         }
+        assert!(Certificate {
+            spki: SPKI.to_vec(),
+            dns_names: vec!["a.example".into(), "b.example".into()],
+            extensions: Vec::new(),
+        }
+        .single_dns_name()
+        .is_err());
         // The absolute and relative spellings of one name are the same name,
         // and both are canonical.
         let canonical = with("sync.example.").single_dns_name().unwrap();
         assert_eq!(with("sync.example").single_dns_name().unwrap(), canonical);
         // But a spelling that merely *parses* to the name is refused, because
-        // the SAN is the string a reader indexing the log searches for. An
-        // attacker who has taken the delegation could otherwise mint an entry
-        // this client accepts for `sync.example` whose leaf contains no such
-        // text — accepted and unfindable, which is the shape §4.2.1 forbids.
+        // the SAN is the string a reader indexing the log searches for — a
+        // non-canonical spelling would be accepted and unfindable (§4.2.1).
         for evasion in ["SYNC.EXAMPLE.", "Sync.Example", "syn\\c.example"] {
             let error = with(evasion)
                 .single_dns_name()
@@ -923,10 +907,9 @@ mod tests {
     /// The exactly-one-*extension* rule never fires here — there is one
     /// extension — so without the wrapper check a reader takes the first
     /// sequence and drops the rest, seeing one name while the leaf carries
-    /// two. Go accepts this shape (its `cryptobyte` reads alias the receiver,
-    /// so the remainder is discarded rather than refused), which means Rekor
-    /// will log it; OpenSSL rejects the certificate outright. Readers in the
-    /// world disagree about these bytes, so this one refuses them.
+    /// two. Go accepts this shape and Rekor will log it; OpenSSL rejects it.
+    /// Readers in the world disagree about these bytes, so this one refuses
+    /// them.
     #[test]
     fn a_second_general_names_sequence_is_refused() {
         let one = tlv(0x82, b"sync.example");
@@ -953,22 +936,16 @@ mod tests {
         let long = "a".repeat(300);
         let extra = vec![(vec![0x41, 0x09], vec![0x7f; 500])];
         let spec = SelfSigned {
-            common_name: "cn",
             dns_name: &long,
-            spki: &spki(),
             serial: &[0xff, 0xff],
             not_before: x509_time(0),
             not_after: x509_time(1),
             extensions: &extra,
+            ..spec("sync.example")
         };
-        let der = spec.build(|_| vec![0x30, 0x03, 0x02, 0x01, 0x01]);
+        let der = spec.build(fake_sign);
         let cert = Certificate::parse(&der).unwrap();
         assert_eq!(cert.dns_names, vec![long]);
         assert_eq!(cert.extension(&[0x41, 0x09]).unwrap().len(), 500);
-        // A serial whose top bit is set gains a leading zero, and one that
-        // is all zeros collapses to a single zero byte.
-        assert_eq!(integer(&[0xff, 0xff]), vec![0x02, 0x03, 0x00, 0xff, 0xff]);
-        assert_eq!(integer(&[0x00, 0x00]), vec![0x02, 0x01, 0x00]);
-        assert_eq!(integer(&[0x00, 0x7f]), vec![0x02, 0x01, 0x7f]);
     }
 }

@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# The shared in-memory tlog-tiles log fixture (`crate::testsupport`). Test
+# machinery: it has no place in a shipped binary and no business being part of
+# this crate's stable surface. Enabled below as a dev-dependency on this same
+# crate, which is how both integration tests and this crate's own unit tests
+# reach it.
+testsupport = []
+
 [dependencies]
 base64.workspace = true
 clap.workspace = true
@@ -25,6 +33,8 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# This crate's own tests need the fixture; production builds do not.
+synch-monitor = { path = ".", features = ["testsupport"] }
 # The simulated zone/log harness, for tests only.
 synch-net = { workspace = true, features = ["sim"] }
 tempfile.workspace = true

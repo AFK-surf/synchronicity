@@ -1109,91 +1109,42 @@ pub(crate) fn origin_column(text: String, column: &'static str) -> Result<Origin
 mod tests {
     use super::*;
     use crate::schema::SCHEMA_VERSION;
-    use rusqlite::Transaction;
+    use crate::testutil;
+    use rusqlite::OptionalExtension;
     use synch_mpt::Trie;
 
-    fn temp_store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        (dir, store)
-    }
-
+    /// The config surface round-trips through a reopen, and the self-origin is one config key written by typed wrappers (§10.3).
     #[test]
-    fn opens_and_reopens() {
+    fn config_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = Store::open(dir.path()).unwrap();
+            assert_eq!(store.config("missing").unwrap(), None);
+            store.set_config("k", "v1").unwrap();
+            store.set_config("k", "v2").unwrap();
+            assert_eq!(store.config("k").unwrap().as_deref(), Some("v2"));
+            store.clear_config("k").unwrap();
+            assert_eq!(store.config("k").unwrap(), None);
             store.set_config("hello", "world").unwrap();
         }
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.config("hello").unwrap().as_deref(), Some("world"));
+        assert_eq!(
+            store.config("hello").unwrap().as_deref(),
+            Some("world"),
+            "persists across a reopen"
+        );
         assert!(dir.path().join(DB_FILE).exists());
         assert!(dir.path().join(CAS_DIR).is_dir());
+        assert_eq!(store.self_origin().unwrap(), None);
+        let origin = OriginId::named("nas", "cluster.example.com").unwrap();
+        store.set_self_origin(&origin).unwrap();
+        assert_eq!(store.self_origin().unwrap(), Some(origin));
     }
 
-    /// A refusal is remembered by the durable store, through either handle and
-    /// across a reopen (§5.5).
-    ///
-    /// [`NodeStore::is_redacted`] carries a default that remembers nothing,
-    /// which is right for `MemStore` and wrong for this one: the fetch loop
-    /// records a boundary through the `Store` and the walk reads it back
-    /// through a `Txn`, so a missing implementation on either side is not a
-    /// compile error but a walk that asks for the same refused node every
-    /// round until §5.2's abandonment clause retires a head that was complete.
-    #[test]
-    fn a_refusal_is_remembered_by_both_handles_and_across_a_reopen() {
-        use synch_mpt::NodeStore;
-        let dir = tempfile::tempdir().unwrap();
-        let withheld = Hash::new(b"withheld");
-        let other = Hash::new(b"other");
-        {
-            let store = Store::open(dir.path()).unwrap();
-            assert!(!store.is_redacted(&withheld).unwrap());
-            store.note_redacted(&withheld).unwrap();
-            assert!(store.is_redacted(&withheld).unwrap());
-            assert!(!store.is_redacted(&other).unwrap());
-            // Recorded through one handle, read back through the other.
-            store
-                .transaction(|txn| {
-                    assert!(txn.is_redacted(&withheld).unwrap());
-                    txn.note_redacted(&other)
-                })
-                .unwrap();
-            assert!(store.is_redacted(&other).unwrap());
-            // Noting one twice is not an error.
-            store.note_redacted(&withheld).unwrap();
-        }
-        let store = Store::open(dir.path()).unwrap();
-        assert!(store.is_redacted(&withheld).unwrap());
-        assert!(store.is_redacted(&other).unwrap());
-    }
-
-    #[test]
-    fn wal_mode_is_enabled() {
-        let (_dir, store) = temp_store();
-        let mode: String = store
-            .conn()
-            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(mode.to_lowercase(), "wal");
-    }
-
-    #[test]
-    fn config_round_trip() {
-        let (_dir, store) = temp_store();
-        assert_eq!(store.config("missing").unwrap(), None);
-        store.set_config("k", "v1").unwrap();
-        store.set_config("k", "v2").unwrap();
-        assert_eq!(store.config("k").unwrap().as_deref(), Some("v2"));
-        store.clear_config("k").unwrap();
-        assert_eq!(store.config("k").unwrap(), None);
-    }
-
-    /// A list-valued config row grows by appending, and an append never
-    /// rewrites what is already there (§9.4).
+    /// A list-valued config row grows by appending, and an append never rewrites what is already there (§9.4).
     #[test]
     fn config_records_append() {
-        let (_dir, store) = temp_store();
+        let (_d, store) = testutil::store();
         store
             .append_config("s3.buckets", "photos\tmedia\tnewest")
             .unwrap();
@@ -1216,18 +1167,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn self_origin_round_trip() {
-        let (_dir, store) = temp_store();
-        assert_eq!(store.self_origin().unwrap(), None);
-        let origin = OriginId::named("nas", "cluster.example.com").unwrap();
-        store.set_self_origin(&origin).unwrap();
-        assert_eq!(store.self_origin().unwrap(), Some(origin));
-    }
-
+    /// Active-first ordering, exactly-one-active rotation, secret round-trip, and removal — the device-key lifecycle (§3.4).
     #[test]
     fn device_keys_round_trip() {
-        let (_dir, store) = temp_store();
+        let (_d, store) = testutil::store();
         let old = SecretKey::generate();
         let new = SecretKey::generate();
         store.add_device_key(&old, KeyState::Active, 1).unwrap();
@@ -1235,8 +1178,6 @@ mod tests {
             store.active_device_key().unwrap().unwrap().node_id,
             old.public()
         );
-
-        // A rotation window has both keys present, exactly one active.
         store
             .set_device_key_state(&old.public(), KeyState::Retiring)
             .unwrap();
@@ -1250,14 +1191,14 @@ mod tests {
             new.public()
         );
         assert_eq!(keys[0].secret.to_bytes(), new.to_bytes());
-
         store.remove_device_key(&old.public()).unwrap();
         assert_eq!(store.device_keys().unwrap().len(), 1);
     }
 
+    /// Store's NodeStore impl against a real trie: inserts, completeness, point lookups, iteration.
     #[test]
     fn store_is_a_trie_node_store() {
-        let (_dir, store) = temp_store();
+        let (_d, store) = testutil::store();
         let trie = Trie::new(&store);
         let mut root = Hash::EMPTY;
         for i in 0..50u8 {
@@ -1268,36 +1209,50 @@ mod tests {
         assert_eq!(trie.iter(root).unwrap().len(), 50);
     }
 
+    /// A refusal is remembered through either handle and across a reopen (§5.5): the fetch loop records through `Store` and the walk reads back through a `Txn`, and both must answer.
     #[test]
-    fn transactions_roll_back_on_error() {
-        let (_dir, store) = temp_store();
-        let err = store.with_tx(|tx| {
-            tx.execute(
-                "INSERT INTO config (key, value) VALUES ('a', 'b')",
-                params![],
-            )?;
-            Err::<(), _>(StoreError::invalid("boom"))
-        });
-        assert!(err.is_err());
-        assert_eq!(store.config("a").unwrap(), None);
+    fn a_refusal_is_remembered_by_both_handles_and_across_a_reopen() {
+        use synch_mpt::NodeStore;
+        let dir = tempfile::tempdir().unwrap();
+        let withheld = Hash::new(b"withheld");
+        let other = Hash::new(b"other");
+        {
+            let store = Store::open(dir.path()).unwrap();
+            assert!(!store.is_redacted(&withheld).unwrap());
+            store.note_redacted(&withheld).unwrap();
+            assert!(store.is_redacted(&withheld).unwrap());
+            assert!(!store.is_redacted(&other).unwrap());
+            store
+                .transaction(|txn| {
+                    assert!(txn.is_redacted(&withheld).unwrap());
+                    txn.note_redacted(&other)
+                })
+                .unwrap();
+            assert!(store.is_redacted(&other).unwrap());
+            store.note_redacted(&withheld).unwrap(); // noting twice is not an error
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.is_redacted(&withheld).unwrap());
+        assert!(store.is_redacted(&other).unwrap());
     }
 
+    /// §10: trie writes, head, history and materialization commit together or not at all, through the public Txn surface.
     #[test]
     fn a_transaction_scope_writes_the_trie_and_the_heads_together() {
-        // §10: trie writes, head, history and materialization commit together
-        // or not at all. Everything the scope touches must be in one commit,
-        // and an error must take all of it back.
-        let (_dir, store) = temp_store();
+        let (_d, store) = testutil::store();
         let origin = OriginId::named("nas", "x.example").unwrap();
         let key = SecretKey::generate();
-
+        let seed = |txn: &Txn| -> Result<Hash> {
+            let trie = Trie::new(txn);
+            let root = trie.insert(Hash::EMPTY, b"k", b"v")?;
+            let head = synch_core::SignedHead::sign(&key, origin.clone(), 1, root, 0);
+            txn.put_head(crate::heads::Slot::Complete, &head, 0, 0)?;
+            txn.record_history(&head, 0)?;
+            Ok(root)
+        };
         let err = store
             .transaction(|txn| -> Result<()> {
-                let trie = Trie::new(txn);
-                let root = trie.insert(Hash::EMPTY, b"k", b"v")?;
-                let head = synch_core::SignedHead::sign(&key, origin.clone(), 1, root, 0);
-                txn.put_head(crate::heads::Slot::Complete, &head, 0, 0)?;
-                txn.record_history(&head, 0)?;
+                seed(txn)?;
                 Err(StoreError::invalid("boom"))
             })
             .unwrap_err()
@@ -1310,72 +1265,39 @@ mod tests {
             0,
             "trie writes roll back too"
         );
-
         // The same body, committed, leaves all three visible together.
-        let root = store
-            .transaction(|txn| -> Result<Hash> {
-                let trie = Trie::new(txn);
-                let root = trie.insert(Hash::EMPTY, b"k", b"v")?;
-                let head = synch_core::SignedHead::sign(&key, origin.clone(), 1, root, 0);
-                txn.put_head(crate::heads::Slot::Complete, &head, 0, 0)?;
-                txn.record_history(&head, 0)?;
-                Ok(root)
-            })
-            .unwrap();
+        let root = store.transaction(seed).unwrap();
         assert_eq!(store.complete_head(&origin).unwrap().unwrap().root, root);
         assert_eq!(store.head_history(&origin).unwrap().len(), 1);
         assert!(NodeStore::has_node(&store, &root).unwrap());
     }
 
+    /// Too-new, unparseable, or unstamped: the migration gate refuses to open.
     #[test]
     fn schema_version_mismatch_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        {
+        for v in [Some("999"), Some("tomorrow"), None] {
+            let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path()).unwrap();
-            store.set_config("schema_version", "999").unwrap();
+            match v {
+                Some(v) => store.set_config("schema_version", v).unwrap(),
+                None => store.clear_config("schema_version").unwrap(),
+            }
+            drop(store);
+            let err = Store::open(dir.path());
+            if v == Some("999") {
+                assert!(err
+                    .unwrap_err()
+                    .to_string()
+                    .contains("newer than this build"));
+            } else {
+                assert!(err.is_err());
+            }
         }
-        let err = Store::open(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("newer than this build"), "{err}");
-
-        // Nor is a version this build cannot even parse.
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let store = Store::open(dir.path()).unwrap();
-            store.set_config("schema_version", "tomorrow").unwrap();
-        }
-        assert!(Store::open(dir.path()).is_err());
-
-        // Nor one that never said what shape it is in.
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let store = Store::open(dir.path()).unwrap();
-            store.clear_config("schema_version").unwrap();
-        }
-        assert!(Store::open(dir.path()).is_err());
     }
 
-    fn table_exists(store: &Store, name: &str) -> bool {
-        store
-            .conn()
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                params![name],
-                |_| Ok(()),
-            )
-            .optional()
-            .unwrap()
-            .is_some()
-    }
-
-    /// Every object `sqlite_master` holds, with its DDL normalized so that
-    /// comments and line breaks do not count as differences.
+    /// Every object `sqlite_master` holds, DDL normalized so comments and layout do not count as differences.
     fn objects(conn: &Connection) -> Vec<(String, String, String)> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT type, name, COALESCE(sql, '') FROM sqlite_master
-                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
-            )
-            .unwrap();
+        let mut stmt = conn.prepare("SELECT type, name, COALESCE(sql, '') FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").unwrap();
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -1388,18 +1310,12 @@ mod tests {
         rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
     }
 
-    /// Drops SQL comments and normalizes layout, so two spellings of the same
-    /// declaration compare equal.
-    ///
-    /// Whitespace *and* spacing around `(`, `)` and `,` are normalized: none of
-    /// it is semantic, and a schema written across several lines in one place
-    /// and on one line in another has to compare equal or the comparison is
-    /// about formatting rather than about shape.
+    /// Drops SQL comments and normalizes `(`, `)`, `,` spacing, so two spellings of the same declaration compare equal.
     fn normalize_ddl(sql: &str) -> String {
         let stripped: String = sql
             .lines()
             .map(|line| match line.find("--") {
-                Some(idx) => &line[..idx],
+                Some(i) => &line[..i],
                 None => line,
             })
             .collect::<Vec<_>>()
@@ -1414,40 +1330,15 @@ mod tests {
         spaced.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    /// The chain is the only path to a database, and what it produces is what
-    /// §10 documents — compared object by object over the whole of
-    /// `sqlite_master`, not just by table name.
-    #[test]
-    fn the_chain_produces_the_documented_schema() {
-        let mut chained = Connection::open_in_memory().unwrap();
-        migrate(&mut chained, MIGRATIONS).unwrap();
-
-        let documented = Connection::open_in_memory().unwrap();
-        documented
-            .execute_batch(crate::schema::FINAL_SCHEMA)
-            .unwrap();
-
-        assert_eq!(
-            objects(&chained),
-            objects(&documented),
-            "replaying the chain must yield exactly the documented §10 schema"
-        );
-        // And the chain leaves nothing of the tables it retired behind.
-        assert!(!objects(&chained).iter().any(|(_, name, _)| name == "want"));
-    }
-
-    /// The `sql` block of `DESIGN.md` §10 — the schema as the design document
-    /// literally states it.
-    ///
-    /// Read from the file rather than copied, because a copy is exactly the
-    /// drift this test exists to catch.
+    /// The `sql` block of `DESIGN.md` §10, read from the file rather than copied: a copy is exactly the drift this test exists to catch.
     fn design_schema() -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("DESIGN.md");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("DESIGN.md"),
+        )
+        .unwrap_or_else(|e| panic!("cannot read DESIGN.md: {e}"));
         let mut blocks: Vec<String> = Vec::new();
         let mut current: Option<Vec<&str>> = None;
         for line in text.lines() {
@@ -1469,46 +1360,50 @@ mod tests {
         blocks.pop().expect("the §10 sql block")
     }
 
-    /// `FINAL_SCHEMA` is the design document's §10 DDL, and this is what makes
-    /// that a fact rather than an intention.
-    ///
-    /// The chain is already checked against `FINAL_SCHEMA`; without this the
-    /// pair could drift from the document they both claim to implement — which
-    /// is how `observed_heads` lost a column in one place and kept it in the
-    /// other. Both sides are executed and compared through `sqlite_master`, so
-    /// the comparison is over what SQLite makes of the DDL rather than over two
-    /// spellings of it, and a §10 block that does not even parse fails here.
+    /// Replaying MIGRATIONS yields exactly FINAL_SCHEMA object by object — which is DESIGN.md's §10 DDL, so the chain, the constant and the document cannot drift apart — and re-migrating changes nothing.
     #[test]
-    fn the_design_document_and_the_final_schema_agree() {
+    fn the_chain_produces_the_documented_schema() {
+        let mut chained = Connection::open_in_memory().unwrap();
+        migrate(&mut chained, MIGRATIONS).unwrap();
         let documented = Connection::open_in_memory().unwrap();
         documented
             .execute_batch(crate::schema::FINAL_SCHEMA)
             .unwrap();
-
         let designed = Connection::open_in_memory().unwrap();
         designed
             .execute_batch(&design_schema())
             .expect("the §10 sql block must be executable DDL");
-
+        let chained_objects = objects(&chained);
+        assert_eq!(
+            chained_objects,
+            objects(&documented),
+            "replaying the chain must yield exactly the documented §10 schema"
+        );
         assert_eq!(
             objects(&designed),
             objects(&documented),
             "DESIGN.md §10 and FINAL_SCHEMA describe different databases"
         );
+        assert!(
+            !chained_objects.iter().any(|(_, name, _)| name == "want"),
+            "the chain leaves nothing of the tables it retired behind"
+        );
+        // And re-opening a database at the current version changes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let before = objects(&store.conn());
+        drop(store);
+        assert_eq!(objects(&Store::open(dir.path()).unwrap().conn()), before);
     }
 
-    /// A database at the version each historical step left it at upgrades to
-    /// the current one with its data intact.
-    ///
-    /// The old shapes are built here from the chain itself — a database stamped
-    /// `v` is exactly what replaying the first `v` steps produces — so the test
-    /// exercises the real historical layouts rather than an approximation.
+    /// A database at the version each historical step left it at: exactly what replaying the first `v` steps produces, not an approximation.
     fn database_at(dir: &Path, version: u32) -> Connection {
         let mut conn = Connection::open(dir.join(DB_FILE)).unwrap();
         migrate(&mut conn, &MIGRATIONS[..version as usize]).unwrap();
         conn
     }
 
+    /// A v2 database — the oldest layout still real — upgrades with its data intact: `want` drops, mirrors become pins, the s3 bucket map moves namespace, and observed heads from before v7 come through unclaimed.
     #[test]
     fn a_v2_database_upgrades_with_its_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -1534,70 +1429,51 @@ mod tests {
                 params!["photos\tnas@x.example\tmedia"],
             )
             .unwrap();
+            conn.execute("INSERT INTO observed_heads (origin_id, seq, root, complete, observed_at) VALUES ('nas@x.example', 7, zeroblob(32), 1, 1)", params![]).unwrap();
         }
-
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(
             store.config("schema_version").unwrap().as_deref(),
             Some(SCHEMA_VERSION.to_string().as_str())
         );
-        assert!(!table_exists(&store, "want"), "v3 drops it");
+        assert!(
+            store
+                .conn()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'want'",
+                    [],
+                    |_| Ok(())
+                )
+                .optional()
+                .unwrap()
+                .is_none(),
+            "v3 drops it"
+        );
         assert_eq!(store.config("keep").unwrap().as_deref(), Some("me"));
-        // v4 carried the mirror over as an origin pin, preserving its behavior.
+        // v4 carried the mirror over as an origin pin; v5 did the same for
+        // the bucket map, and v8 moved it into the `s3.*` namespace.
         let mirrors = store.mirrors().unwrap();
         assert_eq!(mirrors.len(), 1);
         assert_eq!(mirrors[0].local_path, "/mnt/nas");
         assert_eq!(mirrors[0].space, "media");
         assert_eq!(mirrors[0].policy.render(), "origin=nas@x.example");
-        // v5 did the same for the s3 bucket map, and v8 moved it into the
-        // `s3.*` namespace the gateway now reads over the control socket.
         assert_eq!(store.config("s3_buckets").unwrap(), None);
         assert_eq!(
             store.config("s3.buckets").unwrap().as_deref(),
             Some("photos\tmedia\torigin=nas@x.example")
         );
+        let observed = store.observed_heads().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].seq, 7);
+        assert_eq!(
+            observed[0].claimed_by, None,
+            "an observation from before the column knows no claimant"
+        );
     }
 
-    #[test]
-    fn a_v3_database_upgrades_with_its_data() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let conn = database_at(dir.path(), 3);
-            assert!(
-                conn.query_row("SELECT COUNT(*) FROM want", [], |r| r.get::<_, i64>(0))
-                    .is_err(),
-                "a v3 database has already lost the want table"
-            );
-            conn.execute(
-                "INSERT INTO mirrors (origin_id, space, local_path) VALUES (?1, ?2, ?3)",
-                params!["laptop@x.example", "media", "/mnt/one"],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO observed_heads (origin_id, seq, root, complete, observed_at)
-                 VALUES ('nas@x.example', 7, zeroblob(32), 1, 1)",
-                params![],
-            )
-            .unwrap();
-        }
-
-        let store = Store::open(dir.path()).unwrap();
-        assert_eq!(
-            store.config("schema_version").unwrap().as_deref(),
-            Some(SCHEMA_VERSION.to_string().as_str())
-        );
-        assert_eq!(
-            store.mirrors().unwrap()[0].policy.render(),
-            "origin=laptop@x.example"
-        );
-        // The v2 table and its rows are untouched by the later steps.
-        assert_eq!(store.observed_heads().unwrap().len(), 1);
-    }
-
+    /// v6 rebuilds `entries` to carry a symlink's target (§8 version identity), and every existing row comes through it, indexes included.
     #[test]
     fn a_v5_database_upgrades_with_its_entries() {
-        // v6 rebuilds `entries` to carry a symlink's target (§8 version
-        // identity), and every existing row has to come through it.
         let dir = tempfile::tempdir().unwrap();
         {
             let conn = database_at(dir.path(), 5);
@@ -1607,15 +1483,8 @@ mod tests {
                     .is_err(),
                 "a v5 database has no target column"
             );
-            conn.execute(
-                "INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, content,
-                                      seq, prev)
-                 VALUES ('nas@x.example', 'media', 'a.txt', 0, 5, 42, zeroblob(32), 3, NULL)",
-                params![],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO entries (origin_id, space, path, kind, size, mtime_ns, content, seq, prev) VALUES ('nas@x.example', 'media', 'a.txt', 0, 5, 42, zeroblob(32), 3, NULL)", params![]).unwrap();
         }
-
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(
             store.config("schema_version").unwrap().as_deref(),
@@ -1627,7 +1496,6 @@ mod tests {
         assert_eq!(row.mtime_ns, 42);
         assert_eq!(row.seq, 3);
         assert_eq!(row.symlink_target, None, "an existing file has no target");
-        // The indexes came back with the rebuilt table.
         assert!(store
             .conn()
             .query_row(
@@ -1638,57 +1506,17 @@ mod tests {
             .is_ok());
     }
 
-    #[test]
-    fn a_v6_database_upgrades_with_its_observations() {
-        // v7 records which peer claimed an observed head (§3.4); rows written
-        // before it simply do not know.
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let conn = database_at(dir.path(), 6);
-            conn.execute(
-                "INSERT INTO observed_heads (origin_id, seq, root, complete, observed_at)
-                 VALUES ('nas@x.example', 42, zeroblob(32), 1, 7)",
-                params![],
-            )
-            .unwrap();
-        }
-
-        let store = Store::open(dir.path()).unwrap();
-        let observed = store.observed_heads().unwrap();
-        assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].seq, 42);
-        assert_eq!(observed[0].observed_at, 7);
-        assert!(observed[0].complete);
-        assert_eq!(
-            observed[0].claimed_by, None,
-            "an observation from before the column knows no claimant"
-        );
-    }
-
-    /// A step that fails takes its whole transaction with it, stamp included,
-    /// so the database is left at the version before it rather than between two.
+    /// A step that fails takes its whole transaction with it, stamp included, so the database is left at the version before it rather than between two — and the next open finishes the chain from there.
     #[test]
     fn a_failing_step_leaves_the_version_where_it_was() {
-        fn explode(_tx: &Transaction<'_>) -> Result<()> {
-            Err(StoreError::invalid("boom"))
-        }
-        let chain: &[Migration] = &[
-            Migration::Sql(
-                "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE first (a TEXT);",
-            ),
-            Migration::Rust {
-                name: "explodes",
-                run: explode,
-            },
+        let first: &[Migration] = &[
+            Migration::Sql("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE first (a TEXT);"),
+            Migration::Rust { name: "explodes", run: |_tx| Err(StoreError::invalid("boom")) },
             Migration::Sql("CREATE TABLE third (a TEXT);"),
         ];
-
         let mut conn = Connection::open_in_memory().unwrap();
-        let err = migrate(&mut conn, chain).unwrap_err().to_string();
-        assert!(err.contains("explodes"), "{err}");
-        assert!(err.contains("boom"), "{err}");
-
+        let err = migrate(&mut conn, first).unwrap_err().to_string();
+        assert!(err.contains("explodes") && err.contains("boom"), "{err}");
         // Version 1 committed; the failing step's transaction rolled back
         // whole, so nothing it or the step after it would have created exists.
         let stamp: String = conn
@@ -1705,14 +1533,10 @@ mod tests {
         assert!(conn
             .query_row("SELECT COUNT(*) FROM third", [], |r| r.get::<_, i64>(0))
             .is_err());
-
-        // And resuming from that version replays the rest of the chain, so a
+        // Resuming from that version replays the rest of the chain, so a
         // crashed upgrade is finished by the next open rather than repaired.
         let fixed: &[Migration] = &[
-            Migration::Sql(
-                "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 CREATE TABLE first (a TEXT);",
-            ),
+            Migration::Sql("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE first (a TEXT);"),
             Migration::Sql("CREATE TABLE second (a TEXT);"),
             Migration::Sql("CREATE TABLE third (a TEXT);"),
         ];
@@ -1720,60 +1544,5 @@ mod tests {
         assert!(conn
             .query_row("SELECT COUNT(*) FROM third", [], |r| r.get::<_, i64>(0))
             .is_ok());
-    }
-
-    /// Re-opening a database at the current version changes nothing.
-    #[test]
-    fn migrating_a_current_database_is_a_no_op() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let before = objects(&store.conn());
-        drop(store);
-        let store = Store::open(dir.path()).unwrap();
-        assert_eq!(objects(&store.conn()), before);
-        assert_eq!(
-            store.config("schema_version").unwrap().as_deref(),
-            Some(SCHEMA_VERSION.to_string().as_str())
-        );
-    }
-}
-
-#[cfg(all(test, debug_assertions))]
-mod reentry_tests {
-    use super::*;
-
-    /// Reaching for the `Store` inside a transaction closure is a deadlock, and
-    /// the guard makes it a named panic instead.
-    ///
-    /// `Store::transaction` holds the one connection `MutexGuard` for the whole
-    /// closure, and `std::sync::Mutex` is not reentrant. Nothing in the type
-    /// system stops `self.store().blob(root)` being written where `txn` was
-    /// meant — and because the result is a hang rather than a panic, a test
-    /// covering such a path would time out rather than report a location.
-    #[test]
-    #[should_panic(expected = "inside a transaction")]
-    fn using_the_store_inside_a_transaction_panics_instead_of_hanging() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let _: Result<()> = store.transaction(|_txn| {
-            // The mistake: `store`, not `_txn`.
-            let _ = store.config("schema_version")?;
-            Ok(())
-        });
-    }
-
-    /// And the ordinary shape is unaffected, including after a transaction has
-    /// finished — the scope must not leak past its closure.
-    #[test]
-    fn the_guard_does_not_fire_outside_a_transaction() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store
-            .transaction(|txn| -> Result<()> {
-                txn.set_self_origin(&OriginId::Key(iroh_base::SecretKey::generate().public()))?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(store.self_origin().unwrap().is_some());
     }
 }

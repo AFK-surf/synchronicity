@@ -144,25 +144,24 @@ mod tests {
                 },
             ],
         };
-        let der = chain.encode();
-        assert_eq!(DnssecChain::decode(&der).unwrap(), chain);
-        // The apex comes first and the root last; a decoder that sorted or
+        // The apex comes first and the root last: a decoder that sorted or
         // reversed would still round-trip a one-link chain, so assert three.
+        let der = chain.encode();
         let back = DnssecChain::decode(&der).unwrap();
+        assert_eq!(back, chain);
         assert_eq!(back.links[0].zone, "sync.example.");
         assert_eq!(back.links[2].zone, ".");
 
-        // Trailing bytes are a second encoding of the same value, which is
-        // exactly what a decoder must never accept.
+        // Trailing bytes and truncation are a second encoding of the same
+        // value, which is exactly what a decoder must never accept.
         let mut extra = der.clone();
         extra.push(0);
         assert!(DnssecChain::decode(&extra).is_err());
         assert!(DnssecChain::decode(&der[..der.len() - 1]).is_err());
         assert!(DnssecChain::decode(&[]).is_err());
 
-        // An empty chain is representable — a chainless retire says so by
-        // omitting the extension, not by carrying an empty one, but the codec
-        // must not lose the distinction.
+        // An empty chain is representable — a chainless retire omits the
+        // extension, so the codec must not lose the distinction.
         let empty = DnssecChain::default();
         assert_eq!(DnssecChain::decode(&empty.encode()).unwrap(), empty);
     }
@@ -171,54 +170,29 @@ mod tests {
     ///
     /// Go's `encoding/asn1` — and therefore Rekor's `x509.ParseCertificate`,
     /// and therefore Rekor — rejects any OID component that overflows
-    /// `int32`. An arc that violates this makes the log refuse the whole
-    /// submission with an opaque `400 invalid hashedrekord request`, and
-    /// nothing local catches it: OpenSSL and Erlang's `public_key` both parse
-    /// the wide form happily, which is why the original 128-bit UUID arcs
-    /// passed every test in this repo and still could not be published.
-    ///
-    /// So the constraint is asserted here rather than only written in a
-    /// comment. If this test fails, the fix is a *narrower* arc, never a
-    /// wider parser.
+    /// `int32`; OpenSSL and Erlang parse the wide form happily, which is how
+    /// the original 128-bit UUID arcs passed every test in this repo and
+    /// still could not be published. If this fails, the fix is a *narrower*
+    /// arc, never a wider parser.
     #[test]
     fn the_oid_arc_fits_in_an_int32_because_go_rejects_anything_larger() {
-        /// Decodes `2.<second> [.<arc>]*` from an OID's DER content bytes.
-        fn arcs(oid: &[u8]) -> Vec<u128> {
-            let (first, rest) = oid.split_first().expect("a non-empty OID");
-            let mut out = vec![(first / 40) as u128, (first % 40) as u128];
-            let mut acc: u128 = 0;
-            for byte in rest {
-                acc = acc << 7 | u128::from(byte & 0x7f);
-                if byte & 0x80 == 0 {
-                    out.push(acc);
-                    acc = 0;
-                }
-            }
-            assert_eq!(acc, 0, "the OID ends mid-component");
-            out
-        }
-
-        // One extension, so this reads as a check on a constant rather than
-        // a loop over a family. Make it a loop if a second is ever added —
-        // the rule is about every arc, not about this one.
-        let arcs = arcs(OID_DNSSEC_CHAIN);
-        assert_eq!(arcs[0], 2, "DNSSEC chain: not under the UUID arc");
-        assert_eq!(arcs[1], 25, "DNSSEC chain: not under the UUID arc");
-        assert_eq!(arcs.len(), 3, "expected exactly one arc under 2.25");
-        assert_eq!(arcs[2], 1_555_716_359, "the DNSSEC chain arc changed");
-        assert!(
-            arcs[2] <= i32::MAX as u128,
-            "arc {} overflows int32 — Rekor's Go parser will refuse the \
-             certificate and the log will reject the entry",
-            arcs[2]
-        );
-
-        // The arc really is the first four bytes of its UUID, masked to 31
-        // bits — the derivation, so a future edit cannot quietly pick a new
-        // number and keep the comment.
+        // 2.25.1555716359, DER content bytes: the first packs `2.25`
+        // (40 * 2 + 25), the rest is the arc in base-128 continuation form.
         assert_eq!(
-            u128::from(u32::from_be_bytes([0xdc, 0xba, 0x59, 0x07]) & 0x7fff_ffff),
-            1_555_716_359
+            OID_DNSSEC_CHAIN,
+            &[0x69, 0x85, 0xe5, 0xe9, 0xb2, 0x07],
+            "the DNSSEC chain OID changed"
+        );
+        assert_eq!(OID_DNSSEC_CHAIN[0], 40 * 2 + 25);
+        // The arc is the first four bytes of its UUID, masked to 31 bits —
+        // the derivation, so a future edit cannot quietly pick a new number
+        // and keep the comment.
+        let arc = u128::from(u32::from_be_bytes([0xdc, 0xba, 0x59, 0x07]) & 0x7fff_ffff);
+        assert_eq!(arc, 1_555_716_359);
+        assert!(
+            arc <= i32::MAX as u128,
+            "the arc must fit int32 — Rekor's Go parser will refuse the \
+             certificate and the log will reject the entry"
         );
     }
 }

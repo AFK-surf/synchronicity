@@ -1324,16 +1324,7 @@ fn compute_outboard(data: impl Read, tree: BaoTree, outboard: &mut [u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(dir.path()).unwrap();
-        (dir, s)
-    }
-
-    fn data(n: usize) -> Vec<u8> {
-        (0..n).map(|i| (i * 31 + 7) as u8).collect()
-    }
+    use crate::testutil::{data, store};
 
     #[test]
     fn root_matches_plain_blake3() {
@@ -1350,27 +1341,22 @@ mod tests {
     }
 
     #[test]
-    fn small_blobs_are_inlined() {
+    fn small_blobs_are_inlined_and_large_ones_go_to_the_filesystem() {
         let (_d, store) = store();
-        let bytes = data(100);
-        let root = store.ingest_bytes(&bytes, 0).unwrap();
-        let row = store.blob(&root).unwrap().unwrap();
-        assert!(row.inline.is_some());
-        assert!(row.complete);
-        assert!(!store.blob_path(&root).exists());
-        assert_eq!(store.read_all(&root).unwrap(), bytes);
-    }
-
-    #[test]
-    fn large_blobs_go_to_the_filesystem() {
-        let (_d, store) = store();
-        let bytes = data(200_000);
-        let root = store.ingest_bytes(&bytes, 0).unwrap();
-        let row = store.blob(&root).unwrap().unwrap();
-        assert!(row.inline.is_none());
-        assert!(store.blob_path(&root).exists());
-        assert!(store.outboard_path(&root).exists());
-        assert_eq!(store.read_all(&root).unwrap(), bytes);
+        for (size, inline) in [(0usize, true), (100, true), (200_000, false)] {
+            let bytes = data(size);
+            let root = store.ingest_bytes(&bytes, 0).unwrap();
+            let row = store.blob(&root).unwrap().unwrap();
+            assert_eq!(row.inline.is_some(), inline, "size {size}");
+            assert!(row.complete);
+            assert_eq!(store.blob_path(&root).exists(), !inline, "size {size}");
+            assert_eq!(store.outboard_path(&root).exists(), !inline, "size {size}");
+            assert_eq!(store.read_all(&root).unwrap(), bytes);
+            assert_eq!(root.as_bytes(), blake3::hash(&bytes).as_bytes());
+        }
+        // An empty object advertises a complete ad like any other.
+        let root = store.ingest_bytes(b"", 0).unwrap();
+        assert!(store.local_ad(&root).unwrap().unwrap().is_complete());
     }
 
     #[test]
@@ -1456,8 +1442,11 @@ mod tests {
             &bytes[6 * 16384..6 * 16384 + 100]
         );
         assert!(fetcher.read_range(&root, 0, 100).is_err());
+        let all = ChunkRanges::single(0, group_count(size));
+        let (_, served) = fetcher.encode_slice(&root, &all).unwrap();
+        assert_eq!(served, first, "a partial holder reports only what it had");
 
-        let rest = ChunkRanges::single(0, group_count(size)).difference(&first);
+        let rest = all.difference(&first);
         let (encoded, served) = provider.encode_slice(&root, &rest).unwrap();
         fetcher
             .write_slice(&root, size, &served, &encoded, 0)
@@ -1465,26 +1454,6 @@ mod tests {
         let row = fetcher.blob(&root).unwrap().unwrap();
         assert!(row.complete);
         assert_eq!(fetcher.read_all(&root).unwrap(), bytes);
-    }
-
-    #[test]
-    fn slice_from_a_partial_holder_reports_what_it_had() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let bytes = data(300_000);
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        let size = bytes.len() as u64;
-
-        let half = ChunkRanges::single(0, 8);
-        let (encoded, served) = provider.encode_slice(&root, &half).unwrap();
-        fetcher
-            .write_slice(&root, size, &served, &encoded, 0)
-            .unwrap();
-
-        // Asking the partial holder for everything yields only what it has.
-        let all = ChunkRanges::single(0, group_count(size));
-        let (_, served) = fetcher.encode_slice(&root, &all).unwrap();
-        assert_eq!(served, half);
     }
 
     #[test]
@@ -1508,30 +1477,23 @@ mod tests {
             .blob(&root)
             .unwrap()
             .is_none_or(|r| r.verified_groups().is_empty()));
-    }
 
-    #[test]
-    fn a_slice_for_the_wrong_root_is_rejected() {
-        let (_d1, provider) = store();
-        let (_d2, fetcher) = store();
-        let bytes = data(300_000);
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        let ranges = ChunkRanges::single(0, 4);
+        // A slice built for another root is refused the same way, and commits
+        // nothing under the wrong name either.
         let (encoded, served) = provider.encode_slice(&root, &ranges).unwrap();
-
         let wrong = Hash::new(b"not the object");
         assert!(matches!(
-            fetcher.write_slice(&wrong, bytes.len() as u64, &served, &encoded, 0),
+            fetcher.write_slice(&wrong, size, &served, &encoded, 0),
             Err(StoreError::Verification { .. })
         ));
+        assert!(fetcher.blob(&wrong).unwrap().is_none());
     }
 
     #[test]
     fn a_slice_is_clamped_to_one_window() {
-        // The encoding is built in memory and travels in one frame, so what a
-        // peer asks for cannot decide how much a provider allocates: a request
-        // for everything is answered with the first window and a `served` that
-        // says so, which is where the requester's next window starts.
+        // The encoding is built in memory and travels in one frame, so a
+        // request for everything is answered with the first window and a
+        // `served` saying where the requester's next window starts (§12).
         let (_d, provider) = store();
         let bytes = data((synch_core::MAX_SLICE_GROUPS as usize + 200) * 16384);
         let root = provider.ingest_bytes(&bytes, 0).unwrap();
@@ -1560,10 +1522,9 @@ mod tests {
         let root = provider.ingest_bytes(&bytes, 0).unwrap();
         assert!(provider.local_ad(&root).unwrap().unwrap().is_complete());
 
-        // A slice window is 8 MiB and an ad span is 16 MiB, so the first window
-        // alone advertises *nothing*: spans round inward, and a holder that
-        // reported the granule it is halfway through would be claiming bytes it
-        // cannot serve (`coalesce_spans`).
+        // An ad span is 16 MiB and a slice window 8, so the first window
+        // advertises nothing: spans round inward rather than claiming a
+        // granule the holder is halfway through (`coalesce_spans`).
         let groups_per_span = g / CHUNK_GROUP_SIZE;
         let mut want = ChunkRanges::single(0, groups_per_span);
         let mut windows = 0;
@@ -1603,18 +1564,9 @@ mod tests {
     }
 
     /// Re-ingesting content already held complete never leaves the outboard
-    /// truncated, because it is staged and renamed rather than written in
-    /// place.
-    ///
-    /// `write_and_sync` used to `File::create` the outboard — which truncates —
-    /// on a path that may already describe a complete object. Re-ingesting held
-    /// content is routine (a duplicate file in a scanned tree, the scanner's
-    /// racily-clean re-ingest, an explicit re-`put`), so a power loss inside
-    /// that write left `complete = 1` beside a short outboard: still
-    /// advertised, unreadable, unreclaimable, and never re-verified. This
-    /// asserts the invariant the rename buys — the file is never observably
-    /// shorter than a whole outboard — and that the object still reads after a
-    /// second ingest.
+    /// truncated: it is staged and renamed rather than written in place, so a
+    /// power loss inside the write cannot shorten a file that describes a
+    /// complete object.
     #[test]
     fn re_ingesting_held_content_never_truncates_the_outboard() {
         let (dir, store) = store();
@@ -1657,15 +1609,10 @@ mod tests {
         ));
     }
 
-    /// Two writers filling one object keep both halves of what they wrote.
-    ///
-    /// The same content root is reached by more than one path at once as a
-    /// matter of course — a mirror pass, a `synch cat`, the gateway's range
-    /// read — and each commits the groups it verified. Read the bitmap, union,
-    /// write it back as three separate statements and the later write erases
-    /// the earlier one's bits: harmless, since the bytes are on the disk either
-    /// way and bits only ever grow, but the groups it dropped are fetched all
-    /// over again, and a promotion's share of that loss is a whole span.
+    /// Two writers filling one object keep both halves of what they wrote: a
+    /// read-union-write of the verified bitmap drops the earlier writer's bits
+    /// — harmless bytes-wise, but the dropped groups are fetched all over
+    /// again, and a promotion's share of that loss is a whole span.
     #[test]
     fn concurrent_commits_of_disjoint_groups_keep_both() {
         let (_d, store) = store();
@@ -1690,19 +1637,10 @@ mod tests {
         }
     }
 
-    /// A size claim racing a commit that completes the object never wins.
-    ///
-    /// Whether a claimed length may stand is a read of the row followed by a
-    /// write of it, and a committer deciding on a snapshot taken before it did
-    /// its work loses the race. Two writers of one root — the honest one
-    /// finishing the object, the other carrying an entry's overstatement of it
-    /// — each look, each see a row no group attested to yet, and each go ahead;
-    /// whichever commits second writes its size over the other's. When that is
-    /// the claim, the row ends `complete` under a length no byte on
-    /// the disk supports: attested from then on, so `read_all` failed, every
-    /// honest writer was refused "size mismatch" for good, and the entry that
-    /// named the root kept the collector off it. Now the decision is made inside
-    /// the transaction that records it, so the loser is always the claim.
+    /// A size claim racing a commit that completes the object never wins: the
+    /// decision is made inside the transaction that records it, so a claim
+    /// decided on an earlier snapshot can never leave its size on a completed
+    /// row.
     #[test]
     fn a_size_claim_racing_a_completing_commit_never_wins() {
         let (_d, store) = store();
@@ -1736,19 +1674,10 @@ mod tests {
         }
     }
 
-    /// A peer that understates an object's size cannot destroy bytes this node
-    /// has already verified.
-    ///
-    /// The claim arrives before the decode that would disprove it, so
-    /// `set_len`-ing the payload to it on the way past would truncate verified
-    /// bytes: a node holding group 5 of a nine-group object, met by an entry
-    /// claiming three groups, loses group 5's bytes while its bitmap bit
-    /// survives. The row then advertises a group the node cannot serve, every
-    /// read of it fails with an unexpected end of file, every later fetch skips
-    /// it as already held, and nothing short of deleting the object recovers.
-    /// Nothing is
-    /// resized on the strength of a size nobody has proved — the file only ever
-    /// grows until a commit settles the length (§6.2, `docs/DELTA-SYNC.md` §6).
+    /// A peer that understates an object's size cannot destroy bytes already
+    /// verified: nothing is resized on the strength of a size nobody has
+    /// proved — the file only ever grows until a commit settles the length
+    /// (§6.2, `docs/DELTA-SYNC.md` §6).
     #[test]
     fn an_understated_size_cannot_truncate_groups_already_held() {
         let (_d1, provider) = store();
@@ -1768,9 +1697,8 @@ mod tests {
         );
         let payload_len = std::fs::metadata(victim.blob_path(&root)).unwrap().len();
 
-        // A peer offers a slice of the same root under a three-group size. It
-        // could never verify; what matters is that it is refused before
-        // anything is resized, not after.
+        // A peer offers a slice of the same root under a three-group size; it
+        // must be refused before anything is resized, not after.
         let lie = 3 * CHUNK_GROUP_SIZE;
         let attack = ChunkRanges::single(0, 1);
         assert!(matches!(
@@ -1786,7 +1714,7 @@ mod tests {
         let row = victim.blob(&root).unwrap().unwrap();
         assert_eq!(row.size, size);
         assert_eq!(row.verified_groups(), held);
-        // And the group is still readable, and still servable to somebody else.
+        // The group is still readable, and still servable onward.
         let offset = 5 * CHUNK_GROUP_SIZE;
         assert_eq!(
             victim.read_range(&root, offset, 64).unwrap(),
@@ -1806,11 +1734,8 @@ mod tests {
         assert_eq!(victim.read_all(&root).unwrap(), bytes);
     }
 
-    /// The pre-v10 bitmap describes no more groups than it has bits for.
-    ///
-    /// The group count the v10 migration passes comes from the row's stored
-    /// size, and a partial row's size is whatever the writer claimed; the bits
-    /// are what the row actually carries. Reading past them says nothing, and
+    /// The pre-v10 bitmap describes no more groups than it has bits for: the
+    /// group count the migration passes comes from a size nobody proved, and
     /// the walk is inside the migration transaction, where a long loop is a
     /// daemon that will not start.
     #[test]
@@ -1837,20 +1762,11 @@ mod tests {
         );
     }
 
-    /// A collector cannot unlink the bytes of an object a fetch is writing.
-    ///
-    /// The two agreed about *rows* — every blob row goes through the one
-    /// connection — and not about *bytes*: `write_slice` does all its file IO
-    /// with nothing held and takes the connection only to commit. So
-    /// `delete_blob_if_collectable`, which holds its guard across the unlinks,
-    /// merely forced the writer's commit to land *after* them, leaving a row
-    /// claiming verified groups whose payload is gone: advertised by `local_ad`,
-    /// failing every read, and uncollectable once an entry names it.
-    ///
-    /// Driven by hand rather than by racing threads, because the interleaving is
-    /// the point and a race would only find it sometimes: the sweep runs while a
-    /// lease is held, which is exactly the state a writer is in between its first
-    /// byte and its commit.
+    /// A collector cannot unlink the bytes of an object a fetch is writing:
+    /// the sweep holds its guard across the unlinks, so a writer's commit
+    /// would land after them — a row claiming verified groups whose payload is
+    /// gone. Driven by hand rather than racing, because the interleaving is
+    /// the point and a race would only find it sometimes.
     #[test]
     fn a_sweep_leaves_an_object_a_write_is_in_flight_for() {
         let (_d, store) = store();
@@ -1881,14 +1797,9 @@ mod tests {
     }
 
     /// A lease cannot be taken while a sweep is between its check and its
-    /// unlink.
-    ///
-    /// The sweeps hold the connection guard across that whole window, and
-    /// nothing else on a writer's path from `lease_write` to its first
-    /// `rename` touches the connection — so if the lease were taken on the
-    /// lease map alone, a writer could slip in and have its payload unlinked,
-    /// then commit a row claiming a complete object with no bytes. Asserted as
-    /// the ordering itself, because the interleaving that exposes it is a
+    /// unlink: if it could, a writer would slip in and commit a row claiming a
+    /// complete object whose payload the sweep just unlinked. Asserted as the
+    /// ordering itself, because the interleaving that exposes it is a
     /// microsecond wide and a racing test would find it only sometimes.
     #[test]
     fn a_lease_waits_for_a_sweep_that_is_mid_unlink() {
@@ -1915,34 +1826,10 @@ mod tests {
     }
 
     /// An ingest re-creating content whose old row is collectable keeps its
-    /// bytes.
-    ///
-    /// The one writer the mtime window does not cover. `gc_orphans` skips a
-    /// freshly renamed payload because its mtime is inside the retention
-    /// horizon — but this race is with `gc_content`, which acts on the *old*
-    /// row, whose `last_access` is as old as the retention horizon by
-    /// construction. Between the rename and `write_blob_row` there is a full
-    /// payload fsync and an outboard write, and a collection landing in that
-    /// window unlinks the bytes the row is about to call complete: `local_ad`
-    /// then advertises an object every read fails on, and nothing ever
-    /// reclaims it, because the entry the scan publishes keeps the row alive.
-    ///
-    /// Threaded rather than hand-driven, because the window only exists inside
-    /// `ingest_file` and there is no seam to stop it at.
-    ///
-    /// The collector samples `is_being_written` rather than simply hammering the
-    /// sweep, because hammering cannot see this: the first call collects the old
-    /// row and every later one finds nothing to collect, so the sweep is spent
-    /// before the window it is supposed to land in even opens.
-    ///
-    /// It therefore has to catch the window, and `observed` is what makes the
-    /// test mean anything — without the lease it stays false, because
-    /// `is_being_written` is precisely what the lease provides. What made this
-    /// flaky on a fast SSD was not the sampling but the start: `thread::spawn`
-    /// returns before the new thread runs, so a 32 MiB ingest could finish
-    /// before the collector was first scheduled, and the run failed for missing
-    /// the window rather than for the defect. The handshake below fixes that —
-    /// the ingest does not begin until the collector is already spinning.
+    /// bytes: between the rename and the row write there is a window a
+    /// `gc_content` pass could unlink the payload in. Threaded with a
+    /// handshake, because the window only exists inside `ingest_file` and the
+    /// collector must be spinning before the ingest begins.
     #[test]
     fn an_ingest_that_recreates_a_collectable_object_keeps_its_bytes() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2005,12 +1892,10 @@ mod tests {
         assert_eq!(store.read_all(&root).unwrap(), payload);
     }
 
-    /// A write that resumes into a stale payload keeps it.
-    ///
-    /// The mtime test was the whole of the orphan argument, and it was sampled
-    /// before the writer touched the file: `write_slice` opens with
-    /// `truncate(false)` and reuses whatever is there, so for a *resumed* write
-    /// an old reading proves nothing about the present.
+    /// A write that resumes into a stale payload keeps it: `write_slice` opens
+    /// with `truncate(false)` and reuses whatever is there, so an mtime reading
+    /// sampled before the writer touched the file proves nothing about the
+    /// present.
     #[test]
     fn a_resumed_write_is_not_mistaken_for_a_leftover() {
         let (_d, store) = store();

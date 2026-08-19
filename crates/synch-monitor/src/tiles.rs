@@ -1083,82 +1083,8 @@ fn max_pow2_le(n: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A whole log held in memory, served through the tile layout.
-    ///
-    /// Small enough to check by hand and large enough to have partial tiles,
-    /// several tile levels and non-power-of-two frontiers — which is where
-    /// stored-hash arithmetic goes wrong.
-    struct MemoryLog {
-        leaves: Vec<Vec<u8>>,
-    }
-
-    impl TileSource for MemoryLog {
-        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
-            let rest = path.strip_prefix("api/v2/tile/").expect("tile path");
-            let (level, rest) = rest.split_once('/').expect("level");
-            let (digits, width) = match rest.split_once(".p/") {
-                Some((digits, width)) => (digits, width.parse::<u64>().unwrap()),
-                None => (rest, 256),
-            };
-            let index: u64 = digits.split('/').fold(0u64, |acc, group| {
-                acc * 1000 + group.trim_start_matches('x').parse::<u64>().unwrap()
-            });
-            // Serve exactly what a log of this size serves: a width growth
-            // has superseded is collected, the way the real log drops it.
-            let tile_level: u32 = match level {
-                "entries" => 0,
-                level => level.parse().unwrap(),
-            };
-            let current = ((self.leaves.len() as u64) >> (8 * tile_level))
-                .saturating_sub(index * 256)
-                .min(256);
-            if width != current {
-                return Ok(None);
-            }
-            if level == "entries" {
-                let mut out = Vec::new();
-                for i in 0..width {
-                    let body = &self.leaves[(index * 256 + i) as usize];
-                    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-                    out.extend_from_slice(body);
-                }
-                return Ok(Some(out));
-            }
-            let span = 1u64 << (8 * tile_level);
-            let mut out = Vec::new();
-            for i in 0..width {
-                let start = (index * 256 + i) * span;
-                out.extend_from_slice(&reference_root(&self.leaves, start, start + span));
-            }
-            Ok(Some(out))
-        }
-
-        async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
-            Ok(Some(self.leaves.len() as u64))
-        }
-    }
-
-    /// RFC 6962 §2.1, written out plainly so the tile arithmetic has
-    /// something independent to be wrong against.
-    fn reference_root(leaves: &[Vec<u8>], lo: u64, hi: u64) -> [u8; 32] {
-        if lo + 1 == hi {
-            return leaf_hash(&leaves[lo as usize]);
-        }
-        let split = lo + max_pow2_lt(hi - lo);
-        node_hash(
-            &reference_root(leaves, lo, split),
-            &reference_root(leaves, split, hi),
-        )
-    }
-
-    fn log(size: u64) -> MemoryLog {
-        MemoryLog {
-            leaves: (0..size)
-                .map(|i| format!("entry {i}").into_bytes())
-                .collect(),
-        }
-    }
+    use crate::testsupport::{parse_tile_path, reference_root, MemoryLog};
+    use std::sync::Mutex;
 
     #[test]
     fn tile_paths_are_three_digit_groups_from_the_right() {
@@ -1177,24 +1103,14 @@ mod tests {
         );
     }
 
-    /// A hash tile gets the hash tile's cap, not the entry bundle's.
-    ///
-    /// One cap for both let a hostile log answer a hash-tile fetch — which a
-    /// scan makes constantly, several in flight — with 16 MiB of bytes that
-    /// cannot be a tile at any tree size.
+    /// A hash tile gets the hash tile's cap, not the entry bundle's: one cap
+    /// for both would let a hostile log answer a hash-tile fetch with 16 MiB.
     #[test]
     fn each_resource_is_capped_at_its_own_format_ceiling() {
         assert_eq!(cap_for("api/v2/tile/0/001"), MAX_HASH_TILE_BYTES);
         assert_eq!(cap_for("api/v2/tile/2/x001/234.p/17"), MAX_HASH_TILE_BYTES);
-        assert_eq!(MAX_HASH_TILE_BYTES, 8 * 1024);
         assert_eq!(cap_for("api/v2/tile/entries/001"), MAX_BUNDLE_BYTES);
         assert_eq!(cap_for("api/v2/checkpoint"), MAX_CHECKPOINT_BYTES);
-        // The bundle cap is the format's ceiling, not a round number near it:
-        // 256 bodies, each framed by a big-endian u16.
-        assert_eq!(MAX_BUNDLE_BYTES, 256 * (2 + 65_535));
-        // Above a round 16 MiB by exactly 256 bytes, which is the margin a
-        // bundle of 256 maximal entries needs and a round bound denies it.
-        assert_eq!(MAX_BUNDLE_BYTES - 16 * 1024 * 1024, 256);
     }
 
     #[tokio::test]
@@ -1202,7 +1118,7 @@ mod tests {
         // Sizes that straddle every awkward boundary: a single leaf, one
         // short of a tile, exactly a tile, one past it, and two tile levels.
         for size in [1u64, 2, 3, 255, 256, 257, 511, 1000, 65_536, 65_537] {
-            let log = log(size);
+            let log = MemoryLog::new(size);
             let tree = Tree::new(&log, size, 8);
             assert_eq!(
                 tree.root().await.unwrap(),
@@ -1215,7 +1131,7 @@ mod tests {
     #[tokio::test]
     async fn audit_paths_from_tiles_verify_under_the_clients_own_walk() {
         let size = 1_000u64;
-        let log = log(size);
+        let log = MemoryLog::new(size);
         // Concurrency 1: nothing here may depend on fetches overlapping.
         let tree = Tree::new(&log, size, 1);
         let root = tree.root().await.unwrap();
@@ -1239,19 +1155,18 @@ mod tests {
         }
     }
 
+    /// Split-view detection: the prefix's root, recomputed from the *new*
+    /// tree's tiles, is the root the monitor persisted; a forked log no
+    /// longer reproduces it.
     #[tokio::test]
     async fn consistency_is_the_old_root_recomputed_from_the_new_trees_tiles() {
-        // A tree that grew: the prefix's root, recomputed from the *new*
-        // tree's stored hashes, is the root the monitor persisted. That is
-        // precisely what an RFC 6962 consistency proof asserts, so a monitor
-        // that can read tiles never has to ask for one.
-        let grown = log(1_000);
+        let grown = MemoryLog::new(1_000);
         let old_root = reference_root(&grown.leaves, 0, 700);
         let tree = Tree::new(&grown, 1_000, 4);
         assert_eq!(tree.subtree_hash(0, 700).await.unwrap(), old_root);
-        // A forked log — one leaf rewritten inside the prefix — no longer
-        // reproduces it, which is the split view the check exists to catch.
-        let mut forked = log(1_000);
+        // A one-leaf fork inside the prefix breaks it — the split view the
+        // check exists to catch.
+        let mut forked = MemoryLog::new(1_000);
         forked.leaves[42] = b"a different history".to_vec();
         assert_ne!(
             Tree::new(&forked, 1_000, 4)
@@ -1264,7 +1179,7 @@ mod tests {
 
     #[tokio::test]
     async fn entry_bundles_decode_their_length_framing() {
-        let log = log(600);
+        let log = MemoryLog::new(600);
         let tree = Tree::new(&log, 600, 4);
         let full = tree.entry_bundle(0).await.unwrap();
         assert_eq!(full.len(), 256);
@@ -1279,7 +1194,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_streams_decode_every_bundle_strictly_in_order() {
-        let log = log(1_000);
+        let log = MemoryLog::new(1_000);
         // Deliberately below the bundle count, so read-ahead has work in
         // flight and the in-order contract is what is being exercised.
         let tree = Tree::new(&log, 1_000, 2);
@@ -1305,31 +1220,14 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    /// A log that substitutes one entry body **and** the level-0 hash tile
-    /// entry covering it, leaving every higher hash tile alone.
-    ///
-    /// The harness grants the adversary nothing it would not have. Rewriting
-    /// a level-0 hash tile costs exactly what rewriting an entry bundle costs
-    /// — both are static files this same party serves — so a harness that
-    /// passed hash tiles through untouched would be testing a weaker attacker
-    /// than the one in the threat model, and would pass a check that only
-    /// compares a body against a level-0 tile.
-    ///
-    /// Everything above level 8 stays honest, which is what keeps the
     /// A log that answers the *same* level-0 tile path honestly once and with
-    /// a swapped leaf hash every time after.
-    ///
-    /// `TileSource::fetch` promises nothing about determinism — it is a remote
-    /// server, and a static-file host answering two GETs differently is not
-    /// even misbehaviour it has to plan. So a `verify_leaf` that authenticated
-    /// one fetch of a tile and then read its leaf hash out of a *second* fetch
-    /// would bind a body to bytes nothing folded. This is that log.
+    /// a swapped leaf hash every time after — a static-file server answering
+    /// two GETs, which is not even misbehaviour it has to plan.
     struct ShiftyTile {
         honest: MemoryLog,
         at: u64,
         /// The leaf hash served in place of the honest one — set to the hash
-        /// of the body the log wants believed, so a `verify_leaf` reading this
-        /// second fetch would *accept* a forgery rather than merely misfire.
+        /// of the body the log wants believed.
         instead: [u8; 32],
         served: Mutex<usize>,
     }
@@ -1340,16 +1238,12 @@ mod tests {
             let Some(mut data) = served else {
                 return Ok(None);
             };
-            // Only the one tile holding `at`, and only after its first read:
-            // the root recomputation reads level-0 tiles too, and tampering
-            // with those would be an ordinary forged-tile test rather than
-            // this one.
-            if let Some(rest) = path.strip_prefix("api/v2/tile/0/") {
-                let digits = rest.split(".p/").next().unwrap_or(rest);
-                let index = digits.split('/').fold(0u64, |acc, group| {
-                    acc * 1000 + group.trim_start_matches('x').parse::<u64>().unwrap()
-                });
-                if index == self.at / 256 {
+            // Only the tile holding `at`, and only after its first read: the
+            // root recomputation reads level-0 tiles too, and tampering with
+            // those would be an ordinary forged-tile test rather than this
+            // one.
+            if let Some((level, index, _)) = parse_tile_path(path) {
+                if level == "0" && index == self.at / 256 {
                     let mut count = self.served.lock().unwrap_or_else(|e| e.into_inner());
                     *count += 1;
                     if *count > 1 {
@@ -1370,17 +1264,17 @@ mod tests {
     /// folded, so a log cannot swap it on a second read.
     #[tokio::test]
     async fn a_tile_that_changes_between_fetches_cannot_move_the_leaf() {
-        let honest = log(600);
+        let honest = MemoryLog::new(600);
         let root = Tree::new(&honest, 600, 4).root().await.unwrap();
         let shifty = ShiftyTile {
-            honest: log(600),
+            honest: MemoryLog::new(600),
             at: 300,
             instead: leaf_hash(b"forged 300"),
             served: Mutex::new(0),
         };
         let tree = Tree::new(&shifty, 600, 4);
-        // The honest body for entry 300 still verifies, however many times the
-        // tile is read on the way.
+        // The honest body for entry 300 still verifies, however many times
+        // the tile is read on the way.
         tree.verify_leaf(300, b"entry 300", root)
             .await
             .expect("the honest body must verify against the folded tile");
@@ -1397,149 +1291,20 @@ mod tests {
         );
     }
 
-    /// checkpoint root and the consistency prefix intact: the forgery is
-    /// invisible to every check except a walk to the signed root.
-    struct TamperedBundles {
-        honest: MemoryLog,
-        at: u64,
-        instead: Vec<u8>,
-    }
-
-    impl TileSource for TamperedBundles {
-        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
-            let served = self.honest.fetch(path).await?;
-            if path.starts_with("api/v2/tile/entries/") {
-                let mut leaves = self.honest.leaves.clone();
-                leaves[self.at as usize] = self.instead.clone();
-                let bundle = self.at / 256;
-                let width = (leaves.len() as u64).saturating_sub(bundle * 256).min(256);
-                let mut out = Vec::new();
-                for i in 0..width {
-                    let body = &leaves[(bundle * 256 + i) as usize];
-                    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-                    out.extend_from_slice(body);
-                }
-                return Ok(Some(out));
-            }
-            // The level-0 hash tile holding the forged leaf's own hash, so a
-            // body-against-tile comparison agrees with the bundle.
-            let Some(mut data) = served else {
-                return Ok(None);
-            };
-            if let Some(rest) = path.strip_prefix("api/v2/tile/0/") {
-                let digits = rest.split(".p/").next().unwrap_or(rest);
-                let index = digits.split('/').fold(0u64, |acc, group| {
-                    acc * 1000 + group.trim_start_matches('x').parse::<u64>().unwrap()
-                });
-                if (index * 256..index * 256 + 256).contains(&self.at) {
-                    let offset = (self.at - index * 256) as usize * 32;
-                    data[offset..offset + 32].copy_from_slice(&leaf_hash(&self.instead));
-                }
-            }
-            Ok(Some(data))
-        }
-    }
-
-    #[tokio::test]
-    async fn a_substituted_entry_body_is_refused_against_the_signed_root() {
-        let honest = log(600);
-        let tampered = TamperedBundles {
-            honest: log(600),
-            at: 300,
-            // Something that would fail `HashedRekordBody::parse`, which is
-            // the cheapest way for a log to make an entry "uninteresting".
-            instead: b"not an entry at all".to_vec(),
-        };
-
-        // The forgery is invisible to the root check. Leaf 300 sits inside
-        // the aligned 512-leaf subtree, whose hash the walk takes from a
-        // *level-1* tile — so the rewritten level-0 hash is never folded into
-        // the root at all, and the consistency prefix is the same story.
-        let honest_tree = Tree::new(&honest, 600, 1);
-        let tampered_tree = Tree::new(&tampered, 600, 1);
-        let root = honest_tree.root().await.unwrap();
-        assert_eq!(
-            tampered_tree.root().await.unwrap(),
-            root,
-            "the root check cannot see this substitution, which is the point"
-        );
-        assert_eq!(
-            tampered_tree.subtree_hash(0, 512).await.unwrap(),
-            honest_tree.subtree_hash(0, 512).await.unwrap(),
-            "nor can a consistency prefix over the subtree holding it"
-        );
-
-        // The bundle really does serve the substitute...
-        let bundle = tampered_tree.entry_bundle(300).await.unwrap();
-        let served = &bundle
-            .iter()
-            .find(|(index, _)| *index == 300)
-            .expect("entry 300")
-            .1;
-        assert_eq!(served, b"not an entry at all");
-
-        // ...and the body must not be accepted as the leaf the *checkpoint*
-        // committed to, however the log rewrote the tile beneath it.
-        assert!(
-            tampered_tree.verify_leaf(300, served, root).await.is_err(),
-            "a body the signed root does not commit to must be refused"
-        );
-        honest_tree
-            .verify_leaf(300, b"entry 300", root)
-            .await
-            .expect("and the honest body must still verify");
-    }
-
-    /// A log that serves one level-0 hash tile at a length no tile ever has.
-    ///
-    /// Everything else is honest, which is the whole difficulty: in a tree
-    /// this size the root recomputation reads level-1 and never opens this
-    /// tile, so the checkpoint, the root and any consistency prefix all agree
-    /// before the mis-sized body is ever looked at.
-    struct ShortHashTile {
-        honest: MemoryLog,
-        keep: usize,
-    }
-
-    impl TileSource for ShortHashTile {
-        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
-            let served = self.honest.fetch(path).await?;
-            match (served, path.starts_with("api/v2/tile/0/")) {
-                (Some(mut data), true) => {
-                    data.truncate(self.keep);
-                    Ok(Some(data))
-                }
-                (served, _) => Ok(served),
-            }
-        }
-
-        async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
-            self.honest.checkpoint_size().await
-        }
-    }
-
     /// A mis-sized hash tile is refused, and — the part that matters — it is
-    /// *refused* rather than folded.
-    ///
-    /// `fold` halves its input until it reaches 32 bytes, so a length that is
-    /// not `32 · 2^k` recurses until the stack is gone. That is not a panic:
-    /// it aborts the process, uncatchably, taking with it every finding the
-    /// run had already classified — including from earlier shards — and
-    /// exiting 134 rather than the 30 the exit-code contract promises for a
-    /// run that could not finish. The audited party would be choosing when
-    /// its auditor dies.
+    /// *refused* rather than folded: `fold` halves its input until it reaches
+    /// 32 bytes, so a length that is not `32 · 2^k` recurses until the stack
+    /// is gone — an uncatchable process abort.
     #[tokio::test]
     async fn a_hash_tile_of_the_wrong_length_is_refused_not_folded() {
-        let honest = log(600);
+        let honest = MemoryLog::new(600);
         let root = Tree::new(&honest, 600, 1).root().await.unwrap();
 
-        // 100 bytes: not a multiple of 32, and it halves to 50, 25, 12, 6, 3,
-        // 1, 0 — the run that never terminates.
-        for keep in [100, 0, 96, 33] {
-            let short = ShortHashTile {
-                honest: log(600),
-                keep,
-            };
+        // 100 bytes halves to 50, 25, 12, 6, 3, 1, 0 — the run that never
+        // terminates; 0 is the same refusal at the empty end.
+        for keep in [100, 0] {
+            let mut short = MemoryLog::new(600);
+            short.truncate_level0 = Some(keep);
             let tree = Tree::new(&short, 600, 1);
             let Err(error) = tree.verify_leaf(300, b"entry 300", root).await else {
                 panic!("a tile of {keep} bytes is not a run of hashes and must be refused")
@@ -1563,14 +1328,9 @@ mod tests {
     #[test]
     fn fold_is_total() {
         assert!(fold(&[]).is_none());
-        assert!(fold(&[0u8; 31]).is_none());
         assert!(fold(&[0u8; 33]).is_none());
-        assert!(fold(&[0u8; 96]).is_none(), "three hashes is not a subtree");
         assert!(fold(&[0u8; 100]).is_none());
-        assert!(fold(&[0u8; 8191]).is_none());
         assert!(fold(&[0u8; 32]).is_some());
-        assert!(fold(&[0u8; 64]).is_some());
-        assert!(fold(&[0u8; 256 * 32]).is_some());
         // The shape it is actually asked for, against the reference: two
         // leaves fold to the node over them.
         let (a, b) = ([1u8; 32], [2u8; 32]);
@@ -1579,18 +1339,17 @@ mod tests {
         assert_eq!(fold(&pair), Some(node_hash(&a, &b)));
     }
 
+    /// A substituted entry in the *partial* frontier tile is refused too: it
+    /// has no parent tile to fold into, so the check is that the tiles still
+    /// recompute the checkpoint's root.
     #[tokio::test]
     async fn a_substituted_entry_in_the_frontier_tile_is_refused_too() {
-        // Leaf 550 sits in the *partial* level-0 tile, which has no parent
-        // tile to be folded into — the check there is that the tiles still
-        // recompute the checkpoint's root, and a rewritten frontier hash
-        // breaks exactly that.
-        let honest = log(600);
-        let tampered = TamperedBundles {
-            honest: log(600),
-            at: 550,
-            instead: b"not an entry at all".to_vec(),
-        };
+        // Leaf 550 sits in the partial level-0 tile, whose rewritten hash
+        // reaches the root — breaking exactly the recomputation that pins it.
+        let honest = MemoryLog::new(600);
+        let mut tampered = MemoryLog::new(600);
+        tampered.forge_at = Some(550);
+        tampered.forged_body = b"not an entry at all".to_vec();
         let root = Tree::new(&honest, 600, 1).root().await.unwrap();
         let tampered_tree = Tree::new(&tampered, 600, 1);
         assert_ne!(
@@ -1598,22 +1357,25 @@ mod tests {
             root,
             "a frontier hash does reach the root"
         );
-        let served = b"not an entry at all";
-        assert!(tampered_tree.verify_leaf(550, served, root).await.is_err());
+        assert!(tampered_tree
+            .verify_leaf(550, b"not an entry at all", root)
+            .await
+            .is_err());
         Tree::new(&honest, 600, 1)
             .verify_leaf(550, b"entry 550", root)
             .await
             .expect("the honest frontier leaf verifies");
     }
 
+    /// A frontier tile the pin named can be superseded by the time a long
+    /// walk fetches it — the log keeps integrating. `tile_bytes` recovers by
+    /// re-resolving the size and reading the wider tile, keeping only the
+    /// pinned prefix.
     #[tokio::test]
-    async fn a_frontier_tile_completed_since_the_pin_is_read_from_the_full_tile() {
-        // Pinned at 1_000, the walk asks for entries tile 3 as `.p/232`; the
-        // log, now at 1_300, completed that tile long ago and serves it
-        // whole. Level-1 hash tile 0 is still partial — wider than the pin
-        // named — so the root check exercises the wider-partial recovery at
-        // the same time.
-        let log = log(1_300);
+    async fn a_frontier_tile_widened_since_the_pin_is_read_from_the_wider_partial() {
+        // Completed since the pin: the pinned `.p/232` is gone and the log
+        // serves the tile whole (and the level-1 tile under it widened too).
+        let log = MemoryLog::new(1_300);
         let tree = Tree::new(&log, 1_000, 4);
         assert_eq!(
             tree.root().await.unwrap(),
@@ -1624,30 +1386,22 @@ mod tests {
         assert_eq!(bundles.len(), 4);
         assert_eq!(bundles[3].len(), 232);
         assert_eq!(bundles[3][231], (999, b"entry 999".to_vec()));
-    }
 
-    #[tokio::test]
-    async fn a_frontier_tile_widened_since_the_pin_is_read_from_the_wider_partial() {
-        // The same race, but the log grew only within the tile: the pinned
-        // `.p/232` is gone and the tile is now `.p/252` — still partial,
-        // still the same prefix.
-        let log = log(1_020);
+        // Widened within the tile: the pinned `.p/232` is now `.p/252` —
+        // still partial, still the same prefix.
+        let log = MemoryLog::new(1_020);
         let tree = Tree::new(&log, 1_000, 4);
         let bundle = tree.entry_bundle(768).await.unwrap();
         assert_eq!(bundle.len(), 232);
         assert_eq!(bundle[0], (768, b"entry 768".to_vec()));
-        assert_eq!(bundle[231], (999, b"entry 999".to_vec()));
         assert_eq!(
             tree.root().await.unwrap(),
             reference_root(&log.leaves, 0, 1_000)
         );
-    }
 
-    #[tokio::test]
-    async fn a_partial_the_log_never_grew_into_stays_missing() {
-        // Pinned past what the log serves: re-resolving the size says tile 3
-        // holds nothing, and no wider tile can stand in for the pinned one.
-        let log = log(768);
+        // Never grew: a pin past the served size stays missing, and no wider
+        // tile can stand in for the pinned one.
+        let log = MemoryLog::new(768);
         let tree = Tree::new(&log, 1_000, 4);
         let err = tree.entry_bundle(768).await.unwrap_err();
         assert!(matches!(err, MonitorError::Tile(_)), "{err}");

@@ -1027,18 +1027,10 @@ fn record_history_in(
 #[cfg(test)]
 mod tests {
     use iroh_base::SecretKey;
+    use synch_core::{Hash, OriginId};
 
     use super::*;
-
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(dir.path()).unwrap();
-        (dir, s)
-    }
-
-    fn origin() -> OriginId {
-        OriginId::named("nas", "x.example").unwrap()
-    }
+    use crate::testutil::{origin, sign_head, store};
 
     #[test]
     fn head_slots_round_trip() {
@@ -1049,10 +1041,30 @@ mod tests {
 
         let stored = store.head(&origin(), Slot::Complete).unwrap().unwrap();
         assert_eq!(stored.head, head);
-        assert_eq!(stored.received_at, 1);
-        assert_eq!(stored.verified_at, 2);
-        // The signature survives the round trip through SQLite.
+        assert_eq!((stored.received_at, stored.verified_at), (1, 2));
+        // The signature survives the SQLite round trip through the HEAD_JOIN.
         stored.head.verify_signature().unwrap();
+        assert_eq!(store.pending_head(&origin()).unwrap(), None);
+
+        // The listing names every origin's slot.
+        for name in ["laptop", "vps"] {
+            let o = OriginId::named(name, "x.example").unwrap();
+            let h = SignedHead::sign(&key, o, 1, Hash([1u8; 32]), 0);
+            store.put_head(Slot::Complete, &h, 0, 0).unwrap();
+        }
+        assert_eq!(store.all_heads(Slot::Complete).unwrap().len(), 3);
+        assert_eq!(store.all_heads(Slot::Pending).unwrap().len(), 0);
+
+        // Clearing a slot only takes the named head.
+        let pending = sign_head(&key, 1, 9);
+        store.put_head(Slot::Pending, &pending, 0, 0).unwrap();
+        assert!(!store
+            .clear_head_at(&origin(), Slot::Pending, 1, &Hash([8u8; 32]))
+            .unwrap());
+        assert!(store.pending_head(&origin()).unwrap().is_some());
+        assert!(store
+            .clear_head_at(&origin(), Slot::Pending, 1, &Hash([9u8; 32]))
+            .unwrap());
         assert_eq!(store.pending_head(&origin()).unwrap(), None);
     }
 
@@ -1062,15 +1074,17 @@ mod tests {
         let key = SecretKey::generate();
         assert_eq!(store.head_floor(&origin()).unwrap(), None);
 
-        let complete = SignedHead::sign(&key, origin(), 3, Hash([1u8; 32]), 0);
-        store.put_head(Slot::Complete, &complete, 0, 0).unwrap();
+        store
+            .put_head(Slot::Complete, &sign_head(&key, 3, 1), 0, 0)
+            .unwrap();
         assert_eq!(
             store.head_floor(&origin()).unwrap(),
             Some((3, Hash([1u8; 32])))
         );
 
-        let pending = SignedHead::sign(&key, origin(), 5, Hash([2u8; 32]), 0);
-        store.put_head(Slot::Pending, &pending, 0, 0).unwrap();
+        store
+            .put_head(Slot::Pending, &sign_head(&key, 5, 2), 0, 0)
+            .unwrap();
         assert_eq!(
             store.head_floor(&origin()).unwrap(),
             Some((5, Hash([2u8; 32])))
@@ -1081,16 +1095,18 @@ mod tests {
     fn equivocation_is_detected_with_both_proofs() {
         let (_d, store) = store();
         let key = SecretKey::generate();
-        let a = SignedHead::sign(&key, origin(), 7, Hash([1u8; 32]), 0);
-        let b = SignedHead::sign(&key, origin(), 7, Hash([2u8; 32]), 0);
-        let c = SignedHead::sign(&key, origin(), 8, Hash([3u8; 32]), 0);
-        for h in [&a, &b, &c] {
-            store.record_history(h, 0).unwrap();
+        for h in [
+            sign_head(&key, 7, 1),
+            sign_head(&key, 7, 2),
+            sign_head(&key, 8, 3),
+        ] {
+            store.record_history(&h, 0).unwrap();
         }
         let found = store.equivocations().unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].seq, 7);
         assert_eq!(found[0].heads.len(), 2);
+        // The evidence is the signatures: both retained heads verify.
         for h in &found[0].heads {
             h.verify_signature().unwrap();
         }
@@ -1101,23 +1117,23 @@ mod tests {
         let (_d, store) = store();
         let key = SecretKey::generate();
         for seq in 1..=5u64 {
-            let h = SignedHead::sign(&key, origin(), seq, Hash([seq as u8; 32]), 0);
             // Received in seq order, which is what retention reads.
-            store.record_history(&h, seq as i64).unwrap();
+            store
+                .record_history(&sign_head(&key, seq, seq as u8), seq as i64)
+                .unwrap();
         }
-        let head = SignedHead::sign(&key, origin(), 6, Hash([6u8; 32]), 0);
-        store.put_head(Slot::Complete, &head, 10, 0).unwrap();
-        let pending = SignedHead::sign(&key, origin(), 7, Hash([7u8; 32]), 0);
-        store.put_head(Slot::Pending, &pending, 10, 0).unwrap();
+        store
+            .put_head(Slot::Complete, &sign_head(&key, 6, 6), 10, 0)
+            .unwrap();
+        store
+            .put_head(Slot::Pending, &sign_head(&key, 7, 7), 10, 0)
+            .unwrap();
 
         // Seven distinct roots: five recorded directly, plus the two the slots
-        // point at — which `put_head` retains, so they are here by
-        // construction rather than needing a union across both tables.
+        // point at, which `put_head` retains by construction.
         let roots = store.retained_roots().unwrap();
         assert_eq!(roots.len(), 7);
         assert!(roots.contains(&Hash([6u8; 32])));
-        // Pending heads must be in the mark set (§5.4).
-        assert!(roots.contains(&Hash([7u8; 32])));
 
         // A horizon past the first three drops them; seqs 4 and 5 remain, as do
         // the two the slots point at.
@@ -1125,32 +1141,22 @@ mod tests {
         assert_eq!(store.head_history(&origin()).unwrap().len(), 4);
     }
 
-    /// A row a slot points at is never pruned, whatever the horizon says.
-    ///
-    /// `heads` names a `head_history` row and every head read joins the two, so
-    /// the row behind a slot is exempt — checked once when the doomed set is
-    /// chosen, and again as a condition of the delete.
+    /// A row a slot points at is never pruned, whatever the horizon says:
+    /// `heads` names a `head_history` row, so taking it makes a head unreadable.
     #[test]
     fn a_row_a_slot_points_at_survives_every_prune() {
         let (_d, store) = store();
         let key = SecretKey::generate();
-        let complete = SignedHead::sign(&key, origin(), 3, Hash([3u8; 32]), 0);
-        let pending = SignedHead::sign(&key, origin(), 4, Hash([4u8; 32]), 0);
-        // Recorded long before any horizon this test uses.
+        let complete = sign_head(&key, 3, 3);
+        let pending = sign_head(&key, 4, 4);
         store.put_head(Slot::Complete, &complete, 1, 1).unwrap();
         store.put_head(Slot::Pending, &pending, 1, 1).unwrap();
-        store
-            .record_history(&SignedHead::sign(&key, origin(), 1, Hash([1u8; 32]), 0), 1)
-            .unwrap();
+        store.record_history(&sign_head(&key, 1, 1), 1).unwrap();
 
         assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 1);
-        assert_eq!(
-            store.complete_head(&origin()).unwrap(),
-            Some(complete),
-            "the current head is still readable"
-        );
+        assert_eq!(store.complete_head(&origin()).unwrap(), Some(complete));
         assert_eq!(store.pending_head(&origin()).unwrap(), Some(pending));
-        // And a second pass over the same horizon finds nothing left to take.
+        // A second pass over the same horizon finds nothing left to take.
         assert_eq!(store.prune_history_before(&origin(), i64::MAX).unwrap(), 0);
         assert_eq!(store.head_history(&origin()).unwrap().len(), 2);
     }
@@ -1254,34 +1260,5 @@ mod tests {
             [broken.canonical()],
             "and the unreadable one is named rather than propagated or dropped"
         );
-    }
-
-    #[test]
-    fn all_heads_lists_every_origin() {
-        let (_d, store) = store();
-        let key = SecretKey::generate();
-        for name in ["nas", "laptop", "vps"] {
-            let o = OriginId::named(name, "x.example").unwrap();
-            let h = SignedHead::sign(&key, o, 1, Hash::new(name.as_bytes()), 0);
-            store.put_head(Slot::Complete, &h, 0, 0).unwrap();
-        }
-        assert_eq!(store.all_heads(Slot::Complete).unwrap().len(), 3);
-        assert_eq!(store.all_heads(Slot::Pending).unwrap().len(), 0);
-    }
-
-    #[test]
-    fn clearing_a_slot() {
-        let (_d, store) = store();
-        let key = SecretKey::generate();
-        let h = SignedHead::sign(&key, origin(), 1, Hash::EMPTY, 0);
-        store.put_head(Slot::Pending, &h, 0, 0).unwrap();
-        assert!(!store
-            .clear_head_at(&origin(), Slot::Pending, 1, &Hash([9u8; 32]))
-            .unwrap());
-        assert!(store.pending_head(&origin()).unwrap().is_some());
-        assert!(store
-            .clear_head_at(&origin(), Slot::Pending, 1, &Hash::EMPTY)
-            .unwrap());
-        assert_eq!(store.pending_head(&origin()).unwrap(), None);
     }
 }

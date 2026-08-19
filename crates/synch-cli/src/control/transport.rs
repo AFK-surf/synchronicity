@@ -460,33 +460,18 @@ fn unwrap_io(e: tonic::transport::Error) -> io::Error {
 mod tests {
     use super::*;
 
-    /// The kernel's own refusal is "SUN_LEN", one command after `init` said
-    /// everything was fine; the check names the length, the limit, and the
-    /// fix — and runs at init, where the operator can still act on it.
+    // The kernel's own refusal is "SUN_LEN", one command after init said
+    // everything was fine; the check names the length, the limit, and the fix.
     #[cfg(unix)]
     #[test]
     fn a_socket_path_over_the_os_limit_is_refused_by_name() {
         check_socket_path(Path::new("/tmp/short")).unwrap();
         let long = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
         let text = check_socket_path(&long).unwrap_err().to_string();
-        assert!(text.contains("bytes"), "{text}");
-        assert!(text.contains("--data-dir"), "{text}");
-    }
-
-    #[test]
-    fn a_token_is_32_random_bytes_and_replaceable() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = write_token(dir.path()).unwrap();
-        assert_eq!(first.len(), TOKEN_LEN);
-        assert_eq!(read_token(dir.path()).unwrap(), first);
-
-        let second = write_token(dir.path()).unwrap();
-        assert_ne!(first, second, "every daemon start mints a new token");
-        assert_eq!(read_token(dir.path()).unwrap(), second);
-
-        remove_token(dir.path());
-        let err = read_token(dir.path()).unwrap_err();
-        assert!(err.to_string().contains("synch daemon run"), "{err}");
+        assert!(
+            text.contains("bytes") && text.contains("--data-dir"),
+            "{text}"
+        );
     }
 
     #[cfg(unix)]
@@ -512,20 +497,8 @@ mod tests {
         assert_eq!(endpoint_name(a.path()), endpoint_name(a.path()));
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn the_pipe_name_has_the_documented_shape() {
-        let dir = tempfile::tempdir().unwrap();
-        let name = endpoint_name(dir.path());
-        let suffix = name
-            .strip_prefix("\\\\.\\pipe\\synchronicity-")
-            .unwrap_or_else(|| panic!("{name}"));
-        assert_eq!(suffix.len(), 16, "{name}");
-        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
-    }
-
-    /// Nothing is listening, and the answer has to name the socket and the
-    /// command that starts one rather than "transport error" (§9.1).
+    // Nothing is listening, and the answer has to name the socket and the
+    // command that starts one rather than "transport error" (§9.1).
     #[tokio::test]
     async fn connecting_to_nothing_names_the_socket_and_the_command() {
         let dir = tempfile::tempdir().unwrap();

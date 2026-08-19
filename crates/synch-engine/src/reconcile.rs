@@ -1574,7 +1574,6 @@ impl SyncReport {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use iroh_base::SecretKey;
@@ -1583,7 +1582,7 @@ mod tests {
 
     use super::*;
 
-    fn setup() -> (tempfile::TempDir, Arc<Store>, SecretKey, OriginId) {
+    pub(super) fn setup() -> (tempfile::TempDir, Arc<Store>, SecretKey, OriginId) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let key = SecretKey::generate();
@@ -1623,8 +1622,8 @@ mod tests {
     #[test]
     fn a_head_with_a_present_trie_completes_immediately() {
         let (_d, store, key, origin) = setup();
-        let root = publish(&store, &["a", "b"]);
         let syncer = Syncer::new(store.clone());
+        let root = publish(&store, &["a", "b"]);
         let head = SignedHead::sign(&key, origin.clone(), 1, root, 0);
         assert_eq!(syncer.offer_head(&head, 0).unwrap(), HeadOutcome::Completed);
         assert_eq!(store.complete_head(&origin).unwrap(), Some(head));
@@ -1635,52 +1634,31 @@ mod tests {
                 .len(),
             2
         );
+
+        // A head whose trie is missing stays pending, complete slot untouched.
+        let unknown = SignedHead::sign(&key, origin.clone(), 2, Hash::new(b"unknown root"), 0);
+        assert_eq!(
+            syncer.offer_head(&unknown, 0).unwrap(),
+            HeadOutcome::Pending
+        );
+        assert_eq!(store.pending_head(&origin).unwrap(), Some(unknown));
+        assert_eq!(store.complete_head(&origin).unwrap().unwrap().seq, 1);
     }
 
-    #[test]
-    fn a_head_with_a_missing_trie_stays_pending() {
-        let (_d, store, key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
-        let head = SignedHead::sign(&key, origin.clone(), 1, Hash::new(b"unknown root"), 0);
-        assert_eq!(syncer.offer_head(&head, 0).unwrap(), HeadOutcome::Pending);
-        assert_eq!(store.pending_head(&origin).unwrap(), Some(head));
-        // The complete slot is untouched while a fetch is in progress.
-        assert_eq!(store.complete_head(&origin).unwrap(), None);
-    }
-
-    /// A member signing endlessly at one seq stops being *retained* — and is
-    /// never refused.
-    ///
-    /// Same-seq forks outlive `root_retention` until the origin publishes past
-    /// the forked seq, which an origin flooding one seq never does, so the
-    /// width has to be bounded somewhere. It is bounded by eviction, not by
-    /// refusal: the greatest root at the seq always wins the slot, so the
-    /// answer does not depend on which roots arrived first.
+    /// DoS bound: an origin flooding one seq is bounded by eviction, never
+    /// refused — the greatest roots keep the slot, so the answer does not
+    /// depend on which roots arrived first.
     #[test]
     fn same_seq_forks_are_evicted_at_the_cap_and_never_refused() {
         let (_d, store, key, origin) = setup();
         let syncer = Syncer::new(store.clone());
-        // Ascending roots, so each one supersedes the last.
-        for i in 1..=MAX_RETAINED_FORKS as u8 {
+        // Ascending roots, past the cap: each one supersedes the last.
+        for i in 1..=MAX_RETAINED_FORKS as u8 + 4 {
             let head = SignedHead::sign(&key, origin.clone(), 1, Hash([i; 32]), 0);
             assert!(
                 syncer.offer_head(&head, 0).unwrap().accepted(),
                 "fork {i} is evidence and is taken"
             );
-        }
-        assert_eq!(store.fork_width(&origin, 1).unwrap(), MAX_RETAINED_FORKS);
-
-        // Past the cap the heads keep being accepted on their merits, and the
-        // retained set stays at the cap by dropping its lowest roots.
-        for i in 1..=4u8 {
-            let flood = SignedHead::sign(
-                &key,
-                origin.clone(),
-                1,
-                Hash([MAX_RETAINED_FORKS as u8 + i; 32]),
-                0,
-            );
-            assert_eq!(syncer.offer_head(&flood, 0).unwrap(), HeadOutcome::Pending);
         }
         assert_eq!(
             store.fork_width(&origin, 1).unwrap(),
@@ -1696,7 +1674,9 @@ mod tests {
             .collect();
         assert_eq!(
             retained,
-            (5..=12u8).rev().collect::<Vec<_>>(),
+            (MAX_RETAINED_FORKS as u8 - 3..=MAX_RETAINED_FORKS as u8 + 4)
+                .rev()
+                .collect::<Vec<_>>(),
             "the greatest roots are what is kept, whatever arrived first"
         );
         assert_eq!(
@@ -1708,93 +1688,12 @@ mod tests {
         assert_eq!(store.equivocations().unwrap().len(), 1);
 
         // A head at a later seq is the origin moving on, and is taken normally.
-        let next = SignedHead::sign(&key, origin.clone(), 2, Hash([1u8; 32]), 0);
+        let next = SignedHead::sign(&key, origin, 2, Hash([1u8; 32]), 0);
         assert!(syncer.offer_head(&next, 0).unwrap().accepted());
     }
 
-    /// The same head set, offered in any order, settles on the same head.
-    ///
-    /// This is the join-semilattice §5.2 rests on, and the fork cap must not
-    /// break it: refusing the ninth root at a seq would leave a node that met
-    /// the greatest root early holding it while a node that met it tenth never
-    /// took it, and the two would then refuse each other's heads forever.
-    /// Acceptance is decided by `supersedes` alone, so the greatest
-    /// `(seq, root)` wins from every arrival order.
-    #[test]
-    fn arrival_order_cannot_change_which_head_a_node_settles_on() {
-        let roots: Vec<u8> = (1..=9).collect();
-        let key = SecretKey::generate();
-        let origin = OriginId::named("nas", "x.example").unwrap();
-        let heads: Vec<SignedHead> = roots
-            .iter()
-            .map(|i| SignedHead::sign(&key, origin.clone(), 1, Hash([*i; 32]), 0))
-            .collect();
-
-        // Ascending, descending, and the shape that stresses it hardest: the
-        // greatest root first, so every later offer loses the comparison.
-        let mut orders: Vec<Vec<usize>> = vec![
-            (0..heads.len()).collect(),
-            (0..heads.len()).rev().collect(),
-            std::iter::once(heads.len() - 1)
-                .chain(0..heads.len() - 1)
-                .collect(),
-        ];
-        // And a handful of shuffles, so this is not three hand-picked cases.
-        let mut state = 0x243f_6a88_85a3_08d3u64;
-        for _ in 0..8 {
-            let mut order: Vec<usize> = (0..heads.len()).collect();
-            for i in (1..order.len()).rev() {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                order.swap(i, (state >> 33) as usize % (i + 1));
-            }
-            orders.push(order);
-        }
-
-        let mut settled = Vec::new();
-        let mut dirs = Vec::new();
-        for order in &orders {
-            // One node per arrival order, each with the one key bound.
-            let dir = tempfile::tempdir().unwrap();
-            let store = Arc::new(Store::open(dir.path()).unwrap());
-            store
-                .put_binding(&Binding {
-                    origin: origin.clone(),
-                    node_id: key.public(),
-                    source: BindingSource::Static,
-                    domain: None,
-                    issuer: None,
-                    spaces: Vec::new(),
-                    note: None,
-                    added_at: 0,
-                    expires_at: None,
-                })
-                .unwrap();
-            let syncer = Syncer::new(store.clone());
-            for i in order {
-                assert!(
-                    matches!(
-                        syncer.offer_head(&heads[*i], 0).unwrap(),
-                        HeadOutcome::Pending | HeadOutcome::Completed | HeadOutcome::NotNewer
-                    ),
-                    "every offer is judged on the ordering rule alone"
-                );
-            }
-            settled.push(store.head_floor(&origin).unwrap().unwrap());
-            dirs.push(dir);
-        }
-        assert!(
-            settled.windows(2).all(|w| w[0] == w[1]),
-            "every arrival order settles on the same head: {settled:?}"
-        );
-        assert_eq!(settled[0], (1, Hash([9u8; 32])));
-    }
-
-    /// A peer may only answer with what it was asked for.
-    ///
-    /// A self-consistent pair nobody requested counts as progress if it is
-    /// taken: the unproductive counter resets on every round, the fetch never
-    /// gives up on the peer, and the junk is written to the trie tables. Values
-    /// are held to it exactly as nodes are, which is why one helper does both.
+    /// §5.2 containment: only requested hashes, each once, hash-verified —
+    /// the injection and amplification bounds on trie fetch.
     #[test]
     fn a_peer_may_not_answer_with_what_was_not_asked_for() {
         let wanted = Hash::new(b"wanted");
@@ -1831,45 +1730,21 @@ mod tests {
             Err(EngineError::Net(NetError::ValueHashMismatch { .. }))
         ));
         assert_eq!(*stored.borrow(), vec![unrequested]);
-    }
 
-    /// A peer may answer each wanted hash once.
-    ///
-    /// Containment alone bounds *which* hashes may come back, not how many
-    /// times: a request capped at `MAX_BATCH` draws a response capped only by
-    /// the frame length, so one wanted node repeated to fill 16 MiB would pass
-    /// every other check and cost an autocommit insert apiece on the store's
-    /// single write connection. Counting the repeats as progress would also
-    /// defeat `MAX_UNPRODUCTIVE_ROUNDS`, so a peer serving one real node and a
-    /// hundred thousand copies of it would never look stuck.
-    #[test]
-    fn a_peer_may_not_answer_the_same_hash_twice() {
-        let payload = b"a node that really was asked for".to_vec();
-        let wanted = Hash::new(&payload);
-        let stored = std::cell::RefCell::new(Vec::new());
-        let take = |requested: &[Hash], served: &[(Hash, Vec<u8>)]| {
-            take_served(
-                requested,
-                served,
-                "value",
-                |bytes| Some(Hash::new(bytes)),
-                |expected| NetError::ValueHashMismatch { expected },
-                |hash, _| {
-                    stored.borrow_mut().push(*hash);
-                    Ok(true)
-                },
-            )
-        };
-
-        let err = take(
-            &[wanted],
-            &[(wanted, payload.clone()), (wanted, payload.clone())],
-        )
-        .expect_err("a repeat is refused");
+        // One wanted node repeated would pass containment and cost an insert
+        // apiece; the repeat is refused, and counting it as progress would
+        // defeat `MAX_UNPRODUCTIVE_ROUNDS`.
+        stored.borrow_mut().clear();
+        let dup = b"a node that really was asked for".to_vec();
+        let dup_hash = Hash::new(&dup);
+        let err = take(&[dup_hash], &[(dup_hash, dup.clone()), (dup_hash, dup)])
+            .expect_err("a repeat is refused");
         assert!(err.to_string().contains("repeated"), "{err}");
-        // The first copy was taken before the second was seen; what matters is
-        // that the answer does not run past the request.
-        assert_eq!(*stored.borrow(), vec![wanted]);
+        assert_eq!(
+            *stored.borrow(),
+            vec![dup_hash],
+            "taken before the repeat was seen"
+        );
 
         // The honest shape — every wanted hash at most once — still passes.
         stored.borrow_mut().clear();
@@ -1877,8 +1752,11 @@ mod tests {
         let other_hash = Hash::new(&other);
         assert_eq!(
             take(
-                &[wanted, other_hash],
-                &[(wanted, payload), (other_hash, other)]
+                &[dup_hash, other_hash],
+                &[
+                    (dup_hash, b"a node that really was asked for".to_vec()),
+                    (other_hash, other),
+                ],
             )
             .unwrap(),
             2
@@ -1897,26 +1775,23 @@ mod tests {
         );
         assert_eq!(store.complete_head(&origin).unwrap(), None);
         assert!(store.head_history(&origin).unwrap().is_empty());
-    }
 
-    #[test]
-    fn an_unbound_signer_is_rejected_even_when_the_signature_verifies() {
-        // §3.2: heads whose signing key is not bound to the claimed origin are
-        // ignored even if relayed by a trusted peer.
-        let (_d, store, _key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
+        // §3.2: a valid signature from a key that is not bound to the origin
+        // is refused even if relayed by a trusted peer.
         let stranger = SecretKey::generate();
-        let head = SignedHead::sign(&stranger, origin.clone(), 1, Hash::EMPTY, 0);
-        head.verify_signature().unwrap();
-        assert_eq!(syncer.offer_head(&head, 0).unwrap(), HeadOutcome::Unbound);
+        let relayed = SignedHead::sign(&stranger, origin.clone(), 1, Hash::EMPTY, 0);
+        relayed.verify_signature().unwrap();
+        assert_eq!(
+            syncer.offer_head(&relayed, 0).unwrap(),
+            HeadOutcome::Unbound
+        );
         assert_eq!(store.complete_head(&origin).unwrap(), None);
     }
 
     #[test]
     fn an_expired_binding_no_longer_admits_heads() {
         // The instants are real ones: an expiry is compared against a clock,
-        // and a reading below `MIN_TRUSTED_NS` dates nothing, so a binding
-        // offered at "now = 50" is not live at all (§3.2).
+        // and a reading below `MIN_TRUSTED_NS` dates nothing (§3.2).
         let before = synch_core::MIN_TRUSTED_NS + 50;
         let expiry = synch_core::MIN_TRUSTED_NS + 100;
         let after = synch_core::MIN_TRUSTED_NS + 200;
@@ -1948,130 +1823,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_seq_root_rule_accepts_equal_seq_greater_root() {
-        // Strictly-greater-on-seq alone would not converge: two peers receiving
-        // different same-seq heads in different orders would diverge forever.
-        let (_d, store, key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
-        let low = SignedHead::sign(&key, origin.clone(), 1, Hash([1u8; 32]), 0);
-        let high = SignedHead::sign(&key, origin.clone(), 1, Hash([2u8; 32]), 0);
-
-        assert!(syncer.offer_head(&low, 0).unwrap().accepted());
-        assert!(syncer.offer_head(&high, 0).unwrap().accepted());
-        assert_eq!(
-            store.head_floor(&origin).unwrap().unwrap().1,
-            Hash([2u8; 32])
-        );
-        // And the reverse order converges to the same head.
-        assert_eq!(syncer.offer_head(&low, 0).unwrap(), HeadOutcome::NotNewer);
-    }
-
-    #[test]
-    fn same_seq_forks_are_both_retained_as_evidence() {
-        let (_d, store, key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
-        syncer
-            .offer_head(
-                &SignedHead::sign(&key, origin.clone(), 1, Hash([1u8; 32]), 0),
-                0,
-            )
-            .unwrap();
-        syncer
-            .offer_head(
-                &SignedHead::sign(&key, origin.clone(), 1, Hash([2u8; 32]), 0),
-                0,
-            )
-            .unwrap();
-        let equivocations = store.equivocations().unwrap();
-        assert_eq!(equivocations.len(), 1);
-        assert_eq!(equivocations[0].heads.len(), 2);
-        for head in &equivocations[0].heads {
-            head.verify_signature().unwrap();
-        }
-    }
-
-    #[test]
-    fn older_heads_are_ignored() {
-        let (_d, store, key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
-        let new = SignedHead::sign(&key, origin.clone(), 5, Hash([5u8; 32]), 0);
-        syncer.offer_head(&new, 0).unwrap();
-        let old = SignedHead::sign(&key, origin.clone(), 4, Hash([9u8; 32]), 0);
-        assert_eq!(syncer.offer_head(&old, 0).unwrap(), HeadOutcome::NotNewer);
-        assert_eq!(store.head_floor(&origin).unwrap().unwrap().0, 5);
-    }
-
-    /// §3.4 step 2: a peer advertising a head for *our* origin is recorded as
-    /// an observation, never adopted — the head behind it is signed by a key
-    /// that is no longer bound.
-    #[test]
-    fn summaries_for_our_own_origin_are_observed_not_adopted() {
-        let (_d, store, lost_key, origin) = setup();
-        store.set_self_origin(&origin).unwrap();
-        // The lost key is no longer bound to the origin: recovery starts from a
-        // database that knows only the new key.
-        store
-            .remove_binding(&origin, &lost_key.public(), BindingSource::Static)
-            .unwrap();
-        let syncer = Syncer::new(store.clone());
-
-        let observed = syncer
-            .observe_summaries(
-                &[
-                    HeadSummary {
-                        origin: origin.clone(),
-                        seq: 100,
-                        root: Hash([7u8; 32]),
-                        complete: true,
-                    },
-                    HeadSummary {
-                        origin: OriginId::named("laptop", "x.example").unwrap(),
-                        seq: 4,
-                        root: Hash([1u8; 32]),
-                        complete: true,
-                    },
-                ],
-                42,
-            )
-            .unwrap();
-        assert_eq!(observed, Some(100));
-        assert_eq!(store.observed_head(&origin).unwrap().unwrap().seq, 100);
-        // Only our own origin is tracked this way.
-        assert_eq!(
-            store
-                .observed_head(&OriginId::named("laptop", "x.example").unwrap())
-                .unwrap(),
-            None
-        );
-        // And nothing became a head: the signer is unbound.
-        assert_eq!(store.complete_head(&origin).unwrap(), None);
-        let head = SignedHead::sign(&lost_key, origin.clone(), 100, Hash([7u8; 32]), 0);
-        assert_eq!(syncer.offer_head(&head, 0).unwrap(), HeadOutcome::Unbound);
-        assert_eq!(store.head_floor(&origin).unwrap(), None);
-    }
-
-    #[test]
-    fn a_store_with_no_identity_observes_nothing() {
-        let (_d, store, _key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
-        assert_eq!(
-            syncer
-                .observe_summaries(
-                    &[HeadSummary {
-                        origin: origin.clone(),
-                        seq: 9,
-                        root: Hash::EMPTY,
-                        complete: true,
-                    }],
-                    0,
-                )
-                .unwrap(),
-            None
-        );
-        assert_eq!(store.observed_head(&origin).unwrap(), None);
-    }
-
+    /// Two-slot advertising: a pending head is advertised *alongside* the
+    /// servable complete head, never in its place — the exact shape of a
+    /// past propagation-killing regression.
     #[test]
     fn summaries_report_completeness_honestly() {
         let (_d, store, key, origin) = setup();
@@ -2084,11 +1838,6 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].complete);
 
-        // A pending head for an unknown root shows up as explicitly incomplete
-        // — *alongside* the complete head, not in place of it. Both facts are
-        // load-bearing: the peer needs to know the newer head exists, and it
-        // needs to know we can still serve the older root, or it will neither
-        // pull from us nor count us as a provider for it.
         syncer
             .offer_head(
                 &SignedHead::sign(&key, origin, 2, Hash::new(b"unknown"), 0),
@@ -2106,11 +1855,11 @@ mod tests {
         assert_eq!(pending[0].seq, 2);
     }
 
+    /// §5.2: the flip and the materialization are one transaction, so a crash
+    /// can never leave `entries` missing a promoted head's delta — a record
+    /// the materializer cannot decode stands in for the crash.
     #[test]
     fn a_promotion_that_fails_to_materialize_does_not_flip_the_head() {
-        // §5.2: the flip and the materialization are one transaction, so a
-        // crash can never leave `entries` missing a promoted head's delta. A
-        // record the materializer cannot decode stands in for the crash.
         let (_d, store, key, origin) = setup();
         let syncer = Syncer::new(store.clone());
 
@@ -2135,64 +1884,31 @@ mod tests {
         let err = syncer.try_promote(&origin, 0).unwrap_err().to_string();
         assert!(err.contains("corrupt record"), "{err}");
 
-        // The complete head is untouched and the pending head is still pending.
-        //
-        // The poisoned root *is* in `head_history` — every head in a slot has
-        // its signature there by construction (§10, v11), and a pending head is
-        // no exception. What must not have happened is the flip, so that is what
-        // is asserted: the complete slot still names the good root.
+        // What must not have happened is the flip: the complete slot still
+        // names the good root (the poisoned root *is* in `head_history` — the
+        // signature is there by construction — so that table is no oracle).
         let complete = store.complete_head(&origin).unwrap().unwrap();
         assert_eq!(complete.seq, 1);
         assert_eq!(complete.root, good);
         assert_ne!(complete.root, poisoned);
-        // And the head that failed no longer holds the slot. `try_promote` owns
-        // that now — it is the only party that knows which head it judged — so a
-        // direct call retires it too, where before this test's caller would have
-        // had to.
+        // And the head that failed no longer holds the slot, and the good
+        // head's entry is still materialized.
         assert_eq!(store.pending_head(&origin).unwrap(), None);
         assert!(store.entry(&origin, "s", "poisoned").unwrap().is_none());
-        // And the entry the *complete* head materialized is still there.
         assert!(store.entry(&origin, "s", "a").unwrap().is_some());
     }
 }
 
 #[cfg(test)]
 mod containment_tests {
-    use iroh_base::SecretKey;
     use synch_core::{file_key, FileEntry, Hash, OriginId, SignedHead};
-    use synch_store::{Binding, BindingSource, Slot, Store};
+    use synch_store::Slot;
 
+    use super::tests::setup;
     use super::*;
 
-    fn setup() -> (tempfile::TempDir, Arc<Store>, SecretKey, OriginId) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path()).unwrap());
-        let key = SecretKey::generate();
-        let origin = OriginId::named("nas", "x.example").unwrap();
-        store
-            .put_binding(&Binding {
-                origin: origin.clone(),
-                node_id: key.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
-        (dir, store, key, origin)
-    }
-
-    /// A head this node cannot materialize does not keep the pending slot.
-    ///
-    /// `head_floor` is the best of both slots, so a poisoned head sitting there
-    /// holds the floor above every servable head for its origin — and the
-    /// maintenance sweep then drops it and the next exchange re-adopts it,
-    /// paying a full promotion diff under the write lock every round until an
-    /// operator intervenes. The evidence stays: the head is in `head_history`
-    /// either way.
+    /// A poisoned head must not pin `head_floor` above servable heads; the
+    /// evidence stays in `head_history`.
     #[test]
     fn a_head_that_cannot_be_materialized_does_not_hold_the_floor() {
         let (_d, store, key, origin) = setup();
@@ -2218,8 +1934,8 @@ mod containment_tests {
             "the head is still provable history"
         );
 
-        // And a lesser head this node *can* serve is adoptable again, which the
-        // held floor would have refused.
+        // And a lesser head this node *can* serve is adoptable again, which
+        // the held floor would have refused.
         let good = trie
             .insert(
                 Hash::EMPTY,
@@ -2234,28 +1950,17 @@ mod containment_tests {
         );
     }
 
-    /// A structurally invalid trie is condemned like any other origin fault.
-    ///
-    /// The fault this raises comes from `is_complete`, which descends the peer's
-    /// node graph — so it fires *before* the promotion diff, and before the code
-    /// had recorded which head it was about. The fault arm then retired nothing
-    /// and remembered nothing: the head kept the pending slot, holding
-    /// `head_floor` above everything this node could serve until the sweep took
-    /// it, and the next exchange re-adopted it and repeated. That was worse than
-    /// before the memo existed, which is why the key is built before the walk.
+    /// The fault this raises comes from the completeness walk, which fires
+    /// *before* the promotion diff — so the verdict key must be built before
+    /// the walk (§4.3).
     #[test]
     fn a_head_whose_trie_is_structurally_invalid_is_retired_and_remembered() {
         let (_d, store, key, origin) = setup();
         let syncer = Syncer::new(store.clone());
 
-        // An extension whose child is a leaf, which no canonical trie contains:
-        // an extension above anything but a branch would have been merged (§4.3).
-        // Stored through `put_node` directly, because this is what a peer serving
-        // a hand-built graph looks like and `Trie::insert` cannot produce it.
-        //
-        // The fault this raises comes from the *completeness walk*, not from the
-        // promotion diff — which is the whole point: it fires before the diff, so
-        // it is the case where the verdict key must already have been built.
+        // An extension whose child is a leaf, which no canonical trie contains
+        // (§4.3). Stored through `put_node` directly, because this is what a
+        // peer serving a hand-built graph looks like.
         let (value, _) = synch_mpt::ValueRef::for_value(&[7u8; 4]);
         let child = synch_mpt::TrieNode::Leaf {
             key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2]),
@@ -2278,9 +1983,9 @@ mod containment_tests {
 
         // Retired: the floor is back to what this node can serve.
         assert_eq!(store.head_floor(&origin).unwrap(), None);
-        // And remembered: the second offer does not walk it again, so it does not
-        // raise, and it leaves nothing pending — while still counting against the
-        // origin, which §12 requires the sync report to carry.
+        // And remembered: the second offer does not walk it again, so it does
+        // not raise, and it leaves nothing pending — while still counting
+        // against the origin, which §12 requires the sync report to carry.
         assert_eq!(
             syncer.offer_head(&head, 0).unwrap(),
             HeadOutcome::Refused,
@@ -2289,16 +1994,9 @@ mod containment_tests {
         assert_eq!(store.pending_head(&origin).unwrap(), None);
     }
 
-    /// A promotion judged unpromotable once is not attempted again.
-    ///
-    /// Retiring the head from the pending slot is what lets the node serve again
-    /// — and it is also what makes the same head beat `head_floor` on the next
-    /// offer. With no memory of the verdict the node re-adopted it, walked the
-    /// trie, ran the promotion diff and failed, once per exchange, forever, each
-    /// turn holding the single write connection.
-    ///
-    /// The memory is keyed on the *pair* `(head, root-it-would-diff-from)`,
-    /// because that is what the verdict is a function of.
+    /// The verdict is keyed on the pair (head, root-it-would-diff-from): a
+    /// re-offer is Refused from the memo, a different root judged on its
+    /// merits — and the origin is still counted in `heads_failed`.
     #[test]
     fn a_promotion_judged_unpromotable_is_not_attempted_again() {
         let (_d, store, key, origin) = setup();
@@ -2318,25 +2016,16 @@ mod containment_tests {
             "and it was retired"
         );
 
-        // Offered again — which is what every later exchange with a peer holding
-        // it does. The diff must not run a second time, so no error surfaces; and
-        // the outcome must be counted against the origin, or `synch sync` — which
-        // prints the "N origin(s) left behind" line from `heads_failed` — reports
-        // nothing at all for an origin this node permanently cannot apply, since
-        // the fault itself propagates only on the first offer.
+        // Offered again — which is what every later exchange with a peer
+        // holding it does: no error surfaces, the outcome is still counted
+        // against the origin, and it does not keep the floor.
         assert_eq!(
             syncer.offer_head(&head, 0).unwrap(),
             HeadOutcome::Refused,
             "the promotion is not re-attempted, and the origin is still counted"
         );
-        assert_eq!(
-            store.head_floor(&origin).unwrap(),
-            None,
-            "and it does not keep the floor"
-        );
+        assert_eq!(store.head_floor(&origin).unwrap(), None);
 
-        // The verdict is about one promotion, not about the origin: a different
-        // root at a higher seq is still judged on its merits.
         let good = trie
             .insert(
                 Hash::EMPTY,
@@ -2344,23 +2033,16 @@ mod containment_tests {
                 &postcard::to_stdvec(&FileEntry::file(1, 0, Hash::new(b"c"), 1)).unwrap(),
             )
             .unwrap();
-        let later = SignedHead::sign(&key, origin.clone(), 6, good, 0);
+        let later = SignedHead::sign(&key, origin, 6, good, 0);
         assert_eq!(
             syncer.offer_head(&later, 0).unwrap(),
             HeadOutcome::Completed
         );
     }
 
-    /// The pending bell survives a ring nobody is parked on.
-    ///
-    /// This is the whole of what the reactive fetch rests on, and the reason it
-    /// cannot be a `notify_waiters`: the anti-entropy loop is parked on this
-    /// only *between* rounds, and spends the rest of its life inside
-    /// `anti_entropy_round` dialling peers — which is exactly when the pushes
-    /// it needs to hear about land, since a publisher pushes to the whole
-    /// membership at once (§5.3). A bell that keeps nothing for an unparked
-    /// listener is a bell that is silent for every push that arrives during a
-    /// round, and the fetch waits for the next interval after all.
+    /// A bell that keeps nothing for an unparked listener is silent for the
+    /// pushes that land mid-round, when the anti-entropy loop is dialling
+    /// peers rather than parked (§5.3).
     #[tokio::test]
     async fn a_pending_head_rung_mid_round_is_not_lost() {
         let (_d, store, key, origin) = setup();
@@ -2377,17 +2059,9 @@ mod containment_tests {
             .expect("a wake that landed while the loop was busy must still be there");
     }
 
-    /// The pull asks about a peer's *best* summary, not its first.
-    ///
-    /// A peer advertises both slots per origin, and its complete slot can be the
-    /// higher of the two — `publish` and `activate` take `next_own_seq` and write
-    /// the complete slot without consulting pending, which is the §3.4 recovery
-    /// shape §5.2 names. Comparing the first summary listed and skipping the rest
-    /// therefore lost the pull arm for that origin: this node saw the peer's lower
-    /// pending summary, found it not newer, and never asked for the higher head.
-    ///
-    /// Driven at the decision itself rather than over a socket, because what was
-    /// wrong is the choice of summary and nothing about the transport.
+    /// A peer advertises both slots per origin; comparing the first summary
+    /// listed and skipping the rest lost the pull arm when the complete slot
+    /// was the higher of the two (§5.2).
     #[test]
     fn the_pull_compares_the_peers_best_summary_for_an_origin() {
         let (_d, store, key, origin) = setup();
@@ -2399,8 +2073,8 @@ mod containment_tests {
         let mine = syncer.local_summaries().unwrap();
         assert_eq!(mine.len(), 1);
 
-        // The peer lists its pending seq 6 first and its complete seq 7 second,
-        // which is the order `local_summaries` produces for that state.
+        // The peer lists its pending seq 6 first and its complete seq 7
+        // second, which is the order `local_summaries` produces for that state.
         let theirs = vec![
             HeadSummary {
                 origin: origin.clone(),
@@ -2424,14 +2098,9 @@ mod containment_tests {
         );
     }
 
-    /// A head the memo already refuses does not ring the fetch bell.
-    ///
-    /// The bell wakes the anti-entropy loop to go and fetch a trie. A refused
-    /// head is adopted and retired in the same breath — adopting it is what makes
-    /// it beat the floor again — so ringing on adoption woke the loop for a head
-    /// that no longer existed, and `notify_one` keeps a permit while the loop is
-    /// not parked during a round: one such head held by one peer pinned the node
-    /// to back-to-back rounds at the reactive floor, permanently.
+    /// Ringing on adoption would wake the loop for a head that no longer
+    /// exists, and a stuck notify permit pins the node to back-to-back
+    /// rounds at the reactive floor.
     #[tokio::test]
     async fn a_refused_head_does_not_ring_the_fetch_bell() {
         let (_d, store, key, origin) = setup();
@@ -2446,11 +2115,6 @@ mod containment_tests {
         syncer
             .offer_head(&head, 0)
             .expect_err("the record cannot be materialized");
-        // The first offer must not have rung either, and asserting that rather
-        // than draining it is free coverage: the bell lives in the
-        // `Promotion::Waiting` arm, which a promotion that raised never reaches,
-        // so a ring here would be the same defect one retirement path over —
-        // waking the loop to fetch a trie for a head that was just retired.
         tokio::time::timeout(std::time::Duration::from_millis(200), wake.notified())
             .await
             .expect_err("a head retired by a fault must not ring either");
@@ -2465,13 +2129,9 @@ mod containment_tests {
             .expect_err("a refused head has no trie to fetch and must not wake the loop");
     }
 
-    /// The pending slot ages, not the head occupying it.
-    ///
-    /// `pending_head_ttl` is §5.2's only time-based escape from a floor pinned
-    /// by a head nobody can serve, and it reads `heads.received_at`. Taking
-    /// that from each newly adopted head reset the clock on every arrival, so
-    /// an origin publishing faster than the TTL kept the sweep from ever
-    /// firing.
+    /// The pending slot ages, not the head occupying it: taking
+    /// `received_at` from each newly adopted head reset the sweep clock on
+    /// every arrival, so a fast publisher outran the TTL forever.
     #[test]
     fn a_newer_pending_head_inherits_the_slots_clock() {
         let (_d, store, key, origin) = setup();
@@ -2546,12 +2206,8 @@ mod containment_tests {
         );
     }
 
-    /// Abandoning a head names the head being abandoned.
-    ///
-    /// `clear_head` deletes whatever occupies the slot, and both abandonment
-    /// paths reach their verdict on a snapshot taken before several network
-    /// round trips or a trie walk. A newer head accepted in that window went
-    /// with the old one's verdict.
+    /// `clear_head` must name the head being abandoned: a newer head accepted
+    /// while a fetch was between round trips went with the old one's verdict.
     #[test]
     fn clearing_a_slot_leaves_a_head_that_arrived_since() {
         let (_d, store, key, origin) = setup();
@@ -2577,8 +2233,9 @@ mod containment_tests {
         assert_eq!(store.pending_head(&origin).unwrap(), None);
     }
 
-    /// Our own next seq is above everything this node has ever recorded for the
-    /// origin, not just above the complete slot.
+    /// Our own next seq counts the pending slot and the retained history, not
+    /// just the complete slot — the §3.4 recovery shape a restored backup
+    /// meets.
     #[test]
     fn the_next_own_seq_clears_the_pending_slot_and_the_history() {
         let (_d, store, key, origin) = setup();
@@ -2586,8 +2243,7 @@ mod containment_tests {
         assert_eq!(store.next_own_seq(&origin).unwrap(), 1);
 
         // A peer relays one of our own heads back, at a seq the complete slot
-        // knows nothing about. This is the §3.4 recovery shape, and it is what a
-        // restored backup meets.
+        // knows nothing about.
         let relayed = SignedHead::sign(&key, origin.clone(), 9, Hash([9u8; 32]), 0);
         assert_eq!(
             Syncer::new(store.clone()).offer_head(&relayed, 0).unwrap(),

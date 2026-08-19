@@ -40,9 +40,10 @@ pub(crate) fn direct_addr(endpoint: &Endpoint) -> EndpointAddr {
 /// stay open, and no frame ever comes back. Its connections are held for as long
 /// as the task lives so nothing on the wire closes and hands the client an error
 /// the deadline was not responsible for.
+#[allow(missing_debug_implementations)]
 pub(crate) struct StalledPeer {
     /// Where to dial it.
-    pub(crate) addr: EndpointAddr,
+    pub addr: EndpointAddr,
     endpoint: Endpoint,
     task: tokio::task::JoinHandle<()>,
 }
@@ -79,61 +80,16 @@ impl StalledPeer {
 ///
 /// What a client's own validation has to be exercised against: a well-formed
 /// answer that is not one an honest responder would ever send.
-pub(crate) struct ScriptedPeer {
-    /// Where to dial it.
-    pub(crate) addr: EndpointAddr,
-    endpoint: Endpoint,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl ScriptedPeer {
-    /// Binds one and starts answering.
-    pub(crate) async fn bind<T>(alpn: &'static [u8], reply: T) -> ScriptedPeer
-    where
-        T: serde::Serialize + Send + Sync + 'static,
-    {
-        let endpoint = bare_endpoint(alpn).await;
-        let addr = direct_addr(&endpoint);
-        let listening = endpoint.clone();
-        let reply = std::sync::Arc::new(reply);
-        let task = tokio::spawn(async move {
-            while let Some(incoming) = listening.accept().await {
-                let Ok(connection) = incoming.await else {
-                    continue;
-                };
-                let reply = reply.clone();
-                tokio::spawn(async move {
-                    while let Ok((mut send, _recv)) = connection.accept_bi().await {
-                        if crate::frame::write_frame(&mut send, reply.as_ref())
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                        let _ = send.finish();
-                    }
-                });
-            }
-        });
-        ScriptedPeer {
-            addr,
-            endpoint,
-            task,
-        }
-    }
-
-    /// Stops answering and closes the endpoint.
-    pub(crate) async fn shutdown(self) {
-        self.task.abort();
-        self.endpoint.close().await;
-    }
-}
-
+#[allow(missing_debug_implementations)]
 /// A pair of endpoints that trust each other, for exercising a real exchange.
 ///
 /// Membership is unilateral per node (§3.2), so both stores are told about the
 /// other's device key before anything is dialled. The client's data directory
 /// comes back with them: dropping it would take its database with it.
+///
+/// `cfg(test)` only: tempfile is a dev-dependency, absent from the `sim`
+/// feature build the integration suites link.
+#[cfg(test)]
 pub(crate) async fn trusting_pair(
     server_store: std::sync::Arc<synch_store::Store>,
     server_options: crate::endpoint::NetOptions,
@@ -178,4 +134,40 @@ pub(crate) fn trust(store: &synch_store::Store, key: synch_core::NodeId) {
             expires_at: None,
         })
         .expect("a static binding");
+}
+
+/// A [`ResolverOptions`](crate::dns::ResolverOptions) builder for resolver
+/// tests: knobs unset and TUF off by default, chainable overrides on top.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolverOptionsBuilder {
+    options: crate::dns::ResolverOptions,
+}
+
+impl ResolverOptionsBuilder {
+    /// Every knob unset and TUF off.
+    pub(crate) fn new() -> Self {
+        Self {
+            options: crate::dns::ResolverOptions {
+                no_tuf: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A DNSKEY file replacing the ICANN root trust anchor.
+    pub(crate) fn trust_anchor(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.options.trust_anchor = Some(path.into());
+        self
+    }
+
+    /// The built options.
+    pub(crate) fn build(self) -> crate::dns::ResolverOptions {
+        self.options
+    }
+}
+
+impl Default for ResolverOptionsBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }

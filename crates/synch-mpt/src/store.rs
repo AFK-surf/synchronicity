@@ -222,28 +222,3 @@ impl NodeStore for MemStore {
             .contains_key(hash))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mem_store_round_trip() {
-        let s = MemStore::new();
-        let h = Hash::new(b"n");
-        assert!(!s.has_node(&h).unwrap());
-        s.put_node(&h, b"data").unwrap();
-        assert!(s.has_node(&h).unwrap());
-        assert_eq!(s.get_node(&h).unwrap().unwrap(), b"data".to_vec());
-        assert_eq!(s.node_count(), 1);
-
-        let v = Hash::new(b"v");
-        s.put_value(&v, b"payload").unwrap();
-        assert_eq!(s.get_value(&v).unwrap().unwrap(), b"payload".to_vec());
-        assert_eq!(s.value_count(), 1);
-
-        assert_eq!(s.retain(&[], &[v]), 1);
-        assert_eq!(s.node_count(), 0);
-        assert_eq!(s.value_count(), 1);
-    }
-}

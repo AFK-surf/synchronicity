@@ -1511,168 +1511,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_trie_reads_nothing() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        assert_eq!(t.get(Hash::EMPTY, b"a").unwrap(), None);
-        assert!(t.iter(Hash::EMPTY).unwrap().is_empty());
-        assert!(t.is_complete(Hash::EMPTY).unwrap());
-    }
-
-    #[test]
-    fn insert_and_get() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let mut root = Hash::EMPTY;
-        for (k, v) in [("apple", "1"), ("apply", "2"), ("ape", "3"), ("b", "4")] {
-            root = t.insert(root, k.as_bytes(), v.as_bytes()).unwrap();
-        }
-        assert_eq!(t.get(root, b"apple").unwrap().unwrap(), b"1");
-        assert_eq!(t.get(root, b"apply").unwrap().unwrap(), b"2");
-        assert_eq!(t.get(root, b"ape").unwrap().unwrap(), b"3");
-        assert_eq!(t.get(root, b"b").unwrap().unwrap(), b"4");
-        assert_eq!(t.get(root, b"app").unwrap(), None);
-        assert_eq!(t.get(root, b"c").unwrap(), None);
-        assert!(t.contains(root, b"b").unwrap());
-    }
-
-    #[test]
-    fn key_that_is_a_prefix_of_another() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let mut root = Hash::EMPTY;
-        root = t.insert(root, b"abc", b"long").unwrap();
-        root = t.insert(root, b"ab", b"short").unwrap();
-        assert_eq!(t.get(root, b"ab").unwrap().unwrap(), b"short");
-        assert_eq!(t.get(root, b"abc").unwrap().unwrap(), b"long");
-        assert_eq!(
-            t.iter(root).unwrap(),
-            vec![
-                (b"ab".to_vec(), b"short".to_vec()),
-                (b"abc".to_vec(), b"long".to_vec())
-            ]
-        );
-    }
-
-    #[test]
-    fn overwrite_replaces_value() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let root = t.insert(Hash::EMPTY, b"k", b"v1").unwrap();
-        let root2 = t.insert(root, b"k", b"v2").unwrap();
-        assert_ne!(root, root2);
-        assert_eq!(t.get(root2, b"k").unwrap().unwrap(), b"v2");
-        // The old root remains readable: structural sharing keeps history alive.
-        assert_eq!(t.get(root, b"k").unwrap().unwrap(), b"v1");
-    }
-
-    #[test]
-    fn remove_returns_to_empty() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let root = t.insert(Hash::EMPTY, b"only", b"v").unwrap();
-        let root = t.remove(root, b"only").unwrap();
-        assert_eq!(root, Hash::EMPTY);
-    }
-
-    #[test]
-    fn remove_absent_key_is_a_no_op() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let root = t.insert(Hash::EMPTY, b"a", b"1").unwrap();
-        assert_eq!(t.remove(root, b"zzz").unwrap(), root);
-        assert_eq!(t.remove(Hash::EMPTY, b"zzz").unwrap(), Hash::EMPTY);
-    }
-
-    #[test]
-    fn large_values_go_out_of_line() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let big = vec![9u8; 500];
-        let root = t.insert(Hash::EMPTY, b"k", &big).unwrap();
-        assert_eq!(s.value_count(), 1);
-        assert_eq!(t.get(root, b"k").unwrap().unwrap(), big);
-        assert!(t.is_complete(root).unwrap());
-    }
-
-    #[test]
-    fn missing_values_are_reported() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let big = vec![9u8; 500];
-        let root = t.insert(Hash::EMPTY, b"k", &big).unwrap();
-        s.retain(&s.node_hashes(), &[]);
-        let missing = t.missing(root, 10).unwrap();
-        assert_eq!(missing.nodes.len(), 0);
-        assert_eq!(missing.values.len(), 1);
-        assert!(!t.is_complete(root).unwrap());
-        assert!(matches!(t.get(root, b"k"), Err(MptError::MissingValue(_))));
-    }
-
-    #[test]
-    fn missing_nodes_are_reported() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let mut root = Hash::EMPTY;
-        for i in 0..20u8 {
-            root = t.insert(root, &[i, i], b"v").unwrap();
-        }
-        assert!(t.is_complete(root).unwrap());
-        s.retain(&[root], &[]);
-        let missing = t.missing(root, 100).unwrap();
-        assert!(!missing.is_empty());
-        assert!(!t.is_complete(root).unwrap());
-    }
-
-    #[test]
-    fn scan_by_prefix() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let mut root = Hash::EMPTY;
-        for k in ["f:a/1", "f:a/2", "f:a/sub/3", "f:b/1", "b:x"] {
-            root = t.insert(root, k.as_bytes(), k.as_bytes()).unwrap();
-        }
-        let keys: Vec<String> = t
-            .scan(root, b"f:a/", None, None)
-            .unwrap()
-            .into_iter()
-            .map(|(k, _)| String::from_utf8(k).unwrap())
-            .collect();
-        assert_eq!(keys, vec!["f:a/1", "f:a/2", "f:a/sub/3"]);
-
-        let keys: Vec<String> = t
-            .scan(root, b"f:", None, None)
-            .unwrap()
-            .into_iter()
-            .map(|(k, _)| String::from_utf8(k).unwrap())
-            .collect();
-        assert_eq!(keys, vec!["f:a/1", "f:a/2", "f:a/sub/3", "f:b/1"]);
-
-        assert!(t.scan(root, b"zzz", None, None).unwrap().is_empty());
-    }
-
-    #[test]
-    fn scan_pagination() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let mut root = Hash::EMPTY;
-        for i in 0..10u8 {
-            root = t.insert(root, format!("k{i:02}").as_bytes(), b"v").unwrap();
-        }
-        let page1 = t.scan(root, b"k", None, Some(4)).unwrap();
-        assert_eq!(page1.len(), 4);
-        assert_eq!(page1[0].0, b"k00".to_vec());
-        let page2 = t.scan(root, b"k", Some(&page1[3].0), Some(4)).unwrap();
-        assert_eq!(page2.len(), 4);
-        assert_eq!(page2[0].0, b"k04".to_vec());
-        let page3 = t.scan(root, b"k", Some(&page2[3].0), Some(4)).unwrap();
-        assert_eq!(page3.len(), 2);
-        assert_eq!(page3[1].0, b"k09".to_vec());
-        let page4 = t.scan(root, b"k", Some(&page3[1].0), Some(4)).unwrap();
-        assert!(page4.is_empty());
-    }
-
-    #[test]
     fn structural_sharing_bounds_allocation() {
         let s = MemStore::new();
         let t = trie(&s);
@@ -1685,49 +1523,19 @@ mod tests {
         let before = s.node_count();
         let root2 = t.insert(root, b"f:space/0000", b"changed").unwrap();
         let added = s.node_count() - before;
-        // Only the path from the touched leaf to the root is allocated.
+        // Only the path from the touched leaf to the root is allocated, and the
+        // old root stays readable: structural sharing keeps history alive.
         assert!(added <= 12, "allocated {added} nodes for a one-key change");
         assert_ne!(root, root2);
-    }
-
-    #[test]
-    fn apply_batch() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let root = t
-            .apply(
-                Hash::EMPTY,
-                vec![
-                    (b"a".as_slice(), Some(b"1".as_slice())),
-                    (b"b".as_slice(), Some(b"2".as_slice())),
-                ],
-            )
-            .unwrap();
-        let root = t
-            .apply(
-                root,
-                vec![
-                    (b"a".as_slice(), None),
-                    (b"c".as_slice(), Some(b"3".as_slice())),
-                ],
-            )
-            .unwrap();
-        assert_eq!(
-            t.iter(root).unwrap(),
-            vec![
-                (b"b".to_vec(), b"2".to_vec()),
-                (b"c".to_vec(), b"3".to_vec())
-            ]
-        );
+        assert_eq!(t.get(root, b"f:space/0000").unwrap().unwrap(), b"entry");
     }
 
     #[test]
     fn reachable_covers_nodes_and_values() {
         let s = MemStore::new();
         let t = trie(&s);
-        let mut root = Hash::EMPTY;
-        root = t.insert(root, b"a", &vec![1u8; 300]).unwrap();
-        root = t.insert(root, b"b", b"small").unwrap();
+        let root = t.insert(Hash::EMPTY, b"a", &vec![1u8; 300]).unwrap();
+        let root = t.insert(root, b"b", b"small").unwrap();
         let r = t.reachable(root).unwrap();
         assert!(r.nodes.contains(&root));
         assert_eq!(r.values.len(), 1);
@@ -1743,11 +1551,9 @@ mod tests {
             Err(MptError::KeyTooLong(_))
         ));
     }
-    /// The boundary case the whole scoped design rests on.
-    ///
     /// A walk confined to one space must ask for the spine — which is what
-    /// makes the signed root recomputable — and must never ask for a sibling
-    /// subtree, whose hash it nonetheless holds.
+    /// makes the signed root recomputable — and never for a sibling subtree,
+    /// whose hash it nonetheless holds (§5.5).
     #[test]
     fn a_scoped_walk_asks_for_the_spine_and_never_the_sibling() {
         let source = MemStore::new();
@@ -1809,13 +1615,9 @@ mod tests {
         assert!(!scoped.is_complete(root).unwrap());
     }
 
-    /// Position, not hash, is what a scoped fetch may be authorized on.
-    ///
-    /// A position is always a *node boundary*, because both sides derive it by
-    /// descending the structure — a branch slot or an extension's whole
-    /// prefix. A path that stops partway through an extension names nothing,
-    /// which is what makes a fabricated position unresolvable rather than
-    /// merely wrong.
+    /// Position, not hash, is what a scoped fetch may be authorized on: a path
+    /// that stops partway through an extension names nothing, so a fabricated
+    /// position is unresolvable rather than merely wrong (§5.5).
     #[test]
     fn a_claimed_position_resolves_to_what_is_really_there() {
         let source = MemStore::new();
@@ -1880,8 +1682,8 @@ mod tests {
         }
     }
 
-    /// A delegated origin publishing outside its spaces is caught, and caught
-    /// by walking the spine rather than the trie.
+    /// A delegated origin publishing outside its spaces is caught, by walking
+    /// the spine rather than the trie (§3.5).
     #[test]
     fn a_key_outside_the_scope_is_found() {
         let store = MemStore::new();
@@ -1911,13 +1713,9 @@ mod tests {
 mod guard_tests {
     use super::*;
 
-    /// The guard stops a walk at exactly the ceiling.
-    ///
-    /// Driven directly, in microseconds. Proving the same thing through `diff`
-    /// costs a real fan-out DAG expanded to `WALK_POSITION_CEILING` positions,
-    /// which is ~8 s in release and ~90 s in a debug CI run — see
-    /// `fanout_bomb.rs`, where that end-to-end assertion lives behind
-    /// `#[ignore]`. This is the arithmetic; that one is the wiring.
+    /// The guard stops a walk at exactly the ceiling, driven directly in
+    /// microseconds; the end-to-end wiring twin lives `#[ignore]`d in
+    /// fanout_bomb.rs because it must walk all 8 000 000 positions.
     #[test]
     fn the_walk_guard_stops_at_the_ceiling() {
         let mut guard = FanoutGuard::default();

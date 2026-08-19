@@ -416,6 +416,13 @@ mod tests {
         let old_key = node.node_id();
         let old_addr = node.net().direct_addr();
 
+        // Refusals first: an unknown key, and the already-active one.
+        let stranger = SecretKey::generate().public();
+        let err = node.activate_key(&stranger, None).await.unwrap_err();
+        assert!(err.to_string().contains("no such device key"), "{err}");
+        let err = node.activate_key(&old_key, None).await.unwrap_err();
+        assert!(err.to_string().contains("already the active key"), "{err}");
+
         // Publish something, so the re-signed head carries a real root.
         let entry = synch_core::FileEntry::file(3, 0, synch_core::Hash::new(b"c"), 1);
         let first = node
@@ -467,18 +474,6 @@ mod tests {
             .unwrap();
         assert_eq!(next.signed_by, new_key);
         assert_eq!(next.seq, activation.head.seq + 1);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn activate_refuses_unknown_and_already_active_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = node(dir.path(), Some(named())).await;
-        let stranger = SecretKey::generate().public();
-        let err = node.activate_key(&stranger, None).await.unwrap_err();
-        assert!(err.to_string().contains("no such device key"), "{err}");
-        let err = node.activate_key(&node.node_id(), None).await.unwrap_err();
-        assert!(err.to_string().contains("already the active key"), "{err}");
         node.shutdown().await.unwrap();
     }
 
@@ -601,38 +596,14 @@ mod tests {
             "and the old one is still bound"
         );
 
-        a.shutdown().await.unwrap();
+        // With B gone, the same query reports it as unreachable — silence is
+        // not a no, and an operator must not read it as confirmation.
         b.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn an_unreachable_peer_is_reported_rather_than_counted() {
-        let dir = tempfile::tempdir().unwrap();
-        let origin = OriginId::named("a", "cluster.example").unwrap();
-        Node::init_named_by_zone(dir.path(), origin.clone()).unwrap();
-        let node = Node::open(crate::config::NodeConfig::loopback(dir.path()))
-            .await
-            .unwrap();
-        // A trusted peer that is not listening anywhere.
-        let absent = iroh_base::SecretKey::generate().public();
-        node.store()
-            .put_binding(&Binding {
-                origin: OriginId::named("ghost", "cluster.example").unwrap(),
-                node_id: absent,
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
-
-        let answers = node.peer_bindings(&origin).await.unwrap();
+        let answers = a.peer_bindings(&a_origin).await.unwrap();
         assert_eq!(answers.len(), 1);
         assert!(!answers[0].reachable());
-        assert!(!answers[0].holds(&node.node_id()), "silence is not a no");
-        node.shutdown().await.unwrap();
+        assert!(!answers[0].holds(&plan.new_key));
+
+        a.shutdown().await.unwrap();
     }
 }

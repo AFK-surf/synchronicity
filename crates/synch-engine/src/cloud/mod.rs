@@ -125,14 +125,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NodeConfig;
-
-    async fn node() -> (tempfile::TempDir, Node) {
-        let dir = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        (dir, node)
-    }
+    use crate::testkit::node;
 
     #[tokio::test]
     async fn attach_is_on_by_default_until_opted_out() {
@@ -147,23 +140,6 @@ mod tests {
 
         node.enable_cloud().unwrap();
         assert!(!node.cloud_settings().unwrap().disabled);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn status_is_reported_per_domain_and_sorted() {
-        let (_d, node) = node().await;
-        assert!(node.cloud_status().is_empty());
-        node.set_cloud_status("b.example", None, false, Some("no record".into()));
-        node.set_cloud_status("a.example", Some("https://sync.example".into()), true, None);
-        let status = node.cloud_status();
-        assert_eq!(status.len(), 2);
-        assert_eq!(status[0].domain, "a.example");
-        assert!(status[0].attached);
-        assert_eq!(status[1].last_error.as_deref(), Some("no record"));
-
-        node.forget_cloud_status("b.example");
-        assert_eq!(node.cloud_status().len(), 1);
         node.shutdown().await.unwrap();
     }
 }

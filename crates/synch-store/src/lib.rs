@@ -11,6 +11,8 @@ pub mod heads;
 pub mod proof;
 pub mod recovery;
 pub mod schema;
+#[cfg(test)]
+mod testutil;
 pub mod unified;
 pub mod uploads;
 pub mod views;

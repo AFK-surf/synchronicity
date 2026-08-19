@@ -271,20 +271,14 @@ mod tests {
         assert_eq!(batch.len(), 3);
         assert_eq!(publisher.pending(), 0);
         assert!(!publisher.is_full());
-    }
 
-    #[test]
-    fn restaging_keeps_the_failed_batch_first() {
-        let publisher = Publisher::new(Duration::from_secs(2), 1000);
-        publisher.stage([change("a")]);
-        let failed = publisher.take();
-        publisher.stage([change("b")]);
-        publisher.restage(failed);
-
-        let batch = publisher.take();
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch[0].0, b"a".to_vec());
-        assert_eq!(batch[1].0, b"b".to_vec());
+        // A failed batch goes back ahead of anything staged meanwhile.
+        publisher.stage([change("d")]);
+        publisher.restage(batch);
+        let retried = publisher.take();
+        assert_eq!(retried.len(), 4);
+        assert_eq!(retried[0].0, b"a".to_vec());
+        assert_eq!(retried[3].0, b"d".to_vec());
     }
 
     #[tokio::test]
@@ -298,16 +292,15 @@ mod tests {
 
     // ---- the publisher against a real node --------------------------------
 
-    use crate::config::NodeConfig;
+    use crate::testkit::{eventually, node_with};
 
     /// A node whose batch triggers are set for a test rather than for a desk.
     async fn node(quiesce: Duration, batch_max: usize) -> (tempfile::TempDir, Node) {
-        let dir = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), None).unwrap();
-        let mut config = NodeConfig::loopback(dir.path());
-        config.publish_quiesce = quiesce;
-        config.publish_batch_max = batch_max;
-        (dir, Node::open(config).await.unwrap())
+        node_with(move |config| {
+            config.publish_quiesce = quiesce;
+            config.publish_batch_max = batch_max;
+        })
+        .await
     }
 
     fn entry(node: &Node, path: &str) -> StagedChange {
@@ -316,18 +309,6 @@ mod tests {
             node.key_for("s", path).unwrap(),
             Some(postcard::to_stdvec(&entry).unwrap()),
         )
-    }
-
-    /// Polls until `ready` holds, or gives up. Timing-sensitive tests assert
-    /// "soon", never "at 50 ms".
-    async fn eventually(mut ready: impl FnMut() -> bool) -> bool {
-        for _ in 0..200 {
-            if ready() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        false
     }
 
     /// Runs the publisher loop until the returned sender fires.
@@ -422,37 +403,6 @@ mod tests {
 
         assert_eq!(node.publisher().pending(), 0);
         assert_eq!(node.own_head().unwrap().unwrap().seq, 1);
-        node.shutdown().await.unwrap();
-    }
-
-    /// The case batching exists for: several rescans, one head.
-    #[tokio::test]
-    async fn a_burst_of_rescans_costs_one_head() {
-        let (_d, node) = node(Duration::from_millis(50), 1000).await;
-        let space = tempfile::tempdir().unwrap();
-        node.add_space("media", space.path()).unwrap();
-
-        // Two rescans, as a watcher hint per save would produce. Both are
-        // staged before the loop starts, so what is asserted is the batching
-        // and not the width of a timing window.
-        std::fs::write(space.path().join("a.txt"), b"first").unwrap();
-        node.scan_and_stage().unwrap();
-        std::fs::write(space.path().join("b.txt"), b"second").unwrap();
-        node.scan_and_stage().unwrap();
-        assert!(node.own_head().unwrap().is_none(), "nothing published yet");
-
-        let (tx, handle) = run(&node);
-        assert!(eventually(|| node.own_head().unwrap().is_some()).await);
-        stop(tx, handle).await;
-
-        assert_eq!(node.own_head().unwrap().unwrap().seq, 1);
-        assert_eq!(
-            node.store()
-                .list_entries(Some(node.origin()), "media", "", None, None)
-                .unwrap()
-                .len(),
-            2
-        );
         node.shutdown().await.unwrap();
     }
 

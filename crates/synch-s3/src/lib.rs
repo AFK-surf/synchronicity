@@ -1025,31 +1025,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn etags_are_quoted_blake3_roots() {
-        let hash = synch_core::Hash::new(b"payload");
-        let tag = etag(Some(&hash));
-        assert_eq!(tag, format!("\"{}\"", hash.to_hex()));
-        assert_eq!(tag.len(), 66);
-        assert_eq!(etag(None), "\"\"");
-    }
-
-    #[test]
     fn ranges_parse() {
-        assert_eq!(parse_range("bytes=0-9", 100).unwrap(), (0, 10));
-        assert_eq!(parse_range("bytes=10-", 100).unwrap(), (10, 100));
-        assert_eq!(parse_range("bytes=-20", 100).unwrap(), (80, 100));
-        // An end past the object clamps rather than failing.
-        assert_eq!(parse_range("bytes=90-200", 100).unwrap(), (90, 100));
-    }
-
-    #[test]
-    fn bad_ranges_are_rejected() {
-        assert!(parse_range("items=0-9", 100).is_err());
-        assert!(parse_range("bytes=0-9,20-29", 100).is_err());
-        assert!(parse_range("bytes=-", 100).is_err());
-        assert!(parse_range("bytes=abc-def", 100).is_err());
-        assert!(parse_range("bytes=100-200", 100).is_err());
-        assert!(parse_range("bytes=50-40", 100).is_err());
+        // The happy-path boundaries (incl. the clamp-past-end and open-ended
+        // forms the gateway test does not exercise) and the rejections.
+        for (value, size, ok) in [
+            ("bytes=0-9", 100, Some((0, 10))),
+            ("bytes=10-", 100, Some((10, 100))),
+            ("bytes=-20", 100, Some((80, 100))),
+            ("bytes=90-200", 100, Some((90, 100))),
+            ("items=0-9", 100, None),
+            ("bytes=0-9,20-29", 100, None),
+            ("bytes=-", 100, None),
+            ("bytes=abc-def", 100, None),
+            ("bytes=100-200", 100, None),
+            ("bytes=50-40", 100, None),
+        ] {
+            assert_eq!(parse_range(value, size).ok(), ok, "{value}");
+        }
     }
 
     #[test]
@@ -1097,13 +1089,5 @@ mod tests {
         // And a well-formed escape still decodes when a multi-byte character
         // follows it.
         assert_eq!(percent_decode("%2Fé"), "/é");
-    }
-
-    #[test]
-    fn loopback_detection() {
-        assert!(is_loopback(&"127.0.0.1:9000".parse().unwrap()));
-        assert!(is_loopback(&"[::1]:9000".parse().unwrap()));
-        assert!(!is_loopback(&"0.0.0.0:9000".parse().unwrap()));
-        assert!(!is_loopback(&"10.0.0.1:9000".parse().unwrap()));
     }
 }

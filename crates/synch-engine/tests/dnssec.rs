@@ -1,11 +1,5 @@
 //! DNSSEC membership end to end: a simulated signed zone, the real resolver,
 //! and a real node adopting what validates (§3.2).
-//!
-//! This is the full production path with only the world faked: the zone is
-//! served over plaintext DoH by `synch_net::sim`, its key anchored as the
-//! whole root of trust, and the node's ordinary refresh turns the validated
-//! records into live bindings — then keeps them when the resolver goes away,
-//! because a resolver outage must never shrink the member set.
 
 use iroh_base::SecretKey;
 use synch_core::OriginId;
@@ -43,8 +37,6 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
         rekor_key: None,
         rekor_state: None,
         tuf_url: None,
-        // Nothing in this suite exercises pin refresh, and no test run
-        // reaches Sigstore by accident.
         no_tuf: true,
         tuf_root: None,
     })

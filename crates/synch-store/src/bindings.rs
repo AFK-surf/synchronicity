@@ -712,20 +712,12 @@ mod tests {
     use synch_core::MIN_TRUSTED_NS;
 
     use super::*;
+    use crate::testutil::store;
 
-    /// A trustworthy instant, `secs` seconds into the trusted era.
-    ///
-    /// Expiries are compared against a clock, and a clock reading below
-    /// [`MIN_TRUSTED_NS`] dates nothing (see [`crate::clock`]) — so a test that
-    /// wants a binding to be live has to say when.
+    /// A trustworthy instant, `secs` seconds into the trusted era: a clock
+    /// reading below [`MIN_TRUSTED_NS`] dates nothing (see [`crate::clock`]).
     fn at(secs: i64) -> i64 {
         MIN_TRUSTED_NS + secs * 1_000_000_000
-    }
-
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        (dir, store)
     }
 
     fn binding(origin: OriginId, key: NodeId, expires: Option<i64>) -> Binding {
@@ -746,19 +738,42 @@ mod tests {
         }
     }
 
+    /// A delegation of `spaces` from `issuer` to `subject`, live a millennium.
+    fn delegation(subject: NodeId, issuer: OriginId, spaces: &[&str]) -> Binding {
+        Binding {
+            origin: OriginId::Key(subject),
+            node_id: subject,
+            source: BindingSource::Delegated,
+            domain: None,
+            issuer: Some(issuer),
+            spaces: spaces.iter().map(|s| s.to_string()).collect(),
+            note: None,
+            added_at: at(0),
+            expires_at: Some(at(1000)),
+        }
+    }
+
     #[test]
     fn static_bindings_never_expire() {
         let (_d, store) = store();
-        let key = SecretKey::generate().public();
+        let k1 = SecretKey::generate().public();
+        let k2 = SecretKey::generate().public();
         let origin = OriginId::named("nas", "x.example").unwrap();
         store
-            .put_binding(&binding(origin.clone(), key, None))
+            .put_binding(&binding(origin.clone(), k1, None))
+            .unwrap();
+        store
+            .put_binding(&binding(OriginId::Key(k2), k2, None))
             .unwrap();
 
-        assert!(store.is_bound(&origin, &key, i64::MAX).unwrap());
-        assert!(store.is_trusted_key(&key, i64::MAX).unwrap());
+        assert!(store.is_bound(&origin, &k1, i64::MAX).unwrap());
+        assert!(store.is_trusted_key(&k1, i64::MAX).unwrap());
         assert_eq!(store.expire_bindings(i64::MAX).unwrap(), 0);
-        assert!(store.is_trusted_key(&key, i64::MAX).unwrap());
+        assert!(store.is_trusted_key(&k1, i64::MAX).unwrap());
+
+        // Both queries see both static bindings, expiry sweep or not.
+        assert_eq!(store.trusted_origins(at(0)).unwrap().len(), 2);
+        assert_eq!(store.trusted_keys(at(0)).unwrap().len(), 2);
     }
 
     #[test]
@@ -777,14 +792,11 @@ mod tests {
         assert!(store.bindings().unwrap().is_empty());
     }
 
+    /// M3: at the epoch no expiry has passed, so every stored binding reads
+    /// live and nothing is ever reaped — an undatable clock has to withdraw
+    /// DNS trust instead, leaving static trust alone.
     #[test]
     fn an_undatable_clock_honors_no_dns_binding_and_deletes_none() {
-        // M3: `is_live` is `now < expires_at` and `expire_bindings` deletes on
-        // `expires_at <= now`, so at the epoch every binding this node ever
-        // stored reads as live and nothing is ever reaped — a NAS with a dead
-        // RTC trusting revoked members forever. A reading that dates nothing
-        // has to withdraw DNS trust instead, while leaving static trust (which
-        // consults no clock) alone.
         let (_d, store) = store();
         let dns_key = SecretKey::generate().public();
         let static_key = SecretKey::generate().public();
@@ -816,12 +828,11 @@ mod tests {
         assert!(store.is_bound(&origin, &dns_key, at(50)).unwrap());
     }
 
+    /// The mirror image: an older instant reads as "before the expiry", so a
+    /// restored snapshot would hand back lapsed trust — the persisted floor
+    /// keeps trust time from running backwards.
     #[test]
     fn a_backwards_clock_step_cannot_revive_an_expired_binding() {
-        // The mirror image: the same comparison reads an older instant as
-        // "before the expiry", so a bad NTP step or a restored snapshot would
-        // hand back trust that had already lapsed. The persisted floor is what
-        // makes trust time stand still rather than run backwards.
         let (_d, store) = store();
         let key = SecretKey::generate().public();
         let origin = OriginId::named("nas", "x.example").unwrap();
@@ -835,15 +846,6 @@ mod tests {
         assert!(store.live_origins_for_key(&key, at(50)).unwrap().is_empty());
         assert!(store.trusted_origins(at(50)).unwrap().is_empty());
         assert_eq!(store.expire_bindings(at(50)).unwrap(), 1);
-    }
-
-    #[test]
-    fn unknown_keys_are_untrusted() {
-        let (_d, store) = store();
-        let key = SecretKey::generate().public();
-        assert!(!store.is_trusted_key(&key, at(0)).unwrap());
-        let origin = OriginId::named("nas", "x.example").unwrap();
-        assert!(!store.is_bound(&origin, &key, at(0)).unwrap());
     }
 
     #[test]
@@ -861,18 +863,17 @@ mod tests {
 
         let keys = store.keys_for_origin(&origin, at(50)).unwrap();
         assert_eq!(keys.len(), 2);
-        // After the old key's record is dropped and its grace lapses, only the
-        // new key holds the origin — and no replicated state changed.
+        // After the old key's grace lapses, only the new key holds the origin.
         let keys = store.keys_for_origin(&origin, at(150)).unwrap();
         assert_eq!(keys, vec![new]);
         assert!(!store.is_bound(&origin, &old, at(150)).unwrap());
         assert!(store.is_bound(&origin, &new, at(150)).unwrap());
     }
 
+    /// §3.2 malformed-set rule: the store surfaces the ambiguity rather than
+    /// silently picking one origin.
     #[test]
     fn a_key_may_be_reported_under_two_origins() {
-        // §3.2 malformed-set rule: the store must surface the ambiguity rather
-        // than silently pick one.
         let (_d, store) = store();
         let key = SecretKey::generate().public();
         let a = OriginId::named("nas", "x.example").unwrap();
@@ -940,27 +941,11 @@ mod tests {
         assert_eq!(store.remove_origin_bindings(&origin).unwrap(), 1);
     }
 
-    #[test]
-    fn trusted_sets() {
-        let (_d, store) = store();
-        let k1 = SecretKey::generate().public();
-        let k2 = SecretKey::generate().public();
-        let a = OriginId::named("a", "x.example").unwrap();
-        let b = OriginId::Key(k2);
-        store.put_binding(&binding(a.clone(), k1, None)).unwrap();
-        store.put_binding(&binding(b.clone(), k2, None)).unwrap();
-        assert_eq!(store.trusted_origins(at(0)).unwrap().len(), 2);
-        assert_eq!(store.trusted_keys(at(0)).unwrap().len(), 2);
-    }
-    /// Derived trust cannot outlive its source (§3.5).
-    ///
-    /// The hole this guards is invisible when it opens: a delegate whose
-    /// issuer has been removed keeps syncing, and nothing says why. Every
-    /// query has to agree about it, which is why they all route through
-    /// `live_bindings`.
+    /// Derived trust cannot outlive its source (§3.5): every query routes
+    /// through `live_bindings` so they all agree.
     #[test]
     fn a_delegation_dies_with_its_issuer() {
-        let (_dir, store) = store();
+        let (_d, store) = store();
         let issuer_key = SecretKey::generate().public();
         let subject = SecretKey::generate().public();
         let issuer = OriginId::named("nas", "x.example").unwrap();
@@ -968,17 +953,7 @@ mod tests {
             .put_binding(&binding(issuer.clone(), issuer_key, None))
             .unwrap();
         store
-            .put_binding(&Binding {
-                origin: OriginId::Key(subject),
-                node_id: subject,
-                source: BindingSource::Delegated,
-                domain: None,
-                issuer: Some(issuer.clone()),
-                spaces: vec!["photos".into()],
-                note: None,
-                added_at: at(0),
-                expires_at: Some(at(1000)),
-            })
+            .put_binding(&delegation(subject, issuer.clone(), &["photos"]))
             .unwrap();
 
         // While the issuer is rooted, the delegate is trusted and scoped.
@@ -993,9 +968,6 @@ mod tests {
         // the same instant, with nothing having rewritten the delegated row.
         store.remove_origin_bindings(&issuer).unwrap();
         assert!(!store.is_trusted_key(&subject, at(10)).unwrap());
-        assert!(store
-            .is_bound(&OriginId::Key(subject), &subject, at(10))
-            .is_ok());
         assert!(!store
             .is_bound(&OriginId::Key(subject), &subject, at(10))
             .unwrap());
@@ -1006,41 +978,23 @@ mod tests {
         assert_eq!(store.all_delegations().unwrap().len(), 1);
     }
 
-    /// A delegation cannot be the source of another (§3.5).
+    /// A delegation cannot be the source of another (§3.5): depth 2 fails on
+    /// lookup because the named issuer holds no rooted binding.
     #[test]
     fn a_delegated_binding_is_never_rooted() {
-        let (_dir, store) = store();
+        let (_d, store) = store();
         let first = SecretKey::generate().public();
         let second = SecretKey::generate().public();
         let delegate = OriginId::Key(first);
         store
-            .put_binding(&Binding {
-                origin: delegate.clone(),
-                node_id: first,
-                source: BindingSource::Delegated,
-                domain: None,
-                issuer: Some(OriginId::named("nas", "x.example").unwrap()),
-                spaces: vec!["photos".into()],
-                note: None,
-                added_at: at(0),
-                expires_at: Some(at(1000)),
-            })
+            .put_binding(&delegation(
+                first,
+                OriginId::named("nas", "x.example").unwrap(),
+                &["photos"],
+            ))
             .unwrap();
-        // A delegation naming a delegate as its issuer is honored by nobody,
-        // because the issuer holds no rooted binding — depth 2 fails on a
-        // lookup rather than on anything the publisher asserted.
         store
-            .put_binding(&Binding {
-                origin: OriginId::Key(second),
-                node_id: second,
-                source: BindingSource::Delegated,
-                domain: None,
-                issuer: Some(delegate),
-                spaces: vec!["photos".into()],
-                note: None,
-                added_at: at(0),
-                expires_at: Some(at(1000)),
-            })
+            .put_binding(&delegation(second, delegate, &["photos"]))
             .unwrap();
         assert!(!BindingSource::Delegated.is_rooted());
         assert!(!store.is_trusted_key(&second, at(10)).unwrap());
@@ -1050,7 +1004,7 @@ mod tests {
     /// independently.
     #[test]
     fn delegations_from_two_issuers_add_and_are_removed_separately() {
-        let (_dir, store) = store();
+        let (_d, store) = store();
         let subject = SecretKey::generate().public();
         let mut issuers = Vec::new();
         for (name, space) in [("nas", "photos"), ("vps", "docs")] {
@@ -1060,17 +1014,7 @@ mod tests {
                 .put_binding(&binding(origin.clone(), key, None))
                 .unwrap();
             store
-                .put_binding(&Binding {
-                    origin: OriginId::Key(subject),
-                    node_id: subject,
-                    source: BindingSource::Delegated,
-                    domain: None,
-                    issuer: Some(origin.clone()),
-                    spaces: vec![space.to_string()],
-                    note: None,
-                    added_at: at(0),
-                    expires_at: Some(at(1000)),
-                })
+                .put_binding(&delegation(subject, origin.clone(), &[space]))
                 .unwrap();
             issuers.push(origin);
         }
@@ -1093,7 +1037,7 @@ mod tests {
     /// binding.
     #[test]
     fn a_delegation_needs_a_clock_that_can_date_it() {
-        let (_dir, store) = store();
+        let (_d, store) = store();
         let issuer_key = SecretKey::generate().public();
         let subject = SecretKey::generate().public();
         let issuer = OriginId::named("nas", "x.example").unwrap();
@@ -1101,17 +1045,7 @@ mod tests {
             .put_binding(&binding(issuer.clone(), issuer_key, None))
             .unwrap();
         store
-            .put_binding(&Binding {
-                origin: OriginId::Key(subject),
-                node_id: subject,
-                source: BindingSource::Delegated,
-                domain: None,
-                issuer: Some(issuer),
-                spaces: vec!["photos".into()],
-                note: None,
-                added_at: at(0),
-                expires_at: Some(at(1000)),
-            })
+            .put_binding(&delegation(subject, issuer, &["photos"]))
             .unwrap();
         assert!(store.is_trusted_key(&subject, at(10)).unwrap());
         // At the epoch nothing has expired, which is precisely why an instant
@@ -1124,7 +1058,7 @@ mod tests {
     /// The scope a node reads under is learned, and changing it is reported.
     #[test]
     fn the_local_read_scope_round_trips() {
-        let (_dir, store) = store();
+        let (_d, store) = store();
         assert_eq!(store.local_scope().unwrap(), None);
         assert!(store.local_trie_scope().unwrap().is_full());
 

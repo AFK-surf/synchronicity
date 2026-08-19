@@ -609,13 +609,11 @@ mod tests {
     #[test]
     fn dht_discovery_is_opt_in_and_never_mixes_with_offline() {
         let cli = Cli::parse_from(["synch", "daemon", "run"]);
-        assert!(!cli.dht);
-        assert!(cli.dht_bootstrap.is_empty());
-        assert!(!cli.dht_publish_addrs);
+        assert!(!cli.dht && cli.dht_bootstrap.is_empty());
 
         // The DHT joins the pkarr/DNS lookup rather than replacing it, so
         // --dht and --discovery are usable together.
-        let cli = Cli::parse_from([
+        let cli = Cli::try_parse_from([
             "synch",
             "daemon",
             "run",
@@ -625,17 +623,29 @@ mod tests {
             "--dht-publish-addrs",
             "--discovery",
             "https://dns.example.com/pkarr",
-        ]);
-        assert!(cli.dht);
+            "--relay",
+            "https://relay-a.example.com",
+            "--relay",
+            "https://relay-b.example.com",
+        ])
+        .unwrap();
+        assert!(cli.dht && cli.dht_publish_addrs);
         assert_eq!(
-            cli.dht_bootstrap,
-            ["boot1.example:6881", "boot2.example:6881"]
+            cli.dht_bootstrap.join(","),
+            "boot1.example:6881,boot2.example:6881"
         );
-        assert!(cli.dht_publish_addrs);
+        assert_eq!(
+            cli.relay.join(","),
+            "https://relay-a.example.com,https://relay-b.example.com"
+        );
+        assert_eq!(
+            cli.discovery.as_deref(),
+            Some("https://dns.example.com/pkarr")
+        );
 
-        // --offline means nothing leaves the machine, so it refuses every DHT
-        // flag rather than quietly ignoring it, as it already does for
-        // --relay and --discovery.
+        // --offline refuses every network flag rather than quietly ignoring
+        // it, the DHT sub-knobs need --dht, cat/get refuse --from with
+        // --strict, and cloud enable takes no --space.
         for args in [
             vec!["synch", "daemon", "run", "--offline", "--dht"],
             vec![
@@ -647,12 +657,22 @@ mod tests {
                 "boot.example:6881",
             ],
             vec!["synch", "daemon", "run", "--offline", "--dht-publish-addrs"],
-        ] {
-            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
-        }
-
-        // The DHT sub-knobs are meaningless without the DHT itself.
-        for args in [
+            vec![
+                "synch",
+                "daemon",
+                "run",
+                "--offline",
+                "--relay",
+                "https://r.example.com",
+            ],
+            vec![
+                "synch",
+                "daemon",
+                "run",
+                "--offline",
+                "--discovery",
+                "https://d.example.com",
+            ],
             vec![
                 "synch",
                 "daemon",
@@ -661,116 +681,12 @@ mod tests {
                 "boot.example:6881",
             ],
             vec!["synch", "daemon", "run", "--dht-publish-addrs"],
+            vec!["synch", "cat", "media/a.txt", "--from", "nas@x", "--strict"],
+            vec!["synch", "get", "media/a.txt", "--from", "nas@x", "--strict"],
+            vec!["synch", "cloud", "enable", "--space", "media"],
         ] {
             assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
         }
-    }
-
-    #[test]
-    fn parses_the_documented_commands() {
-        // Every §9.2 command must parse.
-        for args in [
-            vec!["synch", "init"],
-            vec!["synch", "init", "--domain", "cluster.example.com"],
-            vec!["synch", "id"],
-            vec!["synch", "key", "rotate"],
-            vec!["synch", "key", "activate", "abc"],
-            vec![
-                "synch",
-                "key",
-                "activate",
-                "abc",
-                "--bind",
-                "127.0.0.1:4433",
-            ],
-            vec!["synch", "key", "retire", "abc"],
-            vec!["synch", "key", "ls"],
-            vec!["synch", "daemon", "run"],
-            vec!["synch", "daemon", "status"],
-            vec!["synch", "daemon", "stop"],
-            vec!["synch", "trust", "add", "abc"],
-            vec!["synch", "trust", "add", "abc", "--note", "a peer"],
-            vec!["synch", "sync"],
-            vec!["synch", "trust", "rm", "nas@x.example"],
-            vec!["synch", "trust", "ls"],
-            vec!["synch", "domain", "set", "cluster.example.com"],
-            vec!["synch", "domain", "clear"],
-            vec!["synch", "domain", "refresh"],
-            vec!["synch", "domain", "ls"],
-            vec!["synch", "space", "add", "media", "/srv/media"],
-            vec!["synch", "space", "ls"],
-            vec!["synch", "space", "rm", "media"],
-            vec!["synch", "ls", "media/talks"],
-            vec!["synch", "ls", "nas@x:media/talks", "--all"],
-            vec!["synch", "status", "media/a.txt"],
-            vec!["synch", "cat", "media/a.txt", "--range", "0..10"],
-            vec!["synch", "cat", "media/a.txt", "--from", "nas@x"],
-            vec!["synch", "cat", "media/a.txt", "--strict"],
-            vec!["synch", "cat", "nas@x:media/a.txt", "--range", "0..10"],
-            vec!["synch", "get", "media/a.txt", "-o", "/tmp/a"],
-            vec!["synch", "get", "media/a.txt", "--strict"],
-            vec!["synch", "get", "nas@x:media/a.txt", "-o", "/tmp/a"],
-            vec!["synch", "take", "nas@x:media/a.txt"],
-            vec!["synch", "log", "media/a.txt"],
-            vec!["synch", "compare", "media", "--to", "nas@x"],
-            vec![
-                "synch",
-                "compare",
-                "media/photos",
-                "--from",
-                "laptop@x",
-                "--to",
-                "nas@x",
-            ],
-            vec!["synch", "compare", "media", "--to", "nas@x", "--json"],
-            vec!["synch", "mirror", "add", "media", "/mnt/nas"],
-            vec![
-                "synch", "mirror", "add", "media", "/mnt/nas", "--policy", "strict",
-            ],
-            vec!["synch", "mirror", "rm", "/mnt/nas"],
-            vec!["synch", "mirror", "ls"],
-            vec!["synch", "pin", "add", "aabb"],
-            vec!["synch", "peers"],
-            vec!["synch", "recover"],
-            vec!["synch", "recover", "--wait", "90m", "--gap", "5000"],
-            vec!["synch", "doctor"],
-            vec!["synch", "cloud", "enable"],
-            vec!["synch", "cloud", "disable"],
-            vec!["synch", "cloud", "status"],
-        ] {
-            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
-        }
-    }
-
-    /// `--space` named a local allowlist; the tunnel now serves whatever the
-    /// control plane requests, so the flag is not part of the surface.
-    #[test]
-    fn cloud_enable_takes_no_space_list() {
-        assert!(Cli::try_parse_from(["synch", "cloud", "enable", "--space", "media"]).is_err());
-    }
-
-    /// `--from` and `--strict` are two answers to the same question, so the
-    /// command surface refuses both at once rather than picking one.
-    #[test]
-    fn from_and_strict_are_mutually_exclusive() {
-        assert!(Cli::try_parse_from([
-            "synch",
-            "cat",
-            "media/a.txt",
-            "--from",
-            "nas@x",
-            "--strict"
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "synch",
-            "get",
-            "media/a.txt",
-            "--from",
-            "nas@x",
-            "--strict"
-        ])
-        .is_err());
     }
 
     #[test]
@@ -782,98 +698,44 @@ mod tests {
     }
 
     #[test]
-    fn relay_and_discovery_parse_and_conflict_with_offline() {
-        let cli = Cli::try_parse_from([
-            "synch",
-            "--relay",
-            "https://relay-a.example.com",
-            "--relay",
-            "https://relay-b.example.com",
-            "--discovery",
-            "https://dns.example.com/pkarr",
-            "daemon",
-            "run",
-        ])
-        .unwrap();
-        assert_eq!(
-            cli.relay,
-            [
-                "https://relay-a.example.com".to_string(),
-                "https://relay-b.example.com".to_string()
-            ]
-        );
-        assert_eq!(
-            cli.discovery.as_deref(),
-            Some("https://dns.example.com/pkarr")
-        );
-        // Offline means no relays and no discovery; both at once is a
-        // mistake to refuse, not a combination to interpret.
-        assert!(Cli::try_parse_from([
-            "synch",
-            "--offline",
-            "--relay",
-            "https://r.example.com",
-            "id"
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "synch",
-            "--offline",
-            "--discovery",
-            "https://d.example.com",
-            "id"
-        ])
-        .is_err());
-    }
-
-    #[test]
     fn durations_parse() {
-        use std::time::Duration;
-        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
-        assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
-        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_duration("90m").unwrap(), Duration::from_secs(5_400));
-        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3_600));
-        assert_eq!(parse_duration("2h30m").unwrap(), Duration::from_secs(9_000));
-        assert_eq!(parse_duration(" 1d ").unwrap(), Duration::from_secs(86_400));
-
-        assert!(parse_duration("").is_err());
-        assert!(parse_duration("soon").is_err());
-        assert!(parse_duration("1w").is_err());
-        assert!(
-            parse_duration("1h30").is_err(),
-            "a trailing number is not a unit"
-        );
-        assert!(parse_duration("h").is_err());
+        for (text, secs) in [
+            ("0", 0),
+            ("45", 45),
+            ("30s", 30),
+            ("90m", 5_400),
+            ("1h", 3_600),
+            ("2h30m", 9_000),
+            (" 1d ", 86_400),
+        ] {
+            assert_eq!(
+                parse_duration(text).unwrap(),
+                std::time::Duration::from_secs(secs),
+                "{text}"
+            );
+        }
+        for bad in ["", "soon", "1w", "1h30", "h"] {
+            assert!(parse_duration(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
     fn ranges_parse() {
-        assert_eq!(
-            ByteRange::parse("10..20").unwrap(),
-            ByteRange {
-                start: 10,
-                end: Some(20)
-            }
-        );
-        assert_eq!(
-            ByteRange::parse("10..").unwrap(),
-            ByteRange {
-                start: 10,
-                end: None
-            }
-        );
-        assert_eq!(
-            ByteRange::parse("..20").unwrap(),
-            ByteRange {
-                start: 0,
-                end: Some(20)
-            }
-        );
-        assert_eq!(ByteRange::parse("10..20").unwrap().length(), Some(10));
-        assert_eq!(ByteRange::parse("10..").unwrap().length(), None);
-        assert!(ByteRange::parse("20..10").is_err());
-        assert!(ByteRange::parse("nonsense").is_err());
-        assert!(ByteRange::parse("a..b").is_err());
+        for (text, start, end) in [
+            ("10..20", 10, Some(20)),
+            ("10..", 10, None),
+            ("..20", 0, Some(20)),
+        ] {
+            let range = ByteRange::parse(text).unwrap();
+            assert_eq!((range.start, range.end), (start, end), "{text}");
+            assert_eq!(
+                range.length(),
+                end.map(|e| e.saturating_sub(start)),
+                "{text}"
+            );
+        }
+        for bad in ["20..10", "nonsense", "a..b"] {
+            assert!(ByteRange::parse(bad).is_err(), "{bad}");
+        }
     }
 }

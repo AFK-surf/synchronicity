@@ -1,18 +1,12 @@
 //! Classification, and the invariant that couples it to the client.
 //!
 //! The two tiers are only useful if tier B — the silent bin — is exactly "an
-//! entry no client would have accepted either". If a client ever accepted
-//! something a monitor filed as tier B, an attacker would hold a key that
-//! works against victims and rings no bell, which is strictly worse than not
-//! logging at all. That invariant is asserted here directly, over every shape
-//! of entry the two sides can disagree about.
+//! entry no client would have accepted either". That invariant is asserted
+//! here directly, over every shape of entry the two sides can disagree about,
+//! in both chain shapes.
 
 use hickory_resolver::proto::dnssec::TrustAnchors;
-use synch_monitor::{
-    classify::{classify, KnownKeys, Tier},
-    tiles::{TileSource, Tree},
-    MonitorError,
-};
+use synch_monitor::classify::{classify, Tier};
 use synch_net::{
     rekor::{self, HashedRekordBody, LogKeys, RekorProof, ZoneKey},
     sim::{SimDelegation, SimLog, SimZone},
@@ -33,8 +27,7 @@ fn anchors(record: &str) -> TrustAnchors {
 ///
 /// The anchor travels with the shape rather than being derived from the zone,
 /// because a root-anchored ladder is anchored at the *root's* key and a
-/// self-anchored zone at its own. Deriving it from the zone is what limited
-/// this suite to one chain shape.
+/// self-anchored zone at its own.
 struct Shape {
     name: &'static str,
     /// The zone whose key the entry is about — what a resolver observed.
@@ -44,26 +37,16 @@ struct Shape {
     /// The trust anchor a reader of this entry holds, in `--dnssec-anchor`
     /// syntax.
     anchor: String,
-    /// The zone a resolver would report from the RRSIG signer field — the
-    /// signing zone, and in these shapes the membership domain too. Almost
-    /// always the zone's own; a malformed-SAN shape is where it differs.
+    /// The signing zone a resolver would report from the RRSIG signer field.
     observed_zone: String,
-    /// The signer a resolver reported for the *membership answer*, when that
-    /// is not `observed_zone`.
-    ///
-    /// Separate because every `ZoneKey` in this tree used to set
-    /// `signing_zone` equal to the apex, which made
-    /// `rekor::verify`'s "the chain proves a signing zone the answer was not
-    /// signed by" check unreachable from the harness — deleting it left the
-    /// whole suite green. It is live code: the upstream guards force both
-    /// names to be ancestors-or-equal of the domain, and two ancestors of one
-    /// name are comparable but need not be equal.
+    /// The signer reported for the *membership answer*, when it is not
+    /// `observed_zone` — the only way rekor::verify's signing-zone check is
+    /// reachable from the harness (deleting the check once left the whole
+    /// suite green).
     observed_signer: Option<String>,
 }
 
 impl Shape {
-    /// The signing zone a reader would report, defaulting to the observed
-    /// zone.
     fn signer(&self) -> &str {
         self.observed_signer
             .as_deref()
@@ -73,12 +56,11 @@ impl Shape {
 
 /// Would a client accept this proof? The real verifier, no re-implementation.
 fn client_accepts(shape: &Shape) -> bool {
-    let rdata = shape.zone.dnskey_rdata();
     let key = ZoneKey {
         domain: &shape.observed_zone,
         signing_zone: shape.signer(),
         key_tag: shape.zone.key_tag(),
-        dnskey_rdata: &rdata,
+        dnskey_rdata: &shape.zone.dnskey_rdata(),
     };
     rekor::verify(
         &shape.proof,
@@ -91,13 +73,11 @@ fn client_accepts(shape: &Shape) -> bool {
 
 /// What a monitor does with a leaf: a tier, or nothing at all.
 ///
-/// `classify` returning `None` is **not** tier B, and collapsing the two loses
-/// the distinction the comment here used to claim it was keeping. Tier B is
-/// noted on stderr as an unauthorized claim; `None` means the leaf was never
-/// judged — not reported, not written anywhere, not even counted. For the
-/// invariant that is strictly the quieter outcome, so a harness that could not
-/// tell them apart could not see the difference between "the monitor filed
-/// this as noise" and "the monitor never looked at it".
+/// `classify` returning `None` is **not** tier B: tier B is noted on stderr
+/// as an unauthorized claim, while `None` means the leaf was never judged —
+/// not reported, not written, not even counted. A harness that could not tell
+/// them apart could not see the difference between "filed as noise" and
+/// "never looked at".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     /// `classify` returned a tier.
@@ -116,13 +96,11 @@ fn monitor_verdict(shape: &Shape) -> Verdict {
     }
 }
 
-/// The tier a shape lands in, for assertions that are about tiers.
+/// The tier a shape lands in — the conservative reading of the two quiet
+/// outcomes, with "never judged" counted as quieter than tier B.
 fn monitor_tier(shape: &Shape) -> Tier {
     match monitor_verdict(shape) {
         Verdict::Tiered(tier) => tier,
-        // Quieter than tier B, so for an invariant of the form "a client
-        // accepted this and the monitor must not be quiet about it" the
-        // conservative reading is the quiet one.
         Verdict::Unclassified => Tier::B,
     }
 }
@@ -184,9 +162,7 @@ fn ground(rooted: Rooted) -> Ground {
 }
 
 /// Every entry shape the two halves could disagree about, in both chain
-/// shapes.
-///
-/// Named, so a failure says which one broke rather than "case 3".
+/// shapes. Named, so a failure says which one broke rather than "case 3".
 fn shapes() -> Vec<Shape> {
     let mut out = Vec::new();
     for rooted in [Rooted::SelfAnchored, Rooted::Ladder] {
@@ -215,13 +191,16 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
         g.zone
             .certificate(&[(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())])
     };
+    let certify = |g: &Ground, log: &mut SimLog| {
+        let statement = g.zone.zone_key_statement("create");
+        log.log_certified(&g.zone, &statement, &certificate(g))
+    };
 
     // 1. The honest genesis key: a zone's first, with a valid chain.
     {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create");
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        let proof = certify(&g, &mut log);
         push("genesis", g, log, proof, None);
     }
 
@@ -239,14 +218,11 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     //    This shape and shape 2 are byte-for-byte indistinguishable in every
     //    respect a monitor can see, which is the point — both are tier A,
     //    both get reported, and which of them actually happened is a question
-    //    only the operator's own records answer. Keeping both here, rather
-    //    than collapsing them into one, is what stops that fact from
-    //    quietly ceasing to be tested.
+    //    only the operator's own records answer.
     {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create");
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        let proof = certify(&g, &mut log);
         push("substitution", g, log, proof, None);
     }
 
@@ -265,8 +241,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
         let at = g.chain.links[0].rrs.len() - 3;
         g.chain.links[0].rrs[at] ^= 0x01;
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create");
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        let proof = certify(&g, &mut log);
         push("broken chain", g, log, proof, None);
     }
 
@@ -275,8 +250,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
         let mut g = ground(rooted);
         g.chain = ground(rooted).chain;
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create");
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        let proof = certify(&g, &mut log);
         push("wrong-key chain", g, log, proof, None);
     }
 
@@ -287,8 +261,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
         let ancient = time::OffsetDateTime::now_utc() - time::Duration::days(900);
         g.chain = match rooted {
             Rooted::SelfAnchored => g.zone.dnssec_chain_at(ancient),
-            // A ladder needs every level re-signed at the old inception, so
-            // rebuild it rather than reaching into one link.
+            // A ladder needs every level re-signed at the old inception.
             Rooted::Ladder => {
                 let delegation = SimDelegation::new("cluster.example", members());
                 let chain = delegation.chain_at(ancient);
@@ -298,8 +271,7 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
             }
         };
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create");
-        let proof = log.log_certified(&g.zone, &statement, &certificate(&g));
+        let proof = certify(&g, &mut log);
         push("expired chain", g, log, proof, None);
     }
 
@@ -316,10 +288,10 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     ] {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create");
         let certificate = g
             .zone
             .certificate_for(san, &[(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())]);
+        let statement = g.zone.zone_key_statement("create");
         let proof = log.log_certified(&g.zone, &statement, &certificate);
         push(label, g, log, proof, None);
     }
@@ -329,11 +301,11 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
     {
         let g = ground(rooted);
         let mut log = SimLog::new("rekor.sim");
-        let statement = g.zone.zone_key_statement("create");
         let certificate = g.zone.certificate_for(
             "somewhere.else",
             &[(OID_DNSSEC_CHAIN.to_vec(), g.chain.encode())],
         );
+        let statement = g.zone.zone_key_statement("create");
         let proof = log.log_certified(&g.zone, &statement, &certificate);
         push("san names another zone", g, log, proof, None);
     }
@@ -345,17 +317,13 @@ fn shapes_for(rooted: Rooted) -> Vec<Shape> {
 /// signed by.
 ///
 /// Both names are constrained only to be ancestors-or-equal of the domain
-/// being resolved — `claimed_apex ⊇ domain` at the entry, `signing_zone ⊇
-/// apex` in the chain walk, `observed_signer ⊇ domain` at the resolver — and
-/// two ancestors of one name are comparable but need not be equal. So a
-/// parent zone's entry can be offered for a child's answer, and only this
-/// check says no.
-///
-/// It had no test: every `ZoneKey` in the tree set `signing_zone` equal to the
-/// apex, so deleting the check left the whole suite green. The gain it holds
-/// is real — `check_binds` matches key membership on rdata digest, not on
-/// publishing zone, so with shared key material the parent's entry would
-/// otherwise authorize the child's answer.
+/// being resolved, and two ancestors of one name are comparable but need not
+/// be equal — so a parent zone's entry can be offered for a child's answer.
+/// It had no test: every `ZoneKey` in the tree set `signing_zone` equal to
+/// the apex, so deleting the check left the whole suite green. The gain is
+/// real — `check_binds` matches key membership on rdata digest, so with
+/// shared key material the parent's entry would otherwise authorize the
+/// child's answer.
 #[test]
 fn an_entry_whose_chain_proves_another_signing_zone_is_refused() {
     let g = ground(Rooted::SelfAnchored);
@@ -400,25 +368,46 @@ fn an_entry_whose_chain_proves_another_signing_zone_is_refused() {
     );
 }
 
-/// The tier of a proof about `zone`, anchored at that zone's own key — the
-/// shorthand the single-purpose tests below use.
-fn tier_of(proof: &RekorProof, zone: &SimZone) -> Tier {
-    let body = HashedRekordBody::parse(&proof.canonicalized_body).expect("a well-formed body");
-    match classify(&body, proof.log_index, &anchors(&zone.anchor_record())) {
-        Some(finding) => finding.tier,
-        None => Tier::B,
-    }
-}
-
-/// A zone's apex as a parsed name, for `KnownKeys`.
-fn apex_name(zone: &SimZone) -> hickory_resolver::proto::rr::Name {
-    synch_net::chain::parse_name(&zone.apex()).expect("a sim apex is a name")
-}
-
-/// **The invariant.** Anything a client accepts is tier A.
+/// **The invariant.** Anything a client accepts is tier A — with the harness
+/// checks that make the equivalence meaningful: both chain shapes really are
+/// exercised (and really are different), and each shape's tier is pinned
+/// against the design's table rather than left implicit.
 #[test]
 fn nothing_a_client_accepts_lands_in_the_silent_bin() {
-    for shape in shapes() {
+    let all = shapes();
+
+    // Both chain shapes are exercised, and they are genuinely different: the
+    // ladder walks a real delegation — apex DS, TLD DNSKEY+DS, root DNSKEY —
+    // while the self-anchored form is one link, anchored directly. Without
+    // this the suite could silently collapse back to one branch, which is
+    // exactly what it did before, and what hid the divergence above.
+    let genesis = |label: &str| {
+        let shape = all
+            .iter()
+            .find(|s| s.name == format!("genesis ({label})"))
+            .expect("a genesis shape");
+        let body = HashedRekordBody::parse(&shape.proof.canonicalized_body).unwrap();
+        synch_net::chain::authorize(&body.certificate, &anchors(&shape.anchor)).unwrap()
+    };
+    let self_anchored = genesis("self-anchored");
+    let ladder = genesis("ladder");
+    assert_eq!(
+        (
+            self_anchored.chain.links,
+            self_anchored.chain.anchored_directly
+        ),
+        (1, true)
+    );
+    assert_eq!(
+        (
+            ladder.chain.links,
+            ladder.chain.anchored_directly,
+            ladder.chain.anchor_zone
+        ),
+        (3, false, ".".to_string())
+    );
+
+    for shape in all {
         let name = shape.name;
         let accepted = client_accepts(&shape);
         let tier = monitor_tier(&shape);
@@ -442,176 +431,22 @@ fn nothing_a_client_accepts_lands_in_the_silent_bin() {
             other => panic!("unclassified shape {other}: say whether a client takes it"),
         };
         assert_eq!(accepted, must_accept, "{name}: client acceptance");
+        // The tier table is the B-side of the acceptance table: every shape a
+        // client takes is tier A, and every shape it refuses is the silent
+        // bin. One equivalence subsumes both tables.
+        assert_eq!(tier == Tier::A, must_accept, "{name}: tier");
 
         // And which of the two quiet outcomes it is, named rather than
         // collapsed. A malformed SAN is not judged at all — no tier, no
-        // stderr line, no record — and that is strictly quieter than tier B,
-        // so it is worth asserting it is the shape it is claimed to be.
+        // stderr line, no record — and that is strictly quieter than tier B.
         let verdict = monitor_verdict(&shape);
-        let unclassified = name.starts_with("malformed san");
         assert_eq!(
             verdict == Verdict::Unclassified,
-            unclassified,
+            name.starts_with("malformed san"),
             "{name}: a leaf is either tiered or never judged, and which it is \
              decides whether an operator sees anything at all"
         );
     }
-}
-
-/// Both chain shapes really are exercised, and they really are different.
-///
-/// Without this the suite could silently collapse back to one branch — which
-/// is exactly what it did before, and what hid the divergence above.
-#[test]
-fn the_suite_covers_both_a_self_anchored_chain_and_a_real_ladder() {
-    let all = shapes();
-    assert!(all.iter().any(|s| s.name.ends_with("(self-anchored)")));
-    assert!(all.iter().any(|s| s.name.ends_with("(ladder)")));
-
-    let genesis = |label: &str| {
-        let shape = all
-            .iter()
-            .find(|s| s.name == format!("genesis ({label})"))
-            .expect("a genesis shape");
-        let body = HashedRekordBody::parse(&shape.proof.canonicalized_body).unwrap();
-        synch_net::chain::authorize(&body.certificate, &anchors(&shape.anchor))
-            .expect("genesis authorizes")
-    };
-    let self_anchored = genesis("self-anchored");
-    let ladder = genesis("ladder");
-    assert_eq!(self_anchored.chain.links, 1);
-    assert!(self_anchored.chain.anchored_directly);
-    // The ladder walks a real delegation: apex DS, TLD DNSKEY+DS, root DNSKEY.
-    assert_eq!(ladder.chain.links, 3);
-    assert!(!ladder.chain.anchored_directly);
-    assert_eq!(ladder.chain.anchor_zone, ".");
-}
-
-/// The tiers themselves, case by case.
-#[test]
-fn each_shape_lands_where_the_design_says_it_should() {
-    let expected = [
-        ("genesis", Tier::A),
-        ("rotation", Tier::A),
-        // The attacker's entry classifies exactly like the operator's. Stated
-        // as an expectation rather than left implicit, because it is the
-        // whole shape of what this monitor now claims: a verified chain is an
-        // authorization, and nothing here says who was entitled to make it.
-        ("substitution", Tier::A),
-        ("chainless", Tier::B),
-        ("broken chain", Tier::B),
-        ("wrong-key chain", Tier::B),
-        ("expired chain", Tier::A),
-        // A SAN that is not a name names no zone: nothing to classify, and
-        // nothing a client takes either.
-        ("malformed san", Tier::B),
-        // A well-formed SAN with a chain for a *different* zone is an
-        // unauthorized claim about the zone it names — tier B, and refused by
-        // every client. A monitor watching the zone whose chain it stole
-        // never sees it at all, because the SAN does not match.
-        ("san names another zone", Tier::B),
-    ];
-    for shape in shapes() {
-        let base = shape.name.split(" (").next().expect("a shape name");
-        let want = expected
-            .iter()
-            .find(|(n, _)| *n == base)
-            .map(|(_, t)| *t)
-            .unwrap_or_else(|| panic!("no expectation for {}", shape.name));
-        assert_eq!(monitor_tier(&shape), want, "{}", shape.name);
-    }
-}
-
-/// Classification takes no state, so nothing a monitor has seen can steer it.
-///
-/// The old classifier consulted its known-keys set to decide between two
-/// tiers, which meant the verdict on an entry depended on the monitor's
-/// history. It no longer does: the same bytes classify the same way against
-/// an empty state and against one holding every key involved. The
-/// already-seen test still exists, but it decides whether to *report*, never
-/// what an entry *is* — and that separation is what keeps a recorded
-/// attacker key from making the next one look ordinary.
-#[test]
-fn what_the_monitor_has_seen_does_not_change_what_an_entry_is() {
-    let zone = SimZone::new("cluster.example", members());
-    let mut log = SimLog::new("rekor.sim");
-    let proof = log.publish(&zone, "create");
-    let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-
-    let anchors = anchors(&zone.anchor_record());
-    let first = classify(&body, proof.log_index, &anchors).unwrap();
-
-    // Whatever a monitor records about this key, the classification of the
-    // entry is unchanged — there is no argument left to pass it.
-    let mut known = KnownKeys::default();
-    known.insert(&apex_name(&zone), &zone.spki());
-    assert!(known.contains(&apex_name(&zone), &zone.spki()));
-
-    let again = classify(&body, proof.log_index, &anchors).unwrap();
-    assert_eq!(first, again);
-    assert_eq!(first.tier, Tier::A);
-}
-
-/// Reporting once: a recorded key is not news, an unrecorded one is.
-///
-/// This is the whole of the state machine `main` runs, asserted against the
-/// types rather than against the binary — the binary's part is which stream
-/// each half goes to.
-#[test]
-fn a_key_is_news_until_it_has_been_recorded() {
-    let zone = SimZone::new("cluster.example", members());
-    let mut log = SimLog::new("rekor.sim");
-    let proof = log.publish(&zone, "create");
-    let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-    let finding = classify(&body, proof.log_index, &anchors(&zone.anchor_record())).unwrap();
-    assert_eq!(finding.tier, Tier::A);
-
-    let apex = apex_name(&zone);
-    let mut known = KnownKeys::default();
-    // Nothing recorded: a new authorization.
-    assert!(!known.contains(&apex, &zone.spki()));
-    known.insert(&apex, &zone.spki());
-    // Recorded: reported once, and not again.
-    assert!(known.contains(&apex, &zone.spki()));
-
-    // A different key for the same apex is still news — recording one key
-    // must not vouch for the zone as a whole.
-    let next = SimZone::new("cluster.example", members());
-    assert!(!known.contains(&apex, &next.spki()));
-}
-
-/// What a monitor derives, it derives from the certificate alone.
-#[test]
-fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
-    let zone = SimZone::new("cluster.example", members());
-    let mut log = SimLog::new("rekor.sim");
-    let proof = log.publish(&zone, "create");
-    let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-    let finding = classify(&body, 7, &anchors(&zone.anchor_record())).unwrap();
-
-    // The same key tag and DS the zone itself would publish, arrived at with
-    // no DNS query — read out of the chain-proven RRset, which is the only
-    // reason a compromised provider cannot steer what the monitor concludes.
-    let [key] = finding.keys.as_slice() else {
-        panic!("a one-key zone proves one key: {:?}", finding.keys);
-    };
-    assert_eq!(key.key_tag, zone.key_tag());
-    assert_eq!(key.ds, zone.ds_field());
-    // The apex is reported in canonical form — parsed from the SAN, so it
-    // carries its root dot however the certificate happened to spell it.
-    assert_eq!(finding.apex, zone.apex());
-    assert_eq!(finding.log_index, 7);
-
-    // The reported line carries everything an operator acts on: the zone, the
-    // key tag, the DS to compare against the registrar, the full rdata digest
-    // and the index to look the entry up by.
-    let line = finding.line();
-    assert!(
-        line.starts_with("[A] index 7 apex cluster.example"),
-        "{line}"
-    );
-    assert!(line.contains(&zone.ds_field()), "{line}");
-    assert!(line.contains(&key.sha256), "{line}");
 }
 
 /// The DS an operator is told to compare against their registrar is computed
@@ -619,10 +454,9 @@ fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
 ///
 /// For a control plane running its own delegated zone the two names are the
 /// same, which is every other case in this suite — so computing it over the
-/// apex passed everything, while for an apex served out of a zone above it the
-/// line would print a DS that matches nothing anywhere. That line is the first
-/// thing an operator acts on when a new authorization appears, and its whole
-/// purpose is to be comparable against what the registrar shows.
+/// apex passed everything, while for an apex served out of a zone above it
+/// the line would print a DS that matches nothing anywhere. That line is the
+/// first thing an operator acts on when a new authorization appears.
 #[test]
 fn the_reported_ds_is_over_the_signing_zone_not_the_apex() {
     use synch_net::chain::{self, TRANSPARENCY_TEXT};
@@ -677,120 +511,4 @@ fn the_reported_ds_is_over_the_signing_zone_not_the_apex() {
         "{}",
         finding.line()
     );
-}
-
-/// A long-expired chain classifies exactly like a fresh one.
-///
-/// The monitor consults **no clock at all**, so an entry whose RRSIGs expired
-/// years ago lands in the same tier as one signed this morning. It has to.
-/// The client does not check windows either (there is no attested time
-/// anywhere near a leaf, and archival entries are read for years), so a
-/// monitor that quietly demoted an expired chain would put a
-/// client-acceptable entry in the silent bin — the exact evasion the
-/// invariant forbids.
-#[test]
-fn a_long_expired_chain_classifies_the_same_as_a_fresh_one() {
-    let zone = SimZone::new("cluster.example", members());
-    let statement = zone.zone_key_statement("create");
-
-    let classify_chain = |chain: Vec<u8>| {
-        let mut log = SimLog::new("rekor.sim");
-        let certificate = zone.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), chain)]);
-        let proof = log.log_certified(&zone, &statement, &certificate);
-        let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-        classify(&body, 0, &anchors(&zone.anchor_record())).unwrap()
-    };
-
-    let ancient = time::OffsetDateTime::now_utc() - time::Duration::days(900);
-    let expired = classify_chain(zone.dnssec_chain_at(ancient).encode());
-    let fresh = classify_chain(zone.dnssec_chain().encode());
-
-    assert_eq!(expired.tier, Tier::A);
-    assert_eq!(expired.tier, fresh.tier);
-    // Not merely the same tier — the same reasons, because nothing in the
-    // classifier looks at time at all.
-    assert_eq!(expired.reasons, fresh.reasons);
-    assert!(
-        expired.reasons.iter().any(|r| r.contains("chain valid")),
-        "{:?}",
-        expired.reasons
-    );
-}
-
-/// An extension this build has never heard of changes nothing.
-///
-/// The certificate parser collects extensions and looks them up by OID, so an
-/// unrecognised one is simply never asked for. A certificate may therefore
-/// carry things this build says nothing about without that changing what the
-/// entry *is*.
-#[test]
-fn an_extension_nothing_reads_does_not_disturb_the_verdict() {
-    let zone = SimZone::new("cluster.example", members());
-    let statement = zone.zone_key_statement("create");
-    let chain = zone.dnssec_chain().encode();
-
-    let classify_cert = |certificate: Vec<u8>| {
-        let mut log = SimLog::new("rekor.sim");
-        let proof = log.log_certified(&zone, &statement, &certificate);
-        let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
-        classify(&body, 0, &anchors(&zone.anchor_record())).unwrap()
-    };
-
-    let plain = classify_cert(zone.certificate(&[(OID_DNSSEC_CHAIN.to_vec(), chain.clone())]));
-    let with_junk = classify_cert(zone.certificate(&[
-        (OID_DNSSEC_CHAIN.to_vec(), chain),
-        // An arc this build has no name for, carrying bytes that decode as
-        // nothing at all.
-        (
-            vec![0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x01],
-            b"opaque".to_vec(),
-        ),
-    ]));
-
-    assert_eq!(plain.tier, Tier::A);
-    assert_eq!(plain.tier, with_junk.tier);
-    assert_eq!(plain.reasons, with_junk.reasons);
-    assert_eq!(plain.keys, with_junk.keys);
-}
-
-/// A monitor reads leaves out of tiles; assert it against a whole simulated
-/// log rather than against a hand-built bundle.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_monitor_finds_a_zones_entry_by_walking_bundles() {
-    struct Bundles(Vec<Vec<u8>>);
-    impl TileSource for Bundles {
-        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
-            assert!(path.starts_with("api/v2/tile/entries/"), "{path}");
-            let mut out = Vec::new();
-            for body in &self.0 {
-                out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-                out.extend_from_slice(body);
-            }
-            Ok(Some(out))
-        }
-    }
-
-    let zone = SimZone::new("cluster.example", members());
-    let mut log = SimLog::new("rekor.sim");
-    log.append(b"somebody else's entry");
-    let proof = log.publish(&zone, "create");
-    let bundles = Bundles(vec![
-        b"somebody else's entry".to_vec(),
-        proof.canonicalized_body.clone(),
-    ]);
-    let tree = Tree::new(&bundles, 2, 4);
-
-    let mut found = Vec::new();
-    for (index, body) in tree.entry_bundle(0).await.unwrap() {
-        let Ok(parsed) = HashedRekordBody::parse(&body) else {
-            continue;
-        };
-        found.push((
-            index,
-            parsed.certificate.single_dns_name().unwrap().to_string(),
-        ));
-    }
-    assert_eq!(found, vec![(1, "cluster.example.".to_string())]);
-    // And the entry it found is an authorization, not noise.
-    assert_eq!(tier_of(&proof, &zone), Tier::A);
 }

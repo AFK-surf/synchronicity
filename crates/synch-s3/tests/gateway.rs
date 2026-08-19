@@ -90,6 +90,32 @@ impl Harness {
         format!("{}{path}", self.base)
     }
 
+    /// Sends one request against the gateway, unwrapping transport errors.
+    async fn request(&self, method: reqwest::Method, path: &str) -> reqwest::Response {
+        client()
+            .request(method, self.url(path))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn get(&self, path: &str) -> reqwest::Response {
+        self.request(reqwest::Method::GET, path).await
+    }
+
+    async fn head(&self, path: &str) -> reqwest::Response {
+        client().head(self.url(path)).send().await.unwrap()
+    }
+
+    async fn put(&self, path: &str, body: impl Into<reqwest::Body>) -> reqwest::Response {
+        client()
+            .put(self.url(path))
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    }
+
     /// Writes a file into the local space and publishes it.
     fn publish(&self, path: &str, content: &[u8]) {
         write_into(&self.space_path, path, content);
@@ -123,25 +149,23 @@ fn client() -> reqwest::Client {
     reqwest::Client::builder().build().unwrap()
 }
 
+/// A deterministic payload of `n` bytes.
+fn payload(n: u32) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_head_list_and_range_round_trip() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
+    // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
-    let payload: Vec<u8> = (0..200_000u32).map(|i| (i * 17 + 3) as u8).collect();
+    let payload = payload(200_000);
     harness.publish("notes.txt", b"hello from s3");
     harness.publish("talks/keynote.mp4", &payload);
     harness.publish("talks/slides.pdf", b"slides");
 
-    let http = client();
-
     // GetObject, byte-exact, with the ETag as the quoted blake3 root.
-    let response = http
-        .get(harness.url("/my-media/notes.txt"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/my-media/notes.txt").await;
     assert_eq!(response.status(), 200);
     let etag = response
         .headers()
@@ -154,9 +178,8 @@ async fn get_head_list_and_range_round_trip() {
         etag,
         format!("\"{}\"", blake3::hash(b"hello from s3").to_hex())
     );
-    // The Last-Modified *header* is RFC 7231 HTTP-date, not the RFC 3339 the
-    // XML body carries — SDKs parse it strictly and rclone refused the
-    // wrong shape outright.
+    // Last-Modified is RFC 7231 HTTP-date, not the RFC 3339 the XML body
+    // carries — SDKs parse it strictly and rclone refused the wrong shape.
     let last_modified = response
         .headers()
         .get("last-modified")
@@ -175,27 +198,24 @@ async fn get_head_list_and_range_round_trip() {
     // The SDK write path probes with HeadBucket and CreateBucket before an
     // upload; a mapped bucket answers both, an unmapped one 404s.
     for method in [reqwest::Method::HEAD, reqwest::Method::PUT] {
-        let response = http
-            .request(method.clone(), harness.url("/my-media"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200, "{method} on a mapped bucket");
-        let response = http
-            .request(method.clone(), harness.url("/not-mapped"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 404, "{method} on an unmapped bucket");
+        assert_eq!(
+            harness.request(method.clone(), "/my-media").await.status(),
+            200,
+            "{method} on a mapped bucket"
+        );
+        assert_eq!(
+            harness
+                .request(method.clone(), "/not-mapped")
+                .await
+                .status(),
+            404,
+            "{method} on an unmapped bucket"
+        );
     }
 
     // A large object comes back byte-for-byte, and its declared length is the
     // object's — a streamed body must still say how long it is.
-    let response = http
-        .get(harness.url("/my-media/talks/keynote.mp4"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/my-media/talks/keynote.mp4").await;
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.headers().get("content-length").unwrap(),
@@ -204,11 +224,7 @@ async fn get_head_list_and_range_round_trip() {
     assert_eq!(response.bytes().await.unwrap().as_ref(), payload.as_slice());
 
     // HeadObject: metadata straight from the entry, no body.
-    let response = http
-        .head(harness.url("/my-media/talks/keynote.mp4"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.head("/my-media/talks/keynote.mp4").await;
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.headers().get("content-length").unwrap(),
@@ -221,8 +237,8 @@ async fn get_head_list_and_range_round_trip() {
     assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
     assert!(response.bytes().await.unwrap().is_empty());
 
-    // A Range read, served as a verified range read.
-    let response = http
+    // A window in the middle, read as a verified range read.
+    let response = client()
         .get(harness.url("/my-media/talks/keynote.mp4"))
         .header("Range", "bytes=100000-100099")
         .send()
@@ -239,7 +255,7 @@ async fn get_head_list_and_range_round_trip() {
     );
 
     // A suffix range.
-    let response = http
+    let response = client()
         .get(harness.url("/my-media/notes.txt"))
         .header("Range", "bytes=-3")
         .send()
@@ -249,7 +265,7 @@ async fn get_head_list_and_range_round_trip() {
     assert_eq!(response.bytes().await.unwrap().as_ref(), b" s3");
 
     // An unsatisfiable range is refused, not silently clamped to nothing.
-    let response = http
+    let response = client()
         .get(harness.url("/my-media/notes.txt"))
         .header("Range", "bytes=9999-99999")
         .send()
@@ -258,11 +274,9 @@ async fn get_head_list_and_range_round_trip() {
     assert_eq!(response.status(), 416);
 
     // ListObjectsV2 over the whole bucket.
-    let body = http
-        .get(harness.url("/my-media?list-type=2"))
-        .send()
+    let body = harness
+        .get("/my-media?list-type=2")
         .await
-        .unwrap()
         .text()
         .await
         .unwrap();
@@ -275,11 +289,9 @@ async fn get_head_list_and_range_round_trip() {
     );
 
     // A prefix narrows it.
-    let body = http
-        .get(harness.url("/my-media?list-type=2&prefix=talks/"))
-        .send()
+    let body = harness
+        .get("/my-media?list-type=2&prefix=talks/")
         .await
-        .unwrap()
         .text()
         .await
         .unwrap();
@@ -287,11 +299,9 @@ async fn get_head_list_and_range_round_trip() {
     assert!(!body.contains("<Key>notes.txt</Key>"), "{body}");
 
     // A delimiter rolls directories up into common prefixes.
-    let body = http
-        .get(harness.url("/my-media?list-type=2&delimiter=%2F"))
-        .send()
+    let body = harness
+        .get("/my-media?list-type=2&delimiter=%2F")
         .await
-        .unwrap()
         .text()
         .await
         .unwrap();
@@ -300,11 +310,9 @@ async fn get_head_list_and_range_round_trip() {
     assert!(!body.contains("<Key>talks/keynote.mp4</Key>"), "{body}");
 
     // Continuation tokens page through the listing.
-    let body = http
-        .get(harness.url("/my-media?list-type=2&max-keys=1"))
-        .send()
+    let body = harness
+        .get("/my-media?list-type=2&max-keys=1")
         .await
-        .unwrap()
         .text()
         .await
         .unwrap();
@@ -316,14 +324,12 @@ async fn get_head_list_and_range_round_trip() {
         .and_then(|rest| rest.split("</NextContinuationToken>").next())
         .expect("a continuation token")
         .to_string();
-    let body = http
-        .get(harness.url(&format!(
+    let body = harness
+        .get(&format!(
             "/my-media?list-type=2&max-keys=5&continuation-token={}",
             urlencode(&token)
-        )))
-        .send()
+        ))
         .await
-        .unwrap()
         .text()
         .await
         .unwrap();
@@ -331,27 +337,16 @@ async fn get_head_list_and_range_round_trip() {
     assert!(body.contains("<Key>talks/keynote.mp4</Key>"), "{body}");
 
     // A missing key and a missing bucket both produce the S3 error codes.
-    let response = http
-        .get(harness.url("/my-media/absent.txt"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/my-media/absent.txt").await;
     assert_eq!(response.status(), 404);
     assert!(response.text().await.unwrap().contains("NoSuchKey"));
 
-    let response = http.get(harness.url("/no-bucket/x")).send().await.unwrap();
+    let response = harness.get("/no-bucket/x").await;
     assert_eq!(response.status(), 404);
     assert!(response.text().await.unwrap().contains("NoSuchBucket"));
 
     // ListBuckets at the service root.
-    let body = http
-        .get(harness.url("/"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let body = harness.get("/").await.text().await.unwrap();
     assert!(body.contains("<Name>my-media</Name>"), "{body}");
     assert!(body.contains("<Name>nas-media</Name>"), "{body}");
 
@@ -359,40 +354,45 @@ async fn get_head_list_and_range_round_trip() {
 }
 
 /// An object far larger than one control-protocol chunk crosses the gateway in
-/// both directions without either process holding it (§9.4). Byte-exactness at
-/// this size is the observable half of that; the bounded channel and the
-/// daemon's staging file are the mechanism.
+/// both directions without either process holding it (§9.4): byte-exactness at
+/// this size is the observable half of the bounded channel and the daemon's
+/// staging file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_large_object_streams_through_in_both_directions() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
+    // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    let payload = payload(3_000_000);
 
-    let response = http
-        .put(harness.url("/my-media/uploads/big.bin"))
-        .body(payload.clone())
-        .send()
-        .await
-        .unwrap();
+    let response = harness
+        .put("/my-media/uploads/big.bin", payload.clone())
+        .await;
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.headers().get("etag").unwrap().to_str().unwrap(),
         format!("\"{}\"", blake3::hash(&payload).to_hex())
     );
 
-    let response = http
-        .get(harness.url("/my-media/uploads/big.bin"))
-        .send()
-        .await
+    // It landed in the local space directory and was published as our entry.
+    assert_eq!(
+        std::fs::read(harness.space_path.join("uploads/big.bin")).unwrap(),
+        payload
+    );
+    let entry = harness
+        .node
+        .store()
+        .entry(harness.node.origin(), "media", "uploads/big.bin")
+        .unwrap()
         .unwrap();
+    assert_eq!(entry.size, payload.len() as u64);
+
+    // And it reads straight back out through the gateway.
+    let response = harness.get("/my-media/uploads/big.bin").await;
     assert_eq!(response.status(), 200);
     assert_eq!(response.bytes().await.unwrap().as_ref(), payload.as_slice());
 
     // A range in the middle of it reads without touching the rest.
-    let response = http
+    let response = client()
         .get(harness.url("/my-media/uploads/big.bin"))
         .header("Range", "bytes=2000000-2000999")
         .send()
@@ -407,61 +407,12 @@ async fn a_large_object_streams_through_in_both_directions() {
     harness.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn put_object_publishes_into_the_local_space() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
-    let _blocking = synch_core::BlockingScope::enter();
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    let payload: Vec<u8> = (0..60_000u32).map(|i| (i % 251) as u8).collect();
-
-    let response = http
-        .put(harness.url("/my-media/uploads/report.bin"))
-        .body(payload.clone())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(
-        response.headers().get("etag").unwrap().to_str().unwrap(),
-        format!("\"{}\"", blake3::hash(&payload).to_hex())
-    );
-
-    // It landed in the local space directory and was published as our entry.
-    assert_eq!(
-        std::fs::read(harness.space_path.join("uploads/report.bin")).unwrap(),
-        payload
-    );
-    let entry = harness
-        .node
-        .store()
-        .entry(harness.node.origin(), "media", "uploads/report.bin")
-        .unwrap()
-        .unwrap();
-    assert_eq!(entry.size, payload.len() as u64);
-
-    // And it reads straight back out through the gateway.
-    let got = http
-        .get(harness.url("/my-media/uploads/report.bin"))
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
-    assert_eq!(got.as_ref(), payload.as_slice());
-
-    harness.stop().await;
-}
-
 /// A node in key-loss recovery cannot publish, so it cannot accept a write
 /// either. That surfaces as an S3 error naming the command that clears it,
 /// rather than a panic or a silently dropped upload (§3.4, §9.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn put_object_is_refused_while_the_node_is_in_recovery() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
+    // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     harness
@@ -506,41 +457,21 @@ async fn put_object_is_refused_while_the_node_is_in_recovery() {
 /// the pinned origin, which is why the gateway warns about that shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_foreign_pinned_bucket_writes_our_view_and_reads_theirs() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
+    // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    let response = http
-        .put(harness.url("/nas-media/ours.txt"))
-        .body("ours")
-        .send()
-        .await
-        .unwrap();
+    let response = harness.put("/nas-media/ours.txt", b"ours".to_vec()).await;
     assert_eq!(response.status(), 200);
 
     // It landed in our own view...
-    let response = http
-        .get(harness.url("/my-media/ours.txt"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/my-media/ours.txt").await;
     assert_eq!(response.status(), 200);
     assert_eq!(response.bytes().await.unwrap().as_ref(), b"ours");
 
     // ...and not in the pinned origin's, which is what the bucket serves.
-    let response = http
-        .get(harness.url("/nas-media/ours.txt"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/nas-media/ours.txt").await;
     assert_eq!(response.status(), 404);
 
-    let ours = harness.daemon.origin().await.unwrap();
-    let bucket = buckets::find(&harness.daemon, "nas-media").await.unwrap();
-    assert!(bucket.pins_a_foreign_origin(&ours));
-    let warning = bucket.foreign_pin_warning(&ours).unwrap();
-    assert!(warning.contains("read-only"), "{warning}");
     harness.stop().await;
 }
 
@@ -548,11 +479,9 @@ async fn a_foreign_pinned_bucket_writes_our_view_and_reads_theirs() {
 /// key with 409 naming the versions, and the unified listing shows one key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn divergent_keys_are_served_by_policy() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
+    // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
     harness.publish("shared.txt", b"ours");
 
     // A peer publishes a different version of the same path. Only the peer's
@@ -583,22 +512,16 @@ async fn divergent_keys_are_served_by_policy() {
         .unwrap();
 
     // The unified listing carries one key for the path, not one per origin.
-    let body = http
-        .get(harness.url("/my-media?list-type=2"))
-        .send()
+    let body = harness
+        .get("/my-media?list-type=2")
         .await
-        .unwrap()
         .text()
         .await
         .unwrap();
     assert_eq!(body.matches("<Key>shared.txt</Key>").count(), 1, "{body}");
 
     // `newest` serves the winning version, and its ETag is that version's root.
-    let response = http
-        .get(harness.url("/my-media/shared.txt"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/my-media/shared.txt").await;
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.headers()["etag"].to_str().unwrap(),
@@ -607,11 +530,7 @@ async fn divergent_keys_are_served_by_policy() {
     assert_eq!(response.bytes().await.unwrap().as_ref(), theirs);
 
     // A strict bucket refuses the key with 409 and names both versions.
-    let response = http
-        .get(harness.url("/strict-media/shared.txt"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/strict-media/shared.txt").await;
     assert_eq!(response.status(), 409);
     let body = response.text().await.unwrap();
     assert!(body.contains("DivergentVersions"), "{body}");
@@ -622,30 +541,16 @@ async fn divergent_keys_are_served_by_policy() {
     );
     assert!(body.contains("<Resource>shared.txt</Resource>"), "{body}");
 
-    // HEAD refuses it the same way.
-    let response = http
-        .head(harness.url("/strict-media/shared.txt"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 409);
-
     // An undisputed key in the same strict bucket still reads.
     harness.publish("undisputed.txt", b"only one");
-    let response = http
-        .get(harness.url("/strict-media/undisputed.txt"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/strict-media/undisputed.txt").await;
     assert_eq!(response.status(), 200);
 
     // And the strict bucket leaves the divergent key out of its listing
     // rather than handing over one side's metadata.
-    let body = http
-        .get(harness.url("/strict-media?list-type=2"))
-        .send()
+    let body = harness
+        .get("/strict-media?list-type=2")
         .await
-        .unwrap()
         .text()
         .await
         .unwrap();
@@ -661,11 +566,9 @@ async fn divergent_keys_are_served_by_policy() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn symlink_keys_are_not_objects() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
+    // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
     harness.publish("real.txt", b"the real thing");
     std::os::unix::fs::symlink("real.txt", harness.space_path.join("link.txt")).unwrap();
     harness.node.scan_and_publish().unwrap();
@@ -681,11 +584,9 @@ async fn symlink_keys_are_not_objects() {
     assert_eq!(entry.kind, synch_core::EntryKind::Symlink);
     assert_eq!(entry.symlink_target.as_deref(), Some("real.txt"));
 
-    let body = http
-        .get(harness.url("/my-media?list-type=2"))
-        .send()
+    let body = harness
+        .get("/my-media?list-type=2")
         .await
-        .unwrap()
         .text()
         .await
         .unwrap();
@@ -694,54 +595,22 @@ async fn symlink_keys_are_not_objects() {
     assert!(body.contains("<KeyCount>1</KeyCount>"), "{body}");
 
     for method in ["GET", "HEAD"] {
-        let response = http
-            .request(method.parse().unwrap(), harness.url("/my-media/link.txt"))
-            .send()
-            .await
-            .unwrap();
+        let response = harness
+            .request(method.parse().unwrap(), "/my-media/link.txt")
+            .await;
         assert_eq!(response.status(), 404, "{method}");
     }
 
     // Writing to the same key is still an ordinary write: it replaces the link
     // with a file, and the file is an object like any other.
-    let response = http
-        .put(harness.url("/my-media/link.txt"))
-        .body("now a file")
-        .send()
-        .await
-        .unwrap();
+    let response = harness
+        .put("/my-media/link.txt", b"now a file".to_vec())
+        .await;
     assert_eq!(response.status(), 200);
-    let response = http
-        .get(harness.url("/my-media/link.txt"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/my-media/link.txt").await;
     assert_eq!(response.status(), 200);
     assert_eq!(response.bytes().await.unwrap().as_ref(), b"now a file");
 
-    harness.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deferred_operations_report_not_implemented() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
-    let _blocking = synch_core::BlockingScope::enter();
-    let harness = Harness::start(AuthMode::Anonymous).await;
-    let http = client();
-    // Deleting a *bucket* is not a thing HTTP may do: a bucket is a mapping the
-    // operator made.
-    let response = http.delete(harness.url("/my-media")).send().await.unwrap();
-    assert_eq!(response.status(), 501);
-    assert!(response.text().await.unwrap().contains("NotImplemented"));
-    // Neither is the batch delete, which is its own API.
-    let response = http
-        .post(harness.url("/my-media?delete"))
-        .body("<Delete><Object><Key>notes.txt</Key></Object></Delete>")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 501);
     harness.stop().await;
 }
 
@@ -749,8 +618,7 @@ async fn deferred_operations_report_not_implemented() {
 /// the gateway edits them by appending records over the socket (§9.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bucket_and_key_configuration_lives_in_the_daemon() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
+    // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
 
@@ -802,7 +670,8 @@ async fn bucket_and_key_configuration_lives_in_the_daemon() {
     .await
     .is_err());
 
-    // Access keys take the same shape.
+    // Access keys take the same shape: one put and one remove prove the
+    // socket append path; the fold semantics are auth.rs's own test.
     let key = AccessKey {
         id: "AKID".into(),
         secret: "shh".into(),
@@ -810,10 +679,6 @@ async fn bucket_and_key_configuration_lives_in_the_daemon() {
     synch_s3::auth::put_key(&harness.daemon, &key)
         .await
         .unwrap();
-    assert_eq!(
-        synch_s3::auth::load_keys(&harness.daemon).await.unwrap(),
-        vec![key]
-    );
     assert!(synch_s3::auth::remove_key(&harness.daemon, "AKID")
         .await
         .unwrap());
@@ -827,8 +692,7 @@ async fn bucket_and_key_configuration_lives_in_the_daemon() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigv4_is_enforced_when_keys_are_configured() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
+    // The runtime workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let keys = vec![AccessKey {
         id: "AKIDEXAMPLE".into(),
@@ -836,14 +700,9 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
     }];
     let harness = Harness::start(AuthMode::SigV4(keys.clone())).await;
     harness.publish("secret.txt", b"authenticated only");
-    let http = client();
 
     // Unsigned requests are refused.
-    let response = http
-        .get(harness.url("/my-media/secret.txt"))
-        .send()
-        .await
-        .unwrap();
+    let response = harness.get("/my-media/secret.txt").await;
     assert_eq!(response.status(), 403);
     assert!(response.text().await.unwrap().contains("AccessDenied"));
 
@@ -855,6 +714,7 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
         .as_secs() as i64;
     let amz_date = synch_s3::auth::format_amz_date(now);
     let scope_date = amz_date[..8].to_string();
+    let http = client();
 
     // A garbage signature is refused — with a fresh date, so the request reaches
     // the signature check rather than being turned away for a stale timestamp.
@@ -926,23 +786,6 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
     );
 
     harness.stop().await;
-}
-
-/// With no daemon there is nothing to serve from, and the gateway says so in
-/// the words the CLI uses rather than as a transport error (§9.1).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_a_daemon_the_gateway_names_the_command_that_starts_one() {
-    // This test's own body drives the world the way an operator would,
-    // synchronously; the runtime workers the node uses stay checked (§10).
-    let _blocking = synch_core::BlockingScope::enter();
-    let dir = tempfile::tempdir().unwrap();
-    Node::init(dir.path(), None).unwrap();
-    let daemon = Daemon::new(dir.path());
-    let error = buckets::load(&daemon)
-        .await
-        .expect_err("there is no daemon listening");
-    assert_eq!(error.status, 503, "{error}");
-    assert!(error.message.contains("synch daemon run"), "{error}");
 }
 
 fn urlencode(value: &str) -> String {

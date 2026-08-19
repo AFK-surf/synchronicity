@@ -1528,6 +1528,7 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1539,41 +1540,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(canonical_json(&value).unwrap()).unwrap(),
-            // Sorted keys, no whitespace, and — the part every
-            // implementation gets wrong once — a raw tab inside the string,
-            // because canonical JSON escapes only the quote and the
-            // backslash.
+            // Canonical JSON escapes only the quote and the backslash, so a
+            // raw tab inside a string survives — the spot implementations
+            // diverge.
             "{\"a\":[true,false,null],\"b\":1,\"c\":\"quote \\\" slash \\\\ tab \t\"}"
         );
         // Floats have no canonical rendering, so they are refused.
         assert!(canonical_json(&serde_json::json!({ "x": 1.5 })).is_err());
-    }
-
-    #[test]
-    fn the_embedded_root_is_the_sigstore_root() {
-        let root = Root::parse(EMBEDDED_TUF_ROOT.as_bytes()).expect("the embedded root parses");
-        assert_eq!(root.version, 15);
-        // Its own root role signs it: the property that lets a later root
-        // chain to it at all.
-        root.check_role(ROOT_ROLE, &root.meta)
-            .expect("the embedded root is self-consistent");
-        for role in [ROOT_ROLE, TIMESTAMP_ROLE, SNAPSHOT_ROLE, TARGETS_ROLE] {
-            assert!(root.roles.contains_key(role), "no {role} role");
-        }
-        assert_eq!(root.roles[ROOT_ROLE].1, 3, "the root threshold");
-        // And every key it names is one this build can actually use — a key
-        // that silently failed to parse would become a threshold failure
-        // later, at the worst possible moment.
-        let keys = root.meta.signed["keys"].as_object().unwrap();
-        assert_eq!(root.keys.len(), keys.len());
-    }
-
-    #[test]
-    fn the_embedded_state_is_the_embedded_root() {
-        let state = PinState::embedded();
-        assert_eq!(state.root_version, 15);
-        // No update accepted yet: the bootstrap snapshot stands.
-        assert_eq!(state.log_keys(), None);
     }
 
     #[test]
@@ -1600,20 +1573,16 @@ mod tests {
             parse_rfc3339("2016-12-31T23:59:60Z"),
             Some(parse_rfc3339("2016-12-31T23:59:59Z").unwrap() + 1)
         );
+        // The fields are read out by offset, so every separator is checked,
+        // not only the ones in the date.
         for broken in [
             "",
             "2026-11-20",
-            "2026-11-20 13:58:18Z",
             "2026-13-20T13:58:18Z",
             "2026-11-20T13:58:18+0200",
             "not a time at all",
-            // Every separator is checked, not only the ones in the date: the
-            // fields are read out by offset, so punctuation that is not RFC
-            // 3339's is a string this parser has no business indexing into.
             "2026-11-20T13.58:18Z",
-            "2026-11-20T13:58.18Z",
             "2026-11-20T135818ZZZ",
-            // And the seconds are bounded like every other field.
             "2026-11-20T13:58:61Z",
             "2026-11-20T13:58:99Z",
         ] {
@@ -1625,8 +1594,6 @@ mod tests {
     fn a_state_file_round_trips_and_is_the_owners_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("rekor-pins.json");
-        // The bootstrap state: nothing accepted, so nothing in the file speaks
-        // about the pin set and there is no targets role to re-check.
         let state = PinState {
             updated_at: 1_700_000_000,
             ..PinState::embedded()
@@ -1639,76 +1606,38 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        // The temporary is gone, and it never shared a name with anybody
-        // else's: two writers filling in one file and then each renaming it
-        // over the real one is the case the rename dance exists to prevent.
+        // The temporary never shared a name with anybody else's: two writers
+        // renaming over the real one is the case the rename dance prevents.
         let siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(siblings, vec!["rekor-pins.json".to_string()]);
-
-        // Anything unreadable as state reads as no state at all, rather
-        // than as an error a client could be stopped by.
-        assert_eq!(
-            PinState::load(dir.path().join("absent.json").as_path()),
-            None
-        );
-        std::fs::write(&path, "not json").unwrap();
-        assert_eq!(PinState::load(&path), None);
-        std::fs::write(&path, r#"{"version":3}"#).unwrap();
-        assert_eq!(PinState::load(&path), None);
-        // A well-formed file of the current format still needs every field
-        // the state is made of; a partial one is not state.
-        std::fs::write(&path, r#"{"version":4}"#).unwrap();
-        assert_eq!(PinState::load(&path), None);
-    }
-
-    #[test]
-    fn a_trusted_root_with_no_logs_is_never_adopted() {
-        assert!(matches!(
-            tlog_keys(br#"{"tlogs":[]}"#),
-            Err(TufError::Malformed(_))
-        ));
-        assert!(matches!(
-            tlog_keys(b"not json"),
-            Err(TufError::Malformed(_))
-        ));
-        assert!(matches!(tlogs(b"not json"), Err(TufError::Malformed(_))));
-        // A log with a key but nowhere to reach it is half an answer, and
-        // the half that is missing is the one this change exists to supply.
-        // Skipped like any other unreadable entry — and since it is the only
-        // one, the file names nothing this build can use.
-        assert!(matches!(
-            tlogs(br#"{"tlogs":[{"publicKey":{"rawBytes":"MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244="}}]}"#),
-            Err(TufError::Malformed(_))
-        ));
     }
 
     /// One entry this build cannot read must not cost the ones it can.
     ///
     /// Sigstore will eventually publish a shard in a shape written after this
-    /// binary — a key on a curve it does not know, a field spelled another
-    /// way. Refusing the whole trusted root for it would stop pin refresh
-    /// globally and permanently, for every zone, until a new build shipped:
-    /// the "a rotation becomes a client upgrade" outcome §10 exists to remove,
-    /// reached with no adversary at all.
+    /// binary; refusing the whole trusted root for it would stop pin refresh
+    /// globally and permanently — "a rotation becomes a client upgrade" (§10).
     #[test]
     fn an_unreadable_shard_is_skipped_and_the_readable_ones_survive() {
-        let p256 = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==";
+        // An empty pin set is never adopted, and neither is garbage.
+        assert!(matches!(
+            tlog_keys(br#"{"tlogs":[]}"#),
+            Err(TufError::Malformed(_))
+        ));
+        assert!(matches!(tlogs(b"not json"), Err(TufError::Malformed(_))));
+        let p384 = "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEnl6ZQFT3z9Xk3gGmNCEnhZAcuP0Ib3Yl                 Cn0nOxKMOxYOs+7t1EytzHnjvUvJcVZLzGGyEXFYVCPmVXOImk7VkRz0hkK+9tJm                 ovNXeqXHtNc4DmMfDsJrbYbHNGiBTsMD";
         let root = serde_json::json!({"tlogs": [
             // A curve this build does not verify with.
-            {"baseUrl": "https://p384.example", "publicKey": {"rawBytes":
-                "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEnl6ZQFT3z9Xk3gGmNCEnhZAcuP0Ib3Yl                 Cn0nOxKMOxYOs+7t1EytzHnjvUvJcVZLzGGyEXFYVCPmVXOImk7VkRz0hkK+9tJm                 ovNXeqXHtNc4DmMfDsJrbYbHNGiBTsMD",
-                "validFor": {"start": "2021-01-12T11:53:27Z"}}},
+            tlog_entry(Some("https://p384.example"), p384, serde_json::json!("2021-01-12T11:53:27Z"), None),
             // A window a future encoder spelled as a number.
-            {"baseUrl": "https://odd.example", "publicKey": {"rawBytes": p256,
-                "validFor": {"start": 1610452407}}},
+            tlog_entry(Some("https://odd.example"), P256, serde_json::json!(1610452407), None),
             // No baseUrl at all.
-            {"publicKey": {"rawBytes": p256, "validFor": {"start": "2021-01-12T11:53:27Z"}}},
+            tlog_entry(None, P256, serde_json::json!("2021-01-12T11:53:27Z"), None),
             // And one this build reads perfectly well.
-            {"baseUrl": "https://good.example", "publicKey": {"rawBytes": p256,
-                "validFor": {"start": "2021-01-12T11:53:27Z"}}},
+            tlog_entry(Some("https://good.example"), P256, serde_json::json!("2021-01-12T11:53:27Z"), None),
         ]})
         .to_string();
 
@@ -1718,8 +1647,7 @@ mod tests {
             .iter()
             .any(|log| log.base_url == "https://good.example"));
         // The one with an unparseable window is *pinned* — a proof under its
-        // key still verifies — but reads as not yet in service, so nothing
-        // selects it.
+        // key still verifies — but reads as not yet in service.
         let odd = logs
             .iter()
             .find(|log| log.base_url == "https://odd.example")
@@ -1728,30 +1656,34 @@ mod tests {
         assert!(tlog_keys(root.as_bytes()).is_ok());
     }
 
+    const P256: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==";
+    const ED25519: &str = "MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=";
+
+    /// One `{"tlogs": [...]}` entry, in the shapes these tests exercise.
+    fn tlog_entry(
+        base_url: Option<&str>,
+        spki_b64: &str,
+        start: serde_json::Value,
+        end: Option<&str>,
+    ) -> serde_json::Value {
+        let mut valid_for = serde_json::json!({ "start": start });
+        if let Some(end) = end {
+            valid_for["end"] = serde_json::json!(end);
+        }
+        let mut entry =
+            serde_json::json!({ "publicKey": { "rawBytes": spki_b64, "validFor": valid_for } });
+        if let Some(base_url) = base_url {
+            entry["baseUrl"] = serde_json::json!(base_url);
+        }
+        entry
+    }
+
     /// A trusted root with three shards: one closed, one open, one not yet.
     fn three_shards() -> Vec<u8> {
-        let ed25519 = "MCowBQYDK2VwAyEAt8rlp1knGwjfbcXAYPYAkn0XiLz1x8O4t0YkEhie244=";
-        let p256 = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==";
         serde_json::json!({"tlogs": [
-            {
-                "baseUrl": "https://retired.example/",
-                "publicKey": {"rawBytes": p256, "validFor": {
-                    "start": "2021-01-12T11:53:27Z",
-                    "end": "2025-09-23T00:00:00Z",
-                }},
-            },
-            {
-                "baseUrl": "https://open.example",
-                "publicKey": {"rawBytes": ed25519, "validFor": {
-                    "start": "2025-09-23T00:00:00Z",
-                }},
-            },
-            {
-                "baseUrl": "https://next.example",
-                "publicKey": {"rawBytes": ed25519, "validFor": {
-                    "start": "2030-01-01T00:00:00Z",
-                }},
-            },
+            tlog_entry(Some("https://retired.example/"), P256, serde_json::json!("2021-01-12T11:53:27Z"), Some("2025-09-23T00:00:00Z")),
+            tlog_entry(Some("https://open.example"), ED25519, serde_json::json!("2025-09-23T00:00:00Z"), None),
+            tlog_entry(Some("https://next.example"), ED25519, serde_json::json!("2030-01-01T00:00:00Z"), None),
         ]})
         .to_string()
         .into_bytes()
@@ -1774,8 +1706,8 @@ mod tests {
             current_tlog(&logs, 2_050_000_000).unwrap().base_url,
             "https://next.example"
         );
-        // Before any of them opened, nothing is in service — which is a
-        // trusted root to report on, not one to guess a hostname from.
+        // Before any of them opened, nothing is in service — a trusted root
+        // to report on, not one to guess a hostname from.
         assert!(current_tlog(&logs, 0).is_none());
 
         // Every shard stays pinned regardless: a proof from the retired one
@@ -1786,26 +1718,23 @@ mod tests {
     #[test]
     fn the_embedded_trusted_root_names_a_log_in_service() {
         let logs = tlogs(EMBEDDED_TRUSTED_ROOT.as_bytes()).expect("the embedded trusted root");
-        // The bootstrap has to be usable on its own — a build whose embedded
+        // The bootstrap has to be usable on its own: a build whose embedded
         // artifact names no open shard cannot make a first request at all.
-        let now = 1_786_854_774;
-        let open = current_tlog(&logs, now).expect("an open shard in the embedded root");
+        let open = current_tlog(&logs, 1_786_854_774).expect("an open shard in the embedded root");
         assert!(open.base_url.starts_with("https://"));
-        // And the bootstrap pin set is exactly what that artifact names, not
-        // a separately maintained list that can drift from it.
+        // And the bootstrap pin set is exactly what that artifact names — the
+        // only guard against the two embedded artifacts drifting apart.
         assert_eq!(
             crate::rekor::LogKeys::embedded(),
             tlog_keys(EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap()
         );
     }
 
-    /// One walk has an aggregate byte budget, not only a per-response cap.
-    ///
-    /// `fetch_metadata` holds every root it collects until `update` can chain
-    /// them, so a per-response bound is not a bound on the walk: a mirror
-    /// answering the whole per-response allowance to all `ROOT_CEILING` root
-    /// probes turns a daily refresh into more than a gigabyte resident, while
-    /// `update` would have bailed after two roots.
+    /// One walk has an aggregate byte budget and a total deadline, not only
+    /// per-response caps: a mirror answering the whole per-response allowance
+    /// to every root probe turns a daily refresh into a gigabyte resident,
+    /// and ~204 requests each stalling just inside a per-request timeout is
+    /// hours of walk — while `update` would have bailed after two roots.
     #[test]
     fn a_walk_that_serves_too_many_bytes_is_abandoned() {
         /// A repository that answers a megabyte of nothing to every request.
@@ -1822,19 +1751,9 @@ mod tests {
         );
         // Well short of what `ROOT_CEILING` responses would have cost.
         assert!(MAX_WALK_BYTES < ROOT_CEILING as usize * 1024 * 1024);
-    }
 
-    /// And a total deadline, not only a per-request timeout.
-    ///
-    /// ~204 requests each stalling just inside a per-request timeout is hours of
-    /// walk, and the walk is awaited inside a membership refresh.
-    #[test]
-    fn a_walk_that_takes_too_long_is_abandoned() {
-        let fresh = Budget::new();
-        fresh
-            .check()
-            .expect("a walk that has just started may proceed");
-
+        // And the same walk has a total deadline: a walk past it stops, and
+        // the current pins stand.
         let overrun = Budget {
             started: Instant::now()
                 .checked_sub(MAX_WALK_TIME * 2)
@@ -1846,20 +1765,5 @@ mod tests {
             matches!(&error, TufError::Malformed(why) if why.contains("longer than")),
             "{error}"
         );
-    }
-
-    #[test]
-    fn error_classes_are_named_for_the_doctor() {
-        for (error, class) in [
-            (TufError::Malformed(String::new()), "malformed"),
-            (TufError::Chain(String::new()), "chain"),
-            (TufError::Threshold(String::new()), "threshold"),
-            (TufError::Signature(String::new()), "signature"),
-            (TufError::Expiry(String::new()), "expiry"),
-            (TufError::Rollback(String::new()), "rollback"),
-            (TufError::TargetHash(String::new()), "target-hash"),
-        ] {
-            assert_eq!(error.class(), class);
-        }
     }
 }

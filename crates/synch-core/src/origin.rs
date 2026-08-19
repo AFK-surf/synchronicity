@@ -193,6 +193,8 @@ mod tests {
         let text = o.canonical();
         assert!(text.starts_with("key:"));
         assert_eq!(OriginId::from_str(&text).unwrap(), o);
+        // The bare z32 form parses to the same key origin.
+        assert_eq!(OriginId::from_str(&key.to_z32()).unwrap(), o);
     }
 
     #[test]
@@ -204,24 +206,12 @@ mod tests {
     }
 
     #[test]
-    fn bare_key_parses() {
-        let key = SecretKey::generate().public();
-        assert_eq!(
-            OriginId::from_str(&key.to_z32()).unwrap(),
-            OriginId::Key(key)
-        );
-    }
-
-    #[test]
     fn rejects_bad_labels() {
         assert!(normalize_label("").is_err());
         assert!(normalize_label("has_underscore").is_err());
         assert!(normalize_label(&"x".repeat(64)).is_err());
         assert!(normalize_label("ok-1").is_ok());
-    }
-
-    #[test]
-    fn rejects_bad_domains() {
+        // Domains validate label-by-label, with the same rules.
         assert!(normalize_domain("").is_err());
         assert!(normalize_domain("a..b").is_err());
         assert!(normalize_domain("-lead.example").is_err());
@@ -272,13 +262,5 @@ mod tests {
         })
         .unwrap();
         assert_eq!(postcard::from_bytes::<OriginId>(&shouty).unwrap(), good);
-    }
-
-    #[test]
-    fn ordering_is_by_canonical_shape() {
-        // Named origins sort together and stably; used for deterministic wire order.
-        let a = OriginId::named("a", "x.example").unwrap();
-        let b = OriginId::named("b", "x.example").unwrap();
-        assert!(a < b);
     }
 }

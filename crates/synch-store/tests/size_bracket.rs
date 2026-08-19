@@ -64,23 +64,14 @@ fn a_size_lie_inside_one_power_of_two_bracket_does_not_brick_the_root() {
     assert_eq!(row.size, true_size, "the true size wins");
     assert!(row.complete, "and the object completes");
     assert_eq!(victim.read_all(&root).unwrap(), bytes);
-}
 
-#[test]
-fn an_attested_size_still_refuses_a_different_claim() {
-    // Rule 1 is what stops the yielding above from churning: once the final
-    // group is held, the size is a fact and a differing claim is refused.
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let size = 20 * CHUNK_GROUP_SIZE;
-    let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-    let root = store.ingest_bytes(&bytes, 0).unwrap();
-
-    let (encoded, served) = store
+    // Once the final group is held the size is attested, and a differing
+    // claim is refused — which is what stops the yielding above from churning.
+    let (encoded, served) = honest
         .encode_slice(&root, &ChunkRanges::single(0, 16))
         .unwrap();
-    let err = store
-        .write_slice(&root, 24 * CHUNK_GROUP_SIZE, &served, &encoded, 0)
+    let err = victim
+        .write_slice(&root, lie_size, &served, &encoded, 0)
         .expect_err("a complete object's size is attested and cannot be re-claimed");
     assert!(err.to_string().contains("size mismatch"), "{err}");
 }

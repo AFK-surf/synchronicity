@@ -1,9 +1,8 @@
 //! Model-based property tests for the trie (§11, testing strategy).
 //!
 //! The model is a `BTreeMap`: the trie must agree with it on every read, its
-//! root must depend only on the map contents and never on the insertion order,
-//! diffs must be complete, and deletion must leave the trie in the same
-//! canonical form as never having inserted at all.
+//! root must depend only on the map contents and never on insertion order,
+//! diffs must be complete, and deletion must leave the canonical trie.
 
 use std::collections::BTreeMap;
 
@@ -11,7 +10,7 @@ use proptest::prelude::*;
 use synch_core::Hash;
 use synch_mpt::{ChangeKind, MemStore, NodeStore, Trie};
 
-/// Keys drawn from a small alphabet so that shared prefixes, prefix-of-another
+/// Keys drawn from a small alphabet so shared prefixes, prefix-of-another
 /// keys, and branch splits all occur frequently.
 fn key_strategy() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(
@@ -66,13 +65,11 @@ proptest! {
     /// same pairs in any order yields the same root.
     #[test]
     fn root_is_order_independent(items in map_strategy(), seed in any::<u64>()) {
-        // Deduplicate by key, keeping the last write, so both orders describe
-        // the same map.
         let map: BTreeMap<Vec<u8>, Vec<u8>> = items.into_iter().collect();
         let forward: Vec<(Vec<u8>, Vec<u8>)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         let mut shuffled = forward.clone();
-        // A deterministic shuffle driven by the proptest-supplied seed.
+        // A deterministic xorshift shuffle driven by the proptest-supplied seed.
         let mut state = seed | 1;
         for i in (1..shuffled.len()).rev() {
             state ^= state << 13;
@@ -194,11 +191,8 @@ proptest! {
     }
 
     /// Every key in a complete trie has a proof that verifies, and every absent
-    /// key has a verifying proof of absence.
-    ///
-    /// Behind the `proofs` feature with the module it exercises: single-key
-    /// proofs are a §13 capability with no v1 caller, so they are not part of
-    /// the default build (DESIGN.md §4.3).
+    /// key has a verifying proof of absence. Behind the `proofs` feature with
+    /// the module it exercises (§13, DESIGN.md §4.3).
     #[cfg(feature = "proofs")]
     #[test]
     fn proofs_verify(items in map_strategy(), probes in prop::collection::vec(key_strategy(), 0..8)) {

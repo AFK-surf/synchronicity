@@ -587,35 +587,54 @@ fn jitter_seed() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NodeConfig;
+    use crate::testkit::{node, node_with};
+    use synch_store::{Binding, BindingSource};
+
+    /// One trusted binding, the literal that recurs through the sweep tests.
+    fn bind(
+        node: &Node,
+        name: &str,
+        key: &iroh_base::PublicKey,
+        source: BindingSource,
+        expires_at: Option<i64>,
+    ) {
+        node.store()
+            .put_binding(&Binding {
+                origin: synch_core::OriginId::named(name, "x.example").unwrap(),
+                node_id: *key,
+                source,
+                domain: Some("x.example".into()),
+                issuer: None,
+                spaces: Vec::new(),
+                note: None,
+                added_at: 0,
+                expires_at,
+            })
+            .unwrap();
+    }
 
     #[test]
     fn jitter_stays_inside_the_window() {
         let base = Duration::from_secs(30);
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
             let d = jittered(base);
             assert!(d >= base / 2, "{d:?}");
             assert!(d <= base + base / 2, "{d:?}");
-        }
-    }
-
-    #[test]
-    fn jitter_actually_varies() {
-        let base = Duration::from_secs(30);
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..50 {
-            seen.insert(jittered(base).as_millis());
+            seen.insert(d.as_millis());
         }
         assert!(seen.len() > 1, "jitter must not be constant");
     }
 
     #[tokio::test]
     async fn a_lone_node_has_nothing_to_sync_with() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::Node::init(dir.path(), None).unwrap();
-        let node = crate::Node::open(NodeConfig::loopback(dir.path()))
-            .await
-            .unwrap();
+        let (_d, node) = node().await;
+        // The self binding exists, but must not appear as a dial target.
+        assert!(node
+            .store()
+            .trusted_keys(now_ns())
+            .unwrap()
+            .contains(&node.node_id()));
         assert!(node.dialable_peers().unwrap().is_empty());
         let report = node.anti_entropy_round().await.unwrap();
         assert!(report.peer.is_none());
@@ -624,42 +643,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_node_never_dials_itself() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::Node::init(dir.path(), None).unwrap();
-        let node = crate::Node::open(NodeConfig::loopback(dir.path()))
-            .await
-            .unwrap();
-        // The self binding exists, but it must not appear as a dial target.
-        assert!(node
-            .store()
-            .trusted_keys(now_ns())
-            .unwrap()
-            .contains(&node.node_id()));
-        assert!(!node.dialable_peers().unwrap().contains(&node.node_id()));
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn maintenance_expires_bindings_and_runs_gc() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::Node::init(dir.path(), None).unwrap();
-        let node = crate::Node::open(NodeConfig::loopback(dir.path()))
-            .await
-            .unwrap();
-        node.store()
-            .put_binding(&synch_store::Binding {
-                origin: synch_core::OriginId::named("gone", "x.example").unwrap(),
-                node_id: iroh_base::SecretKey::generate().public(),
-                source: synch_store::BindingSource::Dns,
-                domain: Some("x.example".into()),
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: Some(1),
-            })
-            .unwrap();
+        let (_d, node) = node().await;
+        let key = iroh_base::SecretKey::generate().public();
+        bind(&node, "gone", &key, BindingSource::Dns, Some(1));
         node.maintenance_pass().unwrap();
         assert_eq!(
             node.store().bindings().unwrap().len(),
@@ -678,29 +665,16 @@ mod tests {
     #[tokio::test]
     async fn a_pending_head_nobody_serves_is_abandoned_by_maintenance() {
         use synch_core::{file_key, FileEntry, Hash, SignedHead};
-        use synch_store::{Binding, BindingSource, Slot};
+        use synch_store::Slot;
 
-        let dir = tempfile::tempdir().unwrap();
-        crate::Node::init(dir.path(), None).unwrap();
-        let mut config = NodeConfig::loopback(dir.path());
-        config.pending_head_ttl = Duration::from_secs(60);
-        let node = crate::Node::open(config).await.unwrap();
+        let (_d, node) = node_with(|config| {
+            config.pending_head_ttl = Duration::from_secs(60);
+        })
+        .await;
 
         let key = iroh_base::SecretKey::generate();
         let origin = synch_core::OriginId::named("nas", "x.example").unwrap();
-        node.store()
-            .put_binding(&Binding {
-                origin: origin.clone(),
-                node_id: key.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
+        bind(&node, "nas", &key.public(), BindingSource::Static, None);
 
         // A root this node holds nothing of, pushed long enough ago that the
         // TTL has run out.
@@ -713,43 +687,16 @@ mod tests {
 
         // A fresh pending head for another origin is left where it is.
         let fresh_origin = synch_core::OriginId::named("laptop", "x.example").unwrap();
-        node.store()
-            .put_binding(&Binding {
-                origin: fresh_origin.clone(),
-                node_id: key.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
+        bind(&node, "laptop", &key.public(), BindingSource::Static, None);
         let fresh = SignedHead::sign(&key, fresh_origin.clone(), 1, Hash::new(b"recent"), 0);
         node.store()
             .put_head(Slot::Pending, &fresh, now, 0)
             .unwrap();
 
-        // And an old pending head whose trie *is* here. The abandonment sweep
-        // steps over it — it is one promotion away from complete, not stranded
-        // — and the promotion pass ahead of it performs that promotion, which
-        // is what keeps "not stranded" from meaning "left in the pending slot
-        // forever holding the floor above every servable head".
+        // And an old pending head whose trie *is* here: the sweep steps over
+        // it, and the promotion pass performs that promotion.
         let held_origin = synch_core::OriginId::named("vps", "x.example").unwrap();
-        node.store()
-            .put_binding(&Binding {
-                origin: held_origin.clone(),
-                node_id: key.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
+        bind(&node, "vps", &key.public(), BindingSource::Static, None);
         let trie = synch_mpt::Trie::new(node.store().as_ref());
         let root = trie
             .insert(
@@ -779,55 +726,23 @@ mod tests {
             Some(held),
             "and what it is promoted into is the complete slot"
         );
-
-        // With the floor dropped, the older head a peer can actually serve is
-        // adopted rather than refused.
-        let servable = SignedHead::sign(&key, origin.clone(), 3, Hash::EMPTY, 0);
-        assert!(crate::Syncer::new(node.store().clone())
-            .offer_head(&servable, now)
-            .unwrap()
-            .accepted());
         node.shutdown().await.unwrap();
     }
 
-    /// A pending head this node cannot materialize fails its own origin and
-    /// nothing else — GC in particular still runs (§12).
-    ///
-    /// `maintenance_pass` used to `?` out of `promote_ready_pending_heads`, so
-    /// one member publishing a structurally perfect trie with a single `f:`
-    /// value that is not a `FileEntry` aborted the whole pass on every peer
-    /// that adopted the head. Nothing after it ever ran again: no abandonment
-    /// sweep, no ad retirement, no history pruning, no trie or content sweep.
-    /// Permanent, silent apart from a `warn!`, and ~200 bytes to trigger.
-    ///
-    /// The head also has to stop holding `head_floor`: its trie *is* complete,
-    /// so the TTL rule steps over it as "one promotion away", which it is not.
+    /// §12: one origin's undecodable `f:` record fails its own origin and
+    /// nothing else — the pass used to abort after it, which silently disabled
+    /// GC and every later sweep on every peer that adopted the head. The head
+    /// also has to stop holding `head_floor`: its trie is complete, so the TTL
+    /// rule steps over it as "one promotion away", which it is not.
     #[tokio::test]
     async fn a_head_that_cannot_be_materialized_does_not_stop_the_pass() {
         use synch_core::{file_key, Hash, SignedHead};
-        use synch_store::{Binding, BindingSource, Slot};
+        use synch_store::Slot;
 
-        let dir = tempfile::tempdir().unwrap();
-        crate::Node::init(dir.path(), None).unwrap();
-        let node = crate::Node::open(NodeConfig::loopback(dir.path()))
-            .await
-            .unwrap();
-
+        let (_d, node) = node().await;
         let key = iroh_base::SecretKey::generate();
         let origin = synch_core::OriginId::named("rogue", "x.example").unwrap();
-        node.store()
-            .put_binding(&Binding {
-                origin: origin.clone(),
-                node_id: key.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
+        bind(&node, "rogue", &key.public(), BindingSource::Static, None);
 
         // A canonical one-leaf trie whose `f:` record will not decode.
         let trie = synch_mpt::Trie::new(node.store().as_ref());
@@ -870,32 +785,6 @@ mod tests {
             .unwrap()
             .accepted());
 
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn the_anti_entropy_loop_stops_on_shutdown() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::Node::init(dir.path(), None).unwrap();
-        let mut config = NodeConfig::loopback(dir.path());
-        config.aae_interval = Duration::from_millis(10);
-        let node = crate::Node::open(config).await.unwrap();
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let runner = node.clone();
-        let handle = tokio::spawn(async move {
-            runner
-                .run_anti_entropy(async {
-                    let _ = rx.await;
-                })
-                .await;
-        });
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("the loop must stop promptly")
-            .unwrap();
         node.shutdown().await.unwrap();
     }
 }

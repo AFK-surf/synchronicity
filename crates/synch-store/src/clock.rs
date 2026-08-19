@@ -151,20 +151,14 @@ mod tests {
     use super::*;
     use synch_core::MIN_TRUSTED_NS;
 
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        (dir, store)
-    }
+    use crate::testutil::store;
 
     #[test]
     fn an_untrustworthy_reading_is_never_rescued_by_the_floor() {
         let (_d, store) = store();
         let good = MIN_TRUSTED_NS + 10_000;
         assert_eq!(store.advance_trust_floor(good).unwrap(), good);
-        // The dead-RTC case: the floor is a real instant, but the reading is
-        // not, so the reading stays untrustworthy and every expiry check
-        // refuses it.
+        // A dead-RTC reading stays untrustworthy, whatever the floor says.
         assert_eq!(store.trust_instant(0).unwrap(), 0);
         let status = store.clock_status(0).unwrap();
         assert!(!status.trusted);
@@ -175,29 +169,20 @@ mod tests {
     fn the_floor_is_monotonic_and_only_moves_on_trustworthy_readings() {
         let (_d, store) = store();
         assert_eq!(store.trust_floor().unwrap(), 0);
-        // The epoch does not become a floor, or a node with a dead clock would
-        // pin its own floor at a number that dates nothing.
+        // The epoch does not become a floor: it dates nothing.
         assert_eq!(store.advance_trust_floor(0).unwrap(), 0);
         let high = MIN_TRUSTED_NS + 2_000;
         assert_eq!(store.advance_trust_floor(high).unwrap(), high);
-        // A backwards step neither lowers the floor nor is honored as an
-        // instant: trust time can stand still, never run backwards.
+        // Trust time can stand still, never run backwards.
         let stepped_back = MIN_TRUSTED_NS + 1_000;
         assert_eq!(store.advance_trust_floor(stepped_back).unwrap(), high);
         assert_eq!(store.trust_instant(stepped_back).unwrap(), high);
         assert!(store.clock_status(stepped_back).unwrap().stepped_back);
-        // Forward motion is honored.
         assert_eq!(store.trust_instant(high + 5).unwrap(), high + 5);
     }
 
-    /// One wild forward reading cannot pin the floor.
-    ///
-    /// `clock_is_trusted` is a lower bound only, so a dead RTC or a restored
-    /// snapshot presents a reading years ahead. Recording it would make every
-    /// later trust decision evaluate at that instant — and since DNS bindings are
-    /// stamped from the floored instant, they would be written already past their
-    /// own expiry and never lapse, so dropping a member from the zone would stop
-    /// removing them. That fails open.
+    /// One wild forward reading cannot pin the floor: bindings stamped from a
+    /// pinned floor would never lapse, and member removal fails open.
     #[test]
     fn a_reading_far_past_the_floor_does_not_pin_it() {
         let (_d, store) = store();
@@ -205,16 +190,11 @@ mod tests {
         assert_eq!(store.advance_trust_floor(now).unwrap(), now);
 
         let wild = now + 400 * 24 * 3600 * 1_000_000_000;
-        assert_eq!(
-            store.advance_trust_floor(wild).unwrap(),
-            now,
-            "a year ahead is refused, and the floor stands where it was"
-        );
+        assert_eq!(store.advance_trust_floor(wild).unwrap(), now);
 
         // Ordinary advances still land, so real time is not held back.
         let later = now + 3600 * 1_000_000_000;
         assert_eq!(store.advance_trust_floor(later).unwrap(), later);
-        // And a trust decision is not evaluated at the refused instant.
         assert_eq!(store.trust_instant(later).unwrap(), later);
     }
 

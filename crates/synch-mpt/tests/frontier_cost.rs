@@ -1,10 +1,7 @@
 //! What the §5.2 frontier *costs*, asserted by counting node reads rather than
-//! by timing anything.
-//!
-//! Both properties here are the ones the design claims and the ones a large
-//! deployment lives or dies by: a fetch must read each node about once rather
-//! than once per batch, and a fetch of a root that mostly matches one already
-//! held must touch what changed rather than the whole tree.
+//! by timing: a fetch must read each node about once rather than once per
+//! batch, and a fetch of a root matching one already held must touch what
+//! changed rather than the whole tree.
 
 use std::{cell::Cell, convert::Infallible};
 
@@ -67,9 +64,8 @@ fn populate(store: &MemStore, count: usize, marker: &str) -> Hash {
 
 #[test]
 fn a_fetch_reads_each_node_about_once() {
-    // The walk is resumed between batches, not restarted at the root. Restarting
-    // makes a cold fetch quadratic — every batch re-descends everything already
-    // pulled — which is invisible in a small test and fatal in a large tree.
+    // The walk is resumed between batches, not restarted at the root: a restart
+    // makes a cold fetch quadratic — invisible in a small test, fatal at scale.
     let source = MemStore::new();
     let root = populate(&source, 2_000, "v1");
     // Reachable from the final root, not everything the store holds: building
@@ -106,10 +102,8 @@ fn a_fetch_reads_each_node_about_once() {
     }
 
     assert_eq!(destination.node_count(), total, "every node arrived");
-    // Each node is read once when found absent and once after it lands. The
-    // restart-per-batch version read roughly `total²/batch` — tens of millions
-    // here — so the bound below is loose and still an order of magnitude under
-    // it.
+    // Each node is read once when found absent and once after it lands; the
+    // restart-per-batch version read roughly `total²/batch` reads.
     assert!(
         counting.reads() < total * 4,
         "a cold fetch of {total} nodes read {} times; it is re-walking what it \
@@ -120,9 +114,8 @@ fn a_fetch_reads_each_node_about_once() {
 
 #[test]
 fn a_fetch_against_a_held_root_touches_only_what_changed() {
-    // Content addressing makes a matching hash proof that a subtree is the same
-    // one — and if the trie it came from is held whole, proof that it is here.
-    // That is what makes an incremental sync cost the change (§5.2).
+    // A matching hash in a trie held whole proves the subtree is here, which
+    // is what makes an incremental sync cost the change (§5.2).
     let store = MemStore::new();
     let old_root = populate(&store, 2_000, "v1");
     let full = Trie::new(&store).reachable(old_root).unwrap().nodes.len();
@@ -164,10 +157,9 @@ fn a_fetch_against_a_held_root_touches_only_what_changed() {
 
 #[test]
 fn pruning_never_reports_a_partial_trie_complete() {
-    // The pruning rule leans on the reference root being held *whole*. This is
-    // the case it must not get wrong: a reference that shares structure with
-    // the new root, where the shared part is genuinely absent — as it would be
-    // if a fetch were interrupted — must still be reported missing.
+    // The pruning rule leans on the reference root being held *whole*: a
+    // reference sharing structure with the new root where the shared part is
+    // genuinely absent must still be reported missing.
     let source = MemStore::new();
     let old_root = populate(&source, 500, "v1");
     let trie = Trie::new(&source);

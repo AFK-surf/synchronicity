@@ -84,6 +84,13 @@
 pub mod classify;
 pub mod discover;
 pub mod state;
+/// Shared test fixtures: an in-memory tlog-tiles log with the tests' attacks
+/// as knobs. Behind the non-default `testsupport` feature — test machinery
+/// with no place in a shipped binary — which this crate's dev-dependency on
+/// itself turns on for every test build, unit and integration alike.
+#[cfg(feature = "testsupport")]
+#[doc(hidden)]
+pub mod testsupport;
 pub mod tiles;
 
 pub use classify::{classify, Finding, KnownKeys, Tier};

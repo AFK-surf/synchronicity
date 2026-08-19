@@ -502,29 +502,39 @@ impl Net {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The config-string validators share one contract: parse, or name the
+    /// offender — before any socket opens.
     #[test]
-    fn relay_urls_parse_or_name_the_offender() {
-        let mode = parse_relay_mode(&["https://relay.example.com".to_string()]).unwrap();
-        assert!(matches!(mode, RelayMode::Custom(_)));
-        let err = parse_relay_mode(&["not a url".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("not a url"), "{err}");
-    }
+    fn config_strings_parse_or_name_the_offender() {
+        let offender = |parse: &dyn Fn(&str) -> Result<(), NetError>, raw: &str, why: &str| {
+            let err = parse(raw).unwrap_err().to_string();
+            assert!(err.contains(raw) && err.contains(why), "{raw}: {err}");
+        };
+        let relay = |raw: &str| parse_relay_mode(&[raw.to_string()]).map(|_| ());
+        let discovery = |raw: &str| parse_discovery_url(raw).map(|_| ());
+        let dht = check_dht_bootstrap;
 
-    #[test]
-    fn discovery_urls_parse_or_name_the_offender() {
-        parse_discovery_url("https://dns.example.com/pkarr").unwrap();
-        let err = parse_discovery_url("dns.example.com/pkarr").unwrap_err();
-        assert!(err.to_string().contains("dns.example.com/pkarr"), "{err}");
-    }
-
-    #[test]
-    fn dht_bootstrap_nodes_check_out_or_name_the_offender() {
-        check_dht_bootstrap("router.bittorrent.com:6881").unwrap();
-        check_dht_bootstrap("10.0.0.1:6881").unwrap();
-        check_dht_bootstrap("[2001:db8::1]:6881").unwrap();
+        // The good shapes all parse.
+        assert!(matches!(
+            parse_relay_mode(&["https://relay.example.com".to_string()]).unwrap(),
+            RelayMode::Custom(_)
+        ));
+        discovery("https://dns.example.com/pkarr").unwrap();
+        for raw in [
+            "router.bittorrent.com:6881",
+            "10.0.0.1:6881",
+            "[2001:db8::1]:6881",
+        ] {
+            dht(raw).unwrap();
+        }
+        // And every failure names the string that failed it — a typo in a
+        // deployment's config is the error message, not a silent drop.
+        offender(&relay, "not a url", "not a url");
+        offender(&discovery, "dns.example.com/pkarr", "dns.example.com/pkarr");
         for (raw, why) in [
             ("router.bittorrent.com", "wants HOST:PORT"),
             (":6881", "has no host"),
@@ -532,17 +542,8 @@ mod tests {
             ("router.bittorrent.com:dht", "wants a port"),
             ("router.bittorrent.com:99999", "wants a port"),
         ] {
-            let err = check_dht_bootstrap(raw).unwrap_err().to_string();
-            assert!(err.contains(raw) && err.contains(why), "{raw}: {err}");
+            offender(&dht, raw, why);
         }
-    }
-
-    #[test]
-    fn dht_bootstrap_is_validated_before_a_socket_is_opened() {
-        // Not a tokio test on purpose: a bad entry has to be caught before
-        // DhtBuilder::build, which needs a runtime and would panic here.
-        let err = dht_address_lookup(&["router.bittorrent.com".to_string()], false).unwrap_err();
-        assert!(err.to_string().contains("router.bittorrent.com"), "{err}");
     }
 
     #[tokio::test]

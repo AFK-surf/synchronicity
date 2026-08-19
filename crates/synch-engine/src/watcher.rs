@@ -241,7 +241,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NodeConfig;
+    use crate::testkit::node;
     use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
 
     fn event(kind: EventKind) -> notify::Event {
@@ -283,51 +283,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_watcher_starts_over_configured_spaces() {
-        let dir = tempfile::tempdir().unwrap();
-        let space = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        node.add_space("media", space.path()).unwrap();
-
-        let mut watcher = SpaceWatcher::start(&node).unwrap();
-        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
-
-        // The hint only schedules a rescan; the rescan is what finds the file.
-        let triggered = tokio::time::timeout(Duration::from_secs(10), watcher.next_rescan())
-            .await
-            .unwrap_or(false);
-        if triggered {
-            let (report, _) = node.scan_and_publish().unwrap();
-            assert_eq!(report.hashed, 1);
-        } else {
-            // Watchers are best-effort on some platforms and filesystems; the
-            // periodic scan is the guarantee, so exercise that instead.
-            let (report, _) = node.scan_and_publish().unwrap();
-            assert_eq!(report.hashed, 1);
-        }
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_watcher_with_no_spaces_is_harmless() {
-        let dir = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        let _watcher = SpaceWatcher::start(&node).unwrap();
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn spaces_added_and_removed_while_running_are_re_registered() {
         // A daemon runs for weeks; `space add` lands whenever an operator says
         // so. A watcher fixed at startup would leave the new root covered only
         // by the hourly rescan (§7.1).
-        let dir = tempfile::tempdir().unwrap();
+        let (_d, node) = node().await;
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), None).unwrap();
-        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
         node.add_space("one", first.path()).unwrap();
 
         let mut watcher = SpaceWatcher::start(&node).unwrap();

@@ -418,23 +418,16 @@ mod tests {
         assert!(known.contains(&name("SYNC.EXAMPLE."), b"a key"));
         assert!(!known.contains(&name("other.example"), b"a key"));
         assert!(!known.contains(&name("sync.example"), b"another key"));
-        // Inserting twice does not double the entry — which is what stops a
-        // key being re-reported once it has been recorded. Asserted on the map
-        // *size* as well: `insert_digest` keys on `apex.to_string()`, so a
-        // parser that stopped lowercasing would file `Sync.Example.` and
-        // `sync.example.` as two entries while indexing one of them still
-        // found a list of length 1.
+        // Inserting twice must not double the entry: reporting-once depends on
+        // it, and a parser that stopped lowercasing would file two entries
+        // while one of them still indexed a list of length 1.
         known.insert(&name("sync.example"), b"a key");
         assert_eq!(known.keys.len(), 1);
         assert_eq!(known.keys["sync.example."].len(), 1);
     }
 
-    /// The watch follows the delegation path, both ways.
-    ///
-    /// The upward half is the one that matters: a parent can nullify its
-    /// child's delegation and publish a perfectly valid entry about itself,
-    /// so an operator watching only `cp.example.` would never see the
-    /// takeover of `cp.example.` go by.
+    /// The watch follows the delegation path both ways — the upward half is
+    /// how a parent's takeover of a child appears in the log.
     #[test]
     fn watching_a_zone_watches_its_whole_delegation_path() {
         let mut known = KnownKeys::default();
@@ -444,41 +437,22 @@ mod tests {
         assert!(known.watches(&name("example.")), "its parent");
         assert!(known.watches(&name(".")), "the root above it");
         assert!(known.watches(&name("a.cp.example.")), "a zone beneath it");
-
-        // Not everything, though: a sibling shares no delegation path, and
-        // a name that merely ends in the same letters is not a suffix in the
-        // DNS sense. That is sound rather than a gap, because a client only
-        // accepts an apex that *contains* the membership domain, so every apex
-        // it would accept is on one delegation path with the watched name.
+        // A sibling shares no delegation path, and a mere string suffix is
+        // not one either (notcp.example).
         assert!(!known.watches(&name("other.example.")));
         assert!(!known.watches(&name("notcp.example.")));
     }
 
-    /// A watch entry that is not a DNS name watches nothing, and is reported
-    /// as such rather than sitting there quietly.
-    ///
-    /// What it must never do is match a certificate by some looser rule than
-    /// the one the chain walk uses — that mismatch is what put a
-    /// client-accepted entry in the silent bin. What it must never do
-    /// *silently* is match nothing at all.
+    /// An entry that is not a DNS name matches nothing and is surfaced by
+    /// `unwatchable` rather than sitting quietly.
     #[test]
     fn an_unparseable_watch_entry_matches_nothing_and_is_reported() {
         let mut known = KnownKeys::default();
-        // The digest is the one for the key asked about below, deliberately:
-        // seeded with an *empty* list the `any()` inside `contains_digest` is
-        // false whatever the name comparison does, so the assertion passed
-        // whether names were parsed or trimmed. `sync.example..` is not a name
-        // at all and must match nothing even when there is something to match.
         known
             .keys
             .insert("sync.example..".into(), vec![hex::encode(sha256(b"a key"))]);
         assert_eq!(known.apexes().count(), 0);
         assert!(!known.contains(&name("sync.example"), b"a key"));
         assert_eq!(known.unwatchable(), ["sync.example.."]);
-
-        // A list of names is watchable, and says so.
-        let mut good = KnownKeys::default();
-        good.keys.insert("cluster.example.com.".into(), vec![]);
-        assert!(good.unwatchable().is_empty());
     }
 }

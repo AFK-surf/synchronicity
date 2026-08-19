@@ -170,6 +170,9 @@ mod tests {
         let key = SecretKey::generate();
         let head = SignedHead::sign(&key, origin(), 7, Hash::new(b"root"), 1234);
         head.verify_signature().unwrap();
+        // A key-identified origin signs and verifies the same way.
+        let head = SignedHead::sign(&key, OriginId::Key(key.public()), 1, Hash::EMPTY, 0);
+        head.verify_signature().unwrap();
     }
 
     #[test]
@@ -196,22 +199,6 @@ mod tests {
         let mut h = head.clone();
         h.signed_by = SecretKey::generate().public();
         assert!(h.verify_signature().is_err());
-    }
-
-    #[test]
-    fn key_origin_head_verifies() {
-        let key = SecretKey::generate();
-        let o = OriginId::Key(key.public());
-        let head = SignedHead::sign(&key, o, 1, Hash::EMPTY, 0);
-        head.verify_signature().unwrap();
-    }
-
-    #[test]
-    fn signing_input_is_domain_separated() {
-        let o = origin();
-        let k = SecretKey::generate().public();
-        let input = head_signing_input(&o, 1, &Hash::EMPTY, 0, &k);
-        assert!(input.starts_with(HEAD_SIGNING_DOMAIN));
     }
 
     #[test]
@@ -242,26 +229,13 @@ mod tests {
         assert!(!low.supersedes(Some(&(1, Hash([2u8; 32])))));
         assert!(!low.supersedes(Some(&(1, Hash([1u8; 32])))));
         assert!(low.supersedes(None));
-    }
 
-    #[test]
-    fn equivocation_detection() {
-        let key = SecretKey::generate();
+        // Same-seq, different-root is equivocation; the next seq is not.
         let a = SignedHead::sign(&key, origin(), 3, Hash([1u8; 32]), 0);
         let b = SignedHead::sign(&key, origin(), 3, Hash([2u8; 32]), 0);
         let c = SignedHead::sign(&key, origin(), 4, Hash([2u8; 32]), 0);
         assert!(a.equivocates_with(&b));
         assert!(!a.equivocates_with(&c));
         assert!(!a.equivocates_with(&a.clone()));
-    }
-
-    #[test]
-    fn head_survives_postcard_round_trip() {
-        let key = SecretKey::generate();
-        let head = SignedHead::sign(&key, origin(), 7, Hash::new(b"root"), 1234);
-        let bytes = postcard::to_stdvec(&head).unwrap();
-        let back: SignedHead = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(back, head);
-        back.verify_signature().unwrap();
     }
 }

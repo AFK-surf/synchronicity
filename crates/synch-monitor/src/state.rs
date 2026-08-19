@@ -362,16 +362,16 @@ mod tests {
         );
         assert!(state.origins_holding(1).is_empty());
 
-        // No temporary is left behind, and the save left exactly one file.
+        // The save left exactly one file, and no temporary.
         let left: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(left, ["monitor.json"]);
 
-        // A file that is not this shape is an error, not a silent reset —
-        // a monitor that quietly forgot its last checkpoint would quietly
-        // stop detecting split views.
+        // A file that is not this shape is an error, not a silent reset — a
+        // monitor that quietly forgot its baseline would quietly stop
+        // detecting split views.
         std::fs::write(&path, b"{").unwrap();
         assert!(MonitorState::load(&path).is_err());
     }
@@ -397,8 +397,8 @@ mod tests {
             .is_some());
     }
 
-    /// Two overlapping saves do not rename each other's partial bytes over
-    /// the target: each writes its own temporary.
+    /// Two overlapping saves must not rename each other's partial bytes over
+    /// the target: each writes its own temporary, even on a frozen clock.
     #[test]
     fn concurrent_saves_do_not_share_a_temporary_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -420,7 +420,7 @@ mod tests {
             scope.spawn(|| second.save(&path).unwrap());
         });
         let loaded = MonitorState::load(&path).unwrap();
-        // Whichever won, the file is one of the two whole states and not a
+        // Whichever won, the file is one of the two whole states, not a
         // splice of both.
         assert!(loaded == first || loaded == second, "{loaded:?}");
         let left: Vec<_> = std::fs::read_dir(dir.path())
@@ -428,26 +428,17 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(left, ["monitor.json"]);
-    }
 
-    /// The same property as above, asserted without depending on the clock.
-    ///
-    /// Whether two saves collide otherwise turns on the platform's clock
-    /// granularity, so on a fine-grained one the concurrent test can pass
-    /// against a name that is not in fact unique. This pins it directly.
-    #[test]
-    fn a_temporary_is_unique_to_its_write() {
-        let path = std::path::Path::new("/tmp/monitor.json");
-        // One frozen clock reading for every call, which is the case a coarse
-        // clock produces and a fine one hides.
-        let names: std::collections::BTreeSet<_> =
-            (0..64).map(|_| temporary_at(path, 1_760_000_000)).collect();
-        assert_eq!(names.len(), 64, "two writes agreed on a temporary");
-        for name in &names {
-            assert_eq!(name.parent(), path.parent());
-            let name = name.file_name().unwrap().to_string_lossy().to_string();
-            assert!(name.starts_with("monitor.json."), "{name}");
-            assert!(name.ends_with(".tmp"), "{name}");
-        }
+        // The uniqueness is pinned directly as well: on a coarse clock two
+        // writes can read the same nanosecond, so the names must differ even
+        // with the clock held still.
+        let frozen = temporary_at(&path, 1_760_000_000);
+        assert_ne!(temporary_at(&path, 1_760_000_000), frozen);
+        assert_eq!(frozen.parent(), path.parent());
+        let name = frozen.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            name.starts_with("monitor.json.") && name.ends_with(".tmp"),
+            "{name}"
+        );
     }
 }

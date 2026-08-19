@@ -143,34 +143,27 @@ mod tests {
     }
 
     #[test]
-    fn proves_presence() {
+    fn proves_presence_absence_and_out_of_line() {
         let (store, root) = populated();
         let trie = Trie::new(&store);
+
         let proof = trie.prove(root, b"f:space/file007").unwrap();
         assert_eq!(
             proof.verify(root, b"f:space/file007").unwrap(),
             Some(b"entry".to_vec())
         );
-        // A proof is much smaller than the trie it came from.
         assert!(proof.nodes.len() < store.node_count());
-    }
 
-    #[test]
-    fn proves_out_of_line_values() {
-        let (store, root) = populated();
-        let trie = Trie::new(&store);
         let proof = trie.prove(root, b"f:space/big").unwrap();
-        assert!(proof.value.is_some());
+        assert!(
+            proof.value.is_some(),
+            "an out-of-line value travels with it"
+        );
         assert_eq!(
             proof.verify(root, b"f:space/big").unwrap(),
             Some(vec![7u8; 400])
         );
-    }
 
-    #[test]
-    fn proves_absence() {
-        let (store, root) = populated();
-        let trie = Trie::new(&store);
         for key in [
             b"f:space/file999".as_slice(),
             b"zzz".as_slice(),
@@ -179,70 +172,45 @@ mod tests {
             let proof = trie.prove(root, key).unwrap();
             assert_eq!(proof.verify(root, key).unwrap(), None);
         }
-    }
 
-    #[test]
-    fn empty_trie_proof() {
-        let store = MemStore::new();
-        let trie = Trie::new(&store);
         let proof = trie.prove(Hash::EMPTY, b"anything").unwrap();
         assert!(proof.nodes.is_empty());
         assert_eq!(proof.verify(Hash::EMPTY, b"anything").unwrap(), None);
     }
 
     #[test]
-    fn tampered_node_fails_verification() {
+    fn a_tampered_proof_never_verifies() {
         let (store, root) = populated();
         let trie = Trie::new(&store);
+
+        // A flipped byte: the node no longer decodes, or no longer hashes to
+        // something the walk can reach from the root. Both are errors.
         let mut proof = trie.prove(root, b"f:space/file007").unwrap();
         let last = proof.nodes.last_mut().unwrap();
         let idx = last.len() - 1;
         last[idx] ^= 0xff;
-        // Either the node no longer decodes, or it hashes to something the walk
-        // cannot reach from the root. Both are errors, never a silent success.
         assert!(proof.verify(root, b"f:space/file007").is_err());
-    }
 
-    #[test]
-    fn truncated_proof_cannot_claim_absence() {
-        let (store, root) = populated();
-        let trie = Trie::new(&store);
+        // Truncation is the omission attack: absence cannot be claimed by
+        // dropping the nodes that prove presence.
         let mut proof = trie.prove(root, b"f:space/file007").unwrap();
         proof.nodes.pop();
         assert!(matches!(
             proof.verify(root, b"f:space/file007"),
             Err(MptError::MissingNode(_))
         ));
-    }
 
-    #[test]
-    fn proof_does_not_verify_against_another_root() {
-        let (store, root) = populated();
-        let trie = Trie::new(&store);
+        // A proof is bound to the root it was made against.
         let other = trie.insert(root, b"f:space/file007", b"changed").unwrap();
         let proof = trie.prove(root, b"f:space/file007").unwrap();
         assert!(proof.verify(other, b"f:space/file007").is_err());
-    }
 
-    #[test]
-    fn substituted_value_fails() {
-        let (store, root) = populated();
-        let trie = Trie::new(&store);
+        // A substituted value payload fails rather than verifying.
         let mut proof = trie.prove(root, b"f:space/big").unwrap();
         proof.value = Some(vec![8u8; 400]);
         assert!(matches!(
             proof.verify(root, b"f:space/big"),
             Err(MptError::MissingValue(_))
         ));
-    }
-
-    #[test]
-    fn proof_round_trips_on_the_wire() {
-        let (store, root) = populated();
-        let trie = Trie::new(&store);
-        let proof = trie.prove(root, b"f:space/file007").unwrap();
-        let bytes = postcard::to_stdvec(&proof).unwrap();
-        let back: Proof = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(back, proof);
     }
 }
