@@ -505,13 +505,19 @@ impl Control for ControlService {
         let request = request.into_inner();
         let policy = parse_policy(request.policy.as_deref())?;
         let node = self.served.node()?.clone();
-        let listing = {
+        // The listing and the instant its rows select against, together: the
+        // resolve below runs on a runtime worker, where a store read aborts
+        // (§10), and one reading per page keeps every path in it consistent.
+        let (listing, now) = {
             let space = request.space.clone();
             let prefix = request.prefix.clone();
             let after = request.start_after.clone();
             let limit = request.limit.map(|n| n as usize);
             read(&node, move |n| {
-                Ok(n.unified_listing(&space, &prefix, after.as_deref(), limit)?)
+                Ok((
+                    n.unified_listing(&space, &prefix, after.as_deref(), limit)?,
+                    n.store().read_instant()?,
+                ))
             })
             .await?
         };
@@ -533,7 +539,7 @@ impl Control for ControlService {
                 // path the policy refuses is left out rather than reported with
                 // one side's metadata. Resolving that path still says exactly
                 // what is wrong.
-                let Ok(row) = node.resolve_set(set, &policy) else {
+                let Ok(row) = node.resolve_set(set, &policy, now) else {
                     continue;
                 };
                 if tx.send(Ok(entry_info(&row, set).into())).await.is_err() {
@@ -550,16 +556,19 @@ impl Control for ControlService {
     ) -> Result<Response<pb::Entry>, Status> {
         let request = request.into_inner();
         let policy = parse_policy(request.policy.as_deref())?;
-        let set = read(self.served.node()?, move |n| {
-            Ok(n.versions(&request.space, &request.path)?)
+        let (set, now) = read(self.served.node()?, move |n| {
+            Ok((
+                n.versions(&request.space, &request.path)?,
+                n.store().read_instant()?,
+            ))
         })
         .await?;
-        // Selection itself reads nothing: the version set is already in hand,
-        // so it stays on this task.
+        // Selection itself reads nothing: the version set and the instant it
+        // selects against are both already in hand, so it stays on this task.
         let row = self
             .served
             .node()?
-            .resolve_set(&set, &policy)
+            .resolve_set(&set, &policy, now)
             .map_err(ControlError::from)?;
         Ok(Response::new(entry_info(&row, &set).into()))
     }
@@ -1531,12 +1540,17 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 // The unified tree: one line per path, divergence marked with
                 // the number of versions the path carries (§8).
                 None => {
-                    let listing = {
+                    let (listing, now) = {
                         let listing = node.clone();
                         let space = reference.space.clone();
                         let prefix = reference.dir_prefix();
-                        offload(move || Ok(listing.unified_listing(&space, &prefix, None, None)?))
-                            .await?
+                        offload(move || {
+                            Ok((
+                                listing.unified_listing(&space, &prefix, None, None)?,
+                                listing.store().read_instant()?,
+                            ))
+                        })
+                        .await?
                     };
                     for set in &listing {
                         if !set.exists() {
@@ -1544,7 +1558,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                             // left the tree, so the tree does not list it.
                             continue;
                         }
-                        for line in render::unified_line(node, set, all)? {
+                        for line in render::unified_line(node, set, all, now)? {
                             out.line(line).await?;
                         }
                     }
@@ -2114,11 +2128,14 @@ async fn receive(
     // does — the entry it reports has to be one peers can already see.
     node.scan_publish_push().await?;
     let ours = VersionPolicy::Origin(node.origin().clone());
-    let set = {
+    let (set, now) = {
         let (space, path) = (header.space.clone(), header.path.clone());
-        read(node, move |n| Ok(n.versions(&space, &path)?)).await?
+        read(node, move |n| {
+            Ok((n.versions(&space, &path)?, n.store().read_instant()?))
+        })
+        .await?
     };
-    let row = node.resolve_set(&set, &ours)?;
+    let row = node.resolve_set(&set, &ours, now)?;
     Ok(pb::Written {
         path: target.display().to_string(),
         entry: Some(entry_info(&row, &set).into()),
