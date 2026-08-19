@@ -539,10 +539,17 @@ ALTER TABLE provider_sync_state ADD COLUMN last_partial_at INTEGER;
 comparison — no provider round-trip on the health path),
 `provider_last_ok_at`, `provider_last_error`/`_at`,
 `provider_last_failures`/`provider_last_partial_at`, and the watcher's
-`keys_observed`, `keys_logged` and `oldest_unlogged_age`. That last one is
-the number to alert on: it is how long the oldest key the watcher has seen
-has gone without a logged claim, so a value past a couple of intervals is a
-zone whose next answer may fail closed. The serve-mode fields (`sig_expiry`,
+`keys_observed`, `keys_logged` and `oldest_unlogged_age`.
+
+**Alert on all three, not on the last alone.** `oldest_unlogged_age` is how
+long the oldest key the watcher has seen has gone without a logged claim, so a
+value past a couple of intervals is a zone whose next answer may fail closed —
+but it is `null` for *both* "every observed key is logged" and "the watcher has
+never observed anything", because the table is empty in both cases. The second
+is the failure that matters: a watcher whose resolver strips AD, or whose
+declaration never resolves, or which cannot reach the log, publishes no
+observation at all. `keys_observed: 0` is what separates them, and on a healthy
+deployment it is never zero. The serve-mode fields (`sig_expiry`,
 served serial) are absent rather than faked.
 
 ## 5. The provider abstraction
@@ -696,8 +703,10 @@ runs the same steps minus the decommissioning.
    and logs the claim (the provider zone answers its own DNSKEY even
    before delegation). Our listeners keep serving the live zone.
    Verify: provider zone contains exactly the rendered set plus the ownership
-   marker; the entry verified in the log; `healthz` `provider_in_sync=true`
-   with `oldest_unlogged_age` null.
+   marker; the entry verified in the log; `healthz` `provider_in_sync=true`,
+   `keys_observed` at least 1, `keys_logged` equal to it, and
+   `oldest_unlogged_age` null. Check `keys_observed` first: null on its own
+   also describes a watcher that has never worked.
 3. **Cut.** At the registrar: replace NS with the provider's, replace the
    DS with the provider's KSK DS. The parent's TTL governs the window;
    during it both zones answer, both validly signed, both carrying proof
