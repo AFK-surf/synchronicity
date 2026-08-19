@@ -1138,8 +1138,10 @@ impl HeadSink for Syncer {
     /// `Hello` loop logged everything as "origin left behind" including a full
     /// disk, and `HeadPush` eleven lines below failed the stream. Doing it on
     /// this side is what gives one rule one implementation — the classifier is
-    /// already here, and `Syncer::offer_head` has already retired the head by
-    /// the time an origin fault reaches this point.
+    /// already here, and `try_promote` has retired the head by the time an
+    /// origin fault reaches this point — whenever it got far enough to judge
+    /// one. A fault raised before that leaves the slot to the maintenance
+    /// sweep rather than to this handler.
     fn offer_head(&self, head: &SignedHead, now: i64) -> std::result::Result<(), NetError> {
         match Syncer::offer_head(self, head, now) {
             Ok(_) => Ok(()),

@@ -189,6 +189,7 @@ impl Node {
         known_paths.extend(self.store().published_paths(self.origin(), space_id)?);
         known_paths.sort();
         known_paths.dedup();
+
         for known in known_paths {
             if seen.contains(known.as_str()) || unjudged_covers(&unjudged, &known) {
                 continue;
@@ -1316,17 +1317,26 @@ mod tests {
         }
         let (_d, space, node) = node_with_space().await;
         let dir = space.path().join("d");
-        std::fs::create_dir(&dir).unwrap();
+        // Both shapes: a file directly under the unreadable directory, and one
+        // under a *subdirectory* of it. `walk` stats a `DirEntry` before it can
+        // know it is a directory, so `d/sub` is what lands in `skipped` while
+        // `d/sub/deep.txt` is the published path at risk — and an exact-match
+        // exemption reaches only the first of the two.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("keep.txt"), b"hello").unwrap();
+        std::fs::write(dir.join("sub").join("deep.txt"), b"deeper").unwrap();
         node.scan_and_publish().unwrap();
-        assert_eq!(
-            node.store()
-                .entry(node.origin(), "media", "d/keep.txt")
-                .unwrap()
-                .unwrap()
-                .kind,
-            EntryKind::File
-        );
+        for path in ["d/keep.txt", "d/sub/deep.txt"] {
+            assert_eq!(
+                node.store()
+                    .entry(node.origin(), "media", path)
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                EntryKind::File,
+                "{path} must be published before the directory is locked"
+            );
+        }
 
         // Listable but not traversable: `read_dir` still yields the child's
         // name, `symlink_metadata` on it fails.

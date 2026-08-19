@@ -450,37 +450,43 @@ impl Node {
             // head where it is for a pass rather than to condemn it: reading it
             // as incomplete would make a `SQLITE_BUSY` past the TTL abandon a
             // head whose trie is wholly here.
-            let complete = match trie.is_complete(stored.head.root) {
-                Ok(complete) => complete,
-                Err(e) => {
-                    tracing::warn!(
-                        origin = %origin,
-                        error = %e,
-                        "cannot decide whether a pending trie is here; leaving it for a pass"
-                    );
-                    true
-                }
-            };
-
-            let stale = stored.received_at <= before && !complete;
+            //
+            // Only asked when the head is not already condemned: for a poisoned
+            // head the answer is discarded, and asking anyway both wasted a full
+            // trie walk and let the "leaving it for a pass" branch log a
+            // reprieve for a head this pass is about to abandon.
+            let stale = !poisoned
+                && stored.received_at <= before
+                && !match trie.is_complete(stored.head.root) {
+                    Ok(complete) => complete,
+                    Err(e) => {
+                        tracing::warn!(
+                            origin = %origin,
+                            error = %e,
+                            "cannot decide whether a pending trie is here; leaving it for a pass"
+                        );
+                        true
+                    }
+                };
             if !poisoned && !stale {
                 continue;
             }
             // Both cases fall through to the compare-and-clear below, the
             // poisoned one included even though `try_promote` will usually have
             // retired it already: it *compares*, so a head already gone reports
-            // `dropped = false` and is not counted twice, and a head
-            // `try_promote` never reached still has an exit. That second case is
-            // why this cannot be an early `continue` — a fault raised before
-            // `try_promote` has read the head it would condemn (a stored row it
-            // cannot decode) leaves nothing to retire it, and the slot then holds
-            // `head_floor` above everything this node can serve indefinitely.
-            tracing::warn!(
-                origin = %origin,
-                seq = stored.head.seq,
-                poisoned,
-                "abandoning a pending head"
-            );
+            // `dropped = false` and the count below stays honest about what this
+            // pass deleted, while a head `try_promote` never reached still gets
+            // an exit. That second case is why this cannot be an early
+            // `continue` — a fault raised before `try_promote` has read the head
+            // it would condemn leaves nothing to retire it, and the slot then
+            // holds `head_floor` above everything this node can serve.
+            if !poisoned {
+                tracing::warn!(
+                    origin = %origin,
+                    seq = stored.head.seq,
+                    "abandoning a pending head no peer will serve"
+                );
+            }
             // The head this pass judged, named explicitly. Between the snapshot
             // above and here the sweep ran a promotion transaction and a trie
             // walk, and a `HeadPush` accepted on the blocking pool in that
@@ -504,7 +510,7 @@ impl Node {
             tracing::info!(promoted, "pending heads whose tries were already here");
         }
         if abandoned > 0 {
-            tracing::info!(abandoned, "pending heads dropped");
+            tracing::info!(abandoned, "pending heads this pass dropped");
         }
     }
 }

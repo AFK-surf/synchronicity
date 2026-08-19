@@ -137,6 +137,16 @@ impl Store {
     }
 
     /// Every slot for every origin.
+    ///
+    /// A row that will not build is skipped, not propagated. This is the bulk
+    /// listing the maintenance sweep and `doctor --rebuild` walk, so one
+    /// undecodable row — a `sig` that is not 64 bytes, a `root` that is not a
+    /// hash — used to fail the whole listing and take every *other* origin's
+    /// maintenance down with it: no pending head anywhere got promoted or
+    /// abandoned again, on any pass, for as long as the row was there. §12's
+    /// rule is that a record this node cannot read fails its own origin and no
+    /// other, and a point read still reports the failure to whoever asked for
+    /// that origin specifically.
     pub fn all_heads(&self, slot: Slot) -> Result<Vec<StoredHead>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -146,11 +156,20 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (origin, seq, root, created_at, signed_by, sig, received_at, verified_at) = row?;
-            out.push(StoredHead {
-                head: build_head(origin, seq, root, created_at, signed_by, sig)?,
-                received_at,
-                verified_at,
-            });
+            match build_head(origin.clone(), seq, root, created_at, signed_by, sig) {
+                Ok(head) => out.push(StoredHead {
+                    head,
+                    received_at,
+                    verified_at,
+                }),
+                Err(e) => tracing::warn!(
+                    origin,
+                    seq,
+                    slot = slot.as_str(),
+                    error = %e,
+                    "skipping a head row that cannot be read; this origin needs `synch doctor`"
+                ),
+            }
         }
         Ok(out)
     }
