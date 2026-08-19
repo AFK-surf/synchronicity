@@ -475,6 +475,23 @@ is the cold-cache and just-admitted-origin case §5.1 names. Learned hints are
 written to `blob_providers` and then ranked like any other, so a wrong hint
 costs one dial: content is hash-verified against the object root regardless.
 
+### §3.1 — the identity poll is a fixed interval
+
+§3.1 says a node with no name yet re-asks its zone on "the negative answer's TTL
+clamped to `[30s, 5m]`". It re-asks every 30 s, which is that range's floor.
+
+A true negative TTL is the SOA minimum of the enclosing zone, and the resolver
+does not surface it: `resolve_members` yields a TTL only for an answer that
+validated and produced records, and the interesting case here is the one that
+produced none — or that failed outright, where there is no answer to take a TTL
+from at all. Carrying it out would mean plumbing the negative response through a
+layer whose whole job is to discard answers that do not validate.
+
+The floor is the safe end of the range: it re-asks more often than the design
+allows for, never less, so a published record is picked up no later than
+specified. `synch domain refresh` re-checks immediately in this state, so the
+interval bounds only the unattended case.
+
 ### §3.4 — rotating a key-identified origin
 
 `synch key rotate` on an `OriginId::Key` origin now fails before it generates

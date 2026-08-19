@@ -11,4 +11,4 @@ pub mod transport;
 
 pub use client::{Chunks, Client, Entries, Frames, Put, Written};
 pub use proto::{Command, ControlError, EntryInfo, ErrorCode, Frame, CONTROL_VERSION};
-pub use server::Server;
+pub use server::{Pending, Server};

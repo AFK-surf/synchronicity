@@ -166,12 +166,22 @@ a zone the node no longer resolves is neither case: nothing currently names it.
 
 **Unidentified**, a node cannot sign heads, publish, or scan, and no peer accepts its
 connections — the same absent record leaves them without a binding for its key. It runs
-the reduced service §3.4's recovery state establishes: control socket up so `synch
-doctor` explains the state, endpoint bound, publishing commands failing with the record
-to publish filled in (`v=sync1 id=<name> nk=<K> apex=<apex>`). It polls on the negative
-answer's TTL clamped to `[30s, 5m]`, re-queries at once on `synch domain refresh`, and
-stops for good once an identity is adopted; the membership refresh loop, which is about
-*other* nodes, runs on regardless.
+the reduced service §3.4's recovery state establishes: control socket up, endpoint
+bound, publishing commands failing with the record to publish filled in (`v=sync1
+id=<name> nk=<K> apex=<apex>`). It polls on the negative answer's TTL clamped to
+`[30s, 5m]`, re-queries at once on `synch domain refresh`, and stops for good once an
+identity is adopted; the membership refresh loop, which is about *other* nodes, runs on
+regardless.
+
+**The socket is not a convenience here, it is what keeps the state escapable.** The
+command that lifts it is `synch domain set`, and every command but `init` and `daemon
+run` is a call over that socket (§9.1) — so a node that waited without one could never
+be pointed at a different zone. A data directory whose configured domain is wrong, or
+whose zone will never name it, would be unrecoverable with its key, its published
+history and its content still in it. So `domain set`, `domain clear`, `domain ls`,
+`domain refresh`, `id`, `daemon status` and `daemon stop` are answered while
+unidentified, and everything else is refused with the record to publish and the command
+that changes zones.
 
 **Adopting a name** — a first one, or one that displaced it — happens on the next start,
 in one transaction, before the endpoint binds: the self binding moves, both head slots
