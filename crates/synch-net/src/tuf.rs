@@ -698,14 +698,42 @@ pub fn current_tlog(logs: &[Tlog], now: u64) -> Option<&Tlog> {
 /// it is the only place a window decides anything: a shard is read from and
 /// written to while its window is open, and its key stays pinned afterwards so
 /// that the archival proofs already published under it keep verifying.
+///
+/// Each key is pinned **for the origin the same artifact names it at**. A
+/// checkpoint's origin line is the log's own name for itself, and for every
+/// shard a Sigstore trusted root lists that name is the host of its
+/// `baseUrl` — so the trusted root carries the `(origin, key)` pairing that
+/// Go's `sumdb/note` takes from a caller-supplied verifier table, and
+/// dropping it here is what left `Checkpoint::verify_signature` reading both
+/// halves of that pairing out of the note's *unsigned* tail. Carried through
+/// rather than re-derived: `Tlog` already holds it.
 pub fn tlog_keys(trusted_root: &[u8]) -> Result<LogKeys, TufError> {
     let bad = |why: String| TufError::Malformed(format!("trusted root: {why}"));
-    let mut lines = String::new();
+    let mut keys = Vec::new();
     for log in tlogs(trusted_root)? {
-        lines.push_str(&base64_encode(&log.spki));
-        lines.push('\n');
+        let key = crate::rekor::LogKey::from_spki(&log.spki).map_err(|e| bad(e.to_string()))?;
+        keys.push(match note_origin(&log.base_url) {
+            Some(origin) => key.for_origin(origin),
+            None => key,
+        });
     }
-    LogKeys::parse(&lines).map_err(|e| bad(e.to_string()))
+    Ok(LogKeys::from_keys(keys))
+}
+
+/// The checkpoint origin a log served at `base_url` signs its notes as: the
+/// host, with no scheme and no path.
+///
+/// `None` for a URL this cannot read, which leaves the key unbound rather
+/// than bound to a guess — the same posture `--rekor-key` gets.
+fn note_origin(base_url: &str) -> Option<String> {
+    let rest = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))?;
+    let host = rest.split('/').next()?.trim_end_matches('.');
+    match host.is_empty() {
+        true => None,
+        false => Some(host.to_ascii_lowercase()),
+    }
 }
 
 /// The version of a `root.json`, without verifying anything about it.

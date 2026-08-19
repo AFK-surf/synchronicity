@@ -177,17 +177,29 @@ impl KnownKeys {
     ///
     /// The question a resumed run has to ask before trusting its recorded
     /// positions: those positions were produced under `covered`, and an entry
-    /// naming an apex outside it was stepped over rather than classified. A
-    /// name that `covered` already `watches` is not a widening — it is what
-    /// the auto-insert does when it records the apex of an entry it just
-    /// reported, and that entry was reported precisely *because* the old set
-    /// matched it. Anything else moves the boundary and leaves everything
-    /// behind the position permanently unread.
+    /// naming an apex outside it was stepped over rather than classified.
+    /// Anything that moves the boundary leaves everything behind the position
+    /// permanently unread.
     ///
-    /// Compared through `watches` rather than by string equality for that
-    /// reason: set difference over the literal names would call every
-    /// auto-inserted subdomain a coverage change and refuse a run that lost
-    /// nothing.
+    /// Two shapes widen, and only the first is obvious:
+    ///
+    /// - a name the old set does not `watch` at all — a sibling, or an
+    ///   unrelated zone;
+    /// - a **proper ancestor** of a name the old set watched. `watches` is
+    ///   bidirectional, so the old set does match the ancestor itself — but
+    ///   what the new set now matches is every *descendant* of that ancestor,
+    ///   which is every sibling subtree of the name that was being watched,
+    ///   and none of those were matched before. Adding `example.com.` beside
+    ///   `a.example.com.` newly covers `cp.example.com.`, and nothing behind
+    ///   the recorded position will ever be classified for it.
+    ///
+    /// A name the old set watched *downward* is deliberately not a widening.
+    /// That is what the auto-insert does when it records the apex of an entry
+    /// it just reported, and that entry was reported precisely because the old
+    /// set matched it: every name a descendant matches — its own ancestors and
+    /// its own descendants — was already matched by the watched name above it.
+    /// String equality here would call every auto-inserted subdomain a coverage
+    /// change and refuse a run that lost nothing.
     pub fn widening_over(&self, covered: &[String]) -> Vec<String> {
         let old = KnownKeys {
             keys: covered
@@ -196,7 +208,12 @@ impl KnownKeys {
                 .collect(),
         };
         self.apexes()
-            .filter(|apex| !old.watches(apex))
+            .filter(|apex| {
+                !old.watches(apex)
+                    || old
+                        .apexes()
+                        .any(|watched| apex.zone_of(&watched) && *apex != watched)
+            })
             .map(|apex| apex.to_string())
             .collect()
     }
@@ -217,8 +234,11 @@ impl KnownKeys {
 /// than any wildcard spelling of it. There is no reading under which this
 /// entry does what whoever typed it meant, which is what makes refusing it
 /// right rather than merely strict.
+/// Any label, not just the first: `a.*.example.com` parses too, and watches
+/// exactly as little. Written as a rule over labels rather than as a prefix
+/// test so a spelling nobody thought of is refused by the same sentence.
 fn is_wildcard(apex: &str) -> bool {
-    apex.starts_with("*.") || apex == "*"
+    apex.split('.').any(|label| label == "*")
 }
 
 /// One key of a proven set, as an operator needs to see it.

@@ -1066,13 +1066,11 @@ impl DnssecResolver {
         // The membership answer is what yields the apex the attach record hangs
         // off, so it gets the *same* gate `member_set` applies before any of
         // its own records are trusted: under `RekorPolicy::Require` the zone key
-        // that signed it must be on the transparency log. Without this a DNS
-        // provider or registrar compromise — the exact adversary the Rekor
-        // design exists to stop — could add an unlogged DNSKEY, sign a
-        // `_synchronicity-cp` record pointing at an attacker, and the daemon
-        // would attach and stream every exposed space to them. `apex=` and the
-        // `url=` inside the record are only bound by DNSSEC otherwise, so the
-        // zone-key gate is what makes trusting them safe.
+        // that signed it must be on the transparency log. This is what makes
+        // the `apex=` field believable, and therefore what makes it safe to go
+        // looking one label under a name this answer chose. It says nothing
+        // about the attach record itself, which is a second RRset with a signer
+        // of its own — gated separately below.
         self.gate_answer(&domain, &membership).await?;
         // The apex the attach record hangs off. Always needed here (unlike in
         // `member_set`, where an `apex=` field is only required under Require),
@@ -1081,6 +1079,27 @@ impl DnssecResolver {
         let cp_name = control_plane_query_name(apex.to_string().trim_end_matches('.'));
         let response = self.lookup(&cp_name, RecordType::TXT).await?;
         let validated = self.validated_txt(&cp_name, &response.answers)?;
+        // **The gate again, on this answer's own signer.** Gating the
+        // membership answer says nothing about who signed *this* record, and
+        // they are two RRsets that a zone can sign with two different keys.
+        // The threat model's attacker is precisely a party who can add a
+        // DNSKEY to the apex RRset — a compromised or coerced parent
+        // substituting a DS — and such a key validates everything it signs.
+        // They then serve the operator's genuine membership RRset and RRSIG,
+        // which is public data, so the gate above passes on the logged key,
+        // and sign only this record with the unlogged one. Without this the
+        // daemon attaches to their control plane and serves every exposed
+        // space to them, and because the unlogged key never enters the log no
+        // monitor sees anything at all.
+        //
+        // The cost is one DNSKEY lookup and the proof set, on a path that runs
+        // once per attach session rather than once per membership refresh. It
+        // is the same call `gate_answer` makes, against the same apex, so a
+        // zone that signs both answers with one key — every ordinary
+        // deployment — reads the same proof twice and passes twice.
+        if self.rekor == RekorPolicy::Require {
+            self.verify_zone_key(&domain, &apex, &validated).await?;
+        }
         // One unreadable record must not sink a readable one, for the reason
         // the proof set applies the same rule: a control plane mid-upgrade can
         // leave an old-format record beside a current one.
@@ -1088,9 +1107,12 @@ impl DnssecResolver {
         // `url=` is checked only for shape — an `https://` or `http://` origin
         // (see `parse_control_plane_record`) — and is otherwise an opaque
         // redirect target. That is acceptable *because* the zone key that
-        // published it is gated above: a value this record carries is one the
-        // logged zone key chose to publish, and on an `https://` endpoint
-        // WebPKI TLS on the WSS connection sits on top of that.
+        // published it is gated **directly above**, which is a claim this
+        // comment made before anything made it true: the gate ran over the
+        // membership answer alone, and this answer's own signer was never
+        // compared to it. On an `https://` endpoint WebPKI TLS on the WSS
+        // connection sits on top of that; on an `http://` one the zone key is
+        // the whole of it, which is the reason the gate has to be real.
         let mut refusal = None;
         for record in &validated.records {
             match parse_control_plane_record(record) {

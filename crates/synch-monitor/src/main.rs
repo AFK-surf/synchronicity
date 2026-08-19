@@ -1332,12 +1332,41 @@ mod tests {
         assert!(watching("sub.a.example.com")
             .widening_over(&recorded)
             .is_empty());
-        // Upward too: the walk matches in both directions.
-        assert!(watching("example.com").widening_over(&recorded).is_empty());
+
+        // An **ancestor** is a widening, and this is the half that matters.
+        // `watches` is bidirectional, so the old list does match
+        // `example.com.` itself — but what watching it now covers is every
+        // descendant of it, and `cp.example.com.` was matched by nothing
+        // before. Every entry for a sibling subtree already in the log is
+        // unread for good, which is exactly the event this guard exists to
+        // announce. Both ways to reach it are ordinary: §5.5 tells operators
+        // the upward half matters most, and the auto-insert writes the parent
+        // itself the first time a legitimate entry for it is reported.
+        assert_eq!(
+            watching("example.com").widening_over(&recorded),
+            vec!["example.com.".to_string()]
+        );
+        // And the reason it is one: the sibling subtree the old list did not
+        // match and the new one does.
+        let sibling = synch_net::chain::parse_name("cp.example.com").unwrap();
+        assert!(!watching("a.example.com").watches(&sibling));
+        assert!(watching("example.com").watches(&sibling));
 
         // And a first run, with nothing recorded, is not a widening either —
         // there are no positions for it to be a gap against.
         assert!(watching("cp.example.com").widening_over(&[]).len().eq(&1));
+    }
+
+    /// A wildcard is refused wherever the label sits, not only in front.
+    #[test]
+    fn a_wildcard_label_anywhere_is_unwatchable() {
+        for spelling in ["*.example.com", "a.*.example.com", "*", "example.*.com"] {
+            assert!(
+                !watching(spelling).unwatchable().is_empty(),
+                "{spelling} watches almost nothing and must be refused"
+            );
+        }
+        assert!(watching("cp.example.com").unwatchable().is_empty());
     }
 
     /// **D7.** A `--from-index` that leaves a permanent hole is refused, not

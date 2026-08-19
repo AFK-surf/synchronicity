@@ -16,7 +16,7 @@ use std::sync::Arc;
 use hickory_resolver::proto::{
     dnssec::{
         crypto::EcdsaSigningKey, rdata::DNSSECRData, rdata::DNSKEY, rdata::RRSIG, Algorithm,
-        DnssecSigner, PublicKey, SigningKey,
+        DigestType, DnssecSigner, PublicKey, SigningKey,
     },
     op::Message,
     rr::{rdata::TXT, DNSClass, Name, RData, Record, RecordSet, RecordType},
@@ -61,6 +61,16 @@ pub struct SimZone {
     /// the zone CSK. Other RRsets stay under `signer`.
     txt_signer: Option<DnssecSigner>,
     declaration_signer: Option<DnssecSigner>,
+    /// If set, the control-plane attach record is signed by this instead of
+    /// the zone CSK.
+    ///
+    /// The shape a compromised parent produces: a second key added to the
+    /// apex DNSKEY RRset (so every answer it signs validates), used to sign
+    /// only the record that redirects a daemon to a control plane, while the
+    /// membership answer keeps its genuine signature by the logged key. A
+    /// harness that could only sign every RRset with one key could not say
+    /// whether the transparency gate reaches this record.
+    cp_signer: Option<DnssecSigner>,
     /// A TXT RRset this zone serves at a name it **does not own**, signed by
     /// its own key.
     ///
@@ -149,6 +159,7 @@ impl SimZone {
             extra_dnskeys: Vec::new(),
             txt_signer: None,
             declaration_signer: None,
+            cp_signer: None,
             impersonate: None,
             splice_foreign_class: Vec::new(),
         }
@@ -245,6 +256,54 @@ impl SimZone {
     /// CSK — see [`SimZone::signer_named`].
     pub fn sign_declaration_with(&mut self, signer: DnssecSigner) {
         self.declaration_signer = Some(signer);
+    }
+
+    /// Signs the control-plane attach record with `signer` instead of the
+    /// zone CSK — see the `cp_signer` field.
+    pub fn sign_cp_with(&mut self, signer: DnssecSigner) {
+        self.cp_signer = Some(signer);
+    }
+
+    /// A **revoked** zone key for this zone, with a signer for it.
+    ///
+    /// RFC 5011 §2.1: a key carrying REVOKE "MUST NOT be used". hickory's
+    /// verifier does not look at flags at all, so honoring that is entirely
+    /// `chain::usable_signer`'s job, and expressing the rule needs a key that
+    /// is genuinely in the RRset and genuinely forbidden.
+    pub fn revoked_key(&self) -> (DNSKEY, DnssecSigner) {
+        let algorithm = Algorithm::ECDSAP256SHA256;
+        let pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).expect("keygen");
+        let key = EcdsaSigningKey::from_pkcs8(&pkcs8, algorithm).expect("key load");
+        let public = key.to_public_key().expect("public key");
+        let dnskey = DNSKEY::new(true, true, true, public);
+        let signer = DnssecSigner::new(
+            dnskey.clone(),
+            Box::new(key),
+            self.origin.clone(),
+            std::time::Duration::from_secs(86_400),
+        );
+        (dnskey, signer)
+    }
+
+    /// A second P-256 zone key for this zone, with a signer for it.
+    ///
+    /// Unlike [`SimZone::colliding_key`] the tag is whatever it comes out as:
+    /// this is an ordinary extra key, the shape a zone has mid-rollover and
+    /// the shape a compromised parent adds. Served at the apex once it is
+    /// handed to [`SimZone::add_dnskey`], so anything it signs validates.
+    pub fn second_key(&self) -> (DNSKEY, DnssecSigner) {
+        let algorithm = Algorithm::ECDSAP256SHA256;
+        let pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).expect("keygen");
+        let key = EcdsaSigningKey::from_pkcs8(&pkcs8, algorithm).expect("key load");
+        let public = key.to_public_key().expect("public key");
+        let dnskey = DNSKEY::from_key(&public);
+        let signer = DnssecSigner::new(
+            dnskey.clone(),
+            Box::new(key),
+            self.origin.clone(),
+            std::time::Duration::from_secs(86_400),
+        );
+        (dnskey, signer)
     }
 
     /// The DS field an operator hands a registrar: `<tag> <alg> 2 <sha256
@@ -396,7 +455,44 @@ impl SimZone {
     /// The DS RRset for `child`, signed by *this* zone — a real delegation
     /// step, as a parent publishes it.
     pub fn ds_records_for(&self, child: &SimZone, inception: time::OffsetDateTime) -> Vec<Record> {
-        use hickory_resolver::proto::dnssec::{rdata::DS, DigestType};
+        self.ds_records_by(child, inception, DigestType::SHA256, None)
+    }
+
+    /// The same over RFC 4509 digest type 4, which `chain::covers` also
+    /// follows and which a registrar may publish instead of type 2.
+    pub fn ds_records_sha384_for(
+        &self,
+        child: &SimZone,
+        inception: time::OffsetDateTime,
+    ) -> Vec<Record> {
+        self.ds_records_by(child, inception, DigestType::SHA384, None)
+    }
+
+    /// The same, signed by a caller-chosen key of this zone.
+    ///
+    /// A parent's DS RRset is verified against the parent's **whole**
+    /// DNSKEY RRset — `verify_ds_set` passes it unfiltered — so the only
+    /// thing stopping a key the standards forbid from signing a delegation is
+    /// the flag check inside `verify_rrset`. Expressing that needs a DS signed
+    /// by a key that is in the RRset and must not be used, which is what this
+    /// is for.
+    pub fn ds_records_signed_by(
+        &self,
+        child: &SimZone,
+        inception: time::OffsetDateTime,
+        signer: &DnssecSigner,
+    ) -> Vec<Record> {
+        self.ds_records_by(child, inception, DigestType::SHA256, Some(signer))
+    }
+
+    fn ds_records_by(
+        &self,
+        child: &SimZone,
+        inception: time::OffsetDateTime,
+        digest_type: DigestType,
+        signer: Option<&DnssecSigner>,
+    ) -> Vec<Record> {
+        use hickory_resolver::proto::dnssec::rdata::DS;
         let mut set = RecordSet::new(child.origin.clone(), RecordType::DS, 0);
         // Built by hand rather than with `DS::from_key`, which derives the key
         // tag from the bare public key instead of the whole DNSKEY rdata that
@@ -406,10 +502,10 @@ impl SimZone {
         let ds = DS::new(
             child.dnskey.calculate_key_tag().expect("key tag"),
             child.dnskey.public_key().algorithm(),
-            DigestType::SHA256,
+            digest_type,
             child
                 .dnskey
-                .to_digest(&child.origin, DigestType::SHA256)
+                .to_digest(&child.origin, digest_type)
                 .expect("ds digest")
                 .as_ref()
                 .to_owned(),
@@ -422,8 +518,13 @@ impl SimZone {
             ),
             0,
         );
-        let rrsig =
-            RRSIG::from_rrset(&set, DNSClass::IN, inception, &self.signer).expect("sign ds set");
+        let rrsig = RRSIG::from_rrset(
+            &set,
+            DNSClass::IN,
+            inception,
+            signer.unwrap_or(&self.signer),
+        )
+        .expect("sign ds set");
         set.insert_rrsig(Record::from_rdata(
             child.origin.clone(),
             self.ttl,
@@ -711,8 +812,11 @@ impl SimZone {
                         .impersonate
                         .as_ref()
                         .is_some_and(|(owner, _)| owner == qname));
+            let cp_txt = query.query_type() == RecordType::TXT && *qname == self.cp_name();
             let signer = if membership_txt {
                 self.txt_signer.as_ref().unwrap_or(&self.signer)
+            } else if cp_txt {
+                self.cp_signer.as_ref().unwrap_or(&self.signer)
             } else {
                 &self.signer
             };
@@ -873,6 +977,123 @@ impl SimDelegation {
         }
     }
 
+    /// The same ladder with the apex's key set **replaced** by `impostor`'s,
+    /// leaving the parent's real DS RRset in place.
+    ///
+    /// This is the one shape the harness could not previously express, and its
+    /// absence is why the DS→DNSKEY binding — the step that makes a ladder a
+    /// ladder — had no test in the workspace at all. Everywhere else the DS
+    /// and the key set it covers are derived from the same key, so they cannot
+    /// disagree, and a validator that stopped comparing digests would pass
+    /// every case the suite could build.
+    ///
+    /// What it produces is exactly the forgery the ladder exists to refuse: a
+    /// delegation ladder is *public data*, so anyone can fetch a victim's real
+    /// DS, its parent's DNSKEY set and the root's, and stand a key set of
+    /// their own at the victim's apex name. `impostor` must therefore be a
+    /// zone at the **same name** as the apex — a different key at the victim's
+    /// name is what an attacker has — and its declaration travels with it,
+    /// because the walk verifies the declaration under whatever set it proved.
+    ///
+    /// Everything else in the chain is genuine. Only the digest comparison
+    /// stands between it and a validating chain for an attacker's keys.
+    pub fn chain_with_substituted_apex_keys(&self, impostor: &SimZone) -> DnssecChain {
+        assert_eq!(
+            impostor.origin, self.apex.origin,
+            "the substituted key set has to sit at the apex's own name, or the \
+             link's owner-name rule refuses it before the digest is reached"
+        );
+        let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let link = |zone: &SimZone, records: Vec<Record>| ChainLink {
+            zone: zone.apex(),
+            rrs: chain::encode_rrs(&records).expect("encode chain link"),
+        };
+        // The impostor's key set, and the *real* parent DS beside it.
+        let mut apex_records = impostor.dnskey_records(inception);
+        apex_records.extend(self.tld.ds_records_for(&self.apex, inception));
+        let mut tld_records = self.tld.dnskey_records(inception);
+        tld_records.extend(self.root.ds_records_for(&self.tld, inception));
+        DnssecChain {
+            links: vec![
+                ChainLink {
+                    zone: impostor.transparency_name().to_string(),
+                    rrs: chain::encode_rrs(&impostor.declaration_records(inception))
+                        .expect("encode declaration link"),
+                },
+                link(&self.apex, apex_records),
+                link(&self.tld, tld_records),
+                link(&self.root, self.root.dnskey_records(inception)),
+            ],
+        }
+    }
+
+    /// The same ladder with the apex delegated by a **SHA-384** DS.
+    ///
+    /// RFC 4509 digest type 4 is an ordinary delegation a registrar may
+    /// publish, and `chain::covers` dispatches on the type — but nothing
+    /// exercised the type-4 arm, so deleting it left the suite green while
+    /// making every such zone permanently unresolvable. That is the failure
+    /// the previous audit found on the publisher side; this is the reader's.
+    pub fn chain_with_sha384_ds(&self) -> DnssecChain {
+        let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let link = |zone: &SimZone, records: Vec<Record>| ChainLink {
+            zone: zone.apex(),
+            rrs: chain::encode_rrs(&records).expect("encode chain link"),
+        };
+        let mut apex_records = self.apex.dnskey_records(inception);
+        apex_records.extend(self.tld.ds_records_sha384_for(&self.apex, inception));
+        let mut tld_records = self.tld.dnskey_records(inception);
+        tld_records.extend(self.root.ds_records_for(&self.tld, inception));
+        DnssecChain {
+            links: vec![
+                ChainLink {
+                    zone: self.apex.transparency_name().to_string(),
+                    rrs: chain::encode_rrs(&self.apex.declaration_records(inception))
+                        .expect("encode declaration link"),
+                },
+                link(&self.apex, apex_records),
+                link(&self.tld, tld_records),
+                link(&self.root, self.root.dnskey_records(inception)),
+            ],
+        }
+    }
+
+    /// The same ladder, with the apex's DS RRset signed by a key of the TLD's
+    /// that the standards forbid from signing anything.
+    ///
+    /// `verify_ds_set` hands `verify_rrset` the parent's **whole** DNSKEY
+    /// RRset, unfiltered, so the flag check inside `verify_rrset` is the only
+    /// thing that stops a revoked key from authorizing a delegation. `extra`
+    /// is served in the TLD's RRset (so it validates as part of it) and its
+    /// signer makes the DS.
+    pub fn chain_with_ds_signed_by(&mut self, extra: DNSKEY, signer: &DnssecSigner) -> DnssecChain {
+        let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let link = |zone: &SimZone, records: Vec<Record>| ChainLink {
+            zone: zone.apex(),
+            rrs: chain::encode_rrs(&records).expect("encode chain link"),
+        };
+        // Served in the TLD's own RRset, so it validates as a member of the
+        // set the root's DS proves — the position a revoked key really sits in.
+        self.tld.add_dnskey(extra);
+
+        let mut apex_records = self.apex.dnskey_records(inception);
+        apex_records.extend(self.tld.ds_records_signed_by(&self.apex, inception, signer));
+        let mut tld_records = self.tld.dnskey_records(inception);
+        tld_records.extend(self.root.ds_records_for(&self.tld, inception));
+        DnssecChain {
+            links: vec![
+                ChainLink {
+                    zone: self.apex.transparency_name().to_string(),
+                    rrs: chain::encode_rrs(&self.apex.declaration_records(inception))
+                        .expect("encode declaration link"),
+                },
+                link(&self.apex, apex_records),
+                link(&self.tld, tld_records),
+                link(&self.root, self.root.dnskey_records(inception)),
+            ],
+        }
+    }
+
     /// The trust-anchor line a reader of this ladder installs: the *root's*
     /// key, not the apex's. This is the shape a real ICANN-rooted deployment
     /// has, and the one the self-anchored sim chain cannot express.
@@ -906,6 +1127,12 @@ pub struct SimLog {
 }
 
 impl SimLog {
+    /// The name this log signs its checkpoints as, and the host a trusted
+    /// root names it at.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
     /// A log named `origin` with a fresh key. The key is fixed for the life
     /// of the log, so its id, its PEM and every checkpoint it signs are one
     /// coherent universe a test can pin.
@@ -1108,7 +1335,7 @@ impl SimTuf {
     /// `now` is the moment the caller intends to verify at; everything
     /// expires a year later, and every test that wants an expiry failure
     /// says so by moving one of the two `expires` fields.
-    pub fn new(now: i64, tlogs: &[Vec<u8>]) -> SimTuf {
+    pub fn new(now: i64, tlogs: &[&SimLog]) -> SimTuf {
         let mut repo = SimTuf {
             root_keys: (0..3).map(|_| SimTufKey::p256()).collect(),
             root_threshold: 2,
@@ -1148,16 +1375,23 @@ impl SimTuf {
     /// Passing fewer keys than last time is how a test asks the question
     /// §10.2 exists to answer: does a key Sigstore removes actually leave
     /// the client's pin set?
-    pub fn set_tlogs(&mut self, tlogs: &[Vec<u8>]) {
+    /// **Each shard is named at its own URL.** A trusted root's `baseUrl` is
+    /// where a shard is served, and the origin its checkpoints carry is that
+    /// URL's host — the pairing `tuf::tlog_keys` carries into the pin set so a
+    /// key vouches for its own tree rather than for any tree a pinned key
+    /// signed. A harness that gave every simulated shard one URL could not
+    /// express a pin bound to the wrong log, which is the shape that check
+    /// exists for.
+    pub fn set_tlogs(&mut self, tlogs: &[&SimLog]) {
         self.trusted_root = serde_json::json!({
             "mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1",
             "tlogs": tlogs
                 .iter()
-                .map(|spki| {
+                .map(|log| {
                     serde_json::json!({
-                        "baseUrl": "https://rekor.sim",
+                        "baseUrl": format!("https://{}", log.origin()),
                         "hashAlgorithm": "SHA2_256",
-                        "publicKey": { "rawBytes": rekor::base64_encode(spki) },
+                        "publicKey": { "rawBytes": rekor::base64_encode(&log.spki()) },
                     })
                 })
                 .collect::<Vec<_>>(),

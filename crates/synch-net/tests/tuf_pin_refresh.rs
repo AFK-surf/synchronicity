@@ -331,7 +331,7 @@ fn real_key_ids_are_the_digest_of_the_key_object_almost_always() {
 /// A synthetic repository whose trusted root names one log.
 fn repo() -> (SimTuf, SimLog) {
     let log = SimLog::new("rekor.sim");
-    let repo = SimTuf::new(NOW, &[log.spki()]);
+    let repo = SimTuf::new(NOW, &[&log]);
     (repo, log)
 }
 
@@ -479,7 +479,7 @@ fn a_version_rollback_is_refused() {
     // A mirror keeps serving the old chain after the repository moved on:
     // valid material, and refused, because the client has seen newer.
     let stale = repo.metadata();
-    repo.set_tlogs(&[SimLog::new("rekor.sim").spki()]);
+    repo.set_tlogs(&[&SimLog::new("rekor.sim")]);
     let newer = tuf::update(&repo.metadata(), &first, at(NOW))
         .unwrap()
         .state;
@@ -526,12 +526,12 @@ fn a_trusted_root_that_drops_a_shard_drops_it_from_the_pin_set() {
     // clients drop.
     let old = SimLog::new("rekor.old");
     let new = SimLog::new("rekor.new");
-    let mut repo = SimTuf::new(NOW, &[old.spki(), new.spki()]);
+    let mut repo = SimTuf::new(NOW, &[&old, &new]);
     let both = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
     assert!(both.log_keys.find(&old.log_id()).is_some());
     assert!(both.log_keys.find(&new.log_id()).is_some());
 
-    repo.set_tlogs(&[new.spki()]);
+    repo.set_tlogs(&[&new]);
     let after = tuf::update(&repo.metadata(), &both.state, at(NOW)).unwrap();
     assert_eq!(after.log_keys.keys().len(), 1);
     assert!(
@@ -548,7 +548,7 @@ fn a_trusted_root_naming_no_logs_is_never_adopted() {
     let mut repo = SimTuf::new(NOW, &[]);
     let error = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW));
     assert!(matches!(error, Err(TufError::Malformed(_))), "{error:?}");
-    repo.set_tlogs(&[SimLog::new("rekor.sim").spki()]);
+    repo.set_tlogs(&[&SimLog::new("rekor.sim")]);
     tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
 }
 
@@ -561,7 +561,7 @@ fn state_is_monotonic_across_two_zones_sharing_one_file() {
     let (mut repo, _log) = repo();
     let stale = repo.metadata();
     repo.rotate_root(false);
-    repo.set_tlogs(&[SimLog::new("rekor.next").spki()]);
+    repo.set_tlogs(&[&SimLog::new("rekor.next")]);
 
     let ahead = tuf::update(&repo.metadata(), &repo.embedded_state(), at(NOW)).unwrap();
     ahead.state.save(&path).unwrap();
@@ -594,7 +594,7 @@ fn zone_learning_a_new_shard() -> (SimZone, SimLog, SimTuf, tempfile::NamedTempF
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let repo = SimTuf::new(now, &[new_shard.spki()]);
+    let repo = SimTuf::new(now, &[&new_shard]);
     // The root this client embeds — written to a file only so the test can
     // seed a PinState from it the way a build would.
     let embedded = write(&String::from_utf8(repo.embedded_root()).unwrap());
@@ -954,6 +954,91 @@ async fn discovery_yields_the_endpoint_once_the_key_is_logged() {
     server.abort();
 }
 
+/// The attach record's **own** signer is gated, not just the membership
+/// answer's.
+///
+/// The two are different RRsets and a zone can sign them with different keys.
+/// The attacker in the threat model is exactly the party who can put a second
+/// key in the apex DNSKEY RRset — a compromised or coerced parent substituting
+/// a DS — and everything such a key signs then validates. So they serve the
+/// operator's *genuine* membership RRset and RRSIG, which is public data and
+/// therefore passes the gate on the logged key, and sign only
+/// `_synchronicity-cp` with the unlogged key. The daemon would attach to their
+/// control plane and stream every exposed space to them, and because the
+/// unlogged key never enters the log no monitor would see anything.
+///
+/// The entry is minted *before* the second key joins the RRset, which is what
+/// makes it an honest proof for the honest key: the chain a certificate
+/// carries is a snapshot, so a key added afterwards is not in the set it
+/// proves.
+#[tokio::test]
+async fn discovery_refuses_an_attach_record_signed_by_an_unlogged_key() {
+    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut log = SimLog::new("rekor.sim");
+    // Logged first: the proof covers the zone's own key and nothing else.
+    zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
+    zone.cp_txt = vec!["v=synccp1 url=https://attacker.example".to_string()];
+    // Now the parent's key joins the RRset and signs the attach record.
+    let (evil, evil_signer) = zone.second_key();
+    zone.add_dnskey(evil);
+    zone.sign_cp_with(evil_signer);
+
+    let anchor = write(&zone.anchor_record());
+    let log_key = write(&log.key_pem());
+    let (url, server) = zone.serve().await;
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        rekor_key: Some(log_key.path().to_path_buf()),
+        ..refreshing(url, anchor.path(), None, None)
+    })
+    .unwrap();
+
+    let error = resolver
+        .control_plane("cluster.example")
+        .await
+        .expect_err("an attach record signed by an unlogged key must yield no endpoint");
+    // The membership answer passes the gate — its key really is logged — so
+    // the refusal is the second gate, on the attach answer's own signer, and
+    // it lands as a key-binding failure rather than an absent proof.
+    assert!(
+        matches!(&error, NetError::RekorBinding { .. }),
+        "the attach record's own signer must be gated: {error}"
+    );
+    server.abort();
+}
+
+/// The positive control for the pair above: with both answers signed by the
+/// logged key — every ordinary deployment — the second gate reads the same
+/// proof and passes.
+#[tokio::test]
+async fn discovery_accepts_an_attach_record_signed_by_the_logged_key() {
+    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut log = SimLog::new("rekor.sim");
+    zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
+    zone.cp_txt = vec!["v=synccp1 url=https://sync.example".to_string()];
+    // A second key exists at the apex — an ordinary rollover — but the attach
+    // record is still signed by the logged one.
+    let (spare, _spare_signer) = zone.second_key();
+    zone.add_dnskey(spare);
+
+    let anchor = write(&zone.anchor_record());
+    let log_key = write(&log.key_pem());
+    let (url, server) = zone.serve().await;
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        rekor_key: Some(log_key.path().to_path_buf()),
+        ..refreshing(url, anchor.path(), None, None)
+    })
+    .unwrap();
+
+    let (record, _ttl) = resolver
+        .control_plane("cluster.example")
+        .await
+        .expect("an attach record signed by the logged key discovers its endpoint");
+    assert_eq!(record.url, "https://sync.example");
+    server.abort();
+}
+
 /// And the gate is what refuses: with transparency off, the unlogged zone's
 /// endpoint is discovered. So the refusal above is the Rekor check, not
 /// something incidental about the answer.
@@ -1158,7 +1243,7 @@ fn a_pin_file_anchored_somewhere_else_does_not_load() {
     let (mut theirs, _their_log) = repo();
     theirs.rotate_root(true);
     theirs.rotate_root(true);
-    theirs.set_tlogs(&[SimLog::new("rekor.attacker").spki()]);
+    theirs.set_tlogs(&[&SimLog::new("rekor.attacker")]);
     let forged = tuf::update(&theirs.metadata(), &theirs.embedded_state(), at(NOW)).unwrap();
     assert!(
         forged.state.root_version > honest.state.root_version,
