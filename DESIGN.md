@@ -117,11 +117,9 @@ enum OriginId {
 
 For DNS-discovered members, the `OriginId` comes from the `id=` field of the TXT
 record (§3.2), scoped by the membership domain: `nas@cluster.example.com`. For
-statically trusted peers without a name, the OriginId degenerates to the device key
-itself — self-certifying, but not rotatable. Static trust may also bind a *named*
-peer (`synch trust add --as nas <node-id>`), which is how a node trusts a named
-origin — and follows its rotations, by hand (§3.4) — without consulting that
-origin's zone itself.
+statically trusted peers, the OriginId is the device key itself — self-certifying, but
+not rotatable. Static trust names nobody: a name comes from a zone, and only from the
+zone that issued it (§3.2).
 
 A **binding** is the association `OriginId → device key`, with a source (static or
 dns) and a validity window. An origin may have several simultaneously bound device
@@ -147,12 +145,21 @@ there is no way to name a node by hand, because a hand-set name is a second auth
 on something the zone already decides. An isolated deployment that wants named
 origins runs its own signed root and points `--dnssec-anchor` at it (§3.2).
 
-The mode is explicit rather than inferred from whether a membership domain happens to
-be configured, because the two are independent. A `key`-mode node may configure a
-domain to trust *other* members by it (§3.2) and stay `key:<z-base32>` itself; only a
-`dns`-mode node draws its own name from that domain. Since that domain is then half of
-its own `OriginId`, `synch domain clear` is refused on a `dns`-mode node: a node that
-could be de-domained is a node whose name silently reverts to its device key.
+**One node, one zone.** `membership.domain` is set exactly in `dns` mode, and it is
+the `@domain` half of that node's own name: a node resolves the zone that names it,
+and no other. A `key`-mode node configures no membership domain at all and trusts
+only what it is told statically (§3.2).
+
+Trusting a second zone is not merely unsupported, it is unsound. Membership is binary
+and total — it grants a read of every byte of metadata and content, and a publish into
+the shared `(space, path)` keyspace of the unified tree (§3.2, §8) — so a node that
+resolved someone else's zone would take that grant from an authority with no say in
+what this node is called, and hold origins whose names it has no standing to be
+measured against. So a `key`-mode node has no way to acquire a domain — `synch domain
+set` is refused on one — and a `dns`-mode node has no way to drop the one it has:
+there is no `clear`. Both would reach the same illegal state from opposite sides, a
+node holding a name from a zone it does not resolve, or resolving a zone that does
+not name it.
 
 **Identity discovery (`dns` mode).** `synch daemon run` resolves the membership domain
 once, before the endpoint binds and before any loop starts, and freezes the answer:
@@ -225,6 +232,12 @@ absence, never on an `id=`-less match. That precondition is the whole safety arg
 for an unattended and destructive operation, and every part of it is a rule §3.2
 enforces anyway.
 
+`synch domain set` on a `dns`-mode node is the same event arriving by another route,
+and takes effect the same way: the running daemon goes on resolving the zone its
+current name comes from — one node, one zone, at every instant — and the new domain
+is resolved, adopted, and migrated at the next start, dropping the old zone's
+bindings with the old name.
+
 A relabel is not cheap, and `synch doctor` says so: the new origin starts at `seq = 1`,
 peers keep the old origin's trie until its bindings expire, and the cluster briefly
 lists the machine twice. Every adoption is recorded durably in `identity_history`
@@ -243,9 +256,16 @@ A remote node is **trusted** iff at least one of the following holds:
    ```
 
    Static trust is unilateral per node and never expires (until removed). For two nodes
-   to sync, *each* must trust the other; there is no transitive trust. With `--as
-   <name>` the binding is to a named OriginId (rotatable via `synch trust rebind`);
-   without it, the key is the identity.
+   to sync, *each* must trust the other; there is no transitive trust. The key is the
+   identity: static trust binds `OriginId::Key`, never a name.
+
+   Naming a peer by hand would be a standing override of the only authority on names,
+   and it never expires — so a member the zone had dropped would stay trusted under
+   its name forever, and removing a record would stop being how a member is removed.
+   That is the fail-closed property (below) inverted. A node that wants named,
+   rotatable members resolves the zone that issues those names; a node that does not
+   trust a zone gets key-identified peers, which cannot rotate. There is no third
+   arrangement, and no command that manufactures one.
 
 2. **DNSSEC-based discovery** — the node's key appears in a TXT record of the
    membership domain:
@@ -254,9 +274,9 @@ A remote node is **trusted** iff at least one of the following holds:
    synch domain set cluster.example.com
    ```
 
-   A node consults at most one membership domain, and for a `dns`-mode node that
-   domain is also the zone which names it (§3.1) — "the joined domain" has to name
-   one zone to name anything.
+   The domain is the one that names this node, and the only one it ever resolves
+   (§3.1): a `dns`-mode node has exactly one, a `key`-mode node none. Every dns
+   binding a node holds is therefore for an origin in its own zone.
 
    The resolver queries `_synchronicity.<domain> TXT` and accepts records of the form:
 
@@ -292,7 +312,7 @@ A remote node is **trusted** iff at least one of the following holds:
    `synch doctor` diagnoses with the likely cause ("duplicate id assignment?").
    Finally, a key statically trusted as `OriginId::Key` while publishing heads under
    a Named origin would sync nothing, silently — doctor detects the mismatch and
-   suggests the missing `--as` name or `synch domain set`.
+   names the zone to resolve (`synch domain set`) to pick that origin up by name.
 
    The lookup MUST be DNSSEC-validated end to end, and it travels one
    transport: DNS-over-HTTP(S), RFC 8484, against `--doh <url>` (`SYNCH_DOH`,
@@ -471,8 +491,10 @@ deterministic `(seq, root)` ordering (§4.4) still converges everyone, and compe
 same-seq heads are flagged as equivocation exactly as in the single-key case. A
 well-behaved node signs with exactly one key at any moment.
 
-Peers that trust a named origin statically rather than through its zone rotate it by
-hand, minus DNS: `synch trust rebind nas <new-node-id>` on each such peer.
+Rotation runs through the zone or not at all. A key-identified origin (§3.1) has no
+name to carry across a key change, and no peer holds a hand-made binding that could
+be pointed at a new key, so replacing its key makes it a different origin — which is
+what `OriginId::Key` means.
 
 One availability edge is accepted deliberately: a peer that first learns of an origin
 *after* a rotation, while the origin is offline and has not yet re-signed its head
@@ -1146,11 +1168,12 @@ synch id                                     print OriginId + current device key
                                              where the name came from, and adoptions
 synch key rotate|activate|retire|ls          operator-driven device-key rotation (§3.4)
 
-synch trust add [--as <name>] [--addr <hint>]|rebind|rm|ls
-                                             static membership (named or key-identified)
-synch domain set|clear|ls|refresh            the DNSSEC membership domain, at most one
-                                             (§3.2); refresh re-resolves it now; clear
-                                             is refused on a `dns`-mode node (§3.1)
+synch trust add [--addr <hint>]|rm|ls        static membership; key-identified peers
+                                             only — names come from zones (§3.2)
+synch domain set|ls|refresh                  this node's own DNSSEC membership domain
+                                             (§3.2); refresh re-resolves it now; set
+                                             moves a `dns`-mode node to another zone
+                                             and is refused on a `key`-mode one (§3.1)
 synch peers                                  live peers, addresses, last sync, lag
 
 synch space add <id> <path>                  index a local directory as a space
@@ -1391,11 +1414,13 @@ CREATE TABLE identity_history (
 
 -- membership: OriginId → device-key bindings.
 -- origin_id is the canonical rendering: '<id>@<domain>' or 'key:<z-base32>'.
--- `domain` carries a dns binding's provenance — `key:<z-base32>` renders no
--- domain of its own, so without the column an `id=`-less record's row would
--- not say which zone vouched for it, and `synch doctor` could not attribute
--- it. '' rather than NULL for a static binding, because SQLite admits no
--- expression in a PRIMARY KEY.
+-- `domain` names the zone a dns binding came from. A node resolves only its
+-- own zone (§3.1), so this is one value at any instant — but not across a
+-- domain change, which is exactly when every binding from the zone being
+-- left has to be found and dropped. `key:<z-base32>` renders no domain of
+-- its own, so an `id=`-less record's row would otherwise not say which zone
+-- vouched for it. '' rather than NULL for a static binding, because SQLite
+-- admits no expression in a PRIMARY KEY.
 CREATE TABLE bindings (
   origin_id    TEXT NOT NULL,
   node_id      BLOB NOT NULL,            -- bound device key (32 bytes)
@@ -1600,7 +1625,9 @@ CI (GitHub Actions):
   `synch doctor`, plus the base mitigations — validated in-process resolution (no
   resolver trust), TTL-bounded caching, and `synch doctor` surfacing the full live
   member set, bindings, and their provenance. Deployments that can't accept
-  domain-controller power use static trust only. The flip side of
+  domain-controller power use static trust only, and pay its price in full: every
+  origin is key-identified, so nothing has a name and nothing rotates (§3.1). The
+  flip side of
   failing closed is worth stating: a prolonged DNSSEC outage expires dns bindings
   and shrinks the member set toward static-only — the cluster degrades to a halt
   rather than falling open. Deliberate.
