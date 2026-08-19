@@ -1091,8 +1091,24 @@ impl Syncer {
     /// either side may read.
     ///
     /// A store read, so it is only ever called from a blocking scope.
+    ///
+    /// `Untrusted` declares nothing rather than an empty list, and the
+    /// difference is the whole point of the distinction. A declaration is not a
+    /// grant — every responder enforces its own scope on every request — so its
+    /// only effect is on how far the *reader* narrows itself. Sending the empty
+    /// list to a peer this node has momentarily lost the binding for tells a
+    /// full member to read nothing, and it remembers that: `set_local_scope`
+    /// outlives the exchange, so one lapsed binding on one side stops the other
+    /// materializing every foreign origin until something declares otherwise.
+    ///
+    /// Declaring nothing is safe in the direction that matters: the peer keeps
+    /// its own view, and every request it then makes is refused by the gate that
+    /// actually decides (`scope_for_key`), which reads the same lapsed binding.
     fn declared_scope(&self, peer: synch_core::NodeId) -> Result<Option<Vec<String>>> {
-        Ok(self.store.publish_scope_of_key(&peer, now_ns())?)
+        Ok(match self.store.publish_scope_of_key(&peer, now_ns())? {
+            synch_store::PublishScope::Untrusted | synch_store::PublishScope::Unrestricted => None,
+            synch_store::PublishScope::Confined(spaces) => Some(spaces),
+        })
     }
 
     /// Adopts the scope a peer declared for us, clearing anything memoized

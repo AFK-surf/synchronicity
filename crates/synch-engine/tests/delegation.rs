@@ -183,7 +183,7 @@ async fn a_delegate_is_admitted_by_replicated_state_and_sees_only_its_spaces() {
             .store
             .publish_scope_of_key(&delegate.key(), now_ns())
             .unwrap(),
-        Some(vec!["photos".to_string()])
+        synch_store::PublishScope::Confined(vec!["photos".to_string()])
     );
 
     // The delegate syncs. It learns its scope from the exchange, walks under

@@ -183,6 +183,12 @@ history and its content still in it. So `domain set`, `domain clear`, `domain ls
 unidentified, and everything else is refused with the record to publish and the command
 that changes zones.
 
+Pointing a node at a zone does not ask that zone to name it, and the cost of the gap
+falls at the next start rather than at the edit — so `domain set` answers with the
+record that zone must carry for this key, and with `domain clear` as the way back. An
+operator who walks away after setting a domain has already been told why the daemon is
+waiting when they return.
+
 **Adopting a name** — a first one, or one that displaced it — happens on the next start,
 in one transaction, before the endpoint binds: the self binding moves, both head slots
 and the old origin's `entries` and `blob_providers` views are dropped, mirror policies
@@ -1036,7 +1042,11 @@ than inherits.
 which it cannot read until it knows its scope. So the peer serving it says, in the
 `Hello` that opens every session. Adopting a peer's word costs nothing: every
 responder enforces the same scope on every request independently, so a wrong or stale
-value can only make a node ask for *less* than it is entitled to.
+value can only make a node ask for *less* than it is entitled to. `synch doctor`
+reports the scope it is holding, because a partial trie and a broken fetch look alike
+from the outside, and because the same scope decides the servable column below it: a
+foreign head on a confined node is judged whole *within the grant*, and this node's
+own head — the one trie it built rather than was served — is judged whole outright.
 
 **`b:` is not served to a delegate at all.** Ads are keyed by content hash, so the
 shape of that subtree would leak how many objects an origin holds. A delegate learns

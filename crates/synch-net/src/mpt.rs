@@ -211,7 +211,16 @@ impl MptProtocol {
                     let summaries = sink.local_summaries()?;
                     // What this node will serve that peer, so a delegated one
                     // can learn the scope it is about to walk under (§5.5).
-                    let scope = store.publish_scope_of_key(&peer, now_ns())?;
+                    //
+                    // Untrusted declares nothing, exactly as the dialing side
+                    // does: an empty list would tell a peer whose binding has
+                    // momentarily lapsed to narrow itself to nothing, and it
+                    // would remember that long after the binding came back.
+                    let scope = match store.publish_scope_of_key(&peer, now_ns())? {
+                        synch_store::PublishScope::Untrusted
+                        | synch_store::PublishScope::Unrestricted => None,
+                        synch_store::PublishScope::Confined(spaces) => Some(spaces),
+                    };
                     Ok((summaries, scope))
                 })
                 .await?;

@@ -244,6 +244,11 @@ message TrustAdd {
   optional string note = 4;
   // A direct address to remember for dialing.
   optional string addr = 5;
+  // Bind the key under this named origin instead of OriginId::Key, for a
+  // member that publishes under a name this node has no zone to learn from
+  // (DESIGN.md 3.2). Not 2 or 3: those held an earlier, implicit version of
+  // this and are reserved so an old client cannot be misread.
+  optional string as_origin = 6;
 }
 
 message TrustRm {

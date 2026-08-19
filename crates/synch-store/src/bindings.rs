@@ -497,12 +497,11 @@ impl Store {
         Ok((Scope::of(&synch_core::scope_prefixes(&spaces)), origins))
     }
 
-    /// The spaces a device key is confined to, or `None` when the key holds a
-    /// rooted binding and is confined to nothing.
+    /// The scope a device key may read under (§3.5).
     ///
-    /// The content half of scope (§3.5): object roots carry no space, so a
-    /// delegated peer's entitlement to bytes is decided against this list.
-    pub fn publish_scope_of_key(&self, node_id: &NodeId, now: i64) -> Result<Option<Vec<String>>> {
+    /// The content half of scope: object roots carry no space, so a delegated
+    /// peer's entitlement to bytes is decided against this list.
+    pub fn publish_scope_of_key(&self, node_id: &NodeId, now: i64) -> Result<PublishScope> {
         Ok(self.publish_scope_of_key_with_origins(node_id, now)?.0)
     }
 
@@ -517,20 +516,35 @@ impl Store {
         &self,
         node_id: &NodeId,
         now: i64,
-    ) -> Result<(Option<Vec<String>>, Vec<OriginId>)> {
+    ) -> Result<(PublishScope, Vec<OriginId>)> {
         let live: Vec<Binding> = self
             .live_bindings(now)?
             .into_iter()
             .filter(|b| &b.node_id == node_id)
             .collect();
         let origins: Vec<OriginId> = live.iter().map(|b| b.origin.clone()).collect();
+        // Three-valued for the same reason [`Store::publish_scope`] is, and it
+        // was two-valued here long after that one was fixed. A key with no live
+        // binding used to fold into the empty list, which is the encoding of
+        // "delegated, and to no space at all" — so a peer this node has never
+        // heard of and a peer whose grant covers nothing were indistinguishable
+        // to every caller.
+        //
+        // Both readings are wrong somewhere. Answering the content gate, the
+        // empty list happened to fail closed and was right by luck. Answering
+        // "what scope should you read under", it is a live member being told to
+        // narrow its view to nothing — which it then remembers, and which stops
+        // it materializing every foreign origin it holds.
+        if live.is_empty() {
+            return Ok((PublishScope::Untrusted, origins));
+        }
         if live.iter().any(|b| b.is_rooted()) {
-            return Ok((None, origins));
+            return Ok((PublishScope::Unrestricted, origins));
         }
         let mut spaces: Vec<String> = live.into_iter().flat_map(|b| b.spaces).collect();
         spaces.sort();
         spaces.dedup();
-        Ok((Some(spaces), origins))
+        Ok((PublishScope::Confined(spaces), origins))
     }
 
     /// The spaces a delegated origin may publish into, or `None` when the
@@ -960,7 +974,7 @@ mod tests {
         assert!(store.is_trusted_key(&subject, at(10)).unwrap());
         assert_eq!(
             store.publish_scope_of_key(&subject, at(10)).unwrap(),
-            Some(vec!["photos".to_string()])
+            PublishScope::Confined(vec!["photos".to_string()])
         );
         assert!(!store.scope_for_key(&subject, at(10)).unwrap().is_full());
 
@@ -1022,13 +1036,13 @@ mod tests {
         // the second did not overwrite the first.
         assert_eq!(
             store.publish_scope_of_key(&subject, at(10)).unwrap(),
-            Some(vec!["docs".to_string(), "photos".to_string()])
+            PublishScope::Confined(vec!["docs".to_string(), "photos".to_string()])
         );
         // Withdrawing one leaves the other, rather than cutting the key off.
         store.remove_origin_bindings(&issuers[0]).unwrap();
         assert_eq!(
             store.publish_scope_of_key(&subject, at(10)).unwrap(),
-            Some(vec!["docs".to_string()])
+            PublishScope::Confined(vec!["docs".to_string()])
         );
         assert!(store.is_trusted_key(&subject, at(10)).unwrap());
     }

@@ -325,6 +325,7 @@ fn trust_add(key: &str, note: Option<&str>, addr: Option<&str>) -> Command {
         key: key.into(),
         note: note.map(String::from),
         addr: addr.map(String::from),
+        as_origin: None,
     })
 }
 
@@ -481,13 +482,20 @@ async fn every_command_variant_round_trips() {
 
     // The domain. `set` records it with no resolver here, pending the next
     // start (§3.1) — `domain ls` says so.
-    let _ = frames(
+    //
+    // Pointing a node at a zone does not ask that zone to name it, and the
+    // cost of that lands at the next start rather than here — so the record
+    // that fixes it, and the way back, are said while the operator is still
+    // reading.
+    let set = says(
         data_dir,
         Command::DomainSet(pb::DomainSet {
             domain: "cluster.example".into(),
         }),
+        "_synchronicity.cluster.example. IN TXT",
     )
     .await;
+    assert!(set.contains("synch domain clear"), "{set}");
     says(
         data_dir,
         Command::DomainLs(pb::DomainLs {}),

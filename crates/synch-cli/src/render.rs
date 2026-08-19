@@ -346,6 +346,31 @@ pub fn doctor(node: &Node) -> Lines {
         ));
     }
 
+    // Before the heads, because it decides how to read them. A node holding a
+    // grant is *meant* to be missing everything outside it; without this line
+    // the only visible difference between that and a broken fetch is that the
+    // heads below happen to be shorter than an operator expected.
+    out.push(String::new());
+    match &report.local_scope {
+        None => out.push("read scope: the whole keyspace (§5.5)".into()),
+        Some(spaces) if spaces.is_empty() => {
+            out.push("READ SCOPE: nothing (§5.5)".into());
+            out.push(
+                "  a peer declared an empty grant, so this node reads no space at all; \
+                 the origin that delegated to it can widen the grant with `synch delegate add`"
+                    .into(),
+            );
+        }
+        Some(spaces) => {
+            out.push(format!("read scope: {} (§5.5)", spaces.join(", ")));
+            out.push(
+                "  everything outside those spaces is absent by design, not missing: \
+                 this node is never served it and never asks for it"
+                    .into(),
+            );
+        }
+    }
+
     out.push(String::new());
     out.push("heads:".into());
     for head in &report.heads {
