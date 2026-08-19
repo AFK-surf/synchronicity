@@ -570,3 +570,64 @@ fn a_revoked_parent_key_cannot_sign_a_childs_ds() {
         "the refusal must be the flag rule: {error}"
     );
 }
+
+/// A chain the **control plane collected** walks under the client's own
+/// validator.
+///
+/// This is the only place either implementation's chain *semantics* meet the
+/// other's. `crossval/chain.der` pins the DER container — link framing, long
+/// and short length forms — and pins it well; what it cannot pin is what
+/// `rekor/chain.collect` puts *inside* a link. The declaration and its three
+/// rules, the DNSKEY and DS RRsets, the RRSIG signed-data construction, the
+/// canonical RRset ordering, the uncompressed wire RRs, the ladder's shape and
+/// the DS digest that ties one link to the next are all written twice, and
+/// until now nothing carried one side's output through the other's reader.
+///
+/// The consequence of that gap is asymmetric and unrecoverable in one
+/// direction: the publisher writes to a public append-only log, so a
+/// divergence discovered after the fact is a permanent entry no client
+/// accepts. A test is the only place to find it.
+///
+/// The fixture is a **real descent** — the root signs a DS for `sync.test.`,
+/// with `test.` an empty non-terminal in between — so this exercises
+/// `verify_ds_set`, `verify_dnskey_set_under` and `covers` over foreign bytes,
+/// not just the self-anchored shape every other sim chain has.
+///
+/// Regenerate with `gleam run -m tools/gen_crossval` in `control-plane/`.
+#[test]
+fn a_chain_the_control_plane_collected_walks_under_this_validator() {
+    let crossval = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../control-plane/test/fixtures/rekor/crossval");
+    let der = std::fs::read(crossval.join("chain-collected.der"))
+        .expect("the Gleam-collected chain fixture");
+    let chain = DnssecChain::decode(&der).expect("a chain this reader can decode");
+
+    // The shape the collector is supposed to produce, asserted before the
+    // crypto so a regeneration that quietly flattened the ladder is a
+    // failure here rather than a weaker test that still passes.
+    assert_eq!(chain.links.len(), 3, "declaration, apex, root");
+    assert_eq!(
+        chain.links[0].zone,
+        "_synchronicity-transparency.sync.test."
+    );
+    assert_eq!(chain.links[1].zone, "sync.test.");
+    assert_eq!(chain.links[2].zone, ".");
+
+    let anchors = TrustAnchors::from_file(&crossval.join("chain-anchor.key"))
+        .expect("the root anchor the same run wrote");
+    let (proven, signing_zone, walked) = chain::validate(&chain, &apex("sync.test."), &anchors)
+        .expect("a chain the control plane collected must walk here");
+    assert_eq!(signing_zone, apex("sync.test."));
+    assert_eq!(walked.anchor_zone, ".");
+    assert!(
+        !walked.anchored_directly,
+        "the fixture is a real descent, not a self-anchored zone"
+    );
+    assert_eq!(proven.len(), 1);
+
+    // And the DS binding is load-bearing over these bytes too: the proven key
+    // is the one the root's DS covers, byte for byte.
+    let mut other = proven[0].clone();
+    other[10] ^= 0x01;
+    assert!(!proven.contains(&other));
+}

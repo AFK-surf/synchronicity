@@ -102,12 +102,34 @@ pub fn the_renderer_emits_data_records_and_the_marker_test() {
 /// than the real one. It holds either way — but a relation written down to be
 /// checked should be the one that is true.
 pub fn the_rotation_window_fits_inside_a_binding_lifetime_test() {
-  let watch_cadence = 300
-  let publish_slack = 60
-  let client_trust_grace = 900
-  assert watch_cadence + publish_slack + render_external.ttl_proof
+  // Against the shared fixture, not against literals. Three of the six terms
+  // are this side's constants and three are the client's, and every one of
+  // them used to be a number typed into a comment or a test on the far side
+  // of the language boundary — a previous audit found one of them stale, in
+  // the direction that *understated* the margin. `meta.txt` is written by the
+  // Rust regenerator from the client's own constants, so a change to either
+  // half now fails one of the two suites instead of drifting.
+  let client_trust_grace = rekor_test.meta_int("client_trust_grace")
+  let republish_window = rekor_test.meta_int("control_plane_republish_window")
+
+  // This side's half of the window the client names: what a rotated provider
+  // key costs before a proof for it is on the wire.
+  assert zonekey_watch.watch_interval_s
+    + publish_slack
+    + render_external.ttl_proof
+    == republish_window
+  // And the relation itself.
+  assert zonekey_watch.watch_interval_s
+    + publish_slack
+    + render_external.ttl_proof
     < render_external.ttl_data + client_trust_grace
 }
+
+/// The log round trip the window budgets for. Not a constant anywhere else:
+/// it is the slack between observing a rotated key and its proof being
+/// servable, and it is named here because the relation above is where it is
+/// spent.
+const publish_slack = 60
 
 /// The budget at the shared base name, held still without standing up a log.
 ///

@@ -35,6 +35,37 @@ pub fn sign_rrset(
   inception: Int,
   expiration: Int,
 ) -> BitArray {
+  rdata.rr(
+    owner,
+    wire.type_rrsig,
+    ttl,
+    sign_rrset_rdata(
+      csk,
+      key_tag,
+      signer,
+      owner,
+      rtype,
+      ttl,
+      rdatas,
+      inception,
+      expiration,
+    ),
+  )
+}
+
+/// The same, as the RRSIG *rdata* alone — what a resolver answer carries per
+/// record rather than as a packed wire RR.
+pub fn sign_rrset_rdata(
+  csk: Csk,
+  key_tag: Int,
+  signer: Name,
+  owner: Name,
+  rtype: Int,
+  ttl: Int,
+  rdatas: List(BitArray),
+  inception: Int,
+  expiration: Int,
+) -> BitArray {
   let signature =
     ecdsa_sign_raw(
       signing_input(
@@ -49,19 +80,17 @@ pub fn sign_rrset(
       ),
       csk.private,
     )
-  let with_sig =
-    rdata.rrsig(
-      rtype,
-      keys.algorithm,
-      list.length(owner),
-      ttl,
-      expiration,
-      inception,
-      key_tag,
-      signer,
-      signature,
-    )
-  rdata.rr(owner, wire.type_rrsig, ttl, with_sig)
+  rdata.rrsig(
+    rtype,
+    keys.algorithm,
+    list.length(owner),
+    ttl,
+    expiration,
+    inception,
+    key_tag,
+    signer,
+    signature,
+  )
 }
 
 /// Verifies a raw signature over an RRset — test support: the real

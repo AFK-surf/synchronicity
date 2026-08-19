@@ -57,7 +57,13 @@ fn now_unix() -> Int
 /// How often the wire is re-read. Not a knob: it is one term of the timing
 /// relation in `zone/render_external.ttl_proof`, and moving it alone would
 /// silently widen the window a rotation can strand clients for.
-const watch_interval_ms = 300_000
+/// Public, and in seconds, because it is one term of a relation whose other
+/// terms live in `crates/synch-net`: the window a client fails closed for
+/// after an unannounced provider key rotation has to fit inside the lifetime
+/// of the membership that client already holds. Private, it was a number two
+/// test files and a doc comment in the other language restated by hand.
+/// Held still against the shared fixture in `external_test`.
+pub const watch_interval_s = 300
 
 /// How soon to look again when the declaration is not on the wire yet.
 /// The reconciler and this watcher both start at boot; five minutes is
@@ -159,7 +165,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   }
   let next_ms = case result {
     WaitingForDeclaration -> declaration_retry_ms
-    Logged | Quiet -> watch_interval_ms
+    Logged | Quiet -> watch_interval_s * 1000
   }
   let _ = process.send_after(state.subject, next_ms, Tick)
   actor.continue(state)

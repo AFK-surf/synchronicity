@@ -47,6 +47,13 @@ fn fixture(file: String) -> BitArray {
   bits
 }
 
+/// A `meta.txt` field as an integer — the shared fixture is where the
+/// numbers both languages have to agree on live.
+pub fn meta_int(field: String) -> Int {
+  let assert Ok(value) = int.parse(meta(field))
+  value
+}
+
 fn meta(field: String) -> String {
   let assert Ok(text) = bit_array.to_string(fixture("meta.txt"))
   let assert Ok(value) =
@@ -2182,3 +2189,37 @@ pub fn the_shipped_trusted_root_is_the_clients_test() {
 
 @external(erlang, "cp_sys_ffi", "priv_dir")
 fn priv_dir(sub: String) -> Result(String, Nil)
+
+/// The chain `chain.collect` builds today is the shape the checked-in
+/// cross-validation fixture pins.
+///
+/// The fixture itself cannot be regenerated-and-diffed in CI: ECDSA signing
+/// draws a fresh nonce, so two runs over the same zone produce different
+/// bytes. What *is* deterministic is the shape — which links, in which order,
+/// under which names — and a change to the collector that altered it without a
+/// regeneration would leave the Rust side walking a chain this side no longer
+/// produces. So this asserts the shape against the live collector, and
+/// `a_chain_the_control_plane_collected_walks_under_this_validator` on the
+/// Rust side asserts the *semantics* against the bytes.
+///
+/// Regenerate with `gleam run -m tools/gen_crossval`.
+pub fn the_collected_chain_matches_the_shape_the_crossval_fixture_pins_test() {
+  let #(links, _root, _apex) = gen_crossval.seeded_chain()
+  assert list.map(links, fn(l: cert.Link) { l.zone })
+    == ["_synchronicity-transparency.sync.test.", "sync.test.", "."]
+
+  // The apex link carries both its DNSKEY RRset and the DS beside it, which
+  // is what makes the ladder a descent rather than a self-anchored zone —
+  // the shape every other sim chain in either tree lacks.
+  let assert Ok(apex_link) =
+    list.find(links, fn(l: cert.Link) { l.zone == "sync.test." })
+  assert bit_array.byte_size(apex_link.rrs) > 200
+
+  // And the fixture the Rust walk reads is a chain of that shape, not an
+  // empty file a failed regeneration left behind.
+  let checked_in = fixture("crossval/chain-collected.der")
+  assert bit_array.byte_size(checked_in)
+    > bit_array.byte_size(cert.encode_chain(links)) - 64
+  assert bit_array.byte_size(checked_in)
+    < bit_array.byte_size(cert.encode_chain(links)) + 64
+}

@@ -807,12 +807,39 @@ fn the_shared_fixture_decodes_and_verifies() {
         synch_net::rekor::MAX_PROOF_PARTS.to_string(),
         fixture_field("max_proof_parts"),
     );
+    // The timing relation, for the same reason and with the same history.
+    // The control plane maintains
+    //   watch cadence + publish + ttl_proof  <  ttl_data + trust grace
+    // so that an unannounced provider key rotation costs a client a few
+    // refreshes rather than every DNS-sourced binding it holds. Three of the
+    // six terms live here and three live in the control plane's source, and
+    // this file's own comment used to say there was no way to pin them across
+    // the boundary — which stopped being true the moment this fixture existed.
+    // A previous audit found one of the six stale, in the direction that
+    // *understated* the margin.
+    assert_eq!(
+        synch_net::dns::DEFAULT_TRUST_GRACE.as_secs().to_string(),
+        fixture_field("client_trust_grace"),
+    );
+    assert_eq!(
+        synch_net::dns::MIN_TTL.as_secs().to_string(),
+        fixture_field("client_min_ttl"),
+    );
+    assert_eq!(
+        synch_net::dns::CONTROL_PLANE_REPUBLISH_WINDOW
+            .as_secs()
+            .to_string(),
+        fixture_field("control_plane_republish_window"),
+    );
     // Re-encoding is byte-identical: the format has exactly one rendering.
     assert_eq!(proof.encode().unwrap(), fixture("proof.bin"));
 
-    // The certificate the Gleam side built, read by the Rust parser: the two
+    // The certificate `tools/gen_crossval` built, read by this parser: the two
     // DER implementations have to agree about the SAN, the SPKI and the two
-    // custom extensions, and this is where that is checked.
+    // custom extensions, and this is where that is checked. (The files in
+    // `crossval/` are the Gleam-authored ones; everything else under
+    // `fixtures/rekor/` is written by `regenerate_the_shared_fixture` below,
+    // and a comment here once claimed otherwise about `certificate.der`.)
     let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
     assert_eq!(body.certificate_der, fixture("certificate.der"));
     let apex = fixture_field("apex");
@@ -1013,17 +1040,35 @@ fn regenerate_the_shared_fixture() {
     write_file(
         "meta.txt",
         format!(
-            // `max_proof_parts` is not about this entry. It is one number
-            // that has to be the same on both sides — the publisher refuses
-            // to emit more parts than it, the client stops reading at it —
-            // and until it landed here each suite asserted its own constant
-            // against itself, which passes however far apart the two drift.
-            "apex={}\nkey_tag={}\nlog_index={}\naction={}\nmax_proof_parts={}\n",
+            // None of the trailing fields is about this entry. They are the
+            // numbers that have to be the same on both sides, and until each
+            // landed here every suite asserted its own constant against
+            // itself, which passes however far apart the two drift.
+            //
+            // `max_proof_parts`: the publisher refuses to emit more parts
+            // than it, the client stops reading at it.
+            //
+            // The three timing terms: the control plane maintains
+            // `watch cadence + publish + ttl_proof < ttl_data + trust grace`
+            // so that an unannounced provider key rotation costs a few
+            // refreshes rather than every DNS-sourced binding. Half of that
+            // relation is these constants and half is the control plane's,
+            // and the Rust side's copies of the control plane's three terms
+            // were transcribed by hand — a comment there once said outright
+            // that there was "no way to pin them across the language boundary
+            // from this side", which stopped being true the moment this file
+            // existed. A previous audit found one of the six terms stale.
+            "apex={}\nkey_tag={}\nlog_index={}\naction={}\nmax_proof_parts={}\n\
+             client_trust_grace={}\nclient_min_ttl={}\n\
+             control_plane_republish_window={}\n",
             zone.apex(),
             zone.key_tag(),
             proof.log_index,
             statement.action,
             synch_net::rekor::MAX_PROOF_PARTS,
+            synch_net::dns::DEFAULT_TRUST_GRACE.as_secs(),
+            synch_net::dns::MIN_TTL.as_secs(),
+            synch_net::dns::CONTROL_PLANE_REPUBLISH_WINDOW.as_secs(),
         )
         .as_bytes(),
     );
