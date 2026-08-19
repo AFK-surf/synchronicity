@@ -200,16 +200,7 @@ async fn attach_once(
         .map_err(|e| EngineError::invalid(format!("{url}: {e}")))?;
     let (mut sink, mut stream) = socket.split();
 
-    // The claim of what this node holds, taken as the spaces stood when the
-    // session opened: a space added after attach is not routable until the
-    // next reconnect, which is the same grain the whole tunnel works at —
-    // the control plane may ask for anything, and this says what it will find.
-    let held: Vec<String> = node
-        .store()
-        .spaces()?
-        .into_iter()
-        .map(|space| space.id)
-        .collect();
+    let held = held_spaces(node)?;
     send(
         &mut sink,
         &Up::Hello {
@@ -278,6 +269,32 @@ async fn attach_once(
         outcome.as_ref().err().map(|e| e.to_string()),
     );
     outcome
+}
+
+/// The spaces this node claims to hold, as they stood when the session opened.
+///
+/// A publish root and a mirror hold a space equally — both leave the unified
+/// tree and its content local — so both claim it, and a node that only mirrors
+/// a space is routable for it rather than a bystander. The claim is taken once
+/// per session: a space added after attach is not routable until the next
+/// reconnect, which is the same grain the whole tunnel works at — the control
+/// plane may ask for anything, and this says what it will find.
+fn held_spaces(node: &Node) -> Result<Vec<String>> {
+    let mut held: Vec<String> = node
+        .store()
+        .spaces()?
+        .into_iter()
+        .map(|space| space.id)
+        .collect();
+    held.extend(
+        node.store()
+            .mirrors()?
+            .into_iter()
+            .map(|mirror| mirror.space),
+    );
+    held.sort_unstable();
+    held.dedup();
+    Ok(held)
 }
 
 impl Node {
@@ -1256,6 +1273,24 @@ mod tests {
         assert!(node.attach_targets().is_empty());
         node.enable_cloud().unwrap();
         assert_eq!(node.attach_targets(), ["cluster.example"]);
+        node.shutdown().await.unwrap();
+    }
+
+    /// A mirror leaves a space as local as a publish root does — its tree and
+    /// its bytes are both on this node — so the attach claim names it, and a
+    /// mirror-only node is routable for what it mirrors.
+    #[tokio::test]
+    async fn the_claim_covers_mirrored_spaces_too() {
+        let (dir, node) = node().await;
+        node.add_space("docs", dir.path().join("docs")).unwrap();
+        let mirror = tempfile::tempdir().unwrap();
+        node.add_mirror("media", mirror.path(), &VersionPolicy::Newest)
+            .unwrap();
+        assert_eq!(held_spaces(&node).unwrap(), ["docs", "media"]);
+
+        // A space both published and mirrored is one claim, not two.
+        node.add_space("media", dir.path().join("media")).unwrap();
+        assert_eq!(held_spaces(&node).unwrap(), ["docs", "media"]);
         node.shutdown().await.unwrap();
     }
 
