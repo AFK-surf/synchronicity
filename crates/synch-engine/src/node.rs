@@ -288,10 +288,17 @@ impl Node {
     ) -> Result<()> {
         let previous = previous.cloned();
         let adopted = adopted.clone();
+        let domain = domain.to_string();
         let now = now_ns();
         store.transaction(|txn| -> Result<()> {
             txn.set_self_origin(&adopted)?;
             txn.put_binding(&self_binding(&adopted, node_id, now))?;
+            // A first name is an adoption too, and the one an operator most
+            // often wants to see dated.
+            txn.record_identity_adoption(previous.as_ref(), &adopted, &node_id, &domain, now)?;
+            // The zone being left has no authority behind its bindings any
+            // more; nothing else would drop them before their own expiry.
+            txn.delete_dns_bindings_other_than(&domain)?;
             if let Some(previous) = &previous {
                 txn.remove_binding(previous, &node_id, BindingSource::Static)?;
                 // Drop the old name's view so the unified tree does not keep a
@@ -300,11 +307,11 @@ impl Node {
                 txn.clear_head(previous, Slot::Pending)?;
                 txn.delete_origin_entries(previous)?;
                 txn.delete_origin_providers(previous)?;
+                txn.clear_observed_head(previous)?;
                 txn.rewrite_mirror_policies(previous, &adopted)?;
                 // The floor was a promise about seqs under the old name; the
                 // new one has no history for it to bound (§3.4).
                 txn.clear_publish_floor()?;
-                txn.record_identity_adoption(previous, &adopted, &node_id, domain, now)?;
             }
             Ok(())
         })?;
@@ -357,8 +364,11 @@ impl Node {
         };
 
         // A name from a zone that is no longer this node's is not a fallback:
-        // nothing currently names it.
-        let usable = stored.filter(|p| p.domain() == Some(domain.as_str()));
+        // nothing currently names it. `stored` is kept alongside, because what
+        // this node holds is what a migration has to clean up.
+        let usable = stored
+            .clone()
+            .filter(|p| p.domain() == Some(domain.as_str()));
 
         let resolved = match resolver {
             Some(resolver) => match resolver.resolve_members(&domain).await {
@@ -386,12 +396,18 @@ impl Node {
 
         match resolved {
             Some(adopted) => {
-                if usable.as_ref() != Some(&adopted) {
+                // `usable` decides whether an old name may be *kept*; what is
+                // migrated away from is whatever this node actually holds. A
+                // name from a replaced zone — and a key identity, which names
+                // no domain at all — is exactly the state that has to be
+                // cleaned up, so filtering here would skip the migration in
+                // the two cases that need it most.
+                if stored.as_ref() != Some(&adopted) {
                     let store = store.clone();
                     let adopted = adopted.clone();
                     let domain = domain.clone();
                     crate::blocking::offload(move || {
-                        Self::migrate_identity(&store, usable.as_ref(), &adopted, node_id, &domain)
+                        Self::migrate_identity(&store, stored.as_ref(), &adopted, node_id, &domain)
                     })
                     .await?;
                 }
@@ -425,10 +441,25 @@ impl Node {
         .await?;
         let (store, secret) = opened;
         // Before the endpoint, before any loop: what this node is called, and
-        // the migration if the zone has changed its mind (§3.1). The resolver
-        // is built from the same options the standing refresh uses, so a node
-        // that cannot resolve at all fails the same way in both places.
-        let resolver = synch_net::DnssecResolver::with_options(&config.dns).ok();
+        // the migration if the zone has changed its mind (§3.1).
+        //
+        // The resolver is built only for a node that has a zone to ask, and a
+        // failure to build one is raised rather than swallowed. Swallowing it
+        // makes a mistyped `--dnssec-anchor` indistinguishable from a zone
+        // that has not published a record yet, and the daemon then waits
+        // forever telling the operator to publish a record they already
+        // published. It is also the same stance the standing refresh takes
+        // (`build_resolver`): options that yield no resolver are a refusal to
+        // start, not a degraded mode.
+        let resolver = {
+            let dns = config.dns.clone();
+            let store = store.clone();
+            crate::blocking::offload(move || match store.membership_domain()? {
+                None => Ok(None),
+                Some(_) => Ok(Some(synch_net::DnssecResolver::with_options(&dns)?)),
+            })
+            .await?
+        };
         let origin = Self::settle_identity(
             &store,
             secret.public(),
@@ -1231,7 +1262,7 @@ mod tests {
 
         let history = store.identity_history().unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].previous, previous);
+        assert_eq!(history[0].previous, Some(previous));
         assert_eq!(history[0].adopted, named);
         assert_eq!(history[0].domain, "cluster.example");
     }
@@ -1282,12 +1313,13 @@ mod tests {
         let report = Node::init_named_by_zone(dir.path(), named.clone()).unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
 
+        let adoptions = store.identity_history().unwrap().len();
         let settled = Node::settle_identity(&store, report.node_id, None)
             .await
             .unwrap();
         assert_eq!(settled, named);
-        // Nothing was migrated, so nothing was destroyed.
-        assert!(store.identity_history().unwrap().is_empty());
+        // Nothing was adopted, so nothing was destroyed.
+        assert_eq!(store.identity_history().unwrap().len(), adoptions);
     }
 
     #[tokio::test]

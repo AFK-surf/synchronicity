@@ -27,7 +27,7 @@ creates the datadir; everything after it is a gRPC call to the running daemon ov
 local control socket:
 
 ```sh
-synch init --id nas@cluster.example.com   # or plain `synch init` for a key identity
+synch init --domain cluster.example.com   # or plain `synch init` for a key identity
 synch daemon run &                         # required: the daemon owns the node
 synch space add media /srv/media
 synch scan                                 # hash, publish a signed root
@@ -45,9 +45,9 @@ command except `synch init` fails with a message naming that socket.
 Admit a peer. Trust is unilateral, so each side runs this for the other:
 
 ```sh
-synch trust add <their-device-key> --as laptop --domain cluster.example.com
-synch domain add cluster.example.com       # or DNSSEC membership instead
-synch domain refresh cluster.example.com   # one domain now, or all of them with no argument
+synch trust add <their-device-key>         # the key is the identity; names come from zones
+synch domain set cluster.example.com       # or DNSSEC membership instead
+synch domain refresh                       # re-resolve the membership zone now
 ```
 
 Membership from DNS refreshes itself: the daemon re-resolves each configured

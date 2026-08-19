@@ -102,8 +102,8 @@ const DOMAIN_KEY: &str = "membership.domain";
 pub struct IdentityAdoption {
     /// When the adoption was committed, unix nanos.
     pub at: i64,
-    /// What this node published as before it.
-    pub previous: OriginId,
+    /// What this node published as before it, or `None` for its first name.
+    pub previous: Option<OriginId>,
     /// The name it took.
     pub adopted: OriginId,
     /// The device key the zone bound to that name.
@@ -534,7 +534,7 @@ impl Store {
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, String>(4)?,
@@ -545,7 +545,9 @@ impl Store {
             let (at, previous, adopted, node_id, domain) = row?;
             out.push(IdentityAdoption {
                 at,
-                previous: origin_column(previous, "identity_history.previous")?,
+                previous: previous
+                    .map(|text| origin_column(text, "identity_history.previous"))
+                    .transpose()?,
                 adopted: origin_column(adopted, "identity_history.adopted")?,
                 node_id: key_column(node_id, "identity_history.node_id")?,
                 domain,
@@ -698,9 +700,13 @@ impl Txn<'_> {
     }
 
     /// Records an identity adoption, inside the transaction (§3.1).
+    ///
+    /// `previous` is `None` for a node's first name, which is an adoption like
+    /// any other: the zone named a key that had no name, and the trail has to
+    /// say when that happened as much as it says when a name was replaced.
     pub fn record_identity_adoption(
         &self,
-        previous: &OriginId,
+        previous: Option<&OriginId>,
         adopted: &OriginId,
         node_id: &NodeId,
         domain: &str,
@@ -711,11 +717,34 @@ impl Txn<'_> {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 at,
-                previous.canonical(),
+                previous.map(|origin| origin.canonical()),
                 adopted.canonical(),
                 node_id.as_bytes().as_slice(),
                 domain,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Drops every dns binding that did not come from `domain`, inside the
+    /// transaction.
+    ///
+    /// A node resolves the zone that names it and no other (§3.1), so on
+    /// adopting a name the bindings vouched for by the zone being left have no
+    /// authority behind them any more — and nothing else would remove them
+    /// before their own expiry.
+    pub fn delete_dns_bindings_other_than(&self, domain: &str) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM bindings WHERE source = 'dns' AND domain <> ?1",
+            params![domain],
+        )?)
+    }
+
+    /// Forgets what peers advertised for an origin, inside the transaction.
+    pub fn clear_observed_head(&self, origin: &OriginId) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM observed_heads WHERE origin_id = ?1",
+            params![origin.canonical()],
         )?;
         Ok(())
     }

@@ -338,12 +338,15 @@ fn domains_are_configurable_without_dns() {
     cli.run(&["init"]);
     let daemon = cli.daemon();
 
-    // `domain set` attempts a refresh; with no resolver or no records it must
-    // still record the domain and fail closed rather than crash. The node goes
-    // on running under the name it has until the next start (§3.1).
-    let _ = cli.try_run(&["domain", "set", "cluster.example"]);
-    assert!(cli.run(&["domain", "ls"]).contains("cluster.example"));
-    assert!(cli.run(&["doctor"]).contains("domain cluster.example"));
+    // `domain set` records the zone and says when it takes effect. This node
+    // is named by its device key, so the running process keeps resolving no
+    // zone at all until it restarts (§3.1) — `domain ls` reports the change as
+    // pending, and `doctor` reports the zone actually in force.
+    let set = cli.run(&["domain", "set", "cluster.example"]);
+    assert!(set.contains("next `synch daemon run`"), "{set}");
+    let listed = cli.run(&["domain", "ls"]);
+    assert!(listed.contains("pending: cluster.example"), "{listed}");
+    assert!(!cli.run(&["doctor"]).contains("domain cluster.example"));
 
     cli.run(&["domain", "clear"]);
     assert!(cli.run(&["domain", "ls"]).trim().is_empty());

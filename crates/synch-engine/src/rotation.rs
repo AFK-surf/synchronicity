@@ -90,6 +90,14 @@ impl Node {
         Ok(self.store().device_keys()?)
     }
 
+    /// Every name this node has adopted from its zone, oldest first (§3.1).
+    ///
+    /// A relabel is unattended and destructive, so this trail is the only
+    /// record that it happened at all.
+    pub fn identity_history(&self) -> Result<Vec<synch_store::IdentityAdoption>> {
+        Ok(self.store().identity_history()?)
+    }
+
     /// Asks every trusted peer which of our device keys it currently holds
     /// bound (§3.4 step 3, §5.1).
     ///

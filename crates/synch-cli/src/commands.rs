@@ -1,8 +1,7 @@
 //! Command dispatch.
 //!
-//! Three commands touch the data directory directly: `synch init`, which creates
-//! it before any daemon can exist; `synch id set`, which names a key-identified
-//! node while the daemon is stopped; and `synch daemon run`, which *is* the
+//! Two commands touch the data directory directly: `synch init`, which creates
+//! it before any daemon can exist, and `synch daemon run`, which *is* the
 //! daemon. Every other command is a control-service call to a running daemon
 //! (§9.1) — there is no in-process fallback.
 

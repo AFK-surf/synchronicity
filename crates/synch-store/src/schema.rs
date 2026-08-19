@@ -515,7 +515,7 @@ CREATE TABLE device_keys (
 );
 CREATE TABLE identity_history (
   at          INTEGER NOT NULL,
-  previous    TEXT NOT NULL,
+  previous    TEXT,
   adopted     TEXT NOT NULL,
   node_id     BLOB NOT NULL,
   domain      TEXT NOT NULL
@@ -652,11 +652,11 @@ CREATE INDEX bindings_by_key ON bindings (node_id);
 /// A node takes its own `id=` from the membership zone, so a relabel there is
 /// adopted unattended and drops the published views under the old name. The
 /// trail of what was adopted, when, and from where is the only record that it
-/// happened; `synch id` and `synch doctor` read it.
+/// happened; `synch id` reads it. `previous` is NULL for a first name.
 const V15_IDENTITY_HISTORY: &str = r#"
 CREATE TABLE identity_history (
   at        INTEGER NOT NULL,
-  previous  TEXT NOT NULL,
+  previous  TEXT,                          -- NULL for a node's first name
   adopted   TEXT NOT NULL,
   node_id   BLOB NOT NULL,
   domain    TEXT NOT NULL

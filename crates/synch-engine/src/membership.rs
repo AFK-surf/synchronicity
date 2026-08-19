@@ -40,7 +40,7 @@ pub const DNS_TRIGGER_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// The shortest the DNS loop ever sleeps between passes.
 const DNS_POLL_FLOOR: Duration = Duration::from_secs(1);
-/// The longest the DNS loop sleeps, so a `domain add` is noticed promptly even
+/// The longest the DNS loop sleeps, so a new zone is noticed promptly even
 /// though nothing was configured when the loop last looked.
 const DNS_POLL_CEILING: Duration = Duration::from_secs(30);
 
@@ -340,25 +340,44 @@ impl Node {
         self.dns_resolver_slot().status.clone()
     }
 
-    /// This node's membership domain, if it has one (§3.1).
+    /// The membership domain *configured* for this node, which the next start
+    /// will take its name from (§3.1).
+    ///
+    /// This is the operator's setting, not necessarily the zone in force: an
+    /// edit lands here immediately and identity is resolved once per process,
+    /// so between a `synch domain set` and the next start the two differ. See
+    /// [`resolving_domain`](Self::resolving_domain) for what is actually being
+    /// refreshed.
     pub fn domain(&self) -> Result<Option<String>> {
         Ok(self.store().membership_domain()?)
     }
 
-    /// The domain as the refresh machinery wants it: a list of none or one.
+    /// The zone this process resolves: the one its own name came from.
+    ///
+    /// Not the configured slot. A node resolves the zone that names it and no
+    /// other (§3.1), and its name is frozen for the life of the process — so a
+    /// domain set under a running daemon must not start pulling bindings from
+    /// a zone this node is not yet a member of, nor stop renewing the ones
+    /// vouched for by the zone it is still publishing under.
+    pub fn resolving_domain(&self) -> Option<String> {
+        self.origin().domain().map(str::to_string)
+    }
+
+    /// The resolving domain as the refresh machinery wants it: none or one.
     ///
     /// Everything below schedules, refreshes and reports per domain, which is
     /// the same work whether there is one of them or none.
-    fn configured_domains(&self) -> Result<Vec<String>> {
-        Ok(self.domain()?.into_iter().collect())
+    pub(crate) fn resolving_domains(&self) -> Vec<String> {
+        self.resolving_domain().into_iter().collect()
     }
 
     /// Sets the membership domain — the zone that will name this node (§3.1).
     ///
-    /// Takes effect on the next start, which is where identity is resolved:
-    /// this process keeps the name it has and the zone that issued it, so
+    /// Takes effect at the next start, which is where identity is resolved.
+    /// This process goes on resolving the zone its current name came from, so
     /// "one node, one zone" holds at every instant rather than only between
-    /// edits.
+    /// edits; the bindings of the zone being left are dropped by the migration
+    /// that adopts the new name.
     pub fn set_domain(&self, domain: &str) -> Result<()> {
         let domain = synch_core::origin::normalize_domain(domain)
             .map_err(|e| EngineError::invalid(e.to_string()))?;
@@ -366,23 +385,13 @@ impl Node {
         Ok(())
     }
 
-    /// Drops the membership domain, and with it every binding it produced.
-    ///
-    /// The node falls back to its device key for a name on the next start.
+    /// Drops the membership domain. The device key names this node at the next
+    /// start, and that migration is what drops the zone's bindings.
     pub fn clear_domain(&self) -> Result<bool> {
-        let Some(domain) = self.domain()? else {
+        if self.domain()?.is_none() {
             return Ok(false);
-        };
-        self.store().set_membership_domain(None)?;
-        for binding in self.store().bindings()? {
-            if binding.source == BindingSource::Dns && binding.domain.as_deref() == Some(&domain) {
-                self.store().remove_binding(
-                    &binding.origin,
-                    &binding.node_id,
-                    BindingSource::Dns,
-                )?;
-            }
         }
+        self.store().set_membership_domain(None)?;
         Ok(true)
     }
 
@@ -529,7 +538,7 @@ impl Node {
         &self,
         resolver: &dyn MemberResolver,
     ) -> Result<Vec<DomainOutcome>> {
-        let domains = self.configured_domains()?;
+        let domains = self.resolving_domains();
         self.refresh_these(resolver, &domains, now_ns()).await
     }
 
@@ -540,7 +549,7 @@ impl Node {
     pub fn configured_domain(&self, domain: &str) -> Result<String> {
         let name = synch_core::origin::normalize_domain(domain)
             .map_err(|e| EngineError::invalid(e.to_string()))?;
-        if !self.configured_domains()?.contains(&name) {
+        if !self.resolving_domains().contains(&name) {
             return Err(EngineError::not_found(format!(
                 "{name} is not a configured membership domain"
             )));
@@ -555,15 +564,11 @@ impl Node {
         resolver: &dyn MemberResolver,
         domain: Option<&str>,
     ) -> Result<Vec<DomainOutcome>> {
-        // Both branches read `config`, and every caller of this is async (§10).
-        let domains = {
-            let node = self.clone();
-            let named = domain.map(str::to_string);
-            crate::blocking::offload(move || match named {
-                None => node.configured_domains(),
-                Some(name) => Ok(vec![node.configured_domain(&name)?]),
-            })
-            .await?
+        // The resolving domain is the origin's, held in memory, so neither
+        // branch touches the store.
+        let domains = match domain {
+            None => self.resolving_domains(),
+            Some(name) => vec![self.configured_domain(name)?],
         };
         self.refresh_these(resolver, &domains, now_ns()).await
     }
@@ -578,12 +583,7 @@ impl Node {
         resolver: &dyn MemberResolver,
         now: i64,
     ) -> Result<Vec<DomainOutcome>> {
-        // The configured list is a `config` read and this runs on a runtime
-        // worker (§10).
-        let configured = {
-            let node = self.clone();
-            crate::blocking::offload(move || node.configured_domains()).await?
-        };
+        let configured = self.resolving_domains();
         let due: Vec<String> = {
             let schedule = self.dns_schedule();
             configured
@@ -608,7 +608,7 @@ impl Node {
     ) -> Result<Vec<DomainOutcome>> {
         let ready: Vec<String> = {
             let schedule = self.dns_schedule();
-            self.configured_domains()?
+            self.resolving_domains()
                 .into_iter()
                 .filter(|d| {
                     schedule
@@ -625,8 +625,7 @@ impl Node {
     pub fn next_dns_delay(&self, now: i64) -> Duration {
         let schedule = self.dns_schedule();
         let soonest = self
-            .configured_domains()
-            .unwrap_or_default()
+            .resolving_domains()
             .into_iter()
             .map(|d| schedule.get(&d).map(|s| s.due_at).unwrap_or(now))
             .min();
@@ -810,7 +809,7 @@ impl Node {
         let bindings = self.store().bindings()?;
         let schedule = self.dns_schedule().clone();
         Ok(self
-            .configured_domains()?
+            .resolving_domains()
             .into_iter()
             .map(|domain| {
                 let held = bindings
@@ -935,7 +934,7 @@ impl Node {
             unbound_origins,
             recovery: self.recovery_state()?,
             unreconciled,
-            domains: self.configured_domains()?,
+            domains: self.resolving_domains(),
             ambiguous,
             self_origin_mismatch,
             clock,
@@ -964,7 +963,22 @@ mod tests {
     use crate::config::NodeConfig;
     use iroh_base::SecretKey;
 
+    /// A node named by `cluster.example`, which is therefore the zone it
+    /// resolves (§3.1) — the configuration every test below needs, since a
+    /// node refreshes the zone its own name came from and no other.
     async fn node() -> (tempfile::TempDir, Node) {
+        let dir = tempfile::tempdir().unwrap();
+        Node::init_named_by_zone(
+            dir.path(),
+            OriginId::named("self", "cluster.example").unwrap(),
+        )
+        .unwrap();
+        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
+        (dir, node)
+    }
+
+    /// A node whose name is its device key, so it resolves no zone at all.
+    async fn key_identified_node() -> (tempfile::TempDir, Node) {
         let dir = tempfile::tempdir().unwrap();
         Node::init(dir.path(), None).unwrap();
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
@@ -973,7 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_domain_round_trips_and_normalizes() {
-        let (_d, node) = node().await;
+        let (_d, node) = key_identified_node().await;
         assert_eq!(node.domain().unwrap(), None);
         node.set_domain("Cluster.Example.COM.").unwrap();
         assert_eq!(
@@ -1011,10 +1025,11 @@ mod tests {
         let addr = node.peer_addr(&nas).unwrap().unwrap();
         assert_eq!(addr.ip_addrs().count(), 1);
 
-        // Removing the domain drops exactly its bindings, leaving self intact.
-        node.set_domain("cluster.example").unwrap();
+        // Clearing the domain leaves the bindings for now: this process still
+        // resolves the zone its name came from, and the adoption at the next
+        // start is what drops them (§3.1).
         node.clear_domain().unwrap();
-        assert!(!node.store().is_bound(&origin, &nas, now_ns()).unwrap());
+        assert!(node.store().is_bound(&origin, &nas, now_ns()).unwrap());
         assert!(node
             .store()
             .is_bound(node.origin(), &node.node_id(), now_ns())

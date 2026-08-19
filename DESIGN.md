@@ -1339,10 +1339,10 @@ CREATE TABLE device_keys (                -- own keys; >1 row only during rotati
 
 -- every identity this node has adopted from the zone (§3.1). A relabel is
 -- unattended and destructive, so the trail of what was adopted and when is
--- the only record of it; `synch id` and `synch doctor` both read this.
+-- the only record of it; `synch id` reads this.
 CREATE TABLE identity_history (
   at          INTEGER NOT NULL,
-  previous    TEXT NOT NULL,
+  previous    TEXT,                      -- NULL for this node's first name
   adopted     TEXT NOT NULL,
   node_id     BLOB NOT NULL,             -- the device key the zone bound
   domain      TEXT NOT NULL

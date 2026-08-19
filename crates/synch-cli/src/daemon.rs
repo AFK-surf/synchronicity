@@ -221,7 +221,7 @@ async fn wait_for_stop(
 /// an operator would run afterwards would otherwise report a healthy node. With
 /// none configured there is nothing to refresh, so the daemon runs on static
 /// trust and the reason is recorded where `doctor`, `daemon status` and the next
-/// `domain add` will say it.
+/// `domain set` will say it.
 fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::DnssecResolver>>> {
     match synch_net::DnssecResolver::with_options(&node.config().dns) {
         Ok(resolver) => {

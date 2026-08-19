@@ -665,6 +665,33 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 ))
                 .await?;
             }
+            // Where the name came from, and every name before it. A zone can
+            // relabel this node unattended (§3.1), so the trail is the only
+            // place that says it happened.
+            match node.origin().domain() {
+                Some(domain) => out.line(format!("named by: {domain}")).await?,
+                None => {
+                    out.line("named by: this device key (no membership domain)")
+                        .await?
+                }
+            }
+            for adoption in read(node, |n| Ok(n.identity_history()?)).await? {
+                out.line(match &adoption.previous {
+                    Some(previous) => format!(
+                        "  adopted {} from {} {} (was {previous})",
+                        adoption.adopted,
+                        adoption.domain,
+                        render::ago(adoption.at)
+                    ),
+                    None => format!(
+                        "  adopted {} from {} {}",
+                        adoption.adopted,
+                        adoption.domain,
+                        render::ago(adoption.at)
+                    ),
+                })
+                .await?;
+            }
             out.line(format!(
                 "address: {}",
                 render::addr(&node.net().direct_addr())
@@ -970,15 +997,13 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 read(node, move |n| Ok(n.set_domain(&domain)?)).await?;
             }
             out.line(format!("membership domain is {domain}")).await?;
-            // What the node is called comes out of this zone, and identity is
-            // frozen for the life of a process (§3.1), so the name follows at
-            // the next start rather than under the running daemon.
+            // Deliberately no refresh here: this process goes on resolving the
+            // zone its current name came from, and pulling bindings out of a
+            // zone that has not named this node yet would leave it holding
+            // membership from an authority with no say in what it is called
+            // (§3.1). The next start resolves the new zone and migrates.
             out.line("takes effect at the next `synch daemon run`")
                 .await?;
-            // Lenient: the change stands even when the first refresh fails —
-            // configuring a domain before its records are published is a
-            // legitimate order of operations.
-            refresh_domains(node, out, Some(&domain), false).await?;
         }
 
         Command::DomainClear(pb::DomainClear {}) => {
@@ -989,20 +1014,34 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     "no membership domain is configured".to_string(),
                 ));
             }
-            out.line("membership domain cleared, with its bindings")
-                .await?;
-            out.line("the device key names this node at the next `synch daemon run`")
-                .await?;
+            out.line("membership domain cleared").await?;
+            out.line(
+                "the device key names this node at the next `synch daemon run`, \
+                 which is also what drops the zone's bindings",
+            )
+            .await?;
         }
 
         Command::DomainLs(pb::DomainLs {}) => {
-            let domains = read(node, |n| Ok(n.domain_health()?)).await?;
-            if domains.is_empty() {
-                out.progress("(no membership domains configured; static trust only)")
+            let (health, configured) =
+                read(node, |n| Ok((n.domain_health()?, n.domain()?))).await?;
+            if health.is_empty() {
+                out.progress("(no membership domain; static trust only)")
                     .await?;
             }
-            for health in domains {
-                out.line(render::domain_health(&health, now_ns())).await?;
+            for entry in &health {
+                out.line(render::domain_health(entry, now_ns())).await?;
+            }
+            // The configured slot and the zone in force differ between a
+            // `domain set` and the next start; saying so is the difference
+            // between a pending change and a broken one.
+            let resolving = health.first().map(|h| h.domain.clone());
+            if configured != resolving {
+                out.line(match &configured {
+                    Some(domain) => format!("pending: {domain} at the next `synch daemon run`"),
+                    None => "pending: no domain at the next `synch daemon run`".to_string(),
+                })
+                .await?;
             }
         }
 
@@ -1540,7 +1579,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 // node with no membership domain has nowhere to look.
                 out.line(
                     "note: no membership domains are configured, so there is no zone to \
-                     discover a control plane from; `synch domain add <domain>` first",
+                     discover a control plane from; `synch domain set <domain>` first",
                 )
                 .await?;
             }
