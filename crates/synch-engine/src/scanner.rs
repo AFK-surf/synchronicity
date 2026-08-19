@@ -1431,9 +1431,14 @@ mod tests {
     /// platform-gated.
     #[tokio::test]
     async fn an_adoption_target_stays_inside_its_space() {
-        let (_d, space, node) = node_with_space().await;
+        let (_d, _space, node) = node_with_space().await;
+        // Against the root as `add_space` recorded it, not as the test made it:
+        // `canonical_dir` resolves `/var` to `/private/var` on macOS and adds a
+        // verbatim prefix on Windows, so the tempdir's own path is a different
+        // spelling of the same directory.
+        let root = PathBuf::from(node.store().space("media").unwrap().unwrap().local_path);
         let inside = node.adoption_target("media", "sub/ok.txt").unwrap();
-        assert!(inside.starts_with(space.path()));
+        assert_eq!(inside, root.join("sub").join("ok.txt"));
 
         #[cfg(windows)]
         for escape in [
