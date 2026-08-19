@@ -1650,7 +1650,18 @@ mod tests {
         // can be shown to a peer delegated that space and withheld from one
         // that was not (§5.5).
         let info = node.space_info_of(node.origin(), "media").unwrap().unwrap();
-        assert_eq!(info.description, space.path().display().to_string());
+        // Against what the store recorded, not against the path handed to
+        // `add_space`: roots are canonicalized on the way in, and on macOS a
+        // temporary directory canonicalizes from `/var` to `/private/var`.
+        let recorded = node
+            .store()
+            .spaces()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "media")
+            .unwrap()
+            .local_path;
+        assert_eq!(info.description, recorded);
         assert!(node
             .space_info_of(node.origin(), "absent")
             .unwrap()
