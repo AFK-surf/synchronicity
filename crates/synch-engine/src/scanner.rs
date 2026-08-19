@@ -76,7 +76,6 @@ impl Node {
             .space(space_id)?
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))?;
         let root_dir = PathBuf::from(&space.local_path);
-        let ignore = IgnoreSet::for_space(&root_dir)?;
         let seq = self.next_seq()?;
 
         // A vanished space root — an unmounted drive, a renamed mount, a
@@ -100,6 +99,11 @@ impl Node {
             }
         }
 
+        // After the root guard, not before. `.syncignore` under a root that is a
+        // regular file returns `ENOTDIR`, which is not `NotFound`, so reading it
+        // first answered "the ignore file exists but could not be read" for a
+        // space whose actual problem the guard above names plainly.
+        let ignore = IgnoreSet::for_space(&root_dir)?;
         let mut report = ScanReport::default();
         let mut found = Vec::new();
         walk(&root_dir, &root_dir, &ignore, &mut report, &mut found)?;
@@ -157,32 +161,36 @@ impl Node {
         // A path the walk could not judge is not a path that is gone.
         //
         // `seen` is built from what the walk actually stat'd, so every path it
-        // skipped — a child whose `symlink_metadata` failed `EACCES` because
-        // the parent lost its execute bit, a name that would not normalize, a
-        // `DirEntry` that failed to read — was absent from `seen` and therefore
-        // swept. The scan then reported the same path in `skipped` *and*
-        // published a tombstone for it: mirrors deleted their copies, GC became
-        // free to drop the origin's own object, and a later successful scan
-        // republished it as a new entry with no `prev`, so every peer re-fetched
-        // bytes it already had.
+        // skipped — a child whose `symlink_metadata` failed `EACCES` because the
+        // parent lost its execute bit, an `EIO` on a network space — was absent
+        // from `seen` and therefore swept. The scan then reported the same path
+        // in `skipped` *and* published a tombstone for it: mirrors deleted their
+        // copies, GC became free to drop the origin's own object, and a later
+        // successful scan republished it as a new entry with no `prev`, so every
+        // peer re-fetched bytes it already had.
         //
         // The asymmetry is what gives it away: `index_file`'s failures are
-        // tolerated *and* the path stays in `seen` a few lines above, for
-        // exactly this reason. `walk`'s failures land in the same field and got
-        // the opposite treatment.
+        // tolerated *and* the path stays in `seen` a few lines above, for exactly
+        // this reason. `walk`'s failures land in the same field and got the
+        // opposite treatment.
+        //
+        // As a prefix, not an exact name. `walk` stats a `DirEntry` before it can
+        // know whether it is a directory, so a *directory* it cannot stat is
+        // skipped under its own path and never recursed into — and the published
+        // paths at risk are the files beneath it, which no exact-match exemption
+        // reaches.
         let unjudged: Vec<String> = report
             .skipped
             .iter()
             .map(|(path, _)| path.clone())
             .collect();
-        seen.extend(unjudged.iter().map(String::as_str));
 
         let mut known_paths: Vec<String> = self.store().local_files(space_id)?;
         known_paths.extend(self.store().published_paths(self.origin(), space_id)?);
         known_paths.sort();
         known_paths.dedup();
         for known in known_paths {
-            if seen.contains(known.as_str()) {
+            if seen.contains(known.as_str()) || unjudged_covers(&unjudged, &known) {
                 continue;
             }
             let prev = self
@@ -926,6 +934,19 @@ impl Drop for Adoption {
 /// and whether it is a symlink.
 type Found = (PathBuf, String, bool);
 
+/// True if `path` is one of the paths this pass could not judge, or is under
+/// one of them.
+///
+/// A prefix rule, because `walk` stats a `DirEntry` before it can know whether
+/// it is a directory: a *directory* it cannot stat is skipped under its own path
+/// and never recursed into, so what is actually at risk is every published file
+/// beneath it. Whole components only, so `a/b` does not cover `a/bc`.
+fn unjudged_covers(unjudged: &[String], path: &str) -> bool {
+    unjudged
+        .iter()
+        .any(|u| path == u || (path.starts_with(u.as_str()) && path[u.len()..].starts_with('/')))
+}
+
 fn walk(
     root: &Path,
     dir: &Path,
@@ -1250,6 +1271,23 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    #[test]
+    fn the_unjudged_exemption_covers_whole_subtrees_only() {
+        let unjudged = vec!["d/sub".to_string(), "solo.txt".to_string()];
+        // The directory itself, and anything under it at any depth.
+        assert!(unjudged_covers(&unjudged, "d/sub"));
+        assert!(unjudged_covers(&unjudged, "d/sub/deep.txt"));
+        assert!(unjudged_covers(&unjudged, "d/sub/a/b/c.txt"));
+        assert!(unjudged_covers(&unjudged, "solo.txt"));
+        // Whole components: a sibling that merely shares a prefix is not
+        // covered, or one unreadable directory would freeze its neighbours'
+        // deletions too.
+        assert!(!unjudged_covers(&unjudged, "d/subterfuge.txt"));
+        assert!(!unjudged_covers(&unjudged, "d/other.txt"));
+        assert!(!unjudged_covers(&unjudged, "solo.txt.bak"));
+        assert!(!unjudged_covers(&[], "anything"));
+    }
+
     /// A path the walk could not judge is not tombstoned.
     ///
     /// A published file whose `symlink_metadata` fails — the parent lost its
@@ -1305,13 +1343,15 @@ mod tests {
             "and must not read it as deleted: {:?}",
             report.skipped
         );
-        assert!(
-            !report
-                .staged
-                .iter()
-                .any(|(key, _)| { String::from_utf8_lossy(key).contains("keep.txt") }),
-            "no tombstone may be staged for a path that is still there"
-        );
+        for path in ["keep.txt", "deep.txt"] {
+            assert!(
+                !report
+                    .staged
+                    .iter()
+                    .any(|(key, _)| String::from_utf8_lossy(key).contains(path)),
+                "no tombstone may be staged for {path}, which is still there"
+            );
+        }
         node.shutdown().await.unwrap();
     }
 

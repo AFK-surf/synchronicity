@@ -463,20 +463,23 @@ impl Node {
             };
 
             let stale = stored.received_at <= before && !complete;
-            if poisoned {
-                // Retired by `try_promote`, which named the head it judged.
-                // Counting it here would double-count, and clearing it again
-                // would be this pass reaching for a head it did not judge.
-                abandoned += 1;
+            if !poisoned && !stale {
                 continue;
             }
-            if !stale {
-                continue;
-            }
+            // Both cases fall through to the compare-and-clear below, the
+            // poisoned one included even though `try_promote` will usually have
+            // retired it already: it *compares*, so a head already gone reports
+            // `dropped = false` and is not counted twice, and a head
+            // `try_promote` never reached still has an exit. That second case is
+            // why this cannot be an early `continue` — a fault raised before
+            // `try_promote` has read the head it would condemn (a stored row it
+            // cannot decode) leaves nothing to retire it, and the slot then holds
+            // `head_floor` above everything this node can serve indefinitely.
             tracing::warn!(
                 origin = %origin,
                 seq = stored.head.seq,
-                "abandoning a pending head no peer will serve"
+                poisoned,
+                "abandoning a pending head"
             );
             // The head this pass judged, named explicitly. Between the snapshot
             // above and here the sweep ran a promotion transaction and a trie

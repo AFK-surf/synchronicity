@@ -400,21 +400,11 @@ impl Syncer {
             //    width of the fork is a storage question, answered below,
             //    after the ordering has been settled.
             let floor = txn.head_floor(&head.origin)?;
-            // A head this node has already judged unpromotable is not adopted
-            // again — adopting it is what would put it back above the floor and
-            // buy another promotion diff (see `Syncer::refuse`).
-            //
-            // Checked *here* rather than before the transaction, which is where
-            // it went first. `record_history` above and `trim_forks` below are
-            // not the expensive part and are not about adoption: the first is
-            // §4.4 evidence retention, which is deliberately kept for heads
-            // that lose the ordering comparison too, and the second is the cap
-            // that keeps a member signing unbounded roots at one seq from
-            // buying permanent growth. Returning in front of both made a
-            // re-offered head stop contributing to either — including to the
-            // `heads ∪ head_history` union `next_own_seq` reads, which for a
-            // relayed head of this node's own origin is what keeps a restored
-            // backup from re-using a seq.
+            // Acceptance deliberately does not consult the refusal memo: a
+            // verdict is about a *promotion*, which is a pair of roots, and
+            // only `try_promote` knows both. A head this node has already
+            // failed on is adopted here and retired there, which costs two
+            // indexed writes rather than the diff.
             let outcome = if head.supersedes(floor.as_ref()) {
                 txn.put_head(Slot::Pending, head, now, now)?;
                 HeadOutcome::Pending
@@ -585,6 +575,11 @@ impl Syncer {
         }
     }
 
+    /// Fetches the pending head's trie from `client`, verifying every node
+    /// against the hash it was requested by.
+    ///
+    /// Nodes are content-addressed, so `client` need not be the origin, nor
+    /// even the peer that told us about the head: any peer advertising a
     /// complete head for the origin at or above this seq will do.
     pub async fn fetch_pending(
         &self,
