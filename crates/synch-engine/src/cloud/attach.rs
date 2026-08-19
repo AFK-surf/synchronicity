@@ -891,6 +891,9 @@ fn collapse(
     let mut inside: Option<String> = None;
     // Whether the listing stopped at the page limit rather than at its end.
     let mut more = false;
+    // One reading for the whole answer, so every path in it selects against
+    // the same instant.
+    let now = node.store().read_instant()?;
     'pages: loop {
         let batch =
             node.unified_listing(space, prefix, start_after.as_deref(), Some(SCAN_BATCH))?;
@@ -938,7 +941,7 @@ fn collapse(
                     // A path the policy refuses is left out rather than shown
                     // with one side's metadata, exactly as `List` does; a
                     // direct stat of it still says what is wrong.
-                    let Ok(row) = node.resolve_set(set, &VersionPolicy::Newest) else {
+                    let Ok(row) = node.resolve_set(set, &VersionPolicy::Newest, now) else {
                         continue;
                     };
                     entries.push(EntryJson {

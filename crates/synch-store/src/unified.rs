@@ -398,12 +398,29 @@ impl Store {
     /// `mtime_ns` orders and is never written down.
     pub fn versions_for(&self, space: &str, path: &str) -> Result<VersionSet> {
         let entries = self.entries_for_path(space, path)?;
-        Ok(VersionSet::from_entries(
-            space,
-            path,
-            entries,
-            synch_core::now_ns(),
-        ))
+        let now = self.read_instant()?;
+        Ok(VersionSet::from_entries(space, path, entries, now))
+    }
+
+    /// The instant a read orders published `mtime_ns` against (§8).
+    ///
+    /// Not the raw clock. The clamp above exists to stop an inflated stamp
+    /// winning forever, but it cuts the other way too: on a reader whose clock
+    /// *lags* the cluster, every honest entry stamped above the reading
+    /// collapses to it, the primary component ties, and selection falls
+    /// through to ordering by content hash. A node restored from a snapshot
+    /// then picks the older edit, and a `newest` mirror on it writes different
+    /// bytes than every other node, unmarked — and flips back when NTP steps
+    /// the clock forward.
+    ///
+    /// The persisted trust floor only ever rises, so lifting the reading to it
+    /// leaves the clamp doing its job against clocks that are ahead while
+    /// keeping a lagging one from reordering honest entries. Taken here rather
+    /// than through `trust_instant`, which returns an untrusted reading
+    /// unchanged so that expiry fails closed — the worst case for selection,
+    /// where a clock reading 1970 ties every path in the cluster at once.
+    pub fn read_instant(&self) -> Result<i64> {
+        Ok(synch_core::now_ns().max(self.trust_floor()?))
     }
 
     /// The unified listing under a prefix: one version set per path, ordered by
@@ -431,7 +448,7 @@ impl Store {
 
         // One clock reading for the whole listing, so every path in it orders
         // its versions against the same instant.
-        let now = synch_core::now_ns();
+        let now = self.read_instant()?;
         let mut out: Vec<VersionSet> = Vec::new();
         let mut current: Vec<EntryRow> = Vec::new();
         for row in rows {
@@ -970,6 +987,61 @@ mod tests {
     /// reader's clock it claims the present instant and no more — the same
     /// claim an honest publish at this instant makes, settled by the rest of
     /// the order rather than by a number nothing can reach.
+    /// A reader whose clock lags the cluster still selects the newer edit.
+    ///
+    /// The clamp bounds an inflated stamp, but read against a raw local clock
+    /// it cuts the other way: every honest entry stamped above the reading
+    /// collapses to it, the primary component ties, and selection falls
+    /// through to ordering by content hash — so a node restored from a
+    /// snapshot picks the *older* edit, and a `newest` mirror on it writes
+    /// different bytes than every other node, unmarked.
+    ///
+    /// Driven through the trust floor, which is the persisted, monotonic
+    /// record of how far the cluster has got: a floor ahead of the local clock
+    /// is exactly the shape of a lagging reader.
+    #[test]
+    fn a_lagging_reader_still_selects_the_newer_edit() {
+        let (_d, store) = store();
+        let now = synch_core::now_ns();
+        // Twelve hours ahead of this machine's clock, and inside the step the
+        // floor will accept.
+        let ahead = now + 12 * 3_600 * 1_000_000_000;
+        store.advance_trust_floor(ahead).unwrap();
+
+        // The older edit gets the greater content hash, so the content-hash
+        // tiebreak the bug falls through to would pick it.
+        let (a, b) = (Hash::new(b"a"), Hash::new(b"b"));
+        let (older, newer) = if a > b { (a, b) } else { (b, a) };
+        store
+            .put_entry(
+                &origin("alpha"),
+                "media",
+                "f",
+                &FileEntry::file(9, ahead - 7_200_000_000_000, older, 1),
+            )
+            .unwrap();
+        store
+            .put_entry(
+                &origin("bravo"),
+                "media",
+                "f",
+                &FileEntry::file(9, ahead - 3_600_000_000_000, newer, 1),
+            )
+            .unwrap();
+
+        let set = store.versions_for("media", "f").unwrap();
+        let selected = set
+            .select(&VersionPolicy::Newest, store.read_instant().unwrap())
+            .entry()
+            .expect("a version is selected")
+            .clone();
+        assert_eq!(
+            selected.origin,
+            origin("bravo"),
+            "the older edit won: honest mtimes tied against a lagging clock"
+        );
+    }
+
     #[test]
     fn a_version_dated_in_the_future_orders_as_of_now() {
         let (_d, store) = store();

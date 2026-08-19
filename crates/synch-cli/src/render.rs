@@ -63,8 +63,11 @@ pub fn entry_line(row: &EntryRow, mark: Option<&str>) -> String {
 /// The line describes the version the reader would get — the `newest` policy's
 /// selection — and the mark says how many others there are. With `all`, every
 /// version follows, indented, with its attestors.
-pub fn unified_line(node: &Node, set: &VersionSet, all: bool) -> Lines {
-    let selected = node.resolve_set(set, &VersionPolicy::Newest)?;
+///
+/// `now` is `Store::read_instant`, taken beside the listing: it touches the
+/// connection, and this renders on a runtime worker (§10).
+pub fn unified_line(node: &Node, set: &VersionSet, all: bool, now: i64) -> Lines {
+    let selected = node.resolve_set(set, &VersionPolicy::Newest, now)?;
     let mark = set
         .is_divergent()
         .then(|| divergence_mark(set.version_count()));

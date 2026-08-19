@@ -458,8 +458,11 @@ fn plan_pass(
     // lexicographically first path wins and the rest are reported.
     let mut claimed: HashMap<String, String> = HashMap::new();
     // One clock reading for the pass, so every path in it selects against the
-    // same instant.
-    let now = synch_core::now_ns();
+    // same instant — and the store's reading rather than the bare clock, or a
+    // node whose clock lags the cluster clamps every honest entry to it, ties,
+    // and mirrors whichever version has the greater content hash
+    // (`Store::read_instant`).
+    let now = node.store().read_instant()?;
     let mut report = MirrorReport::default();
     let mut known: HashSet<String> = HashSet::new();
     let mut wanted: Vec<WantedContent> = Vec::new();

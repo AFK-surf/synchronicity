@@ -43,13 +43,24 @@ impl Node {
     /// a policy means.
     pub fn resolve(&self, space: &str, path: &str, policy: &VersionPolicy) -> Result<EntryRow> {
         let set = self.versions(space, path)?;
-        self.resolve_set(&set, policy)
+        let now = self.store().read_instant()?;
+        self.resolve_set(&set, policy, now)
     }
 
     /// The same selection against a version set already in hand, so a listing
     /// pass does not re-query per path.
-    pub fn resolve_set(&self, set: &VersionSet, policy: &VersionPolicy) -> Result<EntryRow> {
-        match set.select(policy, synch_core::now_ns()) {
+    ///
+    /// `now` comes in rather than being read here: it is `Store::read_instant`,
+    /// which touches the connection, and a listing resolves its rows on a
+    /// runtime worker (§10). Taking it once beside the listing also means every
+    /// path in one page selects against the same instant.
+    pub fn resolve_set(
+        &self,
+        set: &VersionSet,
+        policy: &VersionPolicy,
+        now: i64,
+    ) -> Result<EntryRow> {
+        match set.select(policy, now) {
             Selection::Selected(entry) => Ok(*entry),
             Selection::Absent => Err(EngineError::not_found(reference_of(
                 policy, &set.space, &set.path,

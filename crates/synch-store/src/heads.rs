@@ -403,12 +403,24 @@ impl Store {
     /// `head_history` alone answers it: since v11 the `heads` slots point at a
     /// history row rather than carrying their own signature, so every root
     /// either slot names is here, and so is every root retained for a laggard.
-    pub fn is_head_root(&self, root: &Hash) -> Result<bool> {
-        Ok(self.conn().query_row(
-            "SELECT EXISTS(SELECT 1 FROM head_history WHERE root = ?1)",
-            params![root.as_bytes().to_vec()],
-            |row| row.get::<_, i64>(0),
-        )? == 1)
+    ///
+    /// `except` names origins whose roots do not count — the asking peer's
+    /// own. Signing a head is not the same as being vouched for: a delegate
+    /// publishes its own trie, and this node records that root in
+    /// `head_history` as soon as the signature and the delegated binding
+    /// verify. A root the *asker* authored is exactly "a root of the caller's
+    /// choosing" that the paragraph above rules out — it can place any node
+    /// hash it has heard of at any position it likes, then ask for that
+    /// position and be handed the node. What makes a position real is that
+    /// someone else laid it out.
+    pub fn is_head_root(&self, root: &Hash, except: &[OriginId]) -> Result<bool> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT origin_id FROM head_history WHERE root = ?1")?;
+        let mut rows = stmt.query_map(params![root.as_bytes().to_vec()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let excluded: Vec<String> = except.iter().map(|o| o.canonical()).collect();
+        rows.try_fold(false, |seen, row| Ok(seen || !excluded.contains(&row?)))
     }
 
     /// The retained history for an origin, newest first.
