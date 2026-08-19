@@ -72,7 +72,8 @@ pub fn ls(
   use net <- with_network(ctx, live, slug, network, Member)
   let space = query(req, "space")
   let path = query(req, "path")
-  use session <- serving(browse, net, space)
+  let origin = query(req, "origin")
+  use session <- serving(browse, net, space, origin)
   let question =
     agent.Ls(space, path, query(req, "cursor"), query(req, "all") == "1")
   case agent.ask(session, question) {
@@ -80,6 +81,7 @@ pub fn ls(
       ok_json(
         json.object([
           #("device", json.string(session.label)),
+          #("origin", json.string(session.origin)),
           #("space", json.string(space)),
           #("path", json.string(path)),
           #("entries", json.array(entries, entry_json)),
@@ -104,12 +106,14 @@ pub fn stat(
   use net <- with_network(ctx, live, slug, network, Member)
   let space = query(req, "space")
   let path = query(req, "path")
-  use session <- serving(browse, net, space)
+  let origin = query(req, "origin")
+  use session <- serving(browse, net, space, origin)
   case agent.ask(session, agent.Stat(space, path)) {
     Ok(agent.Versions(versions)) ->
       ok_json(
         json.object([
           #("device", json.string(session.label)),
+          #("origin", json.string(session.origin)),
           #("space", json.string(space)),
           #("path", json.string(path)),
           #("versions", json.array(versions, version_json)),
@@ -267,6 +271,7 @@ fn serving(
   browse: Browse,
   net: Network,
   space: String,
+  origin: String,
   next: fn(Session) -> Response,
 ) -> Response {
   case net.enabled, space {
@@ -278,14 +283,38 @@ fn serving(
       )
     _, "" -> error_json(400, "bad_request", "space= is required")
     True, _ ->
-      case list.filter(attached(browse, net), agent.holds(_, space)) {
-        [session, ..] -> next(session)
-        [] ->
-          error_json(
-            503,
-            "no-device-attached",
-            "no attached daemon holds " <> space,
-          )
+      case pick(space, attached(browse, net), origin) {
+        Ok(session) -> next(session)
+        Error(message) -> error_json(503, "no-device-attached", message)
+      }
+  }
+}
+
+/// The session a request asked for: the one publishing `origin` when the
+/// request names one, any holder of the space when it does not.
+///
+/// The origin, not the label, is the selector — labels are for people and
+/// need not be unique, while an origin names one node for as long as it
+/// exists. A named node that is not attached, and one that is attached but
+/// does not hold the space, are different facts and say so.
+pub fn pick(
+  space: String,
+  attached: List(Session),
+  origin: String,
+) -> Result(Session, String) {
+  let holders = list.filter(attached, agent.holds(_, space))
+  case origin {
+    "" ->
+      list.first(holders)
+      |> result.map_error(fn(_) { "no attached daemon holds " <> space })
+    origin ->
+      case list.find(holders, fn(s) { s.origin == origin }) {
+        Ok(session) -> Ok(session)
+        Error(Nil) ->
+          case list.any(attached, fn(s) { s.origin == origin }) {
+            True -> Error(origin <> " does not hold " <> space)
+            False -> Error(origin <> " is not attached")
+          }
       }
   }
 }

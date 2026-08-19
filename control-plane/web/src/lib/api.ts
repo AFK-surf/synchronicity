@@ -182,6 +182,7 @@ export interface BrowseEntry {
 
 export interface BrowseListing {
   device: string
+  origin: string
   space: string
   path: string
   entries: BrowseEntry[]

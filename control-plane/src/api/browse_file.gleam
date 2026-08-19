@@ -49,7 +49,7 @@ type Download {
   )
 }
 
-/// `GET /api/orgs/:slug/networks/:net/browse/file?space=&path=&from=`
+/// `GET /api/orgs/:slug/networks/:net/browse/file?space=&path=&from=&origin=`
 pub fn handle(
   req: HttpRequest(mist.Connection),
   browse: Browse,
@@ -63,6 +63,7 @@ pub fn handle(
   let space = param(params, "space")
   let path = param(params, "path")
   let from = param(params, "from")
+  let origin = param(params, "origin")
 
   use user_id <- require_user(req, db, secret)
   use #(org_id, network_id, enabled) <- require_network(
@@ -83,19 +84,10 @@ pub fn handle(
   // `browse.download` audit row too, so "who tried to read what" is answerable
   // for the failures as well as the successes.
   let download = Download(db, registry, user_id, org_id, network, space, path)
-  let attached =
-    agent.sessions_for(registry, network_id)
-    |> list.filter(agent.holds(_, space))
-  case attached {
-    [] ->
-      deny(
-        download,
-        "",
-        503,
-        "no-device-attached",
-        "no attached daemon holds " <> space,
-      )
-    [first, ..] ->
+  let sessions = agent.sessions_for(registry, network_id)
+  case browse_api.pick(space, sessions, origin) {
+    Error(message) -> deny(download, "", 503, "no-device-attached", message)
+    Ok(first) ->
       // A read is a same-origin GET with cookies and needs no CSRF token, so a
       // hostile page can start one from an `img` tag. The cap is what stops it
       // starting a hundred.
@@ -127,12 +119,21 @@ pub fn handle(
               )
             }
             Ok(agent.Resolved(_origin, root, size, _seq, holders)) -> {
-              // Holders first, then anyone: a non-holder still answers
-              // correctly, its blob fetcher pulling the missing ranges from
-              // peers bao-verified. One extra internal hop, the same bytes.
-              let session = case agent.route(attached, holders) {
-                Some(session) -> session
-                None -> first
+              // A named node serves the bytes it resolved — its blob fetcher
+              // pulls missing ranges from peers, bao-verified. Unnamed, holders
+              // first and then anyone: one extra internal hop, the same bytes.
+              let session = case origin {
+                "" ->
+                  case
+                    agent.route(
+                      list.filter(sessions, agent.holds(_, space)),
+                      holders,
+                    )
+                  {
+                    Some(session) -> session
+                    None -> first
+                  }
+                _ -> first
               }
               case wanted_range(req, size) {
                 Error(Nil) -> {

@@ -1,4 +1,5 @@
 import api/agent
+import api/browse_api
 import config
 import dns/name
 import dns/wire
@@ -238,6 +239,32 @@ pub fn a_session_holds_only_the_spaces_it_claimed_test() {
   let nas = session("nas", "nas@x.example")
   assert agent.holds(nas, "media")
   assert !agent.holds(nas, "private")
+}
+
+/// A request may name the node that serves it. Unnamed, any holder; named,
+/// that node and no other — and a node that is not attached, and one that is
+/// attached but does not hold the space, are different facts with different
+/// messages.
+pub fn a_request_may_name_its_node_test() {
+  let nas = session("nas", "nas@x.example")
+  let laptop = session("laptop", "laptop@x.example")
+  let vault = agent.Session(..nas, origin: "vault@x.example", spaces: ["secrets"])
+
+  // Unnamed: the first holder answers, as it always has.
+  assert browse_api.pick("media", [nas, laptop], "") == Ok(nas)
+  // Named: the node asked for, not the first in the list.
+  assert browse_api.pick("media", [nas, laptop], "laptop@x.example")
+    == Ok(laptop)
+
+  // Attached, but holding nothing of this space.
+  assert browse_api.pick("media", [nas, vault], "vault@x.example")
+    == Error("vault@x.example does not hold media")
+  // Not attached at all.
+  assert browse_api.pick("media", [nas, laptop], "ghost@x.example")
+    == Error("ghost@x.example is not attached")
+  // And nobody holding the space is nobody to ask, however named.
+  assert browse_api.pick("media", [vault], "")
+    == Error("no attached daemon holds media")
 }
 
 /// Reads are same-origin GETs with cookies and no CSRF token, so a hostile

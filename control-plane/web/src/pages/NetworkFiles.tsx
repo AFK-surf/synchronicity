@@ -10,6 +10,7 @@ import {
   browseQuery,
   get,
   send,
+  type BrowseDevice,
   type BrowseEntry,
   type BrowseListing,
   type BrowseStatus,
@@ -25,6 +26,7 @@ export function NetworkFiles() {
   const [params, setParams] = useSearchParams()
   const space = params.get('space') ?? ''
   const path = params.get('path') ?? ''
+  const origin = params.get('origin') ?? ''
   const { data: me } = useMe()
   const role = me?.orgs.find((o) => o.slug === slug)?.role
   const isAdmin = role === 'owner' || role === 'admin'
@@ -42,6 +44,11 @@ export function NetworkFiles() {
     ...new Set(status.data.devices.flatMap((d) => d.spaces)),
   ].sort()
   const chosen = space === '' ? (spaces[0] ?? '') : space
+  // Which node serves the reading. Unset means automatic — any attached
+  // holder — and a pin that names a node not holding the chosen space (a
+  // stale URL, a node that left) reads as unset rather than as an error.
+  const nodes = status.data.devices.filter((d) => d.spaces.includes(chosen))
+  const pinned = nodes.some((n) => n.origin === origin) ? origin : ''
 
   return (
     <div className="space-y-6">
@@ -52,17 +59,27 @@ export function NetworkFiles() {
         <NoDaemon />
       ) : (
         <>
-          <SpacePicker
-            spaces={spaces}
-            chosen={chosen}
-            onPick={(next) => setParams({ space: next })}
-          />
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+            <SpacePicker
+              spaces={spaces}
+              chosen={chosen}
+              onPick={(next) => setParams({ space: next, origin: pinned })}
+            />
+            <NodePicker
+              nodes={nodes}
+              chosen={pinned}
+              onPick={(next) => setParams({ space: chosen, origin: next })}
+            />
+          </div>
           {chosen !== '' && (
             <Directory
               base={base}
               space={chosen}
               path={path}
-              onNavigate={(next) => setParams({ space: chosen, path: next })}
+              origin={pinned}
+              onNavigate={(next) =>
+                setParams({ space: chosen, origin: pinned, path: next })
+              }
             />
           )}
         </>
@@ -96,8 +113,7 @@ function Header({
       {attached > 0 && (
         <span className="ml-auto inline-flex items-center gap-2 rounded-full border border-teal-900 bg-teal-950/40 px-3 py-1 text-xs font-medium text-teal-300">
           <span className="h-2 w-2 rounded-full bg-teal-400" />
-          via {status.devices[0].device}
-          {attached > 1 && ` · ${attached} attached`}
+          {attached} {attached === 1 ? 'node' : 'nodes'} attached
         </span>
       )}
     </div>
@@ -205,15 +221,71 @@ function SpacePicker({
   )
 }
 
+// Which attached node serves the reading — always visible when one holds the
+// space, so the answer to "which node am I browsing through" is on the page
+// rather than buried in a footer. One holder is named as a chip: a selector
+// between "automatic" and the same node is a choice with one outcome. The
+// origin — not the label, which is for people and may repeat — is what the
+// API selects by.
+function NodePicker({
+  nodes,
+  chosen,
+  onPick,
+}: {
+  nodes: BrowseDevice[]
+  chosen: string
+  onPick: (origin: string) => void
+}) {
+  if (nodes.length === 0) return null
+  if (nodes.length === 1) {
+    return (
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <span className="text-xs text-neutral-500">via</span>
+        <span
+          title={nodes[0].origin}
+          className="rounded-md border border-neutral-800 bg-neutral-900 px-3 py-1 font-mono text-neutral-300"
+        >
+          {nodes[0].device}
+        </span>
+      </div>
+    )
+  }
+  const option = (origin: string, label: string, title: string) => (
+    <button
+      key={origin}
+      title={title}
+      onClick={() => onPick(origin)}
+      className={
+        origin === chosen
+          ? 'rounded-md border border-neutral-600 bg-neutral-800 px-3 py-1 font-mono text-white'
+          : 'rounded-md border border-neutral-800 px-3 py-1 font-mono text-neutral-400 hover:bg-neutral-900'
+      }
+    >
+      {label}
+    </button>
+  )
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-sm">
+      <span className="text-xs text-neutral-500">via</span>
+      {option('', 'automatic', 'any attached node holding this space')}
+      {nodes.map((node) =>
+        option(node.origin, node.device, node.origin),
+      )}
+    </div>
+  )
+}
+
 function Directory({
   base,
   space,
   path,
+  origin,
   onNavigate,
 }: {
   base: string
   space: string
   path: string
+  origin: string
   onNavigate: (path: string) => void
 }) {
   const [open, setOpen] = useState('')
@@ -239,11 +311,17 @@ function Directory({
   // Paginated at the source: a directory of a million paths is a paged read,
   // not one giant frame crossing the tunnel.
   const listing = useInfiniteQuery({
-    queryKey: ['browse-ls', base, space, path],
+    queryKey: ['browse-ls', base, space, path, origin],
     initialPageParam: '',
     queryFn: ({ pageParam }) =>
       get<BrowseListing>(
-        `${base}/ls${browseQuery({ space, path, all: '1', cursor: pageParam })}`,
+        `${base}/ls${browseQuery({
+          space,
+          path,
+          origin,
+          all: '1',
+          cursor: pageParam,
+        })}`,
       ),
     getNextPageParam: (last) => (last.cursor === '' ? undefined : last.cursor),
   })
@@ -292,6 +370,7 @@ function Directory({
                 key={entry.path}
                 base={base}
                 space={space}
+                origin={origin}
                 entry={entry}
                 opened={open === entry.path}
                 onOpen={() => setOpen(open === entry.path ? '' : entry.path)}
@@ -363,6 +442,7 @@ function Breadcrumb({
 function Row({
   base,
   space,
+  origin,
   entry,
   opened,
   onOpen,
@@ -371,6 +451,7 @@ function Row({
 }: {
   base: string
   space: string
+  origin: string
   entry: BrowseEntry
   opened: boolean
   onOpen: () => void
@@ -420,7 +501,11 @@ function Row({
             </button>
           ) : (
             <a
-              href={`${base}/file${browseQuery({ space, path: entry.path })}`}
+              href={`${base}/file${browseQuery({
+                space,
+                path: entry.path,
+                origin,
+              })}`}
               target="synch-dl"
               rel="noopener"
               onClick={onDownload}
@@ -437,6 +522,7 @@ function Row({
             <Drawer
               base={base}
               space={space}
+              origin={origin}
               entry={entry}
               onDownload={onDownload}
             />
@@ -453,11 +539,13 @@ function Row({
 function Drawer({
   base,
   space,
+  origin,
   entry,
   onDownload,
 }: {
   base: string
   space: string
+  origin: string
   entry: BrowseEntry
   onDownload: () => void
 }) {
@@ -476,6 +564,7 @@ function Drawer({
             key={`${version.root}-${version.seq}`}
             base={base}
             space={space}
+            origin={origin}
             path={entry.path}
             version={version}
             newest={index === 0}
@@ -490,6 +579,7 @@ function Drawer({
 function VersionRow({
   base,
   space,
+  origin,
   path,
   version,
   newest,
@@ -497,6 +587,7 @@ function VersionRow({
 }: {
   base: string
   space: string
+  origin: string
   path: string
   version: BrowseVersion
   newest: boolean
@@ -525,7 +616,7 @@ function VersionRow({
         {version.root}
       </code>
       <a
-        href={`${base}/file${browseQuery({ space, path, from })}`}
+        href={`${base}/file${browseQuery({ space, path, origin, from })}`}
         target="synch-dl"
         rel="noopener"
         onClick={onDownload}
