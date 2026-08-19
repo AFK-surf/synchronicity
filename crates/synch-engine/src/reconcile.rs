@@ -75,7 +75,11 @@ pub enum HeadOutcome {
     /// slot flipped immediately.
     Completed,
     /// This node already judged this exact head unpromotable and will not
-    /// spend a promotion diff on it again. See [`Syncer::refuse`].
+    /// spend a promotion diff on it again.
+    ///
+    /// The verdict is remembered in memory for the process's lifetime, keyed by
+    /// `(origin, seq, root)`, so a head the origin publishes past is judged on
+    /// its own merits.
     Refused,
 }
 
@@ -111,7 +115,7 @@ pub struct Syncer {
     /// nothing in this process is going to fetch it until somebody dials.
     on_pending: Option<Arc<tokio::sync::Notify>>,
     /// Heads this node has already judged unpromotable, so it does not judge
-    /// them again on every offer. See [`Syncer::refuse`].
+    /// them again on every offer. See `Syncer::refuse`.
     refused: Arc<Mutex<HashSet<(OriginId, u64, Hash)>>>,
 }
 
