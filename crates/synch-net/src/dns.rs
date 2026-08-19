@@ -588,8 +588,8 @@ impl MemberSet {
 
     /// The origin a device key resolves to, for self-detection.
     ///
-    /// Returns `None` when the key is absent *or* ambiguous: §3.2 requires an
-    /// explicit `--id` rather than a guess.
+    /// Returns `None` when the key is absent *or* ambiguous: §3.1 adopts a
+    /// single unambiguous answer and never guesses at one.
     pub fn self_origin(&self, key: &NodeId) -> Option<OriginId> {
         if self.ambiguous_keys.contains(key) {
             return None;

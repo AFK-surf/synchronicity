@@ -18,9 +18,9 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
     // workers the node uses stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
     let data = tempfile::tempdir().unwrap();
-    Node::init(
+    Node::init_named_by_zone(
         data.path(),
-        Some(OriginId::named("laptop", "cluster.example").unwrap()),
+        OriginId::named("laptop", "cluster.example").unwrap(),
     )
     .unwrap();
     let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
@@ -50,7 +50,7 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
     })
     .unwrap();
 
-    node.add_domain("cluster.example").unwrap();
+    node.set_domain("cluster.example").unwrap();
     let outcomes = node
         .refresh_domains_named(&resolver, Some("cluster.example"))
         .await

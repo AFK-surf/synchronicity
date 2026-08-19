@@ -47,10 +47,7 @@ impl Daemon {
     async fn start(data_dir: &Path) -> Daemon {
         let dir = data_dir.to_path_buf();
         off_runtime(move || {
-            Node::init(
-                &dir,
-                Some(OriginId::named("nas", "cluster.example").unwrap()),
-            )
+            Node::init_named_by_zone(&dir, OriginId::named("nas", "cluster.example").unwrap())
         })
         .await
         .unwrap();
@@ -291,35 +288,26 @@ async fn every_command_variant_round_trips() {
         data_dir,
         Command::TrustAdd(pb::TrustAdd {
             key: peer_key.clone(),
-            name: Some("laptop".into()),
-            domain: Some("cluster.example".into()),
             note: Some("a test peer".into()),
             addr: Some("127.0.0.1:4433".into()),
         }),
     )
     .await;
-    assert!(trusted.contains("laptop@cluster.example"), "{trusted}");
+    // The key is the identity: static trust names nobody (§3.2).
+    assert!(trusted.contains(&peer_key), "{trusted}");
     let trust_ls = lines(data_dir, Command::TrustLs(pb::TrustLs {})).await;
     assert!(trust_ls.contains("a test peer"), "{trust_ls}");
     assert!(lines(data_dir, Command::Peers(pb::Peers {}))
         .await
         .contains(&peer_key));
 
-    let rebound = SecretKey::generate().public().to_z32();
-    assert!(lines(
-        data_dir,
-        Command::TrustRebind(pb::TrustRebind {
-            origin: "laptop@cluster.example".into(),
-            key: rebound.clone(),
-        })
-    )
-    .await
-    .contains(&rebound));
-    // The rotation-window cleanup: one key's binding goes, the other stays.
+    // Dropping one key's binding by name, then the whole origin. A
+    // key-identified origin holds exactly one binding, so the two spellings
+    // are the same removal — and a second attempt at either is a not-found.
     assert!(lines(
         data_dir,
         Command::TrustRm(pb::TrustRm {
-            origin: "laptop@cluster.example".into(),
+            origin: format!("key:{peer_key}"),
             key: Some(peer_key.clone()),
         })
     )
@@ -329,28 +317,39 @@ async fn every_command_variant_round_trips() {
         failure(
             data_dir,
             Command::TrustRm(pb::TrustRm {
-                origin: "laptop@cluster.example".into(),
+                origin: format!("key:{peer_key}"),
                 key: Some(peer_key.clone()),
             })
         )
         .await,
         ErrorCode::NotFound
     );
+
+    let second = SecretKey::generate().public().to_z32();
+    lines(
+        data_dir,
+        Command::TrustAdd(pb::TrustAdd {
+            key: second.clone(),
+            note: None,
+            addr: None,
+        }),
+    )
+    .await;
     assert!(lines(
         data_dir,
         Command::TrustRm(pb::TrustRm {
-            origin: "laptop@cluster.example".into(),
+            origin: format!("key:{second}"),
             key: None,
         })
     )
     .await
     .contains("removed 1 binding(s)"));
 
-    // Domains. `add` attempts a refresh, which has no resolver here and must
-    // still record the domain rather than fail.
+    // The domain. `set` attempts a refresh, which has no resolver here and
+    // must still record the domain rather than fail.
     let _ = frames(
         data_dir,
-        Command::DomainAdd(pb::DomainAdd {
+        Command::DomainSet(pb::DomainSet {
             domain: "cluster.example".into(),
         }),
     )
@@ -358,19 +357,15 @@ async fn every_command_variant_round_trips() {
     assert!(lines(data_dir, Command::DomainLs(pb::DomainLs {}))
         .await
         .contains("cluster.example"));
-    let _ = frames(
-        data_dir,
-        Command::DomainRefresh(pb::DomainRefresh { domain: None }),
-    )
-    .await;
-    assert!(lines(
-        data_dir,
-        Command::DomainRm(pb::DomainRm {
-            domain: "cluster.example".into(),
-        })
-    )
-    .await
-    .contains("removed"));
+    let _ = frames(data_dir, Command::DomainRefresh(pb::DomainRefresh {})).await;
+    assert!(lines(data_dir, Command::DomainClear(pb::DomainClear {}))
+        .await
+        .contains("cleared"));
+    assert_eq!(
+        failure(data_dir, Command::DomainClear(pb::DomainClear {})).await,
+        ErrorCode::NotFound,
+        "there is nothing left to clear"
+    );
 
     // Mirrors.
     let mirror_dir = tempfile::tempdir().unwrap();
@@ -515,8 +510,6 @@ async fn a_sync_that_reaches_nobody_says_so_in_the_exit_code() {
         data_dir,
         Command::TrustAdd(pb::TrustAdd {
             key: SecretKey::generate().public().to_z32(),
-            name: Some("ghost".into()),
-            domain: Some("cluster.example".into()),
             note: None,
             addr: None,
         }),
@@ -644,8 +637,6 @@ async fn errors_cross_the_socket_with_their_code() {
             data_dir,
             Command::TrustAdd(pb::TrustAdd {
                 key: "not-a-key".into(),
-                name: None,
-                domain: None,
                 note: None,
                 addr: None,
             })
@@ -1623,10 +1614,7 @@ async fn a_stale_socket_is_cleared_on_start() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
     off_runtime(move || {
-        Node::init(
-            &path,
-            Some(OriginId::named("nas", "cluster.example").unwrap()),
-        )
+        Node::init_named_by_zone(&path, OriginId::named("nas", "cluster.example").unwrap())
     })
     .await
     .unwrap();
@@ -1978,10 +1966,7 @@ async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
     // addressed, so the initial scan produces a head and pushes it there.
     let path = dir.path().to_path_buf();
     off_runtime(move || {
-        Node::init(
-            &path,
-            Some(OriginId::named("nas", "cluster.example").unwrap()),
-        )
+        Node::init_named_by_zone(&path, OriginId::named("nas", "cluster.example").unwrap())
     })
     .await
     .unwrap();
@@ -2079,15 +2064,11 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
     // refuses when there is none, rather than building a fresh one per request.
     {
         let node = daemon.node.clone();
-        off_runtime(move || node.add_domain("cluster.example"))
+        off_runtime(move || node.set_domain("cluster.example"))
             .await
             .unwrap();
     }
-    let code = failure(
-        data_dir,
-        Command::DomainRefresh(pb::DomainRefresh { domain: None }),
-    )
-    .await;
+    let code = failure(data_dir, Command::DomainRefresh(pb::DomainRefresh {})).await;
     assert_eq!(code, ErrorCode::Unavailable);
 
     // With one installed, the whole effective policy is on the page.

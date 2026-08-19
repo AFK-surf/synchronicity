@@ -23,6 +23,22 @@ use crate::{
     publisher::Publisher,
 };
 
+/// The binding by which a node holds its own name.
+///
+/// Without it a node could not verify its own heads after a restart: every head
+/// check goes through the bindings table (§3.1), including one it signed itself.
+fn self_binding(origin: &OriginId, node_id: NodeId, now: i64) -> Binding {
+    Binding {
+        origin: origin.clone(),
+        node_id,
+        source: BindingSource::Static,
+        domain: None,
+        note: Some("self".into()),
+        added_at: now,
+        expires_at: None,
+    }
+}
+
 /// A staged trie change: a key, and its new value or `None` to remove it.
 pub type StagedChange = (Vec<u8>, Option<Vec<u8>>);
 
@@ -173,135 +189,238 @@ pub(crate) const MAX_PROVIDER_MISSES: usize = 4096;
 /// What `init` created.
 #[derive(Debug, Clone)]
 pub struct InitReport {
-    /// The node's stable identity.
-    pub origin: OriginId,
+    /// The node's identity, when the device key settles it — `None` for a node
+    /// whose zone has yet to name it (§3.1).
+    pub origin: Option<OriginId>,
     /// The generated device key.
     pub node_id: NodeId,
+    /// The membership domain that will name this node, if any.
+    pub domain: Option<String>,
     /// The data directory.
     pub data_dir: PathBuf,
 }
 
-/// What `adopt_named_origin` did.
-#[derive(Debug, Clone)]
-pub struct AdoptOriginReport {
-    /// The origin this node was publishing as.
-    pub previous: OriginId,
-    /// The named origin it will publish as after the next scan.
-    pub origin: OriginId,
-    /// The active device key, unchanged.
-    pub node_id: NodeId,
-}
-
 impl Node {
-    /// Creates an identity and database in `data_dir`.
+    /// Creates a device key and database in `data_dir`.
     ///
-    /// With no `--id`, the device key is the identity (§3.1) — self-certifying
-    /// but not rotatable. With one, the origin is the named form and the key
-    /// can rotate under it.
-    pub fn init(data_dir: impl AsRef<Path>, id: Option<OriginId>) -> Result<InitReport> {
+    /// With no `--domain`, the device key is the identity (§3.1) —
+    /// self-certifying but not rotatable, and settled here. With one, the zone
+    /// names this node: nothing is settled yet, the origin is left unset, and
+    /// the daemon resolves it at startup once a record binds this key.
+    pub fn init(data_dir: impl AsRef<Path>, domain: Option<&str>) -> Result<InitReport> {
         let data_dir = data_dir.as_ref().to_path_buf();
         let store = Store::open(&data_dir)?;
-        if store.self_origin()?.is_some() {
+        if store.self_origin()?.is_some() || store.membership_domain()?.is_some() {
             return Err(EngineError::invalid(format!(
-                "{} already has an identity",
+                "{} is already initialized",
                 data_dir.display()
             )));
         }
+        let domain = domain
+            .map(synch_core::origin::normalize_domain)
+            .transpose()
+            .map_err(|e| EngineError::invalid(e.to_string()))?;
         let secret = SecretKey::generate();
         let node_id = secret.public();
-        let origin = id.unwrap_or(OriginId::Key(node_id));
         store.add_device_key(&secret, KeyState::Active, now_ns())?;
-        store.set_self_origin(&origin)?;
-        // A node always holds its own origin: without this binding it could not
-        // verify its own heads after a restart.
-        store.put_binding(&Binding {
-            origin: origin.clone(),
-            node_id,
-            source: BindingSource::Static,
-            domain: None,
-            note: Some("self".into()),
-            added_at: now_ns(),
-            expires_at: None,
-        })?;
+        let origin = match &domain {
+            Some(domain) => {
+                store.set_membership_domain(Some(domain))?;
+                None
+            }
+            None => {
+                let origin = OriginId::Key(node_id);
+                store.set_self_origin(&origin)?;
+                // A node always holds its own origin: without this binding it
+                // could not verify its own heads after a restart. A node whose
+                // name is still to come gets this when it adopts one.
+                store.put_binding(&self_binding(&origin, node_id, now_ns()))?;
+                Some(origin)
+            }
+        };
         Ok(InitReport {
             origin,
             node_id,
+            domain,
             data_dir,
         })
     }
 
-    /// Names a key-identified node without generating a new device key.
+    /// Test support: initializes a node already named by its zone.
     ///
-    /// OriginId is otherwise permanent (§3.1). This is the missing half of
-    /// §3.2 auto-detection: a node that came up as `key:<nk>` can take the
-    /// `<id>@<domain>` that key is already published under. The next
-    /// `synch scan` publishes a head under the new name; the daemon must be
-    /// restarted first so it signs as that name.
-    pub fn adopt_named_origin(
-        data_dir: impl AsRef<Path>,
-        origin: OriginId,
-    ) -> Result<AdoptOriginReport> {
-        if origin.as_key().is_some() {
-            return Err(EngineError::invalid(
-                "id set wants <name>@<domain>, not a key identity",
-            ));
-        }
-        let data_dir = data_dir.as_ref().to_path_buf();
-        let store = Store::open(&data_dir)?;
-        let previous = store.self_origin()?.ok_or(EngineError::NotInitialized)?;
-        let node_id = store
-            .active_device_key()?
-            .ok_or(EngineError::NoActiveKey)?
-            .node_id;
-        match &previous {
-            OriginId::Named { .. } => {
-                return Err(EngineError::invalid(format!(
-                    "origin is already {previous}; a named identity cannot be renamed"
-                )));
-            }
-            OriginId::Key(key) if key != &node_id => {
-                return Err(EngineError::invalid(
-                    "this node's key identity is not its active device key",
-                ));
-            }
-            OriginId::Key(_) => {}
-        }
-        // One transaction, as §10 requires of every multi-step state change.
-        // As seven autocommit writes, a crash after the head slots are cleared
-        // but before the views are would leave `entries` rows for an origin
-        // with no head in either slot — and nothing removes those:
-        // `rebuild_views` iterates the complete slots, so an origin with
-        // neither is never visited, and the command refuses to run twice. The
-        // unified tree reads `entries` regardless of heads, so every path would
-        // stay duplicated under both identities, in every mirror, permanently.
-        let adopted = origin.clone();
+    /// Production has one path to a name — the zone answers, and
+    /// [`settle_identity`](Self::settle_identity) adopts what it says (§3.1).
+    /// A test that needs a named node without standing up a signed zone gets
+    /// the same end state through the same migration, as though that answer had
+    /// arrived. There is deliberately no non-test way to name a node by hand.
+    #[doc(hidden)]
+    pub fn init_named_by_zone(data_dir: impl AsRef<Path>, origin: OriginId) -> Result<InitReport> {
+        let domain = origin
+            .domain()
+            .ok_or_else(|| EngineError::invalid("a zone names a Named origin"))?
+            .to_string();
+        let report = Self::init(&data_dir, Some(&domain))?;
+        let store = Store::open(data_dir.as_ref())?;
+        Self::migrate_identity(&store, None, &origin, report.node_id, &domain)?;
+        Ok(InitReport {
+            origin: Some(origin),
+            ..report
+        })
+    }
+
+    /// Adopts `origin` as this node's name, migrating everything keyed by the
+    /// old one (§3.1).
+    ///
+    /// One transaction, as §10 requires of every multi-step state change. As
+    /// separate autocommit writes, a crash after the head slots are cleared but
+    /// before the views are would leave `entries` rows for an origin with no
+    /// head in either slot — and nothing removes those: `rebuild_views`
+    /// iterates the complete slots, so an origin with neither is never visited.
+    /// The unified tree reads `entries` regardless of heads, so every path
+    /// would stay duplicated under both names, in every mirror, permanently.
+    ///
+    /// Blobs stay: they are content-addressed, and the next scan republishes
+    /// them under the new name. `head_history` stays too, so heads signed under
+    /// the old name survive as the fork evidence §4.4 makes of them.
+    fn migrate_identity(
+        store: &Store,
+        previous: Option<&OriginId>,
+        adopted: &OriginId,
+        node_id: NodeId,
+        domain: &str,
+    ) -> Result<()> {
+        let previous = previous.cloned();
+        let adopted = adopted.clone();
+        let domain = domain.to_string();
         let now = now_ns();
         store.transaction(|txn| -> Result<()> {
             txn.set_self_origin(&adopted)?;
-            txn.remove_binding(&previous, &node_id, BindingSource::Static)?;
-            txn.put_binding(&Binding {
-                origin: adopted.clone(),
-                node_id,
-                source: BindingSource::Static,
-                domain: None,
-                note: Some("self".into()),
-                added_at: now,
-                expires_at: None,
-            })?;
-            // Drop the key-origin view so the unified tree does not keep a
-            // second copy of every path under the old name. Blobs stay; the
-            // next scan republishes them under the new origin.
-            txn.clear_head(&previous, Slot::Complete)?;
-            txn.clear_head(&previous, Slot::Pending)?;
-            txn.delete_origin_entries(&previous)?;
-            txn.delete_origin_providers(&previous)?;
+            txn.put_binding(&self_binding(&adopted, node_id, now))?;
+            // A first name is an adoption too, and the one an operator most
+            // often wants to see dated.
+            txn.record_identity_adoption(previous.as_ref(), &adopted, &node_id, &domain, now)?;
+            // The zone being left has no authority behind its bindings any
+            // more; nothing else would drop them before their own expiry.
+            txn.delete_dns_bindings_other_than(&domain)?;
+            if let Some(previous) = &previous {
+                txn.remove_binding(previous, &node_id, BindingSource::Static)?;
+                // Drop the old name's view so the unified tree does not keep a
+                // second copy of every path under it.
+                txn.clear_head(previous, Slot::Complete)?;
+                txn.clear_head(previous, Slot::Pending)?;
+                txn.delete_origin_entries(previous)?;
+                txn.delete_origin_providers(previous)?;
+                txn.clear_observed_head(previous)?;
+                txn.rewrite_mirror_policies(previous, &adopted)?;
+                // The floor was a promise about seqs under the old name; the
+                // new one has no history for it to bound (§3.4).
+                txn.clear_publish_floor()?;
+            }
             Ok(())
         })?;
-        Ok(AdoptOriginReport {
-            previous,
-            origin,
-            node_id,
-        })
+        Ok(())
+    }
+
+    /// Settles what this node is called, before anything is bound (§3.1).
+    ///
+    /// With no membership domain the device key is the identity and there is
+    /// nothing to ask. With one, the zone is asked exactly once and the answer
+    /// is frozen for the lifetime of the process — which is what lets a changed
+    /// name be adopted here, with no daemon to stop.
+    ///
+    /// The two ways to get no name apart are the whole point of the shape:
+    /// a validated answer that does not name this key is a *withdrawal* and
+    /// leaves an already-named node alone, while no validated answer at all
+    /// says nothing about anything and must not cost a node its name either.
+    /// Only a node with no usable name is left [`Unidentified`], and a name
+    /// issued by a zone this node no longer resolves is not a usable one.
+    ///
+    /// [`Unidentified`]: EngineError::Unidentified
+    async fn settle_identity(
+        store: &Arc<Store>,
+        node_id: NodeId,
+        resolver: Option<&dyn synch_net::MemberResolver>,
+    ) -> Result<OriginId> {
+        // Store reads go to the blocking pool, and the resolution between them
+        // does not (§10) — so the two are separate offloads with the await in
+        // the middle rather than one closure holding a connection across it.
+        let read = {
+            let store = store.clone();
+            crate::blocking::offload(move || Ok((store.membership_domain()?, store.self_origin()?)))
+                .await?
+        };
+        let (domain, stored) = read;
+
+        let Some(domain) = domain else {
+            // No zone: the key is the name, and adopting it is a migration
+            // like any other when the node was called something else.
+            let adopted = OriginId::Key(node_id);
+            if stored.as_ref() != Some(&adopted) {
+                let store = store.clone();
+                let adopted = adopted.clone();
+                crate::blocking::offload(move || {
+                    Self::migrate_identity(&store, stored.as_ref(), &adopted, node_id, "")
+                })
+                .await?;
+            }
+            return Ok(adopted);
+        };
+
+        // A name from a zone that is no longer this node's is not a fallback:
+        // nothing currently names it. `stored` is kept alongside, because what
+        // this node holds is what a migration has to clean up.
+        let usable = stored
+            .clone()
+            .filter(|p| p.domain() == Some(domain.as_str()));
+
+        let resolved = match resolver {
+            Some(resolver) => match resolver.resolve_members(&domain).await {
+                Ok((set, _ttl)) => set.self_origin(&node_id).filter(|found| {
+                    // A record with no `id=` binds `Key(nk)`. Taking that would
+                    // trade a rotatable identity for a fixed one on the
+                    // strength of a missing field (§3.1).
+                    let named = found.domain().is_some();
+                    if !named {
+                        tracing::warn!(
+                            domain,
+                            key = %node_id.to_z32(),
+                            "this node's key is published without an id=; not adopting it"
+                        );
+                    }
+                    named
+                }),
+                Err(e) => {
+                    tracing::warn!(domain, error = %e, "could not resolve the membership domain");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        match resolved {
+            Some(adopted) => {
+                // `usable` decides whether an old name may be *kept*; what is
+                // migrated away from is whatever this node actually holds. A
+                // name from a replaced zone — and a key identity, which names
+                // no domain at all — is exactly the state that has to be
+                // cleaned up, so filtering here would skip the migration in
+                // the two cases that need it most.
+                if stored.as_ref() != Some(&adopted) {
+                    let store = store.clone();
+                    let adopted = adopted.clone();
+                    let domain = domain.clone();
+                    crate::blocking::offload(move || {
+                        Self::migrate_identity(&store, stored.as_ref(), &adopted, node_id, &domain)
+                    })
+                    .await?;
+                }
+                Ok(adopted)
+            }
+            None => usable.ok_or(EngineError::Unidentified {
+                domain,
+                node_id: Box::new(node_id),
+            }),
+        }
     }
 
     /// Opens an initialized data directory and binds the endpoint.
@@ -312,18 +431,46 @@ impl Node {
         let data_dir = config.data_dir.clone();
         let opened = crate::blocking::offload(move || {
             let store = Store::open(&data_dir)?;
-            // The identity reads come over with it rather than following on the
-            // runtime: they are two more queries on the connection the open just
-            // took, and nothing between them needs to await.
-            let origin = store.self_origin()?.ok_or(EngineError::NotInitialized)?;
-            let secret = store
-                .active_device_key()?
-                .ok_or(EngineError::NoActiveKey)?
-                .secret;
-            Ok((Arc::new(store), origin, secret))
+            // No device key at all is an uninitialized directory; keys but
+            // none active is a rotation that got halfway (§3.4), and the two
+            // want different words.
+            let secret = match store.active_device_key()? {
+                Some(key) => key.secret,
+                None if store.device_keys()?.is_empty() => return Err(EngineError::NotInitialized),
+                None => return Err(EngineError::NoActiveKey),
+            };
+            Ok((Arc::new(store), secret))
         })
         .await?;
-        let (store, origin, secret) = opened;
+        let (store, secret) = opened;
+        // Before the endpoint, before any loop: what this node is called, and
+        // the migration if the zone has changed its mind (§3.1).
+        //
+        // The resolver is built only for a node that has a zone to ask, and a
+        // failure to build one is raised rather than swallowed. Swallowing it
+        // makes a mistyped `--dnssec-anchor` indistinguishable from a zone
+        // that has not published a record yet, and the daemon then waits
+        // forever telling the operator to publish a record they already
+        // published. It is also the same stance the standing refresh takes
+        // (`build_resolver`): options that yield no resolver are a refusal to
+        // start, not a degraded mode.
+        let resolver = {
+            let dns = config.dns.clone();
+            let store = store.clone();
+            crate::blocking::offload(move || match store.membership_domain()? {
+                None => Ok(None),
+                Some(_) => Ok(Some(synch_net::DnssecResolver::with_options(&dns)?)),
+            })
+            .await?
+        };
+        let origin = Self::settle_identity(
+            &store,
+            secret.public(),
+            resolver
+                .as_ref()
+                .map(|r| r as &dyn synch_net::MemberResolver),
+        )
+        .await?;
         // Every endpoint this node ever binds — this one, and the second one a
         // key activation brings up — rings the same bell, because the refusal
         // that matters can arrive at either (§3.4).
@@ -498,54 +645,24 @@ impl Node {
 
     // ---- membership -------------------------------------------------------
 
-    /// Statically trusts a device key, optionally under a name (§3.2).
+    /// Trusts a device key (§3.2).
     ///
-    /// Trust is unilateral: for two nodes to sync, each must trust the other.
-    pub fn trust_add(
-        &self,
-        node_id: NodeId,
-        name: Option<&str>,
-        domain: Option<&str>,
-        note: Option<&str>,
-    ) -> Result<OriginId> {
-        let origin =
-            match (name, domain) {
-                (Some(name), Some(domain)) => OriginId::named(name, domain)
-                    .map_err(|e| EngineError::invalid(e.to_string()))?,
-                (Some(name), None) => OriginId::named(name, "local")
-                    .map_err(|e| EngineError::invalid(e.to_string()))?,
-                (None, _) => OriginId::Key(node_id),
-            };
+    /// The key is the identity. A name belongs to the zone that issues it, so
+    /// there is no way to attach one here: a hand-made binding never expires,
+    /// and one carrying a name would outlive the record it shadowed — dropping
+    /// a member from the zone would stop being how a member is dropped.
+    pub fn trust_add(&self, node_id: NodeId, note: Option<&str>) -> Result<OriginId> {
+        let origin = OriginId::Key(node_id);
         self.store().put_binding(&Binding {
             origin: origin.clone(),
             node_id,
             source: BindingSource::Static,
-            domain: domain.map(str::to_string),
+            domain: None,
             note: note.map(str::to_string),
             added_at: now_ns(),
             expires_at: None,
         })?;
         Ok(origin)
-    }
-
-    /// Rebinds a named origin to a new device key, the static-trust equivalent
-    /// of a DNS rotation (§3.4).
-    pub fn trust_rebind(&self, origin: &OriginId, node_id: NodeId) -> Result<()> {
-        if origin.as_key().is_some() {
-            return Err(EngineError::invalid(
-                "key-identified origins cannot rotate; re-add under a name instead",
-            ));
-        }
-        self.store().put_binding(&Binding {
-            origin: origin.clone(),
-            node_id,
-            source: BindingSource::Static,
-            domain: origin.domain().map(str::to_string),
-            note: None,
-            added_at: now_ns(),
-            expires_at: None,
-        })?;
-        Ok(())
     }
 
     /// Records a peer's address so it can be dialed later.
@@ -1065,18 +1182,23 @@ mod tests {
     }
 
     async fn spawn(dir: &Path, id: Option<OriginId>) -> Node {
-        Node::init(dir, id).unwrap();
+        match id {
+            Some(origin) => Node::init_named_by_zone(dir, origin),
+            None => Node::init(dir, None),
+        }
+        .unwrap();
         Node::open(NodeConfig::loopback(dir)).await.unwrap()
     }
 
     #[tokio::test]
-    async fn init_creates_an_identity_and_binds_it() {
+    async fn init_without_a_domain_makes_the_key_the_identity() {
         let dir = node_dir();
         let report = Node::init(dir.path(), None).unwrap();
-        assert_eq!(report.origin, OriginId::Key(report.node_id));
+        assert_eq!(report.origin, Some(OriginId::Key(report.node_id)));
+        assert_eq!(report.domain, None);
 
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        assert_eq!(node.origin(), &report.origin);
+        assert_eq!(node.origin(), &OriginId::Key(report.node_id));
         assert_eq!(node.node_id(), report.node_id);
         // The node can verify its own heads, which requires a live self binding.
         assert!(node
@@ -1086,41 +1208,133 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// A node whose zone has yet to name it holds no identity at all — and
+    /// says which record would settle it rather than failing opaquely (§3.1).
+    #[tokio::test]
+    async fn init_with_a_domain_settles_nothing_yet() {
+        let dir = node_dir();
+        let report = Node::init(dir.path(), Some("Cluster.Example.")).unwrap();
+        assert_eq!(report.origin, None);
+        assert_eq!(report.domain.as_deref(), Some("cluster.example"));
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        assert_eq!(store.self_origin().unwrap(), None);
+
+        // No resolver, so nothing can name it: the unidentified state, naming
+        // the key an operator has to publish.
+        let err = Node::settle_identity(&store, report.node_id, None)
+            .await
+            .unwrap_err();
+        let EngineError::Unidentified { domain, node_id } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(domain, "cluster.example");
+        assert_eq!(**node_id, report.node_id);
+        assert!(err.to_string().contains(&report.node_id.to_z32()));
+    }
+
+    /// The migration a zone's answer drives: everything keyed by the old name
+    /// goes, including the mirror pins and the floor, and the adoption is on
+    /// the record (§3.1).
     #[test]
-    fn a_key_identity_can_adopt_a_name() {
+    fn adopting_a_name_migrates_everything_keyed_by_the_old_one() {
         let dir = node_dir();
         let report = Node::init(dir.path(), None).unwrap();
-        let named = OriginId::named("orb", "cluster.example").unwrap();
-        let adopted = Node::adopt_named_origin(dir.path(), named.clone()).unwrap();
-        assert_eq!(adopted.previous, OriginId::Key(report.node_id));
-        assert_eq!(adopted.origin, named);
-        assert_eq!(adopted.node_id, report.node_id);
-
+        let previous = OriginId::Key(report.node_id);
         let store = Store::open(dir.path()).unwrap();
+        store
+            .put_mirror(
+                "/srv/mirror",
+                "media",
+                &synch_store::VersionPolicy::Origin(previous.clone()),
+            )
+            .unwrap();
+        store.raise_publish_floor(500).unwrap();
+
+        let named = OriginId::named("orb", "cluster.example").unwrap();
+        Node::migrate_identity(
+            &store,
+            Some(&previous),
+            &named,
+            report.node_id,
+            "cluster.example",
+        )
+        .unwrap();
+
         assert_eq!(store.self_origin().unwrap(), Some(named.clone()));
         assert!(store.is_bound(&named, &report.node_id, now_ns()).unwrap());
         assert!(!store
-            .is_bound(&adopted.previous, &report.node_id, now_ns())
+            .is_bound(&previous, &report.node_id, now_ns())
             .unwrap());
-        assert!(store.complete_head(&adopted.previous).unwrap().is_none());
+        assert!(store.complete_head(&previous).unwrap().is_none());
+        // The pin follows the name; left behind it would select nothing, which
+        // in a mirror is indistinguishable from an origin that published none.
+        assert_eq!(
+            store.mirrors().unwrap()[0].policy.render(),
+            format!("origin={}", named.canonical())
+        );
+        // The floor bounded seqs under a name nobody holds any more.
+        assert_eq!(store.publish_floor().unwrap(), None);
+
+        let history = store.identity_history().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].previous, Some(previous));
+        assert_eq!(history[0].adopted, named);
+        assert_eq!(history[0].domain, "cluster.example");
     }
 
-    #[test]
-    fn a_named_identity_cannot_be_renamed() {
+    /// Clearing the domain is a re-identification like any other: the device
+    /// key names the node again, through the same migration (§3.1).
+    #[tokio::test]
+    async fn dropping_the_domain_returns_the_node_to_its_key() {
         let dir = node_dir();
-        let origin = OriginId::named("nas", "cluster.example").unwrap();
-        Node::init(dir.path(), Some(origin)).unwrap();
-        let other = OriginId::named("orb", "cluster.example").unwrap();
-        let err = Node::adopt_named_origin(dir.path(), other).unwrap_err();
-        assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+        let named = OriginId::named("nas", "cluster.example").unwrap();
+        let report = Node::init_named_by_zone(dir.path(), named.clone()).unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.set_membership_domain(None).unwrap();
+
+        let settled = Node::settle_identity(&store, report.node_id, None)
+            .await
+            .unwrap();
+        assert_eq!(settled, OriginId::Key(report.node_id));
+        assert!(store.complete_head(&named).unwrap().is_none());
+        assert_eq!(
+            store.identity_history().unwrap().last().unwrap().adopted,
+            settled
+        );
     }
 
-    #[test]
-    fn adopt_named_origin_refuses_a_key_identity() {
+    /// A name issued by a zone this node no longer resolves is not a fallback:
+    /// nothing currently names it, so it waits rather than signing under it.
+    #[tokio::test]
+    async fn a_name_from_a_replaced_zone_is_not_kept() {
         let dir = node_dir();
-        let report = Node::init(dir.path(), None).unwrap();
-        let err = Node::adopt_named_origin(dir.path(), OriginId::Key(report.node_id)).unwrap_err();
-        assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+        let named = OriginId::named("nas", "cluster.example").unwrap();
+        let report = Node::init_named_by_zone(dir.path(), named).unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.set_membership_domain(Some("other.example")).unwrap();
+
+        let err = Node::settle_identity(&store, report.node_id, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unidentified { .. }), "{err:?}");
+    }
+
+    /// A withdrawal is not a resolution failure: a node named by the zone it
+    /// still resolves keeps that name when the answer stops mentioning it.
+    #[tokio::test]
+    async fn a_node_keeps_the_name_its_own_zone_stops_publishing() {
+        let dir = node_dir();
+        let named = OriginId::named("nas", "cluster.example").unwrap();
+        let report = Node::init_named_by_zone(dir.path(), named.clone()).unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+
+        let adoptions = store.identity_history().unwrap().len();
+        let settled = Node::settle_identity(&store, report.node_id, None)
+            .await
+            .unwrap();
+        assert_eq!(settled, named);
+        // Nothing was adopted, so nothing was destroyed.
+        assert_eq!(store.identity_history().unwrap().len(), adoptions);
     }
 
     #[tokio::test]
@@ -1128,6 +1342,10 @@ mod tests {
         let dir = node_dir();
         Node::init(dir.path(), None).unwrap();
         assert!(Node::init(dir.path(), None).is_err());
+        // A node waiting on a name is initialized too, even with no origin yet.
+        let pending = node_dir();
+        Node::init(pending.path(), Some("cluster.example")).unwrap();
+        assert!(Node::init(pending.path(), Some("cluster.example")).is_err());
     }
 
     #[tokio::test]
@@ -1279,27 +1497,25 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// Static trust binds the key and only the key: names are the zone's to
+    /// issue, so there is no way to attach one here (§3.2).
     #[tokio::test]
-    async fn trust_add_and_rebind() {
+    async fn trust_add_binds_the_key_as_the_identity() {
         let dir = node_dir();
         let node = spawn(dir.path(), None).await;
         let peer = SecretKey::generate().public();
 
-        let origin = node.trust_add(peer, None, None, Some("laptop")).unwrap();
+        let origin = node.trust_add(peer, Some("laptop")).unwrap();
         assert_eq!(origin, OriginId::Key(peer));
         assert!(node.store().is_trusted_key(&peer, now_ns()).unwrap());
-        // A key-identified origin cannot rotate.
-        assert!(node
-            .trust_rebind(&origin, SecretKey::generate().public())
-            .is_err());
-
-        let named = node
-            .trust_add(peer, Some("nas"), Some("cluster.example"), None)
-            .unwrap();
-        let rotated = SecretKey::generate().public();
-        node.trust_rebind(&named, rotated).unwrap();
-        let keys = node.store().keys_for_origin(&named, now_ns()).unwrap();
-        assert_eq!(keys.len(), 2, "the rotation window binds both keys");
+        // One key, one origin: a second key is a second origin, never a
+        // rotation of this one.
+        let other = SecretKey::generate().public();
+        assert_eq!(
+            node.trust_add(other, None).unwrap(),
+            OriginId::Key(other),
+            "a key-identified origin cannot rotate"
+        );
         node.shutdown().await.unwrap();
     }
 

@@ -1,5 +1,7 @@
 //! Errors produced by the engine.
 
+use synch_core::NodeId;
+
 /// The engine result alias.
 pub type Result<T> = std::result::Result<T, EngineError>;
 
@@ -40,6 +42,22 @@ pub enum EngineError {
     /// The node has no active device key.
     #[error("no active device key")]
     NoActiveKey,
+    /// The membership zone has not named this node yet (§3.1).
+    ///
+    /// Not a failure to start so much as a state to wait in: the daemon polls
+    /// until a record binds this key, and everything that would publish is
+    /// refused until it does.
+    #[error(
+        "{domain} does not name this node yet — publish a record for it:\n  \
+         _synchronicity.{domain}. IN TXT \"v=sync1 id=<name> nk={} apex=<apex>\"",
+        node_id.to_z32()
+    )]
+    Unidentified {
+        /// The zone that was asked.
+        domain: String,
+        /// The device key it did not name. Boxed to keep the enum small.
+        node_id: Box<NodeId>,
+    },
     /// A space, origin, or entry was not found.
     #[error("not found: {0}")]
     NotFound(String),

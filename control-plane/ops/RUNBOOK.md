@@ -190,7 +190,7 @@ need nothing special here — there is nothing to fetch.
    delv _synchronicity.<net>.<org>.<base> TXT +rtrace
    ```
 
-   Then on a device: `synch domain add <net>.<org>.<base>`.
+   Then on a device: `synch domain set <net>.<org>.<base>`.
 
 Air-gapped / direct mode needs no delegation: point the client at the
 control plane itself with

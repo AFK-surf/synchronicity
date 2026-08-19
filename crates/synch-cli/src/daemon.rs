@@ -20,7 +20,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // No "(run `synch init` first?)" stapled onto every failure: the
     // uninitialized case already says exactly that itself, and the hint sent
     // an operator with a taken port off to re-init a healthy node.
-    let node = Node::open(config)
+    let (stop_tx, _) = broadcast::channel::<()>(1);
+    let node = open_once_named(config, &stop_tx)
         .await
         .context("could not open the node")?;
     // Before anything is announced: a daemon that cannot resolve the membership
@@ -34,7 +35,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
             return Err(e);
         }
     };
-    let (stop_tx, _) = broadcast::channel::<()>(1);
     // Subscribed before anything can ask us to stop, so a `daemon stop` that
     // arrives during the initial scan is not sent to nobody.
     let mut stopped = stop_tx.subscribe();
@@ -182,6 +182,144 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     Ok(())
 }
 
+/// Opens the node, serving the reduced control service until the membership
+/// zone names it (§3.1).
+///
+/// A node with no name cannot sign, publish or scan, and no peer would accept
+/// its connections either — the same absent record leaves them without a
+/// binding for its key. But it must still answer the control socket, because
+/// the command that lifts the state is `synch domain set`: without a socket a
+/// data directory pointed at the wrong zone could never be corrected, and its
+/// key, its published history and its content would be unreachable.
+///
+/// So the wait is served, not slept through. The pending server is torn down
+/// before the real one binds, because they want the same socket.
+async fn open_once_named(config: NodeConfig, stop: &broadcast::Sender<()>) -> Result<Node> {
+    let mut serving: Option<(
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        broadcast::Sender<()>,
+    )> = None;
+    let recheck = std::sync::Arc::new(tokio::sync::Notify::new());
+    loop {
+        match Node::open(config.clone()).await {
+            Err(synch_engine::EngineError::Unidentified { domain, node_id }) => {
+                if serving.is_none() {
+                    println!("waiting for {domain} to name this node");
+                    println!(
+                        "  _synchronicity.{domain}. IN TXT \"v=sync1 id=<name> nk={} apex=<apex>\"",
+                        node_id.to_z32()
+                    );
+                    let pending =
+                        pending_state(&config, &domain, *node_id, recheck.clone()).await?;
+                    // Its own stop channel: this server is torn down when the
+                    // zone answers, which is not the daemon shutting down.
+                    let (pending_stop, _) = broadcast::channel::<()>(1);
+                    let server = Server::bind_pending(pending, pending_stop.clone())
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "could not bind the control socket for {}",
+                                config.data_dir.display()
+                            )
+                        })?;
+                    println!("control socket: {}", server.endpoint_name());
+                    serving = Some((tokio::spawn(server.run()), pending_stop));
+                }
+                tokio::select! {
+                    signal = tokio::signal::ctrl_c() => {
+                        signal?;
+                        stop_pending(serving.take()).await;
+                        anyhow::bail!("stopped while waiting for {domain} to name this node");
+                    }
+                    // `synch daemon stop` reaches the pending server, which
+                    // fires its own channel; leaving is the same as Ctrl-C.
+                    stopped = wait_for_pending_stop(&serving) => {
+                        stopped?;
+                        stop_pending(serving.take()).await;
+                        anyhow::bail!("stopped while waiting for {domain} to name this node");
+                    }
+                    // `synch domain refresh` rings this, so an operator who
+                    // has just published the record — or pointed the node at
+                    // another zone — does not wait out the tick.
+                    _ = recheck.notified() => {}
+                    _ = tokio::time::sleep(IDENTITY_POLL) => {}
+                }
+            }
+            other => {
+                // The socket is wanted by the real server next, so this one
+                // has to be all the way down before returning.
+                stop_pending(serving.take()).await;
+                let _ = stop;
+                return Ok(other?);
+            }
+        }
+    }
+}
+
+/// Reads what the reduced service needs to know about a node with no name.
+///
+/// Opening the store is filesystem work, so it goes to the blocking pool like
+/// every other store acquisition (§10).
+async fn pending_state(
+    config: &NodeConfig,
+    domain: &str,
+    node_id: synch_core::NodeId,
+    recheck: std::sync::Arc<tokio::sync::Notify>,
+) -> Result<crate::control::Pending> {
+    let data_dir = config.data_dir.clone();
+    let opened = data_dir.clone();
+    let store = tokio::task::spawn_blocking(move || {
+        let _scope = synch_core::BlockingScope::enter();
+        synch_store::Store::open(&opened)
+    })
+    .await
+    .context("the store-opening task did not complete")?
+    .with_context(|| format!("could not open {}", data_dir.display()))?;
+    Ok(crate::control::Pending {
+        data_dir,
+        store: std::sync::Arc::new(store),
+        node_id,
+        domain: domain.to_string(),
+        recheck,
+    })
+}
+
+/// Waits for a `synch daemon stop` that reached the pending server.
+async fn wait_for_pending_stop(
+    serving: &Option<(
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        broadcast::Sender<()>,
+    )>,
+) -> Result<()> {
+    match serving {
+        Some((_, stop)) => {
+            let mut rx = stop.subscribe();
+            let _ = rx.recv().await;
+            Ok(())
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Brings the pending server down and waits for the socket to go with it.
+async fn stop_pending(
+    serving: Option<(
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        broadcast::Sender<()>,
+    )>,
+) {
+    if let Some((task, stop)) = serving {
+        let _ = stop.send(());
+        let _ = task.await;
+    }
+}
+
+/// How often a node with no name yet re-asks its zone (§3.1).
+///
+/// Tight enough that publishing the record and watching the node come up feels
+/// immediate, loose enough not to flood a name that does not exist yet.
+const IDENTITY_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Waits for the daemon to be told to stop: `Ctrl-C`, or a `synch daemon stop`
 /// request landing on the control socket.
 ///
@@ -219,7 +357,7 @@ async fn wait_for_stop(
 /// an operator would run afterwards would otherwise report a healthy node. With
 /// none configured there is nothing to refresh, so the daemon runs on static
 /// trust and the reason is recorded where `doctor`, `daemon status` and the next
-/// `domain add` will say it.
+/// `domain set` will say it.
 fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::DnssecResolver>>> {
     match synch_net::DnssecResolver::with_options(&node.config().dns) {
         Ok(resolver) => {
@@ -229,15 +367,12 @@ fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::Dnssec
         }
         Err(e) => {
             node.set_dns_resolver(Err(e.to_string()));
-            let domains = node.domains()?;
-            if !domains.is_empty() {
+            if let Some(domain) = node.domain()? {
                 return Err(anyhow::Error::new(e).context(format!(
-                    "no DNSSEC resolver could be built, so the {} configured membership \
-                     domain(s) ({}) would never refresh and their bindings would lapse a \
-                     grace window from now. Fix the resolver options, or \
-                     `synch domain rm` them to run on static trust",
-                    domains.len(),
-                    domains.join(", ")
+                    "no DNSSEC resolver could be built, so {domain} would never refresh: \
+                     its bindings would lapse a grace window from now, and this node's own \
+                     name comes out of it. Fix the resolver options, or `synch domain clear` \
+                     to run key-identified on static trust"
                 )));
             }
             tracing::warn!(

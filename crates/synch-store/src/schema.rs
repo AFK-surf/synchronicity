@@ -19,7 +19,7 @@
 //! - Anything SQL cannot express is a [`Migration::Rust`] step in the same
 //!   numbered chain, under the same transaction rule.
 
-use rusqlite::Transaction;
+use rusqlite::{OptionalExtension, Transaction};
 
 use crate::error::Result;
 
@@ -75,6 +75,11 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration::Sql(V13_PROVIDERS_BY_ORIGIN),
     Migration::Sql(V14_DNS_BINDINGS_ARE_PER_DOMAIN),
+    Migration::Sql(V15_IDENTITY_HISTORY),
+    Migration::Rust {
+        name: "the membership domain is the one that names this node",
+        run: v16_one_membership_domain,
+    },
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -517,6 +522,13 @@ CREATE TABLE device_keys (
   state       TEXT NOT NULL,
   created_at  INTEGER NOT NULL
 );
+CREATE TABLE identity_history (
+  at          INTEGER NOT NULL,
+  previous    TEXT,
+  adopted     TEXT NOT NULL,
+  node_id     BLOB NOT NULL,
+  domain      TEXT NOT NULL
+);
 CREATE TABLE bindings (
   origin_id    TEXT NOT NULL,
   node_id      BLOB NOT NULL,
@@ -643,3 +655,127 @@ INSERT INTO bindings (origin_id, node_id, source, domain, note, added_at, expire
 DROP TABLE bindings_v12;
 CREATE INDEX bindings_by_key ON bindings (node_id);
 "#;
+
+/// v15 — every identity this node has adopted from its zone (§3.1).
+///
+/// A node takes its own `id=` from the membership zone, so a relabel there is
+/// adopted unattended and drops the published views under the old name. The
+/// trail of what was adopted, when, and from where is the only record that it
+/// happened; `synch id` reads it. `previous` is NULL for a first name.
+const V15_IDENTITY_HISTORY: &str = r#"
+CREATE TABLE identity_history (
+  at        INTEGER NOT NULL,
+  previous  TEXT,                          -- NULL for a node's first name
+  adopted   TEXT NOT NULL,
+  node_id   BLOB NOT NULL,
+  domain    TEXT NOT NULL
+);
+"#;
+
+/// v16 — one membership domain, and it is the one that names this node (§3.1).
+///
+/// `membership_domains` held a newline-joined list of zones to resolve for
+/// trusting *other* members, independent of what this node called itself. A
+/// node now takes its own name from its zone, so the domain is the `@domain`
+/// half of that name and there is exactly one.
+///
+/// Which one is not a choice this step has to make: a node that publishes as
+/// `nas@cluster.example` names `cluster.example`, whatever else was configured
+/// alongside it. A key-identified node names none, so every configured domain
+/// was some other zone and none survives. The dns bindings of the zones being
+/// left go with them — they were vouched for by an authority this node no
+/// longer resolves, and nothing would otherwise remove them before their own
+/// expiry.
+fn v16_one_membership_domain(tx: &Transaction<'_>) -> Result<()> {
+    one_membership_domain(tx)
+}
+
+/// The body of [`v16_one_membership_domain`], over any connection, so the test
+/// can replay it on a database the chain has already migrated.
+fn one_membership_domain(tx: &rusqlite::Connection) -> Result<()> {
+    let self_origin: Option<String> = tx
+        .query_row(
+            "SELECT value FROM config WHERE key = 'self_origin_id'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // The canonical rendering of a named origin is '<id>@<domain>'; a
+    // key-identified one is 'key:<z-base-32>' and names no domain.
+    let own_domain = self_origin
+        .as_deref()
+        .and_then(|origin| origin.rsplit_once('@'))
+        .map(|(_, domain)| domain.to_string());
+
+    tx.execute("DELETE FROM config WHERE key = 'membership_domains'", [])?;
+    match own_domain {
+        Some(domain) => {
+            tx.execute(
+                "INSERT INTO config (key, value) VALUES ('membership.domain', ?1)",
+                rusqlite::params![domain],
+            )?;
+            tx.execute(
+                "DELETE FROM bindings WHERE source = 'dns' AND domain <> ?1",
+                rusqlite::params![domain],
+            )?;
+        }
+        None => {
+            tx.execute("DELETE FROM bindings WHERE source = 'dns'", [])?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod identity_migration_tests {
+    use crate::Store;
+
+    /// v16 keeps the domain the node's own name points at, whatever else was
+    /// configured beside it, and drops the bindings of the zones being left.
+    #[test]
+    fn the_surviving_domain_is_the_one_that_names_this_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // The migration has already run on this fresh database, so the state
+        // it consumed is written back and replayed by hand.
+        store
+            .set_config("membership_domains", "other.example\ncluster.example")
+            .unwrap();
+        store
+            .set_config("self_origin_id", "nas@cluster.example")
+            .unwrap();
+        store.set_membership_domain(None).unwrap();
+        store
+            .transaction(|txn| super::one_membership_domain(txn.conn()))
+            .unwrap();
+
+        assert_eq!(
+            store.membership_domain().unwrap().as_deref(),
+            Some("cluster.example")
+        );
+        assert_eq!(store.config("membership_domains").unwrap(), None);
+    }
+
+    /// A key-identified node names no domain, so every configured one was some
+    /// other zone and none survives.
+    #[test]
+    fn a_key_identified_node_keeps_no_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .set_config("membership_domains", "cluster.example")
+            .unwrap();
+        store
+            .set_config(
+                "self_origin_id",
+                "key:c1oa1qttuk8kzr8ntdcrnf9jhgh4bhtxa9x7wqxrn9nkr45yqnro",
+            )
+            .unwrap();
+        store.set_membership_domain(None).unwrap();
+        store
+            .transaction(|txn| super::one_membership_domain(txn.conn()))
+            .unwrap();
+
+        assert_eq!(store.membership_domain().unwrap(), None);
+    }
+}

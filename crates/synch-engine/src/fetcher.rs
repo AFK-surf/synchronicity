@@ -1957,7 +1957,7 @@ mod tests {
         // The fourth is a real node that holds the bytes.
         let holder_dir = tempfile::tempdir().unwrap();
         let holder_origin = OriginId::named("holder", "x.example").unwrap();
-        Node::init(holder_dir.path(), Some(holder_origin.clone())).unwrap();
+        Node::init_named_by_zone(holder_dir.path(), holder_origin.clone()).unwrap();
         let holder = Node::open(NodeConfig::loopback(holder_dir.path()))
             .await
             .unwrap();
@@ -2049,7 +2049,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let origin = OriginId::named(name, "x.example").unwrap();
-            Node::init(dir.path(), Some(origin.clone())).unwrap();
+            Node::init_named_by_zone(dir.path(), origin.clone()).unwrap();
             let holder = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
             dirs.push(dir);
 

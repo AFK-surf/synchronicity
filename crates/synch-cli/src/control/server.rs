@@ -147,7 +147,7 @@ impl<T> Drop for Cancelling<T> {
 /// not) able to listen before it announces itself.
 #[derive(Debug)]
 pub struct Server {
-    node: Node,
+    served: Served,
     listener: Listener,
     token: Arc<Vec<u8>>,
     stop: broadcast::Sender<()>,
@@ -168,14 +168,29 @@ impl Server {
     /// Fails if another daemon is already listening for this datadir; a stale
     /// socket from a crashed one is removed first.
     pub async fn bind(node: Node, stop: broadcast::Sender<()>) -> std::io::Result<Server> {
-        let data_dir = node.config().data_dir.clone();
+        Server::bind_served(Served::Named(node), stop).await
+    }
+
+    /// Binds the socket for a node whose zone has not named it yet (§3.1).
+    ///
+    /// The reduced service: enough to explain the state and to change the zone
+    /// this node waits on, and a refusal naming both for everything else.
+    pub async fn bind_pending(
+        pending: Pending,
+        stop: broadcast::Sender<()>,
+    ) -> std::io::Result<Server> {
+        Server::bind_served(Served::Pending(pending), stop).await
+    }
+
+    async fn bind_served(served: Served, stop: broadcast::Sender<()>) -> std::io::Result<Server> {
+        let data_dir = served.data_dir();
         let listener = Listener::bind(&data_dir).await?;
         let token = Arc::new(transport::write_token(&data_dir)?);
         let stopping = stop.subscribe();
         let accepting = stop.subscribe();
         let draining = stop.subscribe();
         Ok(Server {
-            node,
+            served,
             listener,
             token,
             stop,
@@ -187,7 +202,7 @@ impl Server {
 
     /// The socket path or pipe name this server listens on.
     pub fn endpoint_name(&self) -> String {
-        transport::endpoint_name(&self.node.config().data_dir)
+        transport::endpoint_name(&self.served.data_dir())
     }
 
     /// Serves until `stop` fires — which `synch daemon stop` does by sending on
@@ -200,7 +215,7 @@ impl Server {
     /// daemon exits, however long the call it was serving would have taken.
     pub async fn run(self) -> std::io::Result<()> {
         let Server {
-            node,
+            served: serving,
             mut listener,
             token,
             stop,
@@ -231,7 +246,7 @@ impl Server {
 
         let service = InterceptedService::new(
             ControlServer::new(ControlService {
-                node: node.clone(),
+                served: serving.clone(),
                 stop,
             })
             .max_decoding_message_size(MAX_MESSAGE_LEN)
@@ -271,7 +286,7 @@ impl Server {
         // socket is still bound, and a `Listener::bind` for this datadir is
         // refused until the last of it is gone. The other order lets a
         // replacement bind, mint its own token, and have this process delete it.
-        transport::remove_token(&node.config().data_dir);
+        transport::remove_token(&serving.data_dir());
         drop(accepts.await);
         served.map_err(std::io::Error::other)
     }
@@ -325,8 +340,77 @@ impl Interceptor for Authenticate {
 /// The service the daemon exposes.
 #[derive(Debug)]
 struct ControlService {
-    node: Node,
+    served: Served,
     stop: broadcast::Sender<()>,
+}
+
+/// What a control service has to serve with.
+///
+/// A node whose zone has not named it yet holds no [`Node`] — there is no
+/// origin to key anything by — but it must still answer the control socket
+/// (§3.1). Without that, the one command that can lift the state,
+/// `synch domain set`, would need the socket that the state prevents binding:
+/// a data directory whose configured zone is wrong could never be corrected,
+/// and its key, its published history and its content would be unreachable.
+#[derive(Debug, Clone)]
+enum Served {
+    /// The node is named and everything is available.
+    Named(Node),
+    /// The node is waiting for its zone to name it: only the commands that do
+    /// not need an identity are answered (§3.1).
+    Pending(Pending),
+}
+
+/// The little a daemon knows about itself before its zone has named it.
+#[derive(Debug, Clone)]
+pub struct Pending {
+    /// The data directory, which is where the socket lives.
+    pub data_dir: std::path::PathBuf,
+    /// The store, for the config reads and writes `domain set` needs.
+    pub store: std::sync::Arc<synch_store::Store>,
+    /// This node's active device key, which is what a record must name.
+    pub node_id: synch_core::NodeId,
+    /// The zone that has not named it.
+    pub domain: String,
+    /// Rung by `synch domain refresh` so the wait is re-checked at once
+    /// rather than on its next tick (§3.1).
+    pub recheck: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Served {
+    /// The node, or a refusal naming the state and the way out of it.
+    fn node(&self) -> Result<&Node, ControlError> {
+        match self {
+            Served::Named(node) => Ok(node),
+            Served::Pending(pending) => Err(pending.refusal()),
+        }
+    }
+
+    /// The data directory, which both states have.
+    fn data_dir(&self) -> std::path::PathBuf {
+        match self {
+            Served::Named(node) => node.config().data_dir.clone(),
+            Served::Pending(pending) => pending.data_dir.clone(),
+        }
+    }
+}
+
+impl Pending {
+    /// The refusal every command that needs an identity gets.
+    fn refusal(&self) -> ControlError {
+        ControlError::new(
+            ErrorCode::Unavailable,
+            format!(
+                "{} has not named this node yet, so it has no identity to act under. \
+                 Publish a record for it:\n  _synchronicity.{}. IN TXT \
+                 \"v=sync1 id=<name> nk={} apex=<apex>\"\nor point this node at another \
+                 zone with `synch domain set <domain>`",
+                self.domain,
+                self.domain,
+                self.node_id.to_z32()
+            ),
+        )
+    }
 }
 
 /// Brings the daemon down once the response it is attached to has been
@@ -390,12 +474,19 @@ impl Control for ControlService {
         // triggers are wired together rather than raced.
         let stops = matches!(command, Command::DaemonStop(_));
         let (tx, rx) = mpsc::channel(SEND_AHEAD);
-        let node = self.node.clone();
+        let served = self.served.clone();
         let stopping = self.stop.subscribe();
         tokio::spawn(async move {
             let failed = {
                 let mut out = Frames { tx: tx.clone() };
-                until_stopped(stopping, dispatch(&node, command, &mut out)).await
+                match &served {
+                    Served::Named(node) => {
+                        until_stopped(stopping, dispatch(node, command, &mut out)).await
+                    }
+                    Served::Pending(pending) => {
+                        until_stopped(stopping, dispatch_pending(pending, command, &mut out)).await
+                    }
+                }
             };
             if let Err(error) = failed {
                 let _ = tx.send(Err(error.into())).await;
@@ -413,7 +504,7 @@ impl Control for ControlService {
     ) -> Result<Response<Self::ListStream>, Status> {
         let request = request.into_inner();
         let policy = parse_policy(request.policy.as_deref())?;
-        let node = self.node.clone();
+        let node = self.served.node()?.clone();
         let listing = {
             let space = request.space.clone();
             let prefix = request.prefix.clone();
@@ -459,14 +550,15 @@ impl Control for ControlService {
     ) -> Result<Response<pb::Entry>, Status> {
         let request = request.into_inner();
         let policy = parse_policy(request.policy.as_deref())?;
-        let set = read(&self.node, move |n| {
+        let set = read(self.served.node()?, move |n| {
             Ok(n.versions(&request.space, &request.path)?)
         })
         .await?;
         // Selection itself reads nothing: the version set is already in hand,
         // so it stays on this task.
         let row = self
-            .node
+            .served
+            .node()?
             .resolve_set(&set, &policy)
             .map_err(ControlError::from)?;
         Ok(Response::new(entry_info(&row, &set).into()))
@@ -478,7 +570,7 @@ impl Control for ControlService {
     ) -> Result<Response<Self::ReadStream>, Status> {
         let request = request.into_inner();
         let policy = parse_policy(request.policy.as_deref())?;
-        let node = self.node.clone();
+        let node = self.served.node()?.clone();
         // Resolved before the response opens, so "no provider for the content"
         // or a strict policy's refusal is the call's own answer rather than a
         // stream that dies after the caller has committed to a success.
@@ -522,14 +614,17 @@ impl Control for ControlService {
             Some(PutPart::Header(header)) => header,
             _ => return Err(ControlError::invalid("a write opens with its space and path").into()),
         };
-        read(&self.node, |n| Ok(n.ensure_publishable()?)).await?;
+        read(self.served.node()?, |n| Ok(n.ensure_publishable()?)).await?;
         let adoption = {
             let (space, path) = (header.space.clone(), header.path.clone());
-            read(&self.node, move |n| Ok(n.open_adoption(&space, &path)?)).await?
+            read(self.served.node()?, move |n| {
+                Ok(n.open_adoption(&space, &path)?)
+            })
+            .await?
         };
 
         let (tx, rx) = mpsc::channel(1);
-        let node = self.node.clone();
+        let node = self.served.node()?.clone();
         let mut stopping = self.stop.subscribe();
         tokio::spawn(async move {
             // A write the daemon gives up on is one it keeps nothing of: the
@@ -557,7 +652,7 @@ impl Control for ControlService {
     ) -> Result<Response<pb::GetConfigResponse>, Status> {
         let request = request.into_inner();
         let key = gateway_config_key(&request.key)?.to_string();
-        let records = match read(&self.node, move |n| Ok(n.store().config(&key)?)).await? {
+        let records = match read(self.served.node()?, move |n| Ok(n.store().config(&key)?)).await? {
             Some(value) => value.lines().map(str::to_string).collect(),
             None => Vec::new(),
         };
@@ -577,7 +672,7 @@ impl Control for ControlService {
             .into());
         }
         let record = request.record;
-        read(&self.node, move |n| {
+        read(self.served.node()?, move |n| {
             Ok(n.store().append_config(&key, &record)?)
         })
         .await?;
@@ -652,6 +747,108 @@ fn gone() -> ControlError {
 /// What a helper that only writes output returns.
 type Done = Result<(), ControlError>;
 
+/// Serves the commands that mean something to a node with no name yet (§3.1).
+///
+/// Everything else is refused with the record that would settle the state and
+/// the command that would point the node at a different zone. `domain set` is
+/// the one that matters: without it here, a data directory whose configured
+/// zone is wrong could not be corrected at all, because the socket that carries
+/// the correction is the socket this state would otherwise never bind.
+async fn dispatch_pending(pending: &Pending, command: Command, out: &mut Frames) -> Done {
+    /// The store reads and writes below go to the blocking pool like every
+    /// other one (§10).
+    async fn store<T, F>(pending: &Pending, f: F) -> Result<T, ControlError>
+    where
+        F: FnOnce(&synch_store::Store) -> Result<T, ControlError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let store = pending.store.clone();
+        offload(move || f(&store)).await
+    }
+
+    match command {
+        Command::DomainSet(pb::DomainSet { domain }) => {
+            let name = synch_core::origin::normalize_domain(&domain)
+                .map_err(|e| ControlError::invalid(e.to_string()))?;
+            let stored = name.clone();
+            store(pending, move |s| {
+                s.set_membership_domain(Some(&stored))
+                    .map_err(|e| ControlError::new(ErrorCode::Internal, e.to_string()))
+            })
+            .await?;
+            out.line(format!("membership domain is {name}")).await?;
+            out.line("takes effect at the next `synch daemon run`")
+                .await?;
+        }
+
+        Command::DomainClear(pb::DomainClear {}) => {
+            store(pending, move |s| {
+                s.set_membership_domain(None)
+                    .map_err(|e| ControlError::new(ErrorCode::Internal, e.to_string()))
+            })
+            .await?;
+            out.line("membership domain cleared").await?;
+            out.line("the device key names this node at the next `synch daemon run`")
+                .await?;
+        }
+
+        Command::DomainLs(pb::DomainLs {}) => {
+            let configured = store(pending, |s| {
+                s.membership_domain()
+                    .map_err(|e| ControlError::new(ErrorCode::Internal, e.to_string()))
+            })
+            .await?;
+            match configured {
+                Some(domain) => {
+                    out.line(format!("pending: {domain} at the next `synch daemon run`"))
+                        .await?
+                }
+                None => {
+                    out.progress("(no membership domain; static trust only)")
+                        .await?
+                }
+            }
+        }
+
+        Command::Id(pb::Id {}) => {
+            out.line("origin: none — this node has no name yet").await?;
+            out.line(format!("  {} (active)", pending.node_id.to_z32()))
+                .await?;
+            out.line(format!("waiting on: {}", pending.domain)).await?;
+        }
+
+        // What `doctor` can say here is the state itself, which is the whole
+        // of what is wrong.
+        Command::Doctor(pb::Doctor { .. }) | Command::DaemonStatus(pb::DaemonStatus {}) => {
+            out.line(format!("waiting for {} to name this node", pending.domain))
+                .await?;
+            out.line(format!(
+                "  _synchronicity.{}. IN TXT \"v=sync1 id=<name> nk={} apex=<apex>\"",
+                pending.domain,
+                pending.node_id.to_z32()
+            ))
+            .await?;
+            out.line("or `synch domain set <domain>` to wait on another zone")
+                .await?;
+        }
+
+        Command::DomainRefresh(pb::DomainRefresh {}) => {
+            // There is nothing to refresh *bindings* from until this node has
+            // a name, so what this asks for here is the identity check itself.
+            pending.recheck.notify_one();
+            out.line(format!("re-asking {} now", pending.domain))
+                .await?;
+        }
+
+        Command::DaemonStop(pb::DaemonStop {}) => {
+            out.line("stopping").await?;
+        }
+
+        _ => return Err(pending.refusal()),
+    }
+    Ok(())
+}
+
 /// Serves one CLI subcommand.
 async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
     match command {
@@ -663,6 +860,33 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     key.node_id.to_z32(),
                     key.state.as_str()
                 ))
+                .await?;
+            }
+            // Where the name came from, and every name before it. A zone can
+            // relabel this node unattended (§3.1), so the trail is the only
+            // place that says it happened.
+            match node.origin().domain() {
+                Some(domain) => out.line(format!("named by: {domain}")).await?,
+                None => {
+                    out.line("named by: this device key (no membership domain)")
+                        .await?
+                }
+            }
+            for adoption in read(node, |n| Ok(n.identity_history()?)).await? {
+                out.line(match &adoption.previous {
+                    Some(previous) => format!(
+                        "  adopted {} from {} {} (was {previous})",
+                        adoption.adopted,
+                        adoption.domain,
+                        render::ago(adoption.at)
+                    ),
+                    None => format!(
+                        "  adopted {} from {} {}",
+                        adoption.adopted,
+                        adoption.domain,
+                        render::ago(adoption.at)
+                    ),
+                })
                 .await?;
             }
             out.line(format!(
@@ -878,18 +1102,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             out.line("stopping").await?;
         }
 
-        Command::TrustAdd(pb::TrustAdd {
-            key,
-            name,
-            domain,
-            note,
-            addr,
-        }) => {
+        Command::TrustAdd(pb::TrustAdd { key, note, addr }) => {
             let key = parse_key(&key)?;
-            let origin = read(node, move |n| {
-                Ok(n.trust_add(key, name.as_deref(), domain.as_deref(), note.as_deref())?)
-            })
-            .await?;
+            let origin = read(node, move |n| Ok(n.trust_add(key, note.as_deref())?)).await?;
             if let Some(addr) = addr {
                 let socket = addr
                     .parse()
@@ -901,39 +1116,6 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             out.line(format!("trusted {} as {origin}", key.to_z32()))
                 .await?;
-        }
-
-        Command::TrustRebind(pb::TrustRebind { origin, key }) => {
-            let origin = parse_origin(&origin)?;
-            let key = parse_key(&key)?;
-            let earlier: Vec<String> = {
-                let origin = origin.clone();
-                read(node, move |n| {
-                    Ok(n.store()
-                        .bindings()?
-                        .into_iter()
-                        .filter(|b| b.origin == origin && b.node_id != key)
-                        .map(|b| b.node_id.to_z32())
-                        .collect())
-                })
-                .await?
-            };
-            {
-                let origin = origin.clone();
-                read(node, move |n| Ok(n.trust_rebind(&origin, key)?)).await?;
-            }
-            out.line(format!("{origin} now also accepts {}", key.to_z32()))
-                .await?;
-            // Rebinding is additive on purpose — the rotation window needs
-            // both keys live — but the old binding will stall every dial once
-            // its endpoint dies, and nothing else says whose job that is.
-            for old in earlier {
-                out.line(format!(
-                    "{old} stays bound through the rotation window; drop it with \
-                     `synch trust rm {origin} --key {old}` once the peer retires it"
-                ))
-                .await?;
-            }
         }
 
         Command::TrustRm(pb::TrustRm { origin, key }) => {
@@ -1006,48 +1188,64 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::DomainAdd(pb::DomainAdd { domain }) => {
+        Command::DomainSet(pb::DomainSet { domain }) => {
             {
                 let domain = domain.clone();
-                read(node, move |n| Ok(n.add_domain(&domain)?)).await?;
+                read(node, move |n| Ok(n.set_domain(&domain)?)).await?;
             }
-            out.line(format!("added {domain}")).await?;
-            // Lenient: the add stands even when the first refresh fails —
-            // configuring a domain before its records are published is a
-            // legitimate order of operations.
-            refresh_domains(node, out, Some(&domain), false).await?;
-        }
-
-        Command::DomainRm(pb::DomainRm { domain }) => {
-            let dropped = {
-                let domain = domain.clone();
-                read(node, move |n| Ok(n.remove_domain(&domain)?)).await?
-            };
-            if !dropped {
-                return Err(ControlError::new(
-                    ErrorCode::NotFound,
-                    format!("{domain} is not a configured membership domain"),
-                ));
-            }
-            out.line(format!("removed {domain} and its bindings"))
+            out.line(format!("membership domain is {domain}")).await?;
+            // Deliberately no refresh here: this process goes on resolving the
+            // zone its current name came from, and pulling bindings out of a
+            // zone that has not named this node yet would leave it holding
+            // membership from an authority with no say in what it is called
+            // (§3.1). The next start resolves the new zone and migrates.
+            out.line("takes effect at the next `synch daemon run`")
                 .await?;
         }
 
+        Command::DomainClear(pb::DomainClear {}) => {
+            let dropped = read(node, move |n| Ok(n.clear_domain()?)).await?;
+            if !dropped {
+                return Err(ControlError::new(
+                    ErrorCode::NotFound,
+                    "no membership domain is configured".to_string(),
+                ));
+            }
+            out.line("membership domain cleared").await?;
+            out.line(
+                "the device key names this node at the next `synch daemon run`, \
+                 which is also what drops the zone's bindings",
+            )
+            .await?;
+        }
+
         Command::DomainLs(pb::DomainLs {}) => {
-            let domains = read(node, |n| Ok(n.domain_health()?)).await?;
-            if domains.is_empty() {
-                out.progress("(no membership domains configured; static trust only)")
+            let (health, configured) =
+                read(node, |n| Ok((n.domain_health()?, n.domain()?))).await?;
+            if health.is_empty() {
+                out.progress("(no membership domain; static trust only)")
                     .await?;
             }
-            for health in domains {
-                out.line(render::domain_health(&health, now_ns())).await?;
+            for entry in &health {
+                out.line(render::domain_health(entry, now_ns())).await?;
+            }
+            // The configured slot and the zone in force differ between a
+            // `domain set` and the next start; saying so is the difference
+            // between a pending change and a broken one.
+            let resolving = health.first().map(|h| h.domain.clone());
+            if configured != resolving {
+                out.line(match &configured {
+                    Some(domain) => format!("pending: {domain} at the next `synch daemon run`"),
+                    None => "pending: no domain at the next `synch daemon run`".to_string(),
+                })
+                .await?;
             }
         }
 
         // Strict: a failed refresh is a failed command. Scripts and
         // monitoring read the exit code, not the prose.
-        Command::DomainRefresh(pb::DomainRefresh { domain }) => {
-            refresh_domains(node, out, domain.as_deref(), true).await?
+        Command::DomainRefresh(pb::DomainRefresh {}) => {
+            refresh_domains(node, out, None, true).await?
         }
 
         Command::Peers(pb::Peers {}) => {
@@ -1571,14 +1769,14 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 }
             ))
             .await?;
-            let domains = node.domains()?;
+            let domains: Vec<String> = node.domain()?.into_iter().collect();
             if domains.is_empty() {
                 // Nothing to attach to and nothing that will change that on
                 // its own: the endpoint comes from a membership zone, so a
                 // node with no membership domain has nowhere to look.
                 out.line(
                     "note: no membership domains are configured, so there is no zone to \
-                     discover a control plane from; `synch domain add <domain>` first",
+                     discover a control plane from; `synch domain set <domain>` first",
                 )
                 .await?;
             }
@@ -1989,7 +2187,7 @@ async fn refresh_domains(
     };
     let requested = match &domain {
         Some(domain) => vec![domain.clone()],
-        None => read(node, |n| Ok(n.domains()?)).await?,
+        None => read(node, |n| Ok(n.domain()?.into_iter().collect::<Vec<_>>())).await?,
     };
     if requested.is_empty() {
         out.line("no membership domains configured; nothing to refresh (static trust only)")

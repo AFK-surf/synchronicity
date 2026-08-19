@@ -308,7 +308,7 @@ pub fn doctor(node: &Node) -> Lines {
         ));
         out.push(
             "    peers bind the published id, so nothing this node publishes is accepted \
-             until the record or `synch init --id` agrees"
+             until the record names this key under the id this node publishes as"
                 .into(),
         );
     }

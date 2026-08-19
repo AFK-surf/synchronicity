@@ -1,25 +1,22 @@
 //! Command dispatch.
 //!
-//! Three commands touch the data directory directly: `synch init`, which creates
-//! it before any daemon can exist; `synch id set`, which names a key-identified
-//! node while the daemon is stopped; and `synch daemon run`, which *is* the
+//! Two commands touch the data directory directly: `synch init`, which creates
+//! it before any daemon can exist, and `synch daemon run`, which *is* the
 //! daemon. Every other command is a control-service call to a running daemon
 //! (§9.1) — there is no in-process fallback.
 
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use anyhow::{Context, Result};
-use synch_core::OriginId;
 use synch_engine::{EntryRef, Node, NodeConfig};
 
 use crate::{
     cli::{
-        Cli, CloudCommand, Command, DaemonCommand, DomainCommand, IdCommand, KeyCommand,
-        MirrorCommand, PinCommand, SpaceCommand, TrustCommand,
+        Cli, CloudCommand, Command, DaemonCommand, DomainCommand, KeyCommand, MirrorCommand,
+        PinCommand, SpaceCommand, TrustCommand,
     },
     control::{proto::pb, transport, Client, Command as Cmd, Frame},
     daemon,
@@ -68,11 +65,8 @@ pub const REKOR_PIN_STATE_FILE: &str = "rekor-pins.json";
 pub async fn run(cli: Cli) -> Result<()> {
     let data_dir = data_dir(&cli)?;
     match &cli.command {
-        Command::Init { id } => {
-            let origin = match id {
-                Some(id) => Some(OriginId::from_str(id).context("--id wants <name>@<domain>")?),
-                None => None,
-            };
+        Command::Init { domain } => {
+            let domain = domain.clone();
             // Refuse a data dir whose control socket could never be bound —
             // finding out one command later, from the kernel, in acronyms,
             // is how a newcomer gives up.
@@ -86,36 +80,29 @@ pub async fn run(cli: Cli) -> Result<()> {
             let dir = data_dir.clone();
             let report = tokio::task::spawn_blocking(move || {
                 let _scope = synch_core::BlockingScope::enter();
-                Node::init(&dir, origin)
+                Node::init(&dir, domain.as_deref())
             })
             .await
             .context("the initializing task did not complete")??;
-            println!("origin:     {}", report.origin);
             println!("device key: {}", report.node_id.to_z32());
             println!("data dir:   {}", report.data_dir.display());
-            println!("next:       synch daemon run");
-            Ok(())
-        }
-        Command::Id {
-            command: Some(IdCommand::Set { id }),
-        } => {
-            let origin = OriginId::from_str(id).context("id set wants <name>@<domain>")?;
-            if Client::connect(&data_dir).await.is_ok() {
-                anyhow::bail!(
-                    "a daemon is running for {}; stop it first with `synch daemon stop`                      so it does not keep signing as the old origin",
-                    data_dir.display()
-                );
+            match (&report.origin, &report.domain) {
+                (Some(origin), _) => {
+                    println!("origin:     {origin}");
+                    println!("next:       synch daemon run");
+                }
+                (None, Some(domain)) => {
+                    // The record is the next step, and printing it is the
+                    // difference between one copy-paste and a trip to the docs.
+                    println!("domain:     {domain}");
+                    println!("next:       publish this record, then `synch daemon run`:");
+                    println!(
+                        "  _synchronicity.{domain}. IN TXT \"v=sync1 id=<name> nk={} apex=<apex>\"",
+                        report.node_id.to_z32()
+                    );
+                }
+                (None, None) => unreachable!("init settles a name or a domain"),
             }
-            let dir = data_dir.clone();
-            let report = tokio::task::spawn_blocking(move || {
-                let _scope = synch_core::BlockingScope::enter();
-                Node::adopt_named_origin(&dir, origin)
-            })
-            .await
-            .context("the renaming task did not complete")??;
-            println!("origin:     {}  (was {})", report.origin, report.previous);
-            println!("device key: {}", report.node_id.to_z32());
-            println!("next:       synch daemon run && synch scan");
             Ok(())
         }
         Command::Daemon {
@@ -132,9 +119,6 @@ pub async fn run(cli: Cli) -> Result<()> {
 fn to_command(cli: &Cli) -> Result<Cmd> {
     Ok(match &cli.command {
         Command::Init { .. } => unreachable!("handled before dispatch"),
-        Command::Id {
-            command: Some(IdCommand::Set { .. }),
-        } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => unreachable!("handled before dispatch"),
@@ -145,7 +129,7 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             command: DaemonCommand::Stop,
         } => Cmd::DaemonStop(pb::DaemonStop {}),
 
-        Command::Id { command: None } => Cmd::Id(pb::Id {}),
+        Command::Id => Cmd::Id(pb::Id {}),
 
         Command::Key { command } => match command {
             KeyCommand::Rotate => Cmd::KeyRotate(pb::KeyRotate {}),
@@ -160,39 +144,10 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         },
 
         Command::Trust { command } => match command {
-            TrustCommand::Add {
-                key,
-                name,
-                domain,
-                note,
-                addr,
-            } => {
-                // Origins are spelled name@domain everywhere else, so
-                // `--as nas@cluster.example` means what it says: the name and
-                // the domain, in the one token the user already knows.
-                let (name, domain) = match name.as_deref().and_then(|n| n.split_once('@')) {
-                    Some((n, d)) => {
-                        if domain.as_deref().is_some_and(|given| given != d) {
-                            anyhow::bail!(
-                                "--as names domain {d} but --domain says {}: drop one",
-                                domain.as_deref().unwrap_or_default()
-                            );
-                        }
-                        (Some(n.to_string()), Some(d.to_string()))
-                    }
-                    None => (name.clone(), domain.clone()),
-                };
-                Cmd::TrustAdd(pb::TrustAdd {
-                    key: key.clone(),
-                    name,
-                    domain,
-                    note: note.clone(),
-                    addr: addr.clone(),
-                })
-            }
-            TrustCommand::Rebind { origin, key } => Cmd::TrustRebind(pb::TrustRebind {
-                origin: origin.clone(),
+            TrustCommand::Add { key, note, addr } => Cmd::TrustAdd(pb::TrustAdd {
                 key: key.clone(),
+                note: note.clone(),
+                addr: addr.clone(),
             }),
             TrustCommand::Rm { origin, key } => Cmd::TrustRm(pb::TrustRm {
                 origin: origin.clone(),
@@ -202,16 +157,12 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         },
 
         Command::Domain { command } => match command {
-            DomainCommand::Add { domain } => Cmd::DomainAdd(pb::DomainAdd {
+            DomainCommand::Set { domain } => Cmd::DomainSet(pb::DomainSet {
                 domain: domain.clone(),
             }),
-            DomainCommand::Rm { domain } => Cmd::DomainRm(pb::DomainRm {
-                domain: domain.clone(),
-            }),
+            DomainCommand::Clear => Cmd::DomainClear(pb::DomainClear {}),
             DomainCommand::Ls => Cmd::DomainLs(pb::DomainLs {}),
-            DomainCommand::Refresh { domain } => Cmd::DomainRefresh(pb::DomainRefresh {
-                domain: domain.clone(),
-            }),
+            DomainCommand::Refresh => Cmd::DomainRefresh(pb::DomainRefresh {}),
         },
 
         Command::Peers => Cmd::Peers(pb::Peers {}),
@@ -407,67 +358,24 @@ mod tests {
         to_command(&Cli::parse_from(args))
     }
 
-    /// Origins are spelled `name@domain` everywhere else, so `--as` takes
-    /// that form too and splits it, rather than bouncing it off the
-    /// member-label regex.
+    /// The key is the identity: there is no flag that names a peer, because a
+    /// name belongs to the zone that issues it (§3.2).
     #[test]
-    fn trust_add_accepts_the_origin_form() {
-        let command = command_for(&[
-            "synch",
-            "trust",
-            "add",
-            "abc",
-            "--as",
-            "nas@cluster.example.com",
-        ])
-        .unwrap();
+    fn trust_add_takes_a_key_and_nothing_that_names_it() {
+        let command =
+            command_for(&["synch", "trust", "add", "abc", "--note", "zeynep's laptop"]).unwrap();
         assert_eq!(
             command,
             Cmd::TrustAdd(pb::TrustAdd {
                 key: "abc".into(),
-                name: Some("nas".into()),
-                domain: Some("cluster.example.com".into()),
-                note: None,
+                note: Some("zeynep's laptop".into()),
                 addr: None,
             })
         );
-
-        // A bare label with a separate --domain is unchanged.
-        let command = command_for(&[
-            "synch",
-            "trust",
-            "add",
-            "abc",
-            "--as",
-            "nas",
-            "--domain",
-            "x.example",
-        ])
-        .unwrap();
-        assert_eq!(
-            command,
-            Cmd::TrustAdd(pb::TrustAdd {
-                key: "abc".into(),
-                name: Some("nas".into()),
-                domain: Some("x.example".into()),
-                note: None,
-                addr: None,
-            })
-        );
-
-        // Two domains that disagree are an error, not a silent pick.
-        let err = command_for(&[
-            "synch",
-            "trust",
-            "add",
-            "abc",
-            "--as",
-            "nas@a.example",
-            "--domain",
-            "b.example",
-        ])
-        .unwrap_err();
-        assert!(err.to_string().contains("drop one"), "{err}");
+        // The flags that used to attach a name are not arguments at all now:
+        // clap refuses them before anything reaches the daemon.
+        assert!(Cli::try_parse_from(["synch", "trust", "add", "abc", "--as", "nas"]).is_err());
+        assert!(Cli::try_parse_from(["synch", "trust", "rebind", "nas", "abc"]).is_err());
     }
 
     #[test]

@@ -90,6 +90,14 @@ impl Node {
         Ok(self.store().device_keys()?)
     }
 
+    /// Every name this node has adopted from its zone, oldest first (§3.1).
+    ///
+    /// A relabel is unattended and destructive, so this trail is the only
+    /// record that it happened at all.
+    pub fn identity_history(&self) -> Result<Vec<synch_store::IdentityAdoption>> {
+        Ok(self.store().identity_history()?)
+    }
+
     /// Asks every trusted peer which of our device keys it currently holds
     /// bound (§3.4 step 3, §5.1).
     ///
@@ -126,8 +134,8 @@ impl Node {
             OriginId::Key(key) => {
                 return Err(EngineError::invalid(format!(
                     "origin key:{} is key-identified, so its device key is its identity and \
-                     cannot rotate: re-init with --id <name>@<domain>, or have peers run \
-                     `synch trust add --as <name>`",
+                     cannot rotate. A rotatable name comes from a membership zone: \
+                     `synch domain set <domain>`, then publish a record for this key",
                     key.to_z32()
                 )))
             }
@@ -338,7 +346,11 @@ mod tests {
     use std::path::Path;
 
     async fn node(dir: &Path, id: Option<OriginId>) -> Node {
-        Node::init(dir, id).unwrap();
+        match id {
+            Some(origin) => Node::init_named_by_zone(dir, origin),
+            None => Node::init(dir, None),
+        }
+        .unwrap();
         Node::open(NodeConfig::loopback(dir)).await.unwrap()
     }
 
@@ -381,7 +393,8 @@ mod tests {
         // ever cleans up.
         let err = node.rotate_key().unwrap_err();
         assert!(err.to_string().contains("key-identified"), "{err}");
-        assert!(err.to_string().contains("--id"), "{err}");
+        // And says where a rotatable name comes from: a zone, not a flag.
+        assert!(err.to_string().contains("synch domain set"), "{err}");
         assert_eq!(
             node.device_keys().unwrap().len(),
             1,
@@ -521,8 +534,8 @@ mod tests {
         let b_dir = tempfile::tempdir().unwrap();
         let a_origin = OriginId::named("a", "cluster.example").unwrap();
         let b_origin = OriginId::named("b", "cluster.example").unwrap();
-        Node::init(a_dir.path(), Some(a_origin.clone())).unwrap();
-        Node::init(b_dir.path(), Some(b_origin.clone())).unwrap();
+        Node::init_named_by_zone(a_dir.path(), a_origin.clone()).unwrap();
+        Node::init_named_by_zone(b_dir.path(), b_origin.clone()).unwrap();
         let a = Node::open(crate::config::NodeConfig::loopback(a_dir.path()))
             .await
             .unwrap();
@@ -592,7 +605,7 @@ mod tests {
     async fn an_unreachable_peer_is_reported_rather_than_counted() {
         let dir = tempfile::tempdir().unwrap();
         let origin = OriginId::named("a", "cluster.example").unwrap();
-        Node::init(dir.path(), Some(origin.clone())).unwrap();
+        Node::init_named_by_zone(dir.path(), origin.clone()).unwrap();
         let node = Node::open(crate::config::NodeConfig::loopback(dir.path()))
             .await
             .unwrap();

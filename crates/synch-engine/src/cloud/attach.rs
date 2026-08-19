@@ -131,21 +131,21 @@ impl Node {
 
     /// The membership domains a tunnel should be open for right now.
     ///
-    /// Every domain the node holds membership in, unless the operator has
-    /// opted the feature out — which is the only thing that empties the list,
-    /// there being no enablement to require. Empty for a node with no
-    /// membership domains: there is no apex to take a control plane from, so
-    /// there is nothing to discover and nothing to attach to.
+    /// The zone that names this node, unless the operator has opted the feature
+    /// out — which is the only thing that empties the list, there being no
+    /// enablement to require. Empty for a key-identified node: there is no apex
+    /// to take a control plane from, so there is nothing to discover and
+    /// nothing to attach to.
     ///
-    /// Both reads go over to the blocking pool together: this runs on the
+    /// The settings read goes over to the blocking pool: this runs on the
     /// supervisor's runtime worker once per [`SUPERVISE_INTERVAL`], and a
     /// `config` read waits on the same connection mutex a publish batch or a GC
-    /// pass holds (§10).
+    /// pass holds (§10). The zone itself is the origin's, held in memory.
     async fn attach_targets(&self) -> Vec<String> {
         let node = self.clone();
         crate::blocking::offload(move || {
             Ok(match node.cloud_settings() {
-                Ok(settings) if !settings.disabled => node.domains().unwrap_or_default(),
+                Ok(settings) if !settings.disabled => node.resolving_domains(),
                 _ => Vec::new(),
             })
         })
@@ -1297,12 +1297,23 @@ mod tests {
     /// The task list follows the domains without being asked — the feature
     /// needs no enabling — and empties only when the operator opts out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn attach_targets_follow_the_domains_and_the_opt_out() {
+    async fn attach_targets_follow_the_zone_and_the_opt_out() {
         let _blocking = synch_core::BlockingScope::enter();
+        // A key-identified node names no zone, so there is no apex to take a
+        // control plane from — nothing to attach to, tunnel or no tunnel.
         let (_d, node) = node().await;
-        // No domains: nothing to attach to, tunnel or no tunnel.
         assert!(node.attach_targets().await.is_empty());
-        node.add_domain("cluster.example").unwrap();
+        node.shutdown().await.unwrap();
+
+        // A node named by its zone attaches to that zone, and only the opt-out
+        // empties the list.
+        let dir = tempfile::tempdir().unwrap();
+        Node::init_named_by_zone(
+            dir.path(),
+            OriginId::named("nas", "cluster.example").unwrap(),
+        )
+        .unwrap();
+        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
         assert_eq!(node.attach_targets().await, ["cluster.example"]);
         node.disable_cloud().unwrap();
         assert!(node.attach_targets().await.is_empty());
