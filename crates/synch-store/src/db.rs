@@ -740,6 +740,37 @@ impl Txn<'_> {
         )?)
     }
 
+    /// Drops every delegation an origin issued, inside the transaction.
+    ///
+    /// Revocation is deletion (§3.5), and these rows are a materialized view
+    /// of `d:` leaves in that origin's trie. When the origin itself goes —
+    /// which is what adopting a new name does to the old one — the trie those
+    /// rows derive from goes with it, and nothing would ever come along to
+    /// remove them: materialization only applies deltas, and a vanished origin
+    /// publishes no more of them.
+    ///
+    /// Returns the subjects whose trust this withdrew, so the caller can say
+    /// so rather than leave an operator to discover it.
+    pub fn delete_delegations_by(&self, issuer: &OriginId) -> Result<Vec<NodeId>> {
+        let subjects: Vec<NodeId> = {
+            let mut stmt = self.conn().prepare(
+                "SELECT node_id FROM bindings WHERE source = 'delegated' AND issuer = ?1",
+            )?;
+            let rows =
+                stmt.query_map(params![issuer.canonical()], |row| row.get::<_, Vec<u8>>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(key_column(row?, "bindings.node_id")?);
+            }
+            out
+        };
+        self.conn().execute(
+            "DELETE FROM bindings WHERE source = 'delegated' AND issuer = ?1",
+            params![issuer.canonical()],
+        )?;
+        Ok(subjects)
+    }
+
     /// Forgets what peers advertised for an origin, inside the transaction.
     pub fn clear_observed_head(&self, origin: &OriginId) -> Result<()> {
         self.conn().execute(
