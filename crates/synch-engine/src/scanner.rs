@@ -111,7 +111,31 @@ impl Node {
         // working example, and worse than the hashing on anything larger.
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (path, rel, is_symlink) in &found {
-            self.index_file(space_id, path, rel, seq, *is_symlink, &mut report)?;
+            // A path that vanished between the walk and here is skipped, not
+            // fatal — the same tolerance `walk` above already applies to
+            // `read_dir` and `symlink_metadata`, and for the same reason: a
+            // live directory (a build tree, a browser profile) produces this
+            // routinely.
+            //
+            // It stopped one function short of where it was needed, and the
+            // consequence was not "one file missed". `index_file` commits its
+            // `local_files` row as it goes and the batch it stages is published
+            // only at the end, so an abort left every path indexed before it
+            // durably marked as scanned and never published — and the next scan
+            // reads that row, finds the stat matches, and reports the file
+            // `unchanged`. The files stayed unpublished until the process was
+            // restarted.
+            //
+            // Only failures about *this path* are tolerated. A store failure is
+            // not one, and swallowing it would silently drop the file the same
+            // way.
+            match self.index_file(space_id, path, rel, seq, *is_symlink, &mut report) {
+                Ok(()) => {}
+                Err(EngineError::Io(e)) => {
+                    report.skipped.push((rel.clone(), e.to_string()));
+                }
+                Err(e) => return Err(e),
+            }
             seen.insert(rel.as_str());
         }
 
@@ -119,7 +143,28 @@ impl Node {
         // Deletion propagates by the key vanishing from the new root; the
         // tombstone exists so `synch status`/`synch log` can tell "deleted at
         // seq N" from "never existed" (§4.2).
-        for known in self.store().local_files(space_id)? {
+        //
+        // Over the *union* of what the scanner recorded and what this origin
+        // has published, not over `local_files` alone. The row is removed below
+        // as soon as the tombstone is staged, and staged is not published: a
+        // crash or a failed publish in that window used to leave the path in no
+        // source of truth a later scan reads — absent from disk, absent from
+        // `local_files` — so the deletion could never be re-derived and this
+        // origin went on publishing the file as live at its old root forever.
+        // The published tree is durable and `local_files` is not, so the
+        // published tree is what the sweep is anchored to; `local_files` still
+        // contributes the paths this scan indexed but has not published yet.
+        let mut known_paths: Vec<String> = self.store().local_files(space_id)?;
+        known_paths.extend(
+            self.store()
+                .list_entries(Some(self.origin()), space_id, "", None, None)?
+                .into_iter()
+                .filter(|row| row.kind != synch_core::EntryKind::Tombstone)
+                .map(|row| row.path),
+        );
+        known_paths.sort();
+        known_paths.dedup();
+        for known in known_paths {
             if seen.contains(known.as_str()) {
                 continue;
             }
@@ -318,9 +363,28 @@ impl Node {
     pub fn scan_all_with(&self, mut on_space: impl FnMut(&str, &ScanReport)) -> Result<ScanReport> {
         let mut report = ScanReport::default();
         for space in self.store().spaces()? {
-            let one = self.scan_space(&space.id)?;
-            on_space(&space.id, &one);
-            report.merge(one);
+            // One space's failure does not discard the others' work. It used
+            // to: `scan_space` commits the `local_files` row removal for a
+            // vanished path as it goes (the tombstone that replaces it only
+            // enters `report.staged`), so a later space failing — an unmounted
+            // removable disk is the ordinary case — dropped the tombstone while
+            // the removal stayed committed. The path then existed in no source
+            // of truth this node consults: not on disk, not in `local_files`,
+            // so no later scan could re-derive it, and our origin kept
+            // publishing it as a live file at its old content root forever.
+            //
+            // Reported rather than swallowed: the space appears in `skipped`,
+            // which is what `synch scan` prints and what `doctor` reads.
+            match self.scan_space(&space.id) {
+                Ok(one) => {
+                    on_space(&space.id, &one);
+                    report.merge(one);
+                }
+                Err(e) => {
+                    tracing::warn!(space = %space.id, error = %e, "space skipped by this scan");
+                    report.skipped.push((space.id.clone(), e.to_string()));
+                }
+            }
         }
         // A scan is also where an operator can force tombstone expiry (§4.2):
         // the removals ride the same batch as everything else the scan found.
@@ -1156,6 +1220,91 @@ mod tests {
         assert_eq!(entry.kind, EntryKind::Tombstone);
         assert_eq!(entry.seq, 2);
         assert_eq!(entry.prev, Some(Hash::new(b"hello")));
+        node.shutdown().await.unwrap();
+    }
+
+    /// A deletion whose tombstone never reached a root is re-derived.
+    ///
+    /// The window: `scan_space` stages the tombstone and removes the
+    /// `local_files` row in the same pass, but only the row removal is
+    /// committed — staging is in memory. A crash, or a failed publish, and the
+    /// path is on disk nowhere, in `local_files` nowhere, and still published
+    /// as live. Anchoring the sweep to what this origin published, and not only
+    /// to what the scanner recorded, is what lets a later scan see it again.
+    #[tokio::test]
+    async fn a_deletion_whose_batch_was_lost_is_re_derived_by_the_next_scan() {
+        let (_d, space, node) = node_with_space().await;
+        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
+        node.scan_and_publish().unwrap();
+
+        // The deletion is scanned but its batch never publishes.
+        std::fs::remove_file(space.path().join("a.txt")).unwrap();
+        let lost = node.scan_all().unwrap();
+        assert_eq!(lost.deleted, 1, "the scan saw the deletion");
+        assert!(node.store().local_files("media").unwrap().is_empty());
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "a.txt")
+                .unwrap()
+                .unwrap()
+                .kind,
+            EntryKind::File,
+            "and it is still published as live"
+        );
+
+        // The next scan re-derives it from the published tree.
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert_eq!(report.deleted, 1);
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "a.txt")
+                .unwrap()
+                .unwrap()
+                .kind,
+            EntryKind::Tombstone
+        );
+        assert_eq!(head.unwrap().seq, 2);
+
+        // And a tombstoned path is not swept again, or every scan would
+        // republish a deletion forever.
+        let (again, head) = node.scan_and_publish().unwrap();
+        assert_eq!(again.deleted, 0);
+        assert!(head.is_none());
+        node.shutdown().await.unwrap();
+    }
+
+    /// A path that vanishes mid-scan costs its own indexing, not the pass.
+    #[tokio::test]
+    async fn a_path_that_disappears_mid_scan_does_not_abort_the_pass() {
+        let (_d, space, node) = node_with_space().await;
+        std::fs::write(space.path().join("a.txt"), b"one").unwrap();
+        std::fs::write(space.path().join("gone.tmp"), b"two").unwrap();
+        std::fs::write(space.path().join("z.txt"), b"three").unwrap();
+
+        // Removed after `walk` has listed it and before `index_file` stats it,
+        // which is what a build tree does to a scanner routinely. Driven by
+        // deleting it between two scans of the same walk order: `walk` sorts,
+        // so `gone.tmp` sits between the two files that must survive.
+        let report = node
+            .scan_all_with(|_, _| {
+                let _ = std::fs::remove_file(space.path().join("gone.tmp"));
+            })
+            .unwrap();
+        // Whether the removal beat the stat or not, the two real files are
+        // indexed and published — the failure mode this guards is the pass
+        // aborting and leaving `a.txt` recorded but unpublished.
+        node.publish(&report.staged).unwrap();
+        for name in ["a.txt", "z.txt"] {
+            assert_eq!(
+                node.store()
+                    .entry(node.origin(), "media", name)
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                EntryKind::File,
+                "{name} must be published"
+            );
+        }
         node.shutdown().await.unwrap();
     }
 

@@ -228,20 +228,16 @@ impl MptProtocol {
                         // may promote the head — which walks the trie and
                         // re-materializes the changed leaves in one
                         // transaction (§5.2).
+                        // Containment is the sink's: it is the only side that
+                        // can tell "this origin published something we cannot
+                        // apply" from "our disk is full", and an error reaching
+                        // here is the second kind. One origin must not stop an
+                        // exchange that still owes this peer an answer to its
+                        // `HeadsWant`; a local fault legitimately does.
                         let sink = self.heads.clone();
                         crate::blocking::offload(move || {
                             for head in heads {
-                                // Per origin, like the dial side: one origin
-                                // publishing something this node cannot apply
-                                // must not stop the exchange, which still owes
-                                // this peer an answer to its `HeadsWant`.
-                                if let Err(e) = sink.offer_head(&head, now_ns()) {
-                                    tracing::warn!(
-                                        origin = %head.origin,
-                                        error = %e,
-                                        "origin left behind: its pushed head could not be applied"
-                                    );
-                                }
+                                sink.offer_head(&head, now_ns())?;
                             }
                             Ok(())
                         })

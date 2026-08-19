@@ -133,9 +133,7 @@ impl Store {
     /// two slots, so a head already being fetched is not fetched again and a
     /// head older than an in-progress target is not adopted.
     pub fn head_floor(&self, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
-        let complete = self.complete_head(origin)?.map(|h| (h.seq, h.root));
-        let pending = self.pending_head(origin)?.map(|h| (h.seq, h.root));
-        Ok(best_floor(complete, pending))
+        head_floor_in(&self.conn(), origin)
     }
 
     /// Every slot for every origin.
@@ -171,15 +169,6 @@ impl Store {
     ) -> Result<()> {
         let conn = self.conn();
         put_head_in(&conn, slot, head, received_at, verified_at)
-    }
-
-    /// Clears a head slot.
-    pub fn clear_head(&self, origin: &OriginId, slot: Slot) -> Result<()> {
-        self.conn().execute(
-            "DELETE FROM heads WHERE origin_id = ?1 AND slot = ?2",
-            params![origin.canonical(), slot.as_str()],
-        )?;
-        Ok(())
     }
 
     /// Clears a head slot only if it still holds `(seq, root)`.
@@ -279,11 +268,7 @@ impl Store {
     /// one thing convergence rests on and may never depend on how many roots
     /// happened to arrive first.
     pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
-        Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
-            params![origin.canonical(), seq as i64],
-            |row| row.get::<_, i64>(0),
-        )? as usize)
+        fork_width_in(&self.conn(), origin, seq)
     }
 
     /// The retained history for an origin, newest first.
@@ -551,9 +536,7 @@ impl Txn<'_> {
     /// acquisitions, two concurrent offers both read the same floor, both
     /// decide they beat it, and the lower one wins the race to the slot.
     pub fn head_floor(&self, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
-        let complete = self.complete_head(origin)?.map(|h| (h.seq, h.root));
-        let pending = self.pending_head(origin)?.map(|h| (h.seq, h.root));
-        Ok(best_floor(complete, pending))
+        head_floor_in(&self.conn(), origin)
     }
 
     /// The seq this node's next head for `origin` must carry, read inside the
@@ -596,11 +579,7 @@ impl Txn<'_> {
     /// How many distinct roots this origin has retained at one seq, inside the
     /// transaction. See [`Store::fork_width`].
     pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
-        Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
-            params![origin.canonical(), seq as i64],
-            |row| row.get::<_, i64>(0),
-        )? as usize)
+        fork_width_in(&self.conn(), origin, seq)
     }
 
     /// Bounds the retained fork at one seq to `keep` roots, evicting the
@@ -748,6 +727,22 @@ fn put_head_in(
         ],
     )?;
     Ok(())
+}
+
+/// The one implementation behind [`Store::head_floor`] and [`Txn::head_floor`].
+fn head_floor_in(conn: &rusqlite::Connection, origin: &OriginId) -> Result<Option<(u64, Hash)>> {
+    let complete = head_in(conn, origin, Slot::Complete)?.map(|s| (s.head.seq, s.head.root));
+    let pending = head_in(conn, origin, Slot::Pending)?.map(|s| (s.head.seq, s.head.root));
+    Ok(best_floor(complete, pending))
+}
+
+/// The one implementation behind [`Store::fork_width`] and [`Txn::fork_width`].
+fn fork_width_in(conn: &rusqlite::Connection, origin: &OriginId, seq: u64) -> Result<usize> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM head_history WHERE origin_id = ?1 AND seq = ?2",
+        params![origin.canonical(), seq as i64],
+        |row| row.get::<_, i64>(0),
+    )? as usize)
 }
 
 /// The one implementation behind [`Store::next_own_seq`] and
@@ -1041,7 +1036,13 @@ mod tests {
         let key = SecretKey::generate();
         let h = SignedHead::sign(&key, origin(), 1, Hash::EMPTY, 0);
         store.put_head(Slot::Pending, &h, 0, 0).unwrap();
-        store.clear_head(&origin(), Slot::Pending).unwrap();
+        assert!(!store
+            .clear_head_at(&origin(), Slot::Pending, 1, &Hash([9u8; 32]))
+            .unwrap());
+        assert!(store.pending_head(&origin()).unwrap().is_some());
+        assert!(store
+            .clear_head_at(&origin(), Slot::Pending, 1, &Hash::EMPTY)
+            .unwrap());
         assert_eq!(store.pending_head(&origin()).unwrap(), None);
     }
 }

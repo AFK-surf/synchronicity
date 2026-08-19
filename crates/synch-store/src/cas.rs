@@ -488,6 +488,12 @@ impl Store {
         if size <= INLINE_BLOB_MAX {
             self.write_blob_row(&root, size, true, None, Some(data.to_vec()), now)?;
         } else {
+            // Held from the first byte on disk through the row that describes
+            // it, exactly as `write_slice` does. An ingest re-creating content
+            // whose *old* row is a collection candidate is the one writer that
+            // races `gc_content` rather than `gc_orphans`, so the mtime window
+            // does not cover it ([`Store::lease_write`]).
+            let _lease = self.lease_write(&root);
             self.write_payload(&root, data, &outboard)?;
             self.write_blob_row(&root, size, true, None, None, now)?;
         }
@@ -542,6 +548,14 @@ impl Store {
             }
         };
 
+        // Taken as soon as the root is known — which is the first moment it
+        // *can* be — and held past the row. Everything from here to
+        // `write_blob_row` is file IO with no lock held, and for a large object
+        // that is a full payload fsync plus an outboard write: seconds, during
+        // which `gc_content` acting on this root's older row would delete that
+        // row and unlink the bytes this is about to claim are complete
+        // ([`Store::lease_write`]).
+        let _lease = self.lease_write(&root);
         let target = self.blob_path(&root);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1860,6 +1874,77 @@ mod tests {
         // Once the lease is gone both sweeps do their job.
         assert!(store.gc_orphans(i64::MAX).unwrap() > 0);
         assert!(!store.blob_path(&root).exists());
+    }
+
+    /// An ingest re-creating content whose old row is collectable keeps its
+    /// bytes.
+    ///
+    /// The one writer the mtime window does not cover. `gc_orphans` skips a
+    /// freshly renamed payload because its mtime is inside the retention
+    /// horizon — but this race is with `gc_content`, which acts on the *old*
+    /// row, whose `last_access` is as old as the retention horizon by
+    /// construction. Between the rename and `write_blob_row` there is a full
+    /// payload fsync and an outboard write, and a collection landing in that
+    /// window unlinks the bytes the row is about to call complete: `local_ad`
+    /// then advertises an object every read fails on, and nothing ever
+    /// reclaims it, because the entry the scan publishes keeps the row alive.
+    ///
+    /// Threaded rather than hand-driven, because the window only exists inside
+    /// `ingest_file` and there is no seam to stop it at. The collector waits
+    /// for the lease to appear before it acts, and the test asserts it saw one
+    /// — a run that missed the window entirely would prove nothing.
+    #[test]
+    fn an_ingest_that_recreates_a_collectable_object_keeps_its_bytes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (dir, store) = store();
+        let store = std::sync::Arc::new(store);
+        // Large enough that the rename → fsync → outboard → row window is wide
+        // enough for the collector to land in, and past `INLINE_BLOB_MAX` so
+        // the payload is a file rather than a column.
+        let payload = data(32 * 1024 * 1024);
+        let source = dir.path().join("restored.bin");
+        std::fs::write(&source, &payload).unwrap();
+
+        // The state that makes this reachable: a row for this exact content
+        // that is cold, unreferenced and unpinned — an ordinary `gc_content`
+        // candidate — while the same content is ingested again.
+        let root = store.ingest_bytes(&payload, 0).unwrap();
+
+        let observed = std::sync::Arc::new(AtomicBool::new(false));
+        let collector = {
+            let (store, observed) = (store.clone(), observed.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    if store.is_being_written(&root) {
+                        observed.store(true, Ordering::SeqCst);
+                        // Refused, or this returns true and unlinks the bytes
+                        // the ingest is midway through writing.
+                        assert!(
+                            !store.delete_blob_if_collectable(&root, i64::MAX).unwrap(),
+                            "an ingest in flight is not a collectable object"
+                        );
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let (ingested, size) = store.ingest_file(&source, 1).unwrap();
+        collector.join().unwrap();
+
+        assert_eq!(ingested, root);
+        assert_eq!(size, payload.len() as u64);
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "the collector never saw the ingest's lease, so this run proves nothing"
+        );
+        // The invariant: a row calling the object complete, and the bytes it
+        // describes.
+        assert!(store.blob(&root).unwrap().unwrap().complete);
+        assert_eq!(store.read_all(&root).unwrap(), payload);
     }
 
     /// A write that resumes into a stale payload keeps it.

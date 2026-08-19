@@ -234,9 +234,31 @@ impl Syncer {
         // every one of them to it and buy thousands of autocommit writes on the
         // store's single write connection for one message, repeatable per
         // stream. Picking the maximum first makes it one.
+        // A seq the store cannot represent is dropped here rather than carried
+        // to `record_observed_head`, which refuses it — correctly, because
+        // clamping would silently invert every ordering over the column. But a
+        // refusal there is an `Err`, and both callers propagate it: the serve
+        // side aborts the stream before it has read the peer's push or answered
+        // its want, and the dial side aborts before the adoption loop. A
+        // summary is an unauthenticated *claim* (§3.4), so an unusable one has
+        // to cost the claim and not the exchange — §12's containment rule, the
+        // same one `offer_head` and the pending sweep hold to.
+        let representable = |s: &&HeadSummary| {
+            if s.seq > i64::MAX as u64 {
+                tracing::warn!(
+                    origin = %own,
+                    seq = s.seq,
+                    peer = claimed_by.map(|k| k.fmt_short().to_string()).unwrap_or_default(),
+                    "a peer claims a head for our own origin at an unrepresentable seq; ignored"
+                );
+                return false;
+            }
+            true
+        };
         let best = summaries
             .iter()
             .filter(|s| s.origin == own)
+            .filter(representable)
             .max_by_key(|s| s.order_key());
         if let Some(summary) = best {
             if self.store.record_observed_head(
@@ -972,10 +994,32 @@ impl HeadSink for Syncer {
             .map_err(to_net)
     }
 
+    /// Contained here, not at the wire.
+    ///
+    /// §12's rule is that a record this node cannot apply fails *its own
+    /// origin* and no other, and `to_net` flattens every engine failure into
+    /// one `NetError::Unexpected(String)` — so a caller on the far side of this
+    /// seam cannot tell an undecodable `f:` record from `SQLITE_BUSY`. Both
+    /// `synch-net` arms used to guess, and they guessed differently: the
+    /// `Hello` loop logged everything as "origin left behind" including a full
+    /// disk, and `HeadPush` eleven lines below failed the stream. Doing it on
+    /// this side is what gives one rule one implementation — the classifier is
+    /// already here, and `Syncer::offer_head` has already retired the head by
+    /// the time an origin fault reaches this point.
     fn offer_head(&self, head: &SignedHead, now: i64) -> std::result::Result<(), NetError> {
-        Syncer::offer_head(self, head, now)
-            .map(|_| ())
-            .map_err(to_net)
+        match Syncer::offer_head(self, head, now) {
+            Ok(_) => Ok(()),
+            Err(e) if is_origin_fault(&e) => {
+                tracing::warn!(
+                    origin = %head.origin,
+                    seq = head.seq,
+                    error = %e,
+                    "origin left behind: its pushed head could not be applied"
+                );
+                Ok(())
+            }
+            Err(e) => Err(to_net(e)),
+        }
     }
 
     fn heads_for(&self, origins: &[OriginId]) -> std::result::Result<Vec<SignedHead>, NetError> {
@@ -1788,7 +1832,9 @@ mod containment_tests {
         );
 
         // Even once the pending slot is cleared, the retained history still does.
-        store.clear_head(&origin, Slot::Pending).unwrap();
+        store
+            .clear_head_at(&origin, Slot::Pending, 9, &Hash([9u8; 32]))
+            .unwrap();
         assert_eq!(store.next_own_seq(&origin).unwrap(), 10);
     }
 }
