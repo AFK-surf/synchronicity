@@ -574,19 +574,36 @@ impl Store {
 
     /// Records the scope a peer declared, when it differs from what is held.
     ///
-    /// Returns true if the value changed, which is the caller's cue that
-    /// anything derived from the old scope — a memoized completeness answer
-    /// above all — is now answering the wrong question.
+    /// Returns true if the value changed. A completeness memo needs nothing
+    /// from the caller — [`Scope::memo_key`] folds the scope in, so a widened
+    /// scope re-derives — but the redaction memo is keyed by node hash alone,
+    /// and that one is cleared here.
+    ///
+    /// It has to be. A redaction records *where the walk stopped*, which is a
+    /// fact about a scope rather than about a node: widen the grant and the
+    /// same node stands at the same position, still marked as a boundary, so
+    /// the walk skips a subtree this node is now entitled to and
+    /// `is_complete_scoped` answers complete for a trie it does not hold —
+    /// silently, permanently, with no misbehaving peer anywhere. The memo is a
+    /// cache of an answer that just changed, so it is dropped whole rather
+    /// than re-keyed: a boundary that still stands is re-learned on the next
+    /// walk, at the cost of one round.
     pub fn set_local_scope(&self, scope: Option<&[String]>) -> Result<bool> {
         let current = self.local_scope()?;
         let next = scope.map(|s| s.to_vec());
         if current == next {
             return Ok(false);
         }
-        match next {
-            None => self.clear_config("local_scope")?,
-            Some(spaces) => self.set_config("local_scope", &encode_spaces(&spaces))?,
-        }
+        // One transaction, so a crash cannot leave the new scope beside the
+        // old scope's boundaries.
+        self.transaction(|txn| -> Result<()> {
+            match &next {
+                None => txn.clear_config("local_scope")?,
+                Some(spaces) => txn.set_config("local_scope", &encode_spaces(spaces))?,
+            }
+            txn.clear_redacted()?;
+            Ok(())
+        })?;
         Ok(true)
     }
 
@@ -718,6 +735,37 @@ mod tests {
     /// reading below [`MIN_TRUSTED_NS`] dates nothing (see [`crate::clock`]).
     fn at(secs: i64) -> i64 {
         MIN_TRUSTED_NS + secs * 1_000_000_000
+    }
+
+    #[test]
+    fn widening_the_scope_forgets_the_boundaries_the_old_one_drew() {
+        use synch_mpt::NodeStore;
+
+        let (_dir, store) = store();
+        let withheld = synch_core::Hash::new(b"a subtree the narrow grant withheld");
+        store
+            .set_local_scope(Some(&["photos".to_string()]))
+            .unwrap();
+        store.note_redacted(&withheld).unwrap();
+        assert!(store.is_redacted(&withheld).unwrap());
+
+        // Re-declaring the same scope changes nothing, so the boundary stands.
+        assert!(!store
+            .set_local_scope(Some(&["photos".to_string()]))
+            .unwrap());
+        assert!(store.is_redacted(&withheld).unwrap());
+
+        // Widening it does. The same node now sits at a position this node is
+        // entitled to, and a boundary left over from the narrow grant would
+        // make the walk skip it forever — reporting a trie complete that it
+        // does not hold, with nothing to notice.
+        assert!(store
+            .set_local_scope(Some(&["photos".to_string(), "finance".to_string()]))
+            .unwrap());
+        assert!(
+            !store.is_redacted(&withheld).unwrap(),
+            "a boundary outlived the scope that drew it"
+        );
     }
 
     fn binding(origin: OriginId, key: NodeId, expires: Option<i64>) -> Binding {

@@ -10,6 +10,21 @@ use crate::{
 /// Current schema version stamped into every record's `v` field.
 pub const RECORD_VERSION: u8 = 1;
 
+/// True if a record stamped `v` is one this build understands.
+///
+/// The stamp is only worth carrying if something reads it, and until this
+/// existed nothing did. postcard decodes structurally and ignores trailing
+/// bytes, so a future record with a field appended decodes cleanly *as the
+/// current shape* — the new field silently dropped, the record materialized as
+/// though the publisher had never set it. That is the one failure a version
+/// stamp is for, and the whole cost of catching it is comparing one byte.
+///
+/// Older versions stay readable: `v` below the current one is a shape this
+/// build has already seen. Only the future is refused.
+pub fn is_supported_version(v: u8) -> bool {
+    v <= RECORD_VERSION
+}
+
 /// The `f:` key prefix: this origin's copy of a file.
 pub const PREFIX_FILE: u8 = b'f';
 /// The `b:` key prefix: "I hold (part of) this object".
@@ -404,7 +419,8 @@ impl Delegation {
     /// a file entry this node cannot read loses a row, while a delegation it
     /// cannot read would otherwise grant whatever the caller assumed.
     pub fn is_well_formed(&self) -> bool {
-        !self.spaces.is_empty()
+        is_supported_version(self.v)
+            && !self.spaces.is_empty()
             && self.spaces.len() <= MAX_DELEGATION_SPACES
             && self.spaces.iter().all(|s| validate_space(s).is_ok())
             && {

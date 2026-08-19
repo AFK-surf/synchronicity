@@ -673,6 +673,33 @@ impl Txn<'_> {
         set_device_key_state_in(self.conn(), node_id, state)
     }
 
+    /// Writes a config value, inside the transaction.
+    pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO config (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a config value, inside the transaction.
+    pub fn clear_config(&self, key: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM config WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Forgets every redaction boundary, inside the transaction.
+    ///
+    /// A boundary is a fact about a scope, not about a node, so the memo is
+    /// dropped whenever the scope moves — see [`Store::set_local_scope`],
+    /// which is the only thing that should call this.
+    pub fn clear_redacted(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM redacted_nodes", [])?;
+        Ok(())
+    }
+
     /// Sets or clears the membership domain, inside the transaction.
     pub fn set_membership_domain(&self, domain: Option<&str>) -> Result<()> {
         match domain {

@@ -124,9 +124,19 @@ impl Scope {
             return true;
         }
         match node {
-            crate::node::TrieNode::Branch { value, .. } => {
-                value.is_none() || self.admits_key_path(path)
-            }
+            // A branch's sixteen child hashes are the spine itself, and one of
+            // them may lead into the grant — so refusing the node whole over
+            // its own value costs the peer every subtree below it, not just
+            // the value. Only an `Inline` value forces that: its bytes are in
+            // the node, so the node cannot travel. A `Hash` value puts nothing
+            // in the node but the hash, which is the same thing every redacted
+            // child already contributes, and the payload behind it is refused
+            // separately when the peer asks for it.
+            crate::node::TrieNode::Branch { value, .. } => match value {
+                None => true,
+                Some(crate::node::ValueRef::Hash(_)) => true,
+                Some(crate::node::ValueRef::Inline(_)) => self.admits_key_path(path),
+            },
             crate::node::TrieNode::Ext { prefix, .. } => {
                 let mut covered = path.to_vec();
                 covered.extend_from_slice(prefix.as_slice());
@@ -186,6 +196,36 @@ mod tests {
 
     fn path(bytes: &[u8]) -> Vec<u8> {
         Nibbles::from_bytes(bytes).as_slice().to_vec()
+    }
+
+    #[test]
+    fn a_branch_keeps_its_children_when_its_value_is_out_of_line() {
+        // `photos` is a key in its own right and `photos-raw` is the grant, so
+        // the branch at `f:photos` carries a value the peer may not have while
+        // sitting on the spine into a subtree it may. Refusing it whole cost
+        // all sixteen children; only an inline value forces that now.
+        let scope = Scope::of(&synch_core::ScopeKeys {
+            prefixes: vec![b"f:photos-raw/".to_vec()],
+            exact: Vec::new(),
+        });
+        let at = path(b"f:photos");
+        let children: [Option<Hash>; 16] = std::array::from_fn(|_| None);
+        let out_of_line = crate::node::TrieNode::Branch {
+            children,
+            value: Some(crate::node::ValueRef::Hash(Hash::new(b"record"))),
+        };
+        assert!(
+            scope.admits_node(&at, &out_of_line),
+            "a hash reveals no more than the child hashes already in the node"
+        );
+        let inline = crate::node::TrieNode::Branch {
+            children,
+            value: Some(crate::node::ValueRef::Inline(b"record".to_vec())),
+        };
+        assert!(
+            !scope.admits_node(&at, &inline),
+            "inline bytes are the record itself, so the node cannot travel"
+        );
     }
 
     #[test]
