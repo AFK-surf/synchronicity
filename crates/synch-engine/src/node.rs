@@ -775,15 +775,21 @@ impl Node {
     /// honored by nobody whatever it publishes. This is what makes the command
     /// say so instead of reporting a success that means nothing.
     pub fn is_delegated(&self) -> Result<bool> {
-        if self.store().local_scope()?.is_some() {
-            return Ok(true);
-        }
+        // A live delegation of this node's own key is the authoritative
+        // answer, because it came out of a signed trie. The adopted read scope
+        // is only the bootstrap — what a delegate has before it has replicated
+        // the record naming it — so it answers only when there is no record to
+        // read, and stops answering the moment one says otherwise.
         let own = self.node_id();
-        Ok(self
+        if self
             .store()
             .delegations(now_ns())?
             .into_iter()
-            .any(|b| b.node_id == own))
+            .any(|b| b.node_id == own)
+        {
+            return Ok(true);
+        }
+        Ok(self.store().has_delegations()? && self.store().local_scope()?.is_some())
     }
 
     /// Rebinds a named origin to a new device key, the static-trust equivalent
@@ -1089,7 +1095,7 @@ impl Node {
     /// Node-wide facts only. What this node advertises about each space is a
     /// record of its own under `m:space/<id>`, because a leaf value cannot be
     /// partly redacted and a single manifest listing every space would be
-    /// unshowable to a delegate (§8).
+    /// unshowable to a delegate (§5.5).
     pub fn manifest_change(&self) -> Result<StagedChange> {
         let manifest = NodeManifest {
             v: synch_core::RECORD_VERSION,
@@ -1125,9 +1131,10 @@ impl Node {
 
     /// Reads what an origin publishes about one space (§4.2, §8).
     ///
-    /// `None` for a space the origin does not advertise — and, for a peer this
-    /// node reads under a scope, for a space it was not delegated: the record
-    /// is simply not there to read.
+    /// `None` for a space the origin does not advertise. Reading under a scope
+    /// this space falls outside of is a different answer: the subtree was never
+    /// served, so the lookup fails rather than reporting an absence — which is
+    /// the distinction a scoped node has to keep (§5.5).
     pub fn space_info_of(&self, origin: &OriginId, space: &str) -> Result<Option<SpaceInfo>> {
         let Some(head) = self.store().complete_head(origin)? else {
             return Ok(None);
@@ -1641,7 +1648,7 @@ mod tests {
         assert_eq!(manifest.software, SOFTWARE);
         // What the node advertises about a space is its own record, so that it
         // can be shown to a peer delegated that space and withheld from one
-        // that was not (§8).
+        // that was not (§5.5).
         let info = node.space_info_of(node.origin(), "media").unwrap().unwrap();
         assert_eq!(info.description, space.path().display().to_string());
         assert!(node

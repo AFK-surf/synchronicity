@@ -524,6 +524,16 @@ independently and the effective scope is the union, which is how the binding tab
 already treats a key held by both `static` and `dns`. `issuer` is therefore part of
 the row's identity (§10).
 
+Two consequences of a delegated binding being a *derived* row rather than an
+independent one. A head from an origin holding no live binding is not promoted at all
+— collapsing "no binding" into "unrestricted" would make revoking a delegation
+*promote* the head its scope had been refusing, which is the opposite of what revoking
+is for. And the expiry sweep that deletes lapsed DNS bindings leaves these alone:
+materialization only ever applies deltas, so a row deleted out of band never returns —
+the `d:` leaf it came from has not changed — and a forward clock skew would silently
+drop trust the issuer never withdrew. They stop counting the instant they date-lapse,
+and go when the record that made them does.
+
 This is the first transitive trust in the system, and §3.2's "there is no transitive
 trust" is spent knowingly. What it buys is bounded: a rooted member already reads
 every space and can hand over its own device secret invisibly and forever, so
@@ -558,9 +568,12 @@ A **space** is a named sync root (like a Syncthing folder): a user configures
 Spaces are the unit of sharing policy and of local materialization.
 
 The keyspace is laid out so that **the redaction boundary falls on key prefixes**,
-which §8 depends on: a peer delegated a space is served the subtrees under
-`f:<space>/` and `m:space/<space>` and nothing else, and a prefix is the only shape
-that boundary can take. `m:self` therefore carries no per-space information — a leaf
+which §8 depends on: a peer delegated a space is served the subtrees under `f:<space>/`, that space's own
+`m:space/<space>` record, `m:self`, and `d:` — and of every other space, nothing.
+A prefix is the only shape that boundary can take, which is why `m:space/<id>` and
+`m:self` are carried as *exact* keys rather than prefixes: used as prefixes they would
+admit every key that merely starts with them, so a delegation of `photos` would carry
+`m:space/photos-raw` along with it. `m:self` therefore carries no per-space information — a leaf
 value cannot be partly redacted, so a single manifest listing every space could be
 shown to a delegate not at all. Any new record type is checked against this rule at
 design time, because retrofitting it costs a migration and a cluster-wide republish.
@@ -978,6 +991,26 @@ never generates one — and is logged as the probe it is. The scoped walk is als
 the head-promotion diff runs under, since a node reading under a scope holds only
 that part of the trie.
 
+**The root a request names must be one this node holds a head for.** Given an
+arbitrary root the empty path resolves to that root itself, and every position under
+it is whatever the caller put there — so without this check, authorization by
+position authorizes nothing at all. Roots reached through `head_history` are ones an
+origin signed and this node verified, which is what makes the positions in them real.
+
+**A node is judged by what it reveals, not only by where it sits.** The trie
+compresses, and a compressed node carries key material of its own: an `Ext` spells
+the nibbles between its position and its child, a `Leaf` spells the rest of a key
+together with that key's value. Both can sit at a spine position the scope
+legitimately admits — the spine is what makes the root recompute — while describing a
+key range that runs out of the scope entirely. Such a node is refused as a
+**boundary**, reported distinctly from an absence: `missing` means "ask again", while
+a redacted position means "there is nothing here for you, ever". A scoped node
+records the distinction durably, because a completeness walk that re-read a refused
+position as merely missing would never settle and a fetch would retry until its head
+was abandoned. To every walk over what this node *does* hold, a redacted position
+reads as empty — both roots of a diff redact the same positions, so the two sides
+agree and no spurious change is emitted.
+
 **`complete` becomes scope-relative.** A delegate never holds a foreign trie whole,
 so it advertises `complete: false` for every origin but its own and drops out of the
 swarm as a source for foreign metadata, which is correct — it could not serve it. The
@@ -1000,14 +1033,21 @@ node holding no ads for a root it wants — which makes the namespace invisible 
 than merely filtered. A delegate still *publishes* `b:` for content it holds, or no
 member could fetch from it.
 
-**What remains visible**, stated exactly: the existence and count of sibling subtrees
-along the spine, and one nibble of discrimination each, since a branch on the path to
-a granted space necessarily says which of its sixteen slots are occupied. Where a
-granted space's name shares a prefix with another's, the shared prefix is on the spine
-legitimately and the discriminating nibble is all that is added. Nothing else: no
-names, no paths, no sizes, no mtimes, no content hashes, no counts. Driving even that
-to zero would mean hashing trie keys so prefixes carry no meaning, which would destroy
-the range-scan property §4.1 is built on.
+**What remains visible**, stated exactly. Of an *undelegated space*: the existence and
+count of sibling subtrees along the spine, and one nibble of discrimination each, since
+a branch on the path to a granted space necessarily says which of its sixteen slots are
+occupied. Where a granted space's name shares a prefix with another's, the shared prefix
+is on the spine legitimately and the discriminating nibble is all that is added. Nothing
+else — no names, no paths, no sizes, no mtimes, no content hashes, no counts. Driving
+even that to zero would mean hashing trie keys so prefixes carry no meaning, which would
+destroy the range-scan property §4.1 is built on.
+
+Two things outside that accounting are served to a delegate deliberately, and are worth
+naming rather than leaving to be discovered: `m:self`, which is node-wide and carries
+nothing about any space; and the whole of `d:`, so a delegate reads every *other*
+delegation the cluster holds — including the ids of spaces it was not granted, since a
+`Delegation` names its own list. That is the transitive-trust concession made legible
+(§3.5), and it is what lets `synch delegate ls` answer from any node.
 
 ---
 
@@ -1645,6 +1685,11 @@ CREATE TABLE head_history  (origin_id TEXT, seq INTEGER, root BLOB, created_at I
                                                                  -- pruned by retention
 CREATE TABLE trie_nodes    (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE trie_values   (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
+-- Positions a peer serving a scoped view refused to show (§5.5). A boundary,
+-- not an absence: without it a scoped node could not tell "the peer does not
+-- have this" from "the peer will not show me this", and its completeness walk
+-- would never settle.
+CREATE TABLE redacted_nodes (hash BLOB PRIMARY KEY);
 
 -- materialized views of trie leaves (rebuilt incrementally from diffs)
 CREATE TABLE entries (

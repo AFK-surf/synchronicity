@@ -454,24 +454,36 @@ impl Node {
                 }
             };
 
-            // `is_complete` walks a peer's node graph, so it can raise on its
-            // own — but only in cases `try_promote` has already met: it walks
-            // the same root over the transaction just above, against the same
-            // rows and the same memo, so a graph this raises on made `outcome`
-            // an `Err` and `poisoned` is already true. What is left is the
-            // divergence the two walks *can* have, which is a transient store
-            // failure on the second one, and the answer to that is to leave the
-            // head where it is for a pass rather than to condemn it: reading it
-            // as incomplete would make a `SQLITE_BUSY` past the TTL abandon a
-            // head whose trie is wholly here.
+            // Scoped, like promotion: on a node reading under a scope the
+            // unscoped answer is false by construction for every foreign
+            // origin, so a pending head that failed promotion for any unrelated
+            // reason would read as stale and be abandoned once its TTL passed
+            // (§5.5). A scope this node cannot read is treated as the whole
+            // keyspace, which is the conservative reading: it makes a head look
+            // less complete, never more.
             //
-            // Only asked when the head is not already condemned: for a poisoned
-            // head the answer is discarded, and asking anyway both wasted a full
-            // trie walk and let the "leaving it for a pass" branch log a
+            // `is_complete_scoped` walks a peer's node graph, so it can raise on
+            // its own — but only in cases `try_promote` has already met: it
+            // walks the same root over the transaction just above, against the
+            // same rows and the same memo, so a graph this raises on made
+            // `outcome` an `Err` and `poisoned` is already true. What is left is
+            // the divergence the two walks *can* have, which is a transient
+            // store failure on the second one, and the answer to that is to
+            // leave the head where it is for a pass rather than to condemn it:
+            // reading it as incomplete would make a `SQLITE_BUSY` past the TTL
+            // abandon a head whose trie is wholly here.
+            //
+            // Only walked when the head is not already condemned: for a poisoned
+            // head the answer is discarded, and walking anyway both wasted a
+            // full trie walk and let the "leaving it for a pass" branch log a
             // reprieve for a head this pass is about to abandon.
+            let scope = self
+                .store()
+                .local_trie_scope()
+                .unwrap_or_else(|_| synch_mpt::Scope::full());
             let stale = !poisoned
                 && stored.received_at <= before
-                && !match trie.is_complete(stored.head.root) {
+                && !match trie.is_complete_scoped(stored.head.root, &scope) {
                     Ok(complete) => complete,
                     Err(e) => {
                         tracing::warn!(

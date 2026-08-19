@@ -158,13 +158,17 @@ impl ProtocolHandler for BlobProtocol {
 }
 
 impl BlobProtocol {
-    /// Refuses an object a delegated peer has no granted path to (§7).
+    /// Refuses an object a delegated peer has no granted path to (§3.5).
     ///
     /// `GetSlice` is keyed by object root and carries no space, so
     /// entitlement to the bytes has to be looked up: does any entry in one of
-    /// this peer's granted spaces name this content? A rooted peer skips the
-    /// question entirely, which is also what keeps this off the hot path for
-    /// every ordinary member.
+    /// this peer's granted spaces name this content?
+    ///
+    /// A rooted peer is unrestricted, but finding that out still costs a
+    /// bindings read, and this runs once per slice — thousands of times across
+    /// one large object. The cheap half of the answer is asked first: a store
+    /// holding no delegation at all cannot have a scoped peer, which is the
+    /// state of every cluster that does not use the feature.
     async fn check_content_scope(
         &self,
         peer: synch_core::NodeId,
@@ -172,6 +176,9 @@ impl BlobProtocol {
     ) -> Result<(), NetError> {
         let store = self.store.clone();
         let permitted = crate::blocking::offload(move || {
+            if !store.has_delegations()? {
+                return Ok(true);
+            }
             let spaces = match store.publish_scope_of_key(&peer, synch_core::now_ns())? {
                 None => return Ok(true),
                 Some(spaces) => spaces,

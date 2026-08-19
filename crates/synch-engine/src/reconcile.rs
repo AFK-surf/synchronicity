@@ -22,7 +22,7 @@ use std::{
 
 use synch_core::{now_ns, Hash, HeadSummary, OriginId, SignedHead, MAX_BATCH};
 use synch_mpt::{Scope, Trie, TrieNode};
-use synch_store::{Slot, Store};
+use synch_store::{PublishScope, Slot, Store};
 
 use synch_net::{HeadSink, MptClient, NetError};
 
@@ -630,19 +630,35 @@ impl Syncer {
             //
             // Cheap despite reading like a scan: the check descends only where
             // the boundary is unresolved, so it visits the spine and stops.
-            if let Some(spaces) = &publish_scope {
-                let scope = Scope::of(&synch_core::publish_prefixes(spaces));
-                if let Some(key) = trie.first_key_outside(pending.head.root, &scope)? {
-                    tracing::warn!(
+            match &publish_scope {
+                // An origin this node holds no live binding for publishes
+                // nothing it will promote. Not merely a scope question: were
+                // this to fall through as "unrestricted", revoking a
+                // delegation would *promote* the head its scope had been
+                // refusing, which is the opposite of what revoking is for.
+                PublishScope::Untrusted => {
+                    tracing::debug!(
                         origin = %origin,
                         seq = pending.head.seq,
-                        key = %synch_mpt::Nibbles::from_nibbles(&key)
-                            .to_bytes()
-                            .map(|b| String::from_utf8_lossy(&b).into_owned())
-                            .unwrap_or_else(|| "<partial>".to_string()),
-                        "refusing a delegated origin's head: it publishes outside its spaces"
+                        "not promoting: no live binding for this origin"
                     );
                     return Ok(Promotion::Waiting);
+                }
+                PublishScope::Unrestricted => {}
+                PublishScope::Confined(spaces) => {
+                    let scope = Scope::of(&synch_core::publish_prefixes(spaces));
+                    if let Some(key) = trie.first_key_outside(pending.head.root, &scope)? {
+                        tracing::warn!(
+                            origin = %origin,
+                            seq = pending.head.seq,
+                            key = %synch_mpt::Nibbles::from_nibbles(&key)
+                                .to_bytes()
+                                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                                .unwrap_or_else(|| "<partial>".to_string()),
+                            "refusing a delegated origin's head: it publishes outside its spaces"
+                        );
+                        return Ok(Promotion::Waiting);
+                    }
                 }
             }
             // The displaced head is already retained: `put_head` recorded its
@@ -735,7 +751,7 @@ impl Syncer {
             })
             .await?
         };
-        // Everything below is confined to what this node may read (§8). For a
+        // Everything below is confined to what this node may read (§5.5). For a
         // rooted member that is the whole keyspace and the walk is unchanged;
         // for a delegated one it stops at the boundary rather than asking for
         // what it would be refused, which is why an out-of-scope request is
@@ -770,6 +786,22 @@ impl Syncer {
                 let response = client.get_nodes(pending.root, &missing.nodes).await?;
                 let store = self.store.clone();
                 let requested: Vec<Hash> = missing.nodes.iter().map(|(_, hash)| *hash).collect();
+                // A boundary the peer reported is recorded before anything
+                // else, and counts as progress: the walk then treats it as
+                // satisfied rather than absent, so the fetch converges instead
+                // of retrying to the §5.2 abandonment clause (§5.5).
+                let boundary = response.redacted.clone();
+                learned += boundary.len();
+                {
+                    let store = self.store.clone();
+                    crate::blocking::offload(move || {
+                        for hash in &boundary {
+                            synch_mpt::NodeStore::note_redacted(store.as_ref(), hash)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                }
                 learned += crate::blocking::offload(move || {
                     // One transaction per batch, not one per node. Written
                     // through the `Store`, each `put_node` is a bare `execute`
@@ -1027,7 +1059,30 @@ impl Syncer {
     /// the memo goes with it. It is keyed by scope as well as root, so nothing
     /// stale can be read back — this only avoids a table of answers nobody
     /// will ask for again.
-    fn adopt_scope(&self, scope: Option<&[String]>) -> Result<()> {
+    fn adopt_scope(&self, peer: synch_core::NodeId, scope: Option<&[String]>) -> Result<()> {
+        // Only a peer this node holds a *rooted* binding for may narrow it.
+        //
+        // The declaration drives more than what this node asks for: it decides
+        // what counts as a complete trie and what gets materialized. A delegate
+        // that could set it would be able to stop an ordinary member
+        // replicating spaces it has every right to — and a member never holds a
+        // rooted binding for a delegate, which is exactly the distinction that
+        // closes it. A delegate bootstrapping holds a static or DNS binding for
+        // the peers it dials, so it still learns its own scope.
+        let rooted = self
+            .store
+            .live_bindings(now_ns())?
+            .into_iter()
+            .any(|b| b.node_id == peer && b.is_rooted());
+        if !rooted {
+            if scope.is_some() {
+                tracing::debug!(
+                    peer = %peer.fmt_short(),
+                    "ignoring a read scope declared by a peer this node has no rooted binding for"
+                );
+            }
+            return Ok(());
+        }
         if self.store.set_local_scope(scope)? {
             tracing::info!(
                 spaces = ?scope,
@@ -1082,11 +1137,12 @@ impl Syncer {
         // What the peer says it will serve us. Adopted before anything is
         // fetched, so the very first walk of this session is already confined
         // to it — which is how a delegated node comes to be able to read the
-        // trie its own scope is published in (§8).
+        // trie its own scope is published in (§5.5).
         {
             let syncer = self.clone();
             let scope = theirs.scope.clone();
-            crate::blocking::offload(move || syncer.adopt_scope(scope.as_deref())).await?;
+            let peer = client.remote_id();
+            crate::blocking::offload(move || syncer.adopt_scope(peer, scope.as_deref())).await?;
         }
 
         // Every exchange is also an observation of what peers hold for our own

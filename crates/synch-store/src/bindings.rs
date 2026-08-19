@@ -62,6 +62,24 @@ impl BindingSource {
     }
 }
 
+/// What an origin is permitted to publish, as `try_promote` asks it (§3.5).
+///
+/// Three answers, not two. Collapsing "no live binding" into "unrestricted" is
+/// a fail-open in the worst place: a delegated origin whose head was refused
+/// for a scope violation sits in the pending slot, and the moment its
+/// delegation lapses or is revoked the origin has no live binding at all — so
+/// the very act of revoking would promote the head that revocation exists to
+/// keep out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishScope {
+    /// No live binding: nothing this origin published may be promoted.
+    Untrusted,
+    /// A live rooted binding: the origin may publish anything.
+    Unrestricted,
+    /// Live delegations only: confined to these spaces.
+    Confined(Vec<String>),
+}
+
 /// An `OriginId → device key` binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
@@ -156,10 +174,31 @@ fn put_binding_in(conn: &rusqlite::Connection, binding: &Binding) -> Result<()> 
 }
 
 impl crate::db::Txn<'_> {
+    /// The scope one origin's leaves may be materialized under, inside the
+    /// transaction.
+    ///
+    /// [`Store::materialization_scope`]: the read scope for a foreign origin,
+    /// and always the whole keyspace for this node's own, whose trie it built
+    /// and therefore holds whole.
+    pub fn materialization_scope(&self, origin: &OriginId) -> Result<Scope> {
+        let own: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT value FROM config WHERE key = 'self_origin_id'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if own.as_deref() == Some(origin.canonical().as_str()) {
+            return Ok(Scope::full());
+        }
+        self.local_trie_scope()
+    }
+
     /// The read scope this node is confined to, inside the transaction.
     ///
     /// Promotion reads it to scope the materialization diff the same way the
-    /// fetch that filled the trie was scoped (§8).
+    /// fetch that filled the trie was scoped (§5.5).
     pub fn local_trie_scope(&self) -> Result<Scope> {
         let text: Option<String> = self
             .conn()
@@ -201,63 +240,6 @@ impl crate::db::Txn<'_> {
     /// and cannot verify after a restart.
     pub fn put_binding(&self, binding: &Binding) -> Result<()> {
         put_binding_in(self.conn(), binding)
-    }
-
-    /// Materializes one `d:` leaf into a delegated binding, inside the
-    /// transaction that is promoting the issuer's head.
-    ///
-    /// Part of the same write as the head flip and the `entries` delta, for
-    /// the reason §5.2 gives about materialization generally: a crash between
-    /// them would leave this node's trust table disagreeing with the trie it
-    /// is derived from.
-    pub fn put_delegation(
-        &self,
-        issuer: &OriginId,
-        subject: &NodeId,
-        delegation: &synch_core::Delegation,
-        now: i64,
-    ) -> Result<()> {
-        put_binding_in(
-            self.conn(),
-            &Binding {
-                origin: OriginId::Key(*subject),
-                node_id: *subject,
-                source: BindingSource::Delegated,
-                domain: None,
-                issuer: Some(issuer.clone()),
-                spaces: delegation.spaces.clone(),
-                note: delegation.note.clone(),
-                added_at: now,
-                expires_at: Some(delegation.not_after),
-            },
-        )
-    }
-
-    /// Drops the delegated binding one issuer made for one subject.
-    ///
-    /// Revocation is deletion: the `d:` key vanishes from the issuer's next
-    /// root, the diff surfaces it here, and the binding goes with it. Only
-    /// this issuer's row is touched — another origin's delegation of the same
-    /// key is a separate statement and stands.
-    pub fn remove_delegation(&self, issuer: &OriginId, subject: &NodeId) -> Result<bool> {
-        let n = self.conn().execute(
-            "DELETE FROM bindings WHERE origin_id = ?1 AND node_id = ?2
-               AND source = 'delegated' AND issuer = ?3",
-            params![
-                OriginId::Key(*subject).canonical(),
-                subject.as_bytes().to_vec(),
-                issuer.canonical()
-            ],
-        )?;
-        Ok(n > 0)
-    }
-
-    /// Drops every delegation an issuer has made, for when its whole trie goes.
-    pub fn remove_delegations_by(&self, issuer: &OriginId) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM bindings WHERE source = 'delegated' AND issuer = ?1",
-            params![issuer.canonical()],
-        )?)
     }
 }
 
@@ -481,9 +463,10 @@ impl Store {
     /// rooted origins may each delegate the same key, and each vouches
     /// independently, so their grants add rather than conflict.
     ///
-    /// A key with no live binding at all gets a scope that admits nothing.
-    /// It will have been refused at accept long before this is asked, and a
-    /// scope is the wrong place to discover it.
+    /// A key with no live binding at all gets the scope of an empty space list
+    /// — `m:self` and the public `d:` namespace, and no file data. It will have
+    /// been refused at accept long before this is asked, so the case is
+    /// unreachable rather than permissive.
     pub fn scope_for_key(&self, node_id: &NodeId, now: i64) -> Result<Scope> {
         let live: Vec<Binding> = self
             .live_bindings(now)?
@@ -524,19 +507,22 @@ impl Store {
     ///
     /// This is the publish-scope question (§7), asked of the *origin* whose
     /// trie is being materialized rather than of a connection's peer key.
-    pub fn publish_scope(&self, origin: &OriginId, now: i64) -> Result<Option<Vec<String>>> {
+    pub fn publish_scope(&self, origin: &OriginId, now: i64) -> Result<PublishScope> {
         let live: Vec<Binding> = self
             .live_bindings(now)?
             .into_iter()
             .filter(|b| &b.origin == origin)
             .collect();
-        if live.is_empty() || live.iter().any(|b| b.is_rooted()) {
-            return Ok(None);
+        if live.is_empty() {
+            return Ok(PublishScope::Untrusted);
+        }
+        if live.iter().any(|b| b.is_rooted()) {
+            return Ok(PublishScope::Unrestricted);
         }
         let mut spaces: Vec<String> = live.into_iter().flat_map(|b| b.spaces).collect();
         spaces.sort();
         spaces.dedup();
-        Ok(Some(spaces))
+        Ok(PublishScope::Confined(spaces))
     }
 
     /// The scope this node itself may read, as last declared by a peer (§8).
@@ -571,6 +557,34 @@ impl Store {
             Some(spaces) => self.set_config("local_scope", &encode_spaces(&spaces))?,
         }
         Ok(true)
+    }
+
+    /// The scope one origin's leaves may be materialized under.
+    ///
+    /// [`Store::local_trie_scope`] for a foreign origin, whose trie this node
+    /// holds only as far as it was served — but always [`Scope::full`] for this
+    /// node's *own* origin, whose trie it built and therefore holds whole.
+    /// Scoping the local publish would silently drop every record outside the
+    /// read scope from the derived views, `b:` above all: a delegate would stop
+    /// advertising the content it holds, so no member could fetch from it, and
+    /// its own retired ads would never be swept.
+    pub fn materialization_scope(&self, origin: &OriginId) -> Result<Scope> {
+        match self.self_origin()?.as_ref() == Some(origin) {
+            true => Ok(Scope::full()),
+            false => self.local_trie_scope(),
+        }
+    }
+
+    /// True if this store holds any delegation row at all.
+    ///
+    /// One indexed existence check, for hot paths that would otherwise read the
+    /// whole bindings table to discover that nothing is delegated.
+    pub fn has_delegations(&self) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM bindings WHERE source = 'delegated')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? == 1)
     }
 
     /// The read scope as the trie walk wants it.
@@ -645,8 +659,17 @@ impl Store {
         if !synch_core::clock_is_trusted(now) {
             return Ok(0);
         }
+        // DNS rows only. A delegated row is a *materialized view* of a `d:`
+        // leaf, and materialization only ever applies deltas — so a row
+        // deleted out of band here never comes back, because the leaf it was
+        // derived from has not changed. A forward clock skew would silently
+        // and permanently drop trust the issuer never withdrew. DNS rows are
+        // re-inserted by the refresh loop, which is what makes deleting them
+        // safe; nothing re-derives these. They stop counting the instant they
+        // date-lapse, and go when the record that made them does.
         Ok(self.conn().execute(
-            "DELETE FROM bindings WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            "DELETE FROM bindings
+             WHERE source = 'dns' AND expires_at IS NOT NULL AND expires_at <= ?1",
             params![now],
         )?)
     }

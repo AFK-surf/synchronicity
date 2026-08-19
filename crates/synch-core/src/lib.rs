@@ -22,7 +22,7 @@ pub use record::{
     blob_key, blob_prefix, delegation_key, delegation_prefix, dir_prefix, file_key, manifest_key,
     parse_blob_key, parse_delegation_key, parse_file_key, parse_space_info_key, publish_prefixes,
     scope_prefixes, space_info_key, space_prefix, validate_space, AdState, BlobAd, ChunkFormat,
-    ChunkParams, Delegation, EntryKind, FileEntry, KeyError, NodeManifest, SpaceInfo,
+    ChunkParams, Delegation, EntryKind, FileEntry, KeyError, NodeManifest, ScopeKeys, SpaceInfo,
     AD_SPAN_GRANULARITY, MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
 };
 pub use wire::{

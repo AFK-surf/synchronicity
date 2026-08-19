@@ -281,10 +281,12 @@ impl MptProtocol {
             MptMessage::GetNodes { root, wants } => {
                 check_wants(&wants)?;
                 let store = self.store().clone();
-                let (nodes, missing) = crate::blocking::offload(move || {
+                let (nodes, missing, redacted) = crate::blocking::offload(move || {
+                    let scope = store.scope_for_key(&peer, now_ns())?;
                     let admitted = admit(&store, peer, root, &wants)?;
                     let mut nodes = Vec::new();
                     let mut missing = Vec::new();
+                    let mut redacted = Vec::new();
                     let mut budget = ANSWER_BYTE_BUDGET;
                     // One answer per *distinct* hash. A requester may only ask
                     // once — `take_served` refuses a repeated payload as a
@@ -298,37 +300,62 @@ impl MptProtocol {
                     // authorized by position and only then deduplicated by what
                     // those positions resolved to.
                     let mut answered = std::collections::HashSet::new();
-                    for hash in admitted {
-                        if !answered.insert(hash) {
+                    for (at, (path, claimed)) in admitted.into_iter().zip(wants.iter()) {
+                        if !answered.insert(*claimed) {
                             continue;
                         }
-                        match store.get_node(&hash)? {
-                            Some(data) => {
-                                // A short answer is an ordinary answer: the
-                                // requester's walk defers everything it asked
-                                // for and re-offers what did not come back
-                                // (`MissingWalk::resume`). What is not ordinary
-                                // is discovering the frame is too large *after*
-                                // building it — `write_frame` serializes the
-                                // whole message before it can check
-                                // `MAX_FRAME_LEN`, so the cap has to be applied
-                                // while the answer is being assembled.
-                                match budget.checked_sub(data.len()) {
-                                    Some(left) => {
-                                        budget = left;
-                                        nodes.push((hash, data));
-                                    }
-                                    None if nodes.is_empty() => nodes.push((hash, data)),
-                                    None => break,
-                                }
+                        // A position holding nothing is reported against the
+                        // hash the caller named, so an honest walk sees the
+                        // ordinary `missing` it already handles.
+                        let Some(hash) = at else {
+                            missing.push(*claimed);
+                            continue;
+                        };
+                        let Some(data) = store.get_node(&hash)? else {
+                            missing.push(hash);
+                            continue;
+                        };
+                        // Position admits the node; what the node *reveals* may
+                        // still run out of scope. A compressed node carries key
+                        // material of its own — an extension's prefix, a leaf's
+                        // remaining key and value — and one sitting on the spine
+                        // can describe a key range the peer was never granted.
+                        if !scope.is_full()
+                            && !TrieNode::decode(&data)
+                                .map(|node| scope.admits_node(path, &node))
+                                .unwrap_or(false)
+                        {
+                            redacted.push(hash);
+                            continue;
+                        }
+                        // A short answer is an ordinary answer: the requester's
+                        // walk defers everything it asked for and re-offers what
+                        // did not come back (`MissingWalk::resume`). What is not
+                        // ordinary is discovering the frame is too large *after*
+                        // building it — `write_frame` serializes the whole
+                        // message before it can check `MAX_FRAME_LEN`, so the
+                        // cap has to be applied while the answer is assembled.
+                        match budget.checked_sub(data.len()) {
+                            Some(left) => {
+                                budget = left;
+                                nodes.push((hash, data));
                             }
-                            None => missing.push(hash),
+                            None if nodes.is_empty() => nodes.push((hash, data)),
+                            None => break,
                         }
                     }
-                    Ok((nodes, missing))
+                    Ok((nodes, missing, redacted))
                 })
                 .await?;
-                write_frame(send, &MptMessage::Nodes { nodes, missing }).await?;
+                write_frame(
+                    send,
+                    &MptMessage::Nodes {
+                        nodes,
+                        missing,
+                        redacted,
+                    },
+                )
+                .await?;
                 Ok(())
             }
             MptMessage::GetValues { root, wants } => {
@@ -358,11 +385,11 @@ impl MptProtocol {
                         if !answered.insert(wanted.1) {
                             continue;
                         }
-                        let carried = match store.get_node(&holder)? {
-                            Some(data) => TrieNode::decode(&data)
+                        let carried = match holder.map(|h| store.get_node(&h)).transpose()? {
+                            Some(Some(data)) => TrieNode::decode(&data)
                                 .map(|node| node.value_hashes().contains(&wanted.1))
                                 .unwrap_or(false),
-                            None => false,
+                            _ => false,
                         };
                         if !carried {
                             missing.push(wanted.1);
@@ -458,31 +485,50 @@ fn admit(
     peer: NodeId,
     root: Hash,
     wants: &[(Vec<u8>, Hash)],
-) -> Result<Vec<Hash>, NetError> {
+) -> Result<Vec<Option<Hash>>, NetError> {
     let scope = store.scope_for_key(&peer, now_ns())?;
-    if !scope.is_full() {
-        for (path, _) in wants {
-            if !scope.admits_path(path) {
-                tracing::warn!(
-                    peer = %peer.fmt_short(),
-                    "refusing a trie request outside the peer's scope"
-                );
-                return Err(NetError::Unexpected(
-                    "requested a trie position outside this peer's scope".to_string(),
-                ));
-            }
+    if scope.is_full() {
+        // Nothing to authorize: an unscoped peer may have any node this store
+        // holds, so the request is answered by hash exactly as it always was
+        // and the position it carried is not consulted.
+        return Ok(wants.iter().map(|(_, claimed)| Some(*claimed)).collect());
+    }
+    // The position is only meaningful relative to a trie this node vouches
+    // for. Given a root of the caller's choosing, the empty path resolves to
+    // that root itself and every position below it is whatever the caller put
+    // there — so authorization by position would authorize nothing at all.
+    if !store.is_head_root(&root)? {
+        tracing::warn!(
+            peer = %peer.fmt_short(),
+            "refusing a trie request against a root this node holds no head for"
+        );
+        return Err(NetError::Unexpected(
+            "requested positions against a root this node holds no head for".to_string(),
+        ));
+    }
+    for (path, _) in wants {
+        if !scope.admits_path(path) {
+            tracing::warn!(
+                peer = %peer.fmt_short(),
+                "refusing a trie request outside the peer's scope"
+            );
+            return Err(NetError::Unexpected(
+                "requested a trie position outside this peer's scope".to_string(),
+            ));
         }
     }
-    // The claimed hash is not what authorizes — the position is — but it is
-    // still checked, so that a peer walking a different root than it thinks
-    // learns that here rather than by failing verification later.
+    // For a scoped peer the position is the *only* authorization, so what is
+    // served is what the descent found and never what the request claimed.
+    //
+    // The distinction is the whole of the boundary. A delegate necessarily
+    // holds the hash of every subtree withheld from it — the hash is inside the
+    // branch node that makes the signed root recompute — so falling back to the
+    // claimed hash where a position resolves to nothing would hand over any of
+    // them for the price of naming an in-scope position that happens to be
+    // empty. A position that resolves to nothing holds nothing, and that is the
+    // answer.
     let paths: Vec<Vec<u8>> = wants.iter().map(|(path, _)| path.clone()).collect();
-    let resolved = Trie::new(store).resolve_paths(root, &paths)?;
-    Ok(resolved
-        .into_iter()
-        .zip(wants.iter())
-        .map(|(at, (_, claimed))| at.unwrap_or(*claimed))
-        .collect())
+    Ok(Trie::new(store).resolve_paths(root, &paths)?)
 }
 
 /// Bounds one positioned batch on both axes.
@@ -574,6 +620,12 @@ pub struct NodesResponse {
     pub nodes: Vec<(Hash, Vec<u8>)>,
     /// The hashes the responder did not have.
     pub missing: Vec<Hash>,
+    /// The hashes the responder holds and may not show (§5.5).
+    ///
+    /// A boundary rather than an absence: there is nothing here for this node
+    /// ever, so asking again is pointless and treating it as absent would have
+    /// the walk retry until its head was abandoned.
+    pub redacted: Vec<Hash>,
 }
 
 /// A `Values` response.
@@ -745,7 +797,15 @@ impl MptClient {
             write_frame(&mut send, &MptMessage::GetNodes { root, wants: batch }).await?;
             let _ = send.finish();
             match read_frame::<MptMessage>(&mut recv).await? {
-                MptMessage::Nodes { nodes, missing } => Ok(NodesResponse { nodes, missing }),
+                MptMessage::Nodes {
+                    nodes,
+                    missing,
+                    redacted,
+                } => Ok(NodesResponse {
+                    nodes,
+                    missing,
+                    redacted,
+                }),
                 MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
                 other => Err(unexpected("Nodes", &other)),
             }

@@ -1159,13 +1159,39 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
 
         Command::TrustLs(pb::TrustLs {}) => {
             let now = now_ns();
-            for binding in read(node, |n| Ok(n.store().bindings()?)).await? {
+            // Liveness comes from the cascade, not from the date alone: a
+            // delegated binding whose issuer has been removed is dead, and
+            // printing it as live is the invisible half of the hole §3.5
+            // exists to close. Both reads travel together, on the one hop off
+            // the runtime this command owes the store.
+            type LiveKey = (String, Vec<u8>, &'static str);
+            let (live, bindings) = read(node, move |n| {
+                let live: std::collections::HashSet<LiveKey> = n
+                    .store()
+                    .live_bindings(now)?
+                    .into_iter()
+                    .map(|b| {
+                        (
+                            b.origin.canonical(),
+                            b.node_id.as_bytes().to_vec(),
+                            b.source.as_str(),
+                        )
+                    })
+                    .collect();
+                Ok((live, n.store().bindings()?))
+            })
+            .await?;
+            for binding in bindings {
                 out.line(format!(
                     "{:<32} {} {:<7} {}{}",
                     binding.origin.canonical(),
                     binding.node_id.to_z32(),
                     binding.source.as_str(),
-                    if binding.is_live(now) {
+                    if live.contains(&(
+                        binding.origin.canonical(),
+                        binding.node_id.as_bytes().to_vec(),
+                        binding.source.as_str(),
+                    )) {
                         "live"
                     } else {
                         "lapsed"
@@ -1244,6 +1270,12 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             let now = now_ns();
             let own = node.origin().clone();
             let mut any = false;
+            let live: std::collections::HashSet<Vec<u8>> = node
+                .store()
+                .delegations(now)?
+                .into_iter()
+                .map(|b| b.node_id.as_bytes().to_vec())
+                .collect();
             for binding in node.delegations()? {
                 any = true;
                 let issuer = binding
@@ -1259,6 +1291,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     binding.node_id.to_z32(),
                     binding.spaces.join(","),
                     match binding.expires_at {
+                        // Dated fine, but cut off: its issuer holds no live
+                        // rooted binding here any more.
+                        _ if !live.contains(binding.node_id.as_bytes().as_slice()) => {
+                            "cut off".to_string()
+                        }
                         Some(at) => crate::render::remaining(at, now),
                         None => "never".to_string(),
                     },

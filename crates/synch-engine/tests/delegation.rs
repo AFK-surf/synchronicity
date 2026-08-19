@@ -1,5 +1,5 @@
 //! Delegated space-restricted trust, end to end over two real endpoints
-//! (§3.5, §7, §8).
+//! (§3.5, §5.5, §7).
 //!
 //! The properties worth a network for: a delegate is admitted by replicated
 //! state and nothing else, it sees the spaces it was delegated and no trace of
@@ -300,7 +300,7 @@ async fn a_delegate_publishing_outside_its_spaces_is_refused() {
             .store
             .publish_scope(&delegate.origin, now_ns())
             .unwrap(),
-        Some(vec!["photos".to_string()])
+        synch_store::PublishScope::Confined(vec!["photos".to_string()])
     );
 
     // In scope: the issuer accepts it.
@@ -340,6 +340,151 @@ async fn a_delegate_publishing_outside_its_spaces_is_refused() {
         .list_entries(Some(&delegate.origin), "finance", "", None, None)
         .unwrap()
         .is_empty());
+}
+
+/// A scoped peer cannot reach a redacted node by claiming a position for it.
+///
+/// The sharpest form of the question. A delegate necessarily *holds* the hash
+/// of every subtree withheld from it — the hash is inside the branch node that
+/// makes the signed root recompute — so the only thing between it and the
+/// bytes is that the position it must name is out of scope. This asks for a
+/// withheld hash under an in-scope position that resolves to nothing, and
+/// against a root of the caller's own choosing: the two shapes that get past a
+/// naive position check.
+#[tokio::test]
+async fn a_withheld_node_cannot_be_reached_by_claiming_a_position_for_it() {
+    let issuer = Node::spawn(Some("nas")).await;
+    let delegate = Node::spawn(None).await;
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+
+    issuer.publish(
+        1,
+        &[
+            ("photos", "a.jpg", b"granted"),
+            ("finance", "q3.pdf", b"withheld"),
+            ("finance", "q4.pdf", b"withheld too"),
+        ],
+        &[delegation(&delegate.key(), &["photos"])],
+    );
+    let root = issuer.root();
+
+    // Every node of the issuer's trie by position, from an unscoped walk of
+    // its own store — what a full member legitimately sees.
+    let empty = synch_mpt::MemStore::new();
+    let mut walk = synch_mpt::MissingWalk::new(root);
+    let mut all: Vec<(Vec<u8>, Hash)> = Vec::new();
+    loop {
+        let batch = walk.next_batch(&Trie::new(&empty), 512).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        for (path, hash) in &batch.nodes {
+            all.push((path.clone(), *hash));
+            let bytes = synch_mpt::NodeStore::get_node(issuer.store.as_ref(), hash)
+                .unwrap()
+                .unwrap();
+            synch_mpt::NodeStore::put_node(&empty, hash, &bytes).unwrap();
+        }
+        walk.resume();
+    }
+
+    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let withheld: Vec<Hash> = all
+        .iter()
+        .filter(|(path, _)| !scope.admits_path(path))
+        .map(|(_, hash)| *hash)
+        .collect();
+    assert!(
+        !withheld.is_empty(),
+        "nothing was withheld; test is vacuous"
+    );
+
+    // An in-scope position that resolves to nothing.
+    let mut bogus = synch_mpt::Nibbles::from_bytes(b"f:photos/")
+        .as_slice()
+        .to_vec();
+    bogus.extend_from_slice(&[0xd, 0xe, 0xa, 0xd, 0xb, 0xe, 0xe, 0xf]);
+    assert!(
+        scope.admits_path(&bogus),
+        "the position must pass the scope test"
+    );
+
+    let client = delegate
+        .net
+        .connect_mpt(issuer.net.direct_addr())
+        .await
+        .unwrap();
+    for hash in &withheld {
+        let answer = client
+            .get_nodes(root, &[(bogus.clone(), *hash)])
+            .await
+            .expect("the request itself is well formed");
+        assert!(
+            answer.nodes.is_empty(),
+            "a withheld node was served for a position that does not hold it"
+        );
+        assert_eq!(answer.missing, vec![*hash]);
+
+        // And the same hash named against a root of the caller's choosing:
+        // the empty path resolves to whatever root it was handed, so a root
+        // this node holds no head for has to be refused outright.
+        let refused = client.get_nodes(*hash, &[(Vec::new(), *hash)]).await;
+        assert!(
+            refused.is_err(),
+            "a fabricated root let a withheld node be named"
+        );
+    }
+}
+
+/// A delegate is never shown a node whose key material runs out of its scope.
+///
+/// The trie compresses, so a node at a position the spine legitimately admits
+/// can still spell an undelegated space's name in its extension prefix, or
+/// complete a whole out-of-scope key in its leaf. Both are refused as a
+/// boundary — not as an absence, or the walk would retry until its head was
+/// abandoned.
+#[tokio::test]
+async fn a_compressed_node_spanning_out_of_scope_is_a_boundary_not_an_absence() {
+    let issuer = Node::spawn(Some("nas")).await;
+    let delegate = Node::spawn(None).await;
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+
+    // The issuer holds no `photos` at all, so every spine node below `f:`
+    // compresses toward a space the delegate was never granted.
+    issuer.publish(
+        1,
+        &[("finance", "q3.pdf", b"withheld")],
+        &[delegation(&delegate.key(), &["photos"])],
+    );
+
+    let syncer = Syncer::new(delegate.store.clone());
+    let client = delegate
+        .net
+        .connect_mpt(issuer.net.direct_addr())
+        .await
+        .unwrap();
+    syncer.sync_with(&client).await.unwrap();
+
+    // The delegate converged rather than wedging, and holds nothing of the
+    // space it was not granted — not even the name.
+    let head = delegate
+        .store
+        .complete_head(&issuer.origin)
+        .unwrap()
+        .expect("the delegate promoted the issuer's head");
+    assert_eq!(head.root, issuer.root());
+    assert!(delegate
+        .store
+        .list_entries(Some(&issuer.origin), "finance", "", None, None)
+        .unwrap()
+        .is_empty());
+    // A second pass is a no-op: the boundary was remembered, not re-asked.
+    syncer.sync_with(&client).await.unwrap();
+    assert!(delegate
+        .store
+        .pending_head(&issuer.origin)
+        .unwrap()
+        .is_none());
 }
 
 /// A delegate's own delegation records are read by nobody (§3.5).

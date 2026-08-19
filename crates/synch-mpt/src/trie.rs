@@ -393,6 +393,14 @@ impl MissingWalk {
             if !self.seen.insert(hash) {
                 continue;
             }
+            // A position a peer has refused holds nothing this node may see,
+            // so it is satisfied rather than missing (§5.5). Only above the
+            // grant: inside it there is nothing a peer could rightly refuse,
+            // and treating a refusal there as satisfied would let this node
+            // call a trie complete that it does not hold.
+            if !self.scope.contains_subtree(&path) && trie.is_redacted_raw(&hash)? {
+                continue;
+            }
             let Some(data) = trie.load_raw(&hash)? else {
                 missing.nodes.push((path.clone(), hash));
                 self.deferred.push((reference, hash, path));
@@ -587,6 +595,11 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// whose whole purpose is finding out whether it is.
     pub(crate) fn load_raw(&self, hash: &Hash) -> Result<Option<Vec<u8>>, MptError> {
         Self::wrap(self.store.get_node(hash))
+    }
+
+    /// Whether a peer has refused to show this node (§5.5).
+    pub(crate) fn is_redacted_raw(&self, hash: &Hash) -> Result<bool, MptError> {
+        Self::wrap(self.store.is_redacted(hash))
     }
 
     pub(crate) fn has_value_raw(&self, hash: &Hash) -> Result<bool, MptError> {
@@ -1055,9 +1068,18 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     pub(crate) fn cursor_at(&self, hash: Option<Hash>) -> Result<Cursor, MptError> {
         match hash {
             None => Ok(Cursor::Empty),
-            Some(h) => Ok(Cursor::At {
-                node: self.load(&h)?,
-            }),
+            Some(h) => match self.load(&h) {
+                Ok(node) => Ok(Cursor::At { node }),
+                // A position a peer refused to show holds nothing this node
+                // may see, so to a walk over what it *does* hold it is empty
+                // rather than absent (§5.5). Both roots of a diff redact the
+                // same positions, so the two sides agree and no spurious
+                // change is emitted; without this the materialization that
+                // promotion runs would fail on a subtree the design withheld
+                // on purpose.
+                Err(MptError::MissingNode(_)) if self.is_redacted_raw(&h)? => Ok(Cursor::Empty),
+                Err(e) => Err(e),
+            },
         }
     }
 
@@ -1742,7 +1764,10 @@ mod tests {
 
         // Everything the scoped walk would ever fetch, from an empty store.
         let empty = MemStore::new();
-        let scope = Scope::of(&[b"f:photos/".to_vec()]);
+        let scope = Scope::of(&synch_core::ScopeKeys {
+            prefixes: vec![b"f:photos/".to_vec()],
+            exact: Vec::new(),
+        });
         let mut walk = MissingWalk::scoped(None, root, scope.clone());
         let mut wanted: Vec<(Vec<u8>, Hash)> = Vec::new();
         loop {
@@ -1865,7 +1890,10 @@ mod tests {
         for key in [b"f:photos/a.jpg".as_slice(), b"f:photos/b.jpg".as_slice()] {
             root = trie.insert(root, key, key).unwrap();
         }
-        let scope = Scope::of(&[b"f:photos/".to_vec()]);
+        let scope = Scope::of(&synch_core::ScopeKeys {
+            prefixes: vec![b"f:photos/".to_vec()],
+            exact: Vec::new(),
+        });
         assert_eq!(trie.first_key_outside(root, &scope).unwrap(), None);
 
         // One record outside the grant, and the whole head is refusable.

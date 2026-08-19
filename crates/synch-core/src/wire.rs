@@ -11,6 +11,7 @@ use crate::{
     head::{HeadSummary, SignedHead},
     origin::{NodeId, OriginId},
     record::BlobAd,
+    record::MAX_DELEGATION_SPACES,
 };
 
 /// ALPN for metadata anti-entropy (§5).
@@ -25,20 +26,21 @@ pub const ALPN_BLOB: &[u8] = b"sync/blob/1";
 /// changes this. The check in `Hello` is the whole of the compatibility story —
 /// a peer on another version is refused rather than negotiated with — so the
 /// messages are free to be defined in whatever order reads best.
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 
 /// Maximum number of hashes per `GetNodes`/`GetValues` batch (§5.1).
 pub const MAX_BATCH: usize = 256;
 
 /// The most nibble-path bytes one `GetNodes`/`GetValues` batch may carry.
 ///
-/// The count cap alone stopped bounding these once they began carrying
-/// positions: keys run to [`synch_core::MAX_KEY_LEN`][crate::MAX_KEY_LEN]
-/// bytes, so a path is up to twice that in nibbles and
-/// [`MAX_BATCH`] maximal ones would be megabytes of request for a responder
-/// obliged to descend every one of them. A real walk's paths are the depth of
-/// a key, and its batch shares most of its prefixes.
-pub const MAX_BATCH_PATH_BYTES: usize = 64 * 1024;
+/// Set to exactly what a legal batch can carry — [`MAX_BATCH`] paths of the
+/// deepest key [`MAX_KEY_LEN`][crate::MAX_KEY_LEN] allows — so that no honest
+/// requester can build a batch its peer refuses. A tighter figure would be a
+/// wedge rather than a bound: the walk is deterministic, so a batch once over
+/// the cap is over it again on every retry, and two honest nodes would stop
+/// syncing for good. What it still denies is a frame full of paths that are
+/// long for no reason, which a responder would be obliged to descend.
+pub const MAX_BATCH_PATH_BYTES: usize = MAX_BATCH * 2 * crate::MAX_KEY_LEN;
 
 /// An upper bound on the tree nodes a proof over `ranges` at `level` emits.
 ///
@@ -153,6 +155,28 @@ pub const MAX_PROVIDER_ADS: usize = 256;
 ///
 /// Refused outright rather than truncated: a truncated request is a different
 /// request, and a truncated answer silently misreports what a peer served.
+/// [`bounded_vec`] through an `Option`, for a field that is absent or bounded.
+fn bounded_opt_vec<'de, D, T, const N: usize>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    /// A newtype so the inner vector is deserialized under the cap.
+    struct Bounded<T, const N: usize>(Vec<T>, std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for Bounded<T, N> {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            bounded_vec::<D, T, N>(deserializer).map(|v| Bounded(v, std::marker::PhantomData))
+        }
+    }
+
+    Ok(Option::<Bounded<T, N>>::deserialize(deserializer)?.map(|b| b.0))
+}
+
 fn bounded_vec<'de, D, T, const N: usize>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -251,7 +275,15 @@ pub enum MptMessage {
         /// every session. Advisory in the only direction that matters: the
         /// responder enforces the same scope on every request regardless, so a
         /// wrong or stale value can only cause a peer to ask for less than it
-        /// is entitled to, never more.
+        /// is entitled to, never more — and it is adopted only from a peer this
+        /// node holds a *rooted* binding for, so a delegate cannot narrow a
+        /// member that admitted it.
+        ///
+        /// Bounded while decoding like every other sequence here: the field
+        /// mirrors a `Delegation`'s space list, which is capped at
+        /// [`MAX_DELEGATION_SPACES`], and an unbounded vector of unbounded
+        /// strings turns a 16 MiB frame into hundreds of megabytes of slots.
+        #[serde(deserialize_with = "bounded_opt_vec::<_, _, MAX_DELEGATION_SPACES>")]
         scope: Option<Vec<String>>,
     },
     /// "Yours is newer, send the full signed heads for these origins."
@@ -290,7 +322,8 @@ pub enum MptMessage {
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         wants: Vec<(Vec<u8>, Hash)>,
     },
-    /// Trie nodes, plus the subset the responder did not have.
+    /// Trie nodes, plus the subset the responder did not have, plus the subset
+    /// it holds and may not show.
     Nodes {
         /// `(hash, encoded node)` pairs.
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
@@ -298,6 +331,18 @@ pub enum MptMessage {
         /// Hashes the responder did not have.
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         missing: Vec<Hash>,
+        /// Positions the requester may not see past (§5.5).
+        ///
+        /// Distinct from `missing`, and the distinction is what keeps a scoped
+        /// peer from wedging: `missing` says "ask again", while this says
+        /// "there is nothing here for you, ever". A trie compresses, so a node
+        /// at a position on the spine can carry key material running out of
+        /// the peer's scope — the name of a space it was not granted, or a
+        /// whole leaf record. Withholding it silently would leave the peer
+        /// unable to tell an absent node from a refused one, and it would
+        /// retry until its head was abandoned.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
+        redacted: Vec<Hash>,
     },
     /// Request out-of-line trie value payloads, with the position of the node
     /// that holds each one.
@@ -759,6 +804,7 @@ mod tests {
             MptMessage::Nodes {
                 nodes: vec![(Hash::new(b"a"), vec![1, 2, 3])],
                 missing: vec![Hash::new(b"b")],
+                redacted: vec![Hash::new(b"c")],
             },
             MptMessage::GetValues {
                 root: Hash::new(b"r"),

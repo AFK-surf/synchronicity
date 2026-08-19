@@ -923,8 +923,9 @@ impl Txn<'_> {
     ) -> Result<usize> {
         // Scoped exactly as the fetch that filled this trie was: a node
         // reading under a scope holds only that part, and materializing what
-        // it does not hold is not a thing it could do (§5.5).
-        let scope = self.local_trie_scope()?;
+        // it does not hold is not a thing it could do (§5.5). For this node's
+        // *own* origin the scope is the whole keyspace, whose trie it built.
+        let scope = self.materialization_scope(origin)?;
         let now = now_ns();
         // Streamed, not collected. The walk's position ceiling bounds how many
         // changes there can be and says nothing about how large each one is, so

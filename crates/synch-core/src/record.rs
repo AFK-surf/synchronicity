@@ -604,17 +604,37 @@ pub fn delegation_prefix() -> Vec<u8> {
 /// `FindProviders`, the path §5.1 already provides for a node holding no ads
 /// for a root it wants — which makes the `b:` namespace not merely filtered
 /// for a delegate but invisible, down to how many objects an origin holds.
-pub fn scope_prefixes(spaces: &[String]) -> Vec<Vec<u8>> {
-    let mut out = vec![manifest_key(), delegation_prefix()];
+pub fn scope_prefixes(spaces: &[String]) -> ScopeKeys {
+    let mut out = ScopeKeys {
+        prefixes: vec![delegation_prefix()],
+        exact: vec![manifest_key()],
+    };
     for space in spaces {
         if let Ok(prefix) = space_prefix(space) {
-            out.push(prefix);
+            out.prefixes.push(prefix);
         }
         if let Ok(key) = space_info_key(space) {
-            out.push(key);
+            out.exact.push(key);
         }
     }
     out
+}
+
+/// What part of the keyspace a scope covers, as the two shapes it takes.
+///
+/// The distinction is load-bearing. `f:<space>/` ends in a separator that
+/// `validate_space` forbids inside an id, so it bounds itself and everything
+/// under it belongs to that space. `m:space/<id>` and `m:self` bound nothing:
+/// treated as prefixes they admit every key that merely *starts* with them, so
+/// a delegation of `photos` would carry `m:space/photos-raw` — another space's
+/// entry count and the absolute local path its origin keeps it at — and a
+/// delegate could publish under it too.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScopeKeys {
+    /// Every key beneath these belongs to the scope.
+    pub prefixes: Vec<Vec<u8>>,
+    /// These exact keys belong to the scope, and nothing extending them.
+    pub exact: Vec<Vec<u8>>,
 }
 
 /// The trie key prefixes a delegated origin may *publish* under (§7).
@@ -626,14 +646,17 @@ pub fn scope_prefixes(spaces: &[String]) -> Vec<Vec<u8>> {
 /// delegation is exactly what a delegate may not issue — R1 already means
 /// nobody would read one, and refusing the head keeps the rule visible at the
 /// point it is broken rather than silently ignored.
-pub fn publish_prefixes(spaces: &[String]) -> Vec<Vec<u8>> {
-    let mut out = vec![manifest_key(), blob_prefix()];
+pub fn publish_prefixes(spaces: &[String]) -> ScopeKeys {
+    let mut out = ScopeKeys {
+        prefixes: vec![blob_prefix()],
+        exact: vec![manifest_key()],
+    };
     for space in spaces {
         if let Ok(prefix) = space_prefix(space) {
-            out.push(prefix);
+            out.prefixes.push(prefix);
         }
         if let Ok(key) = space_info_key(space) {
-            out.push(key);
+            out.exact.push(key);
         }
     }
     out
@@ -642,6 +665,69 @@ pub fn publish_prefixes(spaces: &[String]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn space_and_delegation_keys_round_trip() {
+        let key = space_info_key("photos").unwrap();
+        assert_eq!(parse_space_info_key(&key).unwrap(), "photos");
+        assert!(parse_space_info_key(b"m:space/").is_err());
+        assert!(parse_space_info_key(b"m:self").is_err());
+        assert!(space_info_key("bad/id").is_err());
+
+        let subject = iroh_base::SecretKey::generate().public();
+        let key = delegation_key(&subject);
+        assert_eq!(key.len(), 34);
+        assert_eq!(parse_delegation_key(&key).unwrap(), subject);
+        assert!(parse_delegation_key(b"d:short").is_err());
+        assert!(key.starts_with(&delegation_prefix()));
+    }
+
+    /// The two scopes differ, and each difference is load-bearing (§3.5).
+    #[test]
+    fn read_and_publish_scopes_differ_where_they_must() {
+        let spaces = vec!["photos".to_string()];
+        let read = scope_prefixes(&spaces);
+        let publish = publish_prefixes(&spaces);
+        // A delegate is never served `b:` — ads are keyed by content hash, so
+        // the shape of that subtree would leak an origin's object count.
+        assert!(!read.prefixes.contains(&blob_prefix()));
+        // But it must publish `b:`, or no member could fetch content from it.
+        assert!(publish.prefixes.contains(&blob_prefix()));
+        // It reads `d:`, which is public by design, and never publishes one —
+        // the one-level rule made visible where it is broken.
+        assert!(read.prefixes.contains(&delegation_prefix()));
+        assert!(!publish.prefixes.contains(&delegation_prefix()));
+        // A space's own record is an *exact* key in both, so one id being a
+        // prefix of another cannot carry it along.
+        assert!(read.exact.contains(&space_info_key("photos").unwrap()));
+        assert!(!read.prefixes.contains(&space_info_key("photos").unwrap()));
+    }
+
+    #[test]
+    fn a_delegation_must_name_distinct_valid_spaces() {
+        let good = Delegation {
+            v: RECORD_VERSION,
+            spaces: vec!["photos".into(), "incoming".into()],
+            not_after: 1,
+            note: None,
+        };
+        assert!(good.is_well_formed());
+        for spaces in [
+            vec![],
+            vec!["photos".into(), "photos".into()],
+            vec!["bad/id".into()],
+            vec!["".into()],
+            (0..MAX_DELEGATION_SPACES + 1)
+                .map(|i| format!("s{i}"))
+                .collect(),
+        ] {
+            let d = Delegation {
+                spaces,
+                ..good.clone()
+            };
+            assert!(!d.is_well_formed(), "{:?} passed", d.spaces);
+        }
+    }
 
     #[test]
     fn file_keys_round_trip() {

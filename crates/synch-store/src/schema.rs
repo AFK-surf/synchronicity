@@ -81,6 +81,7 @@ pub const MIGRATIONS: &[Migration] = &[
         run: v16_one_membership_domain,
     },
     Migration::Sql(V17_DELEGATED_BINDINGS),
+    Migration::Sql(V18_REDACTED_NODES),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -560,6 +561,7 @@ CREATE TABLE head_history (
 );
 CREATE TABLE trie_nodes    (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE trie_values   (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE redacted_nodes (hash BLOB PRIMARY KEY);
 CREATE TABLE entries (
   origin_id   TEXT NOT NULL,
   space       TEXT NOT NULL,
@@ -822,4 +824,16 @@ INSERT INTO bindings (origin_id, node_id, source, domain, issuer, spaces, note, 
 DROP TABLE bindings_v16;
 CREATE INDEX bindings_by_key    ON bindings (node_id);
 CREATE INDEX bindings_by_issuer ON bindings (issuer);
+"#;
+
+/// v18 — the scope boundary a peer reported, remembered (§5.5).
+///
+/// A node reading under a scope has to tell "the peer does not have this" from
+/// "the peer will not show me this", and has to keep telling them apart across
+/// restarts: a completeness walk that re-read a refused position as merely
+/// missing would never settle, and a fetch would retry until its head was
+/// abandoned. The row is a fact about this node's own view, derived from what
+/// peers answered.
+const V18_REDACTED_NODES: &str = r#"
+CREATE TABLE redacted_nodes (hash BLOB PRIMARY KEY);
 "#;

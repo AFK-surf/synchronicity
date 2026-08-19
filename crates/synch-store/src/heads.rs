@@ -389,6 +389,28 @@ impl Store {
         fork_width_in(&self.conn(), origin, seq)
     }
 
+    /// True if `root` is a root this node holds as a head — current, pending,
+    /// or retained history.
+    ///
+    /// What makes a claimed *position* mean anything (§5.5). A position is
+    /// only ever "where a node sits in some trie", so the trie has to be one
+    /// this node vouches for: given an arbitrary root, the empty path resolves
+    /// to that root itself and every position below it is whatever the caller
+    /// chose, which would make authorization-by-position authorize nothing.
+    /// Roots reached this way are ones some origin signed and this node
+    /// verified, so the positions in them are real.
+    ///
+    /// `head_history` alone answers it: since v11 the `heads` slots point at a
+    /// history row rather than carrying their own signature, so every root
+    /// either slot names is here, and so is every root retained for a laggard.
+    pub fn is_head_root(&self, root: &Hash) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM head_history WHERE root = ?1)",
+            params![root.as_bytes().to_vec()],
+            |row| row.get::<_, i64>(0),
+        )? == 1)
+    }
+
     /// The retained history for an origin, newest first.
     pub fn head_history(&self, origin: &OriginId) -> Result<Vec<SignedHead>> {
         let conn = self.conn();

@@ -851,16 +851,37 @@ impl Node {
             (ambiguous, mismatch)
         };
         let bindings = self.store().bindings()?;
-        // At the instant trust decisions are actually taken, not the raw reading.
-        // `is_bound` and `keys_for_origin` floor `now` with the trust floor, so on
-        // a clock that stepped backwards a binding whose expiry falls in the gap
-        // is *not* honoured — while this list called it live, and the `bound`
-        // column of the same report applied the floor. One report contradicting
-        // itself is worse than either answer.
-        let trusted_now = self.store().trust_instant(now)?;
+        // Lapsed by the cascade, not by the date alone: a delegated binding
+        // whose issuer's own rooted binding is gone has lapsed too, and
+        // reporting it as live is precisely the invisible half of the hole
+        // §3.5's cascade exists to close.
+        //
+        // This carries the trust floor with it rather than dropping it:
+        // `live_bindings` opens by flooring `now` through `trust_instant`, so
+        // the report still agrees with `is_bound` and `keys_for_origin` on a
+        // clock that stepped backwards — one report contradicting itself is
+        // worse than either answer.
+        let live: std::collections::HashSet<(String, Vec<u8>, &str)> = self
+            .store()
+            .live_bindings(now)?
+            .into_iter()
+            .map(|b| {
+                (
+                    b.origin.canonical(),
+                    b.node_id.as_bytes().to_vec(),
+                    b.source.as_str(),
+                )
+            })
+            .collect();
         let lapsed: Vec<Binding> = bindings
             .iter()
-            .filter(|b| !b.is_live(trusted_now))
+            .filter(|b| {
+                !live.contains(&(
+                    b.origin.canonical(),
+                    b.node_id.as_bytes().to_vec(),
+                    b.source.as_str(),
+                ))
+            })
             .cloned()
             .collect();
 
