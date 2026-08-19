@@ -131,38 +131,28 @@ Device secret keys are generated on `synch init` (and on `synch key rotate`) and
 in the SQLite database (created `0600` inside the data directory). Display/interchange
 encoding for keys is z-base-32 (iroh's native encoding).
 
-**Where a node's own identity comes from** is one config value, `identity.mode`, fixed
-at `synch init` and never changed afterwards:
+**Where a node's own identity comes from** is decided by one fact: whether it has a
+membership domain.
 
-| `identity.mode` | Chosen by      | Own `OriginId`         | Rotatable | Authority on the name |
-|-----------------|----------------|------------------------|-----------|-----------------------|
-| `key`           | default        | `Key(K_active)`        | no        | the device key itself |
-| `dns`           | `--domain <d>` | `Named { domain, id }` | yes       | the zone (below)      |
+| Membership domain | Own `OriginId`         | Rotatable | Authority on the name |
+|-------------------|------------------------|-----------|-----------------------|
+| none              | `Key(K_active)`        | no        | the device key itself |
+| one, `<d>`        | `Named { domain, id }` | yes       | the zone (below)      |
 
-`key` needs no configuration at all: the identity *is* the key, self-certifying and
-not rotatable. A named, rotatable identity comes from a zone and only from a zone —
-there is no way to name a node by hand, because a hand-set name is a second authority
-on something the zone already decides. An isolated deployment that wants named
-origins runs its own signed root and points `--dnssec-anchor` at it (§3.2).
+A domainless node needs no identity configuration at all: the identity *is* the key,
+self-certifying and not rotatable. A named, rotatable identity comes from a zone and
+only from a zone — there is no way to name a node by hand, because a hand-set name is
+a second authority on something the zone already decides. An isolated deployment that
+wants named origins runs its own signed root and points `--dnssec-anchor` at it (§3.2).
 
-**One node, one zone.** `membership.domain` is set exactly in `dns` mode, and it is
-the `@domain` half of that node's own name: a node resolves the zone that names it,
-and no other. A `key`-mode node configures no membership domain at all and trusts
-only what it is told statically (§3.2).
+**One node, one zone.** The domain in that slot is the `@domain` half of the node's own
+name: a node resolves the zone that names it. A node with no domain resolves no zone at
+all and trusts only what it is told statically (§3.2). Every dns binding a node holds
+is therefore for an origin in its own zone.
 
-Trusting a second zone is not merely unsupported, it is unsound. Membership is binary
-and total — it grants a read of every byte of metadata and content, and a publish into
-the shared `(space, path)` keyspace of the unified tree (§3.2, §8) — so a node that
-resolved someone else's zone would take that grant from an authority with no say in
-what this node is called, and hold origins whose names it has no standing to be
-measured against. So a `key`-mode node has no way to acquire a domain — `synch domain
-set` is refused on one — and a `dns`-mode node has no way to drop the one it has:
-there is no `clear`. Both would reach the same illegal state from opposite sides, a
-node holding a name from a zone it does not resolve, or resolving a zone that does
-not name it.
-
-**Identity discovery (`dns` mode).** `synch daemon run` resolves the membership domain
-once, before the endpoint binds and before any loop starts, and freezes the answer:
+**Identity discovery.** A node with a membership domain resolves it once at `synch
+daemon run`, before the endpoint binds and before any loop starts, and freezes the
+answer:
 **a node's identity is immutable for the lifetime of the process**. Everything that
 reads it — seq monotonicity, trie keying, head signing — sees one value from first
 call to shutdown, which is exactly what lets a *changed* identity be adopted with no
@@ -175,14 +165,15 @@ adopted — a key published without an `id=` resolves to `Key(nk)`, and adopting
 would quietly turn a rotatable node into a non-rotatable one on the strength of a
 missing field, so it is refused and reported instead.
 
-| Stored identity | Resolution         | Action                                            |
-|-----------------|--------------------|---------------------------------------------------|
-| none            | `<id>@<domain>`    | adopt it; first boot                              |
-| `o`             | `o`                | nothing; steady state                             |
-| `p`             | some other `o`     | adopt `o`, migrating local state (below)          |
-| none            | no match           | **unidentified**: poll                            |
-| `p`             | no match           | keep `p`, report it, do not poll                  |
-| any             | resolution failed  | keep the stored identity if there is one, else poll |
+| Stored identity            | Resolution        | Action                                            |
+|----------------------------|-------------------|---------------------------------------------------|
+| none                       | `<id>@<domain>`   | adopt it; first boot                              |
+| `o`                        | `o`               | nothing; steady state                             |
+| `p`                        | some other `o`    | adopt `o`, migrating local state (below)          |
+| none                       | no match          | **unidentified**: poll                            |
+| `p`, from the current zone | no match          | keep `p`, report it, do not poll                  |
+| `p`, from a replaced zone  | no match          | **unidentified**: poll; `p`'s state left intact   |
+| any                        | resolution failed | keep the stored identity if there is one, else poll |
 
 "A validated answer that says nothing about this key" and "no validated answer" are
 different facts and never collapse. A resolution failure — unreachable resolver,
@@ -232,11 +223,18 @@ absence, never on an `id=`-less match. That precondition is the whole safety arg
 for an unattended and destructive operation, and every part of it is a rule §3.2
 enforces anyway.
 
-`synch domain set` on a `dns`-mode node is the same event arriving by another route,
-and takes effect the same way: the running daemon goes on resolving the zone its
-current name comes from — one node, one zone, at every instant — and the new domain
-is resolved, adopted, and migrated at the next start, dropping the old zone's
-bindings with the old name.
+`synch domain set` and `synch domain clear` are the same event arriving by another
+route, and take effect the same way. What fills the domain slot is what names the
+node, so changing it changes where the name comes from — one zone to another, no zone
+to a zone, or a zone back to the device key — and each is the migration above, run at
+the next start, dropping the bindings of any zone left behind. The running daemon is
+untouched by the edit: it goes on resolving the zone its current name comes from, so
+one node, one zone holds at every instant.
+
+A node moving *to* a zone waits for that zone to name it: until it does it is
+unidentified and polling (the table above), holding intact the state published under
+its previous name but signing nothing new. Clearing the slot waits for nothing, since
+the device key is always there to name a node.
 
 A relabel is not cheap, and `synch doctor` says so: the new origin starts at `seq = 1`,
 peers keep the old origin's trie until its bindings expire, and the cluster briefly
@@ -274,9 +272,8 @@ A remote node is **trusted** iff at least one of the following holds:
    synch domain set cluster.example.com
    ```
 
-   The domain is the one that names this node, and the only one it ever resolves
-   (§3.1): a `dns`-mode node has exactly one, a `key`-mode node none. Every dns
-   binding a node holds is therefore for an origin in its own zone.
+   The domain a node resolves is the one that names it (§3.1), so every dns binding
+   it holds is for an origin in its own zone.
 
    The resolver queries `_synchronicity.<domain> TXT` and accepts records of the form:
 
@@ -1162,7 +1159,8 @@ is a control-service call to a running daemon (§9.3).
 
 ```
 synch init [--domain <d>]                    create device key + database (no daemon);
-                                             --domain picks `dns` identity mode (§3.1)
+                                             --domain joins the zone that will name
+                                             this node (§3.1)
 synch daemon run|status|stop
 synch id                                     print OriginId + current device key(s),
                                              where the name came from, and adoptions
@@ -1170,10 +1168,10 @@ synch key rotate|activate|retire|ls          operator-driven device-key rotation
 
 synch trust add [--addr <hint>]|rm|ls        static membership; key-identified peers
                                              only — names come from zones (§3.2)
-synch domain set|ls|refresh                  this node's own DNSSEC membership domain
+synch domain set|clear|ls|refresh            this node's own DNSSEC membership domain
                                              (§3.2); refresh re-resolves it now; set
-                                             moves a `dns`-mode node to another zone
-                                             and is refused on a `key`-mode one (§3.1)
+                                             and clear change where the node's name
+                                             comes from, at the next start (§3.1)
 synch peers                                  live peers, addresses, last sync, lag
 
 synch space add <id> <path>                  index a local directory as a space
@@ -1384,16 +1382,15 @@ Rules:
 - Anything a plain SQL statement can't express (a backfill, a table rewrite) is a
   Rust migration step in the same numbered chain, under the same transaction rule.
 
-`config` also holds the identity mode and the membership domain that decide where this
-node's name comes from (§3.1), the name itself in `self_origin_id`, and — after a
-recovery (§3.4) — the `publish_floor`.
+`config` also holds the membership domain that decides where this node's name comes
+from (§3.1) — it has to be readable before there is a name to read it out of — the
+name itself in `self_origin_id`, and, after a recovery (§3.4), the `publish_floor`.
 
 ```sql
 -- node & config
 CREATE TABLE config        (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                                         -- 'schema_version', 'identity.mode',
-                                         -- 'membership.domain', 'self_origin_id',
-                                         -- 'publish_floor'
+                                         -- 'schema_version', 'membership.domain',
+                                         -- 'self_origin_id', 'publish_floor'
 CREATE TABLE device_keys (                -- own keys; >1 row only during rotation
   node_id     BLOB PRIMARY KEY,
   secret_key  BLOB NOT NULL,
