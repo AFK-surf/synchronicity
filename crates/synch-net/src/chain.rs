@@ -189,6 +189,28 @@ pub struct ValidChain {
 /// Every field is public and stays readable, but another crate cannot build
 /// one by struct literal — which it could, and which would let a monitor
 /// assemble an `Authorized` that no chain walk ever produced.
+///
+/// That was verified once by hand and by nothing since, which for a guard
+/// whose whole job is to stop a regression is the position the regression was
+/// in. It is a doctest now, and `cargo test --workspace --doc` runs in CI:
+///
+/// ```compile_fail
+/// # use synch_net::chain::Authorized;
+/// # fn f(apex: hickory_resolver::proto::rr::Name) {
+/// // E0639: cannot create non-exhaustive struct using functional update
+/// // syntax. Every field is readable; none of this is constructible.
+/// let _ = Authorized {
+///     apex,
+///     signing_zone: hickory_resolver::proto::rr::Name::root(),
+///     proven_keys: Vec::new(),
+///     chain: synch_net::chain::ValidChain {
+///         anchor_zone: ".".into(),
+///         links: 1,
+///         anchored_directly: true,
+///     },
+/// };
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Authorized {

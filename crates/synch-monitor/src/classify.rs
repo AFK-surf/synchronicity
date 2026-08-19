@@ -419,8 +419,13 @@ mod tests {
         assert!(!known.contains(&name("other.example"), b"a key"));
         assert!(!known.contains(&name("sync.example"), b"another key"));
         // Inserting twice does not double the entry — which is what stops a
-        // key being re-reported once it has been recorded.
+        // key being re-reported once it has been recorded. Asserted on the map
+        // *size* as well: `insert_digest` keys on `apex.to_string()`, so a
+        // parser that stopped lowercasing would file `Sync.Example.` and
+        // `sync.example.` as two entries while indexing one of them still
+        // found a list of length 1.
         known.insert(&name("sync.example"), b"a key");
+        assert_eq!(known.keys.len(), 1);
         assert_eq!(known.keys["sync.example."].len(), 1);
     }
 
@@ -459,7 +464,14 @@ mod tests {
     #[test]
     fn an_unparseable_watch_entry_matches_nothing_and_is_reported() {
         let mut known = KnownKeys::default();
-        known.keys.insert("sync.example..".into(), vec![]);
+        // The digest is the one for the key asked about below, deliberately:
+        // seeded with an *empty* list the `any()` inside `contains_digest` is
+        // false whatever the name comparison does, so the assertion passed
+        // whether names were parsed or trimmed. `sync.example..` is not a name
+        // at all and must match nothing even when there is something to match.
+        known
+            .keys
+            .insert("sync.example..".into(), vec![hex::encode(sha256(b"a key"))]);
         assert_eq!(known.apexes().count(), 0);
         assert!(!known.contains(&name("sync.example"), b"a key"));
         assert_eq!(known.unwatchable(), ["sync.example.."]);
