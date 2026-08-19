@@ -74,6 +74,7 @@ pub const MIGRATIONS: &[Migration] = &[
         run: v12_history_recorded_at,
     },
     Migration::Sql(V13_PROVIDERS_BY_ORIGIN),
+    Migration::Sql(V14_DNS_BINDINGS_ARE_PER_DOMAIN),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -511,11 +512,11 @@ CREATE TABLE bindings (
   origin_id    TEXT NOT NULL,
   node_id      BLOB NOT NULL,
   source       TEXT NOT NULL,
-  domain       TEXT,
+  domain       TEXT NOT NULL DEFAULT '',
   note         TEXT,
   added_at     INTEGER NOT NULL,
   expires_at   INTEGER,
-  PRIMARY KEY (origin_id, node_id, source)
+  PRIMARY KEY (origin_id, node_id, source, domain)
 );
 CREATE INDEX bindings_by_key ON bindings (node_id);
 CREATE TABLE heads (
@@ -587,4 +588,49 @@ CREATE TABLE observed_heads (
   claimed_by  BLOB,
   observed_at INTEGER NOT NULL
 );
+"#;
+
+/// v14 — a DNS binding's identity includes the domain that published it.
+///
+/// The key was `(origin_id, node_id, source)`, and `origin_id` carries the
+/// membership domain only for a *named* record: an `id=`-less one binds
+/// `OriginId::Key(nk)`, which renders `key:<z32>` and names no domain at all.
+/// So two configured membership domains publishing `v=sync1 nk=K` wrote the
+/// same row, and `refresh_dns_bindings`' `DO UPDATE SET domain =
+/// excluded.domain` made whichever refreshed last the owner of it.
+///
+/// Three things rested on that column being right. `hint_source_is_sole`
+/// (`synch-engine`'s membership) asks whether every live binding for a key is
+/// a DNS binding from *this* domain before it lets an answer supply dialing
+/// data — the check the previous audit added precisely so a second domain
+/// could not repoint a key the first one vouches for. With one row it is
+/// trivially satisfied by whichever domain wrote last, so the defence was
+/// absent exactly where it was aimed. `remove_domain` filters on the same
+/// column and would miss a binding the other domain had relabelled, or delete
+/// one this domain still vouches for. And a short TTL from one domain
+/// overwrote a long expiry from the other.
+///
+/// Static bindings are untouched: they have no domain and one row per
+/// `(origin, key)` is what they mean.
+const V14_DNS_BINDINGS_ARE_PER_DOMAIN: &str = r#"
+ALTER TABLE bindings RENAME TO bindings_v12;
+CREATE TABLE bindings (
+  origin_id    TEXT NOT NULL,
+  node_id      BLOB NOT NULL,
+  source       TEXT NOT NULL,            -- 'static' | 'dns'
+  -- '' rather than NULL for a static binding, so the domain can be part of
+  -- the key: SQLite admits no expression in a PRIMARY KEY, and one row per
+  -- (origin, key) is exactly what a static binding means. The reader maps it
+  -- back to `None`.
+  domain       TEXT NOT NULL DEFAULT '',
+  note         TEXT,
+  added_at     INTEGER NOT NULL,
+  expires_at   INTEGER,                  -- NULL for static
+  PRIMARY KEY (origin_id, node_id, source, domain)
+);
+INSERT INTO bindings (origin_id, node_id, source, domain, note, added_at, expires_at)
+  SELECT origin_id, node_id, source, coalesce(domain, ''), note, added_at, expires_at
+  FROM bindings_v12;
+DROP TABLE bindings_v12;
+CREATE INDEX bindings_by_key ON bindings (node_id);
 "#;

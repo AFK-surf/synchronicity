@@ -1174,6 +1174,65 @@ mod tests {
         );
     }
 
+    /// The same, for the `id=`-less record shape — which is where the gate
+    /// used to be absent entirely.
+    ///
+    /// A record with no `id=` binds `OriginId::Key(nk)`, whose canonical
+    /// rendering is `key:<z32>` and names no domain. With the DNS binding keyed
+    /// on `(origin_id, node_id, source)` alone, two membership domains
+    /// publishing one such record wrote the *same row*, and each refresh
+    /// overwrote its `domain` column — so `hint_source_is_sole` saw one
+    /// binding, from whichever domain refreshed last, and said yes. The defence
+    /// was missing exactly where the attack it names lives.
+    #[tokio::test]
+    async fn a_second_domain_cannot_repoint_an_id_less_key_either() {
+        let (_d, node) = node().await;
+        let shared = SecretKey::generate().public();
+        let now = now_ns();
+
+        let a = MemberSet::from_records(
+            "a.example",
+            &[format!(
+                "v=sync1 nk={} addr=192.0.2.7:4433",
+                shared.to_z32()
+            )],
+        )
+        .unwrap();
+        node.apply_member_set(&a, Duration::from_secs(300), now)
+            .unwrap();
+        let first = node.peer_addr(&shared).unwrap().expect("A's hint applies");
+        assert_eq!(first.ip_addrs().count(), 1);
+
+        let b = MemberSet::from_records(
+            "b.example",
+            &[format!(
+                "v=sync1 nk={} addr=198.51.100.66:9999 relay=https://attacker.example",
+                shared.to_z32()
+            )],
+        )
+        .unwrap();
+        node.apply_member_set(&b, Duration::from_secs(300), now)
+            .unwrap();
+
+        let after = node.peer_addr(&shared).unwrap().expect("A's hint stands");
+        assert_eq!(
+            after.ip_addrs().collect::<Vec<_>>(),
+            first.ip_addrs().collect::<Vec<_>>(),
+            "an id-less record from a second domain must not repoint the key"
+        );
+        assert_eq!(after.relay_urls().count(), 0);
+
+        // And the two domains really are two bindings now, which is the thing
+        // that makes the gate able to see them.
+        let bindings = node.store().bindings_for_key(&shared).unwrap();
+        let mut domains: Vec<String> = bindings
+            .iter()
+            .filter_map(|b| b.domain.clone())
+            .collect::<Vec<_>>();
+        domains.sort();
+        assert_eq!(domains, ["a.example", "b.example"]);
+    }
+
     #[tokio::test]
     async fn hints_are_applied_only_for_bound_keys_and_only_in_shape() {
         // M6: a hint steers an address only for a key the set binds, and only

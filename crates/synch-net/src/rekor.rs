@@ -408,38 +408,61 @@ pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>
 /// over the records, not a product, and it is what lets a `1/5` set and a
 /// `1/9` set coexist at one name during a rollover.
 fn assemble_group(group: &str, parts: &[(usize, usize, String)]) -> Result<RekorProof, ProofError> {
-    // The part counts the records claim, smallest first: a complete honest set
-    // is tried before any larger count an added record invented.
-    let mut totals: Vec<usize> = parts.iter().map(|(_, total, _)| *total).collect();
-    totals.sort_unstable();
-    totals.dedup();
+    use std::collections::BTreeMap;
+
+    // Indexed once, by `(total, index)`. The obvious shape — rescanning
+    // `parts` for every index of every claimed total — is quadratic in the
+    // record count and the records are attacker-chosen: sixteen names of
+    // validated TXT hold on the order of 27,000 minimal `sync1p` records, and
+    // one group whose records spread their claimed totals across 1..=255 costs
+    // roughly 9x10^8 tuple comparisons. That is about a second of CPU inside
+    // one `poll`, with no await in it for a timeout to fire at and no
+    // `spawn_blocking` under it, on a task that walks configured domains one at
+    // a time. The candidate cap runs after this, so it does not bound it.
+    //
+    // A BTreeMap rather than a HashMap: the keys are the zone's, and iteration
+    // order is not something an answer should get to choose.
+    let mut by_total: BTreeMap<usize, BTreeMap<usize, &str>> = BTreeMap::new();
+    let mut duplicated: BTreeMap<usize, usize> = BTreeMap::new();
+    for (index, total, chunk) in parts {
+        if by_total
+            .entry(*total)
+            .or_default()
+            .insert(*index, chunk.as_str())
+            .is_some()
+        {
+            duplicated.entry(*total).or_insert(*index);
+        }
+    }
 
     let mut last: Option<ProofError> = None;
-    for total in totals {
+    // Smallest count first: a complete honest set is tried before any larger
+    // count an added record invented.
+    for (total, chunks) in &by_total {
+        let total = *total;
         // Only records that agree on the count take part in its reading. A
         // record claiming some other total is a different reading, not a hole
         // in this one.
         let mut payload = String::new();
         let mut broken = None;
         for index in 1..=total {
-            let mut chunks = parts
-                .iter()
-                .filter(|(at, claimed, _)| *at == index && *claimed == total)
-                .map(|(_, _, chunk)| chunk.as_str());
-            match (chunks.next(), chunks.next()) {
-                (Some(chunk), None) => payload.push_str(chunk),
-                (None, _) => {
-                    broken = Some(ProofError::Malformed(format!(
-                        "proof {group} is served in {total} part(s) and part {index} \
-                         did not arrive"
-                    )));
-                    break;
-                }
-                (Some(_), Some(_)) => {
+            match duplicated.get(&total).is_some_and(|first| *first == index) {
+                true => {
                     broken = Some(ProofError::Malformed(format!(
                         "proof {group} is served in {total} part(s) and part {index} \
                          arrived more than once, so the zone does not agree with \
                          itself about what it published"
+                    )));
+                    break;
+                }
+                false => {}
+            }
+            match chunks.get(&index).copied() {
+                Some(chunk) => payload.push_str(chunk),
+                None => {
+                    broken = Some(ProofError::Malformed(format!(
+                        "proof {group} is served in {total} part(s) and part {index} \
+                         did not arrive"
                     )));
                     break;
                 }
@@ -2298,6 +2321,46 @@ mod tests {
     /// Built rather than captured: the shape needs a key that signed a note
     /// whose origin line names a log the key is not pinned for, and no real
     /// Sigstore checkpoint is one.
+    /// Reassembly is linear in the records offered, not quadratic.
+    ///
+    /// The records are the zone's, and the threat model's attacker *is* the
+    /// zone. Sixteen validated TXT names hold tens of thousands of minimal
+    /// `sync1p` records; spreading their claimed totals across 1..=255 made
+    /// the old rescan-per-index cost around 9x10^8 tuple comparisons — about a
+    /// second of CPU inside one `poll`, with no await for a timeout to fire at
+    /// and no `spawn_blocking` under it, on a task that walks configured
+    /// domains one at a time. The candidate cap runs afterwards and does not
+    /// bound it.
+    ///
+    /// Asserted as a wall-clock ceiling rather than an operation count,
+    /// because the count is what changed. The bound is loose enough that a
+    /// slow machine cannot reach it and tight enough that the old shape
+    /// cannot pass.
+    #[test]
+    fn reassembly_does_not_rescan_every_part_for_every_claimed_total() {
+        let chunk = "A".repeat(8);
+        let records: Vec<String> = (0..20_000)
+            .map(|i| {
+                // One group, every index spread over every plausible total, so
+                // the old form paid sum-of-totals times the record count.
+                let total = (i % 255) + 1;
+                let index = (i % total) + 1;
+                format!("sync1p abcdef01 {index}/{total} {chunk}")
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let out = proofs_from_txt(&records);
+        let elapsed = started.elapsed();
+        // Nothing reassembles — the payloads are not a proof — which is the
+        // point: the cost is paid before any of that is known.
+        assert!(out.iter().all(|r| r.is_err()));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "reassembly of {} records took {elapsed:?}",
+            records.len()
+        );
+    }
+
     #[test]
     fn a_pinned_key_vouches_only_for_the_log_it_is_pinned_for() {
         use ring::signature::{Ed25519KeyPair, KeyPair};
