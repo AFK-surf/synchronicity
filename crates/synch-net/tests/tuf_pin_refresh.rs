@@ -1007,6 +1007,52 @@ async fn discovery_refuses_an_attach_record_signed_by_an_unlogged_key() {
     server.abort();
 }
 
+/// The attach record does not get to name the apex it is judged against.
+///
+/// The gate needs an apex to check the signing key's proof under, and the
+/// membership record supplies its own through `apex=`. The attach RRset has no
+/// such field and must not acquire one: it is the record under audit, so
+/// letting it choose its own bound would let an attacker who can sign it point
+/// the gate at a name whose key really is logged and pass.
+///
+/// This is what `GateApex::Under` encodes — the bound comes from the gated
+/// answer that led here, never from the answer being gated — and switching
+/// this leg to `FromRecords` is the kind of edit that looks like a
+/// simplification. It fails here.
+#[tokio::test]
+async fn an_attach_record_cannot_name_the_apex_it_is_gated_against() {
+    let mut zone = SimZone::new("cluster.example", member_records());
+    let mut log = SimLog::new("rekor.sim");
+    zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
+    // The attacker's attach record, carrying an `apex=` field of its own — a
+    // field this RRset's grammar does not define, and which an implementation
+    // that derived the bound from the records would read.
+    zone.cp_txt = vec!["v=synccp1 url=https://attacker.example apex=cluster.example".to_string()];
+    let (evil, evil_signer) = zone.second_key();
+    zone.add_dnskey(evil);
+    zone.sign_cp_with(evil_signer);
+
+    let anchor = write(&zone.anchor_record());
+    let log_key = write(&log.key_pem());
+    let (url, server) = zone.serve().await;
+
+    let resolver = DnssecResolver::with_options(&ResolverOptions {
+        rekor_key: Some(log_key.path().to_path_buf()),
+        ..refreshing(url, anchor.path(), None, None)
+    })
+    .unwrap();
+
+    let error = resolver
+        .control_plane("cluster.example")
+        .await
+        .expect_err("the record under audit must not choose its own bound");
+    assert!(
+        matches!(&error, NetError::RekorBinding { .. }),
+        "the gate must run against the membership apex: {error}"
+    );
+    server.abort();
+}
+
 /// The positive control for the pair above: with both answers signed by the
 /// logged key — every ordinary deployment — the second gate reads the same
 /// proof and passes.

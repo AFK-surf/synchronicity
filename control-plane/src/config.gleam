@@ -191,23 +191,26 @@ fn browse_enabled(role: Role, public_url: String) -> Result(Bool, String) {
           )
         Primary, True ->
           // The value is rendered straight into a signed apex TXT record as
-          // `v=synccp1 url=<it>`, and the client refuses anything that is not
-          // an `https://` origin and reads the record as whitespace-separated
-          // `key=value` pairs. So a `http://` URL behind a TLS terminator, or
-          // one with a space in it, publishes a record every daemon rejects —
-          // signed, cached for its TTL, and failing in the client rather than
-          // here. `build.valid_hint` exists to keep free-form values out of
-          // that grammar and did not cover this one.
-          case
-            string.starts_with(browse_endpoint(), "https://"),
-            record_safe(browse_endpoint())
-          {
+          // `v=synccp1 url=<it>`, and the client parses that record as
+          // whitespace-separated `key=value` pairs and requires the URL to be
+          // an origin — `https://` or `http://` with something after it. So a
+          // bare host, or one with a space in it, publishes a record every
+          // daemon rejects: signed, cached for its TTL, and failing in the
+          // client rather than here. `build.valid_hint` exists to keep
+          // free-form values out of that grammar and did not cover this one.
+          //
+          // `http://` is accepted because the client accepts it — a deployment
+          // behind a TLS terminator is the case it was widened for. The
+          // attach record's integrity does not rest on the scheme either way:
+          // the zone key that published it is gated on the transparency log,
+          // and on `https://` WebPKI sits on top of that rather than under it.
+          case is_origin(browse_endpoint()), record_safe(browse_endpoint()) {
             True, True -> Ok(True)
             False, _ ->
               Error(
-                "CP_BROWSE=on needs CP_PUBLIC_URL to be an https:// origin: "
-                <> "daemons refuse any other scheme, so the record would be "
-                <> "published and rejected",
+                "CP_BROWSE=on needs CP_PUBLIC_URL to be an https:// or "
+                <> "http:// origin: daemons refuse any other shape, so the "
+                <> "record would be published and rejected",
               )
             _, False ->
               Error(
@@ -234,6 +237,21 @@ fn browse_enabled(role: Role, public_url: String) -> Result(Bool, String) {
 /// `zone/build` imports this module through `zone/model`, so the dependency
 /// only runs one way. Both are one sentence — printable ASCII, no space, no
 /// quote — and both exist because the record grammar is whitespace-separated.
+/// Whether a value is an origin the client's `parse_control_plane_record`
+/// accepts: one of the two schemes with something after it.
+///
+/// Per scheme rather than one length test, because the two prefixes are
+/// different lengths and a shared bound is wrong for one of them: `http://x`
+/// is eight characters and is an origin, while `https://` is eight characters
+/// and is not.
+fn is_origin(value: String) -> Bool {
+  ["https://", "http://"]
+  |> list.any(fn(scheme) {
+    string.starts_with(value, scheme)
+    && string.length(value) > string.length(scheme)
+  })
+}
+
 fn record_safe(value: String) -> Bool {
   string.length(value) <= 255
   && string.to_utf_codepoints(value)

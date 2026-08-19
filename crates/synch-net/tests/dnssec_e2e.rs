@@ -45,7 +45,10 @@ async fn a_signed_zone_validates_end_to_end() {
     })
     .unwrap();
 
-    let validated = resolver.lookup_txt("cluster.example").await.unwrap();
+    let validated = resolver
+        .lookup_txt_ungated("cluster.example")
+        .await
+        .unwrap();
     assert_eq!(validated.records.len(), 2, "{validated:?}");
     assert_eq!(validated.ttl.as_secs(), 300);
 
@@ -87,7 +90,7 @@ async fn a_zone_signed_by_an_unanchored_key_is_refused() {
     })
     .unwrap();
     resolver
-        .lookup_txt("cluster.example")
+        .lookup_txt_ungated("cluster.example")
         .await
         .expect_err("an unanchored signer must not validate");
     server.abort();
@@ -120,7 +123,7 @@ async fn an_unsigned_zone_is_refused() {
     })
     .unwrap();
     resolver
-        .lookup_txt("cluster.example")
+        .lookup_txt_ungated("cluster.example")
         .await
         .expect_err("answers without signatures must not validate");
     server.abort();
@@ -179,7 +182,7 @@ async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
     .unwrap();
 
     let error = resolver
-        .lookup_txt("cluster.example")
+        .lookup_txt_ungated("cluster.example")
         .await
         .expect_err("a sibling zone must not sign for this name");
     // The transport filter strips the off-path RRSIG before hickory sees it;
@@ -244,7 +247,7 @@ async fn a_record_spliced_in_another_class_is_signed_by_nobody() {
     .unwrap();
 
     let validated = resolver
-        .lookup_txt("cluster.example")
+        .lookup_txt_ungated("cluster.example")
         .await
         .expect("the honest RRset still validates");
     assert_eq!(

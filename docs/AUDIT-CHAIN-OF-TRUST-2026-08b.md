@@ -86,6 +86,31 @@ proof twice and passes twice. Covered by
 control, and it needed a new sim knob: the harness could sign every RRset with
 one key and so could not express the split.
 
+**The organizational cause, fixed with it.** The gate was a *call* rather than
+a *type*, and it was spelled three different ways at three sites — `gate_answer`
+twice and an open-coded `if self.rekor == Require { verify_zone_key(..) }` once.
+The fourth site spelled it zero times while reading exactly like the others,
+because a DNSSEC-validated answer and a gated one were the same type with the
+same fields: neither a caller nor a reviewer holding one could see which it was.
+
+There is now one choke point. `gated_txt` does fetch → DNSSEC → policy → TUF
+refresh → proof, and is the only constructor of `GatedTxt`, whose field is
+private — the same device `chain::Authorized` uses one layer down, where a value
+of the type *is* the evidence rather than a comment claiming it. `ValidatedTxt`
+is renamed `DnssecTxt`, because "validated" is the word the false comment used
+to justify itself and it read at every binding site as though the answer were
+finished being checked; and `lookup_txt`, which has no production caller and
+returns an ungated answer, is renamed `lookup_txt_ungated`.
+
+The apex a lookup is gated against is now a parameter with two named cases,
+because the two legs genuinely differ and the difference is load-bearing: a
+membership answer names its own bound through `apex=`, while the attach record
+must inherit the bound from the answer that led to it. Deriving it from the
+record under audit would let an attacker who can sign that record point the gate
+at a name whose key really is logged — so `GateApex::Under` is not a detail, and
+`an_attach_record_cannot_name_the_apex_it_is_gated_against` fails if the leg is
+"simplified" to `FromRecords`.
+
 ### H2. Every `poke` forked a permanent second sweep timer
 
 `control-plane/src/jobs/provider_sync.gleam`. `Msg` had one constructor, so the

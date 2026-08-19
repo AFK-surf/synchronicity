@@ -648,7 +648,7 @@ async fn an_absent_proof_record_refuses_under_require_and_resolves_under_off() {
 
     // The TXT lookup itself never consults the log: it is the member-set
     // path that gained a requirement, not the resolver's every query.
-    strict.lookup_txt("cluster.example").await.unwrap();
+    strict.lookup_txt_ungated("cluster.example").await.unwrap();
     server.abort();
 }
 
