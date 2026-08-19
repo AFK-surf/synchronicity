@@ -452,7 +452,16 @@ impl Syncer {
         }
         match self.try_promote(&head.origin, now) {
             Ok(true) => Ok(HeadOutcome::Completed),
-            Ok(false) => Ok(HeadOutcome::Pending),
+            // `Pending` only if the head is actually pending. `try_promote`
+            // clears the slot when the memo already holds this promotion, and
+            // reporting that as accepted made `sync_with` count a discarded head
+            // in `heads_accepted` and call `fetch_pending` on an empty slot — so
+            // `synch status` read "0 origin(s) left behind" for an origin this
+            // node permanently cannot apply, on every exchange after the first.
+            Ok(false) => Ok(match self.store.pending_head(&head.origin)? {
+                Some(pending) if pending == *head => HeadOutcome::Pending,
+                _ => HeadOutcome::NotNewer,
+            }),
             // The retire and the memo are `try_promote`'s, because only it
             // knows which head it judged — the slot may have moved on between
             // the transaction above and the promotion below. All that is left
@@ -485,11 +494,40 @@ impl Syncer {
             let Some(pending) = txn.head(origin, Slot::Pending)? else {
                 return Ok(None);
             };
+            // The displaced root, the verdict key and the memo check all come
+            // before the completeness walk, because the walk is the most likely
+            // thing here to raise and `judged` has to be set before anything
+            // that can: `is_complete` descends a peer's node graph and refuses a
+            // structurally invalid node, which `is_origin_fault` classifies as
+            // the origin's fault — and with `judged` still unset the fault arm
+            // retired nothing and remembered nothing, so the head kept the slot
+            // until the sweep took it and the next exchange re-adopted it. That
+            // is the cycle the memo exists to break, and it was worse than
+            // before the memo existed. None of this work depends on
+            // completeness, and doing the cheap checks first is free.
+            let displaced = txn.complete_head(origin)?;
+            let old_root = displaced
+                .as_ref()
+                .map(|h| h.root)
+                .unwrap_or(synch_core::Hash::EMPTY);
+            let key: Verdict = (
+                pending.head.origin.clone(),
+                pending.head.seq,
+                pending.head.root,
+                old_root,
+            );
+            // Tried before, from this same root, and failed. Retire it without
+            // paying the diff again — leaving it in the slot would hold
+            // `head_floor` above everything this node can serve.
+            if self.is_refused(&key) {
+                txn.clear_head(origin, Slot::Pending)?;
+                return Ok(None);
+            }
+            *judged.borrow_mut() = Some(key);
             let trie = Trie::new(txn);
             if !trie.is_complete(pending.head.root)? {
                 return Ok(None);
             }
-            let displaced = txn.complete_head(origin)?;
             // The pending head must actually beat the complete one, rather than
             // rest on "pending is always greater", an invariant `offer_head`
             // maintains and two other writers do not: `publish` and the key
@@ -511,24 +549,6 @@ impl Syncer {
                 txn.clear_head(origin, Slot::Pending)?;
                 return Ok(None);
             }
-            let old_root = displaced
-                .as_ref()
-                .map(|h| h.root)
-                .unwrap_or(synch_core::Hash::EMPTY);
-            let key: Verdict = (
-                pending.head.origin.clone(),
-                pending.head.seq,
-                pending.head.root,
-                old_root,
-            );
-            // Tried before, from this same root, and failed. Retire it without
-            // paying the diff again — leaving it in the slot would hold
-            // `head_floor` above everything this node can serve.
-            if self.is_refused(&key) {
-                txn.clear_head(origin, Slot::Pending)?;
-                return Ok(None);
-            }
-            *judged.borrow_mut() = Some(key);
             // The displaced head is already retained: `put_head` recorded its
             // signature when it took the slot. Recording it again here would be
             // a second rule writing the same row, kept honest only by
@@ -1917,6 +1937,60 @@ mod containment_tests {
         );
     }
 
+    /// A structurally invalid trie is condemned like any other origin fault.
+    ///
+    /// The fault this raises comes from `is_complete`, which descends the peer's
+    /// node graph — so it fires *before* the promotion diff, and before the code
+    /// had recorded which head it was about. The fault arm then retired nothing
+    /// and remembered nothing: the head kept the pending slot, holding
+    /// `head_floor` above everything this node could serve until the sweep took
+    /// it, and the next exchange re-adopted it and repeated. That was worse than
+    /// before the memo existed, which is why the key is built before the walk.
+    #[test]
+    fn a_head_whose_trie_is_structurally_invalid_is_retired_and_remembered() {
+        let (_d, store, key, origin) = setup();
+        let syncer = Syncer::new(store.clone());
+
+        // An extension whose child is a leaf, which no canonical trie contains:
+        // an extension above anything but a branch would have been merged (§4.3).
+        // Stored through `put_node` directly, because this is what a peer serving
+        // a hand-built graph looks like and `Trie::insert` cannot produce it.
+        //
+        // The fault this raises comes from the *completeness walk*, not from the
+        // promotion diff — which is the whole point: it fires before the diff, so
+        // it is the case where the verdict key must already have been built.
+        let (value, _) = synch_mpt::ValueRef::for_value(&[7u8; 4]);
+        let child = synch_mpt::TrieNode::Leaf {
+            key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2]),
+            value,
+        };
+        let child_hash = child.hash();
+        let root = synch_mpt::TrieNode::Ext {
+            prefix: synch_mpt::Nibbles::from_nibbles(&[4]),
+            child: child_hash,
+        };
+        let root_hash = root.hash();
+        synch_mpt::NodeStore::put_node(store.as_ref(), &child_hash, &child.encode()).unwrap();
+        synch_mpt::NodeStore::put_node(store.as_ref(), &root_hash, &root.encode()).unwrap();
+
+        let head = SignedHead::sign(&key, origin.clone(), 4, root_hash, 0);
+        let err = syncer
+            .offer_head(&head, 0)
+            .expect_err("a non-canonical node is the origin's fault");
+        assert!(is_origin_fault(&err), "{err}");
+
+        // Retired: the floor is back to what this node can serve.
+        assert_eq!(store.head_floor(&origin).unwrap(), None);
+        // And remembered: the second offer does not walk it again, so it does not
+        // raise, and it leaves nothing pending.
+        assert_eq!(
+            syncer.offer_head(&head, 0).unwrap(),
+            HeadOutcome::NotNewer,
+            "the verdict must be remembered, not re-derived every exchange"
+        );
+        assert_eq!(store.pending_head(&origin).unwrap(), None);
+    }
+
     /// A promotion judged unpromotable once is not attempted again.
     ///
     /// Retiring the head from the pending slot is what lets the node serve again
@@ -1947,11 +2021,13 @@ mod containment_tests {
         );
 
         // Offered again — which is what every later exchange with a peer holding
-        // it does. The diff must not run a second time, so no error surfaces.
+        // it does. The diff must not run a second time, so no error surfaces; and
+        // the outcome must not read as accepted, or `synch status` reports zero
+        // origins left behind for an origin this node cannot apply.
         assert_eq!(
             syncer.offer_head(&head, 0).unwrap(),
-            HeadOutcome::Pending,
-            "the head is adopted, but the promotion is not re-attempted"
+            HeadOutcome::NotNewer,
+            "the promotion is not re-attempted, and nothing is left pending"
         );
         assert_eq!(
             store.head_floor(&origin).unwrap(),

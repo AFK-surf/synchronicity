@@ -422,7 +422,11 @@ impl Node {
                 // the promotion. Naming `stored.head` here condemned whatever
                 // this pass happened to list rather than what actually failed.
                 Err(e) if crate::reconcile::is_origin_fault(&e) => {
-                    tracing::debug!(
+                    // Warn, not debug. `try_promote` warns too when it got far
+                    // enough to name the head — but when it did not, this is the
+                    // only line an operator gets for a head that is about to be
+                    // permanently abandoned.
+                    tracing::warn!(
                         origin = %origin,
                         error = %e,
                         "a pending head for this origin could not be materialized"

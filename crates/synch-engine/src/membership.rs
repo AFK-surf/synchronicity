@@ -963,19 +963,20 @@ impl Node {
     pub fn rebuild_views(&self) -> Result<usize> {
         let mut total = 0;
         let mut failed = Vec::new();
-        for stored in self.store().all_heads(synch_store::Slot::Complete)? {
-            match self
-                .store()
-                .rematerialize(&stored.head.origin, stored.head.root)
-            {
+        // `complete_slot_roots`, not `all_heads`: a rebuild needs the origin and the
+        // root and nothing else, and `all_heads` skips a row whose signature will
+        // not parse — which would have this report success having quietly not
+        // rebuilt that origin at all.
+        for (origin, root) in self.store().complete_slot_roots()? {
+            match self.store().rematerialize(&origin, root) {
                 Ok(n) => total += n,
                 Err(e) => {
                     tracing::warn!(
-                        origin = %stored.head.origin,
+                        origin = %origin,
                         error = %e,
                         "this origin's views could not be rebuilt; the others were"
                     );
-                    failed.push(stored.head.origin.canonical());
+                    failed.push(origin.canonical());
                 }
             }
         }

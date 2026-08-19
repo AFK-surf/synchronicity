@@ -140,13 +140,19 @@ impl Store {
     ///
     /// A row that will not build is skipped, not propagated. This is the bulk
     /// listing the maintenance sweep and `doctor --rebuild` walk, so one
-    /// undecodable row — a `sig` that is not 64 bytes, a `root` that is not a
-    /// hash — used to fail the whole listing and take every *other* origin's
-    /// maintenance down with it: no pending head anywhere got promoted or
-    /// abandoned again, on any pass, for as long as the row was there. §12's
-    /// rule is that a record this node cannot read fails its own origin and no
-    /// other, and a point read still reports the failure to whoever asked for
-    /// that origin specifically.
+    /// undecodable row — a `sig` that is not 64 bytes, say — used to fail the
+    /// whole listing and take every *other* origin's maintenance down with it:
+    /// no pending head anywhere got promoted or abandoned again, on any pass, for
+    /// as long as the row was there. §12's rule is that a record this node
+    /// cannot read fails its own origin and no other, and a point read still
+    /// reports the failure to whoever asked for that origin specifically.
+    ///
+    /// One variant is *not* contained, and saying so here is the honest version
+    /// of the claim: a `root` that is not a hash also breaks `gc`'s mark set,
+    /// which reads `head_history` directly and rightly refuses to proceed —
+    /// skipping a root there would delete live trie nodes. So a bad root still
+    /// stops garbage collection node-wide until it is repaired. Skipping it here
+    /// buys the rest of the maintenance pass, not GC.
     pub fn all_heads(&self, slot: Slot) -> Result<Vec<StoredHead>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -167,9 +173,37 @@ impl Store {
                     seq,
                     slot = slot.as_str(),
                     error = %e,
-                    "skipping a head row that cannot be read; this origin needs `synch doctor`"
+                    "skipping a head row that cannot be read; this origin cannot sync until \
+                     the row is repaired"
                 ),
             }
+        }
+        Ok(out)
+    }
+
+    /// The `(origin, root)` of every complete slot, without decoding signatures.
+    ///
+    /// What a rebuild needs, and all it needs. Going through [`Store::all_heads`]
+    /// made it depend on `head_history` joining and on every signature parsing,
+    /// neither of which it uses — so a row with an unreadable `sig` was silently
+    /// absent from the listing and the rebuild reported success having skipped
+    /// that origin entirely, which is the one outcome `doctor --rebuild` exists
+    /// to rule out. Reading `heads` alone means an unreadable `root` still fails
+    /// loudly, because without it there is genuinely nothing to rebuild from.
+    pub fn complete_slot_roots(&self) -> Result<Vec<(OriginId, Hash)>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT origin_id, root FROM heads WHERE slot = ?1 ORDER BY origin_id")?;
+        let rows = stmt.query_map(params![Slot::Complete.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (origin, root) = row?;
+            out.push((
+                origin_column(origin, "heads.origin_id")?,
+                hash_column(root, "heads.root")?,
+            ));
         }
         Ok(out)
     }
