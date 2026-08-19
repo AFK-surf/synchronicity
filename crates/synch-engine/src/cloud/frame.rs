@@ -7,7 +7,10 @@
 //! **There is no frame that writes.** Nothing here encodes a put, an adopt, a
 //! pin or a config append, so a control plane holding one end of this tunnel
 //! cannot push bytes at a cluster whatever it sends — the read-only property
-//! is a fact about this file, not a check somewhere else.
+//! is a fact about this file, not a check somewhere else. A control plane that
+//! wants a delegation *changed* has no frame for it and never will: delegating
+//! is publishing a `d:` record under an origin's own key, which only that
+//! origin can sign (§3.5).
 
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +18,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// A mismatch is a refusal naming both versions, the same posture
 /// `x-synch-control-version` takes on the local socket.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 added the delegations query. Additive on the wire, and bumped anyway: a
+/// v1 control plane asking a v2 daemon nothing new would work by luck, while a
+/// v2 control plane asking a v1 daemon for delegations would meet an
+/// undecodable frame and a dropped connection rather than a sentence naming
+/// the mismatch. The version check exists so the failure is the legible one.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The domain-separation tag an attach proof signs under.
 ///
@@ -73,8 +82,9 @@ pub fn decode_chunk(frame: &[u8]) -> Option<(u32, u32, &[u8])> {
 
 /// What the control plane sends down the tunnel.
 ///
-/// Every variant either asks a question about the unified tree or governs one
-/// stream. None of them changes anything on the node.
+/// Every variant either asks a question about the unified tree, asks who the
+/// cluster admits to it, or governs one stream. None of them changes anything
+/// on the node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum Down {
@@ -154,6 +164,16 @@ pub enum Down {
     /// Abandon one stream.
     Cancel {
         /// The stream's request id.
+        id: u32,
+    },
+    /// Every delegation this node honors (§3.5), answered with
+    /// [`Up::Delegations`].
+    ///
+    /// Takes no argument: delegations are replicated to every member, so any
+    /// attached node answers for the whole cluster and there is no per-origin
+    /// filter that would mean anything.
+    Delegations {
+        /// The request id.
         id: u32,
     },
     /// Liveness, answered with [`Up::Pong`].
@@ -238,6 +258,13 @@ pub enum Up {
         /// The content root the bytes were verified against, hex.
         root: String,
     },
+    /// The delegations this node honors, live and lapsed alike.
+    Delegations {
+        /// The request id.
+        id: u32,
+        /// One row per `(issuer, subject)` pair, in the store's order.
+        delegations: Vec<DelegationJson>,
+    },
     /// A stream ended, having sent everything it was asked for.
     Done {
         /// The stream's request id.
@@ -300,6 +327,31 @@ pub struct VersionJson {
     pub seq: u64,
     /// Every origin asserting this version.
     pub attestors: Vec<String>,
+}
+
+/// One delegation, as the control plane renders it (§3.5).
+///
+/// Carries `live` rather than leaving the reader to compare `not_after` with a
+/// clock: derived trust dies with its source, so a delegation whose issuer has
+/// been removed or has lapsed from DNS is dead well before its own expiry, and
+/// a date is not enough to tell. The date travels too, because "when does this
+/// end" is a different question from "does it hold now".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationJson {
+    /// The delegated device key, z-base-32.
+    pub key: String,
+    /// The origin that issued it, canonically rendered.
+    pub issuer: String,
+    /// The spaces the grant covers.
+    pub spaces: Vec<String>,
+    /// Whether this node honors it *now*, cascade applied.
+    pub live: bool,
+    /// When the delegation expires, unix nanoseconds.
+    pub not_after: Option<i64>,
+    /// When this node first materialized the record, unix nanoseconds.
+    pub added_at: i64,
+    /// The issuer's note, if it published one.
+    pub note: Option<String>,
 }
 
 #[cfg(test)]

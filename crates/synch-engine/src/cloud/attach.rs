@@ -19,8 +19,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::{
     cloud::frame::{
-        attach_signing_input, encode_chunk, Down, EntryJson, Up, VersionJson, MAX_CHUNK, NONCE_LEN,
-        PROTOCOL_VERSION,
+        attach_signing_input, encode_chunk, DelegationJson, Down, EntryJson, Up, VersionJson,
+        MAX_CHUNK, NONCE_LEN, PROTOCOL_VERSION,
     },
     error::{EngineError, Result},
     node::Node,
@@ -649,6 +649,19 @@ fn handle(
                 let _ = internal.send(Internal::RequestDone).await;
             });
         }
+        Down::Delegations { id } => {
+            if over_capacity(writes, streams, *requests, id) {
+                return Ok(());
+            }
+            *requests += 1;
+            let node = node.clone();
+            let writes = writes.clone();
+            let internal = internal.clone();
+            tokio::spawn(async move {
+                answer(&writes, id, delegations(&node, id).await).await;
+                let _ = internal.send(Internal::RequestDone).await;
+            });
+        }
         Down::Stat { id, space, path } => {
             if over_capacity(writes, streams, *requests, id) {
                 return Ok(());
@@ -1009,6 +1022,55 @@ async fn stat(node: &Node, id: u32, space: &str, path: &str) -> Result<Up> {
     .await
 }
 
+/// Every delegation this node honors, with the cascade already applied (§3.5).
+///
+/// Answers for the cluster rather than for this node: a delegation is a `d:`
+/// record in its issuer's trie, replicated to every member, so whichever node
+/// the control plane happens to be attached to holds them all. That is the
+/// transitive-trust concession made legible — an operator can see from one
+/// place who was admitted, by whom, and to what.
+///
+/// Lapsed rows travel alongside live ones, marked. A dashboard that showed
+/// only what is live could not distinguish "never delegated" from "delegated,
+/// and the issuer is gone", and those call for different actions.
+async fn delegations(node: &Node, id: u32) -> Result<Up> {
+    let node = node.clone();
+    // One hop for both reads: the live set is the same query filtered by the
+    // cascade, and nothing between them awaits.
+    crate::blocking::offload(move || {
+        let now = synch_core::now_ns();
+        let live: std::collections::HashSet<(Vec<u8>, String)> = node
+            .store()
+            .delegations(now)?
+            .into_iter()
+            .map(|b| {
+                (
+                    b.node_id.as_bytes().to_vec(),
+                    b.issuer.map(|i| i.canonical()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        let delegations = node
+            .delegations()?
+            .into_iter()
+            .map(|b| {
+                let issuer = b.issuer.map(|i| i.canonical()).unwrap_or_default();
+                DelegationJson {
+                    key: b.node_id.to_z32(),
+                    live: live.contains(&(b.node_id.as_bytes().to_vec(), issuer.clone())),
+                    issuer,
+                    spaces: b.spaces,
+                    not_after: b.expires_at,
+                    added_at: b.added_at,
+                    note: b.note,
+                }
+            })
+            .collect();
+        Ok(Up::Delegations { id, delegations })
+    })
+    .await
+}
+
 /// Pins a path to one content root and names who holds it.
 async fn resolve(
     node: &Node,
@@ -1193,6 +1255,119 @@ mod tests {
                 other => panic!("unexpected frame {other:?}"),
             }
         }
+    }
+
+    /// Plants a delegated binding as materializing an issuer's `d:` record does.
+    fn delegate(node: &Node, issuer: &OriginId, subject: synch_core::NodeId, spaces: &[&str]) {
+        node.store()
+            .put_binding(&synch_store::Binding {
+                origin: OriginId::Key(subject),
+                node_id: subject,
+                source: synch_store::BindingSource::Delegated,
+                domain: None,
+                issuer: Some(issuer.clone()),
+                spaces: spaces.iter().map(|s| s.to_string()).collect(),
+                note: Some("planted".into()),
+                added_at: 1,
+                expires_at: Some(synch_core::now_ns() + 86_400_000_000_000),
+            })
+            .unwrap();
+    }
+
+    /// The control plane can ask who the cluster admits, and is told which
+    /// grants still hold (§3.5).
+    ///
+    /// The cascade is the whole point of the answer: both rows below are inside
+    /// their own expiry, and they differ only in whether the origin that issued
+    /// them is still trusted here. A dashboard reading dates alone would show
+    /// them identically, which is exactly the reporting hole the delegation
+    /// work closed locally — this is that hole closed over the tunnel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_answers_a_delegations_query_with_the_cascade_applied() {
+        let _blocking = synch_core::BlockingScope::enter();
+        let (_dir, node) = node().await;
+
+        // A rooted issuer, and one this node holds no binding for at all.
+        let rooted = origin("nas");
+        let rooted_key = iroh_base::SecretKey::generate().public();
+        node.store()
+            .put_binding(&synch_store::Binding {
+                origin: rooted.clone(),
+                node_id: rooted_key,
+                source: synch_store::BindingSource::Static,
+                domain: None,
+                issuer: None,
+                spaces: Vec::new(),
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+        let stranger = origin("gone");
+
+        let held = iroh_base::SecretKey::generate().public();
+        let orphaned = iroh_base::SecretKey::generate().public();
+        delegate(&node, &rooted, held, &["photos"]);
+        delegate(&node, &stranger, orphaned, &["finance"]);
+
+        let (to_node, node_rx) = mpsc::unbounded_channel::<Message>();
+        let (node_tx, mut from_node) = mpsc::unbounded_channel::<Message>();
+        let stream = Box::pin(futures_util::stream::unfold(node_rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|m| (Ok::<Message, tokio_tungstenite::tungstenite::Error>(m), rx))
+        }));
+        let sink = Box::pin(futures_util::sink::unfold(
+            node_tx,
+            |tx, m: Message| async move {
+                tx.send(m)
+                    .map_err(|_| tokio_tungstenite::tungstenite::Error::ConnectionClosed)?;
+                Ok::<_, tokio_tungstenite::tungstenite::Error>(tx)
+            },
+        ));
+        let served = {
+            let node = node.clone();
+            tokio::spawn(async move {
+                let _ = serve(&node, sink, stream).await;
+            })
+        };
+
+        to_node
+            .send(down_msg(&Down::Delegations { id: 7 }))
+            .unwrap();
+        let Up::Delegations { id, delegations } = next_up(&mut from_node).await else {
+            panic!("expected a delegations answer")
+        };
+        assert_eq!(id, 7);
+        assert_eq!(delegations.len(), 2, "{delegations:?}");
+
+        let live = delegations
+            .iter()
+            .find(|d| d.key == held.to_z32())
+            .expect("the rooted issuer's delegation");
+        assert!(live.live, "a rooted issuer's grant holds");
+        assert_eq!(live.issuer, rooted.canonical());
+        assert_eq!(live.spaces, ["photos"]);
+        assert_eq!(live.note.as_deref(), Some("planted"));
+        assert!(live.not_after.is_some(), "the end date travels too");
+
+        let lapsed = delegations
+            .iter()
+            .find(|d| d.key == orphaned.to_z32())
+            .expect("the stranger's delegation");
+        assert!(
+            !lapsed.live,
+            "an issuer this node does not trust vouches for nobody, whatever the date says"
+        );
+        // Reported rather than hidden: "never delegated" and "delegated by
+        // someone since cut off" are different states and call for different
+        // actions.
+        assert_eq!(lapsed.issuer, stranger.canonical());
+        assert_eq!(lapsed.spaces, ["finance"]);
+
+        drop(to_node);
+        let _ = served.await;
+        node.shutdown().await.unwrap();
     }
 
     /// Runs `serve` end to end against an in-process socket, exercising the real
