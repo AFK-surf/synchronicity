@@ -435,15 +435,41 @@ fn climb(node: Int, last: Int) -> #(Int, Int) {
   }
 }
 
+/// Splits at the **last** occurrence of `on`, as `bytes.LastIndex` does.
+///
+/// `string.split_once` takes the first, and there is no last-index primitive
+/// in the standard library, so the pieces are rejoined: everything before the
+/// final separator is the head, the tail after it is the rest.
+fn split_at_last(text: String, on: String) -> Result(#(String, String), Nil) {
+  case list.reverse(string.split(text, on)) {
+    [] | [_] -> Error(Nil)
+    [tail, ..head] -> Ok(#(string.join(list.reverse(head), on), tail))
+  }
+}
+
 /// Parses a signed note: text lines, a blank line, then signature lines.
 /// The signature covers the text and its final newline, and nothing after.
+///
+/// The split is at the **last** blank line, as Go's `sumdb/note` does
+/// (`bytes.LastIndex`) and as `Checkpoint::parse` does on the client side
+/// (`crates/synch-net/src/rekor.rs`, `rfind("\n\n")`). Splitting at the first
+/// is a real divergence rather than a stylistic one: appending
+/// `"\n— attacker <b64>\n"` to a *genuine* checkpoint makes the first blank
+/// line fall before the log's own signature line, so a first-blank reader
+/// takes `signed` to be exactly the real note, verifies the real signature
+/// over it, and accepts the appended block as part of the signature section.
+/// A last-blank reader pulls the log's own signature into the signed text,
+/// where no pinned key matches, and refuses. This side reads a checkpoint to
+/// decide whether to *store and serve* one; a checkpoint this service accepts
+/// and every client refuses is the failure the verify-before-store step
+/// exists to prevent.
 pub fn parse_checkpoint(bytes: BitArray) -> Result(Checkpoint, ProofError) {
   let bad = fn(why: String) { Malformed("checkpoint: " <> why) }
   use text <- result.try(
     bit_array.to_string(bytes) |> result.replace_error(bad("not UTF-8")),
   )
   use #(body, sig_text) <- result.try(
-    string.split_once(text, "\n\n")
+    split_at_last(text, "\n\n")
     |> result.replace_error(bad(
       "no blank line between the note and its signatures",
     )),
@@ -482,12 +508,16 @@ pub fn parse_checkpoint(bytes: BitArray) -> Result(Checkpoint, ProofError) {
         bit_array.base64_decode(encoded)
         |> result.replace_error(bad("a signature is not base64")),
       )
+      // Strictly longer than the hint: `slice(blob, 4, 0)` succeeds on a
+      // four-byte blob and yields an empty signature, which the client
+      // refuses outright (`blob.len() <= 4`). One shape, one verdict.
       case
+        bit_array.byte_size(blob) > 4,
         bit_array.slice(blob, 0, 4),
         bit_array.slice(blob, 4, bit_array.byte_size(blob) - 4)
       {
-        Ok(hint), Ok(signature) -> Ok(#(name, hint, signature))
-        _, _ -> Error(bad("a signature is shorter than its key hint"))
+        True, Ok(hint), Ok(signature) -> Ok(#(name, hint, signature))
+        _, _, _ -> Error(bad("a signature is shorter than its key hint"))
       }
     }),
   )

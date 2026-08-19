@@ -42,7 +42,11 @@ jobs:
       # compiles that configuration, but rustdoc's -D warnings denies rustdoc
       # lints rather than rustc's, so dead_code and unused_imports unique to
       # the shipped build reached nobody, and clippy never saw it at all.
-      - run: cargo clippy --workspace --lib -- -D warnings
+      # `--lib` selects library targets only, and `synch-monitor`'s 1500-line
+      # `main.rs` — the trust-surface guard, the coverage guard, the whole
+      # reporting path — is a *binary* target. `--bins` resolves `sim` off for
+      # those too, so the shipped executables are linted as shipped.
+      - run: cargo clippy --workspace --lib --bins -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -67,6 +71,15 @@ jobs:
       # compiling without anyone finding out, which is the opposite of keeping
       # a capability ready.
       - run: cargo test --workspace --all-features --all-targets --no-fail-fast
+      # And the shipped configuration. `--all-targets` unifies features across
+      # the graph — `synch-net` dev-depends on itself with `sim` — so every
+      # line above resolves `sim` ON and no test has ever executed against a
+      # client built the way a released one is. `--lib --bins` resolves it off.
+      # Behind the gate sit `chain::validate`, the DS-digest helpers,
+      # `RekorProof::encode`/`to_txt` and the whole `x509::SelfSigned` writer,
+      # and the design's asymmetry claim — a client reads DER and never writes
+      # it — is a fact about a build nothing ran.
+      - run: cargo test --workspace --lib --bins --no-fail-fast
 
   docs:
     name: rustdoc

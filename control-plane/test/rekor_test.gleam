@@ -11,6 +11,8 @@ import dns/name
 import dns/rdata
 import dns/wire
 import dnssec/keys
+import envoy
+import exception
 import fixtures
 import gleam/bit_array
 import gleam/crypto
@@ -25,6 +27,7 @@ import provider/state
 import rekor/cert
 import rekor/chain
 import rekor/client
+import rekor/gate
 import rekor/proof.{type Proof, Proof}
 import rekor/publish as rekor_publish
 import rekor/statement
@@ -45,6 +48,13 @@ const fixture_dir = "test/fixtures/rekor/"
 fn fixture(file: String) -> BitArray {
   let assert Ok(bits) = simplifile.read_bits(fixture_dir <> file)
   bits
+}
+
+/// A `meta.txt` field as an integer — the shared fixture is where the
+/// numbers both languages have to agree on live.
+pub fn meta_int(field: String) -> Int {
+  let assert Ok(value) = int.parse(meta(field))
+  value
 }
 
 fn meta(field: String) -> String {
@@ -289,6 +299,53 @@ pub fn checkpoints_parse_or_are_refused_test() {
     proof.parse_checkpoint(<<
       "origin\nnope\nAAAA\n\n\u{2014} n AAAAAAEC\n":utf8,
     >>)
+  // A signature blob that is nothing but its four-byte key hint is refused,
+  // not read as an empty signature: `bit_array.slice(blob, 4, 0)` succeeds.
+  let assert Error(_) =
+    proof.parse_checkpoint(<<
+      "origin\n1\n":utf8,
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\n\u{2014} n AAAAAA==\n":utf8,
+    >>)
+}
+
+/// A block appended to a genuine checkpoint is not the note the log signed.
+///
+/// The mirror of the client's
+/// `a_checkpoint_with_a_block_appended_is_not_the_one_the_log_signed`. The
+/// genuine bytes end in a newline, so one appended signature line creates a
+/// **second** blank line: a reader that split at the first would take
+/// `signed` to be exactly the real note, verify the real signature over it,
+/// and accept the appended line as one the log had put there. Splitting at
+/// the last moves the log's own signature into the signed text, where the
+/// pinned key does not match.
+///
+/// Asserted on *verification* rather than on parsing, deliberately: parsing
+/// succeeds either way, and an earlier version of the client's test asserted
+/// on the signature count and passed with the bug still in.
+pub fn a_checkpoint_with_a_block_appended_is_not_the_one_the_log_signed_test() {
+  let keys.Csk(private, public) = keys.generate()
+  let note =
+    "log.example\n7\n" <> "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+  let blob =
+    bit_array.base64_encode(
+      <<0, 0, 0, 0, ecdsa_sign_der(<<note:utf8>>, private):bits>>,
+      True,
+    )
+  let genuine = note <> "\n\u{2014} log.example " <> blob <> "\n"
+
+  let assert Ok(real) = proof.parse_checkpoint(<<genuine:utf8>>)
+  let assert Ok(Nil) = proof.verify_checkpoint(real, public)
+
+  // The attacker's own line, appended after the genuine note's trailing
+  // newline. No key material is needed: the point is which bytes are read as
+  // signed.
+  let appended = genuine <> "\n\u{2014} log.example AAAAAAECAwQ=\n"
+  let assert Ok(tampered) = proof.parse_checkpoint(<<appended:utf8>>)
+  let assert Error(_) = proof.verify_checkpoint(tampered, public)
+  // And the reason: the signed bytes now carry the log's own signature line,
+  // which is exactly what a first-blank-line split would have left out.
+  let assert Ok(signed) = bit_array.to_string(tampered.signed)
+  assert string.contains(signed, "\u{2014}")
 }
 
 @external(erlang, "cp_crypto_ffi", "ecdsa_sign_der")
@@ -2135,3 +2192,59 @@ pub fn the_shipped_trusted_root_is_the_clients_test() {
 
 @external(erlang, "cp_sys_ffi", "priv_dir")
 fn priv_dir(sub: String) -> Result(String, Nil)
+
+/// The chain `chain.collect` builds today is the shape the checked-in
+/// cross-validation fixture pins.
+///
+/// The fixture itself cannot be regenerated-and-diffed in CI: ECDSA signing
+/// draws a fresh nonce, so two runs over the same zone produce different
+/// bytes. What *is* deterministic is the shape — which links, in which order,
+/// under which names — and a change to the collector that altered it without a
+/// regeneration would leave the Rust side walking a chain this side no longer
+/// produces. So this asserts the shape against the live collector, and
+/// `a_chain_the_control_plane_collected_walks_under_this_validator` on the
+/// Rust side asserts the *semantics* against the bytes.
+///
+/// Regenerate with `gleam run -m tools/gen_crossval`.
+pub fn the_collected_chain_matches_the_shape_the_crossval_fixture_pins_test() {
+  let #(links, _root, _apex) = gen_crossval.seeded_chain()
+  assert list.map(links, fn(l: cert.Link) { l.zone })
+    == ["_synchronicity-transparency.sync.test.", "sync.test.", "."]
+
+  // The apex link carries both its DNSKEY RRset and the DS beside it, which
+  // is what makes the ladder a descent rather than a self-anchored zone —
+  // the shape every other sim chain in either tree lacks.
+  let assert Ok(apex_link) =
+    list.find(links, fn(l: cert.Link) { l.zone == "sync.test." })
+  assert bit_array.byte_size(apex_link.rrs) > 200
+
+  // And the fixture the Rust walk reads is a chain of that shape, not an
+  // empty file a failed regeneration left behind.
+  let checked_in = fixture("crossval/chain-collected.der")
+  assert bit_array.byte_size(checked_in)
+    > bit_array.byte_size(cert.encode_chain(links)) - 64
+  assert bit_array.byte_size(checked_in)
+    < bit_array.byte_size(cert.encode_chain(links)) + 64
+}
+
+/// The gate refuses a spelling it does not recognise rather than reading it
+/// as off.
+///
+/// `CP_REKOR_REQUIRE` decides whether this service will publish device
+/// bindings under a zone key that is not on the public record. `TRUE`, `1`,
+/// `yes` and a trailing space all used to leave it silently open, while the
+/// cosmetic `CP_BROWSE` next door refuses anything but `on`/`off`.
+pub fn the_gate_refuses_a_spelling_it_does_not_recognise_test() {
+  fixtures.gate_disarmed()
+  assert gate.required() == False
+  envoy.set(gate.require_env, "false")
+  assert gate.required() == False
+  envoy.set(gate.require_env, "true")
+  assert gate.required() == True
+  // Anything else is a refusal, not a quiet "off".
+  list.each(["TRUE", "True", "1", "yes", "on", "true "], fn(spelling) {
+    envoy.set(gate.require_env, spelling)
+    let assert Error(_) = exception.rescue(fn() { gate.required() })
+  })
+  fixtures.gate_disarmed()
+}

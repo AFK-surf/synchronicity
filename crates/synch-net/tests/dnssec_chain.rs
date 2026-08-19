@@ -459,3 +459,175 @@ fn a_chain_padded_with_signatures_is_refused_rather_than_walked() {
         "{error}"
     );
 }
+
+// ------------------------------------------- the delegation half of the walk
+//
+// Everything above is about what a chain must *say*. These three are about the
+// step that makes a ladder a ladder: a link's DNSKEY RRset is believed because
+// a DS its parent signed covers a key in it. Until the harness could build a
+// child key set the parent's DS does *not* cover, every fixture derived both
+// from one key and they could not disagree — so `covers`, both of its digest
+// arms, and the flag rule that decides who may sign a DS were all invisible to
+// the whole workspace. Deleting any of them left the suite green.
+
+/// A key set the parent's DS does not cover authorizes nothing, even when
+/// every other byte of the ladder is genuine.
+///
+/// This is the forgery the ladder exists to refuse, and it costs an attacker
+/// nothing but a keypair: a delegation ladder is *public data*, so the
+/// victim's DS, its parent's DNSKEY set and the root's can all be fetched from
+/// any open resolver. Stand your own key set at the victim's apex name, keep
+/// the real DS beside it, and the only thing left between you and a chain that
+/// validates to the ICANN root — a client-accepted proof and a tier-A monitor
+/// finding for keys you invented — is the digest comparison in `covers`.
+///
+/// The impostor's key is minted with the **same key tag** as the real one, so
+/// the tag and algorithm prefilter match and the digest is genuinely the
+/// deciding comparison rather than something a cheaper check happens to catch.
+#[test]
+fn a_key_set_the_parents_ds_does_not_cover_authorizes_nothing() {
+    let real = SimDelegation::new("cluster.example", vec![]);
+    let file = tempfile::NamedTempFile::new().expect("temp");
+    std::fs::write(file.path(), real.anchor_record()).expect("write anchor");
+    let anchors = TrustAnchors::from_file(file.path()).expect("the root anchor parses");
+
+    // The genuine ladder walks, so the refusal below is the substitution.
+    let (proven, signing_zone, _) =
+        chain::validate(&real.chain(), &apex("cluster.example."), &anchors)
+            .expect("a genuine ladder walks to the root");
+    assert_eq!(signing_zone, apex("cluster.example."));
+    assert_eq!(proven.len(), 1);
+
+    // An attacker's key set at the victim's own name, tag-matched to the real
+    // one so nothing but the digest can separate them.
+    let mut impostor = SimZone::for_name(apex("cluster.example."), vec![]);
+    while impostor.key_tag() != real.apex.key_tag() {
+        impostor = SimZone::for_name(apex("cluster.example."), vec![]);
+    }
+
+    let error = chain::validate(
+        &real.chain_with_substituted_apex_keys(&impostor),
+        &apex("cluster.example."),
+        &anchors,
+    )
+    .expect_err("a key set no DS covers must authorize nothing");
+    assert!(
+        matches!(&error, ChainError::Signature(why) if why.contains("matches a DS")),
+        "the refusal must be the DS binding: {error}"
+    );
+}
+
+/// A delegation published with only a SHA-384 DS still walks.
+///
+/// RFC 4509 digest type 4 is an ordinary thing for a registrar to publish and
+/// `covers` dispatches on the type, but nothing reached that arm: deleting it
+/// left the workspace green while making every such zone permanently
+/// unresolvable for every client. The publisher's half of this was a real
+/// defect the previous audit found and fixed; this is the reader's half, and
+/// it was equally untested.
+#[test]
+fn a_delegation_published_with_a_sha384_ds_still_walks() {
+    let delegation = SimDelegation::new("cluster.example", vec![]);
+    let file = tempfile::NamedTempFile::new().expect("temp");
+    std::fs::write(file.path(), delegation.anchor_record()).expect("write anchor");
+    let anchors = TrustAnchors::from_file(file.path()).expect("the root anchor parses");
+
+    let (proven, _, walked) = chain::validate(
+        &delegation.chain_with_sha384_ds(),
+        &apex("cluster.example."),
+        &anchors,
+    )
+    .expect("a type-4 delegation is an ordinary delegation");
+    assert_eq!(proven.len(), 1);
+    assert_eq!(walked.anchor_zone, ".");
+}
+
+/// A revoked key cannot sign a child's DS.
+///
+/// `verify_ds_set` hands `verify_rrset` the parent's **whole** DNSKEY RRset
+/// with no filtering of its own, so the flag rule inside `verify_rrset` is the
+/// only thing standing between RFC 5011's "MUST NOT be used" and a revoked key
+/// authorizing a delegation. Its two sibling call sites pre-filter their key
+/// sets, so their mutations are caught and this one's was not.
+///
+/// The revoked key is served in the TLD's own RRset — the position a real
+/// revoked key sits in, published so resolvers can see the repudiation — and
+/// the rest of the ladder is untouched.
+#[test]
+fn a_revoked_parent_key_cannot_sign_a_childs_ds() {
+    let mut delegation = SimDelegation::new("cluster.example", vec![]);
+    let file = tempfile::NamedTempFile::new().expect("temp");
+    std::fs::write(file.path(), delegation.anchor_record()).expect("write anchor");
+    let anchors = TrustAnchors::from_file(file.path()).expect("the root anchor parses");
+
+    let (revoked, signer) = delegation.tld.revoked_key();
+    let chain = delegation.chain_with_ds_signed_by(revoked, &signer);
+
+    let error = chain::validate(&chain, &apex("cluster.example."), &anchors)
+        .expect_err("a repudiated key authorizes no delegation");
+    assert!(
+        matches!(&error, ChainError::Signature(why) if why.contains("unrevoked zone key")),
+        "the refusal must be the flag rule: {error}"
+    );
+}
+
+/// A chain the **control plane collected** walks under the client's own
+/// validator.
+///
+/// This is the only place either implementation's chain *semantics* meet the
+/// other's. `crossval/chain.der` pins the DER container — link framing, long
+/// and short length forms — and pins it well; what it cannot pin is what
+/// `rekor/chain.collect` puts *inside* a link. The declaration and its three
+/// rules, the DNSKEY and DS RRsets, the RRSIG signed-data construction, the
+/// canonical RRset ordering, the uncompressed wire RRs, the ladder's shape and
+/// the DS digest that ties one link to the next are all written twice, and
+/// until now nothing carried one side's output through the other's reader.
+///
+/// The consequence of that gap is asymmetric and unrecoverable in one
+/// direction: the publisher writes to a public append-only log, so a
+/// divergence discovered after the fact is a permanent entry no client
+/// accepts. A test is the only place to find it.
+///
+/// The fixture is a **real descent** — the root signs a DS for `sync.test.`,
+/// with `test.` an empty non-terminal in between — so this exercises
+/// `verify_ds_set`, `verify_dnskey_set_under` and `covers` over foreign bytes,
+/// not just the self-anchored shape every other sim chain has.
+///
+/// Regenerate with `gleam run -m tools/gen_crossval` in `control-plane/`.
+#[test]
+fn a_chain_the_control_plane_collected_walks_under_this_validator() {
+    let crossval = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../control-plane/test/fixtures/rekor/crossval");
+    let der = std::fs::read(crossval.join("chain-collected.der"))
+        .expect("the Gleam-collected chain fixture");
+    let chain = DnssecChain::decode(&der).expect("a chain this reader can decode");
+
+    // The shape the collector is supposed to produce, asserted before the
+    // crypto so a regeneration that quietly flattened the ladder is a
+    // failure here rather than a weaker test that still passes.
+    assert_eq!(chain.links.len(), 3, "declaration, apex, root");
+    assert_eq!(
+        chain.links[0].zone,
+        "_synchronicity-transparency.sync.test."
+    );
+    assert_eq!(chain.links[1].zone, "sync.test.");
+    assert_eq!(chain.links[2].zone, ".");
+
+    let anchors = TrustAnchors::from_file(&crossval.join("chain-anchor.key"))
+        .expect("the root anchor the same run wrote");
+    let (proven, signing_zone, walked) = chain::validate(&chain, &apex("sync.test."), &anchors)
+        .expect("a chain the control plane collected must walk here");
+    assert_eq!(signing_zone, apex("sync.test."));
+    assert_eq!(walked.anchor_zone, ".");
+    assert!(
+        !walked.anchored_directly,
+        "the fixture is a real descent, not a self-anchored zone"
+    );
+    assert_eq!(proven.len(), 1);
+
+    // And the DS binding is load-bearing over these bytes too: the proven key
+    // is the one the root's DS covers, byte for byte.
+    let mut other = proven[0].clone();
+    other[10] ^= 0x01;
+    assert!(!proven.contains(&other));
+}

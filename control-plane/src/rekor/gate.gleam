@@ -27,10 +27,30 @@ pub type GateError {
 }
 
 /// Whether the gate is armed.
+///
+/// **A spelling this does not recognise is refused, not read as off.** The
+/// value is a security posture, and `CP_REKOR_REQUIRE=TRUE`, `=1`, `=yes` or
+/// a trailing space all used to leave the gate silently open — while the
+/// cosmetic `CP_BROWSE` two files away refuses anything but `on`/`off`. An
+/// operator following the phase-1 recipe in `docs/REKOR-ZONE-KEY.md` and
+/// typing `1` got the opposite of what they asked for, with nothing anywhere
+/// saying so.
+///
+/// Off remains the default, and deliberately: the rollout is phased (§7), so
+/// a control plane that has not run `rekor-publish` yet keeps serving. That is
+/// a decision about the *absent* value, not about an unreadable one.
 pub fn required() -> Bool {
   case envoy.get(require_env) {
     Ok("true") -> True
-    _ -> False
+    Error(Nil) | Ok("false") -> False
+    Ok(other) ->
+      panic as {
+        require_env
+        <> " must be \"true\" or \"false\" — got \""
+        <> other
+        <> "\". Refusing to guess: this decides whether the zone publishes "
+        <> "device bindings under a key that is not on the public record."
+      }
   }
 }
 

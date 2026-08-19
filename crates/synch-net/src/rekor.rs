@@ -408,38 +408,58 @@ pub fn proofs_from_txt(records: &[String]) -> Vec<Result<RekorProof, ProofError>
 /// over the records, not a product, and it is what lets a `1/5` set and a
 /// `1/9` set coexist at one name during a rollover.
 fn assemble_group(group: &str, parts: &[(usize, usize, String)]) -> Result<RekorProof, ProofError> {
-    // The part counts the records claim, smallest first: a complete honest set
-    // is tried before any larger count an added record invented.
-    let mut totals: Vec<usize> = parts.iter().map(|(_, total, _)| *total).collect();
-    totals.sort_unstable();
-    totals.dedup();
+    use std::collections::BTreeMap;
+
+    // Indexed once, by `(total, index)`. The obvious shape — rescanning
+    // `parts` for every index of every claimed total — is quadratic in the
+    // record count and the records are attacker-chosen: sixteen names of
+    // validated TXT hold on the order of 27,000 minimal `sync1p` records, and
+    // one group whose records spread their claimed totals across 1..=255 costs
+    // roughly 9x10^8 tuple comparisons. That is about a second of CPU inside
+    // one `poll`, with no await in it for a timeout to fire at and no
+    // `spawn_blocking` under it, on a task that walks configured domains one at
+    // a time. The candidate cap runs after this, so it does not bound it.
+    //
+    // A BTreeMap rather than a HashMap: the keys are the zone's, and iteration
+    // order is not something an answer should get to choose.
+    let mut by_total: BTreeMap<usize, BTreeMap<usize, &str>> = BTreeMap::new();
+    let mut duplicated: BTreeMap<usize, usize> = BTreeMap::new();
+    for (index, total, chunk) in parts {
+        if by_total
+            .entry(*total)
+            .or_default()
+            .insert(*index, chunk.as_str())
+            .is_some()
+        {
+            duplicated.entry(*total).or_insert(*index);
+        }
+    }
 
     let mut last: Option<ProofError> = None;
-    for total in totals {
+    // Smallest count first: a complete honest set is tried before any larger
+    // count an added record invented.
+    for (total, chunks) in &by_total {
+        let total = *total;
         // Only records that agree on the count take part in its reading. A
         // record claiming some other total is a different reading, not a hole
         // in this one.
         let mut payload = String::new();
         let mut broken = None;
         for index in 1..=total {
-            let mut chunks = parts
-                .iter()
-                .filter(|(at, claimed, _)| *at == index && *claimed == total)
-                .map(|(_, _, chunk)| chunk.as_str());
-            match (chunks.next(), chunks.next()) {
-                (Some(chunk), None) => payload.push_str(chunk),
-                (None, _) => {
+            if duplicated.get(&total).is_some_and(|first| *first == index) {
+                broken = Some(ProofError::Malformed(format!(
+                    "proof {group} is served in {total} part(s) and part {index} \
+                     arrived more than once, so the zone does not agree with \
+                     itself about what it published"
+                )));
+                break;
+            }
+            match chunks.get(&index).copied() {
+                Some(chunk) => payload.push_str(chunk),
+                None => {
                     broken = Some(ProofError::Malformed(format!(
                         "proof {group} is served in {total} part(s) and part {index} \
                          did not arrive"
-                    )));
-                    break;
-                }
-                (Some(_), Some(_)) => {
-                    broken = Some(ProofError::Malformed(format!(
-                        "proof {group} is served in {total} part(s) and part {index} \
-                         arrived more than once, so the zone does not agree with \
-                         itself about what it published"
                     )));
                     break;
                 }
@@ -643,10 +663,15 @@ pub struct VerifiedRecord {
 /// no name for. An entry may therefore carry extensions this design says
 /// nothing about — the conformance fixture does — and still verify.
 ///
-/// A `retire` entry is refused outright rather than chain-checked: retirement
-/// is a monitor breadcrumb (§2), never authorization, and a chainless retire
-/// is legal on the publish side — so accepting one here would reopen exactly
-/// the hole the chain requirement closes.
+/// A `retire` entry is refused, and the order is worth stating because it is
+/// the reverse of what this comment used to say. The action is the last thing
+/// `check_binds` tests and `check_binds` is the last thing here, so a retire
+/// carrying a chain is chain-checked first and refused on its action — while
+/// the chainless retire the publish side is actually allowed to emit (a
+/// retired zone may have no DS left) never reaches that arm at all: it is
+/// refused as `Chain` several steps earlier. Either way retirement is a
+/// monitor breadcrumb (§2) and never authorization, which is the point;
+/// accepting one would reopen exactly the hole the chain requirement closes.
 pub fn verify(
     proof: &RekorProof,
     key: &ZoneKey<'_>,
@@ -1275,20 +1300,47 @@ impl Checkpoint {
     /// witness, so "some pinned key signed these bytes" would let an unpinned
     /// log Y's checkpoint — cosigned by pinned key X — travel with
     /// `log_id = id(X)` and an inclusion path into Y's tree, and the only check
-    /// that says which log an entry is in would pass while looking intact. The
-    /// origin is inside the signed bytes; requiring the *signer's own name* to
-    /// be that origin is what makes the pinned key vouch for the tree as
-    /// itself rather than as a bystander.
+    /// that says which log an entry is in would pass while looking intact.
     ///
-    /// The four-byte key hint is the second half of that binding, where the
-    /// algorithm makes it unambiguous: C2SP derives an Ed25519 note key id as
-    /// `SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`, so for an Ed25519 pin the hint
-    /// is a checkable statement that this key belongs to this origin, and it is
-    /// checked. Sigstore's P-256 logs publish a `logId.keyId` that is instead
-    /// SHA-256 over the SubjectPublicKeyInfo, so no single derivation is right
-    /// for that arm and the hint stays what it is there — a selector, not a
-    /// credential.
+    /// **The binding that closes that is the pin's own origin, and nothing
+    /// read out of the note.** This used to rest on the signature line's name
+    /// and its four-byte hint, and both of those sit *after* the blank line —
+    /// the region no signature covers — while the hint's derivation
+    /// (`SHA-256(origin ‖ 0x0A ‖ 0x01 ‖ raw32)`, the C2SP note key id) is
+    /// public arithmetic over public inputs. An attacker holding a genuine
+    /// foreign note simply rewrites both. Go's `sumdb/note` does not have this
+    /// problem because a name there means something the *caller* supplied: its
+    /// `Verifiers` table maps `(name, hash) → key`. [`LogKey::origin`] is that
+    /// table entry, carried from the trusted root that named the key, and it
+    /// is compared against the origin line, which *is* inside the signed
+    /// bytes.
+    ///
+    /// The line name and the hint stay as selectors, which is all they can
+    /// honestly be: they pick which line to try. A key with no pinned origin —
+    /// one from a `--rekor-key` file, whose grammar has nowhere to put a name
+    /// — gets the old, weaker treatment, and that is the honest answer for a
+    /// pin that arrived without one.
     fn verify_signature(&self, key: &LogKey) -> Result<(), ProofError> {
+        // The pin's own name for this log, checked first and against the
+        // **signed** origin line. Everything else this function reads about
+        // *which* log signed is in the unsigned tail: a signature line's name
+        // and its four-byte hint both sit after the blank line, where no
+        // signature covers them, and the hint's derivation is public. So on
+        // their own they are selectors an attacker rewrites at will, and
+        // "some pinned key signed these bytes" is all they can establish —
+        // which is exactly what a cosigned foreign log's checkpoint would
+        // satisfy. A pin that carries an origin turns that into a statement:
+        // this key vouches for this tree *as this log*.
+        if key
+            .origin
+            .as_deref()
+            .is_some_and(|pinned| pinned != self.origin)
+        {
+            return Err(ProofError::Checkpoint(format!(
+                "the checkpoint says it is from {}, but the pinned key that                  signs it is the key for another log",
+                self.origin
+            )));
+        }
         let signed = self.signatures.iter().any(|line| {
             line.name == self.origin
                 && key.note_hint(&self.origin).is_none_or(|id| id == line.hint)
@@ -1322,6 +1374,21 @@ pub struct LogKey {
     algorithm: LogKeyAlgorithm,
     /// The raw public key: an uncompressed P-256 point, or 32 Ed25519 bytes.
     point: Vec<u8>,
+    /// The checkpoint origin this key is pinned *for*, when the pin came from
+    /// an artifact that named one.
+    ///
+    /// Go's `sumdb/note` takes its origin↔key binding from the caller's
+    /// `(name, hash) → key` verifier table: a name means something because
+    /// the *verifier* was constructed with it. This is that table entry. A
+    /// Sigstore trusted root names each shard's `baseUrl` beside its key, and
+    /// the checkpoint origin of every shard it names is that URL's host — so
+    /// the binding is available from the same signed artifact the key came
+    /// from, and [`crate::tuf::tlog_keys`] carries it through.
+    ///
+    /// `None` for a key read from a `--rekor-key` file, whose grammar is bare
+    /// SubjectPublicKeyInfo with nowhere to put a name. Such a key is
+    /// unbound, and the check below says so rather than pretending otherwise.
+    origin: Option<String>,
 }
 
 impl LogKey {
@@ -1469,6 +1536,12 @@ impl LogKeys {
         Ok(LogKeys { keys })
     }
 
+    /// A pin set from keys already parsed — how [`crate::tuf::tlog_keys`]
+    /// builds one, so the origin each key is pinned for survives.
+    pub fn from_keys(keys: Vec<LogKey>) -> LogKeys {
+        LogKeys { keys }
+    }
+
     /// The key a proof's `log_id` names, if this client pins it.
     pub fn find(&self, log_id: &[u8; 32]) -> Option<&LogKey> {
         self.keys.iter().find(|key| &key.id == log_id)
@@ -1504,6 +1577,17 @@ pub(crate) const ED25519_SPKI_PREFIX: &[u8] = &[
 ];
 
 impl LogKey {
+    /// The same key, pinned for the checkpoint origin `origin`.
+    ///
+    /// Used by [`crate::tuf::tlog_keys`], which reads the origin out of the
+    /// same trusted root that named the key.
+    pub fn for_origin(self, origin: String) -> LogKey {
+        LogKey {
+            origin: Some(origin),
+            ..self
+        }
+    }
+
     /// Parses a DER SubjectPublicKeyInfo holding a P-256 or Ed25519 key.
     ///
     /// Deliberately narrow: two shapes are recognized and everything else is
@@ -1520,6 +1604,7 @@ impl LogKey {
                     id,
                     algorithm: LogKeyAlgorithm::EcdsaP256Sha256,
                     point: uncompressed,
+                    origin: None,
                 });
             }
         }
@@ -1529,6 +1614,7 @@ impl LogKey {
                     id,
                     algorithm: LogKeyAlgorithm::Ed25519,
                     point: point.to_vec(),
+                    origin: None,
                 });
             }
         }
@@ -2221,6 +2307,126 @@ mod tests {
             witnessed.verify_under(&embedded).is_err(),
             "cosignatures are tolerated and never authoritative"
         );
+    }
+
+    /// A pinned key does not vouch for a tree that is not its own log's,
+    /// however the note's *unsigned* tail is spelled.
+    ///
+    /// The line name and the four-byte hint are the two things
+    /// `verify_signature` used to read to decide *which* log signed, and both
+    /// sit after the blank line where no signature reaches — while the hint's
+    /// derivation is public arithmetic over public inputs. So an attacker
+    /// holding one genuine note signed by a pinned key under some other name
+    /// rewrites both and the check passes. The binding has to come from the
+    /// pin, which is where the trusted root put it.
+    ///
+    /// Built rather than captured: the shape needs a key that signed a note
+    /// whose origin line names a log the key is not pinned for, and no real
+    /// Sigstore checkpoint is one.
+    /// Reassembly is linear in the records offered, not quadratic.
+    ///
+    /// The records are the zone's, and the threat model's attacker *is* the
+    /// zone. Sixteen validated TXT names hold tens of thousands of minimal
+    /// `sync1p` records; spreading their claimed totals across 1..=255 made
+    /// the old rescan-per-index cost around 9x10^8 tuple comparisons — about a
+    /// second of CPU inside one `poll`, with no await for a timeout to fire at
+    /// and no `spawn_blocking` under it, on a task that walks configured
+    /// domains one at a time. The candidate cap runs afterwards and does not
+    /// bound it.
+    ///
+    /// Asserted as a wall-clock ceiling rather than an operation count,
+    /// because the count is what changed. The bound is loose enough that a
+    /// slow machine cannot reach it and tight enough that the old shape
+    /// cannot pass.
+    #[test]
+    fn reassembly_does_not_rescan_every_part_for_every_claimed_total() {
+        let chunk = "A".repeat(8);
+        let records: Vec<String> = (0..20_000)
+            .map(|i| {
+                // One group, every index spread over every plausible total, so
+                // the old form paid sum-of-totals times the record count.
+                let total = (i % 255) + 1;
+                let index = (i % total) + 1;
+                format!("sync1p abcdef01 {index}/{total} {chunk}")
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let out = proofs_from_txt(&records);
+        let elapsed = started.elapsed();
+        // Nothing reassembles — the payloads are not a proof — which is the
+        // point: the cost is paid before any of that is known.
+        assert!(out.iter().all(|r| r.is_err()));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "reassembly of {} records took {elapsed:?}",
+            records.len()
+        );
+    }
+
+    #[test]
+    fn a_pinned_key_vouches_only_for_the_log_it_is_pinned_for() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("key");
+        let spki = [ED25519_SPKI_PREFIX, pair.public_key().as_ref()].concat();
+        let key = LogKey::from_spki(&spki).expect("an ed25519 pin");
+
+        // A note whose signed origin names some *other* log, signed by this
+        // key: a genuine signature over bytes that say they belong elsewhere.
+        let note = "other-log.example\n7\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
+        // The attacker writes both unsigned fields to whatever passes: the
+        // origin as the line name, and the hint the derivation says goes with
+        // that pair.
+        let hint = key.note_hint("other-log.example").expect("ed25519 has one");
+        let blob = base64_encode(&[&hint[..], pair.sign(note.as_bytes()).as_ref()].concat());
+        let signed = format!("{note}\n\u{2014} other-log.example {blob}\n");
+        let checkpoint = Checkpoint::parse(signed.as_bytes()).expect("a note");
+
+        // Unbound, the note is accepted: name matches origin, hint matches the
+        // derivation, signature verifies. This is what a pin from a
+        // `--rekor-key` file gets, and it is the whole of the old check.
+        checkpoint
+            .verify_signature(&key)
+            .expect("an unbound pin has only the note's own word to go on");
+
+        // Pinned for the log it actually belongs to, the same bytes are
+        // refused — the attacker cannot rewrite the pin.
+        let bound = key.clone().for_origin("our-log.example".to_string());
+        assert!(matches!(
+            checkpoint.verify_signature(&bound),
+            Err(ProofError::Checkpoint(_))
+        ));
+        // And pinned for its own origin it verifies, so the refusal above is
+        // the binding rather than something incidental about the note.
+        let matching = key.for_origin("other-log.example".to_string());
+        checkpoint
+            .verify_signature(&matching)
+            .expect("a key pinned for this origin vouches for it");
+    }
+
+    /// The pin set the trusted root yields carries each shard's origin.
+    #[test]
+    fn pinned_log_keys_carry_the_origin_the_trusted_root_named_them_at() {
+        let keys = crate::tuf::tlog_keys(crate::tuf::EMBEDDED_TRUSTED_ROOT.as_bytes())
+            .expect("the embedded trusted root parses");
+        let origins: Vec<&str> = keys
+            .keys()
+            .iter()
+            .filter_map(|key| key.origin.as_deref())
+            .collect();
+        assert!(
+            origins.contains(&"log2025-1.rekor.sigstore.dev"),
+            "the shard the checked-in checkpoint comes from must be pinned for \
+             its own origin: {origins:?}"
+        );
+        // And the real checkpoint still verifies against that bound pin, which
+        // is what says the derivation matches what Sigstore actually signs.
+        let note = include_bytes!("../tests/fixtures/sigstore_checkpoint.txt");
+        Checkpoint::parse(note)
+            .expect("a real checkpoint parses")
+            .verify_under(&keys)
+            .expect("a real checkpoint verifies under the origin-bound pin set");
     }
 
     /// The four-byte key hint is checked where C2SP makes the derivation

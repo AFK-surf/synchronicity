@@ -91,7 +91,16 @@ const sweep_interval_ms = 300_000
 const reconcile_interval = 900
 
 pub type Msg {
+  /// The sweep timer firing. **The only message that re-arms the timer.**
   Tick
+  /// A product mutation asking for a pass now. Deliberately a separate
+  /// constructor: `handle` re-arms after a `Tick`, so a poke handled as one
+  /// would start a second, permanent timer chain beside the first — once per
+  /// mutation, never cancelled, for the life of the process. The steady-state
+  /// sweep rate would be one pass per interval per poke ever received, which
+  /// any authenticated member can drive up by editing a device in a loop, and
+  /// a revocation's own poke would then queue behind that backlog.
+  Poke
 }
 
 type State {
@@ -101,16 +110,29 @@ type State {
     provider_name: String,
     zone_id: String,
     subject: Subject(Msg),
+    interval_ms: Int,
   )
 }
 
 /// Nudges a running reconciler by its registered name — sent by
 /// `zone_mutation` after its transaction commits, and by anything else
 /// that changed what the zone should say. Falling on the floor is fine:
-/// the hourly sweep repairs a missed poke.
+/// the sweep repairs a missed poke.
+///
+/// **Checked, because `process.send` to an unregistered name raises.** It is
+/// `let assert Ok(pid) = named(name) as "Sending to unregistered name"`, so
+/// "falling on the floor" is not what an absent reconciler gets: the caller
+/// dies. The window is real in both directions — the supervisor registers
+/// this name inside the actor's own init, and any restart of the reconciler
+/// leaves it unregistered until that completes. The caller is
+/// `zone_mutation`, *after* its transaction has committed and *before* the
+/// 200 is built, so a raise there turns a committed revocation into a 500
+/// whose follow-up work (dropping the revoked key's live tunnels) never runs
+/// and whose retry answers 404, the row already being revoked.
 pub fn poke(name: Name(Msg)) -> Nil {
-  case process.named_subject(name) {
-    subject -> process.send(subject, Tick)
+  case process.named(name) {
+    Ok(_) -> process.send(process.named_subject(name), Poke)
+    Error(Nil) -> Nil
   }
 }
 
@@ -121,6 +143,26 @@ pub fn supervised(
   provider_name: String,
   zone_id: String,
 ) -> supervision.ChildSpecification(Nil) {
+  supervised_every(
+    name,
+    db_path,
+    prov,
+    provider_name,
+    zone_id,
+    sweep_interval_ms,
+  )
+}
+
+/// The same with the sweep interval named, so a test can watch the timer
+/// chain without waiting five minutes for it.
+pub fn supervised_every(
+  name: Name(Msg),
+  db_path: String,
+  prov: Provider,
+  provider_name: String,
+  zone_id: String,
+  interval_ms: Int,
+) -> supervision.ChildSpecification(Nil) {
   supervision.worker(fn() {
     let builder =
       actor.new_with_initialiser(1000, fn(subject) {
@@ -130,11 +172,18 @@ pub fn supervised(
         // before the first pass would leave the zone unpublished for that
         // long, which is the one window where nothing else pokes.
         //
-        // This tick and nothing else: `handle` re-arms after every pass, so
-        // also scheduling one here would start a second, permanent timer
+        // This tick and nothing else: `handle` re-arms after every `Tick`,
+        // so also scheduling one here would start a second, permanent timer
         // chain beside the first and sweep at twice the stated interval.
         process.send(subject, Tick)
-        actor.initialised(State(db_path, prov, provider_name, zone_id, subject))
+        actor.initialised(State(
+          db_path,
+          prov,
+          provider_name,
+          zone_id,
+          subject,
+          interval_ms,
+        ))
         |> actor.returning(subject)
         |> Ok
       })
@@ -146,9 +195,16 @@ pub fn supervised(
 }
 
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
-  let Tick = msg
   run_once(state.db_path, state.provider, state.provider_name, state.zone_id)
-  let _ = process.send_after(state.subject, sweep_interval_ms, Tick)
+  // Exactly one timer chain, started by the initialiser's first `Tick` and
+  // continued here. A `Poke` runs its pass and re-arms nothing — see `Msg`.
+  case msg {
+    Tick -> {
+      let _ = process.send_after(state.subject, state.interval_ms, Tick)
+      Nil
+    }
+    Poke -> Nil
+  }
   actor.continue(state)
 }
 
@@ -180,10 +236,10 @@ pub fn run_once_with(
   zone_id: String,
   now: Int,
 ) -> Nil {
-  case pass(conn, prov, zone_id, now) {
+  case pass(conn, prov, provider_name, zone_id, now) {
     Ok(Fresh) -> Nil
     Ok(Converged(serial, hash, changes, shed)) -> {
-      let _ = state.record_ok(conn, provider_name, zone_id, hash, serial, now)
+      note(state.record_ok(conn, provider_name, zone_id, hash, serial, now))
       let _ = audit_sync(conn, now, serial, changes, shed, [])
       io.println(
         "provider-sync: applied serial "
@@ -196,7 +252,7 @@ pub fn run_once_with(
     }
     Ok(Partial(serial, changes, failures)) -> {
       let rendered = render_failures(failures)
-      let _ = state.record_partial(conn, provider_name, zone_id, rendered, now)
+      note(state.record_partial(conn, provider_name, zone_id, rendered, now))
       let _ = audit_sync(conn, now, serial, changes, 0, failures)
       io.println_error(
         "provider-sync: serial "
@@ -206,9 +262,27 @@ pub fn run_once_with(
       )
     }
     Error(why) -> {
-      let _ = state.record_error(conn, provider_name, zone_id, why, now)
+      note(state.record_error(conn, provider_name, zone_id, why, now))
       io.println_error("provider-sync: " <> why)
     }
+  }
+}
+
+/// Reports a sync-state write that did not happen.
+///
+/// These were discarded. The consequence is not cosmetic: `fresh` requires
+/// `last_error == None`, so an error row that fails to land leaves the
+/// previous success row standing and the very next pass short-circuits past a
+/// provider it just failed to reach. A write that fails is a fact about this
+/// deployment that nothing else records, so it goes to stderr like every other
+/// failure here.
+fn note(written: Result(Nil, sqlite.Error)) -> Nil {
+  case written {
+    Ok(Nil) -> Nil
+    Error(e) ->
+      io.println_error(
+        "provider-sync: could not record sync state: " <> string.inspect(e),
+      )
   }
 }
 
@@ -231,7 +305,8 @@ type Outcome {
 fn pass(
   conn: Connection,
   prov: Provider,
-  _zone_id: String,
+  provider_name: String,
+  zone_id: String,
   now: Int,
 ) -> Result(Outcome, String) {
   use input <- result.try(
@@ -262,6 +337,20 @@ fn pass(
       && recently_listed(s.last_ok_at, now)
     Error(Nil) -> False
   }
+  // Whether this deployment has already applied a set to *this* provider and
+  // zone. It is what lets `diff_gated` treat a marker that no longer matches
+  // as drift rather than as somebody else's apex — see `diff.diff_gated`.
+  // Read from our own row, which only `record_ok` writes and only after an
+  // apply that was itself gated on ownership, so it cannot be conjured by
+  // anything at the provider. A zone id or provider name that changed makes
+  // it false again, which is right: that is a first sync somewhere new.
+  let adopted = case stored {
+    Ok(s) ->
+      s.applied_hash != option.None
+      && s.provider == provider_name
+      && s.provider_zone_id == zone_id
+    Error(Nil) -> False
+  }
   use <- fresh_guard(fresh)
   use existing <- result.try(
     prov.list() |> result.map_error(fn(e) { "provider list: " <> e }),
@@ -276,10 +365,17 @@ fn pass(
     False -> Ok([])
     True ->
       render_external.render(input)
+      |> result.map(fn(ungated) {
+        // The *difference*, not the whole ungated set: `withheld` means "what
+        // the gate dropped", and handing the shield every record this pass
+        // rendered would silently widen it to whatever the renderer starts
+        // gating next.
+        list.filter(ungated, fn(r) { !list.contains(desired, r) })
+      })
       |> result.map_error(fn(e) { "rendering: " <> string.inspect(e) })
   })
   use changes <- result.try(
-    diff.diff_gated(desired, existing, withheld)
+    diff.diff_gated(desired, existing, withheld, adopted: adopted)
     |> result.map_error(describe_conflict),
   )
   use applied <- result.try(case provider.no_changes(changes) {

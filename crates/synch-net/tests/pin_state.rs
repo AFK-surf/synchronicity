@@ -31,7 +31,7 @@ const NOW: u64 = 1_760_000_000;
 fn accepted() -> (tempfile::TempDir, SimTuf, SimLog, PinState) {
     let dir = tempfile::tempdir().unwrap();
     let honest = SimLog::new("rekor.honest");
-    let mut repo = SimTuf::new(NOW as i64, &[honest.spki()]);
+    let mut repo = SimTuf::new(NOW as i64, &[&honest]);
     // A non-empty stored root chain, so the round-trip carries one.
     repo.rotate_root(false);
     let accepted = tuf::update(&repo.metadata(), &repo.embedded_state(), NOW)
@@ -86,7 +86,7 @@ fn a_state_from_another_tuf_repository_is_not_loaded() {
     let (dir, repo, _, _) = accepted();
     let anchor = repo.embedded_root();
 
-    let stranger = SimTuf::new(NOW as i64, &[SimLog::new("rekor.other").spki()]);
+    let stranger = SimTuf::new(NOW as i64, &[&SimLog::new("rekor.other")]);
     assert_eq!(
         PinState::load_anchored(&path(&dir), &stranger.embedded_root()),
         None,
@@ -130,7 +130,7 @@ fn a_state_in_a_format_this_build_does_not_know_is_not_loaded() {
 #[test]
 fn no_clock_value_makes_a_tuf_expiry_check_vacuous() {
     let honest = SimLog::new("rekor.honest");
-    let repo = SimTuf::new(NOW as i64, &[honest.spki()]);
+    let repo = SimTuf::new(NOW as i64, &[&honest]);
     let metadata = repo.metadata();
     let state = repo.embedded_state();
 

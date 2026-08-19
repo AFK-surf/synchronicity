@@ -60,9 +60,15 @@ const CONTROL_PLANE_PROOF_TTL: Duration = Duration::from_secs(300);
 /// The longest a control plane in external mode can take to get a rotated
 /// provider key onto the public record and visible to a client — the sum of the
 /// three delays above, spelled as a sum so the arithmetic is checkable here
-/// even though the terms themselves live in the control plane's source. (There
-/// is no way to pin them across the language boundary from this side; the
-/// control plane's own suite is where those three numbers are held still.)
+/// even though the terms themselves live in the control plane's source.
+///
+/// The three terms are the control plane's, transcribed — and the three on
+/// this side are written into the shared fixture's `meta.txt` by
+/// `regenerate_the_shared_fixture` and asserted from both suites, so the
+/// relation is held still across the boundary rather than by a comment. (This
+/// paragraph used to say there was no way to do that from this side, which
+/// stopped being true when that fixture was created; a previous audit found
+/// one of the six numbers stale.)
 ///
 /// It is named here because this is the half that pays for it. A refresh under
 /// [`RekorPolicy::Require`] fails closed for that whole window — the answer
@@ -265,11 +271,15 @@ pub struct MemberRecord {
     /// names it — where the transparency records for it live.
     ///
     /// It is a *hint about where to look*, never an authority: the apex it
-    /// names has to contain this membership domain, has to be contained by
-    /// the zone whose RRSIG signed the answer, and has to be what the log
-    /// entry's own certificate names. A wrong value points at a name with no
-    /// usable proof, which fails closed. Its purpose is to let two control
-    /// planes share one signing zone without sharing a single record name.
+    /// names has to contain this membership domain and has to be contained by
+    /// the zone whose RRSIG signed the answer (`apex_of`), and the entry found
+    /// under it must itself name an apex inside those same bounds
+    /// (`rekor::verify`). The two are held between the same two names rather
+    /// than compared to each other — both are suffixes of the membership
+    /// domain, so they are comparable and a monitor watching either watches
+    /// the other. A wrong value points at a name with no usable proof, which
+    /// fails closed. Its purpose is to let two control planes share one
+    /// signing zone without sharing a single record name.
     pub apex: Option<String>,
 }
 
@@ -744,9 +754,87 @@ impl std::fmt::Debug for DnssecResolver {
     }
 }
 
-/// A validated lookup result.
+/// Which apex a lookup is gated against, and where that apex comes from.
+///
+/// The two legs differ, and the difference is not cosmetic: a membership answer
+/// carries the `apex=` field that names its own bound, while a record hanging
+/// off that apex carries no such field and must inherit the bound from the
+/// answer that led to it. Making the caller name which case it is means a new
+/// subordinate lookup cannot quietly acquire the *first* behaviour, which would
+/// let the record under audit choose the apex it is judged against.
+#[derive(Debug, Clone, Copy)]
+enum GateApex<'a> {
+    /// Derived from this answer's own records — the membership case.
+    FromRecords,
+    /// Fixed by an apex a gated answer already established.
+    Under(&'a Name),
+}
+
+/// A DNSSEC-validated answer that has **also** passed the §4.2 transparency
+/// gate — or that is under a policy which asks for no gate at all.
+///
+/// Distinct from [`DnssecTxt`] because the two are different statements and
+/// were previously one type. `DnssecTxt` says *this zone signed this*, which
+/// under `RekorPolicy::Require` is not enough: the threat model's attacker is a
+/// compromised parent who substitutes a DS, adds a key to the apex DNSKEY
+/// RRset, and thereby signs anything they like with a key that validates. What
+/// the gate adds is that the key which signed *this RRset* is on the
+/// transparency log, so using it leaves a record a monitor can see.
+///
+/// The private field is the mechanism, in the same spirit as
+/// [`chain::Authorized`](crate::chain::Authorized): only
+/// `DnssecResolver::gated_txt` can build one, so a value of this type is
+/// evidence the gate ran rather than a claim in a comment that it did. That
+/// distinction is exactly what a previous audit found missing — the
+/// control-plane attach record was read from a `DnssecTxt` that no gate had
+/// touched, in code that read identically to the gated path.
 #[derive(Debug, Clone)]
-pub struct ValidatedTxt {
+pub struct GatedTxt {
+    /// The apex the gate held this answer against, or `None` under a policy
+    /// that asked for no gate.
+    apex: Option<Name>,
+    /// The validated answer itself.
+    answer: DnssecTxt,
+}
+
+impl GatedTxt {
+    /// The TXT strings, safe to act on.
+    pub fn records(&self) -> &[String] {
+        &self.answer.records
+    }
+
+    /// How long the answer may be believed, already held to the signature's
+    /// own expiration.
+    pub fn ttl(&self) -> Duration {
+        self.answer.ttl
+    }
+
+    /// The zone whose RRSIG covered the answer.
+    pub fn signer(&self) -> &Name {
+        &self.answer.signer
+    }
+
+    /// The apex the gate held this answer against — `None` when the policy in
+    /// force asked for no gate, which is the only way to get one.
+    pub fn apex(&self) -> Option<&Name> {
+        self.apex.as_ref()
+    }
+}
+
+/// A DNSSEC-validated lookup result, and **nothing more than that**.
+///
+/// It says the signing zone signed these records and that hickory's chain to
+/// the trust anchor held. It says nothing about whether the key that did so is
+/// on the transparency log, which under [`RekorPolicy::Require`] is the
+/// question that matters. [`GatedTxt`] is the type that answers both, and a
+/// trust decision belongs there.
+///
+/// Named for the check it *did* pass rather than for "validated", which was
+/// the previous name and read at every binding site as though the answer were
+/// finished being checked. It is the same word an audit found a comment using
+/// to justify trusting an ungated attach record.
+#[derive(Debug, Clone)]
+pub struct DnssecTxt {
     /// The TXT strings, one per record.
     pub records: Vec<String>,
     /// How long the answer may be cached: the §3.2 window, and never past the
@@ -763,8 +851,16 @@ pub struct ValidatedTxt {
     /// as the attacker cared to keep replaying.
     ///
     /// Capped at the signature's own expiration, each replay of one answer buys
-    /// strictly less than the last, the total is bounded by a lifetime the zone
-    /// itself chose and signed, and past it hickory refuses the answer outright.
+    /// less than the last and the total is bounded by a lifetime the zone
+    /// itself chose and signed; past it hickory refuses the answer outright.
+    ///
+    /// "Less than the last" holds down to [`MIN_TTL`], which is where
+    /// `clamp_ttl` floors the poll interval — so inside the final minute of an
+    /// RRSIG's life every replay buys the same 60 s, and a binding taken from
+    /// the last of them outlives the signature by `MIN_TTL +
+    /// DEFAULT_TRUST_GRACE`. Sixteen minutes past a window the zone chose in
+    /// weeks, which is the honest bound and worth writing down as the one that
+    /// is true.
     pub ttl: Duration,
     /// The zone whose RRSIG covered this answer, as the signature named it —
     /// checked to enclose the queried name before the answer was accepted
@@ -1026,102 +1122,79 @@ impl DnssecResolver {
     }
 
     /// Resolves `_synchronicity.<domain> TXT`, discarding anything that does
-    /// not validate.
-    pub async fn lookup_txt(&self, domain: &str) -> Result<ValidatedTxt, NetError> {
+    /// not validate — and **stopping there**.
+    ///
+    /// The name is deliberately unpleasant. What comes back is DNSSEC-valid and
+    /// nothing else: it establishes that *the zone* said this, never that a
+    /// *logged* zone key did, and under [`RekorPolicy::Require`] those two
+    /// differ by precisely the attacker the transparency log exists to catch —
+    /// a compromised parent who substitutes a DS, adds a key to the apex DNSKEY
+    /// RRset, and thereby signs whatever they like with a key that validates.
+    ///
+    /// **No trust decision may be made from this.** `gated_txt` is the
+    /// one way to get an answer that may be acted on, and it returns a
+    /// [`GatedTxt`] so that "has this been gated?" is a question the type
+    /// system answers instead of one a reviewer has to trace. No production
+    /// caller reaches this method at all; it exists so `synch doctor` and the
+    /// tests can see the answer a resolver took *before* anything judged it,
+    /// which is a diagnostic, not an input.
+    pub async fn lookup_txt_ungated(&self, domain: &str) -> Result<DnssecTxt, NetError> {
         let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
         let name = query_name(&domain);
         let response = self.lookup(&name, RecordType::TXT).await?;
         self.validated_txt(&name, &response.answers)
     }
 
-    /// Applies the §3.2 acceptance rules to one answer, holding the TTL it
-    /// yields to the signature's own expiration.
-    fn validated_txt(
-        &self,
-        name: &str,
-        answers: &[hickory_resolver::proto::rr::Record],
-    ) -> Result<ValidatedTxt, NetError> {
-        secure_txt(name, answers, now_unix(0))
-    }
-
-    /// Resolves the control plane a membership domain's base attaches to.
+    /// Fetches one TXT RRset and takes it all the way to trustworthy: DNSSEC
+    /// validation, then the §4.2 transparency gate against an apex.
     ///
-    /// Two validated lookups and no configuration: the membership answer for
-    /// `domain` names the apex, `apex_of` holds that apex between the signing
-    /// zone and the domain exactly as the transparency lookup does, and the
-    /// attach record is read at `_synchronicity-cp.<apex>`. Every step is
-    /// DNSSEC-validated fail-closed, so a stripped, spoofed or absent answer
-    /// yields no endpoint rather than a redirected one.
+    /// **This is the only way to obtain a [`GatedTxt`], and every trust
+    /// decision in this module is made from one.** That is the whole point of
+    /// it being a separate type. The two steps were previously spelled three
+    /// different ways at three call sites — `gate_answer` twice and an
+    /// open-coded `if self.rekor == Require { verify_zone_key(..) }` once — and
+    /// the fourth site, the control-plane attach record, spelled it zero times
+    /// while reading exactly like the others, because a DNSSEC-validated answer
+    /// and a gated one were the same type with the same fields. A caller
+    /// holding a `DnssecTxt` could not see which one it had, and neither
+    /// could a reviewer.
     ///
-    /// The TTL is the shorter of the two answers': the endpoint is only as
-    /// believable as the apex that led to it.
-    pub async fn control_plane(
+    /// The TUF refresh happens here rather than at each site, and its own
+    /// young-walk check makes the second call in a pass a no-op, so routing a
+    /// subordinate lookup through the full gate costs a policy comparison.
+    async fn gated_txt(
         &self,
         domain: &str,
-    ) -> Result<(ControlPlaneRecord, Duration), NetError> {
-        let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
-        let name = query_name(&domain);
-        let response = self.lookup(&name, RecordType::TXT).await?;
-        let membership = self.validated_txt(&name, &response.answers)?;
-        // The membership answer is what yields the apex the attach record hangs
-        // off, so it gets the *same* gate `member_set` applies before any of
-        // its own records are trusted: under `RekorPolicy::Require` the zone key
-        // that signed it must be on the transparency log. Without this a DNS
-        // provider or registrar compromise — the exact adversary the Rekor
-        // design exists to stop — could add an unlogged DNSKEY, sign a
-        // `_synchronicity-cp` record pointing at an attacker, and the daemon
-        // would attach and stream every exposed space to them. `apex=` and the
-        // `url=` inside the record are only bound by DNSSEC otherwise, so the
-        // zone-key gate is what makes trusting them safe.
-        self.gate_answer(&domain, &membership).await?;
-        // The apex the attach record hangs off. Always needed here (unlike in
-        // `member_set`, where an `apex=` field is only required under Require),
-        // because a control plane that offers cloud attach always publishes it.
-        let apex = apex_of(&domain, &membership.signer, &membership.records)?;
-        let cp_name = control_plane_query_name(apex.to_string().trim_end_matches('.'));
-        let response = self.lookup(&cp_name, RecordType::TXT).await?;
-        let validated = self.validated_txt(&cp_name, &response.answers)?;
-        // One unreadable record must not sink a readable one, for the reason
-        // the proof set applies the same rule: a control plane mid-upgrade can
-        // leave an old-format record beside a current one.
-        //
-        // `url=` is checked only for shape — an `https://` or `http://` origin
-        // (see `parse_control_plane_record`) — and is otherwise an opaque
-        // redirect target. That is acceptable *because* the zone key that
-        // published it is gated above: a value this record carries is one the
-        // logged zone key chose to publish, and on an `https://` endpoint
-        // WebPKI TLS on the WSS connection sits on top of that.
-        let mut refusal = None;
-        for record in &validated.records {
-            match parse_control_plane_record(record) {
-                Ok(record) => {
-                    return Ok((record, validated.ttl.min(membership.ttl)));
-                }
-                Err(e) => refusal = Some(e),
-            }
-        }
-        Err(NetError::Dns(match refusal {
-            Some(e) => format!("{cp_name}: no usable attach record: {e}"),
-            None => format!("{cp_name} publishes no attach record"),
-        }))
-    }
-
-    /// Applies the §4.2 transparency gate to a validated membership answer.
-    ///
-    /// The one place the gate lives, so `member_set` and `control_plane` cannot
-    /// drift apart about what "trusting a membership answer" means. A no-op
-    /// unless `RekorPolicy::Require` — under `Off` an answer needs no `apex=`
-    /// field at all, which DNSSEC-only deployments rely on. Under `Require`,
-    /// `apex_of` holds the apex between the signing zone and the domain at both
-    /// ends, the pin set is refreshed (never fatally — an unreachable TUF
-    /// repository leaves the current pins standing), and the zone key that
-    /// signed the answer must carry a verified log record or the whole answer
-    /// is refused.
-    async fn gate_answer(&self, domain: &str, membership: &ValidatedTxt) -> Result<(), NetError> {
+        name: &str,
+        apex: GateApex<'_>,
+    ) -> Result<GatedTxt, NetError> {
+        let response = self.lookup(name, RecordType::TXT).await?;
+        let validated = self.validated_txt(name, &response.answers)?;
         if self.rekor != RekorPolicy::Require {
-            return Ok(());
+            // Off and Prefer make no demand of the signer, so there is no apex
+            // to derive and no proof to read. The answer is DNSSEC-validated
+            // and that is the whole of what this policy asked for.
+            return Ok(GatedTxt {
+                apex: None,
+                answer: validated,
+            });
         }
-        let apex = apex_of(domain, &membership.signer, &membership.records)?;
+        let apex = match apex {
+            // A membership answer names its own apex, and `apex_of` holds it
+            // between the signing zone and the domain. Refusing an answer that
+            // names none or names two happens there, so what comes back is a
+            // single bounded name rather than a claim about a loop.
+            GateApex::FromRecords => apex_of(domain, &validated.signer, &validated.records)?,
+            // A record hanging off an apex a gated answer already established.
+            // Its own RRset carries no `apex=` — only the membership record
+            // does — so the bound comes from the answer that led here.
+            GateApex::Under(apex) => apex.clone(),
+        };
+        // The pins are refreshed *before* the proof is verified, so a proof
+        // from a shard Sigstore added since this build shipped verifies in the
+        // same refresh that learned about it (§10.2) — and never fatally to the
+        // refresh, because a client that cannot read Sigstore degrades to a
+        // frozen pin set rather than a failed cluster.
         match self.refresh_tuf().await {
             Ok(Some(update)) if update.changed => tracing::info!(
                 root = update.state.root_version,
@@ -1141,8 +1214,21 @@ impl DnssecResolver {
                 "Sigstore's TUF repository did not update the pin set; the current pins stand"
             ),
         }
-        self.verify_zone_key(domain, &apex, membership).await?;
-        Ok(())
+        self.verify_zone_key(domain, &apex, &validated).await?;
+        Ok(GatedTxt {
+            apex: Some(apex),
+            answer: validated,
+        })
+    }
+
+    /// Applies the §3.2 acceptance rules to one answer, holding the TTL it
+    /// yields to the signature's own expiration.
+    fn validated_txt(
+        &self,
+        name: &str,
+        answers: &[hickory_resolver::proto::rr::Record],
+    ) -> Result<DnssecTxt, NetError> {
+        secure_txt(name, answers, now_unix(0))
     }
 
     /// Resolves and applies the §3.2 rules in one step.
@@ -1155,21 +1241,100 @@ impl DnssecResolver {
     pub async fn member_set(&self, domain: &str) -> Result<(MemberSet, Duration), NetError> {
         let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
         let name = query_name(&domain);
-        let response = self.lookup(&name, RecordType::TXT).await?;
-        let validated = self.validated_txt(&name, &response.answers)?;
-        // The §4.2 gate: under `RekorPolicy::Require` the zone key that signed
-        // the answer must be on the transparency log, checked against the apex
-        // the answer names. `apex_of` has already refused an answer that names
-        // none or names two, so the requirement is a straight line rather than
-        // an invariant about how many times a loop ran. The pins are refreshed
-        // *before* the proof is verified, so a proof from a shard Sigstore
-        // added since this build shipped verifies in the same refresh that
-        // learned about it (§10.2) — and never fatally to the refresh, because
-        // a client that cannot read Sigstore degrades to a frozen pin set
-        // rather than a failed cluster.
-        self.gate_answer(&domain, &validated).await?;
-        let set = MemberSet::from_records(&domain, &validated.records)?;
-        Ok((set, validated.ttl))
+        // Fetch, validate and gate in one step (§4.2). The membership answer
+        // names the apex it is judged against, which is why this leg is
+        // `FromRecords` and the attach record's is not.
+        let gated = self
+            .gated_txt(&domain, &name, GateApex::FromRecords)
+            .await?;
+        let set = MemberSet::from_records(&domain, gated.records())?;
+        Ok((set, gated.ttl()))
+    }
+
+    /// Resolves the control plane a membership domain's base attaches to.
+    ///
+    /// Two validated lookups and no configuration: the membership answer for
+    /// `domain` names the apex, `apex_of` holds that apex between the signing
+    /// zone and the domain exactly as the transparency lookup does, and the
+    /// attach record is read at `_synchronicity-cp.<apex>`. Every step is
+    /// DNSSEC-validated fail-closed, so a stripped, spoofed or absent answer
+    /// yields no endpoint rather than a redirected one.
+    ///
+    /// The TTL is the shorter of the two answers': the endpoint is only as
+    /// believable as the apex that led to it.
+    pub async fn control_plane(
+        &self,
+        domain: &str,
+    ) -> Result<(ControlPlaneRecord, Duration), NetError> {
+        let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
+        let name = query_name(&domain);
+        // The membership answer is what yields the apex the attach record
+        // hangs off, so it gets the same gate as `member_set`: under
+        // `RekorPolicy::Require` the zone key that signed it must be on the
+        // transparency log. This is what makes the `apex=` field believable,
+        // and therefore what makes it safe to go looking one label under a
+        // name this answer chose. It says nothing about the attach record
+        // itself, which is a second RRset with a signer of its own.
+        let membership = self
+            .gated_txt(&domain, &name, GateApex::FromRecords)
+            .await?;
+        // The apex the attach record hangs off. Always needed here (unlike in
+        // `member_set`, where an `apex=` field is only required under Require),
+        // because a control plane that offers cloud attach always publishes it.
+        let apex = apex_of(&domain, membership.signer(), membership.records())?;
+        let cp_name = control_plane_query_name(apex.to_string().trim_end_matches('.'));
+        // **The gate again, on this answer's own signer**, which is the whole
+        // reason both legs go through one function. Gating the membership
+        // answer says nothing about who signed *this* record, and they are two
+        // RRsets a zone can sign with two different keys. The threat model's
+        // attacker is precisely a party who can add a DNSKEY to the apex RRset
+        // — a compromised or coerced parent substituting a DS — and such a key
+        // validates everything it signs. They then serve the operator's
+        // genuine membership RRset and RRSIG, which is public data, so the
+        // gate above passes on the logged key, and sign only this record with
+        // the unlogged one. Without this the daemon attaches to their control
+        // plane and serves every exposed space to them, and because the
+        // unlogged key never enters the log no monitor sees anything at all.
+        //
+        // `Under(&apex)` rather than `FromRecords`: this RRset carries no
+        // `apex=` field, and letting it name its own bound would hand the
+        // record under audit the choice of what it is judged against. The
+        // bound comes from the gated answer that led here.
+        //
+        // The cost is one DNSKEY lookup and the proof set, on a path that runs
+        // once per attach session rather than once per membership refresh. It
+        // is the same apex, so a zone that signs both answers with one key —
+        // every ordinary deployment — reads the same proof twice and passes
+        // twice, and the TUF walk inside the second call is a no-op.
+        let validated = self
+            .gated_txt(&domain, &cp_name, GateApex::Under(&apex))
+            .await?;
+        // One unreadable record must not sink a readable one, for the reason
+        // the proof set applies the same rule: a control plane mid-upgrade can
+        // leave an old-format record beside a current one.
+        //
+        // `url=` is checked only for shape — an `https://` or `http://` origin
+        // (see `parse_control_plane_record`) — and is otherwise an opaque
+        // redirect target. That is acceptable *because* the zone key that
+        // published it is gated **directly above**, which is a claim this
+        // comment made before anything made it true: the gate ran over the
+        // membership answer alone, and this answer's own signer was never
+        // compared to it. On an `https://` endpoint WebPKI TLS on the WSS
+        // connection sits on top of that; on an `http://` one the zone key is
+        // the whole of it, which is the reason the gate has to be real.
+        let mut refusal = None;
+        for record in validated.records() {
+            match parse_control_plane_record(record) {
+                Ok(record) => {
+                    return Ok((record, validated.ttl().min(membership.ttl())));
+                }
+                Err(e) => refusal = Some(e),
+            }
+        }
+        Err(match refusal {
+            Some(e) => NetError::Dns(format!("{cp_name}: no usable control-plane record ({e})")),
+            None => NetError::Dns(format!("{cp_name}: no control-plane record")),
+        })
     }
 
     /// Walks Sigstore's TUF repository and adopts what it served if it is
@@ -1295,7 +1460,7 @@ impl DnssecResolver {
         &self,
         domain: &str,
         apex: &Name,
-        membership: &ValidatedTxt,
+        membership: &DnssecTxt,
     ) -> Result<VerifiedRecord, NetError> {
         let signing_zone = &membership.signer;
         let zone_text = signing_zone.to_string();
@@ -1953,7 +2118,7 @@ impl hickory_resolver::net::xfer::DnsHandle for DohHandle {
 /// The other half of the quirk stays open, and saying so is the point: which
 /// RRSIG hickory reports as the signer **does** decide which zone key must
 /// carry a transparency proof. `secure_txt` takes exactly one by `find_map`,
-/// `ValidatedTxt` carries that one, and `verify_zone_key` identifies the key
+/// `DnssecTxt` carries that one, and `verify_zone_key` identifies the key
 /// by verifying it. The choice follows the order the answer's records arrived
 /// in and the untrusted transport chooses that order, so during an RFC 6781
 /// double-signature rollover a transport can pick which of the zone's live
@@ -2024,7 +2189,7 @@ fn secure_txt(
     name: &str,
     answers: &[hickory_resolver::proto::rr::Record],
     now: Option<u64>,
-) -> Result<ValidatedTxt, NetError> {
+) -> Result<DnssecTxt, NetError> {
     use hickory_resolver::proto::{
         dnssec::rdata::DNSSECRData,
         rr::{DNSClass, RData, RecordType},
@@ -2147,7 +2312,7 @@ fn secure_txt(
     }
 
     // The signature's own expiration is the ceiling on everything derived from
-    // this answer (see `ValidatedTxt::ttl`). Read from the RRSIG hickory
+    // this answer (see `DnssecTxt::ttl`). Read from the RRSIG hickory
     // verified under, which is the one whose window it checked.
     let expires_at = u64::from(rrsig.input().sig_expiration.get());
     let ttl = match now {
@@ -2159,7 +2324,7 @@ fn secure_txt(
         Some(now) => clamp_ttl(ttl.min(Duration::from_secs(expires_at.saturating_sub(now)))),
     };
 
-    Ok(ValidatedTxt {
+    Ok(DnssecTxt {
         records,
         ttl,
         signer,
@@ -2370,7 +2535,7 @@ mod tests {
         .unwrap();
         let err = tokio::time::timeout(
             Duration::from_secs(30),
-            resolver.lookup_txt("cluster.example"),
+            resolver.lookup_txt_ungated("cluster.example"),
         )
         .await
         .expect("the lookup must finish, not hang")

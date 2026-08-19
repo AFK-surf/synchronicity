@@ -72,7 +72,7 @@ pub fn diff(
   desired: List(Record),
   existing: List(Existing),
 ) -> Result(Changes, Conflict) {
-  diff_gated(desired, existing, [])
+  diff_gated(desired, existing, [], adopted: False)
 }
 
 /// The same, told which records the transparency gate withheld.
@@ -94,10 +94,29 @@ pub fn diff(
 /// for as long as the gate stayed armed, which is unbounded. Matching the
 /// actual withheld records by name *and* value shields the set that was
 /// withheld and nothing else.
+/// `adopted` says this deployment has already applied a set to *this*
+/// provider and zone — that the apex is known to be ours from our own
+/// records, not merely from a record the provider is currently serving.
+///
+/// It exists because both refusal arms below return **before** `create` is
+/// computed, so a reconciler that has lost its marker can never re-assert
+/// one. Whoever holds the provider API token — the party this whole
+/// ownership rule defends against — can therefore overwrite
+/// `_synchronicity-owner.<apex>` with one write, or delete it and add any TXT
+/// below the apex with two, and every pass afterwards refuses forever: no
+/// create, no replace, and above all **no delete**, so a revocation committed
+/// in the product never reaches the wire while the API answers 200.
+///
+/// The guard the refusal exists for is a *first* sync against an apex
+/// somebody else is using, and that case is untouched: a deployment with no
+/// applied set has `adopted = False` and still refuses. After a set has been
+/// applied, a marker that no longer matches is drift like any other, and drift
+/// is what this module repairs.
 pub fn diff_gated(
   desired: List(Record),
   existing: List(Existing),
   withheld: List(Record),
+  adopted adopted: Bool,
 ) -> Result(Changes, Conflict) {
   // The marker has to be *ours*, by name and by value. Checking only the
   // leftmost label made any control plane's marker satisfy every other one's
@@ -111,7 +130,8 @@ pub fn diff_gated(
       }
     })
   let owned =
-    list.any(existing, fn(e) {
+    adopted
+    || list.any(existing, fn(e) {
       e.record.value == owner_value && list.contains(ours, e.record.name)
     })
 
@@ -188,13 +208,31 @@ pub fn diff_gated(
 /// missing proof, which is the design working rather than the publisher
 /// pre-empting it.
 ///
-/// The shield is the withheld records themselves, matched by name *and*
-/// value. It is deliberately not a predicate over names: a revoked device's
-/// record and a forged one both carry a membership-shaped name and neither is
-/// in `withheld`, because the renderer did not produce them this pass. A
-/// name-shaped shield would freeze both in the zone for as long as the gate
-/// stayed armed — which is unbounded, and which an attacker who can get one
-/// uncovered key observed can arm at will.
+/// The shield is the withheld records themselves. It is deliberately not a
+/// predicate over names: a revoked device's record and a forged one both carry
+/// a membership-shaped name and neither is in `withheld`, because the renderer
+/// did not produce them this pass. A name-shaped shield would freeze both in
+/// the zone for as long as the gate stayed armed — which is unbounded, and
+/// which an attacker who can get one uncovered key observed can arm at will.
+///
+/// **Matched by value, and failing that by member identity.** Byte equality
+/// alone shields only the records that did not change, and the gate then turns
+/// an ordinary *replace* into a *delete*: a member who edits their `relay=`
+/// while the gate is armed has their old record removed and the new one
+/// withheld, so the device leaves the zone entirely — through a dashboard edit,
+/// with the gate armed by somebody else's routine key rotation. Last-known-good
+/// for an edited device is the record already published, so the fallback
+/// matches on what a revocation actually removes: the owner name plus the
+/// member label and device key the record binds.
+///
+/// That fallback is **not** applied when two published records share one
+/// identity, and that restriction is what keeps it from being a way in. A
+/// forgery that copies a live device's label and key to change its dialing
+/// hints sits beside the genuine record, so the identity is doubled, neither
+/// is shielded by it, and the forgery is deleted exactly as before (the
+/// genuine one is still shielded by value, being unchanged). The only case
+/// the fallback covers alone is one published record whose replacement this
+/// pass withheld, which is the case it exists for.
 fn deletable(
   foreign: List(Existing),
   desired: List(Record),
@@ -202,13 +240,59 @@ fn deletable(
 ) -> List(Existing) {
   let keep_proofs = !list.any(desired, fn(d) { is_proof_name(d.name) })
   list.filter(foreign, fn(e) {
-    let shielded =
-      { keep_proofs && is_proof_name(e.record.name) }
-      || list.any(withheld, fn(w) {
+    let by_value =
+      list.any(withheld, fn(w) {
         w.name == e.record.name && w.value == e.record.value
       })
+    let by_identity = case member_identity(e.record) {
+      Error(Nil) -> False
+      Ok(id) ->
+        list.any(withheld, fn(w) { member_identity(w) == Ok(id) })
+        && list.length(
+          list.filter(foreign, fn(other) {
+            member_identity(other.record) == Ok(id)
+          }),
+        )
+        == 1
+    }
+    let shielded =
+      { keep_proofs && is_proof_name(e.record.name) } || by_value || by_identity
     !shielded
   })
+}
+
+/// What a membership record is *about*: its owner name, the member label and
+/// the device key it binds. `Error(Nil)` for anything that is not one.
+///
+/// The dialing hints are deliberately outside it. They are the fields an
+/// ordinary edit moves, and the fields a revocation does not — a revoked
+/// device's record disappears from the rendered set altogether, so no withheld
+/// record carries its identity and it is still deleted.
+fn member_identity(record: Record) -> Result(#(String, String, String), Nil) {
+  case string.split(record.value, " ") {
+    ["v=sync1", ..fields] -> {
+      let field = fn(prefix) {
+        list.find(fields, fn(f) { starts_with(f, prefix) })
+      }
+      case field("nk=") {
+        Ok(nk) ->
+          Ok(#(
+            record.name,
+            case field("id=") {
+              Ok(id) -> id
+              Error(Nil) -> ""
+            },
+            nk,
+          ))
+        Error(Nil) -> Error(Nil)
+      }
+    }
+    _ -> Error(Nil)
+  }
+}
+
+fn starts_with(text: String, prefix: String) -> Bool {
+  string.starts_with(text, prefix)
 }
 
 /// Whether a name is one of the proof names: the base name every proof's

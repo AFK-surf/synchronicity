@@ -89,17 +89,41 @@ fn client_accepts(shape: &Shape) -> bool {
     .is_ok()
 }
 
+/// What a monitor does with a leaf: a tier, or nothing at all.
+///
+/// `classify` returning `None` is **not** tier B, and collapsing the two loses
+/// the distinction the comment here used to claim it was keeping. Tier B is
+/// noted on stderr as an unauthorized claim; `None` means the leaf was never
+/// judged — not reported, not written anywhere, not even counted. For the
+/// invariant that is strictly the quieter outcome, so a harness that could not
+/// tell them apart could not see the difference between "the monitor filed
+/// this as noise" and "the monitor never looked at it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// `classify` returned a tier.
+    Tiered(Tier),
+    /// `classify` declined to judge the leaf at all.
+    Unclassified,
+}
+
 /// What would a monitor call it? The real classifier, no re-implementation.
-fn monitor_tier(shape: &Shape) -> Tier {
+fn monitor_verdict(shape: &Shape) -> Verdict {
     let body =
         HashedRekordBody::parse(&shape.proof.canonicalized_body).expect("a well-formed body");
     match classify(&body, shape.proof.log_index, &anchors(&shape.anchor)) {
-        Some(finding) => finding.tier,
-        // A certificate the classifier declines to judge at all — an
-        // unparseable SAN, a key that is not ours — is not in *any* tier, and
-        // for the invariant that is strictly worse than tier B: the entry is
-        // not even recorded. Treat it as C so the assertion below has teeth.
-        None => Tier::B,
+        Some(finding) => Verdict::Tiered(finding.tier),
+        None => Verdict::Unclassified,
+    }
+}
+
+/// The tier a shape lands in, for assertions that are about tiers.
+fn monitor_tier(shape: &Shape) -> Tier {
+    match monitor_verdict(shape) {
+        Verdict::Tiered(tier) => tier,
+        // Quieter than tier B, so for an invariant of the form "a client
+        // accepted this and the monitor must not be quiet about it" the
+        // conservative reading is the quiet one.
+        Verdict::Unclassified => Tier::B,
     }
 }
 
@@ -418,6 +442,19 @@ fn nothing_a_client_accepts_lands_in_the_silent_bin() {
             other => panic!("unclassified shape {other}: say whether a client takes it"),
         };
         assert_eq!(accepted, must_accept, "{name}: client acceptance");
+
+        // And which of the two quiet outcomes it is, named rather than
+        // collapsed. A malformed SAN is not judged at all — no tier, no
+        // stderr line, no record — and that is strictly quieter than tier B,
+        // so it is worth asserting it is the shape it is claimed to be.
+        let verdict = monitor_verdict(&shape);
+        let unclassified = name.starts_with("malformed san");
+        assert_eq!(
+            verdict == Verdict::Unclassified,
+            unclassified,
+            "{name}: a leaf is either tiered or never judged, and which it is \
+             decides whether an operator sees anything at all"
+        );
     }
 }
 
@@ -575,6 +612,71 @@ fn the_key_tag_and_ds_come_from_the_certificate_never_from_dns() {
     );
     assert!(line.contains(&zone.ds_field()), "{line}");
     assert!(line.contains(&key.sha256), "{line}");
+}
+
+/// The DS an operator is told to compare against their registrar is computed
+/// over the **signing zone**, not the apex.
+///
+/// For a control plane running its own delegated zone the two names are the
+/// same, which is every other case in this suite — so computing it over the
+/// apex passed everything, while for an apex served out of a zone above it the
+/// line would print a DS that matches nothing anywhere. That line is the first
+/// thing an operator acts on when a new authorization appears, and its whole
+/// purpose is to be comparable against what the registrar shows.
+#[test]
+fn the_reported_ds_is_over_the_signing_zone_not_the_apex() {
+    use synch_net::chain::{self, TRANSPARENCY_TEXT};
+    use synch_net::zonecert::{ChainLink, DnssecChain};
+
+    // `example.` holds `sync.example.`: one zone, two names.
+    let zone = SimZone::new("example", Vec::new());
+    let apex = chain::parse_name("sync.example.").expect("an apex");
+    let declared_at = chain::transparency_name(&apex).expect("declaration name");
+    let inception = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let encode = |records: Vec<hickory_resolver::proto::rr::Record>| {
+        chain::encode_rrs(&records).expect("encode link")
+    };
+    let carried = DnssecChain {
+        links: vec![
+            ChainLink {
+                zone: declared_at.to_string(),
+                rrs: encode(zone.signed_txt(declared_at.clone(), TRANSPARENCY_TEXT, inception)),
+            },
+            ChainLink {
+                zone: zone.apex(),
+                rrs: encode(zone.dnskey_records(inception)),
+            },
+        ],
+    };
+    let certificate = zone.certificate_for(
+        "sync.example.",
+        &[(OID_DNSSEC_CHAIN.to_vec(), carried.encode())],
+    );
+    let mut log = SimLog::new("rekor.sim");
+    // The Statement names the apex, as a control plane served out of the zone
+    // above it publishes one.
+    let statement = synch_net::rekor::ZoneKeyStatement::for_keys(
+        "sync.example.",
+        &[zone.dnskey_rdata()],
+        "create",
+    );
+    let proof = log.log_certified(&zone, &statement, &certificate);
+    let body = HashedRekordBody::parse(&proof.canonicalized_body).unwrap();
+    let finding = classify(&body, 3, &anchors(&zone.anchor_record())).unwrap();
+
+    assert_eq!(finding.tier, Tier::A);
+    assert_eq!(finding.apex, "sync.example.");
+    let [key] = finding.keys.as_slice() else {
+        panic!("one key: {:?}", finding.keys);
+    };
+    // `ds_field` is over `example.`, the zone that actually holds the records
+    // and whose registrar publishes the DS.
+    assert_eq!(key.ds, zone.ds_field());
+    assert!(
+        finding.line().contains(&zone.ds_field()),
+        "{}",
+        finding.line()
+    );
 }
 
 /// A long-expired chain classifies exactly like a fresh one.

@@ -168,10 +168,14 @@ pub struct ValidChain {
     /// is not a delegation step. Descriptive only: a caller reporting a
     /// finding wants to say how far the chain reached.
     pub links: usize,
-    /// Whether the apex link proved its DNSKEY RRset with a DS from its
-    /// parent (the ordinary case) or the RRset *is* the anchored set (only
-    /// reachable under an explicit trust-anchor override, where the apex is
-    /// the anchor).
+    /// Whether the **signing zone's** link proved its DNSKEY RRset with a DS
+    /// from its parent (the ordinary case) or that RRset *is* the anchored set
+    /// (only reachable under an explicit trust-anchor override, where the
+    /// signing zone is the anchor).
+    ///
+    /// The signing zone, not the apex: the ladder's bottom link is the zone
+    /// that holds the apex's records, and the module docs above spend eighteen
+    /// lines establishing that the two are different names.
     pub anchored_directly: bool,
 }
 
@@ -185,6 +189,28 @@ pub struct ValidChain {
 /// Every field is public and stays readable, but another crate cannot build
 /// one by struct literal — which it could, and which would let a monitor
 /// assemble an `Authorized` that no chain walk ever produced.
+///
+/// That was verified once by hand and by nothing since, which for a guard
+/// whose whole job is to stop a regression is the position the regression was
+/// in. It is a doctest now, and `cargo test --workspace --doc` runs in CI:
+///
+/// ```compile_fail
+/// # use synch_net::chain::Authorized;
+/// # fn f(apex: hickory_resolver::proto::rr::Name) {
+/// // E0639: cannot create non-exhaustive struct using functional update
+/// // syntax. Every field is readable; none of this is constructible.
+/// let _ = Authorized {
+///     apex,
+///     signing_zone: hickory_resolver::proto::rr::Name::root(),
+///     proven_keys: Vec::new(),
+///     chain: synch_net::chain::ValidChain {
+///         anchor_zone: ".".into(),
+///         links: 1,
+///         anchored_directly: true,
+///     },
+/// };
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Authorized {
@@ -436,9 +462,9 @@ fn walk_ladder<'a>(
 
     // Descend: every link below the top — the bottom one included — proves
     // its own DNSKEY RRset with a DS its parent signed. A one-link ladder
-    // skips the loop: the apex *is* the anchored zone, only reachable under
-    // an explicit `--dnssec-anchor` override, where there is no parent to
-    // hold a DS. A public monitor anchored at the ICANN root classifies such
+    // skips the loop: the signing zone *is* the anchored zone, only reachable
+    // under an explicit `--dnssec-anchor` override, where there is no parent
+    // to hold a DS. A public monitor anchored at the ICANN root classifies such
     // an entry tier B, which is the honest answer: nothing outside that
     // private universe can tell whether the keys were authorized.
     for index in (0..ladder.len() - 1).rev() {

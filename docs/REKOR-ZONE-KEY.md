@@ -1667,7 +1667,17 @@ repository and attempts an update:
    rename the result over the real file;
 5. on acceptance, the pin set becomes the tlogs of the new `trusted_root` —
    **replacing** the previous set, never unioning with it, so a key Sigstore
-   removes is a key clients drop. A `trusted_root` naming no transparency log
+   removes from the root is a key clients drop. That is a property of `update`
+   and not a revocation story: Sigstore retires a shard by *window*, keeping
+   its entry listed — the shipped root carries `rekor.sigstore.dev`'s 2021
+   P-256 key with a start and no end — and `tlog_keys` pins every listed shard
+   on purpose, because an archival proof from a closed shard is still a proof.
+   `validFor.end` is unenforceable in principle: nothing near a proof carries a
+   log-attested time, `integratedTime` sits outside the Merkle commitment, and
+   a reader-supplied clock would refuse exactly the archival entries §4.4
+   exists to keep readable. **A shard key that has ever been listed is
+   unrevocable here, and a leaked one is unrecoverable** until Sigstore removes
+   its entry from the root. A `trusted_root` naming no transparency log
    at all is refused rather than adopted: an empty pin set would silently
    refuse every zone from then on, which is exactly the "worse than not
    having asked" this section forbids.

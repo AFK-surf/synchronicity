@@ -80,15 +80,14 @@ fn put_binding_in(conn: &rusqlite::Connection, binding: &Binding) -> Result<()> 
     conn.execute(
         "INSERT INTO bindings (origin_id, node_id, source, domain, note, added_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(origin_id, node_id, source) DO UPDATE SET
-           domain = excluded.domain,
+         ON CONFLICT(origin_id, node_id, source, domain) DO UPDATE SET
            note = COALESCE(excluded.note, bindings.note),
            expires_at = excluded.expires_at",
         params![
             binding.origin.canonical(),
             binding.node_id.as_bytes().to_vec(),
             binding.source.as_str(),
-            binding.domain,
+            binding.domain.as_deref().unwrap_or(""),
             binding.note,
             binding.added_at,
             binding.expires_at,
@@ -212,7 +211,9 @@ impl Store {
                 origin: origin_column(origin, "bindings.origin_id")?,
                 node_id: key_column(node_id, "bindings.node_id")?,
                 source: BindingSource::parse(&source)?,
-                domain,
+                // '' is how the column spells "no domain": it is part of the
+                // key, and SQLite admits no expression in a PRIMARY KEY.
+                domain: domain.filter(|d: &String| !d.is_empty()),
                 note,
                 added_at,
                 expires_at,
@@ -303,10 +304,14 @@ impl Store {
         self.with_tx(|tx| {
             for binding in bindings {
                 tx.execute(
+                    // The conflict target includes the domain, because that is
+                    // what a DNS binding's identity is: an `id=`-less record
+                    // binds `OriginId::Key(nk)`, which names no domain, so two
+                    // membership domains publishing one key used to write one
+                    // row and the last writer owned its `domain` column.
                     "INSERT INTO bindings (origin_id, node_id, source, domain, note, added_at, expires_at)
                      VALUES (?1, ?2, 'dns', ?3, NULL, ?4, ?5)
-                     ON CONFLICT(origin_id, node_id, source) DO UPDATE SET
-                       domain = excluded.domain,
+                     ON CONFLICT(origin_id, node_id, source, domain) DO UPDATE SET
                        expires_at = excluded.expires_at",
                     params![
                         binding.origin.canonical(),

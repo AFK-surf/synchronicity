@@ -265,11 +265,37 @@ fn with_session(
   }
 }
 
+/// Serve-mode health.
+///
+/// **The signature expiry is compared to the clock, not merely reported.** A
+/// primary whose `resign` job has been failing serves a zone whose RRSIGs have
+/// run out: every validating resolver reads it as `Bogus` and every client
+/// fails closed, while this endpoint answered 200 `"status":"ok"` with
+/// `sig_expires_at` in the past. The HTTP status is the only thing an
+/// orchestrator, a load balancer or the image's own HEALTHCHECK reads, so a
+/// field nobody reads is not a signal. A day of headroom, which is far more
+/// than the resign cadence needs and far less than the signature lifetime.
+/// How much life a zone's signatures must have left for serve mode to call
+/// itself healthy. Far more than the resign cadence needs, far less than a
+/// signature's lifetime — so it fires on a resign job that has stopped, and
+/// never on one that is merely between runs.
+pub const zone_health_headroom = 86_400
+
+/// Whether a zone with signatures expiring at `expires` is servable at `now`.
+///
+/// Separated from the handler so the rule can be asserted without standing up
+/// the router: the bug it closes was that the *status code* did not depend on
+/// this at all, and a field nobody reads is not a signal.
+pub fn zone_is_servable(expires: Int, now: Int) -> Bool {
+  expires > now + zone_health_headroom
+}
+
 fn healthz(serving: Serving) -> Response {
+  let now = middleware.now_unix()
   let looked =
     pool.with_connection(serving.pool, fn(conn) { model.health(conn) })
   case looked {
-    Ok(Ok(#(serial, expires))) ->
+    Ok(Ok(#(serial, expires))) if expires > now + zone_health_headroom ->
       json.object([
         #("status", json.string("ok")),
         #("soa_serial", json.int(serial)),
@@ -277,6 +303,14 @@ fn healthz(serving: Serving) -> Response {
       ])
       |> json.to_string
       |> wisp.json_response(200)
+    Ok(Ok(#(serial, expires))) ->
+      json.object([
+        #("status", json.string("zone signatures are expiring or expired")),
+        #("soa_serial", json.int(serial)),
+        #("sig_expires_at", json.int(expires)),
+      ])
+      |> json.to_string
+      |> wisp.json_response(503)
     _ ->
       json.object([#("status", json.string("no zone available"))])
       |> json.to_string

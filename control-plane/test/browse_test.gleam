@@ -140,6 +140,42 @@ pub fn browsing_needs_a_public_url_and_a_primary_test() {
   browse_env()
 }
 
+/// A `CP_PUBLIC_URL` the *client* would reject is refused here, where the
+/// operator can still read the message.
+///
+/// The value is rendered straight into a signed apex TXT record and parsed by
+/// `parse_control_plane_record`, which reads whitespace-separated `key=value`
+/// pairs and requires an origin. A bad one is signed, cached for its TTL, and
+/// fails in every daemon rather than at the boot that produced it.
+///
+/// Both accepted schemes are asserted, including the one-character `http://`
+/// origin: the two prefixes are different lengths, so a single shared length
+/// bound is off by one for whichever scheme it was not written for.
+pub fn a_public_url_the_client_would_reject_is_refused_at_boot_test() {
+  let with_url = fn(url) {
+    browse_env()
+    envoy.set("CP_BROWSE", "on")
+    envoy.set("CP_PUBLIC_URL", url)
+    config.load()
+  }
+
+  let assert Ok(_) = with_url("https://sync.example")
+  let assert Ok(_) = with_url("http://sync.example")
+  // Eight characters, and an origin — the length `https://` alone occupies.
+  let assert Ok(_) = with_url("http://x")
+
+  let assert Error(why) = with_url("sync.example")
+  assert string.contains(why, "origin")
+  let assert Error(why) = with_url("ftp://sync.example")
+  assert string.contains(why, "origin")
+  // A scheme and nothing after it names no host.
+  let assert Error(_) = with_url("https://")
+  // The record's own grammar: a space ends the field.
+  let assert Error(why) = with_url("https://sync.example /x")
+  assert string.contains(why, "whitespace")
+  browse_env()
+}
+
 // -- the switch --------------------------------------------------------------
 
 /// Every network starts unbrowsable, including every network that already
@@ -248,7 +284,8 @@ pub fn a_session_holds_only_the_spaces_it_claimed_test() {
 pub fn a_request_may_name_its_node_test() {
   let nas = session("nas", "nas@x.example")
   let laptop = session("laptop", "laptop@x.example")
-  let vault = agent.Session(..nas, origin: "vault@x.example", spaces: ["secrets"])
+  let vault =
+    agent.Session(..nas, origin: "vault@x.example", spaces: ["secrets"])
 
   // Unnamed: the first holder answers, as it always has.
   assert browse_api.pick("media", [nas, laptop], "") == Ok(nas)

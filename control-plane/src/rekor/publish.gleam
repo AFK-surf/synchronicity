@@ -30,8 +30,18 @@
 //// this signer), inclusion, and the log's signature on the checkpoint. A
 //// row in `rekor_records` means *this service checked it*. The one rule
 //// this side cannot re-run is the cryptographic chain walk — that lives in
-//// the Rust verifier, and the e2e crossval is what keeps this side honest
-//// about it.
+//// the Rust verifier.
+////
+//// What keeps this side honest about it is `tools/gen_crossval`, which
+//// collects a chain from a seeded, really-signed zone and writes it to
+//// `test/fixtures/rekor/crossval/chain-collected.der`, and the Rust test
+//// `a_chain_the_control_plane_collected_walks_under_this_validator`, which
+//// runs `chain::validate` over exactly those bytes. **Not the e2e**: it runs
+//// with `RekorPolicy::Off` and builds no chain at all, and this comment said
+//// otherwise for two audit passes while `rekor/chain`'s 800 lines had no
+//// cross-language coverage of any kind. The asymmetry is why it matters —
+//// a divergence found after publication is a permanent entry in an
+//// append-only log that no client accepts.
 
 import dns/name.{type Name}
 import dnssec/keys

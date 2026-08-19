@@ -1,5 +1,8 @@
 apex=sync.test.
-key_tag=39961
+key_tag=12906
 log_index=1
 action=create
 max_proof_parts=16
+client_trust_grace=900
+client_min_ttl=60
+control_plane_republish_window=660

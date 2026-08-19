@@ -1277,15 +1277,21 @@ CREATE TABLE device_keys (                -- own keys; >1 row only during rotati
 
 -- membership: OriginId → device-key bindings.
 -- origin_id is the canonical rendering: '<id>@<domain>' or 'key:<z-base32>'.
+-- The publishing domain is part of a DNS binding's identity, and has to be:
+-- `key:<z-base32>` names no domain, so two configured membership domains
+-- publishing one `id=`-less record would otherwise share a row and the last
+-- refresh would own it — which is exactly the case the sole-source rule on
+-- dial hints (§3.3) is aimed at. '' rather than NULL for a static binding,
+-- because SQLite admits no expression in a PRIMARY KEY.
 CREATE TABLE bindings (
   origin_id    TEXT NOT NULL,
   node_id      BLOB NOT NULL,            -- bound device key (32 bytes)
   source       TEXT NOT NULL,            -- 'static' | 'dns'
-  domain       TEXT,                     -- for dns source
+  domain       TEXT NOT NULL DEFAULT '', -- the membership domain, '' if static
   note         TEXT,
   added_at     INTEGER NOT NULL,
   expires_at   INTEGER,                  -- NULL for static
-  PRIMARY KEY (origin_id, node_id, source)
+  PRIMARY KEY (origin_id, node_id, source, domain)
 );
 CREATE INDEX bindings_by_key ON bindings (node_id);   -- connection-accept lookup
 
