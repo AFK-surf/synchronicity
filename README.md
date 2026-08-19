@@ -226,7 +226,22 @@ synch-s3 serve --anonymous
 A bucket names a space of the unified tree plus a version policy; reads serve
 the selected version and ETags are that version's BLAKE3 root in hex, quoted. A
 `strict` bucket answers a divergent key with `409 Conflict` naming the
-versions. Writes always publish the local node's own view — the version model
+versions.
+
+`DELETE` removes this node's copy and publishes a tombstone, the same thing an
+`rm` in the space directory does — so, like a write, it publishes our own view.
+A key another origin still publishes stays readable until that origin tombstones
+it too, and the gateway says so in its log rather than in a status code S3 has
+no room for.
+
+Multipart upload is supported, which is what makes the gateway writable from
+[Mountpoint for Amazon S3](https://github.com/awslabs/mountpoint-s3) — it wraps
+every write in one, whatever the file's size. The upload lives in the daemon, so
+one gateway process can create it and another complete it; its parts are staged
+under `<data-dir>/s3-uploads/` and swept if nobody finishes them. Bodies that
+arrive `aws-chunked` are unframed and their trailing checksum verified, so a
+client that checksums while it streams is actually checked rather than taken at
+its word. Writes always publish the local node's own view — the version model
 forbids publishing someone else's — so a bucket pinned to a foreign origin
 accepts writes but keeps reading that origin's versions, and the gateway warns
 about that shape.

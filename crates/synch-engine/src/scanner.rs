@@ -687,9 +687,16 @@ impl Node {
             return Ok(None);
         }
         if target.is_dir() {
+            // The path stays in the log and out of the message. This error
+            // reaches an S3 client verbatim, and the daemon's on-disk layout —
+            // the operator's home, the space roots — is not something a client
+            // that guessed a key is owed.
+            tracing::warn!(
+                target = %target.display(),
+                "refusing to remove a directory as if it were an object"
+            );
             return Err(EngineError::invalid(format!(
-                "{} is a directory here; refusing to remove it",
-                target.display()
+                "{space_id}/{path} is a directory here; refusing to remove it"
             )));
         }
         std::fs::remove_file(&target)?;
@@ -714,7 +721,7 @@ impl Node {
     /// only ever write inside a space this node indexes, because outside one
     /// nothing would publish the adoption and the write would be a silent
     /// no-op with a filesystem side effect.
-    fn adoption_target(&self, space_id: &str, path: &str) -> Result<PathBuf> {
+    pub(crate) fn adoption_target(&self, space_id: &str, path: &str) -> Result<PathBuf> {
         let space = self
             .store()
             .space(space_id)?
@@ -736,7 +743,6 @@ impl Node {
         // A no-op on POSIX, where none of those parse as anything but `Normal`.
         // The mirror's `unsafe_name` already refuses these on the way out; this
         // is the way in.
-        let target = PathBuf::from(&space.local_path).join(&normalized);
         if Path::new(&normalized)
             .components()
             .any(|part| !matches!(part, std::path::Component::Normal(_)))
@@ -745,9 +751,27 @@ impl Node {
                 "path {path} is not a plain relative path on this platform"
             )));
         }
-        Ok(target)
+        // Lexical safety is still not enough. A space root is canonicalized when
+        // it is added but its *interior* never is, so a symlinked directory
+        // inside the space resolves through to wherever it points, and the write
+        // or the delete lands outside every space as whatever uid the daemon
+        // runs as. The mirror loop has always checked this; every other writer
+        // needs the same check, and a deletion needs it as much as a write does.
+        if crate::mirror::escapes_via_symlink(Path::new(&space.local_path), &normalized) {
+            return Err(EngineError::invalid(format!(
+                "{space_id}/{path} resolves through a symlinked directory and would leave the space"
+            )));
+        }
+        Ok(PathBuf::from(&space.local_path).join(&normalized))
     }
 }
+
+/// How much an [`Adoption::append_file`] fallback moves per read/write pair.
+///
+/// Only reached on a filesystem without `copy_file_range`, where the cost is a
+/// bounce through user space and the buffer is the whole of what this process
+/// holds of a part.
+const APPEND_CHUNK: u64 = 1024 * 1024;
 
 /// The suffix a streamed write's staging file carries.
 ///
@@ -796,7 +820,16 @@ impl Adoption {
             std::process::id(),
             synch_core::now_ns()
         ));
-        let file = std::fs::File::create(&staging)?;
+        // Read *and* write: the payload is written here, and a multipart
+        // completion reads it straight back to take the object's root before
+        // the rename. `File::create` alone is write-only, and the read then
+        // fails with `EBADF` on a file this very process is holding open.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&staging)?;
         Ok(Adoption {
             target,
             staging,
@@ -894,6 +927,99 @@ impl Adoption {
     /// How many bytes have arrived so far.
     pub fn written(&self) -> u64 {
         self.written
+    }
+
+    /// The object root of what has been staged so far.
+    ///
+    /// What a multipart completion answers with. Taking the root here rather
+    /// than reading it back off the published entry is the difference between
+    /// describing the bytes this call assembled and describing whatever the
+    /// tree holds for that key by the time the scan reaches it — which a
+    /// concurrent write to the same key wins.
+    pub fn hash_staged(&mut self) -> Result<synch_core::Hash> {
+        use std::io::{Seek, Write};
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        file.flush()?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let root = synch_core::hash_reader(std::io::BufReader::new(file.try_clone()?))?;
+        // The handle is left at the end, where an append expects it.
+        file.seek(std::io::SeekFrom::End(0))?;
+        Ok(root)
+    }
+
+    /// Appends a whole file to the staging payload (§9.4).
+    ///
+    /// What assembles a multipart upload: each part is its own staged payload,
+    /// and completing the upload is this call once per part in ascending
+    /// order. The bytes move inside the kernel — `copy_file_range` shares
+    /// extents outright on a filesystem that can, and copies without a bounce
+    /// through user space on one that cannot — so a 50 GiB object assembled
+    /// from 8 MiB parts never passes through this process.
+    ///
+    /// `FICLONE` is deliberately not used here even though [`Adoption::cloning`]
+    /// prefers it: it is a *whole file* clone that replaces the destination,
+    /// which is the one thing an append must not do. The range form needs
+    /// block-aligned offsets that arbitrary part sizes do not have.
+    ///
+    /// Blocking, like every other method here — the caller runs it off the
+    /// runtime.
+    pub fn append_file(&mut self, source: &Path) -> Result<u64> {
+        use std::io::{Read, Seek, Write};
+        let mut src = std::fs::File::open(source)?;
+        let len = src.metadata()?.len();
+        let dest = self
+            .file
+            .as_mut()
+            .ok_or_else(|| EngineError::invalid("this write has already been committed"))?;
+        // `written` advances as the bytes move, not once at the end: a failure
+        // part-way through still leaves the staging file longer than it was,
+        // and a `written` that under-counts it makes every later size check —
+        // and every error message quoting it — wrong.
+        let mut moved = 0u64;
+        #[cfg(target_os = "linux")]
+        while moved < len {
+            let take = usize::try_from(len - moved).unwrap_or(usize::MAX);
+            // `None` for both offsets advances each file's own cursor, which is
+            // exactly the append semantics wanted: the destination cursor is
+            // already at the end of everything appended so far.
+            match rustix::fs::copy_file_range(&src, None, &*dest, None, take) {
+                // Short of the length the metadata reported: the source is
+                // being written under us, or the filesystem refuses to say
+                // more. The fallback below reads it and reports the real error.
+                Ok(0) => break,
+                Ok(count) => {
+                    moved += count as u64;
+                    self.written += count as u64;
+                }
+                // Swallowed only as a signal to fall back — `EXDEV` and
+                // `ENOSYS` are the expected ones — but logged, because an
+                // `ENOSPC` on the destination would otherwise be reported by
+                // the fallback as whatever it happens to hit next.
+                Err(e) => {
+                    tracing::debug!(error = %e, "copy_file_range unavailable; copying by hand");
+                    break;
+                }
+            }
+        }
+        if moved < len {
+            // `copy_file_range` may have consumed part of the source already,
+            // so the fallback resumes from where it stopped rather than from
+            // the start.
+            src.seek(std::io::SeekFrom::Start(moved))?;
+            let mut buffer = vec![0u8; APPEND_CHUNK.min(len - moved) as usize];
+            while moved < len {
+                let take = (APPEND_CHUNK.min(len - moved)) as usize;
+                let piece = &mut buffer[..take];
+                src.read_exact(piece)?;
+                dest.write_all(piece)?;
+                moved += take as u64;
+                self.written += take as u64;
+            }
+        }
+        Ok(moved)
     }
 
     /// Flushes the payload and moves it into place, returning the target.
@@ -2176,6 +2302,50 @@ mod tests {
         let (report, head) = node.scan_and_publish().unwrap();
         assert_eq!(report.hashed, 0);
         assert!(head.is_none());
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// The symlink-escape guard, exercised where a symlink can be made.
+///
+/// `escapes_via_symlink` itself is cross-platform — `symlink_metadata` reports a
+/// reparse point on Windows as readily as a symlink on Unix — but *creating*
+/// one to test against is not: Windows needs a separate API and, ordinarily,
+/// privileges the CI runner does not have.
+#[cfg(all(test, unix))]
+mod escape_tests {
+    use crate::{Node, NodeConfig};
+
+    /// A symlinked directory inside a space is not a way out of it.
+    ///
+    /// A space root is canonicalized when it is added; its interior never is.
+    /// Without the ancestor check a client that can name a key can write and
+    /// delete anywhere the daemon's uid reaches — `~/.ssh/authorized_keys`, a
+    /// systemd user unit — through an ordinary `photos -> /mnt/nas` link.
+    #[tokio::test]
+    async fn a_symlinked_directory_cannot_be_written_or_deleted_through() {
+        let data = tempfile::tempdir().unwrap();
+        let space = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"not yours").unwrap();
+        Node::init(data.path(), None).unwrap();
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        node.add_space("media", space.path()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), space.path().join("escape")).unwrap();
+
+        assert!(node.open_adoption("media", "escape/secret").is_err());
+        assert!(node.adopt_deletion("media", "escape/secret").is_err());
+        assert!(node
+            .adopt_deletion("media", "escape/nested/deep.txt")
+            .is_err());
+        // The file outside the space is untouched by all of that.
+        assert_eq!(
+            std::fs::read(outside.path().join("secret")).unwrap(),
+            b"not yours"
+        );
+        // An ordinary path in the same space still works, and so does a
+        // symlink that *is* the final component rather than an ancestor.
+        assert!(node.open_adoption("media", "ordinary.txt").is_ok());
         node.shutdown().await.unwrap();
     }
 }

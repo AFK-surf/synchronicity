@@ -82,7 +82,65 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration::Sql(V17_DELEGATED_BINDINGS),
     Migration::Sql(V18_REDACTED_NODES),
+    Migration::Sql(V19_S3_MULTIPART_UPLOADS),
 ];
+
+/// v19 — the multipart uploads an S3 client has open (§9.4).
+///
+/// A multipart upload is a conversation that outlives every request in it: the
+/// client creates one, streams parts over minutes or days, and completes it —
+/// possibly through a different gateway process, since the gateway holds no
+/// state and any number of them may point at one daemon. The daemon is
+/// therefore the only place the conversation can live.
+///
+/// `state` is a three-step latch rather than a boolean, because "being
+/// completed" and "completed" are different answers to a retried request: a
+/// client that never saw the response to its `CompleteMultipartUpload` retries
+/// it, and a row that remembers the result replays it instead of reporting an
+/// upload that no longer exists. It is `open` -> `completing` -> `completed`;
+/// a validation failure returns it to `open`, because the client is entitled
+/// to fix its part list and try again.
+///
+/// `principal` is the access key that opened the upload. An upload id is a
+/// bearer token, and without an owner recorded beside it a listing that names
+/// the id hands every client the ability to overwrite and complete every other
+/// client's upload — publishing forged content under this node's signature.
+///
+/// `latched_ns` is when a completion took the latch. A completion whose caller
+/// simply goes away — a client socket timing out mid-assembly is routine —
+/// leaves the latch set with no error path to clear it, so the latch has to be
+/// stealable on age rather than only by a daemon restart.
+///
+/// A part row is only ever written once its payload is durable on disk, so a
+/// row implies bytes for as long as the upload is open. The reverse does not hold — a crash between the two
+/// leaves a file no row names — which is the safe asymmetry: an unreferenced
+/// file is collectable, an unbacked row is not.
+const V19_S3_MULTIPART_UPLOADS: &str = r#"
+CREATE TABLE s3_uploads (
+  id          TEXT PRIMARY KEY,          -- the S3 UploadId: 32 random hex (§9.4)
+  space       TEXT NOT NULL,
+  path        TEXT NOT NULL,             -- already normalized at creation
+  principal   TEXT,                      -- the access key that opened it; NULL when anonymous
+  created_ns  INTEGER NOT NULL,
+  state       TEXT NOT NULL CHECK (state IN ('open','completing','completed')),
+  etag        BLOB,                      -- the object root, once completed
+  size        INTEGER,                   -- the object size, once completed
+  latched_ns  INTEGER,                   -- when a completion took the latch
+  completed_ns INTEGER
+);
+CREATE INDEX s3_uploads_by_age ON s3_uploads (created_ns);
+CREATE INDEX s3_uploads_by_target ON s3_uploads (space, path);
+
+CREATE TABLE s3_upload_parts (
+  upload      TEXT NOT NULL REFERENCES s3_uploads(id) ON DELETE CASCADE,
+  number      INTEGER NOT NULL,          -- 1..=10000
+  file        TEXT NOT NULL,             -- the payload's name within the upload directory
+  size        INTEGER NOT NULL,
+  root        BLOB NOT NULL,             -- the part's own blake3 root, which is its ETag
+  created_ns  INTEGER NOT NULL,
+  PRIMARY KEY (upload, number)
+);
+"#;
 
 /// v1 — the original schema, exactly as it first shipped.
 const V1_ORIGINAL: &str = r#"
@@ -614,6 +672,31 @@ CREATE TABLE observed_heads (
   complete    INTEGER NOT NULL,
   claimed_by  BLOB,
   observed_at INTEGER NOT NULL
+);
+
+CREATE TABLE s3_uploads (
+  id          TEXT PRIMARY KEY,
+  space       TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  principal   TEXT,
+  created_ns  INTEGER NOT NULL,
+  state       TEXT NOT NULL CHECK (state IN ('open','completing','completed')),
+  etag        BLOB,
+  size        INTEGER,
+  latched_ns  INTEGER,
+  completed_ns INTEGER
+);
+CREATE INDEX s3_uploads_by_age ON s3_uploads (created_ns);
+CREATE INDEX s3_uploads_by_target ON s3_uploads (space, path);
+
+CREATE TABLE s3_upload_parts (
+  upload      TEXT NOT NULL REFERENCES s3_uploads(id) ON DELETE CASCADE,
+  number      INTEGER NOT NULL,
+  file        TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  root        BLOB NOT NULL,
+  created_ns  INTEGER NOT NULL,
+  PRIMARY KEY (upload, number)
 );
 "#;
 

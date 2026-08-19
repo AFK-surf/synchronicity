@@ -26,6 +26,7 @@ pub mod reference;
 pub mod rotation;
 pub mod scanner;
 pub mod tree;
+pub mod uploads;
 pub mod watcher;
 
 pub use aae::RoundReport;
@@ -53,4 +54,5 @@ pub use scanner::{Adoption, CloneKind, ScanReport};
 pub use synch_net::dns::RekorPolicy;
 pub use synch_store::{Donor, ProvenSubtree, Selection, Version, VersionPolicy, VersionSet};
 pub use tree::reference_of;
+pub use uploads::{CompletedUpload, Deleted, PartStaging, DEFAULT_UPLOAD_TTL};
 pub use watcher::SpaceWatcher;

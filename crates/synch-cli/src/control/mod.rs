@@ -9,6 +9,9 @@ pub mod proto;
 pub mod server;
 pub mod transport;
 
-pub use client::{Chunks, Client, Entries, Frames, Put, Written};
+pub use client::{
+    Chunks, Client, CompletedUpload, Deleted, Entries, Frames, OpenUpload, PartUpload, Put,
+    RecordedPart, UploadRef, Written,
+};
 pub use proto::{Command, ControlError, EntryInfo, ErrorCode, Frame, CONTROL_VERSION};
 pub use server::{Pending, Server};

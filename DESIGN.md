@@ -1492,16 +1492,84 @@ through both directions **without either process buffering more than a chunk**.
   - `PutObject` — writes into the local space directory, then runs the normal
     ingest pipeline (hash → CAS → stage entry, §7.1); responds once durably staged,
     with the head publish following the usual batching.
+  - `DeleteObject` — removes this node's copy and publishes its tombstone
+    through the ordinary indexing pipeline, exactly as an `rm` in the space
+    directory would (§8). It obeys the same rule a write does: a delete
+    publishes *this node's own view*, because the version model cannot publish
+    anyone else's. So if another origin still asserts the key, the key is still
+    readable afterwards with one fewer version, and only that origin can retract
+    its own — which is what `synch take` of a tombstone is for. S3 has no status
+    for "deleted my version of it", and inventing one would break every client
+    that treats `rm` as a loop over keys, so the answer is the `204` S3 promises
+    and the surviving publishers are logged. Idempotent: a key that is already
+    absent here is a delete that has already happened, which is what `rm -f`,
+    retried deletes, and losing a race to a concurrent writer all rely on. The
+    recovery gate is taken *before* the unlink, not after: a node that cannot
+    publish would otherwise remove the file and be unable to tell anyone (§3.4),
+    which loses the data outright — the tombstone that justified the removal
+    never gets signed.
+  - **Multipart upload** — `CreateMultipartUpload`, `UploadPart`,
+    `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`,
+    `ListMultipartUploads`. Not optional in practice: Mountpoint for Amazon S3
+    wraps *every* write in a multipart upload, whatever its size, so a gateway
+    without this is read-only to it.
+
+    The upload lives in the daemon (`s3_uploads`, `s3_upload_parts`, §10), not
+    in the gateway: the gateway holds no state and any number of gateway
+    processes may serve one daemon, so an upload created through one has to be
+    completable through another. Parts are staged one payload per part under
+    `<data-dir>/s3-uploads/<id>/`, and a part row is written only once its
+    payload is fsynced and renamed into place — so a row implies bytes, while
+    the reverse is deliberately allowed to fail, because an unreferenced
+    payload is collectable and an unbacked row is not.
+
+    Completion assembles the named parts into a *fresh* staging file and hands
+    it to the ordinary ingest pipeline, so a completed upload is an ordinary
+    version. There is no rename-the-single-part shortcut: `rename(2)` fails
+    across filesystems, which is the normal shape when the data dir and the
+    space are on different devices, and a renamed payload keeps the mtime it
+    was *uploaded* with, which is what §8's `newest` policy orders by — a
+    completion would publish a version that loses to the content it supersedes.
+
+    `state` is a three-step latch (`open → completing → completed`) rather than
+    a flag. A completed row remembers its result, so a client that never saw the
+    response to its completion is answered from the record instead of being told
+    its upload is gone; a refused completion returns to `open`, because
+    `InvalidPart` and `EntityTooSmall` are things the client can fix and retry.
+    Uploads nobody finishes leak by design in S3 — its own answer is a lifecycle
+    rule — so the daemon sweeps them on a TTL, and sweeps unreferenced payloads
+    inside live uploads on the same pass.
+  - **`aws-chunked` request bodies** — a client that checksums while it streams
+    cannot put the result in a header, so it frames the body and sends the
+    digest in a trailer, announcing it in `x-amz-content-sha256`. Mountpoint
+    does this by default. The framing is stripped and the trailing checksum is
+    *verified*; a mismatch ends the body in an error, which the daemon treats
+    exactly as a truncated one — the staging file goes and nothing is published.
 - **ETag** is the object's blake3 root hash, hex, quoted. S3 permits opaque ETags
   (MD5 equivalence is only conventional for non-multipart uploads); tooling that
-  insists on MD5 validation must have it disabled.
+  insists on MD5 validation must have it disabled. A multipart object's ETag
+  carries **no `-N` suffix**: it is the root of the assembled bytes, so the same
+  content uploaded at a different part size compares equal, and a single-part
+  upload produces the ETag its `PutObject` equivalent would — neither of which
+  real S3 does. A *part's* ETag is that part's own root, and a completion that
+  echoes one back has it checked, which is the point of having issued it.
 - **Auth**: SigV4 with static access-key pairs configured on the gateway
   (`synch-s3 key add`), or `--anonymous` for localhost-only development. The
   gateway authenticates S3 clients only; cluster access is the node's own
   membership (§3).
-- **Not in v1**: DeleteObject (maps naturally to a tombstone publish — first in
-  line for v1.1), multipart upload, CopyObject, bucket versioning APIs, presigned
-  URLs.
+- **Headers are refused, not ignored.** A header that says the payload is
+  somewhere else — `x-amz-copy-source`, `x-amz-rename-source` — makes reading
+  the body the wrong thing to do, so the request is answered `NotImplemented`
+  rather than with an object built from a body it does not have. Ignoring one
+  is how a `mv` over a mountpoint became a truncated destination, a source that
+  never went away, and a client that recorded the rename as done. The list is a
+  denylist and not an allowlist: it only has to name the headers whose absence
+  produces a *wrong object*, which is a closed set, where an allowlist has to
+  know every header every SDK sends before it can let a working client through.
+- **Not in v1**: `DeleteObjects` (the batch delete, which is its own API and its
+  own body format), CopyObject and UploadPartCopy, DeleteBucket — a bucket is a
+  mapping the operator made, not a thing HTTP may unmake — bucket versioning
+  APIs, presigned URLs.
 
 ---
 
@@ -1748,6 +1816,35 @@ CREATE TABLE observed_heads (origin_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
                              root BLOB NOT NULL, complete INTEGER NOT NULL,
                              claimed_by BLOB,   -- which peer asserted it (§3.4)
                              observed_at INTEGER NOT NULL);
+
+-- S3 multipart uploads in flight (§9.4). The gateway holds no state and any
+-- number of gateway processes may serve one daemon, so an upload created
+-- through one and completed through another lives here or nowhere.
+-- state is open -> completing -> completed; a completed row remembers its
+-- result so a retried CompleteMultipartUpload replays it rather than reporting
+-- an upload that no longer exists.
+CREATE TABLE s3_uploads (id TEXT PRIMARY KEY,  -- the UploadId: 32 random hex
+                         space TEXT NOT NULL, path TEXT NOT NULL,
+                         principal TEXT,           -- the access key that opened it
+                         created_ns INTEGER NOT NULL,
+                         state TEXT NOT NULL
+                           CHECK (state IN ('open','completing','completed')),
+                         etag BLOB, size INTEGER,   -- the result, once completed
+                         latched_ns INTEGER,        -- when a completion took the latch
+                         completed_ns INTEGER);
+CREATE INDEX s3_uploads_by_age ON s3_uploads (created_ns);
+CREATE INDEX s3_uploads_by_target ON s3_uploads (space, path);
+
+-- One row per part whose payload is already durable: a row implies bytes, and
+-- never the reverse (a crash before the row leaves a collectable orphan file).
+CREATE TABLE s3_upload_parts (upload TEXT NOT NULL
+                                REFERENCES s3_uploads(id) ON DELETE CASCADE,
+                              number INTEGER NOT NULL,   -- 1..=10000
+                              file TEXT NOT NULL,        -- name within the upload dir
+                              size INTEGER NOT NULL,
+                              root BLOB NOT NULL,        -- the part's own blake3 root
+                              created_ns INTEGER NOT NULL,
+                              PRIMARY KEY (upload, number));
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can

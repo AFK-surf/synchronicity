@@ -59,6 +59,18 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     );
     println!("control socket: {}", server.endpoint_name());
 
+    // A completion severed by a stop or a crash left its upload latched, and
+    // nothing else ever clears the latch: without this, an upload whose parts
+    // are all still staged would refuse every retry until it aged out (§9.4).
+    // Off the runtime: it takes a store connection, which §10 keeps off the
+    // worker threads.
+    let reopening = node.clone();
+    match synch_core::offload(move || reopening.reopen_interrupted_uploads()).await {
+        Ok(0) => {}
+        Ok(reopened) => tracing::info!(reopened, "reopened interrupted multipart uploads"),
+        Err(e) => tracing::warn!(error = %e, "could not reopen interrupted uploads"),
+    }
+
     let control = tokio::spawn(server.run());
     let aae = spawn_loop(
         "anti-entropy",
@@ -93,6 +105,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
             Some(resolver) => node.run_dns(resolver.as_ref(), shutdown).await,
             None => shutdown.await,
         }
+    });
+    // Multipart uploads leak by design — S3's own answer is a lifecycle rule —
+    // so something has to collect the ones nobody finished, and the payloads a
+    // crash or a re-uploaded part left unreferenced inside a live upload (§9.4).
+    let uploads = spawn_loop("uploads", &node, &stop_tx, |node, shutdown| async move {
+        run_upload_sweeper(&node, shutdown).await
     });
     // The outbound tunnel to the control plane the membership zone names — on
     // by default, and a settings read per interval once opted out.
@@ -152,6 +170,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         publisher,
         dns,
         mirrors,
+        uploads,
         cloud
     );
     let named: [(&str, bool); 9] = [
@@ -380,6 +399,38 @@ fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::Dnssec
                 "no DNSSEC resolver available; running on static trust (see `synch doctor`)"
             );
             Ok(None)
+        }
+    }
+}
+
+/// How often the multipart sweeper looks for uploads and payloads to collect.
+///
+/// Nothing waits on it: everything it collects has already been abandoned for
+/// longer than any writer's window, so the cadence only bounds how long the
+/// bytes sit, not whether they go.
+const UPLOAD_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Collects abandoned multipart uploads until the daemon stops (§9.4).
+async fn run_upload_sweeper(node: &Node, shutdown: ShutdownSignal) {
+    let shutdown = std::pin::pin!(shutdown);
+    let mut shutdown = shutdown;
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tokio::time::sleep(UPLOAD_SWEEP_INTERVAL) => {
+                let sweeping = node.clone();
+                // Off the runtime: the sweep stats a directory tree and unlinks
+                // what it finds, which is real disk work.
+                let swept = synch_core::offload(move || {
+                    sweeping.sweep_uploads(synch_engine::DEFAULT_UPLOAD_TTL)
+                })
+                .await;
+                match swept {
+                    Ok(0) => {}
+                    Ok(collected) => tracing::info!(collected, "swept multipart uploads"),
+                    Err(e) => tracing::warn!(error = %e, "multipart upload sweep failed"),
+                }
+            }
         }
     }
 }

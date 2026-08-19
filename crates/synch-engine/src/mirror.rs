@@ -961,9 +961,15 @@ fn reingest_the_copy_on_disk(
 
 /// Returns true if any ancestor of `rel` under `root` is a symlink, so that
 /// writing or deleting at `root/rel` would resolve through it and escape the
-/// mirror root. The final component (the target itself) is not an ancestor and
-/// is allowed to be a symlink.
-fn escapes_via_symlink(root: &Path, rel: &str) -> bool {
+/// root. The final component (the target itself) is not an ancestor and is
+/// allowed to be a symlink.
+///
+/// Used by the mirror loop and by [`Node::adoption_target`](crate::Node): a
+/// space root is canonicalized when it is added, but nothing canonicalizes its
+/// *interior*, and a symlinked directory inside a space is an ordinary thing
+/// for a user to have. Without this a client that can name a path can write and
+/// delete through it, anywhere the daemon's uid reaches.
+pub(crate) fn escapes_via_symlink(root: &Path, rel: &str) -> bool {
     let mut cur = root.to_path_buf();
     let mut components: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
     components.pop();

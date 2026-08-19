@@ -116,6 +116,60 @@ impl S3Error {
         S3Error::new(StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange", reason)
     }
 
+    /// `NoSuchUpload`.
+    ///
+    /// Distinct from `NoSuchKey`, and it has to be: a client that gets "no such
+    /// key" back from a `CompleteMultipartUpload` learns nothing, while
+    /// `NoSuchUpload` is the code every SDK branches on to stop retrying and
+    /// start the upload over.
+    pub fn no_such_upload(upload_id: &str) -> S3Error {
+        S3Error::new(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "the upload does not exist, or is not against this key",
+        )
+        .with_resource(upload_id.to_string())
+    }
+
+    /// `InvalidPart`: a completion named a part that was never uploaded, or
+    /// one whose ETag does not match what was.
+    pub fn invalid_part(reason: impl Into<String>) -> S3Error {
+        S3Error::new(StatusCode::BAD_REQUEST, "InvalidPart", reason)
+    }
+
+    /// `InvalidPartOrder`: a completion's part numbers do not ascend.
+    pub fn invalid_part_order() -> S3Error {
+        S3Error::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidPartOrder",
+            "the parts of a completion must be listed in ascending part-number order",
+        )
+    }
+
+    /// `EntityTooSmall`: an interior part is under S3's 5 MiB minimum.
+    pub fn entity_too_small(reason: impl Into<String>) -> S3Error {
+        S3Error::new(StatusCode::BAD_REQUEST, "EntityTooSmall", reason)
+    }
+
+    /// `MalformedXML`: a request body this gateway could not read.
+    pub fn malformed_xml(reason: impl Into<String>) -> S3Error {
+        S3Error::new(StatusCode::BAD_REQUEST, "MalformedXML", reason)
+    }
+
+    /// Restates a "not found" as being about an upload rather than a key.
+    ///
+    /// The daemon reports a missing upload the only way the control protocol
+    /// can — `NotFound` — and the generic conversion turns that into
+    /// `NoSuchKey`, which is the wrong answer to a question about an upload.
+    /// Only the handler knows which question was asked, so only the handler can
+    /// correct it.
+    pub fn about_upload(self, upload_id: &str) -> S3Error {
+        if self.status == StatusCode::NOT_FOUND {
+            return S3Error::no_such_upload(upload_id);
+        }
+        self
+    }
+
     /// `NotImplemented`, for the operations §9.4 defers past v1.
     pub fn not_implemented(operation: &str) -> S3Error {
         S3Error::new(
@@ -259,6 +313,41 @@ mod tests {
                 "{}",
                 code.as_str()
             );
+        }
+    }
+
+    /// A question about an upload gets an answer about an upload (§9.4).
+    #[test]
+    fn missing_uploads_are_not_missing_keys() {
+        let missing = S3Error::from(ControlError::new(ErrorCode::NotFound, "no upload"));
+        assert_eq!(missing.code, "NoSuchKey");
+        let restated = missing.about_upload("abc123");
+        assert_eq!(restated.code, "NoSuchUpload");
+        assert_eq!(restated.status, StatusCode::NOT_FOUND);
+        assert_eq!(restated.resource, "abc123");
+        // Anything that was not a 404 is left alone: a node in recovery is not
+        // a missing upload.
+        let busy = S3Error::from(ControlError::new(ErrorCode::Unavailable, "recovering"));
+        assert_eq!(busy.about_upload("abc123").code, "ServiceUnavailable");
+    }
+
+    #[test]
+    fn multipart_codes_are_distinct() {
+        assert_eq!(S3Error::invalid_part("no part 3").code, "InvalidPart");
+        assert_eq!(S3Error::invalid_part_order().code, "InvalidPartOrder");
+        assert_eq!(
+            S3Error::entity_too_small("too small").code,
+            "EntityTooSmall"
+        );
+        assert_eq!(S3Error::malformed_xml("bad").code, "MalformedXML");
+        // All four are client mistakes the client can fix, so all four are 400.
+        for e in [
+            S3Error::invalid_part("x"),
+            S3Error::invalid_part_order(),
+            S3Error::entity_too_small("x"),
+            S3Error::malformed_xml("x"),
+        ] {
+            assert_eq!(e.status, StatusCode::BAD_REQUEST, "{}", e.code);
         }
     }
 

@@ -4066,6 +4066,7 @@ dependencies = [
  "iroh-base",
  "notify",
  "postcard",
+ "ring",
  "rustix",
  "serde",
  "serde_json",
@@ -4147,8 +4148,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "blake3",
  "clap",
+ "crc",
  "hex",
  "hmac",
  "reqwest",

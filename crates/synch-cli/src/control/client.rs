@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use synch_core::Hash;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
@@ -142,6 +143,162 @@ impl Client {
             .await?
             .into_inner();
         Ok(Put { parts, written })
+    }
+
+    /// Removes this node's copy of a path and publishes its tombstone.
+    pub async fn delete(&mut self, space: &str, path: &str) -> Result<Deleted, ControlError> {
+        let response = self
+            .inner
+            .delete(pb::DeleteRequest {
+                space: space.to_string(),
+                path: path.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(Deleted {
+            removed: response.removed,
+            still_published: response.still_published,
+        })
+    }
+
+    /// Opens a multipart upload and returns its id (§9.4).
+    pub async fn create_upload(
+        &mut self,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> Result<String, ControlError> {
+        Ok(self
+            .inner
+            .create_upload(pb::CreateUploadRequest {
+                space: space.to_string(),
+                path: path.to_string(),
+                principal: principal.unwrap_or_default().to_string(),
+            })
+            .await?
+            .into_inner()
+            .upload_id)
+    }
+
+    /// Opens a streamed write of one part.
+    ///
+    /// Returns once the daemon has checked the upload is still open and the
+    /// part number is one S3 defines, so a refusal arrives before a byte of the
+    /// part is sent — the same contract [`Client::put`] gives.
+    pub async fn upload_part(
+        &mut self,
+        upload: UploadRef,
+        number: u32,
+    ) -> Result<PartUpload, ControlError> {
+        let (parts, body) = mpsc::channel(2);
+        parts
+            .send(pb::UploadPartRequest {
+                part: Some(super::proto::UploadPartPart::Header(pb::UploadPartHeader {
+                    upload: Some(upload.into_pb()),
+                    number,
+                })),
+            })
+            .await
+            .map_err(|_| ControlError::internal("the part was closed before it opened"))?;
+        // The response stream's headers arrive as soon as the daemon has taken
+        // its gates, which is what makes this `await` return before the payload
+        // has been sent (§9.4).
+        let recorded = self
+            .inner
+            .upload_part(ReceiverStream::new(body))
+            .await?
+            .into_inner();
+        Ok(PartUpload { parts, recorded })
+    }
+
+    /// Assembles the named parts and publishes the object.
+    pub async fn complete_upload(
+        &mut self,
+        upload: UploadRef,
+        parts: &[(u32, Option<Hash>)],
+    ) -> Result<CompletedUpload, ControlError> {
+        let response = self
+            .inner
+            .complete_upload(pb::CompleteUploadRequest {
+                upload: Some(upload.into_pb()),
+                parts: parts
+                    .iter()
+                    .map(|(number, root)| pb::CompletionPart {
+                        number: *number,
+                        root: root.map(|r| r.as_bytes().to_vec()).unwrap_or_default(),
+                    })
+                    .collect(),
+            })
+            .await?
+            .into_inner();
+        Ok(CompletedUpload {
+            etag: hash_from(&response.etag, "etag")?,
+            size: response.size,
+            replayed: response.replayed,
+        })
+    }
+
+    /// Drops an upload and everything staged for it.
+    pub async fn abort_upload(&mut self, upload: UploadRef) -> Result<bool, ControlError> {
+        Ok(self
+            .inner
+            .abort_upload(pb::AbortUploadRequest {
+                upload: Some(upload.into_pb()),
+            })
+            .await?
+            .into_inner()
+            .existed)
+    }
+
+    /// Every upload still accepting parts under a prefix.
+    pub async fn list_uploads(
+        &mut self,
+        space: &str,
+        prefix: &str,
+        principal: Option<&str>,
+    ) -> Result<Vec<OpenUpload>, ControlError> {
+        let mut stream = self
+            .inner
+            .list_uploads(pb::ListUploadsRequest {
+                space: space.to_string(),
+                prefix: prefix.to_string(),
+                principal: principal.unwrap_or_default().to_string(),
+            })
+            .await?
+            .into_inner();
+        let mut out = Vec::new();
+        while let Some(upload) = stream.message().await? {
+            out.push(OpenUpload {
+                upload_id: upload.upload_id,
+                path: upload.path,
+                created_ns: upload.created_ns,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every part recorded for one upload, in part-number order.
+    pub async fn list_parts(
+        &mut self,
+        upload: UploadRef,
+    ) -> Result<Vec<RecordedPart>, ControlError> {
+        let mut stream = self
+            .inner
+            .list_parts(pb::ListPartsRequest {
+                upload: Some(upload.into_pb()),
+            })
+            .await?
+            .into_inner();
+        let mut out = Vec::new();
+        while let Some(part) = stream.message().await? {
+            out.push(RecordedPart {
+                number: part.number,
+                size: part.size,
+                root: hash_from(&part.root, "part root")?,
+                created_ns: part.created_ns,
+            });
+        }
+        Ok(out)
     }
 
     /// Reads one config value from the `s3.*` namespace, a record per line.
@@ -309,4 +466,164 @@ fn no_daemon(e: std::io::Error) -> ControlError {
         _ => ErrorCode::Internal,
     };
     ControlError::new(code, e.to_string())
+}
+
+/// Which upload a call is about, and the key it must belong to (§9.4).
+///
+/// The key travels with the id on every call because an id names one key: a
+/// request that quotes it against another key is answered as though the upload
+/// did not exist, which is what stops an id from being a way into a path the
+/// client never named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRef {
+    /// The upload id.
+    pub upload_id: String,
+    /// The space it must be against.
+    pub space: String,
+    /// The path it must be against.
+    pub path: String,
+    /// The access key that must own it, or `None` when the gateway is anonymous.
+    pub principal: Option<String>,
+}
+
+impl UploadRef {
+    /// Names an upload against a key, and the principal that must own it.
+    pub fn new(
+        upload_id: impl Into<String>,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> UploadRef {
+        UploadRef {
+            upload_id: upload_id.into(),
+            space: space.to_string(),
+            path: path.to_string(),
+            principal: principal.map(str::to_string),
+        }
+    }
+
+    fn into_pb(self) -> pb::UploadRef {
+        pb::UploadRef {
+            upload_id: self.upload_id,
+            space: self.space,
+            path: self.path,
+            principal: self.principal.unwrap_or_default(),
+        }
+    }
+}
+
+/// A streamed write of one part, which records nothing until it is finished.
+#[derive(Debug)]
+pub struct PartUpload {
+    parts: mpsc::Sender<pb::UploadPartRequest>,
+    recorded: Streaming<pb::UploadPartResponse>,
+}
+
+impl PartUpload {
+    /// Sends one piece of the part's payload.
+    pub async fn chunk(&mut self, bytes: Vec<u8>) -> Result<(), ControlError> {
+        self.send(super::proto::UploadPartPart::Chunk(bytes)).await
+    }
+
+    /// Abandons the part, so the daemon keeps nothing of it.
+    pub async fn abort(mut self, why: impl Into<String>) -> ControlError {
+        let why = why.into();
+        let _ = self
+            .send(super::proto::UploadPartPart::Abort(why.clone()))
+            .await;
+        drop(self.parts);
+        match self.recorded.message().await {
+            Err(status) => status.into(),
+            Ok(_) => ControlError::internal("the daemon recorded a part that was abandoned"),
+        }
+    }
+
+    /// Commits the part and returns what the daemon recorded.
+    pub async fn finish(mut self) -> Result<RecordedPart, ControlError> {
+        // The commit is a message of its own, so every other way this handle
+        // can end leaves the daemon with a payload it was never told to keep.
+        self.send(super::proto::UploadPartPart::Commit(pb::Commit {}))
+            .await?;
+        drop(self.parts);
+        let recorded = self
+            .recorded
+            .message()
+            .await?
+            .ok_or_else(|| ControlError::internal("the daemon did not report the part"))?;
+        Ok(RecordedPart {
+            number: recorded.number,
+            size: recorded.size,
+            root: hash_from(&recorded.root, "part root")?,
+            created_ns: recorded.created_ns,
+        })
+    }
+
+    async fn send(&mut self, part: super::proto::UploadPartPart) -> Result<(), ControlError> {
+        if self
+            .parts
+            .send(pb::UploadPartRequest { part: Some(part) })
+            .await
+            .is_err()
+        {
+            // The daemon dropped its side, which means it has already decided
+            // the part cannot go on; its reason is on the response stream.
+            return Err(match self.recorded.message().await {
+                Err(status) => status.into(),
+                Ok(_) => ControlError::internal("the daemon stopped reading the part"),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One part the daemon has recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedPart {
+    /// The part number.
+    pub number: u32,
+    /// How many bytes it carries.
+    pub size: u64,
+    /// Its own object root, which is the ETag the client is given.
+    pub root: Hash,
+    /// When it was recorded, unix nanoseconds.
+    pub created_ns: i64,
+}
+
+/// One upload still accepting parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenUpload {
+    /// The upload id.
+    pub upload_id: String,
+    /// The path it will publish to.
+    pub path: String,
+    /// When it was created, unix nanoseconds.
+    pub created_ns: i64,
+}
+
+/// What a completion produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedUpload {
+    /// The assembled object's root.
+    pub etag: Hash,
+    /// Its size in bytes.
+    pub size: u64,
+    /// True when a retry was answered from the recorded result.
+    pub replayed: bool,
+}
+
+/// Reads a 32-byte hash column off the wire.
+fn hash_from(bytes: &[u8], what: &str) -> Result<Hash, ControlError> {
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| ControlError::internal(format!("the daemon sent a malformed {what}")))?;
+    Ok(Hash::from(array))
+}
+
+/// What a delete did, and what it left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deleted {
+    /// Whether there was a local copy to remove.
+    pub removed: bool,
+    /// Whether some origin still publishes a live entry for the path (§8).
+    pub still_published: bool,
 }

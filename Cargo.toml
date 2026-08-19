@@ -35,6 +35,7 @@ base64 = "0.22.1"
 blake3 = "1.8.6"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive", "env"] }
+crc = "3.4.0"
 # Life-before-main, used to install the TLS provider in test builds
 # (`synch_net::tls`).
 ctor = "0.4"

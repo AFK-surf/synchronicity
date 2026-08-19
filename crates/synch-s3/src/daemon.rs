@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use axum::body::Body;
 use synch_cli::control::{
     proto::{pb, CHUNK_SIZE},
-    Client, Command, EntryInfo, Frame,
+    Client, Command, CompletedUpload, Deleted, EntryInfo, Frame, OpenUpload, RecordedPart,
+    UploadRef,
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
@@ -221,7 +222,7 @@ impl Daemon {
         let mut put = client.put(space, path).await?;
 
         let mut stream = body.into_data_stream();
-        let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
+        let mut coalesce = Coalesce::default();
         let mut truncated = None;
         while let Some(piece) = stream.next().await {
             let piece = match piece {
@@ -234,24 +235,108 @@ impl Daemon {
                     break;
                 }
             };
-            let mut rest: &[u8] = &piece;
-            while !rest.is_empty() {
-                let take = (CHUNK_SIZE - pending.len()).min(rest.len());
-                pending.extend_from_slice(&rest[..take]);
-                rest = &rest[take..];
-                if pending.len() == CHUNK_SIZE {
-                    put.chunk(std::mem::take(&mut pending)).await?;
-                    pending.reserve(CHUNK_SIZE);
-                }
+            for chunk in coalesce.push(&piece) {
+                put.chunk(chunk).await?;
             }
         }
         if let Some(why) = truncated {
             return Err(put.abort(why).await.into());
         }
-        if !pending.is_empty() {
-            put.chunk(pending).await?;
+        if let Some(rest) = coalesce.rest() {
+            put.chunk(rest).await?;
         }
         Ok(put.finish().await?.entry)
+    }
+
+    /// Removes this node's copy of a path and publishes its tombstone (§8).
+    pub async fn delete(&self, space: &str, path: &str) -> S3Result<Deleted> {
+        Ok(self.connect().await?.delete(space, path).await?)
+    }
+
+    /// Opens a multipart upload and returns its id (§9.4).
+    pub async fn create_upload(
+        &self,
+        space: &str,
+        path: &str,
+        principal: Option<&str>,
+    ) -> S3Result<String> {
+        Ok(self
+            .connect()
+            .await?
+            .create_upload(space, path, principal)
+            .await?)
+    }
+
+    /// Streams one part of an upload, returning what the daemon recorded.
+    ///
+    /// The same shape as [`Daemon::put`], and for the same reasons: the gates
+    /// are taken before the body is read, the payload is coalesced into
+    /// protocol-sized messages rather than network-sized ones, and a truncated
+    /// body aborts the part rather than recording a short one as whole.
+    pub async fn upload_part(
+        &self,
+        upload: UploadRef,
+        number: u32,
+        body: Body,
+    ) -> S3Result<RecordedPart> {
+        let mut client = self.connect().await?;
+        let mut part = client.upload_part(upload, number).await?;
+
+        let mut stream = body.into_data_stream();
+        let mut coalesce = Coalesce::default();
+        let mut truncated = None;
+        while let Some(piece) = stream.next().await {
+            let piece = match piece {
+                Ok(piece) => piece,
+                Err(e) => {
+                    truncated = Some(e.to_string());
+                    break;
+                }
+            };
+            for chunk in coalesce.push(&piece) {
+                part.chunk(chunk).await?;
+            }
+        }
+        if let Some(why) = truncated {
+            return Err(part.abort(why).await.into());
+        }
+        if let Some(rest) = coalesce.rest() {
+            part.chunk(rest).await?;
+        }
+        Ok(part.finish().await?)
+    }
+
+    /// Assembles the named parts and publishes the object.
+    pub async fn complete_upload(
+        &self,
+        upload: UploadRef,
+        parts: &[(u32, Option<synch_core::Hash>)],
+    ) -> S3Result<CompletedUpload> {
+        Ok(self.connect().await?.complete_upload(upload, parts).await?)
+    }
+
+    /// Drops an upload and everything staged for it.
+    pub async fn abort_upload(&self, upload: UploadRef) -> S3Result<bool> {
+        Ok(self.connect().await?.abort_upload(upload).await?)
+    }
+
+    /// Every upload still accepting parts under a prefix.
+    pub async fn list_uploads(
+        &self,
+        space: &str,
+        prefix: &str,
+        principal: Option<&str>,
+    ) -> S3Result<Vec<OpenUpload>> {
+        Ok(self
+            .connect()
+            .await?
+            .list_uploads(space, prefix, principal)
+            .await?)
+    }
+
+    /// Every part recorded for one upload, in part-number order.
+    pub async fn list_parts(&self, upload: UploadRef) -> S3Result<Vec<RecordedPart>> {
+        Ok(self.connect().await?.list_parts(upload).await?)
     }
 
     /// Reads one of the gateway's config values, a record per line.
@@ -263,5 +348,73 @@ impl Daemon {
     pub async fn append(&self, key: &str, record: &str) -> S3Result<()> {
         self.connect().await?.append_config(key, record).await?;
         Ok(())
+    }
+}
+
+/// Gathers an HTTP body's pieces into control-protocol chunks.
+///
+/// A body arrives in whatever pieces the network chose — a TCP segment, a TLS
+/// record, whatever the client's writer flushed — and a control message per
+/// piece would be all overhead. This accumulates to exactly [`CHUNK_SIZE`] and
+/// never beyond it, so the message size is a property of the protocol rather
+/// than of the sender's write pattern.
+#[derive(Debug, Default)]
+struct Coalesce {
+    pending: Vec<u8>,
+}
+
+impl Coalesce {
+    /// Takes one piece of the body and returns every whole chunk it completed.
+    fn push(&mut self, piece: &[u8]) -> Vec<Vec<u8>> {
+        let mut full = Vec::new();
+        let mut rest = piece;
+        while !rest.is_empty() {
+            if self.pending.capacity() < CHUNK_SIZE {
+                self.pending.reserve(CHUNK_SIZE - self.pending.len());
+            }
+            let take = (CHUNK_SIZE - self.pending.len()).min(rest.len());
+            self.pending.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.pending.len() == CHUNK_SIZE {
+                full.push(std::mem::take(&mut self.pending));
+            }
+        }
+        full
+    }
+
+    /// Whatever is left once the body has ended.
+    fn rest(self) -> Option<Vec<u8>> {
+        Some(self.pending).filter(|p| !p.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalescing_produces_protocol_sized_chunks() {
+        let mut coalesce = Coalesce::default();
+        // Nothing under a chunk is emitted early.
+        assert!(coalesce.push(&[1u8; 10]).is_empty());
+        // A piece that spans a boundary emits exactly the whole chunks in it.
+        let chunks = coalesce.push(&vec![2u8; CHUNK_SIZE * 2]);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| c.len() == CHUNK_SIZE));
+        assert_eq!(coalesce.rest().map(|r| r.len()), Some(10));
+    }
+
+    #[test]
+    fn an_empty_body_coalesces_to_nothing() {
+        let mut coalesce = Coalesce::default();
+        assert!(coalesce.push(&[]).is_empty());
+        assert_eq!(coalesce.rest(), None);
+    }
+
+    #[test]
+    fn an_exact_multiple_leaves_no_remainder() {
+        let mut coalesce = Coalesce::default();
+        assert_eq!(coalesce.push(&vec![7u8; CHUNK_SIZE]).len(), 1);
+        assert_eq!(coalesce.rest(), None);
     }
 }
