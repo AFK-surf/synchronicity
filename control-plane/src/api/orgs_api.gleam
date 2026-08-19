@@ -15,6 +15,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/result
+import gleam/string
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
@@ -474,10 +475,18 @@ pub fn create_invite(
     use role <- decode.optional_field("role", "member", decode.string)
     decode.success(#(email, role))
   }
-  use #(email, role) <- body_decoder(req, decoder)
-  case role == "member" || role == "admin" {
-    False -> error_json(400, "bad_role", "invite role must be member or admin")
-    True ->
+  use #(email_input, role) <- body_decoder(req, decoder)
+  // Normalised the way the magic-link path normalises: the address is
+  // about to be an SMTP recipient, and a pasted `  Name@Example.COM  `
+  // is one the relay would refuse.
+  let email = string.lowercase(string.trim(email_input))
+  let addressable =
+    string.contains(email, "@") && string.byte_size(email) <= 254
+  case role == "member" || role == "admin", addressable {
+    False, _ ->
+      error_json(400, "bad_role", "invite role must be member or admin")
+    _, False -> error_json(400, "bad_email", "invite needs an email address")
+    True, True ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
         let token = id.secret()

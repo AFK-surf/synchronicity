@@ -25,6 +25,7 @@ mod serve;
 pub mod sim;
 #[cfg(test)]
 mod testing;
+pub mod tls;
 pub mod tuf;
 pub mod x509;
 pub mod zonecert;

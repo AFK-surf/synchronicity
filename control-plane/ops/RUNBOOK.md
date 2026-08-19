@@ -67,7 +67,7 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_NS_HOSTS` | primary | `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53` |
 | `CP_PUBLIC_URL` | primary | external URL for links/OAuth callbacks |
 | `CP_SESSION_SECRET` | primary | ≥32 chars; signs session cookies |
-| `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link mail (absent = log-only) |
+| `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link and invitation mail (absent = log-only); `FROM` is the header, display name and all |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |
 | `CP_REKOR_URL` | primary | zone-key transparency log; unset, the shard in service is read from the stored `trusted_root.json` |

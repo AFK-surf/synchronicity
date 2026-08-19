@@ -8,6 +8,9 @@ use synch_cli::{cli::Cli, commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before anything builds a TLS client: reqwest, built without a baked-in
+    // provider, refuses to construct a `Client` until one is installed.
+    synch_net::tls::install_ring_provider();
     let args = Cli::parse();
     let default = if args.verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
