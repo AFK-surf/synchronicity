@@ -241,11 +241,11 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_BUNNY_API_URL` | primary | Bunny API base URL override; default empty means the real endpoint. |
 | `CP_PUBLIC_URL` | primary | External base URL for links and OAuth callbacks. Default `http://127.0.0.1:<http-port>`. |
 | `CP_SESSION_SECRET` | primary | Required on the primary, ≥32 characters. Signs session cookies. |
-| `CP_SMTP_HOST` | primary | SMTP hostname. Absent means log-only magic-link mail, and the login page stops offering the form unless no other sign-in method is configured. |
+| `CP_SMTP_HOST` | primary | SMTP hostname. Absent means log-only mail — magic links and invitations go to the service's stdout — and the login page stops offering the form unless no other sign-in method is configured. |
 | `CP_SMTP_PORT` | primary | SMTP port. Default `587`. Used only when `CP_SMTP_HOST` is set. |
-| `CP_SMTP_USER` | primary | SMTP username. Default empty. |
+| `CP_SMTP_USER` | primary | SMTP username. Default empty. Set, the relay must offer STARTTLS and present a certificate this host trusts: the credential is never put on the wire in the clear. |
 | `CP_SMTP_PASS` | primary | SMTP password. Default empty. |
-| `CP_SMTP_FROM` | primary | Required when `CP_SMTP_HOST` is set. Envelope From. |
+| `CP_SMTP_FROM` | primary | Required when `CP_SMTP_HOST` is set. The `From` header, so a display name is welcome — `Synchronicity <sync@example.com>`. The envelope sender is the bare address inside it. |
 | `CP_GOOGLE_CLIENT_ID` | primary | Google OAuth client id. Both id and secret must be set to enable Google sign-in; unset, it is hidden from the login and settings screens. |
 | `CP_GOOGLE_CLIENT_SECRET` | primary | Google OAuth client secret. |
 | `CP_GITHUB_CLIENT_ID` | primary | GitHub OAuth client id. Both id and secret must be set to enable GitHub sign-in; unset, it is hidden from the login and settings screens. |

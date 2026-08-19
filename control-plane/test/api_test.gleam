@@ -837,12 +837,36 @@ pub fn invite_creation_test() {
       ]),
     )
   assert resp.status == 200
+  // An address is stored the way it will be sent to: trimmed and folded,
+  // since a relay takes neither the surrounding spaces nor the case.
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/invites",
+      json.object([#("email", json.string("  Second@Example.COM  "))]),
+    ).status
+  // And an address that is not one at all never reaches the relay.
+  let unaddressed =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/invites",
+      json.object([#("email", json.string("nobody"))]),
+    )
+  assert unaddressed.status == 400
   let conn = read_db(h)
   let assert Ok([[sqlite.Text("admin"), sqlite.Int(1)]]) =
     sqlite.query(
       conn,
       "SELECT role, accepted_at IS NULL FROM invites
        WHERE email = 'newbie@example.com'",
+      [],
+    )
+  let assert Ok([[sqlite.Int(1)]]) =
+    sqlite.query(
+      conn,
+      "SELECT count(*) FROM invites WHERE email = 'second@example.com'",
       [],
     )
   sqlite.close(conn)
