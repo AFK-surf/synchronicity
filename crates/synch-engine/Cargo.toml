@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+aws-lc-rs.workspace = true
 directories.workspace = true
 futures-util.workspace = true
 hex.workspace = true
@@ -21,7 +22,6 @@ serde_json.workspace = true
 synch-core.workspace = true
 synch-mpt.workspace = true
 synch-net.workspace = true
-ring.workspace = true
 synch-store.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

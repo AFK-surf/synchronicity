@@ -440,13 +440,22 @@ impl Node {
         // leaves this node asserting the key, signed, to every peer, with no
         // later scan or restart able to notice.
         let mine = synch_store::VersionPolicy::Origin(self.origin().clone());
-        let set = {
+        // `now` comes back from the same trip as the listing: it touches the
+        // connection, and selecting every version against one instant is what
+        // keeps a tombstone that expires mid-read from reading two ways.
+        let (set, now) = {
             let (node, space_owned, path_owned) =
                 (self.clone(), space.to_string(), path.to_string());
-            crate::blocking::offload(move || node.versions(&space_owned, &path_owned)).await?
+            crate::blocking::offload(move || {
+                Ok((
+                    node.versions(&space_owned, &path_owned)?,
+                    node.store().read_instant()?,
+                ))
+            })
+            .await?
         };
         if self
-            .resolve_set(&set, &mine)
+            .resolve_set(&set, &mine, now)
             .is_ok_and(|row| row.kind != synch_core::EntryKind::Tombstone)
         {
             tracing::warn!(
@@ -761,9 +770,9 @@ fn choose_parts<'a>(
 /// Hex, never base64: the id travels as a query parameter, and `+` has no
 /// business needing an escape in one.
 fn new_upload_id() -> Result<String> {
-    use ring::rand::SecureRandom;
+    use aws_lc_rs::rand::SecureRandom;
     let mut bytes = [0u8; 16];
-    ring::rand::SystemRandom::new()
+    aws_lc_rs::rand::SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| EngineError::invalid("the system random source is unavailable"))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
