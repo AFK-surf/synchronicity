@@ -672,7 +672,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Every path the scanner has recorded for a space.
     /// The paths one origin currently publishes as live in a space.
     ///
     /// Tombstones excluded: a path this origin has already deleted is not

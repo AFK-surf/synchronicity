@@ -5,6 +5,8 @@
 //! any-depth, a leading `/` to anchor at the space root, a trailing `/` for
 //! directories only, and a leading `!` to un-ignore.
 
+use crate::error::{EngineError, Result};
+
 /// The per-space ignore file name.
 pub const IGNORE_FILE: &str = ".syncignore";
 
@@ -49,12 +51,29 @@ impl IgnoreSet {
     }
 
     /// The built-in defaults plus the space's `.syncignore`, if present.
-    pub fn for_space(root: &std::path::Path) -> Self {
+    ///
+    /// Absent is fine and is the common case. Present-but-unreadable is not:
+    /// this used to swallow every error, so an `.syncignore` the daemon could
+    /// not read — a permission change, an `EIO`, a half-written file — silently
+    /// degraded the set to the builtins, and the very next scan *published*
+    /// every path the operator had asked it to exclude. Exclusion is not a
+    /// preference that may be dropped when convenient: the whole point of the
+    /// file is that its contents leave this machine only when it says so.
+    pub fn for_space(root: &std::path::Path) -> Result<Self> {
         let mut set = IgnoreSet::builtin();
-        if let Ok(text) = std::fs::read_to_string(root.join(IGNORE_FILE)) {
-            set.extend(text.lines());
+        match std::fs::read_to_string(root.join(IGNORE_FILE)) {
+            Ok(text) => set.extend(text.lines()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(EngineError::invalid(format!(
+                    "{} exists but could not be read: {e}. Refusing to scan {} with the \
+                     built-in rules alone, which would publish everything it excludes",
+                    root.join(IGNORE_FILE).display(),
+                    root.display()
+                )))
+            }
         }
-        set
+        Ok(set)
     }
 
     /// Adds patterns, skipping blanks and `#` comments.
@@ -233,10 +252,34 @@ mod tests {
     fn reads_a_space_ignore_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(IGNORE_FILE), "*.raw\n!important.raw\n").unwrap();
-        let set = IgnoreSet::for_space(dir.path());
+        let set = IgnoreSet::for_space(dir.path()).unwrap();
         assert!(set.is_ignored("photo.raw", false));
         assert!(!set.is_ignored("important.raw", false));
         // Built-ins still apply.
         assert!(set.is_ignored(".DS_Store", false));
+    }
+
+    /// An absent ignore file is the ordinary case; an unreadable one is not.
+    ///
+    /// Degrading to the builtins on a read failure means the next scan
+    /// publishes every path the operator excluded, which is the one outcome
+    /// this file exists to prevent — so the scan is refused instead.
+    #[test]
+    fn an_unreadable_ignore_file_is_not_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            IgnoreSet::for_space(dir.path()).is_ok(),
+            "no ignore file at all is fine"
+        );
+
+        // A directory where the file should be: readable as a name, not as
+        // text, on every platform this builds for.
+        std::fs::create_dir(dir.path().join(IGNORE_FILE)).unwrap();
+        let refused = IgnoreSet::for_space(dir.path())
+            .expect_err("an ignore file that cannot be read must fail the scan");
+        assert!(
+            refused.to_string().contains(IGNORE_FILE),
+            "the message must name the file: {refused}"
+        );
     }
 }

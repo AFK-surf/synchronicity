@@ -593,6 +593,31 @@ impl Node {
                     space.id
                 )));
             }
+            // Re-pointing an existing space at a different directory is
+            // refused, because what it actually does is publish a mass
+            // deletion. `put_space` upserts `local_path` and clears neither
+            // `local_files` nor `entries`, so the next scan walks the new root,
+            // finds none of the old paths, and tombstones every one of them —
+            // then every mirror in the cluster deletes its copy. The operator
+            // asking for this usually means "re-sync this space from my peers",
+            // which is the exact opposite.
+            //
+            // `scan_space` already refuses a root that is missing or is not a
+            // directory, with the same reasoning in its comment; this is the
+            // sibling case it does not test, where the root is present, is a
+            // directory, and is simply somewhere else.
+            if space.id == id {
+                let current = stored_root(&space.local_path);
+                if current != path {
+                    return Err(EngineError::invalid(format!(
+                        "space {id} is already rooted at {}. Re-pointing it at {} would publish a \
+                         deletion for every path under the old root: remove the space first if \
+                         that is what you want, or move the directory into place instead",
+                        current.display(),
+                        path.display()
+                    )));
+                }
+            }
         }
         self.store().put_space(id, &path.to_string_lossy())?;
         self.spaces_changed();

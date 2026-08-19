@@ -764,7 +764,7 @@ fn put_head_in(
     // at its last complete head for as long as the origin kept publishing.
     //
     // Occupying an empty slot starts the clock; adopting a newer head into an
-    // occupied one inherits it; `touch_pending` restarts it when a fetch
+    // occupied one inherits it; `touch_pending_at` restarts it when a fetch
     // actually makes progress, so a large trie that is genuinely arriving is
     // not swept out from under itself.
     conn.execute(
@@ -773,7 +773,7 @@ fn put_head_in(
          ON CONFLICT(origin_id, slot) DO UPDATE SET
            seq = excluded.seq, root = excluded.root,
            received_at = CASE
-             WHEN excluded.slot = 'pending' THEN heads.received_at
+             WHEN excluded.slot = ?7 THEN heads.received_at
              ELSE excluded.received_at
            END,
            verified_at = excluded.verified_at",
@@ -784,6 +784,7 @@ fn put_head_in(
             head.root.as_bytes().to_vec(),
             received_at,
             verified_at,
+            Slot::Pending.as_str(),
         ],
     )?;
     Ok(())

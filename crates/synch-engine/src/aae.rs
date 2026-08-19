@@ -415,18 +415,17 @@ impl Node {
                 // abandon a head whose trie may be wholly present, so a busy
                 // gateway holding a write for six seconds cost an origin its
                 // floor and another round to get it back.
+                // `try_promote` has already retired the head it judged and
+                // recorded the verdict if it was a permanent one — and it is the
+                // only party that knows *which* head that was, since the slot
+                // can move under this loop between the `all_heads` snapshot and
+                // the promotion. Naming `stored.head` here condemned whatever
+                // this pass happened to list rather than what actually failed.
                 Err(e) if crate::reconcile::is_origin_fault(&e) => {
-                    // The same verdict `offer_head` reaches, so it is recorded
-                    // the same way: without this the head is condemned here and
-                    // then re-judged from scratch — a full promotion diff — the
-                    // next time any peer offers it, because only the other path
-                    // was writing the memo.
-                    syncer.refuse(&stored.head);
-                    tracing::warn!(
+                    tracing::debug!(
                         origin = %origin,
-                        seq = stored.head.seq,
                         error = %e,
-                        "origin left behind: its pending head cannot be materialized"
+                        "a pending head for this origin could not be materialized"
                     );
                     true
                 }
@@ -464,14 +463,20 @@ impl Node {
             };
 
             let stale = stored.received_at <= before && !complete;
-            if !poisoned && !stale {
+            if poisoned {
+                // Retired by `try_promote`, which named the head it judged.
+                // Counting it here would double-count, and clearing it again
+                // would be this pass reaching for a head it did not judge.
+                abandoned += 1;
+                continue;
+            }
+            if !stale {
                 continue;
             }
             tracing::warn!(
                 origin = %origin,
                 seq = stored.head.seq,
-                poisoned,
-                "abandoning a pending head"
+                "abandoning a pending head no peer will serve"
             );
             // The head this pass judged, named explicitly. Between the snapshot
             // above and here the sweep ran a promotion transaction and a trie

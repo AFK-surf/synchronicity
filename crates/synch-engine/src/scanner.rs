@@ -76,7 +76,7 @@ impl Node {
             .space(space_id)?
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))?;
         let root_dir = PathBuf::from(&space.local_path);
-        let ignore = IgnoreSet::for_space(&root_dir);
+        let ignore = IgnoreSet::for_space(&root_dir)?;
         let seq = self.next_seq()?;
 
         // A vanished space root — an unmounted drive, a renamed mount, a
@@ -154,6 +154,29 @@ impl Node {
         // The published tree is durable and `local_files` is not, so the
         // published tree is what the sweep is anchored to; `local_files` still
         // contributes the paths this scan indexed but has not published yet.
+        // A path the walk could not judge is not a path that is gone.
+        //
+        // `seen` is built from what the walk actually stat'd, so every path it
+        // skipped — a child whose `symlink_metadata` failed `EACCES` because
+        // the parent lost its execute bit, a name that would not normalize, a
+        // `DirEntry` that failed to read — was absent from `seen` and therefore
+        // swept. The scan then reported the same path in `skipped` *and*
+        // published a tombstone for it: mirrors deleted their copies, GC became
+        // free to drop the origin's own object, and a later successful scan
+        // republished it as a new entry with no `prev`, so every peer re-fetched
+        // bytes it already had.
+        //
+        // The asymmetry is what gives it away: `index_file`'s failures are
+        // tolerated *and* the path stays in `seen` a few lines above, for
+        // exactly this reason. `walk`'s failures land in the same field and got
+        // the opposite treatment.
+        let unjudged: Vec<String> = report
+            .skipped
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        seen.extend(unjudged.iter().map(String::as_str));
+
         let mut known_paths: Vec<String> = self.store().local_files(space_id)?;
         known_paths.extend(self.store().published_paths(self.origin(), space_id)?);
         known_paths.sort();
@@ -915,7 +938,17 @@ fn walk(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    // A failing `DirEntry` fails the space, exactly as a failing `read_dir`
+    // does two lines up. `read_dir`'s iterator yields per-entry errors, and
+    // discarding them left the child indistinguishable from one that was never
+    // there — which the deletion sweep reads as "gone" and publishes a tombstone
+    // for. The name is what is unknown here, so no single path can be exempted;
+    // `scan_all_with` already records a failed space and keeps every other
+    // space's work, which is the containment this wants.
+    let mut sorted = Vec::new();
+    for entry in entries {
+        sorted.push(entry?);
+    }
     sorted.sort_by_key(|e| e.file_name());
 
     for entry in sorted {
@@ -1214,6 +1247,71 @@ mod tests {
         assert_eq!(entry.kind, EntryKind::Tombstone);
         assert_eq!(entry.seq, 2);
         assert_eq!(entry.prev, Some(Hash::new(b"hello")));
+        node.shutdown().await.unwrap();
+    }
+
+    /// A path the walk could not judge is not tombstoned.
+    ///
+    /// A published file whose `symlink_metadata` fails — the parent lost its
+    /// execute bit, a network space returned `EIO` — was absent from `seen` and
+    /// so was swept: the scan reported it in `skipped` *and* published a
+    /// tombstone for it, mirrors deleted their copies, and a later successful
+    /// scan republished it with no `prev` so every peer re-fetched the bytes.
+    ///
+    /// Needs a real `EACCES`, so it is Unix-only and cannot run as root, who
+    /// bypasses the check being relied on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_the_walk_could_not_stat_is_not_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses the permission check this relies on, so there is
+        // nothing to observe. Detected by trying it rather than by asking for a
+        // uid: what matters is whether the failure actually happens.
+        let probe = tempfile::tempdir().unwrap();
+        std::fs::write(probe.path().join("p"), b"x").unwrap();
+        std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        let bypassed = std::fs::symlink_metadata(probe.path().join("p")).is_ok();
+        std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        if bypassed {
+            eprintln!("skipped: this user bypasses the EACCES this test needs");
+            return;
+        }
+        let (_d, space, node) = node_with_space().await;
+        let dir = space.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), b"hello").unwrap();
+        node.scan_and_publish().unwrap();
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "d/keep.txt")
+                .unwrap()
+                .unwrap()
+                .kind,
+            EntryKind::File
+        );
+
+        // Listable but not traversable: `read_dir` still yields the child's
+        // name, `symlink_metadata` on it fails.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let report = node.scan_all().unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !report.skipped.is_empty(),
+            "the scan must report the path it could not judge"
+        );
+        assert_eq!(
+            report.deleted, 0,
+            "and must not read it as deleted: {:?}",
+            report.skipped
+        );
+        assert!(
+            !report
+                .staged
+                .iter()
+                .any(|(key, _)| { String::from_utf8_lossy(key).contains("keep.txt") }),
+            "no tombstone may be staged for a path that is still there"
+        );
         node.shutdown().await.unwrap();
     }
 
