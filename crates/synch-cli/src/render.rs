@@ -137,6 +137,22 @@ pub fn ago(timestamp: i64) -> String {
     }
 }
 
+/// How long until an expiry, for `delegate ls` and `doctor`.
+///
+/// Remaining time rather than the raw instant, because a delegation's
+/// `not_after` is written by the issuer's clock and read by this one: what an
+/// operator can act on is how much of it is left here.
+pub fn remaining(expires_at: i64, now: i64) -> String {
+    let seconds = (expires_at - now) / 1_000_000_000;
+    match seconds {
+        s if s <= 0 => "expired".into(),
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
+}
+
 /// One membership domain's health, for `domain ls` and `doctor`.
 ///
 /// Three failing domains must not read like three healthy ones: the line

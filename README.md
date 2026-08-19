@@ -50,6 +50,28 @@ synch domain set cluster.example.com       # or DNSSEC membership instead
 synch domain refresh                       # re-resolve the membership zone now
 ```
 
+Delegate space-restricted access. A node whose own key is already trusted — statically
+or through DNS — can admit one other device key to a named list of spaces, without
+touching the zone and without anyone else's configuration:
+
+```sh
+synch delegate add <their-device-key> --space photos --space incoming --until 7d
+synch delegate ls                          # every delegation this cluster honors
+synch delegate rm <their-device-key>
+```
+
+Nothing is handed to the delegate: the grant is a record in the issuer's own trie, so
+every member learns it through ordinary replication and admits the key on its own.
+The delegate joins from the other side with the commands it would use anyway —
+`synch init`, then `synch domain add <domain>` or `synch trust add <issuer-key>` —
+because trust is unilateral and the two directions are separate problems.
+
+A delegate sees the spaces it was delegated and nothing else, down to the filenames:
+peers serve it a projection of each trie covering those spaces, and it verifies the
+same signed root everyone else does. Withdrawing a delegation deletes the record, and
+that propagates the way every deletion does. A delegate cannot delegate further —
+a grant is only read from an origin whose own trust is static or DNS.
+
 Membership from DNS refreshes itself: the daemon re-resolves each configured
 domain when its TTL runs out, and again — rate-limited — when a peer this node
 holds no binding for tries to connect, which is what the far side of a lagging

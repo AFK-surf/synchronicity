@@ -49,6 +49,8 @@ fn trust(node: &Node, peer: &Node) {
             node_id: peer.node_id(),
             source: BindingSource::Static,
             domain: None,
+            issuer: None,
+            spaces: Vec::new(),
             note: None,
             added_at: 0,
             expires_at: None,

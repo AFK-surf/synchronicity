@@ -95,6 +95,8 @@ fn node(key: &SecretKey, origins: &[OriginId]) -> Node {
                 node_id: key.public(),
                 source: BindingSource::Static,
                 domain: None,
+                issuer: None,
+                spaces: Vec::new(),
                 note: None,
                 added_at: 0,
                 expires_at: None,

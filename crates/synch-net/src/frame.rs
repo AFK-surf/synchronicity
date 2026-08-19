@@ -84,7 +84,8 @@ mod tests {
     #[test]
     fn framing_round_trips() {
         let msg = MptMessage::GetNodes {
-            hashes: vec![synch_core::Hash::new(b"a")],
+            root: synch_core::Hash::EMPTY,
+            wants: vec![(Vec::new(), synch_core::Hash::new(b"a"))],
         };
         assert_eq!(round_trip(&msg), msg);
     }

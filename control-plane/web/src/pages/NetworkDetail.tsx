@@ -2,8 +2,10 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
 import {
+  ApiError,
   get,
   send,
+  type Delegations as DelegationsPayload,
   type DeviceKeyRow,
   type DeviceRow,
   type NetworkDetail as Detail,
@@ -56,6 +58,7 @@ export function NetworkDetail() {
         onChange={refresh}
       />
       <AddDevice slug={slug} network={name} onChange={refresh} />
+      <DelegatedTrust slug={slug} network={name} />
       <ConnectPanel domain={data.domain} />
     </div>
   )
@@ -92,6 +95,107 @@ function ZoneStatus({ data }: { data: Detail }) {
       </div>
     </div>
   )
+}
+
+/// Who the cluster admits on a delegation, read from whichever daemon is
+/// attached.
+///
+/// Not managed here, and deliberately: a delegation is a record its issuer
+/// publishes under its own key, so only that node can sign one. The control
+/// plane can report it and nothing more, which is why this panel has no
+/// buttons.
+function DelegatedTrust({ slug, network }: { slug: string; network: string }) {
+  const { data, error, isLoading } = useQuery({
+    queryKey: ['delegations', slug, network],
+    queryFn: () =>
+      get<DelegationsPayload>(`/api/orgs/${slug}/networks/${network}/delegations`),
+    retry: false,
+  })
+
+  // A network with no daemon attached, or with the tunnel switched off, is an
+  // ordinary state rather than a fault: say so quietly and show nothing else.
+  const unavailable =
+    error instanceof ApiError &&
+    (error.code === 'no-device-attached' || error.code === 'browse-disabled')
+
+  return (
+    <div>
+      <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-neutral-400">
+        Delegated trust
+      </h2>
+      {isLoading && <div className="text-sm text-neutral-500">Loading…</div>}
+      {unavailable && (
+        <div className="text-sm text-neutral-500">
+          No attached daemon to ask.
+        </div>
+      )}
+      {error && !unavailable && <ErrorNote error={error} />}
+      {data && (
+        <>
+          <div className="overflow-x-auto rounded-lg border border-neutral-800">
+            <table className="w-full text-sm">
+              <thead className="bg-neutral-900 text-left text-neutral-400">
+                <tr>
+                  <th className="px-4 py-2 font-medium">key</th>
+                  <th className="px-4 py-2 font-medium">spaces</th>
+                  <th className="px-4 py-2 font-medium">issued by</th>
+                  <th className="px-4 py-2 font-medium">expires</th>
+                  <th className="px-4 py-2 font-medium">state</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-neutral-800">
+                {data.delegations.map((d) => (
+                  <tr key={`${d.issuer}/${d.key}`} className={d.live ? '' : 'opacity-60'}>
+                    <td className="px-4 py-2 font-mono text-xs" title={d.key}>
+                      {d.key.slice(0, 12)}…
+                    </td>
+                    <td className="px-4 py-2">{d.spaces.join(', ')}</td>
+                    <td className="px-4 py-2 font-mono text-xs">{d.issuer}</td>
+                    <td className="px-4 py-2 text-neutral-400">
+                      {d.not_after === 0 ? '—' : remaining(d.not_after)}
+                    </td>
+                    <td className="px-4 py-2">
+                      {d.live ? (
+                        <span className="text-teal-300">live</span>
+                      ) : (
+                        // Shown rather than filtered away: "never delegated"
+                        // and "delegated, and the issuer is gone" are
+                        // different states calling for different actions.
+                        <span className="text-neutral-500">lapsed</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+                {data.delegations.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-6 text-neutral-500">
+                      No keys have been delegated into this network.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-xs text-neutral-500">
+            Answered by {data.device}. Delegations reach every member, so any
+            attached node speaks for the whole network — and only the issuing
+            node can add or revoke one.
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
+/// How long is left, in the coarsest unit that is still true.
+function remaining(at: number): string {
+  const secs = Math.floor(at / 1e9 - Date.now() / 1000)
+  if (secs <= 0) return 'expired'
+  const days = Math.floor(secs / 86400)
+  if (days > 0) return `${days}d`
+  const hours = Math.floor(secs / 3600)
+  if (hours > 0) return `${hours}h`
+  return `${Math.max(1, Math.floor(secs / 60))}m`
 }
 
 function DeviceTable({

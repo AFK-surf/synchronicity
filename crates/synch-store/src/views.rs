@@ -6,8 +6,8 @@
 
 use rusqlite::{params, OptionalExtension};
 use synch_core::{
-    parse_blob_key, parse_file_key, AdState, BlobAd, EntryKind, FileEntry, Hash, OriginId,
-    MAX_PROVIDER_ADS,
+    now_ns, parse_blob_key, parse_delegation_key, parse_file_key, AdState, BlobAd, Delegation,
+    EntryKind, FileEntry, Hash, OriginId, MAX_PROVIDER_ADS,
 };
 use synch_mpt::{ChangeKind, ChangeView, Trie};
 
@@ -632,6 +632,33 @@ impl Store {
         Ok(out)
     }
 
+    /// True if any current entry in one of `spaces` names this content root.
+    ///
+    /// The content half of a delegated peer's scope (§3.5). Object roots carry
+    /// no space of their own — `GetSlice` is keyed by hash and nothing else —
+    /// so entitlement to the bytes is decided by whether a granted path names
+    /// them, which is what the `entries_by_content` index answers.
+    ///
+    /// Where the same content sits in both a granted and an undelegated space
+    /// the answer is yes, and rightly: the bytes are identical, and the
+    /// granted path is title to them.
+    pub fn content_in_spaces(&self, root: &Hash, spaces: &[String]) -> Result<bool> {
+        if spaces.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT DISTINCT space FROM entries WHERE content = ?1")?;
+        let rows = stmt.query_map(params![root.as_bytes().to_vec()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            if spaces.contains(&row?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Every row the scanner has recorded for a space.
     ///
     /// The full rows, not just the paths: startup reconciliation compares the
@@ -894,13 +921,19 @@ impl Txn<'_> {
         old_root: Hash,
         new_root: Hash,
     ) -> Result<usize> {
+        // Scoped exactly as the fetch that filled this trie was: a node
+        // reading under a scope holds only that part, and materializing what
+        // it does not hold is not a thing it could do (§5.5). For this node's
+        // *own* origin the scope is the whole keyspace, whose trie it built.
+        let scope = self.materialization_scope(origin)?;
+        let now = now_ns();
         // Streamed, not collected. The walk's position ceiling bounds how many
         // changes there can be and says nothing about how large each one is, so
         // building the whole resolved set first meant holding every changed
         // value in memory at once — inside the transaction the head flip runs
         // in ([`Trie::for_each_resolved_change`]).
-        Trie::new(self).for_each_resolved_change(old_root, new_root, |change| {
-            apply_change(self.conn(), origin, &change)
+        Trie::new(self).for_each_resolved_change_scoped(old_root, new_root, &scope, |change| {
+            apply_change(self.conn(), origin, &change, now)
         })
     }
 
@@ -946,6 +979,7 @@ fn apply_change(
     tx: &rusqlite::Connection,
     origin: &OriginId,
     change: &ChangeView<'_>,
+    now: i64,
 ) -> Result<()> {
     let key = change.key;
     if key.first() == Some(&synch_core::record::PREFIX_FILE) {
@@ -988,8 +1022,93 @@ fn apply_change(
                 put_provider_in(tx, &root, origin, &ad)?;
             }
         }
+    } else if key.first() == Some(&synch_core::record::PREFIX_DELEGATION) {
+        // A delegation materializes into the trust table, exactly as an `f:`
+        // record materializes into `entries` — derived state, never
+        // independent, written in the same transaction as the head flip so
+        // that a crash cannot leave what this node trusts disagreeing with the
+        // trie it read the trust from.
+        let Ok(subject) = parse_delegation_key(key) else {
+            tracing::debug!(origin = %origin, "skipping unparseable d: key");
+            return Ok(());
+        };
+        match change.kind {
+            ChangeKind::Deleted => {
+                // Revocation is deletion: the key vanished from the issuer's
+                // new root and the binding goes with it.
+                delete_delegation_in(tx, origin, &subject)?;
+            }
+            _ => {
+                let bytes = change.new.expect("non-delete change has a value");
+                // Fail closed where `f:` and `b:` fail open. A file entry that
+                // will not decode loses a row; a delegation that will not
+                // decode would otherwise grant whatever was assumed of it, so
+                // a malformed one is treated as no delegation at all — and the
+                // stale row, if any, is removed rather than left standing.
+                let ok = postcard::from_bytes::<Delegation>(bytes)
+                    .ok()
+                    .filter(|d| d.is_well_formed());
+                match ok {
+                    Some(delegation) => put_delegation_in(tx, origin, &subject, &delegation, now)?,
+                    None => {
+                        tracing::warn!(
+                            origin = %origin,
+                            subject = %subject.fmt_short(),
+                            "ignoring a malformed delegation record"
+                        );
+                        delete_delegation_in(tx, origin, &subject)?;
+                    }
+                }
+            }
+        }
     }
     // `m:` records are read straight from the trie; they have no derived view.
+    Ok(())
+}
+
+/// Writes one delegated binding, on whichever connection is handed in.
+fn put_delegation_in(
+    tx: &rusqlite::Connection,
+    issuer: &OriginId,
+    subject: &synch_core::NodeId,
+    delegation: &Delegation,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO bindings (origin_id, node_id, source, domain, issuer, spaces, note, added_at, expires_at)
+         VALUES (?1, ?2, 'delegated', '', ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(origin_id, node_id, source, domain, issuer) DO UPDATE SET
+           spaces = excluded.spaces,
+           note = excluded.note,
+           expires_at = excluded.expires_at",
+        rusqlite::params![
+            OriginId::Key(*subject).canonical(),
+            subject.as_bytes().to_vec(),
+            issuer.canonical(),
+            crate::bindings::encode_spaces(&delegation.spaces),
+            delegation.note,
+            now,
+            delegation.not_after,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Drops the delegated binding one issuer made for one subject.
+fn delete_delegation_in(
+    tx: &rusqlite::Connection,
+    issuer: &OriginId,
+    subject: &synch_core::NodeId,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM bindings WHERE origin_id = ?1 AND node_id = ?2
+           AND source = 'delegated' AND issuer = ?3",
+        rusqlite::params![
+            OriginId::Key(*subject).canonical(),
+            subject.as_bytes().to_vec(),
+            issuer.canonical()
+        ],
+    )?;
     Ok(())
 }
 

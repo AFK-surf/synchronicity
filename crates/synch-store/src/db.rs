@@ -796,6 +796,14 @@ impl NodeStore for Txn<'_> {
     fn has_value(&self, hash: &Hash) -> Result<bool> {
         has_value_in(self.conn(), hash)
     }
+
+    fn is_redacted(&self, hash: &Hash) -> Result<bool> {
+        is_redacted_in(self.conn(), hash)
+    }
+
+    fn note_redacted(&self, hash: &Hash) -> Result<()> {
+        note_redacted_in(self.conn(), hash)
+    }
 }
 
 // ---- migrations ------------------------------------------------------------
@@ -923,6 +931,20 @@ impl NodeStore for Store {
         roots.insert(*root);
         Ok(())
     }
+
+    /// Redaction is durable, unlike the completeness memo above.
+    ///
+    /// A boundary a peer reported is the answer to "may I see this?", and that
+    /// answer outlives the process: forgetting it across a restart puts the
+    /// walk back to asking for what it will be refused, once per round, until
+    /// §5.2's abandonment clause retires a head that was never incomplete.
+    fn is_redacted(&self, hash: &Hash) -> Result<bool> {
+        is_redacted_in(&self.conn(), hash)
+    }
+
+    fn note_redacted(&self, hash: &Hash) -> Result<()> {
+        note_redacted_in(&self.conn(), hash)
+    }
 }
 
 impl Store {
@@ -1035,6 +1057,25 @@ fn has_value_in(conn: &Connection, hash: &Hash) -> Result<bool> {
         .is_some())
 }
 
+fn is_redacted_in(conn: &Connection, hash: &Hash) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM redacted_nodes WHERE hash = ?1",
+            params![hash.as_bytes().to_vec()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn note_redacted_in(conn: &Connection, hash: &Hash) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO redacted_nodes (hash) VALUES (?1)",
+        params![hash.as_bytes().to_vec()],
+    )?;
+    Ok(())
+}
+
 /// Reads a 32-byte hash column.
 pub(crate) fn hash_column(bytes: Vec<u8>, column: &'static str) -> Result<Hash> {
     Hash::from_slice(&bytes).map_err(|_| StoreError::column(column, "not 32 bytes"))
@@ -1077,6 +1118,43 @@ mod tests {
         assert_eq!(store.config("hello").unwrap().as_deref(), Some("world"));
         assert!(dir.path().join(DB_FILE).exists());
         assert!(dir.path().join(CAS_DIR).is_dir());
+    }
+
+    /// A refusal is remembered by the durable store, through either handle and
+    /// across a reopen (§5.5).
+    ///
+    /// [`NodeStore::is_redacted`] carries a default that remembers nothing,
+    /// which is right for `MemStore` and wrong for this one: the fetch loop
+    /// records a boundary through the `Store` and the walk reads it back
+    /// through a `Txn`, so a missing implementation on either side is not a
+    /// compile error but a walk that asks for the same refused node every
+    /// round until §5.2's abandonment clause retires a head that was complete.
+    #[test]
+    fn a_refusal_is_remembered_by_both_handles_and_across_a_reopen() {
+        use synch_mpt::NodeStore;
+        let dir = tempfile::tempdir().unwrap();
+        let withheld = Hash::new(b"withheld");
+        let other = Hash::new(b"other");
+        {
+            let store = Store::open(dir.path()).unwrap();
+            assert!(!store.is_redacted(&withheld).unwrap());
+            store.note_redacted(&withheld).unwrap();
+            assert!(store.is_redacted(&withheld).unwrap());
+            assert!(!store.is_redacted(&other).unwrap());
+            // Recorded through one handle, read back through the other.
+            store
+                .transaction(|txn| {
+                    assert!(txn.is_redacted(&withheld).unwrap());
+                    txn.note_redacted(&other)
+                })
+                .unwrap();
+            assert!(store.is_redacted(&other).unwrap());
+            // Noting one twice is not an error.
+            store.note_redacted(&withheld).unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.is_redacted(&withheld).unwrap());
+        assert!(store.is_redacted(&other).unwrap());
     }
 
     #[test]

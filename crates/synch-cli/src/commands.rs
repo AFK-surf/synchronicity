@@ -15,8 +15,8 @@ use synch_engine::{EntryRef, Node, NodeConfig};
 
 use crate::{
     cli::{
-        Cli, CloudCommand, Command, DaemonCommand, DomainCommand, KeyCommand, MirrorCommand,
-        PinCommand, SpaceCommand, TrustCommand,
+        Cli, CloudCommand, Command, DaemonCommand, DelegateCommand, DomainCommand, KeyCommand,
+        MirrorCommand, PinCommand, SpaceCommand, TrustCommand,
     },
     control::{proto::pb, transport, Client, Command as Cmd, Frame},
     daemon,
@@ -154,6 +154,22 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
                 key: key.clone(),
             }),
             TrustCommand::Ls => Cmd::TrustLs(pb::TrustLs {}),
+        },
+
+        Command::Delegate { command } => match command {
+            DelegateCommand::Add {
+                key,
+                spaces,
+                until,
+                note,
+            } => Cmd::DelegateAdd(pb::DelegateAdd {
+                key: key.clone(),
+                spaces: spaces.clone(),
+                until: until.clone(),
+                note: note.clone(),
+            }),
+            DelegateCommand::Rm { key } => Cmd::DelegateRm(pb::DelegateRm { key: key.clone() }),
+            DelegateCommand::Ls => Cmd::DelegateLs(pb::DelegateLs {}),
         },
 
         Command::Domain { command } => match command {

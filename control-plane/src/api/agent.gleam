@@ -47,7 +47,7 @@ fn ed25519_verify(message: BitArray, signature: BitArray, key: BitArray) -> Bool
 /// A mismatch is a refusal naming both versions, not a negotiation: protobuf
 /// keeps a field addition readable, but nothing makes a control plane that has
 /// not learnt a frame out of one that has.
-pub const protocol_version = 1
+pub const protocol_version = 2
 
 /// How long an attach nonce stays redeemable.
 const nonce_ttl = 60
@@ -135,11 +135,15 @@ pub type Ask {
   Beat
 }
 
-/// The three questions the tunnel can carry.
+/// The questions the tunnel can carry.
 pub type Question {
   Ls(space: String, path: String, cursor: String, all: Bool)
   Stat(space: String, path: String)
   Resolve(space: String, path: String, from: String)
+  /// Who the cluster admits on a delegation (DESIGN.md 3.5). Takes no
+  /// argument: delegations reach every member, so whichever node answers
+  /// speaks for the whole network.
+  Delegations
 }
 
 /// What a question is answered with.
@@ -152,6 +156,24 @@ pub type Answer {
     size: Int,
     seq: Int,
     holders: List(String),
+  )
+  Delegated(delegations: List(Delegation))
+}
+
+/// One delegated key, as the node reports it.
+///
+/// `live` is the node's own answer, not a date comparison this side can
+/// redo: derived trust dies with its source, so a grant whose issuer has been
+/// removed or has lapsed from DNS is dead well before `not_after`.
+pub type Delegation {
+  Delegation(
+    key: String,
+    issuer: String,
+    spaces: List(String),
+    live: Bool,
+    not_after: Int,
+    added_at: Int,
+    note: String,
   )
 }
 
@@ -534,6 +556,7 @@ fn incoming(
     Ok("page"), Live(_) -> answered(state, body, page_decoder())
     Ok("versions"), Live(_) -> answered(state, body, versions_decoder())
     Ok("resolved"), Live(_) -> answered(state, body, resolved_decoder())
+    Ok("delegations"), Live(_) -> answered(state, body, delegations_decoder())
     Ok("meta"), Live(_) -> streamed(state, body, meta_decoder())
     Ok("done"), Live(_) -> streamed(state, body, done_decoder())
     Ok("err"), Live(_) -> streamed(state, body, error_decoder())
@@ -997,6 +1020,11 @@ fn question_json(id: Int, question: Question) -> Json {
           value -> json.string(value)
         }),
       ])
+    Delegations ->
+      json.object([
+        #("t", json.string("delegations")),
+        #("id", json.int(id)),
+      ])
   }
 }
 
@@ -1082,6 +1110,34 @@ fn resolved_decoder() -> Decoder(#(Int, Answer)) {
   decode.success(#(id, Resolved(origin, root, size, seq, holders)))
 }
 
+fn delegation_decoder() -> Decoder(Delegation) {
+  use key <- decode.field("key", decode.string)
+  use issuer <- decode.field("issuer", decode.string)
+  use spaces <- decode.field("spaces", decode.list(decode.string))
+  use live <- decode.field("live", decode.bool)
+  use not_after <- decode.optional_field("not_after", 0, nullable_int())
+  use added_at <- decode.field("added_at", decode.int)
+  use note <- decode.optional_field("note", "", nullable_string())
+  decode.success(Delegation(
+    key,
+    issuer,
+    spaces,
+    live,
+    not_after,
+    added_at,
+    note,
+  ))
+}
+
+fn delegations_decoder() -> Decoder(#(Int, Answer)) {
+  use id <- decode.field("id", decode.int)
+  use delegations <- decode.field(
+    "delegations",
+    decode.list(delegation_decoder()),
+  )
+  decode.success(#(id, Delegated(delegations)))
+}
+
 fn meta_decoder() -> Decoder(#(Int, Event)) {
   use id <- decode.field("id", decode.int)
   use size <- decode.field("size", decode.int)
@@ -1104,6 +1160,11 @@ fn error_decoder() -> Decoder(#(Int, Event)) {
 /// A field the daemon may send as `null` rather than omit.
 fn nullable_string() -> Decoder(String) {
   decode.one_of(decode.string, [decode.success("")])
+}
+
+/// The same, for a numeric field: a delegation with no expiry reads as 0.
+fn nullable_int() -> Decoder(Int) {
+  decode.one_of(decode.int, [decode.success(0)])
 }
 
 // -- streaming a download ----------------------------------------------------

@@ -61,6 +61,22 @@ pub trait NodeStore {
     fn note_complete(&self, _root: &Hash) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    /// True if a peer has told this store it may not see the node `hash`.
+    ///
+    /// A scoped node needs to tell "absent" from "refused" (§5.5), and needs
+    /// to keep telling them apart across restarts: a completeness walk that
+    /// re-read a refused position as merely missing would never settle, and a
+    /// fetch would retry until its head was abandoned. The default remembers
+    /// nothing, which is right for a store that never asks for a scoped view.
+    fn is_redacted(&self, _hash: &Hash) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    /// Records that a peer refused to show the node `hash`.
+    fn note_redacted(&self, _hash: &Hash) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 impl<S: NodeStore + ?Sized> NodeStore for &S {
@@ -89,6 +105,12 @@ impl<S: NodeStore + ?Sized> NodeStore for &S {
     }
     fn note_complete(&self, root: &Hash) -> Result<(), Self::Error> {
         (**self).note_complete(root)
+    }
+    fn is_redacted(&self, hash: &Hash) -> Result<bool, Self::Error> {
+        (**self).is_redacted(hash)
+    }
+    fn note_redacted(&self, hash: &Hash) -> Result<(), Self::Error> {
+        (**self).note_redacted(hash)
     }
 }
 

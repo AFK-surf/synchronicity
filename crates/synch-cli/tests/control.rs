@@ -1984,6 +1984,8 @@ async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
                     node_id: peer_id,
                     source: synch_store::BindingSource::Static,
                     domain: None,
+                    issuer: None,
+                    spaces: Vec::new(),
                     note: None,
                     added_at: 0,
                     expires_at: None,

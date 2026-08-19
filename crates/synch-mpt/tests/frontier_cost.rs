@@ -92,11 +92,11 @@ fn a_fetch_reads_each_node_about_once() {
             walk.resume();
             continue;
         }
-        for hash in &missing.nodes {
+        for (_path, hash) in &missing.nodes {
             let bytes = source.get_node(hash).unwrap().expect("source has it");
             destination.put_node(hash, &bytes).unwrap();
         }
-        for hash in &missing.values {
+        for (_path, hash) in &missing.values {
             let bytes = source.get_value(hash).unwrap().expect("source has it");
             destination.put_value(hash, &bytes).unwrap();
         }

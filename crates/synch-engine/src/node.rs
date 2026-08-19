@@ -8,8 +8,8 @@ use std::{
 use iroh::EndpointAddr;
 use iroh_base::SecretKey;
 use synch_core::{
-    blob_key, file_key, manifest_key, now_ns, validate_space, BlobAd, Hash, NodeId, NodeManifest,
-    OriginId, SignedHead, SpaceInfo, SOFTWARE,
+    blob_key, file_key, manifest_key, now_ns, validate_space, BlobAd, Delegation, Hash, NodeId,
+    NodeManifest, OriginId, SignedHead, SpaceInfo, SOFTWARE,
 };
 use synch_mpt::Trie;
 use synch_net::Net;
@@ -33,6 +33,8 @@ fn self_binding(origin: &OriginId, node_id: NodeId, now: i64) -> Binding {
         node_id,
         source: BindingSource::Static,
         domain: None,
+        issuer: None,
+        spaces: Vec::new(),
         note: Some("self".into()),
         added_at: now,
         expires_at: None,
@@ -658,11 +660,158 @@ impl Node {
             node_id,
             source: BindingSource::Static,
             domain: None,
+            issuer: None,
+            spaces: Vec::new(),
             note: note.map(str::to_string),
             added_at: now_ns(),
             expires_at: None,
         })?;
         Ok(origin)
+    }
+
+    /// Delegates a device key into the cluster, confined to `spaces` (§3.5).
+    ///
+    /// Returns the staged `d:` record for the caller to publish. The
+    /// delegation is not a credential and nothing is handed to the subject:
+    /// it becomes real when this record reaches the members, which the
+    /// ordinary reactive push does within a round.
+    ///
+    /// Refused unless this node is itself rooted — static or DNS. That is the
+    /// one-level rule seen from the issuing side, and it is courtesy rather
+    /// than enforcement: no other node reads a delegation from an origin
+    /// without a live rooted binding, so a delegate publishing one would
+    /// merely be ignored. Failing here says so at the point an operator can
+    /// still do something about it.
+    pub fn delegate_add(
+        &self,
+        subject: NodeId,
+        spaces: &[String],
+        not_after: i64,
+        note: Option<&str>,
+    ) -> Result<StagedChange> {
+        if subject == self.node_id() {
+            return Err(EngineError::invalid(
+                "a node cannot delegate to its own device key",
+            ));
+        }
+        if self.is_delegated()? {
+            return Err(EngineError::invalid(
+                "this node is itself delegated, and a delegation may not be delegated onward; \
+                 no member would read the record",
+            ));
+        }
+        // `*` is a legal space id — nothing in `validate_space` forbids it —
+        // so a delegation naming it would quietly grant a space called `*`
+        // rather than every space. A closed list is the only thing a
+        // delegation can be, and a user reaching for a wildcard has to be told
+        // that rather than handed an empty grant.
+        if spaces.iter().any(|s| s == "*") {
+            return Err(EngineError::invalid(
+                "a delegation names spaces explicitly; there is no wildcard",
+            ));
+        }
+        let delegation = Delegation {
+            v: synch_core::RECORD_VERSION,
+            spaces: spaces.to_vec(),
+            not_after,
+            note: note.map(str::to_string),
+        };
+        if !delegation.is_well_formed() {
+            return Err(EngineError::invalid(format!(
+                "a delegation names between 1 and {} distinct valid spaces",
+                synch_core::MAX_DELEGATION_SPACES
+            )));
+        }
+        if not_after <= now_ns() {
+            return Err(EngineError::invalid(
+                "a delegation must expire in the future",
+            ));
+        }
+        let bytes =
+            postcard::to_stdvec(&delegation).map_err(|e| EngineError::Record(e.to_string()))?;
+        Ok((synch_core::delegation_key(&subject), Some(bytes)))
+    }
+
+    /// Withdraws a delegation this node issued (§3.5).
+    ///
+    /// Revocation is deletion: the `d:` key vanishes from the next root, and
+    /// tries being replicated whole means the diff surfaces the removal
+    /// everywhere it reaches — including to a peer partitioned for years
+    /// (§4.2). There is no revocation state to retain and nothing to expire.
+    pub fn delegate_remove(&self, subject: &NodeId) -> Result<StagedChange> {
+        let key = synch_core::delegation_key(subject);
+        let root = self.current_root()?;
+        let trie = Trie::new(self.store().as_ref());
+        if trie.get(root, &key)?.is_none() {
+            return Err(EngineError::NotFound(format!(
+                "this node has not delegated {}",
+                subject.fmt_short()
+            )));
+        }
+        Ok((key, None))
+    }
+
+    /// Every delegation this node currently honors, whoever issued it.
+    ///
+    /// After replication every member holds all of them, which is the
+    /// transitive-trust concession made legible: an operator can see from any
+    /// node exactly who was admitted, by whom, and to what.
+    pub fn delegations(&self) -> Result<Vec<Binding>> {
+        Ok(self.store().all_delegations()?)
+    }
+
+    /// True if this node is itself in the cluster on a delegation (§3.5).
+    ///
+    /// Asked of the two facts a node can actually observe about itself: that
+    /// some origin has delegated its device key, and that a peer has declared
+    /// a read scope for it. A node's *own* binding says nothing — every node
+    /// statically trusts itself at `init`, so "am I rooted?" reads true
+    /// everywhere and would answer this question wrongly for exactly the nodes
+    /// it is asked about.
+    ///
+    /// Courtesy, not enforcement. The rule that matters is the one every other
+    /// node applies without asking: a `d:` record is read only from an origin
+    /// holding a live *rooted* binding there, so a delegate's records are
+    /// honored by nobody whatever it publishes. This is what makes the command
+    /// say so instead of reporting a success that means nothing.
+    pub fn is_delegated(&self) -> Result<bool> {
+        // A live delegation of this node's own key is the authoritative
+        // answer, because it came out of a signed trie. The adopted read scope
+        // is only the bootstrap — what a delegate has before it has replicated
+        // the record naming it — so it answers only when there is no record to
+        // read, and stops answering the moment one says otherwise.
+        let own = self.node_id();
+        if self
+            .store()
+            .delegations(now_ns())?
+            .into_iter()
+            .any(|b| b.node_id == own)
+        {
+            return Ok(true);
+        }
+        Ok(self.store().has_delegations()? && self.store().local_scope()?.is_some())
+    }
+
+    /// Rebinds a named origin to a new device key, the static-trust equivalent
+    /// of a DNS rotation (§3.4).
+    pub fn trust_rebind(&self, origin: &OriginId, node_id: NodeId) -> Result<()> {
+        if origin.as_key().is_some() {
+            return Err(EngineError::invalid(
+                "key-identified origins cannot rotate; re-add under a name instead",
+            ));
+        }
+        self.store().put_binding(&Binding {
+            origin: origin.clone(),
+            node_id,
+            source: BindingSource::Static,
+            domain: origin.domain().map(str::to_string),
+            issuer: None,
+            spaces: Vec::new(),
+            note: None,
+            added_at: now_ns(),
+            expires_at: None,
+        })?;
+        Ok(())
     }
 
     /// Records a peer's address so it can be dialed later.
@@ -760,6 +909,9 @@ impl Node {
         for (key, _) in trie.scan(root, &prefix, None, None)? {
             staged.push((key, None));
         }
+        // The space's advertised record goes with its entries; leaving it
+        // would advertise a space this node no longer has.
+        staged.push(self.space_info_removal(id)?);
         self.store().remove_space(id)?;
         for path in self.store().local_files(id)? {
             self.store().remove_local_file(id, &path)?;
@@ -939,25 +1091,61 @@ impl Node {
     }
 
     /// Builds the `m:self` manifest record for this node (§4.2).
+    ///
+    /// Node-wide facts only. What this node advertises about each space is a
+    /// record of its own under `m:space/<id>`, because a leaf value cannot be
+    /// partly redacted and a single manifest listing every space would be
+    /// unshowable to a delegate (§5.5).
     pub fn manifest_change(&self) -> Result<StagedChange> {
-        let mut spaces = Vec::new();
-        for space in self.store().spaces()? {
-            let count = self.store().count_entries(self.origin(), &space.id)?;
-            spaces.push(SpaceInfo {
-                id: space.id,
-                description: space.local_path,
-                entry_count: count,
-            });
-        }
         let manifest = NodeManifest {
             v: synch_core::RECORD_VERSION,
             name: self.inner.config.name.clone(),
-            spaces,
             software: SOFTWARE.to_string(),
         };
         let bytes =
             postcard::to_stdvec(&manifest).map_err(|e| EngineError::Record(e.to_string()))?;
         Ok((manifest_key(), Some(bytes)))
+    }
+
+    /// Builds the `m:space/<id>` records for this node's spaces (§4.2, §5.5).
+    pub fn space_info_changes(&self) -> Result<Vec<StagedChange>> {
+        let mut out = Vec::new();
+        for space in self.store().spaces()? {
+            let entry_count = self.store().count_entries(self.origin(), &space.id)?;
+            let info = SpaceInfo {
+                v: synch_core::RECORD_VERSION,
+                description: space.local_path,
+                entry_count,
+            };
+            let bytes =
+                postcard::to_stdvec(&info).map_err(|e| EngineError::Record(e.to_string()))?;
+            out.push((synch_core::space_info_key(&space.id)?, Some(bytes)));
+        }
+        Ok(out)
+    }
+
+    /// The tombstone that removes one space's advertised record.
+    pub fn space_info_removal(&self, space: &str) -> Result<StagedChange> {
+        Ok((synch_core::space_info_key(space)?, None))
+    }
+
+    /// Reads what an origin publishes about one space (§4.2, §5.5).
+    ///
+    /// `None` for a space the origin does not advertise. Reading under a scope
+    /// this space falls outside of is a different answer: the subtree was never
+    /// served, so the lookup fails rather than reporting an absence — which is
+    /// the distinction a scoped node has to keep (§5.5).
+    pub fn space_info_of(&self, origin: &OriginId, space: &str) -> Result<Option<SpaceInfo>> {
+        let Some(head) = self.store().complete_head(origin)? else {
+            return Ok(None);
+        };
+        let trie = Trie::new(self.store().as_ref());
+        let Some(bytes) = trie.get(head.root, &synch_core::space_info_key(space)?)? else {
+            return Ok(None);
+        };
+        postcard::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|e| EngineError::Record(e.to_string()))
     }
 
     /// Reads an origin's published manifest.
@@ -1452,13 +1640,32 @@ mod tests {
         let node = spawn(dir.path(), None).await;
         let space = tempfile::tempdir().unwrap();
         node.add_space("media", space.path()).unwrap();
-        let change = node.manifest_change().unwrap();
-        node.publish(&[change]).unwrap().unwrap();
+        let mut staged = vec![node.manifest_change().unwrap()];
+        staged.extend(node.space_info_changes().unwrap());
+        node.publish(&staged).unwrap().unwrap();
 
         let manifest = node.manifest_of(node.origin()).unwrap().unwrap();
         assert_eq!(manifest.software, SOFTWARE);
-        assert_eq!(manifest.spaces.len(), 1);
-        assert_eq!(manifest.spaces[0].id, "media");
+        // What the node advertises about a space is its own record, so that it
+        // can be shown to a peer delegated that space and withheld from one
+        // that was not (§5.5).
+        let info = node.space_info_of(node.origin(), "media").unwrap().unwrap();
+        // Against what the store recorded, not against the path handed to
+        // `add_space`: roots are canonicalized on the way in, and on macOS a
+        // temporary directory canonicalizes from `/var` to `/private/var`.
+        let recorded = node
+            .store()
+            .spaces()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "media")
+            .unwrap()
+            .local_path;
+        assert_eq!(info.description, recorded);
+        assert!(node
+            .space_info_of(node.origin(), "absent")
+            .unwrap()
+            .is_none());
         node.shutdown().await.unwrap();
     }
 
@@ -1630,10 +1837,22 @@ mod tests {
             .is_none());
 
         // And a publish after it still works, from the head that survived.
-        let after = node
-            .publish(&[node.manifest_change().unwrap()])
-            .unwrap()
-            .unwrap();
+        // A well-formed record this time, and one that actually changes the
+        // trie: `publish` reports no head for a batch that leaves the root
+        // where it was.
+        let good = vec![(
+            file_key("media", "b.txt").unwrap(),
+            Some(
+                postcard::to_stdvec(&synch_core::FileEntry::file(
+                    5,
+                    now_ns(),
+                    synch_core::Hash::new(b"hello"),
+                    before.seq + 1,
+                ))
+                .unwrap(),
+            ),
+        )];
+        let after = node.publish(&good).unwrap().unwrap();
         assert_eq!(after.seq, before.seq + 1);
         node.shutdown().await.unwrap();
     }

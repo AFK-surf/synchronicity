@@ -410,6 +410,8 @@ fn introduce(peers: &[&Peer]) {
                     node_id: b.node.node_id(),
                     source: BindingSource::Static,
                     domain: None,
+                    issuer: None,
+                    spaces: Vec::new(),
                     note: None,
                     added_at: 0,
                     expires_at: None,

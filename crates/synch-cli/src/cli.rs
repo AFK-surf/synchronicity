@@ -187,6 +187,12 @@ pub enum Command {
         #[command(subcommand)]
         command: TrustCommand,
     },
+    /// Delegate space-restricted access to another node's key.
+    Delegate {
+        /// The delegate subcommand.
+        #[command(subcommand)]
+        command: DelegateCommand,
+    },
     /// DNSSEC membership domains.
     Domain {
         /// The domain subcommand.
@@ -399,6 +405,32 @@ pub enum TrustCommand {
         key: Option<String>,
     },
     /// List bindings.
+    Ls,
+}
+
+/// `synch delegate ...`
+#[derive(Debug, Subcommand)]
+pub enum DelegateCommand {
+    /// Delegate a device key into the cluster, confined to the named spaces.
+    Add {
+        /// The subject's z-base-32 device key.
+        key: String,
+        /// A space the delegation covers. Repeat for more than one.
+        #[arg(long = "space", required = true)]
+        spaces: Vec<String>,
+        /// How long the delegation lasts, e.g. `7d`. Default 30d.
+        #[arg(long)]
+        until: Option<String>,
+        /// A note for `trust ls` and `doctor`.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Withdraw a delegation this node issued.
+    Rm {
+        /// The subject's z-base-32 device key.
+        key: String,
+    },
+    /// List every delegation this node honors, whoever issued it.
     Ls,
 }
 

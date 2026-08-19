@@ -171,6 +171,8 @@ pub(crate) fn trust(store: &synch_store::Store, key: synch_core::NodeId) {
             node_id: key,
             source: synch_store::BindingSource::Static,
             domain: None,
+            issuer: None,
+            spaces: Vec::new(),
             note: None,
             added_at: 0,
             expires_at: None,

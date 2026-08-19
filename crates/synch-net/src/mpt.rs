@@ -14,9 +14,9 @@ use iroh::{
 };
 use synch_core::{
     now_ns, BlobAd, Hash, HeadSummary, MptMessage, NodeId, OriginId, SignedHead, MAX_BATCH,
-    MAX_HEADS_PER_MESSAGE, MAX_PROVIDER_ADS, PROTO_VERSION,
+    MAX_BATCH_PATH_BYTES, MAX_HEADS_PER_MESSAGE, MAX_PROVIDER_ADS, PROTO_VERSION,
 };
-use synch_mpt::NodeStore;
+use synch_mpt::{NodeStore, Trie, TrieNode};
 use synch_store::Store;
 
 use crate::{
@@ -190,7 +190,7 @@ impl MptProtocol {
     ) -> Result<(), NetError> {
         let request: MptMessage = read_frame(recv).await?;
         match request {
-            MptMessage::Hello { proto, heads } => {
+            MptMessage::Hello { proto, heads, .. } => {
                 if proto != PROTO_VERSION {
                     return Err(NetError::Unexpected(format!(
                         "unsupported protocol version {proto}"
@@ -205,9 +205,14 @@ impl MptProtocol {
                 // whole — a walk on the first ask for a root, memoized after —
                 // so the pair runs on the blocking pool (§5.1).
                 let sink = self.heads.clone();
-                let ours = crate::blocking::offload(move || {
+                let store = self.store().clone();
+                let (ours, scope) = crate::blocking::offload(move || {
                     sink.observe_summaries_from(peer, &heads, now_ns())?;
-                    sink.local_summaries()
+                    let summaries = sink.local_summaries()?;
+                    // What this node will serve that peer, so a delegated one
+                    // can learn the scope it is about to walk under (§5.5).
+                    let scope = store.publish_scope_of_key(&peer, now_ns())?;
+                    Ok((summaries, scope))
                 })
                 .await?;
                 write_frame(
@@ -215,6 +220,7 @@ impl MptProtocol {
                     &MptMessage::Hello {
                         proto: PROTO_VERSION,
                         heads: ours,
+                        scope,
                     },
                 )
                 .await?;
@@ -272,12 +278,15 @@ impl MptProtocol {
             // Both batch reads run on the blocking pool: `MAX_BATCH` row reads
             // out of SQLite is a bounded amount of work, but not a small one,
             // and a cold store answers them from disk.
-            MptMessage::GetNodes { hashes } => {
-                check_batch(hashes.len())?;
+            MptMessage::GetNodes { root, wants } => {
+                check_wants(&wants)?;
                 let store = self.store().clone();
-                let (nodes, missing) = crate::blocking::offload(move || {
+                let (nodes, missing, redacted) = crate::blocking::offload(move || {
+                    let scope = store.scope_for_key(&peer, now_ns())?;
+                    let admitted = admit(&store, peer, root, &wants)?;
                     let mut nodes = Vec::new();
                     let mut missing = Vec::new();
+                    let mut redacted = Vec::new();
                     let mut budget = ANSWER_BYTE_BUDGET;
                     // One answer per *distinct* hash. A requester may only ask
                     // once — `take_served` refuses a repeated payload as a
@@ -286,42 +295,71 @@ impl MptProtocol {
                     // hostile for a fault on the asking side. Deduplicating
                     // here also stops a repeated hash from turning one bounded
                     // batch into `MAX_BATCH` copies of the same payload.
+                    //
+                    // After `admit`, never instead of it: the request is
+                    // authorized by position and only then deduplicated by what
+                    // those positions resolved to.
                     let mut answered = std::collections::HashSet::new();
-                    for hash in hashes {
-                        if !answered.insert(hash) {
+                    for (at, (path, claimed)) in admitted.into_iter().zip(wants.iter()) {
+                        if !answered.insert(*claimed) {
                             continue;
                         }
-                        match store.get_node(&hash)? {
-                            Some(data) => {
-                                // A short answer is an ordinary answer: the
-                                // requester's walk defers everything it asked
-                                // for and re-offers what did not come back
-                                // (`MissingWalk::resume`). What is not ordinary
-                                // is discovering the frame is too large *after*
-                                // building it — `write_frame` serializes the
-                                // whole message before it can check
-                                // `MAX_FRAME_LEN`, so the cap has to be applied
-                                // while the answer is being assembled.
-                                match budget.checked_sub(data.len()) {
-                                    Some(left) => {
-                                        budget = left;
-                                        nodes.push((hash, data));
-                                    }
-                                    None if nodes.is_empty() => nodes.push((hash, data)),
-                                    None => break,
-                                }
+                        // A position holding nothing is reported against the
+                        // hash the caller named, so an honest walk sees the
+                        // ordinary `missing` it already handles.
+                        let Some(hash) = at else {
+                            missing.push(*claimed);
+                            continue;
+                        };
+                        let Some(data) = store.get_node(&hash)? else {
+                            missing.push(hash);
+                            continue;
+                        };
+                        // Position admits the node; what the node *reveals* may
+                        // still run out of scope. A compressed node carries key
+                        // material of its own — an extension's prefix, a leaf's
+                        // remaining key and value — and one sitting on the spine
+                        // can describe a key range the peer was never granted.
+                        if !scope.is_full()
+                            && !TrieNode::decode(&data)
+                                .map(|node| scope.admits_node(path, &node))
+                                .unwrap_or(false)
+                        {
+                            redacted.push(hash);
+                            continue;
+                        }
+                        // A short answer is an ordinary answer: the requester's
+                        // walk defers everything it asked for and re-offers what
+                        // did not come back (`MissingWalk::resume`). What is not
+                        // ordinary is discovering the frame is too large *after*
+                        // building it — `write_frame` serializes the whole
+                        // message before it can check `MAX_FRAME_LEN`, so the
+                        // cap has to be applied while the answer is assembled.
+                        match budget.checked_sub(data.len()) {
+                            Some(left) => {
+                                budget = left;
+                                nodes.push((hash, data));
                             }
-                            None => missing.push(hash),
+                            None if nodes.is_empty() => nodes.push((hash, data)),
+                            None => break,
                         }
                     }
-                    Ok((nodes, missing))
+                    Ok((nodes, missing, redacted))
                 })
                 .await?;
-                write_frame(send, &MptMessage::Nodes { nodes, missing }).await?;
+                write_frame(
+                    send,
+                    &MptMessage::Nodes {
+                        nodes,
+                        missing,
+                        redacted,
+                    },
+                )
+                .await?;
                 Ok(())
             }
-            MptMessage::GetValues { hashes } => {
-                check_batch(hashes.len())?;
+            MptMessage::GetValues { root, wants } => {
+                check_wants(&wants)?;
                 // Bounded in bytes as well as in count, and *here*. The count
                 // cap alone was never a cost cap: a value is arbitrary bytes,
                 // so `MAX_BATCH` of them is whatever the origin that published
@@ -332,29 +370,56 @@ impl MptProtocol {
                 // below is what keeps even a full batch of them inside a frame.
                 let store = self.store().clone();
                 let (values, missing) = crate::blocking::offload(move || {
+                    // A value is authorized by the position of the node that
+                    // holds it: resolve that node, and serve the value only if
+                    // the node genuinely carries it. Without the second half a
+                    // scoped peer could name an in-scope node and any value
+                    // hash it liked.
+                    //
+                    // For an unscoped peer there is nothing to authorize — any
+                    // payload this store holds may go — so it is answered by
+                    // hash exactly as it always was, and the descent that finds
+                    // the holder is not paid for at all.
+                    let holders = match store.scope_for_key(&peer, now_ns())?.is_full() {
+                        true => None,
+                        false => Some(admit(&store, peer, root, &wants)?),
+                    };
                     let mut values = Vec::new();
                     let mut missing = Vec::new();
                     let mut budget = ANSWER_BYTE_BUDGET;
                     // One answer per distinct hash, as `GetNodes` above.
                     let mut answered = std::collections::HashSet::new();
-                    for hash in hashes {
-                        if !answered.insert(hash) {
+                    for (i, wanted) in wants.iter().enumerate() {
+                        if !answered.insert(wanted.1) {
                             continue;
                         }
-                        match store.get_value(&hash)? {
+                        if let Some(holders) = &holders {
+                            let carried =
+                                match holders[i].map(|h| store.get_node(&h)).transpose()? {
+                                    Some(Some(data)) => TrieNode::decode(&data)
+                                        .map(|node| node.value_hashes().contains(&wanted.1))
+                                        .unwrap_or(false),
+                                    _ => false,
+                                };
+                            if !carried {
+                                missing.push(wanted.1);
+                                continue;
+                            }
+                        }
+                        match store.get_value(&wanted.1)? {
                             Some(data) => match budget.checked_sub(data.len()) {
                                 Some(left) => {
                                     budget = left;
-                                    values.push((hash, data));
+                                    values.push((wanted.1, data));
                                 }
                                 // One payload always goes, whatever its size:
                                 // a stored value larger than the whole budget
                                 // predates the ceiling, and answering nothing
                                 // would stall the requester's walk forever.
-                                None if values.is_empty() => values.push((hash, data)),
+                                None if values.is_empty() => values.push((wanted.1, data)),
                                 None => break,
                             },
-                            None => missing.push(hash),
+                            None => missing.push(wanted.1),
                         }
                     }
                     Ok((values, missing))
@@ -412,6 +477,89 @@ impl MptProtocol {
 /// Half a frame, so the postcard framing and the `missing` list have room and a
 /// short answer is never produced for lack of a few hundred bytes.
 const ANSWER_BYTE_BUDGET: usize = synch_core::MAX_FRAME_LEN / 2;
+
+/// Resolves a batch of claimed positions and returns what stands at each,
+/// refusing the whole request if any position lies outside the peer's scope.
+///
+/// This is where a scoped peer's view is enforced (§5.5). The peer says where it
+/// believes a node sits; this descends from a root *this* node holds and
+/// reports what is really there, so a fabricated root fails at the first step
+/// and a lie about the position simply resolves to whatever is genuinely at
+/// the path named — which is in scope by construction.
+///
+/// An out-of-scope position is refused rather than answered `missing`, because
+/// it is not a race: an honest peer prunes its own frontier at the boundary
+/// and never asks. A request that crosses it is a probe, and saying so is
+/// worth more than quietly returning nothing.
+fn admit(
+    store: &Store,
+    peer: NodeId,
+    root: Hash,
+    wants: &[(Vec<u8>, Hash)],
+) -> Result<Vec<Option<Hash>>, NetError> {
+    let scope = store.scope_for_key(&peer, now_ns())?;
+    if scope.is_full() {
+        // Nothing to authorize: an unscoped peer may have any node this store
+        // holds, so the request is answered by hash exactly as it always was
+        // and the position it carried is not consulted.
+        return Ok(wants.iter().map(|(_, claimed)| Some(*claimed)).collect());
+    }
+    // The position is only meaningful relative to a trie this node vouches
+    // for. Given a root of the caller's choosing, the empty path resolves to
+    // that root itself and every position below it is whatever the caller put
+    // there — so authorization by position would authorize nothing at all.
+    if !store.is_head_root(&root)? {
+        tracing::warn!(
+            peer = %peer.fmt_short(),
+            "refusing a trie request against a root this node holds no head for"
+        );
+        return Err(NetError::Unexpected(
+            "requested positions against a root this node holds no head for".to_string(),
+        ));
+    }
+    for (path, _) in wants {
+        if !scope.admits_path(path) {
+            tracing::warn!(
+                peer = %peer.fmt_short(),
+                "refusing a trie request outside the peer's scope"
+            );
+            return Err(NetError::Unexpected(
+                "requested a trie position outside this peer's scope".to_string(),
+            ));
+        }
+    }
+    // For a scoped peer the position is the *only* authorization, so what is
+    // served is what the descent found and never what the request claimed.
+    //
+    // The distinction is the whole of the boundary. A delegate necessarily
+    // holds the hash of every subtree withheld from it — the hash is inside the
+    // branch node that makes the signed root recompute — so falling back to the
+    // claimed hash where a position resolves to nothing would hand over any of
+    // them for the price of naming an in-scope position that happens to be
+    // empty. A position that resolves to nothing holds nothing, and that is the
+    // answer.
+    let paths: Vec<Vec<u8>> = wants.iter().map(|(path, _)| path.clone()).collect();
+    Ok(Trie::new(store).resolve_paths(root, &paths)?)
+}
+
+/// Bounds one positioned batch on both axes.
+///
+/// The count is capped while decoding, like every other sequence on this wire.
+/// The *paths* are not, and they are the axis that began mattering when these
+/// requests started carrying positions: a responder descends every path it is
+/// handed, so [`MAX_BATCH`] maximal ones would be megabytes of request for
+/// megabytes of walking (§12). A real walk's batch shares nearly all of its
+/// prefixes and comes nowhere near this.
+fn check_wants(wants: &[(Vec<u8>, Hash)]) -> Result<(), NetError> {
+    check_batch(wants.len())?;
+    let bytes: usize = wants.iter().map(|(path, _)| path.len()).sum();
+    if bytes > MAX_BATCH_PATH_BYTES {
+        return Err(NetError::Unexpected(format!(
+            "batch carries {bytes} path bytes, over the {MAX_BATCH_PATH_BYTES} limit"
+        )));
+    }
+    Ok(())
+}
 
 /// A backstop behind the decode-time bound.
 ///
@@ -483,6 +631,12 @@ pub struct NodesResponse {
     pub nodes: Vec<(Hash, Vec<u8>)>,
     /// The hashes the responder did not have.
     pub missing: Vec<Hash>,
+    /// The hashes the responder holds and may not show (§5.5).
+    ///
+    /// A boundary rather than an absence: there is nothing here for this node
+    /// ever, so asking again is pointless and treating it as absent would have
+    /// the walk retry until its head was abandoned.
+    pub redacted: Vec<Hash>,
 }
 
 /// A `Values` response.
@@ -503,6 +657,8 @@ pub struct HeadExchange {
     pub pushed: usize,
     /// The signed heads the peer sent in response to our want list.
     pub received: Vec<SignedHead>,
+    /// The spaces the peer says it will serve us, or `None` for everything.
+    pub scope: Option<Vec<String>>,
 }
 
 /// A client for the `sync/mpt/1` ALPN, over one established connection.
@@ -547,6 +703,7 @@ impl MptClient {
     pub async fn head_exchange<F>(
         &self,
         ours: Vec<HeadSummary>,
+        declared: Option<Vec<String>>,
         decide: F,
     ) -> Result<HeadExchange, NetError>
     where
@@ -559,19 +716,24 @@ impl MptClient {
                 &MptMessage::Hello {
                     proto: PROTO_VERSION,
                     heads: ours,
+                    scope: declared,
                 },
             )
             .await?;
 
-            let summaries = match read_frame::<MptMessage>(&mut recv).await? {
-                MptMessage::Hello { proto, heads } => {
+            let (summaries, scope) = match read_frame::<MptMessage>(&mut recv).await? {
+                MptMessage::Hello {
+                    proto,
+                    heads,
+                    scope,
+                } => {
                     if proto != PROTO_VERSION {
                         return Err(NetError::Unexpected(format!(
                             "unsupported protocol version {proto}"
                         )));
                     }
                     check_heads(heads.len(), "a Hello summary list")?;
-                    heads
+                    (heads, scope)
                 }
                 // A responder that refuses says why, and the reason is the
                 // error — reading it as a shape mismatch loses the only account
@@ -607,6 +769,7 @@ impl MptClient {
                 summaries,
                 pushed,
                 received,
+                scope,
             })
         })
         .await
@@ -633,18 +796,27 @@ impl MptClient {
     /// outright, so a caller that oversteps loses the whole batch rather than
     /// the tail of it. `MissingWalk::next_batch` is the only caller and stops at
     /// the cap.
-    pub async fn get_nodes(&self, hashes: &[Hash]) -> Result<NodesResponse, NetError> {
-        debug_assert!(
-            hashes.len() <= MAX_BATCH,
-            "a batch past the responder's cap"
-        );
-        let batch: Vec<Hash> = hashes.to_vec();
+    pub async fn get_nodes(
+        &self,
+        root: Hash,
+        wants: &[(Vec<u8>, Hash)],
+    ) -> Result<NodesResponse, NetError> {
+        debug_assert!(wants.len() <= MAX_BATCH, "a batch past the responder's cap");
+        let batch: Vec<(Vec<u8>, Hash)> = wants.to_vec();
         under_deadline(self.deadline, "a trie node request", async {
             let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(&mut send, &MptMessage::GetNodes { hashes: batch }).await?;
+            write_frame(&mut send, &MptMessage::GetNodes { root, wants: batch }).await?;
             let _ = send.finish();
             match read_frame::<MptMessage>(&mut recv).await? {
-                MptMessage::Nodes { nodes, missing } => Ok(NodesResponse { nodes, missing }),
+                MptMessage::Nodes {
+                    nodes,
+                    missing,
+                    redacted,
+                } => Ok(NodesResponse {
+                    nodes,
+                    missing,
+                    redacted,
+                }),
                 MptMessage::Error { reason } => Err(NetError::Unexpected(reason)),
                 other => Err(unexpected("Nodes", &other)),
             }
@@ -655,15 +827,16 @@ impl MptClient {
     /// Fetches out-of-line trie values by hash.
     ///
     /// At most [`MAX_BATCH`] hashes, exactly as [`MptClient::get_nodes`].
-    pub async fn get_values(&self, hashes: &[Hash]) -> Result<ValuesResponse, NetError> {
-        debug_assert!(
-            hashes.len() <= MAX_BATCH,
-            "a batch past the responder's cap"
-        );
-        let batch: Vec<Hash> = hashes.to_vec();
+    pub async fn get_values(
+        &self,
+        root: Hash,
+        wants: &[(Vec<u8>, Hash)],
+    ) -> Result<ValuesResponse, NetError> {
+        debug_assert!(wants.len() <= MAX_BATCH, "a batch past the responder's cap");
+        let batch: Vec<(Vec<u8>, Hash)> = wants.to_vec();
         under_deadline(self.deadline, "a trie value request", async {
             let (mut send, mut recv) = self.connection.open_bi().await?;
-            write_frame(&mut send, &MptMessage::GetValues { hashes: batch }).await?;
+            write_frame(&mut send, &MptMessage::GetValues { root, wants: batch }).await?;
             let _ = send.finish();
             match read_frame::<MptMessage>(&mut recv).await? {
                 MptMessage::Values { values, missing } => Ok(ValuesResponse { values, missing }),
@@ -821,17 +994,23 @@ mod tests {
         let stalled: Vec<(&str, Result<(), NetError>)> = vec![
             (
                 "get_nodes",
-                tokio::time::timeout(PATIENCE, client.get_nodes(&[Hash::new(b"n")]))
-                    .await
-                    .expect("get_nodes must not hang")
-                    .map(|_| ()),
+                tokio::time::timeout(
+                    PATIENCE,
+                    client.get_nodes(Hash::EMPTY, &[(Vec::new(), Hash::new(b"n"))]),
+                )
+                .await
+                .expect("get_nodes must not hang")
+                .map(|_| ()),
             ),
             (
                 "get_values",
-                tokio::time::timeout(PATIENCE, client.get_values(&[Hash::new(b"v")]))
-                    .await
-                    .expect("get_values must not hang")
-                    .map(|_| ()),
+                tokio::time::timeout(
+                    PATIENCE,
+                    client.get_values(Hash::EMPTY, &[(Vec::new(), Hash::new(b"v"))]),
+                )
+                .await
+                .expect("get_values must not hang")
+                .map(|_| ()),
             ),
             (
                 "find_providers",
@@ -851,7 +1030,7 @@ mod tests {
                 "head_exchange",
                 tokio::time::timeout(
                     PATIENCE,
-                    client.head_exchange(Vec::new(), |_| (Vec::new(), Vec::new())),
+                    client.head_exchange(Vec::new(), None, |_| (Vec::new(), Vec::new())),
                 )
                 .await
                 .expect("head_exchange must not hang")
@@ -1035,7 +1214,7 @@ mod tests {
             .connect_mpt(server.direct_addr())
             .await
             .unwrap()
-            .head_exchange(Vec::new(), move |_| (pushed, vec![served.clone()]))
+            .head_exchange(Vec::new(), None, move |_| (pushed, vec![served.clone()]))
             .await
             .expect("the exchange completes");
 
@@ -1101,31 +1280,83 @@ mod tests {
     /// whatever did not come back.
     #[tokio::test]
     async fn a_values_answer_is_bounded_in_bytes() {
+        // Values are authorized by the position of the node carrying them
+        // (§5.5), so the request has to name real positions in a real trie —
+        // and the wants are produced the way a requester produces them, by
+        // walking a store that holds the nodes and not yet the payloads.
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
-
-        let plant = |len: usize, tag: u64| {
-            let mut payload = vec![0u8; len];
-            payload[..8].copy_from_slice(&tag.to_le_bytes());
-            let hash = Hash::new(&payload);
-            synch_mpt::NodeStore::put_value(store.as_ref(), &hash, &payload).unwrap();
-            hash
+        let payload = |len: usize, tag: u64| {
+            let mut bytes = vec![0u8; len];
+            bytes[..8].copy_from_slice(&tag.to_le_bytes());
+            bytes
         };
 
-        // A full batch at the value ceiling.
-        let at_ceiling: Vec<Hash> = (0..MAX_BATCH as u64)
-            .map(|i| plant(synch_core::MAX_TRIE_VALUE_LEN, i))
-            .collect();
-        // And three values from before the ceiling, each a quarter of the budget.
-        let oversized: Vec<Hash> = (0..3u64)
-            .map(|i| plant(ANSWER_BYTE_BUDGET / 2, 1_000 + i))
-            .collect();
+        // A full batch at the value ceiling, published the ordinary way.
+        let mut ceiling_root = Hash::EMPTY;
+        for i in 0..MAX_BATCH as u64 {
+            ceiling_root = Trie::new(store.as_ref())
+                .insert(
+                    ceiling_root,
+                    &synch_core::file_key("s", &i.to_string()).unwrap(),
+                    &payload(synch_core::MAX_TRIE_VALUE_LEN, i),
+                )
+                .unwrap();
+        }
+
+        // And three values from before the ceiling, each half the budget. No
+        // `insert` will make one now, which is the point: the nodes are built
+        // by hand, exactly as a store written before `MAX_TRIE_VALUE_LEN`
+        // existed still holds them.
+        let mut children = [None; 16];
+        for (i, slot) in children.iter_mut().take(3).enumerate() {
+            let bytes = payload(ANSWER_BYTE_BUDGET / 2, 1_000 + i as u64);
+            let value = Hash::new(&bytes);
+            synch_mpt::NodeStore::put_value(store.as_ref(), &value, &bytes).unwrap();
+            let leaf = synch_mpt::TrieNode::Leaf {
+                // Odd, so the branch nibble above it makes a whole number of
+                // bytes and the position names a key that could exist.
+                key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2, 3]),
+                value: synch_mpt::ValueRef::Hash(value),
+            };
+            let encoded = leaf.encode();
+            let hash = Hash::new(&encoded);
+            synch_mpt::NodeStore::put_node(store.as_ref(), &hash, &encoded).unwrap();
+            *slot = Some(hash);
+        }
+        let root_node = synch_mpt::TrieNode::Branch {
+            children,
+            value: None,
+        };
+        let encoded = root_node.encode();
+        let oversized_root = Hash::new(&encoded);
+        synch_mpt::NodeStore::put_node(store.as_ref(), &oversized_root, &encoded).unwrap();
+
+        // The positions a requester would name: every node, none of the values.
+        let positions = |root: Hash| -> (tempfile::TempDir, Vec<(Vec<u8>, Hash)>) {
+            let dir = tempfile::tempdir().unwrap();
+            let bare = synch_store::Store::open(dir.path()).unwrap();
+            let reachable = Trie::new(store.as_ref()).reachable(root).unwrap();
+            for node in &reachable.nodes {
+                let bytes = synch_mpt::NodeStore::get_node(store.as_ref(), node)
+                    .unwrap()
+                    .unwrap();
+                synch_mpt::NodeStore::put_node(&bare, node, &bytes).unwrap();
+            }
+            let missing = Trie::new(&bare).missing(root, MAX_BATCH).unwrap();
+            assert!(missing.nodes.is_empty(), "every node was copied across");
+            (dir, missing.values)
+        };
+        let (_at_dir, at_ceiling) = positions(ceiling_root);
+        let (_over_dir, oversized) = positions(oversized_root);
+        assert_eq!(at_ceiling.len(), MAX_BATCH);
+        assert_eq!(oversized.len(), 3);
 
         let (server, client, _client_dir) =
             trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
         let mpt = client.connect_mpt(server.direct_addr()).await.unwrap();
 
-        let answer = mpt.get_values(&at_ceiling).await.unwrap();
+        let answer = mpt.get_values(ceiling_root, &at_ceiling).await.unwrap();
         assert_eq!(
             answer.values.len(),
             MAX_BATCH,
@@ -1133,7 +1364,7 @@ mod tests {
         );
         assert!(answer.missing.is_empty());
 
-        let answer = mpt.get_values(&oversized).await.unwrap();
+        let answer = mpt.get_values(oversized_root, &oversized).await.unwrap();
         let bytes: usize = answer.values.iter().map(|(_, v)| v.len()).sum();
         assert!(bytes <= ANSWER_BYTE_BUDGET, "{bytes} bytes served");
         assert!(!answer.values.is_empty(), "and it is not empty");
@@ -1143,9 +1374,10 @@ mod tests {
             answer.values.len(),
             oversized.len()
         );
+        let asked: Vec<Hash> = oversized.iter().map(|(_, hash)| *hash).collect();
         for (hash, payload) in &answer.values {
             assert_eq!(&Hash::new(payload), hash);
-            assert!(oversized.contains(hash));
+            assert!(asked.contains(hash));
         }
 
         client.shutdown().await.unwrap();

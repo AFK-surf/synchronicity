@@ -11,6 +11,7 @@ use crate::{
     head::{HeadSummary, SignedHead},
     origin::{NodeId, OriginId},
     record::BlobAd,
+    record::MAX_DELEGATION_SPACES,
 };
 
 /// ALPN for metadata anti-entropy (§5).
@@ -25,10 +26,21 @@ pub const ALPN_BLOB: &[u8] = b"sync/blob/1";
 /// changes this. The check in `Hello` is the whole of the compatibility story —
 /// a peer on another version is refused rather than negotiated with — so the
 /// messages are free to be defined in whatever order reads best.
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 
 /// Maximum number of hashes per `GetNodes`/`GetValues` batch (§5.1).
 pub const MAX_BATCH: usize = 256;
+
+/// The most nibble-path bytes one `GetNodes`/`GetValues` batch may carry.
+///
+/// Set to exactly what a legal batch can carry — [`MAX_BATCH`] paths of the
+/// deepest key [`MAX_KEY_LEN`][crate::MAX_KEY_LEN] allows — so that no honest
+/// requester can build a batch its peer refuses. A tighter figure would be a
+/// wedge rather than a bound: the walk is deterministic, so a batch once over
+/// the cap is over it again on every retry, and two honest nodes would stop
+/// syncing for good. What it still denies is a frame full of paths that are
+/// long for no reason, which a responder would be obliged to descend.
+pub const MAX_BATCH_PATH_BYTES: usize = MAX_BATCH * 2 * crate::MAX_KEY_LEN;
 
 /// An upper bound on the tree nodes a proof over `ranges` at `level` emits.
 ///
@@ -143,6 +155,28 @@ pub const MAX_PROVIDER_ADS: usize = 256;
 ///
 /// Refused outright rather than truncated: a truncated request is a different
 /// request, and a truncated answer silently misreports what a peer served.
+/// [`bounded_vec`] through an `Option`, for a field that is absent or bounded.
+fn bounded_opt_vec<'de, D, T, const N: usize>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    /// A newtype so the inner vector is deserialized under the cap.
+    struct Bounded<T, const N: usize>(Vec<T>, std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for Bounded<T, N> {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            bounded_vec::<D, T, N>(deserializer).map(|v| Bounded(v, std::marker::PhantomData))
+        }
+    }
+
+    Ok(Option::<Bounded<T, N>>::deserialize(deserializer)?.map(|b| b.0))
+}
+
 fn bounded_vec<'de, D, T, const N: usize>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -232,6 +266,25 @@ pub enum MptMessage {
         /// The sender's head summaries.
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_HEADS_PER_MESSAGE>")]
         heads: Vec<HeadSummary>,
+        /// The spaces the sender will serve the peer it is talking to, or
+        /// `None` for the whole keyspace (§5.5).
+        ///
+        /// How a delegated node learns what it may ask for. Its scope lives in
+        /// the delegating origin's trie, which it cannot read until it knows
+        /// its scope — so the peer serving it says, in the exchange that opens
+        /// every session. Advisory in the only direction that matters: the
+        /// responder enforces the same scope on every request regardless, so a
+        /// wrong or stale value can only cause a peer to ask for less than it
+        /// is entitled to, never more — and it is adopted only from a peer this
+        /// node holds a *rooted* binding for, so a delegate cannot narrow a
+        /// member that admitted it.
+        ///
+        /// Bounded while decoding like every other sequence here: the field
+        /// mirrors a `Delegation`'s space list, which is capped at
+        /// [`MAX_DELEGATION_SPACES`], and an unbounded vector of unbounded
+        /// strings turns a 16 MiB frame into hundreds of megabytes of slots.
+        #[serde(deserialize_with = "bounded_opt_vec::<_, _, MAX_DELEGATION_SPACES>")]
+        scope: Option<Vec<String>>,
     },
     /// "Yours is newer, send the full signed heads for these origins."
     HeadsWant {
@@ -250,13 +303,27 @@ pub enum MptMessage {
         /// The changed head.
         head: SignedHead,
     },
-    /// Request trie nodes by hash. At most [`MAX_BATCH`] per batch.
+    /// Request trie nodes, each with the position it is claimed to occupy.
+    ///
+    /// At most [`MAX_BATCH`] per batch, and at most [`MAX_BATCH_PATH_BYTES`]
+    /// of paths across the batch.
+    ///
+    /// The position is what a responder authorizes on, and it has to be: a
+    /// hash carries no position and none can be recovered from it, since
+    /// structural sharing lets one node sit under several prefixes. A
+    /// responder serving a scoped peer descends `path` from `root` in its own
+    /// store and compares the *path* against that peer's scope; the hash is
+    /// the integrity assertion the answer is checked against on arrival (§5.5).
+    /// Between unscoped peers the path is carried and ignored.
     GetNodes {
-        /// The wanted node hashes.
+        /// The root the paths are relative to. Any root the responder holds.
+        root: Hash,
+        /// `(nibble path, wanted node hash)` pairs.
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
-        hashes: Vec<Hash>,
+        wants: Vec<(Vec<u8>, Hash)>,
     },
-    /// Trie nodes, plus the subset the responder did not have.
+    /// Trie nodes, plus the subset the responder did not have, plus the subset
+    /// it holds and may not show.
     Nodes {
         /// `(hash, encoded node)` pairs.
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
@@ -264,12 +331,27 @@ pub enum MptMessage {
         /// Hashes the responder did not have.
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         missing: Vec<Hash>,
-    },
-    /// Request out-of-line trie value payloads by hash.
-    GetValues {
-        /// The wanted value hashes.
+        /// Positions the requester may not see past (§5.5).
+        ///
+        /// Distinct from `missing`, and the distinction is what keeps a scoped
+        /// peer from wedging: `missing` says "ask again", while this says
+        /// "there is nothing here for you, ever". A trie compresses, so a node
+        /// at a position on the spine can carry key material running out of
+        /// the peer's scope — the name of a space it was not granted, or a
+        /// whole leaf record. Withholding it silently would leave the peer
+        /// unable to tell an absent node from a refused one, and it would
+        /// retry until its head was abandoned.
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
-        hashes: Vec<Hash>,
+        redacted: Vec<Hash>,
+    },
+    /// Request out-of-line trie value payloads, with the position of the node
+    /// that holds each one.
+    GetValues {
+        /// The root the paths are relative to.
+        root: Hash,
+        /// `(nibble path of the holding node, wanted value hash)` pairs.
+        #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
+        wants: Vec<(Vec<u8>, Hash)>,
     },
     /// Out-of-line trie values, plus the subset the responder did not have.
     Values {
@@ -703,6 +785,7 @@ mod tests {
                     root: Hash::new(b"r"),
                     complete: true,
                 }],
+                scope: Some(vec!["photos".into()]),
             },
             MptMessage::HeadsWant {
                 origins: vec![origin.clone()],
@@ -712,14 +795,20 @@ mod tests {
             },
             MptMessage::HeadPush { head },
             MptMessage::GetNodes {
-                hashes: vec![Hash::new(b"a"), Hash::new(b"b")],
+                root: Hash::new(b"r"),
+                wants: vec![
+                    (vec![6, 6], Hash::new(b"a")),
+                    (vec![6, 6, 3], Hash::new(b"b")),
+                ],
             },
             MptMessage::Nodes {
                 nodes: vec![(Hash::new(b"a"), vec![1, 2, 3])],
                 missing: vec![Hash::new(b"b")],
+                redacted: vec![Hash::new(b"c")],
             },
             MptMessage::GetValues {
-                hashes: vec![Hash::new(b"v")],
+                root: Hash::new(b"r"),
+                wants: vec![(vec![6, 6], Hash::new(b"v"))],
             },
             MptMessage::Values {
                 values: vec![(Hash::new(b"v"), vec![4, 5])],
@@ -867,18 +956,34 @@ mod bounded_decode_tests {
                 complete: false,
             })
             .collect();
-        let bytes = postcard::to_stdvec(&MptMessage::Hello { proto: 1, heads }).unwrap();
+        let bytes = postcard::to_stdvec(&MptMessage::Hello {
+            proto: 1,
+            heads,
+            scope: None,
+        })
+        .unwrap();
         refuses_past(&bytes);
     }
 
     #[test]
     fn a_node_batch_past_the_cap_is_refused_while_decoding() {
-        let hashes: Vec<Hash> = (0..MAX_BATCH + 1).map(|i| Hash([i as u8; 32])).collect();
-        let bytes = postcard::to_stdvec(&MptMessage::GetNodes { hashes }).unwrap();
+        let wants = |n: usize| -> Vec<(Vec<u8>, Hash)> {
+            (0..n)
+                .map(|i| (vec![0u8, 1], Hash([i as u8; 32])))
+                .collect()
+        };
+        let bytes = postcard::to_stdvec(&MptMessage::GetNodes {
+            root: Hash([0u8; 32]),
+            wants: wants(MAX_BATCH + 1),
+        })
+        .unwrap();
         refuses_past(&bytes);
 
-        let hashes: Vec<Hash> = (0..MAX_BATCH + 1).map(|i| Hash([i as u8; 32])).collect();
-        let bytes = postcard::to_stdvec(&MptMessage::GetValues { hashes }).unwrap();
+        let bytes = postcard::to_stdvec(&MptMessage::GetValues {
+            root: Hash([0u8; 32]),
+            wants: wants(MAX_BATCH + 1),
+        })
+        .unwrap();
         refuses_past(&bytes);
     }
 
@@ -895,12 +1000,21 @@ mod bounded_decode_tests {
 
     #[test]
     fn a_message_at_the_cap_still_decodes() {
-        let hashes: Vec<Hash> = (0..MAX_BATCH).map(|i| Hash([i as u8; 32])).collect();
+        let wants: Vec<(Vec<u8>, Hash)> = (0..MAX_BATCH)
+            .map(|i| (vec![0u8, 1], Hash([i as u8; 32])))
+            .collect();
         let bytes = postcard::to_stdvec(&MptMessage::GetNodes {
-            hashes: hashes.clone(),
+            root: Hash([0u8; 32]),
+            wants: wants.clone(),
         })
         .unwrap();
         let decoded: MptMessage = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, MptMessage::GetNodes { hashes });
+        assert_eq!(
+            decoded,
+            MptMessage::GetNodes {
+                root: Hash([0u8; 32]),
+                wants
+            }
+        );
     }
 }

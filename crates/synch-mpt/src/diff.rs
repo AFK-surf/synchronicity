@@ -11,6 +11,7 @@ use crate::{
     error::MptError,
     nibbles::Nibbles,
     node::ValueRef,
+    scope::Scope,
     store::NodeStore,
     trie::{root_opt, Cursor, FanoutGuard, Frame, Trie, MAX_DEPTH_NIBBLES},
 };
@@ -52,8 +53,24 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// Diffs two roots, returning one [`Change`] per differing key in
     /// lexicographic key order.
     pub fn diff(&self, old_root: Hash, new_root: Hash) -> Result<Vec<Change>, MptError> {
+        self.diff_scoped(old_root, new_root, &Scope::full())
+    }
+
+    /// The same diff, confined to the part of the keyspace `scope` admits.
+    ///
+    /// A node reading a trie under a scope holds only that part of it, so an
+    /// unscoped diff would descend into a subtree it was never sent and fail
+    /// for a node that is absent by design rather than by fault (§5.5). The
+    /// materialization that promotion runs is therefore scoped exactly as the
+    /// fetch that filled the trie was.
+    pub fn diff_scoped(
+        &self,
+        old_root: Hash,
+        new_root: Hash,
+        scope: &Scope,
+    ) -> Result<Vec<Change>, MptError> {
         let mut out = Vec::new();
-        self.diff_each(old_root, new_root, |change| {
+        self.diff_each_scoped(old_root, new_root, scope, |change| {
             out.push(change);
             Ok(())
         })?;
@@ -69,6 +86,17 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         &self,
         old_root: Hash,
         new_root: Hash,
+        emit: impl FnMut(Change) -> Result<(), MptError>,
+    ) -> Result<(), MptError> {
+        self.diff_each_scoped(old_root, new_root, &Scope::full(), emit)
+    }
+
+    /// The same streaming diff, confined to `scope`.
+    pub fn diff_each_scoped(
+        &self,
+        old_root: Hash,
+        new_root: Hash,
+        scope: &Scope,
         mut emit: impl FnMut(Change) -> Result<(), MptError>,
     ) -> Result<(), MptError> {
         if old_root == new_root {
@@ -76,7 +104,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         }
         let a = self.cursor_at(root_opt(old_root))?;
         let b = self.cursor_at(root_opt(new_root))?;
-        self.diff_walk(a, b, &mut emit)
+        self.diff_walk(a, b, scope, &mut emit)
     }
 
     /// Walks both tries in lockstep with an explicit heap stack.
@@ -93,6 +121,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         &self,
         a: Cursor,
         b: Cursor,
+        scope: &Scope,
         emit: &mut dyn FnMut(Change) -> Result<(), MptError>,
     ) -> Result<(), MptError> {
         let mut path: Vec<u8> = Vec::new();
@@ -115,6 +144,16 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
                 continue;
             }
             stack[top].0.next += 1;
+            path.push(nibble);
+            // The boundary, the same one the fetch stopped at: a position out
+            // of scope holds nothing this node was sent, so descending it
+            // would fail on an absence that is the design working. Tested
+            // before the cursors are taken, because taking them is what would
+            // read the absent node (§5.5).
+            if !scope.admits_path(&path) {
+                path.pop();
+                continue;
+            }
             let ca = self.cursor_child(&stack[top].0.cursor, nibble)?;
             let cb = self.cursor_child(&stack[top].1, nibble)?;
             // Charged only where something is actually there, exactly as
@@ -127,9 +166,9 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
             // first-adoption diff of ~57 k files, well inside the 100 k initial
             // index §7.1 names.
             if ca.is_empty() && cb.is_empty() {
+                path.pop();
                 continue;
             }
-            path.push(nibble);
             guard.visit()?;
             if self.enter(&ca, &cb, &path, emit)? {
                 stack.push((
@@ -185,7 +224,17 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         old_root: Hash,
         new_root: Hash,
     ) -> Result<Vec<ResolvedChange>, MptError> {
-        self.diff(old_root, new_root)?
+        self.diff_resolved_scoped(old_root, new_root, &Scope::full())
+    }
+
+    /// The same, confined to `scope`.
+    pub fn diff_resolved_scoped(
+        &self,
+        old_root: Hash,
+        new_root: Hash,
+        scope: &Scope,
+    ) -> Result<Vec<ResolvedChange>, MptError> {
+        self.diff_scoped(old_root, new_root, scope)?
             .into_iter()
             .map(|c| {
                 Ok(ResolvedChange {
@@ -219,6 +268,27 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         &self,
         old_root: Hash,
         new_root: Hash,
+        apply: F,
+    ) -> Result<usize, E>
+    where
+        E: From<MptError>,
+        F: FnMut(ChangeView<'_>) -> Result<(), E>,
+    {
+        self.for_each_resolved_change_scoped(old_root, new_root, &Scope::full(), apply)
+    }
+
+    /// The same stream, confined to the part of the keyspace `scope` admits.
+    ///
+    /// A node reading a trie under a scope holds only that part of it, so an
+    /// unscoped walk would descend into a subtree it was never sent and fail
+    /// for a node that is absent by design rather than by fault (§5.5). The
+    /// materialization a promotion applies is therefore scoped exactly as the
+    /// fetch that filled the trie was.
+    pub fn for_each_resolved_change_scoped<E, F>(
+        &self,
+        old_root: Hash,
+        new_root: Hash,
+        scope: &Scope,
         mut apply: F,
     ) -> Result<usize, E>
     where
@@ -227,7 +297,7 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     {
         let mut count = 0usize;
         let mut stopped: Option<E> = None;
-        let walked = self.diff_each(old_root, new_root, |change| {
+        let walked = self.diff_each_scoped(old_root, new_root, scope, |change| {
             let new = change.new.as_ref().map(|v| self.resolve(v)).transpose()?;
             let view = ChangeView {
                 key: &change.key,

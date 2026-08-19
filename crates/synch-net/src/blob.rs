@@ -143,10 +143,10 @@ impl ProtocolHandler for BlobProtocol {
             connection,
             self.on_unknown_key.as_ref(),
             |_| std::future::ready(()),
-            move |_peer, mut send, mut recv| {
+            move |peer, mut send, mut recv| {
                 let handler = handler.clone();
                 async move {
-                    if let Err(e) = handler.handle_stream(&mut send, &mut recv).await {
+                    if let Err(e) = handler.handle_stream(peer, &mut send, &mut recv).await {
                         tracing::debug!(error = %e, "blob stream ended");
                     }
                     let _ = send.finish();
@@ -158,13 +158,57 @@ impl ProtocolHandler for BlobProtocol {
 }
 
 impl BlobProtocol {
+    /// Refuses an object a delegated peer has no granted path to (§3.5).
+    ///
+    /// `GetSlice` is keyed by object root and carries no space, so
+    /// entitlement to the bytes has to be looked up: does any entry in one of
+    /// this peer's granted spaces name this content?
+    ///
+    /// A rooted peer is unrestricted, but finding that out still costs a
+    /// bindings read, and this runs once per slice — thousands of times across
+    /// one large object. The cheap half of the answer is asked first: a store
+    /// holding no delegation at all cannot have a scoped peer, which is the
+    /// state of every cluster that does not use the feature.
+    async fn check_content_scope(
+        &self,
+        peer: synch_core::NodeId,
+        root: synch_core::Hash,
+    ) -> Result<(), NetError> {
+        let store = self.store.clone();
+        let permitted = crate::blocking::offload(move || {
+            if !store.has_delegations()? {
+                return Ok(true);
+            }
+            let spaces = match store.publish_scope_of_key(&peer, synch_core::now_ns())? {
+                None => return Ok(true),
+                Some(spaces) => spaces,
+            };
+            Ok(store.content_in_spaces(&root, &spaces)?)
+        })
+        .await?;
+        match permitted {
+            true => Ok(()),
+            false => {
+                tracing::warn!(
+                    peer = %peer.fmt_short(),
+                    "refusing content outside the peer's delegated spaces"
+                );
+                Err(NetError::Unexpected(
+                    "requested an object outside this peer's scope".to_string(),
+                ))
+            }
+        }
+    }
+
     async fn handle_stream(
         &self,
+        peer: synch_core::NodeId,
         send: &mut iroh::endpoint::SendStream,
         recv: &mut iroh::endpoint::RecvStream,
     ) -> Result<(), NetError> {
         match read_frame::<BlobMessage>(recv).await? {
             BlobMessage::GetSlice { root, ranges } => {
+                self.check_content_scope(peer, root).await?;
                 // The range set arrives straight off the wire, unnormalized and
                 // unbounded: the set operations below it are quadratic in the
                 // number of ranges, so a request made of a million singleton
@@ -205,6 +249,7 @@ impl BlobProtocol {
                 ranges,
                 level,
             } => {
+                self.check_content_scope(peer, root).await?;
                 // Bounded before anything reads it, for the same reason a slice
                 // request is: the set operations under it are quadratic in the
                 // number of ranges (§12).

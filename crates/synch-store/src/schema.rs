@@ -80,6 +80,8 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "the membership domain is the one that names this node",
         run: v16_one_membership_domain,
     },
+    Migration::Sql(V17_DELEGATED_BINDINGS),
+    Migration::Sql(V18_REDACTED_NODES),
 ];
 
 /// v1 — the original schema, exactly as it first shipped.
@@ -532,14 +534,17 @@ CREATE TABLE identity_history (
 CREATE TABLE bindings (
   origin_id    TEXT NOT NULL,
   node_id      BLOB NOT NULL,
-  source       TEXT NOT NULL,
+  source       TEXT NOT NULL,            -- 'static' | 'dns' | 'delegated'
   domain       TEXT NOT NULL DEFAULT '',
+  issuer       TEXT NOT NULL DEFAULT '', -- delegated: the vouching origin
+  spaces       TEXT,                     -- delegated: newline-separated space ids
   note         TEXT,
   added_at     INTEGER NOT NULL,
   expires_at   INTEGER,
-  PRIMARY KEY (origin_id, node_id, source, domain)
+  PRIMARY KEY (origin_id, node_id, source, domain, issuer)
 );
-CREATE INDEX bindings_by_key ON bindings (node_id);
+CREATE INDEX bindings_by_key    ON bindings (node_id);
+CREATE INDEX bindings_by_issuer ON bindings (issuer);
 CREATE TABLE heads (
   origin_id   TEXT NOT NULL,
   slot        TEXT NOT NULL,
@@ -556,6 +561,7 @@ CREATE TABLE head_history (
 );
 CREATE TABLE trie_nodes    (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
 CREATE TABLE trie_values   (hash BLOB PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE redacted_nodes (hash BLOB PRIMARY KEY);
 CREATE TABLE entries (
   origin_id   TEXT NOT NULL,
   space       TEXT NOT NULL,
@@ -725,6 +731,58 @@ fn one_membership_domain(tx: &rusqlite::Connection) -> Result<()> {
     }
     Ok(())
 }
+
+/// v17 — delegated trust (§3.5).
+///
+/// A binding gains the origin that vouched for it and the spaces that vouching
+/// covers, and `issuer` joins the primary key alongside the `domain` v14 put
+/// there: two rooted origins may each delegate the same device key with
+/// different space lists, and those are two independent statements. Keyed
+/// without it, the second would silently overwrite the first, and removing one
+/// issuer's delegation would take the other's with it — the same argument v14
+/// makes for two membership domains publishing one key, applied to the axis
+/// this migration adds. Both discriminators are `''` for the sources they do
+/// not describe, for the reason v14 gives: SQLite admits no expression in a
+/// primary key.
+///
+/// Delegated rows are a *materialized view* of `d:` trie leaves, exactly as
+/// `entries` is of `f:` leaves — never independent state. Nothing backfills
+/// them here because there is nothing to backfill: no database that has
+/// reached this version has ever held one, and the rows appear as the
+/// delegating origins' tries land.
+const V17_DELEGATED_BINDINGS: &str = r#"
+ALTER TABLE bindings RENAME TO bindings_v16;
+CREATE TABLE bindings (
+  origin_id    TEXT NOT NULL,
+  node_id      BLOB NOT NULL,            -- bound device key (32 bytes)
+  source       TEXT NOT NULL,            -- 'static' | 'dns' | 'delegated'
+  domain       TEXT NOT NULL DEFAULT '', -- for dns source, '' otherwise
+  issuer       TEXT NOT NULL DEFAULT '', -- for delegated source: the vouching origin
+  spaces       TEXT,                     -- for delegated source: newline-separated space ids
+  note         TEXT,
+  added_at     INTEGER NOT NULL,
+  expires_at   INTEGER,                  -- NULL for static
+  PRIMARY KEY (origin_id, node_id, source, domain, issuer)
+);
+INSERT INTO bindings (origin_id, node_id, source, domain, issuer, spaces, note, added_at, expires_at)
+  SELECT origin_id, node_id, source, domain, '', NULL, note, added_at, expires_at
+  FROM bindings_v16;
+DROP TABLE bindings_v16;
+CREATE INDEX bindings_by_key    ON bindings (node_id);
+CREATE INDEX bindings_by_issuer ON bindings (issuer);
+"#;
+
+/// v18 — the scope boundary a peer reported, remembered (§5.5).
+///
+/// A node reading under a scope has to tell "the peer does not have this" from
+/// "the peer will not show me this", and has to keep telling them apart across
+/// restarts: a completeness walk that re-read a refused position as merely
+/// missing would never settle, and a fetch would retry until its head was
+/// abandoned. The row is a fact about this node's own view, derived from what
+/// peers answered.
+const V18_REDACTED_NODES: &str = r#"
+CREATE TABLE redacted_nodes (hash BLOB PRIMARY KEY);
+"#;
 
 #[cfg(test)]
 mod identity_migration_tests {
