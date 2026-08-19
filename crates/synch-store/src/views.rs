@@ -888,6 +888,27 @@ impl Txn<'_> {
             params![origin.canonical()],
         )?)
     }
+
+    /// Repoints every `origin=<id>` mirror policy from one origin to another.
+    ///
+    /// A policy is stored as the text `VersionPolicy` renders (§7.2), so a node
+    /// that adopts a new name leaves every pin on its old one selecting
+    /// nothing — and selecting nothing is indistinguishable, in a mirror, from
+    /// an origin that has published nothing. Part of the identity migration's
+    /// transaction (§3.1) for that reason.
+    pub fn rewrite_mirror_policies(
+        &self,
+        previous: &OriginId,
+        adopted: &OriginId,
+    ) -> Result<usize> {
+        Ok(self.conn().execute(
+            "UPDATE mirrors SET policy = ?2 WHERE policy = ?1",
+            params![
+                format!("origin={}", previous.canonical()),
+                format!("origin={}", adopted.canonical()),
+            ],
+        )?)
+    }
 }
 
 fn apply_change(

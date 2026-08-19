@@ -20,7 +20,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // No "(run `synch init` first?)" stapled onto every failure: the
     // uninitialized case already says exactly that itself, and the hint sent
     // an operator with a taken port off to re-init a healthy node.
-    let node = Node::open(config)
+    let node = open_once_named(config)
         .await
         .context("could not open the node")?;
     // Before anything is announced: a daemon that cannot resolve the membership
@@ -143,6 +143,47 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     Ok(())
 }
 
+/// Opens the node, waiting for the membership zone to name it (§3.1).
+///
+/// A node whose zone has not named it yet holds no identity, so there is
+/// nothing for it to sign, publish or scan under — and no peer would accept its
+/// connections either, since the same absent record leaves them without a
+/// binding for its key. So it waits here, re-asking on the negative answer's
+/// TTL bounds, and prints the record that would settle it. `Ctrl-C` leaves.
+async fn open_once_named(config: NodeConfig) -> Result<Node> {
+    let mut said = false;
+    loop {
+        match Node::open(config.clone()).await {
+            Err(synch_engine::EngineError::Unidentified { domain, node_id }) => {
+                // Once, not once per attempt: this loop can run for as long as
+                // it takes an operator to edit a zone.
+                if !said {
+                    println!("waiting for {domain} to name this node");
+                    println!(
+                        "  _synchronicity.{domain}. IN TXT \"v=sync1 id=<name> nk={} apex=<apex>\"",
+                        node_id.to_z32()
+                    );
+                    said = true;
+                }
+                tokio::select! {
+                    signal = tokio::signal::ctrl_c() => {
+                        signal?;
+                        anyhow::bail!("stopped while waiting for {domain} to name this node");
+                    }
+                    _ = tokio::time::sleep(IDENTITY_POLL) => {}
+                }
+            }
+            other => return Ok(other?),
+        }
+    }
+}
+
+/// How often a node with no name yet re-asks its zone (§3.1).
+///
+/// Tight enough that publishing the record and watching the node come up feels
+/// immediate, loose enough not to flood a name that does not exist yet.
+const IDENTITY_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Waits for the daemon to be told to stop: `Ctrl-C`, or a `synch daemon stop`
 /// request landing on the control socket.
 ///
@@ -190,15 +231,12 @@ fn build_resolver(node: &Node) -> Result<Option<std::sync::Arc<synch_net::Dnssec
         }
         Err(e) => {
             node.set_dns_resolver(Err(e.to_string()));
-            let domains = node.domains()?;
-            if !domains.is_empty() {
+            if let Some(domain) = node.domain()? {
                 return Err(anyhow::Error::new(e).context(format!(
-                    "no DNSSEC resolver could be built, so the {} configured membership \
-                     domain(s) ({}) would never refresh and their bindings would lapse a \
-                     grace window from now. Fix the resolver options, or \
-                     `synch domain rm` them to run on static trust",
-                    domains.len(),
-                    domains.join(", ")
+                    "no DNSSEC resolver could be built, so {domain} would never refresh: \
+                     its bindings would lapse a grace window from now, and this node's own \
+                     name comes out of it. Fix the resolver options, or `synch domain clear` \
+                     to run key-identified on static trust"
                 )));
             }
             tracing::warn!(

@@ -94,6 +94,25 @@ impl KeyState {
     }
 }
 
+/// The config key holding the one membership domain (§3.1).
+const DOMAIN_KEY: &str = "membership.domain";
+
+/// One identity this node adopted from its membership zone (§3.1).
+#[derive(Debug, Clone)]
+pub struct IdentityAdoption {
+    /// When the adoption was committed, unix nanos.
+    pub at: i64,
+    /// What this node published as before it.
+    pub previous: OriginId,
+    /// The name it took.
+    pub adopted: OriginId,
+    /// The device key the zone bound to that name.
+    pub node_id: NodeId,
+    /// The zone that named it, or `''` when the name was dropped for a key
+    /// identity.
+    pub domain: String,
+}
+
 /// A locally held device key.
 #[derive(Debug, Clone)]
 pub struct DeviceKey {
@@ -489,6 +508,52 @@ impl Store {
         self.set_config("self_origin_id", &origin.canonical())
     }
 
+    /// The membership domain this node belongs to, if it has one (§3.1).
+    ///
+    /// Held separately from `self_origin_id` even though it is that origin's
+    /// `@domain` half, because it has to be readable *before* there is a name
+    /// to read it out of: a node that has never identified has only this.
+    pub fn membership_domain(&self) -> Result<Option<String>> {
+        self.config(DOMAIN_KEY)
+    }
+
+    /// Sets the membership domain, or clears it when given `None`.
+    pub fn set_membership_domain(&self, domain: Option<&str>) -> Result<()> {
+        match domain {
+            Some(domain) => self.set_config(DOMAIN_KEY, domain),
+            None => self.clear_config(DOMAIN_KEY),
+        }
+    }
+
+    /// Every identity this node has adopted from its zone, oldest first (§3.1).
+    pub fn identity_history(&self) -> Result<Vec<IdentityAdoption>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT at, previous, adopted, node_id, domain FROM identity_history ORDER BY at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (at, previous, adopted, node_id, domain) = row?;
+            out.push(IdentityAdoption {
+                at,
+                previous: origin_column(previous, "identity_history.previous")?,
+                adopted: origin_column(adopted, "identity_history.adopted")?,
+                node_id: key_column(node_id, "identity_history.node_id")?,
+                domain,
+            });
+        }
+        Ok(out)
+    }
+
     // ---- device keys ------------------------------------------------------
 
     /// Stores a device key.
@@ -604,6 +669,55 @@ impl Txn<'_> {
     /// that would repair it.
     pub fn set_device_key_state(&self, node_id: &NodeId, state: KeyState) -> Result<()> {
         set_device_key_state_in(self.conn(), node_id, state)
+    }
+
+    /// Sets or clears the membership domain, inside the transaction.
+    pub fn set_membership_domain(&self, domain: Option<&str>) -> Result<()> {
+        match domain {
+            Some(domain) => self.conn().execute(
+                "INSERT INTO config (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![DOMAIN_KEY, domain],
+            )?,
+            None => self
+                .conn()
+                .execute("DELETE FROM config WHERE key = ?1", params![DOMAIN_KEY])?,
+        };
+        Ok(())
+    }
+
+    /// Drops the publishing floor, inside the transaction.
+    ///
+    /// A floor is a promise about seqs under one name (§3.4); carried across an
+    /// identity migration it would floor history nobody holds under the name
+    /// being adopted.
+    pub fn clear_publish_floor(&self) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM config WHERE key = 'publish_floor'", [])?;
+        Ok(())
+    }
+
+    /// Records an identity adoption, inside the transaction (§3.1).
+    pub fn record_identity_adoption(
+        &self,
+        previous: &OriginId,
+        adopted: &OriginId,
+        node_id: &NodeId,
+        domain: &str,
+        at: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO identity_history (at, previous, adopted, node_id, domain)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                at,
+                previous.canonical(),
+                adopted.canonical(),
+                node_id.as_bytes().as_slice(),
+                domain,
+            ],
+        )?;
+        Ok(())
     }
 }
 

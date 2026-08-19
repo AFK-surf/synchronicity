@@ -40,7 +40,7 @@ pub use membership::{
     TrustConfig,
 };
 pub use mirror::MirrorReport;
-pub use node::{AdoptOriginReport, InitReport, Node, StagedChange};
+pub use node::{InitReport, Node, StagedChange};
 pub use publisher::{Publisher, DEFAULT_PUBLISH_BATCH_MAX, DEFAULT_PUBLISH_QUIESCE};
 pub use reconcile::{FetchOutcome, HeadOutcome, SyncReport, Syncer};
 pub use recovery::{

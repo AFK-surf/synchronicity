@@ -30,9 +30,6 @@ use crate::{
     recovery::{RecoveryState, UnreconciledHistory},
 };
 
-/// The config key holding the configured membership domains.
-const DOMAINS_KEY: &str = "membership_domains";
-
 /// The shortest gap between two *triggered* re-resolutions of one domain
 /// (§3.4).
 ///
@@ -343,41 +340,40 @@ impl Node {
         self.dns_resolver_slot().status.clone()
     }
 
-    /// The configured DNSSEC membership domains.
-    pub fn domains(&self) -> Result<Vec<String>> {
-        Ok(self
-            .store()
-            .config(DOMAINS_KEY)?
-            .map(|text| {
-                text.split('\n')
-                    .filter(|d| !d.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default())
+    /// This node's membership domain, if it has one (§3.1).
+    pub fn domain(&self) -> Result<Option<String>> {
+        Ok(self.store().membership_domain()?)
     }
 
-    /// Adds a membership domain.
-    pub fn add_domain(&self, domain: &str) -> Result<()> {
+    /// The domain as the refresh machinery wants it: a list of none or one.
+    ///
+    /// Everything below schedules, refreshes and reports per domain, which is
+    /// the same work whether there is one of them or none.
+    fn configured_domains(&self) -> Result<Vec<String>> {
+        Ok(self.domain()?.into_iter().collect())
+    }
+
+    /// Sets the membership domain — the zone that will name this node (§3.1).
+    ///
+    /// Takes effect on the next start, which is where identity is resolved:
+    /// this process keeps the name it has and the zone that issued it, so
+    /// "one node, one zone" holds at every instant rather than only between
+    /// edits.
+    pub fn set_domain(&self, domain: &str) -> Result<()> {
         let domain = synch_core::origin::normalize_domain(domain)
             .map_err(|e| EngineError::invalid(e.to_string()))?;
-        let mut domains = self.domains()?;
-        if !domains.contains(&domain) {
-            domains.push(domain);
-            domains.sort();
-        }
-        self.store().set_config(DOMAINS_KEY, &domains.join("\n"))?;
+        self.store().set_membership_domain(Some(&domain))?;
         Ok(())
     }
 
-    /// Removes a membership domain and every binding it produced.
-    pub fn remove_domain(&self, domain: &str) -> Result<bool> {
-        let domain = synch_core::origin::normalize_domain(domain)
-            .map_err(|e| EngineError::invalid(e.to_string()))?;
-        let mut domains = self.domains()?;
-        let before = domains.len();
-        domains.retain(|d| d != &domain);
-        self.store().set_config(DOMAINS_KEY, &domains.join("\n"))?;
+    /// Drops the membership domain, and with it every binding it produced.
+    ///
+    /// The node falls back to its device key for a name on the next start.
+    pub fn clear_domain(&self) -> Result<bool> {
+        let Some(domain) = self.domain()? else {
+            return Ok(false);
+        };
+        self.store().set_membership_domain(None)?;
         for binding in self.store().bindings()? {
             if binding.source == BindingSource::Dns && binding.domain.as_deref() == Some(&domain) {
                 self.store().remove_binding(
@@ -387,7 +383,7 @@ impl Node {
                 )?;
             }
         }
-        Ok(domains.len() != before)
+        Ok(true)
     }
 
     /// Re-resolves one domain and refreshes its bindings.
@@ -533,7 +529,7 @@ impl Node {
         &self,
         resolver: &dyn MemberResolver,
     ) -> Result<Vec<DomainOutcome>> {
-        let domains = self.domains()?;
+        let domains = self.configured_domains()?;
         self.refresh_these(resolver, &domains, now_ns()).await
     }
 
@@ -544,7 +540,7 @@ impl Node {
     pub fn configured_domain(&self, domain: &str) -> Result<String> {
         let name = synch_core::origin::normalize_domain(domain)
             .map_err(|e| EngineError::invalid(e.to_string()))?;
-        if !self.domains()?.contains(&name) {
+        if !self.configured_domains()?.contains(&name) {
             return Err(EngineError::not_found(format!(
                 "{name} is not a configured membership domain"
             )));
@@ -564,7 +560,7 @@ impl Node {
             let node = self.clone();
             let named = domain.map(str::to_string);
             crate::blocking::offload(move || match named {
-                None => node.domains(),
+                None => node.configured_domains(),
                 Some(name) => Ok(vec![node.configured_domain(&name)?]),
             })
             .await?
@@ -586,7 +582,7 @@ impl Node {
         // worker (§10).
         let configured = {
             let node = self.clone();
-            crate::blocking::offload(move || node.domains()).await?
+            crate::blocking::offload(move || node.configured_domains()).await?
         };
         let due: Vec<String> = {
             let schedule = self.dns_schedule();
@@ -612,7 +608,7 @@ impl Node {
     ) -> Result<Vec<DomainOutcome>> {
         let ready: Vec<String> = {
             let schedule = self.dns_schedule();
-            self.domains()?
+            self.configured_domains()?
                 .into_iter()
                 .filter(|d| {
                     schedule
@@ -629,7 +625,7 @@ impl Node {
     pub fn next_dns_delay(&self, now: i64) -> Duration {
         let schedule = self.dns_schedule();
         let soonest = self
-            .domains()
+            .configured_domains()
             .unwrap_or_default()
             .into_iter()
             .map(|d| schedule.get(&d).map(|s| s.due_at).unwrap_or(now))
@@ -806,15 +802,15 @@ impl Node {
         entry.self_origin_mismatch = refresh.self_origin_mismatch.clone();
     }
 
-    /// Every configured domain's health: bindings held, schedule, last error.
+    /// The membership domain's health: bindings held, schedule, last error.
     ///
-    /// The last error is what keeps three failing domains from reading like
-    /// three healthy ones in `doctor`.
+    /// The last error is what keeps a failing domain from reading like a
+    /// healthy one in `doctor`.
     pub fn domain_health(&self) -> Result<Vec<DomainHealth>> {
         let bindings = self.store().bindings()?;
         let schedule = self.dns_schedule().clone();
         Ok(self
-            .domains()?
+            .configured_domains()?
             .into_iter()
             .map(|domain| {
                 let held = bindings
@@ -939,7 +935,7 @@ impl Node {
             unbound_origins,
             recovery: self.recovery_state()?,
             unreconciled,
-            domains: self.domains()?,
+            domains: self.configured_domains()?,
             ambiguous,
             self_origin_mismatch,
             clock,
@@ -976,14 +972,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn domains_round_trip() {
+    async fn the_domain_round_trips_and_normalizes() {
         let (_d, node) = node().await;
-        assert!(node.domains().unwrap().is_empty());
-        node.add_domain("Cluster.Example.COM.").unwrap();
-        node.add_domain("cluster.example.com").unwrap();
-        assert_eq!(node.domains().unwrap(), vec!["cluster.example.com"]);
-        assert!(node.remove_domain("cluster.example.com").unwrap());
-        assert!(node.domains().unwrap().is_empty());
+        assert_eq!(node.domain().unwrap(), None);
+        node.set_domain("Cluster.Example.COM.").unwrap();
+        assert_eq!(
+            node.domain().unwrap().as_deref(),
+            Some("cluster.example.com")
+        );
+        // Setting a second one replaces the first: a node has one zone (§3.1).
+        node.set_domain("other.example").unwrap();
+        assert_eq!(node.domain().unwrap().as_deref(), Some("other.example"));
+        assert!(node.clear_domain().unwrap());
+        assert_eq!(node.domain().unwrap(), None);
+        assert!(!node.clear_domain().unwrap());
         node.shutdown().await.unwrap();
     }
 
@@ -1010,8 +1012,8 @@ mod tests {
         assert_eq!(addr.ip_addrs().count(), 1);
 
         // Removing the domain drops exactly its bindings, leaving self intact.
-        node.add_domain("cluster.example").unwrap();
-        node.remove_domain("cluster.example").unwrap();
+        node.set_domain("cluster.example").unwrap();
+        node.clear_domain().unwrap();
         assert!(!node.store().is_bound(&origin, &nas, now_ns()).unwrap());
         assert!(node
             .store()
@@ -1075,7 +1077,7 @@ mod tests {
             ],
             MIN_TTL,
         );
-        node.add_domain("cluster.example").unwrap();
+        node.set_domain("cluster.example").unwrap();
         node.refresh_due_domains(&resolver, now_ns()).await.unwrap();
 
         let report = node.doctor().unwrap();
@@ -1097,7 +1099,7 @@ mod tests {
             vec![format!("v=sync1 id=nas nk={}", node.node_id().to_z32())],
             MIN_TTL,
         );
-        node.add_domain("cluster.example").unwrap();
+        node.set_domain("cluster.example").unwrap();
         node.refresh_due_domains(&resolver, now_ns()).await.unwrap();
 
         let report = node.doctor().unwrap();
@@ -1610,7 +1612,7 @@ mod tests {
         let nas = SecretKey::generate().public();
         let resolver =
             FakeResolver::new(vec![format!("v=sync1 id=nas nk={}", nas.to_z32())], MIN_TTL);
-        node.add_domain("cluster.example").unwrap();
+        node.set_domain("cluster.example").unwrap();
 
         let start = now_ns();
         assert_eq!(
@@ -1660,7 +1662,7 @@ mod tests {
         let nas = SecretKey::generate().public();
         let resolver =
             FakeResolver::new(vec![format!("v=sync1 id=nas nk={}", nas.to_z32())], MIN_TTL);
-        node.add_domain("cluster.example").unwrap();
+        node.set_domain("cluster.example").unwrap();
         let start = now_ns();
         node.refresh_due_domains(&resolver, start).await.unwrap();
 
@@ -1707,7 +1709,7 @@ mod tests {
             vec![format!("v=sync1 id=nas nk={}", nas.to_z32())],
             Duration::from_secs(3600),
         );
-        node.add_domain("cluster.example").unwrap();
+        node.set_domain("cluster.example").unwrap();
 
         let now = now_ns();
         assert_eq!(
@@ -1743,7 +1745,7 @@ mod tests {
             vec![format!("v=sync1 id=nas nk={}", nas.to_z32())],
             Duration::from_secs(3600),
         ));
-        node.add_domain("cluster.example").unwrap();
+        node.set_domain("cluster.example").unwrap();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let runner = node.clone();

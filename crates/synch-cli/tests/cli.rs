@@ -154,8 +154,10 @@ fn init_is_the_only_command_that_runs_without_a_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let cli = Cli::new(dir.path());
 
-    let out = cli.run(&["init", "--id", "nas@cluster.example"]);
-    assert!(out.contains("nas@cluster.example"), "{out}");
+    // No domain: the device key is the identity and nothing has to be
+    // published for the node to know what it is (§3.1).
+    let out = cli.run(&["init"]);
+    assert!(out.contains("origin:"), "{out}");
     assert!(out.contains("synch daemon run"), "{out}");
 
     // Init is not idempotent: a second one must not silently replace the key.
@@ -194,7 +196,7 @@ fn the_command_surface_works_over_the_socket() {
     let dir = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     let cli = Cli::new(dir.path());
-    cli.run(&["init", "--id", "nas@cluster.example"]);
+    cli.run(&["init"]);
 
     std::fs::create_dir_all(space.path().join("talks")).unwrap();
     std::fs::write(space.path().join("notes.txt"), b"hello").unwrap();
@@ -203,7 +205,10 @@ fn the_command_surface_works_over_the_socket() {
     let daemon = cli.daemon();
 
     let id = cli.run(&["id"]);
-    assert!(id.contains("nas@cluster.example"), "{id}");
+    let origin = format!("key:{}", key_of(&cli));
+    // Listings render a key-identified origin short (`OriginId::short`).
+    let short = origin[..14].to_string();
+    assert!(id.contains(&origin), "{id}");
     assert!(id.contains("active"), "{id}");
 
     cli.run(&["space", "add", "media", &space.path().to_string_lossy()]);
@@ -223,11 +228,11 @@ fn the_command_surface_works_over_the_socket() {
     // origin-prefixed one and `--from` are the same pin spelled two ways (§8).
     assert_eq!(cli.run_bytes(&["cat", "media/notes.txt"]), b"hello");
     assert_eq!(
-        cli.run_bytes(&["cat", "nas@cluster.example:media/notes.txt"]),
+        cli.run_bytes(&["cat", &format!("{origin}:media/notes.txt")]),
         b"hello"
     );
     assert_eq!(
-        cli.run_bytes(&["cat", "media/notes.txt", "--from", "nas@cluster.example"]),
+        cli.run_bytes(&["cat", "media/notes.txt", "--from", &origin]),
         b"hello"
     );
     // Nothing is divergent here, so `--strict` reads it happily.
@@ -242,7 +247,7 @@ fn the_command_surface_works_over_the_socket() {
 
     let status = cli.run(&["status", "media"]);
     assert!(status.contains("media/notes.txt  1 version(s)"), "{status}");
-    assert!(status.contains("nas@cluster.example"), "{status}");
+    assert!(status.contains(&short), "{status}");
 
     // A mirror names the directory it writes into, and carries a policy.
     let mirror_dir = tempfile::tempdir().unwrap();
@@ -278,13 +283,11 @@ fn the_command_surface_works_over_the_socket() {
     assert!(cli.run(&["pin", "rm", "media/notes.txt"]).contains(&root));
     assert!(!cli.run(&["pin", "ls"]).contains(&root));
 
-    // `domain refresh` takes one domain as well as none.
-    let (ok, _, stderr) = cli.try_run(&["domain", "refresh", "not.configured.example"]);
+    // `domain refresh` names no domain: there is only ever the node's own, so
+    // an extra argument is refused by the parser rather than looked up.
+    let (ok, _, stderr) = cli.try_run(&["domain", "refresh", "other.example"]);
     assert!(!ok);
-    assert!(
-        stderr.contains("not a configured membership domain"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("unexpected argument"), "{stderr}");
 
     // A daemon-side failure is this process's exit status, not a transport
     // error.
@@ -292,53 +295,22 @@ fn the_command_surface_works_over_the_socket() {
     assert!(!ok);
     assert!(stderr.contains("hex"), "{stderr}");
 
-    // Rotation, driven entirely by the operator (§3.4).
-    let rotate = cli.run(&["key", "rotate"]);
-    assert!(
-        rotate.contains("_synchronicity.cluster.example."),
-        "{rotate}"
-    );
-    assert!(rotate.contains("v=sync1 id=nas nk="), "{rotate}");
-    let keys = cli.run(&["key", "ls"]);
-    // Two keys, and the note that no peer could be asked whether either has
-    // propagated (§3.4 step 3).
-    assert_eq!(keys.lines().count(), 3, "{keys}");
-    assert_eq!(keys.matches("active").count(), 1, "{keys}");
-    assert!(keys.contains("bound by 0 of 0 reachable peer(s)"), "{keys}");
-    // The freshly generated key is staged, not "retiring": the operator just
-    // minted it, and the label must not say it is on the way out.
-    let new_key = keys
-        .lines()
-        .find(|line| line.contains("staged"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("the generated key")
-        .to_string();
-    let old_key = keys
-        .lines()
-        .find(|line| line.contains("active"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("the active key")
-        .to_string();
-
-    let activated = cli.run(&["key", "activate", &new_key]);
-    assert!(activated.contains(&new_key), "{activated}");
-    assert!(cli.run(&["id"]).contains(&new_key));
-    // Both keys serve until the old one is retired.
-    assert!(cli.run(&["doctor"]).contains("retiring:"));
-    cli.run(&["key", "retire", &old_key]);
+    // Rotation needs a name to carry across the key change, and this node is
+    // its key (§3.1). The refusal says where a name comes from.
+    let (ok, _, stderr) = cli.try_run(&["key", "rotate"]);
+    assert!(!ok);
+    assert!(stderr.contains("synch domain set"), "{stderr}");
     let keys = cli.run(&["key", "ls"]);
     assert_eq!(keys.lines().count(), 2, "{keys}");
-    assert!(keys.contains(&new_key), "{keys}");
-    assert!(!keys.contains(&old_key), "{keys}");
+    assert_eq!(keys.matches("active").count(), 1, "{keys}");
 
-    // A publish after the rotation is signed by the new key and keeps counting
-    // up from where the old one left off.
+    // A later publish keeps counting up from where the last one left off.
     std::fs::write(space.path().join("after.txt"), b"after").unwrap();
     let scan = cli.run(&["scan"]);
     assert!(scan.contains("published seq"), "{scan}");
 
     let doctor = cli.run(&["doctor"]);
-    assert!(doctor.contains("origin: nas@cluster.example"), "{doctor}");
+    assert!(doctor.contains(&format!("origin: {origin}")), "{doctor}");
     assert!(doctor.contains("equivocation: none detected"), "{doctor}");
     assert!(cli.run(&["daemon", "status"]).contains("head: seq"));
     assert!(cli.run(&["doctor"]).contains("storage:"));
@@ -363,16 +335,17 @@ fn the_command_surface_works_over_the_socket() {
 fn domains_are_configurable_without_dns() {
     let dir = tempfile::tempdir().unwrap();
     let cli = Cli::new(dir.path());
-    cli.run(&["init", "--id", "nas@cluster.example"]);
+    cli.run(&["init"]);
     let daemon = cli.daemon();
 
-    // `domain add` attempts a refresh; with no resolver or no records it must
-    // still record the domain and fail closed rather than crash.
-    let _ = cli.try_run(&["domain", "add", "cluster.example"]);
+    // `domain set` attempts a refresh; with no resolver or no records it must
+    // still record the domain and fail closed rather than crash. The node goes
+    // on running under the name it has until the next start (§3.1).
+    let _ = cli.try_run(&["domain", "set", "cluster.example"]);
     assert!(cli.run(&["domain", "ls"]).contains("cluster.example"));
     assert!(cli.run(&["doctor"]).contains("domain cluster.example"));
 
-    cli.run(&["domain", "rm", "cluster.example"]);
+    cli.run(&["domain", "clear"]);
     assert!(cli.run(&["domain", "ls"]).trim().is_empty());
     daemon.stop(&cli);
 }
@@ -385,8 +358,8 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     let nas = Cli::new(nas_dir.path());
     let laptop = Cli::new(laptop_dir.path());
 
-    nas.run(&["init", "--id", "nas@cluster.example"]);
-    laptop.run(&["init", "--id", "laptop@cluster.example"]);
+    nas.run(&["init"]);
+    laptop.run(&["init"]);
 
     let payload: Vec<u8> = (0..120_000u32).map(|i| (i * 13) as u8).collect();
     std::fs::write(nas_space.path().join("small.txt"), b"a small file").unwrap();
@@ -399,28 +372,16 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     // because these nodes run with discovery disabled.
     let nas_key = key_of(&nas);
     let laptop_key = key_of(&laptop);
+    // Key-identified, because static trust binds the key and names nobody:
+    // names are the zone's to issue (§3.2).
     nas.run(&[
         "trust",
         "add",
         &laptop_key,
-        "--as",
-        "laptop",
-        "--domain",
-        "cluster.example",
         "--addr",
         &laptop_daemon.address,
     ]);
-    laptop.run(&[
-        "trust",
-        "add",
-        &nas_key,
-        "--as",
-        "nas",
-        "--domain",
-        "cluster.example",
-        "--addr",
-        &nas_daemon.address,
-    ]);
+    laptop.run(&["trust", "add", &nas_key, "--addr", &nas_daemon.address]);
 
     // `ls` on the laptop refuses the space by name until some origin
     // publishes it — silence is reserved for "exists but empty".
@@ -453,12 +414,14 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
 
     // A verified full read and a verified range read, both streamed from the
     // laptop's daemon over the control socket.
-    let got = laptop.run_bytes(&["cat", "nas@cluster.example:media/small.txt"]);
+    let nas_origin = format!("key:{nas_key}");
+    let nas_short = nas_origin[..14].to_string();
+    let got = laptop.run_bytes(&["cat", &format!("{nas_origin}:media/small.txt")]);
     assert_eq!(got, b"a small file");
 
     let got = laptop.run_bytes(&[
         "cat",
-        "nas@cluster.example:media/big.bin",
+        &format!("{nas_origin}:media/big.bin"),
         "--range",
         "60000..60100",
     ]);
@@ -468,16 +431,14 @@ fn two_nodes_converge_and_transfer_content_over_the_cli() {
     let target = out_dir.path().join("fetched.bin");
     laptop.run(&[
         "get",
-        "nas@cluster.example:media/big.bin",
+        &format!("{nas_origin}:media/big.bin"),
         "-o",
         &target.to_string_lossy(),
     ]);
     assert_eq!(std::fs::read(&target).unwrap(), payload);
 
     // `status` now shows both origins' views of the space.
-    assert!(laptop
-        .run(&["status", "media"])
-        .contains("nas@cluster.example"));
+    assert!(laptop.run(&["status", "media"]).contains(&nas_short));
     assert!(laptop.run(&["peers"]).contains(&nas_key));
 
     laptop_daemon.stop(&laptop);

@@ -160,19 +160,15 @@ impl From<RekorMode> for synch_net::RekorPolicy {
 /// The top-level commands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create an identity and database.
+    /// Create a device key and database.
     Init {
-        /// The stable origin id, as `<name>@<domain>`. Without it the device
-        /// key is the identity and cannot rotate.
+        /// The membership domain whose zone will name this node. Without it
+        /// the device key is the identity and cannot rotate (§3.1).
         #[arg(long)]
-        id: Option<String>,
+        domain: Option<String>,
     },
-    /// Print the OriginId and current device key(s), or name a key-identified node.
-    Id {
-        /// The id subcommand. With none, print the current identity.
-        #[command(subcommand)]
-        command: Option<IdCommand>,
-    },
+    /// Print the OriginId, current device key(s), and where the name came from.
+    Id,
     /// Device-key rotation.
     Key {
         /// The key subcommand.
@@ -341,18 +337,6 @@ pub enum CloudCommand {
     Status,
 }
 
-/// `synch id set ...`
-#[derive(Debug, Subcommand)]
-pub enum IdCommand {
-    /// Adopt a named origin for a key-identified node, without rotating the
-    /// device key. The daemon must be stopped first; `synch scan` after it
-    /// restarts publishes under the new name.
-    Set {
-        /// The stable origin id, as `<name>@<domain>`.
-        id: String,
-    },
-}
-
 /// `synch key ...`
 ///
 /// Rotation is operator-driven end to end (§3.4): the node never polls its own
@@ -393,29 +377,17 @@ pub enum DaemonCommand {
 /// `synch trust ...`
 #[derive(Debug, Subcommand)]
 pub enum TrustCommand {
-    /// Trust a device key.
+    /// Trust a device key. The key is the identity: names come from zones
+    /// (§3.2).
     Add {
         /// The peer's z-base-32 device key.
         key: String,
-        /// Bind it to a named origin, which makes rotation available.
-        #[arg(long = "as")]
-        name: Option<String>,
-        /// The membership domain for the named origin.
-        #[arg(long)]
-        domain: Option<String>,
         /// A note for `synch trust ls`.
         #[arg(long)]
         note: Option<String>,
         /// A direct address to remember for dialing.
         #[arg(long)]
         addr: Option<String>,
-    },
-    /// Point a named origin at a new device key.
-    Rebind {
-        /// The origin to rebind.
-        origin: String,
-        /// Its new z-base-32 device key.
-        key: String,
     },
     /// Remove trust.
     Rm {
@@ -433,23 +405,19 @@ pub enum TrustCommand {
 /// `synch domain ...`
 #[derive(Debug, Subcommand)]
 pub enum DomainCommand {
-    /// Add a DNSSEC membership domain.
-    Add {
+    /// Set the membership domain — the zone that names this node (§3.1).
+    /// Takes effect at the next start.
+    Set {
         /// The domain, e.g. `cluster.example.com`.
         domain: String,
     },
-    /// Remove a membership domain and its bindings.
-    Rm {
-        /// The domain.
-        domain: String,
-    },
-    /// List configured membership domains.
+    /// Drop the membership domain and its bindings. The device key names the
+    /// node again at the next start.
+    Clear,
+    /// Print the membership domain.
     Ls,
-    /// Re-resolve one configured domain now, or every one.
-    Refresh {
-        /// The domain to refresh. Omitted, every configured domain is.
-        domain: Option<String>,
-    },
+    /// Re-resolve the membership domain now.
+    Refresh,
 }
 
 /// `synch space ...`
@@ -670,9 +638,9 @@ mod tests {
     fn parses_the_documented_commands() {
         // Every §9.2 command must parse.
         for args in [
-            vec!["synch", "init", "--id", "nas@cluster.example.com"],
+            vec!["synch", "init"],
+            vec!["synch", "init", "--domain", "cluster.example.com"],
             vec!["synch", "id"],
-            vec!["synch", "id", "set", "orb@cluster.example.com"],
             vec!["synch", "key", "rotate"],
             vec!["synch", "key", "activate", "abc"],
             vec![
@@ -688,20 +656,14 @@ mod tests {
             vec!["synch", "daemon", "run"],
             vec!["synch", "daemon", "status"],
             vec!["synch", "daemon", "stop"],
-            vec!["synch", "trust", "add", "abc", "--as", "nas"],
-            vec![
-                "synch",
-                "trust",
-                "add",
-                "abc",
-                "--as",
-                "nas@cluster.example.com",
-            ],
+            vec!["synch", "trust", "add", "abc"],
+            vec!["synch", "trust", "add", "abc", "--note", "a peer"],
             vec!["synch", "sync"],
-            vec!["synch", "trust", "rebind", "nas@x.example", "abc"],
             vec!["synch", "trust", "rm", "nas@x.example"],
             vec!["synch", "trust", "ls"],
-            vec!["synch", "domain", "add", "cluster.example.com"],
+            vec!["synch", "domain", "set", "cluster.example.com"],
+            vec!["synch", "domain", "clear"],
+            vec!["synch", "domain", "refresh"],
             vec!["synch", "domain", "ls"],
             vec!["synch", "space", "add", "media", "/srv/media"],
             vec!["synch", "space", "ls"],

@@ -32,7 +32,7 @@ async fn spawn(name: &str) -> Peer {
 
 async fn open(data_dir: &std::path::Path, id: Option<OriginId>) -> Node {
     if let Some(id) = id {
-        Node::init(data_dir, Some(id)).unwrap();
+        Node::init_named_by_zone(data_dir, id).unwrap();
     }
     Node::open(NodeConfig::loopback(data_dir)).await.unwrap()
 }

@@ -495,7 +495,7 @@ mod tests {
 
     async fn node(origin: OriginId) -> (tempfile::TempDir, Node) {
         let dir = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), Some(origin)).unwrap();
+        Node::init_named_by_zone(dir.path(), origin).unwrap();
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
         (dir, node)
     }
@@ -800,13 +800,23 @@ mod tests {
         // While the key is still bound, nothing is unreconciled.
         assert!(node.unreconciled_history(&peer_origin).unwrap().is_empty());
 
-        // The operator rebinds the origin to a fresh key: the lost one no
-        // longer speaks for it.
+        // The zone rebinds the origin to a fresh key: the lost one no longer
+        // speaks for it.
         let recovered = SecretKey::generate();
         node.store()
             .remove_binding(&peer_origin, &lost.public(), BindingSource::Static)
             .unwrap();
-        node.trust_rebind(&peer_origin, recovered.public()).unwrap();
+        node.store()
+            .put_binding(&synch_store::Binding {
+                origin: peer_origin.clone(),
+                node_id: recovered.public(),
+                source: BindingSource::Static,
+                domain: None,
+                note: None,
+                added_at: now_ns(),
+                expires_at: None,
+            })
+            .unwrap();
 
         let unreconciled = node.unreconciled_history(&peer_origin).unwrap();
         assert_eq!(unreconciled.len(), 1, "{unreconciled:?}");

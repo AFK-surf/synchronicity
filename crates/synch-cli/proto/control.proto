@@ -56,6 +56,9 @@ service Control {
 
 // One CLI subcommand.
 message Command {
+  // 9 was `trust rebind`: a hand-made name is the only thing it could
+  // re-point, and there are none (DESIGN.md 3.2).
+  reserved 9;
   oneof kind {
     // `synch id`
     Id id = 1;
@@ -73,19 +76,17 @@ message Command {
     DaemonStop daemon_stop = 7;
     // `synch trust add`
     TrustAdd trust_add = 8;
-    // `synch trust rebind <origin> <key>`
-    TrustRebind trust_rebind = 9;
     // `synch trust rm <origin> [--key <key>]`
     TrustRm trust_rm = 10;
     // `synch trust ls`
     TrustLs trust_ls = 11;
-    // `synch domain add <domain>`
-    DomainAdd domain_add = 12;
-    // `synch domain rm <domain>`
-    DomainRm domain_rm = 13;
+    // `synch domain set <domain>`
+    DomainSet domain_set = 12;
+    // `synch domain clear`
+    DomainClear domain_clear = 13;
     // `synch domain ls`
     DomainLs domain_ls = 14;
-    // `synch domain refresh [<domain>]`
+    // `synch domain refresh`
     DomainRefresh domain_refresh = 15;
     // `synch peers`
     Peers peers = 16;
@@ -179,23 +180,16 @@ message DaemonStatus {}
 message DaemonStop {}
 
 message TrustAdd {
-  // The peer's z-base-32 device key.
+  // The peer's z-base-32 device key. The key is the identity: static trust
+  // binds OriginId::Key, and names come from zones (DESIGN.md 3.2).
   string key = 1;
-  // The name to bind it under.
-  optional string name = 2;
-  // The membership domain for the named origin.
-  optional string domain = 3;
+  // 2 and 3 named a peer by hand; 9 in Command was `trust rebind`, which
+  // existed only to re-point such a name.
+  reserved 2, 3;
   // A note for `synch trust ls`.
   optional string note = 4;
   // A direct address to remember for dialing.
   optional string addr = 5;
-}
-
-message TrustRebind {
-  // The origin to rebind.
-  string origin = 1;
-  // Its new z-base-32 device key.
-  string key = 2;
 }
 
 message TrustRm {
@@ -208,22 +202,16 @@ message TrustRm {
 
 message TrustLs {}
 
-message DomainAdd {
-  // The membership domain.
+message DomainSet {
+  // The zone that will name this node (DESIGN.md 3.1).
   string domain = 1;
 }
 
-message DomainRm {
-  // The membership domain.
-  string domain = 1;
-}
+message DomainClear {}
 
 message DomainLs {}
 
-message DomainRefresh {
-  // The one domain to refresh, or unset for every configured domain.
-  optional string domain = 1;
-}
+message DomainRefresh {}
 
 message Peers {}
 

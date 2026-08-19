@@ -131,14 +131,16 @@ impl Node {
 
     /// The membership domains a tunnel should be open for right now.
     ///
-    /// Every domain the node holds membership in, unless the operator has
-    /// opted the feature out — which is the only thing that empties the list,
-    /// there being no enablement to require. Empty for a node with no
-    /// membership domains: there is no apex to take a control plane from, so
-    /// there is nothing to discover and nothing to attach to.
+    /// The node's own domain, unless the operator has opted the feature out —
+    /// which is the only thing that empties the list, there being no enablement
+    /// to require. Empty for a node with no membership domain: there is no apex
+    /// to take a control plane from, so there is nothing to discover and
+    /// nothing to attach to.
     fn attach_targets(&self) -> Vec<String> {
         match self.cloud_settings() {
-            Ok(settings) if !settings.disabled => self.domains().unwrap_or_default(),
+            Ok(settings) if !settings.disabled => {
+                self.domain().unwrap_or_default().into_iter().collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -1267,7 +1269,7 @@ mod tests {
         let (_d, node) = node().await;
         // No domains: nothing to attach to, tunnel or no tunnel.
         assert!(node.attach_targets().is_empty());
-        node.add_domain("cluster.example").unwrap();
+        node.set_domain("cluster.example").unwrap();
         assert_eq!(node.attach_targets(), ["cluster.example"]);
         node.disable_cloud().unwrap();
         assert!(node.attach_targets().is_empty());

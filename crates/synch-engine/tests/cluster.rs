@@ -47,7 +47,7 @@ async fn spawn_with(name: &str, tune: impl FnOnce(&mut NodeConfig)) -> Peer {
     // (§10). Most tests here run current-thread, where that is silent; the
     // multi-thread one below is why this helper does it properly.
     let dir = data.path().to_path_buf();
-    off_runtime(move || Node::init(&dir, Some(origin)))
+    off_runtime(move || Node::init_named_by_zone(&dir, origin))
         .await
         .unwrap();
     let mut config = NodeConfig::loopback(data.path());
@@ -744,7 +744,7 @@ async fn a_node_recovers_its_state_across_a_restart() {
     let data = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     let origin = OriginId::named("nas", "cluster.example").unwrap();
-    Node::init(data.path(), Some(origin.clone())).unwrap();
+    Node::init_named_by_zone(data.path(), origin.clone()).unwrap();
 
     let head = {
         let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
@@ -788,9 +788,9 @@ async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
     // from the CAS. A pinned object survives all of it.
     let data = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
-    Node::init(
+    Node::init_named_by_zone(
         data.path(),
-        Some(OriginId::named("nas", "cluster.example").unwrap()),
+        OriginId::named("nas", "cluster.example").unwrap(),
     )
     .unwrap();
     let mut config = NodeConfig::loopback(data.path());

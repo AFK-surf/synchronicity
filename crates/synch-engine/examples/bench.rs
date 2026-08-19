@@ -386,7 +386,7 @@ impl Peer {
         let data = tempfile::tempdir().unwrap();
         let space = tempfile::tempdir().unwrap();
         let origin = OriginId::named(name, "bench.example").unwrap();
-        Node::init(data.path(), Some(origin)).unwrap();
+        Node::init_named_by_zone(data.path(), origin).unwrap();
         let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
         Peer {
             _data: data,

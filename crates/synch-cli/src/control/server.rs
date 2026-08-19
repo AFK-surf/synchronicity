@@ -878,18 +878,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             out.line("stopping").await?;
         }
 
-        Command::TrustAdd(pb::TrustAdd {
-            key,
-            name,
-            domain,
-            note,
-            addr,
-        }) => {
+        Command::TrustAdd(pb::TrustAdd { key, note, addr }) => {
             let key = parse_key(&key)?;
-            let origin = read(node, move |n| {
-                Ok(n.trust_add(key, name.as_deref(), domain.as_deref(), note.as_deref())?)
-            })
-            .await?;
+            let origin = read(node, move |n| Ok(n.trust_add(key, note.as_deref())?)).await?;
             if let Some(addr) = addr {
                 let socket = addr
                     .parse()
@@ -901,39 +892,6 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             out.line(format!("trusted {} as {origin}", key.to_z32()))
                 .await?;
-        }
-
-        Command::TrustRebind(pb::TrustRebind { origin, key }) => {
-            let origin = parse_origin(&origin)?;
-            let key = parse_key(&key)?;
-            let earlier: Vec<String> = {
-                let origin = origin.clone();
-                read(node, move |n| {
-                    Ok(n.store()
-                        .bindings()?
-                        .into_iter()
-                        .filter(|b| b.origin == origin && b.node_id != key)
-                        .map(|b| b.node_id.to_z32())
-                        .collect())
-                })
-                .await?
-            };
-            {
-                let origin = origin.clone();
-                read(node, move |n| Ok(n.trust_rebind(&origin, key)?)).await?;
-            }
-            out.line(format!("{origin} now also accepts {}", key.to_z32()))
-                .await?;
-            // Rebinding is additive on purpose — the rotation window needs
-            // both keys live — but the old binding will stall every dial once
-            // its endpoint dies, and nothing else says whose job that is.
-            for old in earlier {
-                out.line(format!(
-                    "{old} stays bound through the rotation window; drop it with \
-                     `synch trust rm {origin} --key {old}` once the peer retires it"
-                ))
-                .await?;
-            }
         }
 
         Command::TrustRm(pb::TrustRm { origin, key }) => {
@@ -1006,30 +964,34 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::DomainAdd(pb::DomainAdd { domain }) => {
+        Command::DomainSet(pb::DomainSet { domain }) => {
             {
                 let domain = domain.clone();
-                read(node, move |n| Ok(n.add_domain(&domain)?)).await?;
+                read(node, move |n| Ok(n.set_domain(&domain)?)).await?;
             }
-            out.line(format!("added {domain}")).await?;
-            // Lenient: the add stands even when the first refresh fails —
+            out.line(format!("membership domain is {domain}")).await?;
+            // What the node is called comes out of this zone, and identity is
+            // frozen for the life of a process (§3.1), so the name follows at
+            // the next start rather than under the running daemon.
+            out.line("takes effect at the next `synch daemon run`")
+                .await?;
+            // Lenient: the change stands even when the first refresh fails —
             // configuring a domain before its records are published is a
             // legitimate order of operations.
             refresh_domains(node, out, Some(&domain), false).await?;
         }
 
-        Command::DomainRm(pb::DomainRm { domain }) => {
-            let dropped = {
-                let domain = domain.clone();
-                read(node, move |n| Ok(n.remove_domain(&domain)?)).await?
-            };
+        Command::DomainClear(pb::DomainClear {}) => {
+            let dropped = read(node, move |n| Ok(n.clear_domain()?)).await?;
             if !dropped {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
-                    format!("{domain} is not a configured membership domain"),
+                    "no membership domain is configured".to_string(),
                 ));
             }
-            out.line(format!("removed {domain} and its bindings"))
+            out.line("membership domain cleared, with its bindings")
+                .await?;
+            out.line("the device key names this node at the next `synch daemon run`")
                 .await?;
         }
 
@@ -1046,8 +1008,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
 
         // Strict: a failed refresh is a failed command. Scripts and
         // monitoring read the exit code, not the prose.
-        Command::DomainRefresh(pb::DomainRefresh { domain }) => {
-            refresh_domains(node, out, domain.as_deref(), true).await?
+        Command::DomainRefresh(pb::DomainRefresh {}) => {
+            refresh_domains(node, out, None, true).await?
         }
 
         Command::Peers(pb::Peers {}) => {
@@ -1571,7 +1533,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 }
             ))
             .await?;
-            let domains = node.domains()?;
+            let domains: Vec<String> = node.domain()?.into_iter().collect();
             if domains.is_empty() {
                 // Nothing to attach to and nothing that will change that on
                 // its own: the endpoint comes from a membership zone, so a
@@ -1989,7 +1951,7 @@ async fn refresh_domains(
     };
     let requested = match &domain {
         Some(domain) => vec![domain.clone()],
-        None => read(node, |n| Ok(n.domains()?)).await?,
+        None => read(node, |n| Ok(n.domain()?.into_iter().collect::<Vec<_>>())).await?,
     };
     if requested.is_empty() {
         out.line("no membership domains configured; nothing to refresh (static trust only)")
