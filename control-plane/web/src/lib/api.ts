@@ -133,6 +133,18 @@ export interface AuditRow {
   detail: string
 }
 
+// What /api/invites/preview says about a token: the invite page renders it
+// before any session exists. `status` is the server's word for whether the
+// token can still be accepted.
+export interface InvitePreview {
+  org: string
+  org_name: string
+  email: string
+  role: string
+  expires_at: number
+  status: 'valid' | 'expired' | 'accepted'
+}
+
 export interface OidcConfig {
   issuer: string
   client_id: string

@@ -12,6 +12,7 @@ import exception
 import fixtures.{nk, now_unix, tmp_db}
 import gleam/erlang/process
 import gleam/http.{Delete, Get, Patch, Post, Put}
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -845,6 +846,78 @@ pub fn invite_creation_test() {
       [],
     )
   sqlite.close(conn)
+}
+
+/// The invite page's lookup: a token holder sees the org, the role and the
+/// state of the invite they hold — including the two states that can no
+/// longer be accepted, which the page must tell apart from an unknown token.
+pub fn invite_preview_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let conn = {
+    let assert Ok(conn) = db.open_primary(h.db_path)
+    conn
+  }
+  let plant = fn(id, token, expires, accepted) {
+    let assert Ok(_) =
+      sqlite.exec(
+        conn,
+        "INSERT INTO invites VALUES (?, (SELECT id FROM orgs WHERE slug = 'acme'),
+           'newbie@example.com', 'admin', ?, 'u-admin', ?, ?, ?)",
+        [
+          sqlite.Text(id),
+          sqlite.Blob(id.hash_token(token)),
+          sqlite.Int(now_unix()),
+          sqlite.Int(expires),
+          accepted,
+        ],
+      )
+    Nil
+  }
+  let now = now_unix()
+  plant("inv-valid", "valid-token", now + 3600, sqlite.Null)
+  plant("inv-expired", "expired-token", now - 10, sqlite.Null)
+  plant("inv-accepted", "accepted-token", now + 3600, sqlite.Int(now))
+  // Both expired and accepted: accepted is what the holder must hear, since
+  // expiry alone would suggest a resend that cannot fix it.
+  plant("inv-both", "both-token", now - 10, sqlite.Int(now))
+  sqlite.close(conn)
+
+  let preview = fn(token) {
+    simulate.read_body(call(
+      h,
+      simulate.request(Get, "/api/invites/preview?token=" <> token),
+    ))
+  }
+  let valid = preview("valid-token")
+  assert string.contains(valid, "\"org\":\"acme\"")
+  assert string.contains(valid, "\"org_name\":\"Acme\"")
+  assert string.contains(valid, "\"email\":\"newbie@example.com\"")
+  assert string.contains(valid, "\"role\":\"admin\"")
+  assert string.contains(valid, "\"status\":\"valid\"")
+  // Unix seconds, not a formatted date: the page renders it itself.
+  assert string.contains(valid, "\"expires_at\":" <> int.to_string(now + 3600))
+  assert string.contains(preview("expired-token"), "\"status\":\"expired\"")
+  assert string.contains(preview("accepted-token"), "\"status\":\"accepted\"")
+  assert string.contains(preview("both-token"), "\"status\":\"accepted\"")
+  // A token that is nobody's invite is a 404, not a guess; an omitted one is
+  // the request's own fault.
+  let unknown =
+    call(h, simulate.request(Get, "/api/invites/preview?token=nope"))
+  assert unknown.status == 404
+  let bare = call(h, simulate.request(Get, "/api/invites/preview"))
+  assert bare.status == 400
+  let empty = call(h, simulate.request(Get, "/api/invites/preview?token="))
+  assert empty.status == 400
 }
 
 /// Deleting a network: the typed confirmation is the guard, the zone shrinks

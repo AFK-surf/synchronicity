@@ -526,6 +526,63 @@ pub fn create_invite(
   }
 }
 
+/// What an invitation link may say about itself before any session exists:
+/// the token is the credential — a holder could accept the invite outright,
+/// so showing them what they would be joining reveals nothing acceptance
+/// would not.
+pub fn preview_invite(req: Request, ctx: AuthContext) -> Response {
+  // Absent and empty are the same omission; only a real token earns a lookup.
+  case list.key_find(wisp.get_query(req), "token") {
+    Error(Nil) | Ok("") ->
+      error_json(400, "bad_request", "token query parameter required")
+    Ok(token) ->
+      with_db(ctx, fn(conn) {
+        let rows =
+          sqlite.query(
+            conn,
+            "SELECT o.slug, o.name, i.email, i.role, i.expires_at,
+                    i.accepted_at IS NOT NULL
+             FROM invites i JOIN orgs o ON o.id = i.org_id
+             WHERE i.token_hash = ?",
+            [Blob(id.hash_token(token))],
+          )
+        case rows {
+          Ok([
+            [
+              Text(slug),
+              Text(org_name),
+              Text(email),
+              Text(role),
+              VInt(expires_at),
+              VInt(accepted),
+            ],
+          ]) -> {
+            // Status over bare existence: an expired or already-accepted
+            // invite is still identifiable to its holder, and the page can
+            // say which it is rather than answering "invalid" for all three.
+            let status = case accepted == 1, expires_at > now_unix() {
+              True, _ -> "accepted"
+              False, False -> "expired"
+              False, True -> "valid"
+            }
+            ok_json(
+              json.object([
+                #("org", json.string(slug)),
+                #("org_name", json.string(org_name)),
+                #("email", json.string(email)),
+                #("role", json.string(role)),
+                #("expires_at", json.int(expires_at)),
+                #("status", json.string(status)),
+              ]),
+            )
+          }
+          Ok(_) -> error_json(404, "bad_invite", "invalid invitation link")
+          Error(_) -> db_error()
+        }
+      })
+  }
+}
+
 pub fn accept_invite(
   req: Request,
   ctx: AuthContext,

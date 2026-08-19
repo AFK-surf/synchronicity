@@ -138,6 +138,10 @@ fn primary_routes(
       use live <- with_session(req, auth)
       orgs_api.accept_invite(req, auth, live)
     }
+    // Anonymous by the same reasoning as /api/auth/methods: the invite page
+    // asks it before a session exists, and the token in the query string is
+    // the credential the invitation email already carried.
+    ["api", "invites", "preview"], Get -> orgs_api.preview_invite(req, auth)
     ["api", "orgs", slug, "audit"], Get -> {
       use live <- with_session(req, auth)
       orgs_api.audit_log(req, auth, live, slug)
