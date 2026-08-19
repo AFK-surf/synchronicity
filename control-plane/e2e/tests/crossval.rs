@@ -24,7 +24,7 @@ fn env(key: &str) -> Option<String> {
 /// `main` of ours and no `sim` feature, so neither of the two paths
 /// `synch_net::tls` describes reaches it — the tests install it themselves.
 fn install_provider() {
-    synch_net::tls::install_ring_provider();
+    synch_net::tls::install_crypto_provider();
 }
 
 #[tokio::test]

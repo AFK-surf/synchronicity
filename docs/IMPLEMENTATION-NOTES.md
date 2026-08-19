@@ -753,8 +753,15 @@ Pinned in the workspace `Cargo.toml`. The notable ones:
   `NodeId` so the design's vocabulary survives in the data model.
 - `bao-tree` 0.16 — used through its synchronous `io::sync` API.
 - `rusqlite` 0.40 with `bundled`, so no system SQLite is needed.
-- `hickory-resolver` 0.26 with `dnssec-ring`, configured with `validate = true`
-  and an additional per-record `Proof::is_secure()` check, so an insecure or
-  bogus answer is discarded rather than trusted.
-- No `openssl` anywhere: `rustls` throughout, via `iroh`'s `tls-ring` feature
-  and `reqwest`'s `rustls` feature in tests.
+- `hickory-resolver` 0.26 with `dnssec-aws-lc-rs`, configured with
+  `validate = true` and an additional per-record `Proof::is_secure()` check, so
+  an insecure or bogus answer is discarded rather than trusted.
+- `aws-lc-rs` 1.18 is the one cryptographic backend in the tree, and `ring` is
+  in none of it: `iroh` takes `tls-aws-lc-rs`, `hickory-resolver`
+  `dnssec-aws-lc-rs`, `rustls` its `aws-lc-rs` feature, and the digests and
+  signatures this workspace computes itself go through the same crate. reqwest
+  takes `rustls-no-provider` so the provider is named in exactly one place;
+  each binary installs it as the first thing `main` does
+  (`synch_net::tls::install_crypto_provider`), and `sim` builds install it
+  before `main` via `ctor` because test binaries have no `main` of ours.
+- No `openssl` anywhere: `rustls` throughout.

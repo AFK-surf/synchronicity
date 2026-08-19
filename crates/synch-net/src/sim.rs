@@ -1143,23 +1143,22 @@ impl SimLog {
     /// fixed-width-only verifier wants, keeping the whole P-256 path green while
     /// it stayed unusable against the real log.
     pub fn new(origin: &str) -> SimLog {
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             &rng,
         )
         .expect("keygen")
         .as_ref()
         .to_vec();
-        let key = ring::signature::EcdsaKeyPair::from_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        let key = aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             &pkcs8,
-            &rng,
         )
         .expect("key load");
         // The public key comes back as an uncompressed point; the SPKI and
         // DNSSEC both want it without the 0x04 tag.
-        let point = ring::signature::KeyPair::public_key(&key).as_ref()[1..].to_vec();
+        let point = aws_lc_rs::signature::KeyPair::public_key(&key).as_ref()[1..].to_vec();
         SimLog {
             origin: origin.to_string(),
             pkcs8,
@@ -1565,21 +1564,20 @@ struct SimTufKey {
 
 impl SimTufKey {
     fn p256() -> SimTufKey {
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             &rng,
         )
         .expect("keygen")
         .as_ref()
         .to_vec();
-        let key = ring::signature::EcdsaKeyPair::from_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        let key = aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             &pkcs8,
-            &rng,
         )
         .expect("key load");
-        let point = ring::signature::KeyPair::public_key(&key).as_ref()[1..].to_vec();
+        let point = aws_lc_rs::signature::KeyPair::public_key(&key).as_ref()[1..].to_vec();
         SimTufKey {
             pkcs8,
             spki: p256_spki(&point),
@@ -1588,16 +1586,16 @@ impl SimTufKey {
     }
 
     fn ed25519() -> SimTufKey {
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(&rng)
             .expect("keygen")
             .as_ref()
             .to_vec();
-        let key = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).expect("key load");
+        let key = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).expect("key load");
         // The same prefix `LogKey::from_spki` strips back off, named once
         // there rather than spelled out again here.
         let mut spki = crate::rekor::ED25519_SPKI_PREFIX.to_vec();
-        spki.extend_from_slice(ring::signature::KeyPair::public_key(&key).as_ref());
+        spki.extend_from_slice(aws_lc_rs::signature::KeyPair::public_key(&key).as_ref());
         SimTufKey {
             pkcs8,
             spki,
@@ -1626,17 +1624,16 @@ impl SimTufKey {
     }
 
     fn sign(&self, message: &[u8]) -> Vec<u8> {
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         match self.scheme {
-            "ed25519" => ring::signature::Ed25519KeyPair::from_pkcs8(&self.pkcs8)
+            "ed25519" => aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(&self.pkcs8)
                 .expect("key load")
                 .sign(message)
                 .as_ref()
                 .to_vec(),
-            _ => ring::signature::EcdsaKeyPair::from_pkcs8(
-                &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            _ => aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(
+                &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
                 &self.pkcs8,
-                &rng,
             )
             .expect("key load")
             .sign(&rng, message)
@@ -1772,13 +1769,13 @@ pub fn hashedrekord_body(statement: &[u8], signature_der: &[u8], certificate: &[
 
 /// Signs with ECDSA P-256/SHA-256, producing the ASN.1/DER form a Rekor
 /// entry signature carries. The zone key's PKCS#8 was minted for FIXED
-/// signing, but ring lets the same key material load under either encoding.
+/// signing, but aws-lc-rs lets the same key material load under either
+/// encoding.
 fn sign_p256_der(pkcs8: &[u8], message: &[u8]) -> Vec<u8> {
-    let rng = ring::rand::SystemRandom::new();
-    let key = ring::signature::EcdsaKeyPair::from_pkcs8(
-        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let key = aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(
+        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
         pkcs8,
-        &rng,
     )
     .expect("key load");
     key.sign(&rng, message).expect("sign").as_ref().to_vec()

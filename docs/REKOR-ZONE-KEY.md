@@ -620,7 +620,7 @@ Then, in process, no network:
   could have collected about a zone that never heard of them;
 - **attribution**: `signature.content` verifies under the certificate's own
   SubjectPublicKeyInfo over the entry's digest as a prehash — equivalently,
-  ECDSA-SHA256 over the DSSE PAE, which is how ring is asked (ASN.1/DER,
+  ECDSA-SHA256 over the DSSE PAE, which is how aws-lc-rs is asked (ASN.1/DER,
   not the raw `r‖s` of DNSSEC);
 - `data.digest` = SHA-256 of the DSSE PAE of the carried Statement;
 - **statement and key binding**: the Statement's claimed set is exactly the
