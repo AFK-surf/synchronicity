@@ -442,13 +442,16 @@ function AddDevice({
 
 function ConnectPanel({ domain }: { domain: string }) {
   const snippet = [
-    `# On each device — print its key, add it above, then join the domain:`,
+    `# On each device — already running \`synch daemon run\` — print its key,`,
+    `# add it above, then join the domain:`,
     `synch id`,
-    `synch domain add ${domain}`,
+    `synch domain set ${domain}`,
     ``,
-    `# Air-gapped / direct mode (anchor from /api/zone/anchor):`,
-    `synch --doh ${window.location.origin}/dns-query \\`,
-    `      --dnssec-anchor anchor.key domain add ${domain}`,
+    `# Air-gapped / direct mode: point the daemon at this control plane and`,
+    `# its DNSSEC anchor (from /api/zone/anchor), then join as usual:`,
+    `synch daemon run --doh ${window.location.origin}/dns-query \\`,
+    `      --dnssec-anchor anchor.key &`,
+    `synch domain set ${domain}`,
   ].join('\n')
   return (
     <div className="rounded-lg border border-neutral-800 p-4">
