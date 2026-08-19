@@ -59,13 +59,18 @@ pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
 
 /// What a promotion attempt concluded.
 ///
-/// Three states rather than a `bool`, because the callers cannot tell them apart
+/// Four states rather than a `bool`, because the callers cannot tell them apart
 /// and kept getting it wrong: a promotion that did nothing because the trie is
-/// still arriving and one that retired the head on a verdict already in the memo
-/// are both "did not flip", and reporting the second as the first counted a
-/// discarded head as accepted. Inferring it by re-reading the slot afterwards was
-/// no better — it cost a lock on every ordinary adoption and still could not see
-/// which case it was.
+/// still arriving, one that retired the head on a verdict already in the memo,
+/// and one that dropped it because the complete slot had overtaken it are all
+/// "did not flip" — and reporting any of the latter two as the first counted a
+/// discarded head as accepted and rang the fetch bell for a head that no longer
+/// existed.
+///
+/// Returned rather than inferred. Re-reading the slot afterwards *could* see the
+/// difference — an earlier pass said it could not, and that was wrong — but it
+/// cost a lock acquisition on every ordinary adoption to answer a question the
+/// promotion already knew.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Promotion {
     /// The pending head's trie was wholly present and the complete slot flipped.
@@ -98,7 +103,15 @@ pub enum HeadOutcome {
     /// Trie heads whose signing key is not bound to the claimed origin are
     /// ignored even if relayed by a trusted peer.
     Unbound,
-    /// The head is not strictly greater than what we already hold.
+    /// Nothing changed for this origin.
+    ///
+    /// Usually because the head is not strictly greater than what we already
+    /// hold. Also the answer when a head *was* adopted and then stopped being
+    /// pending before the promotion looked: the complete slot had overtaken it,
+    /// or another holder of the write connection promoted it in the gap. Both
+    /// leave nothing to fetch, which is what this outcome tells the caller;
+    /// distinguishing them would cost a second read of the complete slot on
+    /// every adoption, to move a head between two counters.
     NotNewer,
     /// The head was adopted, and this node has already judged that it cannot
     /// materialize this promotion, so the head was retired again rather than
@@ -129,7 +142,13 @@ pub enum FetchOutcome {
     Idle,
     /// The trie is now complete and the head flipped.
     Completed,
-    /// Progress was made but the trie is still incomplete.
+    /// The fetch ran and the head did not flip.
+    ///
+    /// Usually because the trie is still incomplete. Also covers the promotion
+    /// declining for a reason the fetch cannot act on — the verdict was already
+    /// in the refusal memo, or the slot had moved on — which is why this does not
+    /// claim progress was made. No caller distinguishes them: both mean this
+    /// exchange is done with the origin.
     Partial,
     /// Every candidate persistently returned `missing`; the pending head was
     /// abandoned and head selection re-runs (§5.2).
@@ -2154,9 +2173,14 @@ mod containment_tests {
         syncer
             .offer_head(&head, 0)
             .expect_err("the record cannot be materialized");
-        // The first offer did adopt it before judging it, so it may have rung.
-        // Drain that permit; what must not ring is the *refusal*.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        // The first offer must not have rung either, and asserting that rather
+        // than draining it is free coverage: the bell lives in the
+        // `Promotion::Waiting` arm, which a promotion that raised never reaches,
+        // so a ring here would be the same defect one retirement path over —
+        // waking the loop to fetch a trie for a head that was just retired.
+        tokio::time::timeout(std::time::Duration::from_millis(200), wake.notified())
+            .await
+            .expect_err("a head retired by a fault must not ring either");
 
         assert_eq!(
             syncer.offer_head(&head, 0).unwrap(),

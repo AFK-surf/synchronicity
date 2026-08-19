@@ -407,10 +407,10 @@ impl Node {
                     promoted += 1;
                     continue;
                 }
-                // `try_promote` retired it, on this pass and on this call, so
-                // it counts here — but there is nothing left for the
-                // compare-and-clear below to delete, which is why this returns
-                // early rather than falling through to it.
+                // `try_promote` retired it on this call, so it counts — and
+                // there is nothing left for the compare-and-clear below to
+                // delete, which is why this returns early rather than falling
+                // through to it.
                 Ok(crate::reconcile::Promotion::Refused) => {
                     abandoned += 1;
                     continue;
@@ -488,12 +488,16 @@ impl Node {
             // Both cases fall through to the compare-and-clear below, the
             // poisoned one included even though `try_promote` will usually have
             // retired it already: it *compares*, so a head already gone reports
-            // `dropped = false` and the count below stays honest about what this
-            // pass deleted, while a head `try_promote` never reached still gets
-            // an exit. That second case is why this cannot be an early
+            // `dropped = false`, while a head `try_promote` never reached still
+            // gets an exit. That second case is why this cannot be an early
             // `continue` — a fault raised before `try_promote` has read the head
             // it would condemn leaves nothing to retire it, and the slot then
             // holds `head_floor` above everything this node can serve.
+            //
+            // `abandoned` counts heads this pass retired, by whichever hand did
+            // it — the same convention the `Refused` arm above uses. Counting
+            // only what this statement deleted would report 0 for a pass whose
+            // own `try_promote` did the retiring, which is most of them.
             if !poisoned {
                 tracing::warn!(
                     origin = %origin,
@@ -506,7 +510,7 @@ impl Node {
             // walk, and a `HeadPush` accepted on the blocking pool in that
             // window would otherwise be deleted by a verdict reached about a
             // different head — and condemned by *its* `received_at`.
-            if contained(
+            let cleared = contained(
                 "clearing a pending head",
                 self.store().clear_head_at(
                     origin,
@@ -514,9 +518,8 @@ impl Node {
                     stored.head.seq,
                     &stored.head.root,
                 ),
-            )
-            .is_some_and(|dropped| dropped)
-            {
+            );
+            if cleared.is_some_and(|dropped| dropped) || poisoned {
                 abandoned += 1;
             }
         }
