@@ -4059,6 +4059,7 @@ dependencies = [
 name = "synch-engine"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "directories",
  "futures-util",
  "hex",
@@ -4066,7 +4067,6 @@ dependencies = [
  "iroh-base",
  "notify",
  "postcard",
- "ring",
  "rustix",
  "serde",
  "serde_json",

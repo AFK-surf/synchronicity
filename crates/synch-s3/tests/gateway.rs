@@ -1592,7 +1592,8 @@ async fn delete_object_removes_the_file_and_tombstones_the_key() {
     // node asserts for the path says deleted.
     let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
     let set = harness.node.versions("media", "notes.txt").unwrap();
-    let row = harness.node.resolve_set(&set, &ours).unwrap();
+    let now = harness.node.store().read_instant().unwrap();
+    let row = harness.node.resolve_set(&set, &ours, now).unwrap();
     assert_eq!(row.kind, synch_core::EntryKind::Tombstone);
     harness.stop().await;
 }
@@ -1936,7 +1937,8 @@ async fn delete_object_tombstones_a_path_with_no_local_row() {
     // Not merely absent from the disk: tombstoned in what this node publishes.
     let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
     let set = harness.node.versions("media", "orphaned.txt").unwrap();
-    let row = harness.node.resolve_set(&set, &ours).unwrap();
+    let now = harness.node.store().read_instant().unwrap();
+    let row = harness.node.resolve_set(&set, &ours, now).unwrap();
     assert_eq!(
         row.kind,
         synch_core::EntryKind::Tombstone,
@@ -1968,7 +1970,8 @@ async fn delete_object_publishes_even_when_the_file_is_already_gone() {
 
     let ours = synch_engine::VersionPolicy::Origin(harness.node.origin().clone());
     let set = harness.node.versions("media", "vanished.txt").unwrap();
-    let row = harness.node.resolve_set(&set, &ours).unwrap();
+    let now = harness.node.store().read_instant().unwrap();
+    let row = harness.node.resolve_set(&set, &ours, now).unwrap();
     assert_eq!(row.kind, synch_core::EntryKind::Tombstone);
     harness.stop().await;
 }
