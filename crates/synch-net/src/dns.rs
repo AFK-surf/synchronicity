@@ -783,7 +783,7 @@ enum GateApex<'a> {
 ///
 /// The private field is the mechanism, in the same spirit as
 /// [`chain::Authorized`](crate::chain::Authorized): only
-/// [`DnssecResolver::gated_txt`] can build one, so a value of this type is
+/// `DnssecResolver::gated_txt` can build one, so a value of this type is
 /// evidence the gate ran rather than a claim in a comment that it did. That
 /// distinction is exactly what a previous audit found missing — the
 /// control-plane attach record was read from a `DnssecTxt` that no gate had
@@ -1131,7 +1131,7 @@ impl DnssecResolver {
     /// a compromised parent who substitutes a DS, adds a key to the apex DNSKEY
     /// RRset, and thereby signs whatever they like with a key that validates.
     ///
-    /// **No trust decision may be made from this.** [`Self::gated_txt`] is the
+    /// **No trust decision may be made from this.** `gated_txt` is the
     /// one way to get an answer that may be acted on, and it returns a
     /// [`GatedTxt`] so that "has this been gated?" is a question the type
     /// system answers instead of one a reviewer has to trace. No production

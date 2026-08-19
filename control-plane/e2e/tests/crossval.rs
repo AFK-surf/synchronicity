@@ -151,10 +151,13 @@ async fn an_unlogged_zone_fails_closed_under_the_default_policy() {
         .expect_err("a zone with no proof record must not resolve by default");
     eprintln!("ok: unlogged zone refused under the default policy: {error}");
 
-    // And the plain TXT lookup still works — it is the member-set path that
-    // gained a requirement, not every query the resolver makes.
+    // And the ungated TXT lookup still works — it is the member-set path that
+    // gained a requirement, not every query the resolver makes. Nothing may
+    // decide anything from this answer, which is what the method's name says;
+    // here it only shows the refusal above came from the gate and not from the
+    // zone being unresolvable.
     resolver
-        .lookup_txt(&domain)
+        .lookup_txt_ungated(&domain)
         .await
         .expect("the TXT lookup itself never consults the log");
 }
