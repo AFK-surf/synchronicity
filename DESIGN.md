@@ -132,116 +132,61 @@ in the SQLite database (created `0600` inside the data directory). Display/inter
 encoding for keys is z-base-32 (iroh's native encoding).
 
 **Where a node's own identity comes from** is decided by one fact: whether it has a
-membership domain.
+membership domain. With none it is `Key(K_active)`, self-certifying and not rotatable;
+with one it is `Named { domain, id }`, named and rotatable by that zone.
 
-| Membership domain | Own `OriginId`         | Rotatable | Authority on the name |
-|-------------------|------------------------|-----------|-----------------------|
-| none              | `Key(K_active)`        | no        | the device key itself |
-| one, `<d>`        | `Named { domain, id }` | yes       | the zone (below)      |
+A name comes from a zone and only from a zone; there is no way to name a node by hand.
+The domain is the `@domain` half of that name, so a node resolves the zone that names
+it, and every dns binding it holds is for an origin in its own zone.
 
-A domainless node needs no identity configuration at all: the identity *is* the key,
-self-certifying and not rotatable. A named, rotatable identity comes from a zone and
-only from a zone — there is no way to name a node by hand, because a hand-set name is
-a second authority on something the zone already decides. An isolated deployment that
-wants named origins runs its own signed root and points `--dnssec-anchor` at it (§3.2).
+**Discovery.** A node with a domain resolves it once at `synch daemon run`, before the
+endpoint binds and before any loop starts, and freezes the answer: **identity is
+immutable for the lifetime of the process**, which is what lets a changed name be
+adopted with no daemon stopped. The answer is the origin the validated record set binds
+this node's active device key to under §3.2's malformed-set rules — nothing at all when
+that key is absent or ambiguous, and nothing adoptable when its record carries no
+`id=`, since taking `Key(nk)` there would trade a rotatable identity for a fixed one on
+the strength of a missing field.
 
-**One node, one zone.** The domain in that slot is the `@domain` half of the node's own
-name: a node resolves the zone that names it. A node with no domain resolves no zone at
-all and trusts only what it is told statically (§3.2). Every dns binding a node holds
-is therefore for an origin in its own zone.
+Such an answer is adopted whether the node had no name, the same one, or a different
+one — the last migrating its local state (below). When there is no such answer:
 
-**Identity discovery.** A node with a membership domain resolves it once at `synch
-daemon run`, before the endpoint binds and before any loop starts, and freezes the
-answer:
-**a node's identity is immutable for the lifetime of the process**. Everything that
-reads it — seq monotonicity, trie keying, head signing — sees one value from first
-call to shutdown, which is exactly what lets a *changed* identity be adopted with no
-daemon stopped.
+| Why there is none                                     | Action                                     |
+|-------------------------------------------------------|--------------------------------------------|
+| the zone no longer names a key it named before         | keep that name, report it, do not poll     |
+| the node has no name, or one from a zone since replaced| **unidentified**: poll, old state intact   |
+| resolution failed                                      | keep the stored name if any, else poll     |
 
-The oracle is the one §3.2's malformed-set rules already define: the origin the
-validated record set binds this node's active device key to, or nothing at all when
-that key is absent from the set or ambiguous within it. Only a `Named` result is
-adopted — a key published without an `id=` resolves to `Key(nk)`, and adopting that
-would quietly turn a rotatable node into a non-rotatable one on the strength of a
-missing field, so it is refused and reported instead.
+A resolution failure is not evidence that a record was withdrawn, so the two never
+collapse: a node that un-identified itself on an unreachable resolver would lose its
+name every time DNS hiccuped. Nor does a withdrawal un-identify one — its bindings
+expire at every peer on `dns_trust_grace` and its data goes unavailable per the edge
+§3.4 accepts, and destroying local state on top of that buys nothing. An identity from
+a zone the node no longer resolves is neither case: nothing currently names it.
 
-| Stored identity            | Resolution        | Action                                            |
-|----------------------------|-------------------|---------------------------------------------------|
-| none                       | `<id>@<domain>`   | adopt it; first boot                              |
-| `o`                        | `o`               | nothing; steady state                             |
-| `p`                        | some other `o`    | adopt `o`, migrating local state (below)          |
-| none                       | no match          | **unidentified**: poll                            |
-| `p`, from the current zone | no match          | keep `p`, report it, do not poll                  |
-| `p`, from a replaced zone  | no match          | **unidentified**: poll; `p`'s state left intact   |
-| any                        | resolution failed | keep the stored identity if there is one, else poll |
+**Unidentified**, a node cannot sign heads, publish, or scan, and no peer accepts its
+connections — the same absent record leaves them without a binding for its key. It runs
+the reduced service §3.4's recovery state establishes: control socket up so `synch
+doctor` explains the state, endpoint bound, publishing commands failing with the record
+to publish filled in (`v=sync1 id=<name> nk=<K> apex=<apex>`). It polls on the negative
+answer's TTL clamped to `[30s, 5m]`, re-queries at once on `synch domain refresh`, and
+stops for good once an identity is adopted; the membership refresh loop, which is about
+*other* nodes, runs on regardless.
 
-"A validated answer that says nothing about this key" and "no validated answer" are
-different facts and never collapse. A resolution failure — unreachable resolver,
-expired RRSIG, a clock that dates nothing (§3.2) — is not evidence that a record was
-withdrawn, and a node that un-identified itself on one would lose its name every time
-its resolver hiccuped. Failing closed here means keeping what you have.
+**Adopting a name** — a first one, or one that displaced it — happens on the next start,
+in one transaction, before the endpoint binds: the self binding moves, both head slots
+and the old origin's `entries` and `blob_providers` views are dropped, mirror policies
+pinned to it (§7.2) are rewritten, and `publish_floor` is cleared. Blobs stay and the
+next scan republishes them; `head_history` is untouched, so heads signed under the old
+name survive as the fork evidence §4.4 makes of them. `synch domain set` and `synch
+domain clear` reach the same migration by another route, since what fills the domain
+slot is what names the node — the running daemon is untouched by the edit, a move waits
+for the new zone to name it, and clearing waits for nothing.
 
-The same asymmetry covers a record that genuinely *is* withdrawn: the node keeps its
-name, keeps signing, and keeps a coherent trie, while its bindings expire at every
-peer on `dns_trust_grace` and its data goes unavailable per the edge §3.4 accepts.
-Un-adopting would destroy local state on top of that, irreversibly, and buy nothing.
-
-**The unidentified state.** A node with a device key and no identity can speak QUIC
-and has nothing to say: it cannot sign heads, publish, or scan into a trie. It is
-also inert in practice — the same absent record leaves every peer without a binding
-for its key, so no peer accepts its connections. It runs the reduced service §3.4's
-recovery state establishes: control socket up so `synch daemon status` and `synch
-doctor` can explain the state, endpoint bound, and every publishing command failing
-with the record to publish filled in (`v=sync1 id=<name> nk=<K> apex=<apex>`).
-
-The identity poll is a one-shot-until-success task, separate from the membership
-refresh loop: it stops the moment an identity is adopted and never runs again in that
-process, while the membership loop — which is about *other* nodes — keeps running. It
-re-queries on the negative answer's TTL, clamped to `[30s, 5m]`: tight enough that
-publishing the record and watching the node come up feels immediate, loose enough not
-to flood a name that does not exist yet. `synch domain refresh` triggers it at once,
-so nobody waits on the clamp.
-
-Bringing up a machine is therefore `synch init --domain cluster.example.com`, which
-prints the device key, then publishing one TXT record naming that key. The ordering is
-forced: a record cannot name a key that does not exist yet.
-
-**Adopting a changed identity.** When the zone binds this node's key to a different
-`id=` than the one it holds, the new name is adopted on the next start, in one
-transaction, before the endpoint binds: the self binding moves, both head slots and
-the old origin's `entries` and `blob_providers` views are dropped, any mirror policy
-pinned to the old origin (§7.2) is rewritten to the new one, and `publish_floor` is
-cleared, since it floors history under a name nobody holds. Blobs stay — they are
-content-addressed — and the next scan republishes them under the new name.
-`head_history` is untouched, so heads signed under the old name survive as the fork
-evidence §4.4 makes of them. No daemon has to be stopped, because the migration runs
-before there is one.
-
-It fires only on a validated answer yielding a single unambiguous `Named` origin for
-the active device key: never on a resolution failure, never on ambiguity, never on
-absence, never on an `id=`-less match. That precondition is the whole safety argument
-for an unattended and destructive operation, and every part of it is a rule §3.2
-enforces anyway.
-
-`synch domain set` and `synch domain clear` are the same event arriving by another
-route, and take effect the same way. What fills the domain slot is what names the
-node, so changing it changes where the name comes from — one zone to another, no zone
-to a zone, or a zone back to the device key — and each is the migration above, run at
-the next start, dropping the bindings of any zone left behind. The running daemon is
-untouched by the edit: it goes on resolving the zone its current name comes from, so
-one node, one zone holds at every instant.
-
-A node moving *to* a zone waits for that zone to name it: until it does it is
-unidentified and polling (the table above), holding intact the state published under
-its previous name but signing nothing new. Clearing the slot waits for nothing, since
-the device key is always there to name a node.
-
-A relabel is not cheap, and `synch doctor` says so: the new origin starts at `seq = 1`,
-peers keep the old origin's trie until its bindings expire, and the cluster briefly
-lists the machine twice. Every adoption is recorded durably in `identity_history`
-(§10) and surfaced by `synch id` and `synch doctor`. §3.4 makes a change of signing
-identity a deliberate act with an audit trail; here the deliberateness is the zone
-operator's, one edit upstream, so the trail carries the weight alone.
+A relabel costs a full republish: the new origin starts at `seq = 1`, peers keep the old
+one's trie until its bindings expire, and `synch doctor` says so. Every adoption is
+recorded in `identity_history` (§10), the audit trail §3.4 wants behind a change of
+signing identity — here the deliberateness is the zone operator's, one edit upstream.
 
 ### 3.2 Trust sources
 
@@ -255,15 +200,9 @@ A remote node is **trusted** iff at least one of the following holds:
 
    Static trust is unilateral per node and never expires (until removed). For two nodes
    to sync, *each* must trust the other; there is no transitive trust. The key is the
-   identity: static trust binds `OriginId::Key`, never a name.
-
-   Naming a peer by hand would be a standing override of the only authority on names,
-   and it never expires — so a member the zone had dropped would stay trusted under
-   its name forever, and removing a record would stop being how a member is removed.
-   That is the fail-closed property (below) inverted. A node that wants named,
-   rotatable members resolves the zone that issues those names; a node that does not
-   trust a zone gets key-identified peers, which cannot rotate. There is no third
-   arrangement, and no command that manufactures one.
+   identity: static trust binds `OriginId::Key`, never a name — a hand-made name would
+   be a standing, non-expiring override of the zone, so dropping a record would stop
+   being how a member is dropped.
 
 2. **DNSSEC-based discovery** — the node's key appears in a TXT record of the
    membership domain:
