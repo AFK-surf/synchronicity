@@ -35,9 +35,8 @@ pub struct RoundReport {
 /// A round dials every reachable peer, so answering each push with its own
 /// round would let one origin publishing in a burst — an import, a large
 /// rename — turn one node's publishes into a dial storm across the membership.
-/// The bell is coalescing (`notify_waiters` wakes whoever is listening and
-/// keeps nothing), so a burst arriving inside the floor costs one round, not
-/// one per head.
+/// The bell holds at most one permit, so a burst arriving inside the floor costs
+/// one extra round rather than one per head.
 const REACTIVE_FLOOR: Duration = Duration::from_secs(2);
 
 impl Node {
@@ -404,23 +403,43 @@ impl Node {
             let origin = &stored.head.origin;
             let outcome = syncer.try_promote(origin, now);
             let poisoned = match outcome {
-                Ok(true) => {
+                Ok(crate::reconcile::Promotion::Flipped) => {
                     promoted += 1;
                     continue;
                 }
-                Ok(false) => false,
+                // `try_promote` retired it, on this pass and on this call, so
+                // it counts here — but there is nothing left for the
+                // compare-and-clear below to delete, which is why this returns
+                // early rather than falling through to it.
+                Ok(crate::reconcile::Promotion::Refused) => {
+                    abandoned += 1;
+                    continue;
+                }
+                // Both mean this pass has no verdict to record: the head
+                // either still needs its trie, or is already gone.
+                Ok(crate::reconcile::Promotion::Waiting)
+                | Ok(crate::reconcile::Promotion::Idle) => false,
                 // Only a fault in what the *origin* published condemns its head.
                 // A `SQLITE_BUSY` from another process, a full disk, an I/O
                 // error — this used to read all of them as "poisoned" and
                 // abandon a head whose trie may be wholly present, so a busy
                 // gateway holding a write for six seconds cost an origin its
                 // floor and another round to get it back.
+                // `try_promote` has already retired the head it judged and
+                // recorded the verdict if it was a permanent one — and it is the
+                // only party that knows *which* head that was, since the slot
+                // can move under this loop between the `all_heads` snapshot and
+                // the promotion. Naming `stored.head` here condemned whatever
+                // this pass happened to list rather than what actually failed.
                 Err(e) if crate::reconcile::is_origin_fault(&e) => {
+                    // Warn, not debug. `try_promote` warns too when it got far
+                    // enough to name the head — but when it did not, this is the
+                    // only line an operator gets for a head that is about to be
+                    // permanently abandoned.
                     tracing::warn!(
                         origin = %origin,
-                        seq = stored.head.seq,
                         error = %e,
-                        "origin left behind: its pending head cannot be materialized"
+                        "a pending head for this origin could not be materialized"
                     );
                     true
                 }
@@ -445,28 +464,43 @@ impl Node {
             // head where it is for a pass rather than to condemn it: reading it
             // as incomplete would make a `SQLITE_BUSY` past the TTL abandon a
             // head whose trie is wholly here.
-            let complete = match trie.is_complete(stored.head.root) {
-                Ok(complete) => complete,
-                Err(e) => {
-                    tracing::warn!(
-                        origin = %origin,
-                        error = %e,
-                        "cannot decide whether a pending trie is here; leaving it for a pass"
-                    );
-                    true
-                }
-            };
-
-            let stale = stored.received_at <= before && !complete;
+            //
+            // Only asked when the head is not already condemned: for a poisoned
+            // head the answer is discarded, and asking anyway both wasted a full
+            // trie walk and let the "leaving it for a pass" branch log a
+            // reprieve for a head this pass is about to abandon.
+            let stale = !poisoned
+                && stored.received_at <= before
+                && !match trie.is_complete(stored.head.root) {
+                    Ok(complete) => complete,
+                    Err(e) => {
+                        tracing::warn!(
+                            origin = %origin,
+                            error = %e,
+                            "cannot decide whether a pending trie is here; leaving it for a pass"
+                        );
+                        true
+                    }
+                };
             if !poisoned && !stale {
                 continue;
             }
-            tracing::warn!(
-                origin = %origin,
-                seq = stored.head.seq,
-                poisoned,
-                "abandoning a pending head"
-            );
+            // Both cases fall through to the compare-and-clear below, the
+            // poisoned one included even though `try_promote` will usually have
+            // retired it already: it *compares*, so a head already gone reports
+            // `dropped = false` and the count below stays honest about what this
+            // pass deleted, while a head `try_promote` never reached still gets
+            // an exit. That second case is why this cannot be an early
+            // `continue` — a fault raised before `try_promote` has read the head
+            // it would condemn leaves nothing to retire it, and the slot then
+            // holds `head_floor` above everything this node can serve.
+            if !poisoned {
+                tracing::warn!(
+                    origin = %origin,
+                    seq = stored.head.seq,
+                    "abandoning a pending head no peer will serve"
+                );
+            }
             // The head this pass judged, named explicitly. Between the snapshot
             // above and here the sweep ran a promotion transaction and a trie
             // walk, and a `HeadPush` accepted on the blocking pool in that
@@ -490,7 +524,7 @@ impl Node {
             tracing::info!(promoted, "pending heads whose tries were already here");
         }
         if abandoned > 0 {
-            tracing::info!(abandoned, "pending heads dropped");
+            tracing::info!(abandoned, "pending heads this pass dropped");
         }
     }
 }

@@ -20,7 +20,7 @@ pub use clock::ClockStatus;
 pub use db::{DeviceKey, IdentityAdoption, KeyState, Store, Txn, CAS_DIR, DB_FILE, STAGING_DIR};
 pub use error::{Result, StoreError};
 pub use gc::{GcStats, TrieStats};
-pub use heads::{Equivocation, Slot, StoredHead};
+pub use heads::{CompleteRoots, Equivocation, Slot, StoredHead};
 pub use proof::{Donor, Proven, ProvenSubtree};
 pub use recovery::ObservedHead;
 pub use schema::SCHEMA_VERSION;

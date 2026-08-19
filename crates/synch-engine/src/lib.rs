@@ -42,7 +42,7 @@ pub use membership::{
 pub use mirror::MirrorReport;
 pub use node::{InitReport, Node, StagedChange};
 pub use publisher::{Publisher, DEFAULT_PUBLISH_BATCH_MAX, DEFAULT_PUBLISH_QUIESCE};
-pub use reconcile::{FetchOutcome, HeadOutcome, SyncReport, Syncer};
+pub use reconcile::{FetchOutcome, HeadOutcome, Promotion, SyncReport, Syncer};
 pub use recovery::{
     ObserveRound, RecoveryOptions, RecoveryProgress, RecoveryReport, RecoveryState,
     UnreconciledHistory, DEFAULT_RECOVERY_QUIESCE, DEFAULT_SEQ_GAP,

@@ -28,6 +28,20 @@ impl Slot {
     }
 }
 
+/// The complete slots a rebuild can work from, and the rows it cannot read.
+///
+/// Both halves, because a rebuild has to do the origins it can *and* say which
+/// it could not: reporting success having silently skipped one is what
+/// `doctor --rebuild` exists to rule out, and failing outright on the first bad
+/// row rebuilds nothing at all.
+#[derive(Debug, Default)]
+pub struct CompleteRoots {
+    /// The `(origin, root)` pairs that read back cleanly.
+    pub roots: Vec<(OriginId, Hash)>,
+    /// The `origin_id` text of every row that did not, as stored.
+    pub unreadable: Vec<String>,
+}
+
 /// A stored head, with the bookkeeping columns §10 keeps alongside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredHead {
@@ -137,6 +151,22 @@ impl Store {
     }
 
     /// Every slot for every origin.
+    ///
+    /// A row that will not build is skipped, not propagated. This is the bulk
+    /// listing the maintenance sweep and `doctor --rebuild` walk, so one
+    /// undecodable row — a `sig` that is not 64 bytes, say — used to fail the
+    /// whole listing and take every *other* origin's maintenance down with it:
+    /// no pending head anywhere got promoted or abandoned again, on any pass, for
+    /// as long as the row was there. §12's rule is that a record this node
+    /// cannot read fails its own origin and no other, and a point read still
+    /// reports the failure to whoever asked for that origin specifically.
+    ///
+    /// One variant is *not* contained, and saying so here is the honest version
+    /// of the claim: a `root` that is not a hash also breaks `gc`'s mark set,
+    /// which reads `head_history` directly and rightly refuses to proceed —
+    /// skipping a root there would delete live trie nodes. So a bad root still
+    /// stops garbage collection node-wide until it is repaired. Skipping it here
+    /// buys the rest of the maintenance pass, not GC.
     pub fn all_heads(&self, slot: Slot) -> Result<Vec<StoredHead>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -146,13 +176,62 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (origin, seq, root, created_at, signed_by, sig, received_at, verified_at) = row?;
-            out.push(StoredHead {
-                head: build_head(origin, seq, root, created_at, signed_by, sig)?,
-                received_at,
-                verified_at,
-            });
+            match build_head(origin.clone(), seq, root, created_at, signed_by, sig) {
+                Ok(head) => out.push(StoredHead {
+                    head,
+                    received_at,
+                    verified_at,
+                }),
+                Err(e) => tracing::warn!(
+                    origin,
+                    seq,
+                    slot = slot.as_str(),
+                    error = %e,
+                    "skipping a head row that cannot be read; this origin cannot sync until \
+                     the row is repaired"
+                ),
+            }
         }
         Ok(out)
+    }
+
+    /// The `(origin, root)` of every complete slot, without decoding signatures.
+    ///
+    /// What a rebuild needs, and all it needs. Going through [`Store::all_heads`]
+    /// made it depend on `head_history` joining and on every signature parsing,
+    /// neither of which it uses — so a row with an unreadable `sig` was silently
+    /// absent from the listing and the rebuild reported success having skipped
+    /// that origin entirely, which is the one outcome `doctor --rebuild` exists
+    /// to rule out. Reading `heads` alone also drops the join, so a row is only
+    /// unreadable here if its own two columns are — and such a row is returned in
+    /// `unreadable` for the caller to name, not propagated.
+    pub fn complete_slot_roots(&self) -> Result<CompleteRoots> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT origin_id, root FROM heads WHERE slot = ?1 ORDER BY origin_id")?;
+        let rows = stmt.query_map(params![Slot::Complete.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut found = CompleteRoots::default();
+        for row in rows {
+            let (origin, root) = row?;
+            // Per row, because the caller rebuilds per origin. Propagating the
+            // first bad row rebuilt *nothing* — the whole vector is materialized
+            // before the caller starts — which is worse than the failure it
+            // replaced and contradicts `rebuild_views`' promise that one origin's
+            // failure does not stop the others.
+            match (
+                origin_column(origin.clone(), "heads.origin_id"),
+                hash_column(root, "heads.root"),
+            ) {
+                (Ok(origin), Ok(root)) => found.roots.push((origin, root)),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!(origin, error = %e, "a complete head row cannot be read");
+                    found.unreadable.push(origin);
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Writes a head into a slot.
@@ -171,7 +250,8 @@ impl Store {
         put_head_in(&conn, slot, head, received_at, verified_at)
     }
 
-    /// Restarts the pending slot's staleness clock for an origin.
+    /// Restarts the pending slot's staleness clock, if it still holds
+    /// `(seq, root)`.
     ///
     /// Called when a fetch commits something, which is the one event that
     /// distinguishes "this slot is being filled" from "this slot is pinned by a
@@ -179,11 +259,32 @@ impl Store {
     /// when the slot went from empty to occupied, and a trie larger than
     /// `pending_head_ttl` takes to fetch would be swept mid-transfer.
     ///
-    /// Returns whether a pending slot was there to touch.
-    pub fn touch_pending(&self, origin: &OriginId, now: i64) -> Result<bool> {
+    /// Named, for the same reason [`Store::clear_head_at`] is. A fetch reads the
+    /// pending head once and then spends many round trips on that root, while
+    /// `HeadPush` writes the slot from the blocking pool throughout — so by the
+    /// time a batch commits, the slot may hold a *different* head. Touching
+    /// whatever is there turns progress on the head the fetch is about into an
+    /// extension of the sweep deadline for the head it is not, which is the
+    /// wedge the slot-scoped clock exists to break: an unservable head that
+    /// keeps being re-stamped by a fetch of something else never ages out.
+    ///
+    /// Returns whether the named head was still there to touch.
+    pub fn touch_pending_at(
+        &self,
+        origin: &OriginId,
+        seq: u64,
+        root: &Hash,
+        now: i64,
+    ) -> Result<bool> {
         let touched = self.conn().execute(
-            "UPDATE heads SET received_at = ?2 WHERE origin_id = ?1 AND slot = 'pending'",
-            params![origin.canonical(), now],
+            "UPDATE heads SET received_at = ?4
+              WHERE origin_id = ?1 AND slot = 'pending' AND seq = ?2 AND root = ?3",
+            params![
+                origin.canonical(),
+                seq as i64,
+                root.as_bytes().to_vec(),
+                now
+            ],
         )?;
         Ok(touched > 0)
     }
@@ -742,7 +843,7 @@ fn put_head_in(
     // at its last complete head for as long as the origin kept publishing.
     //
     // Occupying an empty slot starts the clock; adopting a newer head into an
-    // occupied one inherits it; `touch_pending` restarts it when a fetch
+    // occupied one inherits it; `touch_pending_at` restarts it when a fetch
     // actually makes progress, so a large trie that is genuinely arriving is
     // not swept out from under itself.
     conn.execute(
@@ -751,7 +852,7 @@ fn put_head_in(
          ON CONFLICT(origin_id, slot) DO UPDATE SET
            seq = excluded.seq, root = excluded.root,
            received_at = CASE
-             WHEN excluded.slot = 'pending' THEN heads.received_at
+             WHEN excluded.slot = ?7 THEN heads.received_at
              ELSE excluded.received_at
            END,
            verified_at = excluded.verified_at",
@@ -762,6 +863,7 @@ fn put_head_in(
             head.root.as_bytes().to_vec(),
             received_at,
             verified_at,
+            Slot::Pending.as_str(),
         ],
     )?;
     Ok(())
@@ -1053,6 +1155,48 @@ mod tests {
         // Both roots are now markable from the one table GC reads.
         let roots = store.retained_roots().unwrap();
         assert!(roots.contains(&complete.root) && roots.contains(&pending.root));
+    }
+
+    /// A rebuild sees the rows it can read and is told about the ones it cannot.
+    ///
+    /// Both halves matter and neither had a test: skipping a row silently is what
+    /// lets `doctor --rebuild` report success having rebuilt nothing for an
+    /// origin, and propagating instead rebuilt nothing for *any* origin, because
+    /// the whole list is materialized before the caller starts.
+    #[test]
+    fn complete_slot_roots_separates_the_readable_from_the_unreadable() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let good = SignedHead::sign(&key, origin(), 1, Hash::EMPTY, 0);
+        store.put_head(Slot::Complete, &good, 0, 0).unwrap();
+
+        let found = store.complete_slot_roots().unwrap();
+        assert_eq!(found.roots, [(origin(), Hash::EMPTY)]);
+        assert!(found.unreadable.is_empty());
+
+        // A root that is not a hash — the shape a corrupted row has, and the one
+        // a rebuild cannot do anything with.
+        let broken = OriginId::named("broken", "x.example").unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
+                 VALUES (?1, 'complete', 1, ?2, 0, 0)",
+                rusqlite::params![broken.canonical(), vec![0u8; 31]],
+            )
+            .unwrap();
+
+        let found = store.complete_slot_roots().unwrap();
+        assert_eq!(
+            found.roots,
+            [(origin(), Hash::EMPTY)],
+            "the readable row is still returned"
+        );
+        assert_eq!(
+            found.unreadable,
+            [broken.canonical()],
+            "and the unreadable one is named rather than propagated or dropped"
+        );
     }
 
     #[test]

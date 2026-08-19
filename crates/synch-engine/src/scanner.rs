@@ -76,7 +76,6 @@ impl Node {
             .space(space_id)?
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))?;
         let root_dir = PathBuf::from(&space.local_path);
-        let ignore = IgnoreSet::for_space(&root_dir);
         let seq = self.next_seq()?;
 
         // A vanished space root — an unmounted drive, a renamed mount, a
@@ -100,6 +99,11 @@ impl Node {
             }
         }
 
+        // After the root guard, not before. `.syncignore` under a root that is a
+        // regular file returns `ENOTDIR`, which is not `NotFound`, so reading it
+        // first answered "the ignore file exists but could not be read" for a
+        // space whose actual problem the guard above names plainly.
+        let ignore = IgnoreSet::for_space(&root_dir)?;
         let mut report = ScanReport::default();
         let mut found = Vec::new();
         walk(&root_dir, &root_dir, &ignore, &mut report, &mut found)?;
@@ -154,18 +158,40 @@ impl Node {
         // The published tree is durable and `local_files` is not, so the
         // published tree is what the sweep is anchored to; `local_files` still
         // contributes the paths this scan indexed but has not published yet.
+        // A path the walk could not judge is not a path that is gone.
+        //
+        // `seen` is built from what the walk actually stat'd, so every path it
+        // skipped — a child whose `symlink_metadata` failed `EACCES` because the
+        // parent lost its execute bit, an `EIO` on a network space — was absent
+        // from `seen` and therefore swept. The scan then reported the same path
+        // in `skipped` *and* published a tombstone for it: mirrors deleted their
+        // copies, GC became free to drop the origin's own object, and a later
+        // successful scan republished it as a new entry with no `prev`, so every
+        // peer re-fetched bytes it already had.
+        //
+        // The asymmetry is what gives it away: `index_file`'s failures are
+        // tolerated *and* the path stays in `seen` a few lines above, for exactly
+        // this reason. `walk`'s failures land in the same field and got the
+        // opposite treatment.
+        //
+        // As a prefix, not an exact name. `walk` stats a `DirEntry` before it can
+        // know whether it is a directory, so a *directory* it cannot stat is
+        // skipped under its own path and never recursed into — and the published
+        // paths at risk are the files beneath it, which no exact-match exemption
+        // reaches.
+        let unjudged: Vec<String> = report
+            .skipped
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+
         let mut known_paths: Vec<String> = self.store().local_files(space_id)?;
-        known_paths.extend(
-            self.store()
-                .list_entries(Some(self.origin()), space_id, "", None, None)?
-                .into_iter()
-                .filter(|row| row.kind != synch_core::EntryKind::Tombstone)
-                .map(|row| row.path),
-        );
+        known_paths.extend(self.store().published_paths(self.origin(), space_id)?);
         known_paths.sort();
         known_paths.dedup();
+
         for known in known_paths {
-            if seen.contains(known.as_str()) {
+            if seen.contains(known.as_str()) || unjudged_covers(&unjudged, &known) {
                 continue;
             }
             let prev = self
@@ -909,6 +935,19 @@ impl Drop for Adoption {
 /// and whether it is a symlink.
 type Found = (PathBuf, String, bool);
 
+/// True if `path` is one of the paths this pass could not judge, or is under
+/// one of them.
+///
+/// A prefix rule, because `walk` stats a `DirEntry` before it can know whether
+/// it is a directory: a *directory* it cannot stat is skipped under its own path
+/// and never recursed into, so what is actually at risk is every published file
+/// beneath it. Whole components only, so `a/b` does not cover `a/bc`.
+fn unjudged_covers(unjudged: &[String], path: &str) -> bool {
+    unjudged
+        .iter()
+        .any(|u| path == u || (path.starts_with(u.as_str()) && path[u.len()..].starts_with('/')))
+}
+
 fn walk(
     root: &Path,
     dir: &Path,
@@ -921,7 +960,17 @@ fn walk(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    // A failing `DirEntry` fails the space, exactly as a failing `read_dir`
+    // does two lines up. `read_dir`'s iterator yields per-entry errors, and
+    // discarding them left the child indistinguishable from one that was never
+    // there — which the deletion sweep reads as "gone" and publishes a tombstone
+    // for. The name is what is unknown here, so no single path can be exempted;
+    // `scan_all_with` already records a failed space and keeps every other
+    // space's work, which is the containment this wants.
+    let mut sorted = Vec::new();
+    for entry in entries {
+        sorted.push(entry?);
+    }
     sorted.sort_by_key(|e| e.file_name());
 
     for entry in sorted {
@@ -1220,6 +1269,99 @@ mod tests {
         assert_eq!(entry.kind, EntryKind::Tombstone);
         assert_eq!(entry.seq, 2);
         assert_eq!(entry.prev, Some(Hash::new(b"hello")));
+        node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn the_unjudged_exemption_covers_whole_subtrees_only() {
+        let unjudged = vec!["d/sub".to_string(), "solo.txt".to_string()];
+        // The directory itself, and anything under it at any depth.
+        assert!(unjudged_covers(&unjudged, "d/sub"));
+        assert!(unjudged_covers(&unjudged, "d/sub/deep.txt"));
+        assert!(unjudged_covers(&unjudged, "d/sub/a/b/c.txt"));
+        assert!(unjudged_covers(&unjudged, "solo.txt"));
+        // Whole components: a sibling that merely shares a prefix is not
+        // covered, or one unreadable directory would freeze its neighbours'
+        // deletions too.
+        assert!(!unjudged_covers(&unjudged, "d/subterfuge.txt"));
+        assert!(!unjudged_covers(&unjudged, "d/other.txt"));
+        assert!(!unjudged_covers(&unjudged, "solo.txt.bak"));
+        assert!(!unjudged_covers(&[], "anything"));
+    }
+
+    /// A path the walk could not judge is not tombstoned.
+    ///
+    /// A published file whose `symlink_metadata` fails — the parent lost its
+    /// execute bit, a network space returned `EIO` — was absent from `seen` and
+    /// so was swept: the scan reported it in `skipped` *and* published a
+    /// tombstone for it, mirrors deleted their copies, and a later successful
+    /// scan republished it with no `prev` so every peer re-fetched the bytes.
+    ///
+    /// Needs a real `EACCES`, so it is Unix-only and cannot run as root, who
+    /// bypasses the check being relied on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_the_walk_could_not_stat_is_not_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses the permission check this relies on, so there is
+        // nothing to observe. Detected by trying it rather than by asking for a
+        // uid: what matters is whether the failure actually happens.
+        let probe = tempfile::tempdir().unwrap();
+        std::fs::write(probe.path().join("p"), b"x").unwrap();
+        std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        let bypassed = std::fs::symlink_metadata(probe.path().join("p")).is_ok();
+        std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        if bypassed {
+            eprintln!("skipped: this user bypasses the EACCES this test needs");
+            return;
+        }
+        let (_d, space, node) = node_with_space().await;
+        let dir = space.path().join("d");
+        // Both shapes: a file directly under the unreadable directory, and one
+        // under a *subdirectory* of it. `walk` stats a `DirEntry` before it can
+        // know it is a directory, so `d/sub` is what lands in `skipped` while
+        // `d/sub/deep.txt` is the published path at risk — and an exact-match
+        // exemption reaches only the first of the two.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("keep.txt"), b"hello").unwrap();
+        std::fs::write(dir.join("sub").join("deep.txt"), b"deeper").unwrap();
+        node.scan_and_publish().unwrap();
+        for path in ["d/keep.txt", "d/sub/deep.txt"] {
+            assert_eq!(
+                node.store()
+                    .entry(node.origin(), "media", path)
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                EntryKind::File,
+                "{path} must be published before the directory is locked"
+            );
+        }
+
+        // Listable but not traversable: `read_dir` still yields the child's
+        // name, `symlink_metadata` on it fails.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let report = node.scan_all().unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !report.skipped.is_empty(),
+            "the scan must report the path it could not judge"
+        );
+        assert_eq!(
+            report.deleted, 0,
+            "and must not read it as deleted: {:?}",
+            report.skipped
+        );
+        for path in ["keep.txt", "deep.txt"] {
+            assert!(
+                !report
+                    .staged
+                    .iter()
+                    .any(|(key, _)| String::from_utf8_lossy(key).contains(path)),
+                "no tombstone may be staged for {path}, which is still there"
+            );
+        }
         node.shutdown().await.unwrap();
     }
 

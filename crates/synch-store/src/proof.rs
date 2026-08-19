@@ -1141,9 +1141,14 @@ impl Store {
     ///
     /// `reach` is the first byte past the last node this operation will write,
     /// which is the only length the file may be grown to on the strength of an
-    /// unverified size — the outboard's `window_end_bytes`. The tree's full
-    /// `outboard_size()` is a function of the claimed length, so growing to it
-    /// hands a peer's assertion straight to `set_len`.
+    /// unverified size. The tree's full `outboard_size()` is a function of the
+    /// claimed length, so growing to it hands a peer's assertion straight to
+    /// `set_len`.
+    ///
+    /// Computed from the nodes in hand, not from where the window ends. The
+    /// payload side of `write_slice` used to reason from a window end and got
+    /// this wrong — a window at the tail of the object ends *at* the claimed
+    /// size — which is why it now pre-grows nothing at all.
     fn open_sparse_outboard(&self, root: &Hash, reach: u64) -> Result<File> {
         let path = self.outboard_path(root);
         if let Some(parent) = path.parent() {

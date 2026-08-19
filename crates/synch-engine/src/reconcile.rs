@@ -57,6 +57,37 @@ pub const MAX_RETAINED_FORKS: usize = 8;
 /// sweep, and the two together are what §5.2 means by no wedging.
 pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
 
+/// What a promotion attempt concluded.
+///
+/// Three states rather than a `bool`, because the callers cannot tell them apart
+/// and kept getting it wrong: a promotion that did nothing because the trie is
+/// still arriving and one that retired the head on a verdict already in the memo
+/// are both "did not flip", and reporting the second as the first counted a
+/// discarded head as accepted. Inferring it by re-reading the slot afterwards was
+/// no better — it cost a lock on every ordinary adoption and still could not see
+/// which case it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Promotion {
+    /// The pending head's trie was wholly present and the complete slot flipped.
+    Flipped,
+    /// A pending head stands and its trie is not all here yet: it needs a fetch.
+    Waiting,
+    /// This promotion is in the refusal memo, so the head was retired unjudged.
+    Refused,
+    /// Nothing is pending now: there was no pending head, or the complete slot
+    /// had overtaken the one there and it was dropped.
+    ///
+    /// Distinct from `Waiting`, which the two used to share. The caller has to
+    /// tell them apart: `Waiting` means a head is sitting there needing its trie,
+    /// so it is reported accepted and rings the fetch bell, and doing that for a
+    /// head that was just dropped counted a discarded head as accepted and woke
+    /// the anti-entropy loop for something that no longer existed. The overtake
+    /// is reachable whenever a local `publish` or an `activate` moves the
+    /// complete slot between the offer's transaction and this one — both derive
+    /// their seq from the complete slot alone (§3.4).
+    Idle,
+}
+
 /// What happened when a head was offered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadOutcome {
@@ -69,18 +100,19 @@ pub enum HeadOutcome {
     Unbound,
     /// The head is not strictly greater than what we already hold.
     NotNewer,
+    /// The head was adopted, and this node has already judged that it cannot
+    /// materialize this promotion, so the head was retired again rather than
+    /// re-judged (see [`Syncer::try_promote`]).
+    ///
+    /// Counted as a failure for this origin, because it is one: §12 requires the
+    /// count of origins left behind to be in the sync report, and this is the
+    /// only outcome that carries it after the first exchange.
+    Refused,
     /// The head was adopted as pending and its trie must be fetched.
     Pending,
     /// The head was adopted and its trie was already present, so the complete
     /// slot flipped immediately.
     Completed,
-    /// This node already judged this exact head unpromotable and will not
-    /// spend a promotion diff on it again.
-    ///
-    /// The verdict is remembered in memory for the process's lifetime, keyed by
-    /// `(origin, seq, root)`, so a head the origin publishes past is judged on
-    /// its own merits.
-    Refused,
 }
 
 impl HeadOutcome {
@@ -114,18 +146,29 @@ pub struct Syncer {
     /// Rung when a head is adopted as *pending*: its trie is not here and
     /// nothing in this process is going to fetch it until somebody dials.
     on_pending: Option<Arc<tokio::sync::Notify>>,
-    /// Heads this node has already judged unpromotable, so it does not judge
-    /// them again on every offer. See `Syncer::refuse`.
-    refused: Arc<Mutex<HashSet<(OriginId, u64, Hash)>>>,
+    /// Promotions this node has tried and cannot repeat, so it does not spend
+    /// the diff again. Owned by [`Syncer::try_promote`], which is the only
+    /// place the pair a verdict is about is known.
+    refused: Arc<Mutex<HashSet<Verdict>>>,
 }
 
-/// How many refused heads are remembered before the set is dropped wholesale.
+/// What a promotion verdict is about: the head, and the root it would be
+/// materialized *from*.
 ///
-/// One entry per `(origin, seq, root)` this node has decided it cannot
-/// materialize, which in a healthy cluster is none and in an unhealthy one is
-/// one per origin that published something this build cannot apply. Dropped
-/// rather than evicted one at a time, like the completeness memo: forgetting
-/// costs one more promotion attempt, and no correctness rests on the memory.
+/// Both, because the verdict is a property of the pair. `materialize_diff`
+/// prunes at equal node hashes and pays only for what differs, so a root that
+/// outruns the walk's position budget from a far-behind complete slot promotes
+/// cleanly once an intermediate head has landed. Keyed on the new root alone
+/// this node would refuse that root for the rest of its life while every peer
+/// held it — silent per-origin divergence.
+type Verdict = (OriginId, u64, Hash, Hash);
+
+/// How many refused promotions are remembered before the set is dropped
+/// wholesale.
+///
+/// None at all in a healthy cluster. Dropped rather than evicted one at a time,
+/// like the completeness memo: forgetting costs one more attempt, and no
+/// correctness rests on the memory.
 const MAX_REFUSED_HEADS: usize = 1024;
 
 impl Syncer {
@@ -139,29 +182,20 @@ impl Syncer {
         }
     }
 
-    /// Whether this head has already been judged unpromotable.
-    fn is_refused(&self, head: &SignedHead) -> bool {
+    /// Whether this exact promotion has already been tried and failed.
+    fn is_refused(&self, key: &Verdict) -> bool {
         self.refused
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&(head.origin.clone(), head.seq, head.root))
+            .contains(key)
     }
 
-    /// Remembers that this head's promotion failed on the origin's own data.
-    ///
-    /// Retiring the head from the pending slot drops `head_floor` back to what
-    /// this node can serve, which is the point — but it is also exactly what
-    /// makes the same head supersede the floor again on the next offer. With no
-    /// memory of the verdict the sequence is: adopt, walk the trie, run the
-    /// promotion diff, fail, retire, and do it again on the next exchange, at
-    /// the AAE cadence rather than the 900 s TTL the sweep used to impose. Each
-    /// turn is a full diff under the single write connection.
+    /// Remembers that this promotion failed on the origin's own data.
     ///
     /// In memory rather than in the schema: the verdict is about what *this
-    /// build* can decode, so a node that is upgraded to understand the record
-    /// should re-attempt it, and a restart is the cheapest possible expression
-    /// of that.
-    fn refuse(&self, head: &SignedHead) {
+    /// build* can decode, so an upgraded node should re-attempt it, and a restart
+    /// is the cheapest expression of that.
+    fn refuse(&self, key: Verdict) {
         let mut refused = self
             .refused
             .lock()
@@ -169,7 +203,7 @@ impl Syncer {
         if refused.len() >= MAX_REFUSED_HEADS {
             refused.clear();
         }
-        refused.insert((head.origin.clone(), head.seq, head.root));
+        refused.insert(key);
     }
 
     /// Rings `wake` whenever a head flips to complete (§5.2).
@@ -381,12 +415,6 @@ impl Syncer {
         if !self.store.is_bound(&head.origin, &head.signed_by, now)? {
             return Ok(HeadOutcome::Unbound);
         }
-        // 2b. And this node must not already have judged it. Before the slot
-        // write, not after: adopting it is what would put it back above the
-        // floor and buy another promotion diff.
-        if self.is_refused(head) {
-            return Ok(HeadOutcome::Refused);
-        }
         // The ordering check and the write that acts on it are one transaction.
         // Read-then-write across two lock acquisitions would let two concurrent
         // offers — one per peer connection, all on the blocking pool — both
@@ -411,6 +439,11 @@ impl Syncer {
             //    width of the fork is a storage question, answered below,
             //    after the ordering has been settled.
             let floor = txn.head_floor(&head.origin)?;
+            // Acceptance deliberately does not consult the refusal memo: a
+            // verdict is about a *promotion*, which is a pair of roots, and
+            // only `try_promote` knows both. A head this node has already
+            // failed on is adopted here and retired there, which costs two
+            // indexed writes rather than the diff.
             let outcome = if head.supersedes(floor.as_ref()) {
                 txn.put_head(Slot::Pending, head, now, now)?;
                 HeadOutcome::Pending
@@ -440,44 +473,32 @@ impl Syncer {
         if !outcome.accepted() {
             return Ok(outcome);
         }
-        if outcome == HeadOutcome::Pending {
-            if let Some(wake) = &self.on_pending {
-                wake.notify_waiters();
+        match self.try_promote(&head.origin, now)? {
+            Promotion::Flipped => Ok(HeadOutcome::Completed),
+            // Rung here, not before the promotion. A refused head is adopted and
+            // retired in the same breath — adopting it is what makes it beat the
+            // floor again — so ringing on adoption woke the anti-entropy loop for
+            // a head that no longer exists. `notify_one` keeps a permit and the
+            // loop is not parked during a round, so the permit was always waiting
+            // when the round ended: one unapplicable head held by one peer pinned
+            // the node to back-to-back rounds, forever, at the `REACTIVE_FLOOR`
+            // rather than the interval. It also bought a pointless extra round
+            // for every head whose trie was already here.
+            Promotion::Waiting => {
+                if let Some(wake) = &self.on_pending {
+                    // One permit no matter how often this rings, exactly as the
+                    // promotion bell does — a wake landing mid-round must not be
+                    // lost, and the loop is parked on this only between rounds
+                    // (§5.3).
+                    wake.notify_one();
+                }
+                Ok(HeadOutcome::Pending)
             }
-        }
-        match self.try_promote(&head.origin, now) {
-            Ok(true) => Ok(HeadOutcome::Completed),
-            Ok(false) => Ok(HeadOutcome::Pending),
-            // A head whose trie is here and whose promotion this node's own
-            // rules refuse — an undecodable `f:` record, a node that breaks a
-            // structural invariant — does not get to keep the slot it was just
-            // written into. `head_floor` is the best of both slots, so leaving
-            // it there holds the floor above every servable head for the origin
-            // until the `pending_head_ttl` sweep takes it, and the sweep then
-            // drops it and the next exchange re-adopts it: an adopt/fail/expire
-            // cycle whose every turn is a full promotion diff under the write
-            // lock. Retiring it here leaves the *evidence* — `record_history`
-            // already committed, so the head stays provable — while the floor
-            // falls back to what this node can actually serve.
-            //
-            // Compare-and-clear, and only for a fault in what the origin
-            // published: a transient store failure is not a verdict about a
-            // head, and the head to retire is the one just judged.
-            Err(e) if is_origin_fault(&e) => {
-                self.refuse(head);
-                let dropped =
-                    self.store
-                        .clear_head_at(&head.origin, Slot::Pending, head.seq, &head.root)?;
-                tracing::warn!(
-                    origin = %head.origin,
-                    seq = head.seq,
-                    dropped,
-                    error = %e,
-                    "origin left behind: a head this node cannot materialize does not hold the floor"
-                );
-                Err(e)
-            }
-            Err(e) => Err(e),
+            Promotion::Refused => Ok(HeadOutcome::Refused),
+            // Adopted, and then dropped again by the promotion because the
+            // complete slot had overtaken it. Nothing is pending, so this is not
+            // an acceptance and there is nothing to fetch.
+            Promotion::Idle => Ok(HeadOutcome::NotNewer),
         }
     }
 
@@ -488,16 +509,57 @@ impl Syncer {
     /// §10): a crash between them would leave `entries` — what the unified
     /// tree, mirrors, and `synch-s3` serve from — missing a promoted head's
     /// delta, with nothing left to say so.
-    pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<bool> {
-        let promoted = self.store.transaction(|txn| -> Result<_> {
+    ///
+    /// An origin fault is condemned here, because this is the only place that
+    /// knows which head was judged. Both callers arrive with a head from an
+    /// earlier snapshot — `offer_head` has committed and released the connection,
+    /// and the maintenance sweep is a promotion diff per origin behind its
+    /// `all_heads` list — while `HeadPush` writes this slot from the blocking
+    /// pool throughout. A caller condemning "its" head therefore retired, and
+    /// permanently refused, whatever happened to be in the slot, and left the
+    /// head that actually failed unrecorded.
+    pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<Promotion> {
+        // What the transaction judged, for the fault arm: it rolls back, so the
+        // head cannot be recovered from the slot afterwards.
+        let judged: std::cell::RefCell<Option<Verdict>> = std::cell::RefCell::new(None);
+        let promoted = self.store.transaction(|txn| -> Result<Promotion> {
             let Some(pending) = txn.head(origin, Slot::Pending)? else {
-                return Ok(None);
+                return Ok(Promotion::Idle);
             };
+            // The displaced root, the verdict key and the memo check all come
+            // before the completeness walk, because the walk is the most likely
+            // thing here to raise and `judged` has to be set before anything
+            // that can: `is_complete` descends a peer's node graph and refuses a
+            // structurally invalid node, which `is_origin_fault` classifies as
+            // the origin's fault — and with `judged` still unset the fault arm
+            // retired nothing and remembered nothing, so the head kept the slot
+            // until the sweep took it and the next exchange re-adopted it. That
+            // is the cycle the memo exists to break, and it was worse than
+            // before the memo existed. None of this work depends on
+            // completeness, and doing the cheap checks first is free.
+            let displaced = txn.complete_head(origin)?;
+            let old_root = displaced
+                .as_ref()
+                .map(|h| h.root)
+                .unwrap_or(synch_core::Hash::EMPTY);
+            let key: Verdict = (
+                pending.head.origin.clone(),
+                pending.head.seq,
+                pending.head.root,
+                old_root,
+            );
+            // Tried before, from this same root, and failed. Retire it without
+            // paying the diff again — leaving it in the slot would hold
+            // `head_floor` above everything this node can serve.
+            if self.is_refused(&key) {
+                txn.clear_head(origin, Slot::Pending)?;
+                return Ok(Promotion::Refused);
+            }
+            *judged.borrow_mut() = Some(key);
             let trie = Trie::new(txn);
             if !trie.is_complete(pending.head.root)? {
-                return Ok(None);
+                return Ok(Promotion::Waiting);
             }
-            let displaced = txn.complete_head(origin)?;
             // The pending head must actually beat the complete one, rather than
             // rest on "pending is always greater", an invariant `offer_head`
             // maintains and two other writers do not: `publish` and the key
@@ -517,12 +579,8 @@ impl Syncer {
                     "dropping a pending head the complete slot has overtaken"
                 );
                 txn.clear_head(origin, Slot::Pending)?;
-                return Ok(None);
+                return Ok(Promotion::Idle);
             }
-            let old_root = displaced
-                .as_ref()
-                .map(|h| h.root)
-                .unwrap_or(synch_core::Hash::EMPTY);
             // The displaced head is already retained: `put_head` recorded its
             // signature when it took the slot. Recording it again here would be
             // a second rule writing the same row, kept honest only by
@@ -530,20 +588,40 @@ impl Syncer {
             txn.put_head(Slot::Complete, &pending.head, pending.received_at, now)?;
             txn.clear_head(origin, Slot::Pending)?;
             txn.materialize_diff(origin, old_root, pending.head.root)?;
-            Ok(Some(pending.head))
-        })?;
-        match promoted {
-            Some(head) => {
-                tracing::debug!(origin = %origin, seq = head.seq, "head flipped to complete");
-                if let Some(wake) = &self.on_change {
-                    // One permit no matter how often this rings: passes
-                    // coalesce, and a wake landing mid-pass is not lost.
-                    wake.notify_one();
+            Ok(Promotion::Flipped)
+        });
+        let promoted = match promoted {
+            Ok(promoted) => promoted,
+            Err(e) if is_origin_fault(&e) => {
+                if let Some(key) = judged.into_inner() {
+                    // Retire it, and do not try this pair again. The retire
+                    // stops it holding the floor; the memo stops the
+                    // adopt/diff/fail cycle repeating once per exchange.
+                    let (_, seq, root, _) = key.clone();
+                    self.refuse(key);
+                    self.store
+                        .clear_head_at(origin, Slot::Pending, seq, &root)?;
+                    tracing::warn!(
+                        origin = %origin,
+                        seq,
+                        error = %e,
+                        "origin left behind: a head this node cannot materialize \
+                         does not hold the floor"
+                    );
                 }
-                Ok(true)
+                return Err(e);
             }
-            None => Ok(false),
+            Err(e) => return Err(e),
+        };
+        if promoted == Promotion::Flipped {
+            tracing::debug!(origin = %origin, "head flipped to complete");
+            if let Some(wake) = &self.on_change {
+                // One permit no matter how often this rings: passes coalesce,
+                // and a wake landing mid-pass is not lost.
+                wake.notify_one();
+            }
         }
+        Ok(promoted)
     }
 
     /// Fetches the pending head's trie from `client`, verifying every node
@@ -758,10 +836,18 @@ impl Syncer {
                 // `put_head_in`), so without this a trie that legitimately
                 // takes longer than `pending_head_ttl` to fetch would be swept
                 // out from under the fetch that is filling it.
+                //
+                // Named, because this fetch has been working on `pending.root`
+                // since before the first round trip and the slot may have moved
+                // on since: stamping whatever is there would let progress on
+                // this root hold the sweep off a head nobody can serve.
                 let store = self.store.clone();
                 let touched = origin.clone();
-                crate::blocking::offload(move || Ok(store.touch_pending(&touched, now_ns())?))
-                    .await?;
+                let (seq, root) = (pending.seq, pending.root);
+                crate::blocking::offload(move || {
+                    Ok(store.touch_pending_at(&touched, seq, &root, now_ns())?)
+                })
+                .await?;
             }
             // Everything just stored goes back on the frontier, so the nodes
             // that arrived expand into their own children.
@@ -781,7 +867,7 @@ impl Syncer {
             syncer.try_promote(&origin, now_ns())
         })
         .await?;
-        if promoted {
+        if promoted == Promotion::Flipped {
             Ok(FetchOutcome::Completed)
         } else {
             Ok(FetchOutcome::Partial)
@@ -943,6 +1029,11 @@ impl Syncer {
                 Err(e) => return Err(e),
             };
             match outcome {
+                // §12: the count of origins left behind belongs in the sync
+                // report, and after the first exchange this is the only outcome
+                // that carries it — the fault propagates once, and every later
+                // offer is answered from the memo without re-deriving it.
+                HeadOutcome::Refused => report.left_behind(&head.origin),
                 HeadOutcome::Pending => {
                     report.heads_accepted += 1;
                     match self.fetch_pending(client, &head.origin).await {
@@ -958,11 +1049,6 @@ impl Syncer {
                     report.tries_completed += 1;
                 }
                 HeadOutcome::BadSignature | HeadOutcome::Unbound => report.heads_rejected += 1,
-                // Counted as a failure for this origin, because it is one: the
-                // origin published something this node cannot apply, and the
-                // only thing that has changed since it was judged is that the
-                // judgement is now cheap.
-                HeadOutcome::Refused => report.heads_failed += 1,
                 HeadOutcome::NotNewer => {}
             }
         }
@@ -1106,8 +1192,10 @@ impl HeadSink for Syncer {
     /// `Hello` loop logged everything as "origin left behind" including a full
     /// disk, and `HeadPush` eleven lines below failed the stream. Doing it on
     /// this side is what gives one rule one implementation — the classifier is
-    /// already here, and `Syncer::offer_head` has already retired the head by
-    /// the time an origin fault reaches this point.
+    /// already here, and `try_promote` has retired the head by the time an
+    /// origin fault reaches this point — whenever it got far enough to judge
+    /// one. A fault raised before that leaves the slot to the maintenance
+    /// sweep rather than to this handler.
     fn offer_head(&self, head: &SignedHead, now: i64) -> std::result::Result<(), NetError> {
         match Syncer::offer_head(self, head, now) {
             Ok(_) => Ok(()),
@@ -1212,7 +1300,7 @@ fn contain(origin: &OriginId, error: &EngineError, report: &mut SyncReport) {
         error = %error,
         "origin left behind: its published data could not be applied"
     );
-    report.heads_failed += 1;
+    report.left_behind(origin);
 }
 
 /// What one exchange achieved, for logging and tests.
@@ -1230,6 +1318,24 @@ pub struct SyncReport {
     pub heads_abandoned: usize,
     /// Origins skipped because their own published data could not be applied.
     pub heads_failed: usize,
+    /// Which origins `heads_failed` counts, so counting one twice cannot inflate
+    /// it. Not part of the rendered report.
+    failed_origins: std::collections::HashSet<OriginId>,
+}
+
+impl SyncReport {
+    /// Records that this origin was left behind, once however often it is said.
+    ///
+    /// The number is rendered as "N origin(s) left behind", and two paths reach
+    /// this verdict for the same origin in one exchange: the fault propagates
+    /// from the first offer of a head, and every later offer of it is answered
+    /// from the refusal memo. Nothing dedups the head list a peer sends, so a
+    /// repeated head counted its origin once per copy.
+    fn left_behind(&mut self, origin: &OriginId) {
+        if self.failed_origins.insert(origin.clone()) {
+            self.heads_failed += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1796,7 +1902,11 @@ mod tests {
         assert_eq!(complete.seq, 1);
         assert_eq!(complete.root, good);
         assert_ne!(complete.root, poisoned);
-        assert_eq!(store.pending_head(&origin).unwrap().unwrap().seq, 2);
+        // And the head that failed no longer holds the slot. `try_promote` owns
+        // that now — it is the only party that knows which head it judged — so a
+        // direct call retires it too, where before this test's caller would have
+        // had to.
+        assert_eq!(store.pending_head(&origin).unwrap(), None);
         assert!(store.entry(&origin, "s", "poisoned").unwrap().is_none());
         // And the entry the *complete* head materialized is still there.
         assert!(store.entry(&origin, "s", "a").unwrap().is_some());
@@ -1879,16 +1989,73 @@ mod containment_tests {
         );
     }
 
-    /// A head judged unpromotable once is not judged again.
+    /// A structurally invalid trie is condemned like any other origin fault.
     ///
-    /// Retiring it from the pending slot is what lets the node serve again —
-    /// and it is also what makes the same head beat `head_floor` on the very
-    /// next offer. With no memory of the verdict the node re-adopted it, walked
-    /// the trie, ran the promotion diff and failed, once per exchange, forever;
-    /// the pre-retire behaviour at least paid that only once per
-    /// `pending_head_ttl`. Each turn holds the single write connection.
+    /// The fault this raises comes from `is_complete`, which descends the peer's
+    /// node graph — so it fires *before* the promotion diff, and before the code
+    /// had recorded which head it was about. The fault arm then retired nothing
+    /// and remembered nothing: the head kept the pending slot, holding
+    /// `head_floor` above everything this node could serve until the sweep took
+    /// it, and the next exchange re-adopted it and repeated. That was worse than
+    /// before the memo existed, which is why the key is built before the walk.
     #[test]
-    fn a_head_judged_unpromotable_is_not_judged_again() {
+    fn a_head_whose_trie_is_structurally_invalid_is_retired_and_remembered() {
+        let (_d, store, key, origin) = setup();
+        let syncer = Syncer::new(store.clone());
+
+        // An extension whose child is a leaf, which no canonical trie contains:
+        // an extension above anything but a branch would have been merged (§4.3).
+        // Stored through `put_node` directly, because this is what a peer serving
+        // a hand-built graph looks like and `Trie::insert` cannot produce it.
+        //
+        // The fault this raises comes from the *completeness walk*, not from the
+        // promotion diff — which is the whole point: it fires before the diff, so
+        // it is the case where the verdict key must already have been built.
+        let (value, _) = synch_mpt::ValueRef::for_value(&[7u8; 4]);
+        let child = synch_mpt::TrieNode::Leaf {
+            key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2]),
+            value,
+        };
+        let child_hash = child.hash();
+        let root = synch_mpt::TrieNode::Ext {
+            prefix: synch_mpt::Nibbles::from_nibbles(&[4]),
+            child: child_hash,
+        };
+        let root_hash = root.hash();
+        synch_mpt::NodeStore::put_node(store.as_ref(), &child_hash, &child.encode()).unwrap();
+        synch_mpt::NodeStore::put_node(store.as_ref(), &root_hash, &root.encode()).unwrap();
+
+        let head = SignedHead::sign(&key, origin.clone(), 4, root_hash, 0);
+        let err = syncer
+            .offer_head(&head, 0)
+            .expect_err("a non-canonical node is the origin's fault");
+        assert!(is_origin_fault(&err), "{err}");
+
+        // Retired: the floor is back to what this node can serve.
+        assert_eq!(store.head_floor(&origin).unwrap(), None);
+        // And remembered: the second offer does not walk it again, so it does not
+        // raise, and it leaves nothing pending — while still counting against the
+        // origin, which §12 requires the sync report to carry.
+        assert_eq!(
+            syncer.offer_head(&head, 0).unwrap(),
+            HeadOutcome::Refused,
+            "the verdict must be remembered, not re-derived every exchange"
+        );
+        assert_eq!(store.pending_head(&origin).unwrap(), None);
+    }
+
+    /// A promotion judged unpromotable once is not attempted again.
+    ///
+    /// Retiring the head from the pending slot is what lets the node serve again
+    /// — and it is also what makes the same head beat `head_floor` on the next
+    /// offer. With no memory of the verdict the node re-adopted it, walked the
+    /// trie, ran the promotion diff and failed, once per exchange, forever, each
+    /// turn holding the single write connection.
+    ///
+    /// The memory is keyed on the *pair* `(head, root-it-would-diff-from)`,
+    /// because that is what the verdict is a function of.
+    #[test]
+    fn a_promotion_judged_unpromotable_is_not_attempted_again() {
         let (_d, store, key, origin) = setup();
         let syncer = Syncer::new(store.clone());
         let trie = Trie::new(store.as_ref());
@@ -1906,21 +2073,25 @@ mod containment_tests {
             "and it was retired"
         );
 
-        // The same head, offered again — which is what every subsequent
-        // exchange with a peer holding it does.
+        // Offered again — which is what every later exchange with a peer holding
+        // it does. The diff must not run a second time, so no error surfaces; and
+        // the outcome must be counted against the origin, or `synch sync` — which
+        // prints the "N origin(s) left behind" line from `heads_failed` — reports
+        // nothing at all for an origin this node permanently cannot apply, since
+        // the fault itself propagates only on the first offer.
         assert_eq!(
             syncer.offer_head(&head, 0).unwrap(),
             HeadOutcome::Refused,
-            "the second offer must not reach the promotion diff"
+            "the promotion is not re-attempted, and the origin is still counted"
         );
         assert_eq!(
-            store.pending_head(&origin).unwrap(),
+            store.head_floor(&origin).unwrap(),
             None,
-            "and must not put it back above the floor"
+            "and it does not keep the floor"
         );
 
-        // The verdict is about one head, not about the origin: a different root
-        // at a higher seq is still judged on its merits.
+        // The verdict is about one promotion, not about the origin: a different
+        // root at a higher seq is still judged on its merits.
         let good = trie
             .insert(
                 Hash::EMPTY,
@@ -1933,6 +2104,68 @@ mod containment_tests {
             syncer.offer_head(&later, 0).unwrap(),
             HeadOutcome::Completed
         );
+    }
+
+    /// The pending bell survives a ring nobody is parked on.
+    ///
+    /// This is the whole of what the reactive fetch rests on, and the reason it
+    /// cannot be a `notify_waiters`: the anti-entropy loop is parked on this
+    /// only *between* rounds, and spends the rest of its life inside
+    /// `anti_entropy_round` dialling peers — which is exactly when the pushes
+    /// it needs to hear about land, since a publisher pushes to the whole
+    /// membership at once (§5.3). A bell that keeps nothing for an unparked
+    /// listener is a bell that is silent for every push that arrives during a
+    /// round, and the fetch waits for the next interval after all.
+    #[tokio::test]
+    async fn a_pending_head_rung_mid_round_is_not_lost() {
+        let (_d, store, key, origin) = setup();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let syncer = Syncer::new(store.clone()).on_pending(Some(wake.clone()));
+
+        // Rung with no listener parked, which is the mid-round case.
+        let head = SignedHead::sign(&key, origin.clone(), 1, Hash([1u8; 32]), 0);
+        assert_eq!(syncer.offer_head(&head, 0).unwrap(), HeadOutcome::Pending);
+
+        // A listener arriving afterwards still has to see it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
+            .await
+            .expect("a wake that landed while the loop was busy must still be there");
+    }
+
+    /// A head the memo already refuses does not ring the fetch bell.
+    ///
+    /// The bell wakes the anti-entropy loop to go and fetch a trie. A refused
+    /// head is adopted and retired in the same breath — adopting it is what makes
+    /// it beat the floor again — so ringing on adoption woke the loop for a head
+    /// that no longer existed, and `notify_one` keeps a permit while the loop is
+    /// not parked during a round: one such head held by one peer pinned the node
+    /// to back-to-back rounds at the reactive floor, permanently.
+    #[tokio::test]
+    async fn a_refused_head_does_not_ring_the_fetch_bell() {
+        let (_d, store, key, origin) = setup();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let syncer = Syncer::new(store.clone()).on_pending(Some(wake.clone()));
+        let trie = Trie::new(store.as_ref());
+
+        let poisoned = trie
+            .insert(Hash::EMPTY, &file_key("s", "a.txt").unwrap(), &[0xffu8; 8])
+            .unwrap();
+        let head = SignedHead::sign(&key, origin.clone(), 5, poisoned, 0);
+        syncer
+            .offer_head(&head, 0)
+            .expect_err("the record cannot be materialized");
+        // The first offer did adopt it before judging it, so it may have rung.
+        // Drain that permit; what must not ring is the *refusal*.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+
+        assert_eq!(
+            syncer.offer_head(&head, 0).unwrap(),
+            HeadOutcome::Refused,
+            "answered from the memo"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(200), wake.notified())
+            .await
+            .expect_err("a refused head has no trie to fetch and must not wake the loop");
     }
 
     /// The pending slot ages, not the head occupying it.
@@ -1961,7 +2194,24 @@ mod containment_tests {
 
         // A fetch that commits something restarts it, so a trie that genuinely
         // takes longer than the TTL to arrive is not swept mid-transfer.
-        assert!(store.touch_pending(&origin, 9_500).unwrap());
+        assert!(
+            !store
+                .touch_pending_at(&origin, 1, &Hash([1u8; 32]), 9_500)
+                .unwrap(),
+            "a fetch of a head the slot has moved past must not restart the clock"
+        );
+        assert_eq!(
+            store
+                .head(&origin, Slot::Pending)
+                .unwrap()
+                .unwrap()
+                .received_at,
+            100,
+            "the slot keeps ageing while an unservable head occupies it"
+        );
+        assert!(store
+            .touch_pending_at(&origin, 2, &Hash([2u8; 32]), 9_500)
+            .unwrap());
         assert_eq!(
             store
                 .head(&origin, Slot::Pending)
@@ -1988,7 +2238,12 @@ mod containment_tests {
         );
         assert!(
             !store
-                .touch_pending(&OriginId::named("other", "x.example").unwrap(), 1)
+                .touch_pending_at(
+                    &OriginId::named("other", "x.example").unwrap(),
+                    1,
+                    &Hash([1u8; 32]),
+                    1
+                )
                 .unwrap(),
             "and there is nothing to touch for an origin with no pending head"
         );

@@ -309,18 +309,6 @@ pub(crate) fn grow_to(file: &File, len: u64) -> Result<()> {
     Ok(())
 }
 
-/// The first byte past the last group of `served`, clamped to `size`.
-///
-/// What a window's writes can actually reach, which is the only length a file
-/// may be grown to on the strength of an unverified claim.
-fn window_end_bytes(served: &ChunkRanges, size: u64) -> u64 {
-    served
-        .ranges
-        .last()
-        .map(|r| r.end.saturating_mul(CHUNK_GROUP_SIZE).min(size))
-        .unwrap_or(0)
-}
-
 /// Encodes an object's verified groups for the `blobs.bitmap` column.
 ///
 /// Ranges, not a bit per group, despite the column's name. A bitmap costs
@@ -1178,7 +1166,6 @@ impl Store {
         // payload never gets longer than the bytes that have been proven
         // against the root, whatever the window's position. The comment above
         // already relied on that behaviour for later windows.
-        let _ = window_end_bytes(&served, size);
         let outboard_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1901,18 +1888,29 @@ mod tests {
     /// reclaims it, because the entry the scan publishes keeps the row alive.
     ///
     /// Threaded rather than hand-driven, because the window only exists inside
-    /// `ingest_file` and there is no seam to stop it at. The collector waits
-    /// for the lease to appear before it acts, and the test asserts it saw one
-    /// — a run that missed the window entirely would prove nothing.
+    /// `ingest_file` and there is no seam to stop it at.
+    ///
+    /// The collector samples `is_being_written` rather than simply hammering the
+    /// sweep, because hammering cannot see this: the first call collects the old
+    /// row and every later one finds nothing to collect, so the sweep is spent
+    /// before the window it is supposed to land in even opens.
+    ///
+    /// It therefore has to catch the window, and `observed` is what makes the
+    /// test mean anything — without the lease it stays false, because
+    /// `is_being_written` is precisely what the lease provides. What made this
+    /// flaky on a fast SSD was not the sampling but the start: `thread::spawn`
+    /// returns before the new thread runs, so a 32 MiB ingest could finish
+    /// before the collector was first scheduled, and the run failed for missing
+    /// the window rather than for the defect. The handshake below fixes that —
+    /// the ingest does not begin until the collector is already spinning.
     #[test]
     fn an_ingest_that_recreates_a_collectable_object_keeps_its_bytes() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let (dir, store) = store();
         let store = std::sync::Arc::new(store);
-        // Large enough that the rename → fsync → outboard → row window is wide
-        // enough for the collector to land in, and past `INLINE_BLOB_MAX` so
-        // the payload is a file rather than a column.
+        // Past `INLINE_BLOB_MAX`, so the payload is a file rather than a column
+        // and the rename → fsync → outboard → row window is a real one.
         let payload = data(32 * 1024 * 1024);
         let source = dir.path().join("restored.bin");
         std::fs::write(&source, &payload).unwrap();
@@ -1922,16 +1920,20 @@ mod tests {
         // candidate — while the same content is ingested again.
         let root = store.ingest_bytes(&payload, 0).unwrap();
 
+        let ready = std::sync::Arc::new(AtomicBool::new(false));
         let observed = std::sync::Arc::new(AtomicBool::new(false));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
         let collector = {
-            let (store, observed) = (store.clone(), observed.clone());
+            let store = store.clone();
+            let (ready, observed, done) = (ready.clone(), observed.clone(), done.clone());
             std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                while std::time::Instant::now() < deadline {
+                ready.store(true, Ordering::SeqCst);
+                while !done.load(Ordering::SeqCst) {
                     if store.is_being_written(&root) {
                         observed.store(true, Ordering::SeqCst);
-                        // Refused, or this returns true and unlinks the bytes
-                        // the ingest is midway through writing.
+                        // Refused — or this returns true and unlinks the bytes
+                        // the ingest is midway through writing, leaving the row
+                        // it is about to commit describing nothing.
                         assert!(
                             !store.delete_blob_if_collectable(&root, i64::MAX).unwrap(),
                             "an ingest in flight is not a collectable object"
@@ -1942,15 +1944,20 @@ mod tests {
                 }
             })
         };
+        while !ready.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
 
         let (ingested, size) = store.ingest_file(&source, 1).unwrap();
+        done.store(true, Ordering::SeqCst);
         collector.join().unwrap();
 
         assert_eq!(ingested, root);
         assert_eq!(size, payload.len() as u64);
         assert!(
             observed.load(Ordering::SeqCst),
-            "the collector never saw the ingest's lease, so this run proves nothing"
+            "the ingest held no write lease, so a sweep in its window would have \
+             unlinked the bytes of the row it then committed"
         );
         // The invariant: a row calling the object complete, and the bytes it
         // describes.
