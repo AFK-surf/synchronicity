@@ -76,13 +76,28 @@ pub fn write_token(data_dir: &Path) -> io::Result<Vec<u8>> {
     harden_data_dir(data_dir)?;
     let token = SecretKey::generate().to_bytes().to_vec();
     let path = token_path(data_dir);
-    // Remove first: rewriting in place would keep a previous file's mode.
-    match std::fs::remove_file(&path) {
+    // Written to a sibling and renamed over, so a reader never sees a partial
+    // token.
+    //
+    // `Server::bind` binds the listener *before* minting this, deliberately —
+    // the other order lets a refused replacement daemon clobber the running
+    // one's token (see the shutdown path). So there is a window in which the
+    // socket answers and this file is mid-write, and writing in place made that
+    // window observable: a client that read a created-but-empty file connected
+    // and was then refused `Unauthorized`, on a daemon that had just started
+    // correctly. A rename closes it without disturbing the bind order, because
+    // the name only ever appears with the whole token behind it.
+    //
+    // The temp file is created fresh rather than rewritten, which is also what
+    // keeps the private mode from being inherited from a previous file's.
+    let staged = path.with_extension("token.new");
+    match std::fs::remove_file(&staged) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    write_private(&path, &token)?;
+    write_private(&staged, &token)?;
+    std::fs::rename(&staged, &path)?;
     Ok(token)
 }
 
@@ -97,7 +112,13 @@ pub fn read_token(data_dir: &Path) -> io::Result<Vec<u8>> {
 
 /// Removes the token file, so a stopped daemon leaves no credential behind.
 pub fn remove_token(data_dir: &Path) {
-    let _ = std::fs::remove_file(token_path(data_dir));
+    let path = token_path(data_dir);
+    // The staging name too: a crash between the write and the rename leaves a
+    // file that looks exactly like a credential, and "leaves no credential
+    // behind" has to mean that one as well. It authenticates nothing — no
+    // listener ever saw it — but it should not be lying around.
+    let _ = std::fs::remove_file(path.with_extension("token.new"));
+    let _ = std::fs::remove_file(path);
 }
 
 /// Where the token lives.

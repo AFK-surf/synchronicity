@@ -28,6 +28,20 @@ impl Slot {
     }
 }
 
+/// The complete slots a rebuild can work from, and the rows it cannot read.
+///
+/// Both halves, because a rebuild has to do the origins it can *and* say which
+/// it could not: reporting success having silently skipped one is what
+/// `doctor --rebuild` exists to rule out, and failing outright on the first bad
+/// row rebuilds nothing at all.
+#[derive(Debug, Default)]
+pub struct CompleteRoots {
+    /// The `(origin, root)` pairs that read back cleanly.
+    pub roots: Vec<(OriginId, Hash)>,
+    /// The `origin_id` text of every row that did not, as stored.
+    pub unreadable: Vec<String>,
+}
+
 /// A stored head, with the bookkeeping columns §10 keeps alongside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredHead {
@@ -190,22 +204,33 @@ impl Store {
     /// that origin entirely, which is the one outcome `doctor --rebuild` exists
     /// to rule out. Reading `heads` alone means an unreadable `root` still fails
     /// loudly, because without it there is genuinely nothing to rebuild from.
-    pub fn complete_slot_roots(&self) -> Result<Vec<(OriginId, Hash)>> {
+    pub fn complete_slot_roots(&self) -> Result<CompleteRoots> {
         let conn = self.conn();
         let mut stmt =
             conn.prepare("SELECT origin_id, root FROM heads WHERE slot = ?1 ORDER BY origin_id")?;
         let rows = stmt.query_map(params![Slot::Complete.as_str()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
-        let mut out = Vec::new();
+        let mut found = CompleteRoots::default();
         for row in rows {
             let (origin, root) = row?;
-            out.push((
-                origin_column(origin, "heads.origin_id")?,
-                hash_column(root, "heads.root")?,
-            ));
+            // Per row, because the caller rebuilds per origin. Propagating the
+            // first bad row rebuilt *nothing* — the whole vector is materialized
+            // before the caller starts — which is worse than the failure it
+            // replaced and contradicts `rebuild_views`' promise that one origin's
+            // failure does not stop the others.
+            match (
+                origin_column(origin.clone(), "heads.origin_id"),
+                hash_column(root, "heads.root"),
+            ) {
+                (Ok(origin), Ok(root)) => found.roots.push((origin, root)),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!(origin, error = %e, "a complete head row cannot be read");
+                    found.unreadable.push(origin);
+                }
+            }
         }
-        Ok(out)
+        Ok(found)
     }
 
     /// Writes a head into a slot.

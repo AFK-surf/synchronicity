@@ -967,7 +967,11 @@ impl Node {
         // root and nothing else, and `all_heads` skips a row whose signature will
         // not parse — which would have this report success having quietly not
         // rebuilt that origin at all.
-        for (origin, root) in self.store().complete_slot_roots()? {
+        let complete = self.store().complete_slot_roots()?;
+        // A row that will not read is a named failure, not a silent skip and not
+        // a reason to rebuild nothing.
+        failed.extend(complete.unreadable);
+        for (origin, root) in complete.roots {
             match self.store().rematerialize(&origin, root) {
                 Ok(n) => total += n,
                 Err(e) => {

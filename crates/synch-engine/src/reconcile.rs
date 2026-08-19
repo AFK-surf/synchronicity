@@ -57,6 +57,25 @@ pub const MAX_RETAINED_FORKS: usize = 8;
 /// sweep, and the two together are what §5.2 means by no wedging.
 pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
 
+/// What a promotion attempt concluded.
+///
+/// Three states rather than a `bool`, because the callers cannot tell them apart
+/// and kept getting it wrong: a promotion that did nothing because the trie is
+/// still arriving and one that retired the head on a verdict already in the memo
+/// are both "did not flip", and reporting the second as the first counted a
+/// discarded head as accepted. Inferring it by re-reading the slot afterwards was
+/// no better — it cost a lock on every ordinary adoption and still could not see
+/// which case it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Promotion {
+    /// The pending head's trie was wholly present and the complete slot flipped.
+    Flipped,
+    /// Nothing to promote, or the trie is not all here yet: the slot stands.
+    Waiting,
+    /// This promotion is in the refusal memo, so the head was retired unjudged.
+    Refused,
+}
+
 /// What happened when a head was offered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadOutcome {
@@ -69,6 +88,14 @@ pub enum HeadOutcome {
     Unbound,
     /// The head is not strictly greater than what we already hold.
     NotNewer,
+    /// The head was adopted, and this node has already judged that it cannot
+    /// materialize this promotion, so the head was retired again rather than
+    /// re-judged (see [`Syncer::try_promote`]).
+    ///
+    /// Counted as a failure for this origin, because it is one: §12 requires the
+    /// count of origins left behind to be in the sync report, and this is the
+    /// only outcome that carries it after the first exchange.
+    Refused,
     /// The head was adopted as pending and its trie must be fetched.
     Pending,
     /// The head was adopted and its trie was already present, so the complete
@@ -434,39 +461,28 @@ impl Syncer {
         if !outcome.accepted() {
             return Ok(outcome);
         }
-        if outcome == HeadOutcome::Pending {
-            if let Some(wake) = &self.on_pending {
-                // One permit no matter how often this rings, exactly as the
-                // promotion bell below does — and for the reason stated there:
-                // a wake landing mid-pass must not be lost. `notify_waiters`
-                // keeps nothing for a listener that is not currently parked,
-                // and the anti-entropy loop is only parked on this between
-                // rounds. It spends the rest of its time inside
-                // `anti_entropy_round`, dialling peers — which is precisely
-                // when the pushes it needs to hear about arrive, because a
-                // publisher pushes to the whole membership at once (§5.3). Rung
-                // that way the fetch waited for the next interval after all,
-                // for every push that landed during a round.
-                wake.notify_one();
+        match self.try_promote(&head.origin, now)? {
+            Promotion::Flipped => Ok(HeadOutcome::Completed),
+            // Rung here, not before the promotion. A refused head is adopted and
+            // retired in the same breath — adopting it is what makes it beat the
+            // floor again — so ringing on adoption woke the anti-entropy loop for
+            // a head that no longer exists. `notify_one` keeps a permit and the
+            // loop is not parked during a round, so the permit was always waiting
+            // when the round ended: one unapplicable head held by one peer pinned
+            // the node to back-to-back rounds, forever, at the `REACTIVE_FLOOR`
+            // rather than the interval. It also bought a pointless extra round
+            // for every head whose trie was already here.
+            Promotion::Waiting => {
+                if let Some(wake) = &self.on_pending {
+                    // One permit no matter how often this rings, exactly as the
+                    // promotion bell does — a wake landing mid-round must not be
+                    // lost, and the loop is parked on this only between rounds
+                    // (§5.3).
+                    wake.notify_one();
+                }
+                Ok(HeadOutcome::Pending)
             }
-        }
-        match self.try_promote(&head.origin, now) {
-            Ok(true) => Ok(HeadOutcome::Completed),
-            // `Pending` only if the head is actually pending. `try_promote`
-            // clears the slot when the memo already holds this promotion, and
-            // reporting that as accepted made `sync_with` count a discarded head
-            // in `heads_accepted` and call `fetch_pending` on an empty slot — so
-            // `synch status` read "0 origin(s) left behind" for an origin this
-            // node permanently cannot apply, on every exchange after the first.
-            Ok(false) => Ok(match self.store.pending_head(&head.origin)? {
-                Some(pending) if pending == *head => HeadOutcome::Pending,
-                _ => HeadOutcome::NotNewer,
-            }),
-            // The retire and the memo are `try_promote`'s, because only it
-            // knows which head it judged — the slot may have moved on between
-            // the transaction above and the promotion below. All that is left
-            // here is to hand the failure back.
-            Err(e) => Err(e),
+            Promotion::Refused => Ok(HeadOutcome::Refused),
         }
     }
 
@@ -486,13 +502,13 @@ impl Syncer {
     /// pool throughout. A caller condemning "its" head therefore retired, and
     /// permanently refused, whatever happened to be in the slot, and left the
     /// head that actually failed unrecorded.
-    pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<bool> {
+    pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<Promotion> {
         // What the transaction judged, for the fault arm: it rolls back, so the
         // head cannot be recovered from the slot afterwards.
         let judged: std::cell::RefCell<Option<Verdict>> = std::cell::RefCell::new(None);
-        let promoted = self.store.transaction(|txn| -> Result<_> {
+        let promoted = self.store.transaction(|txn| -> Result<Promotion> {
             let Some(pending) = txn.head(origin, Slot::Pending)? else {
-                return Ok(None);
+                return Ok(Promotion::Waiting);
             };
             // The displaced root, the verdict key and the memo check all come
             // before the completeness walk, because the walk is the most likely
@@ -521,12 +537,12 @@ impl Syncer {
             // `head_floor` above everything this node can serve.
             if self.is_refused(&key) {
                 txn.clear_head(origin, Slot::Pending)?;
-                return Ok(None);
+                return Ok(Promotion::Refused);
             }
             *judged.borrow_mut() = Some(key);
             let trie = Trie::new(txn);
             if !trie.is_complete(pending.head.root)? {
-                return Ok(None);
+                return Ok(Promotion::Waiting);
             }
             // The pending head must actually beat the complete one, rather than
             // rest on "pending is always greater", an invariant `offer_head`
@@ -547,7 +563,7 @@ impl Syncer {
                     "dropping a pending head the complete slot has overtaken"
                 );
                 txn.clear_head(origin, Slot::Pending)?;
-                return Ok(None);
+                return Ok(Promotion::Waiting);
             }
             // The displaced head is already retained: `put_head` recorded its
             // signature when it took the slot. Recording it again here would be
@@ -556,7 +572,7 @@ impl Syncer {
             txn.put_head(Slot::Complete, &pending.head, pending.received_at, now)?;
             txn.clear_head(origin, Slot::Pending)?;
             txn.materialize_diff(origin, old_root, pending.head.root)?;
-            Ok(Some(pending.head))
+            Ok(Promotion::Flipped)
         });
         let promoted = match promoted {
             Ok(promoted) => promoted,
@@ -581,18 +597,15 @@ impl Syncer {
             }
             Err(e) => return Err(e),
         };
-        match promoted {
-            Some(head) => {
-                tracing::debug!(origin = %origin, seq = head.seq, "head flipped to complete");
-                if let Some(wake) = &self.on_change {
-                    // One permit no matter how often this rings: passes
-                    // coalesce, and a wake landing mid-pass is not lost.
-                    wake.notify_one();
-                }
-                Ok(true)
+        if promoted == Promotion::Flipped {
+            tracing::debug!(origin = %origin, "head flipped to complete");
+            if let Some(wake) = &self.on_change {
+                // One permit no matter how often this rings: passes coalesce,
+                // and a wake landing mid-pass is not lost.
+                wake.notify_one();
             }
-            None => Ok(false),
         }
+        Ok(promoted)
     }
 
     /// Fetches the pending head's trie from `client`, verifying every node
@@ -838,7 +851,7 @@ impl Syncer {
             syncer.try_promote(&origin, now_ns())
         })
         .await?;
-        if promoted {
+        if promoted == Promotion::Flipped {
             Ok(FetchOutcome::Completed)
         } else {
             Ok(FetchOutcome::Partial)
@@ -1000,6 +1013,11 @@ impl Syncer {
                 Err(e) => return Err(e),
             };
             match outcome {
+                // §12: the count of origins left behind belongs in the sync
+                // report, and after the first exchange this is the only outcome
+                // that carries it — the fault propagates once, and every later
+                // offer is answered from the memo without re-deriving it.
+                HeadOutcome::Refused => report.heads_failed += 1,
                 HeadOutcome::Pending => {
                     report.heads_accepted += 1;
                     match self.fetch_pending(client, &head.origin).await {
@@ -1982,10 +2000,11 @@ mod containment_tests {
         // Retired: the floor is back to what this node can serve.
         assert_eq!(store.head_floor(&origin).unwrap(), None);
         // And remembered: the second offer does not walk it again, so it does not
-        // raise, and it leaves nothing pending.
+        // raise, and it leaves nothing pending — while still counting against the
+        // origin, which §12 requires the sync report to carry.
         assert_eq!(
             syncer.offer_head(&head, 0).unwrap(),
-            HeadOutcome::NotNewer,
+            HeadOutcome::Refused,
             "the verdict must be remembered, not re-derived every exchange"
         );
         assert_eq!(store.pending_head(&origin).unwrap(), None);
@@ -2022,12 +2041,14 @@ mod containment_tests {
 
         // Offered again — which is what every later exchange with a peer holding
         // it does. The diff must not run a second time, so no error surfaces; and
-        // the outcome must not read as accepted, or `synch status` reports zero
-        // origins left behind for an origin this node cannot apply.
+        // the outcome must be counted against the origin, or `synch sync` — which
+        // prints the "N origin(s) left behind" line from `heads_failed` — reports
+        // nothing at all for an origin this node permanently cannot apply, since
+        // the fault itself propagates only on the first offer.
         assert_eq!(
             syncer.offer_head(&head, 0).unwrap(),
-            HeadOutcome::NotNewer,
-            "the promotion is not re-attempted, and nothing is left pending"
+            HeadOutcome::Refused,
+            "the promotion is not re-attempted, and the origin is still counted"
         );
         assert_eq!(
             store.head_floor(&origin).unwrap(),

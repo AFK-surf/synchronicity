@@ -35,9 +35,8 @@ pub struct RoundReport {
 /// A round dials every reachable peer, so answering each push with its own
 /// round would let one origin publishing in a burst — an import, a large
 /// rename — turn one node's publishes into a dial storm across the membership.
-/// The bell is coalescing (`notify_waiters` wakes whoever is listening and
-/// keeps nothing), so a burst arriving inside the floor costs one round, not
-/// one per head.
+/// The bell holds at most one permit, so a burst arriving inside the floor costs
+/// one extra round rather than one per head.
 const REACTIVE_FLOOR: Duration = Duration::from_secs(2);
 
 impl Node {
@@ -404,11 +403,17 @@ impl Node {
             let origin = &stored.head.origin;
             let outcome = syncer.try_promote(origin, now);
             let poisoned = match outcome {
-                Ok(true) => {
+                Ok(crate::reconcile::Promotion::Flipped) => {
                     promoted += 1;
                     continue;
                 }
-                Ok(false) => false,
+                // A head the memo already condemns was retired by `try_promote`
+                // itself, so there is nothing for this pass to abandon.
+                Ok(crate::reconcile::Promotion::Refused) => {
+                    abandoned += 1;
+                    continue;
+                }
+                Ok(crate::reconcile::Promotion::Waiting) => false,
                 // Only a fault in what the *origin* published condemns its head.
                 // A `SQLITE_BUSY` from another process, a full disk, an I/O
                 // error — this used to read all of them as "poisoned" and
