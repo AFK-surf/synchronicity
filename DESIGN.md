@@ -118,8 +118,10 @@ enum OriginId {
 For DNS-discovered members, the `OriginId` comes from the `id=` field of the TXT
 record (§3.2), scoped by the membership domain: `nas@cluster.example.com`. For
 statically trusted peers without a name, the OriginId degenerates to the device key
-itself — self-certifying, but not rotatable. Static trust may also bind a name
-(`synch trust add --as nas <node-id>`), which makes rotation available without DNS.
+itself — self-certifying, but not rotatable. Static trust may also bind a *named*
+peer (`synch trust add --as nas <node-id>`), which is how a node trusts a named
+origin — and follows its rotations, by hand (§3.4) — without consulting that
+origin's zone itself.
 
 A **binding** is the association `OriginId → device key`, with a source (static or
 dns) and a validity window. An origin may have several simultaneously bound device
@@ -130,6 +132,105 @@ device key as an identity.
 Device secret keys are generated on `synch init` (and on `synch key rotate`) and stored
 in the SQLite database (created `0600` inside the data directory). Display/interchange
 encoding for keys is z-base-32 (iroh's native encoding).
+
+**Where a node's own identity comes from** is one config value, `identity.mode`, fixed
+at `synch init` and never changed afterwards:
+
+| `identity.mode` | Chosen by      | Own `OriginId`         | Rotatable | Authority on the name |
+|-----------------|----------------|------------------------|-----------|-----------------------|
+| `key`           | default        | `Key(K_active)`        | no        | the device key itself |
+| `dns`           | `--domain <d>` | `Named { domain, id }` | yes       | the zone (below)      |
+
+`key` needs no configuration at all: the identity *is* the key, self-certifying and
+not rotatable. A named, rotatable identity comes from a zone and only from a zone —
+there is no way to name a node by hand, because a hand-set name is a second authority
+on something the zone already decides. An isolated deployment that wants named
+origins runs its own signed root and points `--dnssec-anchor` at it (§3.2).
+
+The mode is explicit rather than inferred from whether a membership domain happens to
+be configured, because the two are independent. A `key`-mode node may configure a
+domain to trust *other* members by it (§3.2) and stay `key:<z-base32>` itself; only a
+`dns`-mode node draws its own name from that domain. Since that domain is then half of
+its own `OriginId`, `synch domain clear` is refused on a `dns`-mode node: a node that
+could be de-domained is a node whose name silently reverts to its device key.
+
+**Identity discovery (`dns` mode).** `synch daemon run` resolves the membership domain
+once, before the endpoint binds and before any loop starts, and freezes the answer:
+**a node's identity is immutable for the lifetime of the process**. Everything that
+reads it — seq monotonicity, trie keying, head signing — sees one value from first
+call to shutdown, which is exactly what lets a *changed* identity be adopted with no
+daemon stopped.
+
+The oracle is the one §3.2's malformed-set rules already define: the origin the
+validated record set binds this node's active device key to, or nothing at all when
+that key is absent from the set or ambiguous within it. Only a `Named` result is
+adopted — a key published without an `id=` resolves to `Key(nk)`, and adopting that
+would quietly turn a rotatable node into a non-rotatable one on the strength of a
+missing field, so it is refused and reported instead.
+
+| Stored identity | Resolution         | Action                                            |
+|-----------------|--------------------|---------------------------------------------------|
+| none            | `<id>@<domain>`    | adopt it; first boot                              |
+| `o`             | `o`                | nothing; steady state                             |
+| `p`             | some other `o`     | adopt `o`, migrating local state (below)          |
+| none            | no match           | **unidentified**: poll                            |
+| `p`             | no match           | keep `p`, report it, do not poll                  |
+| any             | resolution failed  | keep the stored identity if there is one, else poll |
+
+"A validated answer that says nothing about this key" and "no validated answer" are
+different facts and never collapse. A resolution failure — unreachable resolver,
+expired RRSIG, a clock that dates nothing (§3.2) — is not evidence that a record was
+withdrawn, and a node that un-identified itself on one would lose its name every time
+its resolver hiccuped. Failing closed here means keeping what you have.
+
+The same asymmetry covers a record that genuinely *is* withdrawn: the node keeps its
+name, keeps signing, and keeps a coherent trie, while its bindings expire at every
+peer on `dns_trust_grace` and its data goes unavailable per the edge §3.4 accepts.
+Un-adopting would destroy local state on top of that, irreversibly, and buy nothing.
+
+**The unidentified state.** A node with a device key and no identity can speak QUIC
+and has nothing to say: it cannot sign heads, publish, or scan into a trie. It is
+also inert in practice — the same absent record leaves every peer without a binding
+for its key, so no peer accepts its connections. It runs the reduced service §3.4's
+recovery state establishes: control socket up so `synch daemon status` and `synch
+doctor` can explain the state, endpoint bound, and every publishing command failing
+with the record to publish filled in (`v=sync1 id=<name> nk=<K> apex=<apex>`).
+
+The identity poll is a one-shot-until-success task, separate from the membership
+refresh loop: it stops the moment an identity is adopted and never runs again in that
+process, while the membership loop — which is about *other* nodes — keeps running. It
+re-queries on the negative answer's TTL, clamped to `[30s, 5m]`: tight enough that
+publishing the record and watching the node come up feels immediate, loose enough not
+to flood a name that does not exist yet. `synch domain refresh` triggers it at once,
+so nobody waits on the clamp.
+
+Bringing up a machine is therefore `synch init --domain cluster.example.com`, which
+prints the device key, then publishing one TXT record naming that key. The ordering is
+forced: a record cannot name a key that does not exist yet.
+
+**Adopting a changed identity.** When the zone binds this node's key to a different
+`id=` than the one it holds, the new name is adopted on the next start, in one
+transaction, before the endpoint binds: the self binding moves, both head slots and
+the old origin's `entries` and `blob_providers` views are dropped, any mirror policy
+pinned to the old origin (§7.2) is rewritten to the new one, and `publish_floor` is
+cleared, since it floors history under a name nobody holds. Blobs stay — they are
+content-addressed — and the next scan republishes them under the new name.
+`head_history` is untouched, so heads signed under the old name survive as the fork
+evidence §4.4 makes of them. No daemon has to be stopped, because the migration runs
+before there is one.
+
+It fires only on a validated answer yielding a single unambiguous `Named` origin for
+the active device key: never on a resolution failure, never on ambiguity, never on
+absence, never on an `id=`-less match. That precondition is the whole safety argument
+for an unattended and destructive operation, and every part of it is a rule §3.2
+enforces anyway.
+
+A relabel is not cheap, and `synch doctor` says so: the new origin starts at `seq = 1`,
+peers keep the old origin's trie until its bindings expire, and the cluster briefly
+lists the machine twice. Every adoption is recorded durably in `identity_history`
+(§10) and surfaced by `synch id` and `synch doctor`. §3.4 makes a change of signing
+identity a deliberate act with an audit trail; here the deliberateness is the zone
+operator's, one edit upstream, so the trail carries the weight alone.
 
 ### 3.2 Trust sources
 
@@ -146,12 +247,16 @@ A remote node is **trusted** iff at least one of the following holds:
    <name>` the binding is to a named OriginId (rotatable via `synch trust rebind`);
    without it, the key is the identity.
 
-2. **DNSSEC-based discovery** — the node's key appears in a TXT record of a configured
+2. **DNSSEC-based discovery** — the node's key appears in a TXT record of the
    membership domain:
 
    ```
-   synch domain add cluster.example.com
+   synch domain set cluster.example.com
    ```
+
+   A node consults at most one membership domain, and for a `dns`-mode node that
+   domain is also the zone which names it (§3.1) — "the joined domain" has to name
+   one zone to name anything.
 
    The resolver queries `_synchronicity.<domain> TXT` and accepts records of the form:
 
@@ -187,7 +292,7 @@ A remote node is **trusted** iff at least one of the following holds:
    `synch doctor` diagnoses with the likely cause ("duplicate id assignment?").
    Finally, a key statically trusted as `OriginId::Key` while publishing heads under
    a Named origin would sync nothing, silently — doctor detects the mismatch and
-   suggests the missing `--as` name or `synch domain add`.
+   suggests the missing `--as` name or `synch domain set`.
 
    The lookup MUST be DNSSEC-validated end to end, and it travels one
    transport: DNS-over-HTTP(S), RFC 8484, against `--doh <url>` (`SYNCH_DOH`,
@@ -212,17 +317,8 @@ A remote node is **trusted** iff at least one of the following holds:
 
    Records are re-resolved on the TTL (clamped to `[60s, 24h]`). A binding that
    disappears from DNS expires after `dns_trust_grace` to absorb propagation
-   glitches. Adding a machine to the cluster becomes: generate identity, publish
-   one TXT record.
-
-   A node's *own* OriginId is explicit — `synch init --id nas@cluster.example.com`,
-   or the device key itself — and is never inferred from DNS: a node that read its
-   identity out of the record set would change identity whenever the zone did. The
-   record set is consulted for the opposite direction. If it binds this node's
-   device key to some *other* id, nothing this node publishes will be accepted by
-   anybody, while the node itself looks healthy — so `synch doctor` reports that
-   mismatch, and reports nothing for a key the malformed-set rule above calls
-   ambiguous, because there is no single answer to report.
+   glitches. Adding a machine to the cluster is: `synch init --domain <d>`, publish
+   one TXT record — the machine takes its own name from that same record (§3.1).
 
    **Expiry is dated, and the date is checked.** Every binding check is
    `now < expires_at`, so the instant is an input to an authorization decision and
@@ -328,7 +424,8 @@ operator commands separated by a propagation wait; that is the intended trade.
 
 **Key-loss recovery**: the operator replaces the TXT record with a fresh `K_new` —
 from the cluster's point of view this is just a rotation without the overlap window.
-The recovering node (fresh DB, same `id=` name) must assume the peers it can
+The recovering node (fresh DB, which rediscovers the same `id=` name from the zone,
+§3.1) must assume the peers it can
 currently reach may not hold its true latest head, so recovery is a distinct,
 explicitly driven state rather than something a node does on startup:
 
@@ -374,8 +471,8 @@ deterministic `(seq, root)` ordering (§4.4) still converges everyone, and compe
 same-seq heads are flagged as equivocation exactly as in the single-key case. A
 well-behaved node signs with exactly one key at any moment.
 
-Static-trust named origins rotate the same way, minus DNS: `synch trust rebind nas
-<new-node-id>` on each peer.
+Peers that trust a named origin statically rather than through its zone rotate it by
+hand, minus DNS: `synch trust rebind nas <new-node-id>` on each such peer.
 
 One availability edge is accepted deliberately: a peer that first learns of an origin
 *after* a rotation, while the origin is offline and has not yet re-signed its head
@@ -1042,15 +1139,18 @@ files.
 is a control-service call to a running daemon (§9.3).
 
 ```
-synch init [--id <name>@<domain>]            create identity + database (no daemon)
+synch init [--domain <d>]                    create device key + database (no daemon);
+                                             --domain picks `dns` identity mode (§3.1)
 synch daemon run|status|stop
-synch id                                     print OriginId + current device key(s)
+synch id                                     print OriginId + current device key(s),
+                                             where the name came from, and adoptions
 synch key rotate|activate|retire|ls          operator-driven device-key rotation (§3.4)
 
 synch trust add [--as <name>] [--addr <hint>]|rebind|rm|ls
                                              static membership (named or key-identified)
-synch domain add|rm|ls|refresh [<domain>]    DNSSEC membership (refresh: re-resolve one
-                                             domain now, or all when none is named)
+synch domain set|clear|ls|refresh            the DNSSEC membership domain, at most one
+                                             (§3.2); refresh re-resolves it now; clear
+                                             is refused on a `dns`-mode node (§3.1)
 synch peers                                  live peers, addresses, last sync, lag
 
 synch space add <id> <path>                  index a local directory as a space
@@ -1261,13 +1361,16 @@ Rules:
 - Anything a plain SQL statement can't express (a backfill, a table rewrite) is a
   Rust migration step in the same numbered chain, under the same transaction rule.
 
-`config` also holds `self_origin_id` and, after a recovery (§3.4), the
-`publish_floor`.
+`config` also holds the identity mode and the membership domain that decide where this
+node's name comes from (§3.1), the name itself in `self_origin_id`, and — after a
+recovery (§3.4) — the `publish_floor`.
 
 ```sql
 -- node & config
 CREATE TABLE config        (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                                         -- 'schema_version', 'self_origin_id', 'publish_floor'
+                                         -- 'schema_version', 'identity.mode',
+                                         -- 'membership.domain', 'self_origin_id',
+                                         -- 'publish_floor'
 CREATE TABLE device_keys (                -- own keys; >1 row only during rotation
   node_id     BLOB PRIMARY KEY,
   secret_key  BLOB NOT NULL,
@@ -1275,14 +1378,24 @@ CREATE TABLE device_keys (                -- own keys; >1 row only during rotati
   created_at  INTEGER NOT NULL
 );
 
+-- every identity this node has adopted from the zone (§3.1). A relabel is
+-- unattended and destructive, so the trail of what was adopted and when is
+-- the only record of it; `synch id` and `synch doctor` both read this.
+CREATE TABLE identity_history (
+  at          INTEGER NOT NULL,
+  previous    TEXT NOT NULL,
+  adopted     TEXT NOT NULL,
+  node_id     BLOB NOT NULL,             -- the device key the zone bound
+  domain      TEXT NOT NULL
+);
+
 -- membership: OriginId → device-key bindings.
 -- origin_id is the canonical rendering: '<id>@<domain>' or 'key:<z-base32>'.
--- The publishing domain is part of a DNS binding's identity, and has to be:
--- `key:<z-base32>` names no domain, so two configured membership domains
--- publishing one `id=`-less record would otherwise share a row and the last
--- refresh would own it — which is exactly the case the sole-source rule on
--- dial hints (§3.3) is aimed at. '' rather than NULL for a static binding,
--- because SQLite admits no expression in a PRIMARY KEY.
+-- `domain` carries a dns binding's provenance — `key:<z-base32>` renders no
+-- domain of its own, so without the column an `id=`-less record's row would
+-- not say which zone vouched for it, and `synch doctor` could not attribute
+-- it. '' rather than NULL for a static binding, because SQLite admits no
+-- expression in a PRIMARY KEY.
 CREATE TABLE bindings (
   origin_id    TEXT NOT NULL,
   node_id      BLOB NOT NULL,            -- bound device key (32 bytes)
@@ -1454,7 +1567,14 @@ CI (GitHub Actions):
   controls membership — adding a hostile node grants full read access and publish
   rights. With named origins the exposure is strictly larger: the domain controller
   can *rebind an existing origin's `id=` to an attacker key*, hijacking that
-  namespace for future publishes. Established peers won't accept lower seqs and
+  namespace for future publishes. It also controls what each member believes its own
+  name to be, since a node takes its `id=` from the same record set (§3.1): editing
+  the record that names a member's key relabels that member on its next start,
+  dropping its published views and restarting it at `seq = 1` under the new name,
+  unattended. That is the cost of the zone being the single authority on a name —
+  a node holds no second opinion to check it against, so `identity_history` and
+  `synch doctor` make every adoption visible after the fact and nothing prevents one
+  in advance. Established peers won't accept lower seqs and
   retain signed history as evidence — but that is per-peer protection only (see the
   rollback bullet below); new peers get none, and forward overwrites at higher seq
   remain possible for any binding holder. The protocol still makes no attempt to
@@ -1576,6 +1696,9 @@ CI (GitHub Actions):
 
 Three nodes: `laptop`, `nas`, `vps`, all in `_synchronicity.cluster.example.com`.
 
+0. Each ran `synch init --domain cluster.example.com` and had its printed device key
+   published in one TXT record. Each daemon resolved the zone at startup, found the
+   record naming its own key, and took that record's `id=` as its name (§3.1).
 1. `nas` runs `synch space add media /srv/media`. The scanner hashes 40 k files,
    the publisher signs head `(seq=1, root=r1)` containing 40 k `f:` records and 40 k
    per-object `b:` ads.
