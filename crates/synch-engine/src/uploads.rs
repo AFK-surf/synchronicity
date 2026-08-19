@@ -252,12 +252,28 @@ impl Node {
         principal: Option<&str>,
         parts: &[(u32, Option<Hash>)],
     ) -> Result<CompletedUpload> {
-        self.upload_for(upload, space, path, principal)?;
-        let start = self.store().begin_complete(
-            upload,
-            synch_core::now_ns(),
-            LATCH_TIMEOUT.as_nanos().try_into().unwrap_or(i64::MAX),
-        )?;
+        // Both reads take a store connection, so they go to the blocking pool
+        // together rather than one at a time (§10): the authorization and the
+        // latch belong to the same instant anyway.
+        let start = {
+            let (node, upload_id) = (self.clone(), upload.to_string());
+            let (space_owned, path_owned) = (space.to_string(), path.to_string());
+            let principal_owned = principal.map(str::to_string);
+            crate::blocking::offload(move || {
+                node.upload_for(
+                    &upload_id,
+                    &space_owned,
+                    &path_owned,
+                    principal_owned.as_deref(),
+                )?;
+                Ok(node.store().begin_complete(
+                    &upload_id,
+                    synch_core::now_ns(),
+                    LATCH_TIMEOUT.as_nanos().try_into().unwrap_or(i64::MAX),
+                )?)
+            })
+            .await?
+        };
         let (recorded_space, recorded_path, available) = match start {
             // A retried completion. The client never saw the first answer, so
             // it gets that answer rather than being told its upload is gone.
@@ -279,7 +295,11 @@ impl Node {
         {
             Ok(completed) => Ok(completed),
             Err(e) => {
-                if let Err(unlatch) = self.store().reopen_upload(upload) {
+                let (node, upload_id) = (self.clone(), upload.to_string());
+                let unlatched: Result<()> =
+                    crate::blocking::offload(move || Ok(node.store().reopen_upload(&upload_id)?))
+                        .await;
+                if let Err(unlatch) = unlatched {
                     tracing::warn!(upload, error = %unlatch, "could not reopen a failed upload");
                 }
                 Err(e)
@@ -298,7 +318,14 @@ impl Node {
     ) -> Result<CompletedUpload> {
         let chosen = choose_parts(wanted, available)?;
         let dir = self.store().upload_dir(upload);
-        let target = self.adoption_target(space, path)?;
+        // Reads the space row, so it goes to the blocking pool like every other
+        // store read on an async path (§10).
+        let target = {
+            let (node, space_owned, path_owned) =
+                (self.clone(), space.to_string(), path.to_string());
+            crate::blocking::offload(move || node.adoption_target(&space_owned, &path_owned))
+                .await?
+        };
         let sources: Vec<PathBuf> = chosen.iter().map(|part| dir.join(&part.file)).collect();
 
         // One blocking closure for the whole assembly: `copy_file_range` is a
@@ -327,12 +354,21 @@ impl Node {
         // them any earlier, for the peak-disk saving it buys, leaves rows naming
         // payloads that are gone: every retry then dies on a missing file
         // instead of being told what was actually wrong.
-        self.store()
-            .finish_complete(upload, &root, size, synch_core::now_ns())?;
-        for part in &chosen {
-            let _ = std::fs::remove_file(dir.join(&part.file));
+        {
+            let (node, upload_id) = (self.clone(), upload.to_string());
+            let files: Vec<PathBuf> = chosen.iter().map(|part| dir.join(&part.file)).collect();
+            let dir = dir.clone();
+            crate::blocking::offload(move || {
+                node.store()
+                    .finish_complete(&upload_id, &root, size, synch_core::now_ns())?;
+                for file in &files {
+                    let _ = std::fs::remove_file(file);
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+                Ok(())
+            })
+            .await?;
         }
-        let _ = std::fs::remove_dir_all(&dir);
 
         // The ordinary indexing pipeline takes it from here — hash, CAS, stage,
         // publish — exactly as a `PutObject` does, so a completed upload is a
@@ -375,13 +411,16 @@ impl Node {
         // otherwise unlink the local copy and be unable to tell anyone (§3.4),
         // which loses data — the tombstone that would have justified the
         // removal never gets signed.
-        self.ensure_publishable()?;
+        // One trip to the blocking pool for both: the recovery check reads the
+        // store, and §10 keeps store reads off the runtime workers.
         let node = self.clone();
         let (space_owned, path_owned) = (space.to_string(), path.to_string());
-        let removed =
-            crate::blocking::offload(move || node.adopt_deletion(&space_owned, &path_owned))
-                .await?
-                .is_some();
+        let removed = crate::blocking::offload(move || {
+            node.ensure_publishable()?;
+            node.adopt_deletion(&space_owned, &path_owned)
+        })
+        .await?
+        .is_some();
 
         // Unconditionally, and not only when a file was removed. The tombstone
         // comes from the scanner's deletion sweep, which walks `local_files`
@@ -401,7 +440,11 @@ impl Node {
         // leaves this node asserting the key, signed, to every peer, with no
         // later scan or restart able to notice.
         let mine = synch_store::VersionPolicy::Origin(self.origin().clone());
-        let set = self.versions(space, path)?;
+        let set = {
+            let (node, space_owned, path_owned) =
+                (self.clone(), space.to_string(), path.to_string());
+            crate::blocking::offload(move || node.versions(&space_owned, &path_owned)).await?
+        };
         if self
             .resolve_set(&set, &mine)
             .is_ok_and(|row| row.kind != synch_core::EntryKind::Tombstone)
@@ -416,12 +459,22 @@ impl Node {
             // expiring a tombstone means — the path would read as "never
             // existed" rather than "deleted at seq N", and peers would lose the
             // assertion that tells them to stop serving their own copies.
-            let previous = self
-                .store()
-                .entry(self.origin(), space, path)?
-                .and_then(|entry| entry.content);
-            let tombstone =
-                synch_core::FileEntry::tombstone(synch_core::now_ns(), self.next_seq()?, previous);
+            let tombstone = {
+                let (node, space_owned, path_owned) =
+                    (self.clone(), space.to_string(), path.to_string());
+                crate::blocking::offload(move || {
+                    let previous = node
+                        .store()
+                        .entry(node.origin(), &space_owned, &path_owned)?
+                        .and_then(|entry| entry.content);
+                    Ok(synch_core::FileEntry::tombstone(
+                        synch_core::now_ns(),
+                        node.next_seq()?,
+                        previous,
+                    ))
+                })
+                .await?
+            };
             let encoded =
                 postcard::to_stdvec(&tombstone).map_err(|e| EngineError::Record(e.to_string()))?;
             self.stage([(synch_core::file_key(space, path)?, Some(encoded))]);
@@ -433,7 +486,11 @@ impl Node {
         // report every ordinary delete as one somebody else is still
         // publishing, which is the opposite of the warning it exists to give.
         let ours = self.origin();
-        let set = self.versions(space, path)?;
+        let set = {
+            let (node, space_owned, path_owned) =
+                (self.clone(), space.to_string(), path.to_string());
+            crate::blocking::offload(move || node.versions(&space_owned, &path_owned)).await?
+        };
         let still_published = set
             .entries
             .iter()

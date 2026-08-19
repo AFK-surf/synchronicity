@@ -119,24 +119,6 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
         .cloned()
         .unwrap_or_else(|| UNSIGNED_PAYLOAD.to_string());
 
-    // A chunk-framed body is refused, not stored.
-    //
-    // SigV4 passes for these: the sentinel hash is exactly what the client signed
-    // into the canonical request, and nothing else about the body is checked. But
-    // there is no `aws-chunked` decoder here, so the bytes published as this
-    // node's own assertion would be the framing — `<hexlen>;chunk-signature=…`
-    // around the data — at the encoded length, with a 200 and an ETag returned.
-    // Silent, cluster-wide corruption of every such upload. Chunked signing is
-    // the default in some SDKs and aws-cli v2 uses the trailer form for its
-    // checksums, so this is an ordinary client, not an exotic one.
-    if payload_hash.starts_with("STREAMING")
-        || headers
-            .get("content-encoding")
-            .is_some_and(|encoding| encoding.contains("aws-chunked"))
-    {
-        return Err(S3Error::not_implemented("aws-chunked request bodies"));
-    }
-
     let path = percent_decode(parts.uri.path());
     // Sign over the *decoded* path: `canonical_uri` URI-encodes each segment
     // exactly once, mirroring what a spec-compliant client signs. Passing the

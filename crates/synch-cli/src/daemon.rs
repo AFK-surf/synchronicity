@@ -62,7 +62,10 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // A completion severed by a stop or a crash left its upload latched, and
     // nothing else ever clears the latch: without this, an upload whose parts
     // are all still staged would refuse every retry until it aged out (§9.4).
-    match node.reopen_interrupted_uploads() {
+    // Off the runtime: it takes a store connection, which §10 keeps off the
+    // worker threads.
+    let reopening = node.clone();
+    match synch_core::offload(move || reopening.reopen_interrupted_uploads()).await {
         Ok(0) => {}
         Ok(reopened) => tracing::info!(reopened, "reopened interrupted multipart uploads"),
         Err(e) => tracing::warn!(error = %e, "could not reopen interrupted uploads"),
