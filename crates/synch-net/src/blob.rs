@@ -179,11 +179,13 @@ impl BlobProtocol {
             if !store.has_delegations()? {
                 return Ok(true);
             }
-            let spaces = match store.publish_scope_of_key(&peer, synch_core::now_ns())? {
+            let (scope, origins) =
+                store.publish_scope_of_key_with_origins(&peer, synch_core::now_ns())?;
+            let spaces = match scope {
                 None => return Ok(true),
                 Some(spaces) => spaces,
             };
-            Ok(store.content_in_spaces(&root, &spaces)?)
+            Ok(store.content_in_spaces(&root, &spaces, &origins)?)
         })
         .await?;
         match permitted {

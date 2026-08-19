@@ -800,7 +800,25 @@ impl Syncer {
                 // else, and counts as progress: the walk then treats it as
                 // satisfied rather than absent, so the fetch converges instead
                 // of retrying to the §5.2 abandonment clause (§5.5).
-                let boundary = response.redacted.clone();
+                //
+                // Only for hashes this round actually asked about, and each
+                // once — the same rule `take_served` applies to `nodes` and
+                // `values`, and for the same reason. Unfiltered, a peer that
+                // answers every request with one arbitrary hash in `redacted`
+                // resets `unproductive` every round, so the abandonment clause
+                // never fires and the fetch never ends; and `note_redacted` is
+                // durable and keyed by hash alone, so the same message poisons
+                // every later walk into reading a genuinely absent node as a
+                // boundary it may skip.
+                let asked: std::collections::HashSet<Hash> =
+                    missing.nodes.iter().map(|(_, hash)| *hash).collect();
+                let mut seen = std::collections::HashSet::new();
+                let boundary: Vec<Hash> = response
+                    .redacted
+                    .iter()
+                    .copied()
+                    .filter(|hash| asked.contains(hash) && seen.insert(*hash))
+                    .collect();
                 learned += boundary.len();
                 {
                     let store = self.store.clone();

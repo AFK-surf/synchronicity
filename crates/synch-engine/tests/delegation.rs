@@ -436,6 +436,159 @@ async fn a_withheld_node_cannot_be_reached_by_claiming_a_position_for_it() {
     }
 }
 
+/// A delegate cannot lay out the trie its own positions are judged against.
+///
+/// The position check is only worth anything relative to a trie this node
+/// vouches for — but a delegate publishes a trie, and its root lands in
+/// `head_history` as soon as the signature and the delegated binding verify.
+/// Given one of its own roots, it can put any node hash it has heard of under
+/// an in-scope position and be handed the node back, which walks every
+/// withheld subtree one level per published head.
+#[tokio::test]
+async fn a_delegate_cannot_authorize_a_position_with_its_own_root() {
+    let issuer = Node::spawn(Some("nas")).await;
+    let delegate = Node::spawn(None).await;
+    // Only the delegate trusts the issuer statically. The issuer learns the
+    // delegate from its own published `d:` record — a static binding here
+    // would make it a rooted member and skip the scope checks entirely.
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+
+    issuer.publish(
+        1,
+        &[
+            ("photos", "a.jpg", b"granted"),
+            ("finance", "q3.pdf", b"withheld"),
+        ],
+        &[delegation(&delegate.key(), &["photos"])],
+    );
+
+    // A node of the issuer's trie the delegate is not entitled to. It knows
+    // this hash honestly: it sits inside a branch the delegate must hold for
+    // the signed root to recompute.
+    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let withheld = {
+        let empty = synch_mpt::MemStore::new();
+        let mut walk = synch_mpt::MissingWalk::new(issuer.root());
+        let mut found = None;
+        loop {
+            let batch = walk.next_batch(&Trie::new(&empty), 512).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for (path, hash) in &batch.nodes {
+                if !scope.admits_path(path) && found.is_none() {
+                    found = Some(*hash);
+                }
+                let bytes = synch_mpt::NodeStore::get_node(issuer.store.as_ref(), hash)
+                    .unwrap()
+                    .unwrap();
+                synch_mpt::NodeStore::put_node(&empty, hash, &bytes).unwrap();
+            }
+            walk.resume();
+        }
+        found.expect("the issuer withholds something; test is vacuous")
+    };
+
+    // The delegate signs a root of its own — an entirely in-scope key, so the
+    // publish itself is legitimate — and the issuer records it.
+    let mine = delegate.publish(1, &[("photos", "mine.jpg", b"my own bytes")], &[]);
+    issuer
+        .store
+        .put_head(Slot::Complete, &mine, now_ns(), now_ns())
+        .unwrap();
+    assert!(
+        issuer.store.is_head_root(&mine.root, &[]).unwrap(),
+        "the issuer really did record the delegate's root"
+    );
+
+    // Asked against that root, an in-scope position must not authorize
+    // anything: the trie it names is the asker's own.
+    let client = delegate
+        .net
+        .connect_mpt(issuer.net.direct_addr())
+        .await
+        .unwrap();
+    let refused = client
+        .get_nodes(
+            mine.root,
+            &[(
+                synch_mpt::Nibbles::from_bytes(b"f:photos/")
+                    .as_slice()
+                    .to_vec(),
+                withheld,
+            )],
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a delegate's own root authorized a position in someone else's trie"
+    );
+}
+
+/// A delegate cannot grant itself title to content by naming it.
+///
+/// `GetSlice` carries no space, so entitlement is looked up by asking which
+/// spaces name the object — and nothing checks that a published entry's
+/// content root is one its publisher holds or could hold. A delegate that has
+/// heard a withheld object's hash could otherwise publish an entirely in-scope
+/// entry naming it and read that row back as its own authorization.
+#[tokio::test]
+async fn a_delegate_cannot_name_withheld_content_into_its_own_scope() {
+    let issuer = Node::spawn(Some("nas")).await;
+    let delegate = Node::spawn(None).await;
+    // Only the delegate trusts the issuer statically. The issuer learns the
+    // delegate from its own published `d:` record — a static binding here
+    // would make it a rooted member and skip the scope checks entirely.
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+
+    let withheld = b"the withheld bytes".to_vec();
+    issuer.publish(
+        1,
+        &[
+            ("photos", "a.jpg", b"granted"),
+            ("finance", "q3.pdf", withheld.as_slice()),
+        ],
+        &[delegation(&delegate.key(), &["photos"])],
+    );
+    let withheld_root = Hash::new(&withheld);
+
+    // The delegate publishes an in-scope path naming the withheld object.
+    // This is what the issuer's store holds once it materializes that head.
+    issuer
+        .store
+        .put_entry(
+            &delegate.origin,
+            "photos",
+            "decoy.bin",
+            &FileEntry::file(withheld.len() as u64, 0, withheld_root, 1),
+        )
+        .unwrap();
+
+    let blob = delegate
+        .net
+        .connect_blob(issuer.net.direct_addr())
+        .await
+        .unwrap();
+    let refused = blob
+        .get_slice(withheld_root, &ChunkRanges::single(0, 1))
+        .await;
+    assert!(
+        refused.is_err(),
+        "a delegate's own entry granted it content outside its spaces"
+    );
+
+    // And the issuer's own grant still works, so the refusal above is about
+    // who published the row and not about the lookup being broken.
+    let granted = blob
+        .get_slice(Hash::new(b"granted"), &ChunkRanges::single(0, 1))
+        .await
+        .unwrap();
+    assert!(
+        !granted.encoded.is_empty(),
+        "the granted object stopped serving"
+    );
+}
+
 /// A delegate is never shown a node whose key material runs out of its scope.
 ///
 /// The trie compresses, so a node at a position the spine legitimately admits

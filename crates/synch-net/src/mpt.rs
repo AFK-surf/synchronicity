@@ -508,7 +508,7 @@ fn admit(
     root: Hash,
     wants: &[(Vec<u8>, Hash)],
 ) -> Result<Vec<Option<Hash>>, NetError> {
-    let scope = store.scope_for_key(&peer, now_ns())?;
+    let (scope, origins) = store.scope_for_key_with_origins(&peer, now_ns())?;
     if scope.is_full() {
         // Nothing to authorize: an unscoped peer may have any node this store
         // holds, so the request is answered by hash exactly as it always was
@@ -519,7 +519,14 @@ fn admit(
     // for. Given a root of the caller's choosing, the empty path resolves to
     // that root itself and every position below it is whatever the caller put
     // there — so authorization by position would authorize nothing at all.
-    if !store.is_head_root(&root)? {
+    //
+    // The peer's own roots are excluded for the same reason. A delegate signs
+    // and publishes its own trie, and this node records that root as soon as
+    // the signature and the delegated binding verify — so a root of the
+    // caller's choosing is exactly what a peer's own head is. Given one, it
+    // could put any node hash it has heard of under an in-scope position and
+    // read the node back, which is every withheld subtree one level at a time.
+    if !store.is_head_root(&root, &origins)? {
         tracing::warn!(
             peer = %peer.fmt_short(),
             "refusing a trie request against a root this node holds no head for"

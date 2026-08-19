@@ -49,7 +49,10 @@ impl Node {
     /// The same selection against a version set already in hand, so a listing
     /// pass does not re-query per path.
     pub fn resolve_set(&self, set: &VersionSet, policy: &VersionPolicy) -> Result<EntryRow> {
-        match set.select(policy, synch_core::now_ns()) {
+        // The store's reading, not the bare clock: a reader whose clock lags
+        // the cluster would otherwise clamp every honest entry to the same
+        // instant and select by content hash (`Store::read_instant`).
+        match set.select(policy, self.store().read_instant()?) {
             Selection::Selected(entry) => Ok(*entry),
             Selection::Absent => Err(EngineError::not_found(reference_of(
                 policy, &set.space, &set.path,

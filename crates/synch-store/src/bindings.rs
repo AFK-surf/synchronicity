@@ -468,18 +468,33 @@ impl Store {
     /// been refused at accept long before this is asked, so the case is
     /// unreachable rather than permissive.
     pub fn scope_for_key(&self, node_id: &NodeId, now: i64) -> Result<Scope> {
+        Ok(self.scope_for_key_with_origins(node_id, now)?.0)
+    }
+
+    /// As [`Self::scope_for_key`], and the origins that key speaks for.
+    ///
+    /// The origins are what makes a claimed position mean anything: a root the
+    /// asking peer signed itself is a root of its own choosing, so it does not
+    /// vouch for the positions in it (`Store::is_head_root`). Taken from the
+    /// same `live_bindings` read, because the caller needs both.
+    pub fn scope_for_key_with_origins(
+        &self,
+        node_id: &NodeId,
+        now: i64,
+    ) -> Result<(Scope, Vec<OriginId>)> {
         let live: Vec<Binding> = self
             .live_bindings(now)?
             .into_iter()
             .filter(|b| &b.node_id == node_id)
             .collect();
+        let origins: Vec<OriginId> = live.iter().map(|b| b.origin.clone()).collect();
         if live.iter().any(|b| b.is_rooted()) {
-            return Ok(Scope::full());
+            return Ok((Scope::full(), origins));
         }
         let mut spaces: Vec<String> = live.into_iter().flat_map(|b| b.spaces).collect();
         spaces.sort();
         spaces.dedup();
-        Ok(Scope::of(&synch_core::scope_prefixes(&spaces)))
+        Ok((Scope::of(&synch_core::scope_prefixes(&spaces)), origins))
     }
 
     /// The spaces a device key is confined to, or `None` when the key holds a
@@ -488,18 +503,34 @@ impl Store {
     /// The content half of scope (§3.5): object roots carry no space, so a
     /// delegated peer's entitlement to bytes is decided against this list.
     pub fn publish_scope_of_key(&self, node_id: &NodeId, now: i64) -> Result<Option<Vec<String>>> {
+        Ok(self.publish_scope_of_key_with_origins(node_id, now)?.0)
+    }
+
+    /// As [`Self::publish_scope_of_key`], and the origins that key speaks for.
+    ///
+    /// The origins are what the content half of the scope needs: an entry
+    /// naming an object is title to its bytes only if some origin *other than
+    /// the requester* published it (`Store::content_in_spaces`). Returned from
+    /// the same `live_bindings` read rather than a second one, because this
+    /// runs once per slice.
+    pub fn publish_scope_of_key_with_origins(
+        &self,
+        node_id: &NodeId,
+        now: i64,
+    ) -> Result<(Option<Vec<String>>, Vec<OriginId>)> {
         let live: Vec<Binding> = self
             .live_bindings(now)?
             .into_iter()
             .filter(|b| &b.node_id == node_id)
             .collect();
+        let origins: Vec<OriginId> = live.iter().map(|b| b.origin.clone()).collect();
         if live.iter().any(|b| b.is_rooted()) {
-            return Ok(None);
+            return Ok((None, origins));
         }
         let mut spaces: Vec<String> = live.into_iter().flat_map(|b| b.spaces).collect();
         spaces.sort();
         spaces.dedup();
-        Ok(Some(spaces))
+        Ok((Some(spaces), origins))
     }
 
     /// The spaces a delegated origin may publish into, or `None` when the

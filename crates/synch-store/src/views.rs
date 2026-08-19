@@ -642,17 +642,38 @@ impl Store {
     /// Where the same content sits in both a granted and an undelegated space
     /// the answer is yes, and rightly: the bytes are identical, and the
     /// granted path is title to them.
-    pub fn content_in_spaces(&self, root: &Hash, spaces: &[String]) -> Result<bool> {
+    ///
+    /// `except` names origins whose entries do not count as title — the
+    /// requester's own. Nothing checks that a published entry's `content` is a
+    /// root its publisher holds, or could hold, so a delegate that has heard a
+    /// withheld object's hash could otherwise publish an entirely in-scope
+    /// entry naming it, and read that row back as its own entitlement. A grant
+    /// has to come from somewhere other than the party being granted.
+    ///
+    /// The cost is that a delegate cannot fetch back content that only its own
+    /// entry names — a restore after losing local bytes, where no other origin
+    /// has published the same object. That is a worse restore path in exchange
+    /// for a boundary that holds, and the bytes were the delegate's own to
+    /// begin with.
+    pub fn content_in_spaces(
+        &self,
+        root: &Hash,
+        spaces: &[String],
+        except: &[OriginId],
+    ) -> Result<bool> {
         if spaces.is_empty() {
             return Ok(false);
         }
+        let excluded: Vec<String> = except.iter().map(|o| o.canonical()).collect();
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT DISTINCT space FROM entries WHERE content = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT origin_id, space FROM entries WHERE content = ?1")?;
         let rows = stmt.query_map(params![root.as_bytes().to_vec()], |row| {
-            row.get::<_, String>(0)
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
-            if spaces.contains(&row?) {
+            let (origin, space) = row?;
+            if !excluded.contains(&origin) && spaces.contains(&space) {
                 return Ok(true);
             }
         }
