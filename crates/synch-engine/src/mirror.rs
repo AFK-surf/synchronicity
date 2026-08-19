@@ -228,6 +228,20 @@ impl Node {
                 if escapes_via_symlink(&root, &path) {
                     return Ok(Written::Escaped);
                 }
+                // A directory standing where a file belongs is cleared first, if
+                // it is empty. The tree has published this path as a file and the
+                // write below would meet `EISDIR`; the sweep tidies the directory
+                // in phase 3, *after* this, so on its own that only fixes the
+                // pass after next. A non-empty directory still fails here, which
+                // is correct — its children are swept in phase 3 and the pass
+                // after that succeeds.
+                if want
+                    .target
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.is_dir())
+                {
+                    let _ = std::fs::remove_dir(&want.target);
+                }
                 // A materialization that fails takes its path down with it and
                 // nothing else: the target is untouched, and the next pass
                 // tries again.
@@ -528,14 +542,14 @@ fn plan_pass(
             if selected.kind == EntryKind::Dir {
                 continue;
             }
-            if selected.kind == EntryKind::Symlink {
-                match materialize_symlink(&target, selected.symlink_target.as_deref()) {
-                    Ok(true) => report.written += 1,
-                    Ok(false) => report.current += 1,
-                    Err(reason) => report.skipped.push((set.path.clone(), reason)),
-                }
-                continue;
-            }
+            // Claimed before the kind is dispatched on, so a symlink competes
+            // for the folded name like anything else. The check used to sit in
+            // the regular-file branch alone, and the symlink branch reached
+            // `materialize_symlink` — which unlinks whatever it finds — without
+            // consulting it: on a case-insensitive target, `Link` was written and
+            // then `link` silently replaced it, counted in `written` rather than
+            // `skipped`. §7.2 promises the mirror writes the lexicographically
+            // first colliding path, reports the rest, and never silently clobbers.
             let folded = fold(&set.path);
             match claimed.get(&folded) {
                 Some(winner) if winner != &set.path => {
@@ -549,7 +563,14 @@ fn plan_pass(
                     claimed.insert(folded, set.path.clone());
                 }
             }
-
+            if selected.kind == EntryKind::Symlink {
+                match materialize_symlink(&target, selected.symlink_target.as_deref()) {
+                    Ok(true) => report.written += 1,
+                    Ok(false) => report.current += 1,
+                    Err(reason) => report.skipped.push((set.path.clone(), reason)),
+                }
+                continue;
+            }
             let Some(content) = selected.content else {
                 report
                     .skipped
@@ -983,6 +1004,13 @@ fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<Vec<PathBuf
             .unwrap_or(false);
         if is_dir {
             removed.extend(sweep(root, &path, known)?);
+            // An emptied directory goes too. Nothing else in the mirror ever
+            // removed one, so a path that used to be a directory and is now a
+            // regular file could never be written again: the rename met `EISDIR`
+            // and the path was reported `skipped` on every pass, for the life of
+            // the mirror. `remove_dir` fails harmlessly while anything is still
+            // in there, which is what makes this need no bookkeeping.
+            let _ = std::fs::remove_dir(&path);
             continue;
         }
         let Ok(relative) = path.strip_prefix(root) else {
@@ -1446,6 +1474,78 @@ mod tests {
         // The lexicographically first path wins.
         assert_eq!(report.skipped[0].0, "readme.md");
         assert!(report.skipped[0].1.contains("collides"));
+        node.shutdown().await.unwrap();
+    }
+
+    /// A symlink competes for a folded name like anything else the mirror writes.
+    ///
+    /// The claim used to be taken in the regular-file branch alone, and the
+    /// symlink branch reached `materialize_symlink` — which unlinks whatever it
+    /// finds — without consulting it. On a case-insensitive target the file was
+    /// written and then silently replaced by the link, counted in `written`
+    /// rather than `skipped`: the one outcome §7.2 rules out.
+    #[tokio::test]
+    async fn a_symlink_cannot_clobber_a_file_it_folds_onto() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        publish_entry(&node, &peer(), "Link", b"a real file", 1);
+        let mut link = synch_core::FileEntry::tombstone(100, 1, None);
+        link.kind = EntryKind::Symlink;
+        link.symlink_target = Some("../elsewhere".into());
+        node.store()
+            .put_entry(&peer(), "media", "link", &link)
+            .unwrap();
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1, "only the first claimant is written");
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert_eq!(report.skipped[0].0, "link");
+        assert!(report.skipped[0].1.contains("collides"));
+        // And the path that won is still a file, not a link.
+        let written = target.path().join("Link");
+        assert!(!std::fs::symlink_metadata(&written).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&written).unwrap(), b"a real file");
+        node.shutdown().await.unwrap();
+    }
+
+    /// A path that was a directory can become a file again.
+    ///
+    /// Nothing in the mirror removed a directory, so an emptied one blocked the
+    /// rename forever: the path was reported `skipped` with `EISDIR` on every
+    /// pass, for the life of the mirror.
+    #[tokio::test]
+    async fn a_directory_that_empties_stops_blocking_the_path() {
+        let (_d, node) = node().await;
+        let target = tempfile::tempdir().unwrap();
+        node.add_mirror("media", target.path(), &VersionPolicy::Newest)
+            .unwrap();
+        publish_entry(&node, &peer(), "x/a", b"one", 1);
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert_eq!(report.written, 1);
+        assert!(target.path().join("x").is_dir());
+
+        // The origin retires the child and publishes the parent as a file.
+        node.store()
+            .put_entry(
+                &peer(),
+                "media",
+                "x/a",
+                &synch_core::FileEntry::tombstone(200, 2, None),
+            )
+            .unwrap();
+        publish_entry(&node, &peer(), "x", b"now a file", 300);
+
+        let report = node.sync_mirror(target.path()).await.unwrap();
+        assert!(
+            report.skipped.is_empty(),
+            "the emptied directory must not block the file: {report:?}"
+        );
+        assert_eq!(
+            std::fs::read(target.path().join("x")).unwrap(),
+            b"now a file"
+        );
         node.shutdown().await.unwrap();
     }
 

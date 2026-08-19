@@ -414,7 +414,28 @@ impl Node {
         }
         // A scan is also where an operator can force tombstone expiry (§4.2):
         // the removals ride the same batch as everything else the scan found.
+        //
+        // Never for a key this scan has already restated. `expired_tombstones`
+        // reads `entries` as it stood *before* the scan, so a path whose
+        // tombstone has aged out and which now exists on disk again appears in
+        // both halves — the scan's live entry first, then a raw removal for the
+        // same key. `publish` folds in order, so the removal won, and the origin
+        // published nothing at all for the path: indistinguishable from "never
+        // existed", gone from the unified tree and from every mirror. Worse, it
+        // was self-perpetuating — `local_files` had already recorded the new
+        // content, so every later scan called the path unchanged, and the
+        // tombstone row the expiry deleted no longer showed up to be retired.
+        // Only a restart repaired it, through `reconcile_local_files`.
         let expired = self.expired_tombstone_changes()?;
+        let restated: std::collections::HashSet<&[u8]> = report
+            .staged
+            .iter()
+            .map(|(key, _)| key.as_slice())
+            .collect();
+        let expired: Vec<StagedChange> = expired
+            .into_iter()
+            .filter(|(key, _)| !restated.contains(key.as_slice()))
+            .collect();
         report.expired = expired.len();
         report.staged.extend(expired);
         if !report.staged.is_empty() {
@@ -494,7 +515,17 @@ impl Node {
     /// publisher, so it costs one head like any other batch. Returns how many
     /// tombstones were staged for removal.
     pub fn expire_tombstones(&self) -> Result<usize> {
-        let changes = self.expired_tombstone_changes()?;
+        // Excluding whatever is already waiting to be published, for the reason
+        // `scan_all_with` gives: a removal that lands in the same batch as a
+        // live entry for the same key erases the path outright. Here the two are
+        // not even ordered — the scanner and this pass stage into one buffer
+        // concurrently — so the filter is what makes the outcome defined.
+        let staged = self.publisher().staged_keys();
+        let changes: Vec<StagedChange> = self
+            .expired_tombstone_changes()?
+            .into_iter()
+            .filter(|(key, _)| !staged.contains(key))
+            .collect();
         let expired = changes.len();
         if expired > 0 {
             self.stage(changes);
@@ -1363,6 +1394,53 @@ mod tests {
             );
         }
         node.shutdown().await.unwrap();
+    }
+
+    /// A path re-created while its own tombstone is expiring survives the batch.
+    ///
+    /// The expiry set is read from `entries` as it stood before the scan, so a
+    /// path that is both aged out and back on disk appears twice in one batch:
+    /// the scan's live entry, then a raw removal of the same key. `publish` folds
+    /// in order, so the removal used to win and the origin published *nothing*
+    /// for the path — not a file, not even a tombstone. And it stuck: the scan
+    /// had already recorded the new content in `local_files`, so every later scan
+    /// called the path unchanged, while the tombstone row the removal deleted was
+    /// no longer there to be retired.
+    #[tokio::test]
+    async fn a_path_re_created_as_its_tombstone_expires_is_still_published() {
+        let (_d, space, node) = node_with_ttl(std::time::Duration::from_secs(3600)).await;
+        std::fs::write(space.path().join("a.txt"), b"first").unwrap();
+        node.scan_and_publish().unwrap();
+        std::fs::remove_file(space.path().join("a.txt")).unwrap();
+        node.scan_and_publish().unwrap();
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "a.txt")
+                .unwrap()
+                .unwrap()
+                .kind,
+            EntryKind::Tombstone
+        );
+
+        // The tombstone ages out and the file comes back, both before the next
+        // scan sees either — which is the whole of the trigger.
+        backdate_tombstone(&node, "a.txt", now_ns() - 2 * 3600 * 1_000_000_000);
+        std::fs::write(space.path().join("a.txt"), b"second").unwrap();
+
+        let report = node.scan_all().unwrap();
+        assert_eq!(
+            report.expired, 0,
+            "the removal must give way to the entry restating the same key"
+        );
+        node.publish(&report.staged).unwrap();
+
+        let entry = node
+            .store()
+            .entry(node.origin(), "media", "a.txt")
+            .unwrap()
+            .expect("the re-created path must still be published");
+        assert_eq!(entry.kind, EntryKind::File);
+        assert_eq!(entry.content, Some(Hash::new(b"second")));
     }
 
     /// A deletion whose tombstone never reached a root is re-derived.

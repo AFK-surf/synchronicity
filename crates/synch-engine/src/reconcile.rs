@@ -575,10 +575,6 @@ impl Syncer {
                 return Ok(Promotion::Refused);
             }
             *judged.borrow_mut() = Some(key);
-            let trie = Trie::new(txn);
-            if !trie.is_complete(pending.head.root)? {
-                return Ok(Promotion::Waiting);
-            }
             // The pending head must actually beat the complete one, rather than
             // rest on "pending is always greater", an invariant `offer_head`
             // maintains and two other writers do not: `publish` and the key
@@ -599,6 +595,21 @@ impl Syncer {
                 );
                 txn.clear_head(origin, Slot::Pending)?;
                 return Ok(Promotion::Idle);
+            }
+            // Only now the walk. `supersedes` above reads `(seq, root)` and
+            // nothing else, and it used to sit *after* this — so a pending head
+            // the complete slot had already overtaken kept the slot until
+            // `pending_head_ttl` expired, and cost three things on the way: this
+            // node went on advertising a `complete = false` summary for a head it
+            // had superseded, the maintenance sweep paid two full completeness
+            // walks for it every five minutes, and `sync_with`'s pending pass
+            // fetched the trie of a root the next promotion would discard. On a
+            // restore-from-backup, where that root shares nothing with the
+            // current one, the last of those is a whole cold trie transfer thrown
+            // away.
+            let trie = Trie::new(txn);
+            if !trie.is_complete(pending.head.root)? {
+                return Ok(Promotion::Waiting);
             }
             // The displaced head is already retained: `put_head` recorded its
             // signature when it took the slot. Recording it again here would be
@@ -972,23 +983,7 @@ impl Syncer {
                 // first one that happens to match. Indexed once rather than
                 // re-scanned per origin: the scan was quadratic in the number
                 // of summaries, on both sides of the decision.
-                let best_of = |set: &[HeadSummary]| {
-                    let mut best: std::collections::HashMap<OriginId, (u64, [u8; 32])> =
-                        std::collections::HashMap::new();
-                    for summary in set {
-                        let key = summary.order_key();
-                        best.entry(summary.origin.clone())
-                            .and_modify(|held| {
-                                if key > *held {
-                                    *held = key;
-                                }
-                            })
-                            .or_insert(key);
-                    }
-                    best
-                };
-                let theirs_best = best_of(theirs);
-                let ours_best = best_of(&ours);
+                let theirs_best = best_summaries(theirs);
 
                 // Push: the servable head we hold, whenever it beats theirs.
                 // Keyed off the complete slot directly rather than off whichever
@@ -1004,22 +999,7 @@ impl Syncer {
                     })
                     .cloned()
                     .collect();
-                // Pull: origins where the peer is ahead of us.
-                let mut want = Vec::new();
-                let mut asked: std::collections::HashSet<&OriginId> =
-                    std::collections::HashSet::new();
-                for summary in theirs {
-                    if !asked.insert(&summary.origin) {
-                        continue;
-                    }
-                    if ours_best
-                        .get(&summary.origin)
-                        .is_none_or(|mine| summary.order_key() > *mine)
-                    {
-                        want.push(summary.origin.clone());
-                    }
-                }
-                (push, want)
+                (push, wanted_origins(theirs, &ours))
             })
             .await?;
 
@@ -1247,6 +1227,55 @@ fn to_net(error: EngineError) -> NetError {
         EngineError::Net(e) => e,
         other => NetError::Unexpected(other.to_string()),
     }
+}
+
+/// The greatest `(seq, root)` each origin appears at in a summary set.
+///
+/// Both slots may be advertised per origin, so every comparison in an exchange is
+/// against the best summary a side has for it. Indexed once rather than rescanned
+/// per origin, which was quadratic in the number of summaries.
+fn best_summaries(set: &[HeadSummary]) -> std::collections::HashMap<OriginId, (u64, [u8; 32])> {
+    let mut best = std::collections::HashMap::new();
+    for summary in set {
+        let key = summary.order_key();
+        best.entry(summary.origin.clone())
+            .and_modify(|held| {
+                if key > *held {
+                    *held = key;
+                }
+            })
+            .or_insert(key);
+    }
+    best
+}
+
+/// The origins to ask a peer for: those whose best summary beats our best.
+///
+/// Over the *best* summary each side has for an origin, never the first one that
+/// happens to match. A peer advertises both slots per origin, and its complete
+/// slot can be the higher of the two — `publish` and `activate` take
+/// `next_own_seq` and write the complete slot without consulting pending, which
+/// is the §3.4 recovery shape §5.2 names. Walking the raw summaries and skipping
+/// origins already seen compared whichever the peer listed first and discarded
+/// the rest, so the pull decision depended on an order nothing on the wire
+/// constrains, and this node could miss a head strictly newer than its own. It
+/// was safe only by accident: `local_summaries` sorts ascending, so the complete
+/// summary is usually second and its being discarded usually did not matter.
+///
+/// Invisible in a symmetric cluster, because the peer's own round pushes what we
+/// failed to pull; visible in exactly the topology the pull exists for, where we
+/// can dial the peer and it cannot dial back (§5.3).
+///
+/// Sorted, so what a peer receives does not depend on hash iteration order.
+fn wanted_origins(theirs: &[HeadSummary], ours: &[HeadSummary]) -> Vec<OriginId> {
+    let ours_best = best_summaries(ours);
+    let mut want: Vec<OriginId> = best_summaries(theirs)
+        .into_iter()
+        .filter(|(origin, theirs)| ours_best.get(origin).is_none_or(|mine| theirs > mine))
+        .map(|(origin, _)| origin)
+        .collect();
+    want.sort();
+    want
 }
 
 /// True if a failure is about *one origin's* replicated data rather than about
@@ -2149,6 +2178,53 @@ mod containment_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
             .await
             .expect("a wake that landed while the loop was busy must still be there");
+    }
+
+    /// The pull asks about a peer's *best* summary, not its first.
+    ///
+    /// A peer advertises both slots per origin, and its complete slot can be the
+    /// higher of the two — `publish` and `activate` take `next_own_seq` and write
+    /// the complete slot without consulting pending, which is the §3.4 recovery
+    /// shape §5.2 names. Comparing the first summary listed and skipping the rest
+    /// therefore lost the pull arm for that origin: this node saw the peer's lower
+    /// pending summary, found it not newer, and never asked for the higher head.
+    ///
+    /// Driven at the decision itself rather than over a socket, because what was
+    /// wrong is the choice of summary and nothing about the transport.
+    #[test]
+    fn the_pull_compares_the_peers_best_summary_for_an_origin() {
+        let (_d, store, key, origin) = setup();
+        let syncer = Syncer::new(store.clone());
+
+        // We hold seq 6 complete; nothing pending.
+        let ours = SignedHead::sign(&key, origin.clone(), 6, Hash([6u8; 32]), 0);
+        store.put_head(Slot::Complete, &ours, 0, 0).unwrap();
+        let mine = syncer.local_summaries().unwrap();
+        assert_eq!(mine.len(), 1);
+
+        // The peer lists its pending seq 6 first and its complete seq 7 second,
+        // which is the order `local_summaries` produces for that state.
+        let theirs = vec![
+            HeadSummary {
+                origin: origin.clone(),
+                seq: 6,
+                root: Hash([6u8; 32]),
+                complete: false,
+            },
+            HeadSummary {
+                origin: origin.clone(),
+                seq: 7,
+                root: Hash([7u8; 32]),
+                complete: true,
+            },
+        ];
+
+        let want = super::wanted_origins(&theirs, &mine);
+        assert_eq!(
+            want,
+            vec![origin],
+            "the peer's seq 7 is newer than ours, so it must be asked for"
+        );
     }
 
     /// A head the memo already refuses does not ring the fetch bell.
