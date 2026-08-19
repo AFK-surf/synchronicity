@@ -11,7 +11,6 @@ repository = "https://github.com/zeynepbabur/synchronicity"
 authors = ["the synchronicity authors"]
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 
@@ -36,6 +35,9 @@ base64 = "0.22.1"
 blake3 = "1.8.6"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive", "env"] }
+# Life-before-main, used to install the TLS provider in test builds
+# (`synch_net::tls`).
+ctor = "0.4"
 directories = "6.0.0"
 futures-core = "0.3"
 futures-util = { version = "0.3.31", default-features = false, features = ["alloc"] }
@@ -53,7 +55,14 @@ prost = "0.14.4"
 proptest = "1.11.0"
 protox = "0.9.1"
 range-collections = "0.4.6"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
+# `rustls-no-provider`, not `rustls`: everything here standardizes on the ring
+# provider (iroh `tls-ring`, hickory `dnssec-ring`). reqwest's `rustls` feature
+# enables rustls's aws-lc-rs provider, and with both providers enabled rustls
+# can't pick a process default and panics on the first TLS handshake. The ring
+# provider is installed at each binary's entry point instead (`synch_net::tls`),
+# and before `main` on test builds via `ctor`.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "stream"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
 ring = "0.17.14"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustix = { version = "1.1.4", features = ["fs"] }

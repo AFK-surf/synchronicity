@@ -28,6 +28,7 @@ hmac.workspace = true
 sha2.workspace = true
 synch-cli.workspace = true
 synch-core.workspace = true
+synch-net.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -38,6 +39,9 @@ tracing-subscriber.workspace = true
 blake3.workspace = true
 reqwest.workspace = true
 synch-engine.workspace = true
+# `sim` turns on the pre-main TLS provider install (`synch_net::tls`) this
+# test binary needs to build its reqwest client.
+synch-net = { workspace = true, features = ["sim"] }
 tempfile.workspace = true
 
 [lints]
