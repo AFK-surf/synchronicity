@@ -168,10 +168,14 @@ pub struct ValidChain {
     /// is not a delegation step. Descriptive only: a caller reporting a
     /// finding wants to say how far the chain reached.
     pub links: usize,
-    /// Whether the apex link proved its DNSKEY RRset with a DS from its
-    /// parent (the ordinary case) or the RRset *is* the anchored set (only
-    /// reachable under an explicit trust-anchor override, where the apex is
-    /// the anchor).
+    /// Whether the **signing zone's** link proved its DNSKEY RRset with a DS
+    /// from its parent (the ordinary case) or that RRset *is* the anchored set
+    /// (only reachable under an explicit trust-anchor override, where the
+    /// signing zone is the anchor).
+    ///
+    /// The signing zone, not the apex: the ladder's bottom link is the zone
+    /// that holds the apex's records, and the module docs above spend eighteen
+    /// lines establishing that the two are different names.
     pub anchored_directly: bool,
 }
 
@@ -436,9 +440,9 @@ fn walk_ladder<'a>(
 
     // Descend: every link below the top — the bottom one included — proves
     // its own DNSKEY RRset with a DS its parent signed. A one-link ladder
-    // skips the loop: the apex *is* the anchored zone, only reachable under
-    // an explicit `--dnssec-anchor` override, where there is no parent to
-    // hold a DS. A public monitor anchored at the ICANN root classifies such
+    // skips the loop: the signing zone *is* the anchored zone, only reachable
+    // under an explicit `--dnssec-anchor` override, where there is no parent
+    // to hold a DS. A public monitor anchored at the ICANN root classifies such
     // an entry tier B, which is the honest answer: nothing outside that
     // private universe can tell whether the keys were authorized.
     for index in (0..ladder.len() - 1).rev() {

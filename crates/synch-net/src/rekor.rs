@@ -446,16 +446,13 @@ fn assemble_group(group: &str, parts: &[(usize, usize, String)]) -> Result<Rekor
         let mut payload = String::new();
         let mut broken = None;
         for index in 1..=total {
-            match duplicated.get(&total).is_some_and(|first| *first == index) {
-                true => {
-                    broken = Some(ProofError::Malformed(format!(
-                        "proof {group} is served in {total} part(s) and part {index} \
-                         arrived more than once, so the zone does not agree with \
-                         itself about what it published"
-                    )));
-                    break;
-                }
-                false => {}
+            if duplicated.get(&total).is_some_and(|first| *first == index) {
+                broken = Some(ProofError::Malformed(format!(
+                    "proof {group} is served in {total} part(s) and part {index} \
+                     arrived more than once, so the zone does not agree with \
+                     itself about what it published"
+                )));
+                break;
             }
             match chunks.get(&index).copied() {
                 Some(chunk) => payload.push_str(chunk),
@@ -666,10 +663,15 @@ pub struct VerifiedRecord {
 /// no name for. An entry may therefore carry extensions this design says
 /// nothing about — the conformance fixture does — and still verify.
 ///
-/// A `retire` entry is refused outright rather than chain-checked: retirement
-/// is a monitor breadcrumb (§2), never authorization, and a chainless retire
-/// is legal on the publish side — so accepting one here would reopen exactly
-/// the hole the chain requirement closes.
+/// A `retire` entry is refused, and the order is worth stating because it is
+/// the reverse of what this comment used to say. The action is the last thing
+/// `check_binds` tests and `check_binds` is the last thing here, so a retire
+/// carrying a chain is chain-checked first and refused on its action — while
+/// the chainless retire the publish side is actually allowed to emit (a
+/// retired zone may have no DS left) never reaches that arm at all: it is
+/// refused as `Chain` several steps earlier. Either way retirement is a
+/// monitor breadcrumb (§2) and never authorization, which is the point;
+/// accepting one would reopen exactly the hole the chain requirement closes.
 pub fn verify(
     proof: &RekorProof,
     key: &ZoneKey<'_>,

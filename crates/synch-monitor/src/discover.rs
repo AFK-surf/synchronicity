@@ -135,6 +135,7 @@ pub fn discover(
     repo: Option<&dyn Repo>,
     pins_path: &Path,
     log_override: Option<&str>,
+    skipped: &[String],
     keys_override: Option<LogKeys>,
     now: u64,
     warn: &mut dyn FnMut(String),
@@ -210,10 +211,49 @@ pub fn discover(
                         .into(),
                 ));
             }
-            pinned
+            // Shards the operator has said this monitor cannot read. Their
+            // keys stay pinned, so this run still *believes* checkpoints from
+            // them; what it stops doing is failing the whole run over a shard
+            // it was never going to be able to walk. The trusted root pins one
+            // such shard today — `rekor.sigstore.dev` is Rekor v1, a Trillian
+            // API with no tiles — and every stock run filed it as a failure and
+            // exited 30, permanently, which is the same as having no exit-code
+            // signal at all.
+            //
+            // Named by the operator and never inferred from a response: a 404
+            // is the audited party's own answer, and reading one as "not a
+            // tiles log" would let a hostile or broken front end drop the live
+            // shard from coverage and exit 0.
+            let skipped: Vec<&String> = pinned
+                .iter()
+                .map(|log| &log.base_url)
+                .filter(|url| skipped.iter().any(|s| s.trim_end_matches('/') == **url))
+                .collect();
+            if !skipped.is_empty() {
+                warn(format!(
+                    "--skip-log: {} pinned shard(s) are not read this run ({}); \
+                     an entry in one of those is client-valid and unclassified",
+                    skipped.len(),
+                    skipped
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            let read: Vec<String> = pinned
                 .iter()
                 .map(|log| log.base_url.clone())
-                .collect::<Vec<_>>()
+                .filter(|url| !skipped.contains(&url))
+                .collect();
+            if read.is_empty() {
+                return Err(MonitorError::Checkpoint(
+                    "every pinned shard is skipped, so this run would classify \
+                     nothing at all"
+                        .into(),
+                ));
+            }
+            read
         }
     };
 
@@ -266,6 +306,7 @@ mod tests {
             None,
             &pins_beside(&dir.path().join("monitor.json")),
             None,
+            &[],
             None,
             NOW,
             &mut |w| warnings.push(w),
@@ -305,6 +346,7 @@ mod tests {
             Some(&Empty),
             &pins_beside(&dir.path().join("monitor.json")),
             None,
+            &[],
             None,
             NOW,
             &mut |w| warnings.push(w),
@@ -332,6 +374,7 @@ mod tests {
             Some(&Fixed(files)),
             &pins_beside(&dir.path().join("monitor.json")),
             None,
+            &[],
             None,
             NOW,
             &mut |w| warnings.push(w),
@@ -357,6 +400,7 @@ mod tests {
             None,
             &pins,
             Some("https://log.example/"),
+            &[],
             None,
             NOW,
             &mut |w| warnings.push(w),
@@ -374,11 +418,80 @@ mod tests {
         let pinned = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
         if let [only] = pinned.as_slice() {
             let mut quiet = Vec::new();
-            discover(None, &pins, Some(&only.base_url), None, NOW, &mut |w| {
-                quiet.push(w)
-            })
+            discover(
+                None,
+                &pins,
+                Some(&only.base_url),
+                &[],
+                None,
+                NOW,
+                &mut |w| quiet.push(w),
+            )
             .unwrap();
             assert!(quiet.is_empty(), "{quiet:?}");
         }
+    }
+
+    /// A shard the operator has named as unreadable is skipped, loudly, and
+    /// the rest of the run proceeds.
+    ///
+    /// The trusted root pins `rekor.sigstore.dev`, which is Rekor v1 — a
+    /// Trillian API with no `api/v2/checkpoint`, no hash tiles and no entry
+    /// bundles — so every stock run filed it as a failure and returned
+    /// `EXIT_INCOMPLETE`, permanently. An exit code that is always 30 is the
+    /// same as having none, which matters because 30 is the documented
+    /// alerting interface.
+    #[test]
+    fn a_skipped_shard_is_named_and_the_rest_are_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let pins = pins_beside(&dir.path().join("monitor.json"));
+        let pinned = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes()).unwrap();
+        assert!(
+            pinned.len() > 1,
+            "this test needs a trusted root pinning more than one shard"
+        );
+        let skip = pinned[0].base_url.clone();
+
+        let mut warnings = Vec::new();
+        let found = discover(
+            None,
+            &pins,
+            None,
+            std::slice::from_ref(&skip),
+            None,
+            NOW,
+            &mut |w| warnings.push(w),
+        )
+        .unwrap();
+        assert!(!found.base_urls.contains(&skip));
+        assert_eq!(found.base_urls.len(), pinned.len() - 1);
+        // The pin set is untouched: this run still believes checkpoints from
+        // the skipped shard, which is why the loss of coverage is worth saying.
+        assert_eq!(found.keys.keys().len(), pinned.len());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&skip) && w.contains("unclassified")),
+            "the skipped shard must be named: {warnings:?}"
+        );
+    }
+
+    /// Skipping every shard would classify nothing, and says so rather than
+    /// exiting 0 over an empty walk.
+    #[test]
+    fn skipping_every_shard_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let pins = pins_beside(&dir.path().join("monitor.json"));
+        let all: Vec<String> = tuf::tlogs(tuf::EMBEDDED_TRUSTED_ROOT.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|log| log.base_url)
+            .collect();
+        let mut warnings = Vec::new();
+        assert!(
+            discover(None, &pins, None, &all, None, NOW, &mut |w| warnings
+                .push(w))
+            .is_err()
+        );
     }
 }

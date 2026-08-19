@@ -146,6 +146,30 @@ struct RunArgs {
     #[arg(long, env = "SYNCH_MONITOR_LOG")]
     log: Option<String>,
 
+    /// A pinned shard this monitor cannot read, acknowledged by the operator.
+    ///
+    /// Repeatable. Unlike `--log` it narrows nothing else: every other pinned
+    /// shard is still walked, and the pin set is untouched, so this run still
+    /// believes checkpoints from the named shard — it simply reports that its
+    /// entries go unclassified instead of failing the run over them.
+    ///
+    /// It exists because the trusted root names shards this tool has no way to
+    /// read. The shipped one pins `rekor.sigstore.dev`, which is Rekor **v1**:
+    /// a Trillian API with no `api/v2/checkpoint`, no hash tiles and no entry
+    /// bundles. `discover` walks every pinned shard on purpose — a retired
+    /// shard's proofs are still client-valid — so a stock run files that one as
+    /// unreadable and exits 30 forever, which makes the exit code useless as
+    /// the alerting interface it is documented to be.
+    ///
+    /// Stated by the operator rather than inferred from the response, and
+    /// deliberately: a 404 is the audited party's own answer, so treating one
+    /// as "not a tiles log" would let a hostile or merely broken front end
+    /// remove the live shard from coverage and exit 0. Same posture as
+    /// `--allow-gap`: a permanent loss of coverage is something the operator
+    /// says out loud.
+    #[arg(long = "skip-log", env = "SYNCH_MONITOR_SKIP_LOG")]
+    skip_log: Vec<String>,
+
     /// Where to persist the last checkpoint, the last index, the apexes to
     /// watch, the keys already reported for each, and the entry bodies behind
     /// the reports.
@@ -416,6 +440,61 @@ fn check_watch_list(known: &KnownKeys, state_path: &Path) -> Result<(), MonitorE
     Ok(())
 }
 
+/// Refuses a run whose watch list covers more than the recorded positions do.
+///
+/// Read coverage is one `next_index` per log, but the watch filter runs per
+/// entry inside the walk: an entry naming an unwatched apex was stepped over
+/// and the position advanced past it. Adding that apex now reaches nothing
+/// behind the position, so every entry the log already holds for it stays
+/// unclassified for good and the run still exits 0.
+///
+/// That is the same "these entries are permanently unread" event
+/// `--from-index` is refused for, arriving through the state file instead of
+/// the command line, so it gets the same treatment and the same escape.
+///
+/// Split out of `run` so it can be tested: as an inline block it could be
+/// deleted whole and the workspace stayed green, which for a guard added by an
+/// audit is the same position the defect was in.
+fn coverage_gap(state: &MonitorState, args: &RunArgs) -> Result<(), MonitorError> {
+    if let Some(covered) = state.watched.clone() {
+        let widened = state.known.widening_over(&covered);
+        if !widened.is_empty() && !args.allow_gap {
+            let behind = state
+                .logs
+                .iter()
+                .map(|(origin, position)| format!("{origin} at {}", position.next_index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(MonitorError::State(format!(
+                "{} now watches {} that it did not when its positions were \
+                 recorded ({behind}) — the watch filter runs per entry, so every \
+                 entry already in the log for {} was stepped over and no run will \
+                 ever classify it. Pass --allow-gap to accept that, or \
+                 --from-index 0 to re-read from the start",
+                args.state.display(),
+                widened.join(", "),
+                match widened.len() {
+                    1 => "it",
+                    _ => "them",
+                },
+            )));
+        }
+        if !widened.is_empty() {
+            eprintln!(
+                "synch-monitor: watch list widened to include {} after its positions \
+                 were recorded; entries already in the log for {} stay unclassified \
+                 (--allow-gap)",
+                widened.join(", "),
+                match widened.len() {
+                    1 => "it",
+                    _ => "them",
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
     let keys_override = match &args.rekor_key {
         Some(path) => Some(
@@ -475,52 +554,8 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
     state.surface = Some(surface.clone());
 
     // A watch list that has *widened* since the recorded positions were
-    // written is a coverage gap, and a silent one. Read coverage is one
-    // `next_index` per log, but the watch filter runs per entry inside the
-    // walk: an entry naming an unwatched apex was stepped over and the
-    // position advanced past it. Adding that apex now reaches nothing behind
-    // the position, so every entry the log already holds for it stays
-    // unclassified for good and the run still exits 0.
-    //
-    // That is the same "these entries are permanently unread" event
-    // `--from-index` is refused for, arriving through the state file instead
-    // of the command line, so it gets the same treatment and the same escape.
-    if let Some(covered) = state.watched.clone() {
-        let widened = state.known.widening_over(&covered);
-        if !widened.is_empty() && !args.allow_gap {
-            let behind = state
-                .logs
-                .iter()
-                .map(|(origin, position)| format!("{origin} at {}", position.next_index))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(MonitorError::State(format!(
-                "{} now watches {} that it did not when its positions were \
-                 recorded ({behind}) — the watch filter runs per entry, so every \
-                 entry already in the log for {} was stepped over and no run will \
-                 ever classify it. Pass --allow-gap to accept that, or \
-                 --from-index 0 to re-read from the start",
-                args.state.display(),
-                widened.join(", "),
-                match widened.len() {
-                    1 => "it",
-                    _ => "them",
-                },
-            )));
-        }
-        if !widened.is_empty() {
-            eprintln!(
-                "synch-monitor: watch list widened to include {} after its positions \
-                 were recorded; entries already in the log for {} stay unclassified \
-                 (--allow-gap)",
-                widened.join(", "),
-                match widened.len() {
-                    1 => "it",
-                    _ => "them",
-                },
-            );
-        }
-    }
+    // written is a coverage gap, and a silent one.
+    coverage_gap(&state, args)?;
 
     eprintln!(
         "synch-monitor: watching {} apex(es) ({}) under anchors {} and log keys {}",
@@ -549,10 +584,11 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
         Some(path) => path.clone(),
         None => discover::pins_beside(&args.state),
     };
-    let (tuf, no_tuf, log, now) = (
+    let (tuf, no_tuf, log, skip, now) = (
         args.tuf.clone(),
         tuf_walk_disabled(args),
         args.log.clone(),
+        args.skip_log.clone(),
         now_unix(),
     );
     let found = tokio::task::spawn_blocking(move || {
@@ -564,6 +600,7 @@ async fn run(args: &RunArgs) -> Result<i32, MonitorError> {
             repo.as_ref().map(|repo| repo as &dyn synch_net::tuf::Repo),
             &pins,
             log.as_deref(),
+            &skip,
             keys_override,
             now,
             &mut |warning| eprintln!("synch-monitor: {warning}"),
@@ -1140,6 +1177,7 @@ mod tests {
     fn run_args(state: &Path) -> RunArgs {
         RunArgs {
             log: None,
+            skip_log: Vec::new(),
             state: state.to_path_buf(),
             tuf: String::new(),
             no_tuf: true,
@@ -1355,6 +1393,60 @@ mod tests {
         // And a first run, with nothing recorded, is not a widening either —
         // there are no positions for it to be a gap against.
         assert!(watching("cp.example.com").widening_over(&[]).len().eq(&1));
+    }
+
+    /// The watch-coverage guard actually refuses a run, and `--allow-gap`
+    /// actually lets one through.
+    ///
+    /// The unit test below covers `widening_over`; this covers the guard built
+    /// on it. Deleting the whole `if let Some(covered)` block — which is to say
+    /// reinstating the defect a previous audit filed and fixed — left the
+    /// workspace green, because nothing exercised the refusal, the message or
+    /// the escape. The sibling guard it was modelled on, `--from-index`, has
+    /// exactly this test.
+    #[test]
+    fn a_widened_watch_list_refuses_the_run_until_the_operator_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("monitor.json");
+        let mut args = run_args(&path);
+
+        let mut state = MonitorState {
+            known: watching("cp.example.com"),
+            // The positions were recorded while only this name was watched.
+            watched: Some(vec!["cp.example.com.".to_string()]),
+            ..MonitorState::default()
+        };
+        state.position("log2025-1.rekor.example").next_index = 500;
+        // Nothing widened: the same list is the same coverage.
+        coverage_gap(&state, &args).expect("an unchanged list is not a gap");
+
+        // A sibling: matched by nothing before, so everything already in the
+        // log for it was stepped over.
+        state.known.keys.insert("other.example.com.".into(), vec![]);
+        let refused = coverage_gap(&state, &args).expect_err("a widened list is a gap");
+        let message = refused.to_string();
+        assert!(message.contains("other.example.com."), "{message}");
+        assert!(message.contains("at 500"), "{message}");
+        assert!(message.contains("--allow-gap"), "{message}");
+
+        // Said out loud, it proceeds.
+        args.allow_gap = true;
+        coverage_gap(&state, &args).expect("--allow-gap accepts the loss");
+
+        // And an added *ancestor* is a gap too, which is the half the guard
+        // used to miss: `watches` is bidirectional, so the old list matched
+        // the parent's own name — but watching it now covers every sibling
+        // subtree beneath it, and none of those were matched before.
+        args.allow_gap = false;
+        let mut upward = MonitorState {
+            known: watching("a.example.com"),
+            watched: Some(vec!["a.example.com.".to_string()]),
+            ..MonitorState::default()
+        };
+        upward.position("log2025-1.rekor.example").next_index = 7;
+        upward.known.keys.insert("example.com.".into(), vec![]);
+        let refused = coverage_gap(&upward, &args).expect_err("an ancestor widens coverage");
+        assert!(refused.to_string().contains("example.com."), "{refused}");
     }
 
     /// A wildcard is refused wherever the label sits, not only in front.

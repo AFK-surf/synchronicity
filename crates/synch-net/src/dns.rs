@@ -60,9 +60,15 @@ const CONTROL_PLANE_PROOF_TTL: Duration = Duration::from_secs(300);
 /// The longest a control plane in external mode can take to get a rotated
 /// provider key onto the public record and visible to a client — the sum of the
 /// three delays above, spelled as a sum so the arithmetic is checkable here
-/// even though the terms themselves live in the control plane's source. (There
-/// is no way to pin them across the language boundary from this side; the
-/// control plane's own suite is where those three numbers are held still.)
+/// even though the terms themselves live in the control plane's source.
+///
+/// The three terms are the control plane's, transcribed — and the three on
+/// this side are written into the shared fixture's `meta.txt` by
+/// `regenerate_the_shared_fixture` and asserted from both suites, so the
+/// relation is held still across the boundary rather than by a comment. (This
+/// paragraph used to say there was no way to do that from this side, which
+/// stopped being true when that fixture was created; a previous audit found
+/// one of the six numbers stale.)
 ///
 /// It is named here because this is the half that pays for it. A refresh under
 /// [`RekorPolicy::Require`] fails closed for that whole window — the answer
@@ -265,11 +271,15 @@ pub struct MemberRecord {
     /// names it — where the transparency records for it live.
     ///
     /// It is a *hint about where to look*, never an authority: the apex it
-    /// names has to contain this membership domain, has to be contained by
-    /// the zone whose RRSIG signed the answer, and has to be what the log
-    /// entry's own certificate names. A wrong value points at a name with no
-    /// usable proof, which fails closed. Its purpose is to let two control
-    /// planes share one signing zone without sharing a single record name.
+    /// names has to contain this membership domain and has to be contained by
+    /// the zone whose RRSIG signed the answer (`apex_of`), and the entry found
+    /// under it must itself name an apex inside those same bounds
+    /// (`rekor::verify`). The two are held between the same two names rather
+    /// than compared to each other — both are suffixes of the membership
+    /// domain, so they are comparable and a monitor watching either watches
+    /// the other. A wrong value points at a name with no usable proof, which
+    /// fails closed. Its purpose is to let two control planes share one
+    /// signing zone without sharing a single record name.
     pub apex: Option<String>,
 }
 
@@ -763,8 +773,16 @@ pub struct ValidatedTxt {
     /// as the attacker cared to keep replaying.
     ///
     /// Capped at the signature's own expiration, each replay of one answer buys
-    /// strictly less than the last, the total is bounded by a lifetime the zone
-    /// itself chose and signed, and past it hickory refuses the answer outright.
+    /// less than the last and the total is bounded by a lifetime the zone
+    /// itself chose and signed; past it hickory refuses the answer outright.
+    ///
+    /// "Less than the last" holds down to [`MIN_TTL`], which is where
+    /// `clamp_ttl` floors the poll interval — so inside the final minute of an
+    /// RRSIG's life every replay buys the same 60 s, and a binding taken from
+    /// the last of them outlives the signature by `MIN_TTL +
+    /// DEFAULT_TRUST_GRACE`. Sixteen minutes past a window the zone chose in
+    /// weeks, which is the honest bound and worth writing down as the one that
+    /// is true.
     pub ttl: Duration,
     /// The zone whose RRSIG covered this answer, as the signature named it —
     /// checked to enclose the queried name before the answer was accepted

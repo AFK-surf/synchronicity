@@ -24,8 +24,8 @@ TXT records, served over port 53 (UDP+TCP) and RFC 8484 DoH.
     next query. There is no reload signal and no poll.
 
   Staleness bound: your refresh interval R, full stop. With R=60s
-  that is well inside the 300s record TTL and the client's 10-minute
-  trust grace. If refresh stops, the replica keeps serving its last good
+  that is well inside the 300s record TTL and the client's 15-minute
+  trust grace (`DEFAULT_TRUST_GRACE`, `crates/synch-net/src/dns.rs`). If refresh stops, the replica keeps serving its last good
   database file (signatures stay valid for days) and `/healthz` shows
   the stale serial. A DB from a newer build is refused at every
   checkout, never probed.
@@ -206,8 +206,11 @@ control plane itself with
   the old key. The dashboard shows a persistent banner while a window is
   open, and refuses a second concurrent rotation.
 - **Revocation is not a kill switch**: a revoked key leaves DNS on the
-  next publish (immediately), but peers may keep trusting it for up to
-  TTL + grace ≈ 15 minutes, plus your replica refresh interval.
+  next publish — immediately in serve mode, and on the next reconciler
+  pass in external mode (a poke after the transaction commits, so
+  seconds; the sweep at 300s is the fallback). Peers may keep trusting
+  it for up to TTL + grace ≈ 20 minutes, plus your replica refresh
+  interval.
 - **Signature freshness**: `/healthz` reports `sig_expires_at`. The
   primary re-signs automatically at 7 days before expiry. If the primary
   is down long enough for that to matter you have days, not minutes.
@@ -327,6 +330,44 @@ control plane itself with
 - **Backups**: the litestream bucket *is* the database backup. The key
   file is backed up offline from the ceremony. Those two artifacts
   restore the whole service.
+
+## External DNS provider mode
+
+`CP_DNS_MODE=external` publishes the zone through a managed provider
+(Cloudflare or Bunny) instead of serving DNS here. The provider holds the
+DNSSEC signing key; this deployment holds only the record set. See
+`docs/EXTERNAL-DNS-PROVIDER.md` for the design.
+
+What differs operationally:
+
+- **Configuration**: `CP_DNS_MODE=external`, `CP_DNS_PROVIDER`
+  (`cloudflare` | `bunny` | `log-only`), the provider credential
+  (`CP_CLOUDFLARE_API_TOKEN` or `CP_BUNNY_API_KEY`), optionally
+  `CP_CLOUDFLARE_ZONE_ID` (set it: otherwise the zone is discovered with a
+  live API call at boot), and `CP_SIGNING_ZONE` when the apex is served
+  out of a zone above it. `CP_KEY_FILE` is **refused** — there is no
+  local zone key.
+- **No `keygen`, no DS to publish, no `resign`.** The provider signs. The
+  `zone-key promote` and `rekor-publish` commands that take a key file do
+  not apply here; the zone-key watcher observes the provider's keys and
+  logs them itself, every 300s.
+- **Ownership marker**: the reconciler will only delete records below the
+  apex when `_synchronicity-owner.<apex>` carries this deployment's
+  marker. A `provider-sync: conflict:` line means it found something else
+  there and touched nothing. On a *first* sync that is correct and the
+  remedy is to remove the foreign record; after a successful sync the
+  marker is re-asserted automatically as drift.
+- **What to alert on**: `/healthz` reports `provider_in_sync`,
+  `provider_last_error`, `provider_last_ok_at`, `keys_observed`,
+  `keys_logged` and `oldest_unlogged_age`. `provider_in_sync: false` for
+  more than a couple of sweeps is the reconciler wedged or the provider
+  API refusing writes; `keys_observed: 0` is the watcher never having
+  worked, which reads the same as "everything is logged" if you look only
+  at `oldest_unlogged_age`.
+- **`CP_DNS_PROVIDER=log-only`** prints the change set and applies
+  nothing, and reports `provider_in_sync: true` while publishing nothing
+  at all. It is a dry run; the `"provider": "log-only"` field beside it is
+  how you tell.
 
 ## Failure posture (deliberate)
 

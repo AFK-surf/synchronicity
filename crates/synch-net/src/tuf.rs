@@ -32,6 +32,19 @@
 //! On acceptance the pin set becomes the tlogs of the new `trusted_root` —
 //! **replacing** the previous set, never unioning with it, so a key Sigstore
 //! removes is a key clients drop.
+//!
+//! **That is a statement about `update`, not a revocation story, and the
+//! difference matters.** Sigstore retires a shard by *window* — the shipped
+//! trusted root lists `rekor.sigstore.dev`'s 2021 P-256 key with a start and
+//! no end — and `tlog_keys` deliberately pins every shard the root lists,
+//! retired ones included, because an archival proof from a closed shard is
+//! still a proof. `validFor.end` is not enforced anywhere and cannot be:
+//! nothing near a proof carries a log-attested time, `integratedTime` sits
+//! outside the Merkle commitment, and a clock the reader supplies would refuse
+//! exactly the archival entries the design exists to keep readable. So a shard
+//! key that has ever been listed is unrevocable here, and a leaked one is
+//! unrecoverable short of Sigstore removing the entry from the root outright.
+//! Saying that plainly is better than a claim the shipped root contradicts.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
