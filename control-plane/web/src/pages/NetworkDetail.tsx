@@ -449,12 +449,6 @@ function ConnectPanel({ domain }: { domain: string }) {
     ``,
     `# Existing device — already initialized elsewhere, just join this domain:`,
     `synch domain set ${domain}`,
-    ``,
-    `# Air-gapped / direct mode: point the daemon at this control plane and`,
-    `# its DNSSEC anchor (from /api/zone/anchor), then join as usual:`,
-    `synch daemon run --doh ${window.location.origin}/dns-query \\`,
-    `      --dnssec-anchor anchor.key &`,
-    `synch domain set ${domain}`,
   ].join('\n')
   return (
     <div className="rounded-lg border border-neutral-800 p-4">
