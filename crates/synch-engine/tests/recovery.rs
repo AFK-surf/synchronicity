@@ -81,8 +81,11 @@ fn quick(wait: Duration, gap: u64) -> RecoveryOptions {
 /// The whole arc: a wiped node refuses to publish, learns how far its origin
 /// had got from an ordinary `Hello` exchange, resumes above it, and is accepted
 /// by the peer that holds the old history.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     trust(&nas.node, &laptop.node);
@@ -207,8 +210,11 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
 /// A genuinely new node joining a cluster that has never heard of it is *not*
 /// in recovery, and publishes at seq 1. Misdetecting this would brick every new
 /// node.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_node_joining_a_busy_cluster_publishes_at_seq_one() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let newcomer = spawn("laptop").await;
     trust(&nas.node, &newcomer.node);
@@ -260,8 +266,11 @@ async fn a_new_node_joining_a_busy_cluster_publishes_at_seq_one() {
 /// Both sides of the report: the recovering node says it is in recovery and how
 /// far peers say it had got; the peer holding the pre-recovery history names
 /// the origin and the seq (§3.4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_reports_recovery_on_one_side_and_the_fork_on_the_other() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     trust(&nas.node, &laptop.node);
@@ -349,8 +358,11 @@ async fn doctor_reports_recovery_on_one_side_and_the_fork_on_the_other() {
 /// *above* the floor: the recovered node's publishes are refused as not newer,
 /// and the pre-recovery history stays as provable fork evidence for the
 /// operator to resolve (§3.4, §4.4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_only_an_unreachable_peer_held_survives_as_fork_evidence() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     let vps = spawn("vps").await;

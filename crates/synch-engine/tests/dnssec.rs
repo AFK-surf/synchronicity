@@ -12,8 +12,11 @@ use synch_core::OriginId;
 use synch_engine::{Node, NodeConfig};
 use synch_net::{sim::SimZone, DnssecResolver, RekorPolicy, ResolverOptions};
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validated_records_become_bindings_and_outages_keep_them() {
+    // This test's own body drives the world synchronously; the runtime
+    // workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let data = tempfile::tempdir().unwrap();
     Node::init(
         data.path(),

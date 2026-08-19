@@ -572,7 +572,7 @@ fn an_extension_nothing_reads_does_not_disturb_the_verdict() {
 
 /// A monitor reads leaves out of tiles; assert it against a whole simulated
 /// log rather than against a hand-built bundle.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_monitor_finds_a_zones_entry_by_walking_bundles() {
     struct Bundles(Vec<Vec<u8>>);
     impl TileSource for Bundles {

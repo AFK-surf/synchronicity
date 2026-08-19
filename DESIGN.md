@@ -1220,13 +1220,20 @@ So the rule is now enforced rather than described. `synch_core::blocking`'s
 `offload` marks its thread with a `BlockingScope`, and `Store::conn` asserts, in
 debug builds, that it is either inside one or not on a multi-thread runtime at
 all — the same shape as the guard that made "no `Store::conn` inside a
-transaction" a named panic instead of a silent deadlock. The daemon runs
-multi-thread, so a debug daemon catches a violation at the call site; the
-`#[tokio::test]` suite runs current-thread, where one worker the test is driving
-is not the hazard and the assertion is deliberately silent; and
-`the_sync_path_never_touches_the_store_on_a_runtime_worker` runs the whole
-accept/exchange/fetch/publish/maintain path multi-thread so CI carries the same
-check.
+transaction" a named panic instead of a silent deadlock.
+
+An assertion only earns its keep where something runs it. It is silent on a
+current-thread runtime — one worker the test itself is driving is not the hazard
+— so a `#[tokio::test]` suite left at the default flavor would have been a
+checker nothing ever executed, and that is precisely how the previous passes
+kept leaving call sites behind. Every integration suite that drives an async
+production surface therefore runs `flavor = "multi_thread"`: the cluster and
+two-node sync paths, recovery, the control socket, and the S3 gateway. Between
+them they cover the accept/exchange/fetch/publish/maintain path, every control
+command, and every gateway verb, on the same runtime flavor the daemon binary
+starts. A test's own body drives its world synchronously — that is what a test
+thread is for — so it declares that with a `BlockingScope`, which exempts that
+one thread and leaves every runtime worker the node uses checked.
 
 This relocates the queue rather than removing it: the one connection mutex is
 still the bottleneck, and a long exclusive holder (a GC pass, a full publish

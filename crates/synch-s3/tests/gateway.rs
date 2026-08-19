@@ -123,8 +123,11 @@ fn client() -> reqwest::Client {
     reqwest::Client::builder().build().unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_head_list_and_range_round_trip() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     let payload: Vec<u8> = (0..200_000u32).map(|i| (i * 17 + 3) as u8).collect();
     harness.publish("notes.txt", b"hello from s3");
@@ -359,8 +362,11 @@ async fn get_head_list_and_range_round_trip() {
 /// both directions without either process holding it (§9.4). Byte-exactness at
 /// this size is the observable half of that; the bounded channel and the
 /// daemon's staging file are the mechanism.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_large_object_streams_through_in_both_directions() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
     let payload: Vec<u8> = (0..3_000_000u32).map(|i| (i * 31 % 251) as u8).collect();
@@ -401,8 +407,11 @@ async fn a_large_object_streams_through_in_both_directions() {
     harness.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn put_object_publishes_into_the_local_space() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
     let payload: Vec<u8> = (0..60_000u32).map(|i| (i % 251) as u8).collect();
@@ -449,8 +458,11 @@ async fn put_object_publishes_into_the_local_space() {
 /// A node in key-loss recovery cannot publish, so it cannot accept a write
 /// either. That surfaces as an S3 error naming the command that clears it,
 /// rather than a panic or a silently dropped upload (§3.4, §9.4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn put_object_is_refused_while_the_node_is_in_recovery() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     harness
         .node
@@ -492,8 +504,11 @@ async fn put_object_is_refused_while_the_node_is_in_recovery() {
 /// §9.4: a write is always a publish of the *local* node's view, so a bucket
 /// pinned to a foreign origin still accepts it — but its reads keep serving
 /// the pinned origin, which is why the gateway warns about that shape.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_foreign_pinned_bucket_writes_our_view_and_reads_theirs() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
     let response = http
@@ -531,8 +546,11 @@ async fn a_foreign_pinned_bucket_writes_our_view_and_reads_theirs() {
 
 /// §8, §9.4: `newest` serves the winning version, `strict` answers a divergent
 /// key with 409 naming the versions, and the unified listing shows one key.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn divergent_keys_are_served_by_policy() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
     harness.publish("shared.txt", b"ours");
@@ -641,8 +659,11 @@ async fn divergent_keys_are_served_by_policy() {
 /// It stays out of listings, and a direct read of it is a missing key —
 /// otherwise the gateway would advertise a key whose GET can only fail.
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn symlink_keys_are_not_objects() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
     harness.publish("real.txt", b"the real thing");
@@ -701,8 +722,11 @@ async fn symlink_keys_are_not_objects() {
     harness.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deferred_operations_report_not_implemented() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
     let http = client();
     let response = http
@@ -717,8 +741,11 @@ async fn deferred_operations_report_not_implemented() {
 
 /// Buckets and access keys live in the daemon's `s3.*` config namespace, and
 /// the gateway edits them by appending records over the socket (§9.4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bucket_and_key_configuration_lives_in_the_daemon() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let harness = Harness::start(AuthMode::Anonymous).await;
 
     // The buckets the harness added are the daemon's rows, not a file of ours.
@@ -792,8 +819,11 @@ async fn bucket_and_key_configuration_lives_in_the_daemon() {
     harness.stop().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigv4_is_enforced_when_keys_are_configured() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let keys = vec![AccessKey {
         id: "AKIDEXAMPLE".into(),
         secret: "wJalrXUtnFEMI/K7MDENG".into(),
@@ -894,8 +924,11 @@ async fn sigv4_is_enforced_when_keys_are_configured() {
 
 /// With no daemon there is nothing to serve from, and the gateway says so in
 /// the words the CLI uses rather than as a transport error (§9.1).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_daemon_the_gateway_names_the_command_that_starts_one() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let dir = tempfile::tempdir().unwrap();
     Node::init(dir.path(), None).unwrap();
     let daemon = Daemon::new(dir.path());

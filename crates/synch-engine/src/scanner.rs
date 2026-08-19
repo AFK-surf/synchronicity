@@ -530,8 +530,13 @@ impl Node {
     ) -> Result<PathBuf> {
         let policy = synch_store::VersionPolicy::Origin(origin.clone());
         // Resolving the target first means a path outside every indexed space
-        // is refused before anything is fetched.
-        let target = self.adoption_target(space_id, path)?;
+        // is refused before anything is fetched. It reads the space row, so it
+        // goes to the blocking pool like every other store read on an async
+        // path (§10).
+        let target = {
+            let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
+            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?
+        };
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
         self.materialize_blob(&range.root, range.size, target.clone())
             .await?;

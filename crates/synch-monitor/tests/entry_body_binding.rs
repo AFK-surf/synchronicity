@@ -135,7 +135,7 @@ const TARGET: u64 = 300; // well away from the frontier
 
 /// A body the signed root does not commit to is refused, even when the
 /// level-0 hash tile beneath it agrees.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forged_body_and_its_level_zero_tile_are_refused_against_the_signed_root() {
     let honest = Log::new(SIZE);
     let tree = Tree::new(&honest, SIZE, 8);
@@ -210,7 +210,7 @@ async fn a_forged_body_and_its_level_zero_tile_are_refused_against_the_signed_ro
 /// per 16.7 M at level 2, every one of them cached for the rest of the run,
 /// and the fold over each is memoized so the 256 entries in a tile share it.
 /// Measured over a whole bundle so the amortized cost is what is asserted.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn binding_a_whole_bundle_to_the_root_costs_a_handful_of_tiles() {
     let log = Log::new(SIZE);
     let tree = Tree::new(&log, SIZE, 1);

@@ -54,8 +54,9 @@ const SEND_AHEAD: usize = 4;
 /// the scanner, and every timer in the process (§9.1). A request that streams an
 /// object, rebuilds the derived views, or unpublishes a space does real disk
 /// work, and doing it on the worker thread that polled the connection stops that
-/// worker from polling anything else for as long as it takes (§10). Requests
-/// that only read a handful of indexed rows stay inline.
+/// worker from polling anything else for as long as it takes (§10). What stays
+/// on the runtime worker is what touches neither the store nor the disk:
+/// in-memory node state, and selection over a version set already in hand.
 async fn offload<T, F>(f: F) -> Result<T, ControlError>
 where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
@@ -458,10 +459,12 @@ impl Control for ControlService {
     ) -> Result<Response<pb::Entry>, Status> {
         let request = request.into_inner();
         let policy = parse_policy(request.policy.as_deref())?;
-        let set = self
-            .node
-            .versions(&request.space, &request.path)
-            .map_err(ControlError::from)?;
+        let set = read(&self.node, move |n| {
+            Ok(n.versions(&request.space, &request.path)?)
+        })
+        .await?;
+        // Selection itself reads nothing: the version set is already in hand,
+        // so it stays on this task.
         let row = self
             .node
             .resolve_set(&set, &policy)
@@ -520,10 +523,10 @@ impl Control for ControlService {
             _ => return Err(ControlError::invalid("a write opens with its space and path").into()),
         };
         read(&self.node, |n| Ok(n.ensure_publishable()?)).await?;
-        let adoption = self
-            .node
-            .open_adoption(&header.space, &header.path)
-            .map_err(ControlError::from)?;
+        let adoption = {
+            let (space, path) = (header.space.clone(), header.path.clone());
+            read(&self.node, move |n| Ok(n.open_adoption(&space, &path)?)).await?
+        };
 
         let (tx, rx) = mpsc::channel(1);
         let node = self.node.clone();
@@ -566,17 +569,18 @@ impl Control for ControlService {
         request: Request<pb::AppendConfigRequest>,
     ) -> Result<Response<pb::AppendConfigResponse>, Status> {
         let request = request.into_inner();
-        let key = gateway_config_key(&request.key)?;
+        let key = gateway_config_key(&request.key)?.to_string();
         if request.record.contains('\n') {
             return Err(ControlError::invalid(
                 "a config record is one line: newlines separate records",
             )
             .into());
         }
-        self.node
-            .store()
-            .append_config(key, &request.record)
-            .map_err(ControlError::from)?;
+        let record = request.record;
+        read(&self.node, move |n| {
+            Ok(n.store().append_config(&key, &record)?)
+        })
+        .await?;
         Ok(Response::new(pb::AppendConfigResponse {}))
     }
 }
@@ -902,13 +906,18 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         Command::TrustRebind(pb::TrustRebind { origin, key }) => {
             let origin = parse_origin(&origin)?;
             let key = parse_key(&key)?;
-            let earlier: Vec<String> = node
-                .store()
-                .bindings()?
-                .into_iter()
-                .filter(|b| b.origin == origin && b.node_id != key)
-                .map(|b| b.node_id.to_z32())
-                .collect();
+            let earlier: Vec<String> = {
+                let origin = origin.clone();
+                read(node, move |n| {
+                    Ok(n.store()
+                        .bindings()?
+                        .into_iter()
+                        .filter(|b| b.origin == origin && b.node_id != key)
+                        .map(|b| b.node_id.to_z32())
+                        .collect())
+                })
+                .await?
+            };
             {
                 let origin = origin.clone();
                 read(node, move |n| Ok(n.trust_rebind(&origin, key)?)).await?;
@@ -1319,13 +1328,17 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // A tombstone is an assertion like any other, and §8 makes it
             // adoptable the same way: take the deletion, and let the next scan
             // publish our own.
-            let theirs = node.resolve(
-                &reference.space,
-                &reference.path,
-                &VersionPolicy::Origin(origin.clone()),
-            )?;
+            let theirs = {
+                let (space, path, pinned) = (
+                    reference.space.clone(),
+                    reference.path.clone(),
+                    VersionPolicy::Origin(origin.clone()),
+                );
+                read(node, move |n| Ok(n.resolve(&space, &path, &pinned)?)).await?
+            };
             if theirs.kind == synch_core::EntryKind::Tombstone {
-                match node.adopt_deletion(&reference.space, &reference.path)? {
+                let (space, path) = (reference.space.clone(), reference.path.clone());
+                match read(node, move |n| Ok(n.adopt_deletion(&space, &path)?)).await? {
                     Some(path) => {
                         out.line(format!("removed {}", path.display())).await?;
                     }
@@ -1543,7 +1556,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::SyncNow(pb::SyncNow {}) => {
-            let peers = node.dialable_peers()?;
+            let peers = read(node, |n| Ok(n.dialable_peers()?)).await?;
             if peers.is_empty() {
                 out.line("no dialable peers: nothing to sync with").await?;
             }
@@ -1691,7 +1704,10 @@ async fn receive(
     // does — the entry it reports has to be one peers can already see.
     node.scan_publish_push().await?;
     let ours = VersionPolicy::Origin(node.origin().clone());
-    let set = node.versions(&header.space, &header.path)?;
+    let set = {
+        let (space, path) = (header.space.clone(), header.path.clone());
+        read(node, move |n| Ok(n.versions(&space, &path)?)).await?
+    };
     let row = node.resolve_set(&set, &ours)?;
     Ok(pb::Written {
         path: target.display().to_string(),

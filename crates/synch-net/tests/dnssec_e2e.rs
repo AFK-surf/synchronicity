@@ -15,7 +15,7 @@ fn anchor_file(record: &str) -> tempfile::NamedTempFile {
     file
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_signed_zone_validates_end_to_end() {
     let nas = SecretKey::generate().public();
     let laptop = SecretKey::generate().public();
@@ -58,7 +58,7 @@ async fn a_signed_zone_validates_end_to_end() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zone_signed_by_an_unanchored_key_is_refused() {
     let nas = SecretKey::generate().public();
     let zone = SimZone::new(
@@ -93,7 +93,7 @@ async fn a_zone_signed_by_an_unanchored_key_is_refused() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unsigned_zone_is_refused() {
     let nas = SecretKey::generate().public();
     let mut zone = SimZone::new(
@@ -144,7 +144,7 @@ async fn an_unsigned_zone_is_refused() {
 /// The suite could not have caught this before: every other negative case
 /// gives the impostor the *same* name as the victim, so "a validly anchored
 /// zone with a **different** name signs for our name" went unexercised.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
     use hickory_resolver::proto::rr::Name;
 
@@ -216,7 +216,7 @@ async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
 /// acceptance rule stands between the spliced record and a full read/write
 /// binding — which is why `dns::covered_by_signed_data` matches the
 /// verifier's `(name, type, class)` triple exactly rather than approximately.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_spliced_in_another_class_is_signed_by_nobody() {
     let nas = SecretKey::generate().public();
     let attacker = SecretKey::generate().public();

@@ -712,7 +712,7 @@ fn seed_state(path: &std::path::Path, embedded_root: &std::path::Path) {
     state.save(path).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_walked_chain_teaches_a_log_the_build_never_knew() {
     let (zone, new_shard, repo, embedded) = zone_learning_a_new_shard();
     let anchor = write(&zone.anchor_record());
@@ -765,7 +765,7 @@ async fn a_walked_chain_teaches_a_log_the_build_never_knew() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_same_zone_without_the_walk_fails_with_unknown_log() {
     // The control: everything identical except the refresh. If the proof
     // verified here too, the update above would have proved nothing.
@@ -790,7 +790,7 @@ async fn the_same_zone_without_the_walk_fails_with_unknown_log() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repository_serving_nonsense_never_fails_a_refresh() {
     // The rule §10.2 calls load-bearing: TUF trouble is never worse than not
     // having asked. The repository here serves garbage while the zone
@@ -847,7 +847,7 @@ async fn a_repository_serving_nonsense_never_fails_a_refresh() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repository_with_nothing_in_it_is_a_non_event() {
     // An unreachable mirror and an empty one look the same from here, and
     // both leave the client exactly where it was.
@@ -879,7 +879,7 @@ async fn a_repository_with_nothing_in_it_is_a_non_event() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_tuf_walks_nothing_and_is_not_a_failure() {
     // The knob for a deployment that will not have its daemon reach a CDN.
     // Off means off — not "a repository that answers nothing", which would
@@ -916,7 +916,7 @@ async fn no_tuf_walks_nothing_and_is_not_a_failure() {
 ///
 /// `SYNCH_TUF_FIXTURE=write cargo test -p synch-net --test tuf_pin_refresh
 /// -- --ignored regenerate_the_shared_fixture`
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn regenerate_the_shared_fixture() {
     assert_eq!(
