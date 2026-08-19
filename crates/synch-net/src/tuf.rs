@@ -52,7 +52,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ring::signature;
+use aws_lc_rs::signature;
 
 use crate::rekor::{base64_encode, sha256, LogKey, LogKeys};
 
@@ -1261,7 +1261,7 @@ impl TufKey {
     /// Verifies one signature over the canonical bytes.
     fn verify(&self, message: &[u8], sig: &[u8]) -> Result<(), TufError> {
         let algorithms: &[&dyn signature::VerificationAlgorithm] = match self.scheme {
-            // Sigstore's TUF signatures are DER; ring's fixed-width verifier
+            // Sigstore's TUF signatures are DER; the fixed-width verifier
             // refuses those outright, so both encodings are tried. They are
             // two spellings of one signature — accepting either concedes
             // nothing beyond the malleability ASN.1 already has.

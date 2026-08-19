@@ -80,8 +80,8 @@
 
 use std::path::Path;
 
+use aws_lc_rs::{digest, signature};
 use hickory_resolver::proto::dnssec::TrustAnchors;
-use ring::{digest, signature};
 
 use crate::{
     chain::{self, ChainError},
@@ -759,9 +759,9 @@ pub fn verify(
     // key — the entry is what its signer made, whoever that is. Rekor signs
     // the hashedrekord's `data.digest` as a prehash — which, because that
     // digest *is* SHA-256(PAE), is the same signature as ECDSA-SHA256 over
-    // the PAE itself. Verifying it over the PAE is how ring is asked the
-    // question. Rekor entry signatures are ASN.1/DER, not the raw r||s of
-    // DNSSEC.
+    // the PAE itself. Verifying it over the PAE is how aws-lc-rs is asked
+    // the question. Rekor entry signatures are ASN.1/DER, not the raw r||s
+    // of DNSSEC.
     let pae = pae(DSSE_PAYLOAD_TYPE, &proof.statement);
     let signer = p256_point(&body.certificate.spki).ok_or_else(|| {
         ProofError::Attribution("the certificate's key is not a P-256 SubjectPublicKeyInfo".into())
@@ -1643,8 +1643,8 @@ pub fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
 /// DNSSEC algorithm 13 public key (64 bytes of coordinates).
 ///
 /// DER, not the raw `r || s` of DNSSEC: a Rekor entry's `signature.content`
-/// is what the log indexed, and Rekor indexes DER. ring hashes the message
-/// (the DSSE PAE) internally.
+/// is what the log indexed, and Rekor indexes DER. aws-lc-rs hashes the
+/// message (the DSSE PAE) internally.
 fn verify_ecdsa_p256_asn1(
     public: &[u8],
     message: &[u8],
@@ -2365,8 +2365,8 @@ mod tests {
 
     #[test]
     fn a_pinned_key_vouches_only_for_the_log_it_is_pinned_for() {
-        use ring::signature::{Ed25519KeyPair, KeyPair};
-        let rng = ring::rand::SystemRandom::new();
+        use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
         let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("key");
         let spki = [ED25519_SPKI_PREFIX, pair.public_key().as_ref()].concat();
@@ -2563,7 +2563,7 @@ mod tests {
     fn pinned_keys_parse_from_pem_and_bare_base64() {
         // A well-formed P-256 SubjectPublicKeyInfo over an arbitrary point:
         // parsing is structural, and a point that is not on the curve fails
-        // later, at verification, where ring checks it.
+        // later, at verification, where aws-lc-rs checks it.
         let mut der = vec![
             0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
             0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,

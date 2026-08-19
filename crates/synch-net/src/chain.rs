@@ -871,7 +871,7 @@ fn ds_digest_sha256(zone: &Name, dnskey_rdata: &[u8]) -> Vec<u8> {
 }
 
 fn ds_digest_sha384(zone: &Name, dnskey_rdata: &[u8]) -> Vec<u8> {
-    ring::digest::digest(&ring::digest::SHA384, &ds_input(zone, dnskey_rdata))
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA384, &ds_input(zone, dnskey_rdata))
         .as_ref()
         .to_vec()
 }

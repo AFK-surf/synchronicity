@@ -18,7 +18,6 @@ hickory-resolver.workspace = true
 # alone: synch_net::tuf::Repo is a synchronous trait, and the TUF walk is a
 # handful of sequential fetches made once per run on a blocking thread.
 reqwest = { workspace = true, features = ["blocking"] }
-ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 synch-net.workspace = true
