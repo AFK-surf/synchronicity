@@ -359,6 +359,64 @@ mod tests {
     use super::*;
     use synch_core::head_signing_input;
 
+    /// The delegations answer's field names are the contract, and the other
+    /// side of it is written in another language.
+    ///
+    /// `control-plane/src/api/agent.gleam` decodes these by name, so a rename
+    /// here is not a compile error anywhere — it is a dashboard that quietly
+    /// stops showing who the cluster admits. Pinned the way the Rekor wire
+    /// layout is pinned, and for the same reason.
+    #[test]
+    fn the_delegations_wire_layout_is_pinned() {
+        let frame = Up::Delegations {
+            id: 4,
+            delegations: vec![DelegationJson {
+                key: "abc".into(),
+                issuer: "nas@cluster.example".into(),
+                spaces: vec!["photos".into()],
+                live: true,
+                not_after: Some(1_700_000_000_000_000_000),
+                added_at: 12,
+                note: Some("laptop".into()),
+            }],
+        };
+        let json: serde_json::Value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(json["t"], "delegations");
+        assert_eq!(json["id"], 4);
+        let row = &json["delegations"][0];
+        assert_eq!(row["key"], "abc");
+        assert_eq!(row["issuer"], "nas@cluster.example");
+        assert_eq!(row["spaces"][0], "photos");
+        assert_eq!(row["live"], true);
+        assert_eq!(row["not_after"], 1_700_000_000_000_000_000i64);
+        assert_eq!(row["added_at"], 12);
+        assert_eq!(row["note"], "laptop");
+
+        // The request side too: the tag the control plane sends.
+        let ask: serde_json::Value = serde_json::to_value(Down::Delegations { id: 4 }).unwrap();
+        assert_eq!(ask["t"], "delegations");
+        assert_eq!(ask["id"], 4);
+
+        // A grant with no expiry and no note travels as null rather than
+        // vanishing: the Gleam decoder reads both fields as nullable, and a
+        // missing key is a different shape from a null one.
+        let bare = serde_json::to_value(Up::Delegations {
+            id: 1,
+            delegations: vec![DelegationJson {
+                key: "k".into(),
+                issuer: String::new(),
+                spaces: Vec::new(),
+                live: false,
+                not_after: None,
+                added_at: 0,
+                note: None,
+            }],
+        })
+        .unwrap();
+        assert!(bare["delegations"][0]["not_after"].is_null());
+        assert!(bare["delegations"][0]["note"].is_null());
+    }
+
     /// The two contexts a device key signs under must not overlap. A head
     /// signature that verified as an attach proof would let anyone who has
     /// ever seen a published head attach as that node.

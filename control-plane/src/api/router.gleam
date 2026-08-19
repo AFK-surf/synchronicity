@@ -189,6 +189,11 @@ fn primary_routes(
         use live <- with_session(req, auth)
         browse_api.status(auth, browse, live, slug, net)
       })
+    ["api", "orgs", slug, "networks", net, "delegations"], Get ->
+      with_browse(browse, fn(browse) {
+        use live <- with_session(req, auth)
+        browse_api.delegations(auth, browse, live, slug, net)
+      })
     ["api", "orgs", slug, "networks", net, "browse", "ls"], Get ->
       with_browse(browse, fn(browse) {
         use live <- with_session(req, auth)

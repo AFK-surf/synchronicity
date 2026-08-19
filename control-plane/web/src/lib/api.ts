@@ -170,6 +170,27 @@ export interface BrowseStatus {
   attach_url: string
 }
 
+/// One delegated device key, as an attached daemon reports it.
+///
+/// `live` is the daemon's answer and not a date comparison to redo here:
+/// derived trust dies with its source, so a grant whose issuer has been
+/// removed, or has lapsed from DNS, is dead well before `not_after`.
+export interface Delegation {
+  key: string
+  issuer: string
+  spaces: string[]
+  live: boolean
+  not_after: number
+  added_at: number
+  note: string
+}
+
+export interface Delegations {
+  device: string
+  origin: string
+  delegations: Delegation[]
+}
+
 export interface BrowseVersion {
   root: string
   kind: string

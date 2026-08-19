@@ -58,6 +58,73 @@ pub fn status(
   )
 }
 
+// -- delegated trust ---------------------------------------------------------
+
+/// Who the cluster admits on a delegation (DESIGN.md 3.5).
+///
+/// A membership question rather than a file one, and the only grant no remote
+/// surface reported: an operator could see every space and every version in
+/// the network and not who was admitted to read them.
+///
+/// Any attached daemon answers. Delegations are `d:` records replicated to
+/// every member, so there is no space to route on and no origin to pick — the
+/// first session serves, and its label travels with the answer so the reader
+/// knows who was asked.
+///
+/// Gated on the same switch as the rest of this module. The toggle is what
+/// decides whether this service asks an org's daemons questions at all, and
+/// answering one it is switched off for would make the switch mean two
+/// different things.
+pub fn delegations(
+  ctx: AuthContext,
+  browse: Browse,
+  live: UserSession,
+  slug: String,
+  network: String,
+) -> Response {
+  use net <- with_network(ctx, live, slug, network, Member)
+  case net.enabled, attached(browse, net) {
+    False, _ ->
+      error_json(
+        409,
+        "browse-disabled",
+        "this network does not answer control-plane questions",
+      )
+    True, [] ->
+      error_json(
+        503,
+        "no-device-attached",
+        "no daemon of this network is attached",
+      )
+    True, [session, ..] ->
+      case agent.ask(session, agent.Delegations) {
+        Ok(agent.Delegated(rows)) ->
+          ok_json(
+            json.object([
+              #("device", json.string(session.label)),
+              #("origin", json.string(session.origin)),
+              #("delegations", json.array(rows, delegation_json)),
+            ]),
+          )
+        Ok(_) ->
+          error_json(502, "internal", "the daemon answered the wrong question")
+        Error(refusal) -> relayed(refusal)
+      }
+  }
+}
+
+fn delegation_json(row: agent.Delegation) -> Json {
+  json.object([
+    #("key", json.string(row.key)),
+    #("issuer", json.string(row.issuer)),
+    #("spaces", json.array(row.spaces, json.string)),
+    #("live", json.bool(row.live)),
+    #("not_after", json.int(row.not_after)),
+    #("added_at", json.int(row.added_at)),
+    #("note", json.string(row.note)),
+  ])
+}
+
 // -- listing -----------------------------------------------------------------
 
 /// One directory of the unified tree.
