@@ -171,6 +171,16 @@ impl Certificate {
                 ))
             }
         };
+        // The two fields after `tbsCertificate`, and then nothing. Unused —
+        // the self-signature proves nothing the SPKI does not, as above — but
+        // read, because the "no second encoding of the same value" rule this
+        // parser applies at every other level is not applied by skipping a
+        // level. Without this, `SEQUENCE { tbsCertificate }` with no signature
+        // at all, or one with a trailing member, parses here and is refused by
+        // any auditor reading the same log entry with a stricter parser.
+        outer.sequence("signatureAlgorithm")?;
+        outer.any("signatureValue")?;
+        outer.finish("the certificate")?;
         Ok(Certificate {
             spki,
             dns_names,
@@ -748,6 +758,52 @@ mod tests {
         );
         let error = Certificate::parse(&forged).expect_err("a second [3] must not parse");
         assert!(error.to_string().contains("tbsCertificate"), "{error}");
+    }
+
+    /// The outer SEQUENCE is closed like every other level.
+    ///
+    /// The parser refuses a second encoding of the same value everywhere else
+    /// — trailing bytes, a second extensions block, a second SAN — but the
+    /// members after `tbsCertificate` were never read, so the one level that
+    /// wraps the whole certificate was the one that let anything through. A
+    /// log entry has to mean the same thing to an auditor with a stricter
+    /// parser; Go's and OpenSSL's both refuse these.
+    #[test]
+    fn the_outer_certificate_sequence_is_closed_too() {
+        let spec = SelfSigned {
+            common_name: "synchronicity zone key",
+            dns_name: "sync.example",
+            spki: &spki(),
+            serial: &[0x01, 0x02, 0x03],
+            not_before: x509_time(1_760_000_000),
+            not_after: x509_time(4_900_000_000),
+            extensions: &[],
+        };
+        let signature = tlv(
+            0x03,
+            &[0x00, 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
+        );
+
+        // Only a tbs, with no signature fields at all.
+        let bare = tlv(0x30, &spec.tbs());
+        assert!(
+            Certificate::parse(&bare).is_err(),
+            "a bare tbs must not parse"
+        );
+
+        // The honest three members, plus a fourth nobody reads.
+        let trailing = tlv(
+            0x30,
+            &[
+                spec.tbs(),
+                algorithm_identifier(),
+                signature,
+                tlv(0x02, &[0x01]),
+            ]
+            .concat(),
+        );
+        let error = Certificate::parse(&trailing).expect_err("a trailing member must not parse");
+        assert!(error.to_string().contains("the certificate"), "{error}");
     }
 
     #[test]

@@ -965,7 +965,18 @@ impl Store {
     /// connection guard either sees the mark — and leaves the object alone — or
     /// runs entirely before the writer started, in which case the writer opens
     /// the payload fresh and its row describes what it actually wrote.
+    ///
+    /// Which is why the mark is taken *through* the connection guard, briefly,
+    /// rather than on the lease map alone. The sweeps hold that guard from
+    /// their `is_being_written` check through the unlink, but nothing on a
+    /// writer's path from the lease to its first byte touches it — so a lease
+    /// taken on the map alone could land after the check and rename a payload
+    /// into place before the unlink, leaving a row that claims a complete
+    /// object with no bytes. Every caller takes the lease with no connection
+    /// held (each reads its row after, through `blob`), so this only orders
+    /// them; it never nests.
     pub(crate) fn lease_write(&self, root: &Hash) -> WriteLease<'_> {
+        let _ordered_against_the_sweeps = self.conn();
         *self.writing().entry(*root).or_insert(0) += 1;
         WriteLease {
             store: self,

@@ -495,6 +495,12 @@ impl Store {
         let size = metadata.len();
         if size <= INLINE_BLOB_MAX {
             let data = std::fs::read(path)?;
+            // The length of what was read, not what the stat said. A file
+            // appended to between the two is ordinary — a log, a download in
+            // progress — and returning the stale length publishes an entry
+            // whose size does not describe its own root: no peer can fetch
+            // that version, because their tree is built over the wrong length.
+            let size = data.len() as u64;
             let root = self.ingest_bytes(&data, now)?;
             return Ok((root, size));
         }
@@ -1872,6 +1878,40 @@ mod tests {
         // Once the lease is gone both sweeps do their job.
         assert!(store.gc_orphans(i64::MAX).unwrap() > 0);
         assert!(!store.blob_path(&root).exists());
+    }
+
+    /// A lease cannot be taken while a sweep is between its check and its
+    /// unlink.
+    ///
+    /// The sweeps hold the connection guard across that whole window, and
+    /// nothing else on a writer's path from `lease_write` to its first
+    /// `rename` touches the connection — so if the lease were taken on the
+    /// lease map alone, a writer could slip in and have its payload unlinked,
+    /// then commit a row claiming a complete object with no bytes. Asserted as
+    /// the ordering itself, because the interleaving that exposes it is a
+    /// microsecond wide and a racing test would find it only sometimes.
+    #[test]
+    fn a_lease_waits_for_a_sweep_that_is_mid_unlink() {
+        let (_d, store) = store();
+        let store = std::sync::Arc::new(store);
+        let root = store.ingest_bytes(&data(64), 0).unwrap();
+
+        let held = store.conn();
+        let leasing = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let _blocking = synch_core::BlockingScope::enter();
+                let _lease = store.lease_write(&root);
+                true
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !leasing.is_finished(),
+            "a lease was taken while a sweep held the connection"
+        );
+        drop(held);
+        assert!(leasing.join().unwrap());
     }
 
     /// An ingest re-creating content whose old row is collectable keeps its
