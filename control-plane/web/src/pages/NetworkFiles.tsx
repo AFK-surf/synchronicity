@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   useInfiniteQuery,
   useMutation,
@@ -16,11 +16,22 @@ import {
   type BrowseStatus,
   type BrowseVersion,
 } from '../lib/api'
+import {
+  IMAGE_PREVIEW_CAP,
+  TEXT_PREVIEW_CAP,
+  imageMime,
+  previewKind,
+  prettyIfJson,
+} from '../lib/preview'
 import { ErrorNote, useMe } from './Shell'
 
 // A scanning UI: breadcrumb, entry table, and a version drawer that opens
 // only when a path diverges. Downloads are plain links — the browser owns
-// progress, cancel and resume, and no file ever lands in this tab's memory.
+// progress, cancel and resume, and no downloaded file lands in this tab's
+// memory. Previews are the deliberate exception: images and text only, both
+// capped, rendered as decoded bytes and never as markup, because the
+// endpoint serves every file as hostile octets and the preview keeps
+// treating it that way.
 export function NetworkFiles() {
   const { slug = '', name = '' } = useParams()
   const [params, setParams] = useSearchParams()
@@ -289,6 +300,9 @@ function Directory({
   onNavigate: (path: string) => void
 }) {
   const [open, setOpen] = useState('')
+  // Which file's preview row is expanded — a second, independent drawer so
+  // a divergent path can show its versions and a preview at once.
+  const [preview, setPreview] = useState('')
   // Downloads target a hidden same-origin iframe rather than the top window, so
   // a refused download (a plain-text 4xx/5xx with no attachment) renders in the
   // frame and never replaces the Files page. A successful download carries
@@ -374,6 +388,10 @@ function Directory({
                 entry={entry}
                 opened={open === entry.path}
                 onOpen={() => setOpen(open === entry.path ? '' : entry.path)}
+                previewed={preview === entry.path}
+                onPreview={() =>
+                  setPreview(preview === entry.path ? '' : entry.path)
+                }
                 onNavigate={onNavigate}
                 onDownload={startDownload}
               />
@@ -446,6 +464,8 @@ function Row({
   entry,
   opened,
   onOpen,
+  previewed,
+  onPreview,
   onNavigate,
   onDownload,
 }: {
@@ -455,10 +475,15 @@ function Row({
   entry: BrowseEntry
   opened: boolean
   onOpen: () => void
+  previewed: boolean
+  onPreview: () => void
   onNavigate: (path: string) => void
   onDownload: () => void
 }) {
   const divergent = entry.versions > 1
+  // Only a plain file with a name the preview can render is clickable —
+  // symlinks and tombstones download, as before.
+  const previewable = entry.kind === 'file' && previewKind(entry.name) !== null
   return (
     <>
       <tr className="align-top">
@@ -469,6 +494,14 @@ function Row({
               className="font-mono text-amber-300 hover:underline"
             >
               {entry.name}/
+            </button>
+          ) : previewable ? (
+            <button
+              onClick={onPreview}
+              title="preview"
+              className="font-mono text-neutral-200 hover:underline"
+            >
+              {entry.name}
             </button>
           ) : (
             <span className="font-mono text-neutral-200">{entry.name}</span>
@@ -529,6 +562,23 @@ function Row({
           </td>
         </tr>
       )}
+      {previewed && (
+        <tr>
+          <td colSpan={5} className="bg-neutral-950 px-4 py-3">
+            {/* The same URL the plain download link takes: the daemon's
+                newest-wins pick. Per-version previews live in the drawer. */}
+            <Preview
+              name={entry.name}
+              size={entry.size}
+              url={`${base}/file${browseQuery({
+                space,
+                path: entry.path,
+                origin,
+              })}`}
+            />
+          </td>
+        </tr>
+      )}
     </>
   )
 }
@@ -566,6 +616,7 @@ function Drawer({
             space={space}
             origin={origin}
             path={entry.path}
+            name={entry.name}
             version={version}
             newest={index === 0}
             onDownload={onDownload}
@@ -581,6 +632,7 @@ function VersionRow({
   space,
   origin,
   path,
+  name,
   version,
   newest,
   onDownload,
@@ -589,41 +641,215 @@ function VersionRow({
   space: string
   origin: string
   path: string
+  name: string
   version: BrowseVersion
   newest: boolean
   onDownload: () => void
 }) {
+  const [show, setShow] = useState(false)
   const from = version.attestors[0] ?? ''
   return (
     <div
       className={
         newest
-          ? 'flex flex-wrap items-baseline gap-x-4 gap-y-1 rounded-md border border-teal-900 bg-teal-950/30 px-3 py-2'
-          : 'flex flex-wrap items-baseline gap-x-4 gap-y-1 rounded-md border border-neutral-800 px-3 py-2'
+          ? 'rounded-md border border-teal-900 bg-teal-950/30 px-3 py-2'
+          : 'rounded-md border border-neutral-800 px-3 py-2'
       }
     >
-      <code className="font-mono text-xs text-neutral-200">
-        {from} · seq {version.seq}
-      </code>
-      <span className="text-xs text-neutral-500">
-        {bytes(version.size)} · {day(version.mtime_ns)} · attested by{' '}
-        {version.attestors.join(', ')}
-      </span>
-      <code
-        className="max-w-[16rem] truncate font-mono text-[11px] text-neutral-600"
-        title={version.root}
-      >
-        {version.root}
-      </code>
-      <a
-        href={`${base}/file${browseQuery({ space, path, origin, from })}`}
-        target="synch-dl"
-        rel="noopener"
-        onClick={onDownload}
-        className="ml-auto text-xs font-semibold text-teal-300 hover:underline"
-      >
-        download ↓{newest ? ' (newest)' : ''}
-      </a>
+      <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+        <code className="font-mono text-xs text-neutral-200">
+          {from} · seq {version.seq}
+        </code>
+        <span className="text-xs text-neutral-500">
+          {bytes(version.size)} · {day(version.mtime_ns)} · attested by{' '}
+          {version.attestors.join(', ')}
+        </span>
+        <code
+          className="max-w-[16rem] truncate font-mono text-[11px] text-neutral-600"
+          title={version.root}
+        >
+          {version.root}
+        </code>
+        {previewKind(name) !== null && (
+          <button
+            onClick={() => setShow(!show)}
+            className="text-xs font-semibold text-teal-300 hover:underline"
+          >
+            {show ? 'hide preview' : 'preview'}
+          </button>
+        )}
+        <a
+          href={`${base}/file${browseQuery({ space, path, origin, from })}`}
+          target="synch-dl"
+          rel="noopener"
+          onClick={onDownload}
+          className="ml-auto text-xs font-semibold text-teal-300 hover:underline"
+        >
+          download ↓{newest ? ' (newest)' : ''}
+        </a>
+      </div>
+      {/* Seeing a version is how you choose between divergent ones, so the
+          preview sits with the download it stands in for. */}
+      {show && (
+        <div className="mt-2">
+          <Preview
+            name={name}
+            size={version.size}
+            url={`${base}/file${browseQuery({ space, path, origin, from })}`}
+          />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// What a preview holds. Text is a string bound for a React text node;
+// an image is an object URL bound for an <img>. Neither form is ever
+// parsed as markup, which is the whole safety argument for previewing
+// hostile files at all.
+type PreviewState =
+  | { state: 'loading' }
+  | { state: 'failed'; message: string }
+  | { state: 'text'; body: string; truncated: boolean; device: string }
+  | { state: 'image'; url: string; device: string }
+
+// Fetches the bytes for a preview and holds them for exactly as long as the
+// preview is mounted: an abort on cleanup, an object URL revoked with it.
+// The fetch is a read like the download link's — cookies, no CSRF — capped
+// through the endpoint's single-range support.
+function usePreview(
+  url: string,
+  name: string,
+  size: number,
+): [PreviewState, (message: string) => void] {
+  const [preview, setPreview] = useState<PreviewState>({ state: 'loading' })
+  useEffect(() => {
+    const kind = previewKind(name)
+    if (kind === null) {
+      // The row only offers the toggle for renderable names; this answers
+      // for itself rather than trust its callers.
+      setPreview({ state: 'failed', message: 'this file has no preview' })
+      return
+    }
+    if (kind === 'image' && size > IMAGE_PREVIEW_CAP) {
+      setPreview({
+        state: 'failed',
+        message: `${bytes(size)} is past the ${bytes(IMAGE_PREVIEW_CAP)} preview cap — download it instead`,
+      })
+      return
+    }
+    const controller = new AbortController()
+    setPreview({ state: 'loading' })
+    // Text past the cap previews as its first MiB — one clean range, the
+    // truncation labelled in the header below.
+    const headers =
+      kind === 'text' && size > TEXT_PREVIEW_CAP
+        ? { range: `bytes=0-${TEXT_PREVIEW_CAP - 1}` }
+        : undefined
+    let objectUrl = ''
+    fetch(url, {
+      credentials: 'same-origin',
+      headers,
+      signal: controller.signal,
+    })
+      .then(async (resp) => {
+        if (!resp.ok) {
+          // This endpoint's refusals are plain text, same as the download
+          // iframe surfaces.
+          throw new Error(
+            (await resp.text()).trim() || `HTTP ${resp.status}`,
+          )
+        }
+        const device = resp.headers.get('x-synch-device') ?? ''
+        if (kind === 'text') {
+          setPreview({
+            state: 'text',
+            body: await resp.text(),
+            truncated: resp.status === 206,
+            device,
+          })
+        } else {
+          const blob = new Blob([await resp.arrayBuffer()], {
+            type: imageMime(name),
+          })
+          objectUrl = URL.createObjectURL(blob)
+          setPreview({ state: 'image', url: objectUrl, device })
+        }
+      })
+      .catch((err: unknown) => {
+        // An abort is the preview closing, not a failure to report.
+        if (controller.signal.aborted) return
+        const message =
+          err instanceof Error && err.message !== '' ? err.message : ''
+        setPreview({
+          state: 'failed',
+          message: message === '' ? 'preview failed' : message,
+        })
+      })
+    return () => {
+      controller.abort()
+      if (objectUrl !== '') URL.revokeObjectURL(objectUrl)
+    }
+  }, [url, name, size])
+  // For an <img> that refuses to decode: the extension promised an image
+  // the bytes did not keep.
+  const fail = useCallback((message: string) => {
+    setPreview({ state: 'failed', message })
+  }, [])
+  return [preview, fail]
+}
+
+// One file, pulled into the tab to be looked at rather than saved.
+function Preview({
+  name,
+  size,
+  url,
+}: {
+  name: string
+  size: number
+  url: string
+}) {
+  const [preview, fail] = usePreview(url, name, size)
+  const loaded =
+    preview.state === 'text' || preview.state === 'image'
+  return (
+    <div>
+      <div className="mb-2 flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs text-neutral-500">
+        <span className="font-mono text-neutral-300">{name}</span>
+        {preview.state === 'text' && preview.truncated && (
+          <span className="text-amber-400/80">
+            first {bytes(TEXT_PREVIEW_CAP)} of {bytes(size)} — download for
+            the rest
+          </span>
+        )}
+        {loaded && preview.device !== '' && <span>via {preview.device}</span>}
+      </div>
+      {preview.state === 'loading' && (
+        <div className="text-sm text-neutral-400">Loading…</div>
+      )}
+      {preview.state === 'failed' && (
+        <div className="rounded-md border border-red-900 bg-red-950/50 px-3 py-2 text-sm text-red-300">
+          {preview.message}
+        </div>
+      )}
+      {preview.state === 'text' &&
+        (preview.body === '' ? (
+          <p className="text-sm text-neutral-500">Empty file.</p>
+        ) : (
+          <pre className="max-h-96 overflow-auto rounded-md border border-neutral-800 bg-neutral-900 p-3 font-mono text-xs leading-relaxed text-neutral-200">
+            {prettyIfJson(name, preview.body)}
+          </pre>
+        ))}
+      {preview.state === 'image' && (
+        <img
+          src={preview.url}
+          alt={name}
+          onError={() =>
+            fail('these bytes will not decode as an image — the extension may be lying')
+          }
+          className="max-h-[32rem] max-w-full rounded-md border border-neutral-800 bg-neutral-900"
+        />
+      )}
     </div>
   )
 }

@@ -8,7 +8,9 @@
 //// Every response is `Content-Disposition: attachment`, `application/octet-
 //// stream`, `X-Content-Type-Options: nosniff`. Stored files are hostile
 //// content, and one HTML file rendered on the origin that holds the session
-//// cookie is a stored-XSS machine — which is also why there is no preview.
+//// cookie is a stored-XSS machine — so nothing here is ever served inline.
+//// The SPA's preview fetches these bytes and renders them as text or as an
+//// image only, never as HTML, which keeps that boundary intact.
 
 import api/agent.{type Relay, type Session}
 import api/browse_api.{type Browse}
