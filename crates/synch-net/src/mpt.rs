@@ -340,7 +340,10 @@ impl MptProtocol {
                                 budget = left;
                                 nodes.push((hash, data));
                             }
-                            None if nodes.is_empty() => nodes.push((hash, data)),
+                            None if nodes.is_empty() => {
+                                nodes.push((hash, data));
+                                break;
+                            }
                             None => break,
                         }
                     }
@@ -416,7 +419,15 @@ impl MptProtocol {
                                 // a stored value larger than the whole budget
                                 // predates the ceiling, and answering nothing
                                 // would stall the requester's walk forever.
-                                None if values.is_empty() => values.push((wanted.1, data)),
+                                // It is the whole answer, though — anything
+                                // after it would push the frame past
+                                // `MAX_FRAME_LEN`, and then the requester gets
+                                // an error instead of the payload, every round,
+                                // without ever advancing `unproductive`.
+                                None if values.is_empty() => {
+                                    values.push((wanted.1, data));
+                                    break;
+                                }
                                 None => break,
                             },
                             None => missing.push(wanted.1),
@@ -1308,29 +1319,43 @@ mod tests {
         // `insert` will make one now, which is the point: the nodes are built
         // by hand, exactly as a store written before `MAX_TRIE_VALUE_LEN`
         // existed still holds them.
-        let mut children = [None; 16];
-        for (i, slot) in children.iter_mut().take(3).enumerate() {
-            let bytes = payload(ANSWER_BYTE_BUDGET / 2, 1_000 + i as u64);
-            let value = Hash::new(&bytes);
-            synch_mpt::NodeStore::put_value(store.as_ref(), &value, &bytes).unwrap();
-            let leaf = synch_mpt::TrieNode::Leaf {
-                // Odd, so the branch nibble above it makes a whole number of
-                // bytes and the position names a key that could exist.
-                key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2, 3]),
-                value: synch_mpt::ValueRef::Hash(value),
+        let hand_built = |sizes: &[usize], tag: u64| -> Hash {
+            let mut children = [None; 16];
+            for (i, slot) in children.iter_mut().take(sizes.len()).enumerate() {
+                let bytes = payload(sizes[i], tag + i as u64);
+                let value = Hash::new(&bytes);
+                synch_mpt::NodeStore::put_value(store.as_ref(), &value, &bytes).unwrap();
+                let leaf = synch_mpt::TrieNode::Leaf {
+                    // Odd, so the branch nibble above it makes a whole number
+                    // of bytes and the position names a key that could exist.
+                    key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2, 3]),
+                    value: synch_mpt::ValueRef::Hash(value),
+                };
+                let encoded = leaf.encode();
+                let hash = Hash::new(&encoded);
+                synch_mpt::NodeStore::put_node(store.as_ref(), &hash, &encoded).unwrap();
+                *slot = Some(hash);
+            }
+            let root_node = synch_mpt::TrieNode::Branch {
+                children,
+                value: None,
             };
-            let encoded = leaf.encode();
-            let hash = Hash::new(&encoded);
-            synch_mpt::NodeStore::put_node(store.as_ref(), &hash, &encoded).unwrap();
-            *slot = Some(hash);
-        }
-        let root_node = synch_mpt::TrieNode::Branch {
-            children,
-            value: None,
+            let encoded = root_node.encode();
+            let root = Hash::new(&encoded);
+            synch_mpt::NodeStore::put_node(store.as_ref(), &root, &encoded).unwrap();
+            root
         };
-        let encoded = root_node.encode();
-        let oversized_root = Hash::new(&encoded);
-        synch_mpt::NodeStore::put_node(store.as_ref(), &oversized_root, &encoded).unwrap();
+        let oversized_root = hand_built(&[ANSWER_BYTE_BUDGET / 2; 3], 1_000);
+        // And one larger than the whole budget, sitting ahead of three more.
+        let crowded_root = hand_built(
+            &[
+                ANSWER_BYTE_BUDGET + 1,
+                ANSWER_BYTE_BUDGET / 2,
+                ANSWER_BYTE_BUDGET / 2,
+                ANSWER_BYTE_BUDGET / 2,
+            ],
+            2_000,
+        );
 
         // The positions a requester would name: every node, none of the values.
         let positions = |root: Hash| -> (tempfile::TempDir, Vec<(Vec<u8>, Hash)>) {
@@ -1349,8 +1374,10 @@ mod tests {
         };
         let (_at_dir, at_ceiling) = positions(ceiling_root);
         let (_over_dir, oversized) = positions(oversized_root);
+        let (_crowded_dir, crowded) = positions(crowded_root);
         assert_eq!(at_ceiling.len(), MAX_BATCH);
         assert_eq!(oversized.len(), 3);
+        assert_eq!(crowded.len(), 4);
 
         let (server, client, _client_dir) =
             trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
@@ -1379,6 +1406,32 @@ mod tests {
             assert_eq!(&Hash::new(payload), hash);
             assert!(asked.contains(hash));
         }
+
+        // A payload larger than the whole budget, asked for ahead of others.
+        // It is served — answering nothing would stall the walk forever — but
+        // it is the *whole* answer. Letting the next value follow it into the
+        // frame is how the budget stops bounding anything: the assembled
+        // message goes past `MAX_FRAME_LEN`, `write_frame` refuses it after
+        // serializing, and the requester gets an error rather than a short
+        // answer, every round, with nothing to advance `unproductive`.
+        // Largest first: the walk orders wants by position, and the case is
+        // about what follows an over-budget payload into the same frame.
+        let mut crowded = crowded;
+        crowded.sort_by_key(|(_, hash)| {
+            std::cmp::Reverse(
+                synch_mpt::NodeStore::get_value(store.as_ref(), hash)
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+            )
+        });
+        let answer = mpt.get_values(crowded_root, &crowded).await.unwrap();
+        assert_eq!(
+            answer.values.len(),
+            1,
+            "an over-budget payload is the whole answer"
+        );
+        assert_eq!(answer.values[0].1.len(), ANSWER_BYTE_BUDGET + 1);
 
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();

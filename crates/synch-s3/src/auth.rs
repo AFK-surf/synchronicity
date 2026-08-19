@@ -196,7 +196,12 @@ pub fn canonical_request(request: &SignedRequest<'_>, signed_headers: &[String])
         let value = request.headers.get(name).map(String::as_str).unwrap_or("");
         canonical_headers.push_str(name);
         canonical_headers.push(':');
-        canonical_headers.push_str(value.trim());
+        // Trimmed *and* internally collapsed, which is what SigV4 specifies:
+        // "convert sequential spaces in the header value to a single space".
+        // Trimming alone matches every value that has none, so the difference
+        // only shows on one a client sent — `x-amz-meta-note: a  b` — and
+        // there it is a 403 the client cannot diagnose.
+        canonical_headers.push_str(&value.split_whitespace().collect::<Vec<_>>().join(" "));
         canonical_headers.push('\n');
     }
 
@@ -458,7 +463,10 @@ mod tests {
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             ),
             ("x-amz-date", "20130524T000000Z"),
-            ("range", "  bytes=0-9  "),
+            // Padded on both ends and doubled inside: SigV4 trims the first
+            // and collapses the second, and a client that signs the collapsed
+            // form gets a 403 from a gateway that only trims.
+            ("range", "  bytes=0-9,   20-29  "),
         ]);
         let request = SignedRequest {
             method: "GET",
@@ -481,7 +489,7 @@ mod tests {
                 "/test.txt\n",
                 "\n",
                 "host:examplebucket.s3.amazonaws.com\n",
-                "range:bytes=0-9\n",
+                "range:bytes=0-9, 20-29\n",
                 "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
                 "x-amz-date:20130524T000000Z\n",
                 "\n",

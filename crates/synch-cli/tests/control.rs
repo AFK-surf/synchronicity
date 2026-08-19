@@ -487,6 +487,21 @@ async fn every_command_variant_round_trips() {
     assert!(keys.contains("no trusted peers to ask"), "{keys}");
     assert_eq!(keys.lines().count(), 2, "{keys}");
 
+    // Cloud attach. These read and write `config` like every other command
+    // here, so they belong in the round trip for the same reason the rest do:
+    // on a runtime worker a store read trips `assert_off_runtime` and takes
+    // the whole daemon down (§10), and only running the command finds that.
+    let status = lines(data_dir, Command::CloudStatus(pb::CloudStatus {})).await;
+    assert!(status.contains("cloud: enabled"), "{status}");
+    assert!(lines(data_dir, Command::CloudDisable(pb::CloudDisable {}))
+        .await
+        .contains("disabled"));
+    let status = lines(data_dir, Command::CloudStatus(pb::CloudStatus {})).await;
+    assert!(status.contains("opted out"), "{status}");
+    assert!(lines(data_dir, Command::CloudEnable(pb::CloudEnable {}))
+        .await
+        .contains("media"));
+
     // Removing the space unpublishes its entries.
     assert!(lines(
         data_dir,

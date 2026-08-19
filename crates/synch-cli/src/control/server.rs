@@ -1402,11 +1402,19 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         Command::SpaceAdd(pb::SpaceAdd { id, path }) => {
             // A typo'd path otherwise becomes a fresh empty directory with no
             // signal; creating it is a feature, doing so silently is not.
-            let created = !std::path::Path::new(&path).is_dir();
-            {
+            //
+            // The `stat` goes over with the store work rather than inline: on a
+            // hung mount it blocks for the mount's timeout, and a runtime
+            // worker that stops polling is the thing §10 exists to prevent.
+            let created = {
                 let (id, path) = (id.clone(), path.clone());
-                read(node, move |n| Ok(n.add_space(&id, &path)?)).await?;
-            }
+                read(node, move |n| {
+                    let created = !std::path::Path::new(&path).is_dir();
+                    n.add_space(&id, &path)?;
+                    Ok(created)
+                })
+                .await?
+            };
             out.line(format!("indexing {path} as {id}")).await?;
             if created {
                 out.line(format!("note: created {path}, which did not exist"))
@@ -1873,8 +1881,15 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::CloudEnable(pb::CloudEnable {}) => {
-            node.enable_cloud()?;
-            let spaces = node.store().spaces()?;
+            // One trip for the write and both reads, like every other handler
+            // here: `config` and `spaces` go through `Store::conn`, which
+            // aborts the process outright when it is touched from a runtime
+            // worker (§10).
+            let (spaces, domains) = read(node, |n| {
+                n.enable_cloud()?;
+                Ok((n.store().spaces()?, n.domain()?))
+            })
+            .await?;
             out.line(format!(
                 "cloud attach enabled: serving the control plane's requests for {}",
                 if spaces.is_empty() {
@@ -1888,7 +1903,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 }
             ))
             .await?;
-            let domains: Vec<String> = node.domain()?.into_iter().collect();
+            let domains: Vec<String> = domains.into_iter().collect();
             if domains.is_empty() {
                 // Nothing to attach to and nothing that will change that on
                 // its own: the endpoint comes from a membership zone, so a
@@ -1908,13 +1923,15 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::CloudDisable(pb::CloudDisable {}) => {
-            node.disable_cloud()?;
+            read(node, |n| Ok(n.disable_cloud()?)).await?;
             out.line("cloud attach disabled; any open tunnel is dropped")
                 .await?;
         }
 
         Command::CloudStatus(pb::CloudStatus {}) => {
-            let settings = node.cloud_settings()?;
+            // `cloud_status` below is in-memory; only the opt-out flag is a
+            // store read, and it is the one that has to go over (§10).
+            let settings = read(node, |n| Ok(n.cloud_settings()?)).await?;
             let state = if settings.disabled {
                 "disabled (opted out)"
             } else {
