@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useParams } from 'react-router'
+import { useNavigate, useParams } from 'react-router'
 import {
   get,
   send,
@@ -20,6 +20,7 @@ export function Settings() {
       {role === 'owner' && <Oidc slug={slug} />}
       {(role === 'owner' || role === 'admin') && <Audit slug={slug} />}
       <LinkedIdentities />
+      {role === 'owner' && <DeleteOrg slug={slug} />}
     </div>
   )
 }
@@ -59,6 +60,16 @@ function Members({
       send('DELETE', `/api/orgs/${slug}/members/${user}`),
     onSuccess: refresh,
   })
+  const transfer = useMutation({
+    mutationFn: (user: string) =>
+      send('POST', `/api/orgs/${slug}/transfer`, { to: user }),
+    onSuccess: () => {
+      refresh()
+      // The acting owner just became an admin: what this page offers is
+      // role-dependent, and `me` is where the role comes from.
+      queryClient.invalidateQueries({ queryKey: ['me'] })
+    },
+  })
 
   return (
     <section>
@@ -90,24 +101,41 @@ function Members({
                   )}
                 </td>
                 <td className="px-4 py-2 text-right">
-                  {canAdmin && m.user_id !== myId && (
-                    <button
-                      onClick={() => {
-                        if (window.confirm(`Remove ${m.email} from the org?`))
-                          remove.mutate(m.user_id)
-                      }}
-                      className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
-                    >
-                      Remove
-                    </button>
-                  )}
+                  <div className="flex justify-end gap-2">
+                    {myRole === 'owner' && m.user_id !== myId && (
+                      <button
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `Transfer ownership to ${m.email}? They become an owner; you step down to admin.`,
+                            )
+                          )
+                            transfer.mutate(m.user_id)
+                        }}
+                        className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
+                      >
+                        Transfer ownership
+                      </button>
+                    )}
+                    {canAdmin && m.user_id !== myId && (
+                      <button
+                        onClick={() => {
+                          if (window.confirm(`Remove ${m.email} from the org?`))
+                            remove.mutate(m.user_id)
+                        }}
+                        className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
-      <ErrorNote error={error || changeRole.error || remove.error} />
+      <ErrorNote error={error || changeRole.error || remove.error || transfer.error} />
       {canAdmin && (
         <form
           className="mt-3 flex flex-wrap gap-2"
@@ -277,6 +305,61 @@ function Audit({ slug }: { slug: string }) {
           </tbody>
         </table>
       </div>
+    </section>
+  )
+}
+
+function DeleteOrg({ slug }: { slug: string }) {
+  const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const [confirm, setConfirm] = useState('')
+  const remove = useMutation({
+    mutationFn: () => send('DELETE', `/api/orgs/${slug}`, { confirm }),
+    onSuccess: async () => {
+      // Drop every org-scoped query with the org rather than leaving it
+      // stale: Back within the stale window would otherwise remount a
+      // ghost page whose actions can only 404. 'me' is refetched so the
+      // org picker no longer offers what is gone.
+      queryClient.removeQueries({
+        predicate: (q) => Array.isArray(q.queryKey) && q.queryKey[1] === slug,
+      })
+      await queryClient.invalidateQueries({ queryKey: ['me'] })
+      navigate('/')
+    },
+  })
+
+  return (
+    <section className="rounded-lg border border-red-900/60 p-4">
+      <h2 className="mb-2 text-sm font-medium uppercase tracking-wide text-red-400">
+        Delete organization
+      </h2>
+      <p className="text-sm text-neutral-400">
+        Deletes {slug} with everything it owns: networks, devices and their
+        keys, invites, members and the org's sign-in configuration. Members'
+        records leave DNS on the next publish. The audit trail is kept. This
+        cannot be undone.
+      </p>
+      <form
+        className="mt-3 flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault()
+          remove.mutate()
+        }}
+      >
+        <input
+          placeholder={`type ${slug} to confirm`}
+          value={confirm}
+          onChange={(e) => setConfirm(e.target.value)}
+          className="rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 font-mono text-sm"
+        />
+        <button
+          disabled={confirm !== slug || remove.isPending}
+          className="rounded-md bg-red-900 px-3 py-2 text-sm font-medium text-red-50 hover:bg-red-800 disabled:opacity-50"
+        >
+          Delete forever
+        </button>
+      </form>
+      <ErrorNote error={remove.error} />
     </section>
   )
 }

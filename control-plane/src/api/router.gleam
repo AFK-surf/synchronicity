@@ -110,6 +110,10 @@ fn primary_routes(
       use live <- with_session(req, auth)
       orgs_api.get_org(auth, live, slug)
     }
+    ["api", "orgs", slug], Delete -> {
+      use live <- with_session(req, auth)
+      orgs_api.delete_org(req, auth, live, slug)
+    }
     ["api", "orgs", slug, "members"], Get -> {
       use live <- with_session(req, auth)
       orgs_api.list_members(auth, live, slug)
@@ -121,6 +125,10 @@ fn primary_routes(
     ["api", "orgs", slug, "members", user], Delete -> {
       use live <- with_session(req, auth)
       orgs_api.remove_member(auth, live, slug, user)
+    }
+    ["api", "orgs", slug, "transfer"], Post -> {
+      use live <- with_session(req, auth)
+      orgs_api.transfer_ownership(req, auth, live, slug)
     }
     ["api", "orgs", slug, "invites"], Post -> {
       use live <- with_session(req, auth)

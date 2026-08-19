@@ -797,6 +797,467 @@ pub fn invite_accept_test() {
   sqlite.close(conn2)
 }
 
+/// Invites go through the API, not only the database: the insert once bound
+/// eight parameters to a statement with seven placeholders, and every
+/// invitation came back "the change conflicts with an existing record".
+pub fn invite_creation_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  // The invite grammar: member or admin, never owner — owners are made by
+  // transfer or promotion, not by self-service token.
+  let bad =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/invites",
+      json.object([
+        #("email", json.string("newbie@example.com")),
+        #("role", json.string("owner")),
+      ]),
+    )
+  assert bad.status == 400
+  let resp =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/invites",
+      json.object([
+        #("email", json.string("newbie@example.com")),
+        #("role", json.string("admin")),
+      ]),
+    )
+  assert resp.status == 200
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text("admin"), sqlite.Int(1)]]) =
+    sqlite.query(
+      conn,
+      "SELECT role, accepted_at IS NULL FROM invites
+       WHERE email = 'newbie@example.com'",
+      [],
+    )
+  sqlite.close(conn)
+}
+
+/// Deleting a network: the typed confirmation is the guard, the zone shrinks
+/// in the same transaction, and the devices live on unassigned.
+pub fn network_deletion_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let nas_nk = nk()
+  let created =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/devices",
+      json.object([
+        #("label", json.string("nas")),
+        #("nk", json.string(nas_nk)),
+      ]),
+    )
+  assert created.status == 200
+  let assert Ok(#(_, tail)) =
+    string.split_once(simulate.read_body(created), "device_id\":\"")
+  let assert [nas_id, ..] = string.split(tail, "\"")
+  let assert 200 =
+    call(h, authed(h, Put, "/api/orgs/acme/networks/prod/devices/" <> nas_id)).status
+  assert published_nks(h) == [nas_nk]
+
+  // A confirm that is not the network's name changes nothing.
+  let wrong =
+    call_json(
+      h,
+      Delete,
+      "/api/orgs/acme/networks/prod",
+      json.object([#("confirm", json.string("nope"))]),
+    )
+  assert wrong.status == 400
+  assert published_nks(h) == [nas_nk]
+
+  let gone =
+    call_json(
+      h,
+      Delete,
+      "/api/orgs/acme/networks/prod",
+      json.object([#("confirm", json.string("prod"))]),
+    )
+  assert gone.status == 200
+  assert published_nks(h) == []
+  assert call(h, authed(h, Get, "/api/orgs/acme/networks/prod")).status == 404
+  // Devices are unassigned by the delete, not deleted by it.
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Int(1)]]) =
+    sqlite.query(conn, "SELECT count(*) FROM devices WHERE label = 'nas'", [])
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn, "SELECT count(*) FROM network_devices", [])
+  sqlite.close(conn)
+}
+
+/// Deleting an org takes everything it owns — and only what it owns: a
+/// sibling org's devices keep resolving, the audit trail outlives the org,
+/// and an admin who is not the owner cannot do it at all.
+/// Removing an org's OIDC provider takes the identities linked through it
+/// and the sign-in states pointing at it — with foreign keys ON, a state
+/// left behind would refuse the removal itself.
+pub fn delete_oidc_takes_its_children_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let conn = {
+    let assert Ok(conn) = db.open_primary(h.db_path)
+    conn
+  }
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO oidc_providers VALUES ('oidc1',
+        (SELECT id FROM orgs WHERE slug = 'acme'), 'https://issuer.test',
+        'cid', 'csec', 'https://issuer.test/auth',
+        'https://issuer.test/token', NULL, 0)",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO auth_identities VALUES
+        ('ident1', 'u-admin', 'oidc', 'oidc1', 'sub-1', 0)",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO oauth_states VALUES
+        ('state1', 'oidc', 'oidc1', 'verifier', NULL, NULL, NULL, 0, 0)",
+      [],
+    )
+  sqlite.close(conn)
+  let resp = call(h, authed(h, Delete, "/api/orgs/acme/oidc"))
+  assert resp.status == 200
+  let conn2 = read_db(h)
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn2, "SELECT count(*) FROM oidc_providers", [])
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn2, "SELECT count(*) FROM auth_identities", [])
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn2, "SELECT count(*) FROM oauth_states", [])
+  sqlite.close(conn2)
+}
+
+pub fn org_deletion_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("keep")),
+        #("name", json.string("Keep")),
+      ]),
+    ).status
+  list.each(["acme", "keep"], fn(org) {
+    let assert 200 =
+      call_json(
+        h,
+        Post,
+        "/api/orgs/" <> org <> "/networks",
+        json.object([#("name", json.string("prod"))]),
+      ).status
+  })
+  let acme_nk = nk()
+  let keep_nk = nk()
+  let label_nk = [
+    #("acme", "nas", acme_nk),
+    #("keep", "laptop", keep_nk),
+  ]
+  list.each(label_nk, fn(entry) {
+    let #(org, label, key) = entry
+    let created =
+      call_json(
+        h,
+        Post,
+        "/api/orgs/" <> org <> "/devices",
+        json.object([
+          #("label", json.string(label)),
+          #("nk", json.string(key)),
+        ]),
+      )
+    assert created.status == 200
+    let assert Ok(#(_, tail)) =
+      string.split_once(simulate.read_body(created), "device_id\":\"")
+    let assert [device_id, ..] = string.split(tail, "\"")
+    let assert 200 =
+      call(
+        h,
+        authed(
+          h,
+          Put,
+          "/api/orgs/" <> org <> "/networks/prod/devices/" <> device_id,
+        ),
+      ).status
+  })
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/invites",
+      json.object([
+        #("email", json.string("newbie@example.com")),
+        #("role", json.string("member")),
+      ]),
+    ).status
+
+  // A fellow admin cannot delete the org, whatever they confirm.
+  let conn = {
+    let assert Ok(conn) = db.open_primary(h.db_path)
+    conn
+  }
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO users VALUES ('u-helper', 'helper@example.com', NULL, 0)",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO org_members VALUES
+       ((SELECT id FROM orgs WHERE slug = 'acme'), 'u-helper', 'admin', 0)",
+      [],
+    )
+  let assert Ok(#(helper_token, helper_live)) =
+    session.create(conn, "u-helper", now_unix())
+  // A configured provider with a linked identity and a sign-in state in
+  // flight: the delete must take all three, in an order the foreign keys
+  // permit.
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO oidc_providers VALUES ('oidc1',
+        (SELECT id FROM orgs WHERE slug = 'acme'), 'https://issuer.test',
+        'cid', 'csec', 'https://issuer.test/auth',
+        'https://issuer.test/token', NULL, 0)",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO auth_identities VALUES
+        ('ident1', 'u-admin', 'oidc', 'oidc1', 'sub-1', 0)",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO oauth_states VALUES
+        ('state1', 'oidc', 'oidc1', 'verifier', NULL, NULL, NULL, 0, 0)",
+      [],
+    )
+  sqlite.close(conn)
+  let as_helper =
+    simulate.request(Delete, "/api/orgs/acme")
+    |> simulate.cookie(session.cookie_name, helper_token, wisp.Signed)
+    |> simulate.header("x-csrf", helper_live.csrf)
+    |> simulate.json_body(json.object([#("confirm", json.string("acme"))]))
+  assert call(h, as_helper).status == 403
+
+  // The slug is the confirmation: anything else is refused.
+  let wrong =
+    call_json(
+      h,
+      Delete,
+      "/api/orgs/acme",
+      json.object([#("confirm", json.string("wrong"))]),
+    )
+  assert wrong.status == 400
+
+  let gone =
+    call_json(
+      h,
+      Delete,
+      "/api/orgs/acme",
+      json.object([#("confirm", json.string("acme"))]),
+    )
+  assert gone.status == 200
+  assert call(h, authed(h, Get, "/api/orgs/acme")).status == 404
+
+  // Everything acme owned is gone; everything keep owns is intact.
+  let conn2 = read_db(h)
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn2, "SELECT count(*) FROM orgs WHERE slug = 'acme'", [])
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(
+      conn2,
+      "SELECT count(*) FROM org_members WHERE org_id NOT IN (SELECT id FROM orgs)",
+      [],
+    )
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(
+      conn2,
+      "SELECT count(*) FROM devices WHERE label = 'nas'
+       OR id IN (SELECT device_id FROM network_devices WHERE network_id NOT IN (SELECT id FROM networks))",
+      [],
+    )
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn2, "SELECT count(*) FROM invites", [])
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn2, "SELECT count(*) FROM oidc_providers", [])
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn2, "SELECT count(*) FROM auth_identities", [])
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn2, "SELECT count(*) FROM oauth_states", [])
+  let assert Ok([[sqlite.Text(detail)]]) =
+    sqlite.query(
+      conn2,
+      "SELECT detail FROM audit_log WHERE action = 'org.delete'",
+      [],
+    )
+  assert string.contains(detail, "acme")
+  sqlite.close(conn2)
+  // Only keep's device is still published — and it is.
+  assert published_nks(h) == [keep_nk]
+  let survivor = call(h, authed(h, Get, "/api/orgs/keep"))
+  assert survivor.status == 200
+}
+
+/// Ownership transfer is one atomic step: the member becomes the owner, the
+/// owner steps down to admin, and the org is never between owners.
+pub fn ownership_transfer_test() {
+  let h = harness()
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let conn = {
+    let assert Ok(conn) = db.open_primary(h.db_path)
+    conn
+  }
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO users VALUES ('u-member', 'm@example.com', NULL, 0)",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO org_members VALUES
+       ((SELECT id FROM orgs WHERE slug = 'acme'), 'u-member', 'member', 0)",
+      [],
+    )
+  sqlite.close(conn)
+
+  // To yourself is a no-op dressed as a transfer; to a non-member, a 404.
+  let to_self =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/transfer",
+      json.object([#("to", json.string("u-admin"))]),
+    )
+  assert to_self.status == 400
+  let to_nobody =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/transfer",
+      json.object([#("to", json.string("u-nobody"))]),
+    )
+  assert to_nobody.status == 404
+
+  let transferred =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/transfer",
+      json.object([#("to", json.string("u-member"))]),
+    )
+  assert transferred.status == 200
+  assert string.contains(
+    simulate.read_body(transferred),
+    "\"your_role\":\"admin\"",
+  )
+  let conn2 = read_db(h)
+  let assert Ok([[sqlite.Text("admin")]]) =
+    sqlite.query(
+      conn2,
+      "SELECT role FROM org_members WHERE user_id = 'u-admin'",
+      [],
+    )
+  let assert Ok([[sqlite.Text("owner")]]) =
+    sqlite.query(
+      conn2,
+      "SELECT role FROM org_members WHERE user_id = 'u-member'",
+      [],
+    )
+  let assert Ok([[sqlite.Int(1)]]) =
+    sqlite.query(
+      conn2,
+      "SELECT count(*) FROM audit_log WHERE action = 'org.transfer'",
+      [],
+    )
+  sqlite.close(conn2)
+
+  // The stepped-down admin no longer holds the transfer — not even back to
+  // the owner who took their place.
+  let again =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/transfer",
+      json.object([#("to", json.string("u-member"))]),
+    )
+  assert again.status == 403
+}
+
 pub fn mutation_visible_to_dns_immediately_test() {
   // Guards the core visibility promise: a committed mutation is what the
   // DNS serving path answers with — there is no cache to go stale.

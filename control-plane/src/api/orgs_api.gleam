@@ -3,7 +3,7 @@
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
   Admin, Member, Owner, audit, body_decoder, constraint_response, db_error,
-  ok_json, require_org, text_at, transaction,
+  ok_json, require_org, text_at, transaction, zone_mutation,
 }
 import api/middleware.{error_json, now_unix}
 import auth/oidc
@@ -18,6 +18,7 @@ import gleam/result
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
+import zone/publish
 
 pub fn create_org(req: Request, ctx: AuthContext, live: Session) -> Response {
   let decoder = {
@@ -113,6 +114,117 @@ pub fn get_org(ctx: AuthContext, live: Session, slug: String) -> Response {
       _, _ -> db_error()
     }
   })
+}
+
+/// Org deletion. Everything the org owns goes in one transaction beside a
+/// zone republish — the same contract every zone-shaping mutation carries,
+/// so DNS and the tables can never disagree about what existed. The typed
+/// confirmation mirrors `delete_network`'s: the slug is the name the zone
+/// answered to, and it is what the operator must retype.
+pub fn delete_org(
+  req: Request,
+  ctx: AuthContext,
+  live: Session,
+  slug: String,
+) -> Response {
+  let decoder = {
+    use confirm <- decode.field("confirm", decode.string)
+    decode.success(confirm)
+  }
+  use confirm <- body_decoder(req, decoder)
+  case confirm == slug {
+    False -> error_json(400, "confirm", "body confirm must equal the org slug")
+    True ->
+      with_db(ctx, fn(conn) {
+        use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+        zone_mutation(conn, ctx, live.user_id, publish.Narrowing, fn() {
+          // Foreign keys are ON, so children leave before parents. The two
+          // IN-clauses on network_devices cover both halves of the join —
+          // assignment is org-scoped in the API, but the delete should not
+          // have to trust that.
+          let work = {
+            use _ <- result.try(
+              sqlite.exec(
+                conn,
+                "DELETE FROM network_devices
+                 WHERE network_id IN (SELECT id FROM networks WHERE org_id = ?)
+                    OR device_id IN (SELECT id FROM devices WHERE org_id = ?)",
+                [Text(org_id), Text(org_id)],
+              ),
+            )
+            use _ <- result.try(
+              sqlite.exec(
+                conn,
+                "DELETE FROM device_keys
+                 WHERE device_id IN (SELECT id FROM devices WHERE org_id = ?)",
+                [Text(org_id)],
+              ),
+            )
+            use _ <- result.try(
+              sqlite.exec(conn, "DELETE FROM networks WHERE org_id = ?", [
+                Text(org_id),
+              ]),
+            )
+            use _ <- result.try(
+              sqlite.exec(conn, "DELETE FROM devices WHERE org_id = ?", [
+                Text(org_id),
+              ]),
+            )
+            // A sign-in state pointing at a provider that is about to exist
+            // no more: the state can never be redeemed, so it goes too.
+            use _ <- result.try(
+              sqlite.exec(
+                conn,
+                "DELETE FROM oauth_states WHERE oidc_provider_id IN
+                 (SELECT id FROM oidc_providers WHERE org_id = ?)",
+                [Text(org_id)],
+              ),
+            )
+            // Identities and their provider row go together: identities
+            // without their provider are not (see delete_oidc).
+            use _ <- result.try(
+              sqlite.exec(
+                conn,
+                "DELETE FROM auth_identities WHERE oidc_provider_id IN
+                 (SELECT id FROM oidc_providers WHERE org_id = ?)",
+                [Text(org_id)],
+              ),
+            )
+            use _ <- result.try(
+              sqlite.exec(conn, "DELETE FROM oidc_providers WHERE org_id = ?", [
+                Text(org_id),
+              ]),
+            )
+            use _ <- result.try(
+              sqlite.exec(conn, "DELETE FROM invites WHERE org_id = ?", [
+                Text(org_id),
+              ]),
+            )
+            use _ <- result.try(
+              sqlite.exec(conn, "DELETE FROM org_members WHERE org_id = ?", [
+                Text(org_id),
+              ]),
+            )
+            // The audit trail outlives the org it describes — org_id carries
+            // no foreign key precisely so history is not cascade-deleted.
+            // The slug rides in the detail because the row naming it is next.
+            use _ <- result.try(audit(
+              conn,
+              live.user_id,
+              org_id,
+              "org.delete",
+              json.object([#("slug", json.string(slug))]),
+            ))
+            sqlite.exec(conn, "DELETE FROM orgs WHERE id = ?", [Text(org_id)])
+            |> result.replace(Nil)
+          }
+          case work {
+            Ok(Nil) -> Ok(json.object([#("deleted", json.string(slug))]))
+            Error(e) -> Error(constraint_response(e))
+          }
+        })
+      })
+  }
 }
 
 pub fn list_members(ctx: AuthContext, live: Session, slug: String) -> Response {
@@ -233,6 +345,101 @@ pub fn remove_member(
   })
 }
 
+/// Ownership transfer as one step: the named member becomes an owner, the
+/// acting owner steps down to admin. Promotion and demotion share a
+/// transaction, so the org is never between owners — the invariant
+/// `change_role` and `remove_member` defend one member at a time.
+///
+/// Not a zone mutation: roles never reach DNS, the same reason `change_role`
+/// is not one. Both updates count their rows: the promote's count is the
+/// member existence check, and the demote's `role = 'owner'` condition is
+/// what happened to the actor re-checked inside the transaction — an actor
+/// demoted or removed between the role check and `BEGIN` must fail the
+/// transfer, not be quietly re-elevated by it.
+pub fn transfer_ownership(
+  req: Request,
+  ctx: AuthContext,
+  live: Session,
+  slug: String,
+) -> Response {
+  let decoder = {
+    use to <- decode.field("to", decode.string)
+    decode.success(to)
+  }
+  use to <- body_decoder(req, decoder)
+  case to == live.user_id {
+    True ->
+      error_json(
+        400,
+        "bad_target",
+        "ownership cannot be transferred to yourself",
+      )
+    False ->
+      with_db(ctx, fn(conn) {
+        use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
+        let applied =
+          transaction(conn, fn() {
+            {
+              use _ <- result.try(
+                case
+                  sqlite.exec(
+                    conn,
+                    "UPDATE org_members SET role = 'owner'
+                     WHERE org_id = ? AND user_id = ?",
+                    [Text(org_id), Text(to)],
+                  )
+                {
+                  Ok(sqlite.Done(1, _)) -> Ok(Nil)
+                  Ok(_) -> Error(error_json(404, "not_found", "no such member"))
+                  Error(e) -> Error(constraint_response(e))
+                },
+              )
+              use _ <- result.try(
+                case
+                  sqlite.exec(
+                    conn,
+                    "UPDATE org_members SET role = 'admin'
+                     WHERE org_id = ? AND user_id = ? AND role = 'owner'",
+                    [Text(org_id), Text(live.user_id)],
+                  )
+                {
+                  Ok(sqlite.Done(1, _)) -> Ok(Nil)
+                  // The promote above rolls back with this refusal: the
+                  // actor stopped being an owner after the role check read
+                  // otherwise, and a transfer may not re-elevate its actor.
+                  Ok(_) ->
+                    Error(error_json(
+                      403,
+                      "forbidden",
+                      "you are no longer an owner of this org",
+                    ))
+                  Error(e) -> Error(constraint_response(e))
+                },
+              )
+              audit(
+                conn,
+                live.user_id,
+                org_id,
+                "org.transfer",
+                json.object([#("to", json.string(to))]),
+              )
+              |> result.map_error(constraint_response)
+            }
+          })
+        case applied {
+          Ok(Nil) ->
+            ok_json(
+              json.object([
+                #("owner", json.string(to)),
+                #("your_role", json.string("admin")),
+              ]),
+            )
+          Error(response) -> response
+        }
+      })
+  }
+}
+
 fn last_owner(conn: Connection, org_id: String, user_id: String) -> Bool {
   case
     sqlite.query(
@@ -278,7 +485,7 @@ pub fn create_invite(
         let insert =
           sqlite.exec(
             conn,
-            "INSERT INTO invites VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+            "INSERT INTO invites VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
             [
               Text(id.new()),
               Text(org_id),
@@ -475,6 +682,14 @@ pub fn delete_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
     let removed =
       transaction(conn, fn() {
         {
+          use _ <- result.try(
+            sqlite.exec(
+              conn,
+              "DELETE FROM oauth_states WHERE oidc_provider_id IN
+               (SELECT id FROM oidc_providers WHERE org_id = ?)",
+              [Text(org_id)],
+            ),
+          )
           use _ <- result.try(
             sqlite.exec(
               conn,

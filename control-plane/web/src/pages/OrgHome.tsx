@@ -113,6 +113,29 @@ function Networks({ slug, canAdmin }: { slug: string; canAdmin: boolean }) {
       queryClient.invalidateQueries({ queryKey: ['networks', slug] })
     },
   })
+  const remove = useMutation({
+    mutationFn: (network: string) =>
+      send('DELETE', `/api/orgs/${slug}/networks/${network}`, {
+        confirm: network,
+      }),
+    onSuccess: (network) => {
+      queryClient.invalidateQueries({ queryKey: ['networks', slug] })
+      // The detail and browse pages keyed by this network go with it, so
+      // Back cannot remount them from cache.
+      queryClient.removeQueries({
+        predicate: (q) =>
+          Array.isArray(q.queryKey) &&
+          q.queryKey[1] === slug &&
+          q.queryKey[2] === network,
+      })
+    },
+  })
+  const askRemove = (network: string) => {
+    const answer = window.prompt(
+      `Delete the network ${network}? Its members' records leave DNS on the next publish; devices are unassigned, not deleted. Type the network name to confirm.`,
+    )
+    if (answer === network) remove.mutate(network)
+  }
 
   return (
     <div className="space-y-6">
@@ -141,23 +164,32 @@ function Networks({ slug, canAdmin }: { slug: string; canAdmin: boolean }) {
           </form>
         )}
       </div>
-      <ErrorNote error={error || create.error} />
+      <ErrorNote error={error || create.error || remove.error} />
       <p className="text-sm text-neutral-400">
         Each network is one synchronicity cluster: every device in it fully
         trusts the others.
       </p>
       <ul className="divide-y divide-neutral-800 rounded-lg border border-neutral-800">
         {(networks ?? []).map((n) => (
-          <li key={n.name}>
+          <li key={n.name} className="flex items-center">
             <Link
               to={`/o/${slug}/networks/${n.name}`}
-              className="flex items-center justify-between px-4 py-3 hover:bg-neutral-900"
+              className="flex flex-1 items-center justify-between px-4 py-3 hover:bg-neutral-900"
             >
               <span className="font-mono">{n.name}</span>
               <span className="text-sm text-neutral-500">
                 {n.device_count} device{n.device_count === 1 ? '' : 's'}
               </span>
             </Link>
+            {canAdmin && (
+              <button
+                onClick={() => askRemove(n.name)}
+                disabled={remove.isPending}
+                className="mr-4 rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 disabled:opacity-50"
+              >
+                Delete
+              </button>
+            )}
           </li>
         ))}
         {networks?.length === 0 && (
