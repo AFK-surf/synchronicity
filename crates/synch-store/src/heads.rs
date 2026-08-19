@@ -548,6 +548,26 @@ impl Store {
             // itself older than the window — and every root at the seq can go
             // in the same pass, so the proof is never left half standing.
             let forked = forked_seqs_in(tx, origin)?;
+            // The top of the retained history, which this pass may never take.
+            //
+            // `next_own_seq` reads `MAX(seq)` over `heads ∪ head_history`, so
+            // this row is how far the origin is known to have got. Pruning it
+            // *lowers* that ceiling — and for this node's own origin that means
+            // re-publishing seqs it has already used, which is equivocation by an
+            // honest node: peers holding the older head reject the new one as
+            // `NotNewer`, so its data stops propagating, and the duplicate seqs
+            // are retained as proof against it.
+            //
+            // The window that gets there is ordinary. A restored backup adopts a
+            // relayed head of its own origin at the seq it really reached (§3.4),
+            // which is exactly what defends the ceiling; if that head's trie is
+            // never served, `sweep_pending_heads` clears the slot after
+            // `pending_head_ttl` and the history row is all that is left. Seven
+            // days later this pass would take it.
+            //
+            // One row per origin is the whole cost, and it is the row that
+            // carries a fact nothing else records.
+            let ceiling = receipts.iter().map(|(seq, _, _)| *seq).max();
             // The highest seq the origin is on record at with a row older than
             // the window: every forked seq below it has been published past.
             let moved_past_below = receipts
@@ -597,6 +617,9 @@ impl Store {
                     continue;
                 }
                 if witnesses.contains(&seq) {
+                    continue;
+                }
+                if Some(seq) == ceiling {
                     continue;
                 }
                 // The exemption again, as a condition of the delete rather

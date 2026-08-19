@@ -130,7 +130,16 @@ impl Daemon {
                 space: space.to_string(),
                 prefix: prefix.to_string(),
                 start_after: start_after.map(str::to_string),
-                limit: None,
+                // Bounded by what this page can use, `+1` so the `more` check
+                // below still sees one row past the budget. `None` made the
+                // daemon materialize a `VersionSet` for *every* path in the
+                // prefix — every path times every publishing origin — collected
+                // into a `Vec` before the stream even opened, and then dropped
+                // all but `max-keys` of them. A one-line `max-keys=1` request
+                // therefore cost the whole space, on the connection that also
+                // owns the single write connection, from a principal who is not
+                // a cluster member and so is outside §12's trust stance.
+                limit: Some(wanted as u64 + 1),
                 policy: Some(policy.to_string()),
             })
             .await?;

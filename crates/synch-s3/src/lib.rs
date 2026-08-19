@@ -109,6 +109,24 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
         .cloned()
         .unwrap_or_else(|| UNSIGNED_PAYLOAD.to_string());
 
+    // A chunk-framed body is refused, not stored.
+    //
+    // SigV4 passes for these: the sentinel hash is exactly what the client signed
+    // into the canonical request, and nothing else about the body is checked. But
+    // there is no `aws-chunked` decoder here, so the bytes published as this
+    // node's own assertion would be the framing — `<hexlen>;chunk-signature=…`
+    // around the data — at the encoded length, with a 200 and an ETag returned.
+    // Silent, cluster-wide corruption of every such upload. Chunked signing is
+    // the default in some SDKs and aws-cli v2 uses the trailer form for its
+    // checksums, so this is an ordinary client, not an exotic one.
+    if payload_hash.starts_with("STREAMING")
+        || headers
+            .get("content-encoding")
+            .is_some_and(|encoding| encoding.contains("aws-chunked"))
+    {
+        return Err(S3Error::not_implemented("aws-chunked request bodies"));
+    }
+
     let path = percent_decode(parts.uri.path());
     // Sign over the *decoded* path: `canonical_uri` URI-encodes each segment
     // exactly once, mirroring what a spec-compliant client signs. Passing the
@@ -476,7 +494,6 @@ fn param(query: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
-/// Decodes percent-escapes and `+` in a URI component.
 /// The gateway's wall clock in Unix seconds, for the SigV4 skew check.
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
@@ -485,26 +502,39 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Decodes percent-escapes in a URI component.
+///
+/// `+` is left alone: it is form encoding, and a URI path or query carries it as
+/// a literal — which is what S3 does and what every compliant SDK expects, since
+/// they send `%2B` for a key that really contains one. Decoding it to a space
+/// made `a+b` and `a b` the same key, so one silently overwrote the other and
+/// the `+` key could not be addressed at all.
 fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&text[i + 1..i + 3], 16) {
-                Ok(byte) => {
+            // Sliced as *bytes*, never as `&str`. `&text[i + 1..i + 3]` panics
+            // when those offsets are not char boundaries, which any request
+            // target of the shape `%` + one ASCII byte + a multi-byte character
+            // produces — and this runs on the path and the query string *before*
+            // `auth::verify`, so it needed no credential at all. httparse and
+            // `http`'s Uri both pass high bytes through, so the request arrives
+            // intact.
+            b'%' if i + 2 < bytes.len() => match std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            {
+                Some(byte) => {
                     out.push(byte);
                     i += 3;
                 }
-                Err(_) => {
+                None => {
                     out.push(bytes[i]);
                     i += 1;
                 }
             },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
             byte => {
                 out.push(byte);
                 i += 1;
@@ -573,11 +603,32 @@ mod tests {
     #[test]
     fn percent_decoding() {
         assert_eq!(percent_decode("a%2Fb"), "a/b");
-        assert_eq!(percent_decode("a+b"), "a b");
         assert_eq!(percent_decode("caf%C3%A9"), "café");
         assert_eq!(percent_decode("plain"), "plain");
         // A truncated escape is passed through rather than dropped.
         assert_eq!(percent_decode("a%"), "a%");
+        // `+` is a literal in a URI, not a space. Decoding it aliased `a+b` onto
+        // `a b`, so one key silently overwrote the other and the `+` key could
+        // not be addressed; compliant clients send `%2B`.
+        assert_eq!(percent_decode("a+b"), "a+b");
+        assert_eq!(percent_decode("a%2Bb"), "a+b");
+    }
+
+    /// A malformed escape before a multi-byte character does not panic.
+    ///
+    /// `&text[i + 1..i + 3]` sliced a `&str` at offsets that need not be char
+    /// boundaries, and this runs on the path and the query *before* SigV4
+    /// verification — so any client that could reach the port could kill the
+    /// connection handler with no credential at all.
+    #[test]
+    fn a_malformed_escape_before_a_multibyte_character_is_not_a_panic() {
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("b/%aé"), "b/%aé");
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode("%%C3%A9"), "%é");
+        // And a well-formed escape still decodes when a multi-byte character
+        // follows it.
+        assert_eq!(percent_decode("%2Fé"), "/é");
     }
 
     #[test]

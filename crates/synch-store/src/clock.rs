@@ -50,6 +50,13 @@ pub struct ClockStatus {
     pub stepped_back: bool,
 }
 
+/// How far past the recorded floor one reading may advance it.
+///
+/// A day: far more than any scheduled pass needs, and far less than the years a
+/// misread clock offers. Bounding the *step* is what keeps one bad reading from
+/// pinning the floor permanently, while genuine time still advances every pass.
+const MAX_FLOOR_STEP: i64 = 24 * 3600 * 1_000_000_000;
+
 impl Store {
     /// The highest trustworthy clock reading this node has recorded.
     ///
@@ -79,6 +86,30 @@ impl Store {
     pub fn advance_trust_floor(&self, reading: i64) -> Result<i64> {
         if !clock_is_trusted(reading) {
             return self.trust_floor();
+        }
+        // And not arbitrarily far forward in one step.
+        //
+        // `clock_is_trusted` is a *lower* bound only, so a dead RTC, a restored
+        // snapshot or a bad `date` presents a reading years ahead and this
+        // records it. Nothing ever lowers the floor and no command resets it, so
+        // every later trust decision evaluates at that instant — and
+        // `refresh_dns_bindings` stamps `expires_at` from the *floored* instant,
+        // so bindings are written already past it and `expire_bindings` deletes
+        // nothing. A member the operator then drops from the zone stays trusted
+        // on this node indefinitely: §3.2's way of removing a member stops
+        // working, and it fails *open*, which is the opposite of what this
+        // module's own comment claims the forward direction does.
+        //
+        // Real time still advances on every pass, so a bounded step loses
+        // nothing; it only refuses to take a year in one.
+        let floor = self.trust_floor()?;
+        if floor > 0 && reading > floor.saturating_add(MAX_FLOOR_STEP) {
+            tracing::warn!(
+                reading,
+                floor,
+                "ignoring a clock reading far past the trust floor"
+            );
+            return Ok(floor);
         }
         self.conn().execute(
             "INSERT INTO config (key, value) VALUES (?1, ?2)
@@ -157,6 +188,34 @@ mod tests {
         assert!(store.clock_status(stepped_back).unwrap().stepped_back);
         // Forward motion is honored.
         assert_eq!(store.trust_instant(high + 5).unwrap(), high + 5);
+    }
+
+    /// One wild forward reading cannot pin the floor.
+    ///
+    /// `clock_is_trusted` is a lower bound only, so a dead RTC or a restored
+    /// snapshot presents a reading years ahead. Recording it would make every
+    /// later trust decision evaluate at that instant — and since DNS bindings are
+    /// stamped from the floored instant, they would be written already past their
+    /// own expiry and never lapse, so dropping a member from the zone would stop
+    /// removing them. That fails open.
+    #[test]
+    fn a_reading_far_past_the_floor_does_not_pin_it() {
+        let (_d, store) = store();
+        let now = synch_core::now_ns();
+        assert_eq!(store.advance_trust_floor(now).unwrap(), now);
+
+        let wild = now + 400 * 24 * 3600 * 1_000_000_000;
+        assert_eq!(
+            store.advance_trust_floor(wild).unwrap(),
+            now,
+            "a year ahead is refused, and the floor stands where it was"
+        );
+
+        // Ordinary advances still land, so real time is not held back.
+        let later = now + 3600 * 1_000_000_000;
+        assert_eq!(store.advance_trust_floor(later).unwrap(), later);
+        // And a trust decision is not evaluated at the refused instant.
+        assert_eq!(store.trust_instant(later).unwrap(), later);
     }
 
     #[test]

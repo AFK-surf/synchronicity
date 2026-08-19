@@ -76,6 +76,28 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// process trusting a different thing — so the daemon holds its own ceiling.
 const MAX_INFLIGHT: usize = 64;
 
+/// How long discovery, the dial, and the three handshake frames get in total.
+///
+/// The heartbeat only starts once the session is serving, so without this a
+/// control plane that accepts the connection and then says nothing holds the
+/// attach task — and its domain's only slot — forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The largest frame and message this daemon will read from the control plane.
+///
+/// Every `Down` frame is small control JSON; content flows the other way. The
+/// tungstenite defaults (64 MiB message, 16 MiB frame) are sized for general
+/// use and would let the peer make the daemon buffer far more than the
+/// protocol ever needs.
+const MAX_DOWN_FRAME: usize = 1 << 20;
+
+/// The most unspent chunk credits one stream may hold.
+///
+/// Credit is a promise to read, not a buffer — the writer channel is what
+/// bounds memory — so the cap exists to keep a peer from adding permits until
+/// the semaphore's own ceiling panics the daemon.
+const MAX_CREDIT: usize = 4096;
+
 /// How many entries one listing page carries.
 const PAGE_LIMIT: usize = 500;
 
@@ -205,70 +227,84 @@ async fn attach_once(
     let url = format!("{base}{ATTACH_PATH}");
     node.set_cloud_status(domain, Some(base.clone()), false, None);
 
-    let (socket, _) = tokio_tungstenite::connect_async(websocket_url(&url))
+    // The whole handshake under one clock: the heartbeat that would otherwise
+    // notice a silent peer does not start until the session is serving.
+    let handshake = async {
+        let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        config.max_message_size = Some(MAX_DOWN_FRAME);
+        config.max_frame_size = Some(MAX_DOWN_FRAME);
+        let (socket, _) =
+            tokio_tungstenite::connect_async_with_config(websocket_url(&url), Some(config), false)
+                .await
+                .map_err(|e| EngineError::invalid(format!("{url}: {e}")))?;
+        let (mut sink, mut stream) = socket.split();
+
+        // Two store reads, so they go over together (§10).
+        let held = {
+            let node = node.clone();
+            crate::blocking::offload(move || held_spaces(&node)).await?
+        };
+        send(
+            &mut sink,
+            &Up::Hello {
+                v: PROTOCOL_VERSION,
+                network: domain.to_string(),
+                origin: node.origin().canonical(),
+                device: node.node_id().to_z32(),
+                spaces: held,
+            },
+        )
+        .await?;
+
+        let nonce = match receive(&mut stream).await? {
+            Down::Challenge { nonce } => decode_nonce(&nonce)?,
+            Down::Err { code, message, .. } => {
+                return Err(EngineError::invalid(brief(&format!("{code}: {message}"))))
+            }
+            other => {
+                return Err(EngineError::invalid(brief(&format!(
+                    "expected a challenge, got {other:?}"
+                ))))
+            }
+        };
+        // Signed here, in the process that holds the key: no RPC exists that
+        // would hand this capability to another program on the node.
+        let signature = node.sign_attach(&url, &nonce);
+        send(
+            &mut sink,
+            &Up::Proof {
+                sig: hex::encode(signature.to_bytes()),
+                key: node.node_id().to_z32(),
+            },
+        )
+        .await?;
+
+        match receive(&mut stream).await? {
+            Down::Attached { session, v } if v == PROTOCOL_VERSION => {
+                tracing::info!(domain, session, url, "cloud attach established");
+            }
+            Down::Attached { v, .. } => {
+                return Err(EngineError::invalid(format!(
+                    "tunnel protocol mismatch: this daemon speaks v{PROTOCOL_VERSION}, \
+                     the control plane settled on v{v}"
+                )))
+            }
+            Down::Err { code, message, .. } => {
+                return Err(EngineError::invalid(brief(&format!("{code}: {message}"))))
+            }
+            other => {
+                return Err(EngineError::invalid(brief(&format!(
+                    "expected an attach, got {other:?}"
+                ))))
+            }
+        }
+        Ok((sink, stream))
+    };
+    let (sink, stream) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
         .await
-        .map_err(|e| EngineError::invalid(format!("{url}: {e}")))?;
-    let (mut sink, mut stream) = socket.split();
-
-    // Two store reads, so they go over together (§10).
-    let held = {
-        let node = node.clone();
-        crate::blocking::offload(move || held_spaces(&node)).await?
-    };
-    send(
-        &mut sink,
-        &Up::Hello {
-            v: PROTOCOL_VERSION,
-            network: domain.to_string(),
-            origin: node.origin().canonical(),
-            device: node.node_id().to_z32(),
-            spaces: held,
-        },
-    )
-    .await?;
-
-    let nonce = match receive(&mut stream).await? {
-        Down::Challenge { nonce } => decode_nonce(&nonce)?,
-        Down::Err { code, message, .. } => {
-            return Err(EngineError::invalid(format!("{code}: {message}")))
-        }
-        other => {
-            return Err(EngineError::invalid(format!(
-                "expected a challenge, got {other:?}"
-            )))
-        }
-    };
-    // Signed here, in the process that holds the key: no RPC exists that would
-    // hand this capability to another program on the node.
-    let signature = node.sign_attach(&url, &nonce);
-    send(
-        &mut sink,
-        &Up::Proof {
-            sig: hex::encode(signature.to_bytes()),
-            key: node.node_id().to_z32(),
-        },
-    )
-    .await?;
-
-    match receive(&mut stream).await? {
-        Down::Attached { session, v } if v == PROTOCOL_VERSION => {
-            tracing::info!(domain, session, url, "cloud attach established");
-        }
-        Down::Attached { v, .. } => {
-            return Err(EngineError::invalid(format!(
-                "tunnel protocol mismatch: this daemon speaks v{PROTOCOL_VERSION}, \
-                 the control plane settled on v{v}"
-            )))
-        }
-        Down::Err { code, message, .. } => {
-            return Err(EngineError::invalid(format!("{code}: {message}")))
-        }
-        other => {
-            return Err(EngineError::invalid(format!(
-                "expected an attach, got {other:?}"
-            )))
-        }
-    }
+        .map_err(|_| {
+            EngineError::invalid(format!("{url}: the handshake did not finish in time"))
+        })??;
     node.set_cloud_status(domain, Some(base), true, None);
 
     let outcome = serve(node, sink, stream).await;
@@ -358,6 +394,15 @@ async fn discover(
 }
 
 /// The WebSocket scheme for an HTTP origin.
+/// Renders text the control plane chose, for a log line or an error message.
+///
+/// The peer picks these strings. Control characters would steer a terminal
+/// reading the daemon's log, and the length is bounded by the frame size
+/// rather than by anything the protocol needs, so both are cut here.
+fn brief(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(200).collect()
+}
+
 fn websocket_url(url: &str) -> String {
     match url.split_once("://") {
         Some(("https", rest)) => format!("wss://{rest}"),
@@ -567,6 +612,7 @@ fn handle(
         }
         Down::Pong => {}
         Down::Err { id, code, message } => {
+            let (code, message) = (brief(&code), brief(&message));
             tracing::debug!(?id, code, message, "the control plane refused a request");
             if let Some(id) = id {
                 streams.remove(&id);
@@ -574,7 +620,8 @@ fn handle(
         }
         Down::Credit { id, n } => {
             if let Some(stream) = streams.get(&id) {
-                stream.credit.add_permits(n as usize);
+                let room = MAX_CREDIT.saturating_sub(stream.credit.available_permits());
+                stream.credit.add_permits((n as usize).min(room));
             }
         }
         Down::Cancel { id } => {
@@ -655,7 +702,7 @@ fn handle(
             if over_capacity(writes, streams, *requests, id) {
                 return Ok(());
             }
-            let permits = Arc::new(Semaphore::new(credit as usize));
+            let permits = Arc::new(Semaphore::new((credit as usize).min(MAX_CREDIT)));
             let task = {
                 let node = node.clone();
                 let writes = writes.clone();
@@ -1414,6 +1461,58 @@ mod tests {
         credit.close();
         assert!(reading.await.unwrap().is_err());
         node.shutdown().await.unwrap();
+    }
+
+    /// Credit is a promise to read, and the control plane may promise more
+    /// than the semaphore can hold. Repeated grants stop at the ceiling
+    /// instead of overflowing it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credit_grants_stop_at_the_ceiling() {
+        let _blocking = synch_core::BlockingScope::enter();
+        let (_dir, node) = node().await;
+        let (writes, _rx) = mpsc::channel(16);
+        let (internal, _drain) = mpsc::channel(16);
+        let credit = Arc::new(Semaphore::new(0));
+        let mut streams = HashMap::from([(
+            7,
+            Stream {
+                credit: credit.clone(),
+                task: tokio::spawn(std::future::pending()),
+            },
+        )]);
+        let mut requests = 0;
+        for _ in 0..4 {
+            handle(
+                &node,
+                &writes,
+                &internal,
+                &mut streams,
+                &mut requests,
+                Down::Credit { id: 7, n: u32::MAX },
+            )
+            .unwrap();
+        }
+        assert_eq!(credit.available_permits(), MAX_CREDIT);
+        // An unopened stream is not a place to bank credit either.
+        handle(
+            &node,
+            &writes,
+            &internal,
+            &mut streams,
+            &mut requests,
+            Down::Credit { id: 9, n: 1 },
+        )
+        .unwrap();
+        streams.clear();
+        node.shutdown().await.unwrap();
+    }
+
+    /// Log lines and error text carry strings the control plane chose, so
+    /// escape sequences and unbounded length are cut before they land.
+    #[test]
+    fn peer_text_is_stripped_and_bounded() {
+        assert_eq!(brief("plain \u{1b}[31mred\n"), "plain [31mred");
+        assert_eq!(brief(&"x".repeat(10_000)).len(), 200);
     }
 
     /// A directory view is a fold over the flat tree, and a subdirectory is
