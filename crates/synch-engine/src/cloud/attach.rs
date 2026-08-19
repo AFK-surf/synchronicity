@@ -85,10 +85,10 @@ const SCAN_BATCH: usize = 500;
 impl Node {
     /// Runs cloud attach until the daemon stops.
     ///
-    /// The loop supervises rather than connects: one child task per configured
-    /// membership domain, started when the operator enables the feature and
-    /// stopped when they disable it or remove the domain. With the feature off
-    /// it costs one settings read per interval and opens nothing at all.
+    /// The loop supervises rather than connects: one child task per membership
+    /// domain the node holds, stopped when the operator opts the feature out
+    /// or the domain goes away. For an opted-out node it costs one settings
+    /// read per interval and opens nothing at all.
     pub async fn run_cloud(
         &self,
         resolver: Option<Arc<synch_net::DnssecResolver>>,
@@ -131,12 +131,14 @@ impl Node {
 
     /// The membership domains a tunnel should be open for right now.
     ///
-    /// Empty whenever the feature is off, and empty for a node with no
+    /// Every domain the node holds membership in, unless the operator has
+    /// opted the feature out — which is the only thing that empties the list,
+    /// there being no enablement to require. Empty for a node with no
     /// membership domains: there is no apex to take a control plane from, so
     /// there is nothing to discover and nothing to attach to.
     fn attach_targets(&self) -> Vec<String> {
         match self.cloud_settings() {
-            Ok(settings) if settings.enabled => self.domains().unwrap_or_default(),
+            Ok(settings) if !settings.disabled => self.domains().unwrap_or_default(),
             _ => Vec::new(),
         }
     }
@@ -198,7 +200,16 @@ async fn attach_once(
         .map_err(|e| EngineError::invalid(format!("{url}: {e}")))?;
     let (mut sink, mut stream) = socket.split();
 
-    let settings = node.cloud_settings()?;
+    // The claim of what this node holds, taken as the spaces stood when the
+    // session opened: a space added after attach is not routable until the
+    // next reconnect, which is the same grain the whole tunnel works at —
+    // the control plane may ask for anything, and this says what it will find.
+    let held: Vec<String> = node
+        .store()
+        .spaces()?
+        .into_iter()
+        .map(|space| space.id)
+        .collect();
     send(
         &mut sink,
         &Up::Hello {
@@ -206,7 +217,7 @@ async fn attach_once(
             network: domain.to_string(),
             origin: node.origin().canonical(),
             device: node.node_id().to_z32(),
-            spaces: settings.spaces.clone(),
+            spaces: held,
         },
     )
     .await?;
@@ -743,20 +754,6 @@ where
     }
 }
 
-/// Refuses a space the operator did not name, on every frame that names one.
-///
-/// Re-read from the settings each time rather than captured at attach: that is
-/// what makes `synch cloud disable` and a narrowed allowlist take effect on
-/// the next request instead of the next reconnect.
-fn permitted(node: &Node, space: &str) -> Result<()> {
-    if node.cloud_settings()?.exposes(space) {
-        return Ok(());
-    }
-    Err(EngineError::not_found(format!(
-        "{space} is not exposed to the control plane"
-    )))
-}
-
 /// One page of a directory of the unified tree.
 async fn list_page(
     node: &Node,
@@ -765,7 +762,6 @@ async fn list_page(
     cursor: Option<String>,
     all: bool,
 ) -> Result<Up> {
-    permitted(node, space)?;
     let node = node.clone();
     let space = space.to_string();
     let prefix = directory_prefix(path);
@@ -918,7 +914,6 @@ fn versions_json(set: &VersionSet) -> Vec<VersionJson> {
 
 /// Every version of one path, with its attestors — `synch status` as frames.
 async fn stat(node: &Node, id: u32, space: &str, path: &str) -> Result<Up> {
-    permitted(node, space)?;
     let set = node.versions(space, path)?;
     Ok(Up::Versions {
         id,
@@ -934,7 +929,6 @@ async fn resolve(
     path: &str,
     from: Option<String>,
 ) -> Result<Up> {
-    permitted(node, space)?;
     let policy = match &from {
         Some(origin) => VersionPolicy::Origin(
             origin
@@ -992,28 +986,6 @@ async fn read(
     let root: Hash = root
         .parse()
         .map_err(|_| EngineError::invalid(format!("{root} is not an object root")))?;
-    // The allowlist is enforced on the *root*, not on a space the frame
-    // claims: a root reachable only through a space the operator did not
-    // expose is not readable however the request is spelled.
-    //
-    // The check is per-frame, not per-chunk: a READ already admitted streams to
-    // completion even if the operator narrows the allowlist mid-transfer. That
-    // is the same grain the whole tunnel enforces at — a request is authorized
-    // when it arrives — and one in-flight file finishing is the bounded cost of
-    // it. `disable` and a narrowed list still take effect on the next frame.
-    let exposed = {
-        let settings = node.cloud_settings()?;
-        node.store()
-            .paths_naming(&root)?
-            .iter()
-            .filter_map(|reference| reference.split_once('/'))
-            .any(|(space, _)| settings.exposes(space))
-    };
-    if !exposed {
-        return Err(EngineError::not_found(format!(
-            "no exposed space names {root}"
-        )));
-    }
     if start > size {
         return Err(EngineError::invalid(format!(
             "offset {start} is past the end of a {size}-byte object"
@@ -1136,7 +1108,6 @@ mod tests {
     async fn serve_answers_ls_resolve_and_read_over_the_wire() {
         let (dir, node) = node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
-        node.enable_cloud(&["media".to_string()]).unwrap();
         // Larger than one chunk, so the CHUNK framing and the multi-chunk
         // credit path both run rather than fitting in a single frame.
         let payload = vec![0xABu8; MAX_CHUNK + 4321];
@@ -1272,81 +1243,19 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The task list is empty until the operator says otherwise, and empty
-    /// again the moment they take it back.
+    /// The task list follows the domains without being asked — the feature
+    /// needs no enabling — and empties only when the operator opts out.
     #[tokio::test]
-    async fn attach_targets_follow_the_operator() {
-        let (dir, node) = node().await;
-        assert!(node.attach_targets().is_empty());
-        node.add_space("media", dir.path().join("media")).unwrap();
-        node.enable_cloud(&["media".to_string()]).unwrap();
-        // Enabled, but with no membership domain there is no apex to take a
-        // control plane from, so there is still nothing to attach to.
+    async fn attach_targets_follow_the_domains_and_the_opt_out() {
+        let (_d, node) = node().await;
+        // No domains: nothing to attach to, tunnel or no tunnel.
         assert!(node.attach_targets().is_empty());
         node.add_domain("cluster.example").unwrap();
         assert_eq!(node.attach_targets(), ["cluster.example"]);
         node.disable_cloud().unwrap();
         assert!(node.attach_targets().is_empty());
-        node.shutdown().await.unwrap();
-    }
-
-    /// Every frame that names a space is checked against the allowlist, and
-    /// the check reads the operator's current answer rather than the one that
-    /// was true when the tunnel opened.
-    #[tokio::test]
-    async fn every_frame_rechecks_the_allowlist() {
-        let (dir, node) = node().await;
-        node.add_space("media", dir.path().join("media")).unwrap();
-        node.add_space("private", dir.path().join("private"))
-            .unwrap();
-        node.enable_cloud(&["media".to_string()]).unwrap();
-
-        assert!(permitted(&node, "media").is_ok());
-        assert!(permitted(&node, "private").is_err());
-        assert!(list_page(&node, "private", "", None, false).await.is_err());
-        assert!(stat(&node, 1, "private", "a").await.is_err());
-        assert!(resolve(&node, 1, "private", "a", None).await.is_err());
-
-        // Disabling closes the tunnel's view before the tunnel itself closes.
-        node.disable_cloud().unwrap();
-        assert!(permitted(&node, "media").is_err());
-        node.shutdown().await.unwrap();
-    }
-
-    /// A read is addressed by root, so the allowlist is enforced on the root:
-    /// a blob only an unexposed space names is not readable however the
-    /// request spells itself.
-    #[tokio::test]
-    async fn a_read_of_an_unexposed_root_is_refused() {
-        let (dir, node) = node().await;
-        node.add_space("media", dir.path().join("media")).unwrap();
-        node.add_space("private", dir.path().join("private"))
-            .unwrap();
-        node.enable_cloud(&["media".to_string()]).unwrap();
-        let secret = Hash::new(b"secret");
-        node.store()
-            .put_entry(
-                &origin("nas"),
-                "private",
-                "f",
-                &FileEntry::file(1, 6, secret, 1),
-            )
-            .unwrap();
-
-        let (writes, _rx) = mpsc::channel(4);
-        let e = read(
-            &node,
-            &writes,
-            1,
-            &secret.to_hex().to_string(),
-            6,
-            0,
-            None,
-            Arc::new(Semaphore::new(4)),
-        )
-        .await
-        .unwrap_err();
-        assert!(e.to_string().contains("no exposed space"), "{e}");
+        node.enable_cloud().unwrap();
+        assert_eq!(node.attach_targets(), ["cluster.example"]);
         node.shutdown().await.unwrap();
     }
 
@@ -1356,7 +1265,6 @@ mod tests {
     async fn a_read_produces_nothing_without_credit() {
         let (dir, node) = node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
-        node.enable_cloud(&["media".to_string()]).unwrap();
         let payload = vec![7u8; MAX_CHUNK * 3];
         let root = node
             .store()
@@ -1431,7 +1339,6 @@ mod tests {
     async fn a_listing_collapses_subdirectories() {
         let (dir, node) = node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
-        node.enable_cloud(&["media".to_string()]).unwrap();
         for path in [
             "a.txt",
             "photos/1.jpg",
@@ -1475,7 +1382,6 @@ mod tests {
     async fn a_listing_reports_every_version_of_a_divergent_path() {
         let (dir, node) = node().await;
         node.add_space("media", dir.path().join("media")).unwrap();
-        node.enable_cloud(&["media".to_string()]).unwrap();
         for (name, content) in [("nas", b"a"), ("laptop", b"b")] {
             node.store()
                 .put_entry(

@@ -186,7 +186,9 @@ pub enum Up {
         origin: String,
         /// The active device key, z-base-32.
         device: String,
-        /// The spaces the operator exposed, and no others.
+        /// The spaces this node holds, as they stood when the session opened.
+        /// A routing claim, not a boundary: the daemon serves whatever the
+        /// control plane asks of it.
         spaces: Vec<String>,
     },
     /// The signed challenge.

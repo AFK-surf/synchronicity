@@ -300,9 +300,7 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         Command::Scan => Cmd::Scan(pb::Scan {}),
 
         Command::Cloud { command } => match command {
-            CloudCommand::Enable { spaces } => Cmd::CloudEnable(pb::CloudEnable {
-                spaces: spaces.clone(),
-            }),
+            CloudCommand::Enable => Cmd::CloudEnable(pb::CloudEnable {}),
             CloudCommand::Disable => Cmd::CloudDisable(pb::CloudDisable {}),
             CloudCommand::Status => Cmd::CloudStatus(pb::CloudStatus {}),
         },

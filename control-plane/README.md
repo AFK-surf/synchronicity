@@ -63,14 +63,18 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   link the operator reads off the service log.
 - **Cloud browse** (`CP_BROWSE=on`, off by default) lets the dashboard read
   a cluster's files. Nodes are unreachable from here, so the connection is
-  one they open: a daemon with `synch cloud enable --space <id>` discovers
-  this deployment from `_synchronicity-cp.<apex>` in the zone it already
-  DNSSEC-validates, dials out over WSS, and proves itself with the device
-  key this service already publishes. It is read-only by construction — the
-  tunnel encodes no write opcode and the API is GET-only — and fail-closed
-  twice over: an org admin must enable browsing for the network *and* a node
-  operator must name the spaces. File bytes pass through this service's
-  memory in bounded chunks and are never stored.
+  one they open: a daemon discovers this deployment from
+  `_synchronicity-cp.<apex>` in the zone it already DNSSEC-validates, dials
+  out over WSS, and proves itself with the device key this service already
+  publishes — no command needed, for the tunnel is on unless a node's
+  operator opted it out with `synch cloud disable`. It is read-only by
+  construction — the tunnel encodes no write opcode and the API is GET-only —
+  and fail-closed on the org's choice: an org admin must enable browsing for
+  the network, and until then nothing is readable however many daemons are
+  attached. Which spaces are browsable is decided here, not on the node: an
+  attached daemon serves whatever this service requests, for every space it
+  holds. File bytes pass through this service's memory in bounded chunks and
+  are never stored.
 
 ## Stack
 

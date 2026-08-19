@@ -88,8 +88,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
             None => shutdown.await,
         }
     });
-    // The outbound tunnel to the control plane the membership zone names — off
-    // until `synch cloud enable`, and a settings read per interval when it is.
+    // The outbound tunnel to the control plane the membership zone names — on
+    // by default, and a settings read per interval once opted out.
     // It shares this process's node, database handle and resolver by
     // construction, because it *is* the daemon (§9.1).
     let cloud_resolver = resolver.clone();

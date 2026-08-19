@@ -131,7 +131,7 @@ message Command {
     Scan scan = 36;
     // `synch sync`
     SyncNow sync_now = 37;
-    // `synch cloud enable --space <id>...`
+    // `synch cloud enable`
     CloudEnable cloud_enable = 38;
     // `synch cloud disable`
     CloudDisable cloud_disable = 39;
@@ -340,18 +340,14 @@ message Doctor {
 
 message Scan {}
 
-// Exposes this node's read surface to the control plane its membership zone
-// names, for the spaces listed and no others.
+// Reopens the tunnel after `cloud disable`.
 //
-// The list is the whole of the exposure: a space nobody named is a space the
-// tunnel cannot see, so an operator cannot share one by forgetting a flag.
-// Enabling replaces the list rather than adding to it — `cloud enable` states
-// what is exposed, it does not accumulate it.
-message CloudEnable {
-  // The space ids to expose. At least one; the empty list is refused rather
-  // than read as "everything".
-  repeated string spaces = 1;
-}
+// The tunnel is on by default — no command is needed to open it — and serves
+// whatever the control plane requests, for every space this node holds. There
+// is no space list to state: which spaces a dashboard may browse is the
+// control plane's decision, made by the org admin's browsing toggle and the
+// RBAC around it.
+message CloudEnable {}
 
 // Stops answering the control plane and drops any open tunnel.
 message CloudDisable {}

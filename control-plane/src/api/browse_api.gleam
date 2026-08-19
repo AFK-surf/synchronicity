@@ -259,9 +259,10 @@ fn attached(browse: Browse, net: Network) -> List(Session) {
 
 /// Picks the daemon that will answer, and refuses honestly when none can.
 ///
-/// Both ends enforce the space allowlist: the daemon re-checks it on every
-/// frame, and this refuses a space no attached daemon exposed — so neither
-/// side has to trust the other to have done it.
+/// What may be browsed is this service's question alone — the admin toggle
+/// above and the RBAC around the route — because the daemon enforces no local
+/// list of its own. This only routes: a space no attached daemon holds has
+/// nobody to ask, which is a 503 rather than a policy statement.
 fn serving(
   browse: Browse,
   net: Network,
@@ -277,13 +278,13 @@ fn serving(
       )
     _, "" -> error_json(400, "bad_request", "space= is required")
     True, _ ->
-      case list.filter(attached(browse, net), agent.exposes(_, space)) {
+      case list.filter(attached(browse, net), agent.holds(_, space)) {
         [session, ..] -> next(session)
         [] ->
           error_json(
             503,
             "no-device-attached",
-            "no attached daemon exposes " <> space,
+            "no attached daemon holds " <> space,
           )
       }
   }

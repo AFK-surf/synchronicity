@@ -2,19 +2,20 @@
 //!
 //! A node behind NAT has no inbound path, so the only connection that can
 //! exist is one it opens itself. This module is that connection: a supervised
-//! task beside the scanner and the fetcher which, when the operator has turned
-//! it on, discovers where its base's control plane lives from the same
+//! task beside the scanner and the fetcher which, unless the operator has
+//! opted it out, discovers where its base's control plane lives from the same
 //! DNSSEC-validated zone that names the membership, dials out, proves itself
 //! with the device key it already holds, and answers listing and read requests
 //! through the same entry points the S3 gateway reads through.
 //!
 //! Two facts hold it in place:
 //!
-//! * **Nothing is exposed unnamed.** `synch cloud enable --space <id>` states
-//!   the whole of what the tunnel can see, and the allowlist is re-checked on
-//!   every frame rather than captured at attach time — so `cloud disable` and
-//!   a narrowed list both take effect on the next request, not on the next
-//!   reconnect.
+//! * **What is served is the control plane's call.** The tunnel is on by
+//!   default and answers for every space this node holds; which spaces a
+//!   dashboard may browse is decided on the other end, by the org admin's
+//!   toggle and the RBAC around it. The one local act is an opt-out —
+//!   `synch cloud disable` — and the supervisor drops an open tunnel on its
+//!   next pass, seconds later, not at the next reconnect.
 //! * **Nothing here can write.** [`frame`] encodes no write opcode, and the
 //!   handlers below call `unified_listing`, `versions`, `resolve_set`,
 //!   `providers_for`, `fetch_range` and `Store::read_range` and nothing else.
@@ -22,35 +23,22 @@
 pub mod attach;
 pub mod frame;
 
-use crate::{
-    error::{EngineError, Result},
-    node::Node,
-};
+use crate::{error::Result, node::Node};
 
-/// Where the enablement flag lives in the daemon's config namespace.
+/// Where the opt-out lives in the daemon's config namespace.
 ///
 /// `cloud.*`, exactly as the gateway keeps `s3.*`: one row per setting, in the
 /// table that already survives restarts, so an operator's choice is not a
-/// process's memory of it.
-const ENABLED_KEY: &str = "cloud.enabled";
-
-/// Where the space allowlist lives, one id per line.
-const SPACES_KEY: &str = "cloud.spaces";
+/// process's memory of it. No row at all is the default state, and the
+/// default is attached — on is where a node starts, not a state it reaches.
+const OPT_OUT_KEY: &str = "cloud.disabled";
 
 /// What the operator has said about cloud attach on this node.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CloudSettings {
-    /// Whether the attach task should be running at all.
-    pub enabled: bool,
-    /// The spaces the tunnel may see, and no others.
-    pub spaces: Vec<String>,
-}
-
-impl CloudSettings {
-    /// Whether a space may be reached through the tunnel.
-    pub fn exposes(&self, space: &str) -> bool {
-        self.enabled && self.spaces.iter().any(|id| id == space)
-    }
+    /// Whether the operator has opted this node out. `false` — the derived
+    /// default, and the state of a node nobody has configured — is attached.
+    pub disabled: bool,
 }
 
 /// What the attach task has achieved for one membership domain.
@@ -75,55 +63,24 @@ pub struct CloudDomainStatus {
 impl Node {
     /// What the operator has said about cloud attach on this node.
     pub fn cloud_settings(&self) -> Result<CloudSettings> {
-        let enabled = self.store().config(ENABLED_KEY)?.as_deref() == Some("1");
-        let spaces = self
-            .store()
-            .config(SPACES_KEY)?
-            .map(|text| {
-                text.lines()
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(CloudSettings { enabled, spaces })
+        let disabled = self.store().config(OPT_OUT_KEY)?.as_deref() == Some("1");
+        Ok(CloudSettings { disabled })
     }
 
-    /// Exposes exactly these spaces through the tunnel.
+    /// Reopens the tunnel after [`Self::disable_cloud`].
     ///
-    /// A replacement, never an addition: `cloud enable` is the operator
-    /// stating what is exposed, and a command that accumulated would make
-    /// "what is shared right now" a question only the database can answer.
-    pub fn enable_cloud(&self, spaces: &[String]) -> Result<CloudSettings> {
-        if spaces.is_empty() {
-            return Err(EngineError::invalid(
-                "name at least one space with --space: nothing is exposed unnamed",
-            ));
-        }
-        let known = self.store().spaces()?;
-        for space in spaces {
-            if !known.iter().any(|local| &local.id == space) {
-                return Err(EngineError::not_found(format!(
-                    "{space} is not a local space: `synch space add` it first, or name one of {}",
-                    known
-                        .iter()
-                        .map(|s| s.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
-        }
-        self.store().set_config(SPACES_KEY, &spaces.join("\n"))?;
-        self.store().set_config(ENABLED_KEY, "1")?;
+    /// There is nothing to name and nothing to choose: the tunnel is on by
+    /// default and serves whatever the control plane requests, so this is
+    /// only ever the undo of an opt-out.
+    pub fn enable_cloud(&self) -> Result<CloudSettings> {
+        self.store().set_config(OPT_OUT_KEY, "0")?;
         self.cloud_settings()
     }
 
-    /// Stops answering the control plane.
-    ///
-    /// The allowlist is kept, so re-enabling does not silently expose a
-    /// different set than the one that was turned off.
+    /// Opts this node out: no tunnel is opened, and one that is open is
+    /// dropped by the supervisor on its next pass.
     pub fn disable_cloud(&self) -> Result<()> {
-        self.store().set_config(ENABLED_KEY, "0")?;
+        self.store().set_config(OPT_OUT_KEY, "1")?;
         Ok(())
     }
 
@@ -178,39 +135,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_is_exposed_until_a_space_is_named() {
-        let (dir, node) = node().await;
+    async fn attach_is_on_by_default_until_opted_out() {
+        let (_d, node) = node().await;
+        // No row was ever written, and the node is still attached: on is the
+        // default, not a state to reach.
         assert_eq!(node.cloud_settings().unwrap(), CloudSettings::default());
-        assert!(!node.cloud_settings().unwrap().exposes("media"));
+        assert!(!node.cloud_settings().unwrap().disabled);
 
-        // An empty list is refused rather than read as "everything".
-        assert!(node.enable_cloud(&[]).is_err());
-        // So is a space that does not exist: the tunnel would silently show
-        // nothing, and the operator would have no way to tell that from an
-        // empty space.
-        assert!(node.enable_cloud(&["media".to_string()]).is_err());
-
-        node.add_space("media", dir.path().join("media")).unwrap();
-        node.add_space("docs", dir.path().join("docs")).unwrap();
-        let settings = node.enable_cloud(&["media".to_string()]).unwrap();
-        assert!(settings.enabled);
-        assert!(settings.exposes("media"));
-        assert!(
-            !settings.exposes("docs"),
-            "a space nobody named is not shared"
-        );
-
-        // Enabling states the list rather than growing it.
-        let settings = node.enable_cloud(&["docs".to_string()]).unwrap();
-        assert!(settings.exposes("docs"));
-        assert!(!settings.exposes("media"));
-
-        // Disabling closes everything, and keeps the list for next time.
         node.disable_cloud().unwrap();
-        let settings = node.cloud_settings().unwrap();
-        assert!(!settings.enabled);
-        assert!(!settings.exposes("docs"));
-        assert_eq!(settings.spaces, ["docs"]);
+        assert!(node.cloud_settings().unwrap().disabled);
+
+        node.enable_cloud().unwrap();
+        assert!(!node.cloud_settings().unwrap().disabled);
         node.shutdown().await.unwrap();
     }
 

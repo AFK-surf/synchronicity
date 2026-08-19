@@ -142,8 +142,8 @@ pub fn browsing_needs_a_public_url_and_a_primary_test() {
 // -- the switch --------------------------------------------------------------
 
 /// Every network starts unbrowsable, including every network that already
-/// existed when the column arrived: the feature is two-key, and this is the
-/// key the org holds.
+/// existed when the column arrived: browsing is the org's call, and this is
+/// the switch it is made with.
 pub fn browsing_is_off_for_every_network_by_default_test() {
   let assert Ok(conn) = db.open_primary(":memory:")
   let assert Ok(_) = migrate.migrate(conn)
@@ -232,12 +232,12 @@ pub fn a_read_prefers_a_daemon_that_holds_the_blob_test() {
   assert agent.route([], ["nas@x.example"]) == None
 }
 
-/// Both ends enforce the allowlist: the daemon re-checks it on every frame,
-/// and the control plane refuses a space no attached daemon named.
-pub fn a_space_nobody_exposed_is_not_servable_test() {
+/// A session's spaces are a routing fact, not a boundary: they say which
+/// daemon can answer for a space, nothing about what may be asked.
+pub fn a_session_holds_only_the_spaces_it_claimed_test() {
   let nas = session("nas", "nas@x.example")
-  assert agent.exposes(nas, "media")
-  assert !agent.exposes(nas, "private")
+  assert agent.holds(nas, "media")
+  assert !agent.holds(nas, "private")
 }
 
 /// Reads are same-origin GETs with cookies and no CSRF token, so a hostile

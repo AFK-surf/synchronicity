@@ -111,7 +111,8 @@ pub type Session {
     origin: String,
     /// The `device_keys` row the proof verified against.
     key_id: String,
-    /// The spaces the operator exposed, and no others.
+    /// The spaces the daemon holds, as it claimed them at attach — a routing
+    /// fact, not a boundary: the daemon serves whatever it is asked.
     spaces: List(String),
     version: Int,
     attached_at: Int,
@@ -1230,9 +1231,10 @@ pub fn route(
   }
 }
 
-/// Whether a session exposes a space, which the control plane checks as well
-/// as the daemon: both ends enforce the allowlist, so neither has to trust
-/// the other to have done it.
-pub fn exposes(session: Session, space: String) -> Bool {
+/// Whether a session's daemon holds a space. Routing, not enforcement: the
+/// daemon puts up no local list anymore, so which spaces may be browsed is
+/// this service's question alone — its admin toggle and RBAC — and this only
+/// picks a daemon that can answer.
+pub fn holds(session: Session, space: String) -> Bool {
   list.contains(session.spaces, space)
 }

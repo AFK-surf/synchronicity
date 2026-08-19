@@ -1460,10 +1460,22 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        Command::CloudEnable(pb::CloudEnable { spaces }) => {
-            let settings = node.enable_cloud(&spaces)?;
-            out.line(format!("exposing {}", settings.spaces.join(", ")))
-                .await?;
+        Command::CloudEnable(pb::CloudEnable {}) => {
+            node.enable_cloud()?;
+            let spaces = node.store().spaces()?;
+            out.line(format!(
+                "cloud attach enabled: serving the control plane's requests for {}",
+                if spaces.is_empty() {
+                    "(no local spaces)".to_string()
+                } else {
+                    spaces
+                        .iter()
+                        .map(|s| s.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ))
+            .await?;
             let domains = node.domains()?;
             if domains.is_empty() {
                 // Nothing to attach to and nothing that will change that on
@@ -1491,20 +1503,12 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
 
         Command::CloudStatus(pb::CloudStatus {}) => {
             let settings = node.cloud_settings()?;
-            out.line(format!(
-                "cloud: {} · spaces: {}",
-                if settings.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                if settings.spaces.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    settings.spaces.join(", ")
-                }
-            ))
-            .await?;
+            let state = if settings.disabled {
+                "disabled (opted out)"
+            } else {
+                "enabled"
+            };
+            out.line(format!("cloud: {state}")).await?;
             let status = node.cloud_status();
             if status.is_empty() {
                 out.progress("(no attach attempts yet)").await?;

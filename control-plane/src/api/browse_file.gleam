@@ -85,7 +85,7 @@ pub fn handle(
   let download = Download(db, registry, user_id, org_id, network, space, path)
   let attached =
     agent.sessions_for(registry, network_id)
-    |> list.filter(agent.exposes(_, space))
+    |> list.filter(agent.holds(_, space))
   case attached {
     [] ->
       deny(
@@ -93,7 +93,7 @@ pub fn handle(
         "",
         503,
         "no-device-attached",
-        "no attached daemon exposes " <> space,
+        "no attached daemon holds " <> space,
       )
     [first, ..] ->
       // A read is a same-origin GET with cookies and needs no CSRF token, so a

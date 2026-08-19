@@ -312,7 +312,8 @@ pub enum Command {
     },
     /// Scan every configured space and publish the result.
     Scan,
-    /// Expose named spaces read-only to the control plane the zone names.
+    /// The read-only tunnel to the control plane the zone names, on by
+    /// default.
     Cloud {
         /// The cloud subcommand.
         #[command(subcommand)]
@@ -322,18 +323,18 @@ pub enum Command {
 
 /// `synch cloud ...`
 ///
-/// The node half of the two-key opt-in: nothing is browsable from a dashboard
-/// until an org admin enables browsing for the network *and* an operator names
-/// spaces here. There is no `--url`: where to attach is read from the same
-/// DNSSEC-validated zone that names the membership.
+/// The tunnel is on by default: a daemon attaches to the control plane its
+/// membership zone names and answers its read requests for every space this
+/// node holds. Which spaces a dashboard may browse is not a local question —
+/// the org admin's browsing toggle and the RBAC around it decide it on the
+/// other end. The only local act is opting out. There is no `--url`: where to
+/// attach is read from the same DNSSEC-validated zone that names the
+/// membership.
 #[derive(Debug, Subcommand)]
 pub enum CloudCommand {
-    /// Expose these spaces, and only these, through the tunnel.
-    Enable {
-        /// A space id to expose. Repeat for several; at least one is required.
-        #[arg(long = "space", value_name = "ID", required = true)]
-        spaces: Vec<String>,
-    },
+    /// Reopen the tunnel after `cloud disable`. It is on by default, so this
+    /// is only ever an undo.
+    Enable,
     /// Stop answering the control plane and drop any open tunnel.
     Disable,
     /// Per membership domain: record found, attached, last error.
@@ -739,10 +740,7 @@ mod tests {
             vec!["synch", "recover"],
             vec!["synch", "recover", "--wait", "90m", "--gap", "5000"],
             vec!["synch", "doctor"],
-            vec!["synch", "cloud", "enable", "--space", "media"],
-            vec![
-                "synch", "cloud", "enable", "--space", "media", "--space", "docs",
-            ],
+            vec!["synch", "cloud", "enable"],
             vec!["synch", "cloud", "disable"],
             vec!["synch", "cloud", "status"],
         ] {
@@ -750,12 +748,11 @@ mod tests {
         }
     }
 
-    /// No flag, no exposure: `cloud enable` with nothing named would have to
-    /// mean either "no spaces" or "every space", and the surface refuses
-    /// rather than choose.
+    /// `--space` named a local allowlist; the tunnel now serves whatever the
+    /// control plane requests, so the flag is not part of the surface.
     #[test]
-    fn cloud_enable_names_at_least_one_space() {
-        assert!(Cli::try_parse_from(["synch", "cloud", "enable"]).is_err());
+    fn cloud_enable_takes_no_space_list() {
+        assert!(Cli::try_parse_from(["synch", "cloud", "enable", "--space", "media"]).is_err());
     }
 
     /// `--from` and `--strict` are two answers to the same question, so the

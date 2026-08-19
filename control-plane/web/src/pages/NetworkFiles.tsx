@@ -49,7 +49,7 @@ export function NetworkFiles() {
       {!status.data.enabled ? (
         <Disabled slug={slug} network={name} isAdmin={isAdmin} />
       ) : status.data.devices.length === 0 ? (
-        <NoDaemon spaces={spaces} />
+        <NoDaemon />
       ) : (
         <>
           <SpacePicker
@@ -130,9 +130,9 @@ function Disabled({
         File browsing is off for this network.
       </p>
       <p className="mt-1 text-sm text-neutral-500">
-        An org admin can enable it here. Nothing becomes visible until a node
-        operator also runs <code className="text-neutral-300">synch cloud
-        enable</code> and names the spaces to expose.
+        An org admin can enable it here. Nodes of this cluster attach on
+        their own once it is on — an operator can still opt one out with{' '}
+        <code className="text-neutral-300">synch cloud disable</code>.
       </p>
       {isAdmin ? (
         <div className="mt-4">
@@ -154,22 +154,23 @@ function Disabled({
   )
 }
 
-// Enabled, but nothing has attached. The exact command to run, and where the
-// node will look for this control plane.
-function NoDaemon({ spaces }: { spaces: string[] }) {
-  const command = `synch cloud enable --space ${spaces[0] ?? '<id>'}`
+// Enabled, but nothing has attached. Daemons attach on their own, so this
+// means no node of the cluster is running one — or the one that is has opted
+// out.
+function NoDaemon() {
   return (
     <div className="rounded-lg border border-neutral-800 bg-neutral-900/50 p-6">
       <p className="text-neutral-300">No daemon is attached yet.</p>
       <p className="mt-1 text-sm text-neutral-500">
-        Run this on any node of the cluster:
+        Daemons attach on their own — there is no command to run. Check that a
+        node of this cluster is running <code className="text-neutral-300">
+        synch daemon run</code> and has not opted out with{' '}
+        <code className="text-neutral-300">synch cloud disable</code>.
       </p>
-      <pre className="mt-3 overflow-x-auto rounded-md bg-neutral-950 p-3 font-mono text-xs text-neutral-300">
-        {command}
-      </pre>
       <p className="mt-3 text-sm text-neutral-500">
-        There is no URL to configure. The node finds this control plane on its
-        own, from the same DNSSEC-signed zone that names its membership.
+        There is no URL to configure either way. The node finds this control
+        plane on its own, from the same DNSSEC-signed zone that names its
+        membership.
       </p>
     </div>
   )

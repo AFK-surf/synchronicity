@@ -284,8 +284,8 @@ pub fn the_org_switch_gates_browsing_test() {
   assert flipped.status == 200
   assert !string.contains(simulate.read_body(flipped), "soa_serial")
 
-  // Enabled but with nothing attached, which is the other half of the
-  // two-key opt-in and reads differently from "disabled".
+  // Enabled but with nothing attached yet, which reads differently from
+  // "disabled".
   let listing =
     call(
       browsing,

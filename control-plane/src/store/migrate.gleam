@@ -68,12 +68,12 @@ fn migrations() -> List(String) {
 /// V9: a network says whether its files may be browsed.
 ///
 /// Off for every network that already exists and for every one created
-/// after, because the feature is two-key: an org admin flips this *and* a
-/// node operator runs `synch cloud enable`, and either side alone leaves
-/// nothing visible. It is deliberately not a zone fact — the apex record is
-/// deployment-wide, and per-network enablement is enforced at the attach
-/// endpoint and on every browse call, where a change takes effect at once
-/// instead of a TTL later, and where it never reaches public DNS.
+/// after, because browsing is the org's call alone: daemons attach by
+/// default, so this column is the whole of the gate. It is deliberately not
+/// a zone fact — the apex record is deployment-wide, and per-network
+/// enablement is enforced at the attach endpoint and on every browse call,
+/// where a change takes effect at once instead of a TTL later, and where it
+/// never reaches public DNS.
 const v9 = "
 ALTER TABLE networks ADD COLUMN browse_enabled INTEGER NOT NULL DEFAULT 0;
 "
