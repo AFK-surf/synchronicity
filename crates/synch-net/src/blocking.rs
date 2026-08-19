@@ -12,14 +12,12 @@
 //! them; a head offer walks a trie in SQLite. All of it is blocking and bounded
 //! by object or tree size rather than by anything the runtime can interrupt, so
 //! a single large transfer served inline would stall every other connection
-//! this node has. What stays inline is the per-connection and per-stream binding
-//! check in `serve`: one indexed row, on a path that runs before a request is
-//! even read, where the handoff would cost more than the work. Everything a
-//! *request* costs is offloaded, including the two metadata handlers —
-//! `FindProviders` and `GetBindings`, which look small enough to run here and
-//! are not: `providers` holds the one connection mutex across a row loop and a
-//! postcard decode per row, which is not a bounded lookup at all when an origin
-//! chooses what is in those rows (§12).
+//! this node has. Nothing stays inline, including the per-connection and
+//! per-stream binding check in `serve`, which used to: it is one indexed row,
+//! but the cost of a store call on a worker is the wait for the one connection
+//! mutex, not the query — and it is the only store call in the process an
+//! *unauthenticated* dialer can reach, so leaving it here let anyone who could
+//! finish a QUIC handshake park a worker behind whatever was writing.
 
 use crate::error::NetError;
 

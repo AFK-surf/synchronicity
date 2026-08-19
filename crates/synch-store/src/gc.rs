@@ -142,10 +142,25 @@ impl Store {
     /// else would ever reclaim.
     ///
     /// A file counts as orphaned only once its own mtime is older than the same
-    /// retention horizon `gc_content` uses. Payload and outboard are created
-    /// before the row that describes them, so inside that window a file with no
-    /// row is a write in progress, not a leftover. Anything in a shard
-    /// directory that is not named for an object is left alone.
+    /// retention horizon `gc_content` uses, **and** no write is in flight for
+    /// its object.
+    ///
+    /// The mtime alone was the argument, and it covered the wrong case. It
+    /// reasoned that payload and outboard are created before the row that
+    /// describes them, so a file with no row inside the window is a write in
+    /// progress — true of a *first* write. `write_slice` opens with
+    /// `truncate(false)` and reuses whatever file is there, so for a resumed
+    /// write the mtime was sampled before the writer touched it and proves
+    /// nothing about the present. The shape that mattered is exactly the one
+    /// this sweep exists for: a stale orphan payload, left by a fetch that
+    /// failed verification days ago, that a fetch is now resuming into. Stat it,
+    /// read `blobs`, drop the guard, and the writer's commit lands before the
+    /// unlink — a row claiming verified groups whose bytes are gone.
+    ///
+    /// So the decision and the unlink are one step under one guard, and the
+    /// writer's own mark is part of the decision (`Store::lease_write`).
+    /// Anything in a shard directory that is not named for an object is left
+    /// alone.
     ///
     /// Half-written ingests go with them, by way of [`Store::gc_staging`].
     ///
@@ -179,18 +194,23 @@ impl Store {
                 let Some(root) = cas_root_of(&path) else {
                     continue;
                 };
+                // One guard across the whole decision and the unlink, so
+                // nothing can make the file live in between. The `stat` is
+                // inside it too: it is the reading the verdict rests on.
+                let conn = self.conn();
                 let Ok(meta) = std::fs::metadata(&path) else {
                     continue;
                 };
                 if !meta.is_file() || mtime_nanos(&meta).is_none_or(|at| at >= before) {
                     continue;
                 }
-                if self.blob(&root)?.is_some() {
+                if blob_row_exists(&conn, &root)? || self.is_being_written(&root) {
                     continue;
                 }
                 if std::fs::remove_file(&path).is_ok() {
                     swept += 1;
                 }
+                drop(conn);
             }
         }
         Ok(swept)
@@ -334,13 +354,17 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
 /// (§5.4). Pending heads must be in the mark set or GC would eat an in-progress
 /// bootstrap.
 ///
-/// One table, not a union across two, and for the reason
-/// [`Store::retained_roots`] gives: `put_head` writes the signature to
+/// One table, not a union across two: `put_head` writes the signature to
 /// `head_history` before the slot points at it, and both delete paths refuse to
 /// remove a row a slot still names, so every current head's root is here by
 /// construction. The union returned the same set — but stating the mark set
 /// twice, in two places, is how the two come to disagree.
-fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
+///
+/// And one *function*, for the same reason. [`Store::retained_roots`] used to
+/// carry a second copy of this query; the sweep ran this one and the sweep's
+/// test asserted on that one, so a change to either would have been invisible
+/// to the other until an audit found them.
+pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
     let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut out = Vec::new();
@@ -348,6 +372,15 @@ fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
         out.push(hash_column(row?, "heads.root")?);
     }
     Ok(out)
+}
+
+/// Whether a `blobs` row accounts for an object, on a connection already held.
+fn blob_row_exists(conn: &rusqlite::Connection, root: &Hash) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM blobs WHERE root = ?1)",
+        params![root.as_bytes().to_vec()],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
 }
 
 /// Deletes every row of `table` whose hash is not in `marked`, in one

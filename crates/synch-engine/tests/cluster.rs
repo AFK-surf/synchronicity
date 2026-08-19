@@ -12,6 +12,21 @@ use synch_core::{now_ns, OriginId};
 use synch_engine::{Node, NodeConfig, VersionPolicy};
 use synch_store::{Binding, BindingSource};
 
+/// Runs a closure that touches the store on the blocking pool.
+///
+/// The scope is what marks the thread as one blocking work belongs on, which is
+/// what `Store::conn`'s assertion reads (§10). `spawn_blocking` alone does not:
+/// tokio propagates the runtime handle into a blocking task, so the guard
+/// cannot tell one from a worker by itself.
+async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(move || {
+        let _scope = synch_core::BlockingScope::enter();
+        f()
+    })
+    .await
+    .unwrap()
+}
+
 struct Peer {
     _data: tempfile::TempDir,
     space: tempfile::TempDir,
@@ -27,7 +42,14 @@ async fn spawn_with(name: &str, tune: impl FnOnce(&mut NodeConfig)) -> Peer {
     let data = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     let origin = OriginId::named(name, "cluster.example").unwrap();
-    Node::init(data.path(), Some(origin)).unwrap();
+    // On the blocking pool: creating a store runs the migration chain, and
+    // `Store::conn` refuses to be acquired on a multi-thread runtime worker
+    // (§10). Most tests here run current-thread, where that is silent; the
+    // multi-thread one below is why this helper does it properly.
+    let dir = data.path().to_path_buf();
+    off_runtime(move || Node::init(&dir, Some(origin)))
+        .await
+        .unwrap();
     let mut config = NodeConfig::loopback(data.path());
     tune(&mut config);
     let node = Node::open(config).await.unwrap();
@@ -40,16 +62,22 @@ async fn spawn_with(name: &str, tune: impl FnOnce(&mut NodeConfig)) -> Peer {
 
 /// Static trust is unilateral, so every node must be told about every other.
 fn introduce(peers: &[&Peer]) {
+    let nodes: Vec<&Node> = peers.iter().map(|p| &p.node).collect();
+    introduce_nodes(&nodes);
+}
+
+/// The same, over the nodes alone, so a multi-thread test can run it inside a
+/// blocking scope.
+fn introduce_nodes(peers: &[&Node]) {
     for a in peers {
         for b in peers {
-            if a.node.origin() == b.node.origin() {
+            if a.origin() == b.origin() {
                 continue;
             }
-            a.node
-                .store()
+            a.store()
                 .put_binding(&Binding {
-                    origin: b.node.origin().clone(),
-                    node_id: b.node.node_id(),
+                    origin: b.origin().clone(),
+                    node_id: b.node_id(),
                     source: BindingSource::Static,
                     domain: None,
                     note: None,
@@ -58,7 +86,7 @@ fn introduce(peers: &[&Peer]) {
                 })
                 .unwrap();
             // Direct addresses only: these tests never touch the network.
-            a.node.remember_peer(&b.node.net().direct_addr()).unwrap();
+            a.remember_peer(&b.net().direct_addr()).unwrap();
         }
     }
 }
@@ -67,8 +95,11 @@ fn big_payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 37 + 11) as u8).collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_nodes_converge_and_fetch_verified_content() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     let vps = spawn("vps").await;
@@ -210,8 +241,11 @@ async fn three_nodes_converge_and_fetch_verified_content() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_edit_propagates_and_divergence_is_observable() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     introduce(&[&nas, &laptop]);
@@ -286,8 +320,11 @@ async fn an_edit_propagates_and_divergence_is_observable() {
 /// same `(space, path)`, and a third — which published nothing — sees one tree
 /// with one divergent path, selects deterministically, and watches the
 /// divergence end when one side adopts the other.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_unified_tree_carries_every_version_of_a_divergent_path() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     let vps = spawn("vps").await;
@@ -401,8 +438,11 @@ async fn the_unified_tree_carries_every_version_of_a_divergent_path() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mirror_materializes_the_unified_tree() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let vps = spawn("vps").await;
     introduce(&[&nas, &vps]);
@@ -483,8 +523,11 @@ async fn a_mirror_materializes_the_unified_tree() {
     vps.node.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn convergence_survives_a_partition() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // §5.3: the periodic pull is what guarantees convergence after a partition
     // heals, independently of whether any reactive push was delivered.
     let nas = spawn("nas").await;
@@ -541,8 +584,11 @@ async fn convergence_survives_a_partition() {
     laptop.node.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_untrusted_node_learns_nothing() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let intruder = spawn("intruder").await;
 
@@ -590,8 +636,11 @@ async fn an_untrusted_node_learns_nothing() {
     intruder.node.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinning_fetches_what_it_promises_to_keep() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // §9.2: a pin is a promise the bytes stay available here, so it starts by
     // fetching what it guards: pinning content this node has never read must
     // not mark zero rows and report success.
@@ -636,8 +685,11 @@ async fn pinning_fetches_what_it_promises_to_keep() {
     laptop.node.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gc_keeps_the_current_root_servable() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     introduce(&[&nas, &laptop]);
@@ -684,8 +736,11 @@ async fn gc_keeps_the_current_root_servable() {
     laptop.node.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_recovers_its_state_across_a_restart() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let data = tempfile::tempdir().unwrap();
     let space = tempfile::tempdir().unwrap();
     let origin = OriginId::named("nas", "cluster.example").unwrap();
@@ -722,8 +777,11 @@ async fn a_node_recovers_its_state_across_a_restart() {
     node.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // §5.4 end to end: publish, overwrite, then run the maintenance pass with
     // a retention window of nothing. The old root leaves `head_history`, its
     // private trie nodes are swept, and the old content's *bytes* are gone
@@ -818,8 +876,11 @@ async fn maintenance_prunes_history_sweeps_the_trie_and_reclaims_bytes() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_and_a_symlink_at_one_path_diverge_on_stable_mtimes() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // §8: a symlink is never the same version as a file, and §7.1 makes the
     // link's own lstat mtime what selection compares — a symlink restated at
     // `now_ns()` on every scan would win `newest` forever, and would churn a
@@ -864,8 +925,11 @@ async fn a_file_and_a_symlink_at_one_path_diverge_on_stable_mtimes() {
     laptop.node.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fetch_falls_back_to_provider_hints_when_no_local_ad_covers_a_root() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // §5.1: a node holding a root whose ads it has not replicated yet — a cold
     // cache, or an origin just admitted — asks peers who holds it. Hints are
     // unverified, and content is hash-verified regardless.
@@ -916,8 +980,11 @@ async fn a_fetch_falls_back_to_provider_hints_when_no_local_ad_covers_a_root() {
     laptop.node.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // §8: deletions are adoptable exactly as content is. A tombstone on one
     // side and a live file on the other is deletion divergence, and it ends
     // the way every other divergence ends — by someone taking the other's
@@ -1006,8 +1073,11 @@ async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
     laptop.node.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopting_a_deletion_refuses_a_path_outside_a_space() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // The same guard content adoption takes: outside a configured space
     // nothing would publish the adoption, so the write would be a silent no-op
     // with a filesystem side effect.
@@ -1044,8 +1114,11 @@ const GROUP: usize = 16 * 1024;
 ///
 /// The node is configured with a small `delta_min_size` so the test can work in
 /// megabytes rather than the 16 MiB an unconfigured node would insist on.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mirror_reuses_local_bytes_when_a_file_it_holds_changes() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let vps = spawn_with("vps", |config| config.delta_min_size = 32 * 1024).await;
     introduce(&[&nas, &vps]);
@@ -1109,8 +1182,11 @@ async fn a_mirror_reuses_local_bytes_when_a_file_it_holds_changes() {
 
 /// An appended file keeps everything it had: the tail is fetched, the prefix is
 /// not (`docs/DELTA-SYNC.md` §7's append case).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_appended_file_transfers_only_what_was_appended() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let vps = spawn_with("vps", |config| config.delta_min_size = 32 * 1024).await;
     introduce(&[&nas, &vps]);
@@ -1159,8 +1235,11 @@ async fn an_appended_file_transfers_only_what_was_appended() {
 /// are sitting at the mirror's own destination, which is where the last pass
 /// put them. The pass notices that the file on the disk *is* the version the
 /// lineage named, ingests it back, and the update is CAS-to-CAS delta again.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mirror_re_ingests_its_own_copy_when_the_cas_has_dropped_it() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let vps = spawn_with("vps", |config| config.delta_min_size = 32 * 1024).await;
     introduce(&[&nas, &vps]);
@@ -1213,8 +1292,11 @@ async fn a_mirror_re_ingests_its_own_copy_when_the_cas_has_dropped_it() {
 /// §7.2 end to end: a mirror on a node that is never asked to sync follows
 /// the tree as the node learns it. The exchange flips the head to complete,
 /// which rings the mirror bell, and the standing loop's pass does the rest.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mirror_follows_the_tree_as_the_node_learns_it() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let vps = spawn("vps").await;
     introduce(&[&nas, &vps]);
@@ -1265,8 +1347,11 @@ async fn a_mirror_follows_the_tree_as_the_node_learns_it() {
 /// said — but taking one costs a `blob_providers` row, and the origin in it is
 /// a peer's word. An origin with no live binding here is one `providers_for`
 /// would skip anyway, so the row buys nothing and is not written.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_provider_hint_for_an_unbound_origin_is_not_stored() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     introduce(&[&nas, &laptop]);
@@ -1311,4 +1396,80 @@ async fn a_provider_hint_for_an_unbound_origin_is_not_stored() {
         !learned.contains(&stranger),
         "the origin we could not dial is not: {learned:?}"
     );
+}
+
+/// The whole sync-and-fetch path runs without blocking a runtime worker on the
+/// store (§10).
+///
+/// This is the test the guard needs to have teeth. `Store::conn` asserts that
+/// it is not being acquired on a **multi-thread** runtime worker outside a
+/// blocking scope, and the rest of the suite runs on `#[tokio::test]`'s
+/// current-thread runtime, where the assertion is deliberately silent: one
+/// worker the test itself is driving is not the hazard. The daemon runs
+/// multi-thread, so this test runs multi-thread, and it drives the paths four
+/// prior audit passes kept leaving call sites behind on — the accept path, the
+/// `Hello` exchange and its push/pull decision, the trie fetch, provider
+/// discovery, the blob fetch, publishing, and the maintenance pass.
+///
+/// A violation is a panic inside the offending task, so the assertion below is
+/// really "the work completed at all": a parked-worker regression fails here
+/// with a message naming the rule instead of showing up as a daemon that goes
+/// quiet under load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sync_path_never_touches_the_store_on_a_runtime_worker() {
+    // Deliberately *without* the `BlockingScope` the other tests take: this is
+    // the one whose own body also holds to the rule, so nothing it does can
+    // mask a violation (§10).
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    {
+        let (a, b) = (nas.node.clone(), laptop.node.clone());
+        off_runtime(move || introduce_nodes(&[&a, &b])).await;
+    }
+
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(nas.space.path().join("big.bin"), &payload).unwrap();
+    std::fs::write(nas.space.path().join("small.txt"), b"hello").unwrap();
+    off_runtime({
+        let node = nas.node.clone();
+        let path = nas.space.path().to_path_buf();
+        move || node.add_space("media", &path).unwrap()
+    })
+    .await;
+
+    // Publish and push: the scan, the head, and the fan-out to the membership.
+    let head = tokio::time::timeout(Duration::from_secs(30), nas.node.scan_publish_push())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a head");
+    assert_eq!(head.seq, 1);
+
+    // Pull: the `Hello` exchange, its decision, and the trie fetch under it.
+    let report = tokio::time::timeout(Duration::from_secs(30), laptop.node.anti_entropy_round())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(report.peer.is_some(), "{report:?}");
+
+    // Fetch: provider ranking, the dial, and the windowed slice transfer.
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(60),
+        laptop.node.read_path(
+            "media",
+            "big.bin",
+            &VersionPolicy::Origin(nas.node.origin().clone()),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(bytes, payload);
+
+    // And the maintenance pass, which is the other standing loop.
+    let node = laptop.node.clone();
+    off_runtime(move || node.maintenance_pass()).await.unwrap();
+
+    nas.node.shutdown().await.unwrap();
+    laptop.node.shutdown().await.unwrap();
 }

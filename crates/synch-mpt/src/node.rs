@@ -118,11 +118,13 @@ impl TrieNode {
         }
         // Bound the node's key portion at the sync trust boundary. A key is
         // never longer than MAX_KEY_LEN bytes (§12), so a single node's nibble
-        // run can never exceed twice that. Without this check a peer could
-        // serve a hash-valid Leaf whose key_rest is megabytes of nibbles;
-        // `diff`/`collect` descend one nibble per stack frame, so ingesting it
-        // (materialize_diff after a head flip) overflows the stack and aborts
-        // the daemon — the very DoS the 4 KiB key bound is meant to prevent.
+        // run can never exceed twice that. Without it a peer could serve a
+        // hash-valid Leaf whose key_rest is megabytes of nibbles, and every
+        // reader would then walk it: `collect` and `diff_walk` use heap stacks
+        // and prune at MAX_DEPTH_NIBBLES, so what it costs is work rather than a
+        // stack overflow, but it is work proportional to a number the peer
+        // chose. This bounds one node; `MissingWalk::next_batch` bounds the
+        // *path*, which is the half a per-node cap cannot see.
         let nibble_len = match &node {
             TrieNode::Leaf { key_rest, .. } => key_rest.len(),
             TrieNode::Ext { prefix, .. } => prefix.len(),
@@ -141,12 +143,15 @@ impl TrieNode {
     /// `merge_down` and `wrap_in_ext` exist precisely to — so this is only ever
     /// about nodes that arrived from a peer. Each one is load-bearing:
     ///
-    /// - An **empty extension prefix** puts the two readers into disagreement
-    ///   about the same bytes: `Trie::get` does `rest.starts_with(&[])`, which
-    ///   is true, and follows the child; `cursor_child` compares
-    ///   `prefix.first()` against the nibble, which never matches, and reports
-    ///   the whole subtree empty. A root built this way promotes cleanly and
-    ///   materializes nothing, while point lookups still find its keys.
+    /// - An **empty extension prefix** is what a canonical trie never contains:
+    ///   `collapse` and `merge_down` exist to remove the shape. Accepting one
+    ///   would give a single key/value map two roots, which is exactly what
+    ///   structural sharing and the reference-pruning walk rest on not
+    ///   happening. (`Trie::get` refuses to follow one as well, and
+    ///   `ingest_boundary`'s `get_and_the_structural_walks_agree_even_if_one_slips_through`
+    ///   pins that the two readers answer alike — so the *reader disagreement*
+    ///   this used to describe is closed at both ends, and this check is what
+    ///   keeps the shape from being stored at all.)
     /// - An **oversized inline value** is 128 bytes by construction
     ///   ([`INLINE_VALUE_MAX`]); decoded, it is bounded only by the frame, so a
     ///   peer could put 16 MiB in a single node and have every diff clone it.

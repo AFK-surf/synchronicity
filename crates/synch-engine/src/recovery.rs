@@ -254,14 +254,15 @@ impl Node {
     /// adopting nothing (§3.4 step 2).
     pub async fn observe_peers(&self) -> Result<ObserveRound> {
         let mut round = ObserveRound::default();
-        for peer in self.dialable_peers()? {
-            let addr = self
-                .peer_addr(&peer)?
-                .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
+        for (peer, addr) in self.dial_targets().await? {
             match self.net().connect_mpt(addr).await {
                 Ok(client) => match self.syncer().observe_with(&client).await {
                     Ok(_summaries) => {
-                        self.store().record_peer_seen(&peer, None, now_ns())?;
+                        let node = self.clone();
+                        crate::blocking::offload(move || {
+                            Ok(node.store().record_peer_seen(&peer, None, now_ns())?)
+                        })
+                        .await?;
                         round.reached.push(peer);
                     }
                     Err(e) => {
@@ -275,7 +276,10 @@ impl Node {
                 }
             }
         }
-        round.observed_seq = self.observed_seq()?;
+        round.observed_seq = {
+            let node = self.clone();
+            crate::blocking::offload(move || node.observed_seq()).await?
+        };
         Ok(round)
     }
 
@@ -340,16 +344,42 @@ impl Node {
             tokio::time::sleep(options.poll.min(deadline - now)).await;
         }
 
+        // Everything from here is store work — the observation, this node's own
+        // head, the seq it would publish at, and the durable floor write — so
+        // it goes over to the blocking pool in one piece rather than four
+        // acquisitions of the write connection on a runtime worker (§10).
+        let node = self.clone();
+        let waited = started.elapsed();
+        let (reached_len, unreachable_len) = (reached.len(), unreachable.len());
+        crate::blocking::offload(move || {
+            node.settle_recovery_floor(options.gap, rounds, reached_len, unreachable_len, waited)
+        })
+        .await
+    }
+
+    /// The tail of [`Node::recover`]: decide the floor from what was observed
+    /// and record it.
+    ///
+    /// Split out so the whole decision runs in one hop to the blocking pool,
+    /// and so the early returns stay readable.
+    fn settle_recovery_floor(
+        &self,
+        gap: u64,
+        rounds: usize,
+        reached: usize,
+        unreachable: usize,
+        waited: std::time::Duration,
+    ) -> Result<RecoveryReport> {
         let observed = self.store().observed_head(self.origin())?;
         let mut report = RecoveryReport {
             origin: self.origin().clone(),
             observed_seq: observed.as_ref().map(|o| o.seq),
             floor: self.store().publish_floor()?,
-            gap: options.gap,
+            gap,
             rounds,
-            reached: reached.len(),
-            unreachable: unreachable.len(),
-            waited: started.elapsed(),
+            reached,
+            unreachable,
+            waited,
         };
         let Some(observed) = observed else {
             // Nothing to resume from: no peer claims this origin ever
@@ -403,11 +433,7 @@ impl Node {
                 "a peer advertises a seq no plausible history reaches: clamping the floor"
             );
         }
-        let floor = observed
-            .seq
-            .min(ceiling)
-            .saturating_add(options.gap)
-            .max(next);
+        let floor = observed.seq.min(ceiling).saturating_add(gap).max(next);
         let floor = self.store().raise_publish_floor(floor)?;
         report.floor = Some(floor);
         tracing::info!(

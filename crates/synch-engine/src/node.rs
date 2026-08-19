@@ -307,12 +307,20 @@ impl Node {
         // are filesystem work, so it goes to the blocking pool like everything
         // else that touches the disk.
         let data_dir = config.data_dir.clone();
-        let store = Arc::new(crate::blocking::offload(move || Ok(Store::open(&data_dir)?)).await?);
-        let origin = store.self_origin()?.ok_or(EngineError::NotInitialized)?;
-        let secret = store
-            .active_device_key()?
-            .ok_or(EngineError::NoActiveKey)?
-            .secret;
+        let opened = crate::blocking::offload(move || {
+            let store = Store::open(&data_dir)?;
+            // The identity reads come over with it rather than following on the
+            // runtime: they are two more queries on the connection the open just
+            // took, and nothing between them needs to await.
+            let origin = store.self_origin()?.ok_or(EngineError::NotInitialized)?;
+            let secret = store
+                .active_device_key()?
+                .ok_or(EngineError::NoActiveKey)?
+                .secret;
+            Ok((Arc::new(store), origin, secret))
+        })
+        .await?;
+        let (store, origin, secret) = opened;
         // Every endpoint this node ever binds — this one, and the second one a
         // key activation brings up — rings the same bell, because the refusal
         // that matters can arrive at either (§3.4).
@@ -700,12 +708,7 @@ impl Node {
     /// what keeps a recovered node above the history its peers still hold,
     /// across restarts.
     pub fn next_seq(&self) -> Result<u64> {
-        let next = self
-            .store()
-            .complete_head(self.origin())?
-            .map(|h| h.seq + 1)
-            .unwrap_or(1);
-        Ok(next.max(self.store().publish_floor()?.unwrap_or(0)))
+        Ok(self.store().next_own_seq(self.origin())?)
     }
 
     /// Applies staged changes as one new signed root (§7.1).
@@ -726,7 +729,6 @@ impl Node {
         self.ensure_publishable()?;
         let secret = self.secret();
         let origin = self.origin().clone();
-        let floor = self.store().publish_floor()?.unwrap_or(0);
         let now = now_ns();
 
         let head = self
@@ -750,7 +752,11 @@ impl Node {
                     return Ok(None);
                 }
 
-                let seq = previous.as_ref().map(|h| h.seq + 1).unwrap_or(1).max(floor);
+                // Read from the same snapshot the flip is written against, and
+                // from *every* record of what this origin has already signed —
+                // both slots and the retained history, not the complete slot
+                // alone ([`Txn::next_own_seq`]).
+                let seq = txn.next_own_seq(&origin)?;
                 let head = SignedHead::sign(&secret, origin.clone(), seq, root, now);
                 // No explicit history writes: `put_head` records the signature
                 // it is pointing at, and the head being displaced recorded its

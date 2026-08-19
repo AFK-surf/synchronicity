@@ -533,7 +533,7 @@ fn a_pin_set_that_names_no_log_accepts_nothing() {
 
 // ------------------------------------------------------ through the resolver
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zone_that_publishes_its_proof_resolves_under_require() {
     let (mut zone, log, proof) = logged_zone();
     // A rollover window publishes two records; the client picks by key tag
@@ -569,7 +569,7 @@ async fn a_zone_that_publishes_its_proof_resolves_under_require() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_colliding_tag_unlogged_zsk_does_not_inherit_the_old_proof() {
     // The live key is the one that verifies the membership RRSIG
     // (`signing_key_rdata`). Identifying it by 16-bit tag alone would
@@ -605,7 +605,7 @@ async fn a_colliding_tag_unlogged_zsk_does_not_inherit_the_old_proof() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_absent_proof_record_refuses_under_require_and_resolves_under_off() {
     // Phase 0 of the rollout, seen from a phase 2 client: a control plane
     // that has not published yet. Under `require` the answer is discarded
@@ -652,7 +652,7 @@ async fn an_absent_proof_record_refuses_under_require_and_resolves_under_off() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_proof_record_covering_only_someone_elses_keys_is_refused() {
     // Under the key-set claim there is no selector to filter on: every
     // served record is a candidate, so a record whose proven set does not
@@ -691,7 +691,7 @@ async fn a_proof_record_covering_only_someone_elses_keys_is_refused() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_chainless_entry_is_refused_through_the_whole_resolver_path() {
     // The same refusal as the unit case, but reached the way a real client
     // reaches it, and surfaced as the error class `synch doctor` explains.
@@ -724,7 +724,7 @@ async fn a_chainless_entry_is_refused_through_the_whole_resolver_path() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_garbled_proof_record_is_refused_as_malformed() {
     let mut zone = SimZone::new("cluster.example", member_records());
     zone.rekor_txt = vec!["this is not a proof".to_string()];
@@ -1047,7 +1047,7 @@ fn regenerate_the_shared_fixture() {
 /// index and origin asserted in this file and in `crates/synch-monitor/tests/
 /// real_entry.rs` move with it, and PROVENANCE.txt is rewritten — including
 /// the log it names, which this run discovers rather than assumes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn publish_a_real_entry() {
     assert_eq!(

@@ -16,6 +16,26 @@ use synch_core::OriginId;
 use synch_engine::{Node, NodeConfig};
 use tokio::sync::broadcast;
 
+/// Runs blocking store work the way production does — off the runtime.
+///
+/// Every test here runs on a multi-thread runtime deliberately: that is the
+/// flavor the daemon binary starts, and it is the only one `Store::conn`'s
+/// assertion can see a violation on (§10). A `current_thread` test would let a
+/// blocking call on a request path pass silently, which is exactly the gap that
+/// let several of them accumulate.
+async fn off_runtime<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _scope = synch_core::BlockingScope::enter();
+        f()
+    })
+    .await
+    .expect("the blocking task should complete")
+}
+
 /// A daemon running in this process, with its control socket bound.
 struct Daemon {
     node: Node,
@@ -25,10 +45,14 @@ struct Daemon {
 
 impl Daemon {
     async fn start(data_dir: &Path) -> Daemon {
-        Node::init(
-            data_dir,
-            Some(OriginId::named("nas", "cluster.example").unwrap()),
-        )
+        let dir = data_dir.to_path_buf();
+        off_runtime(move || {
+            Node::init(
+                &dir,
+                Some(OriginId::named("nas", "cluster.example").unwrap()),
+            )
+        })
+        .await
         .unwrap();
         Daemon::reopen(data_dir).await
     }
@@ -45,6 +69,50 @@ impl Daemon {
         let _ = self.stop.send(());
         let _ = self.served.await;
         self.node.shutdown().await.unwrap();
+    }
+
+    /// Records a file another origin published, the way a completed sync would
+    /// have left it: the bytes in the CAS, the entry in that origin's view.
+    async fn peer_file(
+        &self,
+        origin: &OriginId,
+        space: &str,
+        path: &str,
+        bytes: &[u8],
+        mtime_ns: i64,
+        seq: u64,
+    ) {
+        let (node, origin) = (self.node.clone(), origin.clone());
+        let (space, path, bytes) = (space.to_string(), path.to_string(), bytes.to_vec());
+        off_runtime(move || {
+            let root = node
+                .store()
+                .ingest_bytes(&bytes, synch_core::now_ns())
+                .unwrap();
+            let entry = synch_core::FileEntry::file(bytes.len() as u64, mtime_ns, root, seq);
+            node.store()
+                .put_entry(&origin, &space, &path, &entry)
+                .unwrap();
+        })
+        .await
+    }
+
+    /// The same for an assertion with no content behind it — a tombstone.
+    async fn peer_entry(
+        &self,
+        origin: &OriginId,
+        space: &str,
+        path: &str,
+        entry: synch_core::FileEntry,
+    ) {
+        let (node, origin) = (self.node.clone(), origin.clone());
+        let (space, path) = (space.to_string(), path.to_string());
+        off_runtime(move || {
+            node.store()
+                .put_entry(&origin, &space, &path, &entry)
+                .unwrap();
+        })
+        .await
     }
 }
 
@@ -98,7 +166,7 @@ fn space_with(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     dir
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_command_variant_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -435,7 +503,7 @@ async fn every_command_variant_round_trips() {
     daemon.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sync_that_reaches_nobody_says_so_in_the_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -476,7 +544,7 @@ async fn read(data_dir: &Path, command: Command) -> Vec<u8> {
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_cross_the_socket_with_their_code() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -614,7 +682,7 @@ async fn errors_cross_the_socket_with_their_code() {
 
 /// `scan` and `mirror sync` report what they are doing as they do it, in
 /// frames the CLI renders and discards (§9.3).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_and_mirror_sync_stream_progress() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -670,7 +738,7 @@ async fn scan_and_mirror_sync_stream_progress() {
 
 /// `synch recover` over the socket: the quiesce reports each round as it goes,
 /// and the node it ran on can publish again (§3.4, §9.3).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -687,18 +755,21 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
 
     // A peer has advertised a head for this node's own origin at seq 100 — the
     // observation an ordinary `Hello` exchange leaves behind (§5.1).
-    daemon
-        .node
-        .store()
-        .record_observed_head(
-            daemon.node.origin(),
-            100,
-            &synch_core::Hash([7u8; 32]),
-            true,
-            None,
-            synch_core::now_ns(),
-        )
+    {
+        let node = daemon.node.clone();
+        off_runtime(move || {
+            node.store().record_observed_head(
+                node.origin(),
+                100,
+                &synch_core::Hash([7u8; 32]),
+                true,
+                None,
+                synch_core::now_ns(),
+            )
+        })
+        .await
         .unwrap();
+    }
 
     // Scanning refuses before hashing anything, and says what to run. The
     // node is not broken and the request is not malformed — the state it was
@@ -763,23 +834,26 @@ async fn recover_streams_its_quiesce_and_lifts_the_publishing_floor() {
 
 /// A client that walks away mid-quiesce leaves nothing behind: the daemon
 /// keeps serving, and the publishing floor is untouched (§3.4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_that_hangs_up_mid_quiesce_leaves_the_floor_alone() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
     let data_dir = dir.path();
-    daemon
-        .node
-        .store()
-        .record_observed_head(
-            daemon.node.origin(),
-            100,
-            &synch_core::Hash([7u8; 32]),
-            true,
-            None,
-            synch_core::now_ns(),
-        )
+    {
+        let node = daemon.node.clone();
+        off_runtime(move || {
+            node.store().record_observed_head(
+                node.origin(),
+                100,
+                &synch_core::Hash([7u8; 32]),
+                true,
+                None,
+                synch_core::now_ns(),
+            )
+        })
+        .await
         .unwrap();
+    }
 
     // An hour-long quiesce, abandoned as soon as it has said something.
     let mut client = Client::connect(data_dir).await.unwrap();
@@ -808,8 +882,16 @@ async fn a_client_that_hangs_up_mid_quiesce_leaves_the_floor_alone() {
     .await
     .expect("the daemon must keep serving");
     assert!(id.contains("nas@cluster.example"), "{id}");
-    assert_eq!(daemon.node.store().publish_floor().unwrap(), None);
-    assert!(daemon.node.recovery_state().unwrap().in_recovery);
+    let node = daemon.node.clone();
+    let (floor, state) = off_runtime(move || {
+        (
+            node.store().publish_floor().unwrap(),
+            node.recovery_state().unwrap(),
+        )
+    })
+    .await;
+    assert_eq!(floor, None);
+    assert!(state.in_recovery);
 
     daemon.shutdown().await;
 }
@@ -845,7 +927,7 @@ async fn progress_of(data_dir: &Path, command: Command) -> Vec<String> {
 
 /// A multi-megabyte read must arrive as a sequence of bounded chunks, not as
 /// one buffered payload (§9.3).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_multi_megabyte_cat_streams_in_chunks() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -987,7 +1069,7 @@ async fn tree_read(data_dir: &Path, request: pb::ReadRequest) -> Result<Vec<u8>,
 /// answer in entry metadata rather than in rendered lines, and that name space,
 /// path, and policy as fields — an S3 key may contain a colon, which the text
 /// reference form would read as an origin.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tree_can_be_listed_and_resolved_structurally() {
     let dir = tempfile::tempdir().unwrap();
     // A colon is fine in an S3 key and in this protocol, but not in a Windows
@@ -1114,7 +1196,7 @@ async fn the_tree_can_be_listed_and_resolved_structurally() {
 
 /// `synch compare` reports which files differ between the local node and a peer,
 /// name-status only, over the control socket.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compare_reports_name_status_between_the_local_node_and_a_peer() {
     let dir = tempfile::tempdir().unwrap();
     // The local node publishes these under its own origin (nas@cluster.example).
@@ -1138,26 +1220,13 @@ async fn compare_reports_name_status_between_the_local_node_and_a_peer() {
     // A peer publishes: keep.txt identical, changed.txt with other bytes, and a
     // file the local node does not have.
     let peer = OriginId::named("laptop", "cluster.example").unwrap();
-    let put = |path: &str, bytes: &[u8]| {
-        let root = daemon
-            .node
-            .store()
-            .ingest_bytes(bytes, synch_core::now_ns())
-            .unwrap();
-        daemon
-            .node
-            .store()
-            .put_entry(
-                &peer,
-                "media",
-                path,
-                &synch_core::FileEntry::file(bytes.len() as u64, 1, root, 1),
-            )
-            .unwrap();
-    };
-    put("keep.txt", b"same");
-    put("changed.txt", b"theirs");
-    put("only_peer.txt", b"new");
+    for (path, bytes) in [
+        ("keep.txt", &b"same"[..]),
+        ("changed.txt", &b"theirs"[..]),
+        ("only_peer.txt", &b"new"[..]),
+    ] {
+        daemon.peer_file(&peer, "media", path, bytes, 1, 1).await;
+    }
 
     // Default baseline is the local node; --to names the peer.
     let text = lines(
@@ -1226,7 +1295,7 @@ async fn compare_reports_name_status_between_the_local_node_and_a_peer() {
 
 /// A divergent path is left out of a `strict` listing rather than answered with
 /// one side's metadata, and resolving it directly says what is wrong (§8).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_strict_listing_omits_what_a_strict_resolve_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let space = space_with(&[("shared.txt", b"ours"), ("agreed.txt", b"only one")]);
@@ -1243,21 +1312,9 @@ async fn a_strict_listing_omits_what_a_strict_resolve_refuses() {
     lines(data_dir, Command::Scan(pb::Scan {})).await;
 
     let peer = OriginId::named("laptop", "cluster.example").unwrap();
-    let root = daemon
-        .node
-        .store()
-        .ingest_bytes(b"theirs", synch_core::now_ns())
-        .unwrap();
     daemon
-        .node
-        .store()
-        .put_entry(
-            &peer,
-            "media",
-            "shared.txt",
-            &synch_core::FileEntry::file(6, i64::MAX, root, 4),
-        )
-        .unwrap();
+        .peer_file(&peer, "media", "shared.txt", b"theirs", i64::MAX, 4)
+        .await;
 
     let strict = Some("strict".to_string());
     let listed = entries(
@@ -1307,7 +1364,7 @@ async fn a_strict_listing_omits_what_a_strict_resolve_refuses() {
 
 /// A streamed write crosses the socket a chunk at a time, lands in the space,
 /// and comes back as a published entry (§9.4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_streamed_put_publishes_without_buffering_the_object() {
     let dir = tempfile::tempdir().unwrap();
     let space = space_with(&[]);
@@ -1368,7 +1425,7 @@ async fn a_streamed_put_publishes_without_buffering_the_object() {
 
 /// A client that hangs up mid-payload leaves the space exactly as it was: half
 /// an object must never become this node's signed assertion (§9.4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_abandoned_write_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
     let space = space_with(&[("kept.txt", b"kept")]);
@@ -1411,7 +1468,7 @@ async fn an_abandoned_write_leaves_nothing_behind() {
 /// The gateway's configuration is the daemon's to hold: appended a record at a
 /// time, and fenced to the `s3.*` namespace so a client of the socket cannot
 /// read one config row to reach another (§9.4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_config_appends_within_its_namespace() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -1441,15 +1498,9 @@ async fn gateway_config_appends_within_its_namespace() {
             "{key} must not be writable"
         );
     }
-    assert_eq!(
-        daemon
-            .node
-            .store()
-            .config("self_origin_id")
-            .unwrap()
-            .unwrap(),
-        "nas@cluster.example"
-    );
+    let node = daemon.node.clone();
+    let stored = off_runtime(move || node.store().config("self_origin_id").unwrap().unwrap()).await;
+    assert_eq!(stored, "nas@cluster.example");
 
     // A record is one line: a newline would forge a second record.
     assert_eq!(
@@ -1473,7 +1524,7 @@ async fn admitted(mut client: Client) -> Result<(), ControlError> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bad_token_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -1503,7 +1554,7 @@ async fn a_bad_token_is_rejected() {
     daemon.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_version_mismatch_names_both_versions() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -1527,10 +1578,11 @@ async fn a_version_mismatch_names_both_versions() {
     daemon.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn there_is_no_daemon_error_naming_the_socket_and_the_command() {
     let dir = tempfile::tempdir().unwrap();
-    Node::init(dir.path(), None).unwrap();
+    let path = dir.path().to_path_buf();
+    off_runtime(move || Node::init(&path, None)).await.unwrap();
 
     let error = Client::connect(dir.path())
         .await
@@ -1544,7 +1596,7 @@ async fn there_is_no_daemon_error_naming_the_socket_and_the_command() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_daemon_for_one_datadir_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -1566,13 +1618,17 @@ async fn a_second_daemon_for_one_datadir_is_refused() {
 /// A daemon that was killed leaves its socket file behind; the next one must
 /// notice that nothing answers it and take the address over.
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_socket_is_cleared_on_start() {
     let dir = tempfile::tempdir().unwrap();
-    Node::init(
-        dir.path(),
-        Some(OriginId::named("nas", "cluster.example").unwrap()),
-    )
+    let path = dir.path().to_path_buf();
+    off_runtime(move || {
+        Node::init(
+            &path,
+            Some(OriginId::named("nas", "cluster.example").unwrap()),
+        )
+    })
+    .await
     .unwrap();
 
     // What a killed daemon leaves: a bound socket file with nothing listening.
@@ -1589,7 +1645,7 @@ async fn a_stale_socket_is_cleared_on_start() {
     daemon.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_stop_ends_the_server_and_clears_the_token() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -1615,7 +1671,7 @@ async fn daemon_stop_ends_the_server_and_clears_the_token() {
 
 /// Every daemon start mints a new token, so a client holding the previous one
 /// is refused rather than silently accepted.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_token_is_regenerated_on_every_start() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -1637,7 +1693,7 @@ async fn the_token_is_regenerated_on_every_start() {
 /// A call in flight must not be able to hold the daemon up: `synch recover`
 /// waits an hour by default, and the operator who asked the daemon to stop is
 /// not agreeing to wait it out (§9.1).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_long_call_does_not_hold_the_shutdown_open() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -1689,7 +1745,7 @@ async fn a_long_call_does_not_hold_the_shutdown_open() {
 /// The token must not outlive the socket: while `control.token` is readable,
 /// this datadir's socket is still bound, so a replacement daemon is refused
 /// rather than allowed to mint a token the outgoing one then deletes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_daemon_is_refused_until_the_last_of_the_old_one_is_gone() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
@@ -1720,7 +1776,7 @@ async fn a_replacement_daemon_is_refused_until_the_last_of_the_old_one_is_gone()
 /// of scope — an early `?`, a cancelled future, a process that died — must
 /// leave the space exactly as it was, however much of the payload arrived
 /// (§9.4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_write_publishes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let space = space_with(&[("kept.txt", b"kept")]);
@@ -1787,7 +1843,7 @@ async fn a_dropped_write_publishes_nothing() {
     daemon.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn take_adopts_a_peers_deletion_over_the_socket() {
     // §8: `synch take` of a tombstone version deletes our local copy and
     // publishes our own tombstone. The live form is unchanged, which the same
@@ -1810,31 +1866,17 @@ async fn take_adopts_a_peers_deletion_over_the_socket() {
     let peer = OriginId::named("laptop", "cluster.example").unwrap();
     // The peer publishes a live version of `kept.txt` with the same bytes we
     // could fetch locally, and a tombstone for `shared.txt`.
-    let root = daemon
-        .node
-        .store()
-        .ingest_bytes(b"theirs", synch_core::now_ns())
-        .unwrap();
     daemon
-        .node
-        .store()
-        .put_entry(
-            &peer,
-            "media",
-            "kept.txt",
-            &synch_core::FileEntry::file(6, 9_000, root, 4),
-        )
-        .unwrap();
+        .peer_file(&peer, "media", "kept.txt", b"theirs", 9_000, 4)
+        .await;
     daemon
-        .node
-        .store()
-        .put_entry(
+        .peer_entry(
             &peer,
             "media",
             "shared.txt",
-            &synch_core::FileEntry::tombstone(9_000, 4, None),
+            synch_core::FileEntry::tombstone(9_000, 4, None),
         )
-        .unwrap();
+        .await;
 
     // Taking a live version still works exactly as it did.
     let taken = lines(
@@ -1862,22 +1904,23 @@ async fn take_adopts_a_peers_deletion_over_the_socket() {
     assert!(taken.contains("published seq"), "{taken}");
     assert!(!space.path().join("shared.txt").exists());
 
-    let set = daemon.node.versions("media", "shared.txt").unwrap();
+    let node = daemon.node.clone();
+    let set = off_runtime(move || node.versions("media", "shared.txt"))
+        .await
+        .unwrap();
     assert_eq!(set.version_count(), 1, "{:?}", set.versions);
     assert!(set.versions[0].is_tombstone());
     assert!(!set.exists(), "the path has left the unified tree");
 
     // Taking a deletion of something we never had says so rather than failing.
     daemon
-        .node
-        .store()
-        .put_entry(
+        .peer_entry(
             &peer,
             "media",
             "never-ours.txt",
-            &synch_core::FileEntry::tombstone(9_000, 4, None),
+            synch_core::FileEntry::tombstone(9_000, 4, None),
         )
-        .unwrap();
+        .await;
     let taken = lines(
         data_dir,
         Command::Take(pb::Take {
@@ -1897,7 +1940,7 @@ async fn take_adopts_a_peers_deletion_over_the_socket() {
 /// holds that push for the whole request deadline, and the stop signal has to be
 /// heard during it: an operator asking a daemon to stop must not be told to wait
 /// on a stranger.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
     let dir = tempfile::tempdir().unwrap();
     let space = space_with(&[("notes.txt", b"hello")]);
@@ -1933,32 +1976,44 @@ async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
 
     // A space with something to publish, and the silent peer trusted and
     // addressed, so the initial scan produces a head and pushes it there.
-    Node::init(
-        dir.path(),
-        Some(OriginId::named("nas", "cluster.example").unwrap()),
-    )
+    let path = dir.path().to_path_buf();
+    off_runtime(move || {
+        Node::init(
+            &path,
+            Some(OriginId::named("nas", "cluster.example").unwrap()),
+        )
+    })
+    .await
     .unwrap();
     {
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        node.add_space("s", space.path()).unwrap();
-        node.store()
-            .put_binding(&synch_store::Binding {
-                origin: OriginId::named("silent", "cluster.example").unwrap(),
-                node_id: silent.id(),
-                source: synch_store::BindingSource::Static,
-                domain: None,
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
-            .unwrap();
-        node.store()
-            .record_peer_seen(
-                &silent.id(),
-                Some(&synch_engine::node::encode_addr(&silent_addr)),
-                synch_core::now_ns(),
-            )
-            .unwrap();
+        let seeding = node.clone();
+        let space_path = space.path().to_path_buf();
+        let (peer_id, peer_addr) = (silent.id(), silent_addr.clone());
+        off_runtime(move || {
+            seeding.add_space("s", &space_path).unwrap();
+            seeding
+                .store()
+                .put_binding(&synch_store::Binding {
+                    origin: OriginId::named("silent", "cluster.example").unwrap(),
+                    node_id: peer_id,
+                    source: synch_store::BindingSource::Static,
+                    domain: None,
+                    note: None,
+                    added_at: 0,
+                    expires_at: None,
+                })
+                .unwrap();
+            seeding
+                .store()
+                .record_peer_seen(
+                    &peer_id,
+                    Some(&synch_engine::node::encode_addr(&peer_addr)),
+                    synch_core::now_ns(),
+                )
+                .unwrap();
+        })
+        .await;
         node.shutdown().await.unwrap();
     }
 
@@ -1993,7 +2048,7 @@ async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
     silent.close().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_trust_configuration_and_the_resolver_state_are_reported() {
     // Every trust knob is settable by environment variable, so which trust a
     // daemon enforces is not visible from its command line: `daemon status` and
@@ -2022,7 +2077,12 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
 
     // A refresh asked for over the socket uses the daemon's resolver and
     // refuses when there is none, rather than building a fresh one per request.
-    daemon.node.add_domain("cluster.example").unwrap();
+    {
+        let node = daemon.node.clone();
+        off_runtime(move || node.add_domain("cluster.example"))
+            .await
+            .unwrap();
+    }
     let code = failure(
         data_dir,
         Command::DomainRefresh(pb::DomainRefresh { domain: None }),

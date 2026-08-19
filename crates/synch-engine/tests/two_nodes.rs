@@ -81,11 +81,14 @@ impl Node {
             .unwrap()
             .map(|h| h.root)
             .unwrap_or(Hash::EMPTY);
+        // One transaction, as every production writer of the complete slot
+        // does it: the head and the views it derives commit together (§5.2).
         self.store
-            .put_head(Slot::Complete, &head, now_ns(), now_ns())
-            .unwrap();
-        self.store
-            .materialize_diff(&self.origin, old, root)
+            .transaction(|txn| -> Result<(), synch_store::StoreError> {
+                txn.put_head(Slot::Complete, &head, now_ns(), now_ns())?;
+                txn.materialize_diff(&self.origin, old, root)?;
+                Ok(())
+            })
             .unwrap();
         head
     }
@@ -114,8 +117,11 @@ fn trust_each_other(nodes: &[&Node]) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_nodes_converge_and_content_transfers() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let publisher = Node::spawn("nas").await;
     let follower = Node::spawn("laptop").await;
     trust_each_other(&[&publisher, &follower]);
@@ -177,9 +183,16 @@ async fn two_nodes_converge_and_content_transfers() {
         .await
         .unwrap();
     let all = ChunkRanges::single(0, synch_core::group_count(payload_large.len() as u64));
-    blob.fetch_into(&follower.store, big_root, payload_large.len() as u64, &all)
-        .await
-        .unwrap();
+    let mut got = ChunkRanges::empty();
+    blob.fetch_into(
+        &follower.store,
+        big_root,
+        payload_large.len() as u64,
+        &all,
+        &mut got,
+    )
+    .await
+    .unwrap();
     assert_eq!(follower.store.read_all(&big_root).unwrap(), payload_large);
 
     // And a range read of an object the follower only partially holds.
@@ -190,11 +203,13 @@ async fn two_nodes_converge_and_content_transfers() {
         .content
         .unwrap();
     let one_group = ChunkRanges::single(0, 1);
+    let mut got_small = ChunkRanges::empty();
     blob.fetch_into(
         &follower.store,
         small_root,
         payload_small.len() as u64,
         &one_group,
+        &mut got_small,
     )
     .await
     .unwrap();
@@ -207,8 +222,11 @@ async fn two_nodes_converge_and_content_transfers() {
     follower.net.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_third_node_learns_the_trie_from_a_relayer() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // Peer-agnostic fetch (§5.2): trie nodes are content-addressed, so a node
     // may pull them from a peer that is neither the origin nor the peer that
     // told it about the head.
@@ -272,8 +290,11 @@ async fn a_third_node_learns_the_trie_from_a_relayer() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_updates_transfer_only_the_change() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let publisher = Node::spawn("nas").await;
     let follower = Node::spawn("laptop").await;
     trust_each_other(&[&publisher, &follower]);
@@ -323,8 +344,11 @@ async fn incremental_updates_transfer_only_the_change() {
     follower.net.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn untrusted_peers_are_refused() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // §3.2: connections from device keys with no live binding are closed
     // immediately after the QUIC handshake.
     let server = Node::spawn("nas").await;
@@ -351,8 +375,11 @@ async fn untrusted_peers_are_refused() {
 /// `get` would open one QUIC session per file, each one a handshake here and a
 /// connection left idling out over there. Requests to the same peer and ALPN
 /// share one session, and only a session that is actually gone is replaced.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn requests_to_a_peer_share_one_session() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let client = Node::spawn("laptop").await;
     let server = Node::spawn("nas").await;
     trust_each_other(&[&client, &server]);
@@ -411,8 +438,11 @@ async fn requests_to_a_peer_share_one_session() {
 }
 
 /// A binding that lapses does not leave a session open behind it (§3.2).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lapsed_binding_drops_the_session_it_was_dialed_under() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let client = Node::spawn("laptop").await;
     let server = Node::spawn("nas").await;
     trust_each_other(&[&client, &server]);
@@ -445,8 +475,11 @@ async fn a_lapsed_binding_drops_the_session_it_was_dialed_under() {
     server.net.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reactive_head_push_propagates() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let publisher = Node::spawn("nas").await;
     let follower = Node::spawn("laptop").await;
     trust_each_other(&[&publisher, &follower]);
@@ -492,8 +525,11 @@ async fn reactive_head_push_propagates() {
     follower.net.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unservable_head_is_abandoned_rather_than_wedging() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     // §5.2: if every candidate provider persistently returns `missing`, the
     // pending head is abandoned and head selection re-runs.
     let publisher = Node::spawn("nas").await;
@@ -539,6 +575,80 @@ async fn an_unservable_head_is_abandoned_rather_than_wedging() {
     follower.net.shutdown().await.unwrap();
 }
 
+/// An origin that publishes a value in the wrong representation is retired by the
+/// §5.2 abandonment rule, not left for the TTL sweep.
+///
+/// The rule is that a value small enough to be inline must *be* inline: the
+/// alternative gives one key/value map two roots, which is what structural
+/// sharing rests on not happening. The rule was right and its stated consequence
+/// was not — it returned an error from inside the batch transaction, which rolled
+/// back the legitimate values with it and propagated out of `fetch_pending`, so
+/// `learned == 0` was never reached and `MAX_UNPRODUCTIVE_ROUNDS` could not fire
+/// for this fault at all. The only escape was `pending_head_ttl`, thirty
+/// anti-entropy intervals later, and the head held `head_floor` for all of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_value_in_the_wrong_representation_retires_its_head() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
+    let publisher = Node::spawn("nas").await;
+    let follower = Node::spawn("laptop").await;
+    trust_each_other(&[&publisher, &follower]);
+
+    // A trie the publisher can serve whole, whose one leaf points at an
+    // out-of-line payload small enough that it should have been inline. Planted
+    // rather than inserted: `ValueRef::for_value` makes this unrepresentable
+    // through the write path, which is why the check lives at ingest.
+    let small = b"short enough to be inline".to_vec();
+    assert!(small.len() <= synch_core::INLINE_VALUE_MAX);
+    let value_hash = Hash::new(&small);
+    synch_mpt::NodeStore::put_value(publisher.store.as_ref(), &value_hash, &small).unwrap();
+    let leaf = synch_mpt::TrieNode::Leaf {
+        key_rest: synch_mpt::Nibbles::from_bytes(&synch_core::file_key("media", "a.txt").unwrap()),
+        value: synch_mpt::ValueRef::Hash(value_hash),
+    };
+    let encoded = leaf.encode();
+    let root = synch_mpt::TrieNode::hash_of_encoded(&encoded).unwrap();
+    synch_mpt::NodeStore::put_node(publisher.store.as_ref(), &root, &encoded).unwrap();
+
+    let head = SignedHead::sign(
+        &publisher.secret,
+        publisher.origin.clone(),
+        7,
+        root,
+        now_ns(),
+    );
+    let syncer = Syncer::new(follower.store.clone());
+    assert!(syncer.offer_head(&head, now_ns()).unwrap().accepted());
+
+    let client = follower
+        .net
+        .connect_mpt(publisher.net.direct_addr())
+        .await
+        .unwrap();
+    // The node arrives; the value is refused each round, which is no progress,
+    // so the head is retired by the counter rather than by the clock.
+    let outcome = syncer
+        .fetch_pending(&client, &publisher.origin)
+        .await
+        .unwrap();
+    assert_eq!(outcome, FetchOutcome::Abandoned);
+    assert_eq!(
+        follower.store.pending_head(&publisher.origin).unwrap(),
+        None,
+        "and the head stops holding the floor"
+    );
+    assert!(
+        synch_mpt::NodeStore::get_value(follower.store.as_ref(), &value_hash)
+            .unwrap()
+            .is_none(),
+        "the value itself was never stored"
+    );
+
+    publisher.net.shutdown().await.unwrap();
+    follower.net.shutdown().await.unwrap();
+}
+
 fn count_nodes(store: &Store) -> usize {
     store.trie_stats().unwrap().nodes
 }
@@ -552,8 +662,11 @@ fn count_nodes(store: &Store) -> usize {
 /// cannot replicate a video file. The requester walks the object in
 /// `MAX_SLICE_GROUPS` windows, and the provider clamps to the same bound
 /// whatever it is asked for.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_object_larger_than_one_frame_transfers() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let publisher = Node::spawn("nas").await;
     let follower = Node::spawn("laptop").await;
     trust_each_other(&[&publisher, &follower]);
@@ -573,8 +686,8 @@ async fn an_object_larger_than_one_frame_transfers() {
         .await
         .unwrap();
     let all = ChunkRanges::single(0, synch_core::group_count(payload.len() as u64));
-    let got = blob
-        .fetch_into(&follower.store, root, payload.len() as u64, &all)
+    let mut got = ChunkRanges::empty();
+    blob.fetch_into(&follower.store, root, payload.len() as u64, &all, &mut got)
         .await
         .unwrap();
     assert_eq!(got.count(), synch_core::group_count(payload.len() as u64));
@@ -592,8 +705,11 @@ async fn an_object_larger_than_one_frame_transfers() {
 /// poisoned head is durable, so a single bad record from any trusted origin
 /// would stop *every* origin's metadata from reaching this node, on every sync
 /// from then on.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_poisoned_origin_does_not_hold_up_the_others() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let poisoned = Node::spawn("nas").await;
     let healthy = Node::spawn("vps").await;
     let follower = Node::spawn("laptop").await;
@@ -671,8 +787,11 @@ async fn a_poisoned_origin_does_not_hold_up_the_others() {
 /// be byte-identical, and fetches the one group that changed. What crosses the
 /// wire is the proof plus one 16 KiB group, for an object of a megabyte; before
 /// this, the same edit cost a megabyte.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_small_edit_to_a_large_object_transfers_the_edit() {
+    // This test's own body drives the world the way an operator would,
+    // synchronously; the runtime workers the node uses stay checked (§10).
+    let _blocking = synch_core::BlockingScope::enter();
     let publisher = Node::spawn("nas").await;
     let follower = Node::spawn("laptop").await;
     trust_each_other(&[&publisher, &follower]);

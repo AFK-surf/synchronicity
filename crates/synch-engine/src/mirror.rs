@@ -124,10 +124,16 @@ impl Node {
     /// Brings one mirror up to date with the unified tree under its policy.
     pub async fn sync_mirror(&self, local_path: impl AsRef<Path>) -> Result<MirrorReport> {
         let key = mirror_key(local_path.as_ref());
-        let mirror = self
-            .store()
-            .mirror(&key)?
-            .ok_or_else(|| EngineError::not_found(format!("mirror {key}")))?;
+        let mirror = {
+            let store = self.store().clone();
+            let key = key.clone();
+            crate::blocking::offload(move || {
+                store
+                    .mirror(&key)?
+                    .ok_or_else(|| EngineError::not_found(format!("mirror {key}")))
+            })
+            .await?
+        };
         self.sync_mirror_row(&mirror).await
     }
 
@@ -304,7 +310,9 @@ impl Node {
     /// not starve the others.
     pub async fn sync_all_mirrors(&self) -> Result<Vec<(String, Result<MirrorReport>)>> {
         let mut out = Vec::new();
-        for mirror in self.store().mirrors()? {
+        let node = self.clone();
+        let mirrors = crate::blocking::offload(move || Ok(node.store().mirrors()?)).await?;
+        for mirror in mirrors {
             let path = mirror.local_path.clone();
             let report = self.sync_mirror_row(&mirror).await;
             out.push((path, report));

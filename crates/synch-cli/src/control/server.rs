@@ -54,19 +54,44 @@ const SEND_AHEAD: usize = 4;
 /// the scanner, and every timer in the process (§9.1). A request that streams an
 /// object, rebuilds the derived views, or unpublishes a space does real disk
 /// work, and doing it on the worker thread that polled the connection stops that
-/// worker from polling anything else for as long as it takes (§10). Requests
-/// that only read a handful of indexed rows stay inline.
+/// worker from polling anything else for as long as it takes (§10). What stays
+/// on the runtime worker is what touches neither the store nor the disk:
+/// in-memory node state, and selection over a version set already in hand.
 async fn offload<T, F>(f: F) -> Result<T, ControlError>
 where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    match tokio::task::spawn_blocking(move || {
+        let _scope = synch_core::BlockingScope::enter();
+        f()
+    })
+    .await
+    {
         Ok(result) => result,
         Err(e) => Err(ControlError::internal(format!(
             "a blocking task did not complete: {e}"
         ))),
     }
+}
+
+/// Reads node or store state on the blocking pool.
+///
+/// Every `Store` acquisition waits on the one global connection mutex, so a
+/// read here parks a runtime worker for as long as whatever is writing holds
+/// it — however few rows the read itself touches (§10). The daemon serves this
+/// service on the same runtime as the endpoint and the anti-entropy timers, so
+/// that worker is one the cluster is waiting on. There is deliberately no
+/// "short enough to stay inline" exception: which reads are short is a
+/// judgement, and `Store::conn`'s own assertion is what makes the rule
+/// checkable instead.
+async fn read<T, F>(node: &Node, f: F) -> Result<T, ControlError>
+where
+    F: FnOnce(Node) -> Result<T, ControlError> + Send + 'static,
+    T: Send + 'static,
+{
+    let node = node.clone();
+    offload(move || f(node)).await
 }
 
 /// The shortest gap between recovery collection rounds.
@@ -389,14 +414,16 @@ impl Control for ControlService {
         let request = request.into_inner();
         let policy = parse_policy(request.policy.as_deref())?;
         let node = self.node.clone();
-        let listing = node
-            .unified_listing(
-                &request.space,
-                &request.prefix,
-                request.start_after.as_deref(),
-                request.limit.map(|n| n as usize),
-            )
-            .map_err(ControlError::from)?;
+        let listing = {
+            let space = request.space.clone();
+            let prefix = request.prefix.clone();
+            let after = request.start_after.clone();
+            let limit = request.limit.map(|n| n as usize);
+            read(&node, move |n| {
+                Ok(n.unified_listing(&space, &prefix, after.as_deref(), limit)?)
+            })
+            .await?
+        };
         let (tx, rx) = mpsc::channel(SEND_AHEAD);
         let mut stopping = self.stop.subscribe();
         tokio::spawn(async move {
@@ -432,10 +459,12 @@ impl Control for ControlService {
     ) -> Result<Response<pb::Entry>, Status> {
         let request = request.into_inner();
         let policy = parse_policy(request.policy.as_deref())?;
-        let set = self
-            .node
-            .versions(&request.space, &request.path)
-            .map_err(ControlError::from)?;
+        let set = read(&self.node, move |n| {
+            Ok(n.versions(&request.space, &request.path)?)
+        })
+        .await?;
+        // Selection itself reads nothing: the version set is already in hand,
+        // so it stays on this task.
         let row = self
             .node
             .resolve_set(&set, &policy)
@@ -493,11 +522,11 @@ impl Control for ControlService {
             Some(PutPart::Header(header)) => header,
             _ => return Err(ControlError::invalid("a write opens with its space and path").into()),
         };
-        self.node.ensure_publishable().map_err(ControlError::from)?;
-        let adoption = self
-            .node
-            .open_adoption(&header.space, &header.path)
-            .map_err(ControlError::from)?;
+        read(&self.node, |n| Ok(n.ensure_publishable()?)).await?;
+        let adoption = {
+            let (space, path) = (header.space.clone(), header.path.clone());
+            read(&self.node, move |n| Ok(n.open_adoption(&space, &path)?)).await?
+        };
 
         let (tx, rx) = mpsc::channel(1);
         let node = self.node.clone();
@@ -527,8 +556,8 @@ impl Control for ControlService {
         request: Request<pb::GetConfigRequest>,
     ) -> Result<Response<pb::GetConfigResponse>, Status> {
         let request = request.into_inner();
-        let key = gateway_config_key(&request.key)?;
-        let records = match self.node.store().config(key).map_err(ControlError::from)? {
+        let key = gateway_config_key(&request.key)?.to_string();
+        let records = match read(&self.node, move |n| Ok(n.store().config(&key)?)).await? {
             Some(value) => value.lines().map(str::to_string).collect(),
             None => Vec::new(),
         };
@@ -540,17 +569,18 @@ impl Control for ControlService {
         request: Request<pb::AppendConfigRequest>,
     ) -> Result<Response<pb::AppendConfigResponse>, Status> {
         let request = request.into_inner();
-        let key = gateway_config_key(&request.key)?;
+        let key = gateway_config_key(&request.key)?.to_string();
         if request.record.contains('\n') {
             return Err(ControlError::invalid(
                 "a config record is one line: newlines separate records",
             )
             .into());
         }
-        self.node
-            .store()
-            .append_config(key, &request.record)
-            .map_err(ControlError::from)?;
+        let record = request.record;
+        read(&self.node, move |n| {
+            Ok(n.store().append_config(&key, &record)?)
+        })
+        .await?;
         Ok(Response::new(pb::AppendConfigResponse {}))
     }
 }
@@ -627,7 +657,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
     match command {
         Command::Id(pb::Id {}) => {
             out.line(format!("origin: {}", node.origin())).await?;
-            for key in node.device_keys()? {
+            for key in read(node, |n| Ok(n.device_keys()?)).await? {
                 out.line(format!(
                     "  {} ({})",
                     key.node_id.to_z32(),
@@ -650,7 +680,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             let peers = node.peer_bindings(node.origin()).await?;
             let reachable: Vec<&synch_engine::PeerBindings> =
                 peers.iter().filter(|p| p.reachable()).collect();
-            for key in node.device_keys()? {
+            for key in read(node, |n| Ok(n.device_keys()?)).await? {
                 let holding = reachable.iter().filter(|p| p.holds(&key.node_id)).count();
                 out.line(format!(
                     "{} {:<8} bound by {} of {} reachable peer(s)",
@@ -679,7 +709,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::KeyRotate(pb::KeyRotate {}) => {
-            let plan = node.rotate_key()?;
+            let plan = read(node, |n| Ok(n.rotate_key()?)).await?;
             out.line(format!("generated device key {}", plan.new_key.to_z32()))
                 .await?;
             // A key-identified origin is refused by `rotate_key` itself, so
@@ -772,21 +802,24 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 render::addr(&node.net().direct_addr())
             ))
             .await?;
-            let spaces = node.store().spaces()?;
+            let spaces = read(node, |n| Ok(n.store().spaces()?)).await?;
             let names: Vec<&str> = spaces.iter().map(|s| s.id.as_str()).collect();
             out.line(format!(
                 "spaces: {} ({}) · mirrors: {}",
                 spaces.len(),
                 names.join(", "),
-                node.store().mirrors()?.len()
+                read(node, |n| Ok(n.store().mirrors()?.len())).await?
             ))
             .await?;
-            let head = node.store().complete_head(origin)?;
+            let head = {
+                let origin = origin.clone();
+                read(node, move |n| Ok(n.store().complete_head(&origin)?)).await?
+            };
             out.line(format!(
                 "head: {} · peers seen: {}",
                 head.map(|h| format!("seq {}", h.seq))
                     .unwrap_or_else(|| "none published yet".into()),
-                node.store().peers_seen()?.len()
+                read(node, |n| Ok(n.store().peers_seen()?.len())).await?
             ))
             .await?;
             // Which trust this daemon is actually enforcing. Every knob here
@@ -797,7 +830,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 render::trust_summary(&node.resolver_status())
             ))
             .await?;
-            let clock = node.store().clock_status(now_ns())?;
+            let clock = read(node, |n| Ok(n.store().clock_status(now_ns())?)).await?;
             if !clock.trusted {
                 out.line(
                     "CLOCK UNUSABLE: the host clock cannot date a trust decision, so no DNS \
@@ -812,7 +845,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 )
                 .await?;
             }
-            let recovery = node.recovery_state()?;
+            let recovery = read(node, |n| Ok(n.recovery_state()?)).await?;
             if recovery.in_recovery {
                 out.line(format!(
                     "IN RECOVERY: a peer advertises seq {} for {origin}; run `synch recover`",
@@ -853,13 +886,18 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             addr,
         }) => {
             let key = parse_key(&key)?;
-            let origin =
-                node.trust_add(key, name.as_deref(), domain.as_deref(), note.as_deref())?;
+            let origin = read(node, move |n| {
+                Ok(n.trust_add(key, name.as_deref(), domain.as_deref(), note.as_deref())?)
+            })
+            .await?;
             if let Some(addr) = addr {
                 let socket = addr
                     .parse()
                     .map_err(|_| ControlError::invalid("--addr wants HOST:PORT"))?;
-                node.remember_peer(&iroh::EndpointAddr::new(key).with_ip_addr(socket))?;
+                read(node, move |n| {
+                    Ok(n.remember_peer(&iroh::EndpointAddr::new(key).with_ip_addr(socket))?)
+                })
+                .await?;
             }
             out.line(format!("trusted {} as {origin}", key.to_z32()))
                 .await?;
@@ -868,14 +906,22 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         Command::TrustRebind(pb::TrustRebind { origin, key }) => {
             let origin = parse_origin(&origin)?;
             let key = parse_key(&key)?;
-            let earlier: Vec<String> = node
-                .store()
-                .bindings()?
-                .into_iter()
-                .filter(|b| b.origin == origin && b.node_id != key)
-                .map(|b| b.node_id.to_z32())
-                .collect();
-            node.trust_rebind(&origin, key)?;
+            let earlier: Vec<String> = {
+                let origin = origin.clone();
+                read(node, move |n| {
+                    Ok(n.store()
+                        .bindings()?
+                        .into_iter()
+                        .filter(|b| b.origin == origin && b.node_id != key)
+                        .map(|b| b.node_id.to_z32())
+                        .collect())
+                })
+                .await?
+            };
+            {
+                let origin = origin.clone();
+                read(node, move |n| Ok(n.trust_rebind(&origin, key)?)).await?;
+            }
             out.line(format!("{origin} now also accepts {}", key.to_z32()))
                 .await?;
             // Rebinding is additive on purpose — the rotation window needs
@@ -895,7 +941,12 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             match key {
                 Some(key) => {
                     let key = parse_key(&key)?;
-                    if !node.store().remove_key_binding(&origin, &key)? {
+                    let owned = origin.clone();
+                    if !read(node, move |n| {
+                        Ok(n.store().remove_key_binding(&owned, &key)?)
+                    })
+                    .await?
+                    {
                         return Err(ControlError::new(
                             ErrorCode::NotFound,
                             format!("{origin} has no binding to {}", key.to_z32()),
@@ -905,7 +956,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                         .await?;
                 }
                 None => {
-                    let removed = node.store().remove_origin_bindings(&origin)?;
+                    let owned = origin.clone();
+                    let removed = read(node, move |n| {
+                        Ok(n.store().remove_origin_bindings(&owned)?)
+                    })
+                    .await?;
                     // "removed 0 binding(s)" with exit 0 is the cheerful lie
                     // the rest of the rm family refuses to tell.
                     if removed == 0 {
@@ -922,7 +977,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
 
         Command::TrustLs(pb::TrustLs {}) => {
             let now = now_ns();
-            for binding in node.store().bindings()? {
+            for binding in read(node, |n| Ok(n.store().bindings()?)).await? {
                 out.line(format!(
                     "{:<32} {} {:<7} {}{}",
                     binding.origin.canonical(),
@@ -952,7 +1007,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::DomainAdd(pb::DomainAdd { domain }) => {
-            node.add_domain(&domain)?;
+            {
+                let domain = domain.clone();
+                read(node, move |n| Ok(n.add_domain(&domain)?)).await?;
+            }
             out.line(format!("added {domain}")).await?;
             // Lenient: the add stands even when the first refresh fails —
             // configuring a domain before its records are published is a
@@ -961,7 +1019,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::DomainRm(pb::DomainRm { domain }) => {
-            if !node.remove_domain(&domain)? {
+            let dropped = {
+                let domain = domain.clone();
+                read(node, move |n| Ok(n.remove_domain(&domain)?)).await?
+            };
+            if !dropped {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
                     format!("{domain} is not a configured membership domain"),
@@ -972,7 +1034,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::DomainLs(pb::DomainLs {}) => {
-            let domains = node.domain_health()?;
+            let domains = read(node, |n| Ok(n.domain_health()?)).await?;
             if domains.is_empty() {
                 out.progress("(no membership domains configured; static trust only)")
                     .await?;
@@ -990,7 +1052,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
 
         Command::Peers(pb::Peers {}) => {
             let now = now_ns();
-            let seen = node.store().peers_seen()?;
+            let seen = read(node, |n| Ok(n.store().peers_seen()?)).await?;
             if seen.is_empty() {
                 // On stderr, as every empty listing here is: a human learns
                 // the silence is "nothing yet", a script still gets clean
@@ -998,7 +1060,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 out.progress("(no peers seen yet)").await?;
             }
             for peer in seen {
-                let origins = node.store().live_origins_for_key(&peer.node_id, now)?;
+                let key = peer.node_id;
+                let origins = read(node, move |n| {
+                    Ok(n.store().live_origins_for_key(&key, now)?)
+                })
+                .await?;
                 let names: Vec<String> = origins.iter().map(|o| o.canonical()).collect();
                 out.line(format!(
                     "{}  {}  last-seen {}  last-sync {}  rtt {}µs",
@@ -1020,7 +1086,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // A typo'd path otherwise becomes a fresh empty directory with no
             // signal; creating it is a feature, doing so silently is not.
             let created = !std::path::Path::new(&path).is_dir();
-            node.add_space(&id, &path)?;
+            {
+                let (id, path) = (id.clone(), path.clone());
+                read(node, move |n| Ok(n.add_space(&id, &path)?)).await?;
+            }
             out.line(format!("indexing {path} as {id}")).await?;
             if created {
                 out.line(format!("note: created {path}, which did not exist"))
@@ -1029,7 +1098,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::SpaceLs(pb::SpaceLs {}) => {
-            let spaces = node.store().spaces()?;
+            let spaces = read(node, |n| Ok(n.store().spaces()?)).await?;
             if spaces.is_empty() {
                 out.progress("(no local spaces; add one with `synch space add`)")
                     .await?;
@@ -1058,7 +1127,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // Refuse before hashing rather than after: a scan records what it
             // hashed, so a scan whose publish is refused would leave the node
             // believing it had published files it never did (§3.4).
-            node.ensure_publishable()?;
+            read(node, |n| Ok(n.ensure_publishable()?)).await?;
             // Hashing a tree is long and blocking, so it runs off the runtime
             // — the daemon keeps serving other requests — and each space is
             // reported as a progress message while the scan is still going.
@@ -1066,6 +1135,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             let scanning = {
                 let node = node.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _scope = synch_core::BlockingScope::enter();
                     node.scan_all_with(|space, report| {
                         let _ = progress_tx.send(format!(
                             "scanned {space}: hashed {} · unchanged {} · deleted {}",
@@ -1112,9 +1182,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // An unknown space and an empty listing print the same nothing,
             // and only one of them is fine: silence must mean "empty", never
             // "you misspelled it and nobody said so".
-            ensure_known_space(node, &reference.space)?;
+            ensure_known_space(node, &reference.space).await?;
             if let Some(origin) = &reference.origin {
-                ensure_known_origin(node, origin)?;
+                ensure_known_origin(node, origin).await?;
             }
             match &reference.origin {
                 // The origin-prefixed form lists exactly one origin's view,
@@ -1168,14 +1238,21 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             let explicit = space.is_some();
             let spaces = match space {
                 Some(space) => {
-                    ensure_known_space(node, &space)?;
+                    ensure_known_space(node, &space).await?;
                     vec![space]
                 }
-                None => node.store().known_spaces()?,
+                None => read(node, |n| Ok(n.store().known_spaces()?)).await?,
             };
             let mut printed = false;
             for space in &spaces {
-                for set in node.unified_listing(space, &path, None, None)? {
+                let sets = {
+                    let (space, path) = (space.clone(), path.clone());
+                    read(node, move |n| {
+                        Ok(n.unified_listing(&space, &path, None, None)?)
+                    })
+                    .await?
+                };
+                for set in sets {
                     for line in render::version_set(&set) {
                         out.line(line).await?;
                         printed = true;
@@ -1251,13 +1328,17 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // A tombstone is an assertion like any other, and §8 makes it
             // adoptable the same way: take the deletion, and let the next scan
             // publish our own.
-            let theirs = node.resolve(
-                &reference.space,
-                &reference.path,
-                &VersionPolicy::Origin(origin.clone()),
-            )?;
+            let theirs = {
+                let (space, path, pinned) = (
+                    reference.space.clone(),
+                    reference.path.clone(),
+                    VersionPolicy::Origin(origin.clone()),
+                );
+                read(node, move |n| Ok(n.resolve(&space, &path, &pinned)?)).await?
+            };
             if theirs.kind == synch_core::EntryKind::Tombstone {
-                match node.adopt_deletion(&reference.space, &reference.path)? {
+                let (space, path) = (reference.space.clone(), reference.path.clone());
+                match read(node, move |n| Ok(n.adopt_deletion(&space, &path)?)).await? {
                     Some(path) => {
                         out.line(format!("removed {}", path.display())).await?;
                     }
@@ -1294,7 +1375,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             if reference.path.is_empty() {
                 return Err(ControlError::invalid("log needs a path, not just a space"));
             }
-            for line in render::log(node, &reference)? {
+            let lines = {
+                let reference = reference.clone();
+                read(node, move |n| render::log(&n, &reference)).await?
+            };
+            for line in lines {
                 out.line(line).await?;
             }
         }
@@ -1341,13 +1426,16 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             policy,
         }) => {
             let policy = parse_policy(policy.as_deref())?;
-            let stored = node.add_mirror(&space, &path, &policy)?;
+            let stored = {
+                let (space, path, policy) = (space.clone(), path.clone(), policy.clone());
+                read(node, move |n| Ok(n.add_mirror(&space, &path, &policy)?)).await?
+            };
             out.line(format!("mirroring {space} into {stored} ({policy})"))
                 .await?;
             // Configuring the mirror before the space first syncs is a
             // legitimate order of operations; doing it to a typo'd id is not,
             // and nothing else in the exchange tells the two apart.
-            if ensure_known_space(node, &space).is_err() {
+            if ensure_known_space(node, &space).await.is_err() {
                 out.line(format!(
                     "note: no origin publishes {space} yet; the mirror stays empty until one does"
                 ))
@@ -1356,7 +1444,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::MirrorRm(pb::MirrorRm { path }) => {
-            if !node.remove_mirror(&path)? {
+            let dropped = {
+                let path = path.clone();
+                read(node, move |n| Ok(n.remove_mirror(&path)?)).await?
+            };
+            if !dropped {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
                     format!("no mirror at {path}"),
@@ -1366,7 +1458,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::MirrorLs(pb::MirrorLs {}) => {
-            let mirrors = node.store().mirrors()?;
+            let mirrors = read(node, |n| Ok(n.store().mirrors()?)).await?;
             if mirrors.is_empty() {
                 out.progress("(no mirrors configured)").await?;
             }
@@ -1384,7 +1476,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         Command::MirrorSync(pb::MirrorSync {}) => {
             // One mirror at a time, so the report of each arrives while the
             // next is still being materialized.
-            for mirror in node.store().mirrors()? {
+            for mirror in read(node, |n| Ok(n.store().mirrors()?)).await? {
                 out.progress(format!("{} …", mirror.local_path)).await?;
                 let report = node.sync_mirror(&mirror.local_path).await?;
                 out.line(format!(
@@ -1417,14 +1509,14 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::PinAdd(pb::PinAdd { target }) => {
-            let (root, size) = pin_target(node, &target)?;
+            let (root, size) = pin_target(node, &target).await?;
             node.pin_object(&root, size).await?;
             out.line(format!("pinned {root}")).await?;
         }
 
         Command::PinRm(pb::PinRm { target }) => {
-            let (root, _) = pin_target(node, &target)?;
-            if !node.store().set_pinned(&root, false)? {
+            let (root, _) = pin_target(node, &target).await?;
+            if !read(node, move |n| Ok(n.store().set_pinned(&root, false)?)).await? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
                     format!("no object {root} in the local store"),
@@ -1434,7 +1526,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::PinLs(pb::PinLs {}) => {
-            let pinned = node.store().pinned_blobs()?;
+            let pinned = read(node, |n| Ok(n.store().pinned_blobs()?)).await?;
             if pinned.is_empty() {
                 out.progress("(nothing pinned)").await?;
             }
@@ -1442,12 +1534,15 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 // A bare hash answers "what is pinned" without answering
                 // "what is it": the size and the paths currently naming the
                 // object are what make the list reviewable.
-                let size = node
-                    .store()
-                    .blob(&root)?
-                    .map(|b| format!("{} B", b.size))
-                    .unwrap_or_else(|| "(bytes not held)".into());
-                let paths = node.store().paths_naming(&root)?;
+                let (size, paths) = read(node, move |n| {
+                    let size = n
+                        .store()
+                        .blob(&root)?
+                        .map(|b| format!("{} B", b.size))
+                        .unwrap_or_else(|| "(bytes not held)".into());
+                    Ok((size, n.store().paths_naming(&root)?))
+                })
+                .await?;
                 out.line(format!(
                     "{root}  {size}  {}",
                     if paths.is_empty() {
@@ -1537,7 +1632,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::SyncNow(pb::SyncNow {}) => {
-            let peers = node.dialable_peers()?;
+            let peers = read(node, |n| Ok(n.dialable_peers()?)).await?;
             if peers.is_empty() {
                 out.line("no dialable peers: nothing to sync with").await?;
             }
@@ -1562,7 +1657,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                     joined.map_err(|e| ControlError::internal(format!("sync round: {e}")))?;
                 // The peer as the operator knows it — the origins its key is
                 // bound to — with the key for disambiguation, not as the name.
-                let origins = node.store().live_origins_for_key(&peer, now)?;
+                let origins = read(node, move |n| {
+                    Ok(n.store().live_origins_for_key(&peer, now)?)
+                })
+                .await?;
                 let name = if origins.is_empty() {
                     "(unnamed key)".to_string()
                 } else {
@@ -1682,7 +1780,10 @@ async fn receive(
     // does — the entry it reports has to be one peers can already see.
     node.scan_publish_push().await?;
     let ours = VersionPolicy::Origin(node.origin().clone());
-    let set = node.versions(&header.space, &header.path)?;
+    let set = {
+        let (space, path) = (header.space.clone(), header.path.clone());
+        read(node, move |n| Ok(n.versions(&space, &path)?)).await?
+    };
     let row = node.resolve_set(&set, &ours)?;
     Ok(pb::Written {
         path: target.display().to_string(),
@@ -1769,7 +1870,7 @@ async fn recover(node: &Node, out: &mut Frames, wait: Option<String>, gap: Optio
     // Never sleep past the end of the wait, and keep short waits responsive.
     options.poll = options.poll.min(options.wait).max(POLL_FLOOR);
 
-    let state = node.recovery_state()?;
+    let state = read(node, |n| Ok(n.recovery_state()?)).await?;
     if state.in_recovery {
         out.line(format!(
             "{} is in recovery: peers advertise a head at seq {}",
@@ -1839,10 +1940,14 @@ async fn recover(node: &Node, out: &mut Frames, wait: Option<String>, gap: Optio
 ///
 /// An unknown space and an empty one print the same nothing; this is what
 /// keeps that silence meaning "empty" rather than "misspelled".
-fn ensure_known_space(node: &Node, space: &str) -> Result<(), ControlError> {
-    if node.store().spaces()?.iter().any(|s| s.id == space)
-        || node.store().known_spaces()?.iter().any(|s| s == space)
-    {
+async fn ensure_known_space(node: &Node, space: &str) -> Result<(), ControlError> {
+    let owned = space.to_string();
+    let known = read(node, move |n| {
+        Ok(n.store().spaces()?.iter().any(|s| s.id == owned)
+            || n.store().known_spaces()?.iter().any(|s| s == &owned))
+    })
+    .await?;
+    if known {
         return Ok(());
     }
     Err(ControlError::new(
@@ -1852,8 +1957,13 @@ fn ensure_known_space(node: &Node, space: &str) -> Result<(), ControlError> {
 }
 
 /// Refuses an origin this node holds no binding for and is not itself.
-fn ensure_known_origin(node: &Node, origin: &OriginId) -> Result<(), ControlError> {
-    if node.origin() == origin || node.store().bindings()?.iter().any(|b| &b.origin == origin) {
+async fn ensure_known_origin(node: &Node, origin: &OriginId) -> Result<(), ControlError> {
+    let owned = origin.clone();
+    let known = read(node, move |n| {
+        Ok(n.origin() == &owned || n.store().bindings()?.iter().any(|b| b.origin == owned))
+    })
+    .await?;
+    if known {
         return Ok(());
     }
     Err(ControlError::new(
@@ -1870,10 +1980,16 @@ async fn refresh_domains(
 ) -> Done {
     // A domain the node was never told about is a typo, and it is refused
     // before a resolver is even built.
-    let domain = domain.map(|d| node.configured_domain(d)).transpose()?;
+    let domain = match domain {
+        Some(d) => {
+            let d = d.to_string();
+            Some(read(node, move |n| Ok(n.configured_domain(&d)?)).await?)
+        }
+        None => None,
+    };
     let requested = match &domain {
         Some(domain) => vec![domain.clone()],
-        None => node.domains()?,
+        None => read(node, |n| Ok(n.domains()?)).await?,
     };
     if requested.is_empty() {
         out.line("no membership domains configured; nothing to refresh (static trust only)")
@@ -2022,7 +2138,7 @@ fn parse_policy(text: Option<&str>) -> Result<VersionPolicy, ControlError> {
 /// the reading policy picks — the same selection every other read goes
 /// through, so a pin and a `synch cat` of the same reference always mean the
 /// same object. An `<origin>:` prefix pins that origin's version.
-fn pin_target(node: &Node, text: &str) -> Result<(Hash, Option<u64>), ControlError> {
+async fn pin_target(node: &Node, text: &str) -> Result<(Hash, Option<u64>), ControlError> {
     if let Ok(root) = Hash::from_str(text) {
         return Ok((root, None));
     }
@@ -2041,7 +2157,10 @@ fn pin_target(node: &Node, text: &str) -> Result<(Hash, Option<u64>), ControlErr
         return Err(malformed());
     }
     let policy = policy_for(&reference, None, false)?;
-    let entry = node.resolve(&reference.space, &reference.path, &policy)?;
+    let entry = read(node, move |n| {
+        Ok(n.resolve(&reference.space, &reference.path, &policy)?)
+    })
+    .await?;
     let root = entry.content.ok_or_else(|| {
         ControlError::invalid(format!("{text} selects a version with no content to pin"))
     })?;

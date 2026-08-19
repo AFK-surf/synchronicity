@@ -13,7 +13,7 @@
 //! All four are rejected at the boundary, so the structures below never reach
 //! a store.
 
-use synch_core::{Hash, INLINE_VALUE_MAX};
+use synch_core::{Hash, INLINE_VALUE_MAX, MAX_KEY_LEN, MAX_TRIE_VALUE_LEN};
 use synch_mpt::{MemStore, MptError, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
 
 /// Offers a hand-built node to the boundary the sync path uses.
@@ -219,4 +219,196 @@ fn an_extension_above_a_non_branch_is_refused_by_the_walk() {
         // And so the trie is never declared complete, so no head over it flips.
         assert!(trie.is_complete(root).is_err(), "ext above {name}");
     }
+}
+
+/// A key at exactly the §12 ceiling is one thing to every reader.
+///
+/// `get` counted node *loads* against `MAX_DEPTH_NIBBLES` while a key of `n`
+/// nibbles needs `n + 1` of them, so the longest legal key was yielded by
+/// `iter` and `diff` — and therefore materialized into `entries` and served
+/// through the unified tree — while `get` called it structurally invalid and
+/// `synch history` rendered the path as absent.
+#[test]
+fn the_longest_legal_key_is_visible_to_every_reader() {
+    let store = MemStore::new();
+
+    // A branch at every nibble of the deepest legal key, planted directly: the
+    // same shape a prefix chain of keys produces through `insert`, without the
+    // quadratic cost of building it that way. The key of 8 192 zero nibbles
+    // descends 8 192 branches and then loads the leaf holding the value, which
+    // is 8 193 node loads for a key `insert` accepts.
+    // Two fillers, so a branch's second occupant always puts its value at an
+    // even nibble depth: an odd one is a position no byte key can name, and
+    // every walk fails closed on it.
+    let flat = plant(
+        &store,
+        &TrieNode::Leaf {
+            key_rest: Nibbles::from_nibbles(&[]),
+            value: ValueRef::Inline(b"filler".to_vec()),
+        },
+    );
+    let stepped = plant(
+        &store,
+        &TrieNode::Leaf {
+            key_rest: Nibbles::from_nibbles(&[2]),
+            value: ValueRef::Inline(b"filler".to_vec()),
+        },
+    );
+    let mut node = plant(
+        &store,
+        &TrieNode::Leaf {
+            key_rest: Nibbles::from_nibbles(&[]),
+            value: ValueRef::Inline(b"deepest".to_vec()),
+        },
+    );
+    for depth in (0..MAX_KEY_LEN * 2).rev() {
+        let filler = if depth % 2 == 0 { stepped } else { flat };
+        node = plant(
+            &store,
+            &TrieNode::Branch {
+                children: {
+                    let mut c = [None; 16];
+                    c[0] = Some(node);
+                    c[1] = Some(filler);
+                    c
+                },
+                value: None,
+            },
+        );
+    }
+    let root = node;
+    let longest = vec![0x00u8; MAX_KEY_LEN];
+
+    let trie = Trie::new(&store);
+    assert_eq!(
+        trie.get(root, &longest).unwrap().as_deref(),
+        Some(b"deepest".as_slice()),
+        "the longest legal key must be readable"
+    );
+    let walked: Vec<Vec<u8>> = trie
+        .iter(root)
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        walked.contains(&longest),
+        "and reachable by the structural walk"
+    );
+    // The fetch that would have admitted this graph accepts it too: the value
+    // sits exactly at the ceiling, not past it.
+    assert!(trie.is_complete(root).unwrap());
+
+    // One byte past it is refused by every path, rather than refused by some.
+    let past = vec![0x00u8; MAX_KEY_LEN + 1];
+    assert!(matches!(
+        trie.get(root, &past),
+        Err(MptError::KeyTooLong(_))
+    ));
+    assert!(matches!(
+        trie.insert(root, &past, b"v"),
+        Err(MptError::KeyTooLong(_))
+    ));
+}
+
+/// A value past the §12 ceiling is refused where a key past it is.
+#[test]
+fn an_oversized_value_is_refused_by_the_write_path() {
+    let store = MemStore::new();
+    let trie = Trie::new(&store);
+    let big = vec![7u8; MAX_TRIE_VALUE_LEN + 1];
+    let err = trie
+        .insert(Hash::EMPTY, b"k", &big)
+        .expect_err("a value past the ceiling must not be published");
+    assert!(matches!(err, MptError::ValueTooLong(_)), "{err}");
+
+    // At the ceiling it is an ordinary value.
+    let edge = vec![7u8; MAX_TRIE_VALUE_LEN];
+    let root = trie.insert(Hash::EMPTY, b"k", &edge).unwrap();
+    assert_eq!(trie.get(root, b"k").unwrap().as_deref(), Some(&edge[..]));
+}
+
+/// A node hung below the depth any valid key reaches is refused by the fetch.
+///
+/// The node encoding bounds one node's nibble run, and DESIGN §12 read that as
+/// bounding ingest depth. It does not: a path is made of many nodes. Without a
+/// rule about the *path*, a chain reaching past that depth was pulled and
+/// committed, `is_complete` vouched for the root, no `entries` row reflected any
+/// of it, and every GC pass marked it from the retained head above.
+///
+/// A canonicality rule, not a quota: the walk deduplicates on hash, so a node is
+/// expanded at whichever depth it is reached first and sharing can make a deep
+/// chain shallow. What bounds storage is the deduplication itself — a member gets
+/// no leverage beyond what it uploads.
+#[test]
+fn a_node_past_the_key_depth_is_refused_by_the_walk() {
+    let store = MemStore::new();
+
+    // A ladder of one-nibble extensions, each above a branch, reaching past the
+    // depth a 4 KiB key can address. Every node is canonical on its own.
+    let leaf = plant(
+        &store,
+        &TrieNode::Leaf {
+            key_rest: Nibbles::from_nibbles(&[]),
+            value: ValueRef::Inline(vec![1]),
+        },
+    );
+    let mut child = plant(
+        &store,
+        &TrieNode::Branch {
+            children: {
+                let mut c = [None; 16];
+                c[0] = Some(leaf);
+                c[1] = Some(leaf);
+                c
+            },
+            value: None,
+        },
+    );
+    // Two nibbles per rung — one for the `Ext` prefix, one for the branch's
+    // child index — so this reaches just past the ceiling.
+    for _ in 0..=(MAX_KEY_LEN) {
+        let ext = plant(
+            &store,
+            &TrieNode::Ext {
+                prefix: Nibbles::from_nibbles(&[0]),
+                child,
+            },
+        );
+        child = plant(
+            &store,
+            &TrieNode::Branch {
+                children: {
+                    let mut c = [None; 16];
+                    c[0] = Some(ext);
+                    c[1] = Some(ext);
+                    c
+                },
+                value: None,
+            },
+        );
+    }
+
+    let trie = Trie::new(&store);
+    let mut walk = synch_mpt::MissingWalk::new(child);
+    let err = loop {
+        match walk.next_batch(&trie, 256) {
+            Ok(missing) => {
+                assert!(
+                    missing.is_empty(),
+                    "every node of the ladder is already stored"
+                );
+                if walk.is_exhausted() {
+                    panic!("the walk accepted a graph past the key-depth ceiling");
+                }
+                walk.resume();
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(err.to_string().contains("nibble depth"), "{err}");
+    assert!(
+        !trie.is_complete(child).unwrap_or(false),
+        "and the root is not vouched for"
+    );
 }

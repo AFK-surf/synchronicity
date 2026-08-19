@@ -101,10 +101,7 @@ impl Node {
     /// not".
     pub async fn peer_bindings(&self, origin: &OriginId) -> Result<Vec<PeerBindings>> {
         let mut out = Vec::new();
-        for peer in self.dialable_peers()? {
-            let addr = self
-                .peer_addr(&peer)?
-                .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
+        for (peer, addr) in self.dial_targets().await? {
             let keys = match self.net().connect_mpt(addr).await {
                 Ok(client) => client.get_bindings(origin).await.map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
@@ -163,9 +160,6 @@ impl Node {
                 "key-identified origins cannot rotate: the device key is the identity",
             ));
         }
-        // Activation re-signs a head of its own, so it is a publish and the
-        // recovery gate applies to it too (§3.4).
-        self.ensure_publishable()?;
         let previous_key = self.node_id();
         if new_key == &previous_key {
             return Err(EngineError::invalid(format!(
@@ -173,16 +167,26 @@ impl Node {
                 new_key.to_z32()
             )));
         }
-        let held = self
-            .device_keys()?
-            .into_iter()
-            .find(|key| &key.node_id == new_key)
-            .ok_or_else(|| {
-                EngineError::not_found(format!(
-                    "{}: this node holds no such device key; run `synch key rotate` first",
-                    new_key.to_z32()
-                ))
-            })?;
+        // Activation re-signs a head of its own, so it is a publish and the
+        // recovery gate applies to it too (§3.4). The gate and the key lookup
+        // are both store reads, and this runs on a runtime worker (§10).
+        let held = {
+            let node = self.clone();
+            let wanted = *new_key;
+            crate::blocking::offload(move || {
+                node.ensure_publishable()?;
+                node.device_keys()?
+                    .into_iter()
+                    .find(|key| key.node_id == wanted)
+                    .ok_or_else(|| {
+                        EngineError::not_found(format!(
+                            "{}: this node holds no such device key; run `synch key rotate` first",
+                            wanted.to_z32()
+                        ))
+                    })
+            })
+            .await?
+        };
 
         // A second endpoint on a fixed bind port would collide with the one
         // already running, so without an explicit address the incoming key
@@ -229,33 +233,47 @@ impl Node {
             added_at: now,
             expires_at: None,
         };
-        let floor = self.store().publish_floor()?.unwrap_or(0);
-        let head = self.store().transaction(|txn| -> Result<SignedHead> {
-            // The node must be able to verify its own heads after a restart,
-            // which means holding a binding for the key that signs them. This
-            // is its own locally generated key, not a claim from the network.
-            txn.put_binding(&binding)?;
-            txn.set_device_key_state(&previous_key, KeyState::Retiring)?;
-            txn.set_device_key_state(new_key, KeyState::Active)?;
+        // On the blocking pool: this is a transaction that writes a binding,
+        // two key states, a head and the derived views, on the store's one
+        // write connection (§10).
+        let store = self.store().clone();
+        let previous_key_for_txn = previous_key;
+        let new_key_for_txn = *new_key;
+        let head = crate::blocking::offload(move || {
+            store.transaction(|txn| -> Result<SignedHead> {
+                // The node must be able to verify its own heads after a
+                // restart, which means holding a binding for the key that signs
+                // them. This is its own locally generated key, not a claim from
+                // the network.
+                txn.put_binding(&binding)?;
+                txn.set_device_key_state(&previous_key_for_txn, KeyState::Retiring)?;
+                txn.set_device_key_state(&new_key_for_txn, KeyState::Active)?;
 
-            // Re-sign the current root as a new head under the new key. The
-            // data is untouched: only the signer changes, and seq still moves
-            // forward so peers accept it under the ordinary (seq, root) rule.
-            // Both come from the snapshot the flip is written against, exactly
-            // as `publish` reads them.
-            let previous = txn.complete_head(&origin)?;
-            let root = previous.as_ref().map(|h| h.root).unwrap_or(Hash::EMPTY);
-            let seq = previous.as_ref().map(|h| h.seq + 1).unwrap_or(1).max(floor);
-            let head = SignedHead::sign(&secret, origin.clone(), seq, root, now);
-            // `put_head` retains the signature; the displaced head retained its
-            // own when it took the slot (§10, v11).
-            txn.put_head(Slot::Complete, &head, now, now)?;
-            // The root does not move, so the diff is empty — but running it is
-            // what keeps every complete-slot writer to the same rule, rather
-            // than leaving this one relying on a root it did not read here.
-            txn.materialize_diff(&origin, root, head.root)?;
-            Ok(head)
-        })?;
+                // Re-sign the current root as a new head under the new key.
+                // The data is untouched: only the signer changes, and seq still
+                // moves forward so peers accept it under the ordinary
+                // (seq, root) rule. Both come from the snapshot the flip is
+                // written against, exactly as `publish` reads them.
+                let previous = txn.complete_head(&origin)?;
+                let root = previous.as_ref().map(|h| h.root).unwrap_or(Hash::EMPTY);
+                // The same rule `publish` uses, from the same one place: the
+                // complete slot alone does not know what the pending slot or
+                // the retained history say this origin has already signed
+                // ([`Txn::next_own_seq`]).
+                let seq = txn.next_own_seq(&origin)?;
+                let head = SignedHead::sign(&secret, origin.clone(), seq, root, now);
+                // `put_head` retains the signature; the displaced head retained
+                // its own when it took the slot (§10, v11).
+                txn.put_head(Slot::Complete, &head, now, now)?;
+                // The root does not move, so the diff is empty — but running it
+                // is what keeps every complete-slot writer to the same rule,
+                // rather than leaving this one relying on a root it did not
+                // read here.
+                txn.materialize_diff(&origin, root, head.root)?;
+                Ok(head)
+            })
+        })
+        .await?;
         self.swap_active_endpoint(held.secret.clone(), net);
         tracing::info!(
             seq = head.seq,
@@ -281,7 +299,13 @@ impl Node {
                 key.to_z32()
             )));
         }
-        if !self.device_keys()?.iter().any(|held| &held.node_id == key) {
+        let node = self.clone();
+        let held = *key;
+        let known = crate::blocking::offload(move || {
+            Ok(node.device_keys()?.iter().any(|k| k.node_id == held))
+        })
+        .await?;
+        if !known {
             return Err(EngineError::not_found(format!(
                 "{}: this node holds no such device key",
                 key.to_z32()
@@ -290,12 +314,18 @@ impl Node {
         if let Some(net) = self.take_retiring_endpoint(key) {
             net.shutdown().await?;
         }
-        self.store().remove_device_key(key)?;
-        // The old key no longer speaks for this origin locally either; peers
-        // stop accepting it when the record the operator removed expires.
-        let _ = self
-            .store()
-            .remove_binding(self.origin(), key, BindingSource::Static)?;
+        let node = self.clone();
+        let retired = *key;
+        crate::blocking::offload(move || {
+            node.store().remove_device_key(&retired)?;
+            // The old key no longer speaks for this origin locally either; peers
+            // stop accepting it when the record the operator removed expires.
+            let _ = node
+                .store()
+                .remove_binding(node.origin(), &retired, BindingSource::Static)?;
+            Ok(())
+        })
+        .await?;
         tracing::info!(key = %key.to_z32(), "retired a device key");
         Ok(())
     }

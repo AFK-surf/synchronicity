@@ -60,12 +60,24 @@ pub trait HeadSink: Send + Sync + std::fmt::Debug + 'static {
 /// How often a live session refreshes the sighting it recorded at accept.
 const PEER_SEEN_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many peers the sighting throttle remembers before it drops what has
+/// lapsed.
+///
+/// The map is keyed by device key, so it is bounded by the membership in any
+/// honest cluster (§12 sizes that at N ≤ 100) — but a key with no live binding
+/// never reaches the sighting closure at all, so this is a backstop against a
+/// membership larger than anyone has, not against a stranger.
+const MAX_TRACKED_SIGHTINGS: usize = 4096;
+
 /// The `sync/mpt/1` protocol handler.
 #[derive(Debug, Clone)]
 pub struct MptProtocol {
     store: Arc<Store>,
     heads: Arc<dyn HeadSink>,
     on_unknown_key: Option<Arc<tokio::sync::Notify>>,
+    /// When each peer's sighting was last written, shared across every
+    /// connection this handler serves.
+    last_sighting: Arc<std::sync::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>>,
 }
 
 impl MptProtocol {
@@ -75,6 +87,7 @@ impl MptProtocol {
             store,
             heads,
             on_unknown_key: None,
+            last_sighting: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -101,14 +114,42 @@ impl ProtocolHandler for MptProtocol {
         // `synch peers`. Refreshed as requests arrive, but at most once an
         // interval — the sighting is for an operator's eyes, not worth a write
         // per stream.
+        //
+        // The throttle is shared across connections rather than captured per
+        // `accept`, and the write goes to the blocking pool. Both matter: it is
+        // a row update and a WAL frame on the store's one write connection, and
+        // a per-connection throttle throttles nothing — a peer that opens N
+        // sessions bought N writes on runtime workers for the price of N
+        // handshakes.
         let store = self.store().clone();
-        let mut refreshed: Option<std::time::Instant> = None;
+        let last = self.last_sighting.clone();
         let sighting = move |peer: NodeId| {
-            if refreshed.is_some_and(|at| at.elapsed() < PEER_SEEN_REFRESH) {
-                return;
+            let store = store.clone();
+            let last = last.clone();
+            async move {
+                {
+                    let mut seen = last.lock().expect("the sighting lock");
+                    if seen
+                        .get(&peer)
+                        .is_some_and(|at: &std::time::Instant| at.elapsed() < PEER_SEEN_REFRESH)
+                    {
+                        return;
+                    }
+                    // Stamped before the write, so concurrent streams do not
+                    // each queue one while the first is still in flight.
+                    if seen.len() >= MAX_TRACKED_SIGHTINGS {
+                        seen.retain(|_, at| at.elapsed() < PEER_SEEN_REFRESH);
+                    }
+                    seen.insert(peer, std::time::Instant::now());
+                }
+                let recorded: Result<(), NetError> = crate::blocking::offload(move || {
+                    Ok(store.record_peer_seen(&peer, None, now_ns())?)
+                })
+                .await;
+                if let Err(e) = recorded {
+                    tracing::debug!(peer = %peer.fmt_short(), error = %e, "could not record a sighting");
+                }
             }
-            let _ = store.record_peer_seen(&peer, None, now_ns());
-            refreshed = Some(std::time::Instant::now());
         };
 
         let handler = self.clone();
@@ -241,6 +282,7 @@ impl MptProtocol {
                 let (nodes, missing) = crate::blocking::offload(move || {
                     let mut nodes = Vec::new();
                     let mut missing = Vec::new();
+                    let mut budget = ANSWER_BYTE_BUDGET;
                     // One answer per *distinct* hash. A requester may only ask
                     // once — `take_served` refuses a repeated payload as a
                     // protocol violation and ends the exchange — so answering a
@@ -254,7 +296,25 @@ impl MptProtocol {
                             continue;
                         }
                         match store.get_node(&hash)? {
-                            Some(data) => nodes.push((hash, data)),
+                            Some(data) => {
+                                // A short answer is an ordinary answer: the
+                                // requester's walk defers everything it asked
+                                // for and re-offers what did not come back
+                                // (`MissingWalk::resume`). What is not ordinary
+                                // is discovering the frame is too large *after*
+                                // building it — `write_frame` serializes the
+                                // whole message before it can check
+                                // `MAX_FRAME_LEN`, so the cap has to be applied
+                                // while the answer is being assembled.
+                                match budget.checked_sub(data.len()) {
+                                    Some(left) => {
+                                        budget = left;
+                                        nodes.push((hash, data));
+                                    }
+                                    None if nodes.is_empty() => nodes.push((hash, data)),
+                                    None => break,
+                                }
+                            }
                             None => missing.push(hash),
                         }
                     }
@@ -266,19 +326,19 @@ impl MptProtocol {
             }
             MptMessage::GetValues { hashes } => {
                 check_batch(hashes.len())?;
-                // The answer is bounded in bytes as well as in count, but not
-                // here — by what a trie value can be. `AdState` decodes bounded
-                // at `MAX_AD_SPANS` and `coalesce_spans` truncates to the same
-                // cap on the publish side, so a `b:` record is ~20 KB at worst;
-                // a `FileEntry` is small, because the path lives in the *key*
-                // and keys are capped at `MAX_KEY_LEN`. `MAX_BATCH` of either
-                // is a few MiB against a 16 MiB frame. What a value cannot be
-                // is unbounded: nothing larger than a frame can have arrived to
-                // be stored in the first place.
+                // Bounded in bytes as well as in count, and *here*. The count
+                // cap alone was never a cost cap: a value is arbitrary bytes,
+                // so `MAX_BATCH` of them is whatever the origin that published
+                // them chose. This handler used to reason that a `b:` record is
+                // ~20 KB and a `FileEntry` small — true of honest records, and
+                // a claim about record shapes rather than an enforced bound.
+                // `MAX_TRIE_VALUE_LEN` is the enforced one now, and the budget
+                // below is what keeps even a full batch of them inside a frame.
                 let store = self.store().clone();
                 let (values, missing) = crate::blocking::offload(move || {
                     let mut values = Vec::new();
                     let mut missing = Vec::new();
+                    let mut budget = ANSWER_BYTE_BUDGET;
                     // One answer per distinct hash, as `GetNodes` above.
                     let mut answered = std::collections::HashSet::new();
                     for hash in hashes {
@@ -286,7 +346,18 @@ impl MptProtocol {
                             continue;
                         }
                         match store.get_value(&hash)? {
-                            Some(data) => values.push((hash, data)),
+                            Some(data) => match budget.checked_sub(data.len()) {
+                                Some(left) => {
+                                    budget = left;
+                                    values.push((hash, data));
+                                }
+                                // One payload always goes, whatever its size:
+                                // a stored value larger than the whole budget
+                                // predates the ceiling, and answering nothing
+                                // would stall the requester's walk forever.
+                                None if values.is_empty() => values.push((hash, data)),
+                                None => break,
+                            },
                             None => missing.push(hash),
                         }
                     }
@@ -332,6 +403,19 @@ impl MptProtocol {
         }
     }
 }
+
+/// How many payload bytes one `Nodes` or `Values` answer may carry.
+///
+/// The request is capped at [`MAX_BATCH`] hashes; the answer it draws was capped
+/// only by [`MAX_FRAME_LEN`](synch_core::MAX_FRAME_LEN), and discovered to
+/// overrun it only *after* `write_frame` had serialized the whole message —
+/// which is to say after the responder had already allocated it twice. Applied
+/// while the answer is assembled, it is a bound on the work as well as on the
+/// wire (§12).
+///
+/// Half a frame, so the postcard framing and the `missing` list have room and a
+/// short answer is never produced for lack of a few hundred bytes.
+const ANSWER_BYTE_BUDGET: usize = synch_core::MAX_FRAME_LEN / 2;
 
 /// A backstop behind the decode-time bound.
 ///
@@ -995,6 +1079,68 @@ mod tests {
         .expect("a stalled stream must not hold the connection")
         .unwrap();
         assert!(keys.is_empty());
+
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+    /// A batch answer is bounded in bytes, not only in hashes.
+    ///
+    /// Two halves. A full legal batch of ceiling-sized values fits one frame and
+    /// is served whole — that is what `MAX_TRIE_VALUE_LEN` buys. And a store that
+    /// holds something larger than the ceiling, as one written before the ceiling
+    /// existed does, still cannot be made to build an answer past the frame: the
+    /// budget is applied while the answer is assembled rather than discovered by
+    /// `write_frame` after the whole message has been serialized. A short answer
+    /// is ordinary — the requester's walk defers what it asked for and re-offers
+    /// whatever did not come back.
+    #[tokio::test]
+    async fn a_values_answer_is_bounded_in_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+
+        let plant = |len: usize, tag: u64| {
+            let mut payload = vec![0u8; len];
+            payload[..8].copy_from_slice(&tag.to_le_bytes());
+            let hash = Hash::new(&payload);
+            synch_mpt::NodeStore::put_value(store.as_ref(), &hash, &payload).unwrap();
+            hash
+        };
+
+        // A full batch at the value ceiling.
+        let at_ceiling: Vec<Hash> = (0..MAX_BATCH as u64)
+            .map(|i| plant(synch_core::MAX_TRIE_VALUE_LEN, i))
+            .collect();
+        // And three values from before the ceiling, each a quarter of the budget.
+        let oversized: Vec<Hash> = (0..3u64)
+            .map(|i| plant(ANSWER_BYTE_BUDGET / 2, 1_000 + i))
+            .collect();
+
+        let (server, client, _client_dir) =
+            trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
+        let mpt = client.connect_mpt(server.direct_addr()).await.unwrap();
+
+        let answer = mpt.get_values(&at_ceiling).await.unwrap();
+        assert_eq!(
+            answer.values.len(),
+            MAX_BATCH,
+            "a full batch at the ceiling is served whole"
+        );
+        assert!(answer.missing.is_empty());
+
+        let answer = mpt.get_values(&oversized).await.unwrap();
+        let bytes: usize = answer.values.iter().map(|(_, v)| v.len()).sum();
+        assert!(bytes <= ANSWER_BYTE_BUDGET, "{bytes} bytes served");
+        assert!(!answer.values.is_empty(), "and it is not empty");
+        assert!(
+            answer.values.len() < oversized.len(),
+            "the budget bit: {} of {}",
+            answer.values.len(),
+            oversized.len()
+        );
+        for (hash, payload) in &answer.values {
+            assert_eq!(&Hash::new(payload), hash);
+            assert!(oversized.contains(hash));
+        }
 
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();

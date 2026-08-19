@@ -28,22 +28,39 @@ pub enum MptError {
     /// A key exceeded the §12 bound.
     #[error("trie key too long: {0} bytes (max {max})", max = synch_core::MAX_KEY_LEN)]
     KeyTooLong(usize),
+    /// A value exceeded the §12 bound.
+    ///
+    /// The counterpart of [`MptError::KeyTooLong`], and it did not exist: a
+    /// value was bounded only by the frame it arrived in, which is what let one
+    /// small trie cost every peer gigabytes to serve and terabytes to
+    /// materialize ([`MAX_TRIE_VALUE_LEN`](synch_core::MAX_TRIE_VALUE_LEN)).
+    #[error("trie value too long: {0} bytes (max {max})", max = synch_core::MAX_TRIE_VALUE_LEN)]
+    ValueTooLong(usize),
     /// A node was well-formed and correctly hashed but broke one of the
     /// structural invariants the node kinds document (§4.3).
     ///
     /// The write path maintains these by construction; a node arriving from a
     /// peer is only decoded, so they are checked at the trust boundary
     /// ([`TrieNode::hash_of_encoded`](crate::TrieNode::hash_of_encoded)).
-    /// Accepting such a node does not corrupt anything on its own, but it puts
-    /// the readers into disagreement — an empty extension prefix is followed by
-    /// `get` and skipped by every structural walk — and it gives one key/value
-    /// map more than one root, which defeats structural sharing.
+    /// Accepting such a node corrupts nothing on its own — every reader agrees
+    /// about what it means — but it gives one key/value map more than one root,
+    /// which defeats structural sharing and makes every peer's incremental sync
+    /// cost the whole tree.
     #[error("trie node breaks a structural invariant: {0}")]
     NonCanonical(String),
     /// The trie contained a value at an odd nibble depth, which no byte-string
     /// key can produce.
     #[error("trie contains a value at an odd nibble depth")]
     OddDepthValue,
+    /// A caller's own error ended a streaming walk.
+    ///
+    /// Never returned to that caller — [`Trie::for_each_resolved_change`] hands
+    /// back the error it was carrying. It exists because the walk's own
+    /// signature is `Result<_, MptError>` and a caller's error type is not one.
+    ///
+    /// [`Trie::for_each_resolved_change`]: crate::Trie::for_each_resolved_change
+    #[error("a walk was stopped by its caller")]
+    WalkStopped,
     /// The backing store failed.
     #[error("trie store error: {0}")]
     Store(#[source] Box<dyn std::error::Error + Send + Sync>),

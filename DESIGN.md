@@ -669,6 +669,27 @@ Properties:
     committed batch and the promotion that would have followed leaves a head that
     neither path revisits — holding the floor while sitting on every byte it
     needs.
+  - A head whose trie is wholly present and whose *promotion* this node's own
+    rules refuse — an undecodable `f:` record, say — never keeps the slot it was
+    written into: the offer that wrote it retires it again, leaving the head in
+    `head_history` as evidence and dropping the floor back to what this node can
+    serve. Left in place it looked to the TTL rule like a head one promotion away
+    from complete, which it is not, and the cycle that followed (abandon, re-adopt,
+    fail, abandon) cost a full promotion diff under the write lock every round.
+
+Abandonment names the head it is abandoning. All three rules reach their verdict
+on a snapshot — after several network round trips, or after a trie walk — and the
+slot is written by any concurrent `offer_head`, so a delete that took *whatever
+occupies the slot* could discard a strictly newer head that arrived in between.
+
+The `seq` a local publish carries is derived from **everything this node has
+recorded for its own origin** — both slots and the retained history — not from the
+complete slot alone. A database restored from a backup still holds a complete
+head, so §3.4's key-loss recovery does not cover it, and deriving the next seq
+from that slot alone lets the node sign a second root at a seq its own history
+already names. Both roots are valid and bound, so every peer takes the greater
+under the rule above — and if that is the older root, this node's own `entries`
+are rolled back to it everywhere.
 
 ### 5.3 Anti-entropy scheduling
 
@@ -772,7 +793,14 @@ Consequences:
   (fetching different ranges from different peers in parallel) falls out naturally.
   Span summaries are **hints, not promises**: the fetcher learns exact availability
   from `SliceEnd` and re-plans, so a stale ad costs one wasted round-trip, never
-  correctness.
+  correctness. They are hints in one direction only, though: spans round *inward*
+  to the granularity, so a holder advertises the largest aligned run it can
+  actually serve and never a byte more. Over-reporting sends a fetcher to a
+  provider that cannot serve, while under-reporting costs at most a re-fetch — and
+  because "I hold all of this" is read off the spans, rounding outward made a node
+  holding one 8 MiB window of a 10 MiB object claim the whole object, which is not
+  a hint but a wrong answer. The cost is that a partial holder advertises in whole
+  16 MiB units, so the first slice window of a span buys no advertisement.
 - Cost model: availability metadata is ~1 trie record per (object, holder). For the
   §14 media example, 40 k objects ≈ 40 k ads per holding node — the same order as
   the `f:` namespace itself, and consistent with the §12 quota.
@@ -798,7 +826,11 @@ The fetcher:
 
 1. Resolves providers from `blob_providers`, ranks them (recent latency EWMA, then
    random tiebreak), and splits the wanted range across up to `fetch_fanout` (default 3)
-   providers.
+   providers — each getting a contiguous share **of what it claims**, taken in rank
+   order so nothing is handed to two of them. Cutting the range positionally and
+   handing piece *i* to provider *i* is only an assignment if every provider claims
+   the whole object: two peers holding complementary halves are each handed the half
+   they do not have.
 2. Streams and verifies groups as they arrive; verified groups are committed to the
    CAS and the completeness bitmap immediately (progress survives restarts).
 3. Re-plans on provider failure: a provider that cannot help is dropped from the
@@ -1161,19 +1193,47 @@ the invariant that matters is that every multi-step state change (head flips,
 publish batches) is a single transaction and no partial state is ever observable;
 read concurrency is deliberately traded away for that simplicity.
 
-**Blocking work never runs on the runtime.** The store and the CAS are
-synchronous by design — `synch-store` has no async runtime dependency at all —
-and so is everything built directly on them: the scanner's directory walks and
-BLAKE3 hashing, publish transactions, slice encode and decode, mirror
-materialization, GC. None of that belongs on a tokio worker thread. A worker
-hashing a 10 GB file is a worker that is not polling the endpoint, the control
-socket, or a timer, and the multi-thread runtime has only one worker per core,
-so a few concurrent scans would stall the daemon outright. Every long or
-unbounded blocking operation reachable from an async context is therefore
-dispatched to tokio's blocking pool (`synch_engine::blocking`,
-`synch_net::blocking`, and the control server's own helper). Short bounded
-lookups — one indexed `SELECT`, a single `stat` — stay inline, where the handoff
-would cost more than the work itself.
+**Blocking work never runs on the runtime, and that is checked.** The store and
+the CAS are synchronous by design — `synch-store` has no async runtime
+dependency at all — and so is everything built directly on them: the scanner's
+directory walks and BLAKE3 hashing, publish transactions, slice encode and
+decode, mirror materialization, GC. None of that belongs on a tokio worker
+thread. A worker hashing a 10 GB file is a worker that is not polling the
+endpoint, the control socket, or a timer, and the multi-thread runtime has only
+one worker per core, so a few concurrent scans would stall the daemon outright.
+Every blocking operation reachable from an async context is therefore dispatched
+to tokio's blocking pool (`synch_engine::blocking`, `synch_net::blocking`, and
+the control server's own helper).
+
+**Every** one, with no "short enough to stay inline" exception. There used to be
+one, for a single indexed `SELECT` or a `stat`, and it was the wrong shape of
+rule twice over. It measured the wrong thing: what a store call costs on a
+worker is not the query, it is the wait for the one connection mutex, and a
+publish batch or a GC pass holds that for as long as it runs whatever the
+waiting caller wanted to read. And it made correctness a per-call-site
+judgement across a couple of hundred sites, which is not a rule a reader can
+check — four separate audit passes moved call sites off the runtime and each one
+left some behind, because a violation compiles, passes its tests, and shows up
+only as a daemon that goes quiet under load.
+
+So the rule is now enforced rather than described. `synch_core::blocking`'s
+`offload` marks its thread with a `BlockingScope`, and `Store::conn` asserts, in
+debug builds, that it is either inside one or not on a multi-thread runtime at
+all — the same shape as the guard that made "no `Store::conn` inside a
+transaction" a named panic instead of a silent deadlock.
+
+An assertion only earns its keep where something runs it. It is silent on a
+current-thread runtime — one worker the test itself is driving is not the hazard
+— so a `#[tokio::test]` suite left at the default flavor would have been a
+checker nothing ever executed, and that is precisely how the previous passes
+kept leaving call sites behind. Every integration suite that drives an async
+production surface therefore runs `flavor = "multi_thread"`: the cluster and
+two-node sync paths, recovery, the control socket, and the S3 gateway. Between
+them they cover the accept/exchange/fetch/publish/maintain path, every control
+command, and every gateway verb, on the same runtime flavor the daemon binary
+starts. A test's own body drives its world synchronously — that is what a test
+thread is for — so it declares that with a `BlockingScope`, which exempts that
+one thread and leaves every runtime worker the node uses checked.
 
 This relocates the queue rather than removing it: the one connection mutex is
 still the bottleneck, and a long exclusive holder (a GC pass, a full publish
@@ -1285,6 +1345,7 @@ CREATE TABLE blob_providers (
   spans       BLOB,                      -- coalesced 16 MiB-granularity byte spans when partial
   PRIMARY KEY (object_root, origin_id)
 );
+CREATE INDEX blob_providers_by_origin ON blob_providers (origin_id);
 
 -- local content store index
 CREATE TABLE blobs (
@@ -1453,8 +1514,18 @@ CI (GitHub Actions):
   radius) and ages out with normal retention; `synch doctor` lists origins whose
   data is held without a live binding. What remains are sanity bounds that
   cap the cost of any *single* malformed or extreme message: `GetNodes`/`GetValues`
-  batches are capped at 256 hashes, and trie keys are bounded to 4 KiB (so ingest
-  depth ≤ ~8 K nibbles). A `GetSlice` is bounded the same way, on both axes: at
+  batches are capped at 256 hashes *and* at half a frame of payload, because a
+  count alone bounds nothing when the payloads are the publishing origin's to
+  choose; trie keys are bounded to 4 KiB and trie values to 32 KiB; and the fetch
+  that ingests a peer's trie stops descending at the ~8 K nibbles a 4 KiB key
+  reaches. That last one is a canonicality rule about *positions*, and the key
+  bound does not imply it: the node encoding caps one node's nibble run, so
+  without it a chain reaching past that depth was pulled, committed, vouched for
+  by `is_complete`, reflected in no `entries` row, and marked by every GC pass
+  thereafter. It is not a quota — the ingest walk deduplicates on hash, so what a
+  member can make a peer store is what it uploads, which is the membership
+  question above rather than a sanity bound. A `GetSlice` is bounded the same way, on
+  both axes: at
   most 512 groups are encoded per exchange (§6.4), and at most 4 096 ranges are
   accepted in one request, because the range set operations are quadratic in the
   number of ranges. Trust does not extend to the *shape* of replicated

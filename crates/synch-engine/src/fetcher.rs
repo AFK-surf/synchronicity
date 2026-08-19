@@ -123,54 +123,6 @@ pub struct FetchReport {
     pub complete: bool,
 }
 
-/// Splits a set of groups into `parts` contiguous shares of roughly equal size.
-///
-/// This is what makes `fetch_fanout` mean something: without it, the first
-/// provider asked for a whole object claims all of it and the others have
-/// nothing left to do. Contiguous shares rather than interleaved ones, because
-/// a bao slice over one span is cheaper to encode and verify than one over
-/// many.
-fn split_ranges(ranges: &ChunkRanges, parts: usize) -> Vec<ChunkRanges> {
-    let parts = parts.max(1) as u64;
-    let total = ranges.count();
-    if total == 0 {
-        return vec![ChunkRanges::empty(); parts as usize];
-    }
-    let mut out = Vec::with_capacity(parts as usize);
-    let mut consumed = 0u64;
-    let mut cursor = ranges.ranges.iter().copied().peekable();
-    let mut carry: Option<synch_core::GroupRange> = None;
-    for part in 0..parts {
-        // Each share ends at its proportional boundary, so rounding never
-        // leaves a group unassigned: the last share takes whatever is left.
-        let boundary = if part + 1 == parts {
-            total
-        } else {
-            total * (part + 1) / parts
-        };
-        let mut share = Vec::new();
-        while consumed < boundary {
-            let range = match carry.take().or_else(|| cursor.next()) {
-                Some(range) => range,
-                None => break,
-            };
-            let len = range.end - range.start;
-            let want = boundary - consumed;
-            if len <= want {
-                share.push(range);
-                consumed += len;
-            } else {
-                let split = range.start + want;
-                share.push(synch_core::GroupRange::new(range.start, split));
-                carry = Some(synch_core::GroupRange::new(split, range.end));
-                consumed = boundary;
-            }
-        }
-        out.push(ChunkRanges::from_ranges(share));
-    }
-    out
-}
-
 impl Node {
     /// Resolves and ranks the providers for a byte range of an object (§6.4).
     ///
@@ -292,7 +244,11 @@ impl Node {
     /// nobody holds even partially has no size to fetch by, and is refused
     /// rather than half-promised.
     pub async fn pin_object(&self, root: &Hash, size_hint: Option<u64>) -> Result<()> {
-        let blob = self.store().blob(root)?;
+        let blob = {
+            let store = self.store().clone();
+            let root = *root;
+            crate::blocking::offload(move || Ok(store.blob(&root)?)).await?
+        };
         if !blob.as_ref().is_some_and(|b| b.complete) {
             let Some(size) = blob.as_ref().map(|b| b.size).or(size_hint) else {
                 return Err(EngineError::NotFound(format!(
@@ -302,7 +258,12 @@ impl Node {
             };
             self.fetch_all(root, size).await?;
         }
-        if !self.store().set_pinned(root, true)? {
+        let pinned = {
+            let store = self.store().clone();
+            let root = *root;
+            crate::blocking::offload(move || Ok(store.set_pinned(&root, true)?)).await?
+        };
+        if !pinned {
             return Err(EngineError::NotFound(format!(
                 "object {root} left the store before it could be pinned"
             )));
@@ -349,10 +310,12 @@ impl Node {
         donors: &[Donor],
     ) -> Result<FetchReport> {
         if size == 0 {
-            return self.take_empty_object(root);
+            let node = self.clone();
+            let root = *root;
+            return crate::blocking::offload(move || node.take_empty_object(&root)).await;
         }
         let mut report = FetchReport::default();
-        let mut remaining = wanted.difference(&self.local_groups(root)?);
+        let mut remaining = wanted.difference(&self.local_groups_off_runtime(root).await?);
         if remaining.is_empty() {
             report.complete = true;
             return Ok(report);
@@ -378,7 +341,7 @@ impl Node {
         let mut providers = if remaining.is_empty() {
             Vec::new()
         } else {
-            self.providers_for(root, 0, size.max(1))?
+            self.providers_off_runtime(root, size).await?
         };
         if providers.is_empty() && !remaining.is_empty() {
             // No local ad covers this root — a cold cache, or an origin just
@@ -418,50 +381,75 @@ impl Node {
                 break;
             }
 
-            // Split what is missing into one contiguous share per provider,
-            // then narrow each share to what that provider actually claims.
-            // Anything a provider does not claim simply stays in `remaining`
-            // and is offered to the next batch.
-            let shares = split_ranges(&remaining, chosen.len());
-            let batch: Vec<(Provider, ChunkRanges)> = chosen
-                .into_iter()
-                .zip(shares)
-                .map(|(provider, share)| {
-                    let ask = share.intersect(&provider.claims);
-                    (provider, ask)
-                })
-                .filter(|(_, ask)| !ask.is_empty())
-                .collect();
+            // Each provider gets a contiguous share *of what it claims*, taken
+            // in rank order so the fastest picks first, and nothing is handed to
+            // two of them.
+            //
+            // Cutting `remaining` positionally and zipping the pieces onto the
+            // ranked providers assumed every provider claims the whole object.
+            // When they do not the assignment is simply wrong: with two peers
+            // holding complementary halves, share 0 goes to the holder of the
+            // second half and share 1 to the holder of the first, both asks
+            // intersect to nothing, both are filtered out — and an empty batch
+            // ended the whole fetch, with nothing retired from the pool and no
+            // second attempt, so `prepare_range` reported "no provider could
+            // serve" while both halves were online. Deterministically, because
+            // the ranking is. The comment above promised a next batch that the
+            // `break` made sure never came.
+            let mut unassigned = remaining.clone();
+            let mut batch: Vec<(Provider, ChunkRanges)> = Vec::new();
+            let mut left = chosen.len() as u64;
+            for provider in chosen {
+                let mine = unassigned.intersect(&provider.claims);
+                left = left.saturating_sub(1);
+                if mine.is_empty() {
+                    continue;
+                }
+                // An even split of what is still unclaimed among the providers
+                // still to be offered a share, so the last one takes whatever is
+                // left rather than a rounded-down fraction of it.
+                let share = match left {
+                    0 => mine,
+                    rest => mine.take(mine.count().div_ceil(rest + 1)),
+                };
+                unassigned = unassigned.difference(&share);
+                batch.push((provider, share));
+            }
             if batch.is_empty() {
                 break;
             }
             report.providers_tried += batch.len();
 
             let results = futures_join(batch.iter().map(|(provider, ask)| async move {
-                (
-                    provider.origin.clone(),
-                    self.fetch_from(provider, root, size, ask).await,
-                )
+                // The accumulator travels with the request, so a provider that
+                // fails on its fifth window still hands back the four before it:
+                // those groups are in the bitmap, and treating them as lost had
+                // the next provider asked for bytes this node already held and
+                // `write_slice` re-decode them.
+                let mut got = ChunkRanges::empty();
+                let outcome = self.fetch_from(provider, root, size, ask, &mut got).await;
+                (provider.origin.clone(), got, outcome)
             }))
             .await;
             let mut progressed = false;
-            for (origin, result) in results {
+            for (origin, got, result) in results {
+                if !got.is_empty() {
+                    progressed = true;
+                }
+                remaining = remaining.difference(&got);
+                report.fetched = report.fetched.union(&got);
                 match result {
-                    Ok(got) => {
-                        if !got.is_empty() {
-                            progressed = true;
-                        } else {
+                    Ok(()) => {
+                        if got.is_empty() {
                             // Served nothing despite claiming the range: its
                             // ads overstate what it has, so stop asking.
                             pool.retain(|p| p.origin != origin);
                         }
-                        remaining = remaining.difference(&got);
-                        report.fetched = report.fetched.union(&got);
                     }
                     Err(e) => {
                         // A peer that cannot help is retired from the pool and
-                        // its slice stays in `remaining`, so the next batch
-                        // offers it to whoever is left.
+                        // whatever it did not serve stays in `remaining`, so the
+                        // next batch offers it to whoever is left.
                         tracing::debug!(origin = %origin, error = %e, "provider failed");
                         pool.retain(|p| p.origin != origin);
                     }
@@ -485,7 +473,9 @@ impl Node {
             let root = *root;
             crate::blocking::offload(move || node.on_content_progress(&root).map(|_| ())).await?;
         }
-        report.complete = wanted.difference(&self.local_groups(root)?).is_empty();
+        report.complete = wanted
+            .difference(&self.local_groups_off_runtime(root).await?)
+            .is_empty();
         Ok(report)
     }
 
@@ -734,7 +724,7 @@ impl Node {
         level: u8,
         report: &mut FetchReport,
     ) -> Result<Proven> {
-        let mut providers = self.providers_for(root, 0, size.max(1))?;
+        let mut providers = self.providers_off_runtime(root, size).await?;
         if providers.is_empty() {
             providers = self.ask_peers_for_providers(root, size).await?;
         }
@@ -749,14 +739,21 @@ impl Node {
                 continue;
             }
             report.providers_tried += 1;
-            match self.proofs_from(&provider, root, size, &ask, level).await {
-                Ok(outcome) => {
-                    remaining = remaining.difference(&outcome.served);
-                    proven.absorb(outcome.proven)?;
-                }
-                Err(e) => {
-                    tracing::debug!(origin = %provider.origin, error = %e, "proof request failed");
-                }
+            // Accumulated here, so a descent that fails on a later window keeps
+            // every subtree the earlier ones proved: a `ProvenSubtree` is the
+            // only thing `promote` can act on, and the committed outboard nodes
+            // cannot be read back into one.
+            let mut outcome = synch_net::ProofOutcome {
+                proven: Proven::none(*root, size),
+                served: ChunkRanges::empty(),
+            };
+            let asked = self
+                .proofs_from(&provider, root, size, &ask, level, &mut outcome)
+                .await;
+            remaining = remaining.difference(&outcome.served);
+            proven.absorb(outcome.proven)?;
+            if let Err(e) = asked {
+                tracing::debug!(origin = %provider.origin, error = %e, "proof request failed");
             }
         }
         Ok(proven)
@@ -769,10 +766,11 @@ impl Node {
         size: u64,
         ask: &ChunkRanges,
         level: u8,
-    ) -> Result<synch_net::ProofOutcome> {
+        out: &mut synch_net::ProofOutcome,
+    ) -> Result<()> {
         let mut last_error = None;
         for key in &provider.keys {
-            let addr = match self.peer_addr(key)? {
+            let addr = match self.peer_addr_off_runtime(key).await? {
                 Some(addr) => addr,
                 None => iroh::EndpointAddr::new(*key),
             };
@@ -783,11 +781,14 @@ impl Node {
                     // proof descent is also a walk of as many windows as the
                     // range needs.
                     let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
-                    let outcome = client
-                        .fetch_proof_into(self.store(), *root, size, ask, level)
+                    self.record_dial_off_runtime(key, elapsed).await;
+                    // The accumulator is ours, so a window that fails part-way
+                    // through leaves what was already proven with the caller
+                    // rather than discarding it.
+                    client
+                        .fetch_proof_into(self.store(), *root, size, ask, level, out)
                         .await?;
-                    return Ok(outcome);
+                    return Ok(());
                 }
                 Err(e) => last_error = Some(e),
             }
@@ -925,7 +926,7 @@ impl Node {
     async fn ask_peers_for_providers(&self, root: &Hash, size: u64) -> Result<Vec<Provider>> {
         if self.provider_discovery_backed_off(root, now_ns()) {
             tracing::debug!(root = %root, "provider discovery backed off; not dialling");
-            let known = self.providers_for(root, 0, size.max(1))?;
+            let known = self.providers_off_runtime(root, size).await?;
             if !known.is_empty() {
                 // An ad reached this node some other way — head replication, or
                 // another fetch's hints — so the miss is stale.
@@ -934,10 +935,7 @@ impl Node {
             return Ok(known);
         }
         let mut learned = 0;
-        for peer in self.dialable_peers()? {
-            let addr = self
-                .peer_addr(&peer)?
-                .unwrap_or_else(|| iroh::EndpointAddr::new(peer));
+        for (peer, addr) in self.dial_targets().await? {
             let client = match self.net().connect_mpt(addr).await {
                 Ok(client) => client,
                 Err(e) => {
@@ -987,7 +985,7 @@ impl Node {
         if learned > 0 {
             tracing::debug!(hints = learned, "learned providers from peers");
         }
-        let found = self.providers_for(root, 0, size.max(1))?;
+        let found = self.providers_off_runtime(root, size).await?;
         if found.is_empty() {
             self.note_provider_miss(root, now_ns());
         } else {
@@ -996,16 +994,29 @@ impl Node {
         Ok(found)
     }
 
+    /// [`Node::providers_for`] on the blocking pool.
+    ///
+    /// One `blob_providers` scan plus a `peers_seen` read and a binding query
+    /// per candidate — store work, and reached from inside a fetch running on a
+    /// runtime worker (§10).
+    async fn providers_off_runtime(&self, root: &Hash, size: u64) -> Result<Vec<Provider>> {
+        let node = self.clone();
+        let root = *root;
+        let end = size.max(1);
+        crate::blocking::offload(move || node.providers_for(&root, 0, end)).await
+    }
+
     async fn fetch_from(
         &self,
         provider: &Provider,
         root: &Hash,
         size: u64,
         ask: &ChunkRanges,
-    ) -> Result<ChunkRanges> {
+        got: &mut ChunkRanges,
+    ) -> Result<()> {
         let mut last_error = None;
         for key in &provider.keys {
-            let addr = match self.peer_addr(key)? {
+            let addr = match self.peer_addr_off_runtime(key).await? {
                 Some(addr) => addr,
                 None => iroh::EndpointAddr::new(*key),
             };
@@ -1021,9 +1032,14 @@ impl Node {
                     // dial was refused, inverting the ranking under exactly the
                     // load it exists to spread.
                     let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
-                    self.store().record_peer_sync(key, now_ns(), elapsed)?;
-                    let got = client.fetch_into(self.store(), *root, size, ask).await?;
-                    return Ok(got);
+                    self.record_dial_off_runtime(key, elapsed).await;
+                    // Likewise: the groups are in the bitmap whether or not a
+                    // later window fails, so the caller keeps them and does not
+                    // ask another provider for bytes it already holds.
+                    client
+                        .fetch_into(self.store(), *root, size, ask, got)
+                        .await?;
+                    return Ok(());
                 }
                 Err(e) => {
                     // A failed dial has to move the EWMA, or ranking is a
@@ -1031,9 +1047,7 @@ impl Node {
                     // peer that was once fast and is now a black hole keeps its
                     // low EWMA and is therefore selected first on every
                     // subsequent fetch, forever, with nothing able to demote it.
-                    let _ = self
-                        .store()
-                        .record_peer_failure(key, now_ns(), FAILURE_PENALTY_US);
+                    self.record_dial_failure_off_runtime(key).await;
                     last_error = Some(e);
                 }
             }
@@ -1042,6 +1056,54 @@ impl Node {
             Some(e) => EngineError::Net(e),
             None => EngineError::not_found(format!("no dialable key for {}", provider.origin)),
         })
+    }
+
+    /// [`Node::peer_addr`] on the blocking pool: it reads `peers_seen`.
+    pub(crate) async fn peer_addr_off_runtime(
+        &self,
+        key: &synch_core::NodeId,
+    ) -> Result<Option<iroh::EndpointAddr>> {
+        let node = self.clone();
+        let key = *key;
+        crate::blocking::offload(move || node.peer_addr(&key)).await
+    }
+
+    /// Records how long a dial took, on the blocking pool.
+    ///
+    /// A row update and a WAL frame per dial, which is not something to do on
+    /// the worker the dial itself is being driven from (§10). Ranking is
+    /// advisory, so a failure to record it is logged rather than propagated:
+    /// losing one measurement must not fail a fetch that otherwise worked.
+    async fn record_dial_off_runtime(&self, key: &synch_core::NodeId, elapsed_us: i64) {
+        let store = self.store().clone();
+        let key = *key;
+        let recorded: Result<()> = crate::blocking::offload(move || {
+            Ok(store.record_peer_sync(&key, now_ns(), elapsed_us)?)
+        })
+        .await;
+        if let Err(e) = recorded {
+            tracing::debug!(peer = %key.fmt_short(), error = %e, "could not record dial latency");
+        }
+    }
+
+    /// Records a failed dial's penalty, on the blocking pool.
+    async fn record_dial_failure_off_runtime(&self, key: &synch_core::NodeId) {
+        let store = self.store().clone();
+        let key = *key;
+        let recorded: Result<()> = crate::blocking::offload(move || {
+            Ok(store.record_peer_failure(&key, now_ns(), FAILURE_PENALTY_US)?)
+        })
+        .await;
+        if let Err(e) = recorded {
+            tracing::debug!(peer = %key.fmt_short(), error = %e, "could not record dial failure");
+        }
+    }
+
+    /// [`Node::local_groups`] on the blocking pool.
+    pub(crate) async fn local_groups_off_runtime(&self, root: &Hash) -> Result<ChunkRanges> {
+        let node = self.clone();
+        let root = *root;
+        crate::blocking::offload(move || node.local_groups(&root)).await
     }
 
     /// The groups of an object we hold and have verified.
@@ -1116,7 +1178,16 @@ impl Node {
         start: u64,
         len: Option<u64>,
     ) -> Result<PreparedRange> {
-        let entry = self.resolve(space, path, policy)?;
+        // Resolving the entry is a `versions_for` query and a policy decision
+        // over it, and the donor lineage below is another; both are store work
+        // and this runs on a runtime worker for every gateway read (§10). They
+        // go over together, after the window is known, so a read costs one
+        // handoff rather than three.
+        let entry = {
+            let node = self.clone();
+            let (space, path, policy) = (space.to_string(), path.to_string(), policy.clone());
+            crate::blocking::offload(move || node.resolve(&space, &path, &policy)).await?
+        };
         if entry.kind == synch_core::EntryKind::Tombstone {
             return Err(EngineError::not_found(format!(
                 "{} was deleted at seq {}",
@@ -1148,15 +1219,22 @@ impl Node {
         // few hundred: below one span the descent costs more than the read
         // (§4). Whole-object reads always descend.
         let whole = start == 0 && end == entry.size;
-        let donors = match self.store().versions_for(space, path) {
-            Ok(versions) if whole || end - start >= DESCENT_MIN_RANGE => {
-                self.donors_for(&entry, &versions)?
-            }
-            Ok(_) => Vec::new(),
-            Err(e) => {
-                tracing::debug!(error = %e, "no version set for donors");
-                Vec::new()
-            }
+        let donors = {
+            let node = self.clone();
+            let (space, path) = (space.to_string(), path.to_string());
+            let entry = entry.clone();
+            let worth_descending = whole || end - start >= DESCENT_MIN_RANGE;
+            crate::blocking::offload(move || {
+                Ok(match node.store().versions_for(&space, &path) {
+                    Ok(versions) if worth_descending => node.donors_for(&entry, &versions)?,
+                    Ok(_) => Vec::new(),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "no version set for donors");
+                        Vec::new()
+                    }
+                })
+            })
+            .await?
         };
         let wanted = ChunkRanges::from_ranges([groups_for_byte_range(start, end)])
             .intersect(&ChunkRanges::single(0, group_count(entry.size)));
@@ -1855,40 +1933,6 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    #[test]
-    fn ranges_split_into_contiguous_shares() {
-        let all = ChunkRanges::single(0, 9);
-        let shares = split_ranges(&all, 3);
-        assert_eq!(shares.len(), 3);
-        assert_eq!(shares[0], ChunkRanges::single(0, 3));
-        assert_eq!(shares[1], ChunkRanges::single(3, 6));
-        assert_eq!(shares[2], ChunkRanges::single(6, 9));
-        // Nothing is lost and nothing overlaps.
-        assert_eq!(shares.iter().map(|s| s.count()).sum::<u64>(), 9);
-
-        // A ragged split gives the remainder to the last share.
-        let shares = split_ranges(&ChunkRanges::single(0, 10), 3);
-        assert_eq!(shares.iter().map(|s| s.count()).sum::<u64>(), 10);
-        assert_eq!(shares[2], ChunkRanges::single(6, 10));
-
-        // Shares cross range boundaries without dropping anything.
-        let split = ChunkRanges::from_ranges([
-            synch_core::GroupRange::new(0, 2),
-            synch_core::GroupRange::new(10, 14),
-        ]);
-        let shares = split_ranges(&split, 2);
-        assert_eq!(shares.iter().map(|s| s.count()).sum::<u64>(), 6);
-        assert_eq!(
-            shares[0].union(&shares[1]),
-            split,
-            "the shares reassemble into the original"
-        );
-
-        // Degenerate cases stay well-defined.
-        assert_eq!(split_ranges(&ChunkRanges::empty(), 3).len(), 3);
-        assert_eq!(split_ranges(&all, 1)[0], all);
-    }
-
     #[tokio::test]
     async fn a_fetch_keeps_going_past_the_first_fanout_candidates() {
         // §6.4: giving up after `fetch_fanout` candidates would strand a fetch
@@ -1965,6 +2009,119 @@ mod tests {
         assert_eq!(node.store().read_all(&root).unwrap(), payload);
 
         holder.shutdown().await.unwrap();
+        node.shutdown().await.unwrap();
+    }
+
+    /// Two providers holding complementary halves between them can serve an
+    /// object.
+    ///
+    /// Shares used to be cut out of `remaining` in byte order and zipped onto the
+    /// providers in *rank* order, which is only an assignment if everybody claims
+    /// everything. With one peer holding the first half and the other the second,
+    /// share 0 went to the holder of the second half and share 1 to the holder of
+    /// the first, both asks intersected to nothing, both were filtered out, and an
+    /// empty batch ended the whole fetch — deterministically, because the ranking
+    /// is, with both halves online and nothing retired from the pool.
+    #[tokio::test]
+    async fn complementary_holders_are_asked_for_what_they_hold() {
+        let (_d, node) = node().await;
+        // Four ad spans, so each half is a whole number of spans and survives the
+        // inward rounding `coalesce_spans` applies.
+        let size = 4 * synch_core::AD_SPAN_GRANULARITY;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let half = size / 2;
+
+        // A source of verified slices, so each holder can be given exactly its
+        // half rather than the whole object.
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = synch_store::Store::open(source_dir.path()).unwrap();
+        let root = source.ingest_bytes(&payload, now_ns()).unwrap();
+
+        // The tempdirs outlive the loop: dropping one deletes the store its
+        // node is still running on.
+        let mut dirs = Vec::new();
+        let mut holders = Vec::new();
+        for (name, spans, latency) in [
+            // The fast one holds the *second* half, so the positional share it
+            // would have been handed is the one it cannot serve.
+            ("tail", vec![(half, size)], 10i64),
+            ("head", vec![(0, half)], 1_000i64),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let origin = OriginId::named(name, "x.example").unwrap();
+            Node::init(dir.path(), Some(origin.clone())).unwrap();
+            let holder = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
+            dirs.push(dir);
+
+            let mut want = ChunkRanges::from_ranges(
+                spans
+                    .iter()
+                    .map(|&(s, e)| synch_core::groups_for_byte_range(s, e)),
+            );
+            while !want.is_empty() {
+                let (encoded, served) = source.encode_slice(&root, &want).unwrap();
+                holder
+                    .store()
+                    .write_slice(&root, size, &served, &encoded, now_ns())
+                    .unwrap();
+                want = want.difference(&served);
+            }
+            assert!(!holder.store().blob(&root).unwrap().unwrap().complete);
+
+            for (here, there, whose) in [
+                (&node, &holder, origin.clone()),
+                (&holder, &node, node.origin().clone()),
+            ] {
+                here.store()
+                    .put_binding(&Binding {
+                        origin: whose,
+                        node_id: there.node_id(),
+                        source: BindingSource::Static,
+                        domain: None,
+                        note: None,
+                        added_at: 0,
+                        expires_at: None,
+                    })
+                    .unwrap();
+                here.remember_peer(&there.net().direct_addr()).unwrap();
+            }
+            // The ad each holder would publish for what it actually has.
+            let ad = holder.store().local_ad(&root).unwrap().unwrap();
+            assert!(!ad.is_complete(), "{:?}", ad.state.spans);
+            node.store().put_provider(&root, &origin, &ad).unwrap();
+            node.store()
+                .record_peer_sync(&holder.node_id(), 0, latency)
+                .unwrap();
+            holders.push(holder);
+        }
+
+        let ranked = node.providers_for(&root, 0, size).unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert!(
+            ranked[0].claims.intersect(&ranked[1].claims).is_empty(),
+            "the two claims are disjoint: {:?} vs {:?}",
+            ranked[0].claims,
+            ranked[1].claims
+        );
+
+        // What each holder will actually serve, before the fetch is blamed for
+        // anything: a partial row must encode its own half.
+        for (holder, expect) in holders.iter().zip([half..size, 0..half]) {
+            let ask = ChunkRanges::from_ranges([synch_core::groups_for_byte_range(
+                expect.start,
+                expect.end,
+            )]);
+            let (_, served) = holder.store().encode_slice(&root, &ask).unwrap();
+            assert!(!served.is_empty(), "a holder must serve its own half");
+        }
+
+        let report = node.fetch_all(&root, size).await.unwrap();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(node.store().read_all(&root).unwrap(), payload);
+
+        for holder in holders {
+            holder.shutdown().await.unwrap();
+        }
         node.shutdown().await.unwrap();
     }
 }

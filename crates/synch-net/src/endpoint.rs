@@ -413,7 +413,16 @@ impl Net {
         // per node, both sides must hold it for a session to work (§3.2), and a
         // binding that lapses mid-session must stop the next request rather
         // than ride the connection it was opened under.
-        if !self.store.is_trusted_key(&addr.id, synch_core::now_ns())? {
+        // On the blocking pool with every other store read: the query is one
+        // indexed row, but the wait is on the store's single connection mutex,
+        // and this runs on the worker driving the dial (§10).
+        let trusted = {
+            let store = self.store.clone();
+            let key = addr.id;
+            crate::blocking::offload(move || Ok(store.is_trusted_key(&key, synch_core::now_ns())?))
+                .await?
+        };
+        if !trusted {
             // And the session we were holding goes with the trust: a binding
             // that lapsed is not a peer to keep a connection open with.
             self.forget(&addr.id);

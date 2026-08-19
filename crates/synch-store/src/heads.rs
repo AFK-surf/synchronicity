@@ -182,6 +182,80 @@ impl Store {
         Ok(())
     }
 
+    /// Clears a head slot only if it still holds `(seq, root)`.
+    ///
+    /// Abandonment is a decision about *one* head, and the two places that
+    /// make it — a fetch that gave up after several round trips, and the
+    /// maintenance sweep, which walks a trie before it decides — reach their
+    /// verdict on a snapshot taken long before the delete. `clear_head` deletes
+    /// whatever occupies the slot, so a newer head that a concurrent
+    /// `offer_head` installed in the gap went with it: the serve side's
+    /// `HeadPush` runs on the blocking pool while a fetch is between round
+    /// trips, and the slot is written under a per-statement lock, so the two
+    /// interleave freely. The head is recoverable — a peer holding it complete
+    /// re-offers it on the next round — but only after a delay the caller never
+    /// intended.
+    ///
+    /// Naming the head being condemned makes the decision and the delete one
+    /// step, which is what [`crate::Txn`]'s own `clear_head` gets for free by
+    /// reading and writing inside one transaction.
+    ///
+    /// Returns whether the slot was cleared.
+    pub fn clear_head_at(
+        &self,
+        origin: &OriginId,
+        slot: Slot,
+        seq: u64,
+        root: &Hash,
+    ) -> Result<bool> {
+        let cleared = self.conn().execute(
+            "DELETE FROM heads
+              WHERE origin_id = ?1 AND slot = ?2 AND seq = ?3 AND root = ?4",
+            params![
+                origin.canonical(),
+                slot.as_str(),
+                seq as i64,
+                root.as_bytes().to_vec()
+            ],
+        )?;
+        Ok(cleared > 0)
+    }
+
+    /// The seq this node's next head for `origin` must carry.
+    ///
+    /// One function, because "what comes next" is one rule and it had three
+    /// writers restating it. `publish` and the key rotation in `activate` both
+    /// derived it from the **complete slot alone**, and `try_promote` carried a
+    /// ten-line comment explaining that it therefore could not trust "pending
+    /// is always greater than complete" and had to re-check the ordering itself
+    /// — a downstream reader defending against an invariant with no owner.
+    ///
+    /// What the complete slot alone misses:
+    ///
+    /// - **The pending slot.** A peer's copy of one of our own heads — signed
+    ///   by a key of ours that is still bound, which is exactly the §3.4
+    ///   recovery shape — sits there for the length of a fetch. Publishing
+    ///   `complete.seq + 1` against it mints a second root at a seq this
+    ///   origin has already signed.
+    /// - **Retained history.** A database restored from a backup still has a
+    ///   complete head, so `recovery_state` does not call it recovery (§3.4
+    ///   covers key loss, not a rolled-back store) and nothing stops it
+    ///   publishing straight into seqs it used before the restore. Every head
+    ///   a peer has relayed back to us since is in `head_history`, verified and
+    ///   bound, and that is the highest seq this node can prove its origin
+    ///   reached.
+    ///
+    /// Self-equivocation is not a theoretical harm: both roots are valid and
+    /// bound, so every peer takes the greater one under the §5.2 rule, and if
+    /// that is the *older* root this node's own `entries` are rolled back to it
+    /// on every peer that adopted it.
+    ///
+    /// The publishing floor (§3.4) is applied here too, so recovery's "resume
+    /// above what peers saw" and this rule cannot disagree.
+    pub fn next_own_seq(&self, origin: &OriginId) -> Result<u64> {
+        next_own_seq_in(&self.conn(), origin)
+    }
+
     /// Records a head in `head_history`, keeping its signature.
     ///
     /// `now` is when this node received the head, which is what retention
@@ -198,8 +272,8 @@ impl Store {
     /// cannot clear: same-seq forks are *exempt* from `root_retention` until the
     /// origin publishes past that seq, and an attacker simply never does. Every
     /// row is verified and bound, so nothing upstream rejects them, and
-    /// `equivocations()` re-reads the whole set per pair, so `doctor` and each
-    /// GC pass go quadratic in the storm. What bounds the width is
+    /// `doctor`'s equivocation report costs the retained rows. What bounds the
+    /// width is
     /// [`Txn::trim_forks`], which *evicts* the lowest-ordered rows at a seq
     /// rather than refusing the head that would widen it — acceptance is the
     /// one thing convergence rests on and may never depend on how many roots
@@ -241,31 +315,48 @@ impl Store {
     ///
     /// Equivocation only harms the equivocator's own published view, but it is
     /// reported loudly (§4.4) with both signed heads retained as proof.
+    /// One ordered scan, not a full history read per forked pair. The pairs are
+    /// found by a `GROUP BY` and the heads by a join against the same grouping,
+    /// so the whole report costs the forked rows rather than the forked rows
+    /// times the origin's entire history. `trim_forks` bounds the *width* of one
+    /// seq's fork and nothing bounds how many seqs are forked, so the quadratic
+    /// version grew with what an equivocating member chose to publish.
     pub fn equivocations(&self) -> Result<Vec<Equivocation>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT origin_id, seq, COUNT(DISTINCT root) AS roots FROM head_history
-             GROUP BY origin_id, seq HAVING roots > 1 ORDER BY origin_id, seq",
+            "SELECT h.origin_id, h.seq, h.root, h.created_at, h.signed_by, h.sig
+               FROM head_history h
+               JOIN (SELECT origin_id, seq FROM head_history
+                      GROUP BY origin_id, seq
+                     HAVING COUNT(DISTINCT root) > 1) f
+                 ON f.origin_id = h.origin_id AND f.seq = h.seq
+              ORDER BY h.origin_id, h.seq, h.root",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+            ))
         })?;
-        let mut pairs = Vec::new();
-        for row in rows {
-            let (origin, seq) = row?;
-            pairs.push((origin_column(origin, "head_history.origin_id")?, seq));
-        }
-        drop(stmt);
-        drop(conn);
 
-        let mut out = Vec::new();
-        for (origin, seq) in pairs {
-            let heads: Vec<SignedHead> = self
-                .head_history(&origin)?
-                .into_iter()
-                .filter(|h| h.seq == seq)
-                .collect();
-            out.push(Equivocation { origin, seq, heads });
+        let mut out: Vec<Equivocation> = Vec::new();
+        for row in rows {
+            let (origin, seq, root, created_at, signed_by, sig) = row?;
+            let head = build_head(origin, seq, root, created_at, signed_by, sig)?;
+            match out.last_mut() {
+                Some(last) if last.origin == head.origin && last.seq == seq => {
+                    last.heads.push(head)
+                }
+                _ => out.push(Equivocation {
+                    origin: head.origin.clone(),
+                    seq,
+                    heads: vec![head],
+                }),
+            }
         }
         Ok(out)
     }
@@ -426,18 +517,13 @@ impl Store {
     ///
     /// Pending heads must be in the mark set or GC would eat an in-progress
     /// bootstrap.
+    ///
+    /// One implementation, shared with the sweep, because there were two — this
+    /// one and a byte-identical private copy in `gc`, with the sweep executing
+    /// the copy and the sweep's own test asserting on this one. A rule verified
+    /// against a version production does not run is not verified.
     pub fn retained_roots(&self) -> Result<Vec<Hash>> {
-        let conn = self.conn();
-        // One table, not a union across two. `put_head` writes the signature to
-        // `head_history` before the slot points at it, so every current head's
-        // root is here by construction rather than by coincidence.
-        let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(hash_column(row?, "heads.root")?);
-        }
-        Ok(out)
+        crate::gc::retained_roots_in(&self.conn())
     }
 }
 
@@ -468,6 +554,15 @@ impl Txn<'_> {
         let complete = self.complete_head(origin)?.map(|h| (h.seq, h.root));
         let pending = self.pending_head(origin)?.map(|h| (h.seq, h.root));
         Ok(best_floor(complete, pending))
+    }
+
+    /// The seq this node's next head for `origin` must carry, read inside the
+    /// transaction that will write it.
+    ///
+    /// See [`Store::next_own_seq`] for why this is one function and not a rule
+    /// each writer restates.
+    pub fn next_own_seq(&self, origin: &OriginId) -> Result<u64> {
+        next_own_seq_in(self.conn(), origin)
     }
 
     /// Writes a head into a slot, inside the transaction.
@@ -655,6 +750,43 @@ fn put_head_in(
     Ok(())
 }
 
+/// The one implementation behind [`Store::next_own_seq`] and
+/// [`Txn::next_own_seq`], so the two scopes cannot drift.
+fn next_own_seq_in(conn: &rusqlite::Connection, origin: &OriginId) -> Result<u64> {
+    // The highest seq this node can prove the origin reached, from every place
+    // that records one: both slots, and the retained history behind them.
+    let highest: i64 = conn
+        .query_row(
+            "SELECT MAX(seq) FROM (
+             SELECT seq FROM heads        WHERE origin_id = ?1
+             UNION ALL
+             SELECT seq FROM head_history WHERE origin_id = ?1
+         )",
+            params![origin.canonical()],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .unwrap_or(0);
+    let floor = crate::recovery::publish_floor_in(conn)?.unwrap_or(0);
+    Ok((highest.max(0) as u64).saturating_add(1).max(floor))
+}
+
+/// Records a head's signature, refusing a second signature over one
+/// `(origin, seq, root)`.
+///
+/// The row is keyed by `(origin_id, seq, root)` and `signed_by`/`sig`/
+/// `created_at` are not in the key, so `INSERT OR IGNORE` silently kept the
+/// *first* signature and dropped the incoming one. Since v11 `heads` holds only
+/// `(seq, root)` and every head read joins the two, so the slot then read back
+/// as a head nobody put there: a different signer, a different `created_at`, and
+/// a `verified_at` recording a binding check that was made about the *other*
+/// head. `heads_for` would hand peers that head, and if its signer had since
+/// been unbound every peer would reject it as `Unbound` — with the origin
+/// blamed.
+///
+/// Ed25519 is deterministic, so an origin re-signing the same root at the same
+/// seq produces the same bytes and lands in the no-op case. Anything else is two
+/// keys claiming one point of an origin's history, which is not a thing to store
+/// quietly under whichever arrived first.
 fn record_history_in(
     conn: &rusqlite::Connection,
     head: &SignedHead,
@@ -662,7 +794,7 @@ fn record_history_in(
 ) -> Result<()> {
     let seq = i64::try_from(head.seq)
         .map_err(|_| StoreError::column("head_history.seq", "past the representable range"))?;
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO head_history
            (origin_id, seq, root, created_at, signed_by, sig, recorded_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -676,6 +808,27 @@ fn record_history_in(
             recorded_at,
         ],
     )?;
+    if inserted > 0 {
+        return Ok(());
+    }
+    // A row was already there. It has to be the same head, or the pointer the
+    // slot is about to write means something other than what the caller
+    // verified.
+    let (signed_by, sig, created_at): (Vec<u8>, Vec<u8>, i64) = conn.query_row(
+        "SELECT signed_by, sig, created_at FROM head_history
+          WHERE origin_id = ?1 AND seq = ?2 AND root = ?3",
+        params![head.origin.canonical(), seq, head.root.as_bytes().to_vec()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let same = signed_by == head.signed_by.as_bytes()
+        && sig == head.sig.to_bytes()
+        && created_at == head.created_at;
+    if !same {
+        return Err(StoreError::invalid(format!(
+            "{} already retains a different signature at seq {} over root {}",
+            head.origin, head.seq, head.root
+        )));
+    }
     Ok(())
 }
 

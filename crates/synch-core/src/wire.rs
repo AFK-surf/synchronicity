@@ -178,6 +178,50 @@ where
     deserializer.deserialize_seq(Visitor::<T, N>(std::marker::PhantomData))
 }
 
+/// The longest error text a peer may send.
+///
+/// Generous for a sentence naming what went wrong, and small enough that a
+/// stream of them is not a way to write to this node's log.
+pub const MAX_ERROR_REASON_LEN: usize = 1024;
+
+/// Decodes an error reason that refuses to grow past [`MAX_ERROR_REASON_LEN`].
+///
+/// Truncated rather than refused, unlike a request field: the reason is the only
+/// account of the failure the peer will give, and losing it entirely to punish
+/// its length would leave the caller with less than a clipped sentence.
+fn bounded_reason<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl serde::de::Visitor<'_> for Visitor {
+        type Value = String;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "at most {MAX_ERROR_REASON_LEN} bytes of text")
+        }
+
+        // Copies only what it keeps, so an over-long reason never becomes an
+        // allocation of its own size.
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> std::result::Result<String, E> {
+            if text.len() <= MAX_ERROR_REASON_LEN {
+                return Ok(text.to_string());
+            }
+            let cut = (0..=MAX_ERROR_REASON_LEN)
+                .rev()
+                .find(|i| text.is_char_boundary(*i))
+                .unwrap_or(0);
+            let mut out = String::with_capacity(cut + '…'.len_utf8());
+            out.push_str(&text[..cut]);
+            out.push('…');
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_str(Visitor)
+}
+
 /// A message on the `sync/mpt/1` ALPN (§5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MptMessage {
@@ -250,6 +294,11 @@ pub enum MptMessage {
     /// An error response, used instead of dropping a stream silently.
     Error {
         /// A short human-readable reason.
+        ///
+        /// Bounded while decoding, like every collection field here: it was the
+        /// one field a peer could fill to [`MAX_FRAME_LEN`], and what a
+        /// requester does with it is wrap it in an error and log it.
+        #[serde(deserialize_with = "bounded_reason")]
         reason: String,
     },
     /// "Which device keys do you currently hold bound for this origin?"
@@ -306,7 +355,8 @@ pub struct ChunkRanges {
     pub ranges: Vec<GroupRange>,
 }
 
-/// Decoding stops at [`MAX_RANGES`] rather than checking afterwards.
+/// Decoding stops at [`MAX_RANGES`] rather than checking afterwards, and
+/// normalizes.
 ///
 /// Both sides refuse a range set past [`MAX_RANGES`], because the set
 /// operations under it are quadratic in the number of ranges — and a check on
@@ -320,6 +370,17 @@ pub struct ChunkRanges {
 /// short tail is a weaker claim and costs a re-fetch, a truncated *request* is a
 /// different request, and a truncated `served` would silently overstate what a
 /// provider withheld.
+///
+/// The *normalizing* is the other half, and it was missing. "Sorted,
+/// non-overlapping" is documented on the field and required by
+/// [`ChunkRanges::overlaps`], [`ChunkRanges::covers`] and
+/// [`ChunkRanges::difference`], all three of which walk the ranges assuming
+/// order — and the field is `pub` and the decoder is a trust boundary. Every
+/// call site happens to run its input through [`ChunkRanges::from_ranges`] or
+/// [`ChunkRanges::intersect`] first, so the invariant held by convention,
+/// across three crates, on data a peer supplies. Establishing it here makes it
+/// a property of the type instead: a set that has been decoded is a set the
+/// operations may be run on.
 impl<'de> Deserialize<'de> for ChunkRanges {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -330,9 +391,7 @@ impl<'de> Deserialize<'de> for ChunkRanges {
             ranges: BoundedRanges,
         }
         let raw = Raw::deserialize(deserializer)?;
-        Ok(ChunkRanges {
-            ranges: raw.ranges.0,
-        })
+        Ok(ChunkRanges::from_ranges(raw.ranges.0))
     }
 }
 

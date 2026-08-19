@@ -57,23 +57,33 @@ pub(crate) const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// peer's cryptographically established device key, which the handshake settled
 /// — reports its own failures to the peer in its own vocabulary, and finishes
 /// the send side.
-pub(crate) async fn serve_connection<D, F>(
+pub(crate) async fn serve_connection<D, F, S, G>(
     store: &Arc<Store>,
     connection: Connection,
     on_unknown_key: Option<&Arc<tokio::sync::Notify>>,
-    mut on_request: impl FnMut(NodeId),
+    mut on_request: G,
     dispatch: D,
 ) -> Result<(), AcceptError>
 where
     D: Fn(NodeId, SendStream, RecvStream) -> F + Clone + Send + 'static,
     F: std::future::Future<Output = ()> + Send + 'static,
+    G: FnMut(NodeId) -> S,
+    S: std::future::Future<Output = ()>,
 {
     let remote = connection.remote_id();
     // Enforcement at connection-accept time (§3.2): connections from device
     // keys with no live binding are closed immediately after the handshake.
-    match store.is_trusted_key(&remote, now_ns()) {
-        Ok(true) => {}
-        _ => {
+    //
+    // Off the runtime, like every other store read (§10). It looks like the one
+    // lookup small enough to stay inline — one indexed row — and it is not: the
+    // cost is not the query, it is the wait for the store's single connection
+    // mutex, which a publish batch or a GC pass holds for as long as it runs.
+    // This is also the only store call in the process an *unauthenticated*
+    // dialer can reach, so leaving it here let anyone who could complete a QUIC
+    // handshake park a runtime worker behind whatever was writing.
+    match trusted(store, &remote).await {
+        true => {}
+        false => {
             tracing::debug!(peer = %remote.fmt_short(), "refusing connection: no live binding");
             if let Some(wake) = on_unknown_key {
                 wake.notify_waiters();
@@ -84,19 +94,19 @@ where
             )));
         }
     }
-    on_request(remote);
+    on_request(remote).await;
 
     let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
     while let Ok((send, recv)) = connection.accept_bi().await {
         // §3.2 enforcement is per message, not just per connection: a binding
         // revoked or expired mid-connection must cut off further requests, not
         // linger for the life of the QUIC session.
-        if !matches!(store.is_trusted_key(&remote, now_ns()), Ok(true)) {
+        if !trusted(store, &remote).await {
             tracing::debug!(peer = %remote.fmt_short(), "closing connection: binding lapsed");
             connection.close(0u32.into(), b"untrusted");
             break;
         }
-        on_request(remote);
+        on_request(remote).await;
         let Ok(permit) = limit.clone().acquire_owned().await else {
             break;
         };
@@ -112,4 +122,17 @@ where
         });
     }
     Ok(())
+}
+
+/// Whether a device key has a live binding, decided on the blocking pool.
+///
+/// A failure to reach the store is not a grant: anything but a definite `true`
+/// closes the connection, which is the same fail-closed reading the inline
+/// version had.
+async fn trusted(store: &Arc<Store>, remote: &NodeId) -> bool {
+    let store = store.clone();
+    let remote = *remote;
+    let answer: Result<bool, crate::error::NetError> =
+        crate::blocking::offload(move || Ok(store.is_trusted_key(&remote, now_ns())?)).await;
+    matches!(answer, Ok(true))
 }

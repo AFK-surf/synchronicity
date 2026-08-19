@@ -841,19 +841,29 @@ impl Store {
     /// Returns whether the object was deleted.
     pub(crate) fn delete_blob_if_collectable(&self, root: &Hash, before: i64) -> Result<bool> {
         // The connection guard is held across the unlinks, not just across the
-        // transaction. Releasing it at the commit leaves a window in which
-        // `write_slice`/`promote` can insert a fresh row for this root — a
-        // resumed fetch of an object that had gone cold — after which the
-        // unlinks below take the bytes out from under it. What that leaves is
-        // the state `delete_blob` calls the dangerous orphan: `complete`/bitmap
-        // set with no payload, advertised by `local_ad`, failing every read,
-        // and self-healing never, because the new row is warm so `gc_content`
-        // skips it and `gc_orphans` only removes files that have *no* row.
+        // transaction, so no *row* writer can slip between the delete and the
+        // files going.
         //
-        // Every writer of a blob row goes through this same mutex, so holding
-        // it for two `unlink` syscalls is what makes the row delete and the
-        // unlink one step from any other writer's point of view.
+        // That is not enough on its own, and the version of this comment that
+        // said it was had the ordering backwards. Every writer of a blob row
+        // goes through this mutex; no writer of a blob's *bytes* does.
+        // `write_slice` creates, grows, decodes and fsyncs the payload and the
+        // outboard with nothing held, and only then takes the connection to
+        // commit. Holding the guard across the unlinks therefore forces that
+        // commit to land *after* them — which is precisely the bad order, since
+        // the writer's bytes went into the inode this just unlinked. What that
+        // leaves is the state `delete_blob` calls the dangerous orphan:
+        // `complete`/bitmap set with no payload, advertised by `local_ad`,
+        // failing every read, and self-healing never, because the new row is
+        // warm so `gc_content` skips it and `gc_orphans` only removes files that
+        // have *no* row.
+        //
+        // So the writer's own mark is consulted, under the same guard. A write
+        // in flight is not a collectable object, whatever the row says.
         let mut conn = self.conn();
+        if self.is_being_written(root) {
+            return Ok(false);
+        }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = tx.execute(
             "DELETE FROM blobs
@@ -1068,6 +1078,11 @@ impl Store {
         if served.is_empty() {
             return Ok(ChunkRanges::empty());
         }
+        // Taken before the row is read and held past the commit: everything
+        // between is file IO with no lock held, and a sweep deciding this object
+        // is collectable in that window would unlink the bytes out from under
+        // the row this is about to write ([`Store::lease_write`]).
+        let _lease = self.lease_write(root);
         let tree = Self::tree(size);
         let bao_ranges = to_bao_ranges(&served);
         let root_hash = blake3::Hash::from_bytes(root.0);
@@ -1527,12 +1542,32 @@ mod tests {
         let root = provider.ingest_bytes(&bytes, 0).unwrap();
         assert!(provider.local_ad(&root).unwrap().unwrap().is_complete());
 
+        // A slice window is 8 MiB and an ad span is 16 MiB, so the first window
+        // alone advertises *nothing*: spans round inward, and a holder that
+        // reported the granule it is halfway through would be claiming bytes it
+        // cannot serve (`coalesce_spans`).
         let groups_per_span = g / CHUNK_GROUP_SIZE;
-        let first_span = ChunkRanges::single(0, groups_per_span);
-        let (encoded, served) = provider.encode_slice(&root, &first_span).unwrap();
-        fetcher
-            .write_slice(&root, bytes.len() as u64, &served, &encoded, 0)
-            .unwrap();
+        let mut want = ChunkRanges::single(0, groups_per_span);
+        let mut windows = 0;
+        while !want.is_empty() {
+            let (encoded, served) = provider.encode_slice(&root, &want).unwrap();
+            fetcher
+                .write_slice(&root, bytes.len() as u64, &served, &encoded, 0)
+                .unwrap();
+            want = want.difference(&served);
+            windows += 1;
+            if windows == 1 {
+                let partial = fetcher.local_ad(&root).unwrap().unwrap();
+                assert!(!partial.is_complete());
+                assert_eq!(
+                    partial.state.spans,
+                    vec![],
+                    "half a span is not a span this node can serve"
+                );
+            }
+        }
+        assert!(windows > 1, "a span takes more than one window");
+
         let ad = fetcher.local_ad(&root).unwrap().unwrap();
         assert!(!ad.is_complete());
         assert_eq!(ad.state.spans, vec![(0, g)]);
@@ -1782,5 +1817,79 @@ mod tests {
                 .expect("the walk is bounded by the bitmap, not by the claim"),
             held
         );
+    }
+
+    /// A collector cannot unlink the bytes of an object a fetch is writing.
+    ///
+    /// The two agreed about *rows* — every blob row goes through the one
+    /// connection — and not about *bytes*: `write_slice` does all its file IO
+    /// with nothing held and takes the connection only to commit. So
+    /// `delete_blob_if_collectable`, which holds its guard across the unlinks,
+    /// merely forced the writer's commit to land *after* them, leaving a row
+    /// claiming verified groups whose payload is gone: advertised by `local_ad`,
+    /// failing every read, and uncollectable once an entry names it.
+    ///
+    /// Driven by hand rather than by racing threads, because the interleaving is
+    /// the point and a race would only find it sometimes: the sweep runs while a
+    /// lease is held, which is exactly the state a writer is in between its first
+    /// byte and its commit.
+    #[test]
+    fn a_sweep_leaves_an_object_a_write_is_in_flight_for() {
+        let (_d, store) = store();
+        let size = 4 * CHUNK_GROUP_SIZE;
+        let payload = data(size as usize);
+        let root = store.ingest_bytes(&payload, 0).unwrap();
+        // Cold and unreferenced: an ordinary collection candidate.
+        assert!(store.blob(&root).unwrap().is_some());
+
+        {
+            let _lease = store.lease_write(&root);
+            assert!(
+                !store.delete_blob_if_collectable(&root, i64::MAX).unwrap(),
+                "a write in flight is not a collectable object"
+            );
+            assert!(store.blob_path(&root).exists());
+            // And the orphan sweep leaves its files alone too, even with the row
+            // gone — which is the shape a resumed fetch into a stale payload has.
+            store.delete_blob(&root).unwrap();
+            std::fs::write(store.blob_path(&root), &payload).unwrap();
+            assert_eq!(store.gc_orphans(i64::MAX).unwrap(), 0);
+            assert!(store.blob_path(&root).exists());
+        }
+
+        // Once the lease is gone both sweeps do their job.
+        assert!(store.gc_orphans(i64::MAX).unwrap() > 0);
+        assert!(!store.blob_path(&root).exists());
+    }
+
+    /// A write that resumes into a stale payload keeps it.
+    ///
+    /// The mtime test was the whole of the orphan argument, and it was sampled
+    /// before the writer touched the file: `write_slice` opens with
+    /// `truncate(false)` and reuses whatever is there, so for a *resumed* write
+    /// an old reading proves nothing about the present.
+    #[test]
+    fn a_resumed_write_is_not_mistaken_for_a_leftover() {
+        let (_d, store) = store();
+        let size = 4 * CHUNK_GROUP_SIZE;
+        let payload = data(size as usize);
+        let root = store.ingest_bytes(&payload, 0).unwrap();
+        let (encoded, served) = store
+            .encode_slice(&root, &ChunkRanges::single(0, group_count(size)))
+            .unwrap();
+
+        // A stale orphan: the files are there, no row accounts for them.
+        store.delete_blob(&root).unwrap();
+        std::fs::write(store.blob_path(&root), vec![0u8; size as usize]).unwrap();
+
+        // A fetch resumes into it while the sweep runs.
+        let lease = store.lease_write(&root);
+        assert_eq!(store.gc_orphans(i64::MAX).unwrap(), 0);
+        drop(lease);
+        let written = store
+            .write_slice(&root, size, &served, &encoded, 0)
+            .unwrap();
+        assert_eq!(written.count(), group_count(size));
+        assert_eq!(store.read_all(&root).unwrap(), payload);
     }
 }

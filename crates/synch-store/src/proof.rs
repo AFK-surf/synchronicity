@@ -149,7 +149,22 @@ impl Proven {
                 ),
             });
         }
-        self.subtrees.extend(other.subtrees);
+        // Deduplicated by position. `Walk::descend` emits a subtree for every
+        // level-L node that *overlaps* the request, not only those wholly inside
+        // it, so two providers whose asks split one span both prove that whole
+        // span — and `promote` reads `held` once before its loop, so the second
+        // copy misses the "already held" guard and the whole run is copied
+        // again. Wasted IO inside the path whose entire purpose is avoiding IO,
+        // and it grows with the fanout rather than being a constant.
+        for subtree in other.subtrees {
+            if !self
+                .subtrees
+                .iter()
+                .any(|held| held.start == subtree.start && held.groups == subtree.groups)
+            {
+                self.subtrees.push(subtree);
+            }
+        }
         Ok(())
     }
 }
@@ -657,6 +672,9 @@ impl Store {
     ) -> Result<Proven> {
         let groups = group_count(size);
         let served = served.intersect(&ChunkRanges::single(0, groups));
+        // Held past the commit below, for the reason `write_slice` takes one: the
+        // outboard is written with no lock held ([`Store::lease_write`]).
+        let _lease = self.lease_write(root);
         if let Some(row) = self.blob(root)? {
             // The cheap refusal; `commit_groups` makes the same decision again
             // inside the transaction that records it (`settle_size`).
@@ -871,6 +889,11 @@ impl Store {
         // verify in the first place.
         let root = &proven.root;
         let size = proven.size;
+        // Promotion copies donor bytes into this object's payload and its tree
+        // into the outboard, both with no lock held, and commits after — the same
+        // shape as `write_slice`, and the same reason for a lease
+        // ([`Store::lease_write`]).
+        let _lease = self.lease_write(root);
         let groups = group_count(size);
         // Inline blobs never delta (§4): one group is smaller than the round
         // trip that would discover it could be reused.

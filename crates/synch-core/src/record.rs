@@ -274,34 +274,49 @@ impl BlobAd {
     }
 }
 
-/// Rounds spans out to [`AD_SPAN_GRANULARITY`] boundaries and merges overlaps.
+/// Rounds spans *inward* to [`AD_SPAN_GRANULARITY`] boundaries and merges what
+/// touches.
 ///
-/// Rounding *outward* would over-claim; ads are hints, not promises (§6.3), and
-/// the fetcher learns exact availability from `SliceEnd`, so we round the start
-/// down and the end up only within the object's true size, then merge.
+/// Ads are hints, not promises (§6.3) — the fetcher learns exact availability
+/// from `SliceEnd` — but the direction of the error is not a free choice, and
+/// this is where the policy stated at [`MAX_AD_SPANS`] is kept:
+/// over-reporting availability sends a fetcher to a provider that cannot serve
+/// it, while under-reporting costs at most a re-fetch.
+///
+/// This used to round the start down and the end *up*, which over-claims at both
+/// ends of every run — up to a 16 MiB granule of bytes the node does not hold on
+/// each side. Not an edge case: a slice window is 8 MiB, so a fetch in progress
+/// almost never lands on a granule boundary, and `ad_update_due` republishes
+/// mid-window every 60 s. Worse, the clamp to `size` made it *claim the whole
+/// object*: a holder of the first 8 MiB of a 10 MiB object published
+/// `[(0, 10 485 760)]`, which is exactly the shape [`BlobAd::is_complete`] reads
+/// as "I hold all of this". Peers wrote `complete = 1` into `blob_providers`,
+/// ordered it first, and handed it a full `1/fanout` share of the object.
+///
+/// So a run contributes the largest granule-aligned span inside it. The object's
+/// own boundaries are exact rather than rounded — 0 is a granule boundary
+/// anyway, and the final partial granule is real bytes the holder has — so a
+/// holder of the whole object still advertises the whole object, and
+/// `is_complete` means what its name says again.
 pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) -> Vec<(u64, u64)> {
     let mut v: Vec<(u64, u64)> = spans
         .into_iter()
         .filter(|(s, e)| s < e)
         .map(|(s, e)| {
-            // Clamp to the object size *before* rounding the end up, so an `e`
-            // far past the object cannot overflow on the way out.
-            //
-            // That leaves the case where `size` itself is within one
-            // granularity of `u64::MAX`, where the round-up still overflows —
-            // so it is done on the group index and multiplied back with a
-            // checked step rather than asserted away. No verifying write can
-            // produce such a row (a ~2^50-group claim survives no chaining
-            // value), which is why this is cheap insurance rather than a live
-            // path, but a comment claiming it *cannot* happen is worse than the
-            // arithmetic that makes sure it does not.
-            let s = (s / AD_SPAN_GRANULARITY) * AD_SPAN_GRANULARITY;
-            let e = e
-                .min(size)
+            // Clamped to the object first, so nothing downstream has to reason
+            // about a span past the end.
+            let (s, e) = (s.min(size), e.min(size));
+            // The start rounds *up* to the next boundary and the end *down* to
+            // the previous one — except at the object's end, where the tail
+            // granule is not a rounding artifact but the last real bytes.
+            let start = s
                 .div_ceil(AD_SPAN_GRANULARITY)
-                .checked_mul(AD_SPAN_GRANULARITY)
-                .unwrap_or(size);
-            (s.min(size), e.min(size).max(s.min(size)))
+                .saturating_mul(AD_SPAN_GRANULARITY);
+            let end = match e == size {
+                true => e,
+                false => (e / AD_SPAN_GRANULARITY) * AD_SPAN_GRANULARITY,
+            };
+            (start.min(size), end.min(size))
         })
         .filter(|(s, e)| s < e)
         .collect();
@@ -600,22 +615,68 @@ mod tests {
         );
     }
 
+    /// Coalescing under-reports rather than over-reports.
+    ///
+    /// The direction is the policy `MAX_AD_SPANS` states: over-reporting sends a
+    /// fetcher to a provider that cannot serve, under-reporting costs at most a
+    /// re-fetch. Rounding a run *out* to granule boundaries claims up to 16 MiB
+    /// of unheld bytes at each end, which is what a holder of two bytes used to
+    /// advertise as the whole first granule.
     #[test]
     fn spans_coalesce_at_16mib() {
         let g = AD_SPAN_GRANULARITY;
         let size = 10 * g;
-        let spans = coalesce_spans([(1, 2), (g + 5, g + 6)], size);
-        assert_eq!(spans, vec![(0, 2 * g)]);
 
-        let spans = coalesce_spans([(0, 1), (5 * g, 5 * g + 1)], size);
-        assert_eq!(spans, vec![(0, g), (5 * g, 6 * g)]);
+        // Two byte-sized runs are not two granules.
+        assert_eq!(coalesce_spans([(1, 2), (g + 5, g + 6)], size), vec![]);
+        assert_eq!(coalesce_spans([(0, 1), (5 * g, 5 * g + 1)], size), vec![]);
+
+        // A run that covers whole granules keeps them, and loses only the
+        // partial granule at each end.
+        assert_eq!(coalesce_spans([(g - 1, 3 * g + 1)], size), vec![(g, 3 * g)]);
+        // Runs that meet at a boundary merge.
+        assert_eq!(
+            coalesce_spans([(0, 2 * g), (2 * g, 4 * g)], size),
+            vec![(0, 4 * g)]
+        );
+    }
+
+    /// A holder of part of an object never advertises the whole of it.
+    ///
+    /// `is_complete` reads one span reaching from 0 to the size, and clamping an
+    /// outward-rounded end to `size` produced exactly that shape for a node
+    /// holding one window: peers derived `complete = 1`, ranked it first, and
+    /// handed it a full share of the object.
+    #[test]
+    fn a_partial_holder_never_reports_complete() {
+        let g = AD_SPAN_GRANULARITY;
+        // The first slice window of a 10 MiB object — under one granule, so the
+        // node advertises nothing rather than everything.
+        let small = 10 * 1024 * 1024;
+        let ad = BlobAd::partial(small, [(0, 8 * 1024 * 1024)]);
+        assert!(!ad.is_complete(), "{:?}", ad.state.spans);
+
+        // And the first two granules of a larger one is two granules, not all.
+        let ad = BlobAd::partial(10 * g, [(0, 2 * g + 7)]);
+        assert_eq!(ad.state.spans, vec![(0, 2 * g)]);
+        assert!(!ad.is_complete());
+
+        // A holder of the whole object still says so, tail granule included.
+        let ad = BlobAd::partial(small, [(0, small)]);
+        assert_eq!(ad.state.spans, vec![(0, small)]);
+        assert!(ad.is_complete());
     }
 
     #[test]
     fn spans_clamp_to_size() {
         let g = AD_SPAN_GRANULARITY;
         let size = g / 2;
-        assert_eq!(coalesce_spans([(0, 10)], size), vec![(0, size)]);
+        // The object's own end is exact: its tail granule is real bytes, not a
+        // rounding artifact.
+        assert_eq!(coalesce_spans([(0, size)], size), vec![(0, size)]);
+        assert_eq!(coalesce_spans([(0, size * 4)], size), vec![(0, size)]);
+        // Part of it is part of it.
+        assert_eq!(coalesce_spans([(0, 10)], size), vec![]);
     }
 
     #[test]

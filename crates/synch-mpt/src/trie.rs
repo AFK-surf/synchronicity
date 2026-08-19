@@ -229,12 +229,13 @@ pub type Entry = (Vec<u8>, Vec<u8>);
 /// than the tree (§5.2).
 #[derive(Debug)]
 pub struct MissingWalk {
-    /// `(the hash at this position in the reference trie, the hash wanted)`.
-    frontier: Vec<(Option<Hash>, Hash)>,
+    /// `(the hash at this position in the reference trie, the hash wanted, the
+    /// nibble depth of the position)`.
+    frontier: Vec<(Option<Hash>, Hash, usize)>,
     seen: HashSet<Hash>,
     /// Reported absent and awaiting the caller's fetch, so they can be
     /// revisited — and their children discovered — once they land.
-    deferred: Vec<(Option<Hash>, Hash)>,
+    deferred: Vec<(Option<Hash>, Hash, usize)>,
     /// Children of extension nodes that were not yet present when their parent
     /// was walked, and so must be checked for being branches when they arrive.
     must_be_branch: HashSet<Hash>,
@@ -255,7 +256,7 @@ impl MissingWalk {
     pub fn since(known_complete: Option<Hash>, root: Hash) -> MissingWalk {
         let frontier = match root_opt(root) {
             None => Vec::new(),
-            Some(root) => vec![(known_complete.and_then(root_opt), root)],
+            Some(root) => vec![(known_complete.and_then(root_opt), root, 0usize)],
         };
         MissingWalk {
             frontier,
@@ -275,9 +276,9 @@ impl MissingWalk {
     /// are reported again, which is what lets a caller notice it is making no
     /// progress.
     pub fn resume(&mut self) {
-        for (reference, hash) in self.deferred.drain(..) {
-            self.seen.remove(&hash);
-            self.frontier.push((reference, hash));
+        for entry in self.deferred.drain(..) {
+            self.seen.remove(&entry.1);
+            self.frontier.push(entry);
         }
     }
 
@@ -301,10 +302,40 @@ impl MissingWalk {
         // next round has to be reported again, or the unproductive counter that
         // §5.2's abandonment clause rests on would never fire.
         let mut asked: HashSet<Hash> = HashSet::new();
-        while let Some((reference, hash)) = self.frontier.pop() {
+        while let Some((reference, hash, depth)) = self.frontier.pop() {
             if missing.len() >= max {
-                self.frontier.push((reference, hash));
+                self.frontier.push((reference, hash, depth));
                 break;
+            }
+            // The depth bound every *walk* in this crate carries, applied to the
+            // *fetch*, which carried none. `hash_of_encoded` bounds one node's
+            // nibble run at `MAX_KEY_LEN * 2` and DESIGN §12 read that as
+            // bounding ingest depth; it does not, because the bound is per node
+            // and a path is made of many. Without this, a chain of nodes reaching
+            // past the depth any valid key addresses was pulled and committed in
+            // full, `is_complete` vouched for the root, `iter` and `diff` pruned
+            // at `MAX_DEPTH_NIBBLES` so the promotion succeeded, and the nodes
+            // were then reachable from a retained head: marked by every GC pass,
+            // reflected in no `entries` row, and served on to every peer.
+            //
+            // What this is and is not. It refuses a *position* no valid key
+            // reaches, which is a canonicality rule and costs nothing an honest
+            // origin can produce — no key `insert` accepts descends this far. It
+            // is **not** a bound on how much a member can make a peer store,
+            // and it should not be read as one: `seen` deduplicates on hash, so
+            // a node is expanded at whichever depth it is popped at first, and
+            // one extra branch pointing at every rung of a deep chain makes the
+            // whole chain reachable at depth 1. What bounds storage is that this
+            // walk is deduplicated at all — the fetch costs one node per
+            // *distinct* node served, so a member gets no leverage over a peer
+            // beyond what it uploads (§12 puts that under `synch trust rm`).
+            //
+            // An `MptError`, so it fails that origin and not the peer relaying it.
+            if depth > MAX_DEPTH_NIBBLES {
+                return Err(MptError::NonCanonical(format!(
+                    "a trie node sits at nibble depth {depth}, past the \
+                     {MAX_DEPTH_NIBBLES} any valid key reaches"
+                )));
             }
             // The same hash in a trie held whole: this subtree is already here,
             // values and all.
@@ -316,7 +347,7 @@ impl MissingWalk {
             }
             let Some(data) = trie.load_raw(&hash)? else {
                 missing.nodes.push(hash);
-                self.deferred.push((reference, hash));
+                self.deferred.push((reference, hash, depth));
                 continue;
             };
             let node = TrieNode::decode(&data)?;
@@ -365,8 +396,30 @@ impl MissingWalk {
                     .transpose()?,
                 None => None,
             };
-            self.frontier
-                .extend(paired_children(reference_node.as_ref(), &node));
+            // How far into the key a child of this node sits: a branch spends
+            // one nibble on the child index, an extension spends its whole
+            // prefix, and a leaf has no children. A leaf's *value* sits at the
+            // end of its own run, which is the position a key would have to be
+            // that long to name.
+            let step = match &node {
+                TrieNode::Branch { .. } => 1,
+                TrieNode::Ext { prefix, .. } => prefix.len(),
+                TrieNode::Leaf { key_rest, .. } => {
+                    if depth.saturating_add(key_rest.len()) > MAX_DEPTH_NIBBLES {
+                        return Err(MptError::NonCanonical(format!(
+                            "a trie value sits at nibble depth {}, past the \
+                             {MAX_DEPTH_NIBBLES} any valid key reaches",
+                            depth.saturating_add(key_rest.len())
+                        )));
+                    }
+                    0
+                }
+            };
+            self.frontier.extend(
+                paired_children(reference_node.as_ref(), &node)
+                    .into_iter()
+                    .map(|(r, h)| (r, h, depth.saturating_add(step))),
+            );
             // A node whose out-of-line values have not arrived is not done
             // with, so it is deferred alongside the nodes that never loaded at
             // all. Reporting the value once and moving on would have the walk
@@ -389,7 +442,7 @@ impl MissingWalk {
                 }
             }
             if awaiting_values {
-                self.deferred.push((reference, hash));
+                self.deferred.push((reference, hash, depth));
             }
         }
         Ok(missing)
@@ -498,7 +551,19 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     // ---- reads ------------------------------------------------------------
 
     /// Looks up a key.
+    ///
+    /// Refuses a key the write path would refuse, for the reason every
+    /// structural walk stops at [`MAX_DEPTH_NIBBLES`]: `insert` and `remove`
+    /// bound the key at [`MAX_KEY_LEN`] and this did not, so a peer could put a
+    /// value past that depth with compressed nodes and have `get` answer for a
+    /// key `iter`, `diff` and therefore `entries` can never see. The two
+    /// readers must agree about which keys exist; that is the whole of what
+    /// [`TrieNode::check_invariants`](crate::TrieNode::check_invariants) and
+    /// the ingest bound below are for.
     pub fn get(&self, root: Hash, key: &[u8]) -> Result<Option<Vec<u8>>, MptError> {
+        if key.len() > MAX_KEY_LEN {
+            return Err(MptError::KeyTooLong(key.len()));
+        }
         let nibbles = Nibbles::from_bytes(key);
         let mut rest = nibbles.as_slice();
         let mut current = root_opt(root);
@@ -508,10 +573,17 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         // stays because `get` is the one descent with no stack to bound it, and
         // a chain of zero-progress nodes would otherwise turn one lookup into
         // one store read per node.
+        //
+        // A key of `n` nibbles needs up to `n + 1` node loads, not `n`: the last
+        // load is the leaf or branch holding the value, and it consumes nothing.
+        // Counted at `MAX_DEPTH_NIBBLES` this refused a key of exactly
+        // `MAX_KEY_LEN` bytes — one `iter` and `diff` yield, and that the
+        // materializer therefore puts in `entries`, while `get` called it
+        // structurally invalid and `synch history` rendered the path as absent.
         let mut steps = 0usize;
         loop {
             steps += 1;
-            if steps > MAX_DEPTH_NIBBLES {
+            if steps > MAX_DEPTH_NIBBLES + 1 {
                 return Err(MptError::NonCanonical(
                     "lookup descended further than any valid key is long".into(),
                 ));
@@ -561,6 +633,13 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     pub fn insert(&self, root: Hash, key: &[u8], value: &[u8]) -> Result<Hash, MptError> {
         if key.len() > MAX_KEY_LEN {
             return Err(MptError::KeyTooLong(key.len()));
+        }
+        // The value side is bounded here for the same reason the key side is,
+        // and it was not: this node must not publish a record every peer's
+        // `GetValues` answer and promotion diff will then have to carry
+        // ([`MAX_TRIE_VALUE_LEN`]).
+        if value.len() > synch_core::MAX_TRIE_VALUE_LEN {
+            return Err(MptError::ValueTooLong(value.len()));
         }
         let (vref, out_of_line) = ValueRef::for_value(value);
         if let Some((hash, payload)) = out_of_line {
