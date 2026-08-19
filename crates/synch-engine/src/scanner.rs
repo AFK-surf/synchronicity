@@ -717,7 +717,31 @@ impl Node {
             .ok_or_else(|| EngineError::not_found(format!("space {space_id}")))?;
         let normalized =
             synch_core::normalize_path(path).map_err(|e| EngineError::invalid(e.to_string()))?;
-        Ok(PathBuf::from(&space.local_path).join(&normalized))
+        // And the platform has to agree the result is purely relative before it
+        // is joined onto the space root.
+        //
+        // `normalize_path` works in the protocol's own path language, where `/`
+        // is the only separator — deliberately, so a trie key means the same
+        // thing on every node. On Windows the *platform* reads more than that: a
+        // key of `..\..\evil.txt` is one `Normal` component to the protocol and
+        // a traversal to `Path::join`, and one of `C:/Windows/Temp/evil.txt`
+        // carries a drive prefix, which makes `join` discard the space root
+        // entirely. Either writes outside every space, as the daemon user, from
+        // any key the S3 gateway accepts.
+        //
+        // A no-op on POSIX, where none of those parse as anything but `Normal`.
+        // The mirror's `unsafe_name` already refuses these on the way out; this
+        // is the way in.
+        let target = PathBuf::from(&space.local_path).join(&normalized);
+        if Path::new(&normalized)
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(EngineError::invalid(format!(
+                "path {path} is not a plain relative path on this platform"
+            )));
+        }
+        Ok(target)
     }
 }
 
@@ -1393,6 +1417,44 @@ mod tests {
                 "no tombstone may be staged for {path}, which is still there"
             );
         }
+        node.shutdown().await.unwrap();
+    }
+
+    /// A key the platform reads as more than one relative component is refused.
+    ///
+    /// `normalize_path` speaks the protocol's path language, where `/` is the
+    /// only separator — so on Windows a key of `..\\..\\evil.txt` is a single
+    /// `Normal` component to it and a traversal to `Path::join`, and one with a
+    /// drive prefix makes `join` discard the space root outright. Either writes
+    /// outside every space, as the daemon user, from any key the S3 gateway
+    /// accepts. A no-op on POSIX, which is why the assertions below are
+    /// platform-gated.
+    #[tokio::test]
+    async fn an_adoption_target_stays_inside_its_space() {
+        let (_d, _space, node) = node_with_space().await;
+        // Against the root as `add_space` recorded it, not as the test made it:
+        // `canonical_dir` resolves `/var` to `/private/var` on macOS and adds a
+        // verbatim prefix on Windows, so the tempdir's own path is a different
+        // spelling of the same directory.
+        let root = PathBuf::from(node.store().space("media").unwrap().unwrap().local_path);
+        let inside = node.adoption_target("media", "sub/ok.txt").unwrap();
+        assert_eq!(inside, root.join("sub").join("ok.txt"));
+
+        #[cfg(windows)]
+        for escape in [
+            "..\\..\\evil.txt",
+            "C:/Windows/Temp/evil.txt",
+            "\\\\srv\\s\\x",
+        ] {
+            assert!(
+                node.adoption_target("media", escape).is_err(),
+                "{escape} must not resolve outside the space"
+            );
+        }
+        // On POSIX every one of those is a single ordinary component, and the
+        // protocol's own rules already refuse the separators that matter.
+        assert!(node.adoption_target("media", "../evil.txt").is_err());
+        assert!(node.adoption_target("media", "/etc/passwd").is_err());
         node.shutdown().await.unwrap();
     }
 

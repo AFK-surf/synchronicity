@@ -851,11 +851,21 @@ mod tests {
         // leave a fork nothing could ever retire.
         assert_eq!(store.prune_history_before(&origin(), 500).unwrap(), 0);
         assert_eq!(store.equivocations().unwrap().len(), 1);
-        // Once both roots are past the window, the fork and its witness go
-        // together.
-        assert_eq!(store.prune_history_before(&origin(), 1_000).unwrap(), 3);
+        // Once both roots are past the window, the fork goes whole. Its
+        // witness at seq 3 is also the top of the history, which no pass ever
+        // takes: pruning it would lower the seq ceiling the origin is on
+        // record at.
+        assert_eq!(store.prune_history_before(&origin(), 1_000).unwrap(), 2);
         assert!(store.equivocations().unwrap().is_empty());
-        assert!(store.head_history(&origin()).unwrap().is_empty());
+        assert_eq!(
+            store
+                .head_history(&origin())
+                .unwrap()
+                .iter()
+                .map(|h| h.seq)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
     }
 
     #[test]

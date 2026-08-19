@@ -849,9 +849,16 @@ impl Node {
             (ambiguous, mismatch)
         };
         let bindings = self.store().bindings()?;
+        // At the instant trust decisions are actually taken, not the raw reading.
+        // `is_bound` and `keys_for_origin` floor `now` with the trust floor, so on
+        // a clock that stepped backwards a binding whose expiry falls in the gap
+        // is *not* honoured — while this list called it live, and the `bound`
+        // column of the same report applied the floor. One report contradicting
+        // itself is worse than either answer.
+        let trusted_now = self.store().trust_instant(now)?;
         let lapsed: Vec<Binding> = bindings
             .iter()
-            .filter(|b| !b.is_live(now))
+            .filter(|b| !b.is_live(trusted_now))
             .cloned()
             .collect();
 
