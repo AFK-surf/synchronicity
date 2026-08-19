@@ -80,6 +80,15 @@ impl Publisher {
         }
     }
 
+    /// The keys currently waiting to be published.
+    ///
+    /// So a producer of *removals* can avoid contradicting a live entry already
+    /// in the batch: `publish` folds in order and the last value for a key wins,
+    /// which for a removal against a fresh entry means the path is erased.
+    pub(crate) fn staged_keys(&self) -> std::collections::HashSet<Vec<u8>> {
+        self.buffer().iter().map(|(key, _)| key.clone()).collect()
+    }
+
     /// How many changes are waiting to be published.
     pub fn pending(&self) -> usize {
         self.buffer().len()
@@ -103,9 +112,19 @@ impl Publisher {
     /// Puts a batch back at the front after a publish failed, so the next
     /// flush retries it rather than dropping it on the floor.
     pub(crate) fn restage(&self, changes: Vec<StagedChange>) {
-        let mut staged = self.buffer();
-        let queued = std::mem::replace(&mut *staged, changes);
-        staged.extend(queued);
+        {
+            let mut staged = self.buffer();
+            let queued = std::mem::replace(&mut *staged, changes);
+            staged.extend(queued);
+        }
+        // And wake the loop, or "it stays staged" means "until something else
+        // happens to be staged". The permit that drove the failed flush was
+        // consumed by it, so the loop parks on `woken()` with a full buffer —
+        // and the scan that produced the batch has already written its
+        // `local_files` rows, so every later scan calls those paths unchanged.
+        // The node's own tree then lags until an unrelated change arrives or the
+        // daemon stops.
+        self.wake.notify_one();
     }
 
     fn buffer(&self) -> std::sync::MutexGuard<'_, Vec<StagedChange>> {
