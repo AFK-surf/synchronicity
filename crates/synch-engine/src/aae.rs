@@ -407,13 +407,18 @@ impl Node {
                     promoted += 1;
                     continue;
                 }
-                // A head the memo already condemns was retired by `try_promote`
-                // itself, so there is nothing for this pass to abandon.
+                // `try_promote` retired it, on this pass and on this call, so
+                // it counts here — but there is nothing left for the
+                // compare-and-clear below to delete, which is why this returns
+                // early rather than falling through to it.
                 Ok(crate::reconcile::Promotion::Refused) => {
                     abandoned += 1;
                     continue;
                 }
-                Ok(crate::reconcile::Promotion::Waiting) => false,
+                // Both mean this pass has no verdict to record: the head
+                // either still needs its trie, or is already gone.
+                Ok(crate::reconcile::Promotion::Waiting)
+                | Ok(crate::reconcile::Promotion::Idle) => false,
                 // Only a fault in what the *origin* published condemns its head.
                 // A `SQLITE_BUSY` from another process, a full disk, an I/O
                 // error — this used to read all of them as "poisoned" and

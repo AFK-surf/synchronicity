@@ -202,8 +202,9 @@ impl Store {
     /// neither of which it uses — so a row with an unreadable `sig` was silently
     /// absent from the listing and the rebuild reported success having skipped
     /// that origin entirely, which is the one outcome `doctor --rebuild` exists
-    /// to rule out. Reading `heads` alone means an unreadable `root` still fails
-    /// loudly, because without it there is genuinely nothing to rebuild from.
+    /// to rule out. Reading `heads` alone also drops the join, so a row is only
+    /// unreadable here if its own two columns are — and such a row is returned in
+    /// `unreadable` for the caller to name, not propagated.
     pub fn complete_slot_roots(&self) -> Result<CompleteRoots> {
         let conn = self.conn();
         let mut stmt =
@@ -1154,6 +1155,48 @@ mod tests {
         // Both roots are now markable from the one table GC reads.
         let roots = store.retained_roots().unwrap();
         assert!(roots.contains(&complete.root) && roots.contains(&pending.root));
+    }
+
+    /// A rebuild sees the rows it can read and is told about the ones it cannot.
+    ///
+    /// Both halves matter and neither had a test: skipping a row silently is what
+    /// lets `doctor --rebuild` report success having rebuilt nothing for an
+    /// origin, and propagating instead rebuilt nothing for *any* origin, because
+    /// the whole list is materialized before the caller starts.
+    #[test]
+    fn complete_slot_roots_separates_the_readable_from_the_unreadable() {
+        let (_d, store) = store();
+        let key = SecretKey::generate();
+        let good = SignedHead::sign(&key, origin(), 1, Hash::EMPTY, 0);
+        store.put_head(Slot::Complete, &good, 0, 0).unwrap();
+
+        let found = store.complete_slot_roots().unwrap();
+        assert_eq!(found.roots, [(origin(), Hash::EMPTY)]);
+        assert!(found.unreadable.is_empty());
+
+        // A root that is not a hash — the shape a corrupted row has, and the one
+        // a rebuild cannot do anything with.
+        let broken = OriginId::named("broken", "x.example").unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO heads (origin_id, slot, seq, root, received_at, verified_at)
+                 VALUES (?1, 'complete', 1, ?2, 0, 0)",
+                rusqlite::params![broken.canonical(), vec![0u8; 31]],
+            )
+            .unwrap();
+
+        let found = store.complete_slot_roots().unwrap();
+        assert_eq!(
+            found.roots,
+            [(origin(), Hash::EMPTY)],
+            "the readable row is still returned"
+        );
+        assert_eq!(
+            found.unreadable,
+            [broken.canonical()],
+            "and the unreadable one is named rather than propagated or dropped"
+        );
     }
 
     #[test]

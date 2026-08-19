@@ -70,10 +70,22 @@ pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
 pub enum Promotion {
     /// The pending head's trie was wholly present and the complete slot flipped.
     Flipped,
-    /// Nothing to promote, or the trie is not all here yet: the slot stands.
+    /// A pending head stands and its trie is not all here yet: it needs a fetch.
     Waiting,
     /// This promotion is in the refusal memo, so the head was retired unjudged.
     Refused,
+    /// Nothing is pending now: there was no pending head, or the complete slot
+    /// had overtaken the one there and it was dropped.
+    ///
+    /// Distinct from `Waiting`, which the two used to share. The caller has to
+    /// tell them apart: `Waiting` means a head is sitting there needing its trie,
+    /// so it is reported accepted and rings the fetch bell, and doing that for a
+    /// head that was just dropped counted a discarded head as accepted and woke
+    /// the anti-entropy loop for something that no longer existed. The overtake
+    /// is reachable whenever a local `publish` or an `activate` moves the
+    /// complete slot between the offer's transaction and this one — both derive
+    /// their seq from the complete slot alone (§3.4).
+    Idle,
 }
 
 /// What happened when a head was offered.
@@ -483,6 +495,10 @@ impl Syncer {
                 Ok(HeadOutcome::Pending)
             }
             Promotion::Refused => Ok(HeadOutcome::Refused),
+            // Adopted, and then dropped again by the promotion because the
+            // complete slot had overtaken it. Nothing is pending, so this is not
+            // an acceptance and there is nothing to fetch.
+            Promotion::Idle => Ok(HeadOutcome::NotNewer),
         }
     }
 
@@ -508,7 +524,7 @@ impl Syncer {
         let judged: std::cell::RefCell<Option<Verdict>> = std::cell::RefCell::new(None);
         let promoted = self.store.transaction(|txn| -> Result<Promotion> {
             let Some(pending) = txn.head(origin, Slot::Pending)? else {
-                return Ok(Promotion::Waiting);
+                return Ok(Promotion::Idle);
             };
             // The displaced root, the verdict key and the memo check all come
             // before the completeness walk, because the walk is the most likely
@@ -563,7 +579,7 @@ impl Syncer {
                     "dropping a pending head the complete slot has overtaken"
                 );
                 txn.clear_head(origin, Slot::Pending)?;
-                return Ok(Promotion::Waiting);
+                return Ok(Promotion::Idle);
             }
             // The displaced head is already retained: `put_head` recorded its
             // signature when it took the slot. Recording it again here would be
@@ -1017,7 +1033,7 @@ impl Syncer {
                 // report, and after the first exchange this is the only outcome
                 // that carries it — the fault propagates once, and every later
                 // offer is answered from the memo without re-deriving it.
-                HeadOutcome::Refused => report.heads_failed += 1,
+                HeadOutcome::Refused => report.left_behind(&head.origin),
                 HeadOutcome::Pending => {
                     report.heads_accepted += 1;
                     match self.fetch_pending(client, &head.origin).await {
@@ -1284,7 +1300,7 @@ fn contain(origin: &OriginId, error: &EngineError, report: &mut SyncReport) {
         error = %error,
         "origin left behind: its published data could not be applied"
     );
-    report.heads_failed += 1;
+    report.left_behind(origin);
 }
 
 /// What one exchange achieved, for logging and tests.
@@ -1302,6 +1318,24 @@ pub struct SyncReport {
     pub heads_abandoned: usize,
     /// Origins skipped because their own published data could not be applied.
     pub heads_failed: usize,
+    /// Which origins `heads_failed` counts, so counting one twice cannot inflate
+    /// it. Not part of the rendered report.
+    failed_origins: std::collections::HashSet<OriginId>,
+}
+
+impl SyncReport {
+    /// Records that this origin was left behind, once however often it is said.
+    ///
+    /// The number is rendered as "N origin(s) left behind", and two paths reach
+    /// this verdict for the same origin in one exchange: the fault propagates
+    /// from the first offer of a head, and every later offer of it is answered
+    /// from the refusal memo. Nothing dedups the head list a peer sends, so a
+    /// repeated head counted its origin once per copy.
+    fn left_behind(&mut self, origin: &OriginId) {
+        if self.failed_origins.insert(origin.clone()) {
+            self.heads_failed += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2096,6 +2130,42 @@ mod containment_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
             .await
             .expect("a wake that landed while the loop was busy must still be there");
+    }
+
+    /// A head the memo already refuses does not ring the fetch bell.
+    ///
+    /// The bell wakes the anti-entropy loop to go and fetch a trie. A refused
+    /// head is adopted and retired in the same breath — adopting it is what makes
+    /// it beat the floor again — so ringing on adoption woke the loop for a head
+    /// that no longer existed, and `notify_one` keeps a permit while the loop is
+    /// not parked during a round: one such head held by one peer pinned the node
+    /// to back-to-back rounds at the reactive floor, permanently.
+    #[tokio::test]
+    async fn a_refused_head_does_not_ring_the_fetch_bell() {
+        let (_d, store, key, origin) = setup();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let syncer = Syncer::new(store.clone()).on_pending(Some(wake.clone()));
+        let trie = Trie::new(store.as_ref());
+
+        let poisoned = trie
+            .insert(Hash::EMPTY, &file_key("s", "a.txt").unwrap(), &[0xffu8; 8])
+            .unwrap();
+        let head = SignedHead::sign(&key, origin.clone(), 5, poisoned, 0);
+        syncer
+            .offer_head(&head, 0)
+            .expect_err("the record cannot be materialized");
+        // The first offer did adopt it before judging it, so it may have rung.
+        // Drain that permit; what must not ring is the *refusal*.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+
+        assert_eq!(
+            syncer.offer_head(&head, 0).unwrap(),
+            HeadOutcome::Refused,
+            "answered from the memo"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(200), wake.notified())
+            .await
+            .expect_err("a refused head has no trie to fetch and must not wake the loop");
     }
 
     /// The pending slot ages, not the head occupying it.
