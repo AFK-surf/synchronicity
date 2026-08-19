@@ -84,6 +84,18 @@ pub const MAX_DEPTH_NIBBLES: usize = MAX_KEY_LEN * 2;
 ///
 /// The consequence worth stating plainly: this caps how large a trie any origin
 /// can have materialized here. That is a deliberate limit, not an accident.
+///
+/// It is not, however, a limit anyone observes on the way to it, and that part
+/// *is* an accident. A follower promoting an origin's next head diffs
+/// `old_root → new_root`, and the diff prunes at the first equal node hash, so
+/// it is charged in changed paths however large the trie is. The publisher
+/// diffs the same way. `MissingWalk` carries no position guard at all, since it
+/// dedups on hash. So an origin can grow past this ceiling with no node —
+/// itself included — ever running the walk that would say so, and the limit
+/// then manifests only on the *first cold materialization*: a node joining, a
+/// node restoring from backup, `doctor --rebuild`. Existing followers keep
+/// syncing it happily. The refusal at least names the situation now, rather
+/// than reading as one more unparseable record.
 const WALK_POSITION_CEILING: usize = 8_000_000;
 
 /// Keeps a structural walk proportional to the work it is allowed to do.
@@ -123,7 +135,10 @@ impl FanoutGuard {
         self.positions += 1;
         if self.positions > WALK_POSITION_CEILING {
             return Err(MptError::NonCanonical(format!(
-                "structural walk exceeded {WALK_POSITION_CEILING} positions"
+                "structural walk exceeded {WALK_POSITION_CEILING} positions. If this is a cold \
+                 materialization of an origin that has been publishing for a long time, this \
+                 node cannot adopt it at all — its trie has grown past what any *first* \
+                 adoption here can walk, while incremental followers are unaffected"
             )));
         }
         Ok(())

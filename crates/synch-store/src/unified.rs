@@ -322,14 +322,14 @@ fn content_of(entry: &EntryRow) -> Option<Hash> {
 /// The one derivation, over the three fields any version carries, so an
 /// `EntryRow` and a `Version` cannot come to different answers about the same
 /// assertion.
-fn identity_of(kind: EntryKind, content: Option<Hash>, symlink_target: &Option<String>) -> Identity {
+fn identity_of(
+    kind: EntryKind,
+    content: Option<Hash>,
+    symlink_target: &Option<String>,
+) -> Identity {
     match kind {
         EntryKind::Tombstone => (kind, None, None),
-        EntryKind::Symlink => (
-            kind,
-            None,
-            Some(symlink_target.clone().unwrap_or_default()),
-        ),
+        EntryKind::Symlink => (kind, None, Some(symlink_target.clone().unwrap_or_default())),
         _ => (kind, content.map(|h| *h.as_bytes()), None),
     }
 }

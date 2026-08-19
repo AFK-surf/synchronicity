@@ -951,12 +951,39 @@ impl Node {
 
     /// Rebuilds `entries` and `blob_providers` from the authoritative trie
     /// (`synch doctor --rebuild`, §10).
+    ///
+    /// Per origin, and one origin's failure does not stop the others. Each
+    /// `rematerialize` is its own transaction, so a failure rolls back only
+    /// that origin — but propagating it left every origin sorted after it in
+    /// `all_heads` order un-rebuilt, with no indication that the command had
+    /// stopped short. Which origin fails is not random: a trie past
+    /// `WALK_POSITION_CEILING` fails a *cold* materialization every time,
+    /// deterministically, on every node — so one such origin used to make
+    /// `doctor --rebuild` unusable for the whole cluster.
     pub fn rebuild_views(&self) -> Result<usize> {
         let mut total = 0;
+        let mut failed = Vec::new();
         for stored in self.store().all_heads(synch_store::Slot::Complete)? {
-            total += self
+            match self
                 .store()
-                .rematerialize(&stored.head.origin, stored.head.root)?;
+                .rematerialize(&stored.head.origin, stored.head.root)
+            {
+                Ok(n) => total += n,
+                Err(e) => {
+                    tracing::warn!(
+                        origin = %stored.head.origin,
+                        error = %e,
+                        "this origin's views could not be rebuilt; the others were"
+                    );
+                    failed.push(stored.head.origin.canonical());
+                }
+            }
+        }
+        if !failed.is_empty() {
+            return Err(EngineError::invalid(format!(
+                "rebuilt every origin except {}; see the log for why",
+                failed.join(", ")
+            )));
         }
         Ok(total)
     }

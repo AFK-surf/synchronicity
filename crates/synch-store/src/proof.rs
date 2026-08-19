@@ -156,12 +156,20 @@ impl Proven {
         // copy misses the "already held" guard and the whole run is copied
         // again. Wasted IO inside the path whose entire purpose is avoiding IO,
         // and it grows with the fanout rather than being a constant.
+        //
+        // Through a set rather than a scan of what is already held. A window
+        // carries up to `MAX_PROOF_NODES`-worth of subtrees — about 8 000 at
+        // the span level — and one window covers a 100 GB object, so below that
+        // the scan never ran at all. Past it the accumulator is folded once per
+        // window, and a linear scan makes the fold quadratic in the object's
+        // size: a 1 TB object is eight windows and ~1.9e9 comparisons, seconds
+        // of a runtime worker. This runs beside the offloaded `write_proof`
+        // rather than inside it, and it touches no store connection, so §10's
+        // checker cannot see it (`Store::conn` is where that check lives).
+        let mut held: std::collections::HashSet<(u64, u64)> =
+            self.subtrees.iter().map(|s| (s.start, s.groups)).collect();
         for subtree in other.subtrees {
-            if !self
-                .subtrees
-                .iter()
-                .any(|held| held.start == subtree.start && held.groups == subtree.groups)
-            {
+            if held.insert((subtree.start, subtree.groups)) {
                 self.subtrees.push(subtree);
             }
         }

@@ -1150,24 +1150,35 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&payload_path)?;
-        // Grown to fit the *window*, never to the claimed size, and never
-        // shrunk.
+        // Not pre-grown at all, and never shrunk.
         //
         // Never shrunk, because sizing a file down on the strength of a claim
         // is how an understated entry destroys verified groups — bytes gone,
         // bitmap bits intact, the node advertising a group it can no longer
         // serve ([`grow_to`], `docs/DELTA-SYNC.md` §6).
         //
-        // Never to the claimed size, because `size` is a peer's assertion off an
-        // entry and this runs *before* `decode_ranges` turns any of it into
-        // fact. An entry claiming 32 TiB for any root would otherwise have
-        // every node that attempts a fetch create a 32 TiB sparse payload and a
-        // 128 GiB sparse outboard, fail verification, and leave both behind —
-        // `trim_to_size` only runs on a commit that completed the object, so
-        // nothing would reclaim them. Growing to the end of the window bounds
-        // the file by what is about to be verified; `write_at` extends past it
-        // as later windows land, so a real object still fills out normally.
-        grow_to(&payload, window_end_bytes(&served, size))?;
+        // Not pre-grown, because `size` is a peer's assertion off an entry and
+        // this runs *before* `decode_ranges` turns any of it into fact. An
+        // entry claiming 32 TiB for any root would otherwise have every node
+        // that attempts a fetch create a 32 TiB payload and a 128 GiB outboard,
+        // fail verification, and leave both behind — `trim_to_size` only runs
+        // on a commit that completed the object, so nothing reclaims them.
+        //
+        // This used to grow to the end of the *window*, on the reasoning that a
+        // window bounds the file by what is about to be verified. It does not:
+        // `window_end_bytes` reads the last range's end and nothing about where
+        // the window starts, so a fetch whose ask sits at the tail of the object
+        // — an S3 `Range: bytes=-1`, `synch cat --range` near the end, or simply
+        // provider *i*'s share under a fanout, which begins at ~i/fanout of the
+        // object — had a window whose end *was* the claimed size. The bound
+        // held only for fetches that began at group 0.
+        //
+        // Letting the decode do the extending is the honest version of the same
+        // rule: `write_at` grows the file as each verified group lands, so the
+        // payload never gets longer than the bytes that have been proven
+        // against the root, whatever the window's position. The comment above
+        // already relied on that behaviour for later windows.
+        let _ = window_end_bytes(&served, size);
         let outboard_file = OpenOptions::new()
             .read(true)
             .write(true)

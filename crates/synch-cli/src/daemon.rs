@@ -60,18 +60,24 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     println!("control socket: {}", server.endpoint_name());
 
     let control = tokio::spawn(server.run());
-    let aae = spawn_loop("anti-entropy", &node, &stop_tx, |node, shutdown| async move {
-        node.run_anti_entropy(shutdown).await
-    });
+    let aae = spawn_loop(
+        "anti-entropy",
+        &node,
+        &stop_tx,
+        |node, shutdown| async move { node.run_anti_entropy(shutdown).await },
+    );
     let scanner = spawn_loop("scanner", &node, &stop_tx, |node, shutdown| async move {
         node.run_scanner(shutdown).await
     });
     let watcher = spawn_loop("watcher", &node, &stop_tx, |node, shutdown| async move {
         node.run_watcher(shutdown).await
     });
-    let maintenance = spawn_loop("maintenance", &node, &stop_tx, |node, shutdown| async move {
-        node.run_maintenance(shutdown).await
-    });
+    let maintenance = spawn_loop(
+        "maintenance",
+        &node,
+        &stop_tx,
+        |node, shutdown| async move { node.run_maintenance(shutdown).await },
+    );
     // The standing mirror loop: materializes the unified tree whenever it
     // changes, and once at startup (§7.2).
     let mirrors = spawn_loop("mirrors", &node, &stop_tx, |node, shutdown| async move {
