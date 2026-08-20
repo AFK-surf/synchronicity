@@ -10,11 +10,11 @@ TXT records, served over port 53 (UDP+TCP) and RFC 8484 DoH.
   (`csk.key`) and the writable SQLite database. Republishes and re-signs
   the whole zone inside every mutating transaction; a background job
   re-signs when signatures come within 7 days of expiry (14-day validity).
-- **N replicas** (typically your `ns1`, `ns2` hosts): DNS/DoH, read
-  a copy of the database, hold **no key material** — the private key never
-  enters the database, so replication never carries it. With
-  They also serve the dashboard, every GET of the API and the file browser
-  off that same copy; see below.
+- **N replicas**: read a copy of the database and hold **no key material** —
+  the private key never enters the database, so replication never carries it.
+  They serve the dashboard, every GET of the API and the file browser off
+  that copy (see below), and DNS/DoH as well where this deployment serves its
+  own zone rather than a provider's.
 - **Replication is external and operator-owned.** The service never runs,
   configures, or supervises litestream (or whatever tool you choose). The
   contract is only:
@@ -66,7 +66,7 @@ the dashboard renders that as a link rather than an error.
 
 Why you would: the reads are the load. A network's file listing, a version
 history, a download of a 40 GB object — all of it is a GET, and putting it on
-`ns1` and `ns2` takes it off the node that owns the zone key. The writes stay
+the replicas takes it off the node that owns the zone key. The writes stay
 in one place because there is only one writable database.
 
 ### Two kinds of name
@@ -75,7 +75,7 @@ in one place because there is only one writable database.
   replicas — `sync.example`. This is where the dashboard is, and the only
   name a browser sees, so the session cookie is host-only on it and works on
   whichever node the balancer picks. Nothing needs a `Domain` attribute.
-- **One name per node for daemons** — `ns1.sync.example` — each node's own
+- **One name per node for daemons** — `cp1.sync.example` — each node's own
   `CP_PUBLIC_URL`, published in the attach record. A daemon holds a tunnel to
   every node, so these are dialed individually and never balanced.
 
@@ -95,12 +95,12 @@ Two things then have to line up:
 ```sh
 # primary — behind sync.example along with the replicas
 CP_PUBLIC_URL=https://cp0.sync.example
-CP_ENDPOINTS=https://ns1.sync.example,https://ns2.sync.example
+CP_ENDPOINTS=https://cp1.sync.example,https://cp2.sync.example
 CP_SESSION_SECRET=…
 
-# ns1 — behind sync.example too, and dialed directly by daemons
+# cp1 — behind sync.example too, and dialed directly by daemons
 CP_ROLE=replica
-CP_PUBLIC_URL=https://ns1.sync.example
+CP_PUBLIC_URL=https://cp1.sync.example
 CP_PRIMARY_URL=https://cp0.sync.example
 CP_SESSION_SECRET=…the primary's, byte for byte…
 ```
@@ -135,7 +135,7 @@ a download.
 | `CP_PUBLIC_URL` | both | **Required.** This node's own external URL: links and OAuth callbacks on the primary, and on every node the attach endpoint daemons dial and sign their proof over. Published verbatim at `_synchronicity-cp.<base>`, so it must be an `https://` or `http://` origin with no whitespace — refused at boot rather than in every daemon a TTL later |
 | `CP_SESSION_SECRET` | both | ≥32 chars; signs session cookies. **The same value on every node**: a replica verifies cookies the primary minted, and one byte of difference is a dashboard nobody can sign in to |
 | `CP_PRIMARY_URL` | replica | the primary's URL. Required, and the one fact a read-only node cannot derive: it is what a refused write and the login screen name, and without it the dashboard is a dead end |
-| `CP_ENDPOINTS` | primary | this deployment's *other* control-plane endpoints, comma- or semicolon-separated (`https://ns1.sync.example,https://ns2.sync.example`). Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>`, beside this node's `CP_PUBLIC_URL` — the apex saying where this base's control plane answers, not a browse-specific list. Cloud attach is what dials them today, one standing tunnel per endpoint per daemon. At most 8 endpoints in total |
+| `CP_ENDPOINTS` | primary | this deployment's *other* control-plane endpoints, comma- or semicolon-separated (`https://cp1.sync.example,https://cp2.sync.example`). Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>`, beside this node's `CP_PUBLIC_URL` — the apex saying where this base's control plane answers, not a browse-specific list. Cloud attach is what dials them today, one standing tunnel per endpoint per daemon. At most 8 endpoints in total |
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link and invitation mail (absent = log-only); `FROM` is the header, display name and all |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |

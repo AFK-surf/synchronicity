@@ -1528,7 +1528,7 @@ pub fn a_read_only_node_serves_the_browse_surface_test() {
       ..h,
       ctx: router.Context(
         ..h.ctx,
-        browse: browse_api.Browse(name, "https://ns1.cp.test/agent/v1/attach"),
+        browse: browse_api.Browse(name, "https://cp1.test/agent/v1/attach"),
       ),
     )
   let assert 200 =
@@ -1565,7 +1565,7 @@ pub fn a_read_only_node_serves_the_browse_surface_test() {
   assert status.status == 200
   let body = simulate.read_body(status)
   assert string.contains(body, "\"enabled\":true")
-  assert string.contains(body, "https://ns1.cp.test/agent/v1/attach")
+  assert string.contains(body, "https://cp1.test/agent/v1/attach")
 
   // A listing reaches the same refusal the primary gives with nothing
   // attached, which is what says the route ran rather than 404ing.

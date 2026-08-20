@@ -94,7 +94,7 @@ pub fn the_attach_record_sits_at_the_apex_test() {
 /// reads the first record it can parse and reaches one node of the fleet,
 /// where a second `url=` in one record is a duplicate field it refuses.
 pub fn the_attach_record_names_every_node_of_the_fleet_test() {
-  let urls = ["https://sync.example", "https://ns1.sync.example"]
+  let urls = ["https://sync.example", "https://cp1.sync.example"]
   let assert Ok(rrsets) = build.build(fleet(urls))
   let assert Ok(owner) = name.parse("_synchronicity-cp.sync.test.")
   let assert Ok(rrset) =
@@ -105,7 +105,7 @@ pub fn the_attach_record_names_every_node_of_the_fleet_test() {
   assert texts
     == [
       "v=synccp1 url=https://sync.example",
-      "v=synccp1 url=https://ns1.sync.example",
+      "v=synccp1 url=https://cp1.sync.example",
     ]
   // Still one owner name in the chain, however many records hang off it.
   assert list.length(
@@ -121,7 +121,7 @@ pub fn the_attach_record_names_every_node_of_the_fleet_test() {
     list.filter(records, fn(r) { r.name == "_synchronicity-cp.sync.test" })
   assert list.map(attach, fn(r) { r.value })
     == [
-      "v=synccp1 url=https://ns1.sync.example",
+      "v=synccp1 url=https://cp1.sync.example",
       "v=synccp1 url=https://sync.example",
     ]
 }
@@ -132,7 +132,7 @@ pub fn the_endpoints_come_from_the_primarys_environment_test() {
   envoy.set("CP_PUBLIC_URL", "https://sync.example/")
   envoy.set(
     "CP_ENDPOINTS",
-    "https://ns1.sync.example, https://ns2.sync.example/;https://ns3.sync.example",
+    "https://cp1.sync.example, https://cp2.sync.example/;https://cp3.sync.example",
   )
   let assert Ok(cfg) = config.load()
   // This node first, then the rest, each with its trailing slash trimmed to
@@ -140,15 +140,15 @@ pub fn the_endpoints_come_from_the_primarys_environment_test() {
   assert cfg.endpoints
     == [
       "https://sync.example",
-      "https://ns1.sync.example",
-      "https://ns2.sync.example",
-      "https://ns3.sync.example",
+      "https://cp1.sync.example",
+      "https://cp2.sync.example",
+      "https://cp3.sync.example",
     ]
 
   // The same rules as CP_PUBLIC_URL, applied where the operator can still
   // read the message: a value the daemon would reject never reaches a signed
   // record that is cached for its TTL.
-  envoy.set("CP_ENDPOINTS", "ns1.sync.example")
+  envoy.set("CP_ENDPOINTS", "cp1.sync.example")
   let assert Error(why) = config.load()
   assert string.contains(why, "origin")
 
@@ -176,7 +176,7 @@ pub fn the_endpoints_come_from_the_primarys_environment_test() {
     "CP_ENDPOINTS",
     list.repeat(Nil, config.max_endpoints)
       |> list.index_map(fn(_, i) {
-        "https://ns" <> int.to_string(i) <> ".sync.example"
+        "https://cp" <> int.to_string(i) <> ".sync.example"
       })
       |> string.join(","),
   )
@@ -191,8 +191,8 @@ pub fn the_endpoints_come_from_the_primarys_environment_test() {
   envoy.unset("CP_SESSION_SECRET")
   envoy.set("CP_SESSION_SECRET", "0123456789abcdef0123456789abcdef")
   envoy.set("CP_PRIMARY_URL", "https://sync.example")
-  envoy.set("CP_PUBLIC_URL", "https://ns1.sync.example")
-  envoy.set("CP_ENDPOINTS", "https://ns2.sync.example")
+  envoy.set("CP_PUBLIC_URL", "https://cp1.sync.example")
+  envoy.set("CP_ENDPOINTS", "https://cp2.sync.example")
   let assert Error(why) = config.load()
   assert string.contains(why, "primary-only")
   browse_env()
@@ -238,7 +238,7 @@ pub fn a_node_needs_its_own_url_and_a_replica_needs_the_primarys_test() {
 
   // A replica offers the surface too: the tunnel is a read, and the tables
   // its attach resolves against are replicated.
-  envoy.set("CP_PUBLIC_URL", "https://ns1.sync.example")
+  envoy.set("CP_PUBLIC_URL", "https://cp1.sync.example")
   envoy.set("CP_ROLE", "replica")
   envoy.unset("CP_KEY_FILE")
 
@@ -253,7 +253,7 @@ pub fn a_node_needs_its_own_url_and_a_replica_needs_the_primarys_test() {
   assert cfg.primary_url == "https://cp0.sync.example"
   // Its own endpoint and nobody else's: the deployment's list is the
   // primary's to publish.
-  assert cfg.endpoints == ["https://ns1.sync.example"]
+  assert cfg.endpoints == ["https://cp1.sync.example"]
   browse_env()
 }
 
