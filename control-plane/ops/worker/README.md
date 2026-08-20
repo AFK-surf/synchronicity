@@ -16,6 +16,31 @@ to spread the reads — which are the load.
 | `GET /api/auth/methods` | the primary — a replica answers about *itself* |
 | `/agent/v1/attach` | nowhere: **421**, with the record to read instead |
 
+Reads are **sticky per reader, per region**. Replication is asynchronous, so
+two replicas are two different moments of the same database: a reader bounced
+between them watches the zone go backwards — a network they just created is
+there, gone, and there again. So the replica that served a reader is
+remembered against a digest of their address in the Cache API, which is
+per-colo, and reused for five minutes.
+
+Best-effort, and the ways it gives way are all the same shape — the reader is
+balanced instead of pinned, never refused:
+
+- a reader whose requests land in two colos has two pins, and may see two
+  replicas;
+- a reader behind no `cf-connecting-ip` (and no `x-forwarded-for`) is not
+  pinned at all, because one shared pin would put a whole colo's anonymous
+  traffic on one replica;
+- a pin naming a node no longer in `REPLICAS` is ignored;
+- a pinned node that fails is retried past *and the pin moves* to whatever
+  answered — a pin nobody updates on failure sends every later request
+  through a dead node first;
+- the primary is never pinned. It is the fallback, not a replica.
+
+The pin is written after the response is on its way (`waitUntil`), so no
+reader ever waits on a cache write whose only purpose is to make a *later*
+request consistent.
+
 It is not a route table. The service guarantees that every route a replica
 mounts is a `GET`, so method and prefix decide it, and there is no second copy
 of the router here to fall out of date. The three named paths are the
@@ -44,6 +69,8 @@ them.
 
     node --test ops/worker/lb.test.mjs
 
-Sixteen cases: where each route in the service's own read and write tables is
-sent, and the handler itself driven against stub origins for forwarding,
-retry, and the two refusals. CI runs it in the `worker` job.
+Twenty-seven cases: where each route in the service's own read and write
+tables is sent; the handler driven against stub origins for forwarding, retry
+and the two refusals; and stickiness against a stubbed Cache API — one reader
+staying put, two readers pinned independently, a re-pin past a failed node, a
+stale pin ignored, and every way it degrades. CI runs it in the `worker` job.

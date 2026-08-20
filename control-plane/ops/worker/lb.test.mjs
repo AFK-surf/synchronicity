@@ -13,7 +13,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker from "./lb.js";
-import { route, ATTACH_PATH, AUTH_METHODS_PATH } from "./lb.js";
+import {
+  route,
+  clientAddress,
+  ATTACH_PATH,
+  AUTH_METHODS_PATH,
+  STICKY_TTL_SECONDS,
+} from "./lb.js";
 
 const PRIMARY = "https://cp0.sync.test";
 const REPLICAS = ["https://cp1.sync.test", "https://cp2.sync.test"];
@@ -282,4 +288,276 @@ test("trailing slashes in configuration do not become double slashes", async () 
   } finally {
     stub.restore();
   }
+});
+
+
+// -- per-region stickiness ---------------------------------------------------
+//
+// Replication is asynchronous, so two replicas are two moments of the same
+// database. A reader bounced between them watches the zone move backwards.
+// These pin that down — and the degradation too, because the Cache API is per
+// colo and a reader who moves between them is balanced again.
+
+/// The Cache API, as one colo has it: a map, and the option of not being
+/// there at all.
+function stubCache(entries = new Map()) {
+  const original = globalThis.caches;
+  globalThis.caches = {
+    default: {
+      async match(key) {
+        const hit = entries.get(key.url);
+        return hit === undefined ? undefined : new Response(hit);
+      },
+      async put(key, response) {
+        entries.set(key.url, await response.text());
+      },
+    },
+  };
+  return { entries, restore: () => (globalThis.caches = original) };
+}
+
+const FROM = (ip) => ({ headers: { "cf-connecting-ip": ip } });
+
+/// Lets the deferred cache write land. Without a `waitUntil` to hand it to,
+/// `writePin` leaves the put running as a microtask and the response goes out
+/// ahead of it — which is the point of it, so a test that wants to see the
+/// entry has to wait where a reader does not.
+const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test("a reader is served by one replica for the whole of a session", async () => {
+  const cache = stubCache();
+  const stub = stubFetch([ok()]);
+  try {
+    const served = new Set();
+    for (let i = 0; i < 30; i++) {
+      await worker.fetch(
+        new Request("https://sync.test/api/me", FROM("203.0.113.7")),
+        ENV,
+      );
+      await settled();
+      served.add(new URL(stub.seen.at(-1).url).origin);
+    }
+    assert.equal(
+      served.size,
+      1,
+      `one replica for one reader, got ${[...served]}`,
+    );
+    assert.ok(REPLICAS.includes([...served][0]));
+  } finally {
+    stub.restore();
+    cache.restore();
+  }
+});
+
+test("two readers are not pinned to the same replica by construction", async () => {
+  // Not an assertion that they differ — one of two is a coin toss — but that
+  // each is pinned independently, so the set over many addresses is both.
+  const cache = stubCache();
+  const stub = stubFetch([ok()]);
+  try {
+    const served = new Set();
+    for (let i = 0; i < 40; i++) {
+      await worker.fetch(
+        new Request("https://sync.test/api/me", FROM(`198.51.100.${i}`)),
+        ENV,
+      );
+      await settled();
+      served.add(new URL(stub.seen.at(-1).url).origin);
+    }
+    assert.deepEqual([...served].sort(), [...REPLICAS].sort());
+  } finally {
+    stub.restore();
+    cache.restore();
+  }
+});
+
+test("the pin is what gets cached, with a TTL", async () => {
+  const cache = stubCache();
+  const stub = stubFetch([ok()]);
+  try {
+    await worker.fetch(
+      new Request("https://sync.test/api/me", FROM("203.0.113.9")),
+      ENV,
+    );
+    await settled();
+    const [[key, value]] = [...cache.entries];
+    // Keyed on a digest of the address, not the address: this cache should
+    // not be a list of who has been here.
+    // Under the request's own origin: caches.default refuses a key outside
+    // the Worker's zone, and a refused put here is swallowed — so a synthetic
+    // hostname would be stickiness that silently never happens.
+    assert.match(key, /^https:\/\/sync\.test\/__cp-lb-sticky\/[0-9a-f]{64}$/);
+    assert.ok(!key.includes("203.0.113.9"));
+    assert.ok(REPLICAS.includes(value));
+    assert.equal(STICKY_TTL_SECONDS, 300);
+  } finally {
+    stub.restore();
+    cache.restore();
+  }
+});
+
+test("a reader whose replica goes down is re-pinned to the one that answered", async () => {
+  const cache = stubCache();
+  let stub = stubFetch([ok()]);
+  let firstChoice;
+  try {
+    await worker.fetch(new Request("https://sync.test/api/me", FROM("203.0.113.11")), ENV);
+    await settled();
+    firstChoice = new URL(stub.seen[0].url).origin;
+  } finally {
+    stub.restore();
+  }
+
+  stub = stubFetch([unwell, ok("from the sibling")]);
+  try {
+    const response = await worker.fetch(
+      new Request("https://sync.test/api/me", FROM("203.0.113.11")),
+      ENV,
+    );
+    assert.equal(await response.text(), "from the sibling");
+    assert.equal(new URL(stub.seen[0].url).origin, firstChoice, "the pin was tried");
+    const sibling = new URL(stub.seen[1].url).origin;
+    assert.notEqual(sibling, firstChoice);
+    await settled();
+    // A pin nobody updates on failure sends every later request through the
+    // dead node first, for as long as it stands.
+    assert.equal([...cache.entries.values()][0], sibling);
+  } finally {
+    stub.restore();
+    cache.restore();
+  }
+});
+
+test("a stale pin naming a node no longer configured is ignored", async () => {
+  const cache = stubCache();
+  const stub = stubFetch([ok()]);
+  try {
+    await worker.fetch(new Request("https://sync.test/api/me", FROM("203.0.113.13")), ENV);
+    await settled();
+    const [key] = [...cache.entries.keys()];
+    cache.entries.set(key, "https://cp9.sync.test"); // removed from REPLICAS
+    await worker.fetch(new Request("https://sync.test/api/me", FROM("203.0.113.13")), ENV);
+    assert.ok(REPLICAS.includes(new URL(stub.seen.at(-1).url).origin));
+  } finally {
+    stub.restore();
+    cache.restore();
+  }
+});
+
+test("the primary is never pinned: it is the fallback, not a replica", async () => {
+  const cache = stubCache();
+  const stub = stubFetch([unwell, unwell, ok("primary")]);
+  try {
+    await worker.fetch(new Request("https://sync.test/api/me", FROM("203.0.113.15")), ENV);
+    await settled();
+    assert.equal(new URL(stub.seen.at(-1).url).origin, PRIMARY);
+    assert.equal(cache.entries.size, 0);
+  } finally {
+    stub.restore();
+    cache.restore();
+  }
+});
+
+test("writes are not pinned and cost no cache lookup", async () => {
+  const cache = stubCache();
+  const stub = stubFetch([ok()]);
+  try {
+    await worker.fetch(
+      new Request("https://sync.test/api/orgs", {
+        method: "POST",
+        body: "{}",
+        headers: { "cf-connecting-ip": "203.0.113.17" },
+      }),
+      ENV,
+    );
+    await settled();
+    assert.equal(new URL(stub.seen[0].url).origin, PRIMARY);
+    assert.equal(cache.entries.size, 0, "a write has one node whatever a pin says");
+  } finally {
+    stub.restore();
+    cache.restore();
+  }
+});
+
+test("a request with no address to key on is balanced, not pinned", async () => {
+  const cache = stubCache();
+  const stub = stubFetch([ok()]);
+  try {
+    const served = new Set();
+    for (let i = 0; i < 60; i++) {
+      await worker.fetch(new Request("https://sync.test/api/me"), ENV);
+      served.add(new URL(stub.seen.at(-1).url).origin);
+    }
+    await settled();
+    // Everyone sharing one pin would be worse than none: it would put the
+    // whole colo's anonymous traffic on one replica.
+    assert.deepEqual([...served].sort(), [...REPLICAS].sort());
+    assert.equal(cache.entries.size, 0);
+  } finally {
+    stub.restore();
+    cache.restore();
+  }
+});
+
+test("no Cache API at all is a balancer that still works", async () => {
+  // Which is also how every test above this section runs.
+  const original = globalThis.caches;
+  globalThis.caches = undefined;
+  const stub = stubFetch([ok("served")]);
+  try {
+    const response = await worker.fetch(
+      new Request("https://sync.test/api/me", FROM("203.0.113.19")),
+      ENV,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "served");
+  } finally {
+    stub.restore();
+    globalThis.caches = original;
+  }
+});
+
+test("the cache write does not hold the response up", async () => {
+  const cache = stubCache();
+  const stub = stubFetch([ok()]);
+  const deferred = [];
+  try {
+    await worker.fetch(
+      new Request("https://sync.test/api/me", FROM("203.0.113.21")),
+      ENV,
+      { waitUntil: (promise) => deferred.push(promise) },
+    );
+    // Handed to the runtime rather than awaited: a reader should not wait on
+    // a write whose only purpose is to make a *later* request consistent.
+    assert.equal(deferred.length, 1);
+    await Promise.all(deferred);
+    assert.equal(cache.entries.size, 1);
+  } finally {
+    stub.restore();
+    cache.restore();
+  }
+});
+
+test("cf-connecting-ip wins over a forwarded header a client can set", () => {
+  assert.equal(
+    clientAddress(
+      new Request("https://sync.test/", {
+        headers: {
+          "cf-connecting-ip": "203.0.113.1",
+          "x-forwarded-for": "198.51.100.1, 203.0.113.9",
+        },
+      }),
+    ),
+    "203.0.113.1",
+  );
+  // The fallback takes the first hop, for running this behind something else.
+  assert.equal(
+    clientAddress(
+      new Request("https://sync.test/", {
+        headers: { "x-forwarded-for": "198.51.100.1, 203.0.113.9" },
+      }),
+    ),
+    "198.51.100.1",
+  );
+  assert.equal(clientAddress(new Request("https://sync.test/")), "");
 });
