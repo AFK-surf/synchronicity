@@ -1,6 +1,14 @@
 //// HTTP routing. The DNS endpoints and health/anchor are role-agnostic;
-//// the product API mounts on the primary only (a replica has no sessions
-//// and no writes, by construction).
+//// the product API mounts in one of two shapes.
+////
+//// **The split is reads against writes, not primary against replica.** A
+//// replica holds a read-only copy of the same database, so every GET the
+//// primary answers it answers identically — the dashboard, the org and
+//// network listings, and the browse surface, whose daemons attach to it
+//// directly. What it cannot do is mint a session or mutate a row, so those
+//// routes are not mounted at all: they answer with a refusal that names the
+//// primary, which is the one fact a read-only node holds that a 404 does
+//// not carry.
 ////
 //// Naming convention in api/: endpoint modules carry the `_api` suffix
 //// (auth_api, orgs_api, networks_api, devices_api); plumbing does not
@@ -12,6 +20,7 @@ import api/devices_api
 import api/middleware
 import api/networks_api
 import api/orgs_api
+import api/reads.{type Reads}
 import api/static
 import auth/session.{type Session}
 import dns/doh
@@ -39,8 +48,11 @@ pub type Context {
     /// Empty in external mode — there is no zone key of ours to anchor.
     anchor: String,
     ds: String,
-    /// Present on the primary only; replicas serve DNS and health alone.
-    auth: Option(AuthContext),
+    /// The product API this node mounts, or `None` for a node that serves
+    /// DNS and health alone — a replica with `CP_DASHBOARD` off, which is
+    /// the default and the shape every replica had before the switch
+    /// existed.
+    api: Option(Api),
     /// Read-only serving context (pool + apex) on serving roles. A replica
     /// needs no reload signal: every checkout reopens the database file,
     /// so an atomically renamed replacement is picked up on next use.
@@ -50,6 +62,28 @@ pub type Context {
     /// mounted and refusing.
     browse: Option(Browse),
   )
+}
+
+/// Which half of the product API is mounted here.
+pub type Api {
+  /// Everything: the reads, the writes, and the sign-in flows that mint the
+  /// sessions both halves are gated on.
+  Writable(auth: AuthContext)
+  /// The read half alone, and the primary's URL to send the rest to.
+  ///
+  /// `primary_url` is not decoration: a node that refuses a write without
+  /// naming where the write is taken is a dead end, and a replica cannot
+  /// derive it — the database records the fleet's zone, not which of its
+  /// nodes holds the pen.
+  ReadOnly(reads: Reads, primary_url: String)
+}
+
+/// The read half's context, whichever surface is mounted.
+fn readable(api: Api) -> Reads {
+  case api {
+    Writable(auth) -> auth.reads
+    ReadOnly(reads, _) -> reads
+  }
 }
 
 pub fn handle(req: Request, ctx: Context) -> Response {
@@ -69,21 +103,183 @@ pub fn handle(req: Request, ctx: Context) -> Response {
         "" -> wisp.not_found()
         _ -> anchor(ctx)
       }
+    // Anonymous by necessity: the login screen asks it before a session
+    // exists, to draw only the methods this deployment has configured. It
+    // sits outside both route tables because it is the one answer that
+    // differs between the surfaces rather than being shared or absent — a
+    // read-only node offers no method and names the node that does.
+    ["api", "auth", "methods"] ->
+      case ctx.api, req.method {
+        Some(Writable(auth)), Get -> auth_api.methods(Some(auth), "")
+        Some(ReadOnly(_, primary_url)), Get ->
+          auth_api.methods(None, primary_url)
+        _, _ -> wisp.not_found()
+      }
     ["auth", ..] | ["api", ..] ->
-      case ctx.auth {
-        Some(auth) -> primary_routes(req, auth, ctx.browse)
+      case ctx.api {
+        Some(api) ->
+          // Reads first, whichever surface this is: the two mount the same
+          // handlers over the same tables, so a route that appears in both
+          // is written once and cannot drift between them.
+          case read_routes(req, readable(api), ctx.browse) {
+            Some(response) -> response
+            None ->
+              case api {
+                Writable(auth) -> write_routes(req, auth, ctx.browse)
+                ReadOnly(_, primary_url) -> elsewhere(req, primary_url)
+              }
+          }
         None -> wisp.not_found()
       }
     _ ->
-      case ctx.auth {
-        // The dashboard ships with the primary; replicas serve DNS only.
+      case ctx.api {
+        // The dashboard ships with the API, on either surface: a node that
+        // answers the reads serves the pages that make them.
         Some(_) -> static.serve(req, wisp.not_found)
         None -> wisp.not_found()
       }
   }
 }
 
-fn primary_routes(
+/// What a read-only node answers for a route it does not mount.
+///
+/// A write route the primary has is a 409 naming the primary — the request is
+/// well-formed and this node simply is not where it is taken, and the SPA
+/// turns the `primary` field into a link rather than a stack trace. Anything
+/// else is the 404 it would be anywhere: a path that exists on no node.
+///
+/// The test is the method and not a second copy of the primary's route table.
+/// A table listing every write here would be a table to forget to update; the
+/// property that actually holds is that every route a read-only node mounts
+/// is a GET, so a non-GET under `/api` or `/auth` is by construction a route
+/// it does not have.
+fn elsewhere(req: Request, primary_url: String) -> Response {
+  case req.method {
+    Get -> wisp.not_found()
+    _ ->
+      json.object([
+        #(
+          "error",
+          json.object([
+            #("code", json.string("read-only-replica")),
+            #(
+              "message",
+              json.string(
+                "this control-plane node serves a read-only copy of the "
+                <> "database; changes are made at "
+                <> primary_url,
+              ),
+            ),
+            #("primary", json.string(primary_url)),
+          ]),
+        ),
+      ])
+      |> json.to_string
+      |> wisp.json_response(409)
+  }
+}
+
+/// The routes a node with a read-only copy of the database can answer, and
+/// therefore the routes *both* surfaces answer: they are mounted once, here,
+/// so a primary and a replica cannot come to disagree about what a GET
+/// returns.
+///
+/// `None` means "not one of mine", which is a different fact from a 404 —
+/// the caller decides whether the request falls through to the write table
+/// or to a refusal.
+fn read_routes(
+  req: Request,
+  reads: Reads,
+  browse: Option(Browse),
+) -> Option(Response) {
+  case wisp.path_segments(req), req.method {
+    ["api", "me"], Get -> Some(auth_api.me(req, reads))
+    // Anonymous by the same reasoning as /api/auth/methods: the invite page
+    // asks it before a session exists, and the token in the query string is
+    // the credential the invitation email already carried.
+    ["api", "invites", "preview"], Get ->
+      Some(orgs_api.preview_invite(req, reads))
+
+    ["api", "orgs", slug], Get ->
+      Some({
+        use live <- with_session(req, reads)
+        orgs_api.get_org(reads, live, slug)
+      })
+    ["api", "orgs", slug, "members"], Get ->
+      Some({
+        use live <- with_session(req, reads)
+        orgs_api.list_members(reads, live, slug)
+      })
+    ["api", "orgs", slug, "audit"], Get ->
+      Some({
+        use live <- with_session(req, reads)
+        orgs_api.audit_log(req, reads, live, slug)
+      })
+    ["api", "orgs", slug, "oidc"], Get ->
+      Some({
+        use live <- with_session(req, reads)
+        orgs_api.get_oidc(reads, live, slug)
+      })
+
+    ["api", "orgs", slug, "networks"], Get ->
+      Some({
+        use live <- with_session(req, reads)
+        networks_api.list_networks(reads, live, slug)
+      })
+    ["api", "orgs", slug, "networks", net], Get ->
+      Some({
+        use live <- with_session(req, reads)
+        networks_api.network_detail(reads, live, slug, net)
+      })
+
+    // The browse surface is a read surface end to end: the tunnel encodes no
+    // write opcode, and every route below resolves its org on a pooled
+    // connection and then asks a daemon on the operator's own network. A
+    // replica with daemons attached answers all of it.
+    ["api", "orgs", slug, "networks", net, "browse"], Get ->
+      Some(
+        with_browse(browse, fn(browse) {
+          use live <- with_session(req, reads)
+          browse_api.status(reads, browse, live, slug, net)
+        }),
+      )
+    ["api", "orgs", slug, "networks", net, "delegations"], Get ->
+      Some(
+        with_browse(browse, fn(browse) {
+          use live <- with_session(req, reads)
+          browse_api.delegations(reads, browse, live, slug, net)
+        }),
+      )
+    ["api", "orgs", slug, "networks", net, "browse", "ls"], Get ->
+      Some(
+        with_browse(browse, fn(browse) {
+          use live <- with_session(req, reads)
+          browse_api.ls(req, reads, browse, live, slug, net)
+        }),
+      )
+    ["api", "orgs", slug, "networks", net, "browse", "stat"], Get ->
+      Some(
+        with_browse(browse, fn(browse) {
+          use live <- with_session(req, reads)
+          browse_api.stat(req, reads, browse, live, slug, net)
+        }),
+      )
+
+    ["api", "orgs", slug, "devices"], Get ->
+      Some({
+        use live <- with_session(req, reads)
+        devices_api.list_devices(reads, live, slug)
+      })
+
+    _, _ -> None
+  }
+}
+
+/// The routes that mutate, and the sign-in flows that mint the sessions the
+/// rest are gated on. Mounted on the primary alone, because a replica's
+/// database is opened read-only and every one of these would fail at the
+/// sqlite layer with a message about a file rather than about a topology.
+fn write_routes(
   req: Request,
   auth: AuthContext,
   browse: Option(Browse),
@@ -97,145 +293,88 @@ fn primary_routes(
     ["auth", "magic"], Post -> auth_api.magic_request(req, auth)
     ["auth", "magic", "redeem"], Get -> auth_api.magic_redeem(req, auth)
     ["api", "logout"], Post -> auth_api.logout(req, auth)
-    ["api", "me"], Get -> auth_api.me(req, auth)
-    // Anonymous by necessity: the login screen asks it before a session
-    // exists, to draw only the methods this deployment has configured.
-    ["api", "auth", "methods"], Get -> auth_api.methods(auth)
-
     ["api", "orgs"], Post -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       orgs_api.create_org(req, auth, live)
     }
-    ["api", "orgs", slug], Get -> {
-      use live <- with_session(req, auth)
-      orgs_api.get_org(auth, live, slug)
-    }
     ["api", "orgs", slug], Delete -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       orgs_api.delete_org(req, auth, live, slug)
     }
-    ["api", "orgs", slug, "members"], Get -> {
-      use live <- with_session(req, auth)
-      orgs_api.list_members(auth, live, slug)
-    }
     ["api", "orgs", slug, "members", user], Patch -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       orgs_api.change_role(req, auth, live, slug, user)
     }
     ["api", "orgs", slug, "members", user], Delete -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       orgs_api.remove_member(auth, live, slug, user)
     }
     ["api", "orgs", slug, "transfer"], Post -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       orgs_api.transfer_ownership(req, auth, live, slug)
     }
     ["api", "orgs", slug, "invites"], Post -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       orgs_api.create_invite(req, auth, live, slug)
     }
     ["api", "invites", "accept"], Post -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       orgs_api.accept_invite(req, auth, live)
     }
-    // Anonymous by the same reasoning as /api/auth/methods: the invite page
-    // asks it before a session exists, and the token in the query string is
-    // the credential the invitation email already carried.
-    ["api", "invites", "preview"], Get -> orgs_api.preview_invite(req, auth)
-    ["api", "orgs", slug, "audit"], Get -> {
-      use live <- with_session(req, auth)
-      orgs_api.audit_log(req, auth, live, slug)
-    }
-    ["api", "orgs", slug, "oidc"], Get -> {
-      use live <- with_session(req, auth)
-      orgs_api.get_oidc(auth, live, slug)
-    }
     ["api", "orgs", slug, "oidc"], Put -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       orgs_api.put_oidc(req, auth, live, slug)
     }
     ["api", "orgs", slug, "oidc"], Delete -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       orgs_api.delete_oidc(auth, live, slug)
     }
 
-    ["api", "orgs", slug, "networks"], Get -> {
-      use live <- with_session(req, auth)
-      networks_api.list_networks(auth, live, slug)
-    }
     ["api", "orgs", slug, "networks"], Post -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       networks_api.create_network(req, auth, live, slug)
     }
-    ["api", "orgs", slug, "networks", net], Get -> {
-      use live <- with_session(req, auth)
-      networks_api.network_detail(auth, live, slug, net)
-    }
     ["api", "orgs", slug, "networks", net], Delete -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       networks_api.delete_network(req, auth, live, slug, net)
     }
     ["api", "orgs", slug, "networks", net, "devices", dev], Put -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       networks_api.assign_device(auth, live, slug, net, dev)
     }
     ["api", "orgs", slug, "networks", net, "devices", dev], Delete -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       networks_api.unassign_device(auth, live, slug, net, dev)
     }
 
-    ["api", "orgs", slug, "networks", net, "browse"], Get ->
-      with_browse(browse, fn(browse) {
-        use live <- with_session(req, auth)
-        browse_api.status(auth, browse, live, slug, net)
-      })
-    ["api", "orgs", slug, "networks", net, "delegations"], Get ->
-      with_browse(browse, fn(browse) {
-        use live <- with_session(req, auth)
-        browse_api.delegations(auth, browse, live, slug, net)
-      })
-    ["api", "orgs", slug, "networks", net, "browse", "ls"], Get ->
-      with_browse(browse, fn(browse) {
-        use live <- with_session(req, auth)
-        browse_api.ls(req, auth, browse, live, slug, net)
-      })
-    ["api", "orgs", slug, "networks", net, "browse", "stat"], Get ->
-      with_browse(browse, fn(browse) {
-        use live <- with_session(req, auth)
-        browse_api.stat(req, auth, browse, live, slug, net)
-      })
     ["api", "orgs", slug, "networks", net, "browse", "enabled"], Put ->
       with_browse(browse, fn(browse) {
-        use live <- with_session(req, auth)
+        use live <- with_session(req, auth.reads)
         browse_api.set_enabled(req, auth, browse, live, slug, net)
       })
 
-    ["api", "orgs", slug, "devices"], Get -> {
-      use live <- with_session(req, auth)
-      devices_api.list_devices(auth, live, slug)
-    }
     ["api", "orgs", slug, "devices"], Post -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       devices_api.create_device(req, auth, live, slug)
     }
     ["api", "orgs", slug, "devices", dev], Patch -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       devices_api.patch_device(req, auth, live, slug, dev)
     }
     ["api", "orgs", slug, "devices", dev], Delete -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       devices_api.delete_device(auth, live, slug, dev)
     }
     ["api", "orgs", slug, "devices", dev, "keys"], Post -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       devices_api.add_key(req, auth, live, slug, dev)
     }
     ["api", "orgs", slug, "devices", dev, "keys", key, "retire"], Post -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       devices_api.retire_key(auth, live, slug, dev, key)
     }
     ["api", "orgs", slug, "devices", dev, "keys", key, "revoke"], Post -> {
-      use live <- with_session(req, auth)
+      use live <- with_session(req, auth.reads)
       devices_api.revoke_key(auth, browse, live, slug, dev, key)
     }
 
@@ -269,13 +408,13 @@ fn with_browse(
 /// avoid it.
 fn with_session(
   req: Request,
-  auth: AuthContext,
+  reads: Reads,
   next: fn(Session) -> Response,
 ) -> Response {
   // pool.with_connection rather than auth_api.with_db: the latter is
   // Response-typed, and this needs the session out of the closure so the
   // connection can be released before `next` runs.
-  case pool.with_connection(auth.pool, middleware.check_session(req, _)) {
+  case pool.with_connection(reads.pool, middleware.check_session(req, _)) {
     Ok(Ok(live)) -> next(live)
     Ok(Error(refusal)) -> refusal
     Error(_) -> middleware.error_json(500, "internal", "database unavailable")

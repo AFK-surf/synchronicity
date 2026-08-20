@@ -1,6 +1,7 @@
 import api/agent
 import api/auth_api
 import api/browse_api
+import api/reads
 import api/router
 import auth/google
 import auth/session
@@ -56,7 +57,7 @@ fn harness_sized(pool_size: Int) -> Harness {
   let assert Ok(apex) = dns_name.parse("sync.test.")
   let auth =
     auth_api.AuthContext(
-      api_pool,
+      reads.Reads(api_pool),
       "http://cp.test",
       mailer.LogOnly,
       None,
@@ -70,7 +71,7 @@ fn harness_sized(pool_size: Int) -> Harness {
     router.Context(
       "anchor",
       "ds",
-      Some(auth),
+      Some(router.Writable(auth)),
       router.ServingZone(serve.Serving(dns_pool, apex)),
       None,
     ),
@@ -120,8 +121,11 @@ fn with_auth(
   h: Harness,
   change: fn(auth_api.AuthContext) -> auth_api.AuthContext,
 ) -> Harness {
-  let assert Some(auth) = h.ctx.auth
-  Harness(..h, ctx: router.Context(..h.ctx, auth: Some(change(auth))))
+  let assert Some(router.Writable(auth)) = h.ctx.api
+  Harness(
+    ..h,
+    ctx: router.Context(..h.ctx, api: Some(router.Writable(change(auth)))),
+  )
 }
 
 pub fn auth_methods_lists_only_configured_test() {
@@ -1445,7 +1449,7 @@ pub fn with_db_discards_conn_on_panic_test() {
   // close stands between a panicking handler and a csqlite process
   // holding the write lock for the life of the HTTP connection.
   let h = harness()
-  let assert router.Context(_, _, Some(auth), _, _) = h.ctx
+  let assert router.Context(_, _, Some(router.Writable(auth)), _, _) = h.ctx
   let _ =
     exception.rescue(fn() {
       auth_api.with_db(auth, fn(conn) {

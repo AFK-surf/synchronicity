@@ -10,6 +10,7 @@ import api/common.{
   require_org, text_at, zone_mutation,
 }
 import api/middleware.{error_json, now_unix}
+import api/reads.{type Reads}
 import auth/session.{type Session}
 import dns/name
 import gleam/dynamic/decode
@@ -42,8 +43,8 @@ fn bad_hint(relay: String, addr: String) -> build.BuildError {
   }
 }
 
-pub fn list_devices(ctx: AuthContext, live: Session, slug: String) -> Response {
-  with_db(ctx, fn(conn) {
+pub fn list_devices(reads: Reads, live: Session, slug: String) -> Response {
+  reads.with_db(reads, fn(conn) {
     use org_id, _ <- require_org(conn, slug, live.user_id, Member)
     let rows =
       sqlite.query(

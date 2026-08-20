@@ -13,6 +13,7 @@ import api/agent.{type Session}
 import api/auth_api.{type AuthContext}
 import api/common.{Admin, Member, audit, check_org, db_error, ok_json}
 import api/middleware.{error_json, now_unix}
+import api/reads.{type Reads}
 import auth/session.{type Session as UserSession}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Name}
@@ -41,13 +42,13 @@ type Network {
 /// The observability surface for the feature: attach count, per-session
 /// spaces, protocol version, attach time.
 pub fn status(
-  ctx: AuthContext,
+  reads: Reads,
   browse: Browse,
   live: UserSession,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(ctx, live, slug, network, Member)
+  use net <- with_network(reads, live, slug, network, Member)
   let sessions = attached(browse, net)
   ok_json(
     json.object([
@@ -76,13 +77,13 @@ pub fn status(
 /// answering one it is switched off for would make the switch mean two
 /// different things.
 pub fn delegations(
-  ctx: AuthContext,
+  reads: Reads,
   browse: Browse,
   live: UserSession,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(ctx, live, slug, network, Member)
+  use net <- with_network(reads, live, slug, network, Member)
   case net.enabled, attached(browse, net) {
     False, _ ->
       error_json(
@@ -130,13 +131,13 @@ fn delegation_json(row: agent.Delegation) -> Json {
 /// One directory of the unified tree.
 pub fn ls(
   req: Request,
-  ctx: AuthContext,
+  reads: Reads,
   browse: Browse,
   live: UserSession,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(ctx, live, slug, network, Member)
+  use net <- with_network(reads, live, slug, network, Member)
   let space = query(req, "space")
   let path = query(req, "path")
   let origin = query(req, "origin")
@@ -164,13 +165,13 @@ pub fn ls(
 /// Every version of one path, with its attestors — the version inspector.
 pub fn stat(
   req: Request,
-  ctx: AuthContext,
+  reads: Reads,
   browse: Browse,
   live: UserSession,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(ctx, live, slug, network, Member)
+  use net <- with_network(reads, live, slug, network, Member)
   let space = query(req, "space")
   let path = query(req, "path")
   let origin = query(req, "origin")
@@ -213,9 +214,9 @@ pub fn set_enabled(
     decode.success(enabled)
   }
   use enabled <- common.body_decoder(req, decoder)
-  use net <- with_network(ctx, live, slug, network, Admin)
+  use net <- with_network(ctx.reads, live, slug, network, Admin)
   let written =
-    pool.with_connection(ctx.pool, fn(conn) {
+    pool.with_connection(ctx.reads.pool, fn(conn) {
       common.transaction(conn, fn() {
         case
           sqlite.exec(
@@ -277,7 +278,7 @@ pub fn set_enabled(
 /// Resolves the org, the role floor and the network, giving the connection
 /// back before `next` runs.
 fn with_network(
-  ctx: AuthContext,
+  reads: Reads,
   live: UserSession,
   slug: String,
   network: String,
@@ -285,7 +286,7 @@ fn with_network(
   next: fn(Network) -> Response,
 ) -> Response {
   let looked =
-    pool.with_connection(ctx.pool, fn(conn) {
+    pool.with_connection(reads.pool, fn(conn) {
       resolve(conn, slug, network, live.user_id, minimum)
     })
   case looked {

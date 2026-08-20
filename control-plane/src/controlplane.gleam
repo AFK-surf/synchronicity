@@ -22,6 +22,7 @@ import api/agent
 import api/auth_api
 import api/browse_api
 import api/edge
+import api/reads
 import api/router
 import auth/github
 import auth/google
@@ -332,9 +333,18 @@ fn serve() -> Result(Nil, String) {
 }
 
 /// A replica serves DNS/DoH from a database an external process refreshes
-/// (atomic rename); it holds no key material and mounts no product API.
+/// (atomic rename); it holds no key material and takes no writes.
 /// No reload signal exists or is needed: every pooled checkout reopens
 /// the database file, so a swapped replacement is seen on the next query.
+///
+/// With `CP_DASHBOARD=on` it also serves the dashboard and the read half of
+/// the product API off that same copy, and with `CP_BROWSE=on` the browse
+/// surface too — daemons attach *here*, to this node's own `CP_PUBLIC_URL`,
+/// because the registry of attached sessions is one process's memory and a
+/// node with no tunnel of its own can answer no browse question however
+/// faithfully the database replicated. The primary lists the fleet's
+/// endpoints in the apex record with `CP_BROWSE_ENDPOINTS`, and every daemon
+/// opens one tunnel per endpoint.
 fn serve_replica(cfg: Config) -> Result(Nil, String) {
   // Anchor/DS come from the replicated public key material; this also
   // verifies the database is readable and not from a newer build.
@@ -361,23 +371,41 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   })
   let dns_name = process.new_name("cp_dns_pool")
   let udp_name = process.new_name("cp_udp_server")
+  let agents_name = process.new_name("cp_agents")
   let dns_pool = pool.handle(dns_name, db.read_pragmas)
   let serving = dns_serve.Serving(dns_pool, meta.apex)
+  // The dashboard reads the same pool the nameserver does: both are
+  // read-only against the same replicated file, and a second pool would only
+  // double the workers competing for it.
+  let api = case cfg.dashboard {
+    True -> option.Some(router.ReadOnly(reads.Reads(dns_pool), cfg.primary_url))
+    False -> option.None
+  }
+  let browse = browse_surface(cfg, agents_name)
   let ctx =
     router.Context(
       keys.anchor_line(meta.apex, meta.dnskey_public),
       keys.ds_line(meta.apex, meta.dnskey_public),
-      option.None,
+      api,
       router.ServingZone(serving),
-      option.None,
+      browse,
     )
   let handler = fn(req) { router.handle(req, ctx) }
+  // The secret is the primary's, byte for byte (`CP_SESSION_SECRET`), or no
+  // cookie the primary minted verifies here. A replica with no dashboard
+  // reads no cookie at all, and the placeholder says so rather than looking
+  // like a key somebody chose badly.
+  let cookie_secret = case cfg.dashboard {
+    True -> cfg.session_secret
+    False -> "replica-has-no-sessions-0000000000000000"
+  }
   let http =
-    wisp_mist.handler(handler, "replica-has-no-sessions-0000000000000000")
+    wisp_mist.handler(handler, cookie_secret)
+    |> edge.handler(edge.surface(browse, dns_pool, cookie_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)
-  use _ <- result.try(
+  let tree =
     sup.new(sup.OneForOne)
     |> sup.restart_tolerance(intensity: 60, period: 10)
     |> sup.add(pool.supervised(
@@ -385,7 +413,7 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       cfg.db_path,
       sqlite.ReadOnly,
       db.read_pragmas,
-      4,
+      replica_pool_size(cfg),
     ))
     |> sup.add(server_udp.supervised(
       udp_name,
@@ -399,6 +427,11 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       serving,
     ))
     |> sup.add(mist.supervised(http))
+  use _ <- result.try(
+    case browse {
+      option.Some(_) -> sup.add(tree, agent.supervised(agents_name))
+      option.None -> tree
+    }
     |> sup.start
     |> result.map_error(fn(_) { "could not start supervision tree" }),
   )
@@ -408,10 +441,34 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
     <> " — dns "
     <> endpoint(cfg.dns_listen)
     <> " http "
-    <> endpoint(cfg.http_listen),
+    <> endpoint(cfg.http_listen)
+    <> case cfg.dashboard {
+      True -> " — read-only dashboard, writes at " <> cfg.primary_url
+      False -> " — dns only"
+    }
+    <> case cfg.browse {
+      True -> " — attach at " <> agent.attach_url(cfg.public_url)
+      False -> ""
+    },
   )
   process.sleep_forever()
   Ok(Nil)
+}
+
+/// How many pooled readers a replica runs.
+///
+/// Four is what a nameserver alone needs: a DNS answer is one short read
+/// transaction out of a pre-signed table. A replica that also serves the
+/// dashboard has a second kind of caller — a browse call resolves its org on
+/// a connection, and `router.with_session` borrows one to check the cookie
+/// before the handler borrows its own — so it gets the primary's eight.
+/// Sizing them the same would let a handful of dashboard tabs queue DNS
+/// answers behind them.
+fn replica_pool_size(cfg: Config) -> Int {
+  case cfg.dashboard {
+    True -> 8
+    False -> 4
+  }
 }
 
 fn serve_primary(cfg: Config) -> Result(Nil, String) {
@@ -435,7 +492,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   let browse = browse_surface(cfg, agents_name)
   let auth =
     auth_api.AuthContext(
-      api_pool,
+      reads.Reads(api_pool),
       cfg.public_url,
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
@@ -450,7 +507,7 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
     router.Context(
       keys.anchor_line(apex, csk.public),
       keys.ds_line(apex, csk.public),
-      option.Some(auth),
+      option.Some(router.Writable(auth)),
       router.ServingZone(serving),
       browse,
     )
@@ -561,7 +618,7 @@ fn serve_external(
   let browse = browse_surface(cfg, agents_name)
   let auth =
     auth_api.AuthContext(
-      api_pool,
+      reads.Reads(api_pool),
       cfg.public_url,
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
@@ -579,7 +636,7 @@ fn serve_external(
     router.Context(
       "",
       "",
-      option.Some(auth),
+      option.Some(router.Writable(auth)),
       router.ExternalZone(api_pool),
       browse,
     )

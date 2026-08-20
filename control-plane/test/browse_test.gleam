@@ -56,6 +56,10 @@ fn browse_env() -> Nil {
   envoy.unset("CP_NS_HOSTS")
   envoy.unset("CP_BROWSE")
   envoy.unset("CP_PUBLIC_URL")
+  envoy.unset("CP_BROWSE_ENDPOINTS")
+  envoy.unset("CP_DASHBOARD")
+  envoy.unset("CP_PRIMARY_URL")
+  envoy.unset("CP_COOKIE_DOMAIN")
 }
 
 // -- the apex record ---------------------------------------------------------
@@ -126,12 +130,27 @@ pub fn browsing_needs_a_public_url_and_a_primary_test() {
   let assert Error(why) = config.load()
   assert string.contains(why, "CP_PUBLIC_URL")
 
-  envoy.set("CP_PUBLIC_URL", "https://sync.example")
+  // A replica may browse — the tunnel is a read and the tables are
+  // replicated — but only where it also mounts the dashboard, since every
+  // browse route is session-gated and a node with no session to read gates
+  // nothing.
+  envoy.set("CP_PUBLIC_URL", "https://ns1.sync.example")
   envoy.set("CP_ROLE", "replica")
   envoy.unset("CP_KEY_FILE")
   envoy.unset("CP_SESSION_SECRET")
   let assert Error(why) = config.load()
-  assert string.contains(why, "primary-only")
+  assert string.contains(why, "CP_DASHBOARD=on")
+
+  envoy.set("CP_DASHBOARD", "on")
+  envoy.set("CP_SESSION_SECRET", "0123456789abcdef0123456789abcdef")
+  envoy.set("CP_PRIMARY_URL", "https://sync.example")
+  let assert Ok(cfg) = config.load()
+  assert cfg.browse
+  assert cfg.dashboard
+  assert cfg.primary_url == "https://sync.example"
+  // Its own endpoint and nobody else's: the fleet's list is the primary's to
+  // publish.
+  assert cfg.browse_endpoints == ["https://ns1.sync.example"]
 
   browse_env()
   envoy.set("CP_BROWSE", "maybe")

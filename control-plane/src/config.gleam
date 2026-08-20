@@ -80,6 +80,36 @@ pub type Config {
     /// all exist only when this is on, in the same shape an unset optional
     /// provider takes.
     browse: Bool,
+    /// Whether this node mounts the dashboard and the product API.
+    ///
+    /// Always true on the primary — the dashboard is what a primary is for.
+    /// On a replica it is `CP_DASHBOARD=on`, and what it mounts is the *read*
+    /// half: the SPA, every GET route, and the browse surface. A replica's
+    /// database is a read-only copy, so there is no write half to mount.
+    dashboard: Bool,
+    /// Where the writes live, as a replica's dashboard tells its users
+    /// (`CP_PRIMARY_URL`). Empty on the primary, which *is* that place.
+    ///
+    /// A read-only node that answers "no" to a sign-in without saying where
+    /// to go instead is a dead end, and the one fact that resolves it — the
+    /// primary's public URL — is not derivable from anything a replica holds.
+    primary_url: String,
+    /// The `Domain` attribute session cookies are set with
+    /// (`CP_COOKIE_DOMAIN`), or `None` for a host-only cookie — the default,
+    /// and the only correct answer for a single-node deployment.
+    ///
+    /// A fleet whose nodes have names of their own (`ns1.sync.example`
+    /// beside `sync.example`) needs one session to be readable at all of
+    /// them, and a host-only cookie is by definition not. Set to a parent of
+    /// every node's name, it is; the trade is that every host under that
+    /// name receives the cookie, which is why it is opt-in and never derived
+    /// from the apex.
+    cookie_domain: Option(String),
+    /// The attach endpoints the apex record names, in publication order:
+    /// this node's own first, then `CP_BROWSE_ENDPOINTS`. Empty when
+    /// `CP_BROWSE` is off, which is how the record's owner name stops
+    /// existing at all.
+    browse_endpoints: List(String),
   )
 }
 
@@ -135,18 +165,35 @@ pub fn load() -> Result(Config, String) {
   let public_url =
     envoy.get("CP_PUBLIC_URL")
     |> result.unwrap("http://127.0.0.1:" <> int.to_string(http_listen.port))
-  use session_secret <- result.try(case role {
-    Primary -> {
+  use dashboard <- result.try(dashboard_enabled(role))
+  use session_secret <- result.try(case role, dashboard {
+    // The secret signs session cookies, so a node that reads them needs it —
+    // and a replica needs *the primary's*, byte for byte, or every cookie the
+    // primary minted fails its signature check here and the dashboard it
+    // mounts can never be signed in to.
+    Primary, _ | Replica, True -> {
       use secret <- result.try(required("CP_SESSION_SECRET"))
       case string.length(secret) >= 32 {
         True -> Ok(secret)
         False -> Error("CP_SESSION_SECRET must be at least 32 characters")
       }
     }
-    Replica -> Ok("")
+    Replica, False ->
+      case envoy.get("CP_SESSION_SECRET") {
+        Ok(_) ->
+          Error(
+            "CP_SESSION_SECRET is only read with CP_DASHBOARD=on: a replica "
+            <> "serving DNS alone reads no cookie, and a secret that signs "
+            <> "nothing is dead config",
+          )
+        Error(Nil) -> Ok("")
+      }
   })
+  use primary_url <- result.try(primary_url(role, dashboard))
+  use cookie_domain <- result.try(cookie_domain(dashboard))
   use smtp <- result.try(smtp_config())
-  use browse <- result.try(browse_enabled(role, public_url))
+  use browse <- result.try(browse_enabled(dashboard, public_url))
+  use browse_endpoints <- result.try(validated_browse_endpoints(role, browse))
   Ok(Config(
     role,
     base_domain,
@@ -162,26 +209,134 @@ pub fn load() -> Result(Config, String) {
     credential_pair("CP_GITHUB_CLIENT_ID", "CP_GITHUB_CLIENT_SECRET"),
     dns_mode,
     browse,
+    dashboard,
+    primary_url,
+    cookie_domain,
+    browse_endpoints,
   ))
+}
+
+/// `CP_DASHBOARD`: `on` or `off` (the default), and a replica's switch alone.
+///
+/// The primary always mounts the dashboard — it is what a primary is for — so
+/// the variable there is not a knob but a claim about the service that the
+/// service does not honour, and it is refused rather than ignored.
+fn dashboard_enabled(role: Role) -> Result(Bool, String) {
+  case role, envoy.get("CP_DASHBOARD") {
+    Primary, Error(Nil) -> Ok(True)
+    Primary, Ok(_) ->
+      Error(
+        "CP_DASHBOARD is replica-only: the primary always serves the "
+        <> "dashboard, so setting it here would name a switch that does not "
+        <> "exist",
+      )
+    Replica, Error(Nil) | Replica, Ok("off") -> Ok(False)
+    Replica, Ok("on") -> Ok(True)
+    Replica, Ok(other) -> Error("CP_DASHBOARD must be on or off, got " <> other)
+  }
+}
+
+/// `CP_PRIMARY_URL`: where a replica's dashboard sends the writes it cannot do.
+///
+/// Required with `CP_DASHBOARD=on` and refused everywhere else. A replica
+/// holds a read-only copy of the database, so signing in, creating a network
+/// and every other mutation has exactly one place it can happen; a dashboard
+/// that refuses them without naming that place is a dead end, and nothing a
+/// replica holds names it — the database records the fleet's zone, not which
+/// of its nodes took the writes.
+fn primary_url(role: Role, dashboard: Bool) -> Result(String, String) {
+  case role, dashboard {
+    Replica, True -> {
+      use url <- result.try(required("CP_PRIMARY_URL"))
+      let url = trim_trailing_slash(string.trim(url))
+      case is_origin(url) {
+        True -> Ok(url)
+        False ->
+          Error(
+            "CP_PRIMARY_URL must be an https:// or http:// origin, got " <> url,
+          )
+      }
+    }
+    _, _ ->
+      case envoy.get("CP_PRIMARY_URL") {
+        Ok(_) ->
+          Error(
+            "CP_PRIMARY_URL is only meaningful on a replica with "
+            <> "CP_DASHBOARD=on: it names where the writes this node refuses "
+            <> "are taken, and every other node takes its own",
+          )
+        Error(Nil) -> Ok("")
+      }
+  }
+}
+
+/// `CP_COOKIE_DOMAIN`: the `Domain` attribute session cookies carry.
+///
+/// Unset is a host-only cookie, which is right for one node and wrong for a
+/// fleet: `ns1.sync.example` never receives a cookie the primary set at
+/// `sync.example`, so a session minted there is invisible at every replica
+/// however faithfully the row replicated. Setting it to a name that is a
+/// parent of every node's makes one session work fleet-wide, at the price
+/// that every host under that name is sent the cookie — which is why it is
+/// the operator's decision and not derived from `CP_BASE_DOMAIN`.
+///
+/// A leading dot is accepted and dropped: RFC 6265 ignores it, and operators
+/// write it from habit.
+fn cookie_domain(dashboard: Bool) -> Result(Option(String), String) {
+  case envoy.get("CP_COOKIE_DOMAIN"), dashboard {
+    Error(Nil), _ -> Ok(None)
+    Ok(_), False ->
+      Error(
+        "CP_COOKIE_DOMAIN is only read where sessions are: this node mounts "
+        <> "no dashboard, so it sets no cookie for the attribute to appear on",
+      )
+    Ok(text), True -> {
+      let host = case string.starts_with(string.trim(text), ".") {
+        True -> string.drop_start(string.trim(text), 1)
+        False -> string.trim(text)
+      }
+      // The value lands in a `Set-Cookie` header, where a semicolon or a
+      // space would end the attribute and start another one.
+      case host != "" && record_safe(host) && !string.contains(host, ";") {
+        True -> Ok(Some(host))
+        False ->
+          Error(
+            "CP_COOKIE_DOMAIN must be a bare domain name with no whitespace "
+            <> "or semicolon: it is a Set-Cookie attribute, and either one "
+            <> "ends it early",
+          )
+      }
+    }
+  }
 }
 
 /// `CP_BROWSE`: `on` or `off` (the default).
 ///
-/// Refused on a replica, which has no sessions and no tunnels; and refused
-/// on a primary that has not been told its own public URL, because the apex
-/// record names that URL and a daemon signs its attach proof over it — a
-/// loopback default published into DNS would send every node nowhere.
-fn browse_enabled(role: Role, public_url: String) -> Result(Bool, String) {
+/// Allowed on either role, because a tunnel is not a write: a daemon's attach
+/// is resolved against `device_keys` with a SELECT, and every browse call
+/// reads the replicated tables and then asks a node on the operator's own
+/// network. What a replica cannot do is *mint* a session, which is why the
+/// switch requires `CP_DASHBOARD=on` there — a browse API with no session to
+/// authorize it answers nobody.
+///
+/// Refused on any node that has not been told its own public URL, because the
+/// apex record names that URL and a daemon signs its attach proof over it — a
+/// loopback default published into DNS would send every node nowhere. Each
+/// node names *itself* here: a replica's `CP_PUBLIC_URL` is the replica's, and
+/// the primary gathers the fleet's into the record with
+/// `CP_BROWSE_ENDPOINTS`.
+fn browse_enabled(dashboard: Bool, public_url: String) -> Result(Bool, String) {
   case envoy.get("CP_BROWSE") {
     Error(Nil) | Ok("off") -> Ok(False)
     Ok("on") ->
-      case role, result.is_ok(envoy.get("CP_PUBLIC_URL")) {
-        Replica, _ ->
+      case dashboard, result.is_ok(envoy.get("CP_PUBLIC_URL")) {
+        False, _ ->
           Error(
-            "CP_BROWSE is primary-only: a replica holds no sessions and no "
-            <> "attach tunnels",
+            "CP_BROWSE=on needs CP_DASHBOARD=on on a replica: the browse API "
+            <> "is session-gated, and a node that mounts no dashboard reads "
+            <> "no session to gate it with",
           )
-        Primary, False ->
+        _, False ->
           Error(
             "CP_BROWSE=on needs CP_PUBLIC_URL: the apex record publishes it "
             <> "and attaching daemons sign their proof over it, so the "
@@ -189,7 +344,7 @@ fn browse_enabled(role: Role, public_url: String) -> Result(Bool, String) {
             <> public_url
             <> " would send them nowhere",
           )
-        Primary, True ->
+        _, True ->
           // The value is rendered straight into a signed apex TXT record as
           // `v=synccp1 url=<it>`, and the client parses that record as
           // whitespace-separated `key=value` pairs and requires the URL to be
@@ -263,8 +418,130 @@ fn record_safe(value: String) -> Bool {
 
 pub fn browse_endpoint() -> String {
   case envoy.get("CP_BROWSE"), envoy.get("CP_PUBLIC_URL") {
-    Ok("on"), Ok(url) -> string.trim(url)
+    Ok("on"), Ok(url) -> trim_trailing_slash(string.trim(url))
     _, _ -> ""
+  }
+}
+
+/// Every attach endpoint the apex record names: this node's own, then the
+/// rest of the fleet's from `CP_BROWSE_ENDPOINTS`.
+///
+/// **One RRset, one rdata per endpoint** — not one record listing several.
+/// A daemon needs a live tunnel to *every* node that may be asked a browse
+/// question, because the registry of attached sessions is one process's
+/// memory and a node with no tunnel of its own can answer nothing; so the
+/// record has to name them all. Spelling that as extra records rather than
+/// extra `url=` fields is what keeps a daemon built before this change
+/// working: it reads the first record it can parse and attaches there, which
+/// is one node of the fleet instead of all of them, while a second `url=`
+/// in one record is a duplicate field it refuses outright.
+///
+/// Order is publication order and carries no precedence: a daemon opens all
+/// of them.
+pub fn browse_endpoints() -> List(String) {
+  case browse_endpoint() {
+    "" -> []
+    own -> [own, ..extra_browse_endpoints()]
+  }
+}
+
+/// `CP_BROWSE_ENDPOINTS`: the fleet's *other* attach endpoints, comma- or
+/// semicolon-separated, in the same origin form as `CP_PUBLIC_URL`.
+///
+/// Configured rather than discovered because nothing in this service knows
+/// its replicas: replication is external and operator-owned (ops/RUNBOOK.md),
+/// so the fleet's shape is a fact only the operator holds. It is read on the
+/// node that publishes the zone, which is the primary — a replica publishes
+/// nothing, and one that set this would be describing a record it does not
+/// write.
+fn extra_browse_endpoints() -> List(String) {
+  envoy.get("CP_BROWSE_ENDPOINTS")
+  |> result.unwrap("")
+  |> string.replace(each: ";", with: ",")
+  |> string.split(",")
+  |> list.map(fn(entry) { trim_trailing_slash(string.trim(entry)) })
+  |> list.filter(fn(entry) { entry != "" })
+}
+
+/// The endpoints validated and deduplicated, or the reason the operator's
+/// list cannot be published.
+///
+/// Each entry is checked exactly as `CP_PUBLIC_URL` is, and for the same
+/// reason: a value that is not an origin, or that carries whitespace, is a
+/// record every daemon rejects — signed, cached for its TTL, and failing in
+/// the client rather than at the boot that produced it.
+fn validated_browse_endpoints(
+  role: Role,
+  browse: Bool,
+) -> Result(List(String), String) {
+  let configured = result.is_ok(envoy.get("CP_BROWSE_ENDPOINTS"))
+  use Nil <- result.try(case role, browse, configured {
+    Replica, _, True ->
+      Error(
+        "CP_BROWSE_ENDPOINTS is primary-only: it names the fleet the apex "
+        <> "record lists, and only the node that publishes the zone writes "
+        <> "that record. A replica names itself with CP_PUBLIC_URL",
+      )
+    _, False, True ->
+      Error(
+        "CP_BROWSE_ENDPOINTS is set but CP_BROWSE is not on: with browsing "
+        <> "off there is no attach record for the endpoints to appear in",
+      )
+    _, _, _ -> Ok(Nil)
+  })
+  let endpoints = browse_endpoints()
+  use Nil <- result.try(
+    list.try_each(endpoints, fn(endpoint) {
+      case is_origin(endpoint), record_safe(endpoint) {
+        True, True -> Ok(Nil)
+        False, _ ->
+          Error(
+            "CP_BROWSE_ENDPOINTS entry "
+            <> endpoint
+            <> " is not an https:// or http:// origin: daemons refuse any "
+            <> "other shape, so the record would be published and rejected",
+          )
+        _, False ->
+          Error(
+            "CP_BROWSE_ENDPOINTS entry "
+            <> endpoint
+            <> " has whitespace or a quote in it: the attach record is "
+            <> "whitespace-separated key=value pairs and either one changes "
+            <> "what it says",
+          )
+      }
+    }),
+  )
+  // Deduplicated because the RRset is a set: two identical rdatas at one
+  // owner name are not two answers but one malformed RRset, and a daemon
+  // that read them would open the same tunnel twice.
+  let unique = list.unique(endpoints)
+  case list.length(unique) > max_browse_endpoints {
+    True ->
+      Error(
+        "CP_BROWSE_ENDPOINTS names more than "
+        <> int.to_string(max_browse_endpoints)
+        <> " attach endpoints (including CP_PUBLIC_URL): every daemon in "
+        <> "every network opens a standing tunnel to each one, and the "
+        <> "client refuses to open more than that many",
+      )
+    False -> Ok(unique)
+  }
+}
+
+/// How many attach endpoints one apex may name.
+///
+/// The same ceiling the client applies (`MAX_CP_ENDPOINTS` in
+/// `crates/synch-net/src/dns.rs`), restated here so the refusal reaches the
+/// operator at boot rather than the fleet at its next refresh. Every entry
+/// costs every daemon a standing WebSocket, so the zone decides how much a
+/// node spends and the bound is what keeps that decision small.
+pub const max_browse_endpoints = 8
+
+fn trim_trailing_slash(url: String) -> String {
+  case string.ends_with(url, "/") {
+    True -> trim_trailing_slash(string.drop_end(url, 1))
+    False -> url
   }
 }
 

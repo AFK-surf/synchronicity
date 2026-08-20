@@ -6,6 +6,7 @@ import api/common.{
   ok_json, require_org, text_at, transaction, zone_mutation,
 }
 import api/middleware.{error_json, now_unix}
+import api/reads.{type Reads}
 import auth/oidc
 import auth/session.{type Session}
 import dns/name
@@ -85,8 +86,8 @@ pub fn create_org(req: Request, ctx: AuthContext, live: Session) -> Response {
   }
 }
 
-pub fn get_org(ctx: AuthContext, live: Session, slug: String) -> Response {
-  with_db(ctx, fn(conn) {
+pub fn get_org(reads: Reads, live: Session, slug: String) -> Response {
+  reads.with_db(reads, fn(conn) {
     use org_id, role <- require_org(conn, slug, live.user_id, Member)
     let networks =
       sqlite.query(
@@ -228,8 +229,8 @@ pub fn delete_org(
   }
 }
 
-pub fn list_members(ctx: AuthContext, live: Session, slug: String) -> Response {
-  with_db(ctx, fn(conn) {
+pub fn list_members(reads: Reads, live: Session, slug: String) -> Response {
+  reads.with_db(reads, fn(conn) {
     use org_id, _role <- require_org(conn, slug, live.user_id, Member)
     let rows =
       sqlite.query(
@@ -539,13 +540,13 @@ pub fn create_invite(
 /// the token is the credential — a holder could accept the invite outright,
 /// so showing them what they would be joining reveals nothing acceptance
 /// would not.
-pub fn preview_invite(req: Request, ctx: AuthContext) -> Response {
+pub fn preview_invite(req: Request, reads: Reads) -> Response {
   // Absent and empty are the same omission; only a real token earns a lookup.
   case list.key_find(wisp.get_query(req), "token") {
     Error(Nil) | Ok("") ->
       error_json(400, "bad_request", "token query parameter required")
     Ok(token) ->
-      with_db(ctx, fn(conn) {
+      reads.with_db(reads, fn(conn) {
         let rows =
           sqlite.query(
             conn,
@@ -669,8 +670,8 @@ pub fn accept_invite(
 
 /// OIDC configuration is owner-only in both directions: it is
 /// takeover-adjacent (it decides who can sign in under the org's issuer).
-pub fn get_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
-  with_db(ctx, fn(conn) {
+pub fn get_oidc(reads: Reads, live: Session, slug: String) -> Response {
+  reads.with_db(reads, fn(conn) {
     use org_id, _ <- require_org(conn, slug, live.user_id, Owner)
     let rows =
       sqlite.query(
@@ -782,11 +783,11 @@ pub fn delete_oidc(ctx: AuthContext, live: Session, slug: String) -> Response {
 
 pub fn audit_log(
   req: Request,
-  ctx: AuthContext,
+  reads: Reads,
   live: Session,
   slug: String,
 ) -> Response {
-  with_db(ctx, fn(conn) {
+  reads.with_db(reads, fn(conn) {
     use org_id, _ <- require_org(conn, slug, live.user_id, Admin)
     let cursor =
       wisp.get_query(req)
