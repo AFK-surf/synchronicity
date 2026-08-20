@@ -1010,6 +1010,9 @@ async fn dispatch_pending(pending: &Pending, command: Command, out: &mut Frames)
             out.line(format!("membership domain is {name}")).await?;
             out.line("takes effect at the next `synch daemon run`")
                 .await?;
+            for line in domain_set_advice(&name, pending.node_id) {
+                out.line(line).await?;
+            }
         }
 
         Command::DomainClear(pb::DomainClear {}) => {
@@ -1078,6 +1081,25 @@ async fn dispatch_pending(pending: &Pending, command: Command, out: &mut Frames)
         _ => return Err(pending.refusal()),
     }
     Ok(())
+}
+
+/// What an operator has to do about a membership domain they just set (§3.1).
+///
+/// A zone names its members; setting the domain does not ask to be named. So
+/// the node that has just been pointed at a zone with no record for its key
+/// will come back up with no name, and the daemon will wait — correctly, and
+/// unhelpfully, if the operator has already walked away. Both handlers say
+/// this, because a node without a name serves the reduced socket and a node
+/// with one serves the full one, and the advice is the same either way.
+fn domain_set_advice(domain: &str, node_id: NodeId) -> Vec<String> {
+    vec![
+        format!("{domain} must name this key, or this node comes up with no name and waits:"),
+        format!(
+            "  _synchronicity.{domain}. IN TXT \"v=sync1 id=<name> nk={} apex=<apex>\"",
+            node_id.to_z32()
+        ),
+        "`synch domain clear` returns this node to its device key as its name".into(),
+    ]
 }
 
 /// Serves one CLI subcommand.
@@ -1333,9 +1355,26 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             out.line("stopping").await?;
         }
 
-        Command::TrustAdd(pb::TrustAdd { key, note, addr }) => {
+        Command::TrustAdd(pb::TrustAdd {
+            key,
+            note,
+            addr,
+            as_origin,
+        }) => {
             let key = parse_key(&key)?;
-            let origin = read(node, move |n| Ok(n.trust_add(key, note.as_deref())?)).await?;
+            let named = as_origin.as_deref().map(parse_origin).transpose()?;
+            let origin = match named {
+                None => read(node, move |n| Ok(n.trust_add(key, note.as_deref())?)).await?,
+                Some(origin) => {
+                    let owned = origin.clone();
+                    read(node, move |n| {
+                        n.trust_add_named(&owned, key, note.as_deref())?;
+                        Ok(())
+                    })
+                    .await?;
+                    origin
+                }
+            };
             if let Some(addr) = addr {
                 let socket = addr
                     .parse()
@@ -1347,6 +1386,16 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             out.line(format!("trusted {} as {origin}", key.to_z32()))
                 .await?;
+            // Said at the moment it is chosen, because the cost of a hand-made
+            // name is not visible later: it never expires, so dropping this
+            // member from the zone stops being how it is dropped.
+            if as_origin.is_some() {
+                out.line(
+                    "this binding never expires and shadows the zone record it names; \
+                     remove it with `synch trust rm` when the zone should govern again",
+                )
+                .await?;
+            }
         }
 
         Command::TrustRm(pb::TrustRm { origin, key }) => {
@@ -1560,6 +1609,15 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // (§3.1). The next start resolves the new zone and migrates.
             out.line("takes effect at the next `synch daemon run`")
                 .await?;
+            // Said here, while the operator is still at the keyboard, because
+            // the consequence lands at the next start: a zone that does not
+            // name this key leaves the node with nothing to publish under, and
+            // `daemon run` then waits rather than serving. The record is the
+            // fix and the clear is the way back, so both belong with the
+            // change that makes them necessary.
+            for line in domain_set_advice(&domain, node.node_id()) {
+                out.line(line).await?;
+            }
         }
 
         Command::DomainClear(pb::DomainClear {}) => {

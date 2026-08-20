@@ -261,6 +261,14 @@ pub struct DoctorReport {
     pub unreconciled: Vec<UnreconciledHistory>,
     /// Configured membership domains.
     pub domains: Vec<String>,
+    /// The spaces this node may read, as last declared by a peer, or `None`
+    /// for the whole keyspace (§5.5).
+    ///
+    /// A delegated node holds nothing outside this list and never will, so the
+    /// list is the difference between "this node is broken" and "this node is
+    /// working as delegated" — the same partial trie reads as either one until
+    /// an operator can see the scope it was held under.
+    pub local_scope: Option<Vec<String>>,
     /// Device keys a domain's answer published under more than one `id=`, whose
     /// every binding was therefore dropped (§3.2).
     ///
@@ -919,8 +927,20 @@ impl Node {
             unreconciled.extend(self.unreconciled_history(&origin)?);
             let complete = self.store().complete_head(&origin)?;
             let pending = self.store().pending_head(&origin)?;
+            // Scoped, like promotion and like the summaries this node
+            // advertises (§5.5): under a read scope the unscoped answer is
+            // false by construction for every foreign origin, so an unscoped
+            // check here would report a delegate holding exactly what it was
+            // granted as PARTIAL on every line — the one report an operator
+            // consults to tell a broken node from a confined one.
+            //
+            // `materialization_scope` rather than the read scope flat, because
+            // this node's *own* trie is one it built and therefore holds
+            // whole; judging it by the grant would call a genuinely partial
+            // local trie servable.
             let servable = match &complete {
-                Some(head) => trie.is_complete(head.root)?,
+                Some(head) => trie
+                    .is_complete_scoped(head.root, &self.store().materialization_scope(&origin)?)?,
                 None => false,
             };
             let bound = !self.store().keys_for_origin(&origin, now)?.is_empty();
@@ -965,6 +985,7 @@ impl Node {
             recovery: self.recovery_state()?,
             unreconciled,
             domains: self.resolving_domains(),
+            local_scope: self.store().local_scope()?,
             ambiguous,
             self_origin_mismatch,
             clock,
@@ -1297,6 +1318,40 @@ mod tests {
         assert!(report.equivocations.is_empty() && report.unbound_origins.is_empty());
         assert!(report.trie.nodes > 0);
         assert_eq!(report.blobs, (1, 1));
+    }
+
+    /// A delegate is meant to be missing things, and the report has to say so.
+    ///
+    /// The read scope is the whole difference between a node holding exactly
+    /// its grant and a node whose fetch is broken, and it decides the servable
+    /// column too: judged against the whole keyspace every foreign head on a
+    /// confined node reads PARTIAL by construction. This node's own trie is
+    /// the exception — it built that one, so it is judged whole (§5.5).
+    #[tokio::test]
+    async fn doctor_reports_the_read_scope_and_judges_heads_under_it() {
+        let (_d, node) = node().await;
+        assert!(
+            node.doctor().unwrap().local_scope.is_none(),
+            "an undelegated node reads the whole keyspace"
+        );
+
+        let space = tempfile::tempdir().unwrap();
+        node.add_space("media", space.path()).unwrap();
+        std::fs::write(space.path().join("a.txt"), b"hello").unwrap();
+        node.scan_and_publish().unwrap();
+
+        // What a peer's `Hello` would have left behind on a delegated node.
+        node.store()
+            .set_local_scope(Some(&["photos".to_string()]))
+            .unwrap();
+
+        let report = node.doctor().unwrap();
+        assert_eq!(report.local_scope, Some(vec!["photos".to_string()]));
+        assert!(
+            report.heads[0].servable,
+            "this node's own head is held whole whatever it was granted to read"
+        );
+        node.shutdown().await.unwrap();
     }
 
     /// §12: an origin whose trust was withdrawn keeps its head and entries,

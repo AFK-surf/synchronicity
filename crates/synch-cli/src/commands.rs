@@ -144,10 +144,16 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         },
 
         Command::Trust { command } => match command {
-            TrustCommand::Add { key, note, addr } => Cmd::TrustAdd(pb::TrustAdd {
+            TrustCommand::Add {
+                key,
+                note,
+                addr,
+                as_origin,
+            } => Cmd::TrustAdd(pb::TrustAdd {
                 key: key.clone(),
                 note: note.clone(),
                 addr: addr.clone(),
+                as_origin: as_origin.clone(),
             }),
             TrustCommand::Rm { origin, key } => Cmd::TrustRm(pb::TrustRm {
                 origin: origin.clone(),
@@ -374,19 +380,46 @@ mod tests {
         to_command(&Cli::parse_from(args))
     }
 
-    // The key is the identity: there is no flag that names a peer (§3.2),
-    // and clap refuses the old ones before anything reaches the daemon.
+    /// The key is the identity, and naming a peer is the explicit exception.
+    ///
+    /// A name belongs to the zone that issues it (§3.2), so nothing infers one:
+    /// a plain `trust add` binds the key and only the key. But head validity is
+    /// a check on the `(origin, key)` pair, and a node with no membership zone
+    /// cannot otherwise express a member that publishes under a name — so `--as`
+    /// exists, says what it costs, and is never reached by accident.
     #[test]
-    fn trust_add_takes_a_key_and_nothing_that_names_it() {
+    fn trust_add_takes_a_key_and_names_one_only_when_asked() {
         let command =
             command_for(&["synch", "trust", "add", "abc", "--note", "zeynep's laptop"]).unwrap();
-        let Cmd::TrustAdd(pb::TrustAdd { key, note, addr }) = command else {
-            panic!("expected trust add, got {command:?}");
-        };
-        assert_eq!(key, "abc");
-        assert_eq!(note.as_deref(), Some("zeynep's laptop"));
-        assert!(addr.is_none());
-        assert!(Cli::try_parse_from(["synch", "trust", "add", "abc", "--as", "nas"]).is_err());
+        assert_eq!(
+            command,
+            Cmd::TrustAdd(pb::TrustAdd {
+                key: "abc".into(),
+                note: Some("zeynep's laptop".into()),
+                addr: None,
+                as_origin: None,
+            })
+        );
+        let named = command_for(&[
+            "synch",
+            "trust",
+            "add",
+            "abc",
+            "--as",
+            "nas@cluster.example",
+        ])
+        .unwrap();
+        assert_eq!(
+            named,
+            Cmd::TrustAdd(pb::TrustAdd {
+                key: "abc".into(),
+                note: None,
+                addr: None,
+                as_origin: Some("nas@cluster.example".into()),
+            })
+        );
+        // `trust rebind` stays gone: re-pointing a name is `--as` again, since
+        // the binding upserts on the row's identity.
         assert!(Cli::try_parse_from(["synch", "trust", "rebind", "nas", "abc"]).is_err());
     }
 

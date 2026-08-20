@@ -182,8 +182,13 @@ impl BlobProtocol {
             let (scope, origins) =
                 store.publish_scope_of_key_with_origins(&peer, synch_core::now_ns())?;
             let spaces = match scope {
-                None => return Ok(true),
-                Some(spaces) => spaces,
+                // A peer with no live binding gets nothing. The dial gate has
+                // already refused it, so this is the second lock on the same
+                // door rather than the only one — but it is the lock that would
+                // matter if a binding lapsed mid-session.
+                synch_store::PublishScope::Untrusted => return Ok(false),
+                synch_store::PublishScope::Unrestricted => return Ok(true),
+                synch_store::PublishScope::Confined(spaces) => spaces,
             };
             Ok(store.content_in_spaces(&root, &spaces, &origins)?)
         })

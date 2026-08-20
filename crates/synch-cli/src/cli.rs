@@ -394,6 +394,13 @@ pub enum TrustCommand {
         /// A direct address to remember for dialing.
         #[arg(long)]
         addr: Option<String>,
+        /// Bind the key under this named origin, e.g. `nas@cluster.example`.
+        ///
+        /// For a member that publishes under a name this node has no
+        /// membership zone to learn from. The binding never expires, so it
+        /// shadows the zone record it names — prefer a zone where there is one.
+        #[arg(long = "as", value_name = "ORIGIN")]
+        as_origin: Option<String>,
     },
     /// Remove trust.
     Rm {
