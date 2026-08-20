@@ -61,6 +61,14 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   a session exists. Magic links stay on the page when nothing else is
   configured, mail relay or not: an empty login screen is worse than a
   link the operator reads off the service log.
+- **API keys** are the second credential the API takes, for callers that
+  are programs. A key belongs to an *org*, not to a person: it names one
+  org and carries its own role (`admin` or `member`, never `owner`), so it
+  can never reach another org and no change to anybody's membership can
+  widen it. Send it as `Authorization: Bearer synch_…`; a bearer request
+  needs no CSRF token, because nothing attaches that header on its own.
+  Accounts, membership and key management stay a signed-in person's — see
+  [API keys](#api-keys) below.
 - **Cloud browse** lets the dashboard read a cluster's files. Nodes are
   unreachable from here, so the connection is one they open: a daemon
   discovers this deployment from
@@ -83,6 +91,72 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   of the database is. There is no deployment-level switch — the org admin's
   per-network toggle is the whole of the gate, and it is off until they turn
   it on.
+
+## API keys
+
+For scripts, CI and anything else that is not a person at a browser. Org
+owners and admins manage them under **Settings → API keys**, or over the
+API itself:
+
+| Method   | Path                              | Role  |
+| -------- | --------------------------------- | ----- |
+| `GET`    | `/api/orgs/:slug/api-keys`        | admin |
+| `POST`   | `/api/orgs/:slug/api-keys`        | admin |
+| `PATCH`  | `/api/orgs/:slug/api-keys/:id`    | admin |
+| `DELETE` | `/api/orgs/:slug/api-keys/:id`    | admin |
+
+`POST` takes `{"name": "ci", "role": "member", "expires_in": 2592000}` —
+`role` defaults to `member`, and `expires_in` is seconds from now, `0` (the
+default) for no expiry. A duration rather than a date, so nothing depends on
+the caller's clock agreeing with the service's. It answers with the token:
+
+```json
+{ "id": "…", "name": "ci", "role": "member", "prefix": "synch_A1b2C3d4",
+  "expires_at": 0, "token": "synch_…" }
+```
+
+**That is the only time the token exists outside the holder's hands.** The
+row keeps its SHA-256 and the `prefix` above, which is what lets the list say
+which key a leaked or forgotten token is without holding enough to be one.
+Lose it and mint another.
+
+`PATCH` takes any of `name`, `role` and `expires_in`; an absent field is left
+alone, and `expires_in: 0` clears the expiry. The secret is not among them:
+rotating a credential is minting a new key and deleting the old, which is two
+audited acts rather than one that silently invalidates whatever is deployed.
+`DELETE` revokes — the row goes, and with it the hash the token
+authenticates by.
+
+Then use it:
+
+```bash
+curl -H "Authorization: Bearer $SYNCH_TOKEN" \
+  https://cp.example.com/api/orgs/acme/networks
+```
+
+What a key may do is what its role may do, in its own org: networks,
+devices and their keys, the browse and download surface, the audit trail.
+What no key may do, whatever its role:
+
+- **manage accounts** — create an org, accept an invitation, read
+  `/api/me`. These are about a person, and a key is not one.
+- **manage membership** — invitations, role changes, removals. An admin key
+  that could invite an admin would be handing out standing human access
+  that outlives the key.
+- **manage keys** — including reading the list. A key that could mint keys
+  could mint one that never expires, and revoking the one you knew about
+  would not have ended the access.
+- **anything owner-gated** — ownership transfer, org deletion, the SSO
+  configuration. No key is an owner, so these refuse every key without
+  naming keys at all.
+
+Each of those answers `403 api_key_forbidden`. A key aimed at an org that is
+not its own answers `404` — the same answer a person outside that org gets,
+since an org is not enumerable by whoever cannot see it.
+
+Every act a key takes is in the org's audit log under the actor `key:<id>`,
+which names the credential rather than whoever minted it — true still after
+that person's role has changed or they have left.
 
 ## `GET /SKILL.md`
 

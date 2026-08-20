@@ -4,8 +4,10 @@ import { useNavigate, useParams } from 'react-router'
 import {
   get,
   send,
+  type ApiKeyRow,
   type AuditRow,
   type MemberRow,
+  type MintedApiKey,
   type OidcConfig,
 } from '../lib/api'
 import { useTitle } from '../lib/title'
@@ -19,6 +21,7 @@ export function Settings() {
   return (
     <div className="space-y-10">
       <Members slug={slug} myRole={role ?? 'member'} myId={me?.user.id ?? ''} />
+      {(role === 'owner' || role === 'admin') && <ApiKeys slug={slug} />}
       {role === 'owner' && <Oidc slug={slug} />}
       {(role === 'owner' || role === 'admin') && <Audit slug={slug} />}
       <LinkedIdentities />
@@ -216,6 +219,194 @@ function Members({
           <ErrorNote error={invite.error} />
         </form>
       )}
+    </section>
+  )
+}
+
+// How long a new key lives, offered as durations rather than dates: the
+// server takes seconds from now, so nothing here depends on the two clocks
+// agreeing.
+const EXPIRIES = [
+  { label: 'no expiry', seconds: 0 },
+  { label: '30 days', seconds: 30 * 86400 },
+  { label: '90 days', seconds: 90 * 86400 },
+  { label: '1 year', seconds: 365 * 86400 },
+]
+
+function stamp(at: number) {
+  return at === 0 ? '—' : new Date(at * 1000).toLocaleString()
+}
+
+function ApiKeys({ slug }: { slug: string }) {
+  const queryClient = useQueryClient()
+  const [name, setName] = useState('')
+  const [role, setRole] = useState('member')
+  const [expiresIn, setExpiresIn] = useState(0)
+  // The token, held only until the operator navigates away. Nothing can
+  // fetch it back, so the panel says so plainly rather than offering a
+  // "show again" that would have to lie.
+  const [minted, setMinted] = useState<MintedApiKey | null>(null)
+
+  const { data: keys, error } = useQuery({
+    queryKey: ['api-keys', slug],
+    queryFn: () => get<ApiKeyRow[]>(`/api/orgs/${slug}/api-keys`),
+  })
+  const refresh = () =>
+    queryClient.invalidateQueries({ queryKey: ['api-keys', slug] })
+  const create = useMutation({
+    mutationFn: () =>
+      send<MintedApiKey>('POST', `/api/orgs/${slug}/api-keys`, {
+        name,
+        role,
+        expires_in: expiresIn,
+      }),
+    onSuccess: (key) => {
+      setMinted(key)
+      setName('')
+      refresh()
+    },
+  })
+  const update = useMutation({
+    mutationFn: (args: { id: string; role: string }) =>
+      send('PATCH', `/api/orgs/${slug}/api-keys/${args.id}`, {
+        role: args.role,
+      }),
+    onSuccess: refresh,
+  })
+  const revoke = useMutation({
+    mutationFn: (id: string) =>
+      send('DELETE', `/api/orgs/${slug}/api-keys/${id}`),
+    onSuccess: refresh,
+  })
+  const now = Date.now() / 1000
+
+  return (
+    <section>
+      <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-neutral-400">
+        API keys
+      </h2>
+      <p className="mb-3 text-sm text-neutral-400">
+        For programs rather than people: send the token as{' '}
+        <span className="font-mono">Authorization: Bearer …</span>. A key
+        reaches this org only, at the role it was given, and can never manage
+        members, sign-in configuration or other keys.
+      </p>
+      {minted && (
+        <div className="mb-3 rounded-lg border border-emerald-900/60 bg-emerald-950/30 p-4 text-sm">
+          <div className="font-medium text-emerald-300">
+            {minted.name} created. Copy it now — this is the only time it is
+            shown.
+          </div>
+          <code className="mt-2 block break-all rounded bg-neutral-950 p-2 font-mono text-xs">
+            {minted.token}
+          </code>
+          <button
+            onClick={() => setMinted(null)}
+            className="mt-2 rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
+          >
+            Done
+          </button>
+        </div>
+      )}
+      {(keys ?? []).length > 0 && (
+        <div className="overflow-x-auto rounded-lg border border-neutral-800">
+          <table className="w-full text-sm">
+            <tbody className="divide-y divide-neutral-800">
+              {(keys ?? []).map((k) => (
+                <tr key={k.id}>
+                  <td className="px-4 py-2">
+                    {k.name}
+                    {k.expires_at !== 0 && k.expires_at <= now && (
+                      <span className="ml-2 text-xs text-amber-400">
+                        expired
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2 font-mono text-xs text-neutral-500">
+                    {k.prefix}…
+                  </td>
+                  <td className="px-4 py-2">
+                    <select
+                      value={k.role}
+                      onChange={(e) =>
+                        update.mutate({ id: k.id, role: e.target.value })
+                      }
+                      className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
+                    >
+                      <option value="admin">admin</option>
+                      <option value="member">member</option>
+                    </select>
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-2 text-xs text-neutral-500">
+                    last used {stamp(k.last_used_at)}
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-2 text-xs text-neutral-500">
+                    expires {stamp(k.expires_at)}
+                  </td>
+                  <td className="px-4 py-2 text-right">
+                    <button
+                      onClick={() => {
+                        if (
+                          window.confirm(
+                            `Revoke ${k.name}? Anything using this token stops working at once.`,
+                          )
+                        )
+                          revoke.mutate(k.id)
+                      }}
+                      className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
+                    >
+                      Revoke
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <ErrorNote error={error || update.error || revoke.error} />
+      <form
+        className="mt-3 flex flex-wrap gap-2"
+        onSubmit={(e) => {
+          e.preventDefault()
+          create.mutate()
+        }}
+      >
+        <input
+          required
+          maxLength={64}
+          placeholder="what is this key for?"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          className="min-w-64 rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm"
+        />
+        <select
+          value={role}
+          onChange={(e) => setRole(e.target.value)}
+          className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-2 text-sm"
+        >
+          <option value="member">member</option>
+          <option value="admin">admin</option>
+        </select>
+        <select
+          value={expiresIn}
+          onChange={(e) => setExpiresIn(Number(e.target.value))}
+          className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-2 text-sm"
+        >
+          {EXPIRIES.map((choice) => (
+            <option key={choice.seconds} value={choice.seconds}>
+              {choice.label}
+            </option>
+          ))}
+        </select>
+        <button
+          disabled={create.isPending}
+          className="rounded-md bg-white px-3 py-2 text-sm font-medium text-neutral-950 disabled:opacity-50"
+        >
+          Create key
+        </button>
+        <ErrorNote error={create.error} />
+      </form>
     </section>
   )
 }

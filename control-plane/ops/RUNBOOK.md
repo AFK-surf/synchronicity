@@ -291,6 +291,15 @@ control plane itself with
   seconds; the sweep at 300s is the fallback). Peers may keep trusting
   it for up to TTL + grace ≈ 20 minutes, plus your replica refresh
   interval.
+- **A leaked API key is revoked from the dashboard**: Settings → API keys
+  → Revoke, or `DELETE /api/orgs/<slug>/api-keys/<id>`. Unlike a device
+  key, this *is* a kill switch — the token authenticates against the row's
+  hash, so the next request with it is a 401 and nothing is cached
+  anywhere. The list identifies keys by their `synch_…` prefix and by when
+  each was last used, which is how you tell which row a token found in a
+  log belongs to; `last_used_at` records use against the primary, so a
+  key exercised only against replicas reads older than it is. Every act
+  the key took is in the org's audit log under `key:<id>`.
 - **Signature freshness**: `/healthz` reports `sig_expires_at`. The
   primary re-signs automatically at 7 days before expiry. If the primary
   is down long enough for that to matter you have days, not minutes.
