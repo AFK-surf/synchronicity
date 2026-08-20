@@ -1507,8 +1507,17 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 None => DEFAULT_DELEGATION_TTL,
             };
             let not_after = now_ns().saturating_add(ttl.as_nanos().min(i64::MAX as u128) as i64);
-            let change = node.delegate_add(subject, &spaces, not_after, note.as_deref())?;
-            let head = node.publish(&[change])?;
+            // Writing the record and publishing the head are both store work,
+            // so they go to the blocking pool (§10).
+            let head = {
+                let spaces = spaces.clone();
+                let note = note.clone();
+                read(node, move |n| {
+                    let change = n.delegate_add(subject, &spaces, not_after, note.as_deref())?;
+                    Ok(n.publish(&[change])?)
+                })
+                .await?
+            };
             out.line(format!(
                 "delegated {} for {}",
                 subject.to_z32(),
@@ -1533,8 +1542,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
 
         Command::DelegateRm(pb::DelegateRm { key }) => {
             let subject = parse_key(&key)?;
-            let change = node.delegate_remove(&subject)?;
-            let head = node.publish(&[change])?;
+            let head = read(node, move |n| {
+                let change = n.delegate_remove(&subject)?;
+                Ok(n.publish(&[change])?)
+            })
+            .await?;
             out.line(format!("removed the delegation of {}", subject.to_z32()))
                 .await?;
             if let Some(head) = head {
@@ -1550,13 +1562,20 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             let now = now_ns();
             let own = node.origin().clone();
             let mut any = false;
-            let live: std::collections::HashSet<Vec<u8>> = node
-                .store()
-                .delegations(now)?
-                .into_iter()
-                .map(|b| b.node_id.as_bytes().to_vec())
-                .collect();
-            for binding in node.delegations()? {
+            // Both of these take the store connection, so both go to the
+            // blocking pool — together, in one hop, since the rendering below
+            // touches neither (§10).
+            let (live, bindings) = read(node, move |n| {
+                let live: std::collections::HashSet<Vec<u8>> = n
+                    .store()
+                    .delegations(now)?
+                    .into_iter()
+                    .map(|b| b.node_id.as_bytes().to_vec())
+                    .collect();
+                Ok((live, n.delegations()?))
+            })
+            .await?;
+            for binding in bindings {
                 any = true;
                 let issuer = binding
                     .issuer

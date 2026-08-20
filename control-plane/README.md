@@ -76,6 +76,24 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   holds. File bytes pass through this service's memory in bounded chunks and
   are never stored.
 
+## `GET /SKILL.md`
+
+Every role serves [`priv/skill/SKILL.md`](priv/skill/SKILL.md) at
+`/SKILL.md` as `text/markdown` — a guide to the `synch` CLI written for
+whoever, or whatever, has to drive a node: the daemon model, references
+and version policies, membership and delegation, key rotation, recovery,
+and the error messages each of those produces.
+
+It is mounted beside `/healthz` rather than behind the product API, and
+so is public and role-agnostic: it needs no session, no database and no
+zone, and an operator pointed at any node of a deployment — primary,
+replica, external — gets the same document from the same URL. That is
+the only property that makes the URL worth handing out.
+
+The file rides in the shipment, so `.dockerignore` exempts it from the
+blanket `*.md` and `ops/image-smoke.sh` fetches it from the built image;
+a build that dropped it would boot, serve, and pass every other check.
+
 ## Stack
 
 - **Backend**: Gleam on OTP 27 (pinned via `.tool-versions`, asdf).
@@ -180,7 +198,8 @@ Nothing is published until that exact image has booted:
 [`ops/image-smoke.sh`](ops/image-smoke.sh) runs the built image the way
 this section tells you to run it — `keygen` and `seed` into fresh named
 volumes, then `serve` — and checks what only running it can check. The
-shipped SPA is served with its bundle, `/healthz` reports a loaded zone,
+shipped SPA is served with its bundle, `/SKILL.md` answers with the CLI
+guide, `/healthz` reports a loaded zone,
 the authoritative DNS answers over UDP and TCP with signatures, the
 csqlite workers come up sandboxed under the default runtime profile, the
 service is uid 10001, and the image's own `HEALTHCHECK` goes healthy.
