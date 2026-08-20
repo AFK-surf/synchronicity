@@ -8,6 +8,7 @@ import envoy
 import fixtures.{nk}
 import gleam/bit_array
 import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -20,6 +21,13 @@ import zone/model.{type ZoneInput, Member, NsHost, TxtName, ZoneInput, ZoneMeta}
 import zone/render_external
 
 fn input(browse_url: String) -> ZoneInput {
+  case browse_url {
+    "" -> fleet([])
+    url -> fleet([url])
+  }
+}
+
+fn fleet(browse_urls: List(String)) -> ZoneInput {
   let assert Ok(apex) = name.parse("sync.test.")
   let assert Ok(ns1) = name.parse("ns1.sync.test.")
   let assert Ok(owner) = name.parse("_synchronicity.prod.acme.sync.test.")
@@ -40,7 +48,7 @@ fn input(browse_url: String) -> ZoneInput {
     [TxtName(owner, [Member("nas", nk(), "", "")])],
     [],
     0,
-    browse_url,
+    browse_urls,
   )
 }
 
@@ -86,6 +94,111 @@ pub fn the_attach_record_sits_at_the_apex_test() {
   // In the NSEC chain like any other owner: a name that is not in it cannot
   // be proven absent, and this one is proven present.
   assert list.contains(build.owners_in_order(rrsets), owner)
+}
+
+/// A fleet is named one record per node, at the one apex name.
+///
+/// Every node holds its own registry of attached daemons, so a node nobody
+/// has a tunnel to answers no browse question — which is why the record has
+/// to name them all, and why the daemon opens one tunnel per record rather
+/// than picking one. Separate records rather than several `url=` fields in
+/// one is what keeps a daemon built before the fleet existed working: it
+/// reads the first record it can parse and reaches one node of the fleet,
+/// where a second `url=` in one record is a duplicate field it refuses.
+pub fn the_attach_record_names_every_node_of_the_fleet_test() {
+  let urls = ["https://sync.example", "https://ns1.sync.example"]
+  let assert Ok(rrsets) = build.build(fleet(urls))
+  let assert Ok(owner) = name.parse("_synchronicity-cp.sync.test.")
+  let assert Ok(rrset) =
+    list.find(rrsets, fn(r) { r.owner == owner && r.rtype == wire.type_txt })
+  // One RRset, one rdata each, in publication order — no precedence is
+  // implied and none is read.
+  let texts = list.filter_map(rrset.rdatas, txt_text)
+  assert texts
+    == [
+      "v=synccp1 url=https://sync.example",
+      "v=synccp1 url=https://ns1.sync.example",
+    ]
+  // Still one owner name in the chain, however many records hang off it.
+  assert list.length(
+      list.filter(build.owners_in_order(rrsets), fn(o) { o == owner }),
+    )
+    == 1
+
+  // External mode says the same thing to a provider: several values at one
+  // name, which is how the reconciler already carries a multi-member
+  // membership name.
+  let assert Ok(records) = render_external.render(fleet(urls))
+  let attach =
+    list.filter(records, fn(r) { r.name == "_synchronicity-cp.sync.test" })
+  assert list.map(attach, fn(r) { r.value })
+    == [
+      "v=synccp1 url=https://ns1.sync.example",
+      "v=synccp1 url=https://sync.example",
+    ]
+}
+
+/// The primary names the fleet; each node names only itself.
+pub fn the_fleets_endpoints_come_from_the_primarys_environment_test() {
+  browse_env()
+  envoy.set("CP_BROWSE", "on")
+  envoy.set("CP_PUBLIC_URL", "https://sync.example/")
+  envoy.set(
+    "CP_BROWSE_ENDPOINTS",
+    "https://ns1.sync.example, https://ns2.sync.example/;https://ns3.sync.example",
+  )
+  let assert Ok(cfg) = config.load()
+  // This node first, then the rest, each with its trailing slash trimmed to
+  // the origin the daemon signs its attach proof over.
+  assert cfg.browse_endpoints
+    == [
+      "https://sync.example",
+      "https://ns1.sync.example",
+      "https://ns2.sync.example",
+      "https://ns3.sync.example",
+    ]
+
+  // The same rules as CP_PUBLIC_URL, applied where the operator can still
+  // read the message: a value the daemon would reject never reaches a signed
+  // record that is cached for its TTL.
+  envoy.set("CP_BROWSE_ENDPOINTS", "ns1.sync.example")
+  let assert Error(why) = config.load()
+  assert string.contains(why, "origin")
+
+  // An RRset is a set: the same endpoint twice is one malformed RRset, not
+  // two answers.
+  envoy.set("CP_BROWSE_ENDPOINTS", "https://sync.example")
+  let assert Ok(cfg) = config.load()
+  assert cfg.browse_endpoints == ["https://sync.example"]
+
+  // Every entry costs every daemon in every network a standing tunnel, so
+  // the zone does not get to decide that number freely.
+  envoy.set(
+    "CP_BROWSE_ENDPOINTS",
+    list.repeat(Nil, config.max_browse_endpoints)
+      |> list.index_map(fn(_, i) {
+        "https://ns" <> int.to_string(i) <> ".sync.example"
+      })
+      |> string.join(","),
+  )
+  let assert Error(why) = config.load()
+  assert string.contains(why, "attach endpoints")
+
+  // And it is the primary's list: a replica publishes no zone, so one that
+  // set this would be describing a record it does not write.
+  browse_env()
+  envoy.set("CP_ROLE", "replica")
+  envoy.unset("CP_KEY_FILE")
+  envoy.unset("CP_SESSION_SECRET")
+  envoy.set("CP_DASHBOARD", "on")
+  envoy.set("CP_SESSION_SECRET", "0123456789abcdef0123456789abcdef")
+  envoy.set("CP_PRIMARY_URL", "https://sync.example")
+  envoy.set("CP_BROWSE", "on")
+  envoy.set("CP_PUBLIC_URL", "https://ns1.sync.example")
+  envoy.set("CP_BROWSE_ENDPOINTS", "https://ns2.sync.example")
+  let assert Error(why) = config.load()
+  assert string.contains(why, "primary-only")
+  browse_env()
 }
 
 /// External mode publishes the same one record through the provider, and

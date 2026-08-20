@@ -118,12 +118,15 @@ struct NodeInner {
     /// Rung when a space is added or removed, so the watcher re-registers
     /// without waiting for the next filesystem hint (§7.1).
     spaces_changed: Arc<tokio::sync::Notify>,
-    /// What the cloud-attach task has achieved per membership domain.
+    /// What the cloud-attach task has achieved per endpoint of per
+    /// membership domain.
     ///
     /// In memory and nowhere else: a stored table of live connections is a
     /// lie the moment the process dies, and `synch cloud status` is asking
     /// what this daemon is doing now.
-    cloud: std::sync::Mutex<std::collections::HashMap<String, crate::cloud::CloudDomainStatus>>,
+    cloud: std::sync::Mutex<
+        std::collections::HashMap<crate::cloud::CloudKey, crate::cloud::CloudDomainStatus>,
+    >,
 }
 
 /// What mirror passes believe about the file at one target, and the stat
@@ -1020,11 +1023,14 @@ impl Node {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// What the cloud-attach task has achieved per membership domain.
+    /// What the cloud-attach task has achieved per endpoint of per
+    /// membership domain.
     pub(crate) fn cloud_slot(
         &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, crate::cloud::CloudDomainStatus>>
-    {
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<crate::cloud::CloudKey, crate::cloud::CloudDomainStatus>,
+    > {
         self.inner
             .cloud
             .lock()

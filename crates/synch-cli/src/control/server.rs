@@ -2255,20 +2255,24 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             if status.is_empty() {
                 out.progress("(no attach attempts yet)").await?;
             }
-            for domain in status {
+            // One line per endpoint, not per domain: an apex names every
+            // node of its control plane and this daemon holds a tunnel to
+            // each, so one replica being down is its own line rather than a
+            // verdict on the whole domain.
+            for endpoint in status {
                 out.line(format!(
                     "{:<32} {:<10} {}{}",
-                    domain.domain,
-                    if domain.attached {
+                    endpoint.domain,
+                    if endpoint.attached {
                         "attached"
                     } else {
                         "detached"
                     },
-                    domain
+                    endpoint
                         .endpoint
                         .as_deref()
                         .unwrap_or("(no validated _synchronicity-cp record)"),
-                    domain
+                    endpoint
                         .last_error
                         .as_ref()
                         .map(|why| format!("  last error: {why}"))

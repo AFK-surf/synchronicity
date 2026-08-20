@@ -732,11 +732,11 @@ async fn discovery_refuses_an_unlogged_zone_under_require() {
         tuf_root: None,
     })
     .unwrap();
-    let (record, _ttl) = off
+    let (records, _ttl) = off
         .control_plane("cluster.example")
         .await
         .expect("with the gate off, a DNSSEC-valid answer is enough");
-    assert_eq!(record.url, "https://sync.example");
+    assert_eq!(urls(&records), ["https://sync.example"]);
     server.abort();
 }
 
@@ -750,11 +750,11 @@ async fn discovery_yields_the_endpoint_once_the_key_is_logged() {
     zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
     zone.cp_txt = vec!["v=synccp1 url=https://sync.example".to_string()];
     let (resolver, server) = static_resolver(zone, &log).await;
-    let (record, _ttl) = resolver
+    let (records, _ttl) = resolver
         .control_plane("cluster.example")
         .await
         .expect("a logged zone key discovers its endpoint");
-    assert_eq!(record.url, "https://sync.example");
+    assert_eq!(urls(&records), ["https://sync.example"]);
     server.abort();
 }
 
@@ -827,12 +827,75 @@ async fn discovery_accepts_an_attach_record_signed_by_the_logged_key() {
     zone.add_dnskey(spare);
 
     let (resolver, server) = static_resolver(zone, &log).await;
-    let (record, _ttl) = resolver
+    let (records, _ttl) = resolver
         .control_plane("cluster.example")
         .await
         .expect("an attach record signed by the logged key discovers its endpoint");
-    assert_eq!(record.url, "https://sync.example");
+    assert_eq!(urls(&records), ["https://sync.example"]);
     server.abort();
+}
+
+/// A control plane is a fleet, so the apex names every node of it and every
+/// name is returned — one tunnel each, because the registry of attached
+/// daemons is one node's memory and a node nobody attached to answers
+/// nothing.
+///
+/// Order is the zone's data and not the wire's: a caller that opens one
+/// tunnel per endpoint must not open a different *set* each refresh because
+/// an RRset arrived shuffled.
+#[tokio::test]
+async fn discovery_yields_every_endpoint_the_apex_names() {
+    let mut zone = SimZone::new("cluster.example", common::member_records());
+    let mut log = SimLog::new("rekor.sim");
+    zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
+    zone.cp_txt = vec![
+        "v=synccp1 url=https://ns2.sync.example".to_string(),
+        "v=synccp1 url=https://sync.example".to_string(),
+        "v=synccp1 url=https://ns1.sync.example".to_string(),
+    ];
+    let (resolver, server) = static_resolver(zone, &log).await;
+    let (records, _ttl) = resolver
+        .control_plane("cluster.example")
+        .await
+        .expect("every named node is an endpoint");
+    assert_eq!(
+        urls(&records),
+        [
+            "https://ns1.sync.example",
+            "https://ns2.sync.example",
+            "https://sync.example"
+        ]
+    );
+    server.abort();
+}
+
+/// One unreadable record must not sink the readable ones beside it — a
+/// control plane mid-upgrade can leave an old-format record in the RRset —
+/// and a set with nothing usable in it is still a refusal.
+#[tokio::test]
+async fn an_unreadable_record_does_not_sink_the_fleet() {
+    let mut zone = SimZone::new("cluster.example", common::member_records());
+    let mut log = SimLog::new("rekor.sim");
+    zone.rekor_txt = log.publish(&zone, "create").to_txt().expect("encodes");
+    zone.cp_txt = vec![
+        "v=synccp0 url=https://old.sync.example".to_string(),
+        "v=synccp1 url=https://sync.example".to_string(),
+        // Duplicated at the same owner name: an RRset is a set, and one
+        // tunnel is what a repeated endpoint deserves.
+        "v=synccp1 url=https://sync.example".to_string(),
+    ];
+    let (resolver, server) = static_resolver(zone, &log).await;
+    let (records, _ttl) = resolver
+        .control_plane("cluster.example")
+        .await
+        .expect("a readable record survives an unreadable neighbour");
+    assert_eq!(urls(&records), ["https://sync.example"]);
+    server.abort();
+}
+
+/// The urls of a discovered fleet, for assertions.
+fn urls(records: &[synch_net::dns::ControlPlaneRecord]) -> Vec<&str> {
+    records.iter().map(|r| r.url.as_str()).collect()
 }
 
 /// A pin file naming a root this build never signed is not state: the state

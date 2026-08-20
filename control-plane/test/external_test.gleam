@@ -43,7 +43,7 @@ fn input(txt_names: List(model.TxtName)) -> ZoneInput {
     txt_names,
     [#(1, "proofblob")],
     0,
-    "",
+    [],
   )
 }
 
