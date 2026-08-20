@@ -403,29 +403,68 @@ impl Node {
             .clone()
             .filter(|p| p.domain() == Some(domain.as_str()));
 
-        let resolved = match resolver {
+        // `answered` is what separates a delegate from a broken start. A zone
+        // that replies and does not name this key has *said* this node is not
+        // one of its members, which is exactly what a delegated node is (§3.5):
+        // it belongs to the cluster, takes its name from no zone in it, and
+        // still resolves that zone for everyone else's bindings. A zone that
+        // could not be asked has said nothing at all, and starting unnamed on
+        // the strength of a DNS failure would trade this node's published
+        // identity for a key origin on a transient error.
+        //
+        // Both used to arrive below as `None`, so the first refused to start.
+        let (resolved, answered) = match resolver {
             Some(resolver) => match resolver.resolve_members(&domain).await {
-                Ok((set, _ttl)) => set.self_origin(&node_id).filter(|found| {
-                    // A record with no `id=` binds `Key(nk)`. Taking that would
-                    // trade a rotatable identity for a fixed one on the
-                    // strength of a missing field (§3.1).
-                    let named = found.domain().is_some();
-                    if !named {
-                        tracing::warn!(
-                            domain,
-                            key = %node_id.to_z32(),
-                            "this node's key is published without an id=; not adopting it"
-                        );
-                    }
-                    named
-                }),
+                Ok((set, _ttl)) => {
+                    let found = set.self_origin(&node_id).filter(|found| {
+                        // A record with no `id=` binds `Key(nk)`. Taking that
+                        // would trade a rotatable identity for a fixed one on
+                        // the strength of a missing field (§3.1).
+                        let named = found.domain().is_some();
+                        if !named {
+                            tracing::warn!(
+                                domain,
+                                key = %node_id.to_z32(),
+                                "this node's key is published without an id=; not adopting it"
+                            );
+                        }
+                        named
+                    });
+                    (found, true)
+                }
                 Err(e) => {
                     tracing::warn!(domain, error = %e, "could not resolve the membership domain");
-                    None
+                    (None, false)
                 }
             },
-            None => None,
+            // No resolver is configured only where no domain is, and that case
+            // returned above — so reaching here is a resolver that could not be
+            // built, which is not an answer either.
+            None => (None, false),
         };
+
+        // Named by no zone, and the zone said so: a delegate. It keeps the key
+        // that identifies it, and `resolving_domain` goes on returning the
+        // configured domain so its cluster's members are still resolved.
+        if resolved.is_none() && answered && usable.is_none() {
+            tracing::info!(
+                domain,
+                key = %node_id.to_z32(),
+                "this zone does not name this node; running key-identified, and still \
+                 resolving that zone for its members"
+            );
+            let adopted = OriginId::Key(node_id);
+            if stored.as_ref() != Some(&adopted) {
+                let store = store.clone();
+                let adopted = adopted.clone();
+                let domain = domain.clone();
+                crate::blocking::offload(move || {
+                    Self::migrate_identity(&store, stored.as_ref(), &adopted, node_id, &domain)
+                })
+                .await?;
+            }
+            return Ok(adopted);
+        }
 
         match resolved {
             Some(adopted) => {
@@ -1530,6 +1569,81 @@ mod tests {
             store.all_delegations().unwrap().is_empty(),
             "the rows went with the name that issued them"
         );
+    }
+
+    /// A zone that answers and does not name this node is a *delegate*, not a
+    /// failure: it keeps its key identity and goes on resolving the zone.
+    ///
+    /// This is the case §3.5 is built on — a delegated node belongs to a
+    /// cluster and is named by no zone in it — and `settle_identity` used to
+    /// refuse to start for it, because "the zone says you are not in it" and "I
+    /// could not ask the zone" both arrived here as `None`. Only the second is
+    /// an error.
+    #[tokio::test]
+    async fn a_zone_that_does_not_name_this_node_leaves_it_key_identified() {
+        #[derive(Debug)]
+        struct Answers(Vec<String>);
+        impl synch_net::MemberResolver for Answers {
+            fn resolve_members<'a>(
+                &'a self,
+                domain: &'a str,
+            ) -> synch_net::dns::MemberSetFuture<'a> {
+                let records = self.0.clone();
+                Box::pin(async move {
+                    Ok((
+                        synch_net::MemberSet::from_records(domain, &records)
+                            .map_err(|e| synch_net::NetError::Dns(e.to_string()))?,
+                        std::time::Duration::from_secs(300),
+                    ))
+                })
+            }
+        }
+
+        let dir = node_dir();
+        let report = Node::init(dir.path(), None).unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        // The operator joins the cluster's zone. The zone names other members
+        // and says nothing about this key, which is what being a delegate is.
+        store
+            .set_membership_domain(Some("cluster.example"))
+            .unwrap();
+        let other = iroh_base::SecretKey::generate().public();
+        let zone = Answers(vec![format!("v=synch1 id=nas k={}", other.to_z32())]);
+
+        let settled = Node::settle_identity(&store, report.node_id, Some(&zone))
+            .await
+            .expect("a zone that does not name this node is not a failure to start");
+        assert_eq!(
+            settled,
+            OriginId::Key(report.node_id),
+            "a delegate keeps the key that identifies it"
+        );
+    }
+
+    /// The other half: a zone this node *cannot reach* is still fatal, because
+    /// "not in the zone" and "could not ask" must not look alike (§3.1).
+    #[tokio::test]
+    async fn a_zone_that_cannot_be_reached_is_still_a_refusal_to_start() {
+        #[derive(Debug)]
+        struct Unreachable;
+        impl synch_net::MemberResolver for Unreachable {
+            fn resolve_members<'a>(
+                &'a self,
+                _domain: &'a str,
+            ) -> synch_net::dns::MemberSetFuture<'a> {
+                Box::pin(async move { Err(synch_net::NetError::Dns("nxdomain".into())) })
+            }
+        }
+
+        let dir = node_dir();
+        let report = Node::init(dir.path(), None).unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.set_membership_domain(Some("typo.example")).unwrap();
+
+        let err = Node::settle_identity(&store, report.node_id, Some(&Unreachable))
+            .await
+            .expect_err("a zone that cannot be asked is not a delegation");
+        assert!(matches!(err, EngineError::Unidentified { .. }), "{err:?}");
     }
 
     /// `settle_identity` answers from the membership domain alone: a cleared
