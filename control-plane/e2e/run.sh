@@ -46,6 +46,11 @@ export CP_DNS_LISTEN=127.0.0.1:$DNS_PORT
 export CP_NS_HOSTS="ns1=127.0.0.1"
 export CP_PUBLIC_URL="http://127.0.0.1:$HTTP_PORT"
 export CP_SESSION_SECRET="e2e-only-session-secret-not-for-production"
+# Browsing on, and the apex naming the whole fleet: the replica below is a
+# node of this control plane, so a daemon must hold a tunnel to it too. The
+# record's shape is cross-validated by the real client in e2e/tests.
+export CP_BROWSE=on
+export CP_BROWSE_ENDPOINTS="http://127.0.0.1:8054"
 
 gleam run -- keygen "$CP_BASE_DOMAIN" "$CP_KEY_FILE" | tee "$WORKDIR/keygen.out"
 # Zone-file syntax for the synchronicity client's --dnssec-anchor...
@@ -107,8 +112,18 @@ import sqlite3, sys
 sqlite3.connect(sys.argv[1]).execute("PRAGMA wal_checkpoint(FULL)")
 EOF
 cp "$CP_DB_PATH" "$WORKDIR/replica.db"
-env -u CP_KEY_FILE -u CP_SESSION_SECRET \
+# ...and with the dashboard on, so the read half of the API is exercised
+# against a genuinely read-only copy rather than only against the primary's
+# writable one. CP_SESSION_SECRET is the primary's, which is the contract.
+# -u CP_BROWSE_ENDPOINTS: that list is the primary's, and a replica that
+# sets it is describing a record it does not write — config refuses it,
+# exactly as it refuses CP_KEY_FILE here.
+env -u CP_KEY_FILE -u CP_BROWSE_ENDPOINTS \
   CP_ROLE=replica CP_DB_PATH="$WORKDIR/replica.db" \
+  CP_DASHBOARD=on \
+  CP_PRIMARY_URL="http://127.0.0.1:$HTTP_PORT" \
+  CP_BROWSE=on \
+  CP_PUBLIC_URL=http://127.0.0.1:8054 \
   CP_HTTP_LISTEN=127.0.0.1:8054 \
   CP_DNS_LISTEN=127.0.0.1:5360 \
   setsid gleam run -- serve > "$WORKDIR/replica.log" 2>&1 &
@@ -131,6 +146,26 @@ out=$(delv @127.0.0.1 -p 5360 -a "$WORKDIR/anchor.bindkeys" \
 grep -q "fully validated" <<<"$out" || { echo "FAIL: replica after file swap"; echo "$out"; cat "$WORKDIR/replica.log"; exit 1; }
 echo "ok: replica serves the swapped database file on the next query, fully validated"
 
+# The read-only product surface: the reads answer, and the writes name the
+# node that takes them rather than 404ing or failing at the sqlite layer.
+methods=$(curl -fsS "http://127.0.0.1:8054/api/auth/methods")
+grep -q '"primary":"http://127.0.0.1:'"$HTTP_PORT"'"' <<<"$methods" || {
+  echo "FAIL: the replica's login screen must name the primary"; echo "$methods"; exit 1; }
+grep -q '"magic_link":false' <<<"$methods" || {
+  echo "FAIL: a node that mints no session must offer no method"; echo "$methods"; exit 1; }
+# No -f: 409 is the answer under test, not a transport failure, and --fail
+# would throw away the body that names the primary.
+refused=$(curl -sS -o "$WORKDIR/refused.json" -w '%{http_code}' \
+  -X POST -H 'content-type: application/json' -d '{"slug":"x","name":"X"}' \
+  "http://127.0.0.1:8054/api/orgs" || true)
+[[ "$refused" == "409" ]] || { echo "FAIL: a write on a replica must be 409, got $refused"; exit 1; }
+grep -q 'read-only-replica' "$WORKDIR/refused.json" || {
+  echo "FAIL: the refusal must name itself"; cat "$WORKDIR/refused.json"; exit 1; }
+# The dashboard itself, off the same read-only copy.
+spa=$(curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:8054/o/acme" || true)
+[[ "$spa" == "200" ]] || { echo "FAIL: the replica must serve the dashboard, got $spa"; exit 1; }
+echo "ok: replica serves the dashboard and the read API, and names the primary for writes"
+
 # The actual synchronicity client resolver, over DoH.
 export CP_DOH_URL="http://127.0.0.1:$HTTP_PORT/dns-query"
 export CP_ANCHOR_FILE="$WORKDIR/anchor.key"
@@ -139,6 +174,7 @@ export CP_NAS_ACTIVE=$(get_seed nas_active)
 export CP_NAS_REVOKED=$(get_seed nas_revoked)
 export CP_LAPTOP_ACTIVE=$(get_seed laptop_active)
 export CP_LAPTOP_RETIRING=$(get_seed laptop_retiring)
+export CP_EXPECTED_ENDPOINTS="$CP_PUBLIC_URL,$CP_BROWSE_ENDPOINTS"
 cargo test --manifest-path e2e/Cargo.toml -- --nocapture
 
 echo "E2E-OK"

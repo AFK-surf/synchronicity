@@ -1541,6 +1541,16 @@ pub fn a_read_only_node_names_where_the_writes_go_test() {
   // refusal names a place to go, and there is nowhere to send a typo.
   let nonsense = call(replica, authed(replica, http.Get, "/api/nope"))
   assert nonsense.status == 404
+
+  // The sign-in flows under GET are browser navigations, not fetches, so a
+  // stale bookmark or a second tab is redirected to the node that can
+  // complete it rather than dead-ended — query and all, since `?link=1` is
+  // what makes a start URL a linking flow rather than a sign-in.
+  let start =
+    call(replica, simulate.request(http.Get, "/auth/start/google?link=1"))
+  assert start.status == 303
+  assert list.key_find(start.headers, "location")
+    == Ok("https://sync.test/auth/start/google?link=1")
 }
 
 /// The login screen asks what it may offer before a session exists. On a

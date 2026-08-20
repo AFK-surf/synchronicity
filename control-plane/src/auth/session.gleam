@@ -43,6 +43,13 @@ pub fn create(
 }
 
 /// Resolves a bearer token; slides expiry at most once an hour.
+///
+/// The slide is advisory and its failure is ignored, which is what lets a
+/// node holding a read-only copy of the database resolve sessions at all: a
+/// replica serving the dashboard reads the row the primary wrote and cannot
+/// write the `last_seen_at` back. The consequence is small and worth naming —
+/// a session used only against replicas expires 30 days after its last
+/// contact with the primary rather than after its last use.
 pub fn get(conn: Connection, token: String, now: Int) -> Result(Session, Nil) {
   let sql =
     "SELECT user_id, csrf_token, last_seen_at FROM sessions

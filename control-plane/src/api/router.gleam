@@ -29,6 +29,7 @@ import gleam/http.{Delete, Get, Patch, Post, Put}
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import provider/state as provider_state
 import store/pool
 import wisp.{type Request, type Response}
@@ -143,20 +144,33 @@ pub fn handle(req: Request, ctx: Context) -> Response {
 
 /// What a read-only node answers for a route it does not mount.
 ///
-/// A write route the primary has is a 409 naming the primary — the request is
-/// well-formed and this node simply is not where it is taken, and the SPA
-/// turns the `primary` field into a link rather than a stack trace. Anything
-/// else is the 404 it would be anywhere: a path that exists on no node.
+/// Three answers, and the difference between them is what the caller can do
+/// about it:
 ///
-/// The test is the method and not a second copy of the primary's route table.
-/// A table listing every write here would be a table to forget to update; the
-/// property that actually holds is that every route a read-only node mounts
-/// is a GET, so a non-GET under `/api` or `/auth` is by construction a route
-/// it does not have.
+/// * **`/auth/...` under `GET` is a redirect.** These are the sign-in flows,
+///   and every one of them is a browser navigation rather than a `fetch` — so
+///   the browser follows the redirect to the primary, signs in there, and
+///   gets a cookie set on the host that can set one. A 404 for a stale
+///   bookmark or a second tab would be a dead end for no reason.
+/// * **Any other non-GET is a 409 naming the primary.** The request is
+///   well-formed and this node simply is not where it is taken. The SPA turns
+///   the `primary` field into a link rather than a stack trace. Not a
+///   redirect: these are `fetch` calls with `credentials: 'same-origin'`, so
+///   a cross-origin redirect arrives without the cookie and is refused by
+///   CORS besides — the SPA has to decide, and this is what it decides on.
+/// * **Anything else is the 404 it would be anywhere**: a path that exists on
+///   no node, and there is nowhere to send a typo.
+///
+/// The `GET`/non-`GET` test is deliberately not a second copy of the
+/// primary's route table — a table listing every write here would be a table
+/// to forget to update. The property that actually holds is that every route
+/// a read-only node mounts is a `GET`, so a non-GET under `/api` or `/auth`
+/// is by construction a route it does not have.
 fn elsewhere(req: Request, primary_url: String) -> Response {
-  case req.method {
-    Get -> wisp.not_found()
-    _ ->
+  case req.method, wisp.path_segments(req) {
+    Get, ["auth", ..] -> wisp.redirect(primary_url <> auth_path(req))
+    Get, _ -> wisp.not_found()
+    _, _ ->
       json.object([
         #(
           "error",
@@ -176,6 +190,24 @@ fn elsewhere(req: Request, primary_url: String) -> Response {
       ])
       |> json.to_string
       |> wisp.json_response(409)
+  }
+}
+
+/// The path and query to hand the primary, rebuilt from the parsed segments
+/// rather than echoed from the request line.
+///
+/// The value lands in a `Location` header prefixed with an operator-supplied
+/// origin, so what it must not do is change which origin that is.
+/// `path_segments` has already decoded, split and dropped the empty segments,
+/// which is what makes the rebuilt path start with exactly one `/` — an
+/// echoed `//evil.example` would still be a path under the primary's
+/// authority rather than a new one, but a normalized path is the version that
+/// does not need the argument.
+fn auth_path(req: Request) -> String {
+  let path = "/" <> string.join(wisp.path_segments(req), "/")
+  case req.query {
+    Some(query) -> path <> "?" <> query
+    None -> path
   }
 }
 
