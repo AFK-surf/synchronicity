@@ -196,11 +196,10 @@ ok "the built SPA is served from priv/web, bundle included"
 # --- the shipped CLI guide ---------------------------------------------
 #
 # priv/skill/SKILL.md is a tracked source file the shipment stage COPYs in,
-# and `.dockerignore` excludes `*.md` wholesale with this one path exempted
-# — exactly the shape that dropped the trusted root once. Served over HTTP
-# rather than found on disk, because the route is the thing being claimed:
-# a file that shipped under a path `priv_dir/1` does not resolve is the same
-# 404 to every caller.
+# the same shape as the trusted root above and open to the same packaging
+# slip. Served over HTTP rather than found on disk, because the route is the
+# thing being claimed: a file that shipped under a path `priv_dir/1` does not
+# resolve is the same 404 to every caller.
 curl -fsS "http://127.0.0.1:$HTTP_PORT/SKILL.md" > "$WORKDIR/SKILL.md" \
   || logs_and_fail "GET /SKILL.md did not respond"
 grep -q '^# synch' "$WORKDIR/SKILL.md" \

@@ -6,10 +6,6 @@
 # file, the TUF anchor the shipment stage COPYs in. Excluding all of
 # priv/ once shipped an image with no anchor, which is a boot-time
 # "priv/tuf is missing from this build" and no Rekor discovery.
-#
-# `*.md` below is for the prose at the top of this directory, and it
-# would take priv/skill/SKILL.md with it — the one .md the image serves —
-# so that path is exempted after it.
 build/
 priv/csqlite
 priv/web/
@@ -22,5 +18,3 @@ Dockerfile
 .dockerignore
 .git/
 erl_crash.dump
-*.md
-!priv/skill/SKILL.md

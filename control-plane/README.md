@@ -90,9 +90,9 @@ zone, and an operator pointed at any node of a deployment — primary,
 replica, external — gets the same document from the same URL. That is
 the only property that makes the URL worth handing out.
 
-The file rides in the shipment, so `.dockerignore` exempts it from the
-blanket `*.md` and `ops/image-smoke.sh` fetches it from the built image;
-a build that dropped it would boot, serve, and pass every other check.
+The file rides in the shipment, and `ops/image-smoke.sh` fetches it from
+the built image rather than trusting the `COPY`; a build that dropped it
+would boot, serve, and pass every other check.
 
 ## Stack
 
