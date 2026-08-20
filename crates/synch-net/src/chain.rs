@@ -956,7 +956,6 @@ fn name(text: &str) -> Result<Name, ChainError> {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 

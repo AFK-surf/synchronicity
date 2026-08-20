@@ -1337,7 +1337,8 @@ impl Checkpoint {
             .is_some_and(|pinned| pinned != self.origin)
         {
             return Err(ProofError::Checkpoint(format!(
-                "the checkpoint says it is from {}, but the pinned key that                  signs it is the key for another log",
+                "the checkpoint says it is from {}, but the pinned key that \
+                 signs it is the key for another log",
                 self.origin
             )));
         }

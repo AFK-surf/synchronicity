@@ -53,6 +53,17 @@
 //! parent — until a tile the checkpoint-root recomputation itself consumed.
 //! One fold per tile, memoized, so 256 entries share it.
 //!
+//! The **frontier** tile is the exception, and it is the one a monitor reads
+//! on every run: a partial tile holds complete subtrees of differing sizes, so
+//! there is nothing to fold and no parent node to fold into. What pins it is
+//! the root recomputation, which consumes exactly those hashes — but only if
+//! the bytes it consumed are the bytes a leaf is then compared against.
+//! Recomputing the root and reading the tile again is two fetches, and
+//! [`TileSource::fetch`] promises nothing about answering them the same way,
+//! so the recomputation would be a statement about a copy that no longer
+//! exists. `Tree::root_over` recomputes over the bytes in hand instead, and
+//! those same bytes are what the leaf is checked against.
+//!
 //! # Fetching posture
 //!
 //! A log of 10⁸ entries is ~400 000 bundles; fetched one round-trip at a
@@ -606,11 +617,19 @@ impl<'a, S: TileSource> Tree<'a, S> {
     async fn stored_hash(&self, level: u32, index: u64) -> Result<[u8; 32], MonitorError> {
         let tile_level = level / 8;
         let within = level % 8;
-        // `index << within` overflows for a level/index pair a hostile log
-        // can name; refuse rather than wrap into a different node.
-        let shifted = index.checked_shl(within).ok_or_else(|| {
-            MonitorError::Tile(format!("node ({level},{index}) is not addressable"))
-        })?;
+        // `index << within` drops bits off the top for a level/index pair a
+        // hostile log can name; refuse rather than wrap into a different node.
+        //
+        // Checked on the bits, not with `checked_shl`, which only refuses a
+        // shift *distance* of 64 or more — and `within` is a remainder mod 8,
+        // so that test can never fire and the wrap it was guarding against
+        // would have gone through silently.
+        if index.leading_zeros() < within {
+            return Err(MonitorError::Tile(format!(
+                "node ({level},{index}) is not addressable"
+            )));
+        }
+        let shifted = index << within;
         let tile_index = shifted >> 8;
         let offset = index - ((tile_index << 8) >> within);
         let data = self.hash_tile(tile_level, tile_index).await?;
@@ -671,6 +690,63 @@ impl<'a, S: TileSource> Tree<'a, S> {
             0 => Ok(sha256(&[])),
             size => self.subtree_hash(0, size).await,
         }
+    }
+
+    /// The same recomputation, but with level-0 tile `tile` read out of `data`
+    /// instead of fetched.
+    ///
+    /// This is what pins a **frontier** tile to the checkpoint. A partial tile
+    /// cannot be folded into a parent — its hashes are complete subtrees of
+    /// differing sizes — so the only thing that can vouch for it is the root
+    /// recomputation that consumes it. Recomputing the root and then reading
+    /// the tile again is not that: `TileSource::fetch` promises nothing about
+    /// determinism, so the second read is free to differ from the one the root
+    /// was checked against, and a leaf compared against it is compared against
+    /// nothing. Passing the held bytes in is what makes the pinning a
+    /// statement about *these* bytes.
+    ///
+    /// Every decomposition part that lies inside the tile is folded out of
+    /// `data`; the rest are fetched as usual. A partial tile admits no part of
+    /// level 8 or above, since one would span 256 leaves the tile does not
+    /// hold.
+    async fn root_over(&self, tile: u64, data: &[u8]) -> Result<[u8; 32], MonitorError> {
+        let base = tile * 256;
+        let mut hashes = Vec::new();
+        let mut at = 0u64;
+        while at < self.size {
+            let mut span = max_pow2_le(self.size - at);
+            while at & (span - 1) != 0 {
+                span /= 2;
+            }
+            let (level, index) = (span.trailing_zeros(), at / span);
+            let hash = match level < 8 && at >= base && at - base < 256 {
+                true => {
+                    let start = (at - base) as usize * 32;
+                    let end = start + (span as usize * 32);
+                    let run = data.get(start..end).ok_or_else(|| {
+                        MonitorError::Tile(format!(
+                            "the frontier hash tile 0/{tile} is {} bytes, too short to hold \
+                             the subtree at ({level},{index})",
+                            data.len()
+                        ))
+                    })?;
+                    fold(run).ok_or_else(|| {
+                        MonitorError::Tile(format!(
+                            "the frontier hash tile 0/{tile} is not a run of complete-subtree \
+                             hashes"
+                        ))
+                    })?
+                }
+                false => self.stored_hash(level, index).await?,
+            };
+            hashes.push(hash);
+            at += span;
+        }
+        let mut hash = *hashes.last().expect("a tree with a frontier is non-empty");
+        for part in hashes.iter().rev().skip(1) {
+            hash = node_hash(part, &hash);
+        }
+        Ok(hash)
     }
 
     /// The RFC 6962 audit path from leaf `index` to this tree's root.
@@ -900,9 +976,6 @@ impl<'a, S: TileSource> Tree<'a, S> {
                 256 => {
                     let data = self.hash_tile(level, at).await?;
                     let parent = self.stored_hash(8 * (level + 1), at).await?;
-                    if level == 0 {
-                        self.remember_leaf_tile(root, at, &data);
-                    }
                     let folded = fold(&data).ok_or_else(|| {
                         MonitorError::Tile(format!(
                             "hash tile {level}/{at} is {} bytes, which is not a run of \
@@ -917,6 +990,28 @@ impl<'a, S: TileSource> Tree<'a, S> {
                              belong to the tree it signed"
                         )));
                     }
+                    // Held only once it has folded to the node its parent
+                    // commits to. Remembering first and checking after leaves
+                    // unauthenticated bytes in the memo, and the memo is
+                    // first-write-wins — so a tile that failed here would be
+                    // the one a later leaf was compared against.
+                    if level == 0 {
+                        self.remember_leaf_tile(root, at, &data);
+                    }
+                }
+                // The frontier, which has no parent to fold into. At level 0
+                // the bytes are read here and pinned *as read*, then held: a
+                // root recomputation that fetched the tile separately would
+                // say nothing about the copy a leaf is later compared against.
+                _ if level == 0 => {
+                    let data = self.hash_tile(level, at).await?;
+                    if self.root_over(at, &data).await? != root {
+                        return Err(MonitorError::Tile(format!(
+                            "the frontier hash tile {level}/{at} does not recompute the \
+                             checkpoint's root"
+                        )));
+                    }
+                    self.remember_leaf_tile(root, at, &data);
                 }
                 _ => {
                     if self.root().await? != root {
@@ -982,23 +1077,34 @@ impl<'a, S: TileSource> Tree<'a, S> {
                 let data = self.hash_tile(0, tile).await?;
                 // A full tile is bound by folding it into the node its parent
                 // holds. A *partial* one is not foldable at all — its nodes are
-                // complete subtrees of differing sizes — and needs no parent:
-                // it is the frontier, pinned by the root recomputation that
-                // `authenticate_tile` has already run against this same `root`.
-                if self.width(0, tile) == 256 {
-                    let folded = fold(&data).ok_or_else(|| {
-                        MonitorError::Tile(format!(
-                            "hash tile 0/{tile} is {} bytes, which is not a run of \
-                             complete-subtree hashes",
-                            data.len()
-                        ))
-                    })?;
-                    if folded != self.stored_hash(8, tile).await? {
-                        return Err(MonitorError::Tile(format!(
-                            "hash tile 0/{tile} does not fold to the node its parent tile \
-                             stores for it: the log is serving tiles that do not belong to \
-                             the tree it signed"
-                        )));
+                // complete subtrees of differing sizes — so it is pinned by
+                // recomputing the root *over these bytes*. The recomputation
+                // `authenticate_tile` already ran is not a substitute: it read
+                // the tile through its own fetch, and this is a different one.
+                match self.width(0, tile) {
+                    256 => {
+                        let folded = fold(&data).ok_or_else(|| {
+                            MonitorError::Tile(format!(
+                                "hash tile 0/{tile} is {} bytes, which is not a run of \
+                                 complete-subtree hashes",
+                                data.len()
+                            ))
+                        })?;
+                        if folded != self.stored_hash(8, tile).await? {
+                            return Err(MonitorError::Tile(format!(
+                                "hash tile 0/{tile} does not fold to the node its parent tile \
+                                 stores for it: the log is serving tiles that do not belong to \
+                                 the tree it signed"
+                            )));
+                        }
+                    }
+                    _ => {
+                        if self.root_over(tile, &data).await? != root {
+                            return Err(MonitorError::Tile(format!(
+                                "the frontier hash tile 0/{tile} does not recompute the \
+                                 checkpoint's root"
+                            )));
+                        }
                     }
                 }
                 self.remember_leaf_tile(root, tile, &data);
@@ -1287,6 +1393,111 @@ mod tests {
             .expect_err("a body that is not the committed leaf must be refused");
         assert!(
             error.to_string().contains("does not hash to the leaf"),
+            "refused for the wrong reason: {error}"
+        );
+    }
+
+    /// A log whose *first* answer for a tile is forged and whose later ones
+    /// are honest — the same non-determinism as [`ShiftyTile`], the other way
+    /// round.
+    struct ForgesFirst {
+        honest: MemoryLog,
+        at: u64,
+        instead: [u8; 32],
+        served: Mutex<usize>,
+    }
+
+    impl TileSource for ForgesFirst {
+        async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, MonitorError> {
+            let Some(mut data) = self.honest.fetch(path).await? else {
+                return Ok(None);
+            };
+            if let Some((level, index, _)) = parse_tile_path(path) {
+                if level == "0" && index == self.at / 256 {
+                    let mut count = self.served.lock().unwrap_or_else(|e| e.into_inner());
+                    *count += 1;
+                    if *count == 1 {
+                        let start = (self.at - index * 256) as usize * 32;
+                        data[start..start + 32].copy_from_slice(&self.instead);
+                    }
+                }
+            }
+            Ok(Some(data))
+        }
+
+        async fn checkpoint_size(&self) -> Result<Option<u64>, MonitorError> {
+            self.honest.checkpoint_size().await
+        }
+    }
+
+    /// Bytes that failed to authenticate are not held for a later leaf to be
+    /// compared against.
+    ///
+    /// The memo is first-write-wins, so a tile remembered before its fold was
+    /// checked is the tile every later read of it gets — including after a
+    /// second, honest fetch has satisfied the fold and marked it verified.
+    #[tokio::test]
+    async fn a_tile_that_failed_to_authenticate_is_not_left_in_the_memo() {
+        let honest = MemoryLog::new(600);
+        let root = Tree::new(&honest, 600, 1).root().await.unwrap();
+        let log = ForgesFirst {
+            honest: MemoryLog::new(600),
+            at: 300,
+            instead: leaf_hash(b"forged 300"),
+            served: Mutex::new(0),
+        };
+        let tree = Tree::new(&log, 600, 1);
+
+        // The forged first answer does not fold to its parent, so nothing can
+        // be bound against it.
+        assert!(tree.verify_leaf(300, b"forged 300", root).await.is_err());
+
+        // The log now answers honestly, and the tile authenticates. The body
+        // it tried to swap in is still not the committed leaf: answering this
+        // call out of the bytes the *failed* read left behind is the bug.
+        let error = tree
+            .verify_leaf(300, b"forged 300", root)
+            .await
+            .expect_err("a body that is not the committed leaf must be refused");
+        assert!(
+            error.to_string().contains("does not hash to the leaf"),
+            "refused for the wrong reason: {error}"
+        );
+        tree.verify_leaf(300, b"entry 300", root)
+            .await
+            .expect("the honest body verifies once the log answers honestly");
+    }
+
+    /// The same swap, against an entry in the **frontier** tile.
+    ///
+    /// The partial tile is the one a monitor reads on every run — it holds the
+    /// newest entries, which is all a resumed run has to classify — and it
+    /// takes a different path through `verify_leaf`: it cannot be folded into
+    /// a parent, so it is pinned by the root recomputation instead. That
+    /// pinning only means anything if the bytes it is compared against are the
+    /// bytes the recomputation consumed.
+    ///
+    /// A size of 576 puts the frontier at a 64-wide tile, so the root
+    /// decomposition reads it exactly once and the swap lands on
+    /// `verify_leaf`'s own read rather than on the recomputation.
+    #[tokio::test]
+    async fn a_frontier_tile_that_changes_between_fetches_cannot_move_the_leaf() {
+        let honest = MemoryLog::new(576);
+        let root = Tree::new(&honest, 576, 4).root().await.unwrap();
+        let shifty = ShiftyTile {
+            honest: MemoryLog::new(576),
+            at: 550,
+            instead: leaf_hash(b"forged 550"),
+            served: Mutex::new(0),
+        };
+        let tree = Tree::new(&shifty, 576, 4);
+        let error = tree
+            .verify_leaf(550, b"forged 550", root)
+            .await
+            .expect_err("a body that is not the committed leaf must be refused");
+        assert!(
+            error.to_string().contains("does not hash to the leaf")
+                || error.to_string().contains("frontier"),
             "refused for the wrong reason: {error}"
         );
     }
