@@ -820,54 +820,6 @@ impl Node {
         Ok(self.store().has_delegations()? && self.store().local_scope()?.is_some())
     }
 
-    /// Trusts a device key under a *name* the operator supplies (§3.2).
-    ///
-    /// [`Node::trust_add`] is the rule and this is the exception. The key is
-    /// normally the identity, and a name belongs to the zone that issues it —
-    /// but head validity is a check on the `(origin, key)` pair, and a member
-    /// that publishes under `nas@example` is only ever reachable by a binding
-    /// that names `nas@example`. A node with no membership domain has no zone
-    /// to learn that from, so without this it can dial such a member, be let
-    /// in, and reject every head it is sent. That is the state a delegated node
-    /// is in by construction.
-    ///
-    /// The hazard the zone route does not have: this binding never expires, so
-    /// it shadows the record it names and dropping that member from the zone
-    /// stops being how the member is dropped. That is why it is reachable only
-    /// behind an explicit `--as`, why the command says so, and why `doctor`
-    /// reports one that shadows a domain this node actually resolves.
-    ///
-    /// Re-pointing a name at a new key is the same call: `put_binding` upserts
-    /// on the row's identity, and a *different* key is a second row — which is
-    /// exactly the rotation window §3.4 asks for, closed with `trust rm --key`.
-    pub fn trust_add_named(
-        &self,
-        origin: &OriginId,
-        node_id: NodeId,
-        note: Option<&str>,
-    ) -> Result<()> {
-        if origin.as_key().is_some() {
-            return Err(EngineError::invalid(
-                "that origin is a key, which `synch trust add <key>` already binds; \
-                 --as is for a member that publishes under a name",
-            ));
-        }
-        self.store().put_binding(&Binding {
-            origin: origin.clone(),
-            node_id,
-            source: BindingSource::Static,
-            // No domain, like every other static binding: the column records
-            // which zone vouched, and no zone vouched for this one (§10, v14).
-            domain: None,
-            issuer: None,
-            spaces: Vec::new(),
-            note: note.map(str::to_string),
-            added_at: now_ns(),
-            expires_at: None,
-        })?;
-        Ok(())
-    }
-
     /// Records a peer's address so it can be dialed later.
     pub fn remember_peer(&self, addr: &EndpointAddr) -> Result<()> {
         let encoded = encode_addr(addr);

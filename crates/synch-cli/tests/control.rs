@@ -315,7 +315,6 @@ fn trust_add(key: &str, note: Option<&str>, addr: Option<&str>) -> Command {
         key: key.into(),
         note: note.map(String::from),
         addr: addr.map(String::from),
-        as_origin: None,
     })
 }
 

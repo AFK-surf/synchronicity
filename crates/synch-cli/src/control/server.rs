@@ -1355,26 +1355,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             out.line("stopping").await?;
         }
 
-        Command::TrustAdd(pb::TrustAdd {
-            key,
-            note,
-            addr,
-            as_origin,
-        }) => {
+        Command::TrustAdd(pb::TrustAdd { key, note, addr }) => {
             let key = parse_key(&key)?;
-            let named = as_origin.as_deref().map(parse_origin).transpose()?;
-            let origin = match named {
-                None => read(node, move |n| Ok(n.trust_add(key, note.as_deref())?)).await?,
-                Some(origin) => {
-                    let owned = origin.clone();
-                    read(node, move |n| {
-                        n.trust_add_named(&owned, key, note.as_deref())?;
-                        Ok(())
-                    })
-                    .await?;
-                    origin
-                }
-            };
+            let origin = read(node, move |n| Ok(n.trust_add(key, note.as_deref())?)).await?;
             if let Some(addr) = addr {
                 let socket = addr
                     .parse()
@@ -1386,16 +1369,6 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             out.line(format!("trusted {} as {origin}", key.to_z32()))
                 .await?;
-            // Said at the moment it is chosen, because the cost of a hand-made
-            // name is not visible later: it never expires, so dropping this
-            // member from the zone stops being how it is dropped.
-            if as_origin.is_some() {
-                out.line(
-                    "this binding never expires and shadows the zone record it names; \
-                     remove it with `synch trust rm` when the zone should govern again",
-                )
-                .await?;
-            }
         }
 
         Command::TrustRm(pb::TrustRm { origin, key }) => {

@@ -248,7 +248,6 @@ message TrustAdd {
   // member that publishes under a name this node has no zone to learn from
   // (DESIGN.md 3.2). Not 2 or 3: those held an earlier, implicit version of
   // this and are reserved so an old client cannot be misread.
-  optional string as_origin = 6;
 }
 
 message TrustRm {

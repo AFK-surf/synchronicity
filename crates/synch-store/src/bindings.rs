@@ -845,6 +845,18 @@ impl Store {
         })
     }
 
+    /// Drops every binding one zone vouched for, now rather than at expiry.
+    ///
+    /// For leaving a zone: those bindings are trusted *because* that zone said
+    /// so, and waiting out `dns_trust_grace` would leave its members dialable
+    /// for hours after the operator said otherwise.
+    pub fn drop_dns_bindings(&self, domain: &str) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM bindings WHERE source = 'dns' AND domain = ?1",
+            params![domain],
+        )?)
+    }
+
     /// Deletes DNS bindings whose expiry has passed, returning how many went.
     ///
     /// Nothing is deleted at an instant no expiry can be compared against (see

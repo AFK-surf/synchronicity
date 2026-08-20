@@ -136,8 +136,20 @@ membership domain. With none it is `Key(K_active)`, self-certifying and not rota
 with one it is `Named { domain, id }`, named and rotatable by that zone.
 
 A name comes from a zone and only from a zone; there is no way to name a node by hand.
-The domain is the `@domain` half of that name, so a node resolves the zone that names
-it, and every dns binding it holds is for an origin in its own zone.
+The domain is the `@domain` half of that name, and it is the zone whose members this
+node necessarily resolves.
+
+**Belonging to a zone and being named by one are different questions.** A node resolves
+the zone it *belongs to*; whether that zone names it decides only what it is called. A
+full member is named and so the two coincide, which is why they were once one setting.
+A delegated node (§3.5) belongs to a cluster and is named by no zone in it — so
+resolving only the zone in its own name left it resolving nothing, and reaching a member
+that publishes under a name meant pinning a static binding by hand: one that never
+expires, and so shadows the record it names until an operator removes it, which stops
+dropping a member from the zone being how that member is dropped. `synch domain set` is
+the same command for both, and a delegate gets `Dns` bindings that lapse on TTL plus
+grace like everyone else's. There is no third case: a node belongs to one cluster, so
+this is one zone or none, never a set.
 
 **Discovery.** A node with a domain resolves it once at `synch daemon run`, before the
 endpoint binds and before any loop starts, and freezes the answer: **identity is
@@ -1434,10 +1446,13 @@ synch key rotate|activate|retire|ls          operator-driven device-key rotation
 
 synch trust add [--addr <hint>]|rm|ls        static membership; key-identified peers
                                              only — names come from zones (§3.2)
-synch domain set|clear|ls|refresh            this node's own DNSSEC membership domain
-                                             (§3.2); refresh re-resolves it now; set
-                                             and clear change where the node's name
-                                             comes from, at the next start (§3.1)
+synch domain set|clear|ls|refresh            the DNSSEC zone this node belongs to
+                                             (§3.2) — its members are resolved from
+                                             here whether or not the zone names this
+                                             node, which is how a delegate reaches its
+                                             cluster; refresh re-resolves now, set and
+                                             clear change the name at the next start
+                                             (§3.1) and clear drops the zone's bindings
 synch peers                                  live peers, addresses, last sync, lag
 
 synch space add <id> <path>                  index a local directory as a space
@@ -1740,9 +1755,10 @@ Rules:
 - Anything a plain SQL statement can't express (a backfill, a table rewrite) is a
   Rust migration step in the same numbered chain, under the same transaction rule.
 
-`config` also holds the membership domain that decides where this node's name comes
-from (§3.1) — it has to be readable before there is a name to read it out of — the
-name itself in `self_origin_id`, and, after a recovery (§3.4), the `publish_floor`.
+`config` also holds the membership domain — the zone this node belongs to, which
+decides both where its name comes from (§3.1) and whose member records it resolves
+(§3.2) — it has to be readable before there is a name to read it out of — the name
+itself in `self_origin_id`, and, after a recovery (§3.4), the `publish_floor`.
 
 ```sql
 -- node & config

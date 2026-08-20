@@ -360,15 +360,26 @@ impl Node {
         Ok(self.store().membership_domain()?)
     }
 
-    /// The zone this process resolves: the one its own name came from.
+    /// The zone this process resolves.
     ///
-    /// Not the configured slot. A node resolves the zone that names it and no
-    /// other (§3.1), and its name is frozen for the life of the process — so a
-    /// domain set under a running daemon must not start pulling bindings from
-    /// a zone this node is not yet a member of, nor stop renewing the ones
-    /// vouched for by the zone it is still publishing under.
+    /// The one its own name came from, where it has such a name: identity is
+    /// frozen for the life of the process, so a domain set under a running
+    /// daemon must not start pulling bindings from a zone this node is not yet
+    /// named by, nor stop renewing the ones vouched for by the zone it is still
+    /// publishing under.
+    ///
+    /// A node its zone does not name falls back to the configured domain — and
+    /// that is not a corner case, it is what a delegate *is* (§3.5). A delegate
+    /// belongs to a cluster and is named by no zone in it, so resolving only
+    /// the zone in its own name left it resolving nothing and reaching named
+    /// members through static bindings pinned by hand, which never expire.
+    /// There is no third case: a node belongs to one cluster, so this is one
+    /// zone or none, never a set.
     pub fn resolving_domain(&self) -> Option<String> {
-        self.origin().domain().map(str::to_string)
+        match self.origin().domain() {
+            Some(named) => Some(named.to_string()),
+            None => self.store().membership_domain().ok().flatten(),
+        }
     }
 
     /// The resolving domain as the refresh machinery wants it: none or one.
@@ -394,12 +405,25 @@ impl Node {
     }
 
     /// Drops the membership domain. The device key names this node at the next
-    /// start, and that migration is what drops the zone's bindings.
+    /// start, and for a node that zone named, that migration is what drops the
+    /// zone's bindings.
+    ///
+    /// A node the zone never named — a delegate (§3.5) — has no such migration
+    /// coming, so its bindings are dropped here instead.
     pub fn clear_domain(&self) -> Result<bool> {
-        if self.domain()?.is_none() {
+        let Some(leaving) = self.domain()? else {
             return Ok(false);
-        }
+        };
         self.store().set_membership_domain(None)?;
+        // A node this zone *names* keeps them: its identity is frozen for the
+        // life of the process, so it is still publishing under that name and
+        // still talking to those peers (§3.1). A node it does not name was
+        // already key-identified and stays that way, so nothing would ever
+        // remove them and a cluster this delegate just left would stay dialable
+        // until every binding expired on its own.
+        if self.origin().domain() != Some(leaving.as_str()) {
+            self.store().drop_dns_bindings(&leaving)?;
+        }
         Ok(true)
     }
 
@@ -1059,6 +1083,61 @@ mod tests {
     /// The DNS record line for one `(id, key)`.
     fn rec(id: &str, key: &NodeId) -> String {
         format!("v=sync1 id={id} nk={}", key.to_z32())
+    }
+
+    /// §3.2: a node resolves the zone it *belongs to*, whether or not that
+    /// zone names it — which is the whole route a delegate has to its cluster.
+    ///
+    /// A delegated node is named by no zone (§3.5). Resolving only the zone in
+    /// its own name left it resolving nothing, so it could reach a member
+    /// publishing under a name only through a hand-pinned static binding
+    /// (`trust add --as`) that never expired and shadowed the record it named.
+    /// The configured domain is the fallback, and there is no third case: a
+    /// node belongs to one cluster, so this is one zone or none.
+    #[tokio::test]
+    async fn a_node_resolves_its_zone_even_when_that_zone_does_not_name_it() {
+        // A delegate: identified by its own key, belonging to a zone that
+        // publishes no record for it. `init` with no domain is exactly that
+        // shape, and identity is frozen for the process, so this cannot be
+        // reached by clearing a named node's domain (§3.1).
+        let dir = tempfile::tempdir().unwrap();
+        Node::init(dir.path(), None).unwrap();
+        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
+        let _d = dir;
+        assert!(node.origin().domain().is_none());
+        assert!(node.resolving_domains().is_empty());
+
+        node.set_domain("cluster.example").unwrap();
+        assert_eq!(
+            node.resolving_domains(),
+            ["cluster.example"],
+            "a node its zone does not name still resolves that zone"
+        );
+
+        let nas = SecretKey::generate().public();
+        let set = MemberSet::from_records("cluster.example", &[rec("nas", &nas)]).unwrap();
+        node.apply_member_set(&set, Duration::from_secs(300), now_ns())
+            .unwrap();
+
+        let origin = OriginId::named("nas", "cluster.example").unwrap();
+        let now = now_ns();
+        assert!(node.store().is_bound(&origin, &nas, now).unwrap());
+        // And it expires, which is what a `--as` binding never did.
+        let binding = node
+            .store()
+            .bindings_for_origin(&origin)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(binding.source, synch_store::BindingSource::Dns);
+        assert!(binding.expires_at.is_some());
+
+        // Leaving the zone takes its bindings with it, rather than leaving a
+        // cluster this node just left dialable until their grace runs out.
+        assert!(node.clear_domain().unwrap());
+        assert!(node.resolving_domains().is_empty());
+        assert!(!node.store().is_bound(&origin, &nas, now).unwrap());
     }
 
     #[tokio::test]

@@ -144,16 +144,10 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         },
 
         Command::Trust { command } => match command {
-            TrustCommand::Add {
-                key,
-                note,
-                addr,
-                as_origin,
-            } => Cmd::TrustAdd(pb::TrustAdd {
+            TrustCommand::Add { key, note, addr } => Cmd::TrustAdd(pb::TrustAdd {
                 key: key.clone(),
                 note: note.clone(),
                 addr: addr.clone(),
-                as_origin: as_origin.clone(),
             }),
             TrustCommand::Rm { origin, key } => Cmd::TrustRm(pb::TrustRm {
                 origin: origin.clone(),
@@ -380,14 +374,15 @@ mod tests {
         to_command(&Cli::parse_from(args))
     }
 
-    /// The key is the identity, and naming a peer is the explicit exception.
+    /// A device key or a zone, told apart by shape rather than by a flag.
     ///
-    /// A name belongs to the zone that issues it (§3.2), so nothing infers one:
-    /// a plain `trust add` binds the key and only the key. Head validity is a
-    /// check on the `(origin, key)` pair, so `--as` exists for a node with no
-    /// membership zone — says what it costs, never reached by accident.
+    /// A name belongs to the zone that issues it (§3.2), so nothing infers one
+    /// from a key: a plain `trust add <key>` binds the key and only the key. A
+    /// member publishing under a name is reached by trusting its *zone*, which
+    /// is what `trust add <domain>` does — the route that used to require
+    /// `--as` and a static binding that never expired.
     #[test]
-    fn trust_add_takes_a_key_and_names_one_only_when_asked() {
+    fn trust_add_takes_a_key_or_a_zone() {
         let command =
             command_for(&["synch", "trust", "add", "abc", "--note", "zeynep's laptop"]).unwrap();
         assert_eq!(
@@ -396,29 +391,30 @@ mod tests {
                 key: "abc".into(),
                 note: Some("zeynep's laptop".into()),
                 addr: None,
-                as_origin: None,
             })
         );
-        let named = command_for(&[
+        // A domain travels in the same field; the daemon tells them apart,
+        // because a device key is fixed-length z-base-32 and a domain is not.
+        let zone = command_for(&["synch", "trust", "add", "cluster.example"]).unwrap();
+        assert_eq!(
+            zone,
+            Cmd::TrustAdd(pb::TrustAdd {
+                key: "cluster.example".into(),
+                note: None,
+                addr: None,
+            })
+        );
+        // `--as` is gone: a name is the zone's to issue.
+        assert!(Cli::try_parse_from([
             "synch",
             "trust",
             "add",
             "abc",
             "--as",
-            "nas@cluster.example",
+            "nas@cluster.example"
         ])
-        .unwrap();
-        assert_eq!(
-            named,
-            Cmd::TrustAdd(pb::TrustAdd {
-                key: "abc".into(),
-                note: None,
-                addr: None,
-                as_origin: Some("nas@cluster.example".into()),
-            })
-        );
-        // `trust rebind` stays gone: re-pointing a name is `--as` again, since
-        // the binding upserts on the row's identity.
+        .is_err());
+        // `trust rebind` stays gone: re-pointing a name is the zone's job.
         assert!(Cli::try_parse_from(["synch", "trust", "rebind", "nas", "abc"]).is_err());
     }
 
