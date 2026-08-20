@@ -500,7 +500,9 @@ function ApiKeys({ slug }: { slug: string }) {
                         className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
                       >
                         <option value="">leave as {stamp(k.expires_at)}</option>
-                        {EXPIRIES.map((choice) => (
+                        {EXPIRIES.filter(
+                          (choice) => choice.seconds !== 0 || k.role !== 'join',
+                        ).map((choice) => (
                           <option key={choice.seconds} value={choice.seconds}>
                             set to {choice.label}
                           </option>
@@ -594,7 +596,15 @@ function ApiKeys({ slug }: { slug: string }) {
         <select
           value={role}
           aria-label="What the new API key may do"
-          onChange={(e) => setRole(e.target.value)}
+          onChange={(e) => {
+            setRole(e.target.value)
+            // A join key must say how long it lives — the server refuses one
+            // that does not — so switching to it cannot leave the form on
+            // "no expiry", which is the org key's sensible default.
+            if (e.target.value === 'join' && expiresIn === 0)
+              setExpiresIn(30 * 86400)
+            if (e.target.value !== 'join') setNetwork('')
+          }}
           className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-2 text-sm"
         >
           <option value="member">org key · member</option>
@@ -629,7 +639,11 @@ function ApiKeys({ slug }: { slug: string }) {
           onChange={(e) => setExpiresIn(Number(e.target.value))}
           className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-2 text-sm"
         >
-          {EXPIRIES.map((choice) => (
+          {EXPIRIES.filter(
+            // "no expiry" is not on offer for a join key: nothing bounds how
+            // many devices one enrols, so its lifetime is the only bound.
+            (choice) => choice.seconds !== 0 || role !== 'join',
+          ).map((choice) => (
             <option key={choice.seconds} value={choice.seconds}>
               {choice.label}
             </option>

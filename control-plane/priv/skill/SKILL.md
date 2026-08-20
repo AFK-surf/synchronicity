@@ -566,7 +566,6 @@ listings return.
 | Method | Path | Role | What |
 | --- | --- | --- | --- |
 | `GET` | `/api/orgs/<org>` | member | the org: its networks, its device count, your role |
-| `GET` | `/api/orgs/<org>/audit` | admin | the trail, newest first, 50 at a time; `?before=<id>` pages back |
 | `GET` | `/api/orgs/<org>/networks` | member | each network and how many devices it holds |
 | `POST` | `/api/orgs/<org>/networks` | admin | `{"name": "prod"}` — a DNS label |
 | `GET` | `/api/orgs/<org>/networks/<net>` | member | every device, its live keys, the zone's signature health |
@@ -614,9 +613,11 @@ One row, and that is the point:
 | --- | --- | --- |
 | `POST` | `/api/orgs/<org>/networks/<net>/devices` | the network it was minted for, and no other |
 
-Everything else in the service — including `GET` on that same network — is
-refused: `403 join_key_forbidden` from the JSON API, and a plain-text `404`
-from the streaming `…/browse/file`, which sits below that layer. That is not a
+Every other route that reads a credential — including `GET` on that same
+network — refuses it: `403 join_key_forbidden` from the JSON API, and a
+plain-text `404` from the streaming `…/browse/file`, which sits below that
+layer. (`POST /api/logout` is the exception that proves it: it reads only the
+session cookie, so a bearer-only request is a no-op `200`.) That is not a
 list somebody maintains: every org-scoped route resolves its caller through
 one function, and that function refuses the whole family before it reads a
 rank. A join key has no rank to read.
@@ -628,6 +629,13 @@ POST /api/orgs/acme/api-keys
 {"name": "rack 3 provisioning", "role": "join",
  "network": "prod", "expires_in": 2592000}
 ```
+
+`expires_in` is **required** here, where it is optional on an org key. An org
+key lives in a secret store somebody guards, so a permanent one is a choice; a
+join key lives where nobody is guarding, and nothing bounds how many devices
+one enrols — so its lifetime is the only bound it has, and leaving the field
+out would have handed out a permanent credential by default. Omitting it is a
+`400 bad_expiry` that says so.
 
 Shown without a `curl` because **no key can mint a key**, this one included:
 that route is a signed-in person's, so it is the dashboard's Settings → API
@@ -642,10 +650,10 @@ admin is not an edit, it is a different credential with a secret that is
 already deployed.
 
 **What a join key does not bound is how many.** Anyone holding it can enrol
-devices until it expires or is revoked, which is why `expires_in` is worth
-setting on one and why the audit trail records every `network.join` under
-`key:<id>`, with the key's name and its minter's address on the same row.
-Revoking is the same one call as any other key.
+devices until it expires or is revoked — which is why the expiry is required
+rather than offered, and why the audit trail records every `network.join`
+under `key:<id>`, with the key's name and its minter's address on the same
+row. Revoking is the same one call as any other key.
 
 ### What a key can never reach
 
@@ -654,10 +662,13 @@ scope. The first three answer `403 api_key_forbidden`:
 
 - **accounts** — creating an org, accepting an invitation, `/api/me`. These are
   about a person, and a key is not one.
-- **membership** — invitations, role changes, removals, and the roster read at
-  `GET /api/orgs/<org>/members`. An admin key that could invite an admin would
-  be handing out standing human access that outlives the key, and a leaked one
-  should not carry the address book either.
+- **membership** — invitations, role changes, removals, the roster read at
+  `GET /api/orgs/<org>/members`, and the audit trail at
+  `GET /api/orgs/<org>/audit`. An admin key that could invite an admin would be
+  handing out standing human access that outlives the key; a leaked one should
+  not carry the address book; and the trail carries the address book *and* an
+  inventory of the org's other keys, so closing the roster while leaving it
+  open would have closed nothing.
 - **API keys themselves**, the listing included. A key that could mint keys
   could mint one that never expires, and revoking the one you knew about would
   not have ended the access.

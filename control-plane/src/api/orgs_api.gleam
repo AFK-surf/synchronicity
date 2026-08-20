@@ -823,12 +823,24 @@ pub fn delete_oidc(ctx: AuthContext, who: Principal, slug: String) -> Response {
   })
 }
 
+/// The org's trail.
+///
+/// A person's endpoint, for the same reason the roster is. The trail carries
+/// exactly the two things the rest of this module closes to keys: members'
+/// email addresses and `user_id`s, in the `actor` column and in the details of
+/// `invite.create`, `member.role`, `member.remove` and `org.transfer`; and the
+/// full inventory of the org's other credentials, from `apikey.create` —
+/// including which network each join key is scoped to. A leaked CI key that
+/// could read this would recover the address book and a map of what else to go
+/// looking for, which is precisely what refusing it the roster and the key
+/// listing was meant to prevent.
 pub fn audit_log(
   req: Request,
   reads: Reads,
   who: Principal,
   slug: String,
 ) -> Response {
+  use <- require_user(who)
   reads.with_db(reads, fn(conn) {
     use org_id, _ <- require_org(conn, slug, who, Admin)
     let cursor =

@@ -1877,6 +1877,8 @@ fn mint_join(
         #("name", json.string(name)),
         #("role", json.string("join")),
         #("network", json.string(network)),
+        // Not optional on a join key, and the helper says so by carrying one.
+        #("expires_in", json.int(2_592_000)),
       ]),
     )
   assert created.status == 200
@@ -1956,13 +1958,14 @@ pub fn api_key_carries_its_own_role_test() {
   // opens, the admin floor does not.
   let member = mint(h, "acme", "read-mostly", "member")
   assert call(h, keyed(member, Get, "/api/orgs/acme/networks")).status == 200
-  let refused = call(h, keyed(member, Get, "/api/orgs/acme/audit"))
+  let refused = call(h, keyed(member, Delete, "/api/orgs/acme/devices/nope"))
   assert refused.status == 403
   assert string.contains(simulate.read_body(refused), "requires admin role")
 
-  // An admin key clears the same floor.
+  // An admin key clears the same floor: a miss, not a refusal.
   let admin = mint(h, "acme", "deployer", "admin")
-  assert call(h, keyed(admin, Get, "/api/orgs/acme/audit")).status == 200
+  assert call(h, keyed(admin, Delete, "/api/orgs/acme/devices/nope")).status
+    == 404
 
   // No key is ever an owner, in either direction: the role cannot be asked
   // for, and the owner-gated routes refuse the keys that do exist.
@@ -2013,6 +2016,11 @@ pub fn api_key_may_not_manage_accounts_membership_or_keys_test() {
     json.object([#("email", json.string("someone@example.com"))]),
   ))
   forbidden(call(h, keyed(token, Delete, "/api/orgs/acme/members/u-admin")))
+
+  // The audit trail, which carries both of the things above: members'
+  // addresses and ids in its actor column and its invite and role details,
+  // and an inventory of the org's other keys from every apikey.create row.
+  forbidden(call(h, keyed(token, Get, "/api/orgs/acme/audit")))
 
   // And keys themselves, in all four directions — including the listing,
   // which would otherwise tell a key what else to go looking for.
@@ -2610,9 +2618,33 @@ pub fn a_join_keys_scope_is_not_optional_test() {
         #("name", json.string("k")),
         #("role", json.string("join")),
         #("network", json.string("nope")),
+        #("expires_in", json.int(3600)),
       ]),
     ).status
     == 404
+
+  // And a join key must say how long it lives. Nothing bounds how many
+  // devices one enrols, so its lifetime is the only bound it has — and the
+  // default of "no expiry" is right for a key in a secret store and wrong
+  // for one in a provisioning image.
+  let forever =
+    ask(
+      json.object([
+        #("name", json.string("k")),
+        #("role", json.string("join")),
+        #("network", json.string("prod")),
+      ]),
+    )
+  assert forever.status == 400
+  assert string.contains(simulate.read_body(forever), "bad_expiry")
+  // An org key is still allowed to be permanent.
+  assert ask(
+      json.object([
+        #("name", json.string("ci")),
+        #("role", json.string("member")),
+      ]),
+    ).status
+    == 200
 
   // The listing says which network a join key is for, and says nothing for
   // an org key.
@@ -2720,6 +2752,119 @@ pub fn a_row_a_person_wrote_stays_bare_test() {
     )
   sqlite.close(conn)
   assert detail == "{\"name\":\"prod\"}"
+}
+
+/// The join route is one act or none.
+///
+/// Three inserts share a transaction, and that is what makes the route safe
+/// to hand a credential whose only power is this: a half-done enrolment would
+/// leave a device in the org, attached to nothing, that the join key can
+/// neither see nor remove. The second insert is the one to fail — a key
+/// already bound to another device trips the global live-key index — so the
+/// first has already written by the time it does.
+pub fn a_failed_join_leaves_nothing_behind_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let token = mint_join(h, "acme", "prod", "rack-1")
+  let shared = nk()
+  let joining_with = fn(label) {
+    json.object([
+      #("label", json.string(label)),
+      #("nk", json.string(shared)),
+    ])
+  }
+  assert call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks/prod/devices")
+        |> simulate.json_body(joining_with("first")),
+    ).status
+    == 200
+
+  // Same key, different label: the device row goes in, the key row is
+  // refused, and the whole thing has to come back out.
+  let second =
+    call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks/prod/devices")
+        |> simulate.json_body(joining_with("second")),
+    )
+  assert second.status == 409
+
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Int(orphans)]]) =
+    sqlite.query(conn, "SELECT count(*) FROM devices WHERE label = ?", [
+      sqlite.Text("second"),
+    ])
+  let assert Ok([[sqlite.Int(devices)]]) =
+    sqlite.query(conn, "SELECT count(*) FROM devices", [])
+  sqlite.close(conn)
+  assert orphans == 0
+  assert devices == 1
+}
+
+/// The join route re-checks what the older device route checks, because it is
+/// the route a machine uses and the older one is not.
+pub fn the_join_route_validates_what_it_stores_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let token = mint_join(h, "acme", "prod", "rack-1")
+  let post = fn(body) {
+    call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks/prod/devices")
+        |> simulate.json_body(body),
+    )
+  }
+  let bad = fn(body, code) {
+    let answer = post(body)
+    assert answer.status == 400
+    assert string.contains(simulate.read_body(answer), code)
+    Nil
+  }
+
+  bad(
+    json.object([
+      #("label", json.string("Not A Label")),
+      #("nk", json.string(nk())),
+    ]),
+    "invalid_label",
+  )
+  bad(
+    json.object([
+      #("label", json.string("nas")),
+      #("nk", json.string("not-a-key")),
+    ]),
+    "invalid_nk",
+  )
+  // A hint carrying whitespace is extra fields in a membership record, not
+  // one value — which is what makes a client refuse the whole record.
+  bad(
+    json.object([
+      #("label", json.string("nas")),
+      #("nk", json.string(nk())),
+      #("relay", json.string("one two")),
+    ]),
+    "bad_hint",
+  )
+
+  // And the hints it accepts are the hints it stores.
+  assert post(
+      json.object([
+        #("label", json.string("nas")),
+        #("nk", json.string(nk())),
+        #("relay", json.string("relay.example")),
+        #("addr", json.string("203.0.113.7:1234")),
+      ]),
+    ).status
+    == 200
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(relay), sqlite.Text(addr)]]) =
+    sqlite.query(conn, "SELECT relay, addr FROM devices WHERE label = ?", [
+      sqlite.Text("nas"),
+    ])
+  sqlite.close(conn)
+  assert relay == "relay.example"
+  assert addr == "203.0.113.7:1234"
 }
 
 /// A join key does not outlive the network it names.

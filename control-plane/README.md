@@ -111,8 +111,9 @@ API itself:
 `POST` takes `{"name": "ci", "role": "member", "expires_in": 2592000}` —
 `role` defaults to `member`, and `expires_in` is seconds from now, `0` (the
 default) for no expiry. `role: "join"` mints a **join key** and additionally
-requires `network`; the two imply each other in both directions, here and in
-the schema's CHECK. A duration rather than a date, so nothing depends on
+requires `network` *and* `expires_in`; role and network imply each other in
+both directions, here and in the schema's CHECK, and the expiry is required
+because nothing else bounds a join key — see below. A duration rather than a date, so nothing depends on
 the caller's clock agreeing with the service's. It answers with the token:
 
 ```json
@@ -169,9 +170,10 @@ same org, or the same name elsewhere — a join key gets the `404` a stranger
 gets, so a leaked one reveals nothing about what else the org runs.
 
 What it does not bound is *how many*. Anyone holding it can enrol devices
-until it expires or is revoked, so set `expires_in` on one; every use is in
-the audit log as `network.join` under `key:<id>`, with the key's name and its
-minter beside it.
+until it expires or is revoked — which is why `expires_in` is required on a
+join key rather than merely offered. Every use is in the audit log as
+`network.join` under `key:<id>`, with the key's name and its minter beside
+it.
 
 ### What an org key may do
 
@@ -181,10 +183,13 @@ What no key of either kind may do:
 
 - **manage accounts** — create an org, accept an invitation, read
   `/api/me`. These are about a person, and a key is not one.
-- **manage membership** — invitations, role changes, removals, and the
-  roster read at `GET /api/orgs/:slug/members`. An admin key that could
-  invite an admin would be handing out standing human access that outlives
-  the key, and a leaked one should not carry the address book either.
+- **manage membership** — invitations, role changes, removals, the roster
+  read at `GET /api/orgs/:slug/members`, and the audit trail at
+  `GET /api/orgs/:slug/audit`. An admin key that could invite an admin would
+  be handing out standing human access that outlives the key; a leaked one
+  should not carry the address book; and the trail carries the address book
+  *and* an inventory of the org's other keys, so closing the roster while
+  leaving the trail open would have closed nothing.
 - **manage keys** — including reading the list. A key that could mint keys
   could mint one that never expires, and revoking the one you knew about
   would not have ended the access.

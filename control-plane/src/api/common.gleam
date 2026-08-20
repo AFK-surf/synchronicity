@@ -387,8 +387,8 @@ pub fn db_error() -> Response {
 /// changed role or left. The column carries no foreign key, precisely so it
 /// can hold something that is not a user.
 ///
-/// **A row a key wrote also carries who that key was**, folded into the
-/// detail: its name, and the address of whoever minted it. That is
+/// **A row written *here* by a key also carries who that key was**, folded
+/// into the detail: its name, and the address of whoever minted it. That is
 /// denormalisation on purpose, and for the reason `org.delete` already copies
 /// the slug into its detail — the row that would answer the question later is
 /// about to stop existing. `key:<id>` alone is resolvable only by finding the
@@ -396,6 +396,11 @@ pub fn db_error() -> Response {
 /// unbounded number of pages back in a log served fifty at a time. An entry
 /// that cannot be read without a second lookup nobody will make is an entry
 /// that does not say what it appears to.
+///
+/// The qualifier matters: `zone/publish` writes its own `zone.publish` rows
+/// straight to the table, so the publish that accompanies every zone-shaping
+/// mutation carries the actor and nothing else. The mutation's own row, right
+/// beside it, is the one that names the credential.
 ///
 /// Takes fields rather than a finished object so it can add its own; a
 /// handler that wants a bare row passes `[]`.
@@ -452,9 +457,10 @@ fn describe_key(conn: Connection, key_id: String) -> List(#(String, Json)) {
       #("key_name", json.string(name)),
       #("key_minted_by", json.string(email)),
     ]
-    // The key is being used, so its row is there; a miss means the schema
-    // moved under this query. Say nothing rather than guess — the actor
-    // column still names the key.
+    // A miss is ordinary rather than impossible: an admin may have revoked
+    // the key between the request authenticating and this write, and the
+    // query itself can fail. Say nothing rather than guess — the actor column
+    // still names the key, and a lookup is not worth failing a mutation for.
     _ -> []
   }
 }

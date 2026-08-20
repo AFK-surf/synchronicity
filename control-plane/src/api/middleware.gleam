@@ -173,15 +173,20 @@ pub fn presented(headers: List(#(String, String))) -> Presented {
 ///   * **Account endpoints** — creating an org, accepting an invitation,
 ///     signing in or out. These are about a *person*; a key has no account
 ///     to act on, and an org it created would answer to nobody's membership.
-///   * **Membership endpoints** — invitations, role changes, removals, and
-///     the roster read. An admin key that can invite an admin can hand out
-///     standing human access that outlives the key, which is exactly the
-///     escalation a scoped credential is supposed to make impossible; and the
-///     roster is people's names and addresses, plus the very `user_id` values
-///     the mutations take.
+///   * **Membership endpoints** — invitations, role changes, removals, the
+///     roster read, and the audit trail. An admin key that can invite an
+///     admin can hand out standing human access that outlives the key, which
+///     is exactly the escalation a scoped credential is supposed to make
+///     impossible; and the roster is people's names and addresses, plus the
+///     very `user_id` values the mutations take. The trail carries both of
+///     those *and* an inventory of the org's other credentials, so closing
+///     the roster while leaving it open would have closed nothing.
 ///   * **Key management itself** — a key that can mint keys can mint one
 ///     that never expires, and revoking the one you know about would not end
-///     the access.
+///     the access. Not an absolute: an admin key that deletes a network takes
+///     that network's join keys with it, since a scope whose network is gone
+///     is a token that can never be used again. What it cannot do is mint,
+///     rename, re-scope or enumerate one.
 ///
 /// Everything else an org owns — its networks, its devices and their keys,
 /// the browse surface, the audit trail — is open to a key at the role floor

@@ -4,9 +4,10 @@
 ////
 //// Admin-gated in all four directions, and closed to keys themselves —
 //// `middleware.require_user` is the first thing every handler here runs, and
-//// `middleware.api_key_refused` says why. A key that could mint keys could
-//// mint one that never expires, and revoking the key you knew about would
-//// not have ended the access.
+//// answers `api_key_refused` to an org key or `join_key_refused` to a join
+//// key, each naming what that kind may do instead. A key that could mint keys
+//// could mint one that never expires, and revoking the key you knew about
+//// would not have ended the access.
 ////
 //// Not a zone mutation: a credential is not a membership record and never
 //// reaches DNS. Each mutation is one statement followed by its audit row,
@@ -20,7 +21,7 @@
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
   Admin, audit, body_decoder, constraint_response, db_error, ok_json,
-  require_org, text_at,
+  require_org, text_at, transaction,
 }
 import api/middleware.{error_json, now_unix, require_user}
 import api/reads.{type Reads}
@@ -148,7 +149,7 @@ pub fn create_key(
     check_name(name),
     check_role(role),
     check_scope(role, network),
-    check_expiry(expires_in)
+    check_join_expiry(role, expires_in, check_expiry(expires_in))
   {
     Error(refusal), _, _, _
     | _, Error(refusal), _, _
@@ -162,28 +163,38 @@ pub fn create_key(
         // name from somewhere else is a 404 rather than a scope.
         use network_id <- scoped_to(conn, org_id, role, network)
         let key_id = id.new()
-        case
-          api_key.create(
-            conn,
-            key_id,
-            org_id,
-            network_id,
-            name,
-            role,
-            who.user_id,
-            expires_at_of(expiry),
-            now_unix(),
-          )
-        {
-          Error(e) -> constraint_response(e)
-          Ok(#(token, prefix)) -> {
-            let _ =
+        // The row and its trail together, or neither: a live key with no
+        // `apikey.create` row is a credential nobody knows exists.
+        let minted =
+          transaction(conn, fn() {
+            use #(token, prefix) <- result.try(
+              api_key.create(
+                conn,
+                key_id,
+                org_id,
+                network_id,
+                name,
+                role,
+                who.user_id,
+                expires_at_of(expiry),
+                now_unix(),
+              )
+              |> result.map_error(constraint_response),
+            )
+            use _ <- result.try(
               audit(conn, who, org_id, "apikey.create", [
                 #("key", json.string(key_id)),
                 #("name", json.string(name)),
                 #("role", json.string(role)),
                 #("network", json.string(network)),
               ])
+              |> result.map_error(fn(_) { db_error() }),
+            )
+            Ok(#(token, prefix))
+          })
+        case minted {
+          Error(refusal) -> refusal
+          Ok(#(token, prefix)) -> {
             ok_json(
               json.object([
                 #("id", json.string(key_id)),
@@ -269,46 +280,83 @@ pub fn update_key(
               Text(org_id),
             ],
           )
-        case update {
-          Ok(sqlite.Done(1, _)) -> {
-            // Only what moved. A field the request did not carry is absent
-            // from the row rather than present as null, so `expires_at: null`
-            // can mean the one thing it should: this key stopped expiring.
-            // An update that changed nothing writes nothing — the value of
-            // this trail is that it is short.
-            let changed =
-              list.flatten([
-                case name {
-                  Some(text) -> [#("name", json.string(text))]
-                  None -> []
-                },
-                case role_field {
-                  Some(text) -> [#("role", json.string(text))]
-                  None -> []
-                },
-                case expiry {
-                  Leave -> []
-                  Clear -> [#("expires_at", json.null())]
-                  SetAt(at) -> [#("expires_at", json.int(at))]
-                },
-              ])
-            case changed {
-              [] -> Nil
-              fields -> {
-                let _ =
-                  audit(conn, who, org_id, "apikey.update", [
-                    #("key", json.string(key_id)),
-                    ..fields
-                  ])
-                Nil
-              }
-            }
-            ok_json(json.object([#("ok", json.bool(True))]))
-          }
-          Ok(_) -> error_json(404, "not_found", "no such API key")
-          Error(e) -> constraint_response(e)
+        case
+          transaction(conn, fn() {
+            audited_update(
+              conn,
+              who,
+              org_id,
+              key_id,
+              name,
+              role_field,
+              expiry,
+              update,
+            )
+          })
+        {
+          Ok(response) -> response
+          Error(response) -> response
         }
       })
+  }
+}
+
+/// The update's outcome and its trail, inside one transaction: a role that
+/// moved with no row saying so is the same hole a mint with no row is.
+/// The update's outcome and its trail, inside one transaction: a role that
+/// moved with no row saying so is the same hole a mint with no row would be.
+///
+/// `Error` rolls the transaction back and is still the response to send — a
+/// 404 for a key that is not there, a 409 for a constraint, a 500 when the
+/// trail could not be written and the change therefore must not stand.
+fn audited_update(
+  conn: Connection,
+  who: Principal,
+  org_id: String,
+  key_id: String,
+  name: Option(String),
+  role_field: Option(String),
+  expiry: Expiry,
+  update: Result(sqlite.Outcome, sqlite.Error),
+) -> Result(Response, Response) {
+  case update {
+    Ok(sqlite.Done(1, _)) -> {
+      // Only what moved. A field the request did not carry is absent from the
+      // row rather than present as null, so `expires_at: null` can mean the
+      // one thing it should: this key stopped expiring. An update that
+      // changed nothing writes nothing — the value of this trail is that it
+      // is short.
+      let changed =
+        list.flatten([
+          case name {
+            Some(text) -> [#("name", json.string(text))]
+            None -> []
+          },
+          case role_field {
+            Some(text) -> [#("role", json.string(text))]
+            None -> []
+          },
+          case expiry {
+            Leave -> []
+            Clear -> [#("expires_at", json.null())]
+            SetAt(at) -> [#("expires_at", json.int(at))]
+          },
+        ])
+      let recorded = case changed {
+        [] -> Ok(Nil)
+        fields ->
+          audit(conn, who, org_id, "apikey.update", [
+            #("key", json.string(key_id)),
+            ..fields
+          ])
+      }
+      case recorded {
+        Ok(Nil) -> Ok(ok_json(json.object([#("ok", json.bool(True))])))
+        Error(_) -> Error(db_error())
+      }
+    }
+    Ok(_) -> Error(error_json(404, "not_found", "no such API key"))
+    Error(e) -> Error(constraint_response(e))
   }
 }
 
@@ -367,21 +415,33 @@ pub fn delete_key(
   use <- require_user(who)
   with_db(ctx, fn(conn) {
     use org_id, _ <- require_org(conn, slug, who, Admin)
-    case
-      sqlite.exec(conn, "DELETE FROM api_keys WHERE id = ? AND org_id = ?", [
-        Text(key_id),
-        Text(org_id),
-      ])
-    {
-      Ok(sqlite.Done(1, _)) -> {
-        let _ =
-          audit(conn, who, org_id, "apikey.delete", [
-            #("key", json.string(key_id)),
+    let revoked =
+      transaction(conn, fn() {
+        case
+          sqlite.exec(conn, "DELETE FROM api_keys WHERE id = ? AND org_id = ?", [
+            Text(key_id),
+            Text(org_id),
           ])
-        ok_json(json.object([#("ok", json.bool(True))]))
-      }
-      Ok(_) -> error_json(404, "not_found", "no such API key")
-      Error(e) -> constraint_response(e)
+        {
+          Ok(sqlite.Done(1, _)) ->
+            case
+              audit(conn, who, org_id, "apikey.delete", [
+                #("key", json.string(key_id)),
+              ])
+            {
+              Ok(Nil) -> Ok(ok_json(json.object([#("ok", json.bool(True))])))
+              // The revocation rolls back with its row: a key that stopped
+              // working, with nothing saying when or by whose hand, is the
+              // question an incident starts from.
+              Error(_) -> Error(db_error())
+            }
+          Ok(_) -> Error(error_json(404, "not_found", "no such API key"))
+          Error(e) -> Error(constraint_response(e))
+        }
+      })
+    case revoked {
+      Ok(response) -> response
+      Error(response) -> response
     }
   })
 }
@@ -416,6 +476,34 @@ fn check_role(role: String) -> Result(Nil, Response) {
         "an API key's role is admin, member or join: an org is only ever "
           <> "handed away by an owner, and no key is one",
       ))
+  }
+}
+
+/// A join key must name how long it lives.
+///
+/// `expires_in` defaults to `0` — no expiry — which is right for an org key:
+/// that one lives in a secret store somebody guards, and a long-lived
+/// credential there is a deliberate choice. It is wrong for a join key, whose
+/// whole point is going somewhere nobody guards: a provisioning image, a
+/// cloud-init file, a QR code taped to a rack. Nothing bounds how many devices
+/// one enrols, so its lifetime is the only bound it has, and defaulting that
+/// to "forever" would hand out a permanent credential every time an operator
+/// left the field alone.
+fn check_join_expiry(
+  role: String,
+  expires_in: Int,
+  checked: Result(Expiry, Response),
+) -> Result(Expiry, Response) {
+  case role == api_key.join_role, expires_in {
+    True, 0 ->
+      Error(error_json(
+        400,
+        "bad_expiry",
+        "a join key must say how long it lives: give expires_in a number of "
+          <> "seconds. Nothing bounds how many devices one enrols, so its "
+          <> "lifetime is the only bound it has",
+      ))
+    _, _ -> checked
   }
 }
 
