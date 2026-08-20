@@ -246,7 +246,7 @@ pub fn set_enabled(
                 True -> "browse.enable"
                 False -> "browse.disable"
               },
-              json.object([#("network", json.string(network))]),
+              [#("network", json.string(network))],
             )
             |> result.replace(Nil)
             |> result.map_error(fn(_) { db_error() })

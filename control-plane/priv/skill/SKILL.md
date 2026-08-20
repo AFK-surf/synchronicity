@@ -641,7 +641,8 @@ already deployed.
 **What a join key does not bound is how many.** Anyone holding it can enrol
 devices until it expires or is revoked, which is why `expires_in` is worth
 setting on one and why the audit trail records every `network.join` under
-`key:<id>`. Revoking is the same one call as any other key.
+`key:<id>`, with the key's name and its minter's address on the same row.
+Revoking is the same one call as any other key.
 
 ### What a key can never reach
 
@@ -706,10 +707,14 @@ deployment's apex names every node, and reads are answered by all of them while
 writes go to one. Follow the `primary` field.
 
 Every *change* a key makes lands in the org's audit trail as `key:<id>` — the
-credential, not whoever minted it, so it stays true after that person's role has
-changed or they have left. Reads are not recorded, browse reads included: they
-are an org reading its own files through a tunnel its own daemon opened, and a
-row per download would be a log of ordinary use.
+credential, not whoever minted it, so it stays true after that person's role
+has changed or they have left. The row's `detail` also carries `key_name` and
+`key_minted_by`, so it says which key and whose without a second lookup, and
+still says it after the key has been revoked.
+
+Reads are not recorded, browse reads included: they are an org reading its own
+files through a tunnel its own daemon opened, and a row per download would be
+a log of ordinary use.
 
 ## Global flags
 

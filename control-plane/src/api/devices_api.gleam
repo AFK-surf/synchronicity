@@ -135,16 +135,10 @@ pub fn create_device(
                 ],
               ),
             )
-            audit(
-              conn,
-              who,
-              org_id,
-              "device.create",
-              json.object([
-                #("label", json.string(label)),
-                #("nk", json.string(nk)),
-              ]),
-            )
+            audit(conn, who, org_id, "device.create", [
+              #("label", json.string(label)),
+              #("nk", json.string(nk)),
+            ])
           }
           case work {
             Ok(Nil) -> Ok(json.object([#("device_id", json.string(device_id))]))
@@ -191,13 +185,9 @@ pub fn patch_device(
               case update {
                 Ok(_) -> {
                   let _ =
-                    audit(
-                      conn,
-                      who,
-                      org_id,
-                      "device.update",
-                      json.object([#("device", json.string(device_id))]),
-                    )
+                    audit(conn, who, org_id, "device.update", [
+                      #("device", json.string(device_id)),
+                    ])
                   Ok(json.object([#("device_id", json.string(device_id))]))
                 }
                 Error(e) -> Error(constraint_response(e))
@@ -238,13 +228,9 @@ pub fn delete_device(
                 Text(device_id),
               ]),
             )
-            audit(
-              conn,
-              who,
-              org_id,
-              "device.delete",
-              json.object([#("label", json.string(label))]),
-            )
+            audit(conn, who, org_id, "device.delete", [
+              #("label", json.string(label)),
+            ])
           }
           case work {
             Ok(Nil) -> Ok(json.object([#("deleted", json.string(label))]))
@@ -317,16 +303,10 @@ pub fn add_key(
                         ],
                       ),
                     )
-                    audit(
-                      conn,
-                      who,
-                      org_id,
-                      "device.key.add",
-                      json.object([
-                        #("device", json.string(device_id)),
-                        #("nk", json.string(nk)),
-                      ]),
-                    )
+                    audit(conn, who, org_id, "device.key.add", [
+                      #("device", json.string(device_id)),
+                      #("nk", json.string(nk)),
+                    ])
                   }
                   case work {
                     Ok(Nil) ->
@@ -414,13 +394,7 @@ fn key_state_change(
           case update {
             Ok(sqlite.Done(1, _)) -> {
               let _ =
-                audit(
-                  conn,
-                  who,
-                  org_id,
-                  action,
-                  json.object([#("key", json.string(key_id))]),
-                )
+                audit(conn, who, org_id, action, [#("key", json.string(key_id))])
               Ok(json.object([#(done_field, json.string(key_id))]))
             }
             Ok(_) -> Error(no_qualifying_key(change))

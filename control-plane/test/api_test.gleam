@@ -2658,6 +2658,70 @@ pub fn a_keys_kind_cannot_be_patched_test() {
     == 200
 }
 
+/// Whose key was it? A row a key wrote answers on its own.
+///
+/// `key:<id>` alone is resolvable only by finding the `apikey.create` row
+/// that named it — which survives revocation, but sits an unbounded number of
+/// pages back in a log served fifty at a time. The provenance an incident
+/// actually needs is on the row in front of you, and it is still there after
+/// the key it describes has been revoked.
+pub fn a_row_a_key_wrote_names_the_key_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let token = mint_join(h, "acme", "prod", "rack-1 provisioning")
+  assert call(
+      h,
+      keyed(token, Post, "/api/orgs/acme/networks/prod/devices")
+        |> simulate.json_body(joining("nas")),
+    ).status
+    == 200
+
+  // Revoke it, which is what you do when a provisioning image leaks — and
+  // which takes the row that would otherwise have answered this.
+  let listed =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  let assert Ok(#(_, after_id)) = string.split_once(listed, "\"id\":\"")
+  let assert Ok(#(key_id, _)) = string.split_once(after_id, "\"")
+  assert call(h, authed(h, Delete, "/api/orgs/acme/api-keys/" <> key_id)).status
+    == 200
+
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(actor), sqlite.Text(detail)]]) =
+    sqlite.query(
+      conn,
+      "SELECT actor, detail FROM audit_log WHERE action = 'network.join'",
+      [],
+    )
+  // Nothing is left to look the key up in.
+  let assert Ok([[sqlite.Int(0)]]) =
+    sqlite.query(conn, "SELECT count(*) FROM api_keys", [])
+  sqlite.close(conn)
+
+  // Which key, what it was called, and who minted it — all on the one row.
+  assert actor == "key:" <> key_id
+  assert string.contains(detail, "\"key_name\":\"rack-1 provisioning\"")
+  assert string.contains(detail, "\"key_minted_by\":\"admin@example.com\"")
+  // And what it did.
+  assert string.contains(detail, "\"label\":\"nas\"")
+  assert string.contains(detail, "\"network\":\"prod\"")
+}
+
+/// A person's row carries no credential fields: the actor column already
+/// names them, and there is nothing else to say.
+pub fn a_row_a_person_wrote_stays_bare_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(detail)]]) =
+    sqlite.query(
+      conn,
+      "SELECT detail FROM audit_log WHERE action = 'network.create'",
+      [],
+    )
+  sqlite.close(conn)
+  assert detail == "{\"name\":\"prod\"}"
+}
+
 /// A join key does not outlive the network it names.
 pub fn deleting_a_network_takes_its_join_keys_test() {
   let h = harness()

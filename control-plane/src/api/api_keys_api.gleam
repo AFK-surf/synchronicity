@@ -178,18 +178,12 @@ pub fn create_key(
           Error(e) -> constraint_response(e)
           Ok(#(token, prefix)) -> {
             let _ =
-              audit(
-                conn,
-                who,
-                org_id,
-                "apikey.create",
-                json.object([
-                  #("key", json.string(key_id)),
-                  #("name", json.string(name)),
-                  #("role", json.string(role)),
-                  #("network", json.string(network)),
-                ]),
-              )
+              audit(conn, who, org_id, "apikey.create", [
+                #("key", json.string(key_id)),
+                #("name", json.string(name)),
+                #("role", json.string(role)),
+                #("network", json.string(network)),
+              ])
             ok_json(
               json.object([
                 #("id", json.string(key_id)),
@@ -302,13 +296,10 @@ pub fn update_key(
               [] -> Nil
               fields -> {
                 let _ =
-                  audit(
-                    conn,
-                    who,
-                    org_id,
-                    "apikey.update",
-                    json.object([#("key", json.string(key_id)), ..fields]),
-                  )
+                  audit(conn, who, org_id, "apikey.update", [
+                    #("key", json.string(key_id)),
+                    ..fields
+                  ])
                 Nil
               }
             }
@@ -384,13 +375,9 @@ pub fn delete_key(
     {
       Ok(sqlite.Done(1, _)) -> {
         let _ =
-          audit(
-            conn,
-            who,
-            org_id,
-            "apikey.delete",
-            json.object([#("key", json.string(key_id))]),
-          )
+          audit(conn, who, org_id, "apikey.delete", [
+            #("key", json.string(key_id)),
+          ])
         ok_json(json.object([#("ok", json.bool(True))]))
       }
       Ok(_) -> error_json(404, "not_found", "no such API key")

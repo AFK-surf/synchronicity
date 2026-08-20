@@ -66,13 +66,9 @@ pub fn create_org(req: Request, ctx: AuthContext, who: Principal) -> Response {
                   ],
                 ),
               )
-              audit(
-                conn,
-                who,
-                org_id,
-                "org.create",
-                json.object([#("slug", json.string(slug))]),
-              )
+              audit(conn, who, org_id, "org.create", [
+                #("slug", json.string(slug)),
+              ])
             }
             |> result.map_error(constraint_response)
           })
@@ -223,13 +219,11 @@ pub fn delete_org(
             // The audit trail outlives the org it describes — org_id carries
             // no foreign key precisely so history is not cascade-deleted.
             // The slug rides in the detail because the row naming it is next.
-            use _ <- result.try(audit(
-              conn,
-              who,
-              org_id,
-              "org.delete",
-              json.object([#("slug", json.string(slug))]),
-            ))
+            use _ <- result.try(
+              audit(conn, who, org_id, "org.delete", [
+                #("slug", json.string(slug)),
+              ]),
+            )
             sqlite.exec(conn, "DELETE FROM orgs WHERE id = ?", [Text(org_id)])
             |> result.replace(Nil)
           }
@@ -305,16 +299,10 @@ pub fn change_role(
             case update {
               Ok(sqlite.Done(1, _)) -> {
                 let _ =
-                  audit(
-                    conn,
-                    who,
-                    org_id,
-                    "member.role",
-                    json.object([
-                      #("user", json.string(target_user)),
-                      #("role", json.string(role_text)),
-                    ]),
-                  )
+                  audit(conn, who, org_id, "member.role", [
+                    #("user", json.string(target_user)),
+                    #("role", json.string(role_text)),
+                  ])
                 ok_json(json.object([#("ok", json.bool(True))]))
               }
               Ok(_) -> error_json(404, "not_found", "no such member")
@@ -393,7 +381,7 @@ pub fn remove_member(
                       True -> "member.leave"
                       False -> "member.remove"
                     },
-                    json.object([#("user", json.string(target_user))]),
+                    [#("user", json.string(target_user))],
                   )
                 ok_json(
                   json.object([
@@ -488,13 +476,9 @@ pub fn transfer_ownership(
                   Error(e) -> Error(constraint_response(e))
                 },
               )
-              audit(
-                conn,
-                who,
-                org_id,
-                "org.transfer",
-                json.object([#("to", json.string(to))]),
-              )
+              audit(conn, who, org_id, "org.transfer", [
+                #("to", json.string(to)),
+              ])
               |> result.map_error(constraint_response)
             }
           })
@@ -590,16 +574,10 @@ pub fn create_invite(
                 "Accept the invitation (valid for 7 days):\n\n" <> link <> "\n",
               )
             let _ =
-              audit(
-                conn,
-                who,
-                org_id,
-                "invite.create",
-                json.object([
-                  #("email", json.string(email)),
-                  #("role", json.string(role)),
-                ]),
-              )
+              audit(conn, who, org_id, "invite.create", [
+                #("email", json.string(email)),
+                #("role", json.string(role)),
+              ])
             ok_json(json.object([#("ok", json.bool(True))]))
           }
         }
@@ -709,13 +687,9 @@ pub fn accept_invite(
                   [VInt(now_unix()), Text(invite_id)],
                 ),
               )
-              audit(
-                conn,
-                who,
-                org_id,
-                "invite.accept",
-                json.object([#("invite", json.string(invite_id))]),
-              )
+              audit(conn, who, org_id, "invite.accept", [
+                #("invite", json.string(invite_id)),
+              ])
             }
             |> result.map_error(constraint_response)
           })
@@ -790,13 +764,9 @@ pub fn put_oidc(
     case oidc.save(conn, org_id, issuer, client_id, client_secret, now_unix()) {
       Ok(found) -> {
         let _ =
-          audit(
-            conn,
-            who,
-            org_id,
-            "oidc.configure",
-            json.object([#("issuer", json.string(issuer))]),
-          )
+          audit(conn, who, org_id, "oidc.configure", [
+            #("issuer", json.string(issuer)),
+          ])
         ok_json(
           json.object([
             #("issuer", json.string(issuer)),
@@ -842,7 +812,7 @@ pub fn delete_oidc(ctx: AuthContext, who: Principal, slug: String) -> Response {
               Text(org_id),
             ]),
           )
-          audit(conn, who, org_id, "oidc.remove", json.object([]))
+          audit(conn, who, org_id, "oidc.remove", [])
         }
         |> result.map_error(constraint_response)
       })

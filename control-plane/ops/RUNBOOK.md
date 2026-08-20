@@ -301,15 +301,18 @@ control plane itself with
   last used, which is how you tell which row a token found in a log belongs
   to; `last_used_at` records use against the primary, so a key exercised
   only against replicas reads older than it is. Every *change* the key made
-  is in the org's audit log under `key:<id>` — reads are not recorded, so
-  the trail says what it did and not what it saw.
+  is in the org's audit log under `key:<id>`, and each of those rows carries
+  the key's name and its minter's address, so the trail stays readable after
+  you have revoked the key and its row is gone — reads are not recorded, so
+  it says what the key did and not what it saw.
 - **A join key is the credential to hand a machine being built.** It names
   one network and can only add a device to it, so a provisioning image, a
   cloud-init file or a kickstart template can carry one without carrying the
   ability to read the network, list its devices, or touch anything else in
   the org. Give it an expiry — nothing caps how many devices one enrols —
-  and read `network.join` in the audit log to see what it did. Deleting a
-  network takes its join keys with it.
+  and read `network.join` in the audit log to see what it did — each row
+  names the key and whoever minted it. Deleting a network takes its join keys
+  with it.
 - **When somebody leaves an org, review the keys they minted.** A key
   belongs to the org and not to its minter, so removing a member — or
   demoting them — leaves their keys working at the role they were given.

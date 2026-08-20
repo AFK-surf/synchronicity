@@ -386,12 +386,25 @@ pub fn db_error() -> Response {
 /// made with an API key names the key, which stays true after its minter has
 /// changed role or left. The column carries no foreign key, precisely so it
 /// can hold something that is not a user.
+///
+/// **A row a key wrote also carries who that key was**, folded into the
+/// detail: its name, and the address of whoever minted it. That is
+/// denormalisation on purpose, and for the reason `org.delete` already copies
+/// the slug into its detail — the row that would answer the question later is
+/// about to stop existing. `key:<id>` alone is resolvable only by finding the
+/// `apikey.create` row that named it, which survives revocation but sits an
+/// unbounded number of pages back in a log served fifty at a time. An entry
+/// that cannot be read without a second lookup nobody will make is an entry
+/// that does not say what it appears to.
+///
+/// Takes fields rather than a finished object so it can add its own; a
+/// handler that wants a bare row passes `[]`.
 pub fn audit(
   conn: Connection,
   who: Principal,
   org_id: String,
   action: String,
-  detail: Json,
+  detail: List(#(String, Json)),
 ) -> Result(Nil, sqlite.Error) {
   sqlite.exec(
     conn,
@@ -402,10 +415,48 @@ pub fn audit(
       Text(principal.actor(who)),
       Text(org_id),
       Text(action),
-      Text(json.to_string(detail)),
+      Text(
+        json.to_string(
+          json.object(list.append(detail, credential_fields(conn, who))),
+        ),
+      ),
     ],
   )
   |> result.replace(Nil)
+}
+
+/// Who the credential was, for a row a key wrote. Empty for a person: the
+/// actor column already names them, and there is nothing else to say.
+fn credential_fields(
+  conn: Connection,
+  who: Principal,
+) -> List(#(String, Json)) {
+  case who.credential {
+    principal.Cookie(_) -> []
+    principal.ApiKey(key_id, _, _) | principal.JoinKey(key_id, _, _) ->
+      describe_key(conn, key_id)
+  }
+}
+
+fn describe_key(conn: Connection, key_id: String) -> List(#(String, Json)) {
+  let looked =
+    sqlite.query(
+      conn,
+      "SELECT k.name, coalesce(u.email, '') FROM api_keys k
+       LEFT JOIN users u ON u.id = k.created_by
+       WHERE k.id = ?",
+      [Text(key_id)],
+    )
+  case looked {
+    Ok([[Text(name), Text(email)]]) -> [
+      #("key_name", json.string(name)),
+      #("key_minted_by", json.string(email)),
+    ]
+    // The key is being used, so its row is there; a miss means the schema
+    // moved under this query. Say nothing rather than guess — the actor
+    // column still names the key.
+    _ -> []
+  }
 }
 
 /// Decodes a JSON request body, or answers 400.

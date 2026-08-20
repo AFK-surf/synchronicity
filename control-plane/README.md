@@ -167,7 +167,8 @@ gets, so a leaked one reveals nothing about what else the org runs.
 
 What it does not bound is *how many*. Anyone holding it can enrol devices
 until it expires or is revoked, so set `expires_in` on one; every use is in
-the audit log as `network.join` under `key:<id>`.
+the audit log as `network.join` under `key:<id>`, with the key's name and its
+minter beside it.
 
 ### What an org key may do
 
@@ -197,10 +198,12 @@ cannot see it.
 
 Every *change* a key makes is in the org's audit log under the actor
 `key:<id>`, which names the credential rather than whoever minted it — true
-still after that person's role has changed or they have left. Reads are not
-recorded, browse reads included: that is a deliberate choice about logging
-ordinary use, and it means the trail says what a key *did*, never what it
-saw.
+still after that person's role has changed or they have left. The detail
+carries `key_name` and `key_minted_by` beside it, so a row says which key and
+whose without a second lookup, and goes on saying it after the key is revoked
+and its row is gone. Reads are not recorded, browse reads included: that is a
+deliberate choice about logging ordinary use, and it means the trail says what
+a key *did*, never what it saw.
 
 ## `GET /SKILL.md`
 

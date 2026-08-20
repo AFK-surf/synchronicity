@@ -75,13 +75,9 @@ pub fn create_network(
           case insert {
             Ok(_) -> {
               let _ =
-                audit(
-                  conn,
-                  who,
-                  org_id,
-                  "network.create",
-                  json.object([#("name", json.string(network))]),
-                )
+                audit(conn, who, org_id, "network.create", [
+                  #("name", json.string(network)),
+                ])
               Ok(json.object([#("name", json.string(network))]))
             }
             Error(e) -> Error(constraint_response(e))
@@ -210,13 +206,9 @@ pub fn delete_network(
                     Text(network_id),
                   ]),
                 )
-                audit(
-                  conn,
-                  who,
-                  org_id,
-                  "network.delete",
-                  json.object([#("name", json.string(network))]),
-                )
+                audit(conn, who, org_id, "network.delete", [
+                  #("name", json.string(network)),
+                ])
               }
               case work {
                 Ok(Nil) -> Ok(json.object([#("deleted", json.string(network))]))
@@ -343,17 +335,11 @@ pub fn join_device(
                         ],
                       ),
                     )
-                    audit(
-                      conn,
-                      who,
-                      org_id,
-                      "network.join",
-                      json.object([
-                        #("network", json.string(network)),
-                        #("label", json.string(label)),
-                        #("nk", json.string(nk)),
-                      ]),
-                    )
+                    audit(conn, who, org_id, "network.join", [
+                      #("network", json.string(network)),
+                      #("label", json.string(label)),
+                      #("nk", json.string(nk)),
+                    ])
                   }
                   case work {
                     Ok(Nil) ->
@@ -431,16 +417,10 @@ pub fn assign_device(
                     [Text(network_id), Text(device_id), VInt(now_unix())],
                   ),
                 )
-                audit(
-                  conn,
-                  who,
-                  org_id,
-                  "network.assign",
-                  json.object([
-                    #("network", json.string(network)),
-                    #("label", json.string(label)),
-                  ]),
-                )
+                audit(conn, who, org_id, "network.assign", [
+                  #("network", json.string(network)),
+                  #("label", json.string(label)),
+                ])
               }
               case work {
                 Ok(Nil) -> Ok(json.object([#("assigned", json.string(label))]))
@@ -476,13 +456,9 @@ pub fn unassign_device(
           case delete {
             Ok(sqlite.Done(1, _)) -> {
               let _ =
-                audit(
-                  conn,
-                  who,
-                  org_id,
-                  "network.unassign",
-                  json.object([#("device", json.string(device_id))]),
-                )
+                audit(conn, who, org_id, "network.unassign", [
+                  #("device", json.string(device_id)),
+                ])
               Ok(json.object([#("unassigned", json.string(device_id))]))
             }
             Ok(_) -> Error(error_json(404, "not_found", "not assigned"))
