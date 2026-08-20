@@ -102,9 +102,10 @@ next:       publish this record, then `synch daemon run`:
 The last two lines are not yours to do. Add the device on the network's page
 in the control plane — a label and the device key — and the record is
 signed and served in the same moment; **The control-plane API** below is the
-same act as one `POST`, which is the form to reach for from this node itself.
-Until it is done, `daemon run` waits rather than serves: the zone does not name
-this key yet, so the node has no name to publish under.
+same act as a `POST` and a `PUT` — the device, then its network — which is the
+form to reach for from this node itself. Until it is done, `daemon run` waits
+rather than serves: the zone does not name this key yet, so the node has no
+name to publish under.
 
 `scan` reports what it did and what it published:
 
@@ -237,8 +238,8 @@ and publishes your own. Once every publisher has, the path leaves the tree.
 ## Membership
 
 Membership is the zone. The control plane signs and serves one per network —
-`<network>.<org>.<apex>` — and adding a device on the network's page (or with
-one `POST`; see **The control-plane API**) is the whole enrollment: a label, a
+`<network>.<org>.<apex>` — and adding a device on the network's page (or over
+the API; see **The control-plane API**) is the whole enrollment: a label, a
 device key, and the record exists. There is nothing to publish by hand, and no
 per-node configuration of anybody else's membership.
 
@@ -494,7 +495,7 @@ characters.
 cp=https://cp.acme.example.com
 token=synch_...
 
-curl -fsS -H "Authorization: Bearer $token" "$cp/api/orgs/acme"
+curl -sS -H "Authorization: Bearer $token" "$cp/api/orgs/acme"
 ```
 
 That header is the whole of it. There is no CSRF token to echo — that defends a
@@ -511,14 +512,14 @@ indented under `origin:`, with its state in parentheses:
 ```sh
 nk=qmpmjtrw6w6h5ri3taracdpajdg14d5di7i1xq3ahomw485jrezo   # from init, or id
 
-curl -fsS -X POST "$cp/api/orgs/acme/devices" \
+curl -sS -X POST "$cp/api/orgs/acme/devices" \
   -H "Authorization: Bearer $token" -H 'content-type: application/json' \
   -d "{\"label\": \"nas\", \"nk\": \"$nk\"}"
 # -> {"ok":true,"soa_serial":42,"result":{"device_id":"0000068a4c…"}}
 
 # device_id is result.device_id above — the org knows the device now; this is
 # what puts it in a network's zone.
-curl -fsS -X PUT "$cp/api/orgs/acme/networks/prod/devices/$device_id" \
+curl -sS -X PUT "$cp/api/orgs/acme/networks/prod/devices/$device_id" \
   -H "Authorization: Bearer $token"
 ```
 
@@ -534,15 +535,14 @@ listings return.
 | Method | Path | Role | What |
 | --- | --- | --- | --- |
 | `GET` | `/api/orgs/<org>` | member | the org: its networks, its device count, your role |
-| `GET` | `/api/orgs/<org>/members` | member | who is in it (reading only — see below) |
-| `GET` | `/api/orgs/<org>/audit` | admin | the trail, newest first; `?before=<id>` pages back |
+| `GET` | `/api/orgs/<org>/audit` | admin | the trail, newest first, 50 at a time; `?before=<id>` pages back |
 | `GET` | `/api/orgs/<org>/networks` | member | each network and how many devices it holds |
 | `POST` | `/api/orgs/<org>/networks` | admin | `{"name": "prod"}` — a DNS label |
 | `GET` | `/api/orgs/<org>/networks/<net>` | member | every device, its live keys, the zone's signature health |
 | `DELETE` | `/api/orgs/<org>/networks/<net>` | admin | `{"confirm": "<net>"}` — typed back, as the UI asks |
 | `GET` | `/api/orgs/<org>/devices` | member | every device, with its keys and its networks |
 | `POST` | `/api/orgs/<org>/devices` | member | `{"label", "nk", "relay"?, "addr"?}` |
-| `PATCH` | `/api/orgs/<org>/devices/<dev>` | member | `{"relay"?, "addr"?}` — the hints, nothing else |
+| `PATCH` | `/api/orgs/<org>/devices/<dev>` | member | `{"relay", "addr"}` — **both**, always: an omitted one is cleared |
 | `DELETE` | `/api/orgs/<org>/devices/<dev>` | admin | the device and its keys leave the zone |
 | `PUT` | `/api/orgs/<org>/networks/<net>/devices/<dev>` | member | assign; no body |
 | `DELETE` | `/api/orgs/<org>/networks/<net>/devices/<dev>` | member | unassign |
@@ -564,45 +564,68 @@ from the node's side, and it stays gated on the org's per-network switch:
 | `PUT` | `…/networks/<net>/browse/enabled` | admin | `{"enabled": true}` |
 | `GET` | `…/browse/ls?space=&path=&origin=&cursor=&all=1` | member | one directory of the unified tree |
 | `GET` | `…/browse/stat?space=&path=&origin=` | member | every version of one path, with attestors |
-| `GET` | `…/browse/file?space=&path=&from=&origin=` | member | the bytes, streamed; `Range` honoured |
+| `GET` | `…/browse/file?space=&path=&from=&origin=` | member | the bytes, streamed; `Range` honoured, plain-text refusals |
 | `GET` | `…/networks/<net>/delegations` | member | the delegated keys an attached daemon reports |
 
 Space and path are query parameters and never path segments — a file path may
 contain anything, separators included.
 
+Downloads are capped at four open at once **per credential**: a key gets its
+own budget rather than spending the budget of whoever minted it, and the
+fifth concurrent stream is a `429` naming the limit.
+
 ### What a key can never reach
 
 Four families, and each is a way a scoped credential could reach past its
-scope. All four answer `403 api_key_forbidden`:
+scope. The first three answer `403 api_key_forbidden`:
 
 - **accounts** — creating an org, accepting an invitation, `/api/me`. These are
   about a person, and a key is not one.
-- **membership** — invitations, role changes, removals. An admin key that could
-  invite an admin would be handing out standing human access that outlives the
-  key.
+- **membership** — invitations, role changes, removals, and the roster read at
+  `GET /api/orgs/<org>/members`. An admin key that could invite an admin would
+  be handing out standing human access that outlives the key, and a leaked one
+  should not carry the address book either.
 - **API keys themselves**, the listing included. A key that could mint keys
   could mint one that never expires, and revoking the one you knew about would
   not have ended the access.
+
+The fourth answers `403 forbidden` — *"requires owner role"* — because it is
+not a rule about keys at all:
+
 - **anything owner-gated** — ownership transfer, org deletion, the SSO
-  configuration. No key is an owner, so these refuse every key without knowing
-  keys exist.
+  configuration. No key is ever an owner, so the ordinary role floor refuses
+  every one of them. Match on the status, not the code, if you want to catch
+  both families with one branch.
 
 ### Answers, and what the refusals mean
 
-Every error is `{"error": {"code": "...", "message": "..."}}`, and every
+A JSON error is `{"error": {"code": "...", "message": "..."}}`, and every
 zone-shaping mutation answers `{"ok": true, "soa_serial": N, "result": {...}}`.
+
+**Three answers are not JSON**, so parse defensively: `…/browse/file` refuses
+in plain text at every status (its success is a byte stream, and its failures
+are not dressed as this API's), and a path or method no route matches is
+wisp's own plain-text `404 Not found` / `405 Method not allowed`.
 
 | Status | `code` | Means |
 | --- | --- | --- |
-| `401` | `unauthenticated` | no credential, or one that is unknown, expired or revoked |
+| `400` | `bad_name`, `bad_role`, `bad_expiry`, `confirm`, `invalid_nk`, … | the request itself; the message names the field and why |
+| `401` | `unauthenticated` | no credential, one that is unknown, expired or revoked, or an unreadable `Authorization` header |
 | `403` | `forbidden` | your role is under the route's floor; the message names it |
 | `403` | `api_key_forbidden` | a person's endpoint, reached with a key |
 | `404` | `not_found` | it does not exist, or it is not in your org — one answer for both, on purpose |
 | `409` | `conflict` | the change collides with a record that exists; the message names the invariant |
-| `409` | `rotation_open` | a second rotation window while the first is open |
+| `409` | `rotation_open` / `not_retiring` | a second rotation window while one is open; retiring a key that is not the retiring one |
+| `409` | `browse-disabled` | the org has not turned browsing on for this network |
+| `409` | `duplicate_label`, `ambiguous_nk`, `bad_glue`, … | the zone the change would produce is refused — the 400 vocabulary, caught later |
 | `409` | `read-only-replica` | this node holds a read-only copy; the `primary` field names where writes go |
 | `409` | `no_rekor_record` | the transparency gate is holding the zone key back — an operator ceremony, not your request |
-| `400` | `bad_name`, `invalid_label`, `invalid_nk`, `bad_hint`, … | the request itself; the message names the field and why |
+| `503` | `no-device-attached`, `unavailable` | no daemon is attached to answer this browse call, or the one that is went away |
+
+Two shapes to match on, not one. Codes this service raises are
+`snake_case`; codes **relayed from a daemon** through the browse surface are
+`kebab-case` — `not-found`, `invalid`, `divergent`, `unavailable`. A client
+matching `not_found` will miss a browse 404.
 
 A `not_found` for an org you believe you can reach is worth reading twice: an
 org is not enumerable by whoever cannot see it, so a key pointed at somebody

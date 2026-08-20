@@ -1861,9 +1861,11 @@ fn mint(h: Harness, slug: String, name: String, role: String) -> String {
   token_of(simulate.read_body(created))
 }
 
-/// The `token` field of a mint response. The body is this suite's own JSON
-/// and the field is the last one in it, so the split is enough — a decoder
-/// here would only restate the encoder.
+/// The `token` field of a mint response.
+///
+/// The split is enough wherever it is in the body: `"token":"` appears once,
+/// and base64url has no `"` to escape one into the value. A decoder here
+/// would only restate the encoder.
 fn token_of(body: String) -> String {
   let assert Ok(#(_, after)) = string.split_once(body, "\"token\":\"")
   let assert Ok(#(token, _)) = string.split_once(after, "\"")
@@ -1978,7 +1980,26 @@ pub fn api_key_may_not_manage_accounts_membership_or_keys_test() {
     "/api/orgs/acme/api-keys",
     json.object([#("name", json.string("another"))]),
   ))
+  forbidden(call(
+    h,
+    keyed(token, Patch, "/api/orgs/acme/api-keys/whatever")
+      |> simulate.json_body(json.object([#("name", json.string("mine"))])),
+  ))
   forbidden(call(h, keyed(token, Delete, "/api/orgs/acme/api-keys/whatever")))
+}
+
+/// The org roster is a person's to read. A key drives networks, devices and
+/// keys; the address book is not part of that, and the `user_id` values it
+/// carries are what the membership mutations take.
+pub fn api_key_may_not_read_the_member_roster_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let token = mint(h, "acme", "ci", "admin")
+  let refused = call(h, keyed(token, Get, "/api/orgs/acme/members"))
+  assert refused.status == 403
+  assert string.contains(simulate.read_body(refused), "api_key_forbidden")
+  // Still the dashboard's to read, on the same org.
+  assert call(h, authed(h, Get, "/api/orgs/acme/members")).status == 200
 }
 
 /// A bearer token needs no CSRF header, and never falls back to the cookie.
@@ -2006,13 +2027,22 @@ pub fn api_key_mutations_need_no_csrf_and_never_fall_back_test() {
     |> simulate.header("authorization", "Bearer synch_junk")
   assert call(h, mixed).status == 401
 
-  // An empty bearer is no credential rather than a bad one.
-  let empty =
-    simulate.request(Get, "/api/orgs/acme")
-    |> simulate.header("authorization", "Bearer ")
-  let answer = call(h, empty)
-  assert answer.status == 401
-  assert string.contains(simulate.read_body(answer), "sign in first")
+  // Every shape of Authorization header is terminal, cookie or no cookie.
+  // The one that matters in practice is `Bearer ` with an unset variable
+  // behind it: falling back would run a whole CI job as the person whose
+  // cookie happened to be on the machine.
+  let shapes = ["Bearer ", "Bearer", "Basic dXNlcjpwYXNz", "Bearer\tsynch_x"]
+  list.each(shapes, fn(header) {
+    let alone =
+      simulate.request(Get, "/api/orgs/acme")
+      |> simulate.header("authorization", header)
+    assert call(h, alone).status == 401
+    // And beside a good cookie, which is the case a fallback would answer.
+    let beside =
+      authed(h, Get, "/api/orgs/acme")
+      |> simulate.header("authorization", header)
+    assert call(h, beside).status == 401
+  })
 }
 
 /// The management surface end to end: mint, list, update, delete — and what
@@ -2044,7 +2074,7 @@ pub fn api_keys_are_created_listed_updated_and_deleted_test() {
   assert string.contains(listed, "\"name\":\"ci\"")
   assert string.contains(listed, "\"prefix\":\"synch_")
   assert !string.contains(listed, token)
-  assert string.contains(listed, "\"created_by\":\"admin@example.com\"")
+  assert string.contains(listed, "\"created_by_email\":\"admin@example.com\"")
 
   let assert Ok(#(_, after_id)) = string.split_once(listed, "\"id\":\"")
   let assert Ok(#(key_id, _)) = string.split_once(after_id, "\"")
@@ -2083,7 +2113,9 @@ pub fn api_keys_are_created_listed_updated_and_deleted_test() {
     == 200
 
   // A key id from another org — or one that never existed — is a miss, not
-  // an edit.
+  // an edit. The cross-org half is what `org_id` in the WHERE is for, and it
+  // is the half worth asserting: the caller owns both orgs, so only the
+  // statement's own scoping stands between them.
   assert call_json(
       h,
       Patch,
@@ -2091,6 +2123,24 @@ pub fn api_keys_are_created_listed_updated_and_deleted_test() {
       json.object([#("name", json.string("x"))]),
     ).status
     == 404
+  org_named(h, "other")
+  let other_token = mint(h, "other", "theirs", "member")
+  let other_listing =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/other/api-keys")))
+  let assert Ok(#(_, after_other)) =
+    string.split_once(other_listing, "\"id\":\"")
+  let assert Ok(#(other_id, _)) = string.split_once(after_other, "\"")
+  assert call_json(
+      h,
+      Patch,
+      "/api/orgs/acme/api-keys/" <> other_id,
+      json.object([#("role", json.string("admin"))]),
+    ).status
+    == 404
+  // Untouched, not merely unreported: the other org's key still authenticates
+  // and is still a member.
+  assert call(h, keyed(other_token, Get, "/api/orgs/other")).status == 200
+  assert call(h, keyed(other_token, Get, "/api/orgs/other/audit")).status == 403
 
   // Deleting the row is what ends the access: the token authenticates by the
   // hash that row held.
@@ -2105,7 +2155,10 @@ pub fn api_keys_are_created_listed_updated_and_deleted_test() {
   let assert Ok(rows) =
     sqlite.query(
       conn,
-      "SELECT action FROM audit_log WHERE action LIKE 'apikey.%' ORDER BY id",
+      "SELECT action FROM audit_log
+       WHERE action LIKE 'apikey.%'
+         AND org_id = (SELECT id FROM orgs WHERE slug = 'acme')
+       ORDER BY id",
       [],
     )
   sqlite.close(conn)
@@ -2114,6 +2167,126 @@ pub fn api_keys_are_created_listed_updated_and_deleted_test() {
       action
     })
     == ["apikey.create", "apikey.update", "apikey.delete"]
+}
+
+/// One field at a time, the empty body, and the explicit null — the cases the
+/// `coalesce`/`CASE` update exists for, and the ones nothing else sends.
+///
+/// The audit row is what these turn on: two of the three expiry inputs carry
+/// no timestamp and mean opposite things, so a row that cannot tell "stopped
+/// expiring" from "changed nothing" is a trail that cannot answer the one
+/// question it is kept for.
+pub fn api_key_updates_record_only_what_moved_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let assert 200 =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/api-keys",
+      json.object([
+        #("name", json.string("ci")),
+        #("expires_in", json.int(3600)),
+      ]),
+    ).status
+  let listed =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  let assert Ok(#(_, after_id)) = string.split_once(listed, "\"id\":\"")
+  let assert Ok(#(key_id, _)) = string.split_once(after_id, "\"")
+  let path = "/api/orgs/acme/api-keys/" <> key_id
+  let patch = fn(body) { call_json(h, Patch, path, body).status }
+  let row = fn() {
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  }
+
+  // Name only: the other two columns are untouched, expiry included.
+  assert patch(json.object([#("name", json.string("renamed"))])) == 200
+  assert string.contains(row(), "\"name\":\"renamed\"")
+  assert string.contains(row(), "\"role\":\"member\"")
+  assert !string.contains(row(), "\"expires_at\":0")
+
+  // Expiry only, cleared. The name survives.
+  assert patch(json.object([#("expires_in", json.int(0))])) == 200
+  assert string.contains(row(), "\"expires_at\":0")
+  assert string.contains(row(), "\"name\":\"renamed\"")
+
+  // An empty body changes nothing and is not a 404 — the statement still had
+  // to find the row.
+  assert patch(json.object([])) == 200
+  // An explicit null is refused rather than guessed at, the same as on POST.
+  assert patch(json.object([#("role", json.null())])) == 400
+
+  let conn = read_db(h)
+  let assert Ok(rows) =
+    sqlite.query(
+      conn,
+      "SELECT detail FROM audit_log WHERE action = 'apikey.update' ORDER BY id",
+      [],
+    )
+  sqlite.close(conn)
+  let details =
+    list.map(rows, fn(row) {
+      let assert [sqlite.Text(detail)] = row
+      detail
+    })
+  // Two rows for the two updates that moved something, and none for the
+  // empty body or the refusal.
+  assert list.length(details) == 2
+  let assert [renamed, cleared] = details
+  assert string.contains(renamed, "\"name\":\"renamed\"")
+  // Absent, not null: the request did not carry an expiry.
+  assert !string.contains(renamed, "expires_at")
+  // Null, and it can only mean the one thing.
+  assert string.contains(cleared, "\"expires_at\":null")
+  assert !string.contains(cleared, "name")
+}
+
+/// `expires_in` is bounded, because `now + expires_in` is arithmetic on the
+/// BEAM and the storage layer is not: an unbounded duration wraps and mints a
+/// key that has already expired.
+pub fn absurd_expiry_is_refused_rather_than_wrapped_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let asked =
+    call_json(
+      h,
+      Post,
+      "/api/orgs/acme/api-keys",
+      json.object([
+        #("name", json.string("forever")),
+        #("expires_in", json.int(999_999_999_999_999_999_999)),
+      ]),
+    )
+  assert asked.status == 400
+  assert string.contains(simulate.read_body(asked), "bad_expiry")
+  // And a negative one, which was never a duration forward.
+  assert call_json(
+      h,
+      Post,
+      "/api/orgs/acme/api-keys",
+      json.object([
+        #("name", json.string("past")),
+        #("expires_in", json.int(-1)),
+      ]),
+    ).status
+    == 400
+}
+
+/// The listing records when each key was last used, which is how an operator
+/// tells a key still in service from one to clean up.
+pub fn a_keys_use_is_stamped_test() {
+  let h = harness()
+  org_named(h, "acme")
+  let token = mint(h, "acme", "ci", "member")
+  // Never used: the listing says so with the zero the SPA tests for.
+  let before =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  assert string.contains(before, "\"last_used_at\":0")
+
+  assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 200
+  let after =
+    simulate.read_body(call(h, authed(h, Get, "/api/orgs/acme/api-keys")))
+  assert !string.contains(after, "\"last_used_at\":0")
 }
 
 /// The audit trail names the credential that acted, not the person who
@@ -2150,17 +2323,21 @@ pub fn expired_api_key_is_refused_test() {
   assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 200
 
   // Reach past the API to age the key: the surface deliberately takes a
-  // duration forward, and there is no way to ask it for the past.
+  // duration forward, and there is no way to ask it for the past. Named in
+  // the WHERE, so this still ages one key once a second is minted.
   let assert Ok(conn) = db.open_primary(h.db_path)
   let assert Ok(_) =
-    sqlite.exec(conn, "UPDATE api_keys SET expires_at = ?", [
+    sqlite.exec(conn, "UPDATE api_keys SET expires_at = ? WHERE name = ?", [
       sqlite.Int(now_unix() - 1),
+      sqlite.Text("fortnight"),
     ])
   sqlite.close(conn)
 
-  let refused = call(h, keyed(token, Get, "/api/orgs/acme"))
-  assert refused.status == 401
-  assert string.contains(simulate.read_body(refused), "expired")
+  // The 200-then-401 sandwich around that one write is the whole evidence:
+  // the body deliberately says nothing about *why*, since expiry is folded
+  // into the lookup so an expired key and one that never existed are the
+  // same answer.
+  assert call(h, keyed(token, Get, "/api/orgs/acme")).status == 401
 
   // It is still listed, so an operator can see what stopped working and
   // clean it up rather than wondering.

@@ -21,7 +21,12 @@ export function Settings() {
   return (
     <div className="space-y-10">
       <Members slug={slug} myRole={role ?? 'member'} myId={me?.user.id ?? ''} />
-      {(role === 'owner' || role === 'admin') && <ApiKeys slug={slug} />}
+      {(role === 'owner' || role === 'admin') && (
+        // Keyed on the org: this route is one element, so switching :slug
+        // re-renders without remounting, and a minted token held in state
+        // would appear under the next org's heading.
+        <ApiKeys key={slug} slug={slug} />
+      )}
       {role === 'owner' && <Oidc slug={slug} />}
       {(role === 'owner' || role === 'admin') && <Audit slug={slug} />}
       <LinkedIdentities />
@@ -224,8 +229,8 @@ function Members({
 }
 
 // How long a new key lives, offered as durations rather than dates: the
-// server takes seconds from now, so nothing here depends on the two clocks
-// agreeing.
+// server takes seconds from now, so minting never depends on this browser's
+// clock agreeing with the service's.
 const EXPIRIES = [
   { label: 'no expiry', seconds: 0 },
   { label: '30 days', seconds: 30 * 86400 },
@@ -246,6 +251,7 @@ function ApiKeys({ slug }: { slug: string }) {
   // fetch it back, so the panel says so plainly rather than offering a
   // "show again" that would have to lie.
   const [minted, setMinted] = useState<MintedApiKey | null>(null)
+  const [copied, setCopied] = useState(false)
 
   const { data: keys, error } = useQuery({
     queryKey: ['api-keys', slug],
@@ -263,6 +269,8 @@ function ApiKeys({ slug }: { slug: string }) {
     onSuccess: (key) => {
       setMinted(key)
       setName('')
+      setRole('member')
+      setExpiresIn(0)
       refresh()
     },
   })
@@ -278,6 +286,9 @@ function ApiKeys({ slug }: { slug: string }) {
       send('DELETE', `/api/orgs/${slug}/api-keys/${id}`),
     onSuccess: refresh,
   })
+  // Advisory only, and the one thing on this panel that trusts the browser's
+  // clock: the server is what actually refuses an expired key, and it does so
+  // against its own. A skewed clock here mislabels a row, nothing more.
   const now = Date.now() / 1000
 
   return (
@@ -292,7 +303,14 @@ function ApiKeys({ slug }: { slug: string }) {
         members, sign-in configuration or other keys.
       </p>
       {minted && (
-        <div className="mb-3 rounded-lg border border-emerald-900/60 bg-emerald-950/30 p-4 text-sm">
+        // role="status" and aria-live: the one sentence a screen-reader user
+        // must not miss on this page is the one saying a secret is on screen
+        // once. A panel inserted silently says it to nobody.
+        <div
+          role="status"
+          aria-live="polite"
+          className="mb-3 rounded-lg border border-emerald-900/60 bg-emerald-950/30 p-4 text-sm"
+        >
           <div className="font-medium text-emerald-300">
             {minted.name} created. Copy it now — this is the only time it is
             shown.
@@ -300,17 +318,51 @@ function ApiKeys({ slug }: { slug: string }) {
           <code className="mt-2 block break-all rounded bg-neutral-950 p-2 font-mono text-xs">
             {minted.token}
           </code>
-          <button
-            onClick={() => setMinted(null)}
-            className="mt-2 rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
-          >
-            Done
-          </button>
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              onClick={() => {
+                navigator.clipboard?.writeText(minted.token).then(
+                  () => setCopied(true),
+                  // Clipboard access can be refused; the token is selectable
+                  // either way, so say nothing rather than claim success.
+                  () => setCopied(false),
+                )
+              }}
+              className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+            >
+              Copy token
+            </button>
+            <button
+              onClick={() => {
+                setMinted(null)
+                setCopied(false)
+              }}
+              className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
+            >
+              Dismiss
+            </button>
+            {copied && (
+              <span className="text-xs text-emerald-400">Copied.</span>
+            )}
+          </div>
         </div>
       )}
       {(keys ?? []).length > 0 && (
         <div className="overflow-x-auto rounded-lg border border-neutral-800">
           <table className="w-full text-sm">
+            <thead className="text-left text-xs uppercase tracking-wide text-neutral-500">
+              <tr className="border-b border-neutral-800">
+                <th className="px-4 py-2 font-medium">Name</th>
+                <th className="px-4 py-2 font-medium">Prefix</th>
+                <th className="px-4 py-2 font-medium">Role</th>
+                <th className="px-4 py-2 font-medium">Created by</th>
+                <th className="px-4 py-2 font-medium">Last used</th>
+                <th className="px-4 py-2 font-medium">Expires</th>
+                <th className="px-4 py-2">
+                  <span className="sr-only">Actions</span>
+                </th>
+              </tr>
+            </thead>
             <tbody className="divide-y divide-neutral-800">
               {(keys ?? []).map((k) => (
                 <tr key={k.id}>
@@ -328,23 +380,35 @@ function ApiKeys({ slug }: { slug: string }) {
                   <td className="px-4 py-2">
                     <select
                       value={k.role}
+                      aria-label={`Role for ${k.name}`}
+                      disabled={update.isPending}
                       onChange={(e) =>
                         update.mutate({ id: k.id, role: e.target.value })
                       }
-                      className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
+                      className="rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs disabled:opacity-50"
                     >
                       <option value="admin">admin</option>
                       <option value="member">member</option>
                     </select>
                   </td>
+                  {/* Who minted it — the column to read when somebody leaves
+                      the org, since a key outlives its minter's membership. */}
                   <td className="whitespace-nowrap px-4 py-2 text-xs text-neutral-500">
-                    last used {stamp(k.last_used_at)}
+                    {k.created_by_email}
                   </td>
                   <td className="whitespace-nowrap px-4 py-2 text-xs text-neutral-500">
-                    expires {stamp(k.expires_at)}
+                    {stamp(k.last_used_at)}
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-2 text-xs text-neutral-500">
+                    {stamp(k.expires_at)}
                   </td>
                   <td className="px-4 py-2 text-right">
                     <button
+                      aria-label={`Revoke ${k.name}`}
+                      // Disabled while a revoke is in flight: a second DELETE
+                      // for the same row answers 404, which would render as a
+                      // failure of an operation that had in fact succeeded.
+                      disabled={revoke.isPending}
                       onClick={() => {
                         if (
                           window.confirm(
@@ -353,7 +417,7 @@ function ApiKeys({ slug }: { slug: string }) {
                         )
                           revoke.mutate(k.id)
                       }}
-                      className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800"
+                      className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 disabled:opacity-50"
                     >
                       Revoke
                     </button>
@@ -374,7 +438,7 @@ function ApiKeys({ slug }: { slug: string }) {
       >
         <input
           required
-          maxLength={64}
+          aria-label="Name for the new API key"
           placeholder="what is this key for?"
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -382,6 +446,7 @@ function ApiKeys({ slug }: { slug: string }) {
         />
         <select
           value={role}
+          aria-label="Role for the new API key"
           onChange={(e) => setRole(e.target.value)}
           className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-2 text-sm"
         >
@@ -390,6 +455,7 @@ function ApiKeys({ slug }: { slug: string }) {
         </select>
         <select
           value={expiresIn}
+          aria-label="How long the new API key lives"
           onChange={(e) => setExpiresIn(Number(e.target.value))}
           className="rounded-md border border-neutral-700 bg-neutral-950 px-2 py-2 text-sm"
         >

@@ -7,10 +7,13 @@
 //// not have ended the access.
 ////
 //// Not a zone mutation: a credential is not a membership record and never
-//// reaches DNS. The mutations are single statements, so they need no
-//// transaction either — what they do need is the audit row beside them,
+//// reaches DNS. Each mutation is one statement followed by its audit row,
 //// which is the whole trail an operator has for a credential that is
-//// invisible by design.
+//// invisible by design. The two are not one transaction — the same shape
+//// every other mutation in this API has, `orgs_api.change_role` included —
+//// so a crash between them loses the row and not the change. Worth knowing
+//// when reading the trail; not worth a transaction the rest of the API does
+//// not take.
 
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
@@ -23,16 +26,41 @@ import auth/principal.{type Principal}
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import store/sqlite.{Int as VInt, Text}
 import util/id
 import wisp.{type Request, type Response}
 
-/// The longest a key may be named. The column carries the same ceiling, so a
-/// name past it is refused here with a sentence rather than there with a
+/// The longest a key may be named, in bytes.
+///
+/// The column carries a ceiling too — `length(name) BETWEEN 1 AND 64` — but
+/// SQLite's `length()` counts *characters* on TEXT, so this check is the
+/// stricter of the two for any name that is not pure ASCII. That is the right
+/// way round: a name is refused here with a sentence, never there with a
 /// constraint failure.
 const name_limit = 64
+
+/// The longest life a key may be given: ten years.
+///
+/// Less a policy than a guard. `now + expires_in` is arithmetic on the BEAM,
+/// whose integers are unbounded, and the storage layer truncates to 64 bits —
+/// so an absurd duration would silently mint a key that has *already* expired.
+/// A bound turns that into a sentence.
+const max_expires_in = 315_360_000
+
+/// What a request says about a key's expiry. Three cases, kept apart because
+/// two of them carry no timestamp and mean opposite things: `Leave` is "the
+/// field was absent", `Clear` is "this key stops expiring". Collapsing them
+/// into one `Option(Int)` is what made an audit row unable to say which had
+/// happened.
+type Expiry {
+  Leave
+  Clear
+  SetAt(at: Int)
+}
 
 /// Every key the org holds — never a token, which exists once, in the reply
 /// to the request that minted it.
@@ -65,7 +93,13 @@ pub fn list_keys(reads: Reads, who: Principal, slug: String) -> Response {
         // number the SPA can test, rather than a null it would have to.
         #("expires_at", json.int(common.int_at(row, 5))),
         #("last_used_at", json.int(common.int_at(row, 6))),
-        #("created_by", json.string(text_at(row, 7))),
+        // The minter's email, not their id: this list is read by a person
+        // deciding whether a key is still wanted, and "who made this" is a
+        // question an id does not answer. It is also the column to look down
+        // when somebody leaves the org — a key outlives its minter's
+        // membership by design, so nothing else surfaces what they left
+        // behind.
+        #("created_by_email", json.string(text_at(row, 7))),
       ])
     })
   })
@@ -94,7 +128,7 @@ pub fn create_key(
   case check_name(name), check_role(role), check_expiry(expires_in) {
     Error(refusal), _, _ | _, Error(refusal), _ | _, _, Error(refusal) ->
       refusal
-    Ok(Nil), Ok(Nil), Ok(expires_at) ->
+    Ok(Nil), Ok(Nil), Ok(expiry) ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, who, Admin)
         let key_id = id.new()
@@ -106,7 +140,7 @@ pub fn create_key(
             name,
             role,
             who.user_id,
-            expires_at,
+            expires_at_of(expiry),
             now_unix(),
           )
         {
@@ -130,7 +164,10 @@ pub fn create_key(
                 #("name", json.string(name)),
                 #("role", json.string(role)),
                 #("prefix", json.string(prefix)),
-                #("expires_at", json.int(option.unwrap(expires_at, 0))),
+                #(
+                  "expires_at",
+                  json.int(option.unwrap(expires_at_of(expiry), 0)),
+                ),
                 // The one and only time this value exists anywhere but the
                 // holder's hands: the row keeps its SHA-256, and nothing
                 // stored can produce the token again.
@@ -143,8 +180,13 @@ pub fn create_key(
   }
 }
 
-/// Renames a key, changes its role, or moves its expiry. Every field is
-/// optional and an absent one is left alone.
+/// Renames a key, changes its role, or moves its expiry.
+///
+/// Every field is optional and an **absent** one is left alone. An explicit
+/// `null` is not the same thing and is refused: `{"role": null}` is a client
+/// that meant something it has not said, and guessing which — leave it, or
+/// clear it — is how a credential quietly ends up with the wrong reach.
+/// `POST` refuses a null in the same field for the same reason.
 ///
 /// What cannot be updated is the secret: rotating a credential is minting a
 /// new one and deleting the old, which is two audited acts rather than one
@@ -158,20 +200,12 @@ pub fn update_key(
 ) -> Response {
   use <- require_user(who)
   let decoder = {
-    use name <- decode.optional_field(
-      "name",
-      None,
-      decode.optional(decode.string),
-    )
-    use role <- decode.optional_field(
-      "role",
-      None,
-      decode.optional(decode.string),
-    )
+    use name <- decode.optional_field("name", None, some(decode.string))
+    use role <- decode.optional_field("role", None, some(decode.string))
     use expires_in <- decode.optional_field(
       "expires_in",
       None,
-      decode.optional(decode.int),
+      some(decode.int),
     )
     decode.success(#(name, role, expires_in))
   }
@@ -179,11 +213,16 @@ pub fn update_key(
   let name = option.map(name_field, string.trim)
   case validate_update(name, role_field, expiry_field) {
     Error(refusal) -> refusal
-    Ok(expires_at) ->
+    Ok(expiry) ->
       with_db(ctx, fn(conn) {
         use org_id, _ <- require_org(conn, slug, who, Admin)
         // `org_id` in the WHERE and not merely in the lookup: it is what
         // makes another org's key id a miss rather than an edit.
+        //
+        // `?3` carries all three expiry cases because SQL has no third state
+        // to bind: NULL leaves the column, 0 clears it, anything else sets
+        // it. `expiry_argument` is the only thing that produces it, and
+        // `check_expiry` is what guarantees a real timestamp is never 0.
         let update =
           sqlite.exec(
             conn,
@@ -197,26 +236,48 @@ pub fn update_key(
             [
               nullable_text(name),
               nullable_text(role_field),
-              expiry_argument(expiry_field, expires_at),
+              expiry_argument(expiry),
               Text(key_id),
               Text(org_id),
             ],
           )
         case update {
           Ok(sqlite.Done(1, _)) -> {
-            let _ =
-              audit(
-                conn,
-                who,
-                org_id,
-                "apikey.update",
-                json.object([
-                  #("key", json.string(key_id)),
-                  #("name", json.nullable(name, json.string)),
-                  #("role", json.nullable(role_field, json.string)),
-                  #("expires_at", json.nullable(expires_at, json.int)),
-                ]),
-              )
+            // Only what moved. A field the request did not carry is absent
+            // from the row rather than present as null, so `expires_at: null`
+            // can mean the one thing it should: this key stopped expiring.
+            // An update that changed nothing writes nothing — the value of
+            // this trail is that it is short.
+            let changed =
+              list.flatten([
+                case name {
+                  Some(text) -> [#("name", json.string(text))]
+                  None -> []
+                },
+                case role_field {
+                  Some(text) -> [#("role", json.string(text))]
+                  None -> []
+                },
+                case expiry {
+                  Leave -> []
+                  Clear -> [#("expires_at", json.null())]
+                  SetAt(at) -> [#("expires_at", json.int(at))]
+                },
+              ])
+            case changed {
+              [] -> Nil
+              fields -> {
+                let _ =
+                  audit(
+                    conn,
+                    who,
+                    org_id,
+                    "apikey.update",
+                    json.object([#("key", json.string(key_id)), ..fields]),
+                  )
+                Nil
+              }
+            }
             ok_json(json.object([#("ok", json.bool(True))]))
           }
           Ok(_) -> error_json(404, "not_found", "no such API key")
@@ -268,7 +329,8 @@ pub fn delete_key(
 // -- validation --------------------------------------------------------------
 
 fn check_name(name: String) -> Result(Nil, Response) {
-  case string.byte_size(name) >= 1 && string.byte_size(name) <= name_limit {
+  let size = string.byte_size(name)
+  case size >= 1 && size <= name_limit {
     True -> Ok(Nil)
     False ->
       Error(error_json(
@@ -299,71 +361,68 @@ fn check_role(role: String) -> Result(Nil, Response) {
 /// `expires_in` is seconds from now, and `0` is "no expiry" — a duration
 /// rather than a timestamp, because the caller's clock is not this service's
 /// and a key that expired on arrival is a support ticket.
-fn check_expiry(expires_in: Int) -> Result(Option(Int), Response) {
+fn check_expiry(expires_in: Int) -> Result(Expiry, Response) {
   case expires_in {
-    0 -> Ok(None)
-    seconds if seconds > 0 -> Ok(Some(now_unix() + seconds))
+    0 -> Ok(Clear)
+    seconds if seconds > 0 && seconds <= max_expires_in ->
+      Ok(SetAt(now_unix() + seconds))
     _ ->
       Error(error_json(
         400,
         "bad_expiry",
-        "expires_in is a number of seconds from now, or 0 for no expiry",
+        "expires_in is a number of seconds from now, at most "
+          <> int.to_string(max_expires_in)
+          <> " of them, or 0 for no expiry",
       ))
   }
 }
 
+/// The three optional fields of a PATCH, checked in the order they are
+/// written. The expiry is the only one that produces a value, so it is what
+/// comes back.
 fn validate_update(
   name: Option(String),
   role: Option(String),
   expires_in: Option(Int),
-) -> Result(Option(Int), Response) {
-  case name {
-    Some(text) ->
-      case check_name(text) {
-        Error(refusal) -> Error(refusal)
-        Ok(Nil) -> validate_update_role(role, expires_in)
-      }
-    None -> validate_update_role(role, expires_in)
-  }
-}
-
-fn validate_update_role(
-  role: Option(String),
-  expires_in: Option(Int),
-) -> Result(Option(Int), Response) {
-  case role {
-    Some(text) ->
-      case check_role(text) {
-        Error(refusal) -> Error(refusal)
-        Ok(Nil) -> validate_update_expiry(expires_in)
-      }
-    None -> validate_update_expiry(expires_in)
-  }
-}
-
-fn validate_update_expiry(
-  expires_in: Option(Int),
-) -> Result(Option(Int), Response) {
+) -> Result(Expiry, Response) {
+  use _ <- result.try(optionally(name, check_name))
+  use _ <- result.try(optionally(role, check_role))
   case expires_in {
     Some(seconds) -> check_expiry(seconds)
-    None -> Ok(None)
+    None -> Ok(Leave)
   }
 }
 
-/// The `expires_at` argument, where three cases have to stay distinct: the
-/// field was absent (NULL — leave the column alone), it was `0` (0 — clear
-/// the column), or it named a duration (the resulting timestamp).
-fn expiry_argument(
-  field: Option(Int),
-  expires_at: Option(Int),
-) -> sqlite.Value {
+/// Runs a check over a field that may not have been sent. An absent field is
+/// nothing to complain about.
+fn optionally(
+  field: Option(a),
+  check: fn(a) -> Result(Nil, Response),
+) -> Result(Nil, Response) {
   case field {
-    None -> sqlite.Null
-    Some(_) ->
-      case expires_at {
-        Some(at) -> VInt(at)
-        None -> VInt(0)
-      }
+    Some(value) -> check(value)
+    None -> Ok(Nil)
+  }
+}
+
+/// `Some(at)` for a key that expires, `None` for one that does not — the
+/// shape `api_key.create` takes, where there is no column to leave alone
+/// because the row does not exist yet.
+fn expires_at_of(expiry: Expiry) -> Option(Int) {
+  case expiry {
+    SetAt(at) -> Some(at)
+    Clear | Leave -> None
+  }
+}
+
+/// The `?3` argument of the update: NULL leaves the column, `0` clears it,
+/// anything else sets it. `check_expiry` is what keeps a real timestamp from
+/// ever being `0` and colliding with the clear sentinel.
+fn expiry_argument(expiry: Expiry) -> sqlite.Value {
+  case expiry {
+    Leave -> sqlite.Null
+    Clear -> VInt(0)
+    SetAt(at) -> VInt(at)
   }
 }
 
@@ -372,4 +431,11 @@ fn nullable_text(value: Option(String)) -> sqlite.Value {
     Some(text) -> Text(text)
     None -> sqlite.Null
   }
+}
+
+/// A decoder that wraps its value in `Some`, so `optional_field`'s default of
+/// `None` means "absent" and an explicit `null` fails the inner decoder
+/// rather than being read as absent. `decode.optional` would swallow it.
+fn some(inner: decode.Decoder(a)) -> decode.Decoder(Option(a)) {
+  decode.map(inner, Some)
 }

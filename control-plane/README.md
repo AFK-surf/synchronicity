@@ -140,23 +140,30 @@ What no key may do, whatever its role:
 
 - **manage accounts** — create an org, accept an invitation, read
   `/api/me`. These are about a person, and a key is not one.
-- **manage membership** — invitations, role changes, removals. An admin key
-  that could invite an admin would be handing out standing human access
-  that outlives the key.
+- **manage membership** — invitations, role changes, removals, and the
+  roster read at `GET /api/orgs/:slug/members`. An admin key that could
+  invite an admin would be handing out standing human access that outlives
+  the key, and a leaked one should not carry the address book either.
 - **manage keys** — including reading the list. A key that could mint keys
   could mint one that never expires, and revoking the one you knew about
   would not have ended the access.
-- **anything owner-gated** — ownership transfer, org deletion, the SSO
-  configuration. No key is an owner, so these refuse every key without
-  naming keys at all.
 
-Each of those answers `403 api_key_forbidden`. A key aimed at an org that is
-not its own answers `404` — the same answer a person outside that org gets,
-since an org is not enumerable by whoever cannot see it.
+Those three answer `403 api_key_forbidden`. **Owner-gated routes** —
+ownership transfer, org deletion, the SSO configuration — answer the
+ordinary `403 forbidden`, *"requires owner role"*: no key is ever an owner,
+so the role floor refuses them without the question of keys arising. A
+client that wants one branch for both should match the status, not the code.
 
-Every act a key takes is in the org's audit log under the actor `key:<id>`,
-which names the credential rather than whoever minted it — true still after
-that person's role has changed or they have left.
+A key aimed at an org that is not its own answers `404` — the same answer a
+person outside that org gets, since an org is not enumerable by whoever
+cannot see it.
+
+Every *change* a key makes is in the org's audit log under the actor
+`key:<id>`, which names the credential rather than whoever minted it — true
+still after that person's role has changed or they have left. Reads are not
+recorded, browse reads included: that is a deliberate choice about logging
+ordinary use, and it means the trail says what a key *did*, never what it
+saw.
 
 ## `GET /SKILL.md`
 

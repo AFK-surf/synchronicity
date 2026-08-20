@@ -268,8 +268,8 @@ fn require_principal(
   secret: String,
   next: fn(Principal) -> HttpResponse(mist.ResponseData),
 ) -> HttpResponse(mist.ResponseData) {
-  case middleware.bearer_token(req.headers) {
-    Ok(token) ->
+  case middleware.presented(req.headers) {
+    middleware.Bearer(token) ->
       case
         pool.with_connection(db, fn(conn) {
           api_key.authenticate(conn, token, now_unix())
@@ -280,10 +280,13 @@ fn require_principal(
             key.created_by,
             ApiKey(key.key_id, key.org_id, key.role),
           ))
-        Ok(Error(Nil)) -> refused(401, "unknown, expired or revoked API key")
+        Ok(Error(Nil)) -> refused(401, middleware.bad_key_message)
         Error(_) -> refused(500, "database unavailable")
       }
-    Error(Nil) -> require_session(req, db, secret, next)
+    // Terminal, exactly as above the wisp line: a header naming a credential
+    // this service cannot read is refused, not downgraded to the cookie.
+    middleware.Foreign -> refused(401, middleware.foreign_credential_message)
+    middleware.Absent -> require_session(req, db, secret, next)
   }
 }
 

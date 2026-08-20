@@ -294,12 +294,22 @@ control plane itself with
 - **A leaked API key is revoked from the dashboard**: Settings → API keys
   → Revoke, or `DELETE /api/orgs/<slug>/api-keys/<id>`. Unlike a device
   key, this *is* a kill switch — the token authenticates against the row's
-  hash, so the next request with it is a 401 and nothing is cached
-  anywhere. The list identifies keys by their `synch_…` prefix and by when
-  each was last used, which is how you tell which row a token found in a
-  log belongs to; `last_used_at` records use against the primary, so a
-  key exercised only against replicas reads older than it is. Every act
-  the key took is in the org's audit log under `key:<id>`.
+  hash, so the next request with it is a 401. One exception: a download
+  already streaming resolved its credential when it started and runs to
+  completion, so a revocation during a large transfer does not cut it off.
+  The list identifies keys by their `synch_…` prefix and by when each was
+  last used, which is how you tell which row a token found in a log belongs
+  to; `last_used_at` records use against the primary, so a key exercised
+  only against replicas reads older than it is. Every *change* the key made
+  is in the org's audit log under `key:<id>` — reads are not recorded, so
+  the trail says what it did and not what it saw.
+- **When somebody leaves an org, review the keys they minted.** A key
+  belongs to the org and not to its minter, so removing a member — or
+  demoting them — leaves their keys working at the role they were given.
+  That is the intended behaviour (a CI pipeline should not break because
+  its author changed teams), but it is only safe if somebody looks: the
+  Settings → API keys list carries a `created_by` column for exactly this,
+  and revoking is the same one click as above.
 - **Signature freshness**: `/healthz` reports `sig_expires_at`. The
   primary re-signs automatically at 7 days before expiry. If the primary
   is down long enough for that to matter you have days, not minutes.

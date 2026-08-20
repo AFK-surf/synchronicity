@@ -243,7 +243,17 @@ pub fn delete_org(
   }
 }
 
+/// The org's roster.
+///
+/// A person's endpoint, though it only reads. The row it returns is a
+/// person's name, email and id, and the org's machine credentials have no
+/// business carrying that: an API key exists to drive networks, devices and
+/// keys, and a leaked one should not also hand over the address book — nor
+/// the `user_id` values that the membership *mutations* take. Reading the
+/// roster is a thing the dashboard does, so the dashboard's credential is
+/// what may do it.
 pub fn list_members(reads: Reads, who: Principal, slug: String) -> Response {
+  use <- require_user(who)
   reads.with_db(reads, fn(conn) {
     use org_id, _role <- require_org(conn, slug, who, Member)
     let rows =

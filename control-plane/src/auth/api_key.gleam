@@ -42,7 +42,8 @@ const display_length = 8
 /// is worth far less than a write lock on every request.
 const use_stamp_interval = 3600
 
-/// Mints a key. Returns the token, the row's id, and the display prefix.
+/// Mints a key. Returns the token and the display prefix; the row's id is an
+/// argument, because the caller needs it for the audit row either way.
 ///
 /// The token is the only copy — nothing stored can reproduce it, so a caller
 /// that loses it mints another.
@@ -100,10 +101,14 @@ pub type Authenticated {
 ///
 /// The `last_used_at` stamp is advisory and its failure ignored, which is
 /// what lets a node holding a read-only copy of the database authenticate at
-/// all: a replica reads the row the primary wrote and cannot write back. The
-/// consequence is the one `session.get` names — the column records the last
-/// use *against the primary*, which is what an operator deciding whether a
-/// key is still in service wants from it anyway.
+/// all: a replica reads the row the primary wrote, and its `UPDATE` comes
+/// back `SQLITE_READONLY` without disturbing the connection. The consequence
+/// is the one `session.get` names — the column records the last use *against
+/// the primary*, which is what an operator deciding whether a key is still in
+/// service wants from it anyway. The cost of getting nothing back is one
+/// doomed round trip per request on a replica, since the stamp it reads never
+/// moves; at the rate a replica serves reads that is not worth a second
+/// mechanism to avoid.
 pub fn authenticate(
   conn: Connection,
   token: String,
