@@ -18,4 +18,3 @@ Dockerfile
 .dockerignore
 .git/
 erl_crash.dump
-*.md

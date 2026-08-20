@@ -193,6 +193,19 @@ curl -fsS -o /dev/null "http://127.0.0.1:$HTTP_PORT$asset" \
   || logs_and_fail "the SPA bundle $asset is missing from priv/web"
 ok "the built SPA is served from priv/web, bundle included"
 
+# --- the shipped CLI guide ---------------------------------------------
+#
+# priv/skill/SKILL.md is a tracked source file the shipment stage COPYs in,
+# the same shape as the trusted root above and open to the same packaging
+# slip. Served over HTTP rather than found on disk, because the route is the
+# thing being claimed: a file that shipped under a path `priv_dir/1` does not
+# resolve is the same 404 to every caller.
+curl -fsS "http://127.0.0.1:$HTTP_PORT/SKILL.md" > "$WORKDIR/SKILL.md" \
+  || logs_and_fail "GET /SKILL.md did not respond"
+grep -q '^# synch' "$WORKDIR/SKILL.md" \
+  || logs_and_fail "/SKILL.md is not the CLI guide: $(head -c 200 "$WORKDIR/SKILL.md")"
+ok "the synch guide ships in priv/skill and is served at /SKILL.md"
+
 # The DoH route exists (400 for a query with no dns= parameter, not the
 # 404 an unrouted path would give).
 doh=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/dns-query")

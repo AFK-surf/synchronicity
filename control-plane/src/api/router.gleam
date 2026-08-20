@@ -4,7 +4,8 @@
 ////
 //// Naming convention in api/: endpoint modules carry the `_api` suffix
 //// (auth_api, orgs_api, networks_api, devices_api); plumbing does not
-//// (router, middleware, common, static — static serves files, not an API).
+//// (router, middleware, common, static — static serves files, not an API;
+//// skill serves one file, likewise).
 
 import api/auth_api.{type AuthContext}
 import api/browse_api.{type Browse}
@@ -12,6 +13,7 @@ import api/devices_api
 import api/middleware
 import api/networks_api
 import api/orgs_api
+import api/skill
 import api/static
 import auth/session.{type Session}
 import dns/doh
@@ -64,6 +66,10 @@ pub fn handle(req: Request, ctx: Context) -> Response {
         ServingZone(serving) -> healthz(serving)
         ExternalZone(pool) -> healthz_external(pool)
       }
+    // Role-agnostic like the two above, and for the same reason: public text
+    // about the `synch` client, needing no session, no database and no zone.
+    // Whichever node of a deployment you reach, this URL answers.
+    ["SKILL.md"] -> skill.serve(req)
     ["api", "zone", "anchor"] ->
       case ctx.anchor {
         "" -> wisp.not_found()

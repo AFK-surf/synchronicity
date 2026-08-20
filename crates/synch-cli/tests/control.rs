@@ -480,6 +480,45 @@ async fn every_command_variant_round_trips() {
     )
     .await;
 
+    // Delegation, all three variants. They were the gap this test's name
+    // promised to close and did not: none of them was exercised anywhere, and
+    // every one of them read the store on the runtime worker that polled the
+    // connection, which §10's guard turns into an abort on a debug daemon.
+    let subject = SecretKey::generate().public().to_z32();
+    let delegated = says(
+        data_dir,
+        Command::DelegateAdd(pb::DelegateAdd {
+            key: subject.clone(),
+            spaces: vec!["media".into()],
+            until: Some("7d".into()),
+            note: Some("a test laptop".into()),
+        }),
+        "delegated",
+    )
+    .await;
+    // The grant names its spaces, and says what the subject will not see.
+    assert!(delegated.contains("media"), "{delegated}");
+    assert!(
+        delegated.contains("it will not learn that any other space exists"),
+        "{delegated}"
+    );
+    let listed = says(data_dir, Command::DelegateLs(pb::DelegateLs {}), &subject).await;
+    assert!(listed.contains("this node"), "{listed}");
+    says(
+        data_dir,
+        Command::DelegateRm(pb::DelegateRm {
+            key: subject.clone(),
+        }),
+        "removed the delegation",
+    )
+    .await;
+    says(
+        data_dir,
+        Command::DelegateLs(pb::DelegateLs {}),
+        "no delegations",
+    )
+    .await;
+
     // The domain. `set` records it with no resolver here, pending the next
     // start (§3.1) — `domain ls` says so.
     //
