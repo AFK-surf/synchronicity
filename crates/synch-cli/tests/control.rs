@@ -370,6 +370,13 @@ fn domain_set(domain: &str) -> Command {
         delegate: false,
     })
 }
+
+fn domain_set_delegate(domain: &str) -> Command {
+    Command::DomainSet(pb::DomainSet {
+        domain: domain.into(),
+        delegate: true,
+    })
+}
 fn domain_ls() -> Command {
     Command::DomainLs(pb::DomainLs {})
 }
@@ -609,6 +616,27 @@ async fn every_command_variant_round_trips() {
     )
     .await;
     assert!(set.contains("synch domain clear"), "{set}");
+    assert!(
+        set.contains("--delegate"),
+        "a member is told the other way out too: {set}"
+    );
+
+    // `--delegate` says the zone will *not* name this node, so the advice must
+    // not turn round and tell the operator to publish a record for it.
+    let as_delegate = says(
+        data_dir,
+        domain_set_delegate("cluster.example"),
+        "this node is a delegate",
+    )
+    .await;
+    assert!(
+        !as_delegate.contains("must name this key"),
+        "the delegate advice contradicted the flag just passed: {as_delegate}"
+    );
+    assert!(
+        !as_delegate.contains("IN TXT"),
+        "a delegate is not told to publish a record naming itself: {as_delegate}"
+    );
     says(data_dir, domain_ls(), "not yet resolved by this daemon").await;
     let _ = frames(data_dir, domain_refresh()).await;
     says(data_dir, domain_clear(), "cleared").await;

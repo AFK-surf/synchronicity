@@ -255,16 +255,17 @@ synch domain clear
 
 (`synch init --domain` is this same setting, made at init.) Enroll before
 you serve: a zone that does not name this node's key leaves it with nothing
-to publish under, and `daemon run` refuses to start rather than serving,
-naming the record to publish.
+to publish under, so `daemon run` comes up on a reduced control socket and
+waits, printing the record to publish. It re-checks until the zone answers.
 
 `--delegate` is how a node says it belongs to that zone and expects *no*
 record naming itself (§3.5). It still resolves the zone — that is how a
 delegate learns its cluster's members at all — and keeps publishing under its
 device key. The flag is needed because on a first start "the zone does not
 name me" and "my record has not propagated yet" are the same answer, and
-guessing wrong either refuses to start every delegate or lets a member
-silently publish under a key origin it must later migrate away from.
+guessing wrong either leaves every delegate waiting for a record nobody will
+publish, or lets a member silently publish under a key origin it must later
+migrate away from.
 
 A delegate that is *later* named by the zone adopts that name at the next
 daemon start, migrating everything keyed by the old identity. Identity is
