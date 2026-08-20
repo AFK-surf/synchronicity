@@ -1,8 +1,6 @@
 //! Core types for synchronicity: origins, hashes, records, signed heads and the
-//! wire schemas shared by every other crate in the workspace.
-//!
-//! Section references in the documentation point at `DESIGN.md` at the
-//! repository root.
+//! wire schemas shared by every other crate. Section references point at
+//! `DESIGN.md` at the repository root.
 #![deny(missing_docs)]
 
 pub mod blocking;
@@ -43,14 +41,10 @@ pub const CHUNK_GROUP_LOG2: u8 = 4;
 /// The descent level whose subtrees are exactly one ad span across.
 ///
 /// Delta sync's first proof round asks for the tree at this level and no
-/// deeper: one chaining value per 16 MiB. What travels is the *interior* of the
-/// tree above those spans — a 64-byte pair per node, one node per span less one
-/// — so a 100 GB object costs about 381 KB, not the 32 bytes per span the
-/// chaining values alone would suggest (`docs/DELTA-SYNC.md` §3.3, §7). The ad
-/// span is the
-/// unit deliberately — a span proven equal to a donor's is promoted whole, and
-/// the same boundary is what `BlobAd` summarizes possession at (§6.3), so a
-/// node that promotes a span can advertise it without any further arithmetic.
+/// deeper: one chaining value per 16 MiB, a 64-byte pair per node, so a 100 GB
+/// object costs about 381 KB (`docs/DELTA-SYNC.md` §3.3, §7). The ad span is the
+/// unit deliberately — a span proven equal is promoted whole, and the same
+/// boundary is what `BlobAd` summarizes possession at (§6.3).
 pub const AD_SPAN_LEVEL: u8 = (AD_SPAN_GRANULARITY / CHUNK_GROUP_SIZE).trailing_zeros() as u8;
 
 /// Blobs at or below this size are inlined in SQLite rather than written to the
@@ -62,27 +56,17 @@ pub const INLINE_VALUE_MAX: usize = 128;
 
 /// The largest a trie value may be, inline or out of line (§4.3, §12).
 ///
-/// The key side of the trie is bounded three ways — [`MAX_KEY_LEN`] on insert,
-/// twice that in nibbles at decode, and `MAX_DEPTH_NIBBLES` on every walk. The
-/// value side had none: `check_invariants` bounds `ValueRef::Inline` at
-/// [`INLINE_VALUE_MAX`] and says nothing about `ValueRef::Hash`, and the fetch
-/// that carries the payload only enforced the *lower* edge (a value small enough
-/// to be inline must be inline). So a value was bounded by the frame, at 16 MiB
-/// each and no limit on how many.
-///
-/// That is the enabler for two costs a §12 "sanity bound on any single message"
-/// is supposed to cap. A `GetValues` answer is `MAX_BATCH` payloads built in
-/// memory and serialized whole, so 256 × 16 MiB is gigabytes of allocation for
-/// an 8 KB request. And the promotion diff resolves a value per changed
-/// position, so a canonical six-node trie whose one leaf carries a 16 MiB
-/// payload — legal, cheap to publish, and well inside the walk's position
-/// ceiling — resolves to terabytes.
-///
-/// Generous next to anything the system produces: the largest legitimate value
-/// is a `b:` record, whose span list is capped at
-/// [`MAX_AD_SPANS`] and comes to ~20 KB; a `FileEntry` is
-/// small because the path lives in the *key*. At this ceiling a full
-/// `MAX_BATCH` answer is 8 MiB, half a frame.
+/// The key side is bounded three ways — [`MAX_KEY_LEN`] on insert, twice that
+/// in nibbles at decode, and `MAX_DEPTH_NIBBLES` on every walk — but the value
+/// side had none: `check_invariants` bounds `ValueRef::Inline` at
+/// [`INLINE_VALUE_MAX`] and says nothing about `ValueRef::Hash`, so a value was
+/// bounded only by the frame, at 16 MiB each. That is the enabler for two costs
+/// a §12 sanity bound is supposed to cap: a `GetValues` answer is `MAX_BATCH`
+/// payloads serialized whole (256 × 16 MiB), and a promotion diff resolves a
+/// value per changed position, so one 16 MiB leaf payload resolves to terabytes.
+/// Generous next to anything the system produces — the largest legitimate value
+/// is a `b:` record at ~20 KB — and at this ceiling a full `MAX_BATCH` answer is
+/// 8 MiB, half a frame.
 ///
 /// `MAX_DEPTH_NIBBLES` is `synch-mpt`'s; it is twice [`MAX_KEY_LEN`].
 pub const MAX_TRIE_VALUE_LEN: usize = 32 * 1024;
@@ -90,28 +74,22 @@ pub const MAX_TRIE_VALUE_LEN: usize = 32 * 1024;
 /// The earliest wall-clock reading a trust decision may be evaluated at
 /// (§3.2): 2025-01-01T00:00:00Z, in unix nanoseconds.
 ///
-/// Every expiry check in this system is `now < expires_at`, so the instant the
-/// check is made at decides what it means. At the epoch — a dead RTC coming up
-/// at 1970, a clock stepped backwards, a container with no time source —
-/// *nothing has ever expired*, and a node in that state would honor every
-/// binding it has ever stored, revoked members included, forever. So a reading
-/// no build of this software could honestly produce is not treated as a small
-/// number: it is treated as no reading at all, and a trust decision that
-/// cannot be dated is refused.
-///
-/// The bound is a fixed date rather than the build date because it has to be
-/// checkable from a stored constant, and it only has to be far enough forward
-/// to exclude a clock that never got set: this repository is younger than it.
+/// Every expiry check is `now < expires_at`, so the instant the check is made
+/// decides what it means. At the epoch — a dead RTC, a stepped-back clock —
+/// *nothing has ever expired*, and a node would honor every binding it has ever
+/// stored, revoked members included, forever. So a reading no build of this
+/// software could honestly produce is treated as no reading at all: a trust
+/// decision that cannot be dated is refused. The bound is a fixed date rather
+/// than the build date because it must be checkable from a stored constant.
 pub const MIN_TRUSTED_NS: i64 = 1_735_689_600_000_000_000;
 
 /// Returns the current unix time in nanoseconds.
 ///
-/// A clock reading before the epoch comes back *negative* rather than clamped
-/// to zero, because zero is a plausible-looking instant and a broken clock
-/// must not be able to disguise itself as one. Nothing derives trust from this
-/// value directly: [`clock_is_trusted`] is what decides whether a reading can
-/// carry a trust decision, and `Store::trust_instant` is what every expiry
-/// check in the store passes through.
+/// A reading before the epoch comes back *negative* rather than clamped to
+/// zero, because zero is a plausible-looking instant and a broken clock must
+/// not be able to disguise itself as one. Nothing derives trust from this
+/// directly: [`clock_is_trusted`] decides whether a reading can carry a trust
+/// decision.
 pub fn now_ns() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -122,10 +100,9 @@ pub fn now_ns() -> i64 {
 
 /// Whether `ns` is a clock reading a trust decision may be dated by (§3.2).
 ///
-/// See [`MIN_TRUSTED_NS`]. A node whose clock fails this keeps its static
-/// trust — which no clock is consulted for — and honors no DNS binding at all,
-/// which is the fail-closed half of the two available answers: it refuses to
-/// extend trust rather than serving on trust it cannot date.
+/// See [`MIN_TRUSTED_NS`]. A node whose clock fails this keeps its static trust
+/// and honors no DNS binding at all: it refuses to extend trust rather than
+/// serving on trust it cannot date.
 pub fn clock_is_trusted(ns: i64) -> bool {
     ns >= MIN_TRUSTED_NS
 }
@@ -171,9 +148,8 @@ mod tests {
 
     #[test]
     fn the_epoch_is_not_a_trustworthy_instant() {
-        // The failure this guards is `now = 0` passing an expiry check: at zero
-        // nothing has ever expired. A clock that reads at or before the epoch
-        // has to be refused rather than believed.
+        // `now = 0` must not pass an expiry check: at zero nothing has ever
+        // expired, so a clock at or before the epoch is refused, not believed.
         assert!(!clock_is_trusted(0));
         assert!(!clock_is_trusted(-1));
         assert!(!clock_is_trusted(MIN_TRUSTED_NS - 1));

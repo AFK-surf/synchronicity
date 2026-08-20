@@ -60,9 +60,9 @@ pub fn entry_line(row: &EntryRow, mark: Option<&str>) -> String {
 
 /// One path of the unified tree, as `synch ls` prints it.
 ///
-/// The line describes the version the reader would get — the `newest` policy's
-/// selection — and the mark says how many others there are. With `all`, every
-/// version follows, indented, with its attestors.
+/// The line is the version the reader would get — the `newest` policy's
+/// selection — with the mark saying how many others there are. With `all`,
+/// every version follows, indented, with its attestors.
 ///
 /// `now` is `Store::read_instant`, taken beside the listing: it touches the
 /// connection, and this renders on a runtime worker (§10).
@@ -101,12 +101,10 @@ fn version_lines(set: &VersionSet) -> Vec<String> {
         .rev()
         .map(|version| {
             let attestors: Vec<String> = version.attestors.iter().map(|o| o.short()).collect();
-            // A content-less kind is identified by its target rather than by
-            // a root (§8), so that is what the line has to show. The store
-            // words it; this only shortens a root to fit the column, because a
-            // second copy of the wording is a second copy that drifts — the
-            // two used to say "(unknown target)" and "(unknown)" for the same
-            // thing.
+            // A content-less kind is identified by its target, not a root
+            // (§8), so that is what the line shows. This only shortens a root
+            // to fit the column — a second copy of the store's wording is a
+            // copy that drifts, and the two used to disagree.
             let identity = version.identity_text();
             let identity = match version.kind {
                 EntryKind::Tombstone | EntryKind::Symlink => identity,
@@ -142,9 +140,9 @@ pub fn ago(timestamp: i64) -> String {
 
 /// How long until an expiry, for `delegate ls` and `doctor`.
 ///
-/// Remaining time rather than the raw instant, because a delegation's
-/// `not_after` is written by the issuer's clock and read by this one: what an
-/// operator can act on is how much of it is left here.
+/// Remaining time rather than the raw instant: `not_after` is written by the
+/// issuer's clock and read by this one, so what an operator can act on is how
+/// much is left here.
 pub fn remaining(expires_at: i64, now: i64) -> String {
     let seconds = (expires_at - now) / 1_000_000_000;
     match seconds {
@@ -159,8 +157,8 @@ pub fn remaining(expires_at: i64, now: i64) -> String {
 /// One membership domain's health, for `domain ls` and `doctor`.
 ///
 /// Three failing domains must not read like three healthy ones: the line
-/// carries the binding count, the refresh times, and the last failure —
-/// the reason itself, not a pointer at the daemon log.
+/// carries the binding count, refresh times, and the last failure reason
+/// itself, not a pointer at the daemon log.
 pub fn domain_health(health: &synch_engine::DomainHealth, now: i64) -> String {
     let mut line = format!("{}  {} binding(s)", health.domain, health.bindings);
     match &health.schedule {
@@ -187,9 +185,9 @@ pub fn domain_health(health: &synch_engine::DomainHealth, now: i64) -> String {
 
 /// The trust configuration in force, in one line, for `synch daemon status`.
 ///
-/// The policy first, because it is the one that decides whether an answer is
-/// accepted at all, and every override after it: an override is a different
-/// universe and the operator has to be able to see which one they are in.
+/// The policy first — it decides whether an answer is accepted at all — then
+/// every override: an override is a different universe, and the operator has
+/// to see which one they are in.
 pub fn trust_summary(status: &ResolverStatus) -> String {
     match status {
         ResolverStatus::Absent => "no membership resolver in this process".into(),
@@ -232,10 +230,9 @@ pub fn doctor(node: &Node) -> Lines {
         out.push(format!("retiring: {}", addr(&net)));
     }
 
-    // The clock, before anything dated by it. An expiry check is `now <
+    // The clock, before anything dated by it: an expiry check is `now <
     // expires_at`, so a node that cannot say when it is cannot say what is
-    // still trusted — and that has to be the first thing an operator reads,
-    // not an inference from a page of bindings.
+    // still trusted — the first thing an operator reads, not an inference.
     out.push(String::new());
     if !report.clock.trusted {
         out.push("CLOCK UNUSABLE (§3.2):".into());

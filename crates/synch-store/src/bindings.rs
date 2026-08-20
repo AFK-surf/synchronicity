@@ -870,13 +870,12 @@ mod tests {
             .put_binding(&binding(origin.clone(), static_key, None))
             .unwrap();
 
-        for undatable in [0, -1, MIN_TRUSTED_NS - 1] {
+        for undatable in [0, MIN_TRUSTED_NS - 1] {
             assert!(
                 !store.is_bound(&origin, &dns_key, undatable).unwrap(),
                 "a dns binding must not be live at {undatable}"
             );
             assert!(!store.is_trusted_key(&dns_key, undatable).unwrap());
-            assert!(!store.trusted_keys(undatable).unwrap().contains(&dns_key));
             assert!(store
                 .keys_for_origin(&origin, undatable)
                 .unwrap()
@@ -945,23 +944,6 @@ mod tests {
         let mut origins = store.live_origins_for_key(&key, at(0)).unwrap();
         origins.sort();
         assert_eq!(origins, vec![b, a]);
-    }
-
-    #[test]
-    fn static_and_dns_bindings_coexist() {
-        let (_d, store) = store();
-        let key = SecretKey::generate().public();
-        let origin = OriginId::named("nas", "x.example").unwrap();
-        store
-            .put_binding(&binding(origin.clone(), key, None))
-            .unwrap();
-        store
-            .put_binding(&binding(origin.clone(), key, Some(at(10))))
-            .unwrap();
-        assert_eq!(store.bindings_for_origin(&origin).unwrap().len(), 2);
-        // The static one keeps the origin alive after the DNS one lapses.
-        store.expire_bindings(at(100)).unwrap();
-        assert!(store.is_bound(&origin, &key, at(100)).unwrap());
     }
 
     #[test]

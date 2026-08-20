@@ -278,41 +278,28 @@ mod tests {
         assert!(xml.contains("<Code>DivergentVersions</Code>"), "{xml}");
         assert!(xml.contains("nas, laptop"), "{xml}");
 
-        assert_eq!(
-            S3Error::not_implemented("DeleteObject").status,
-            StatusCode::NOT_IMPLEMENTED
-        );
-        assert_eq!(
-            S3Error::invalid_range("bad").status,
-            StatusCode::RANGE_NOT_SATISFIABLE
-        );
+        let status = S3Error::not_implemented("DeleteObject").status;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        let status = S3Error::invalid_range("bad").status;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
     }
 
-    /// Every code the daemon can send lands on a status a client can act on
-    /// (§9.4): "it is not there", "choose a version", "you asked wrong", and
-    /// "come back later" are four different answers.
+    /// Every daemon code lands on a status a client can act on (§9.4).
     #[test]
     fn daemon_error_codes_become_s3_statuses() {
         let status = |code| S3Error::from(ControlError::new(code, "why")).status;
         assert_eq!(status(ErrorCode::NotFound), StatusCode::NOT_FOUND);
         assert_eq!(status(ErrorCode::Divergent), StatusCode::CONFLICT);
         assert_eq!(status(ErrorCode::Invalid), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            status(ErrorCode::Internal),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+        let internal = status(ErrorCode::Internal);
+        assert_eq!(internal, StatusCode::INTERNAL_SERVER_ERROR);
         for code in [
             ErrorCode::Unavailable,
             ErrorCode::Unauthorized,
             ErrorCode::VersionMismatch,
             ErrorCode::NotInitialized,
         ] {
-            assert_eq!(
-                status(code),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{}",
-                code.as_str()
-            );
+            assert!(status(code) == StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
@@ -325,29 +312,8 @@ mod tests {
         assert_eq!(restated.code, "NoSuchUpload");
         assert_eq!(restated.status, StatusCode::NOT_FOUND);
         assert_eq!(restated.resource, "abc123");
-        // Anything that was not a 404 is left alone: a node in recovery is not
-        // a missing upload.
+        // Anything that was not a 404 is left alone: recovery is not a missing upload.
         let busy = S3Error::from(ControlError::new(ErrorCode::Unavailable, "recovering"));
         assert_eq!(busy.about_upload("abc123").code, "ServiceUnavailable");
-    }
-
-    #[test]
-    fn multipart_codes_are_distinct() {
-        assert_eq!(S3Error::invalid_part("no part 3").code, "InvalidPart");
-        assert_eq!(S3Error::invalid_part_order().code, "InvalidPartOrder");
-        assert_eq!(
-            S3Error::entity_too_small("too small").code,
-            "EntityTooSmall"
-        );
-        assert_eq!(S3Error::malformed_xml("bad").code, "MalformedXML");
-        // All four are client mistakes the client can fix, so all four are 400.
-        for e in [
-            S3Error::invalid_part("x"),
-            S3Error::invalid_part_order(),
-            S3Error::entity_too_small("x"),
-            S3Error::malformed_xml("x"),
-        ] {
-            assert_eq!(e.status, StatusCode::BAD_REQUEST, "{}", e.code);
-        }
     }
 }

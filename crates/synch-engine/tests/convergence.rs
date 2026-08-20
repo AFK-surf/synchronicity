@@ -1,39 +1,16 @@
-//! Randomized convergence over the §5.2 head-reconciliation rule.
-//!
-//! DESIGN §11 asks for an `mptsync` harness: an in-memory duplex-transport
-//! simulation of N nodes with random partitions, message loss and interleaved
-//! publishes, asserting that all heads and tries converge. This is the part of
-//! it that carries the weight of the rule itself — many randomized deliveries
-//! of one head set to N nodes, each in its own order and each seeing only some
-//! of it, then gossip until it settles — built directly on [`Syncer`] and
-//! [`Store`] so a case costs milliseconds and hundreds of them can run per
-//! test.
+//! Randomized convergence over the §5.2 head-reconciliation rule, built
+//! directly on [`Syncer`]/[`Store`] so hundreds of cases run per test: many
+//! randomized deliveries of one head set to N nodes, each in its own order,
+//! then gossip until it settles (DESIGN §11's `mptsync` minus the live
+//! transport, partitions and interleaved publishes, which are outstanding).
 //!
 //! What it pins is the join: `(seq, root)` under lexicographic order is a
-//! join-semilattice, so the head a node settles on is the *maximum* of what it
-//! has seen and cannot depend on the order it saw things in. Anything that
-//! refuses a head for a reason other than the ordering rule breaks that, and
-//! the failure is not local — two honest peers end up on different heads and
-//! then refuse each other's forever. The wide forks below are exactly that
-//! case: applying the fork cap as an acceptance rule would leave a node that
-//! met the greatest root of a storm late never taking it.
-//!
-//! Two harnesses, because the rule and the decision are two things:
-//! `heads_converge_whatever_order_they_arrive_in` gossips `head_floor` — the
-//! maximum over both slots — with fabricated roots, covering the acceptance
-//! rule and nothing else. `the_push_pull_decision_converges_over_real_slots`
-//! covers the part the wire actually runs, which is narrower in two ways:
-//! `heads_for` serves the **complete** slot only, and `sync_with` pushes off
-//! `complete_head` rather than off whichever summary was advertised. Every
-//! root there is a real trie, so promotion runs and "converged" is checked as
-//! *servable* — the trie is here and the derived `entries` agree with the
-//! head — rather than merely known. That half used to be covered by nothing,
-//! and the decision is what a later audit found reading the store once per
-//! advertised origin on a runtime worker.
-//!
-//! Still outstanding from §11: the live duplex transport, partitions and
-//! message loss as first-class events, and interleaved *publishes* (the heads
-//! here are minted up front).
+//! join-semilattice, so the head a node settles on is the maximum of what it
+//! has seen, independent of arrival order — an acceptance rule that looks at
+//! anything else leaves two honest peers on different heads forever. Two
+//! harnesses: `heads_converge_…` gossips `head_floor` with fabricated roots;
+//! `the_push_pull_decision_…` runs the shape `sync_with` actually runs (the
+//! complete slot only) over real tries, so "converged" means servable.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -41,7 +18,10 @@ use std::sync::Arc;
 use iroh_base::SecretKey;
 use synch_core::{Hash, OriginId, SignedHead};
 use synch_engine::reconcile::{Syncer, MAX_RETAINED_FORKS};
-use synch_store::{Binding, BindingSource, Store};
+use synch_store::Store;
+
+mod common;
+use common::binding;
 
 /// xorshift64*, so a case is reproducible from its seed.
 struct Rng(u64);
@@ -70,6 +50,13 @@ impl Rng {
     }
 }
 
+fn origins(names: &[&str]) -> Vec<OriginId> {
+    names
+        .iter()
+        .map(|name| OriginId::named(name, "x.example").expect("an origin"))
+        .collect()
+}
+
 /// One node: a store with the signing key bound, and a syncer over it.
 struct Node {
     store: Arc<Store>,
@@ -84,17 +71,7 @@ fn node(key: &SecretKey, origins: &[OriginId]) -> Node {
     let store = Arc::new(Store::open(dir.path()).expect("a store"));
     for origin in origins {
         store
-            .put_binding(&Binding {
-                origin: origin.clone(),
-                node_id: key.public(),
-                source: BindingSource::Static,
-                domain: None,
-                issuer: None,
-                spaces: Vec::new(),
-                note: None,
-                added_at: 0,
-                expires_at: None,
-            })
+            .put_binding(&binding(origin, &key.public()))
             .expect("the binding");
     }
     Node {
@@ -112,6 +89,27 @@ fn maximum(heads: &[SignedHead]) -> (u64, Hash) {
         .map(|h| (h.seq, h.root))
         .max_by_key(|(seq, root)| (*seq, root.0))
         .expect("a non-empty head set")
+}
+
+/// Random rounds, then an all-pairs sweep, so what must reach everybody
+/// provably does.
+fn gossip<F: FnMut(usize, usize)>(rng: &mut Rng, count: usize, mut exchange: F) {
+    for _ in 0..count {
+        for i in 0..count {
+            let mut j = rng.below(count);
+            if j == i {
+                j = (j + 1) % count;
+            }
+            exchange(i, j);
+        }
+    }
+    for i in 0..count {
+        for j in 0..count {
+            if i != j {
+                exchange(i, j);
+            }
+        }
+    }
 }
 
 /// Builds the head set for one case: a few origins, a few seqs each, forks of
@@ -138,15 +136,11 @@ fn head_set(rng: &mut Rng, key: &SecretKey, origins: &[OriginId], seed: u64) -> 
     heads
 }
 
-/// Runs one randomized case: deliver, gossip, and check what everyone settled
-/// on.
+/// One randomized case: deliver, gossip, and check what everyone settled on.
 fn one_case(seed: u64) {
     let mut rng = Rng::new(seed);
     let key = SecretKey::generate();
-    let origins: Vec<OriginId> = ["nas", "laptop"]
-        .iter()
-        .map(|name| OriginId::named(name, "x.example").expect("an origin"))
-        .collect();
+    let origins = origins(&["nas", "laptop"]);
     let heads = head_set(&mut rng, &key, &origins, seed);
     let by_key: HashMap<(u64, [u8; 32]), SignedHead> = heads
         .iter()
@@ -156,8 +150,7 @@ fn one_case(seed: u64) {
     let count = 3 + rng.below(3);
     let mut nodes: Vec<Node> = (0..count).map(|_| node(&key, &origins)).collect();
 
-    // Every head reaches at least one node, and each node sees a random part of
-    // the rest — message loss, without a transport to lose it on.
+    // Message loss without a transport: every head reaches at least one node; each sees a random part.
     let mut plan: Vec<Vec<SignedHead>> = vec![Vec::new(); count];
     for head in &heads {
         plan[rng.below(count)].push(head.clone());
@@ -177,12 +170,8 @@ fn one_case(seed: u64) {
         }
     }
 
-    // Gossip: each round, every node offers what it currently holds to one
-    // peer, which is the one thing a `Hello` exchange does with heads. Random
-    // rounds first — the interesting part, since a node's own best head changes
-    // under it — then one all-pairs sweep, so what has to reach everybody
-    // provably does rather than probably does.
-    let exchange = |from: usize, to: usize, nodes: &mut Vec<Node>| {
+    // Gossip: offer what each node holds, then the sweep that proves delivery.
+    let exchange = |from: usize, to: usize| {
         for origin in &origins {
             let Some(floor) = nodes[from].store.head_floor(origin).expect("a floor") else {
                 continue;
@@ -194,22 +183,7 @@ fn one_case(seed: u64) {
             nodes[to].syncer.offer_head(&head, 0).expect("an offer");
         }
     };
-    for _round in 0..count {
-        for i in 0..count {
-            let mut j = rng.below(count);
-            if j == i {
-                j = (j + 1) % count;
-            }
-            exchange(i, j, &mut nodes);
-        }
-    }
-    for i in 0..count {
-        for j in 0..count {
-            if i != j {
-                exchange(i, j, &mut nodes);
-            }
-        }
-    }
+    gossip(&mut rng, count, exchange);
 
     for origin in &origins {
         let mine: Vec<SignedHead> = heads
@@ -227,8 +201,7 @@ fn one_case(seed: u64) {
         }
     }
 
-    // Evidence survives the eviction that bounds it: wherever a node was handed
-    // two different roots at one seq, it can still say so (§4.4).
+    // Evidence survives the eviction that bounds it: a fork delivered to a node is still reportable (§4.4).
     for node in &nodes {
         let mut seen: HashMap<(String, u64), HashSet<[u8; 32]>> = HashMap::new();
         for head in &node.delivered {
@@ -254,9 +227,8 @@ fn one_case(seed: u64) {
     }
 }
 
-/// Every node settles on the same head, from every arrival order: the property
-/// the whole of §5.2 rests on, and the one an acceptance rule that looks at
-/// anything but `(seq, root)` destroys.
+/// Every node settles on the same head, from every arrival order — the
+/// property the whole of §5.2 rests on.
 #[test]
 fn heads_converge_whatever_order_they_arrive_in() {
     for seed in 0..10 {
@@ -264,12 +236,9 @@ fn heads_converge_whatever_order_they_arrive_in() {
     }
 }
 
-/// The same convergence property, gossiped the way the *protocol* gossips:
-/// `heads_for` serves the complete slot only, and `sync_with` pushes off
-/// `complete_head` rather than off whichever summary was advertised. That
-/// decision was quietly reading the store per advertised origin and had to be
-/// rewritten; every root here is a real trie, so promotion runs and
-/// "converged" means servable, not merely known.
+/// The same property, gossiped the way the *protocol* gossips: `heads_for`
+/// serves the complete slot only, `sync_with` pushes off `complete_head`, and
+/// every root is a real trie, so "converged" means servable.
 #[test]
 fn the_push_pull_decision_converges_over_real_slots() {
     for seed in 0..8 {
@@ -284,37 +253,25 @@ fn wire_case(seed: u64) {
 
     let mut rng = Rng::new(seed);
     let key = SecretKey::generate();
-    let origins: Vec<OriginId> = ["nas", "laptop", "vps"]
-        .iter()
-        .map(|name| OriginId::named(name, "x.example").expect("an origin"))
-        .collect();
+    let origins = origins(&["nas", "laptop", "vps"]);
 
     let count = 3 + rng.below(3);
     let nodes: Vec<Node> = (0..count).map(|_| node(&key, &origins)).collect();
 
-    // A published head is a head whose trie exists, so each one is built in the
-    // store of the node that "published" it and nowhere else. Peers have to pull
-    // the nodes to be able to serve it on, exactly as they do over the wire.
+    // A published head is a head whose trie exists, built in the publisher's
+    // store and nowhere else — peers must pull the nodes to serve it on.
     let entry = |n: u64| {
         postcard::to_stdvec(&FileEntry::file(n, 0, Hash::new(&n.to_le_bytes()), 1)).expect("encode")
     };
-    /// A published head and how many leaves its trie holds.
-    struct Published {
-        head: SignedHead,
-        leaves: usize,
-    }
-    let mut published: Vec<Published> = Vec::new();
+    let mut published: Vec<SignedHead> = Vec::new();
     for (i, origin) in origins.iter().enumerate() {
-        // One origin per publisher, and a couple of successive heads each, so
-        // the pull side has to choose the greater and the push side has to stop
-        // offering the lesser.
+        // One publisher per origin, a couple of successive heads each, so the
+        // pull side chooses the greater and the push side stops offering the lesser.
         let at = i % count;
         let mut root = Hash::EMPTY;
-        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for seq in 1..=(1 + rng.below(3) as u64) {
             let key_bytes = file_key("media", &format!("{origin}-{seq}.bin")).expect("a key");
             let value = entry(seq);
-            leaves.push((key_bytes.clone(), value.clone()));
             root = Trie::new(nodes[at].store.as_ref())
                 .insert(root, &key_bytes, &value)
                 .expect("the insert");
@@ -327,18 +284,14 @@ fn wire_case(seed: u64) {
                 .store
                 .transaction(|txn| txn.materialize_diff(origin, Hash::EMPTY, root))
                 .expect("the views");
-            published.push(Published {
-                head,
-                leaves: leaves.len(),
-            });
+            published.push(head);
         }
     }
 
-    // One exchange, in the shape `sync_with` runs it: both sides advertise what
-    // `local_summaries` says, each decides what to push and what to want, the
-    // pushed heads go through `offer_head`, and the wanted origins are answered
-    // out of `heads_for` — the complete slot only.
-    let exchange = |from: usize, to: usize, nodes: &[Node]| {
+    // One exchange, in the shape `sync_with` runs it: both sides advertise
+    // `local_summaries`, each decides what to push and want, and the wanted
+    // origins are answered out of `heads_for` — the complete slot only.
+    let exchange = |from: usize, to: usize| {
         let ours = nodes[from].syncer.local_summaries().expect("summaries");
         let theirs = nodes[to].syncer.local_summaries().expect("summaries");
         let best = |set: &[HeadSummary], origin: &OriginId| {
@@ -356,15 +309,12 @@ fn wire_case(seed: u64) {
         {
             let head = stored.head;
             if best(&theirs, &head.origin).is_none_or(|peer| (head.seq, head.root.0) > peer) {
-                // Applying it needs the trie, so the receiver first pulls
-                // whatever the sender can serve: content-addressed nodes, from
-                // any peer that holds them (§5.2).
+                // Applying it needs the trie: content-addressed nodes, from any peer (§5.2).
                 copy_trie(&nodes[from], &nodes[to], head.root);
                 let _ = nodes[to].syncer.offer_head(&head, 0);
             }
         }
-        // Pull: every origin the peer is ahead on, answered from its complete
-        // slot alone.
+        // Pull: every origin the peer is ahead on, answered from its complete slot alone.
         let want: Vec<OriginId> = theirs
             .iter()
             .filter(|s| best(&ours, &s.origin).is_none_or(|mine| s.order_key() > mine))
@@ -376,30 +326,13 @@ fn wire_case(seed: u64) {
         }
     };
 
-    // Random rounds, then an all-pairs sweep so what has to reach everybody
-    // provably does.
-    for _ in 0..count {
-        for i in 0..count {
-            let mut j = rng.below(count);
-            if j == i {
-                j = (j + 1) % count;
-            }
-            exchange(i, j, &nodes);
-        }
-    }
-    for i in 0..count {
-        for j in 0..count {
-            if i != j {
-                exchange(i, j, &nodes);
-            }
-        }
-    }
+    gossip(&mut rng, count, exchange);
 
     for origin in &origins {
         let expected = published
             .iter()
-            .filter(|p| &p.head.origin == origin)
-            .map(|p| (p.head.seq, p.head.root))
+            .filter(|p| &p.origin == origin)
+            .map(|p| (p.seq, p.root))
             .max_by_key(|(seq, root)| (*seq, root.0))
             .expect("every origin published");
         for (i, holder) in nodes.iter().enumerate() {
@@ -413,40 +346,31 @@ fn wire_case(seed: u64) {
                 expected,
                 "seed {seed}: node {i} settled elsewhere for {origin}"
             );
-            // Converged means servable, not merely known: the trie under the
-            // head is here, so this node can hand it to the next one.
+            // Converged means servable, not merely known: the trie is here.
             assert!(
                 synch_mpt::Trie::new(holder.store.as_ref())
                     .is_complete(complete.root)
                     .expect("completeness"),
                 "seed {seed}: node {i} holds a head for {origin} it cannot serve"
             );
-            // And the derived view agrees with the head, which is what the
-            // unified tree, mirrors and the gateway read.
-            let leaves = published
-                .iter()
-                .filter(|p| p.head.root == complete.root)
-                .map(|p| p.leaves)
-                .max()
-                .expect("the published head");
+            // The derived view agrees with the head — what the unified tree,
+            // mirrors and the gateway read (one key per head, so seq is leaf count).
             assert_eq!(
                 holder
                     .store
                     .list_entries(Some(origin), "media", "", None, None)
                     .expect("the entries")
                     .len(),
-                leaves,
+                complete.seq as usize,
                 "seed {seed}: node {i}'s entries do not match the head it holds"
             );
         }
     }
 }
 
-/// Copies every trie node and value under `root` from one store to another.
-///
-/// Stands in for `GetNodes`/`GetValues` without a transport: the fetch's job is
-/// to make the receiver able to *serve* the root, and this is that outcome. The
-/// walk itself is covered over real endpoints in `two_nodes.rs`.
+/// Copies every trie node and value under `root` between stores — `GetNodes`/
+/// `GetValues` without a transport; the walk itself is covered over real
+/// endpoints in `two_nodes.rs`.
 fn copy_trie(from: &Node, to: &Node, root: Hash) {
     use synch_mpt::NodeStore;
     let reachable = synch_mpt::Trie::new(from.store.as_ref())

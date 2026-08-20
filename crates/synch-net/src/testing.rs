@@ -25,6 +25,14 @@ pub(crate) async fn bare_endpoint(alpn: &'static [u8]) -> Endpoint {
         .expect("a loopback endpoint binds")
 }
 
+/// A scratch store in a temporary directory, kept alive for the store's
+/// lifetime.
+pub(crate) fn test_store() -> (tempfile::TempDir, std::sync::Arc<synch_store::Store>) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).expect("a store"));
+    (dir, store)
+}
+
 /// The directly bound address of an endpoint, which is all a loopback dial
 /// needs.
 pub(crate) fn direct_addr(endpoint: &Endpoint) -> EndpointAddr {
@@ -34,12 +42,11 @@ pub(crate) fn direct_addr(endpoint: &Endpoint) -> EndpointAddr {
     )
 }
 
-/// A peer that completes the handshake and then answers nothing.
-///
-/// The shape a client deadline exists for: the session stays open, the streams
-/// stay open, and no frame ever comes back. Its connections are held for as long
-/// as the task lives so nothing on the wire closes and hands the client an error
-/// the deadline was not responsible for.
+/// A peer that completes the handshake and then answers nothing — the shape
+/// a client deadline exists for: the session stays open, the streams stay
+/// open, and no frame ever comes back. Connections are held for as long as
+/// the task lives, so nothing on the wire closes and hands the client an
+/// error the deadline was not responsible for.
 #[allow(missing_debug_implementations)]
 pub(crate) struct StalledPeer {
     /// Where to dial it.
@@ -83,9 +90,10 @@ impl StalledPeer {
 #[allow(missing_debug_implementations)]
 /// A pair of endpoints that trust each other, for exercising a real exchange.
 ///
-/// Membership is unilateral per node (§3.2), so both stores are told about the
-/// other's device key before anything is dialled. The client's data directory
-/// comes back with them: dropping it would take its database with it.
+/// Membership is unilateral per node (§3.2), so both stores are told about
+/// the other's device key before anything is dialled. The client's data
+/// directory comes back with them: dropping it would take its database
+/// with it.
 ///
 /// `cfg(test)` only: tempfile is a dev-dependency, absent from the `sim`
 /// feature build the integration suites link.

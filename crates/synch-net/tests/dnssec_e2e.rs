@@ -1,8 +1,6 @@
-//! DNSSEC end to end, against a simulated signed zone (§3.2): the sim serves
-//! over plaintext DoH, the test installs the zone's key as the entire root
-//! of trust, and the real validation path runs — TXT, RRSIG, DNSKEY, anchor.
-//! DNSSEC-only coverage: the zone-key transparency path has its own suite,
-//! and no test run reaches Sigstore.
+//! DNSSEC end to end against a simulated signed zone (§3.2): the sim serves over
+//! plaintext DoH, the test installs the zone's key as the entire root of trust,
+//! and the real validation path runs. DNSSEC-only: transparency has its own suite.
 
 mod common;
 
@@ -23,7 +21,7 @@ fn options(url: String, anchor: &std::path::Path) -> ResolverOptions {
     }
 }
 
-/// Serve `zone` over plaintext DoH and build a resolver anchored at it.
+/// Serve `zone` over plaintext DoH, resolver anchored at it.
 async fn resolve(zone: SimZone) -> (DnssecResolver, tokio::task::JoinHandle<()>) {
     let anchor = common::write(&zone.anchor_record());
     let (url, server) = zone.serve().await;
@@ -31,10 +29,9 @@ async fn resolve(zone: SimZone) -> (DnssecResolver, tokio::task::JoinHandle<()>)
     (resolver, server)
 }
 
-/// The positive end-to-end: real hickory validation under a self-installed
-/// anchor, member_set bindings and TTL. And the negative phase on the same
-/// zone: with the anchor swapped for a stranger's key, correctly signed
-/// answers refuse exactly as well as forgeries.
+/// The positive end-to-end: real hickory validation under a self-installed anchor,
+/// member_set bindings and TTL. And the negative phase: under a stranger's anchor,
+/// correctly signed answers refuse exactly as well as forgeries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_signed_zone_validates_end_to_end() {
     let nas = SecretKey::generate().public();
@@ -61,8 +58,7 @@ async fn a_signed_zone_validates_end_to_end() {
         .any(|(origin, key)| origin.canonical() == "nas@cluster.example" && *key == nas));
     server.abort();
 
-    // The same zone under a stranger's anchor: a root we never trusted
-    // validates exactly as well as forgeries.
+    // The same zone under a stranger's anchor: a root we never trusted validates exactly as well as forgeries.
     let nas = SecretKey::generate().public();
     let zone = SimZone::new(
         "cluster.example",
@@ -78,13 +74,11 @@ async fn a_signed_zone_validates_end_to_end() {
     server.abort();
 }
 
-/// The forgery the owner-name filter does **not** catch: an anchored
-/// attacker zone signs RRsets owned by the victim's name — hickory skips
-/// RFC 4035 §5.3.1's signer check in two places, both marked TODO — so the
-/// transport filter strips the off-path RRSIG, and `secure_txt` would refuse
-/// the same answer for the enclosure rule. Either refusal is the defense.
-/// `rekor` is off on purpose: under `require` the apex sandwich in `apex_of`
-/// happens to block this too, and the signer rule has to stand on its own.
+/// The forgery the owner-name filter does **not** catch: an anchored attacker
+/// zone signs RRsets owned by the victim's name — hickory skips §5.3.1's signer
+/// check in two places (both marked TODO) — so the transport filter strips the
+/// off-path RRSIG. `rekor` is off on purpose: under `require` the apex sandwich
+/// in `apex_of` happens to block this too, and the signer rule must stand alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
     use hickory_resolver::proto::rr::Name;
@@ -110,8 +104,7 @@ async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
             || error.to_string().contains("no RRSIG"),
         "refused for the wrong reason: {error}"
     );
-    // And the same through the membership path, which is what an attacker
-    // is actually after.
+    // And the same through the membership path — what an attacker is actually after.
     resolver
         .member_set("cluster.example")
         .await
@@ -120,10 +113,10 @@ async fn a_zone_may_not_sign_for_a_name_it_does_not_contain() {
 }
 
 /// A record spliced into a validated answer in another class binds nothing.
-/// hickory groups RRsets by `(name, record_type)` and stamps its verdict on
-/// the whole group, while the signed-data construction filters by class — so
-/// `dns::covered_by_signed_data` matches the verifier's `(name, type, class)`
-/// triple exactly, and the honest RRSIG verifying is not enough.
+/// hickory groups RRsets by `(name, type)` and stamps its verdict on the whole
+/// group, while the signed-data construction filters by class — so the filter
+/// matches the verifier's `(name, type, class)` triple, and the honest RRSIG
+/// verifying is not enough.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_spliced_in_another_class_is_signed_by_nobody() {
     let nas = SecretKey::generate().public();

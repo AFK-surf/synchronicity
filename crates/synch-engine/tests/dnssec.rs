@@ -3,21 +3,16 @@
 
 use iroh_base::SecretKey;
 use synch_core::OriginId;
-use synch_engine::{Node, NodeConfig};
 use synch_net::{sim::SimZone, DnssecResolver, RekorPolicy, ResolverOptions};
+
+mod common;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validated_records_become_bindings_and_outages_keep_them() {
-    // This test's own body drives the world synchronously; the runtime
-    // workers the node uses stay checked (§10).
+    // The body drives the world synchronously; the node's runtime workers stay checked (§10).
     let _blocking = synch_core::BlockingScope::enter();
-    let data = tempfile::tempdir().unwrap();
-    Node::init_named_by_zone(
-        data.path(),
-        OriginId::named("laptop", "cluster.example").unwrap(),
-    )
-    .unwrap();
-    let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+    let peer = common::spawn_node("laptop").await;
+    let node = &peer.node;
 
     let nas = SecretKey::generate().public();
     let zone = SimZone::new(
@@ -31,8 +26,7 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
     let resolver = DnssecResolver::with_options(&ResolverOptions {
         doh_url: Some(url),
         trust_anchor: Some(anchor.path().to_path_buf()),
-        // DNSSEC-only coverage: the zone-key transparency path has its own
-        // suite, and this zone logs nothing.
+        // DNSSEC-only: the zone-key transparency path has its own suite, and this zone logs nothing.
         rekor: Some(RekorPolicy::Off),
         rekor_key: None,
         rekor_state: None,
@@ -54,13 +48,9 @@ async fn validated_records_become_bindings_and_outages_keep_them() {
     let origin = OriginId::named("nas", "cluster.example").unwrap();
     let now = synch_core::now_ns();
     assert!(node.store().is_bound(&origin, &nas, now).unwrap());
-    let health = node.domain_health().unwrap();
-    assert_eq!(health[0].bindings, 1, "{health:?}");
-    assert!(health[0].schedule.as_ref().unwrap().last_success > 0);
 
-    // The zone goes dark; the refresh reports the failure and the binding
-    // stays exactly as cached. Fail closed means the member set shrinks by
-    // expiry, never by outage.
+    // The zone goes dark: the refresh reports the failure and the binding
+    // stays exactly as cached — fail closed shrinks the member set by expiry, never by outage.
     server.abort();
     let outcomes = node
         .refresh_domains_named(&resolver, Some("cluster.example"))

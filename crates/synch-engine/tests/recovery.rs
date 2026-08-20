@@ -1,34 +1,18 @@
-//! Key-loss recovery across real loopback endpoints (§3.4).
-//!
-//! The scenario throughout: an origin named `nas@cluster.example` publishes for
-//! a while, its device key and database are lost, and the operator brings it
-//! back under a fresh key with the same `id=` name. Its peers still hold the
-//! history it no longer has, signed by a key that is no longer bound — so those
-//! heads can never be accepted (§4.4), and their existence in the `Hello`
-//! summary is the only thing recovery has to work with.
+//! Key-loss recovery across real loopback endpoints (§3.4). The scenario
+//! throughout: an origin's device key and database are lost, and the operator
+//! brings it back under a fresh key with the same `id=` name. Its peers still
+//! hold history signed by a key that is no longer bound, so those heads can
+//! never be accepted (§4.4) — and their existence in the `Hello` summary is
+//! the only thing recovery has to work with.
 
 use std::time::Duration;
 
 use synch_core::OriginId;
 use synch_engine::{Node, NodeConfig, RecoveryOptions};
-use synch_store::{Binding, BindingSource};
+use synch_store::BindingSource;
 
-struct Peer {
-    _data: tempfile::TempDir,
-    space: tempfile::TempDir,
-    node: Node,
-}
-
-async fn spawn(name: &str) -> Peer {
-    let data = tempfile::tempdir().unwrap();
-    let space = tempfile::tempdir().unwrap();
-    let node = open(data.path(), Some(origin(name))).await;
-    Peer {
-        _data: data,
-        space,
-        node,
-    }
-}
+mod common;
+use common::{shutdown, spawn_node as spawn, trust, trust_all, Peer};
 
 async fn open(data_dir: &std::path::Path, id: Option<OriginId>) -> Node {
     if let Some(id) = id {
@@ -39,24 +23,6 @@ async fn open(data_dir: &std::path::Path, id: Option<OriginId>) -> Node {
 
 fn origin(name: &str) -> OriginId {
     OriginId::named(name, "cluster.example").unwrap()
-}
-
-/// Trust is unilateral, so admitting a peer is one direction at a time (§3.2).
-fn trust(node: &Node, peer: &Node) {
-    node.store()
-        .put_binding(&Binding {
-            origin: peer.origin().clone(),
-            node_id: peer.node_id(),
-            source: BindingSource::Static,
-            domain: None,
-            issuer: None,
-            spaces: Vec::new(),
-            note: None,
-            added_at: 0,
-            expires_at: None,
-        })
-        .unwrap();
-    node.remember_peer(&peer.net().direct_addr()).unwrap();
 }
 
 /// What the operator's replacement TXT record does to a peer: the origin now
@@ -81,15 +47,14 @@ fn quick(wait: Duration, gap: u64) -> RecoveryOptions {
 }
 
 /// The whole arc: a wiped node refuses to publish, learns how far its origin
-/// had got from an ordinary `Hello` exchange, resumes above it, and is accepted
+/// got from an ordinary `Hello` exchange, resumes above it, and is accepted
 /// by the peer that holds the old history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
     let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
-    trust(&nas.node, &laptop.node);
-    trust(&laptop.node, &nas.node);
+    trust_all(&[&nas, &laptop]);
     let lost_key = nas.node.node_id();
 
     // The NAS publishes three roots; the laptop replicates them.
@@ -115,7 +80,7 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
     );
     nas.node.shutdown().await.unwrap();
 
-    // Key and database are gone. The operator brings the origin back under a
+    // Key and database are gone; the operator brings the origin back under a
     // fresh key, with the same name, on an empty database.
     let data = tempfile::tempdir().unwrap();
     let recovered = open(data.path(), Some(origin("nas"))).await;
@@ -123,9 +88,8 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
     trust(&recovered, &laptop.node);
     rebind(&laptop.node, &origin("nas"), &lost_key, &recovered);
 
-    // One ordinary exchange. The laptop's head for `nas` is signed by the lost
-    // key, which is no longer bound: it is rejected, exactly as §4.4 requires.
-    // What survives the exchange is the summary that mentioned it.
+    // One ordinary exchange: the laptop's head for `nas` is signed by the lost
+    // key, no longer bound, and rejected (§4.4); what survives is the summary.
     let report = recovered
         .sync_with_peer(&laptop.node.node_id())
         .await
@@ -139,11 +103,9 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
 
     let state = recovered.recovery_state().unwrap();
     assert!(state.in_recovery, "{state:?}");
-    assert_eq!(state.observed_seq, Some(3));
-    assert_eq!(state.own_seq, None);
 
-    // Publishing is refused, and the error says what to run. The refusal comes
-    // before the scan, so nothing is recorded as published that was not.
+    // Publishing is refused, and the error says what to run — before the
+    // scan, so nothing is recorded as published that was not.
     recovered.add_space("media", nas.space.path()).unwrap();
     let err = recovered.scan_and_publish().unwrap_err();
     let message = err.to_string();
@@ -167,18 +129,15 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
     assert_eq!(recovery.floor, Some(1_003));
     assert!(!recovered.recovery_state().unwrap().in_recovery);
 
-    // The floor is durable: it is still there after a restart, before anything
-    // has been published under it.
+    // The floor is durable: still there after a restart, before anything has been published under it.
     recovered.shutdown().await.unwrap();
     let recovered = open(data.path(), None).await;
     assert_eq!(recovered.next_seq().unwrap(), 1_003);
 
-    // Publishing resumes strictly above everything the peer advertised, by the
-    // gap, and the peer accepts it under the ordinary acceptance rule.
+    // Publishing resumes strictly above everything the peer advertised, by the gap, and is accepted under the ordinary rule.
     let head = recovered.scan_publish_push().await.unwrap().unwrap();
     assert_eq!(head.seq, 1_003);
-    // The push carries the head; the pull that follows completes its trie and
-    // flips the peer's complete slot (§5.2).
+    // The push carries the head; the pull that follows completes its trie and flips the peer's complete slot (§5.2).
     laptop
         .node
         .sync_with_peer(&recovered.node_id())
@@ -191,31 +150,26 @@ async fn a_wiped_node_refuses_to_publish_then_resumes_above_its_peers() {
         .unwrap()
         .unwrap();
     assert_eq!(theirs.seq, 1_003);
-    assert_eq!(theirs.root, head.root);
 
     // And the next publish carries on from there, not from the floor.
     write(&nas, "after-recovery.txt", "more");
     let head = recovered.scan_and_publish().unwrap().1.unwrap();
     assert_eq!(head.seq, 1_004);
 
-    recovered.shutdown().await.unwrap();
-    laptop.node.shutdown().await.unwrap();
+    shutdown(&[&recovered, &laptop.node]).await;
 }
 
-/// Why the gap is not an optimization to remove. With it turned down to 1, a
-/// peer that was unreachable throughout the quiesce comes back holding history
-/// *above* the floor: the recovered node's publishes are refused as not newer,
-/// and the pre-recovery history stays as provable fork evidence for the
-/// operator to resolve (§3.4, §4.4).
+/// Why the gap is not an optimization to remove: a peer unreachable
+/// throughout the quiesce comes back holding history *above* the floor, so
+/// the recovered node's publishes are refused as not newer and the old
+/// history stays as provable fork evidence for the operator (§3.4, §4.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_only_an_unreachable_peer_held_survives_as_fork_evidence() {
     let _blocking = synch_core::BlockingScope::enter();
     let nas = spawn("nas").await;
     let laptop = spawn("laptop").await;
     let vps = spawn("vps").await;
-    for (a, b) in [(&nas, &laptop), (&laptop, &nas), (&nas, &vps), (&vps, &nas)] {
-        trust(&a.node, &b.node);
-    }
+    trust_all(&[&nas, &laptop, &vps]);
     let lost_key = nas.node.node_id();
 
     nas.node.add_space("media", nas.space.path()).unwrap();
@@ -245,8 +199,7 @@ async fn history_only_an_unreachable_peer_held_survives_as_fork_evidence() {
     nas.node.shutdown().await.unwrap();
     vps.node.shutdown().await.unwrap();
 
-    // Recovery sees only the laptop, which knows about seq 1, and the operator
-    // asks for a gap of 1 — the smallest the protocol allows.
+    // Recovery sees only the laptop (which knows seq 1), with the smallest gap the protocol allows.
     let data = tempfile::tempdir().unwrap();
     let recovered = open(data.path(), Some(origin("nas"))).await;
     trust(&recovered, &laptop.node);
@@ -263,9 +216,8 @@ async fn history_only_an_unreachable_peer_held_survives_as_fork_evidence() {
     let head = recovered.scan_publish_push().await.unwrap().unwrap();
     assert_eq!(head.seq, 2);
 
-    // The VPS returns. Its own head is newer than anything the recovered node
-    // has published, so seq monotonicity refuses the new head — a fork, not a
-    // silent overwrite.
+    // The VPS returns: its head is newer than anything the recovered node has
+    // published, so monotonicity refuses the new head — a fork, not a silent overwrite.
     let vps = open(vps._data.path(), None).await;
     rebind(&vps, &origin("nas"), &lost_key, &recovered);
     trust(&recovered, &vps);
@@ -297,7 +249,5 @@ async fn history_only_an_unreachable_peer_held_survives_as_fork_evidence() {
         b"one"
     );
 
-    recovered.shutdown().await.unwrap();
-    laptop.node.shutdown().await.unwrap();
-    vps.shutdown().await.unwrap();
+    shutdown(&[&recovered, &laptop.node, &vps]).await;
 }

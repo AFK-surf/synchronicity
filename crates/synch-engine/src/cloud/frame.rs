@@ -359,13 +359,9 @@ mod tests {
     use super::*;
     use synch_core::head_signing_input;
 
-    /// The delegations answer's field names are the contract, and the other
-    /// side of it is written in another language.
-    ///
-    /// `control-plane/src/api/agent.gleam` decodes these by name, so a rename
-    /// here is not a compile error anywhere — it is a dashboard that quietly
-    /// stops showing who the cluster admits. Pinned the way the Rekor wire
-    /// layout is pinned, and for the same reason.
+    /// The delegations answer's field names are the contract: the other side
+    /// is written in another language, which decodes them by name — a rename
+    /// here is a dashboard that quietly stops showing who the cluster admits.
     #[test]
     fn the_delegations_wire_layout_is_pinned() {
         let frame = Up::Delegations {
@@ -392,7 +388,6 @@ mod tests {
         assert_eq!(row["added_at"], 12);
         assert_eq!(row["note"], "laptop");
 
-        // The request side too: the tag the control plane sends.
         let ask: serde_json::Value = serde_json::to_value(Down::Delegations { id: 4 }).unwrap();
         assert_eq!(ask["t"], "delegations");
         assert_eq!(ask["id"], 4);
@@ -417,9 +412,9 @@ mod tests {
         assert!(bare["delegations"][0]["note"].is_null());
     }
 
-    /// The two contexts a device key signs under must not overlap. A head
-    /// signature that verified as an attach proof would let anyone who has
-    /// ever seen a published head attach as that node.
+    /// The two contexts a device key signs under must not overlap: a head
+    /// signature verified as an attach proof lets anyone who saw a published
+    /// head attach as that node.
     #[test]
     fn an_attach_proof_is_not_a_head_signature() {
         let key = iroh_base::SecretKey::generate();
@@ -450,8 +445,7 @@ mod tests {
             attach_signing_input("https://b.example/agent/v1/attach", &nonce)
         );
         // The boundary cannot be shifted: the nonce is a fixed-width tail, so
-        // a URL ending in the first nonce byte does not produce the input a
-        // shorter URL with a longer nonce would.
+        // a URL ending in the first nonce byte is not a shifted-nonce input.
         let shifted = [&[0x2fu8][..], &nonce[..NONCE_LEN - 1]].concat();
         assert_ne!(
             attach_signing_input("https://a.example", &nonce),
@@ -553,9 +547,8 @@ mod tests {
         );
     }
 
-    /// There is no opcode that writes, and this is where that stays true: a
-    /// frame naming one is not a refusal at some later gate, it is a decode
-    /// failure with nowhere to go.
+    /// There is no opcode that writes: a frame naming one fails to decode,
+    /// not at some later gate.
     #[test]
     fn no_frame_encodes_a_write() {
         for attempt in [

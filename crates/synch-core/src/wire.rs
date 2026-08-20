@@ -1,8 +1,8 @@
 //! Wire schemas for the two ALPNs (§5.1, §6.4).
 //!
-//! All messages are length-framed `postcard` on QUIC streams. The framing
-//! itself lives in `synch-net`; this module owns the schemas so that they can be
-//! round-trip tested without any networking.
+//! All messages are length-framed `postcard` on QUIC streams; the framing lives
+//! in `synch-net`. This module owns the schemas so they can be round-trip
+//! tested without networking.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,11 +21,10 @@ pub const ALPN_BLOB: &[u8] = b"sync/blob/1";
 
 /// Protocol version carried in `Hello`.
 ///
-/// postcard numbers enum variants by position, so the shape of the messages
-/// below *is* the protocol: reordering or reshaping one changes the wire and
-/// changes this. The check in `Hello` is the whole of the compatibility story —
-/// a peer on another version is refused rather than negotiated with — so the
-/// messages are free to be defined in whatever order reads best.
+/// postcard numbers enum variants by position, so the message shapes *are* the
+/// protocol: reordering one changes the wire. `Hello`'s check is the whole
+/// compatibility story — a peer on another version is refused, not negotiated
+/// with.
 pub const PROTO_VERSION: u16 = 2;
 
 /// Maximum number of hashes per `GetNodes`/`GetValues` batch (§5.1).
@@ -34,34 +33,27 @@ pub const MAX_BATCH: usize = 256;
 /// The most nibble-path bytes one `GetNodes`/`GetValues` batch may carry.
 ///
 /// Set to exactly what a legal batch can carry — [`MAX_BATCH`] paths of the
-/// deepest key [`MAX_KEY_LEN`][crate::MAX_KEY_LEN] allows — so that no honest
+/// deepest key [`MAX_KEY_LEN`][crate::MAX_KEY_LEN] allows — so no honest
 /// requester can build a batch its peer refuses. A tighter figure would be a
-/// wedge rather than a bound: the walk is deterministic, so a batch once over
-/// the cap is over it again on every retry, and two honest nodes would stop
-/// syncing for good. What it still denies is a frame full of paths that are
-/// long for no reason, which a responder would be obliged to descend.
+/// wedge: the walk is deterministic, so an over-cap batch is over it on every
+/// retry and two honest nodes would stop syncing for good.
 pub const MAX_BATCH_PATH_BYTES: usize = MAX_BATCH * 2 * crate::MAX_KEY_LEN;
 
 /// An upper bound on the tree nodes a proof over `ranges` at `level` emits.
 ///
-/// A proof stopping at `level` names one subtree per `2^level` groups. The
-/// interior nodes above `n` subtrees of one contiguous run number at most
-/// `n - 1`, as in any binary tree, and each disjoint range additionally costs a
-/// root-to-range path no deeper than the 64 levels a `u64` group index can
-/// address. So `n + ranges * 64` bounds it.
+/// A proof stopping at `level` names one subtree per `2^level` groups; the
+/// interior above `n` subtrees of one run numbers at most `n - 1`, and each
+/// disjoint range costs a root-to-range path no deeper than the 64 levels a
+/// `u64` group index can address. So `n + ranges * 64` bounds it. The looser
+/// `2n + ranges * 64` is wrong in a way that matters, because the provider
+/// *refuses* an over-budget request rather than truncating: it puts the
+/// span-level round of a 100 GB object (~5 960 subtrees, what `MAX_PROOF_NODES`
+/// is sized to carry in one exchange) over the budget, splitting the one round
+/// the whole descent depends on being atomic.
 ///
-/// The looser `2n + ranges * 64` would be simpler and is wrong in a way that
-/// matters, because the provider *refuses* an over-budget request rather than
-/// truncating it: it puts the span-level round of a 100 GB object — about
-/// 5 960 subtrees, which `MAX_PROOF_NODES` is sized to carry in one exchange —
-/// over the budget, and would split the one round the whole descent depends on
-/// being atomic.
-///
-/// This is what lets the requester size a window so the provider never has to
-/// truncate. It is an over-estimate, and deliberately so: the provider walks
-/// `requested ∩ what it holds`, which the requester cannot predict, but a
-/// subset never emits more nodes than the whole. So a window sized to fit
-/// assuming a full holder fits for every holder.
+/// An over-estimate on purpose: the provider walks `requested ∩ what it holds`,
+/// which the requester cannot predict, but a subset never emits more nodes than
+/// the whole — so a window sized for a full holder fits for every holder.
 pub fn proof_nodes_upper_bound(ranges: &ChunkRanges, level: u8) -> u64 {
     /// The deepest a root-to-range path can be for a `u64` group index.
     const MAX_PATH: u64 = 64;
@@ -72,46 +64,37 @@ pub fn proof_nodes_upper_bound(ranges: &ChunkRanges, level: u8) -> u64 {
 
 /// How many heads or head summaries one message may carry (§5.1).
 ///
-/// The counterpart of [`MAX_BATCH`] for the head-gossip messages, which need a
-/// bound of their own and are the costlier of the two: each `SignedHead` in a
-/// `Heads` frame buys an Ed25519 verification and a `head_history` insert, and
-/// each origin in a `HeadsWant` buys a query. Bounded only by the frame, one
-/// 16 MiB message is worth six figures of both.
-///
-/// §12 sizes a cluster at N ≤ 100 origins and one head per origin per slot, so
-/// a legitimate exchange names tens; this leaves two orders of magnitude of
-/// headroom over that and still cuts the amplification to nothing.
+/// The costlier counterpart of [`MAX_BATCH`]: each `SignedHead` in a `Heads`
+/// frame buys an Ed25519 verification and a `head_history` insert, and each
+/// origin in a `HeadsWant` buys a query — bounded only by the frame, one 16 MiB
+/// message is worth six figures of both. §12 sizes a cluster at N ≤ 100 origins
+/// and one head per origin per slot, so a legitimate exchange names tens; this
+/// leaves two orders of magnitude of headroom and still cuts the amplification.
 pub const MAX_HEADS_PER_MESSAGE: usize = 4096;
 
-/// Maximum accepted length of a single framed message, in bytes.
-///
-/// This bounds memory use per stream against a hostile peer (§12, DoS).
+/// Maximum accepted length of a single framed message, in bytes — the per-stream
+/// memory bound against a hostile peer (§12, DoS).
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// The most chunk groups one slice exchange carries — 8 MiB of payload.
 ///
-/// A bao slice is encoded into memory whole, on both sides, and travels in one
+/// A bao slice is encoded into memory whole on both sides and travels in one
 /// frame, so an unbounded `GetSlice` is two problems at once: an object larger
-/// than [`MAX_FRAME_LEN`] could never be served at all, and a peer could make a
-/// provider allocate an object-sized buffer just by asking for one (§6.4, §12).
+/// than [`MAX_FRAME_LEN`] could never be served, and a peer could make a
+/// provider allocate an object-sized buffer just by asking (§6.4, §12).
 /// Requests are therefore served a window at a time and the requester loops.
-/// The ceiling leaves room for the hash pairs bao interleaves with the payload,
-/// which stay well under the remaining 8 MiB even when a window is asked for
-/// one group at a time.
 pub const MAX_SLICE_GROUPS: u64 = 512;
 
 /// The most interior tree nodes one proof exchange carries — 512 KiB of hashes.
 ///
-/// A proof is a slice with the payload left out, and it is bounded for the same
-/// reason (§12): it is built in memory and travels in one frame, so the size of
-/// the provider's allocation must not be the requester's to choose. Unlike a
-/// slice, though, a proof cannot be bounded by group count alone — the whole
-/// point of the span-level round is that one exchange describes a very large
-/// range very cheaply, and clamping it to [`MAX_SLICE_GROUPS`] groups would
-/// turn the 381 KB descent of a 100 GB object into twelve thousand round trips
+/// A proof is a slice with the payload left out, bounded for the same reason
+/// (§12): built in memory and traveling in one frame, its allocation size must
+/// not be the requester's to choose. It cannot be bounded by group count alone
+/// — the point of the span-level round is that one exchange describes a huge
+/// range cheaply, and clamping to [`MAX_SLICE_GROUPS`] would turn the 381 KB
+/// descent of a 100 GB object into twelve thousand round trips
 /// (`docs/DELTA-SYNC.md` §3.3). Nodes are what a proof costs, so nodes are what
-/// it is counted in: this ceiling covers a 100 GB object's span-level round in
-/// a single exchange, and `ProofEnd` reports where anything larger stopped.
+/// it is counted in; `ProofEnd` reports where anything larger stopped.
 pub const MAX_PROOF_NODES: u64 = 8192;
 
 /// The wire size of one proof node: a pair of 32-byte chaining values.
@@ -121,41 +104,34 @@ pub const PROOF_NODE_LEN: usize = 64;
 ///
 /// Set operations are quadratic in the number of ranges, so a request built
 /// from a million singleton ranges is a CPU exhaustion vector even though it
-/// fits in a frame. No honest request needs anything near this many: a window
-/// is [`MAX_SLICE_GROUPS`] groups, so it cannot describe more than that many
-/// disjoint runs.
+/// fits in a frame. No honest request needs near this many: a window is
+/// [`MAX_SLICE_GROUPS`] groups, so it cannot describe more disjoint runs.
 pub const MAX_RANGES: usize = 4096;
 
 /// How many provider hints one [`MptMessage::Providers`] may carry (§5.1).
 ///
-/// A hint is unverified by design — content is hash-verified whatever the hint
-/// said — but taking one still costs a `blob_providers` row, and `OriginId`
-/// arrives off the wire without anything vouching that the origin exists. An
-/// unbounded answer therefore buys the responder's peer a table of fabricated
-/// origins for one small request.
-///
-/// §12 sizes a cluster at N ≤ 100 origins, and one object has at most one ad per
-/// origin, so a legitimate answer names tens.
+/// A hint is unverified by design — content is hash-verified whatever it said —
+/// but taking one still costs a `blob_providers` row, and `OriginId` arrives
+/// without anything vouching the origin exists, so an unbounded answer buys the
+/// responder's peer a table of fabricated origins for one small request. §12
+/// sizes a cluster at N ≤ 100 origins, one ad per origin, so a legitimate
+/// answer names tens.
 pub const MAX_PROVIDER_ADS: usize = 256;
 
 /// Decodes a `Vec` that refuses to grow past `N` elements, rather than checking
 /// its length once it is already in memory.
 ///
-/// Every `MptMessage` field with a documented cap uses this, for the reason
-/// [`ChunkRanges`]'s own decoder gives: a check on the materialized `Vec` comes
-/// too late. Both halves of that mattered here. The *memory* is the obvious
-/// half — a 16 MiB frame is ~524 000 `NodeId`s or ~117 000 `SignedHead`s, all
-/// resident before a length check can look at them. The *CPU* is the half that
-/// actually hurt: a `NodeId` decodes through an Edwards decompression, so
-/// deserializing that frame cost 2.4 s of runtime-worker time — measured —
-/// before `check_heads` could reject it, and the decode runs inline on the
-/// connection task rather than on the blocking pool. §12 promises "sanity
-/// bounds that cap the cost of any *single* malformed or extreme message"; a
-/// cap that fires after the work is not one.
-///
-/// Refused outright rather than truncated: a truncated request is a different
-/// request, and a truncated answer silently misreports what a peer served.
-/// [`bounded_vec`] through an `Option`, for a field that is absent or bounded.
+/// Every capped `MptMessage` field uses this, because a check on the
+/// materialized `Vec` comes too late — in both senses. The memory: a 16 MiB
+/// frame is ~524 000 `NodeId`s or ~117 000 `SignedHead`s, all resident before a
+/// length check can look at them. The CPU, which is the half that hurt: a
+/// `NodeId` decodes through an Edwards decompression, so that frame cost 2.4 s
+/// of runtime-worker time — measured — before `check_heads` could reject it,
+/// and the decode runs inline on the connection task, not the blocking pool.
+/// §12 promises "sanity bounds that cap the cost of any *single* malformed or
+/// extreme message"; a cap that fires after the work is not one. Refused
+/// outright rather than truncated: a truncated request is a different request,
+/// and a truncated answer silently misreports what a peer served.
 fn bounded_opt_vec<'de, D, T, const N: usize>(
     deserializer: D,
 ) -> std::result::Result<Option<Vec<T>>, D::Error>
@@ -269,20 +245,17 @@ pub enum MptMessage {
         /// The spaces the sender will serve the peer it is talking to, or
         /// `None` for the whole keyspace (§5.5).
         ///
-        /// How a delegated node learns what it may ask for. Its scope lives in
+        /// How a delegated node learns what it may ask for: its scope lives in
         /// the delegating origin's trie, which it cannot read until it knows
-        /// its scope — so the peer serving it says, in the exchange that opens
-        /// every session. Advisory in the only direction that matters: the
+        /// its scope, so the peer serving it says, in the exchange that opens
+        /// every session. Advisory in the only direction that matters — the
         /// responder enforces the same scope on every request regardless, so a
-        /// wrong or stale value can only cause a peer to ask for less than it
-        /// is entitled to, never more — and it is adopted only from a peer this
-        /// node holds a *rooted* binding for, so a delegate cannot narrow a
-        /// member that admitted it.
+        /// wrong value can only make a peer ask for less, never more — and it
+        /// is adopted only from a peer this node holds a *rooted* binding for,
+        /// so a delegate cannot narrow a member that admitted it.
         ///
-        /// Bounded while decoding like every other sequence here: the field
-        /// mirrors a `Delegation`'s space list, which is capped at
-        /// [`MAX_DELEGATION_SPACES`], and an unbounded vector of unbounded
-        /// strings turns a 16 MiB frame into hundreds of megabytes of slots.
+        /// Bounded while decoding like every sequence here: the field mirrors a
+        /// `Delegation`'s space list, capped at [`MAX_DELEGATION_SPACES`].
         #[serde(deserialize_with = "bounded_opt_vec::<_, _, MAX_DELEGATION_SPACES>")]
         scope: Option<Vec<String>>,
     },
@@ -306,15 +279,13 @@ pub enum MptMessage {
     /// Request trie nodes, each with the position it is claimed to occupy.
     ///
     /// At most [`MAX_BATCH`] per batch, and at most [`MAX_BATCH_PATH_BYTES`]
-    /// of paths across the batch.
-    ///
-    /// The position is what a responder authorizes on, and it has to be: a
-    /// hash carries no position and none can be recovered from it, since
-    /// structural sharing lets one node sit under several prefixes. A
-    /// responder serving a scoped peer descends `path` from `root` in its own
-    /// store and compares the *path* against that peer's scope; the hash is
-    /// the integrity assertion the answer is checked against on arrival (§5.5).
-    /// Between unscoped peers the path is carried and ignored.
+    /// of paths across the batch. The position is what a responder authorizes
+    /// on, and it has to be: a hash carries no position and none can be
+    /// recovered from it, since structural sharing lets one node sit under
+    /// several prefixes. A responder serving a scoped peer descends `path`
+    /// from `root` in its own store and compares it against the peer's scope;
+    /// the hash is the integrity assertion checked on arrival (§5.5). Between
+    /// unscoped peers the path is carried and ignored.
     GetNodes {
         /// The root the paths are relative to. Any root the responder holds.
         root: Hash,
@@ -336,11 +307,10 @@ pub enum MptMessage {
         /// Distinct from `missing`, and the distinction is what keeps a scoped
         /// peer from wedging: `missing` says "ask again", while this says
         /// "there is nothing here for you, ever". A trie compresses, so a node
-        /// at a position on the spine can carry key material running out of
-        /// the peer's scope — the name of a space it was not granted, or a
-        /// whole leaf record. Withholding it silently would leave the peer
-        /// unable to tell an absent node from a refused one, and it would
-        /// retry until its head was abandoned.
+        /// on the spine can carry key material running out of the peer's scope
+        /// — the name of an ungranted space, or a whole leaf record. Withheld
+        /// silently, the peer could not tell an absent node from a refused one
+        /// and would retry until its head was abandoned.
         #[serde(deserialize_with = "bounded_vec::<_, _, MAX_BATCH>")]
         redacted: Vec<Hash>,
     },
@@ -375,23 +345,18 @@ pub enum MptMessage {
     },
     /// An error response, used instead of dropping a stream silently.
     Error {
-        /// A short human-readable reason.
-        ///
-        /// Bounded while decoding, like every collection field here: it was the
-        /// one field a peer could fill to [`MAX_FRAME_LEN`], and what a
-        /// requester does with it is wrap it in an error and log it.
+        /// A short human-readable reason, bounded while decoding — the one
+        /// field a peer could otherwise fill to [`MAX_FRAME_LEN`].
         #[serde(deserialize_with = "bounded_reason")]
         reason: String,
     },
     /// "Which device keys do you currently hold bound for this origin?"
     ///
-    /// Purely informational within the trusted cluster: this is what
-    /// `synch key ls` aggregates to tell an operator whether a rotation's new
-    /// key has actually propagated (§3.4, §5.1).
-    ///
-    /// Appended after [`MptMessage::Error`] rather than beside the other
-    /// request/response pairs: postcard numbers variants by position, so a new
-    /// variant may only ever go on the end.
+    /// Purely informational within the trusted cluster: what `synch key ls`
+    /// aggregates to tell an operator whether a rotation's new key has
+    /// propagated (§3.4, §5.1). Appended after [`MptMessage::Error`] because
+    /// postcard numbers variants by position — a new variant only ever goes on
+    /// the end.
     GetBindings {
         /// The origin being asked about.
         origin: OriginId,
@@ -440,29 +405,24 @@ pub struct ChunkRanges {
 /// Decoding stops at [`MAX_RANGES`] rather than checking afterwards, and
 /// normalizes.
 ///
-/// Both sides refuse a range set past [`MAX_RANGES`], because the set
-/// operations under it are quadratic in the number of ranges — and a check on
-/// the already-materialized `Vec` comes too late. A `GroupRange` of two zeroes
-/// is two postcard bytes, so a frame at [`MAX_FRAME_LEN`] decodes to ~8.4
-/// million elements, ~134 MB resident, before anything can look at the length:
-/// an eightfold heap amplification over the frame the reader has already
-/// accepted, per stream, on both `GetSlice` and `GetProof`.
-///
-/// Refusing outright rather than truncating: unlike a `BlobAd`'s spans, where a
-/// short tail is a weaker claim and costs a re-fetch, a truncated *request* is a
+/// Both sides refuse a set past [`MAX_RANGES`], because the set operations
+/// under it are quadratic in the number of ranges — and a check on the
+/// materialized `Vec` comes too late: a `GroupRange` of two zeroes is two
+/// postcard bytes, so a frame at [`MAX_FRAME_LEN`] decodes to ~8.4 million
+/// elements, ~134 MB resident — an eightfold heap amplification over the frame
+/// already accepted, per stream, on `GetSlice` and `GetProof`. Refused
+/// outright rather than truncated: unlike a `BlobAd`'s spans, where a short
+/// tail is a weaker claim and costs a re-fetch, a truncated *request* is a
 /// different request, and a truncated `served` would silently overstate what a
 /// provider withheld.
 ///
-/// The *normalizing* is the other half, and it was missing. "Sorted,
-/// non-overlapping" is documented on the field and required by
-/// [`ChunkRanges::overlaps`], [`ChunkRanges::covers`] and
-/// [`ChunkRanges::difference`], all three of which walk the ranges assuming
-/// order — and the field is `pub` and the decoder is a trust boundary. Every
-/// call site happens to run its input through [`ChunkRanges::from_ranges`] or
-/// [`ChunkRanges::intersect`] first, so the invariant held by convention,
-/// across three crates, on data a peer supplies. Establishing it here makes it
-/// a property of the type instead: a set that has been decoded is a set the
-/// operations may be run on.
+/// The *normalizing* is the other half. "Sorted, non-overlapping" is documented
+/// on the field and required by [`ChunkRanges::overlaps`], `covers` and
+/// `difference`, all of which walk the ranges assuming order — and the field is
+/// `pub` and the decoder is a trust boundary. Every call site happened to
+/// normalize first, so the invariant held by convention, across three crates,
+/// on data a peer supplies. Establishing it here makes it a property of the
+/// type: a set that has been decoded is a set the operations may be run on.
 impl<'de> Deserialize<'de> for ChunkRanges {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -549,11 +509,8 @@ impl ChunkRanges {
         self.ranges.iter().all(GroupRange::is_empty)
     }
 
-    /// Total number of groups covered.
-    ///
-    /// Saturating: `GroupRange`s in a `GetSlice` arrive from peers unbounded, so
-    /// a range near `[0, u64::MAX)` must not panic (debug) or silently wrap
-    /// (release) here.
+    /// Total number of groups covered. Saturating: a `GetSlice` range arrives
+    /// from a peer unbounded, so `[0, u64::MAX)` must not panic or wrap here.
     pub fn count(&self) -> u64 {
         self.ranges
             .iter()
@@ -570,11 +527,10 @@ impl ChunkRanges {
 
     /// True if any part of `[start, end)` is covered.
     ///
-    /// The question a tree descent asks at every node it considers, which is
-    /// why it is answered by a binary search over the (sorted, disjoint) ranges
-    /// rather than by building an intersection: a proof walk visits thousands
-    /// of nodes and a set that may carry thousands of ranges, and the quadratic
-    /// version of that is a denial of service with extra steps (§12).
+    /// The question a tree descent asks at every node, answered by a binary
+    /// search over the (sorted, disjoint) ranges rather than by building an
+    /// intersection: a proof walk visits thousands of nodes, and the quadratic
+    /// version is a denial of service with extra steps (§12).
     pub fn overlaps(&self, start: u64, end: u64) -> bool {
         if start >= end {
             return false;
@@ -599,23 +555,21 @@ impl ChunkRanges {
     /// The intersection of two sets.
     ///
     /// A linear merge over both sides, which the sorted-and-disjoint invariant
-    /// permits — a nested loop over the same two sets costs `n * m`. The
-    /// difference matters because a range set arrives off the wire: `served` in
-    /// a `SliceEnd`/`ProofEnd` is bounded only by the frame, so a provider
-    /// could answer with a million singleton ranges and make the requester
-    /// spend that on a set operation it runs on a runtime worker.
-    /// The groups in both sets.
+    /// permits — a nested loop over the same two sets costs `n * m`, and a
+    /// range set arrives off the wire: `served` in a `SliceEnd`/`ProofEnd` is
+    /// bounded only by the frame, so a provider could answer with a million
+    /// singleton ranges and make the requester spend that on a set operation
+    /// it runs on a runtime worker.
     ///
-    /// Two properties this has that callers rely on, stated because one of them
-    /// is load-bearing at a trust boundary and neither is obvious from the
-    /// signature. Every emitted group is in *both* inputs, because each output
+    /// Two properties callers rely on, stated because one is load-bearing at a
+    /// trust boundary. Every emitted group is in *both* inputs — each output
     /// range is the overlap of an actual pair — so the result is a subset of
-    /// `other` **whatever order `self` arrived in**. That is what makes
+    /// `other` **whatever order `self` arrived in**, which is what makes
     /// `check_served` safe against a provider's unsorted `served`: containment
     /// is structural, not a consequence of sortedness. And the result is
-    /// normalized, because it is built through [`ChunkRanges::from_ranges`], so
-    /// a malformed input cannot propagate past here. A malformed `self` can
-    /// make the answer too *small* — which costs a retry — never too large.
+    /// normalized (built through [`ChunkRanges::from_ranges`]), so a malformed
+    /// input cannot propagate past here: a malformed `self` can make the
+    /// answer too *small* — a retry — never too large.
     pub fn intersect(&self, other: &ChunkRanges) -> ChunkRanges {
         let mut out = Vec::new();
         let (mut i, mut j) = (0usize, 0usize);
@@ -637,9 +591,7 @@ impl ChunkRanges {
         ChunkRanges::from_ranges(out)
     }
 
-    /// The part of `self` not covered by `other`.
-    ///
-    /// Linear, for the same reason as [`ChunkRanges::intersect`].
+    /// The part of `self` not covered by `other`. Linear, like [`ChunkRanges::intersect`].
     pub fn difference(&self, other: &ChunkRanges) -> ChunkRanges {
         let mut out = Vec::new();
         let mut j = 0usize;
@@ -680,10 +632,8 @@ impl ChunkRanges {
         ChunkRanges::from_ranges(self.ranges.iter().chain(other.ranges.iter()).copied())
     }
 
-    /// The first `groups` groups of this set, in order.
-    ///
-    /// How a fetch walks a large object: one bounded window per exchange
-    /// ([`MAX_SLICE_GROUPS`]) rather than one request for the whole thing.
+    /// The first `groups` groups of this set, in order — how a fetch walks a
+    /// large object: one bounded window per exchange ([`MAX_SLICE_GROUPS`]).
     pub fn take(&self, groups: u64) -> ChunkRanges {
         let mut out = Vec::new();
         let mut budget = groups;
@@ -709,10 +659,8 @@ impl ChunkRanges {
     }
 }
 
-/// A message on the `sync/blob/1` ALPN (§6.4).
-///
-/// The blob ALPN carries nothing but these messages plus the raw bao slice and
-/// proof bytes (§5.3).
+/// A message on the `sync/blob/1` ALPN (§6.4) — nothing but these plus the raw
+/// bao slice and proof bytes (§5.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobMessage {
     /// Request a verified bao slice.
@@ -731,19 +679,15 @@ pub enum BlobMessage {
     /// (`docs/DELTA-SYNC.md` §3.1).
     ///
     /// The response is the interior hash pairs on the paths from the root to
-    /// `ranges`, in pre-order, descending no deeper than `level` — which is
-    /// exactly a bao slice with the payload left out. It is what lets a
-    /// requester ask "what does the new version's tree look like here?" without
-    /// paying for the bytes it may well already have: the answer is 64 bytes
-    /// per node rather than 16 KiB per group.
+    /// `ranges`, in pre-order, descending no deeper than `level` — exactly a
+    /// bao slice with the payload left out: 64 bytes per node rather than
+    /// 16 KiB per group, so a requester can ask "what does the new version's
+    /// tree look like here?" without paying for bytes it may well already have.
     ///
     /// `level` is in chunk-group units: `level = n` stops at subtrees of `2^n`
-    /// groups, so `level = 0` yields the chaining value of every leaf group and
-    /// [`AD_SPAN_LEVEL`](crate::AD_SPAN_LEVEL) yields one per ad span.
-    ///
-    /// Appended after [`BlobMessage::SliceEnd`] rather than beside `GetSlice`:
-    /// postcard numbers variants by position, so a new variant may only ever go
-    /// on the end.
+    /// groups, so `level = 0` yields every leaf group's chaining value and
+    /// [`AD_SPAN_LEVEL`](crate::AD_SPAN_LEVEL) one per ad span. Appended after
+    /// [`BlobMessage::SliceEnd`] because postcard numbers variants by position.
     GetProof {
         /// The object root.
         root: Hash,
@@ -752,11 +696,9 @@ pub enum BlobMessage {
         /// How deep to descend, in group units.
         level: u8,
     },
-    /// Terminates a proof response with the ranges it actually covers.
-    ///
-    /// A proof for a large range can run past [`MAX_PROOF_NODES`]; `served` is
-    /// how the requester learns where the answer stopped, and where its next
-    /// request starts — the same shape as [`BlobMessage::SliceEnd`] (§6.4).
+    /// Terminates a proof response with the ranges it actually covers — how the
+    /// requester learns where an answer past [`MAX_PROOF_NODES`] stopped and
+    /// where its next request starts, the same shape as [`BlobMessage::SliceEnd`] (§6.4).
     ProofEnd {
         /// The ranges the proof covers.
         served: ChunkRanges,
@@ -862,20 +804,6 @@ mod tests {
     }
 
     #[test]
-    fn chunk_ranges_normalize() {
-        let r = ChunkRanges::from_ranges([
-            GroupRange::new(5, 8),
-            GroupRange::new(0, 3),
-            GroupRange::new(3, 4),
-            GroupRange::new(9, 9),
-        ]);
-        assert_eq!(r.ranges, vec![GroupRange::new(0, 4), GroupRange::new(5, 8)]);
-        assert_eq!(r.count(), 7);
-        assert!(r.contains(0));
-        assert!(!r.contains(4));
-    }
-
-    #[test]
     fn chunk_ranges_take_bounds_a_window() {
         let r = ChunkRanges::from_ranges([GroupRange::new(0, 4), GroupRange::new(10, 20)]);
         assert_eq!(r.take(0), ChunkRanges::empty());
@@ -891,7 +819,19 @@ mod tests {
     }
 
     #[test]
-    fn chunk_ranges_set_ops() {
+    fn chunk_ranges_normalize_and_set_ops() {
+        // Normalization: unsorted and inverted input is sorted and merged.
+        let r = ChunkRanges::from_ranges([
+            GroupRange::new(5, 8),
+            GroupRange::new(0, 3),
+            GroupRange::new(3, 4),
+            GroupRange::new(9, 9),
+        ]);
+        assert_eq!(r.ranges, vec![GroupRange::new(0, 4), GroupRange::new(5, 8)]);
+        assert_eq!(r.count(), 7);
+        assert!(r.contains(0));
+        assert!(!r.contains(4));
+
         let a = ChunkRanges::from_ranges([GroupRange::new(0, 10)]);
         let b = ChunkRanges::from_ranges([GroupRange::new(3, 5), GroupRange::new(8, 20)]);
         assert_eq!(
@@ -934,97 +874,70 @@ mod bounded_decode_tests {
     use super::*;
 
     /// Every capped field refuses an over-long sequence *while decoding*, not
-    /// after.
-    ///
-    /// The responder's `check_heads`/`check_batch` calls run after
+    /// after: the responder's `check_heads`/`check_batch` calls run after
     /// `read_frame` has already deserialized the message, so a 16 MiB frame of
-    /// `SignedHead`s or `NodeId`s bought the sender hundreds of milliseconds to
-    /// seconds of the victim's runtime-worker time — a `NodeId` decodes through
-    /// an Edwards decompression — for the price of an upload. The cap now
-    /// fires on element `N + 1`.
-    /// postcard collapses a visitor's custom message into its own opaque
-    /// `Serde Deserialization Error`, so the assertion is that decoding fails
-    /// at all; the at-cap control below says the failure is the cap and not
+    /// `SignedHead`s or `NodeId`s bought the sender seconds of the victim's
+    /// runtime-worker time — a `NodeId` decodes through an Edwards
+    /// decompression — for the price of an upload. The cap fires on element
+    /// `N + 1`. postcard collapses a visitor's custom message into its own
+    /// opaque `Serde Deserialization Error`, so the assertion is that decoding
+    /// fails at all; the at-cap control below says the failure is the cap, not
     /// the encoding.
-    fn refuses_past(bytes: &[u8]) {
+    fn refuses(msg: &MptMessage) {
         assert!(
-            postcard::from_bytes::<MptMessage>(bytes).is_err(),
+            postcard::from_bytes::<MptMessage>(&postcard::to_stdvec(msg).unwrap()).is_err(),
             "a sequence past its cap must not decode"
         );
     }
 
     #[test]
-    fn a_heads_summary_list_past_the_cap_is_refused_while_decoding() {
-        // The at-cap control: the failure above is the cap, not the encoding.
-        let wants: Vec<(Vec<u8>, Hash)> = (0..MAX_BATCH)
-            .map(|i| (vec![0u8, 1], Hash([i as u8; 32])))
-            .collect();
-        let bytes = postcard::to_stdvec(&MptMessage::GetNodes {
-            root: Hash([0u8; 32]),
-            wants: wants.clone(),
-        })
-        .unwrap();
-        let decoded: MptMessage = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(
-            decoded,
-            MptMessage::GetNodes {
-                root: Hash([0u8; 32]),
-                wants
-            }
-        );
-
-        let heads: Vec<HeadSummary> = (0..MAX_HEADS_PER_MESSAGE + 1)
-            .map(|i| HeadSummary {
-                origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
-                seq: i as u64,
-                root: Hash([0u8; 32]),
-                complete: false,
-            })
-            .collect();
-        refuses_past(
-            &postcard::to_stdvec(&MptMessage::Hello {
-                proto: 1,
-                heads,
-                scope: None,
-            })
-            .unwrap(),
-        );
-
-        // The same mechanism on the other capped batch fields.
+    fn a_sequence_past_its_cap_is_refused_while_decoding() {
         let wants = |n: usize| -> Vec<(Vec<u8>, Hash)> {
             (0..n)
                 .map(|i| (vec![0u8, 1], Hash([i as u8; 32])))
                 .collect()
         };
-        refuses_past(
-            &postcard::to_stdvec(&MptMessage::GetNodes {
-                root: Hash([0u8; 32]),
-                wants: wants(MAX_BATCH + 1),
-            })
-            .unwrap(),
-        );
-        refuses_past(
-            &postcard::to_stdvec(&MptMessage::GetValues {
-                root: Hash([0u8; 32]),
-                wants: wants(MAX_BATCH + 1),
-            })
-            .unwrap(),
+        let origin = || OriginId::Key(iroh_base::SecretKey::generate().public());
+
+        // At-cap control: a batch at exactly MAX_BATCH decodes, so the failures
+        // below are the caps, not the encoding.
+        let at_cap = MptMessage::GetNodes {
+            root: Hash([0u8; 32]),
+            wants: wants(MAX_BATCH),
+        };
+        assert_eq!(
+            postcard::from_bytes::<MptMessage>(&postcard::to_stdvec(&at_cap).unwrap()).unwrap(),
+            at_cap
         );
 
-        let keys = vec![iroh_base::SecretKey::generate().public(); MAX_HEADS_PER_MESSAGE + 1];
-        refuses_past(
-            &postcard::to_stdvec(&MptMessage::BindingsFor {
-                origin: OriginId::Key(iroh_base::SecretKey::generate().public()),
-                keys,
+        let heads: Vec<HeadSummary> = (0..MAX_HEADS_PER_MESSAGE + 1)
+            .map(|i| HeadSummary {
+                origin: origin(),
+                seq: i as u64,
+                root: Hash([0u8; 32]),
+                complete: false,
             })
-            .unwrap(),
-        );
-
-        // Provider hints are capped at MAX_PROVIDER_ADS the same way.
-        let origin = OriginId::Key(iroh_base::SecretKey::generate().public());
-        let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS + 1)
-            .map(|i| (origin.clone(), BlobAd::complete(i as u64)))
             .collect();
-        refuses_past(&postcard::to_stdvec(&MptMessage::Providers { ads }).unwrap());
+        refuses(&MptMessage::Hello {
+            proto: 1,
+            heads,
+            scope: None,
+        });
+        refuses(&MptMessage::GetNodes {
+            root: Hash([0u8; 32]),
+            wants: wants(MAX_BATCH + 1),
+        });
+        refuses(&MptMessage::GetValues {
+            root: Hash([0u8; 32]),
+            wants: wants(MAX_BATCH + 1),
+        });
+        refuses(&MptMessage::BindingsFor {
+            origin: origin(),
+            keys: vec![iroh_base::SecretKey::generate().public(); MAX_HEADS_PER_MESSAGE + 1],
+        });
+        let ads: Vec<(OriginId, BlobAd)> = (0..MAX_PROVIDER_ADS + 1)
+            .map(|i| (origin(), BlobAd::complete(i as u64)))
+            .collect();
+        refuses(&MptMessage::Providers { ads });
     }
 }

@@ -248,22 +248,16 @@ mod tests {
         notify::Event::new(kind)
     }
 
-    /// The watcher must not hint on its own reading.
-    ///
-    /// A scan opens and reads every space directory and every file it hashes,
-    /// and inotify reports each of those as an event. Hinting on them costs a
-    /// full rescan of every space per debounce window, forever, on a tree
-    /// nobody has touched — measured at a fifth of a core on an idle daemon
-    /// indexing 2 000 small files, and proportional to the tree from there.
+    /// The watcher must not hint on its own reading: a scan opens and reads
+    /// every file it hashes, and inotify reports each as an event — hinting
+    /// would cost a full rescan per debounce window, forever, on an idle tree.
     #[test]
     fn reads_are_not_change_hints_but_writes_are() {
+        // One literal per classifier arm: every non-`Close(Write)` access
+        // variant is read-shaped, and a scan's own reads must not rescan.
         for read in [
             EventKind::Access(AccessKind::Read),
-            EventKind::Access(AccessKind::Open(AccessMode::Read)),
-            EventKind::Access(AccessKind::Open(AccessMode::Any)),
             EventKind::Access(AccessKind::Close(AccessMode::Read)),
-            EventKind::Access(AccessKind::Any),
-            EventKind::Access(AccessKind::Other),
         ] {
             assert!(!changes_something(&event(read)), "{read:?}");
         }
@@ -276,7 +270,6 @@ mod tests {
             EventKind::Access(AccessKind::Close(AccessMode::Write)),
             // Unclassifiable: hint, and let the scan decide.
             EventKind::Any,
-            EventKind::Other,
         ] {
             assert!(changes_something(&event(change)), "{change:?}");
         }

@@ -35,17 +35,17 @@ const MAX_BARREN_WINDOWS: u32 = 4;
 
 /// The largest prefix of `remaining` whose proof fits one exchange.
 ///
-/// Sized by [`proof_nodes_upper_bound`], so a provider holding everything asked
-/// for still comes in under [`MAX_PROOF_NODES`] and never truncates. Ranges are
-/// taken whole where they fit and split where they do not, and the count is
-/// clamped to [`MAX_RANGES`] so the set operations under it stay cheap on both
-/// sides (§12).
+/// Sized by [`proof_nodes_upper_bound`], so a provider holding everything
+/// asked for still comes in under [`MAX_PROOF_NODES`] and never truncates.
+/// Ranges are taken whole where they fit and split where they do not, and
+/// the count is clamped to [`MAX_RANGES`] so the set operations under it
+/// stay cheap on both sides (§12).
 ///
 /// Public because a caller walking a large region in rounds has to cut it the
 /// same way: what fits depends on the level and on how fragmented the ranges
 /// are — a contiguous run costs one node per subtree plus a root path, a
-/// scattered set costs a root path each — so any second answer to "how much per
-/// round?" would disagree with this one.
+/// scattered set costs a root path each — so any second answer to "how much
+/// per round?" would disagree with this one.
 pub fn proof_window(remaining: &ChunkRanges, level: u8) -> ChunkRanges {
     let mut taken: Vec<synch_core::GroupRange> = Vec::new();
     for range in remaining.ranges.iter().take(MAX_RANGES) {
@@ -569,7 +569,7 @@ impl BlobClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{bare_endpoint, StalledPeer};
+    use crate::testing::{bare_endpoint, test_store, StalledPeer};
     use synch_core::{GroupRange, AD_SPAN_LEVEL, ALPN_BLOB, CHUNK_GROUP_SIZE, MAX_PROOF_NODES};
 
     /// A peer that keeps the session open and answers nothing fails the
@@ -616,9 +616,7 @@ mod tests {
     /// this path as on the slice path (`docs/DELTA-SYNC.md` §3.3).
     #[tokio::test]
     async fn a_provider_serving_one_group_at_a_time_cannot_stretch_a_descent() {
-        let provider_dir = tempfile::tempdir().unwrap();
-        let provider_store =
-            std::sync::Arc::new(synch_store::Store::open(provider_dir.path()).unwrap());
+        let (_provider_dir, provider_store) = test_store();
         // Sixty-four groups, all of which one proof window covers, so the
         // ceiling under test is the only thing that can end the loop.
         let size = 64 * CHUNK_GROUP_SIZE;
@@ -671,8 +669,7 @@ mod tests {
             }
         });
 
-        let fetcher_dir = tempfile::tempdir().unwrap();
-        let fetcher = std::sync::Arc::new(synch_store::Store::open(fetcher_dir.path()).unwrap());
+        let (_fetcher_dir, fetcher) = test_store();
         let dialer = bare_endpoint(ALPN_BLOB).await;
         let connection = dialer.connect(addr, ALPN_BLOB).await.unwrap();
         let client = BlobClient::new(connection);

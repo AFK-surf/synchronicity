@@ -91,10 +91,9 @@ impl MptProtocol {
         }
     }
 
-    /// Rings `wake` whenever a connection is refused for an unknown key.
-    ///
-    /// A peer whose key this node has not resolved yet — the far side of a key
-    /// rotation, typically — arrives exactly this way, and §3.4 makes that
+    /// Rings `wake` whenever a connection is refused for an unknown key — a
+    /// peer whose key this node has not resolved yet (the far side of a key
+    /// rotation, typically) arrives exactly this way, and §3.4 makes that
     /// refusal a trigger for an immediate DNS re-resolution.
     pub fn on_unknown_key(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
         self.on_unknown_key = wake;
@@ -109,18 +108,17 @@ impl MptProtocol {
 impl ProtocolHandler for MptProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         // A session outlives the request that opened it, so "last seen" cannot
-        // be recorded only at accept: a peer that has been syncing steadily
-        // over one connection for an hour would read as an hour absent in
-        // `synch peers`. Refreshed as requests arrive, but at most once an
-        // interval — the sighting is for an operator's eyes, not worth a write
-        // per stream.
+        // be recorded only at accept: a peer syncing steadily over one
+        // connection for an hour would read as an hour absent in `synch
+        // peers`. Refreshed as requests arrive, at most once an interval —
+        // the sighting is for an operator's eyes, not worth a write per
+        // stream.
         //
-        // The throttle is shared across connections rather than captured per
-        // `accept`, and the write goes to the blocking pool. Both matter: it is
-        // a row update and a WAL frame on the store's one write connection, and
-        // a per-connection throttle throttles nothing — a peer that opens N
-        // sessions bought N writes on runtime workers for the price of N
-        // handshakes.
+        // The throttle is shared across connections, not captured per `accept`,
+        // and the write goes to the blocking pool: it is a row update and a
+        // WAL frame on the store's one write connection, and a per-connection
+        // throttle throttles nothing — N sessions bought N writes for the
+        // price of N handshakes.
         let store = self.store().clone();
         let last = self.last_sighting.clone();
         let sighting = move |peer: NodeId| {
@@ -197,13 +195,12 @@ impl MptProtocol {
                     )));
                 }
                 check_heads(heads.len(), "a Hello summary list")?;
-                // A dialing peer's summaries are as good an observation as the
-                // ones we collect by dialing out, and a node in recovery is
-                // more likely to be called than to be calling (§3.4).
-                //
+                // A dialing peer's summaries are as good an observation as
+                // the ones we collect by dialing out, and a node in recovery
+                // is more likely to be called than to be calling (§3.4).
                 // Summarizing means asking the trie whether we hold each root
-                // whole — a walk on the first ask for a root, memoized after —
-                // so the pair runs on the blocking pool (§5.1).
+                // whole — a walk on the first ask, memoized after — so the
+                // pair runs on the blocking pool (§5.1).
                 let sink = self.heads.clone();
                 let store = self.store().clone();
                 let (ours, scope) = crate::blocking::offload(move || {
@@ -211,7 +208,6 @@ impl MptProtocol {
                     let summaries = sink.local_summaries()?;
                     // What this node will serve that peer, so a delegated one
                     // can learn the scope it is about to walk under (§5.5).
-                    //
                     // Untrusted declares nothing, exactly as the dialing side
                     // does: an empty list would tell a peer whose binding has
                     // momentarily lapsed to narrow itself to nothing, and it
@@ -239,16 +235,15 @@ impl MptProtocol {
                 match read_frame::<MptMessage>(recv).await? {
                     MptMessage::Heads { heads } => {
                         check_heads(heads.len(), "a Heads push")?;
-                        // Each offer verifies a signature, records history, and
-                        // may promote the head — which walks the trie and
+                        // Each offer verifies a signature, records history,
+                        // and may promote the head — which walks the trie and
                         // re-materializes the changed leaves in one
-                        // transaction (§5.2).
-                        // Containment is the sink's: it is the only side that
-                        // can tell "this origin published something we cannot
-                        // apply" from "our disk is full", and an error reaching
-                        // here is the second kind. One origin must not stop an
-                        // exchange that still owes this peer an answer to its
-                        // `HeadsWant`; a local fault legitimately does.
+                        // transaction (§5.2). Containment is the sink's: only
+                        // it can tell "this origin published something we
+                        // cannot apply" from "our disk is full", and an error
+                        // reaching here is the second kind. One origin must
+                        // not stop an exchange that still owes this peer an
+                        // answer to its `HeadsWant`; a local fault does.
                         let sink = self.heads.clone();
                         crate::blocking::offload(move || {
                             for head in heads {
@@ -279,8 +274,7 @@ impl MptProtocol {
                 let pushed = head.clone();
                 crate::blocking::offload(move || sink.offer_head(&pushed, now_ns())).await?;
                 tracing::debug!(origin = %head.origin, "head pushed to us");
-                // The ack tells the pusher we processed it; an empty Heads is
-                // the smallest well-typed acknowledgement in the schema.
+                // An empty Heads is the smallest well-typed ack in the schema.
                 write_frame(send, &MptMessage::Heads { heads: Vec::new() }).await?;
                 Ok(())
             }
@@ -542,16 +536,14 @@ fn admit(
         return Ok(wants.iter().map(|(_, claimed)| Some(*claimed)).collect());
     }
     // The position is only meaningful relative to a trie this node vouches
-    // for. Given a root of the caller's choosing, the empty path resolves to
+    // for: given a root of the caller's choosing, the empty path resolves to
     // that root itself and every position below it is whatever the caller put
     // there — so authorization by position would authorize nothing at all.
-    //
-    // The peer's own roots are excluded for the same reason. A delegate signs
-    // and publishes its own trie, and this node records that root as soon as
-    // the signature and the delegated binding verify — so a root of the
-    // caller's choosing is exactly what a peer's own head is. Given one, it
-    // could put any node hash it has heard of under an in-scope position and
-    // read the node back, which is every withheld subtree one level at a time.
+    // The peer's own roots are excluded for the same reason: a delegate signs
+    // and publishes its own trie, which this node records once the signature
+    // and binding verify, so a root of the caller's choosing is exactly what
+    // a peer's own head is — and with one it could read every withheld
+    // subtree, one level at a time.
     if !store.is_head_root(&root, &origins)? {
         tracing::warn!(
             peer = %peer.fmt_short(),
@@ -562,19 +554,16 @@ fn admit(
         ));
     }
     // An out-of-scope position is refused as a position, not as a batch.
-    //
     // Failing the whole request was too blunt for what is usually an honest
     // disagreement: a delegation widens, the delegate learns its new scope
-    // from the peer serving it, and every peer that has not yet replicated the
-    // new record still holds the old one. Erroring turned that lag into an
-    // aborted exchange for *every* origin in the round, including the ones
-    // neither side disagrees about — and it self-heals a moment later, so the
-    // cost was paid for nothing. Resolving to `None` refuses exactly the
-    // position asked about, which the caller already reports as holding
-    // nothing, and leaves the rest of the batch to be answered.
-    //
-    // Nothing is conceded by the downgrade: a refused position is served no
-    // more than it was before, and the log line still names the peer.
+    // from the peer serving it, and peers that have not yet replicated the
+    // new record still hold the old one. Erroring turned that lag into an
+    // aborted exchange for *every* origin in the round — and it self-heals a
+    // moment later, so the cost was paid for nothing. Resolving to `None`
+    // refuses exactly the position asked about, which the caller already
+    // reports as holding nothing, and leaves the rest of the batch answered.
+    // Nothing is conceded: a refused position is served no more than before,
+    // and the log line still names the peer.
     let mut refused = 0usize;
     let paths: Vec<Vec<u8>> = wants.iter().map(|(path, _)| path.clone()).collect();
     let admitted: Vec<bool> = paths
@@ -987,10 +976,9 @@ impl MptClient {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{bare_endpoint, trusting_pair, StalledPeer};
+    use crate::testing::{bare_endpoint, test_store, trusting_pair, StalledPeer};
     use synch_core::{BlobAd, ALPN_MPT};
 
     /// How long a test waits before calling a request hung rather than slow.
@@ -1099,8 +1087,7 @@ mod tests {
     /// by the runtime's own clock.
     #[tokio::test]
     async fn find_providers_never_blocks_the_runtime_on_the_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let root = Hash::new(b"an object someone advertises");
         store
             .put_provider(
@@ -1164,8 +1151,7 @@ mod tests {
     /// answered.
     #[tokio::test]
     async fn a_contained_origin_does_not_stop_a_hello_exchange() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let signer = iroh_base::SecretKey::generate();
         let bad = OriginId::named("bad", "x.example").unwrap();
         let good = OriginId::named("good", "x.example").unwrap();
@@ -1216,8 +1202,7 @@ mod tests {
     /// keeps the session usable either way.
     #[tokio::test]
     async fn a_stalled_stream_does_not_hold_the_connection() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let (server, client, _client_dir) =
             trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
         let mpt = client.connect_mpt(server.direct_addr()).await.unwrap();
@@ -1257,8 +1242,7 @@ mod tests {
         // (§5.5), so the request has to name real positions in a real trie —
         // and the wants are produced the way a requester produces them, by
         // walking a store that holds the nodes and not yet the payloads.
-        let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(synch_store::Store::open(dir.path()).unwrap());
+        let (_dir, store) = test_store();
         let payload = |len: usize, tag: u64| {
             let mut bytes = vec![0u8; len];
             bytes[..8].copy_from_slice(&tag.to_le_bytes());
@@ -1321,16 +1305,15 @@ mod tests {
 
         // The positions a requester would name: every node, none of the values.
         let positions = |root: Hash| -> (tempfile::TempDir, Vec<(Vec<u8>, Hash)>) {
-            let dir = tempfile::tempdir().unwrap();
-            let bare = synch_store::Store::open(dir.path()).unwrap();
+            let (dir, bare) = test_store();
             let reachable = Trie::new(store.as_ref()).reachable(root).unwrap();
             for node in &reachable.nodes {
                 let bytes = synch_mpt::NodeStore::get_node(store.as_ref(), node)
                     .unwrap()
                     .unwrap();
-                synch_mpt::NodeStore::put_node(&bare, node, &bytes).unwrap();
+                synch_mpt::NodeStore::put_node(bare.as_ref(), node, &bytes).unwrap();
             }
-            let missing = Trie::new(&bare).missing(root, MAX_BATCH).unwrap();
+            let missing = Trie::new(bare.as_ref()).missing(root, MAX_BATCH).unwrap();
             assert!(missing.nodes.is_empty(), "every node was copied across");
             (dir, missing.values)
         };

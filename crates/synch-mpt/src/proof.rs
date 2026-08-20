@@ -1,10 +1,10 @@
 //! Merkle proofs for single keys (§4.3).
 //!
 //! A proof is the node path from the root down to where the key resolves — or
-//! to where it provably dead-ends. Verification is self-contained: it needs the
-//! root hash and the proof, nothing else, which is what lets a holder of one
-//! signed head answer for one key without shipping a whole trie — the
-//! capability partial replication (§13) is built on.
+//! to where it provably dead-ends. Verification is self-contained: root hash
+//! and proof alone, which is what lets a holder of one signed head answer for
+//! one key without shipping a whole trie — the capability partial replication
+//! (§13) is built on.
 //!
 //! **Not on any wire.** This module is behind the off-by-default `proofs`
 //! feature and has no caller in the workspace; no `MptMessage` carries a
@@ -72,9 +72,8 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         let mut current = root_opt(root);
         let mut proof = Proof::default();
         // The same bound `Trie::get` descends under, and for the same reason:
-        // a value placed past the depth any valid key reaches is invisible to
-        // every structural walk, so answering about it here would put the two
-        // readers into disagreement.
+        // a value past the depth any valid key reaches is invisible to every
+        // structural walk, so answering about it would split the two readers.
         let mut steps = 0usize;
         loop {
             steps += 1;

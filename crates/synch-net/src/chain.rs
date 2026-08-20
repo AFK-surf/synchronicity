@@ -1,109 +1,78 @@
-//! Offline validation of the DNSSEC chain a zone-key log entry carries.
+//! Offline validation of the DNSSEC chain a zone-key log entry carries
+//! (docs/REKOR-ZONE-KEY.md §5.5).
 //!
 //! One validator, used by two very different readers, and that sharing is
-//! load-bearing rather than tidy (docs/REKOR-ZONE-KEY.md §5.5):
+//! load-bearing: the **client** runs it on every proof it accepts, the
+//! **monitor** on every leaf it classifies. The invariant that couples them:
+//! *anything a client accepts must be classified tier A by a monitor* — never
+//! tier B, the silent bin. If the monitor's rule were stricter, an attacker
+//! could publish an entry the client waves through and the monitor files as
+//! noise: usable against victims and inaudible to the operator. **If you
+//! tighten anything in this file, you tighten it for both, which is the
+//! point.**
 //!
-//! - the **client** runs it on every proof it accepts, and
-//! - the **monitor** runs it on every leaf it classifies.
-//!
-//! The invariant that couples them is: *anything a client accepts must be
-//! classified tier A by a monitor* — never tier B, which is the silent bin.
-//! If the monitor's chain rule were stricter than the client's,
-//! an attacker could publish an entry with a chain the client waves through
-//! and the monitor files as noise: usable against victims and inaudible to
-//! the operator, which is strictly worse than not logging at all. So neither
-//! side gets its own notion of a valid chain. **If you tighten anything in
-//! this file, you tighten it for both, which is the point.**
-//!
-//! # What is checked, and what deliberately is not
-//!
-//! Checked, cryptographically: every RRSIG in the chain verifies, the links
-//! form an unbroken delegation ladder from the trust anchor down to the apex,
-//! and the apex's DNSKEY RRset is proved by a DS its parent signed. What the
-//! walk *establishes* is that RRset — the authorized key set — and the caller
-//! decides membership against it. The zone's signing keys need not be covered
-//! by the DS directly: a provider-managed zone signs answers with a ZSK the
-//! DS never names, and the DS→KSK→DNSKEY-RRset walk is exactly how DNSSEC
-//! itself authorizes that key.
+//! Checked, cryptographically: every RRSIG verifies, the links form an
+//! unbroken delegation ladder from the trust anchor down to the apex, and the
+//! apex's DNSKEY RRset is proved by a DS its parent signed. The walk
+//! *establishes* that RRset — the authorized key set — and the caller decides
+//! membership against it. The zone's signing keys need not be covered by the
+//! DS directly: the DS→KSK→DNSKEY-RRset walk is exactly how DNSSEC itself
+//! authorizes a provider-managed ZSK the DS never names.
 //!
 //! # The declaration, and why the chain starts below the apex
 //!
-//! A delegation ladder is *public data*. Anyone can walk `victim.example.`'s
-//! DNSKEY and DS records out of the open resolver of their choice and mint an
-//! entry carrying them, without the zone's knowledge or cooperation — so a
-//! chain that proved only the key set would let anybody log a claim about
-//! anybody's zone.
-//!
-//! So the chain does not start at the apex. It starts one label below it, at
+//! A delegation ladder is *public data* — anyone can walk a zone's DNSKEY and
+//! DS records out of the open resolver of their choice, so a chain that
+//! proved only the key set would let anybody log a claim about anybody's
+//! zone. The chain therefore starts one label below the apex, at
 //! `_synchronicity-transparency.<apex>`, whose TXT RRset is signed by the
 //! zone that holds it. That record is the operator's **declaration**: *this
 //! name is a synchronicity control plane, and its keys are meant to be found
-//! in the log*. Publishing it takes zone write, and it asks nothing of the
-//! private key, so a zone whose DNSSEC keys live inside a managed provider can
-//! publish one with an ordinary record write.
+//! in the log*. Publishing it takes zone write, not the private key, so a
+//! managed-provider zone can publish one with an ordinary record write.
 //!
-//! **What the declaration narrows, and what it does not.** The record and its
-//! RRSIG are public DNS the moment they are published — a third party fetches
-//! the identical bytes with the DO bit set, and the publisher itself collects
-//! them that way — so producing the *chain link* takes no authority at all.
-//! What the requirement buys is therefore a narrowing of *who can mint an
-//! entry about a zone*: from any zone to any zone that has declared itself a
-//! control plane. It is not attribution. An entry carrying a valid chain is
-//! not thereby the operator's own statement rather than a bystander's
-//! transcription of public records, and nothing a monitor reads out of one
-//! says which of the two it is. What it *does* deliver is that authorization
-//! stays intact regardless: the Statement's key set must equal the
-//! chain-proven set read out of the DS-covered, RRSIG-verified DNSKEY RRset,
-//! so the worst a transcriber can log is a true statement about the victim's
-//! real keys — never a rogue key, and never a set the delegation does not
-//! authorize.
+//! The declaration narrows *who can mint an entry about a zone* — from any
+//! zone to any zone that has declared itself a control plane — but it is not
+//! attribution: the record and its RRSIG are public DNS the moment they are
+//! published, so producing the chain link takes no authority, and nothing a
+//! monitor reads out of an entry says whether the operator or a transcriber
+//! of public records made it. Authorization stays intact regardless: the
+//! Statement's key set must equal the chain-proven set read out of the
+//! DS-covered, RRSIG-verified DNSKEY RRset, so the worst a transcriber can
+//! log is a true statement about the victim's real keys — never a rogue key.
 //!
 //! # The apex and the signing zone are two different names
 //!
-//! The apex is the control plane's *name*. The **signing zone** is whatever
-//! DNS zone actually holds and signs its records. Usually they coincide — the
-//! control plane runs a delegated zone of its own. They need not: a control
-//! plane at `sync.example.` may be served entirely out of the `example.` zone,
-//! with no delegation and no DNSKEY of its own. Then `example.` signs
-//! everything, the declaration included, and it is `example.`'s key set that
-//! the ladder proves and that signs membership answers.
+//! The apex is the control plane's *name*; the **signing zone** is whatever
+//! zone actually holds and signs its records. Usually they coincide; they
+//! need not — a control plane at `sync.example.` may be served entirely out
+//! of the `example.` zone, with no delegation and no DNSKEY of its own. The
+//! rule tying them is that the signing zone must **enclose** the apex, and
+//! everything else follows: the declaration is verified under the signing
+//! zone's own chain-proven keys, and its RRSIG names that zone as signer,
+//! because per RFC 4035 §5.3.1 the closest enclosing zone is the only one
+//! entitled to sign a name it contains.
 //!
-//! So a chain reads as: the declaration at the apex, then the ladder starting
-//! at the **signing zone** and climbing to the anchor. The rule tying them
-//! together is that the signing zone must **enclose** the apex — it has to be
-//! a zone the declaration could actually live in. Everything else follows
-//! from that: the declaration is verified under the signing zone's own
-//! chain-proven keys, and its RRSIG names that zone as signer, because per
-//! RFC 4035 §5.3.1 the closest enclosing zone is the only one entitled to
-//! sign a name it contains.
-//!
-//! What the declaration does **not** do is prevent an ancestor zone from
-//! making one about itself. A parent that nullifies its child's delegation
-//! owns the child's namespace outright and can declare, sign and log
-//! whatever it likes. No record inside DNS can stop that, because the parent
-//! *is* the authority DNS would consult. What the declaration does is force
-//! the attempt into the open: to serve a victim, an attacker must publish a
+//! The declaration does **not** prevent an ancestor zone from making one
+//! about itself — a parent that nullifies its child's delegation owns the
+//! child's namespace outright, and no record inside DNS can stop that. What
+//! it does is force the attempt into the open: an attacker must publish a
 //! declaration in public DNS and a chain for it in a public append-only log,
 //! both naming a zone on the victim's own delegation path. That is what the
 //! monitor watches for, above and below the zone it was pointed at.
 //!
-//! **Not checked: RRSIG validity windows.** Two independent reasons, and both
-//! matter. First, there is no trustworthy clock in the input at all — a Rekor
-//! leaf commits to `data` and `signature` and nothing else, so
-//! `integratedTime` is attacker-supplied metadata outside the Merkle
-//! commitment and can never be a security input. Second, RRSIGs expire in
-//! weeks while log entries are read for years; a window check would reject
-//! legitimate archival entries and force a republish on every zone re-sign.
-//! Nothing is lost: the chain is bound to the key *by content*, so replaying
-//! somebody else's old chain gains an attacker nothing (it does not cover
-//! their key), and a client independently requires a live DS through native
-//! DNSSEC validation before it ever reaches this code.
-//!
-//! The windows are not reported either. Handing them to a caller would only
-//! be useful for a note like "this chain had already expired when the world
-//! last saw this tree", and that reading needs a signed clock, which nothing
-//! near a leaf provides. Inception and expiration are still *verified as part
-//! of the RRSIG* by hickory; what is absent is only the bookkeeping.
+//! **Not checked: RRSIG validity windows.** There is no trustworthy clock in
+//! the input — a Rekor leaf commits to `data` and `signature` and nothing
+//! else, so `integratedTime` is attacker-supplied metadata outside the Merkle
+//! commitment. And RRSIGs expire in weeks while entries are read for years; a
+//! window check would reject legitimate archival entries. Nothing is lost:
+//! the chain is bound to the key *by content*, so replaying somebody else's
+//! old chain gains an attacker nothing, and a client independently requires a
+//! live DS through native DNSSEC validation before it ever reaches this code.
+//! The windows are not reported either — that reading would need a signed
+//! clock, which nothing near a leaf provides. Inception and expiration are
+//! still *verified as part of the RRSIG* by hickory; only the bookkeeping is
+//! absent.
 
 use hickory_resolver::proto::{
     dnssec::{
@@ -174,8 +143,8 @@ pub struct ValidChain {
     /// signing zone is the anchor).
     ///
     /// The signing zone, not the apex: the ladder's bottom link is the zone
-    /// that holds the apex's records, and the module docs above spend eighteen
-    /// lines establishing that the two are different names.
+    /// that holds the apex's records, and the module docs above establish
+    /// that the two are different names.
     pub anchored_directly: bool,
 }
 
@@ -237,16 +206,14 @@ pub struct Authorized {
 /// The one path from a certificate to "this key is delegated for this zone".
 ///
 /// **Both the client and the monitor must reach the chain through here, and
-/// neither may supply its own apex.** That constraint is not stylistic; it is
-/// what closes a real evasion. Were the two to share `validate` but compose
-/// the call themselves, they could feed it different things: the client the
+/// neither may supply its own apex.** That constraint is not stylistic; it
+/// closes a real evasion. Were the two to share `validate` but compose the
+/// call themselves, they could feed it different things — the client the
 /// well-formed apex it has from DNS, the monitor the raw SAN string. A
 /// certificate whose SAN is `victim.example..` would then satisfy a
-/// trailing-dot-trimming comparison on the client *and* validate —
-/// because the client fed the chain a different, well-formed name — while the
+/// trailing-dot-trimming comparison on the client *and* validate, while the
 /// monitor's chain walk failed to parse the SAN at all and filed the entry
-/// tier B, the silent bin. Every client accepts, no monitor alerts: exactly
-/// the evasion the tiering exists to prevent.
+/// tier B, the silent bin: every client accepts, no monitor alerts.
 ///
 /// Sharing a primitive is not sharing a decision. The sequence — extract the
 /// SAN, parse it once, derive the key from the SPKI, walk the chain against
@@ -277,10 +244,9 @@ pub fn authorize(
 ///
 /// Exposed so a caller can compare a certificate's claim against what it
 /// observed *before* paying for a chain walk, and so a mismatch reports as
-/// the binding failure it is rather than as a confusing chain error. It
-/// cannot be used to route around [`authorize`]: that calls this itself and
-/// walks the chain against what *it* returns, never against a caller's
-/// string.
+/// the binding failure it is rather than a confusing chain error. It cannot
+/// route around [`authorize`]: that calls this itself and walks the chain
+/// against what *it* returns, never against a caller's string.
 pub fn identify(certificate: &Certificate) -> Result<Name, ChainError> {
     certificate
         .single_dns_name()
@@ -308,18 +274,18 @@ pub fn parse_name(text: &str) -> Result<Name, ChainError> {
 /// that signed its answer for membership rather than asking the DS to name
 /// it directly — a KSK/ZSK split zone's DS never names the signing key.
 ///
-/// The walk descends to the apex and then turns around once, to check that
-/// the apex's own keys signed the declaration sitting under them. That last
-/// step is what makes the entry the zone's statement instead of a passer-by's
-/// copy of public records (see the module docs).
-/// Behind the harness gate, and deliberately. A caller that supplies its own
-/// apex is a caller that can be handed one the certificate does not carry,
-/// which is precisely the split [`authorize`] exists to close: it parses the
-/// apex out of the certificate itself, so the client and the monitor cannot
-/// come to different answers about the same entry. The tiers suite exists
-/// because those two once composed the SAN differently and put a
-/// client-accepted entry in the silent bin. Only the chain tests want the
-/// looser form, and they run with `sim` on.
+/// The walk descends to the apex and turns around once, to check that the
+/// apex's own keys signed the declaration sitting under them — the step that
+/// makes the entry the zone's statement instead of a passer-by's copy of
+/// public records (see the module docs).
+/// Behind the harness gate, and deliberately: a caller that supplies its own
+/// apex can be handed one the certificate does not carry, which is precisely
+/// the split [`authorize`] exists to close — it parses the apex out of the
+/// certificate itself, so the client and the monitor cannot come to
+/// different answers about the same entry. The tiers suite exists because
+/// those two once composed the SAN differently and put a client-accepted
+/// entry in the silent bin. Only the chain tests want the looser form, and
+/// they run with `sim` on.
 #[cfg(any(test, feature = "sim"))]
 pub fn validate(
     chain: &DnssecChain,

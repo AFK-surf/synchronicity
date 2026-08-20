@@ -223,19 +223,12 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// The disable/enable round-trip lives in `attach` against what it gates;
+    /// what belongs here is that no row at all means attached.
     #[tokio::test]
-    async fn attach_is_on_by_default_until_opted_out() {
+    async fn attach_is_on_by_default() {
         let (_d, node) = node().await;
-        // No row was ever written, and the node is still attached: on is the
-        // default, not a state to reach.
         assert_eq!(node.cloud_settings().unwrap(), CloudSettings::default());
-        assert!(!node.cloud_settings().unwrap().disabled);
-
-        node.disable_cloud().unwrap();
-        assert!(node.cloud_settings().unwrap().disabled);
-
-        node.enable_cloud().unwrap();
-        assert!(!node.cloud_settings().unwrap().disabled);
         node.shutdown().await.unwrap();
     }
 }

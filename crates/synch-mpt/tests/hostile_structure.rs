@@ -1,7 +1,6 @@
-//! Trie *structure* arrives from peers over the network (§5.2), and only the
-//! per-node hash is checked on the way in — nothing canonicalizes the shape.
-//! These tests build the shapes a well-behaved publisher never would, and pin
-//! that walking them fails safely instead of aborting the process.
+//! Trie *structure* arrives from peers (§5.2) and only the per-node hash is
+//! checked — nothing canonicalizes the shape. These build shapes a well-behaved
+//! publisher never would, and pin that walking them fails safely.
 
 use synch_core::Hash;
 use synch_mpt::{node::hash_encoded, MemStore, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
@@ -14,8 +13,7 @@ fn put(store: &MemStore, node: &TrieNode) -> Hash {
     hash
 }
 
-/// A leaf under `depth` single-nibble extension nodes: a legal-looking trie of
-/// any depth the builder cares to name.
+/// A leaf under `depth` single-nibble extension nodes: a legal-looking trie of any depth.
 fn extension_chain(store: &MemStore, depth: usize) -> Hash {
     let mut hash = put(
         store,
@@ -41,23 +39,19 @@ fn extension_chain(store: &MemStore, depth: usize) -> Hash {
 /// peer can serve in a few megabytes; both position-walking readers must fail
 /// safely instead.
 #[test]
-fn a_deep_extension_chain_fails_safely() {
+fn extension_chains_fail_safely_past_the_bound_and_read_within_it() {
     let store = MemStore::new();
-    let root = extension_chain(&store, 50_000);
     let trie = Trie::new(&store);
-    // Every value in the chain sits below the depth any valid key can reach,
+
+    // 50 000 deep: every value sits below the depth any valid key can reach,
     // so there is nothing to report — and, above all, the process is still here.
+    let root = extension_chain(&store, 50_000);
     assert!(trie.diff(Hash::EMPTY, root).unwrap().is_empty());
     assert!(trie.iter(root).unwrap().is_empty());
-}
 
-#[test]
-fn a_hand_built_chain_within_the_bound_still_reads() {
     // The depth bound must not cost anything a real trie relies on: the same
-    // hand-built shape, shallow enough to hold a valid key, still yields it.
-    let store = MemStore::new();
+    // shape, shallow enough to hold a valid key, still yields it.
     let root = extension_chain(&store, 100);
-    let trie = Trie::new(&store);
     let key = vec![0x11u8; 50];
     assert_eq!(trie.get(root, &key).unwrap(), Some(vec![7]));
     assert_eq!(trie.iter(root).unwrap(), vec![(key, vec![7])]);

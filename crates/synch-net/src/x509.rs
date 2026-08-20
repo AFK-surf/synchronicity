@@ -11,11 +11,11 @@
 //! *monitorable name* out of a log that has exactly one entry type and no
 //! room for a payload (docs/REKOR-ZONE-KEY.md §2).
 //!
-//! So the certificate here is a **key envelope, not a trust assertion**.
-//! Nothing validates its signature, its issuer or its validity window; it
-//! exists to carry three things — the SubjectPublicKeyInfo, the apex, and one
-//! custom extension (see [`crate::zonecert`]) — through a field Rekor
-//! serializes verbatim.
+//! So the certificate here is a **key envelope, not a trust assertion**:
+//! nothing validates its signature, issuer or validity window; it exists to
+//! carry three things — the SubjectPublicKeyInfo, the apex, and one custom
+//! extension (see [`crate::zonecert`]) — through a field Rekor serializes
+//! verbatim.
 //!
 //! This module is deliberately a *narrow* DER reader rather than a general
 //! X.509 stack: it extracts a SPKI, the `dNSName` SANs and an extension by
@@ -191,18 +191,14 @@ impl Certificate {
     /// The value of the extension with this OID, if the certificate has
     /// exactly one.
     ///
-    /// **Exactly one, for the same reason `subjectAltName` is.** Returning
+    /// **Exactly one, for the same reason `subjectAltName` is:** returning
     /// the first of two would let a certificate mean one thing to this
-    /// parser and another to any reader that took the last — and the
-    /// extension this is used for carries the DNSSEC chain, the evidence
-    /// that decides whether a monitor reports an entry or files it in the
-    /// silent bin. The SAN path had this rule and spelled out why; the
-    /// extension lookup beside it did not.
-    ///
-    /// Go's `crypto/x509` rejects duplicate extensions outright, so the
-    /// public log would not have accepted such a certificate anyway. That is
-    /// a property of somebody else's parser, which is not where this design
-    /// should be keeping its invariants.
+    /// parser and another to any reader that took the last — and this
+    /// extension carries the DNSSEC chain, the evidence that decides whether
+    /// a monitor reports an entry or files it in the silent bin. Go's
+    /// `crypto/x509` rejects duplicate extensions outright, so the public
+    /// log would not have accepted such a certificate anyway — but that is
+    /// somebody else's parser, not where this design keeps its invariants.
     pub fn extension(&self, oid: &[u8]) -> Option<&[u8]> {
         let mut matching = self.extensions.iter().filter(|e| e.oid == oid);
         match (matching.next(), matching.next()) {
@@ -234,23 +230,20 @@ impl Certificate {
             }
         };
         // The SAN must be the name *spelled canonically*, not merely a string
-        // that parses to it.
+        // that parses to it. This is the one field the whole certificate
+        // exists to carry: the apex is written into the Merkle leaf so that
+        // anyone reading the log can index it (docs/REKOR-ZONE-KEY.md §2.1).
+        // `Name::from_utf8` reads DNS *presentation* format, where
+        // `CLUSTER.EXAMPLE` and `clus\ter.example` are both
+        // `cluster.example.` — so an attacker who has taken the delegation
+        // can mint an entry this client accepts for `cluster.example` while
+        // the leaf contains no such string, and every reader that indexes by
+        // byte pattern — a `grep`, a CT-style indexer, an operator watching
+        // for their own apex — misses it. Accepted and unfindable is the
+        // exact shape §4.2.1 forbids: a client must enforce whatever property
+        // makes an entry discoverable, or an attacker simply omits it.
         //
-        // This is the one field the whole certificate exists to carry: the
-        // apex is written into the Merkle leaf so that anyone reading the log
-        // can index it (docs/REKOR-ZONE-KEY.md §2.1). `Name::from_utf8` reads
-        // DNS *presentation* format, where `CLUSTER.EXAMPLE` and
-        // `clus\ter.example` are both `cluster.example.` — so an attacker who
-        // has taken the delegation can mint an entry that this client accepts
-        // for `cluster.example` while the leaf contains no such string. Every
-        // reader that indexes the log by byte pattern rather than by this
-        // parser — a `grep`, a CT-style indexer, an operator watching for
-        // their own apex — misses it. The entry is accepted and unfindable,
-        // which is the exact shape §4.2.1 forbids: a client must enforce
-        // whatever property makes an entry discoverable, or an attacker
-        // simply omits it.
-        //
-        // So the bytes have to be the canonical presentation of the name they
+        // So the bytes must be the canonical presentation of the name they
         // decode to. A trailing dot is the one tolerated difference, because
         // it is the same name written absolute.
         let mut name = Name::from_utf8(text)
@@ -684,7 +677,6 @@ impl<'a> Der<'a> {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -760,10 +752,7 @@ mod tests {
             &[
                 body,
                 algorithm_identifier(),
-                tlv(
-                    0x03,
-                    &[0x00, 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
-                ),
+                tlv(0x03, &[&[0x00], &fake_sign(&[])[..]].concat()),
             ]
             .concat(),
         );
@@ -780,10 +769,7 @@ mod tests {
     #[test]
     fn the_outer_certificate_sequence_is_closed_too() {
         let spec = spec("sync.example");
-        let signature = tlv(
-            0x03,
-            &[0x00, 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
-        );
+        let signature = tlv(0x03, &[&[0x00], &fake_sign(&[])[..]].concat());
 
         // Only a tbs, with no signature fields at all.
         let bare = tlv(0x30, &spec.tbs());
@@ -809,10 +795,11 @@ mod tests {
 
     #[test]
     fn a_built_certificate_parses_back_to_what_went_in() {
+        let base = spec("sync.example");
         let extra = vec![(vec![0x41, 0x01], b"payload".to_vec())];
         let spec = SelfSigned {
             extensions: &extra,
-            ..spec("sync.example")
+            ..base.clone()
         };
         let der = spec.build(fake_sign);
         let cert = Certificate::parse(&der).expect("the certificate must parse");
@@ -830,6 +817,24 @@ mod tests {
         // 2125 — the boundary RFC 5280 draws at 2050.
         assert_eq!(spec.not_before, Time::Utc("251009085320Z".into()));
         assert_eq!(spec.not_after, Time::Generalized("21250410230640Z".into()));
+
+        // And under long-form DER lengths, the path where hand-rolled DER
+        // usually dies: a 300-byte SAN and a 500-byte extension force the
+        // multi-byte length in both the writer and the reader.
+        let long = "a".repeat(300);
+        let extra = vec![(vec![0x41, 0x09], vec![0x7f; 500])];
+        let spec = SelfSigned {
+            dns_name: &long,
+            serial: &[0xff, 0xff],
+            not_before: x509_time(0),
+            not_after: x509_time(1),
+            extensions: &extra,
+            ..base
+        };
+        let der = spec.build(fake_sign);
+        let cert = Certificate::parse(&der).unwrap();
+        assert_eq!(cert.dns_names, vec![long]);
+        assert_eq!(cert.extension(&[0x41, 0x09]).unwrap().len(), 500);
     }
 
     #[test]
@@ -927,25 +932,5 @@ mod tests {
             error.to_string().contains("bytes after"),
             "refused for the wrong reason: {error}"
         );
-    }
-
-    #[test]
-    fn long_form_lengths_round_trip() {
-        // A SAN of 300 bytes forces the multi-byte length path in both the
-        // writer and the reader, which is where hand-rolled DER usually dies.
-        let long = "a".repeat(300);
-        let extra = vec![(vec![0x41, 0x09], vec![0x7f; 500])];
-        let spec = SelfSigned {
-            dns_name: &long,
-            serial: &[0xff, 0xff],
-            not_before: x509_time(0),
-            not_after: x509_time(1),
-            extensions: &extra,
-            ..spec("sync.example")
-        };
-        let der = spec.build(fake_sign);
-        let cert = Certificate::parse(&der).unwrap();
-        assert_eq!(cert.dns_names, vec![long]);
-        assert_eq!(cert.extension(&[0x41, 0x09]).unwrap().len(), 500);
     }
 }

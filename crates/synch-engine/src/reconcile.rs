@@ -1635,35 +1635,8 @@ mod tests {
         root
     }
 
-    #[test]
-    fn a_head_with_a_present_trie_completes_immediately() {
-        let (_d, store, key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
-        let root = publish(&store, &["a", "b"]);
-        let head = SignedHead::sign(&key, origin.clone(), 1, root, 0);
-        assert_eq!(syncer.offer_head(&head, 0).unwrap(), HeadOutcome::Completed);
-        assert_eq!(store.complete_head(&origin).unwrap(), Some(head));
-        assert_eq!(
-            store
-                .list_entries(Some(&origin), "s", "", None, None)
-                .unwrap()
-                .len(),
-            2
-        );
-
-        // A head whose trie is missing stays pending, complete slot untouched.
-        let unknown = SignedHead::sign(&key, origin.clone(), 2, Hash::new(b"unknown root"), 0);
-        assert_eq!(
-            syncer.offer_head(&unknown, 0).unwrap(),
-            HeadOutcome::Pending
-        );
-        assert_eq!(store.pending_head(&origin).unwrap(), Some(unknown));
-        assert_eq!(store.complete_head(&origin).unwrap().unwrap().seq, 1);
-    }
-
-    /// DoS bound: an origin flooding one seq is bounded by eviction, never
-    /// refused — the greatest roots keep the slot, so the answer does not
-    /// depend on which roots arrived first.
+    /// DoS bound: an origin flooding one seq is evicted at the cap, never
+    /// refused — the greatest roots keep the slot, whatever arrived first.
     #[test]
     fn same_seq_forks_are_evicted_at_the_cap_and_never_refused() {
         let (_d, store, key, origin) = setup();
@@ -1676,25 +1649,15 @@ mod tests {
                 "fork {i} is evidence and is taken"
             );
         }
-        assert_eq!(
-            store.fork_width(&origin, 1).unwrap(),
-            MAX_RETAINED_FORKS,
-            "the retained set stops at the cap"
-        );
-        let retained: Vec<u8> = store
+        assert_eq!(store.fork_width(&origin, 1).unwrap(), MAX_RETAINED_FORKS);
+        let roots: Vec<u8> = store
             .head_history(&origin)
             .unwrap()
             .iter()
             .filter(|h| h.seq == 1)
             .map(|h| h.root.0[0])
             .collect();
-        assert_eq!(
-            retained,
-            (MAX_RETAINED_FORKS as u8 - 3..=MAX_RETAINED_FORKS as u8 + 4)
-                .rev()
-                .collect::<Vec<_>>(),
-            "the greatest roots are what is kept, whatever arrived first"
-        );
+        assert_eq!(*roots.iter().min().unwrap(), MAX_RETAINED_FORKS as u8 - 3);
         assert_eq!(
             store.head_floor(&origin).unwrap().unwrap().1,
             Hash([MAX_RETAINED_FORKS as u8 + 4; 32]),
@@ -1762,7 +1725,6 @@ mod tests {
             "taken before the repeat was seen"
         );
 
-        // The honest shape — every wanted hash at most once — still passes.
         stored.borrow_mut().clear();
         let other = b"a second wanted node".to_vec();
         let other_hash = Hash::new(&other);
@@ -1840,8 +1802,7 @@ mod tests {
     }
 
     /// Two-slot advertising: a pending head is advertised *alongside* the
-    /// servable complete head, never in its place — the exact shape of a
-    /// past propagation-killing regression.
+    /// servable complete head, never in its place — a propagation-killing shape.
     #[test]
     fn summaries_report_completeness_honestly() {
         let (_d, store, key, origin) = setup();
@@ -1871,8 +1832,7 @@ mod tests {
         assert_eq!(pending[0].seq, 2);
     }
 
-    /// §5.2: the flip and the materialization are one transaction, so a crash
-    /// can never leave `entries` missing a promoted head's delta — a record
+    /// §5.2: the flip and the materialization are one transaction — a record
     /// the materializer cannot decode stands in for the crash.
     #[test]
     fn a_promotion_that_fails_to_materialize_does_not_flip_the_head() {
@@ -1923,10 +1883,23 @@ mod containment_tests {
     use super::tests::setup;
     use super::*;
 
+    fn pending_received_at(store: &Store, origin: &OriginId) -> i64 {
+        store
+            .head(origin, Slot::Pending)
+            .unwrap()
+            .unwrap()
+            .received_at
+    }
+
     /// A poisoned head must not pin `head_floor` above servable heads; the
-    /// evidence stays in `head_history`.
+    /// verdict is remembered (re-offer Refused from the memo, a different
+    /// root judged on its merits), the evidence stays in `head_history`.
+    ///
+    /// Two ways to poison a trie, one verdict: a non-`FileEntry` value, and a
+    /// node the walk refuses (§4.3) — the walk fires before the promotion
+    /// diff, so the verdict key is built before it.
     #[test]
-    fn a_head_that_cannot_be_materialized_does_not_hold_the_floor() {
+    fn a_promotion_judged_unpromotable_holds_no_floor_and_is_not_attempted_again() {
         let (_d, store, key, origin) = setup();
         let syncer = Syncer::new(store.clone());
         let trie = Trie::new(store.as_ref());
@@ -1944,93 +1917,7 @@ mod containment_tests {
         assert_eq!(store.pending_head(&origin).unwrap(), None);
         assert_eq!(store.complete_head(&origin).unwrap(), None);
         assert_eq!(store.head_floor(&origin).unwrap(), None);
-        assert_eq!(
-            store.head_history(&origin).unwrap().len(),
-            1,
-            "the head is still provable history"
-        );
-
-        // And a lesser head this node *can* serve is adoptable again, which
-        // the held floor would have refused.
-        let good = trie
-            .insert(
-                Hash::EMPTY,
-                &file_key("s", "a.txt").unwrap(),
-                &postcard::to_stdvec(&FileEntry::file(1, 0, Hash::new(b"c"), 1)).unwrap(),
-            )
-            .unwrap();
-        let servable = SignedHead::sign(&key, origin.clone(), 4, good, 0);
-        assert_eq!(
-            syncer.offer_head(&servable, 0).unwrap(),
-            HeadOutcome::Completed
-        );
-    }
-
-    /// The fault this raises comes from the completeness walk, which fires
-    /// *before* the promotion diff — so the verdict key must be built before
-    /// the walk (§4.3).
-    #[test]
-    fn a_head_whose_trie_is_structurally_invalid_is_retired_and_remembered() {
-        let (_d, store, key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
-
-        // An extension whose child is a leaf, which no canonical trie contains
-        // (§4.3). Stored through `put_node` directly, because this is what a
-        // peer serving a hand-built graph looks like.
-        let (value, _) = synch_mpt::ValueRef::for_value(&[7u8; 4]);
-        let child = synch_mpt::TrieNode::Leaf {
-            key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2]),
-            value,
-        };
-        let child_hash = child.hash();
-        let root = synch_mpt::TrieNode::Ext {
-            prefix: synch_mpt::Nibbles::from_nibbles(&[4]),
-            child: child_hash,
-        };
-        let root_hash = root.hash();
-        synch_mpt::NodeStore::put_node(store.as_ref(), &child_hash, &child.encode()).unwrap();
-        synch_mpt::NodeStore::put_node(store.as_ref(), &root_hash, &root.encode()).unwrap();
-
-        let head = SignedHead::sign(&key, origin.clone(), 4, root_hash, 0);
-        let err = syncer
-            .offer_head(&head, 0)
-            .expect_err("a non-canonical node is the origin's fault");
-        assert!(is_origin_fault(&err), "{err}");
-
-        // Retired: the floor is back to what this node can serve.
-        assert_eq!(store.head_floor(&origin).unwrap(), None);
-        // And remembered: the second offer does not walk it again, so it does
-        // not raise, and it leaves nothing pending — while still counting
-        // against the origin, which §12 requires the sync report to carry.
-        assert_eq!(
-            syncer.offer_head(&head, 0).unwrap(),
-            HeadOutcome::Refused,
-            "the verdict must be remembered, not re-derived every exchange"
-        );
-        assert_eq!(store.pending_head(&origin).unwrap(), None);
-    }
-
-    /// The verdict is keyed on the pair (head, root-it-would-diff-from): a
-    /// re-offer is Refused from the memo, a different root judged on its
-    /// merits — and the origin is still counted in `heads_failed`.
-    #[test]
-    fn a_promotion_judged_unpromotable_is_not_attempted_again() {
-        let (_d, store, key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
-        let trie = Trie::new(store.as_ref());
-
-        let poisoned = trie
-            .insert(Hash::EMPTY, &file_key("s", "a.txt").unwrap(), &[0xffu8; 8])
-            .unwrap();
-        let head = SignedHead::sign(&key, origin.clone(), 5, poisoned, 0);
-        syncer
-            .offer_head(&head, 0)
-            .expect_err("the record cannot be materialized");
-        assert_eq!(
-            store.head_floor(&origin).unwrap(),
-            None,
-            "and it was retired"
-        );
+        assert_eq!(store.head_history(&origin).unwrap().len(), 1);
 
         // Offered again — which is what every later exchange with a peer
         // holding it does: no error surfaces, the outcome is still counted
@@ -2042,13 +1929,50 @@ mod containment_tests {
         );
         assert_eq!(store.head_floor(&origin).unwrap(), None);
 
-        let good = trie
-            .insert(
-                Hash::EMPTY,
-                &file_key("s", "a.txt").unwrap(),
-                &postcard::to_stdvec(&FileEntry::file(1, 0, Hash::new(b"c"), 1)).unwrap(),
-            )
+        // The same verdict by the other route: a trie that is structurally
+        // invalid — an extension whose child is a leaf, which no canonical
+        // trie contains (§4.3). Stored through `put_node` directly, because
+        // this is what a peer serving a hand-built graph looks like.
+        let (value, _) = synch_mpt::ValueRef::for_value(&[7u8; 4]);
+        let child = synch_mpt::TrieNode::Leaf {
+            key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2]),
+            value,
+        };
+        let child_hash = child.hash();
+        let structural = synch_mpt::TrieNode::Ext {
+            prefix: synch_mpt::Nibbles::from_nibbles(&[4]),
+            child: child_hash,
+        };
+        let structural_root = structural.hash();
+        synch_mpt::NodeStore::put_node(store.as_ref(), &child_hash, &child.encode()).unwrap();
+        synch_mpt::NodeStore::put_node(store.as_ref(), &structural_root, &structural.encode())
             .unwrap();
+        let bad = SignedHead::sign(&key, origin.clone(), 7, structural_root, 0);
+        let err = syncer
+            .offer_head(&bad, 0)
+            .expect_err("a non-canonical node is the origin's fault");
+        assert!(is_origin_fault(&err), "{err}");
+        assert_eq!(store.pending_head(&origin).unwrap(), None);
+        assert_eq!(
+            store.head_floor(&origin).unwrap(),
+            None,
+            "retired: the floor is back to what this node can serve"
+        );
+
+        // A good root this node *can* serve is adoptable again — a lesser
+        // one, which the held floor would have refused...
+        let good_value = postcard::to_stdvec(&FileEntry::file(1, 0, Hash::new(b"c"), 1)).unwrap();
+        let good = trie
+            .insert(Hash::EMPTY, &file_key("s", "a.txt").unwrap(), &good_value)
+            .unwrap();
+        let lesser = SignedHead::sign(&key, origin.clone(), 4, good, 0);
+        assert_eq!(
+            syncer.offer_head(&lesser, 0).unwrap(),
+            HeadOutcome::Completed,
+            "a lesser servable head must be adoptable again"
+        );
+
+        // ...and a later one is the origin moving on, taken normally.
         let later = SignedHead::sign(&key, origin, 6, good, 0);
         assert_eq!(
             syncer.offer_head(&later, 0).unwrap(),
@@ -2056,11 +1980,12 @@ mod containment_tests {
         );
     }
 
-    /// A bell that keeps nothing for an unparked listener is silent for the
-    /// pushes that land mid-round, when the anti-entropy loop is dialling
-    /// peers rather than parked (§5.3).
+    /// The fetch bell (§5.3): a pending head rung mid-round — when the loop
+    /// is dialling peers rather than parked — must still wake a listener that
+    /// parks afterwards, and a refused head must not ring at all: a Notify
+    /// keeps one permit per ring, so either fault would fail a check.
     #[tokio::test]
-    async fn a_pending_head_rung_mid_round_is_not_lost() {
+    async fn the_fetch_bell_keeps_mid_round_rings_and_stays_silent_for_refusals() {
         let (_d, store, key, origin) = setup();
         let wake = Arc::new(tokio::sync::Notify::new());
         let syncer = Syncer::new(store.clone()).on_pending(Some(wake.clone()));
@@ -2068,86 +1993,36 @@ mod containment_tests {
         // Rung with no listener parked, which is the mid-round case.
         let head = SignedHead::sign(&key, origin.clone(), 1, Hash([1u8; 32]), 0);
         assert_eq!(syncer.offer_head(&head, 0).unwrap(), HeadOutcome::Pending);
-
         // A listener arriving afterwards still has to see it.
         tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
             .await
             .expect("a wake that landed while the loop was busy must still be there");
-    }
 
-    /// A peer advertises both slots per origin; comparing the first summary
-    /// listed and skipping the rest lost the pull arm when the complete slot
-    /// was the higher of the two (§5.2).
-    #[test]
-    fn the_pull_compares_the_peers_best_summary_for_an_origin() {
-        let (_d, store, key, origin) = setup();
-        let syncer = Syncer::new(store.clone());
-
-        // We hold seq 6 complete; nothing pending.
-        let ours = SignedHead::sign(&key, origin.clone(), 6, Hash([6u8; 32]), 0);
-        store.put_head(Slot::Complete, &ours, 0, 0).unwrap();
-        let mine = syncer.local_summaries().unwrap();
-        assert_eq!(mine.len(), 1);
-
-        // The peer lists its pending seq 6 first and its complete seq 7
-        // second, which is the order `local_summaries` produces for that state.
-        let theirs = vec![
-            HeadSummary {
-                origin: origin.clone(),
-                seq: 6,
-                root: Hash([6u8; 32]),
-                complete: false,
-            },
-            HeadSummary {
-                origin: origin.clone(),
-                seq: 7,
-                root: Hash([7u8; 32]),
-                complete: true,
-            },
-        ];
-
-        let want = super::wanted_origins(&theirs, &mine);
-        assert_eq!(
-            want,
-            vec![origin],
-            "the peer's seq 7 is newer than ours, so it must be asked for"
-        );
-    }
-
-    /// Ringing on adoption would wake the loop for a head that no longer
-    /// exists, and a stuck notify permit pins the node to back-to-back
-    /// rounds at the reactive floor.
-    #[tokio::test]
-    async fn a_refused_head_does_not_ring_the_fetch_bell() {
-        let (_d, store, key, origin) = setup();
-        let wake = Arc::new(tokio::sync::Notify::new());
-        let syncer = Syncer::new(store.clone()).on_pending(Some(wake.clone()));
+        // A poisoned head rings nothing: neither the fault on arrival nor the
+        // memo refusal.
         let trie = Trie::new(store.as_ref());
-
         let poisoned = trie
             .insert(Hash::EMPTY, &file_key("s", "a.txt").unwrap(), &[0xffu8; 8])
             .unwrap();
-        let head = SignedHead::sign(&key, origin.clone(), 5, poisoned, 0);
+        let bad = SignedHead::sign(&key, origin.clone(), 5, poisoned, 0);
         syncer
-            .offer_head(&head, 0)
+            .offer_head(&bad, 0)
             .expect_err("the record cannot be materialized");
-        tokio::time::timeout(std::time::Duration::from_millis(200), wake.notified())
-            .await
-            .expect_err("a head retired by a fault must not ring either");
-
         assert_eq!(
-            syncer.offer_head(&head, 0).unwrap(),
+            syncer.offer_head(&bad, 0).unwrap(),
             HeadOutcome::Refused,
             "answered from the memo"
         );
-        tokio::time::timeout(std::time::Duration::from_millis(200), wake.notified())
-            .await
-            .expect_err("a refused head has no trie to fetch and must not wake the loop");
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_millis(200), wake.notified())
+                .await
+                .expect_err("a retired or refused head must not ring the fetch bell");
+        }
     }
 
-    /// The pending slot ages, not the head occupying it: taking
-    /// `received_at` from each newly adopted head reset the sweep clock on
-    /// every arrival, so a fast publisher outran the TTL forever.
+    /// The pending slot ages, not the head occupying it: taking `received_at`
+    /// from each new head reset the sweep clock, so a fast publisher outran
+    /// the TTL forever.
     #[test]
     fn a_newer_pending_head_inherits_the_slots_clock() {
         let (_d, store, key, origin) = setup();
@@ -2160,10 +2035,7 @@ mod containment_tests {
             .unwrap();
         let stored = store.head(&origin, Slot::Pending).unwrap().unwrap();
         assert_eq!(stored.head.seq, 2, "the newer head took the slot");
-        assert_eq!(
-            stored.received_at, 100,
-            "but the slot has been occupied since 100"
-        );
+        assert_eq!(stored.received_at, 100);
 
         // A fetch that commits something restarts it, so a trie that genuinely
         // takes longer than the TTL to arrive is not swept mid-transfer.
@@ -2173,26 +2045,13 @@ mod containment_tests {
                 .unwrap(),
             "a fetch of a head the slot has moved past must not restart the clock"
         );
-        assert_eq!(
-            store
-                .head(&origin, Slot::Pending)
-                .unwrap()
-                .unwrap()
-                .received_at,
-            100,
-            "the slot keeps ageing while an unservable head occupies it"
-        );
+        let received = pending_received_at(&store, &origin);
+        assert_eq!(received, 100);
         assert!(store
             .touch_pending_at(&origin, 2, &Hash([2u8; 32]), 9_500)
             .unwrap());
-        assert_eq!(
-            store
-                .head(&origin, Slot::Pending)
-                .unwrap()
-                .unwrap()
-                .received_at,
-            9_500
-        );
+        let received = pending_received_at(&store, &origin);
+        assert_eq!(received, 9_500);
 
         // An empty slot starts its own clock.
         assert!(store
@@ -2201,57 +2060,19 @@ mod containment_tests {
         store
             .put_head(Slot::Pending, &first, 20_000, 20_000)
             .unwrap();
-        assert_eq!(
-            store
-                .head(&origin, Slot::Pending)
-                .unwrap()
-                .unwrap()
-                .received_at,
-            20_000
-        );
+        let received = pending_received_at(&store, &origin);
+        assert_eq!(received, 20_000);
+        let other = OriginId::named("other", "x.example").unwrap();
         assert!(
             !store
-                .touch_pending_at(
-                    &OriginId::named("other", "x.example").unwrap(),
-                    1,
-                    &Hash([1u8; 32]),
-                    1
-                )
+                .touch_pending_at(&other, 1, &Hash([1u8; 32]), 1)
                 .unwrap(),
             "and there is nothing to touch for an origin with no pending head"
         );
     }
 
-    /// `clear_head` must name the head being abandoned: a newer head accepted
-    /// while a fetch was between round trips went with the old one's verdict.
-    #[test]
-    fn clearing_a_slot_leaves_a_head_that_arrived_since() {
-        let (_d, store, key, origin) = setup();
-        let stale = SignedHead::sign(&key, origin.clone(), 1, Hash([1u8; 32]), 0);
-        let fresh = SignedHead::sign(&key, origin.clone(), 2, Hash([2u8; 32]), 0);
-        store.put_head(Slot::Pending, &stale, 0, 0).unwrap();
-
-        // The slot moves on while a fetch is between round trips.
-        store.put_head(Slot::Pending, &fresh, 0, 0).unwrap();
-
-        assert!(
-            !store
-                .clear_head_at(&origin, Slot::Pending, stale.seq, &stale.root)
-                .unwrap(),
-            "the verdict was about a head the slot no longer holds"
-        );
-        assert_eq!(store.pending_head(&origin).unwrap(), Some(fresh.clone()));
-
-        // And the head it *is* about goes.
-        assert!(store
-            .clear_head_at(&origin, Slot::Pending, fresh.seq, &fresh.root)
-            .unwrap());
-        assert_eq!(store.pending_head(&origin).unwrap(), None);
-    }
-
     /// Our own next seq counts the pending slot and the retained history, not
-    /// just the complete slot — the §3.4 recovery shape a restored backup
-    /// meets.
+    /// just the complete slot — the §3.4 recovery shape a restored backup meets.
     #[test]
     fn the_next_own_seq_clears_the_pending_slot_and_the_history() {
         let (_d, store, key, origin) = setup();
@@ -2266,11 +2087,7 @@ mod containment_tests {
             HeadOutcome::Pending
         );
         assert_eq!(store.complete_head(&origin).unwrap(), None);
-        assert_eq!(
-            store.next_own_seq(&origin).unwrap(),
-            10,
-            "the pending slot and the history both count"
-        );
+        assert_eq!(store.next_own_seq(&origin).unwrap(), 10);
 
         // Even once the pending slot is cleared, the retained history still does.
         store

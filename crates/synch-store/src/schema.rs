@@ -871,25 +871,25 @@ CREATE TABLE redacted_nodes (hash BLOB PRIMARY KEY);
 mod identity_migration_tests {
     use crate::Store;
 
-    /// v16 keeps the domain the node's own name points at, whatever else was
-    /// configured beside it, and drops the bindings of the zones being left.
-    #[test]
-    fn the_surviving_domain_is_the_one_that_names_this_node() {
+    /// The migration has already run on a fresh database, so the state it
+    /// consumed is written back and replayed by hand.
+    fn replay_v16(domains: &str, self_origin: &str) -> Store {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        // The migration has already run on this fresh database, so the state
-        // it consumed is written back and replayed by hand.
-        store
-            .set_config("membership_domains", "other.example\ncluster.example")
-            .unwrap();
-        store
-            .set_config("self_origin_id", "nas@cluster.example")
-            .unwrap();
+        store.set_config("membership_domains", domains).unwrap();
+        store.set_config("self_origin_id", self_origin).unwrap();
         store.set_membership_domain(None).unwrap();
         store
             .transaction(|txn| super::one_membership_domain(txn.conn()))
             .unwrap();
+        store
+    }
 
+    /// v16 keeps the domain the node's own name points at, whatever else was
+    /// configured beside it, and drops the bindings of the zones being left.
+    #[test]
+    fn the_surviving_domain_is_the_one_that_names_this_node() {
+        let store = replay_v16("other.example\ncluster.example", "nas@cluster.example");
         assert_eq!(
             store.membership_domain().unwrap().as_deref(),
             Some("cluster.example")
@@ -901,22 +901,10 @@ mod identity_migration_tests {
     /// other zone and none survives.
     #[test]
     fn a_key_identified_node_keeps_no_domain() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store
-            .set_config("membership_domains", "cluster.example")
-            .unwrap();
-        store
-            .set_config(
-                "self_origin_id",
-                "key:c1oa1qttuk8kzr8ntdcrnf9jhgh4bhtxa9x7wqxrn9nkr45yqnro",
-            )
-            .unwrap();
-        store.set_membership_domain(None).unwrap();
-        store
-            .transaction(|txn| super::one_membership_domain(txn.conn()))
-            .unwrap();
-
+        let store = replay_v16(
+            "cluster.example",
+            "key:c1oa1qttuk8kzr8ntdcrnf9jhgh4bhtxa9x7wqxrn9nkr45yqnro",
+        );
         assert_eq!(store.membership_domain().unwrap(), None);
     }
 }

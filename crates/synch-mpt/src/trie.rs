@@ -68,62 +68,41 @@ pub const MAX_DEPTH_NIBBLES: usize = MAX_KEY_LEN * 2;
 
 /// An absolute ceiling on the positions any one structural walk may visit.
 ///
-/// This is the whole bound, and it is a bound on *work* rather than a guess at
-/// which shapes are honest. Both numbers that set it are measured:
+/// The bound is on *work*, not a guess at which shapes are honest; both numbers
+/// that set it are measured: honest data costs ~5.2 positions per entry (§14's
+/// shape) to ~11 (identical placeholder files, the densest legitimate shape), so
+/// this ceiling carries ~1.5 M entries, past §7.1's 100 k index and §12's
+/// sizes. A refused walk is the worst case: a fan-out DAG expands until stopped
+/// — ~8 s inside the promotion transaction, once, failing the head's own origin
+/// (§12). Raising it is not free: at 64 M a nine-node bomb cost 63 s to refuse,
+/// and a seven-node one slipped under and wrote 16.7 M rows.
 ///
-/// - **What honest data costs.** §14's shape — one `f:` record and one `b:` ad
-///   per file — walks ~5.2 positions per entry, so 200 000 files (400 000
-///   entries) is ~2.1 M positions. A trie of identical placeholder files, the
-///   densest legitimate shape, walks ~11 positions per entry. This ceiling
-///   therefore carries ~1.5 M entries, an order of magnitude past the 100 k
-///   initial index §7.1 names and well past §12's sizes.
-/// - **What a refused walk costs.** A fan-out DAG expands until it is stopped,
-///   so the ceiling *is* the worst case: ~8 s of walking, inside the promotion
-///   transaction, once, after which the head fails its own origin and no other
-///   (§12). Raising it is not free — at 64 M a nine-node bomb cost 63 s to
-///   refuse, and a seven-node one slipped under entirely and wrote 16.7 M rows.
-///
-/// The consequence worth stating plainly: this caps how large a trie any origin
-/// can have materialized here. That is a deliberate limit, not an accident.
-///
-/// It is not, however, a limit anyone observes on the way to it, and that part
-/// *is* an accident. A follower promoting an origin's next head diffs
-/// `old_root → new_root`, and the diff prunes at the first equal node hash, so
-/// it is charged in changed paths however large the trie is. The publisher
-/// diffs the same way. `MissingWalk` carries no position guard at all, since it
-/// dedups on hash. So an origin can grow past this ceiling with no node —
-/// itself included — ever running the walk that would say so, and the limit
-/// then manifests only on the *first cold materialization*: a node joining, a
-/// node restoring from backup, `doctor --rebuild`. Existing followers keep
-/// syncing it happily. The refusal at least names the situation now, rather
-/// than reading as one more unparseable record.
+/// This caps how large a trie any origin can have materialized here — a
+/// deliberate limit — but nothing observes it on the way there: diffs prune at
+/// the first equal hash and `MissingWalk` dedups, so an origin grows past it
+/// with no node ever running the walk that would say so, and the limit shows up
+/// only on *first cold materialization* (join, restore, `doctor --rebuild`).
+/// Existing followers keep syncing it happily; the refusal at least names the
+/// situation rather than reading as one more unparseable record.
 const WALK_POSITION_CEILING: usize = 8_000_000;
 
 /// Keeps a structural walk proportional to the work it is allowed to do.
 ///
-/// A walk over trie *structure* descends positions, and a peer's node graph is
-/// a DAG rather than a tree: nothing stops a branch pointing all sixteen
-/// children at one hash. Sixteen such branches stacked are seventeen distinct
-/// nodes — which `MissingWalk` fetches happily, because it dedups on hash, and
-/// which `is_complete` then passes — and 16^16 positions to walk. Depth bounds
-/// do not help; the explosion is in breadth.
+/// A peer's node graph is a DAG: nothing stops a branch pointing all sixteen
+/// children at one hash, and sixteen such branches stacked are seventeen
+/// distinct nodes — which `MissingWalk` fetches happily and `is_complete`
+/// passes — yet 16^16 positions to walk. Depth bounds do not help; the
+/// explosion is in breadth.
 ///
-/// Deduping positions by node hash is *not* the fix, and looks like it is:
-/// structural sharing means one leaf node legitimately sits at as many
-/// positions as there are keys with that value, so pruning repeats silently
-/// drops keys from `scan` and changes from `diff`.
-///
-/// Neither is classifying the shape. This guard used to carry a second rule —
-/// arrivals at stored nodes, capped at a multiple of the *distinct* node count
-/// — on the theory that an honest walk reaches each stored node about once
-/// because sharing requires whole subtries to coincide. That theory is false,
-/// and content addressing is why: give sixty thousand keys under dense
-/// structured paths one identical value and every leaf *is* the same node, so
-/// the whole lower trie collapses to about ten distinct nodes carrying sixty
-/// thousand positions. That is an ordinary `Trie::insert` corpus — a tree of
-/// identical placeholder files — and it blew the ratio by the same margin a
-/// fan-out bomb does. The two cases are not separable by this measurement, so
-/// the walk is bounded by how much work it does and nothing else.
+/// Deduping positions by node hash is *not* the fix: structural sharing means
+/// one leaf node legitimately sits at as many positions as there are keys with
+/// that value, so pruning repeats silently drops keys from `scan` and changes
+/// from `diff`. Neither is classifying the shape — a former rule capping
+/// arrivals at a multiple of the *distinct* node count collapsed on an ordinary
+/// corpus: sixty thousand keys with one identical value make every leaf the
+/// same node, ~ten distinct nodes carrying sixty thousand positions, blowing
+/// the ratio exactly as a fan-out bomb does. The two cases are not separable by
+/// this measurement, so the walk is bounded by work and nothing else.
 #[derive(Debug, Default)]
 pub(crate) struct FanoutGuard {
     /// Positions of every kind, against the absolute ceiling.
@@ -233,25 +212,17 @@ type Position = (Option<Hash>, Hash, Vec<u8>);
 
 /// The §5.2 frontier, as a walk that keeps its place.
 ///
-/// A fetch asks "what does this root need?" repeatedly, a batch at a time, and
-/// two things about how it asks decide what the whole exchange costs.
+/// **It resumes.** Restarting at the root for every batch makes a cold fetch
+/// quadratic — roughly `n²/batch` node reads — so the walk holds its frontier
+/// across batches and only revisits a node once the caller has stored it.
 ///
-/// **It resumes.** Restarting the walk at the root for every batch makes a cold
-/// fetch quadratic: each round re-descends everything already fetched to reach
-/// the next batch of absent nodes, so a trie of `n` nodes costs roughly
-/// `n²/batch` node reads. The walk therefore holds its frontier across batches
-/// and only revisits a node once the caller has stored it.
-///
-/// **It prunes against what is already held.** Content addressing makes
-/// subtree *equality* free — matching hashes are the same subtree — but says
-/// nothing about whether a subtree is *held*, and a node is committed the
-/// moment it arrives, so a present node's children may well be absent. That is
-/// why a walk cannot simply stop at a node it has. Given a root it holds
-/// *whole*, though, it can: a hash appearing in that trie is a subtree it has
-/// all of. Handed the origin's last complete root, the walk skips everything
-/// the new root shares with it and descends only the paths that actually
-/// changed — which is what makes an incremental sync cost the change rather
-/// than the tree (§5.2).
+/// **It prunes against what is already held.** A node is committed the moment
+/// it arrives, so a present node's children may well be absent and a walk
+/// cannot simply stop at a node it has — but a hash appearing in a root held
+/// *whole* is a subtree it has all of. Handed the origin's last complete root,
+/// the walk skips everything the new root shares with it and descends only the
+/// paths that changed, making an incremental sync cost the change rather than
+/// the tree (§5.2).
 #[derive(Debug)]
 pub struct MissingWalk {
     /// `(the hash at this position in the reference trie, the hash wanted,
@@ -267,9 +238,8 @@ pub struct MissingWalk {
     /// The part of the keyspace this walk may descend into (§5.5).
     ///
     /// A scoped walk stops at the boundary rather than asking for what it
-    /// would be refused: the peer serving it applies the same predicate, so an
-    /// out-of-scope request is not a race but a probe, and an honest walk
-    /// never makes one.
+    /// would be refused — the serving peer applies the same predicate, so an
+    /// out-of-scope request is a probe, never a race.
     scope: Scope,
 }
 
@@ -291,11 +261,10 @@ impl MissingWalk {
 
     /// The same walk, confined to `scope`.
     ///
-    /// Pruning against the reference root survives the confinement, and its
-    /// soundness condition with it: a hash matching one in a trie held whole
-    /// *within this scope* is a subtree held whole within this scope, because
-    /// the walk never commits part of a subtree it is inside — every boundary
-    /// it stops at is a scope edge.
+    /// Pruning against the reference root survives the confinement: a hash
+    /// matching one in a trie held whole *within this scope* is a subtree held
+    /// whole within this scope, since every boundary the walk stops at is a
+    /// scope edge.
     pub fn scoped(known_complete: Option<Hash>, root: Hash, scope: Scope) -> MissingWalk {
         let frontier = match root_opt(root) {
             None => Vec::new(),
@@ -336,48 +305,36 @@ impl MissingWalk {
         max: usize,
     ) -> Result<Missing, MptError> {
         let mut missing = Missing::default();
-        // One request may ask for a hash once. Structural sharing makes a
-        // repeat ordinary rather than exotic — two keys whose values coincide
-        // reference the same out-of-line payload from two different nodes — and
-        // the node side is deduplicated by `seen` while this was not, so a
-        // single batch asked for one hash several times. The responder answers
-        // per requested hash, and `take_served` treats the second copy as a
-        // protocol violation and ends the *whole* exchange, for every origin,
+        // One request may ask for a hash once. Structural sharing makes repeats
+        // ordinary — two keys with one out-of-line payload — and `seen` dedups
+        // nodes but not values, so a single batch asked for one hash several
+        // times; the responder answers per hash, and `take_served` treats a
+        // second copy as a protocol violation that ends the *whole* exchange,
         // blaming an honest peer for answering exactly what it was asked.
-        //
-        // Local to the batch, never across batches: a value still absent on the
-        // next round has to be reported again, or the unproductive counter that
-        // §5.2's abandonment clause rests on would never fire.
+        // Local to the batch: an absent value must be reported again next round,
+        // or the unproductive counter behind §5.2's abandonment never fires.
         let mut asked: HashSet<Hash> = HashSet::new();
         while let Some((reference, hash, path)) = self.frontier.pop() {
             if missing.len() >= max {
                 self.frontier.push((reference, hash, path));
                 break;
             }
-            // The depth bound every *walk* in this crate carries, applied to the
-            // *fetch*, which carried none. `hash_of_encoded` bounds one node's
-            // nibble run at `MAX_KEY_LEN * 2` and DESIGN §12 read that as
-            // bounding ingest depth; it does not, because the bound is per node
-            // and a path is made of many. Without this, a chain of nodes reaching
-            // past the depth any valid key addresses was pulled and committed in
-            // full, `is_complete` vouched for the root, `iter` and `diff` pruned
-            // at `MAX_DEPTH_NIBBLES` so the promotion succeeded, and the nodes
-            // were then reachable from a retained head: marked by every GC pass,
-            // reflected in no `entries` row, and served on to every peer.
+            // The depth bound every walk carries, applied to the *fetch*, which
+            // carried none: `hash_of_encoded` bounds one node's run at
+            // `MAX_KEY_LEN * 2` and §12 read that as bounding ingest depth, but
+            // the bound is per node and a path is made of many. Without this, a
+            // chain past the depth any valid key reaches was pulled in full,
+            // vouched for, and served on to every peer — marked by no GC pass,
+            // reflected in no `entries` row.
             //
-            // What this is and is not. It refuses a *position* no valid key
-            // reaches, which is a canonicality rule and costs nothing an honest
-            // origin can produce — no key `insert` accepts descends this far. It
-            // is **not** a bound on how much a member can make a peer store,
-            // and it should not be read as one: `seen` deduplicates on hash, so
-            // a node is expanded at whichever depth it is popped at first, and
-            // one extra branch pointing at every rung of a deep chain makes the
-            // whole chain reachable at depth 1. What bounds storage is that this
-            // walk is deduplicated at all — the fetch costs one node per
-            // *distinct* node served, so a member gets no leverage over a peer
-            // beyond what it uploads (§12 puts that under `synch trust rm`).
-            //
-            // An `MptError`, so it fails that origin and not the peer relaying it.
+            // It refuses a *position* no valid key reaches (a canonicality rule
+            // costing nothing honest) and is **not** a bound on how much a
+            // member can make a peer store: `seen` expands a node at whichever
+            // depth it is popped first, so one extra branch per rung makes the
+            // whole chain reachable at depth 1. Storage is bounded by the walk
+            // being deduplicated — one node per *distinct* node served, no
+            // leverage beyond what the member uploads (§12: `synch trust rm`).
+            // An `MptError`, so it fails that origin and not the relaying peer.
             if path.len() > MAX_DEPTH_NIBBLES {
                 return Err(MptError::NonCanonical(format!(
                     "a trie node sits at nibble depth {}, past the \
@@ -395,18 +352,14 @@ impl MissingWalk {
             }
             // A position a peer has refused holds nothing this node may see,
             // so it is satisfied rather than missing (§5.5). Only above the
-            // grant: inside it there is nothing a peer could rightly refuse,
-            // and treating a refusal there as satisfied would let this node
-            // call a trie complete that it does not hold.
-            //
-            // It cannot be tightened to `admits_path` — the child filter below
-            // already drops every position the scope does not admit, so the
-            // walk only ever asks about admitted ones, and the memo would
-            // never fire. That is not a loose end but the shape of the
-            // problem: a refusal arrives as a bare hash, and an honest one (an
-            // `Ext` whose prefix runs out of scope, a `Leaf` whose key does)
-            // is indistinguishable here from a branch that leads back into the
-            // grant. The distinction is only visible where the node is —
+            // grant: inside it nothing could rightly be refused, and calling
+            // such a trie complete would vouch for what is not held.
+            // It cannot be tightened to `admits_path`: the child filter below
+            // drops every unadmitted position, so the memo would never fire.
+            // That is the shape of the problem — a refusal arrives as a bare
+            // hash, and an honest one (`Ext`/`Leaf` running out of scope) is
+            // indistinguishable here from a branch leading back into the
+            // grant. The distinction lives where the node is:
             // `Scope::admits_node`, which no longer refuses a branch it can
             // serve.
             if !self.scope.contains_subtree(&path) && trie.is_redacted_raw(&hash)? {
@@ -419,29 +372,22 @@ impl MissingWalk {
             };
             let node = TrieNode::decode(&data)?;
             // The half of the extension invariant `check_invariants` cannot
-            // reach: an `Ext` must sit above a `Branch`, and that needs the
-            // child node. `node.rs` documents it as "checked where the
-            // structure is walked" — this is that check, and until it existed
-            // the sentence was false. An `Ext` above a `Leaf` or another `Ext`
-            // reads correctly through `get`, `iter` and `diff`, so it corrupts
-            // nothing; what it does is give one key/value map several distinct
-            // roots, which is precisely what structural sharing and the
-            // reference pruning below rely on not happening. An origin serving
-            // non-collapsed shapes makes every peer's incremental sync cost the
-            // whole tree.
-            //
-            // Raised as an `MptError`, so it fails its own origin and no other
-            // (§12): the relaying peer served exactly what it was asked for.
+            // reach: an `Ext` must sit above a `Branch`, which needs the child
+            // node. An `Ext` above a `Leaf` or another `Ext` reads fine through
+            // `get`/`iter`/`diff` but gives one key/value map several distinct
+            // roots — exactly what structural sharing and reference pruning
+            // rely on not happening — making every peer's incremental sync cost
+            // the whole tree. An `MptError`, so it fails its own origin and no
+            // other (§12): the relaying peer served exactly what it was asked.
             if self.must_be_branch.remove(&hash) && !matches!(node, TrieNode::Branch { .. }) {
                 return Err(MptError::NonCanonical(format!(
                     "node {hash} sits under an extension but is not a branch"
                 )));
             }
             if let TrieNode::Ext { child, .. } = &node {
-                // Recorded for when the child is popped, and checked now if it
-                // is already here — a node graph is a DAG, so the child may
-                // have been visited under some other parent already and `seen`
-                // would keep it from being revisited.
+                // Checked now if the child is already here: a DAG means it may
+                // have been visited under another parent, and `seen` would keep
+                // it from being revisited.
                 match trie.load_raw(child)? {
                     Some(bytes)
                         if !matches!(TrieNode::decode(&bytes)?, TrieNode::Branch { .. }) =>
@@ -463,10 +409,9 @@ impl MissingWalk {
                     .transpose()?,
                 None => None,
             };
-            // A leaf's *value* sits at the end of its own run, which is the
-            // position a key would have to be that long to name — and a leaf
-            // has no children, so nothing below charges the depth this node
-            // reaches. Checked here or not at all.
+            // A leaf's value sits at the end of its own run, which is the
+            // position a key would have to be that long to name, and nothing
+            // below charges this depth. Checked here or not at all.
             if let TrieNode::Leaf { key_rest, .. } = &node {
                 let depth = path.len().saturating_add(key_rest.len());
                 if depth > MAX_DEPTH_NIBBLES {
@@ -479,29 +424,27 @@ impl MissingWalk {
             for (child_reference, child, step) in paired_children(reference_node.as_ref(), &node) {
                 let mut child_path = path.clone();
                 child_path.extend_from_slice(&step);
-                // The boundary: a child leading out of scope is not descended
-                // and not asked for. Its hash stays committed by the node just
-                // walked, which is what keeps the root verifiable without it.
+                // A child leading out of scope is not descended or asked for;
+                // its hash stays committed by the node just walked, keeping the
+                // root verifiable without it.
                 if !self.scope.admits_path(&child_path) {
                     continue;
                 }
                 self.frontier.push((child_reference, child, child_path));
             }
             // A node whose out-of-line values have not arrived is not done
-            // with, so it is deferred alongside the nodes that never loaded at
-            // all. Reporting the value once and moving on would have the walk
-            // claim exhaustion over a trie it cannot serve: the node loads, so
-            // it is never deferred, and `seen` keeps it from ever being
-            // revisited. The fetch loop would then break out with its
-            // unproductive counter at one, so the §5.2 abandonment clause could
-            // never fire for a value-only failure, and `note_complete` would
-            // vouch for the root.
+            // with, so it is deferred like a node that never loaded. Reporting
+            // the value once and moving on would have the walk claim exhaustion
+            // over a trie it cannot serve — the node loads, so it is never
+            // deferred and `seen` never revisits it — and the §5.2 abandonment
+            // counter would sit at one while `note_complete` vouched for the
+            // root.
             let mut awaiting_values = false;
             for value_hash in node.value_hashes() {
                 if !trie.has_value_raw(&value_hash)? {
-                    // Deferred whether or not this batch has already asked for
-                    // it: another node reporting the same payload says nothing
-                    // about *this* node being done with.
+                    // Deferred whether or not already asked this batch: another
+                    // node reporting the same payload says nothing about *this*
+                    // node being done with.
                     awaiting_values = true;
                     if asked.insert(value_hash) {
                         missing.values.push((path.clone(), value_hash));
@@ -519,15 +462,12 @@ impl MissingWalk {
 /// Pairs a node's children with the ones at the same positions in the
 /// reference trie, so the walk can prune where the two agree.
 ///
-/// Pairing is only attempted where the two nodes have the same shape. Anywhere
-/// else the children are walked with no reference, which costs traversal and
-/// never correctness — pruning is an optimization, and declining to prune is
-/// always safe.
-/// Each child is returned with the nibbles that lead to it from this node —
-/// one nibble for a branch slot, the whole prefix for an extension — so the
-/// walk can accumulate the position of everything it descends into. That
-/// position is what a scoped fetch is authorized on (§5.5), and it is a function
-/// of the node shape alone, so it costs the walk nothing to keep.
+/// Pairing is only attempted where the two nodes have the same shape; elsewhere
+/// children are walked with no reference — pruning is an optimization, and
+/// declining to prune is always safe. Each child carries the nibbles that lead
+/// to it (one for a branch slot, the whole prefix for an extension), the
+/// position a scoped fetch is authorized on (§5.5), which costs the walk
+/// nothing to keep.
 fn paired_children(
     reference: Option<&TrieNode>,
     node: &TrieNode,
@@ -638,14 +578,13 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
 
     /// Looks up a key.
     ///
-    /// Refuses a key the write path would refuse, for the reason every
-    /// structural walk stops at [`MAX_DEPTH_NIBBLES`]: `insert` and `remove`
-    /// bound the key at [`MAX_KEY_LEN`] and this did not, so a peer could put a
-    /// value past that depth with compressed nodes and have `get` answer for a
-    /// key `iter`, `diff` and therefore `entries` can never see. The two
-    /// readers must agree about which keys exist; that is the whole of what
+    /// Refuses a key the write path would refuse: `insert`/`remove` bound the
+    /// key at [`MAX_KEY_LEN`] and this did not, so a peer could put a value
+    /// past that depth with compressed nodes and `get` would answer for a key
+    /// `iter`, `diff` and therefore `entries` can never see. The two readers
+    /// must agree about which keys exist — the whole of what
     /// [`TrieNode::check_invariants`](crate::TrieNode::check_invariants) and
-    /// the ingest bound below are for.
+    /// the ingest bound are for.
     pub fn get(&self, root: Hash, key: &[u8]) -> Result<Option<Vec<u8>>, MptError> {
         if key.len() > MAX_KEY_LEN {
             return Err(MptError::KeyTooLong(key.len()));
@@ -654,18 +593,13 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         let mut rest = nibbles.as_slice();
         let mut current = root_opt(root);
         // Every iteration consumes at least one nibble except the last, so this
-        // is bounded by the key length — but only once an empty extension
-        // prefix is impossible. `hash_of_encoded` rejects those now; the guard
-        // stays because `get` is the one descent with no stack to bound it, and
-        // a chain of zero-progress nodes would otherwise turn one lookup into
-        // one store read per node.
-        //
-        // A key of `n` nibbles needs up to `n + 1` node loads, not `n`: the last
-        // load is the leaf or branch holding the value, and it consumes nothing.
-        // Counted at `MAX_DEPTH_NIBBLES` this refused a key of exactly
-        // `MAX_KEY_LEN` bytes — one `iter` and `diff` yield, and that the
-        // materializer therefore puts in `entries`, while `get` called it
-        // structurally invalid and `synch history` rendered the path as absent.
+        // is bounded by the key length — once an empty extension prefix is
+        // impossible. `hash_of_encoded` rejects those now; the guard stays
+        // because `get` is the one descent with no stack to bound it. A key of
+        // `n` nibbles needs up to `n + 1` loads, not `n` (the last is the leaf
+        // or branch holding the value), so the budget is `MAX_DEPTH_NIBBLES + 1`:
+        // counted without it, this refused a key of exactly `MAX_KEY_LEN` bytes
+        // that `iter` and `diff` yield.
         let mut steps = 0usize;
         loop {
             steps += 1;
@@ -757,16 +691,14 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// Descends to the one position an insert changes, then rebuilds the path
     /// above it — with the path on the heap.
     ///
-    /// This used to recurse, one frame per trie level, mutually with
-    /// `insert_into`. `insert` accepts keys up to `MAX_KEY_LEN` (§12), which is
-    /// 8 192 nibbles, and the store runs on `spawn_blocking`'s 2 MiB stacks: a
-    /// tree ~500 directories deep — a 4 013-byte key, comfortably inside the
-    /// bound — overflowed and *aborted the process* rather than returning an
-    /// error, mid-publish, with the batch restaged so the next start did it
-    /// again. Every peer-facing walk in this crate was already converted to a
-    /// heap stack for exactly this reason (`diff_walk`, `collect`); the write
-    /// path was the one that was not, and it is reachable from any local
-    /// directory tree and from an authenticated S3 `PUT` key.
+    /// This used to recurse, one frame per trie level. `insert` accepts keys up
+    /// to `MAX_KEY_LEN` (§12) — 8 192 nibbles — and the store runs on
+    /// `spawn_blocking`'s 2 MiB stacks: a tree ~500 directories deep (a
+    /// 4 013-byte key, comfortably inside the bound) overflowed and *aborted
+    /// the process* rather than returning an error, mid-publish. Every
+    /// peer-facing walk in this crate was already on a heap stack
+    /// (`diff_walk`, `collect`); the write path was not, and it is reachable
+    /// from any local directory tree and an authenticated S3 `PUT` key.
     fn insert_at(
         &self,
         node: Option<Hash>,
@@ -1081,13 +1013,11 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
             None => Ok(Cursor::Empty),
             Some(h) => match self.load(&h) {
                 Ok(node) => Ok(Cursor::At { node }),
-                // A position a peer refused to show holds nothing this node
-                // may see, so to a walk over what it *does* hold it is empty
-                // rather than absent (§5.5). Both roots of a diff redact the
-                // same positions, so the two sides agree and no spurious
-                // change is emitted; without this the materialization that
-                // promotion runs would fail on a subtree the design withheld
-                // on purpose.
+                // A refused position holds nothing this node may see, so to a
+                // walk over what it *does* hold it is empty rather than absent
+                // (§5.5). Both roots of a diff redact the same positions, so no
+                // spurious change is emitted; otherwise promotion's
+                // materialization would fail on a subtree withheld on purpose.
                 Err(MptError::MissingNode(_)) if self.is_redacted_raw(&h)? => Ok(Cursor::Empty),
                 Err(e) => Err(e),
             },
@@ -1162,12 +1092,10 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// Walks a subtree, collecting values, with an explicit heap stack.
     ///
     /// Depth is attacker-controlled — a peer's trie is fetched by hash and
-    /// nothing about the *shape* it describes is canonicalized, so it may chain
-    /// extension nodes to any depth — and a recursive walk would abort the
-    /// process on a stack overflow rather than return an error (§12). The
-    /// frames therefore live on the heap, and the walk stops descending past
-    /// [`MAX_DEPTH_NIBBLES`], below which no key short enough to be valid can
-    /// begin.
+    /// nothing about its shape is canonicalized, so it may chain extensions to
+    /// any depth — and a recursive walk would abort the process on a stack
+    /// overflow (§12). The frames live on the heap, and the walk stops past
+    /// [`MAX_DEPTH_NIBBLES`], below which no valid key can begin.
     fn collect(
         &self,
         cursor: &Cursor,
@@ -1265,22 +1193,20 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
 
     /// True if the whole trie under `root` is present locally and servable.
     ///
-    /// The answer is computed from the trie, never assumed from the fact that
-    /// a head names the root — but it is computed *once* per root. A walk of
-    /// everything reachable is not a per-`Hello` cost a converged cluster
-    /// should pay (§5.1), and a content-addressed root that was complete
-    /// cannot become incomplete: no node is ever rewritten under an existing
-    /// hash, and GC marks from every head a root can be reached through.
+    /// Computed from the trie, never assumed from a head naming the root — but
+    /// computed *once* per root: a full walk is not a per-`Hello` cost a
+    /// converged cluster should pay (§5.1), and a content-addressed root that
+    /// was complete cannot become incomplete — no node is ever rewritten under
+    /// an existing hash, and GC marks from every head a root reaches through.
     pub fn is_complete(&self, root: Hash) -> Result<bool, MptError> {
         self.is_complete_scoped(root, &Scope::full())
     }
 
     /// True if everything under `root` *that `scope` admits* is present.
     ///
-    /// Completeness is a property of a root and a scope together, not of a
-    /// root alone: a trie held whole within one grant is not held whole within
-    /// a wider one. The memo is keyed by both, so widening a scope re-derives
-    /// the answer instead of inheriting a narrower one.
+    /// Completeness is a property of a root *and* a scope: a trie held whole
+    /// within one grant is not held whole within a wider one. The memo is keyed
+    /// by both, so widening a scope re-derives rather than inheriting.
     pub fn is_complete_scoped(&self, root: Hash, scope: &Scope) -> Result<bool, MptError> {
         let memo = scope.memo_key(root);
         if Self::wrap(self.store.is_known_complete(&memo))? {
@@ -1298,17 +1224,15 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// Resolves claimed positions against `root`, returning what actually
     /// stands at each one.
     ///
-    /// This is the responder's half of a scoped fetch (§5.5). The caller says
-    /// where it believes a node sits; this descends from a root the responder
-    /// itself holds and reports what is really there, so a position cannot be
-    /// claimed into existence — a fabricated root fails at the first step,
-    /// because the descent reads this store and nothing else.
+    /// The responder's half of a scoped fetch (§5.5): the caller says where it
+    /// believes a node sits; this descends from a root the responder itself
+    /// holds and reports what is really there, so a position cannot be claimed
+    /// into existence — a fabricated root fails at the first step, because the
+    /// descent reads this store and nothing else.
     ///
-    /// Resolved as one merged descent over the sorted paths, sharing the work
-    /// of every prefix two wants have in common. A batch is the frontier of a
-    /// single walk, so nearly all of it is shared: the cost is close to the
-    /// depth of the trie plus the size of the batch, rather than their
-    /// product.
+    /// One merged descent over the sorted paths shares every prefix two wants
+    /// have in common: a batch is the frontier of a single walk, so the cost is
+    /// close to trie depth plus batch size, not their product.
     pub fn resolve_paths(
         &self,
         root: Hash,
@@ -1381,20 +1305,17 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
 
     /// The first key under `root` that `scope` does not admit, if there is one.
     ///
-    /// This is the publish-scope question (§3.5): a delegated origin's trie must
-    /// hold nothing outside the spaces it was delegated, and a head whose trie
-    /// does is refused whole rather than materialized in part.
+    /// The publish-scope question (§3.5): a delegated origin's trie must hold
+    /// nothing outside its granted spaces, and a head whose trie does is
+    /// refused whole rather than materialized in part.
     ///
-    /// Cheap, despite sounding like a full scan. The walk descends only where
-    /// the boundary is still unresolved — a position already *inside* a
-    /// granted prefix cannot lead out of it, so its subtree is skipped
-    /// outright, and a position outside one is the answer. What actually gets
-    /// visited is the spine: on the order of the trie's depth times the number
-    /// of granted prefixes, whatever the trie holds below them.
+    /// Cheap despite sounding like a full scan: the walk descends only where
+    /// the boundary is unresolved — a position already *inside* a granted
+    /// prefix cannot lead out of it, so its subtree is skipped — and visits on
+    /// the order of trie depth times the number of granted prefixes.
     ///
-    /// A node that is absent locally stops that branch rather than raising:
-    /// this is asked of a trie about to be promoted, where absence has already
-    /// been settled by the fetch.
+    /// An absent node stops that branch rather than raising: this is asked of
+    /// a trie about to be promoted, where absence was already settled by fetch.
     pub fn first_key_outside(
         &self,
         root: Hash,
@@ -1464,21 +1385,17 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// The same walk, accumulating into a mark set that already holds what
     /// earlier roots reached.
     ///
-    /// Marking a store means walking every retained root, and successive roots
-    /// of one origin share all but the path that changed — that is the whole
-    /// point of the content-addressed node store (§4.3). Walked one at a time
-    /// into fresh sets, GC would re-read the entire trie once per retained
-    /// root: `head_history` keeps a row per publish for `root_retention`
-    /// (7 days), so a node publishing steadily accumulates thousands of roots,
-    /// and the pass would be a store read per node per root — all of it inside
-    /// the single `BEGIN IMMEDIATE` that holds the one write connection, every
-    /// five minutes. Sharing the visited set collapses that to one walk of the
-    /// live node set plus each root's own delta, which is what §5.4's "runs
-    /// incrementally" means.
+    /// Successive roots of one origin share all but the path that changed
+    /// (§4.3), so walking each retained root into a fresh set would re-read the
+    /// entire trie once per root: `head_history` keeps a row per publish for
+    /// `root_retention` (7 days), thousands of roots, all inside the single
+    /// `BEGIN IMMEDIATE` that holds the one write connection, every five
+    /// minutes. Sharing the visited set collapses that to one walk of the live
+    /// node set plus each root's own delta — what §5.4's "runs incrementally"
+    /// means.
     ///
-    /// A hash already in `out.nodes` has had its subtree walked by definition —
-    /// a node's children are a function of the node — so skipping it is exactly
-    /// the dedup the single-root walk already does against itself.
+    /// A hash already in `out.nodes` has had its subtree walked by definition,
+    /// so skipping it is exactly the dedup the single-root walk does.
     pub fn reach_into(&self, root: Hash, out: &mut Reachable) -> Result<(), MptError> {
         let mut frontier = match root_opt(root) {
             None => return Ok(()),
@@ -1517,51 +1434,29 @@ mod tests {
     use super::*;
     use crate::store::MemStore;
 
-    fn trie(store: &MemStore) -> Trie<'_, MemStore> {
-        Trie::new(store)
-    }
-
-    #[test]
-    fn structural_sharing_bounds_allocation() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let mut root = Hash::EMPTY;
-        for i in 0..200u16 {
-            root = t
-                .insert(root, format!("f:space/{i:04}").as_bytes(), b"entry")
-                .unwrap();
+    /// Fetches everything a walk asks for from `source` into `into`, and
+    /// returns the requested positions, in order.
+    fn drain(walk: &mut MissingWalk, source: &MemStore, into: &MemStore) -> Vec<(Vec<u8>, Hash)> {
+        let mut wanted = Vec::new();
+        loop {
+            let batch = MissingWalk::next_batch(walk, &Trie::new(into), 64).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for (path, hash) in &batch.nodes {
+                wanted.push((path.clone(), *hash));
+                let bytes = source.get_node(hash).unwrap().unwrap();
+                into.put_node(hash, &bytes).unwrap();
+            }
+            for (_, hash) in &batch.values {
+                let bytes = source.get_value(hash).unwrap().unwrap();
+                into.put_value(hash, &bytes).unwrap();
+            }
+            walk.resume();
         }
-        let before = s.node_count();
-        let root2 = t.insert(root, b"f:space/0000", b"changed").unwrap();
-        let added = s.node_count() - before;
-        // Only the path from the touched leaf to the root is allocated, and the
-        // old root stays readable: structural sharing keeps history alive.
-        assert!(added <= 12, "allocated {added} nodes for a one-key change");
-        assert_ne!(root, root2);
-        assert_eq!(t.get(root, b"f:space/0000").unwrap().unwrap(), b"entry");
+        wanted
     }
 
-    #[test]
-    fn reachable_covers_nodes_and_values() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let root = t.insert(Hash::EMPTY, b"a", &vec![1u8; 300]).unwrap();
-        let root = t.insert(root, b"b", b"small").unwrap();
-        let r = t.reachable(root).unwrap();
-        assert!(r.nodes.contains(&root));
-        assert_eq!(r.values.len(), 1);
-    }
-
-    #[test]
-    fn key_length_is_bounded() {
-        let s = MemStore::new();
-        let t = trie(&s);
-        let key = vec![b'x'; MAX_KEY_LEN + 1];
-        assert!(matches!(
-            t.insert(Hash::EMPTY, &key, b"v"),
-            Err(MptError::KeyTooLong(_))
-        ));
-    }
     /// A walk confined to one space must ask for the spine — which is what
     /// makes the signed root recomputable — and never for a sibling subtree,
     /// whose hash it nonetheless holds (§5.5).
@@ -1586,23 +1481,7 @@ mod tests {
             exact: Vec::new(),
         });
         let mut walk = MissingWalk::scoped(None, root, scope.clone());
-        let mut wanted: Vec<(Vec<u8>, Hash)> = Vec::new();
-        loop {
-            let batch = { MissingWalk::next_batch(&mut walk, &Trie::new(&empty), 64).unwrap() };
-            if batch.is_empty() {
-                break;
-            }
-            for (path, hash) in &batch.nodes {
-                wanted.push((path.clone(), *hash));
-                let bytes = source.get_node(hash).unwrap().unwrap();
-                empty.put_node(hash, &bytes).unwrap();
-            }
-            for (_, hash) in &batch.values {
-                let bytes = source.get_value(hash).unwrap().unwrap();
-                empty.put_value(hash, &bytes).unwrap();
-            }
-            walk.resume();
-        }
+        let wanted = drain(&mut walk, &source, &empty);
 
         assert!(!wanted.is_empty(), "the walk fetched nothing at all");
         // Every position asked for is one the scope admits — an honest walk
@@ -1646,23 +1525,7 @@ mod tests {
         // for them. This is exactly what a request carries.
         let empty = MemStore::new();
         let mut walk = MissingWalk::new(root);
-        let mut wants: Vec<(Vec<u8>, Hash)> = Vec::new();
-        loop {
-            let batch = MissingWalk::next_batch(&mut walk, &Trie::new(&empty), 64).unwrap();
-            if batch.is_empty() {
-                break;
-            }
-            for (path, hash) in &batch.nodes {
-                wants.push((path.clone(), *hash));
-                let bytes = source.get_node(hash).unwrap().unwrap();
-                empty.put_node(hash, &bytes).unwrap();
-            }
-            for (_, hash) in &batch.values {
-                let bytes = source.get_value(hash).unwrap().unwrap();
-                empty.put_value(hash, &bytes).unwrap();
-            }
-            walk.resume();
-        }
+        let wants = drain(&mut walk, &source, &empty);
         assert!(wants.len() > 1, "the trie is too small to be a test");
 
         // Every position the walk claimed resolves, on the server's own copy,

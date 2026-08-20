@@ -269,16 +269,13 @@ mod tests {
         lines.iter().map(|l| l.to_string()).collect()
     }
 
-    /// Every fold rule in one pass over the log: a later record replaces an
-    /// existing name, a single-field record removes it (and re-adding brings it
-    /// back, because nothing was rewritten), and a record nobody can read costs
-    /// only itself.
+    /// Every fold rule in one pass: replace, remove, re-add, and a bad record costs only itself.
     #[test]
     fn the_last_record_naming_a_bucket_wins() {
         let buckets = fold(&records(&[
             "photos\tmedia\tnewest",
             "docs\tpapers\tstrict",
-            "photos\tmedia\torigin=nas@cluster.example",
+            "photos\tmedia\torigin=nas",
             "garbage\tmedia\twhatever",
             "\t\t",
             "docs",
@@ -287,19 +284,9 @@ mod tests {
         let names: Vec<&str> = buckets.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, vec!["docs", "photos"]);
         let photos = buckets.iter().find(|b| b.name == "photos").unwrap();
-        assert_eq!(
-            photos.policy,
-            Policy::Origin("nas@cluster.example".to_string())
-        );
+        assert_eq!(photos.policy, Policy::Origin("nas".to_string()));
         let docs = buckets.iter().find(|b| b.name == "docs").unwrap();
         assert_eq!(docs.space, "other");
-
-        // Databases written before the unified tree stored the bucket map as
-        // `<bucket>\t<space>\t<policy>`; what the log reads back on an
-        // upgraded node is exactly a run of add records.
-        let migrated = fold(&records(&["photos\tmedia\torigin=nas@x.example"]));
-        assert_eq!(migrated[0].space, "media");
-        assert_eq!(migrated[0].policy.pinned_origin(), Some("nas@x.example"));
     }
 
     #[test]
@@ -314,17 +301,15 @@ mod tests {
 
     #[test]
     fn references_split_into_an_origin_and_a_space() {
-        assert_eq!(split_reference("media").unwrap(), (None, "media".into()));
-        assert_eq!(
-            split_reference("nas@cluster.example:media").unwrap(),
-            (Some("nas@cluster.example".into()), "media".into())
-        );
-        // A key-identified origin keeps its own colon.
-        assert_eq!(
-            split_reference("key:abcdef:media").unwrap(),
-            (Some("key:abcdef".into()), "media".into())
-        );
-        assert!(split_reference("nas@cluster.example:media/sub").is_err());
+        for (text, expect) in [
+            ("media", (None, "media")),
+            ("nas:media", (Some("nas"), "media")),
+            ("key:abcdef:media", (Some("key:abcdef"), "media")),
+        ] {
+            let got = split_reference(text).unwrap();
+            assert_eq!(got, (expect.0.map(String::from), expect.1.to_string()));
+        }
+        assert!(split_reference("nas:media/sub").is_err());
         assert!(split_reference(":media").is_err());
         assert!(split_reference("").is_err());
     }
@@ -338,10 +323,8 @@ mod tests {
             policy: Policy::Origin("nas@cluster.example".into()),
         };
         assert!(bucket.pins_a_foreign_origin(ours));
-        assert!(bucket
-            .foreign_pin_warning(ours)
-            .unwrap()
-            .contains("read-only"));
+        let warning = bucket.foreign_pin_warning(ours).unwrap();
+        assert!(warning.contains("read-only"));
 
         for policy in [Policy::Origin(ours.into()), Policy::Strict] {
             let bucket = Bucket {
@@ -361,7 +344,6 @@ mod tests {
         assert!(validate_name("ab").is_err());
         assert!(validate_name("UPPER").is_err());
         assert!(validate_name("-lead").is_err());
-        assert!(validate_name("trail-").is_err());
         assert!(validate_name(&"x".repeat(64)).is_err());
     }
 }

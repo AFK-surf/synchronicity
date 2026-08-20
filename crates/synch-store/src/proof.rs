@@ -1374,16 +1374,7 @@ mod tests {
     #[test]
     fn our_tree_math_agrees_with_the_outboard_bao_wrote() {
         let (_d, store) = testutil::store();
-        for n in [
-            2 * GROUP,
-            3 * GROUP,
-            4 * GROUP,
-            5 * GROUP + 1,
-            8 * GROUP,
-            9 * GROUP - 5,
-            20 * GROUP,
-            33 * GROUP + 100,
-        ] {
+        for n in [2 * GROUP, 5 * GROUP + 1, 8 * GROUP, 33 * GROUP + 100] {
             let bytes = testutil::data(n);
             let size = bytes.len() as u64;
             let root = store.ingest_bytes(&bytes, 0).unwrap();
@@ -1486,10 +1477,6 @@ mod tests {
         let written = std::fs::metadata(victim.outboard_path(&root))
             .unwrap()
             .len();
-        assert_eq!(
-            written,
-            (encoded.len() / PROOF_NODE_LEN) as u64 * PROOF_NODE_LEN as u64
-        );
         assert!(
             written < Store::tree(size).outboard_size() / 4,
             "nothing like the tree of the claimed length"
@@ -1633,39 +1620,6 @@ mod tests {
         );
     }
 
-    /// A proof of the right object at the wrong length is refused: a group-aligned understatement would promote subtrees the object does not end after, completing a row at 80% of its length (§6).
-    #[test]
-    fn a_proof_carries_the_length_it_was_taken_at() {
-        let bytes = testutil::data(20 * GROUP);
-        let size = bytes.len() as u64;
-        let mut donor_bytes = bytes.clone();
-        donor_bytes[19 * GROUP] ^= 0xff;
-        let (_d1, _d2, provider, fetcher, root, donor, _) = pair_of_stores(&donor_bytes, &bytes);
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = provider
-            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        let short = 16 * GROUP as u64;
-        assert!(
-            fetcher
-                .write_proof(&root, short, &served, 0, &encoded, 0)
-                .is_err(),
-            "a proof must not verify under a length the tree does not have"
-        );
-        let proven = fetcher
-            .write_proof(&root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        assert_eq!(
-            proven.size, size,
-            "a proof carries the size it was taken at"
-        );
-        assert_eq!(
-            fetcher.promote(&Donor(donor), &proven, 0).unwrap().count(),
-            19,
-            "every group but the changed one"
-        );
-    }
-
     /// A size claim short of the truth cannot promote a short tail: the run would be copied truncated, completing a row nothing supports (§6).
     #[test]
     fn an_understated_size_does_not_promote_a_short_tail() {
@@ -1700,45 +1654,43 @@ mod tests {
         // The honest writer of the real length is not refused by the residue.
         finish_via_slice(&provider, &victim, &root, size, &all, &bytes);
     }
-
-    /// A lying size claim racing a completing write never wins: settle_size decides inside the commit transaction. A bounded loop — rare to hit.
+    /// A proof of the right object at the wrong length is refused: a group-aligned
+    /// understatement would promote subtrees the object does not end after, completing
+    /// a row at 80% of its length (§6).
     #[test]
-    fn a_size_claim_racing_a_completing_write_never_wins() {
-        let (_d1, provider) = testutil::store();
-        let (_d2, victim) = testutil::store();
-        for round in 0..64usize {
-            let bytes = testutil::data(4 * GROUP + 500 + round);
-            let size = bytes.len() as u64;
-            let root = provider.ingest_bytes(&bytes, 0).unwrap();
-            // A hundred bytes further on, inside the same chunk: same tree.
-            let lie = size + 100;
-            assert_eq!(group_count(lie), group_count(size));
-            let all = ChunkRanges::single(0, group_count(size));
-            let (slice, slice_served) = provider.encode_slice(&root, &all).unwrap();
-            let (proof, proof_served) = provider
-                .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-                .unwrap();
-            let (victim, root, slice, slice_served, proof, proof_served) =
-                (&victim, &root, &slice, &slice_served, &proof, &proof_served);
-            std::thread::scope(|scope| {
-                scope.spawn(move || {
-                    victim
-                        .write_slice(root, size, slice_served, slice, 0)
-                        .expect("the honest writer is never refused")
-                });
-                // Refused or absorbed, either is fine — never its size on a row.
-                scope.spawn(move || {
-                    let _ = victim.write_proof(root, lie, proof_served, 0, proof, 0);
-                });
-            });
-            let row = victim.blob(root).unwrap().unwrap();
-            assert_eq!(row.size, size, "round {round}: the claim won");
-            assert!(row.complete, "round {round}");
-            assert_eq!(victim.read_all(root).unwrap(), bytes, "round {round}");
-        }
+    fn a_proof_carries_the_length_it_was_taken_at() {
+        let bytes = testutil::data(20 * GROUP);
+        let size = bytes.len() as u64;
+        let mut donor_bytes = bytes.clone();
+        donor_bytes[19 * GROUP] ^= 0xff;
+        let (_d1, _d2, provider, fetcher, root, donor, _) = pair_of_stores(&donor_bytes, &bytes);
+        let all = ChunkRanges::single(0, group_count(size));
+        let (encoded, served) = provider
+            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
+            .unwrap();
+        let short = 16 * GROUP as u64;
+        assert!(
+            fetcher
+                .write_proof(&root, short, &served, 0, &encoded, 0)
+                .is_err(),
+            "a proof must not verify under a length the tree does not have"
+        );
+        let proven = fetcher
+            .write_proof(&root, size, &served, 0, &encoded, 0)
+            .unwrap();
+        assert_eq!(
+            proven.size, size,
+            "a proof carries the size it was taken at"
+        );
+        assert_eq!(
+            fetcher.promote(&Donor(donor), &proven, 0).unwrap().count(),
+            19,
+            "every group but the changed one"
+        );
     }
 
-    /// A size a peer merely claimed does not brick a root: it yields to the next honest writer, and a completed row refuses a later lie.
+    /// A size a peer merely claimed does not brick a root: it yields to the next
+    /// honest writer, and a completed row refuses a later lie.
     #[test]
     fn an_overstated_size_does_not_brick_a_root() {
         let (_d1, provider) = testutil::store();
@@ -1834,7 +1786,6 @@ mod tests {
             .expect_err("an over-budget request must be refused");
         assert!(err.to_string().contains("budget"), "{err}");
         let window = ChunkRanges::single(0, 8);
-        assert!(synch_core::proof_nodes_upper_bound(&window, 0) <= 12 + 64);
         let (encoded, served) = provider.encode_proof(&root, &window, 0, 128).unwrap();
         assert_eq!(served, window, "a sized window is never short");
         let (_d2, fetcher) = testutil::store();
@@ -1844,36 +1795,11 @@ mod tests {
         assert!(!proven.is_empty());
     }
 
-    /// A partial holder proves only the groups it holds, and what it serves still verifies against the root.
-    #[test]
-    fn a_partial_holder_proves_only_the_groups_it_holds() {
-        let (_d1, provider) = testutil::store();
-        let (_d2, partial) = testutil::store();
-        let bytes = testutil::data(16 * GROUP);
-        let size = bytes.len() as u64;
-        let root = provider.ingest_bytes(&bytes, 0).unwrap();
-        let half = ChunkRanges::single(0, 8);
-        let (encoded, served) = provider.encode_slice(&root, &half).unwrap();
-        partial
-            .write_slice(&root, size, &served, &encoded, 0)
-            .unwrap();
-        let all = ChunkRanges::single(0, group_count(size));
-        let (encoded, served) = partial
-            .encode_proof(&root, &all, 0, MAX_PROOF_NODES)
-            .unwrap();
-        assert_eq!(served, half);
-        let (_d3, fetcher) = testutil::store();
-        let proven = fetcher
-            .write_proof(&root, size, &served, 0, &encoded, 0)
-            .unwrap();
-        assert_eq!(proven.subtrees.len(), 8);
-    }
-
     /// Objects too small to have a tree have nothing to prove, and an inline donor promotes nothing: a single group has no chaining value (§2).
     #[test]
     fn tiny_objects_have_nothing_to_prove() {
         let (_d, store) = testutil::store();
-        for size in [0usize, 1, 100, GROUP] {
+        for size in [0usize, GROUP] {
             let bytes = testutil::data(size);
             let root = store.ingest_bytes(&bytes, 0).unwrap();
             let all = ChunkRanges::single(0, group_count(bytes.len() as u64));

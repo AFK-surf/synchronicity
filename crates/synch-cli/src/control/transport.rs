@@ -1,16 +1,16 @@
 //! The local control transport (§9.3).
 //!
 //! gRPC needs a byte stream under it, and this is where that stream comes from.
-//! On Unix it is a domain socket at `<data_dir>/control.sock`, created `0600`
-//! inside a `0700` data directory. On Windows it is a named pipe,
+//! On Unix it is a domain socket at `<data_dir>/control.sock`, `0600` inside a
+//! `0700` data directory; on Windows a named pipe,
 //! `\\.\pipe\synchronicity-<16 hex of the data dir path hash>`, so several
 //! nodes on one machine do not collide.
 //!
 //! Both platforms authenticate with the 32-byte token in
 //! `<data_dir>/control.token`, sent as a header on every call. On Unix the
 //! directory permissions are the primary control and the token is a second
-//! check; on Windows, where pipe ACLs are easy to get subtly wrong, the token is
-//! what actually carries it.
+//! check; on Windows, where pipe ACLs are easy to get subtly wrong, the token
+//! is what actually carries it.
 
 use std::{
     io,
@@ -35,9 +35,9 @@ pub const TOKEN_LEN: usize = 32;
 
 /// The authority every control channel claims.
 ///
-/// HTTP/2 wants one and the local transport has none to offer: the data
+/// HTTP/2 wants one and the local transport has none to offer — the data
 /// directory, not a host and a port, is what says which daemon this is. It is
-/// never resolved — the connector below hands back an already-open stream.
+/// never resolved: the connector hands back an already-open stream.
 const LOCAL_AUTHORITY: &str = "http://synchronicity.local";
 
 /// The error a client gets when nothing is listening (§9.1).
@@ -70,7 +70,7 @@ fn already_running_error(data_dir: &Path) -> io::Error {
 /// previous one.
 ///
 /// Regenerated on every daemon start, so a token captured from an earlier run
-/// is worthless (§9.3). The bytes come from the same OS CSPRNG that generates
+/// is worthless (§9.3); the bytes come from the same CSPRNG that generates
 /// device keys.
 pub fn write_token(data_dir: &Path) -> io::Result<Vec<u8>> {
     harden_data_dir(data_dir)?;
@@ -81,12 +81,12 @@ pub fn write_token(data_dir: &Path) -> io::Result<Vec<u8>> {
     //
     // `Server::bind` binds the listener *before* minting this, deliberately —
     // the other order lets a refused replacement daemon clobber the running
-    // one's token (see the shutdown path). So there is a window in which the
-    // socket answers and this file is mid-write, and writing in place made that
-    // window observable: a client that read a created-but-empty file connected
-    // and was then refused `Unauthorized`, on a daemon that had just started
-    // correctly. A rename closes it without disturbing the bind order, because
-    // the name only ever appears with the whole token behind it.
+    // one's token (see the shutdown path). So the socket answers while this
+    // file is mid-write, and writing in place made that window observable: a
+    // client that read a created-but-empty file was refused `Unauthorized` on
+    // a daemon that had just started correctly. A rename closes it without
+    // disturbing the bind order, because the name only ever appears with the
+    // whole token behind it.
     //
     // The temp file is created fresh rather than rewritten, which is also what
     // keeps the private mode from being inherited from a previous file's.
@@ -174,9 +174,9 @@ mod imp {
     /// Refuses a data directory whose control socket could never be bound.
     ///
     /// The kernel's own answer is "path must be shorter than SUN_LEN" — an
-    /// acronym, no measurement, no remedy — and it arrives one command *after*
-    /// `synch init` said everything was fine. This check runs at init and at
-    /// bind, so the answer names the length, the limit, and the fix.
+    /// acronym, no measurement, no remedy — one command *after* `synch init`
+    /// said everything was fine. This check runs at init and at bind, so the
+    /// answer names the length, the limit, and the fix.
     pub fn check_socket_path(data_dir: &Path) -> io::Result<()> {
         let path = socket_path(data_dir);
         let len = path.as_os_str().len();

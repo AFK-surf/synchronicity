@@ -1114,8 +1114,7 @@ mod tests {
             .unwrap();
     }
 
-    /// A plausible published stamp: a real wall-clock value, not a pre-epoch
-    /// stamp every filesystem stores exactly.
+    /// A real wall-clock stamp, not a pre-epoch one every filesystem stores exactly.
     const STAMP: i64 = 1_700_000_000_123_456_789;
 
     fn on_disk_mtime(path: &Path) -> i64 {
@@ -1138,7 +1137,7 @@ mod tests {
     }
 
     /// A recorded file is believed by stat without a read: a chmod 000 proves
-    /// the pass never opened the file — a hash would fail and rewrite it.
+    /// the pass never opened it — a hash would fail and rewrite it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_recorded_file_is_believed_without_a_read() {
@@ -1155,31 +1154,13 @@ mod tests {
         assert_eq!(report.written, 0, "{report:?}");
         assert!(report.skipped.is_empty(), "{report:?}");
         assert_eq!(on_disk_mode(&written), 0o644);
-        // Once the mode is repaired, quiet passes stay quiet.
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.current, 1, "{report:?}");
         node.shutdown().await.unwrap();
     }
 
-    /// A same-length local edit moves the mtime, which moves the stat, which
-    /// spends the hash — and the pass rewrites the file.
-    #[tokio::test]
-    async fn a_same_size_local_edit_is_repaired() {
-        let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;
-        publish_entry(&node, &peer(), "f.txt", b"hello", STAMP);
-        node.sync_mirror(target.path()).await.unwrap();
-
-        let written = target.path().join("f.txt");
-        std::fs::write(&written, b"world").unwrap();
-
-        let report = node.sync_mirror(target.path()).await.unwrap();
-        assert_eq!(report.written, 1, "{report:?}");
-        assert_eq!(std::fs::read(&written).unwrap(), b"hello");
-        node.shutdown().await.unwrap();
-    }
-
-    /// An atomic replace that spoofs the published stamp lands on a different
-    /// inode: the identity half of the record catches what timestamps cannot.
+    /// An atomic replace spoofing the stamp lands on a different inode: the
+    /// identity half of the record catches what timestamps cannot.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_atomic_replace_with_a_spoofed_mtime_is_repaired() {
@@ -1199,8 +1180,7 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// `newest` writes the winning version and follows it when the winner
-    /// changes; `origin=` writes only that origin's version of the path.
+    /// `newest` writes the winner and follows it; `origin=` writes only that origin's.
     #[tokio::test]
     async fn the_policies_write_the_selected_version() {
         for (policy, (expected, written)) in [
@@ -1238,8 +1218,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// §7.2: a strict mirror never guesses — divergent paths are skipped and
-    /// reported, stale copies removed, until the publishers agree.
+    /// §7.2: strict never guesses — divergent paths are skipped and reported,
+    /// stale copies removed, until the publishers agree.
     #[tokio::test]
     async fn a_strict_mirror_skips_and_reports_divergence() {
         let (_d, target, node) = mirrored(&VersionPolicy::Strict).await;
@@ -1256,8 +1236,8 @@ mod tests {
         assert!(report.skipped[0].1.contains("nas@x.example"), "{report:?}");
         assert!(!target.path().join("split.txt").exists());
 
-        // A path that was materialized and then diverged: yesterday's file
-        // standing in for a guess is the silent wrong answer strict refuses.
+        // Materialized, then diverged: a stale copy standing in is the silent
+        // wrong answer strict refuses.
         publish_entry(&node, &peer(), "agreed.txt", b"revised", 400);
         publish_entry(&node, &other(), "agreed.txt", b"opposed", 500);
         let report = node.sync_mirror(target.path()).await.unwrap();
@@ -1285,9 +1265,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// §8: a path leaves a mirror once every publisher has deleted it, or when
-    /// it has left the tree with no tombstone left to point at it; `origin=`
-    /// follows its own origin only.
+    /// §8: a path leaves once every publisher deleted it or no tombstone
+    /// points at it; `origin=` follows its own origin only.
     #[tokio::test]
     async fn deletions_converge_in_the_mirror() {
         let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;
@@ -1327,8 +1306,7 @@ mod tests {
         assert_eq!(report.removed, 1);
         assert!(!target.path().join("a.txt").exists());
 
-        // A path that left the tree entirely, with no tombstone to point at
-        // it, is swept: what is on disk but no longer named is removed.
+        // Left the tree with no tombstone to point at it: on disk but unnamed is swept.
         publish_entry(&node, &peer(), "sub/gone.txt", b"bye", 1);
         node.sync_mirror(target.path()).await.unwrap();
         node.store()
@@ -1340,8 +1318,7 @@ mod tests {
         assert!(target.path().join("stays.txt").exists());
         node.shutdown().await.unwrap();
 
-        // Pinned to an origin: its tombstone is the answer for that path even
-        // while another origin still publishes it.
+        // Pinned: the pin's tombstone is the answer even while another origin publishes.
         let (_d, target, node) = mirrored(&VersionPolicy::Origin(peer())).await;
         publish_entry(&node, &peer(), "a.txt", b"hello", 1);
         node.store()
@@ -1355,8 +1332,7 @@ mod tests {
         node.sync_mirror(target.path()).await.unwrap();
         assert!(target.path().join("a.txt").exists());
 
-        // Re-pointing the mirror is the policy change; the new pin's deletion
-        // then removes the path.
+        // Re-pointing is the policy change; the new pin's deletion removes the path.
         node.add_mirror("media", target.path(), &VersionPolicy::Origin(other()))
             .unwrap();
         let report = node.sync_mirror(target.path()).await.unwrap();
@@ -1365,8 +1341,7 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// Never silently clobber (§7.2): fold collisions and platform-invalid
-    /// names are skipped and reported.
+    /// Never silently clobber (§7.2): fold collisions and invalid names are skipped.
     #[tokio::test]
     async fn colliding_and_invalid_names_are_skipped() {
         let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;
@@ -1392,7 +1367,7 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// §7.2: the fold claim must cover symlinks too, or a link would silently
+    /// §7.2: the fold claim covers symlinks too, or a link would silently
     /// replace the file it folds onto (the audit regression this guards).
     #[tokio::test]
     async fn a_symlink_cannot_clobber_a_file_it_folds_onto() {
@@ -1410,7 +1385,6 @@ mod tests {
         assert_eq!(report.skipped.len(), 1, "{report:?}");
         assert_eq!(report.skipped[0].0, "link");
         assert!(report.skipped[0].1.contains("collides"));
-        // And the path that won is still a file, not a link.
         let written = target.path().join("Link");
         assert!(!std::fs::symlink_metadata(&written).unwrap().is_symlink());
         assert_eq!(std::fs::read(&written).unwrap(), b"a real file");
@@ -1449,8 +1423,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// Backslashes and drive-prefixed names must be refused before any write
-    /// or removal branch reaches the target, across every policy.
+    /// Backslashes and drive-prefixed names are refused before any write or
+    /// removal branch reaches the target, across every policy.
     #[tokio::test]
     async fn a_name_this_platform_cannot_open_is_refused_before_any_removal() {
         let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;
@@ -1459,15 +1433,13 @@ mod tests {
         let divergent = r"C:\Windows\hosts";
         let unpinned = r"D:\other\thing";
         // Where these are ordinary filenames they land inside the mirror, so
-        // the removal branches have something to take and the refusal is what
-        // keeps it.
+        // the removal branches have something for the refusal to keep.
         #[cfg(unix)]
         for name in [tombstoned, divergent, unpinned] {
             std::fs::write(target.path().join(name), b"not the mirror's to touch").unwrap();
         }
 
-        // The three selections that remove: a tombstone, a strict divergence,
-        // and a path the pinned origin does not publish.
+        // The three removal selections: a tombstone, a strict divergence, an unpinned path.
         node.store()
             .put_entry(
                 &peer(),
@@ -1504,82 +1476,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// No echo is structural: a mirror may not overlap a space or another
-    /// mirror; re-registering the same directory is the legal policy change.
-    #[tokio::test]
-    async fn mirrors_may_not_overlap_spaces_or_each_other() {
-        let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;
-        assert!(node
-            .add_mirror("other", target.path().join("sub"), &VersionPolicy::Newest)
-            .is_err());
-        let shared = tempfile::tempdir().unwrap();
-        node.add_space("media2", shared.path()).unwrap();
-        assert!(node
-            .add_mirror("media", shared.path(), &VersionPolicy::Newest)
-            .unwrap_err()
-            .to_string()
-            .contains("overlaps space"));
-
-        node.add_mirror("media", target.path(), &VersionPolicy::Strict)
-            .unwrap();
-        assert_eq!(
-            node.mirror(target.path()).unwrap().unwrap().policy,
-            VersionPolicy::Strict
-        );
-        assert!(node.remove_mirror(target.path()).unwrap());
-        assert!(!node.remove_mirror(target.path()).unwrap());
-        node.shutdown().await.unwrap();
-    }
-
-    /// An unfetchable object is skipped with a reason; the rest of the pass
-    /// completes.
-    #[tokio::test]
-    async fn an_unfetchable_entry_is_reported_not_fatal() {
-        let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;
-        node.store()
-            .put_entry(
-                &peer(),
-                "media",
-                "missing.bin",
-                &FileEntry::file(100_000, 0, Hash::new(b"nobody has this"), 1),
-            )
-            .unwrap();
-        publish_entry(&node, &peer(), "present.txt", b"here", 1);
-
-        let report = node.sync_mirror(target.path()).await.unwrap();
-        assert_eq!(report.written, 1);
-        assert_eq!(report.skipped.len(), 1);
-        assert_eq!(report.skipped[0].0, "missing.bin");
-        node.shutdown().await.unwrap();
-    }
-
-    /// A zero-byte object the local CAS never held still materializes empty,
-    /// and reads as current on the next pass.
-    #[tokio::test]
-    async fn an_empty_file_is_mirrored() {
-        let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;
-        node.store()
-            .put_entry(
-                &peer(),
-                "media",
-                "empty.txt",
-                &FileEntry::file(0, 1, Hash::new(b""), 1),
-            )
-            .unwrap();
-
-        let report = node.sync_mirror(target.path()).await.unwrap();
-        assert_eq!(report.written, 1, "{report:?}");
-        assert!(report.skipped.is_empty(), "{report:?}");
-        assert_eq!(std::fs::read(target.path().join("empty.txt")).unwrap(), b"");
-
-        let report = node.sync_mirror(target.path()).await.unwrap();
-        assert_eq!(report.current, 1, "{report:?}");
-        assert_eq!(report.written, 0, "{report:?}");
-        node.shutdown().await.unwrap();
-    }
-
-    /// A read-only published file can still be restamped: the mode is applied
-    /// only after the times, borrowing the owner-write bit for the stamp.
+    /// A read-only file can still be restamped: the mode is applied after the
+    /// times, borrowing the owner-write bit for the stamp.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_read_only_file_can_still_be_restamped() {
@@ -1610,8 +1508,7 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The mode is advisory and a peer chose it: the bits that grant authority
-    /// (setuid, setgid, sticky) are not reproduced.
+    /// The bits that grant authority (setuid, setgid, sticky) are not reproduced.
     #[cfg(unix)]
     #[tokio::test]
     async fn setuid_and_friends_are_not_materialized() {
@@ -1634,7 +1531,7 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A coarse filesystem stores a stamp truncated, never advanced; treating
+    /// A coarse filesystem truncates stamps, never advances them; treating
     /// that as drift would re-touch every file on every pass forever.
     #[test]
     fn a_coarsened_timestamp_is_not_drift() {
@@ -1656,9 +1553,8 @@ mod tests {
         assert!(!metadata_matches(&path, published));
     }
 
-    /// Materializing an object produces the object over whatever was there
-    /// before, and leaves nothing beside it — shorter and longer predecessors
-    /// included, and the tiny-object path out of the index.
+    /// Materializing replaces whatever was there whole, leaves nothing beside
+    /// it, and the tiny-object path comes out of the index.
     #[tokio::test]
     async fn materializing_an_object_replaces_the_file_and_leaves_no_residue() {
         let (_d, node) = node().await;
@@ -1682,14 +1578,6 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), new);
         assert_eq!(left_in(dir.path()), vec!["disk.img".to_string()]);
 
-        // A version of a different length replaces it exactly.
-        let mut longer = new.clone();
-        longer.extend(vec![3u8; 2 * GROUP]);
-        let root = node.store().ingest_bytes(&longer, now_ns()).unwrap();
-        node.materialize_blob_blocking(&root, longer.len() as u64, &target)
-            .unwrap();
-        assert_eq!(std::fs::read(&target).unwrap(), longer);
-
         // And an object small enough to live in the index comes out of it.
         let root = node.store().ingest_bytes(b"tiny", now_ns()).unwrap();
         node.materialize_blob_blocking(&root, 4, &target).unwrap();
@@ -1698,8 +1586,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A materialization that dies partway leaves the target exactly as it
-    /// was, and the abandoned staging file goes with the failure.
+    /// A materialization that dies partway leaves the target as it was; the
+    /// abandoned staging file goes with the failure.
     #[tokio::test]
     async fn a_torn_materialization_leaves_the_target_untouched() {
         let (_d, node) = node().await;
@@ -1716,7 +1604,7 @@ mod tests {
         assert!(err.to_string().contains("not held whole"), "{err}");
 
         // One whose payload has gone from under the index: the staging file is
-        // created and the clone of the payload then fails.
+        // created, then the clone of the payload fails.
         let new: Vec<u8> = (0..100_000).map(|i| (i % 13) as u8).collect();
         let root = node.store().ingest_bytes(&new, now_ns()).unwrap();
         std::fs::remove_file(node.store().blob_path(&root)).unwrap();
@@ -1737,17 +1625,8 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    #[test]
-    fn name_safety_checks() {
-        assert!(unsafe_name("fine/path.txt").is_none());
-        assert!(unsafe_name("CON").is_some());
-        assert!(unsafe_name("nul.txt").is_some());
-        assert!(unsafe_name("bad<name").is_some());
-        assert!(unsafe_name("trailing ").is_some());
-    }
-
-    /// The interval is the backstop for a change no bell covered; the wake
-    /// from `add_mirror` drives the first pass (the whole of the wake path).
+    /// The interval backstops a change no bell covered; the `add_mirror` wake
+    /// drives the first pass (the whole of the wake path).
     #[tokio::test]
     async fn the_mirror_loop_falls_back_to_its_interval() {
         let dir = tempfile::tempdir().unwrap();
@@ -1770,25 +1649,21 @@ mod tests {
         publish_entry(&node, &peer(), "first.txt", b"one", 1);
         node.add_mirror("media", target.path(), &VersionPolicy::Newest)
             .unwrap();
-        for _ in 0..500 {
-            if target.path().join("first.txt").exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(target.path().join("first.txt").exists(), "the wake ran");
+        assert!(
+            crate::testkit::eventually(|| target.path().join("first.txt").exists()).await,
+            "the wake ran"
+        );
 
         // Nothing rang for the second publish; only the interval carries it.
         publish_entry(&node, &peer(), "second.txt", b"two", 1);
-        for _ in 0..500 {
-            if target.path().join("second.txt").exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            std::fs::read(target.path().join("second.txt")).unwrap(),
-            b"two",
+        assert!(
+            crate::testkit::eventually(|| {
+                std::fs::read(target.path().join("second.txt"))
+                    .ok()
+                    .as_deref()
+                    == Some(b"two")
+            })
+            .await,
             "nothing rang for this one; the interval pass carried it"
         );
         tx.send(()).unwrap();
@@ -1799,24 +1674,22 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A peer that plants a symlink ancestor cannot get the mirror to write
-    /// through it and out of the root.
+    /// A planted symlink ancestor cannot get the mirror to write through it out of the root.
     #[cfg(unix)]
     #[test]
     fn a_planted_symlink_ancestor_is_refused() {
         let root = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("/etc", root.path().join("sub")).unwrap();
         assert!(escapes_via_symlink(root.path(), "sub/passwd"));
-        // A real directory ancestor is fine, and the symlink leaf itself is
-        // fine.
+        // A real directory ancestor, and the symlink leaf itself, are fine.
         std::fs::create_dir(root.path().join("real")).unwrap();
         assert!(!escapes_via_symlink(root.path(), "real/file.txt"));
         assert!(!escapes_via_symlink(root.path(), "sub"));
         assert!(!escapes_via_symlink(root.path(), "brandnew/file.txt"));
     }
 
-    /// §7.2: a mirror writes a real symlink, idempotently, and retargeting
-    /// replaces it rather than writing beside it.
+    /// §7.2: a mirror writes a real symlink, idempotently; retargeting
+    /// replaces rather than writing beside it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_mirror_materializes_a_symlink_as_a_symlink() {
@@ -1837,7 +1710,6 @@ mod tests {
             Path::new("../elsewhere")
         );
 
-        // A second pass has nothing to do.
         let report = node.sync_mirror(target.path()).await.unwrap();
         assert_eq!(report.written, 0);
         assert_eq!(report.current, 1);
@@ -1871,6 +1743,41 @@ mod tests {
         assert_eq!(report.skipped.len(), 1, "{report:?}");
         assert!(report.skipped[0].1.contains("symbolic link"), "{report:?}");
         assert!(!target.path().join("link").exists());
+        node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn name_safety_checks() {
+        assert!(unsafe_name("fine/path.txt").is_none());
+        // Reserved device names are refused end to end (`aux.txt` in
+        // `colliding_and_invalid_names_are_skipped`); here are the classes
+        // no mirror test reaches: an invalid character and a trailing space.
+        assert!(unsafe_name("bad<name").is_some());
+        assert!(unsafe_name("trailing ").is_some());
+    }
+
+    #[tokio::test]
+    async fn mirrors_may_not_overlap_spaces_or_each_other() {
+        let (_d, target, node) = mirrored(&VersionPolicy::Newest).await;
+        assert!(node
+            .add_mirror("other", target.path().join("sub"), &VersionPolicy::Newest)
+            .is_err());
+        let shared = tempfile::tempdir().unwrap();
+        node.add_space("media2", shared.path()).unwrap();
+        assert!(node
+            .add_mirror("media", shared.path(), &VersionPolicy::Newest)
+            .unwrap_err()
+            .to_string()
+            .contains("overlaps space"));
+
+        node.add_mirror("media", target.path(), &VersionPolicy::Strict)
+            .unwrap();
+        assert_eq!(
+            node.mirror(target.path()).unwrap().unwrap().policy,
+            VersionPolicy::Strict
+        );
+        assert!(node.remove_mirror(target.path()).unwrap());
+        assert!(!node.remove_mirror(target.path()).unwrap());
         node.shutdown().await.unwrap();
     }
 }

@@ -614,13 +614,9 @@ fn like_escape(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::testutil;
 
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        (dir, store)
-    }
+    use super::*;
 
     fn part(number: u32, size: u64) -> UploadPart {
         UploadPart {
@@ -632,10 +628,13 @@ mod tests {
         }
     }
 
-    /// The latch admits one completion and turns the rest away.
+    /// The latch admits one completion and turns the rest away: a second
+    /// completion, an abort, and a joining part are all refused while an
+    /// assembly is live — and a latch nobody cleared is stealable, or the
+    /// upload could never end.
     #[test]
-    fn the_latch_admits_one_completion() {
-        let (_d, store) = store();
+    fn the_latch_admits_one_completion_and_an_uncleared_one_is_stealable() {
+        let (_d, store) = testutil::store();
         store
             .create_upload("u1", "media", "a.bin", None, 10)
             .unwrap();
@@ -651,27 +650,19 @@ mod tests {
         // A part cannot join an upload that is already being assembled, or the
         // completion would use a list the row no longer describes.
         assert!(store.record_part("u1", &part(2, 8)).is_err());
-    }
-
-    /// A latch nobody cleared is stealable, or the upload can never end.
-    #[test]
-    fn a_stale_latch_is_stealable() {
-        let (_d, store) = store();
-        store
-            .create_upload("u1", "media", "a.bin", None, 10)
-            .unwrap();
-        store.record_part("u1", &part(1, 8)).unwrap();
-        store.begin_complete("u1", 100, 1_000).unwrap();
-
+        // A latch nobody cleared is stealable once it is old enough, so an
+        // interrupted completion can be retried rather than stuck forever.
         assert!(store.begin_complete("u1", 900, 1_000).is_err());
         let stolen = store.begin_complete("u1", 2_000, 1_000).unwrap();
         assert!(matches!(stolen, CompleteStart::Ready { ref parts, .. } if parts.len() == 1));
     }
 
-    /// A refused completion goes back to `open` so the client can fix it.
+    /// A refused completion goes back to `open` so the client can fix it —
+    /// on the client's own call and for interrupted completions at startup
+    /// alike.
     #[test]
-    fn reopening_restores_the_upload() {
-        let (_d, store) = store();
+    fn a_refused_completion_goes_back_to_open() {
+        let (_d, store) = testutil::store();
         store
             .create_upload("u1", "media", "a.bin", None, 10)
             .unwrap();
@@ -683,6 +674,14 @@ mod tests {
         );
         store.record_part("u1", &part(1, 8)).unwrap();
         assert!(store.begin_complete("u1", 200, 1_000).is_ok());
+
+        // The startup sweep reopens whatever the client left latched, once.
+        assert_eq!(store.reopen_interrupted_uploads().unwrap(), 1);
+        assert_eq!(
+            store.upload("u1").unwrap().unwrap().state,
+            UploadState::Open
+        );
+        assert_eq!(store.reopen_interrupted_uploads().unwrap(), 0);
     }
 
     /// A completed upload remembers its answer, and an abort does not erase it.
@@ -692,7 +691,7 @@ mod tests {
     /// `NoSuchUpload`, which is the lie the record exists to prevent.
     #[test]
     fn a_completed_upload_keeps_its_answer() {
-        let (_d, store) = store();
+        let (_d, store) = testutil::store();
         store
             .create_upload("u1", "media", "a.bin", None, 10)
             .unwrap();
@@ -719,7 +718,7 @@ mod tests {
     /// A completed row's clock starts when it completed, not when it was made.
     #[test]
     fn a_completed_upload_ages_from_its_completion() {
-        let (_d, store) = store();
+        let (_d, store) = testutil::store();
         store
             .create_upload("old", "media", "a.bin", None, 0)
             .unwrap();
@@ -747,7 +746,7 @@ mod tests {
     /// then complete another client's upload with content of their choosing.
     #[test]
     fn listings_do_not_cross_principals() {
-        let (_d, store) = store();
+        let (_d, store) = testutil::store();
         store
             .create_upload("mine", "media", "a.bin", Some("AKIA1"), 10)
             .unwrap();
@@ -775,7 +774,7 @@ mod tests {
 
     #[test]
     fn open_counts_and_staged_bytes_feed_the_quotas() {
-        let (_d, store) = store();
+        let (_d, store) = testutil::store();
         store
             .create_upload("u1", "media", "a.bin", Some("AKIA1"), 10)
             .unwrap();
@@ -801,7 +800,7 @@ mod tests {
     /// A prefix containing `LIKE` wildcards matches itself, not everything.
     #[test]
     fn listing_prefixes_are_escaped() {
-        let (_d, store) = store();
+        let (_d, store) = testutil::store();
         store
             .create_upload("u1", "media", "100%/a.bin", None, 10)
             .unwrap();
@@ -811,22 +810,5 @@ mod tests {
         let listed = store.open_uploads("media", "100%", None).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "u1");
-    }
-
-    /// An interrupted completion is recoverable at startup.
-    #[test]
-    fn interrupted_completions_reopen() {
-        let (_d, store) = store();
-        store
-            .create_upload("u1", "media", "a.bin", None, 10)
-            .unwrap();
-        store.record_part("u1", &part(1, 8)).unwrap();
-        store.begin_complete("u1", 100, 1_000).unwrap();
-        assert_eq!(store.reopen_interrupted_uploads().unwrap(), 1);
-        assert_eq!(
-            store.upload("u1").unwrap().unwrap().state,
-            UploadState::Open
-        );
-        assert_eq!(store.reopen_interrupted_uploads().unwrap(), 0);
     }
 }

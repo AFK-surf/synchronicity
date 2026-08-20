@@ -418,16 +418,14 @@ mod tests {
         assert!(known.contains(&name("SYNC.EXAMPLE."), b"a key"));
         assert!(!known.contains(&name("other.example"), b"a key"));
         assert!(!known.contains(&name("sync.example"), b"another key"));
-        // Inserting twice must not double the entry: reporting-once depends on
-        // it, and a parser that stopped lowercasing would file two entries
-        // while one of them still indexed a list of length 1.
+        // Inserting twice must not double the entry (reporting-once depends on
+        // it); a parser that stopped lowercasing would file two entries.
         known.insert(&name("sync.example"), b"a key");
         assert_eq!(known.keys.len(), 1);
         assert_eq!(known.keys["sync.example."].len(), 1);
     }
 
-    /// The watch follows the delegation path both ways — the upward half is
-    /// how a parent's takeover of a child appears in the log.
+    /// The watch follows the delegation path both ways — the upward half is how a parent's takeover appears in the log.
     #[test]
     fn watching_a_zone_watches_its_whole_delegation_path() {
         let mut known = KnownKeys::default();
@@ -437,20 +435,16 @@ mod tests {
         assert!(known.watches(&name("example.")), "its parent");
         assert!(known.watches(&name(".")), "the root above it");
         assert!(known.watches(&name("a.cp.example.")), "a zone beneath it");
-        // A sibling shares no delegation path, and a mere string suffix is
-        // not one either (notcp.example).
+        // A sibling shares no delegation path; a string suffix is not one either (notcp.example).
         assert!(!known.watches(&name("other.example.")));
         assert!(!known.watches(&name("notcp.example.")));
     }
 
-    /// An entry that is not a DNS name matches nothing and is surfaced by
-    /// `unwatchable` rather than sitting quietly.
+    /// An entry that is not a DNS name matches nothing and is surfaced by `unwatchable`, not silently.
     #[test]
     fn an_unparseable_watch_entry_matches_nothing_and_is_reported() {
         let mut known = KnownKeys::default();
-        known
-            .keys
-            .insert("sync.example..".into(), vec![hex::encode(sha256(b"a key"))]);
+        known.keys.insert("sync.example..".into(), vec!["1".into()]);
         assert_eq!(known.apexes().count(), 0);
         assert!(!known.contains(&name("sync.example"), b"a key"));
         assert_eq!(known.unwatchable(), ["sync.example.."]);

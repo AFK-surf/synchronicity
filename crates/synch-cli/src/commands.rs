@@ -383,10 +383,9 @@ mod tests {
     /// The key is the identity, and naming a peer is the explicit exception.
     ///
     /// A name belongs to the zone that issues it (§3.2), so nothing infers one:
-    /// a plain `trust add` binds the key and only the key. But head validity is
-    /// a check on the `(origin, key)` pair, and a node with no membership zone
-    /// cannot otherwise express a member that publishes under a name — so `--as`
-    /// exists, says what it costs, and is never reached by accident.
+    /// a plain `trust add` binds the key and only the key. Head validity is a
+    /// check on the `(origin, key)` pair, so `--as` exists for a node with no
+    /// membership zone — says what it costs, never reached by accident.
     #[test]
     fn trust_add_takes_a_key_and_names_one_only_when_asked() {
         let command =

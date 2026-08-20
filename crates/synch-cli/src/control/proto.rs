@@ -32,16 +32,16 @@ pub use pb::{
 
 /// The control protocol version.
 ///
-/// Client and daemon are normally the same binary, so this exists to catch the
-/// upgrade-while-running case rather than to support mixed versions: protobuf
-/// keeps a field addition readable, but it cannot make a daemon that has learnt
-/// a new command out of one that has not. It is bumped whenever the meaning of
-/// an existing request changes, and travels as a header on every call.
+/// Client and daemon are normally the same binary, so this catches the
+/// upgrade-while-running case rather than supporting mixed versions: protobuf
+/// keeps a field addition readable but cannot make a daemon that has learnt a
+/// new command out of one that has not. Bumped whenever the meaning of an
+/// existing request changes, and travels as a header on every call.
 ///
-/// v2 added the multipart upload calls (§9.4). A field addition would not have
-/// needed a bump, but a *call* addition does: an old daemon answers a new one
-/// with a bare gRPC `Unimplemented`, which reaches the client as an internal
-/// error rather than as the "restart the daemon" a version mismatch says.
+/// v2 added the multipart upload calls (§9.4): a field addition would not need
+/// a bump, but a *call* addition does — an old daemon answers a new one with a
+/// bare gRPC `Unimplemented`, which reads as an internal error rather than the
+/// "restart the daemon" a version mismatch says.
 pub const CONTROL_VERSION: u32 = 2;
 
 /// How many payload bytes one chunk carries.
@@ -52,9 +52,9 @@ pub const CHUNK_SIZE: usize = 256 * 1024;
 
 /// The largest message either side will encode or accept.
 ///
-/// A chunk is [`CHUNK_SIZE`], and nothing else in the protocol is close, so the
-/// ceiling exists to bound what a malformed length can make the other side
-/// allocate rather than to be reached.
+/// A chunk is [`CHUNK_SIZE`] and nothing else in the protocol is close, so the
+/// ceiling bounds what a malformed length can make the other side allocate
+/// rather than being reached.
 pub const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 
 /// The header carrying the client's [`CONTROL_VERSION`].
@@ -69,7 +69,7 @@ pub const ERROR_CODE_HEADER: &str = "x-synch-error-code";
 /// Why a request failed.
 ///
 /// The CLI renders these as its own exit status rather than as a transport
-/// error (§9.3). Each maps to a gRPC status code, and travels alongside it in
+/// error (§9.3). Each maps to a gRPC status code and travels alongside it in
 /// the [`ERROR_CODE_HEADER`] trailer, because more of them exist than gRPC has
 /// codes to keep apart — and a caller that renders codes as protocol statuses,
 /// as the S3 gateway does, needs the distinction the mapping loses.
@@ -92,9 +92,9 @@ pub enum ErrorCode {
     Divergent,
     /// The daemon is in a state that cannot serve this request yet, and the
     /// message names what clears it — key-loss recovery (§3.4) is the case
-    /// that exists. Neither a malformed request nor a fault: a caller that
-    /// renders codes as protocol statuses owes this one a "come back later"
-    /// rather than a "you asked wrong".
+    /// that exists. Neither malformed nor a fault: a caller that renders codes
+    /// as protocol statuses owes this one "come back later", not "you asked
+    /// wrong".
     Unavailable,
 }
 

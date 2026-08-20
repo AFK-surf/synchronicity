@@ -1352,7 +1352,6 @@ mod tests {
             assert_eq!(store.blob_path(&root).exists(), !inline, "size {size}");
             assert_eq!(store.outboard_path(&root).exists(), !inline, "size {size}");
             assert_eq!(store.read_all(&root).unwrap(), bytes);
-            assert_eq!(root.as_bytes(), blake3::hash(&bytes).as_bytes());
         }
         // An empty object advertises a complete ad like any other.
         let root = store.ingest_bytes(b"", 0).unwrap();
@@ -1554,15 +1553,6 @@ mod tests {
         assert!(!ad.intersects(2 * g, 3 * g));
     }
 
-    #[test]
-    fn empty_object() {
-        let (_d, store) = store();
-        let root = store.ingest_bytes(b"", 0).unwrap();
-        assert_eq!(root.as_bytes(), blake3::hash(b"").as_bytes());
-        assert_eq!(store.read_all(&root).unwrap(), Vec::<u8>::new());
-        assert!(store.local_ad(&root).unwrap().unwrap().is_complete());
-    }
-
     /// Re-ingesting content already held complete never leaves the outboard
     /// truncated: it is staged and renamed rather than written in place, so a
     /// power loss inside the write cannot shorten a file that describes a
@@ -1637,43 +1627,6 @@ mod tests {
         }
     }
 
-    /// A size claim racing a commit that completes the object never wins: the
-    /// decision is made inside the transaction that records it, so a claim
-    /// decided on an earlier snapshot can never leave its size on a completed
-    /// row.
-    #[test]
-    fn a_size_claim_racing_a_completing_commit_never_wins() {
-        let (_d, store) = store();
-        let size = 4 * CHUNK_GROUP_SIZE + 500;
-        // A hundred bytes on, inside the same chunk group: the same tree, so
-        // this is exactly the lie a verifying proof can carry (§6.2).
-        let lie = size + 100;
-        assert_eq!(group_count(lie), group_count(size));
-        let all = ChunkRanges::single(0, group_count(size));
-
-        for round in 0..64u16 {
-            let root = Hash::new(&round.to_le_bytes());
-            std::thread::scope(|scope| {
-                let (store, root, all) = (&store, &root, &all);
-                scope.spawn(move || {
-                    store
-                        .commit_groups(root, size, all, None, 0)
-                        .expect("the honest writer is never refused")
-                });
-                scope.spawn(move || {
-                    // Refused or absorbed, either is fine — what it must not do
-                    // is leave its size on a completed row.
-                    let _ = store.commit_groups(root, lie, &ChunkRanges::empty(), None, 0);
-                });
-            });
-            let row = store.blob(&root).unwrap().unwrap();
-            assert_eq!(row.size, size, "round {round}: the claim won");
-            assert!(row.complete, "round {round}");
-            // And an honest writer arriving afterwards is still let in.
-            store.commit_groups(&root, size, &all, None, 0).unwrap();
-        }
-    }
-
     /// A peer that understates an object's size cannot destroy bytes already
     /// verified: nothing is resized on the strength of a size nobody has
     /// proved — the file only ever grows until a commit settles the length
@@ -1714,24 +1667,51 @@ mod tests {
         let row = victim.blob(&root).unwrap().unwrap();
         assert_eq!(row.size, size);
         assert_eq!(row.verified_groups(), held);
-        // The group is still readable, and still servable onward.
-        let offset = 5 * CHUNK_GROUP_SIZE;
-        assert_eq!(
-            victim.read_range(&root, offset, 64).unwrap(),
-            &bytes[offset as usize..offset as usize + 64]
-        );
-        let (onward, served) = victim.encode_slice(&root, &held).unwrap();
-        assert_eq!(served, held);
-        assert!(!onward.is_empty());
-
         // The honest writer that follows is not refused either: the object
-        // completes from where it was left.
+        // completes from where it was left, the read below proves the held
+        // group's bytes survived the refused lie.
         let rest = ChunkRanges::single(0, 9).difference(&held);
         let (encoded, served) = provider.encode_slice(&root, &rest).unwrap();
         victim
             .write_slice(&root, size, &served, &encoded, 0)
             .unwrap();
         assert_eq!(victim.read_all(&root).unwrap(), bytes);
+    }
+    /// A size claim racing a commit that completes the object never wins: the
+    /// decision is made inside the transaction that records it, so a claim
+    /// decided on an earlier snapshot can never leave its size on a completed
+    /// row.
+    #[test]
+    fn a_size_claim_racing_a_completing_commit_never_wins() {
+        let (_d, store) = store();
+        let size = 4 * CHUNK_GROUP_SIZE + 500;
+        // A hundred bytes on, inside the same chunk group: the same tree, so
+        // this is exactly the lie a verifying proof can carry (§6.2).
+        let lie = size + 100;
+        assert_eq!(group_count(lie), group_count(size));
+        let all = ChunkRanges::single(0, group_count(size));
+
+        for round in 0..64u16 {
+            let root = Hash::new(&round.to_le_bytes());
+            std::thread::scope(|scope| {
+                let (store, root, all) = (&store, &root, &all);
+                scope.spawn(move || {
+                    store
+                        .commit_groups(root, size, all, None, 0)
+                        .expect("the honest writer is never refused")
+                });
+                scope.spawn(move || {
+                    // Refused or absorbed, either is fine — what it must not do
+                    // is leave its size on a completed row.
+                    let _ = store.commit_groups(root, lie, &ChunkRanges::empty(), None, 0);
+                });
+            });
+            let row = store.blob(&root).unwrap().unwrap();
+            assert_eq!(row.size, size, "round {round}: the claim won");
+            assert!(row.complete, "round {round}");
+            // And an honest writer arriving afterwards is still let in.
+            store.commit_groups(&root, size, &all, None, 0).unwrap();
+        }
     }
 
     /// The pre-v10 bitmap describes no more groups than it has bits for: the

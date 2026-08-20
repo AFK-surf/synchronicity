@@ -1,5 +1,4 @@
-//! Helpers the integration suites share: a tempfile with contents, a
-//! one-member TXT record set, and checked-in fixture readers.
+//! Helpers the integration suites share: a tempfile with contents, a one-member TXT record set, and fixture readers.
 
 /// A temp file holding `contents`; the caller keeps it alive by holding it.
 #[allow(dead_code)] // each suite imports only the helpers it uses

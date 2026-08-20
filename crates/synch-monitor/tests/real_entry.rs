@@ -1,9 +1,7 @@
 //! The classifier, over the same real published entry the client verifier is
-//! asserted against. `synch-net`'s `tests/fixtures/rekor_v3` holds a genuine
-//! `hashedrekord` entry from `log2025-1.rekor.sigstore.dev`; over there the
-//! client verifier accepts it end to end, and here the monitor classifies the
-//! very same bytes — the anchor that keeps the synthetic `tiers.rs` matrix
-//! honest.
+//! asserted against: `synch-net`'s `tests/fixtures/rekor_v3` holds a genuine
+//! `hashedrekord` entry from `log2025-1.rekor.sigstore.dev`, accepted end to
+//! end there — the anchor that keeps the synthetic `tiers.rs` matrix honest.
 
 use hickory_resolver::proto::dnssec::TrustAnchors;
 use synch_monitor::classify::{classify, Tier};
@@ -20,9 +18,8 @@ const APEX: &str = "zone-key-transparency.demo.invalid";
 const LOG_INDEX: u64 = 68_295_246;
 
 /// The zone is its own trust anchor: we own no DNSSEC-signed domain, so the
-/// chain in the certificate terminates at the apex rather than at the ICANN
-/// root (a public monitor rooted at ICANN would file this entry tier B — the
-/// honest verdict for that population).
+/// chain terminates at the apex (a monitor rooted at ICANN would file this
+/// tier B — the honest verdict for that population).
 fn anchors() -> (tempfile::TempDir, TrustAnchors) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("anchor.key");
@@ -45,30 +42,15 @@ fn the_real_published_entry_classifies_tier_a() {
     assert_eq!(finding.tier, Tier::A, "{}", finding.line());
     assert_eq!(finding.apex, format!("{APEX}."));
     assert_eq!(finding.log_index, LOG_INDEX);
-    assert!(
-        finding.reasons.iter().any(|r| r.contains("chain valid")),
-        "{:?}",
-        finding.reasons
-    );
+    assert!(finding.reasons.iter().any(|r| r.contains("chain valid")));
     let [key] = finding.keys.as_slice() else {
         panic!("a one-key zone proves one key: {:?}", finding.keys);
     };
     assert_eq!(key.key_tag, 32784);
     assert_eq!(key.sha256.len(), 64);
-    // The DS is the line a registrar would show, so an operator can compare
-    // without believing anything the entry says.
-    assert!(
-        key.ds.starts_with("32784 13 2 "),
-        "the derived DS: {}",
-        key.ds
-    );
+    // The DS is the line a registrar would show, comparable without belief.
+    assert!(key.ds.starts_with("32784 13 2 "));
     let line = finding.line();
-    assert!(
-        line.starts_with(&format!("[A] index {LOG_INDEX} apex {APEX}.")),
-        "{line}"
-    );
-    assert!(
-        line.contains(&key.ds) && line.contains(&key.sha256),
-        "{line}"
-    );
+    assert!(line.starts_with(&format!("[A] index {LOG_INDEX} apex {APEX}.")));
+    assert!(line.contains(&key.ds) && line.contains(&key.sha256));
 }

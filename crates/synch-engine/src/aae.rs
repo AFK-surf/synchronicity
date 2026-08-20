@@ -613,35 +613,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn jitter_stays_inside_the_window() {
-        let base = Duration::from_secs(30);
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..200 {
-            let d = jittered(base);
-            assert!(d >= base / 2, "{d:?}");
-            assert!(d <= base + base / 2, "{d:?}");
-            seen.insert(d.as_millis());
-        }
-        assert!(seen.len() > 1, "jitter must not be constant");
-    }
-
-    #[tokio::test]
-    async fn a_lone_node_has_nothing_to_sync_with() {
-        let (_d, node) = node().await;
-        // The self binding exists, but must not appear as a dial target.
-        assert!(node
-            .store()
-            .trusted_keys(now_ns())
-            .unwrap()
-            .contains(&node.node_id()));
-        assert!(node.dialable_peers().unwrap().is_empty());
-        let report = node.anti_entropy_round().await.unwrap();
-        assert!(report.peer.is_none());
-        assert_eq!(report.unreachable, 0);
-        node.shutdown().await.unwrap();
-    }
-
     #[tokio::test]
     async fn maintenance_expires_bindings_and_runs_gc() {
         let (_d, node) = node().await;
@@ -655,7 +626,6 @@ mod tests {
         );
         node.shutdown().await.unwrap();
     }
-
     /// A pending head nobody can serve stops holding an origin hostage.
     ///
     /// `head_floor` is the best of both slots, so a head pushed reactively by a

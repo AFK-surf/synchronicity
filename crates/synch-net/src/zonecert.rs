@@ -15,12 +15,12 @@
 //!   in weeks while entries are read for years. An entry from 2029 verifies
 //!   in 2039 exactly as it did the day it was logged. See `crate::chain`.
 //!
-//! The client does not read it either. The client validates DNSSEC natively
-//! and already holds the DNSKEY it is asking about, so re-deriving
-//! authorization from a copy of the chain inside the entry would be a slower
-//! way to learn the same fact. It is monitor food, and the client enforces
-//! its presence only because an entry without one would be invisible to a
-//! monitor (see `rekor::verify`).
+//! The client does not read it either: it validates DNSSEC natively and
+//! already holds the DNSKEY it is asking about, so re-deriving authorization
+//! from a copy of the chain inside the entry would be a slower way to learn
+//! the same fact. It is monitor food, and the client enforces its presence
+//! only because an entry without one would be invisible to a monitor (see
+//! `rekor::verify`).
 
 #[cfg(any(test, feature = "sim"))]
 use crate::x509::tlv;
