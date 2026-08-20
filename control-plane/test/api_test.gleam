@@ -3,6 +3,7 @@ import api/auth_api
 import api/browse_api
 import api/reads
 import api/router
+import api/skill
 import auth/google
 import auth/session
 import dns/name as dns_name
@@ -1754,4 +1755,49 @@ pub fn healthz_fails_when_the_zone_signatures_have_run_out_test() {
   // job that has stopped rather than one merely between runs.
   assert !router.zone_is_servable(now - 60, now)
   assert !router.zone_is_servable(now + 60, now)
+}
+
+/// `/SKILL.md` is public, role-agnostic, and actually in the shipment.
+///
+/// Role-agnostic is the whole point of the route existing at all: the `synch`
+/// guide needs no session, no database and no zone, so a replica — which
+/// answers 404 for every product route and has no SPA to fall back to — must
+/// still serve it. A URL that only works on the primary is not one worth
+/// publishing.
+///
+/// The shipment assertion is the other half. `priv/skill/SKILL.md` is a
+/// tracked source file that a packaging change can silently drop, and a build
+/// that dropped it boots, serves, and passes every other check while this one
+/// route answers 404.
+pub fn skill_md_is_served_by_every_role_test() {
+  let h = harness()
+  let body = fn(res) { simulate.read_body(res) }
+
+  let served = call(h, simulate.request(Get, "/SKILL.md"))
+  assert served.status == 200
+  assert list.contains(served.headers, #(
+    "content-type",
+    "text/markdown; charset=utf-8",
+  ))
+  // Enough of the document to know it is the guide and not, say, index.html.
+  assert string.contains(body(served), "synch daemon run")
+
+  // Role-agnostic, and that means all three surfaces — not just the two that
+  // existed when the route was written. A DNS-only replica 404s every
+  // product route and the SPA fallback; a read-only one answers the reads and
+  // refuses the writes; the primary answers everything. This URL is the same
+  // document on each, which is the only property that makes it worth handing
+  // to an operator who may reach any node.
+  let dns_only = Harness(..h, ctx: router.Context(..h.ctx, api: None))
+  list.each([dns_only, read_only(h, "https://sync.test")], fn(other) {
+    let elsewhere = call(other, simulate.request(Get, "/SKILL.md"))
+    assert elsewhere.status == 200
+    assert body(elsewhere) == body(served)
+  })
+
+  // Read-only: anything but a GET is a refusal, not a fallthrough.
+  assert call(h, authed(h, Post, "/SKILL.md")).status == 405
+
+  // And the file really is where the shipment puts it.
+  assert skill.read() != Error(Nil)
 }

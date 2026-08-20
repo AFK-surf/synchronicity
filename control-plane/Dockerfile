@@ -5,9 +5,10 @@
 #
 #   docker build -t controlplane control-plane
 #
-# The image ships the same three pieces the systemd deployment does
+# The image ships the same pieces the systemd deployment does
 # (ops/systemd/): the Gleam/OTP service as an Erlang shipment, the
-# `csqlite` port program in `priv/`, and the built SPA in `priv/web`.
+# `csqlite` port program in `priv/`, the built SPA in `priv/web`, and the
+# `synch` guide in `priv/skill`.
 # It runs the primary and the replica alike — the role is `CP_ROLE`,
 # and everything else is `CP_*` environment too (see README.md).
 #
@@ -72,14 +73,16 @@ RUN gleam deps download
 
 COPY src/ ./src/
 # The SPA is served out of priv/web (src/api/static.gleam), so it has to
-# be in place before the export copies priv/ into the shipment. So does
-# the trusted root: tuf/trusted_root.gleam reads
-# priv/tuf/sigstore_trusted_root.json at runtime — a tracked source file,
-# so a plain COPY ships it (only the build-artifact paths under priv/ are
-# dockerignored). image-smoke.sh asserts it is actually there, because a
-# build that drops it still boots and serves and passes every other check.
+# be in place before the export copies priv/ into the shipment. So do the
+# trusted root and the CLI guide: tuf/trusted_root.gleam reads
+# priv/tuf/sigstore_trusted_root.json and api/skill.gleam reads
+# priv/skill/SKILL.md at runtime — tracked source files, so a plain COPY
+# ships them (only the build-artifact paths under priv/ are dockerignored).
+# image-smoke.sh asserts they are actually there, because a build that
+# drops one still boots and serves and passes every other check.
 COPY --from=web /src/web/dist/ ./priv/web/
 COPY priv/tuf/ ./priv/tuf/
+COPY priv/skill/ ./priv/skill/
 RUN gleam export erlang-shipment
 
 # --- the csqlite port program ------------------------------------------
