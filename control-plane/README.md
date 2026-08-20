@@ -61,9 +61,9 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   a session exists. Magic links stay on the page when nothing else is
   configured, mail relay or not: an empty login screen is worse than a
   link the operator reads off the service log.
-- **Cloud browse** (`CP_BROWSE=on`, off by default) lets the dashboard read
-  a cluster's files. Nodes are unreachable from here, so the connection is
-  one they open: a daemon discovers this deployment from
+- **Cloud browse** lets the dashboard read a cluster's files. Nodes are
+  unreachable from here, so the connection is one they open: a daemon
+  discovers this deployment from
   `_synchronicity-cp.<apex>` in the zone it already DNSSEC-validates, dials
   out over WSS, and proves itself with the device key this service already
   publishes — no command needed, for the tunnel is on unless a node's
@@ -75,6 +75,14 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   attached daemon serves whatever this service requests, for every space it
   holds. File bytes pass through this service's memory in bounded chunks and
   are never stored.
+
+  The record names **every node** of the deployment, one `v=synccp1 url=`
+  each (`CP_ENDPOINTS` on the primary), and a daemon opens a tunnel to all of
+  them. It has to: the registry of open tunnels is one process's memory, so a
+  replica no daemon attached to can answer nothing however current its copy
+  of the database is. There is no deployment-level switch — the org admin's
+  per-network toggle is the whole of the gate, and it is off until they turn
+  it on.
 
 ## `GET /SKILL.md`
 
@@ -106,8 +114,11 @@ would boot, serve, and pass every other check.
   mutation time and served straight from SQLite through a pool of
   reset-on-checkout workers (one read transaction per answer).
 - **Frontend**: Vite + React + TypeScript + Tailwind (`web/`).
-- **Replication**: primary + read-only DNS replicas fed by external,
-  operator-owned tooling (e.g. litestream). See `ops/RUNBOOK.md`.
+- **Replication**: primary + read-only replicas fed by external,
+  operator-owned tooling (e.g. litestream). Replicas serve the dashboard,
+  the read half of the API and the file browser off the same copy, and DNS
+  too where this deployment serves its own zone. See `ops/RUNBOOK.md`, and
+  `ops/worker/` for a Cloudflare Worker that balances the entry name.
 
 ## Developing
 
@@ -122,7 +133,13 @@ just dev                # backend :8080 + vite dev server
 just e2e                # delv + the real synchronicity resolver validate
                         # a served zone end to end (needs bind9-dnsutils,
                         # rust, and the repo's crates/)
+node --test ops/worker/lb.test.mjs   # the entry-name balancer
 ```
+
+`just dev` reads the `CP_*` environment (see the table below); every node
+needs at least `CP_ROLE`, `CP_BASE_DOMAIN`, `CP_DB_PATH`, `CP_SESSION_SECRET`
+and `CP_PUBLIC_URL`, plus `CP_KEY_FILE` on a serving primary and
+`CP_PRIMARY_URL` on a replica.
 
 The e2e is the load-bearing test: `delv` must report `fully validated`
 for positive, NODATA and NXDOMAIN answers over UDP and TCP, and the
@@ -258,8 +275,9 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_BUNNY_API_KEY` | primary | Required when the provider is `bunny`. |
 | `CP_BUNNY_ZONE_ID` | primary | Bunny DNS zone id. Default empty: discovered by zone name at boot. |
 | `CP_BUNNY_API_URL` | primary | Bunny API base URL override; default empty means the real endpoint. |
-| `CP_PUBLIC_URL` | primary | External base URL for links and OAuth callbacks. Default `http://127.0.0.1:<http-port>`. |
-| `CP_SESSION_SECRET` | primary | Required on the primary, ≥32 characters. Signs session cookies. |
+| `CP_PUBLIC_URL` | both | **Required.** This node's own external base URL: links and OAuth callbacks on the primary, and on every node the attach endpoint daemons dial and sign their proof over. It is published verbatim at `_synchronicity-cp.<base>`, so it must be an `https://` or `http://` origin with no whitespace — refused at boot rather than in every daemon a TTL later. |
+| `CP_SESSION_SECRET` | both | Required, ≥32 characters. Signs session cookies. **The same value on every node**: a replica verifies cookies the primary minted, and one byte of difference is a dashboard nobody can sign in to. |
+| `CP_PRIMARY_URL` | replica | Required. The primary's URL — what a refused write and the login screen point at. Nothing in a replicated database says which node holds the pen, so this is the one fact a read-only node cannot derive. |
 | `CP_SMTP_HOST` | primary | SMTP hostname. Absent means log-only mail — magic links and invitations go to the service's stdout — and the login page stops offering the form unless no other sign-in method is configured. |
 | `CP_SMTP_PORT` | primary | SMTP port. Default `587`. Used only when `CP_SMTP_HOST` is set. |
 | `CP_SMTP_USER` | primary | SMTP username. Default empty. Set, the relay must offer STARTTLS and present a certificate this host trusts: the credential is never put on the wire in the clear. |
@@ -272,7 +290,8 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_REKOR_URL` | primary | Zone-key transparency log write endpoint (Rekor v2, `POST /api/v2/log/entries`). Unset — the normal case — the shard in service is read from the stored `trusted_root.json`, so a Sigstore rotation costs a metadata refresh and not a release. |
 | `CP_REKOR_KEY` | primary | File pinning the log's verification key — a PEM `PUBLIC KEY` block or one base64 SubjectPublicKeyInfo, `#` starting a comment. Exactly one key: this service submits to one log and stores the proof under that log's id. Unset, the key comes from the same trusted-root entry as the endpoint. Set it for a self-hosted log, together with `CP_REKOR_URL`. |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose active key has no verified log record. Default off — the rollout publishes before it enforces. |
-| `CP_BROWSE` | primary | `on` or `off` (the default). `on` mounts the daemon attach endpoint at `/agent/v1/attach`, the read-only browse API, and publishes `_synchronicity-cp.<base> TXT "v=synccp1 url=<CP_PUBLIC_URL>"` at the apex so a daemon finds this deployment from the zone it already validates. Requires `CP_PUBLIC_URL` — the record names it and attaching daemons sign their proof over it — and is refused on a replica. Per-network enablement is a separate switch (`PUT /api/orgs/:slug/networks/:net/browse/enabled`, admin) that is off for every network until an org admin turns it on, and never reaches DNS. Downloads are capped at four concurrent streams per user. |
+| `CP_ENTRY_URL` | both | The name a browser reaches this deployment at — the load-balanced entry name. Defaults to `CP_PUBLIC_URL`, which is right for a single node. OAuth callbacks, magic links and invitations are built from it: behind a balancer, a link built from one node's own name returns the person there and leaves their new session cookie on it. `ops/worker/` is a Cloudflare Worker that balances the entry name correctly. |
+| `CP_ENDPOINTS` | primary | This deployment's *other* control-plane endpoints, comma- or semicolon-separated. Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>` beside this node's `CP_PUBLIC_URL`, which is how the apex says where this base's control plane answers. Cloud attach is the first thing to dial them, and today the only one: every daemon opens a standing tunnel to **each**, because the registry of attached daemons is one node's memory and a node no daemon attached to can answer no browse question however current its copy of the database is. At most 8 endpoints in total, refused at boot rather than by counting sockets. |
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the DNSSEC chain in a log entry is collected from. Default `https://cloudflare-dns.com/dns-query`. Not a trust decision — every reader verifies the signatures itself — so point it at your own validating resolver if you would rather not tell a third party when you rotate keys. |
 
 Day-2 operations (replicas, key ceremony, backups) live in

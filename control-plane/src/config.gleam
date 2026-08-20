@@ -67,6 +67,18 @@ pub type Config {
     /// (hostname, ipv4, ipv6) — hostname relative to apex unless dotted.
     ns_hosts: List(#(String, String, String)),
     public_url: String,
+    /// The name a *browser* reaches this deployment at (`CP_ENTRY_URL`), for
+    /// OAuth callbacks, magic links and invitations. Defaults to
+    /// `CP_PUBLIC_URL`, which is right for a deployment of one node.
+    ///
+    /// Separate from `public_url` because a load-balanced deployment has two
+    /// kinds of name and these two uses fall on opposite sides of the split:
+    /// `public_url` is *this node's own*, dialed directly by daemons and
+    /// signed over in their attach proof, while every link mailed to a person
+    /// has to come back to the balanced entry name — a sign-in that lands on
+    /// one node's own name sets its cookie there, and the browser returns to
+    /// the entry name without it.
+    entry_url: String,
     /// Signs session cookies; sessions survive restarts because of it.
     session_secret: String,
     /// (host, port, username, password, from) — absent means log-only mail.
@@ -75,11 +87,16 @@ pub type Config {
     google: Option(#(String, String)),
     github: Option(#(String, String)),
     dns_mode: DnsMode,
-    /// Whether daemons may attach and browse (`CP_BROWSE`). Off by default:
-    /// the attach endpoint, the apex record naming it, and the browse API
-    /// all exist only when this is on, in the same shape an unset optional
-    /// provider takes.
-    browse: Bool,
+    /// Where the writes live, as a replica's dashboard tells its users
+    /// (`CP_PRIMARY_URL`). Empty on the primary, which *is* that place.
+    ///
+    /// A read-only node that answers "no" to a sign-in without saying where
+    /// to go instead is a dead end, and the one fact that resolves it — the
+    /// primary's public URL — is not derivable from anything a replica holds.
+    primary_url: String,
+    /// The control-plane endpoints the apex record names, in publication
+    /// order: this node's own first, then `CP_ENDPOINTS`.
+    endpoints: List(String),
   )
 }
 
@@ -132,21 +149,22 @@ pub fn load() -> Result(Config, String) {
       }
     Serve -> ns_hosts()
   })
-  let public_url =
-    envoy.get("CP_PUBLIC_URL")
-    |> result.unwrap("http://127.0.0.1:" <> int.to_string(http_listen.port))
-  use session_secret <- result.try(case role {
-    Primary -> {
-      use secret <- result.try(required("CP_SESSION_SECRET"))
-      case string.length(secret) >= 32 {
-        True -> Ok(secret)
-        False -> Error("CP_SESSION_SECRET must be at least 32 characters")
-      }
+  use public_url <- result.try(public_url())
+  use entry_url <- result.try(entry_url(public_url))
+  // Every node serves the dashboard, so every node reads session cookies and
+  // every node needs the secret that signs them — a replica needs *the
+  // primary's*, byte for byte, or every cookie the primary minted fails its
+  // signature check here.
+  use session_secret <- result.try({
+    use secret <- result.try(required("CP_SESSION_SECRET"))
+    case string.length(secret) >= 32 {
+      True -> Ok(secret)
+      False -> Error("CP_SESSION_SECRET must be at least 32 characters")
     }
-    Replica -> Ok("")
   })
+  use primary_url <- result.try(primary_url(role))
   use smtp <- result.try(smtp_config())
-  use browse <- result.try(browse_enabled(role, public_url))
+  use endpoints <- result.try(validated_endpoints(role))
   Ok(Config(
     role,
     base_domain,
@@ -156,71 +174,98 @@ pub fn load() -> Result(Config, String) {
     dns_listen,
     ns_hosts,
     public_url,
+    entry_url,
     session_secret,
     smtp,
     credential_pair("CP_GOOGLE_CLIENT_ID", "CP_GOOGLE_CLIENT_SECRET"),
     credential_pair("CP_GITHUB_CLIENT_ID", "CP_GITHUB_CLIENT_SECRET"),
     dns_mode,
-    browse,
+    primary_url,
+    endpoints,
   ))
 }
 
-/// `CP_BROWSE`: `on` or `off` (the default).
+/// `CP_PRIMARY_URL`: where a replica's dashboard sends the writes it cannot do.
 ///
-/// Refused on a replica, which has no sessions and no tunnels; and refused
-/// on a primary that has not been told its own public URL, because the apex
-/// record names that URL and a daemon signs its attach proof over it — a
-/// loopback default published into DNS would send every node nowhere.
-fn browse_enabled(role: Role, public_url: String) -> Result(Bool, String) {
-  case envoy.get("CP_BROWSE") {
-    Error(Nil) | Ok("off") -> Ok(False)
-    Ok("on") ->
-      case role, result.is_ok(envoy.get("CP_PUBLIC_URL")) {
-        Replica, _ ->
+/// Required on a replica and refused on the primary. A replica holds a
+/// read-only copy of the database, so signing in, creating a network and
+/// every other mutation has exactly one place it can happen; a dashboard that
+/// refuses them without naming that place is a dead end, and nothing a
+/// replica holds names it — the database records the deployment's zone, not
+/// which of its nodes took the writes.
+fn primary_url(role: Role) -> Result(String, String) {
+  case role {
+    Replica -> {
+      use url <- result.try(required("CP_PRIMARY_URL"))
+      let url = trim_trailing_slash(string.trim(url))
+      case is_origin(url) {
+        True -> Ok(url)
+        False ->
           Error(
-            "CP_BROWSE is primary-only: a replica holds no sessions and no "
-            <> "attach tunnels",
+            "CP_PRIMARY_URL must be an https:// or http:// origin, got " <> url,
           )
-        Primary, False ->
-          Error(
-            "CP_BROWSE=on needs CP_PUBLIC_URL: the apex record publishes it "
-            <> "and attaching daemons sign their proof over it, so the "
-            <> "default "
-            <> public_url
-            <> " would send them nowhere",
-          )
-        Primary, True ->
-          // The value is rendered straight into a signed apex TXT record as
-          // `v=synccp1 url=<it>`, and the client parses that record as
-          // whitespace-separated `key=value` pairs and requires the URL to be
-          // an origin — `https://` or `http://` with something after it. So a
-          // bare host, or one with a space in it, publishes a record every
-          // daemon rejects: signed, cached for its TTL, and failing in the
-          // client rather than here. `build.valid_hint` exists to keep
-          // free-form values out of that grammar and did not cover this one.
-          //
-          // `http://` is accepted because the client accepts it — a deployment
-          // behind a TLS terminator is the case it was widened for. The
-          // attach record's integrity does not rest on the scheme either way:
-          // the zone key that published it is gated on the transparency log,
-          // and on `https://` WebPKI sits on top of that rather than under it.
-          case is_origin(browse_endpoint()), record_safe(browse_endpoint()) {
-            True, True -> Ok(True)
-            False, _ ->
-              Error(
-                "CP_BROWSE=on needs CP_PUBLIC_URL to be an https:// or "
-                <> "http:// origin: daemons refuse any other shape, so the "
-                <> "record would be published and rejected",
-              )
-            _, False ->
-              Error(
-                "CP_BROWSE=on needs a CP_PUBLIC_URL with no whitespace: the "
-                <> "attach record is whitespace-separated key=value pairs and "
-                <> "a space in the value changes what it says",
-              )
-          }
       }
-    Ok(other) -> Error("CP_BROWSE must be on or off, got " <> other)
+    }
+    Primary ->
+      case envoy.get("CP_PRIMARY_URL") {
+        Ok(_) ->
+          Error(
+            "CP_PRIMARY_URL is replica-only: it names where the writes a node "
+            <> "refuses are taken, and the primary takes its own",
+          )
+        Error(Nil) -> Ok("")
+      }
+  }
+}
+
+/// `CP_PUBLIC_URL`: this node's own external URL, and the one it publishes.
+///
+/// Required, because the apex names it: every node offers cloud attach, and
+/// `_synchronicity-cp` says where. A daemon signs its attach proof over this
+/// exact string, so a loopback default published into DNS would send every
+/// node in every network nowhere.
+///
+/// Validated here rather than at publish, where the operator can still read
+/// the message. The value is rendered straight into a signed apex TXT record
+/// as `v=synccp1 url=<it>`, and the client parses that record as
+/// whitespace-separated `key=value` pairs and requires the URL to be an
+/// origin — `https://` or `http://` with something after it. So a bare host,
+/// or one with a space in it, publishes a record every daemon rejects:
+/// signed, cached for its TTL, and failing in the client rather than at the
+/// boot that produced it.
+///
+/// `http://` is accepted because the client accepts it — a deployment behind
+/// a TLS terminator is the case it was widened for. The attach record's
+/// integrity does not rest on the scheme either way: the zone key that
+/// published it is gated on the transparency log, and on `https://` WebPKI
+/// sits on top of that rather than under it.
+fn public_url() -> Result(String, String) {
+  use url <- result.try(
+    envoy.get("CP_PUBLIC_URL")
+    |> result.replace_error(
+      "CP_PUBLIC_URL is required: every published zone names this node's "
+      <> "attach endpoint at _synchronicity-cp.<base>, and a daemon signs "
+      <> "its attach proof over exactly this URL. Behind a load balancer "
+      <> "this is the node's *own* name; CP_ENTRY_URL is the balanced one "
+      <> "that links mailed to people come back to",
+    ),
+  )
+  let url = trim_trailing_slash(string.trim(url))
+  case is_origin(url), record_safe(url) {
+    True, True -> Ok(url)
+    False, _ ->
+      Error(
+        "CP_PUBLIC_URL must be an https:// or http:// origin, got "
+        <> url
+        <> ": daemons refuse any other shape, so the attach record would be "
+        <> "published and rejected",
+      )
+    _, False ->
+      Error(
+        "CP_PUBLIC_URL must have no whitespace or quote in it: the attach "
+        <> "record is whitespace-separated key=value pairs and either one "
+        <> "changes what it says",
+      )
   }
 }
 
@@ -262,9 +307,159 @@ fn record_safe(value: String) -> Bool {
 }
 
 pub fn browse_endpoint() -> String {
-  case envoy.get("CP_BROWSE"), envoy.get("CP_PUBLIC_URL") {
-    Ok("on"), Ok(url) -> string.trim(url)
-    _, _ -> ""
+  envoy.get("CP_PUBLIC_URL")
+  |> result.unwrap("")
+  |> string.trim
+  |> trim_trailing_slash
+}
+
+/// Every control-plane endpoint the apex record names: this node's own, then
+/// the rest of the deployment's from `CP_ENDPOINTS`.
+///
+/// **One RRset, one rdata per endpoint** — not one record listing several.
+/// A daemon needs a live tunnel to *every* node that may be asked a browse
+/// question, because the registry of attached sessions is one process's
+/// memory and a node with no tunnel of its own can answer nothing; so the
+/// record has to name them all. Spelling that as extra records rather than
+/// extra `url=` fields is what keeps a daemon built before this change
+/// working: it reads the first record it can parse and attaches there, which
+/// is one node of the fleet instead of all of them, while a second `url=`
+/// in one record is a duplicate field it refuses outright.
+///
+/// Order is publication order and carries no precedence: a daemon opens all
+/// of them.
+pub fn endpoints() -> List(String) {
+  // Deduplicated *here*, where the zone builder reads it, and not only in the
+  // boot-time validator: an RRset is a set, and RFC 4034 §6.3 has a signer
+  // remove duplicate RRs before signing. Two identical rdatas would be signed
+  // as two, and a validator that canonicalizes to one computes a different
+  // hash — an RRSIG mismatch, which is the whole zone failing closed rather
+  // than one wasted record. An operator listing their own `CP_PUBLIC_URL` in
+  // `CP_ENDPOINTS` is an ordinary mistake.
+  list.unique([browse_endpoint(), ..extra_endpoints()])
+  |> list.filter(fn(endpoint) { endpoint != "" })
+}
+
+/// `CP_ENTRY_URL`: the name a browser reaches this deployment at.
+///
+/// Defaults to this node's own `CP_PUBLIC_URL`, which is the whole of the
+/// answer for a deployment of one node. Behind a balancer they differ, and
+/// the difference matters in one direction only: a link mailed to a person —
+/// an OAuth callback, a magic link, an invitation — must return them to the
+/// entry name, because a sign-in completed on one node's own name sets its
+/// cookie there and the browser comes back to the entry name without it.
+///
+/// Checked as an origin like the others, but not for record safety: this one
+/// never reaches DNS.
+fn entry_url(public_url: String) -> Result(String, String) {
+  case envoy.get("CP_ENTRY_URL") {
+    Error(Nil) -> Ok(public_url)
+    Ok(url) -> {
+      let url = trim_trailing_slash(string.trim(url))
+      case is_origin(url) {
+        True -> Ok(url)
+        False ->
+          Error(
+            "CP_ENTRY_URL must be an https:// or http:// origin, got " <> url,
+          )
+      }
+    }
+  }
+}
+
+/// `CP_ENDPOINTS`: the deployment's *other* control-plane endpoints, comma-
+/// or semicolon-separated, in the same origin form as `CP_PUBLIC_URL`.
+///
+/// Named for what the record is rather than for today's only consumer: the
+/// apex publishes *where this base's control plane answers*, and a daemon's
+/// attach tunnel is the first thing to dial it, not the last. Which of those
+/// endpoints a given node exposes is that node's own configuration.
+///
+/// Configured rather than discovered because nothing in this service knows
+/// its replicas: replication is external and operator-owned (ops/RUNBOOK.md),
+/// so the fleet's shape is a fact only the operator holds. It is read on the
+/// node that publishes the zone, which is the primary — a replica publishes
+/// nothing, and one that set this would be describing a record it does not
+/// write.
+fn extra_endpoints() -> List(String) {
+  envoy.get("CP_ENDPOINTS")
+  |> result.unwrap("")
+  |> string.replace(each: ";", with: ",")
+  |> string.split(",")
+  |> list.map(fn(entry) { trim_trailing_slash(string.trim(entry)) })
+  |> list.filter(fn(entry) { entry != "" })
+}
+
+/// The endpoints validated and deduplicated, or the reason the operator's
+/// list cannot be published.
+///
+/// Each entry is checked exactly as `CP_PUBLIC_URL` is, and for the same
+/// reason: a value that is not an origin, or that carries whitespace, is a
+/// record every daemon rejects — signed, cached for its TTL, and failing in
+/// the client rather than at the boot that produced it.
+fn validated_endpoints(role: Role) -> Result(List(String), String) {
+  let configured = result.is_ok(envoy.get("CP_ENDPOINTS"))
+  use Nil <- result.try(case role, configured {
+    Replica, True ->
+      Error(
+        "CP_ENDPOINTS is primary-only: it names the endpoints the apex record "
+        <> "lists, and only the node that publishes the zone writes that "
+        <> "record. A replica names itself with CP_PUBLIC_URL",
+      )
+    _, _ -> Ok(Nil)
+  })
+  let endpoints = endpoints()
+  use Nil <- result.try(
+    list.try_each(endpoints, fn(endpoint) {
+      case is_origin(endpoint), record_safe(endpoint) {
+        True, True -> Ok(Nil)
+        False, _ ->
+          Error(
+            "CP_ENDPOINTS entry "
+            <> endpoint
+            <> " is not an https:// or http:// origin: daemons refuse any "
+            <> "other shape, so the record would be published and rejected",
+          )
+        _, False ->
+          Error(
+            "CP_ENDPOINTS entry "
+            <> endpoint
+            <> " has whitespace or a quote in it: the attach record is "
+            <> "whitespace-separated key=value pairs and either one changes "
+            <> "what it says",
+          )
+      }
+    }),
+  )
+  // `browse_endpoints` has already deduplicated, so the cap counts the
+  // records that will actually be published rather than the entries the
+  // operator typed.
+  case list.length(endpoints) > max_endpoints {
+    True ->
+      Error(
+        "CP_ENDPOINTS names more than "
+        <> int.to_string(max_endpoints)
+        <> " endpoints (including CP_PUBLIC_URL): every daemon in every "
+        <> "network opens a standing tunnel to each one, and the client "
+        <> "refuses to open more than that many",
+      )
+    False -> Ok(endpoints)
+  }
+}
+
+/// How many control-plane endpoints one apex may name.
+///
+/// The same ceiling the client applies (`MAX_CP_ENDPOINTS` in
+/// `crates/synch-net/src/dns.rs`), restated here so the refusal reaches the
+/// operator at boot rather than the fleet at its next refresh. Every entry
+/// costs every daemon a standing WebSocket, so the zone decides how much a
+/// node spends and the bound is what keeps that decision small.
+pub const max_endpoints = 8
+
+fn trim_trailing_slash(url: String) -> String {
+  case string.ends_with(url, "/") {
+    True -> trim_trailing_slash(string.drop_end(url, 1))
+    False -> url
   }
 }
 

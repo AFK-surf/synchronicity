@@ -118,17 +118,20 @@ pub fn render_gated(
   // Conditional, unlike the declaration: with the feature off there is no
   // endpoint to name, and the reconciler removes the record as it removes any
   // other record the desired set stopped containing.
-  let browse = case input.browse_url {
-    "" -> []
-    url -> [
+  //
+  // One record per endpoint at one name, as in serve mode: a fleet's nodes
+  // each hold their own registry of attached daemons, so each has to be
+  // named, and a provider holds several values at one owner name the same
+  // way a served RRset does.
+  let browse =
+    list.map(input.cp_endpoints, fn(url) {
       Record(
-        rdata.browse_label <> "." <> apex,
+        rdata.cp_label <> "." <> apex,
         provider.Txt,
         ttl_data,
         rdata.synccp1_text(url),
-      ),
-    ]
-  }
+      )
+    })
   Ok(sort(
     [diff.owner_record(apex), transparency, ..members]
     |> list.append(browse)

@@ -22,6 +22,7 @@ import api/agent
 import api/auth_api
 import api/browse_api
 import api/edge
+import api/reads
 import api/router
 import auth/github
 import auth/google
@@ -306,18 +307,17 @@ fn prepare_primary(cfg: Config) -> Result(keys.Csk, String) {
   Ok(csk)
 }
 
-/// The browse surface a deployment offers, or `option.None` with `CP_BROWSE`
-/// off — which is how every route, the tunnel and the apex record disappear
-/// together rather than one of them being left behind.
+/// The browse surface this node offers.
+///
+/// Every node offers one: the apex names it, and a daemon opens a tunnel to
+/// each name. What a *network* may be browsed is the org admin's switch
+/// (`networks.browse_enabled`), enforced at the endpoint, where a change
+/// takes effect at once rather than a TTL away.
 fn browse_surface(
   cfg: Config,
   agents: process.Name(agent.Msg),
-) -> option.Option(browse_api.Browse) {
-  case cfg.browse {
-    True ->
-      option.Some(browse_api.Browse(agents, agent.attach_url(cfg.public_url)))
-    False -> option.None
-  }
+) -> browse_api.Browse {
+  browse_api.Browse(agents, agent.attach_url(cfg.public_url))
 }
 
 fn serve() -> Result(Nil, String) {
@@ -332,9 +332,18 @@ fn serve() -> Result(Nil, String) {
 }
 
 /// A replica serves DNS/DoH from a database an external process refreshes
-/// (atomic rename); it holds no key material and mounts no product API.
+/// (atomic rename); it holds no key material and takes no writes.
 /// No reload signal exists or is needed: every pooled checkout reopens
 /// the database file, so a swapped replacement is seen on the next query.
+///
+/// It also serves the dashboard and the read half of the product API off
+/// that same copy, and the browse surface too — daemons attach *here*, to
+/// this node's own `CP_PUBLIC_URL`,
+/// because the registry of attached sessions is one process's memory and a
+/// node with no tunnel of its own can answer no browse question however
+/// faithfully the database replicated. The primary lists the fleet's
+/// endpoints in the apex record with `CP_ENDPOINTS`, and every daemon
+/// opens one tunnel per endpoint.
 fn serve_replica(cfg: Config) -> Result(Nil, String) {
   // Anchor/DS come from the replicated public key material; this also
   // verifies the database is readable and not from a newer build.
@@ -361,23 +370,32 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   })
   let dns_name = process.new_name("cp_dns_pool")
   let udp_name = process.new_name("cp_udp_server")
+  let agents_name = process.new_name("cp_agents")
   let dns_pool = pool.handle(dns_name, db.read_pragmas)
   let serving = dns_serve.Serving(dns_pool, meta.apex)
+  // The dashboard reads the same pool the nameserver does: both are
+  // read-only against the same replicated file, and a second pool would only
+  // double the workers competing for it.
+  let api = router.ReadOnly(reads.Reads(dns_pool), cfg.primary_url)
+  let browse = browse_surface(cfg, agents_name)
   let ctx =
     router.Context(
       keys.anchor_line(meta.apex, meta.dnskey_public),
       keys.ds_line(meta.apex, meta.dnskey_public),
-      option.None,
+      api,
       router.ServingZone(serving),
-      option.None,
+      browse,
     )
   let handler = fn(req) { router.handle(req, ctx) }
+  // The secret is the primary's, byte for byte (`CP_SESSION_SECRET`), or no
+  // cookie the primary minted verifies here.
   let http =
-    wisp_mist.handler(handler, "replica-has-no-sessions-0000000000000000")
+    wisp_mist.handler(handler, cfg.session_secret)
+    |> edge.handler(edge.Surface(browse, dns_pool, cfg.session_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)
-  use _ <- result.try(
+  let tree =
     sup.new(sup.OneForOne)
     |> sup.restart_tolerance(intensity: 60, period: 10)
     |> sup.add(pool.supervised(
@@ -385,7 +403,7 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       cfg.db_path,
       sqlite.ReadOnly,
       db.read_pragmas,
-      4,
+      replica_pool_size,
     ))
     |> sup.add(server_udp.supervised(
       udp_name,
@@ -398,6 +416,14 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
       cfg.dns_listen.port,
       serving,
     ))
+  // The registry before the listener, as on the primary: `sup` starts
+  // children in order, so mounting HTTP first would open a window where an
+  // attach or a browse call reaches a `cp_agents` name nothing has
+  // registered yet, and the request kills its connection handler instead of
+  // being answered.
+  use _ <- result.try(
+    tree
+    |> sup.add(agent.supervised(agents_name))
     |> sup.add(mist.supervised(http))
     |> sup.start
     |> result.map_error(fn(_) { "could not start supervision tree" }),
@@ -408,11 +434,25 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
     <> " — dns "
     <> endpoint(cfg.dns_listen)
     <> " http "
-    <> endpoint(cfg.http_listen),
+    <> endpoint(cfg.http_listen)
+    <> " — read-only dashboard, writes at "
+    <> cfg.primary_url
+    <> " — attach at "
+    <> agent.attach_url(cfg.public_url),
   )
   process.sleep_forever()
   Ok(Nil)
 }
+
+/// How many pooled readers a replica runs.
+///
+/// The primary's eight rather than the four a nameserver alone would need. A
+/// DNS answer is one short read out of a pre-signed table, but a replica also
+/// serves the dashboard: a browse call resolves its org on a connection, and
+/// `router.with_session` borrows one to check the cookie before the handler
+/// borrows its own. At four, a handful of dashboard tabs would queue DNS
+/// answers behind them.
+const replica_pool_size = 8
 
 fn serve_primary(cfg: Config) -> Result(Nil, String) {
   use csk <- result.try(prepare_primary(cfg))
@@ -435,8 +475,8 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   let browse = browse_surface(cfg, agents_name)
   let auth =
     auth_api.AuthContext(
-      api_pool,
-      cfg.public_url,
+      reads.Reads(api_pool),
+      cfg.entry_url,
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
@@ -450,14 +490,14 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
     router.Context(
       keys.anchor_line(apex, csk.public),
       keys.ds_line(apex, csk.public),
-      option.Some(auth),
+      router.Writable(auth),
       router.ServingZone(serving),
       browse,
     )
   let handler = fn(req) { router.handle(req, ctx) }
   let http =
     wisp_mist.handler(handler, cfg.session_secret)
-    |> edge.handler(edge.surface(browse, api_pool, cfg.session_secret))
+    |> edge.handler(edge.Surface(browse, api_pool, cfg.session_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)
@@ -561,8 +601,8 @@ fn serve_external(
   let browse = browse_surface(cfg, agents_name)
   let auth =
     auth_api.AuthContext(
-      api_pool,
-      cfg.public_url,
+      reads.Reads(api_pool),
+      cfg.entry_url,
       mail,
       option.map(cfg.google, fn(pair) { google.provider(pair.0, pair.1) }),
       option.map(cfg.github, fn(pair) { github.provider(pair.0, pair.1) }),
@@ -579,14 +619,14 @@ fn serve_external(
     router.Context(
       "",
       "",
-      option.Some(auth),
+      router.Writable(auth),
       router.ExternalZone(api_pool),
       browse,
     )
   let handler = fn(req) { router.handle(req, ctx) }
   let http =
     wisp_mist.handler(handler, cfg.session_secret)
-    |> edge.handler(edge.surface(browse, api_pool, cfg.session_secret))
+    |> edge.handler(edge.Surface(browse, api_pool, cfg.session_secret))
     |> mist.new
     |> mist.bind(cfg.http_listen.address)
     |> mist.port(cfg.http_listen.port)
@@ -720,7 +760,7 @@ fn seed_admin(email: String) -> Result(Nil, String) {
   )
   io.println(
     "one-time sign-in link (15 minutes):\n"
-    <> cfg.public_url
+    <> cfg.entry_url
     <> "/auth/magic/redeem?token="
     <> token,
   )

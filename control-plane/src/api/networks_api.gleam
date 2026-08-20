@@ -9,6 +9,7 @@ import api/common.{
   find_network, ok_json, require_org, text_at, zone_mutation,
 }
 import api/middleware.{error_json, now_unix}
+import api/reads.{type Reads}
 import auth/session.{type Session}
 import dns/name
 import gleam/dynamic/decode
@@ -21,12 +22,8 @@ import wisp.{type Request, type Response}
 import zone/model
 import zone/publish
 
-pub fn list_networks(
-  ctx: AuthContext,
-  live: Session,
-  slug: String,
-) -> Response {
-  with_db(ctx, fn(conn) {
+pub fn list_networks(reads: Reads, live: Session, slug: String) -> Response {
+  reads.with_db(reads, fn(conn) {
     use org_id, _ <- require_org(conn, slug, live.user_id, Member)
     let rows =
       sqlite.query(
@@ -94,12 +91,12 @@ pub fn create_network(
 }
 
 pub fn network_detail(
-  ctx: AuthContext,
+  reads: Reads,
   live: Session,
   slug: String,
   network: String,
 ) -> Response {
-  with_db(ctx, fn(conn) {
+  reads.with_db(reads, fn(conn) {
     use org_id, _ <- require_org(conn, slug, live.user_id, Member)
     case find_network(conn, org_id, network) {
       Error(Nil) -> error_json(404, "not_found", "no such network")

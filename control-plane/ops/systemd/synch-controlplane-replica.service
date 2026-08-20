@@ -1,6 +1,12 @@
 # A replica: DNS + DoH from a database file an EXTERNAL process refreshes
 # (litestream restore loop, rsync — operator-owned; see RUNBOOK.md). The
 # service itself never runs or supervises the replication tool.
+#
+# It also serves the dashboard, the read half of the API and the file
+# browser off that same copy. Daemons attach to this node's own
+# CP_PUBLIC_URL, which the primary lists in CP_ENDPOINTS; writes are refused
+# here and named to the operator's browser as CP_PRIMARY_URL. See RUNBOOK.md
+# "A replica that also serves the dashboard".
 [Unit]
 Description=synchronicity control plane (replica)
 After=network-online.target

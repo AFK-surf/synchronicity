@@ -213,13 +213,17 @@ pub const transparency_label = "_synchronicity-transparency"
 /// What the declaration says.
 pub const transparency_text = "v=sync1 transparency"
 
-/// The label the cloud-attach endpoint lives under, one below the apex.
+/// The label this base's control-plane endpoints live under, one below the
+/// apex.
 ///
 /// Beside the transparency declaration and for the same reason: every network
-/// under one base attaches to the same control plane, so the endpoint is one
+/// under one base has the same control plane, so the endpoint is one
 /// deployment fact at one name — not a copy per network, where the copies can
 /// skew and every browse toggle becomes a zone mutation.
-pub const browse_label = "_synchronicity-cp"
+///
+/// Named for the record rather than for cloud attach, which is only the first
+/// thing to dial it.
+pub const cp_label = "_synchronicity-cp"
 
 /// Renders the attach record's text: `v=synccp1 url=<endpoint>`.
 ///

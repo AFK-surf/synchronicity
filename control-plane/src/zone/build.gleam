@@ -140,12 +140,23 @@ pub fn build(input: ZoneInput) -> Result(List(Rrset), BuildError) {
   // offer cloud attach has no endpoint to name, and the name simply does not
   // exist — which is what a daemon's fail-closed discovery reads as "there is
   // nowhere to attach", rather than as an endpoint it should keep retrying.
-  let browse = case input.browse_url {
-    "" -> []
-    url -> [
-      Rrset([rdata.browse_label, ..apex], wire.type_txt, ttl_data, [
-        rdata.txt(rdata.synccp1_text(url)),
-      ]),
+  //
+  // One RRset, one rdata per endpoint. A fleet's nodes each hold their own
+  // registry of attached daemons, so every node that may be asked a browse
+  // question has to be named here — and naming them as separate records
+  // rather than as several `url=` fields in one is what keeps a daemon built
+  // before the fleet existed working: it reads the first record it can parse
+  // and attaches to that node, where a second `url=` in one record is a
+  // duplicate field it refuses outright.
+  let browse = case input.cp_endpoints {
+    [] -> []
+    urls -> [
+      Rrset(
+        [rdata.cp_label, ..apex],
+        wire.type_txt,
+        ttl_data,
+        list.map(urls, fn(url) { rdata.txt(rdata.synccp1_text(url)) }),
+      ),
     ]
   }
 

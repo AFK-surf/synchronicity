@@ -17,13 +17,14 @@ fn primary_env() -> Nil {
   envoy.unset("CP_HTTP_LISTEN")
   envoy.unset("CP_DNS_LISTEN")
   envoy.unset("CP_NS_HOSTS")
-  envoy.unset("CP_PUBLIC_URL")
+  // Required now: every node publishes an attach endpoint at the apex, and
+  // the record names this.
+  envoy.set("CP_PUBLIC_URL", "https://sync.test")
   envoy.unset("CP_SMTP_HOST")
   envoy.unset("CP_GOOGLE_CLIENT_ID")
   envoy.unset("CP_GOOGLE_CLIENT_SECRET")
   envoy.unset("CP_GITHUB_CLIENT_ID")
   envoy.unset("CP_GITHUB_CLIENT_SECRET")
-  envoy.unset("CP_BROWSE")
 }
 
 pub fn listen_defaults_to_all_interfaces_test() {

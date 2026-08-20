@@ -8,11 +8,18 @@
 //// Space and path travel as query parameters, never path segments: a file
 //// path may contain anything, which is the same lesson the S3 gateway learnt
 //// when it stopped putting keys through the CLI's text parser.
+////
+//// Reads are not recorded. A browse call is a read of an operator's own
+//// files through a tunnel their own daemon opened, and the durable half of
+//// the feature is the switch that permits it — `networks.browse_enabled`,
+//// whose every flip *is* audited. A per-download row would be a log of
+//// ordinary use, written on whichever node happened to serve it.
 
 import api/agent.{type Session}
 import api/auth_api.{type AuthContext}
 import api/common.{Admin, Member, audit, check_org, db_error, ok_json}
-import api/middleware.{error_json, now_unix}
+import api/middleware.{error_json}
+import api/reads.{type Reads}
 import auth/session.{type Session as UserSession}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Name}
@@ -41,13 +48,13 @@ type Network {
 /// The observability surface for the feature: attach count, per-session
 /// spaces, protocol version, attach time.
 pub fn status(
-  ctx: AuthContext,
+  reads: Reads,
   browse: Browse,
   live: UserSession,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(ctx, live, slug, network, Member)
+  use net <- with_network(reads, live, slug, network, Member)
   let sessions = attached(browse, net)
   ok_json(
     json.object([
@@ -76,13 +83,13 @@ pub fn status(
 /// answering one it is switched off for would make the switch mean two
 /// different things.
 pub fn delegations(
-  ctx: AuthContext,
+  reads: Reads,
   browse: Browse,
   live: UserSession,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(ctx, live, slug, network, Member)
+  use net <- with_network(reads, live, slug, network, Member)
   case net.enabled, attached(browse, net) {
     False, _ ->
       error_json(
@@ -130,13 +137,13 @@ fn delegation_json(row: agent.Delegation) -> Json {
 /// One directory of the unified tree.
 pub fn ls(
   req: Request,
-  ctx: AuthContext,
+  reads: Reads,
   browse: Browse,
   live: UserSession,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(ctx, live, slug, network, Member)
+  use net <- with_network(reads, live, slug, network, Member)
   let space = query(req, "space")
   let path = query(req, "path")
   let origin = query(req, "origin")
@@ -164,13 +171,13 @@ pub fn ls(
 /// Every version of one path, with its attestors — the version inspector.
 pub fn stat(
   req: Request,
-  ctx: AuthContext,
+  reads: Reads,
   browse: Browse,
   live: UserSession,
   slug: String,
   network: String,
 ) -> Response {
-  use net <- with_network(ctx, live, slug, network, Member)
+  use net <- with_network(reads, live, slug, network, Member)
   let space = query(req, "space")
   let path = query(req, "path")
   let origin = query(req, "origin")
@@ -213,9 +220,9 @@ pub fn set_enabled(
     decode.success(enabled)
   }
   use enabled <- common.body_decoder(req, decoder)
-  use net <- with_network(ctx, live, slug, network, Admin)
+  use net <- with_network(ctx.reads, live, slug, network, Admin)
   let written =
-    pool.with_connection(ctx.pool, fn(conn) {
+    pool.with_connection(ctx.reads.pool, fn(conn) {
       common.transaction(conn, fn() {
         case
           sqlite.exec(
@@ -277,7 +284,7 @@ pub fn set_enabled(
 /// Resolves the org, the role floor and the network, giving the connection
 /// back before `next` runs.
 fn with_network(
-  ctx: AuthContext,
+  reads: Reads,
   live: UserSession,
   slug: String,
   network: String,
@@ -285,7 +292,7 @@ fn with_network(
   next: fn(Network) -> Response,
 ) -> Response {
   let looked =
-    pool.with_connection(ctx.pool, fn(conn) {
+    pool.with_connection(reads.pool, fn(conn) {
       resolve(conn, slug, network, live.user_id, minimum)
     })
   case looked {
@@ -453,41 +460,4 @@ fn version_json(version: agent.Version) -> Json {
     #("seq", json.int(version.seq)),
     #("attestors", json.array(version.attestors, json.string)),
   ])
-}
-
-/// Records one download in the org's audit trail.
-///
-/// The row names the user, the network, the space, the path, the version root
-/// served and the bytes that reached the client — enough to answer "who read
-/// what" from the same table and the same UI the org already reads.
-pub fn audit_download(
-  db: pool.Pool,
-  user_id: String,
-  org_id: String,
-  network: String,
-  space: String,
-  path: String,
-  root: String,
-  bytes: Int,
-  outcome: String,
-) -> Nil {
-  let _ =
-    pool.with_connection(db, fn(conn) {
-      audit(
-        conn,
-        user_id,
-        org_id,
-        "browse.download",
-        json.object([
-          #("network", json.string(network)),
-          #("space", json.string(space)),
-          #("path", json.string(path)),
-          #("root", json.string(root)),
-          #("bytes", json.int(bytes)),
-          #("outcome", json.string(outcome)),
-          #("at", json.int(now_unix())),
-        ]),
-      )
-    })
-  Nil
 }

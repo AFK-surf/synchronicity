@@ -126,6 +126,18 @@ pub const CP_TXT_PREFIX: &str = "_synchronicity-cp";
 /// The version tag a control-plane attach record opens with.
 pub const CP_RECORD_VERSION_TAG: &str = "synccp1";
 
+/// How many attach endpoints one apex may name.
+///
+/// Each one costs this daemon a standing WebSocket it opens, heartbeats and
+/// reconnects for the life of the process, and the number is chosen by the
+/// zone rather than by the operator of the node paying for it. A fleet is a
+/// primary and its nameservers; eight is well past any of them and far short
+/// of a number a hostile or misconfigured zone could make expensive. The
+/// control plane refuses to publish more than this
+/// (`config.max_browse_endpoints`), so the two ends agree on the bound and
+/// an operator hears about it at boot rather than by counting sockets.
+pub const MAX_CP_ENDPOINTS: usize = 8;
+
 /// The query name a base's control-plane attach record lives under.
 ///
 /// One record per apex, beside the transparency declaration and the proof set,
@@ -1262,10 +1274,21 @@ impl DnssecResolver {
     ///
     /// The TTL is the shorter of the two answers': the endpoint is only as
     /// believable as the apex that led to it.
+    ///
+    /// **Every usable record, not the first one.** A control plane is a
+    /// fleet, and the registry of attached daemons is one node's memory: a
+    /// node nobody holds a tunnel to can answer no browse question however
+    /// faithfully its database replicated. So the apex names each node with
+    /// a record of its own, and the caller opens a tunnel to each. Reading
+    /// them as several records rather than as several `url=` fields in one
+    /// is what lets a zone add a node without breaking a daemon built before
+    /// it: an older client takes the first record it can parse and reaches
+    /// one node of the fleet, where a second `url=` would be a duplicate
+    /// field it refuses outright.
     pub async fn control_plane(
         &self,
         domain: &str,
-    ) -> Result<(ControlPlaneRecord, Duration), NetError> {
+    ) -> Result<(Vec<ControlPlaneRecord>, Duration), NetError> {
         let domain = normalize_domain(domain).map_err(|e| NetError::Dns(e.to_string()))?;
         let name = query_name(&domain);
         // The membership answer is what yields the apex the attach record
@@ -1323,18 +1346,42 @@ impl DnssecResolver {
         // connection sits on top of that; on an `http://` one the zone key is
         // the whole of it, which is the reason the gate has to be real.
         let mut refusal = None;
+        let mut endpoints: Vec<ControlPlaneRecord> = Vec::new();
         for record in validated.records() {
             match parse_control_plane_record(record) {
                 Ok(record) => {
-                    return Ok((record, validated.ttl().min(membership.ttl())));
+                    if !endpoints.contains(&record) {
+                        endpoints.push(record);
+                    }
                 }
                 Err(e) => refusal = Some(e),
             }
         }
-        Err(match refusal {
-            Some(e) => NetError::Dns(format!("{cp_name}: no usable control-plane record ({e})")),
-            None => NetError::Dns(format!("{cp_name}: no control-plane record")),
-        })
+        if endpoints.is_empty() {
+            return Err(match refusal {
+                Some(e) => {
+                    NetError::Dns(format!("{cp_name}: no usable control-plane record ({e})"))
+                }
+                None => NetError::Dns(format!("{cp_name}: no control-plane record")),
+            });
+        }
+        // An RRset arrives in whatever order the wire happened to carry it,
+        // and a caller that opens one tunnel per endpoint must not open a
+        // different *set* on each refresh — so the order is the zone's data
+        // rather than the answer's arrival, and the cap cuts a fixed
+        // prefix instead of an arbitrary one.
+        endpoints.sort_by(|a, b| a.url.cmp(&b.url));
+        if endpoints.len() > MAX_CP_ENDPOINTS {
+            tracing::warn!(
+                name = %cp_name,
+                named = endpoints.len(),
+                cap = MAX_CP_ENDPOINTS,
+                "the apex names more control-plane endpoints than a daemon will attach to; \
+                 the rest are ignored"
+            );
+            endpoints.truncate(MAX_CP_ENDPOINTS);
+        }
+        Ok((endpoints, validated.ttl().min(membership.ttl())))
     }
 
     /// Walks Sigstore's TUF repository and adopts what it served if it is

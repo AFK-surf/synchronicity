@@ -12,7 +12,7 @@
 //// The SPA's preview fetches these bytes and renders them as text or as an
 //// image only, never as HTML, which keeps that boundary intact.
 
-import api/agent.{type Relay, type Session}
+import api/agent.{type Session}
 import api/browse_api.{type Browse}
 import auth/session
 import gleam/bit_array
@@ -37,18 +37,11 @@ fn now_unix() -> Int
 /// between two ticks is a dead tunnel dressed as a slow one.
 const watchdog_ms = 60_000
 
-/// What one download needs to know about itself: the audit row it will write,
-/// and the slot it has to give back.
+/// What one download needs to know about itself: the concurrency slot it has
+/// to give back and who to give it back for, plus the path the filename in
+/// `Content-Disposition` comes from.
 type Download {
-  Download(
-    db: Pool,
-    registry: Subject(agent.Msg),
-    user_id: String,
-    org_id: String,
-    network: String,
-    space: String,
-    path: String,
-  )
+  Download(registry: Subject(agent.Msg), user_id: String, path: String)
 }
 
 /// `GET /api/orgs/:slug/networks/:net/browse/file?space=&path=&from=&origin=`
@@ -68,7 +61,7 @@ pub fn handle(
   let origin = param(params, "origin")
 
   use user_id <- require_user(req, db, secret)
-  use #(org_id, network_id, enabled) <- require_network(
+  use #(_org_id, network_id, enabled) <- require_network(
     db,
     user_id,
     slug,
@@ -82,13 +75,10 @@ pub fn handle(
   )
 
   let registry = browse_api.registry(browse)
-  // The read-attempt trail is complete: from here on every refusal writes a
-  // `browse.download` audit row too, so "who tried to read what" is answerable
-  // for the failures as well as the successes.
-  let download = Download(db, registry, user_id, org_id, network, space, path)
+  let download = Download(registry, user_id, path)
   let sessions = agent.sessions_for(registry, network_id)
   case browse_api.pick(space, sessions, origin) {
-    Error(message) -> deny(download, "", 503, "no-device-attached", message)
+    Error(message) -> deny(503, message)
     Ok(first) ->
       // A read is a same-origin GET with cookies and needs no CSRF token, so a
       // hostile page can start one from an `img` tag. The cap is what stops it
@@ -96,10 +86,7 @@ pub fn handle(
       case agent.claim_stream(registry, user_id) {
         False ->
           deny(
-            download,
-            "",
             429,
-            "too-many-downloads",
             "too many downloads open at once (limit "
               <> int.to_string(agent.streams_per_user())
               <> ")",
@@ -112,13 +99,7 @@ pub fn handle(
           case agent.ask(first, agent.Resolve(space, path, from)) {
             Error(refusal) -> {
               agent.release_stream(registry, user_id)
-              deny(
-                download,
-                "",
-                status_of(refusal.code),
-                refusal.code,
-                refusal.message,
-              )
+              deny(status_of(refusal.code), refusal.message)
             }
             Ok(agent.Resolved(_origin, root, size, _seq, holders)) -> {
               // A named node serves the bytes it resolved — its blob fetcher
@@ -140,7 +121,7 @@ pub fn handle(
               case wanted_range(req, size) {
                 Error(Nil) -> {
                   agent.release_stream(registry, user_id)
-                  deny_range(download, root, size)
+                  deny_range(size)
                 }
                 Ok(#(start, length, partial)) ->
                   stream(
@@ -157,60 +138,21 @@ pub fn handle(
             }
             Ok(_) -> {
               agent.release_stream(registry, user_id)
-              deny(
-                download,
-                "",
-                502,
-                "bad-answer",
-                "the daemon answered the wrong question",
-              )
+              deny(502, "the daemon answered the wrong question")
             }
           }
       }
   }
 }
 
-/// Records a refused download in the same trail the successes land in, then
-/// returns the plain-text refusal.
-fn deny(
-  download: Download,
-  root: String,
-  status: Int,
-  outcome: String,
-  message: String,
-) -> HttpResponse(mist.ResponseData) {
-  browse_api.audit_download(
-    download.db,
-    download.user_id,
-    download.org_id,
-    download.network,
-    download.space,
-    download.path,
-    root,
-    0,
-    outcome,
-  )
+/// The plain-text refusal a download ends on.
+fn deny(status: Int, message: String) -> HttpResponse(mist.ResponseData) {
   refused(status, message)
 }
 
 /// A 416 carries `Content-Range: bytes */<size>` (RFC 7233 §4.2), so a client
 /// learns the object's real length rather than only that its range was wrong.
-fn deny_range(
-  download: Download,
-  root: String,
-  size: Int,
-) -> HttpResponse(mist.ResponseData) {
-  browse_api.audit_download(
-    download.db,
-    download.user_id,
-    download.org_id,
-    download.network,
-    download.space,
-    download.path,
-    root,
-    0,
-    "range-not-satisfiable",
-  )
+fn deny_range(size: Int) -> HttpResponse(mist.ResponseData) {
   refused(
     416,
     "that Range is not satisfiable for a "
@@ -287,12 +229,12 @@ fn stream(
       }
       case agent.relay_step(relay, event, conn) {
         agent.Relaying(next) -> mist.ChunkContinue(#(next, sink))
-        agent.Finished(next) -> {
-          record(download, next, "ok")
+        agent.Finished(_next) -> {
+          record(download)
           mist.ChunkStop
         }
-        agent.Failed(next, why) -> {
-          record(download, next, why)
+        agent.Failed(_next, why) -> {
+          record(download)
           // Aborted rather than closed cleanly: a truncated body must never
           // reach a browser as a complete file.
           mist.ChunkAbort(why)
@@ -302,19 +244,9 @@ fn stream(
   )
 }
 
-fn record(download: Download, relay: Relay, outcome: String) -> Nil {
+/// Gives the download's concurrency slot back, however the stream ended.
+fn record(download: Download) -> Nil {
   agent.release_stream(download.registry, download.user_id)
-  browse_api.audit_download(
-    download.db,
-    download.user_id,
-    download.org_id,
-    download.network,
-    download.space,
-    download.path,
-    agent.relay_root(relay),
-    agent.relay_sent(relay),
-    outcome,
-  )
 }
 
 // -- request plumbing --------------------------------------------------------

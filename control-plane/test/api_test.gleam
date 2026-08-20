@@ -1,6 +1,7 @@
 import api/agent
 import api/auth_api
 import api/browse_api
+import api/reads
 import api/router
 import api/skill
 import auth/google
@@ -57,7 +58,7 @@ fn harness_sized(pool_size: Int) -> Harness {
   let assert Ok(apex) = dns_name.parse("sync.test.")
   let auth =
     auth_api.AuthContext(
-      api_pool,
+      reads.Reads(api_pool),
       "http://cp.test",
       mailer.LogOnly,
       None,
@@ -67,13 +68,15 @@ fn harness_sized(pool_size: Int) -> Harness {
       },
       fn() { Nil },
     )
+  let agents = process.new_name("cp_agents_test_" <> id.new())
+  let assert Ok(_) = agent.start(agents)
   Harness(
     router.Context(
       "anchor",
       "ds",
-      Some(auth),
+      router.Writable(auth),
       router.ServingZone(serve.Serving(dns_pool, apex)),
-      None,
+      browse_api.Browse(agents, "https://cp.test/agent/v1/attach"),
     ),
     db_path,
     token,
@@ -121,8 +124,8 @@ fn with_auth(
   h: Harness,
   change: fn(auth_api.AuthContext) -> auth_api.AuthContext,
 ) -> Harness {
-  let assert Some(auth) = h.ctx.auth
-  Harness(..h, ctx: router.Context(..h.ctx, auth: Some(change(auth))))
+  let assert router.Writable(auth) = h.ctx.api
+  Harness(..h, ctx: router.Context(..h.ctx, api: router.Writable(change(auth))))
 }
 
 pub fn auth_methods_lists_only_configured_test() {
@@ -160,74 +163,15 @@ pub fn auth_methods_lists_only_configured_test() {
   assert string.contains(both, "\"magic_link\":true")
 }
 
-/// With `CP_BROWSE` off the browse routes do not exist. Not mounted and
-/// refusing — absent, the same answer a replica gives for the whole product
-/// API, so a deployment that has not turned the feature on has no surface to
-/// have got wrong.
-pub fn browse_routes_are_absent_unless_the_feature_is_on_test() {
-  let h = harness()
-  let assert Ok(_) =
-    call_json(
-      h,
-      Post,
-      "/api/orgs",
-      json.object([
-        #("slug", json.string("acme")),
-        #("name", json.string("Acme")),
-      ]),
-    )
-    |> fn(r) {
-      case r.status {
-        200 -> Ok(Nil)
-        _ -> Error(Nil)
-      }
-    }
-  let assert Ok(_) =
-    call_json(
-      h,
-      Post,
-      "/api/orgs/acme/networks",
-      json.object([#("name", json.string("prod"))]),
-    )
-    |> fn(r) {
-      case r.status {
-        200 -> Ok(Nil)
-        _ -> Error(Nil)
-      }
-    }
-  for_each_browse_route(fn(method, path) {
-    let resp = case method {
-      Get -> call(h, authed(h, Get, path))
-      _ ->
-        call_json(h, method, path, json.object([#("enabled", json.bool(True))]))
-    }
-    assert resp.status == 404
-  })
-}
-
-/// Every route the feature adds, so a new one cannot be added without
-/// deciding what it does with the feature off.
-fn for_each_browse_route(check: fn(http.Method, String) -> Nil) -> Nil {
-  let base = "/api/orgs/acme/networks/prod/browse"
-  check(Get, base)
-  check(Get, base <> "/ls?space=media&path=")
-  check(Get, base <> "/stat?space=media&path=a.txt")
-  check(Put, base <> "/enabled")
-}
-
-/// With it on: the org's switch is off until an admin flips it, flipping it
-/// is audited, and a network nobody has attached to answers honestly rather
-/// than emptily.
+/// The org's switch is off until an admin flips it, flipping it is audited,
+/// and a network nobody has attached to answers honestly rather than emptily.
+///
+/// The deployment always offers the surface — the apex names this node and
+/// daemons dial it — so this switch is the whole of the gate, and it is the
+/// org's to hold.
 pub fn the_org_switch_gates_browsing_test() {
   let h = harness()
-  let name = process.new_name("cp_agents_test")
-  let assert Ok(_) = agent.start(name)
-  let ctx =
-    router.Context(
-      ..h.ctx,
-      browse: Some(browse_api.Browse(name, "https://cp.test/agent/v1/attach")),
-    )
-  let browsing = Harness(..h, ctx: ctx)
+  let browsing = h
   let assert Ok(_) =
     call_json(
       browsing,
@@ -1440,13 +1384,222 @@ pub fn one_request_needs_one_connection_test() {
   assert resp.status == 200
 }
 
+// -- the read-only surface ---------------------------------------------------
+
+/// The same harness reading through a replica's surface: the read half of
+/// the API over the same tables, and the primary's URL for the other half.
+///
+/// The database is the primary's own file rather than a copy, which is the
+/// point — a replica's copy is byte-identical, so what the surface answers is
+/// exactly what the primary would, and any difference is the router's doing
+/// rather than the data's.
+fn read_only(h: Harness, primary_url: String) -> Harness {
+  let assert router.Writable(auth) = h.ctx.api
+  Harness(
+    ..h,
+    ctx: router.Context(..h.ctx, api: router.ReadOnly(auth.reads, primary_url)),
+  )
+}
+
+/// Every GET the primary answers, a read-only node answers identically:
+/// the tables are the same and the handlers are mounted once.
+pub fn a_read_only_node_answers_every_read_test() {
+  let h = harness()
+  let replica = read_only(h, "https://sync.test")
+  let reads = [
+    "/api/me",
+    "/api/orgs/acme",
+    "/api/orgs/acme/members",
+    "/api/orgs/acme/networks",
+    "/api/orgs/acme/devices",
+    "/api/orgs/acme/audit",
+  ]
+  // An org to read, created through the surface that can create one.
+  let created =
+    call_json(
+      h,
+      http.Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    )
+  assert created.status == 200
+
+  list.each(reads, fn(path) {
+    let from_primary = call(h, authed(h, http.Get, path))
+    let from_replica = call(replica, authed(replica, http.Get, path))
+    assert from_replica.status == from_primary.status
+    assert simulate.read_body(from_replica) == simulate.read_body(from_primary)
+  })
+
+  // And the dashboard itself: a node that answers the reads serves the pages
+  // that make them. There is no built SPA in a test tree, so what is asserted
+  // is that the request is not refused for the reason it used to be — the
+  // static handler's own "nothing to serve" 404 is indistinguishable here,
+  // but a routing refusal would be the same 404 on the primary too.
+  let spa = call(replica, simulate.request(http.Get, "/orgs/acme"))
+  assert spa.status == call(h, simulate.request(http.Get, "/orgs/acme")).status
+}
+
+/// A write is refused with the address of the node that takes it — not a
+/// 404, which tells an operator nothing, and not a 500 from sqlite about a
+/// read-only file, which tells them about the wrong layer.
+pub fn a_read_only_node_names_where_the_writes_go_test() {
+  let replica = read_only(harness(), "https://sync.test")
+  let refused =
+    call_json(
+      replica,
+      http.Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    )
+  assert refused.status == 409
+  let body = simulate.read_body(refused)
+  assert string.contains(body, "read-only-replica")
+  assert string.contains(body, "\"primary\":\"https://sync.test\"")
+
+  // The sign-in flows are writes too — they mint the session everything else
+  // is gated on — so they are refused by the same rule.
+  let magic =
+    call_json(
+      replica,
+      http.Post,
+      "/auth/magic",
+      json.object([#("email", json.string("someone@example.com"))]),
+    )
+  assert magic.status == 409
+
+  // A path that exists on no node is still the 404 it would be anywhere: the
+  // refusal names a place to go, and there is nowhere to send a typo.
+  let nonsense = call(replica, authed(replica, http.Get, "/api/nope"))
+  assert nonsense.status == 404
+
+  // The sign-in flows under GET are browser navigations, not fetches, so a
+  // stale bookmark or a second tab is redirected to the node that can
+  // complete it rather than dead-ended — query and all, since `?link=1` is
+  // what makes a start URL a linking flow rather than a sign-in.
+  let start =
+    call(replica, simulate.request(http.Get, "/auth/start/google?link=1"))
+  assert start.status == 303
+  assert list.key_find(start.headers, "location")
+    == Ok("https://sync.test/auth/start/google?link=1")
+}
+
+/// The login screen asks what it may offer before a session exists. On a
+/// read-only node the honest answer is "nothing here, and here is where":
+/// every method false, and the primary named.
+pub fn a_read_only_node_offers_no_sign_in_but_names_one_test() {
+  let replica = read_only(harness(), "https://sync.test")
+  let body =
+    simulate.read_body(call(
+      replica,
+      simulate.request(http.Get, "/api/auth/methods"),
+    ))
+  assert string.contains(body, "\"magic_link\":false")
+  assert string.contains(body, "\"google\":false")
+  assert string.contains(body, "\"primary\":\"https://sync.test\"")
+
+  // The primary names no one else: it is the place.
+  let here =
+    simulate.read_body(call(
+      harness(),
+      simulate.request(http.Get, "/api/auth/methods"),
+    ))
+  assert string.contains(here, "\"primary\":\"\"")
+}
+
+/// The browse surface is a read surface, so a read-only node serves it — and
+/// must, since the registry of attached daemons is one node's memory and a
+/// node no daemon attached to answers nothing.
+///
+/// The one write in the surface is the org's own switch, and that goes where
+/// every other write goes.
+pub fn a_read_only_node_serves_the_browse_surface_test() {
+  let h = harness()
+  let name = process.new_name("cp_agents_replica_test")
+  let assert Ok(_) = agent.start(name)
+  let browsing =
+    Harness(
+      ..h,
+      ctx: router.Context(
+        ..h.ctx,
+        browse: browse_api.Browse(name, "https://cp1.test/agent/v1/attach"),
+      ),
+    )
+  let assert 200 =
+    call_json(
+      browsing,
+      Post,
+      "/api/orgs",
+      json.object([
+        #("slug", json.string("acme")),
+        #("name", json.string("Acme")),
+      ]),
+    ).status
+  let assert 200 =
+    call_json(
+      browsing,
+      Post,
+      "/api/orgs/acme/networks",
+      json.object([#("name", json.string("prod"))]),
+    ).status
+  let assert 200 =
+    call_json(
+      browsing,
+      Put,
+      "/api/orgs/acme/networks/prod/browse/enabled",
+      json.object([#("enabled", json.bool(True))]),
+    ).status
+
+  let replica = read_only(browsing, "https://sync.test")
+
+  // Status reads, and names *this* node's attach URL — the one its own
+  // daemons dialled, not the primary's.
+  let status =
+    call(replica, authed(replica, Get, "/api/orgs/acme/networks/prod/browse"))
+  assert status.status == 200
+  let body = simulate.read_body(status)
+  assert string.contains(body, "\"enabled\":true")
+  assert string.contains(body, "https://cp1.test/agent/v1/attach")
+
+  // A listing reaches the same refusal the primary gives with nothing
+  // attached, which is what says the route ran rather than 404ing.
+  let listing =
+    call(
+      replica,
+      authed(
+        replica,
+        Get,
+        "/api/orgs/acme/networks/prod/browse/ls?space=media&path=",
+      ),
+    )
+  assert listing.status == 503
+  assert string.contains(simulate.read_body(listing), "no-device-attached")
+
+  // The org's switch is a write like any other.
+  let flip =
+    call_json(
+      replica,
+      Put,
+      "/api/orgs/acme/networks/prod/browse/enabled",
+      json.object([#("enabled", json.bool(False))]),
+    )
+  assert flip.status == 409
+  assert string.contains(simulate.read_body(flip), "read-only-replica")
+}
+
 pub fn with_db_discards_conn_on_panic_test() {
   // A panic inside a request handler must not leak the connection: wisp
   // rescues crashes, so the process survives — only with_db's deferred
   // close stands between a panicking handler and a csqlite process
   // holding the write lock for the life of the HTTP connection.
   let h = harness()
-  let assert router.Context(_, _, Some(auth), _, _) = h.ctx
+  let assert router.Context(_, _, router.Writable(auth), _, _) = h.ctx
   let _ =
     exception.rescue(fn() {
       auth_api.with_db(auth, fn(conn) {
@@ -1508,12 +1661,14 @@ pub fn skill_md_is_served_by_every_role_test() {
   // Enough of the document to know it is the guide and not, say, index.html.
   assert string.contains(body(served), "synch daemon run")
 
-  // A replica: no auth context, so every product route and the SPA fallback
-  // are 404. This one is not.
-  let replica = Harness(..h, ctx: router.Context(..h.ctx, auth: None))
-  let from_replica = call(replica, simulate.request(Get, "/SKILL.md"))
-  assert from_replica.status == 200
-  assert body(from_replica) == body(served)
+  // Role-agnostic, so a read-only node serves the same document: it needs no
+  // session, no writable database and no zone key, and an operator pointed at
+  // any node of a deployment gets the same guide from the same URL. That is
+  // the only property that makes the URL worth handing out.
+  let replica = read_only(h, "https://sync.test")
+  let elsewhere = call(replica, simulate.request(Get, "/SKILL.md"))
+  assert elsewhere.status == 200
+  assert body(elsewhere) == body(served)
 
   // Read-only: anything but a GET is a refusal, not a fallthrough.
   assert call(h, authed(h, Post, "/SKILL.md")).status == 405

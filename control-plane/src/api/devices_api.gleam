@@ -10,11 +10,11 @@ import api/common.{
   require_org, text_at, zone_mutation,
 }
 import api/middleware.{error_json, now_unix}
+import api/reads.{type Reads}
 import auth/session.{type Session}
 import dns/name
 import gleam/dynamic/decode
 import gleam/json
-import gleam/option.{type Option, Some}
 import gleam/result
 import store/sqlite.{Blob, Int as VInt, Text}
 import util/id
@@ -42,8 +42,8 @@ fn bad_hint(relay: String, addr: String) -> build.BuildError {
   }
 }
 
-pub fn list_devices(ctx: AuthContext, live: Session, slug: String) -> Response {
-  with_db(ctx, fn(conn) {
+pub fn list_devices(reads: Reads, live: Session, slug: String) -> Response {
+  reads.with_db(reads, fn(conn) {
     use org_id, _ <- require_org(conn, slug, live.user_id, Member)
     let rows =
       sqlite.query(
@@ -371,16 +371,16 @@ pub fn retire_key(
 /// revocation exists to close.
 pub fn revoke_key(
   ctx: AuthContext,
-  browse: Option(Browse),
+  browse: Browse,
   live: Session,
   slug: String,
   device_id: String,
   key_id: String,
 ) -> Response {
   let outcome = key_state_change(ctx, live, slug, device_id, key_id, Revoke)
-  case outcome.status, browse {
-    200, Some(browse) -> agent.drop_key(browse_api.registry(browse), key_id)
-    _, _ -> Nil
+  case outcome.status {
+    200 -> agent.drop_key(browse_api.registry(browse), key_id)
+    _ -> Nil
   }
   outcome
 }

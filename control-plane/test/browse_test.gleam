@@ -8,6 +8,7 @@ import envoy
 import fixtures.{nk}
 import gleam/bit_array
 import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -20,6 +21,13 @@ import zone/model.{type ZoneInput, Member, NsHost, TxtName, ZoneInput, ZoneMeta}
 import zone/render_external
 
 fn input(browse_url: String) -> ZoneInput {
+  case browse_url {
+    "" -> fleet([])
+    url -> fleet([url])
+  }
+}
+
+fn fleet(browse_urls: List(String)) -> ZoneInput {
   let assert Ok(apex) = name.parse("sync.test.")
   let assert Ok(ns1) = name.parse("ns1.sync.test.")
   let assert Ok(owner) = name.parse("_synchronicity.prod.acme.sync.test.")
@@ -40,7 +48,7 @@ fn input(browse_url: String) -> ZoneInput {
     [TxtName(owner, [Member("nas", nk(), "", "")])],
     [],
     0,
-    browse_url,
+    browse_urls,
   )
 }
 
@@ -54,20 +62,13 @@ fn browse_env() -> Nil {
   envoy.unset("CP_HTTP_LISTEN")
   envoy.unset("CP_DNS_LISTEN")
   envoy.unset("CP_NS_HOSTS")
-  envoy.unset("CP_BROWSE")
-  envoy.unset("CP_PUBLIC_URL")
+  envoy.set("CP_PUBLIC_URL", "https://sync.example")
+  envoy.unset("CP_ENTRY_URL")
+  envoy.unset("CP_ENDPOINTS")
+  envoy.unset("CP_PRIMARY_URL")
 }
 
 // -- the apex record ---------------------------------------------------------
-
-/// With the feature off the name does not exist at all, which is what a
-/// daemon's fail-closed discovery reads as "there is nowhere to attach".
-pub fn a_zone_without_browsing_has_no_attach_name_test() {
-  let assert Ok(rrsets) = build.build(input(""))
-  let assert Ok(owner) = name.parse("_synchronicity-cp.sync.test.")
-  assert list.all(rrsets, fn(r) { r.owner != owner })
-  assert !list.contains(build.owners_in_order(rrsets), owner)
-}
 
 /// One record, at the apex, naming the deployment's endpoint and nothing
 /// about which network may be browsed.
@@ -84,6 +85,120 @@ pub fn the_attach_record_sits_at_the_apex_test() {
   assert list.contains(build.owners_in_order(rrsets), owner)
 }
 
+/// A fleet is named one record per node, at the one apex name.
+///
+/// Every node holds its own registry of attached daemons, so a node nobody
+/// has a tunnel to answers no browse question — which is why the record has
+/// to name them all, and why the daemon opens one tunnel per record rather
+/// than picking one. Separate records rather than several `url=` fields in
+/// one is what keeps a daemon built before the fleet existed working: it
+/// reads the first record it can parse and reaches one node of the fleet,
+/// where a second `url=` in one record is a duplicate field it refuses.
+pub fn the_attach_record_names_every_node_of_the_fleet_test() {
+  let urls = ["https://sync.example", "https://cp1.sync.example"]
+  let assert Ok(rrsets) = build.build(fleet(urls))
+  let assert Ok(owner) = name.parse("_synchronicity-cp.sync.test.")
+  let assert Ok(rrset) =
+    list.find(rrsets, fn(r) { r.owner == owner && r.rtype == wire.type_txt })
+  // One RRset, one rdata each, in publication order — no precedence is
+  // implied and none is read.
+  let texts = list.filter_map(rrset.rdatas, txt_text)
+  assert texts
+    == [
+      "v=synccp1 url=https://sync.example",
+      "v=synccp1 url=https://cp1.sync.example",
+    ]
+  // Still one owner name in the chain, however many records hang off it.
+  assert list.length(
+      list.filter(build.owners_in_order(rrsets), fn(o) { o == owner }),
+    )
+    == 1
+
+  // External mode says the same thing to a provider: several values at one
+  // name, which is how the reconciler already carries a multi-member
+  // membership name.
+  let assert Ok(records) = render_external.render(fleet(urls))
+  let attach =
+    list.filter(records, fn(r) { r.name == "_synchronicity-cp.sync.test" })
+  assert list.map(attach, fn(r) { r.value })
+    == [
+      "v=synccp1 url=https://cp1.sync.example",
+      "v=synccp1 url=https://sync.example",
+    ]
+}
+
+/// The primary names the deployment; each node names only itself.
+pub fn the_endpoints_come_from_the_primarys_environment_test() {
+  browse_env()
+  envoy.set("CP_PUBLIC_URL", "https://sync.example/")
+  envoy.set(
+    "CP_ENDPOINTS",
+    "https://cp1.sync.example, https://cp2.sync.example/;https://cp3.sync.example",
+  )
+  let assert Ok(cfg) = config.load()
+  // This node first, then the rest, each with its trailing slash trimmed to
+  // the origin the daemon signs its attach proof over.
+  assert cfg.endpoints
+    == [
+      "https://sync.example",
+      "https://cp1.sync.example",
+      "https://cp2.sync.example",
+      "https://cp3.sync.example",
+    ]
+
+  // The same rules as CP_PUBLIC_URL, applied where the operator can still
+  // read the message: a value the daemon would reject never reaches a signed
+  // record that is cached for its TTL.
+  envoy.set("CP_ENDPOINTS", "cp1.sync.example")
+  let assert Error(why) = config.load()
+  assert string.contains(why, "origin")
+
+  // An RRset is a set, and RFC 4034 §6.3 has a signer drop duplicate RRs
+  // before signing: two identical rdatas would be signed as two and
+  // canonicalized to one by a validator, which is an RRSIG mismatch and the
+  // whole zone failing closed. Listing your own CP_PUBLIC_URL among the
+  // others is an ordinary mistake, so it collapses rather than refusing.
+  envoy.set("CP_ENDPOINTS", "https://sync.example")
+  let assert Ok(cfg) = config.load()
+  assert cfg.endpoints == ["https://sync.example"]
+  // And the zone builder reads the same deduplicated list — this is the
+  // path that actually reaches an RRSIG, and it does not go through the
+  // boot-time validator above.
+  assert config.endpoints() == ["https://sync.example"]
+  let assert Ok(rrsets) = build.build(fleet(config.endpoints()))
+  let assert Ok(owner) = name.parse("_synchronicity-cp.sync.test.")
+  let assert Ok(rrset) =
+    list.find(rrsets, fn(r) { r.owner == owner && r.rtype == wire.type_txt })
+  assert list.length(rrset.rdatas) == 1
+
+  // Every entry costs every daemon in every network a standing tunnel, so
+  // the zone does not get to decide that number freely.
+  envoy.set(
+    "CP_ENDPOINTS",
+    list.repeat(Nil, config.max_endpoints)
+      |> list.index_map(fn(_, i) {
+        "https://cp" <> int.to_string(i) <> ".sync.example"
+      })
+      |> string.join(","),
+  )
+  let assert Error(why) = config.load()
+  assert string.contains(why, "names more than")
+
+  // And it is the primary's list: a replica publishes no zone, so one that
+  // set this would be describing a record it does not write.
+  browse_env()
+  envoy.set("CP_ROLE", "replica")
+  envoy.unset("CP_KEY_FILE")
+  envoy.unset("CP_SESSION_SECRET")
+  envoy.set("CP_SESSION_SECRET", "0123456789abcdef0123456789abcdef")
+  envoy.set("CP_PRIMARY_URL", "https://sync.example")
+  envoy.set("CP_PUBLIC_URL", "https://cp1.sync.example")
+  envoy.set("CP_ENDPOINTS", "https://cp2.sync.example")
+  let assert Error(why) = config.load()
+  assert string.contains(why, "primary-only")
+  browse_env()
+}
+
 /// External mode publishes the same one record through the provider, and
 /// drops it again when the feature goes off.
 pub fn external_mode_reconciles_the_attach_record_test() {
@@ -97,46 +212,85 @@ pub fn external_mode_reconciles_the_attach_record_test() {
   assert list.all(without, fn(r) { r.name != "_synchronicity-cp.sync.test" })
 }
 
-// -- the flag ----------------------------------------------------------------
+// -- the endpoints -----------------------------------------------------------
 
-pub fn browsing_is_off_unless_it_is_turned_on_test() {
+/// A node names itself, always. There is no deployment-level switch: the
+/// apex says where this base's control plane answers, and a node that
+/// answers nowhere is not a node of it. What a *network* may be browsed is
+/// the org admin's switch, which is a different question asked at the
+/// endpoint.
+pub fn a_node_always_names_its_own_endpoint_test() {
   browse_env()
   let assert Ok(cfg) = config.load()
-  assert cfg.browse == False
-  assert config.browse_endpoint() == ""
-
-  envoy.set("CP_BROWSE", "off")
-  let assert Ok(cfg) = config.load()
-  assert cfg.browse == False
-
-  envoy.set("CP_BROWSE", "on")
-  envoy.set("CP_PUBLIC_URL", "https://sync.example")
-  let assert Ok(cfg) = config.load()
-  assert cfg.browse == True
+  assert cfg.endpoints == ["https://sync.example"]
   assert config.browse_endpoint() == "https://sync.example"
   browse_env()
 }
 
 /// The record publishes the public URL and a daemon signs its proof over it,
-/// so a deployment that has not been told its own URL must not turn the
-/// feature on with a loopback default.
-pub fn browsing_needs_a_public_url_and_a_primary_test() {
+/// so a node that has not been told its own URL cannot start: a loopback
+/// default published into DNS would send every node in every network
+/// nowhere.
+pub fn a_node_needs_its_own_url_and_a_replica_needs_the_primarys_test() {
   browse_env()
-  envoy.set("CP_BROWSE", "on")
+  envoy.unset("CP_PUBLIC_URL")
   let assert Error(why) = config.load()
   assert string.contains(why, "CP_PUBLIC_URL")
 
-  envoy.set("CP_PUBLIC_URL", "https://sync.example")
+  // A replica offers the surface too: the tunnel is a read, and the tables
+  // its attach resolves against are replicated.
+  envoy.set("CP_PUBLIC_URL", "https://cp1.sync.example")
   envoy.set("CP_ROLE", "replica")
   envoy.unset("CP_KEY_FILE")
-  envoy.unset("CP_SESSION_SECRET")
-  let assert Error(why) = config.load()
-  assert string.contains(why, "primary-only")
 
-  browse_env()
-  envoy.set("CP_BROWSE", "maybe")
+  // It still needs the primary's URL, which is the one fact a read-only node
+  // cannot derive from a database that records the deployment's zone rather
+  // than which of its nodes holds the pen.
   let assert Error(why) = config.load()
-  assert string.contains(why, "must be on or off")
+  assert string.contains(why, "CP_PRIMARY_URL")
+
+  envoy.set("CP_PRIMARY_URL", "https://cp0.sync.example")
+  let assert Ok(cfg) = config.load()
+  assert cfg.primary_url == "https://cp0.sync.example"
+  // Its own endpoint and nobody else's: the deployment's list is the
+  // primary's to publish.
+  assert cfg.endpoints == ["https://cp1.sync.example"]
+  browse_env()
+}
+
+/// The two names a load-balanced deployment has, and which use falls on
+/// which side.
+///
+/// `CP_PUBLIC_URL` is this node's own — daemons dial it directly and sign
+/// their attach proof over it, so the apex publishes it verbatim.
+/// `CP_ENTRY_URL` is where a browser reaches the deployment, so it is what a
+/// magic link, an OAuth callback and an invitation come back to: a sign-in
+/// completed on one node's own name sets its cookie there, and the browser
+/// returns to the entry name without it.
+pub fn a_deployment_behind_a_balancer_has_two_names_test() {
+  browse_env()
+  // One node: they are the same name, and nothing has to be told twice.
+  let assert Ok(cfg) = config.load()
+  assert cfg.public_url == "https://sync.example"
+  assert cfg.entry_url == cfg.public_url
+
+  envoy.set("CP_PUBLIC_URL", "https://cp0.sync.example")
+  envoy.set("CP_ENTRY_URL", "https://sync.example")
+  let assert Ok(cfg) = config.load()
+  // The record still names this node, not the balancer: a tunnel relayed
+  // from the entry name would carry a proof signed over the wrong URL.
+  assert cfg.endpoints == ["https://cp0.sync.example"]
+  assert cfg.entry_url == "https://sync.example"
+
+  // Same origin rule as the rest, and a trailing slash trimmed the same way.
+  envoy.set("CP_ENTRY_URL", "https://sync.example/")
+  let assert Ok(cfg) = config.load()
+  assert cfg.entry_url == "https://sync.example"
+  envoy.set("CP_ENTRY_URL", "sync.example")
+  let assert Error(why) = config.load()
+  assert string.contains(why, "origin")
+
+  envoy.unset("CP_ENTRY_URL")
   browse_env()
 }
 
@@ -154,7 +308,6 @@ pub fn browsing_needs_a_public_url_and_a_primary_test() {
 pub fn a_public_url_the_client_would_reject_is_refused_at_boot_test() {
   let with_url = fn(url) {
     browse_env()
-    envoy.set("CP_BROWSE", "on")
     envoy.set("CP_PUBLIC_URL", url)
     config.load()
   }

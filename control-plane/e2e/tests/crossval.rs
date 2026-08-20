@@ -118,6 +118,39 @@ async fn control_plane_zone_validates_and_parses() {
     assert!(missing.is_err(), "nonexistent domain must not resolve");
 }
 
+/// Every node of the control plane's fleet is named at the apex, and the
+/// client returns all of them.
+///
+/// The two halves of this are written in different languages: the control
+/// plane renders one `v=synccp1 url=` record per `CP_ENDPOINTS` entry
+/// (plus its own `CP_PUBLIC_URL`), and the daemon opens a tunnel to each
+/// endpoint this parses out. A disagreement about the shape would look like
+/// a fleet where only one node is ever attached — which is exactly the
+/// failure the record exists to prevent, and it would show up nowhere else.
+#[tokio::test]
+async fn the_fleets_attach_endpoints_cross_validate() {
+    install_provider();
+    let Some((doh_url, anchor, domain)) = e2e_env() else {
+        eprintln!("CP_DOH_URL not set; skipping (run via e2e/run.sh)");
+        return;
+    };
+    let Some(expected) = env("CP_EXPECTED_ENDPOINTS") else {
+        eprintln!("CP_EXPECTED_ENDPOINTS not set; skipping (run via e2e/run.sh)");
+        return;
+    };
+    // Gate off for the same reason as the membership test above: this zone
+    // logs nothing, and the transparency path has its own suite.
+    let resolver = test_resolver(doh_url, anchor, Some(RekorPolicy::Off));
+    let (records, _ttl) = resolver.control_plane(&domain).await.expect(
+        "the apex's attach records must validate and parse — a failure here          is the control plane and the client disagreeing about the record",
+    );
+    let mut got: Vec<String> = records.into_iter().map(|r| r.url).collect();
+    got.sort();
+    let mut want: Vec<String> = expected.split(',').map(|s| s.trim().to_string()).collect();
+    want.sort();
+    assert_eq!(got, want, "every node the primary named must come back");
+}
+
 /// The same zone, under the default policy: refused.
 ///
 /// The e2e zone deliberately logs nothing, and "logs nothing" must mean "no

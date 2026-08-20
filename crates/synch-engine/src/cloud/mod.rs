@@ -41,11 +41,18 @@ pub struct CloudSettings {
     pub disabled: bool,
 }
 
-/// What the attach task has achieved for one membership domain.
+/// What the attach task has achieved for one endpoint of one membership
+/// domain.
 ///
 /// Reported by `synch cloud status` and by nothing else: it is a running
 /// process's account of itself, so it lives in memory and dies with the
 /// daemon rather than pretending to be durable.
+///
+/// One row per *endpoint*, not per domain: an apex names every node of its
+/// control plane and this daemon holds a tunnel to each, so "attached" is a
+/// fact about a node. Collapsed to one row per domain, a fleet with one dead
+/// replica would read as either attached or detached, and both readings are
+/// wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudDomainStatus {
     /// The membership domain this attach is for.
@@ -59,6 +66,11 @@ pub struct CloudDomainStatus {
     /// When this state was last changed, unix nanoseconds.
     pub since_ns: i64,
 }
+
+/// What one row of the status map is keyed by: the domain, and the endpoint
+/// within it — `None` before discovery has produced one, which is the row a
+/// failing lookup leaves behind.
+pub(crate) type CloudKey = (String, Option<String>);
 
 impl Node {
     /// What the operator has said about cloud attach on this node.
@@ -84,18 +96,19 @@ impl Node {
         Ok(())
     }
 
-    /// What the attach task has achieved, per membership domain.
+    /// What the attach task has achieved, per endpoint of per membership
+    /// domain.
     pub fn cloud_status(&self) -> Vec<CloudDomainStatus> {
         let mut out: Vec<CloudDomainStatus> = self
             .cloud_slot()
             .values()
             .cloned()
             .collect::<Vec<CloudDomainStatus>>();
-        out.sort_by(|a, b| a.domain.cmp(&b.domain));
+        out.sort_by(|a, b| (&a.domain, &a.endpoint).cmp(&(&b.domain, &b.endpoint)));
         out
     }
 
-    /// Records what one domain's attach is doing now.
+    /// Records what one endpoint's attach is doing now.
     pub(crate) fn set_cloud_status(
         &self,
         domain: &str,
@@ -104,7 +117,7 @@ impl Node {
         last_error: Option<String>,
     ) {
         self.cloud_slot().insert(
-            domain.to_string(),
+            (domain.to_string(), endpoint.clone()),
             CloudDomainStatus {
                 domain: domain.to_string(),
                 endpoint,
@@ -118,7 +131,25 @@ impl Node {
     /// Forgets a domain the operator has removed, so `cloud status` does not
     /// report on something that is no longer configured.
     pub(crate) fn forget_cloud_status(&self, domain: &str) {
-        self.cloud_slot().remove(domain);
+        self.cloud_slot().retain(|(held, _), _| held != domain);
+    }
+
+    /// Forgets one endpoint the zone stopped naming — a replica taken out of
+    /// the record — while the domain's other tunnels carry on.
+    pub(crate) fn forget_cloud_endpoint(&self, domain: &str, endpoint: &str) {
+        self.cloud_slot()
+            .remove(&(domain.to_string(), Some(endpoint.to_string())));
+    }
+
+    /// Forgets the endpoint-less row a failed discovery round leaves — the
+    /// one that says "no validated record" for the domain as a whole.
+    ///
+    /// Its own key, because nothing else can clear it: it names no endpoint,
+    /// so the per-endpoint sweep never reaches it, and one transient resolver
+    /// failure at startup would otherwise sit above the real rows in `synch
+    /// cloud status` for the life of the daemon.
+    pub(crate) fn forget_cloud_endpoint_none(&self, domain: &str) {
+        self.cloud_slot().remove(&(domain.to_string(), None));
     }
 }
 
@@ -126,6 +157,71 @@ impl Node {
 mod tests {
     use super::*;
     use crate::testkit::node;
+
+    /// Status is per endpoint, and the two kinds of row are forgotten
+    /// separately.
+    ///
+    /// A failed discovery round writes a row that names no endpoint — "this
+    /// domain has no validated record" — and the per-endpoint sweep cannot
+    /// reach it, because it is keyed by an endpoint that is not there. One
+    /// transient resolver failure at startup would otherwise leave a
+    /// permanent bogus line above the real ones in `synch cloud status`.
+    #[tokio::test]
+    async fn cloud_status_is_per_endpoint_and_forgettable() {
+        let (_d, node) = node().await;
+        node.set_cloud_status("cluster.example", None, false, Some("no record".into()));
+        node.set_cloud_status(
+            "cluster.example",
+            Some("https://cp.example".into()),
+            true,
+            None,
+        );
+        node.set_cloud_status(
+            "cluster.example",
+            Some("https://ns1.cp.example".into()),
+            false,
+            Some("refused".into()),
+        );
+        node.set_cloud_status("other.example", Some("https://cp.other".into()), true, None);
+        assert_eq!(node.cloud_status().len(), 4);
+
+        // Discovery recovers: the endpoint-less row goes, the tunnels stay.
+        node.forget_cloud_endpoint_none("cluster.example");
+        assert!(node.cloud_status().iter().all(|s| s.endpoint.is_some()));
+
+        // The zone stops naming one node: its row goes and no other does.
+        node.forget_cloud_endpoint("cluster.example", "https://ns1.cp.example");
+        let left: Vec<(String, Option<String>)> = node
+            .cloud_status()
+            .into_iter()
+            .map(|s| (s.domain, s.endpoint))
+            .collect();
+        assert_eq!(
+            left,
+            [
+                (
+                    "cluster.example".to_string(),
+                    Some("https://cp.example".to_string())
+                ),
+                (
+                    "other.example".to_string(),
+                    Some("https://cp.other".to_string())
+                ),
+            ]
+        );
+
+        // The operator removes the domain: every one of its rows goes, and
+        // the other domain's do not.
+        node.forget_cloud_status("cluster.example");
+        assert_eq!(
+            node.cloud_status()
+                .iter()
+                .map(|s| s.domain.clone())
+                .collect::<Vec<_>>(),
+            ["other.example"]
+        );
+        node.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn attach_is_on_by_default_until_opted_out() {

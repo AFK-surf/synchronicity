@@ -9,11 +9,16 @@ export function setCsrf(token: string) {
 export class ApiError extends Error {
   status: number
   code: string
+  // Where the request should have gone, when this node could not take it.
+  // Empty for every other failure. Set by a read-only replica, which
+  // refuses writes with the address of the node that holds the pen.
+  primary: string
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, primary = '') {
     super(message)
     this.status = status
     this.code = code
+    this.primary = primary
   }
 }
 
@@ -25,7 +30,7 @@ async function handle<T>(resp: Response): Promise<T> {
   const body = await resp.json().catch(() => null)
   if (!resp.ok) {
     const err = body?.error ?? { code: 'error', message: `HTTP ${resp.status}` }
-    throw new ApiError(resp.status, err.code, err.message)
+    throw new ApiError(resp.status, err.code, err.message, err.primary ?? '')
   }
   return body as T
 }
@@ -66,6 +71,11 @@ export interface AuthMethods {
   github: boolean
   magic_link: boolean
   oidc: boolean
+  // The node that takes the writes, when this one does not: a replica
+  // serves the dashboard off a read-only copy and mints no session, so it
+  // offers no method and names the node that does. Empty on the primary,
+  // which is that node.
+  primary: string
 }
 
 export interface OrgRef {

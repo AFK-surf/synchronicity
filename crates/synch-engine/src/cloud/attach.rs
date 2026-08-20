@@ -47,6 +47,16 @@ const MIN_BACKOFF: Duration = Duration::from_secs(2);
 /// The longest a disconnected node waits before trying again.
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
+/// The floor and ceiling on how often the endpoint list is re-read.
+///
+/// The record's TTL sets the cadence — it is the zone's own statement of how
+/// long the answer stands — and these bound what the zone may ask for. The
+/// floor keeps a one-second TTL from turning a fleet's DNS into a poll loop;
+/// the ceiling keeps a day-long one from leaving a decommissioned replica
+/// attached until the daemon restarts.
+const MIN_REDISCOVERY: Duration = Duration::from_secs(60);
+const MAX_REDISCOVERY: Duration = Duration::from_secs(3600);
+
 /// How often each side sends a heartbeat.
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
@@ -176,24 +186,94 @@ impl Node {
     }
 }
 
-/// Keeps one domain's tunnel up, with exponential backoff and jitter.
+/// Keeps one domain's tunnels up: one per endpoint the apex names, each with
+/// a retry clock of its own.
+///
+/// **A tunnel per endpoint, not per domain.** A control plane is a fleet, and
+/// the registry of attached daemons is one node's memory — a node this daemon
+/// holds no tunnel to can answer no browse question about it, however
+/// faithfully the node's database replicated. So discovery yields a list and
+/// every entry gets a child; one replica being down costs its own tunnel and
+/// nothing else's, which is the whole point of there being several.
+///
+/// Discovery runs here rather than in the children so the answer is read once
+/// per round instead of once per endpoint, and is re-read on a clock: the set
+/// is zone data and a fleet gains and loses nodes without this process
+/// restarting. A round that cannot resolve keeps the children it has — an
+/// endpoint that was validated stays believed for as long as the last answer
+/// says, and a resolver outage must not tear down working tunnels.
 async fn attach_forever(
     node: Node,
     resolver: Option<Arc<synch_net::DnssecResolver>>,
     domain: String,
 ) {
+    // `AbortOnDrop`, not a bare handle, because this task is itself stopped by
+    // being aborted — `run_cloud` does exactly that when the operator opts out
+    // or the domain goes away. An abort drops this future and everything it
+    // owns; a bare `JoinHandle` dropped is a task that keeps running, so the
+    // tunnels would outlive the supervisor that was told to stop them and go
+    // on serving browse requests for a node that has opted out.
+    let mut running: HashMap<String, AbortOnDrop> = HashMap::new();
+    let mut backoff = MIN_BACKOFF;
+    loop {
+        let wait = match discover(resolver.as_deref(), &domain).await {
+            Ok((endpoints, ttl)) => {
+                backoff = MIN_BACKOFF;
+                // The row a failed round left behind. Discovery works now, so
+                // "no validated record" is no longer true of this domain, and
+                // nothing else would ever remove it — `forget_cloud_endpoint`
+                // only reaches rows that name an endpoint.
+                node.forget_cloud_endpoint_none(&domain);
+                running.retain(|url, task| {
+                    let keep = endpoints.iter().any(|e| e == url) && !task.0.is_finished();
+                    if !keep {
+                        node.forget_cloud_endpoint(&domain, url);
+                    }
+                    keep
+                });
+                for url in endpoints {
+                    if running.contains_key(&url) {
+                        continue;
+                    }
+                    let node = node.clone();
+                    let domain = domain.clone();
+                    let endpoint = url.clone();
+                    running.insert(
+                        url,
+                        AbortOnDrop(tokio::spawn(async move {
+                            attach_endpoint_forever(node, domain, endpoint).await
+                        })),
+                    );
+                }
+                ttl.clamp(MIN_REDISCOVERY, MAX_REDISCOVERY)
+            }
+            Err(e) => {
+                tracing::debug!(domain, error = %e, "control-plane discovery failed");
+                // Only a domain with nothing running is worth reporting on:
+                // with tunnels up, the endpoints' own rows are the truth and
+                // a discovery hiccup is not news about any of them.
+                if running.is_empty() {
+                    node.set_cloud_status(&domain, None, false, Some(e.to_string()));
+                }
+                let wait = backoff;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                wait
+            }
+        };
+        tokio::time::sleep(jittered(wait)).await;
+    }
+}
+
+/// Keeps one endpoint's tunnel up, with exponential backoff and jitter.
+async fn attach_endpoint_forever(node: Node, domain: String, endpoint: String) {
     let mut backoff = MIN_BACKOFF;
     loop {
         let started = Instant::now();
-        match attach_once(&node, resolver.as_deref(), &domain).await {
-            Ok(()) => tracing::info!(domain, "cloud attach closed cleanly"),
+        match attach_once(&node, &domain, &endpoint).await {
+            Ok(()) => tracing::info!(domain, endpoint, "cloud attach closed cleanly"),
             Err(e) => {
-                tracing::debug!(domain, error = %e, "cloud attach failed");
-                let endpoint = node
-                    .cloud_slot()
-                    .get(&domain)
-                    .and_then(|status| status.endpoint.clone());
-                node.set_cloud_status(&domain, endpoint, false, Some(e.to_string()));
+                tracing::debug!(domain, endpoint, error = %e, "cloud attach failed");
+                node.set_cloud_status(&domain, Some(endpoint.clone()), false, Some(e.to_string()));
             }
         }
         // A session that stood for a while was healthy; only repeated fast
@@ -217,13 +297,9 @@ fn jittered(base: Duration) -> Duration {
     base + Duration::from_millis(noise)
 }
 
-/// Discovers, connects, proves, and serves one session to its end.
-async fn attach_once(
-    node: &Node,
-    resolver: Option<&synch_net::DnssecResolver>,
-    domain: &str,
-) -> Result<()> {
-    let base = discover(node, resolver, domain).await?;
+/// Connects to one endpoint, proves, and serves one session to its end.
+async fn attach_once(node: &Node, domain: &str, base: &str) -> Result<()> {
+    let base = base.to_string();
     let url = format!("{base}{ATTACH_PATH}");
     node.set_cloud_status(domain, Some(base.clone()), false, None);
 
@@ -305,16 +381,12 @@ async fn attach_once(
         .map_err(|_| {
             EngineError::invalid(format!("{url}: the handshake did not finish in time"))
         })??;
-    node.set_cloud_status(domain, Some(base), true, None);
+    node.set_cloud_status(domain, Some(base.clone()), true, None);
 
     let outcome = serve(node, sink, stream).await;
-    let endpoint = node
-        .cloud_slot()
-        .get(domain)
-        .and_then(|status| status.endpoint.clone());
     node.set_cloud_status(
         domain,
-        endpoint,
+        Some(base),
         false,
         outcome.as_ref().err().map(|e| e.to_string()),
     );
@@ -358,39 +430,58 @@ impl Node {
     }
 }
 
-/// The endpoint this domain's base attaches to.
+/// The endpoints this domain's base attaches to, and how long the answer
+/// stands.
 ///
 /// From the zone or from nowhere: no validated record means no connection
 /// attempt at all, which is the shape a resolver outage has to degrade to.
+/// Several, because the apex names every node of its control plane and a
+/// tunnel reaches exactly one of them.
 async fn discover(
-    node: &Node,
     resolver: Option<&synch_net::DnssecResolver>,
     domain: &str,
-) -> Result<String> {
-    if let Ok(url) = std::env::var(URL_ENV) {
-        let url = url.trim_end_matches('/').to_string();
-        if url.is_empty() {
-            return Err(EngineError::invalid(format!("{URL_ENV} is empty")));
-        }
-        return Ok(url);
+) -> Result<(Vec<String>, Duration)> {
+    if let Ok(configured) = std::env::var(URL_ENV) {
+        // No TTL to take from an environment variable, and nothing that would
+        // change it while the process runs: re-read on the slow clock.
+        return Ok((overridden_endpoints(&configured)?, MAX_REDISCOVERY));
     }
     let resolver = resolver.ok_or_else(|| {
         EngineError::invalid(
             "this daemon runs no DNSSEC resolver, so it cannot discover a control plane",
         )
     })?;
-    let (record, ttl) = resolver
+    let (records, ttl) = resolver
         .control_plane(domain)
         .await
         .map_err(|e| EngineError::invalid(format!("{domain}: {e}")))?;
+    let urls: Vec<String> = records.into_iter().map(|record| record.url).collect();
     tracing::debug!(
         domain,
-        url = record.url,
+        endpoints = urls.len(),
         ttl = ttl.as_secs(),
         "discovered a control plane"
     );
-    node.set_cloud_status(domain, Some(record.url.clone()), false, None);
-    Ok(record.url)
+    Ok((urls, ttl))
+}
+
+/// The endpoints [`URL_ENV`] names, comma-separated.
+///
+/// A list rather than one URL because a fleet is what the record carries, and
+/// an override that could only name one endpoint would not stand up the case
+/// the supervisor exists for. Trailing slashes go, because the daemon signs
+/// its attach proof over the URL it dials and both ends have to derive the
+/// same bytes from the same origin.
+fn overridden_endpoints(configured: &str) -> Result<Vec<String>> {
+    let urls: Vec<String> = configured
+        .split(',')
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+    if urls.is_empty() {
+        return Err(EngineError::invalid(format!("{URL_ENV} is empty")));
+    }
+    Ok(urls)
 }
 
 /// The WebSocket scheme for an HTTP origin.
@@ -1507,9 +1598,27 @@ mod tests {
     async fn discovery_without_a_resolver_attempts_nothing() {
         let _blocking = synch_core::BlockingScope::enter();
         let (_d, node) = node().await;
-        let e = discover(&node, None, "cluster.example").await.unwrap_err();
+        let e = discover(None, "cluster.example").await.unwrap_err();
         assert!(e.to_string().contains("no DNSSEC resolver"), "{e}");
         node.shutdown().await.unwrap();
+    }
+
+    /// The override names a fleet the same way a zone does, and every entry
+    /// gets a tunnel of its own.
+    #[test]
+    fn the_override_names_every_endpoint() {
+        assert_eq!(
+            overridden_endpoints("https://cp.example/ , https://ns1.cp.example").unwrap(),
+            vec!["https://cp.example", "https://ns1.cp.example"]
+        );
+        // One is still the ordinary case.
+        assert_eq!(
+            overridden_endpoints("https://cp.example").unwrap(),
+            vec!["https://cp.example"]
+        );
+        // Set but empty is a mistake worth naming, not a silent no-op.
+        assert!(overridden_endpoints("").is_err());
+        assert!(overridden_endpoints(" , ").is_err());
     }
 
     /// The task list follows the domains without being asked — the feature

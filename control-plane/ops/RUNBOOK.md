@@ -10,9 +10,11 @@ TXT records, served over port 53 (UDP+TCP) and RFC 8484 DoH.
   (`csk.key`) and the writable SQLite database. Republishes and re-signs
   the whole zone inside every mutating transaction; a background job
   re-signs when signatures come within 7 days of expiry (14-day validity).
-- **N replicas** (typically your `ns1`, `ns2` hosts): DNS/DoH only, read
-  a copy of the database, hold **no key material** — the private key never
-  enters the database, so replication never carries it.
+- **N replicas**: read a copy of the database and hold **no key material** —
+  the private key never enters the database, so replication never carries it.
+  They serve the dashboard, every GET of the API and the file browser off
+  that copy (see below), and DNS/DoH as well where this deployment serves its
+  own zone rather than a provider's.
 - **Replication is external and operator-owned.** The service never runs,
   configures, or supervises litestream (or whatever tool you choose). The
   contract is only:
@@ -54,6 +56,81 @@ litestream restore -o /var/lib/synch-controlplane/db/cp.db.new "$REPLICA_URL" \
 **The database contains OAuth client secrets and per-org OIDC client
 secrets.** Protect the replication bucket accordingly.
 
+### A replica that also serves the dashboard
+
+A replica mounts, off the same read-only copy the nameserver reads: the SPA,
+every GET of the product API, and the file browser, including the
+`/agent/v1/attach` tunnel daemons open. Writes are not mounted:
+a mutation answers **409 `read-only-replica`** naming `CP_PRIMARY_URL`, and
+the dashboard renders that as a link rather than an error.
+
+Why you would: the reads are the load. A network's file listing, a version
+history, a download of a 40 GB object — all of it is a GET, and putting it on
+the replicas takes it off the node that owns the zone key. The writes stay
+in one place because there is only one writable database.
+
+### Two kinds of name
+
+- **One entry name for people**, load-balanced across the primary and the
+  replicas — `sync.example`. This is where the dashboard is, and the only
+  name a browser sees, so the session cookie is host-only on it and works on
+  whichever node the balancer picks. Nothing needs a `Domain` attribute.
+  Every node names it as `CP_ENTRY_URL`, so a magic link, an OAuth callback
+  or an invitation comes back *here* rather than to whichever node minted it
+  — a sign-in completed on one node's own name would set the cookie there,
+  and the browser would return to the entry name without it.
+- **One name per node for daemons** — `cp1.sync.example` — each node's own
+  `CP_PUBLIC_URL`, published in the attach record. A daemon holds a tunnel to
+  every node, so these are dialed individually and never balanced.
+
+Two things then have to line up:
+
+1. **`CP_SESSION_SECRET` is identical on every node.** A replica verifies
+   cookies the primary minted; one byte of difference and every session fails
+   its signature check.
+2. **Sign-in and every other write reaches the primary.** Minting a session
+   is an `INSERT`, and a replica's database is opened read-only *and*
+   replaced wholesale on the next refresh — a row written there would not
+   survive the interval even if the handle allowed it. So the balancer sends
+   `/auth/*` and the non-GET `/api/*` methods to the primary; the replica's
+   409 and its login screen, which name `CP_PRIMARY_URL`, are the backstop
+   for a request that gets there anyway.
+
+   [`ops/worker/`](worker/) is that balancer as one Cloudflare Worker, if you
+   want it: two variables, the routing table above, and reads that fall back
+   through the replicas to the primary.
+
+```sh
+# primary — behind sync.example along with the replicas
+CP_PUBLIC_URL=https://cp0.sync.example
+CP_ENTRY_URL=https://sync.example
+CP_ENDPOINTS=https://cp1.sync.example,https://cp2.sync.example
+CP_SESSION_SECRET=…
+
+# cp1 — behind sync.example too, and dialed directly by daemons
+CP_ROLE=replica
+CP_PUBLIC_URL=https://cp1.sync.example
+CP_ENTRY_URL=https://sync.example
+CP_PRIMARY_URL=https://cp0.sync.example
+CP_SESSION_SECRET=…the primary's, byte for byte…
+```
+
+The apex then publishes one `v=synccp1 url=` record per endpoint at
+`_synchronicity-cp.<base>`, and every daemon opens a standing tunnel to each
+(`synch cloud status` lists one line per endpoint). At most 8 endpoints:
+every one costs every daemon in every network a WebSocket, and both ends
+refuse a longer list — the control plane at boot, the daemon at discovery.
+
+A daemon built before this change reads the first record it can parse and
+attaches to one node of the fleet, which still works; it is one tunnel
+instead of several.
+
+**Browse reads are not recorded.** The durable half of the feature is the
+switch that permits it — `networks.browse_enabled`, whose every flip is in
+the org's audit trail — not a row per file read. So there is nothing here a
+read-only node fails to write, and nothing that depends on which node served
+a download.
+
 ## Configuration (environment; missing required values refuse to start)
 
 | Variable | Role | Meaning |
@@ -65,8 +142,11 @@ secrets.** Protect the replication bucket accordingly.
 | `CP_HTTP_LISTEN` | both | `address:port`, default `0.0.0.0:8080` |
 | `CP_DNS_LISTEN` | both | `address:port`, default `0.0.0.0:53` |
 | `CP_NS_HOSTS` | primary | `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53` |
-| `CP_PUBLIC_URL` | primary | external URL for links/OAuth callbacks |
-| `CP_SESSION_SECRET` | primary | ≥32 chars; signs session cookies |
+| `CP_PUBLIC_URL` | both | **Required.** This node's own external URL: links and OAuth callbacks on the primary, and on every node the attach endpoint daemons dial and sign their proof over. Published verbatim at `_synchronicity-cp.<base>`, so it must be an `https://` or `http://` origin with no whitespace — refused at boot rather than in every daemon a TTL later |
+| `CP_SESSION_SECRET` | both | ≥32 chars; signs session cookies. **The same value on every node**: a replica verifies cookies the primary minted, and one byte of difference is a dashboard nobody can sign in to |
+| `CP_PRIMARY_URL` | replica | the primary's URL. Required, and the one fact a read-only node cannot derive: it is what a refused write and the login screen name, and without it the dashboard is a dead end |
+| `CP_ENTRY_URL` | both | the name a browser reaches this deployment at — the balanced entry name. Defaults to `CP_PUBLIC_URL`, which is right for a deployment of one node. OAuth callbacks, magic links and invitations are built from it, so behind a balancer it must be set or those links return people to one node's own name and their new cookie stays there |
+| `CP_ENDPOINTS` | primary | this deployment's *other* control-plane endpoints, comma- or semicolon-separated (`https://cp1.sync.example,https://cp2.sync.example`). Each becomes its own `v=synccp1 url=` record at `_synchronicity-cp.<base>`, beside this node's `CP_PUBLIC_URL` — the apex saying where this base's control plane answers, not a browse-specific list. Cloud attach is what dials them today, one standing tunnel per endpoint per daemon. At most 8 endpoints in total |
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link and invitation mail (absent = log-only); `FROM` is the header, display name and all |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |

@@ -2,6 +2,7 @@
 //// magic-link request/redeem, logout, and /api/me.
 
 import api/middleware.{error_json, now_unix}
+import api/reads.{type Reads}
 import auth/github
 import auth/google
 import auth/identity
@@ -13,9 +14,8 @@ import email/mailer.{type Mailer}
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import gleam/result
-import store/pool.{type Pool}
 import store/sqlite.{type Connection, Text}
 import wisp.{type Request, type Response}
 import zone/publish
@@ -23,9 +23,13 @@ import zone/publish
 pub type AuthContext {
   AuthContext(
     /// Request-scoped connections come from here; every checkout is
-    /// reset to pristine.
-    pool: Pool,
-    public_url: String,
+    /// reset to pristine. Held as `Reads` rather than a bare pool so a
+    /// write handler can hand the read half straight to a read handler,
+    /// which is the same half a replica mounts on its own.
+    reads: Reads,
+    /// Where a link mailed to a person comes back to — the balanced entry
+    /// name, not this node's own (`CP_ENTRY_URL`).
+    entry_url: String,
     mail: Mailer,
     google: Option(Provider),
     github: Option(Provider),
@@ -48,10 +52,7 @@ pub type AuthContext {
 /// dies holding one is reclaimed by monitor, so a crashed handler can
 /// never wedge the database write lock.
 pub fn with_db(ctx: AuthContext, next: fn(Connection) -> Response) -> Response {
-  case pool.with_connection(ctx.pool, next) {
-    Ok(response) -> response
-    Error(_) -> error_json(500, "internal", "database unavailable")
-  }
+  reads.with_db(ctx.reads, next)
 }
 
 fn provider_for(ctx: AuthContext, key: String) -> Result(Provider, Nil) {
@@ -63,7 +64,7 @@ fn provider_for(ctx: AuthContext, key: String) -> Result(Provider, Nil) {
 }
 
 fn redirect_uri(ctx: AuthContext, key: String) -> String {
-  ctx.public_url <> "/auth/callback/" <> key
+  ctx.entry_url <> "/auth/callback/" <> key
 }
 
 /// `?link=1` on a start URL, from a live session, records that the
@@ -297,6 +298,13 @@ fn finish_oauth(
 }
 
 /// Creates the session and sets the signed cookie.
+///
+/// Host-only, which is what a browser does with no `Domain` attribute and
+/// what this deployment shape wants: the dashboard is reached through one
+/// entry name that a load balancer points at whichever node is serving, so
+/// the cookie set there is sent back there. Nodes' own names carry the
+/// attach endpoints (`CP_ENDPOINTS`), which is a daemon's business and
+/// involves no cookie at all.
 pub fn sign_in(req: Request, conn: Connection, user_id: String) -> Response {
   case session.create(conn, user_id, now_unix()) {
     Ok(#(token, _session)) ->
@@ -323,7 +331,7 @@ pub fn magic_request(req: Request, ctx: AuthContext) -> Response {
     Ok(email) ->
       with_db(ctx, fn(conn) {
         // Always 200: no account enumeration through this endpoint.
-        let _ = magic.request(conn, email, now_unix(), ctx.public_url, ctx.mail)
+        let _ = magic.request(conn, email, now_unix(), ctx.entry_url, ctx.mail)
         json.object([#("ok", json.bool(True))])
         |> json.to_string
         |> wisp.json_response(200)
@@ -363,7 +371,30 @@ pub fn logout(req: Request, ctx: AuthContext) -> Response {
 /// session — the login page asks before anyone has one — and so it
 /// carries booleans and nothing else: no client ids, no org slugs,
 /// nothing that says who has an account here.
-pub fn methods(ctx: AuthContext) -> Response {
+/// Which sign-in methods this deployment has configured, and — on a node
+/// that cannot mint a session — where they are offered instead.
+///
+/// `primary` is empty on the primary, which is that place. On a replica it
+/// is the primary's URL and every method reads false: the flows are not
+/// mounted here, so offering them would be offering a 404, and the login
+/// screen turns the one non-empty field into a link.
+pub fn methods(ctx: Option(AuthContext), primary_url: String) -> Response {
+  case ctx {
+    None ->
+      json.object([
+        #("google", json.bool(False)),
+        #("github", json.bool(False)),
+        #("magic_link", json.bool(False)),
+        #("oidc", json.bool(False)),
+        #("primary", json.string(primary_url)),
+      ])
+      |> json.to_string
+      |> wisp.json_response(200)
+    Some(ctx) -> configured_methods(ctx)
+  }
+}
+
+fn configured_methods(ctx: AuthContext) -> Response {
   with_db(ctx, fn(conn) {
     let google_on = option.is_some(ctx.google)
     let github_on = option.is_some(ctx.github)
@@ -379,14 +410,15 @@ pub fn methods(ctx: AuthContext) -> Response {
       #("github", json.bool(github_on)),
       #("magic_link", json.bool(magic_on)),
       #("oidc", json.bool(oidc_on)),
+      #("primary", json.string("")),
     ])
     |> json.to_string
     |> wisp.json_response(200)
   })
 }
 
-pub fn me(req: Request, ctx: AuthContext) -> Response {
-  with_db(ctx, fn(conn) {
+pub fn me(req: Request, db: Reads) -> Response {
+  reads.with_db(db, fn(conn) {
     use live <- middleware.require_session(req, conn)
     let user =
       sqlite.query(
