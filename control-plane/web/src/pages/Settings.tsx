@@ -8,10 +8,12 @@ import {
   type MemberRow,
   type OidcConfig,
 } from '../lib/api'
+import { useTitle } from '../lib/title'
 import { ErrorNote, useAuthMethods, useMe } from './Shell'
 
 export function Settings() {
   const { slug = '' } = useParams()
+  useTitle(`${slug} settings`)
   const { data: me } = useMe()
   const role = me?.orgs.find((o) => o.slug === slug)?.role
   return (

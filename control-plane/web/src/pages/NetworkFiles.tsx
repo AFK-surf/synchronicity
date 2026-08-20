@@ -23,6 +23,7 @@ import {
   previewKind,
   prettyIfJson,
 } from '../lib/preview'
+import { useTitle } from '../lib/title'
 import { ErrorNote, useMe } from './Shell'
 
 // A scanning UI: breadcrumb, entry table, and a version drawer that opens
@@ -34,6 +35,7 @@ import { ErrorNote, useMe } from './Shell'
 // treating it that way.
 export function NetworkFiles() {
   const { slug = '', name = '' } = useParams()
+  useTitle(`${name} files`)
   const [params, setParams] = useSearchParams()
   const space = params.get('space') ?? ''
   const path = params.get('path') ?? ''

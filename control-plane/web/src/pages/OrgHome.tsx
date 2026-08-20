@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useParams } from 'react-router'
 import { get, send, type NetworkSummary } from '../lib/api'
+import { useTitle } from '../lib/title'
 import { isDnsLabel } from '../lib/zbase32'
 import { ErrorNote, useMe } from './Shell'
 
@@ -16,6 +17,7 @@ export function OrgHome({ pick = false }: { pick?: boolean }) {
 }
 
 function PickOrCreateOrg() {
+  useTitle('Organizations')
   const { data: me } = useMe()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -100,6 +102,7 @@ function PickOrCreateOrg() {
 }
 
 function Networks({ slug, canAdmin }: { slug: string; canAdmin: boolean }) {
+  useTitle(`${slug} networks`)
   const queryClient = useQueryClient()
   const [name, setName] = useState('')
   const { data: networks, error } = useQuery({

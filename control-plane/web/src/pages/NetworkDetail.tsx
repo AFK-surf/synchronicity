@@ -10,11 +10,13 @@ import {
   type DeviceRow,
   type NetworkDetail as Detail,
 } from '../lib/api'
+import { useTitle } from '../lib/title'
 import { isDeviceKey, isDeviceLabel } from '../lib/zbase32'
 import { ErrorNote, useMe } from './Shell'
 
 export function NetworkDetail() {
   const { slug = '', name = '' } = useParams()
+  useTitle(name)
   const queryClient = useQueryClient()
   const { data: me } = useMe()
   const role = me?.orgs.find((o) => o.slug === slug)?.role

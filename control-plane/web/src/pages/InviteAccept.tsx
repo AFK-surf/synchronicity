@@ -9,9 +9,11 @@ import {
   type InvitePreview,
   type Me,
 } from '../lib/api'
+import { useTitle } from '../lib/title'
 import { ErrorNote } from './Shell'
 
 export function InviteAccept() {
+  useTitle('Invitation')
   const token = new URLSearchParams(window.location.search).get('token') ?? ''
   const navigate = useNavigate()
   const [error, setError] = useState<unknown>(null)

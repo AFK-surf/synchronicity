@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { send } from '../lib/api'
+import { useTitle } from '../lib/title'
 import { useAuthMethods } from './Shell'
 
 /// The host of an origin, for a link that reads as a place rather than a
@@ -14,6 +15,7 @@ function hostOf(origin: string): string {
 }
 
 export function Login() {
+  useTitle('Sign in')
   const [email, setEmail] = useState('')
   const [orgSlug, setOrgSlug] = useState('')
   const [sent, setSent] = useState(false)
