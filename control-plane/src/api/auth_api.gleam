@@ -9,6 +9,7 @@ import auth/identity
 import auth/magic
 import auth/oauth.{type Provider}
 import auth/oidc
+import auth/principal.{type Principal}
 import auth/session
 import email/mailer.{type Mailer}
 import gleam/dynamic/decode
@@ -417,14 +418,28 @@ fn configured_methods(ctx: AuthContext) -> Response {
   })
 }
 
-pub fn me(req: Request, db: Reads) -> Response {
+/// The signed-in person, their CSRF token and their orgs — what the SPA
+/// bootstraps from.
+///
+/// Refused for an API key rather than answered: every field here is about an
+/// account, and a key does not have one. Its own reach is not a secret it
+/// needs an endpoint for — the org it may act in is the org it was minted in,
+/// and `GET /api/orgs/<slug>` says whether it still can.
+pub fn me(reads_ctx: Reads, who: Principal) -> Response {
+  case who.credential {
+    principal.Cookie(csrf) -> me_for(reads_ctx, who.user_id, csrf)
+    principal.ApiKey(..) -> middleware.api_key_refused()
+    principal.JoinKey(..) -> middleware.join_key_refused()
+  }
+}
+
+fn me_for(db: Reads, user_id: String, csrf: String) -> Response {
   reads.with_db(db, fn(conn) {
-    use live <- middleware.require_session(req, conn)
     let user =
       sqlite.query(
         conn,
         "SELECT email, coalesce(name, '') FROM users WHERE id = ?",
-        [Text(live.user_id)],
+        [Text(user_id)],
       )
     let orgs =
       sqlite.query(
@@ -432,7 +447,7 @@ pub fn me(req: Request, db: Reads) -> Response {
         "SELECT o.id, o.slug, o.name, m.role
          FROM org_members m JOIN orgs o ON o.id = m.org_id
          WHERE m.user_id = ? ORDER BY o.slug",
-        [Text(live.user_id)],
+        [Text(user_id)],
       )
     case user, orgs {
       Ok([[Text(email), Text(display)]]), Ok(org_rows) ->
@@ -440,12 +455,12 @@ pub fn me(req: Request, db: Reads) -> Response {
           #(
             "user",
             json.object([
-              #("id", json.string(live.user_id)),
+              #("id", json.string(user_id)),
               #("email", json.string(email)),
               #("name", json.string(display)),
             ]),
           ),
-          #("csrf", json.string(live.csrf)),
+          #("csrf", json.string(csrf)),
           #(
             "orgs",
             json.array(org_rows, fn(row) {

@@ -61,6 +61,17 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   a session exists. Magic links stay on the page when nothing else is
   configured, mail relay or not: an empty login screen is worse than a
   link the operator reads off the service log.
+- **API keys** are the second credential the API takes, for callers that
+  are programs. Two kinds. An **org key** belongs to an *org*, not to a
+  person: it names one org and carries its own role (`admin` or `member`,
+  never `owner`), so it can never reach another org and no change to
+  anybody's membership can widen it. A **join key** is narrower still — one
+  *network*, and the single operation of adding a device to it, which is
+  what makes it safe to bake into a provisioning image. Send either as
+  `Authorization: Bearer synch_…`; a bearer request needs no CSRF token,
+  because nothing attaches that header on its own. Accounts, membership and
+  key management stay a signed-in person's — see [API keys](#api-keys)
+  below.
 - **Cloud browse** lets the dashboard read a cluster's files. Nodes are
   unreachable from here, so the connection is one they open: a daemon
   discovers this deployment from
@@ -84,6 +95,125 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   per-network toggle is the whole of the gate, and it is off until they turn
   it on.
 
+## API keys
+
+For scripts, CI and anything else that is not a person at a browser. Org
+owners and admins manage them under **Settings → API keys**, or over the
+API itself:
+
+| Method   | Path                              | Role  |
+| -------- | --------------------------------- | ----- |
+| `GET`    | `/api/orgs/:slug/api-keys`        | admin |
+| `POST`   | `/api/orgs/:slug/api-keys`        | admin |
+| `PATCH`  | `/api/orgs/:slug/api-keys/:id`    | admin |
+| `DELETE` | `/api/orgs/:slug/api-keys/:id`    | admin |
+
+`POST` takes `{"name": "ci", "role": "member", "expires_in": 2592000}` —
+`role` defaults to `member`, and `expires_in` is seconds from now, `0` (the
+default) for no expiry. `role: "join"` mints a **join key** and additionally
+requires `network` *and* `expires_in`; role and network imply each other in
+both directions, here and in the schema's CHECK, and the expiry is required
+because nothing else bounds a join key — see below. A duration rather than a date, so nothing depends on
+the caller's clock agreeing with the service's. It answers with the token:
+
+```json
+{ "id": "…", "name": "ci", "role": "member", "network": "",
+  "prefix": "synch_A1b2C3d4", "expires_at": 1795123456, "token": "synch_…" }
+```
+
+`network` is empty for an org key and names the network for a join key;
+`expires_at` is `0` when the key never expires.
+
+**That is the only time the token exists outside the holder's hands.** The
+row keeps its SHA-256 and the `prefix` above, which is what lets the list say
+which key a leaked or forgotten token is without holding enough to be one.
+Lose it and mint another.
+
+`PATCH` takes any of `name`, `role` and `expires_in`; an absent field is left
+alone, and `expires_in: 0` clears the expiry. It will not move a key across
+the org/join boundary: a key's kind is settled when it is minted, because a
+join key promoted to admin is not an edit but a different credential with a
+secret that is already deployed. The secret is not among them:
+rotating a credential is minting a new key and deleting the old, which is two
+audited acts rather than one that silently invalidates whatever is deployed.
+`DELETE` revokes — the row goes, and with it the hash the token
+authenticates by.
+
+Then use it:
+
+```bash
+curl -H "Authorization: Bearer $SYNCH_TOKEN" \
+  https://cp.example.com/api/orgs/acme/networks
+```
+
+### The join key
+
+A join key names one network and can do exactly one thing with it:
+
+```
+POST /api/orgs/:slug/networks/:net/devices
+{"label": "nas", "nk": "<device key>", "relay": "", "addr": ""}
+```
+
+That route creates the device and puts it in the network in one transaction
+and one zone republish — one call, because a device in no network appears in
+no zone, so a caller that stopped halfway has enrolled nothing. Org keys and
+people reach it too, at the `member` floor; it is the same act.
+
+Everything else answers `403 join_key_forbidden`, including a `GET` on the
+very network it may add to, and including the two older routes (`POST
+/devices`, `PUT /networks/:net/devices/:dev`) that between them do the same
+job less tightly. That is not a maintained list: every org-scoped route
+resolves its caller through one function, and that function refuses the whole
+family before it reads a rank. Aimed at another network — a sibling in the
+same org, or the same name elsewhere — a join key gets the `404` a stranger
+gets, so a leaked one reveals nothing about what else the org runs.
+
+What it does not bound is *how many*. Anyone holding it can enrol devices
+until it expires or is revoked — which is why `expires_in` is required on a
+join key rather than merely offered. Every use is in the audit log as
+`network.join` under `key:<id>`, with the key's name and its minter beside
+it.
+
+### What an org key may do
+
+What an org key may do is what its role may do, in its own org: networks,
+devices and their keys, the browse and download surface, the audit trail.
+What no key of either kind may do:
+
+- **manage accounts** — create an org, accept an invitation, read
+  `/api/me`. These are about a person, and a key is not one.
+- **manage membership** — invitations, role changes, removals, the roster
+  read at `GET /api/orgs/:slug/members`, and the audit trail at
+  `GET /api/orgs/:slug/audit`. An admin key that could invite an admin would
+  be handing out standing human access that outlives the key; a leaked one
+  should not carry the address book; and the trail carries the address book
+  *and* an inventory of the org's other keys, so closing the roster while
+  leaving the trail open would have closed nothing.
+- **manage keys** — including reading the list. A key that could mint keys
+  could mint one that never expires, and revoking the one you knew about
+  would not have ended the access.
+
+Those three answer `403 api_key_forbidden`. **Owner-gated routes** —
+ownership transfer, org deletion, the SSO configuration — refuse every key
+too, since no key is ever an owner, but which code you get depends on which
+check runs first: transfer and deletion name keys, while the SSO
+configuration is refused by the ordinary role floor and answers `forbidden`,
+*"requires owner role"*. Branch on the 403, not on the code.
+
+A key aimed at an org that is not its own answers `404` — the same answer a
+person outside that org gets, since an org is not enumerable by whoever
+cannot see it.
+
+Every *change* a key makes is in the org's audit log under the actor
+`key:<id>`, which names the credential rather than whoever minted it — true
+still after that person's role has changed or they have left. The detail
+carries `key_name` and `key_minted_by` beside it, so a row says which key and
+whose without a second lookup, and goes on saying it after the key is revoked
+and its row is gone. Reads are not recorded, browse reads included: that is a
+deliberate choice about logging ordinary use, and it means the trail says what
+a key *did*, never what it saw.
+
 ## `GET /SKILL.md`
 
 Every role serves [`priv/skill/SKILL.md`](priv/skill/SKILL.md) at
@@ -91,6 +221,12 @@ Every role serves [`priv/skill/SKILL.md`](priv/skill/SKILL.md) at
 whoever, or whatever, has to drive a node: the daemon model, references
 and version policies, membership and delegation, key rotation, recovery,
 and the error messages each of those produces.
+
+It also documents **this service's own API**, since the node that answers
+`/SKILL.md` is the node that answers `/api`: how to hold an org-scoped API
+key, every route one can reach, the four families it never can, and what each
+refusal means. A guide that tells an agent to "add the device on the network's
+page" and stops there has handed it a step it cannot take.
 
 It is mounted beside `/healthz` rather than behind the product API, and
 so is public and role-agnostic: it needs no session, no database and no

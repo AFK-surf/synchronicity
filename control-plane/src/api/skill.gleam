@@ -3,7 +3,9 @@
 //// It rides in the shipment (`priv/skill/`) rather than in the SPA bundle,
 //// and it is mounted role-agnostically beside `/healthz` rather than behind
 //// the product API. Both choices follow from what the document is: public
-//// text about a client binary, needing no session, no database and no zone.
+//// text about a client binary — and about this service's own API, which a
+//// reader reaches at the host they just read the document from — needing no
+//// session, no database and no zone.
 //// An operator or an agent pointed at *any* node of a deployment — primary,
 //// replica, external — gets the same answer from the same URL, which is the
 //// only property that makes the URL worth publishing.

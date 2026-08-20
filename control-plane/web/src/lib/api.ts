@@ -155,6 +155,41 @@ export interface InvitePreview {
   status: 'valid' | 'expired' | 'accepted'
 }
 
+// One org-scoped API key, as the settings list sees it. Never the token:
+// that value exists once, in the reply to the request that minted it.
+//
+// `expires_at` and `last_used_at` are 0 for "never expires" and "never
+// used" — the server sends a number rather than a null so the two absent
+// cases test the same way as every other timestamp on this page.
+export interface ApiKeyRow {
+  id: string
+  name: string
+  prefix: string
+  // `admin` and `member` are org keys, reaching whatever that role reaches
+  // across the org. `join` is a join key: one network, one operation.
+  role: 'admin' | 'member' | 'join'
+  created_at: number
+  expires_at: number
+  last_used_at: number
+  // The minter's email, not their id — the question a list answers is "who
+  // made this", and it is the column to read when somebody leaves the org.
+  created_by_email: string
+  // The network a join key is scoped to; empty for an org key.
+  network: string
+}
+
+// What minting one answers with. `token` is shown once and then cannot be
+// recovered from anywhere — the server keeps only its SHA-256.
+export interface MintedApiKey {
+  id: string
+  name: string
+  role: string
+  network: string
+  prefix: string
+  expires_at: number
+  token: string
+}
+
 export interface OidcConfig {
   issuer: string
   client_id: string

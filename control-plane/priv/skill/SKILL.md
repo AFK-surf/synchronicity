@@ -1,6 +1,6 @@
 ---
 name: synch
-description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, pin, rotate keys, and recover a lost origin. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, or a node's data directory.
+description: Drive the `synch` CLI — a synchronicity node: initialize it, run its daemon, index local directories as spaces, join a control-plane-managed membership zone, delegate space-restricted access, read the unified tree, resolve divergent paths, mirror, pin, rotate keys, and recover a lost origin — and drive the control plane's own HTTP API with an org-scoped API key or a network-scoped join key, to enroll devices, manage networks and keys, and browse a cluster's files without a browser. Use whenever a task involves `synch`, `synch-s3`, a synchronicity cluster, a node's data directory, or the control-plane API.
 ---
 
 # synch
@@ -14,7 +14,8 @@ This guide assumes the cluster's membership zone is **managed by a
 synchronicity control plane**: devices are enrolled on the network's page in
 the web UI, and the control plane signs and serves the zone. No step here
 involves editing a DNS record — where the CLI prints one, it is describing
-what the control plane publishes for you.
+what the control plane publishes for you. Every such step has a second way
+round that needs no browser: see **The control-plane API** below.
 
 Two rules explain most of the surface:
 
@@ -100,9 +101,11 @@ next:       publish this record, then `synch daemon run`:
 
 The last two lines are not yours to do. Add the device on the network's page
 in the control plane — a label and the device key — and the record is
-signed and served in the same moment. Until it is, `daemon run` waits rather
-than serves: the zone does not name this key yet, so the node has no name to
-publish under.
+signed and served in the same moment; **The control-plane API** below is the
+same act as one `POST` to the network — which is the form to reach for from
+this node itself, and the only one a join key can make. Until it is done,
+`daemon run` waits rather than serves: the zone does not name this key yet, so
+the node has no name to publish under.
 
 `scan` reports what it did and what it published:
 
@@ -235,10 +238,10 @@ and publishes your own. Once every publisher has, the path leaves the tree.
 ## Membership
 
 Membership is the zone. The control plane signs and serves one per network —
-`<network>.<org>.<apex>` — and adding a device on the network's page is the
-whole enrollment: a label, a device key, and the record exists. There is
-nothing to publish by hand, and no per-node configuration of anybody else's
-membership.
+`<network>.<org>.<apex>` — and adding a device on the network's page (or over
+the API; see **The control-plane API**) is the whole enrollment: a label, a
+device key, and the record exists. There is nothing to publish by hand, and no
+per-node configuration of anybody else's membership.
 
 A node points at its zone once:
 
@@ -399,7 +402,9 @@ synch key ls
 ```
 
 What `key rotate` prints is the record a zone run by hand would need; here
-the `nk=` value is the whole payload, and the device's page takes it.
+the `nk=` value is the whole payload, and the device's page takes it — as does
+`POST …/devices/<dev>/keys`, with `POST …/keys/<old>/retire` for the last step
+(**The control-plane API**).
 
 `synch key ls` answers the question the middle step turns on — *have my peers
 picked up the new record yet?* It asks every reachable trusted peer which of
@@ -467,6 +472,270 @@ cloud attach enabled: serving the control plane's requests for (no local spaces)
 note: no membership domains are configured, so there is no zone to discover a
 control plane from; `synch domain set <domain>` first
 ```
+
+## The control-plane API
+
+The node whose `/SKILL.md` you are reading also serves an HTTP API at the same
+base URL. **Every act this guide has so far handed to a person, a program can
+take** — enrolling a device, assigning it to a network, opening and closing a
+rotation window, revoking a key. What it cannot take is the handful that would
+let it widen its own reach — **What a key can never reach**, below, is the
+whole list.
+
+### Getting a token
+
+An org owner or admin mints one under **Settings → API keys**. Both kinds look
+identical on the wire — `synch_` followed by 43 random characters, shown once,
+because the control plane keeps only its SHA-256 — and differ in what they can
+reach:
+
+* An **org key** belongs to the org, not to whoever minted it. It names one
+  org and carries its own role (`admin` or `member`, never `owner`), so it
+  reaches no other org and no change to anybody's membership widens it.
+* A **join key** names one *network* and can do exactly one thing: add a
+  device to it. It cannot read the network, list its devices, or see anything
+  else in the org — every other route answers `403 join_key_forbidden`. That
+  is what makes it the credential to put somewhere a person cannot guard: a
+  provisioning image, a cloud-init file, a kickstart template.
+
+Everything below is the org key's surface unless it says otherwise; the join
+key's is one route, and it has its own section.
+
+```sh
+cp=https://cp.acme.example.com
+token=synch_...
+
+curl -sS -H "Authorization: Bearer $token" "$cp/api/orgs/acme"
+```
+
+That header is the whole of it. There is no CSRF token to echo — that defends a
+*cookie*, which the browser attaches to cross-site requests on its own, and
+nothing attaches an `Authorization` header for you.
+
+### Enrolling this node from this node
+
+The one flow worth spelling out, because it is what turns a waiting
+`daemon run` into a serving one. The key to hand over is the z-base-32 string
+`synch init --domain` labels `device key:`; `synch id` prints the same value
+indented under `origin:`, with its state in parentheses:
+
+```sh
+nk=qmpmjtrw6w6h5ri3taracdpajdg14d5di7i1xq3ahomw485jrezo   # from init, or id
+
+curl -sS -X POST "$cp/api/orgs/acme/networks/prod/devices" \
+  -H "Authorization: Bearer $token" -H 'content-type: application/json' \
+  -d "{\"label\": \"nas\", \"nk\": \"$nk\"}"
+# -> {"ok":true,"soa_serial":42,
+#     "result":{"device_id":"0068a4c1f2…","label":"nas","network":"prod"}}
+```
+
+One call, and it has to be: a device that exists in the org but sits in no
+network appears in no zone, so a caller that created one and stopped has
+enrolled nothing and its daemon is still waiting. The answer carries
+`soa_serial` because **the commit is the publication** — the zone is rebuilt
+and re-signed inside the same transaction, so there is no cache to wait for
+and no second call to make.
+
+**This is the route a join key exists for**, and the only one it can take. A
+node being provisioned needs no more reach than this, so give it no more:
+
+```sh
+# baked into the image, or handed over at first boot
+token=synch_...            # a join key for acme/prod
+curl -sS -X POST "$cp/api/orgs/acme/networks/prod/devices" \
+  -H "Authorization: Bearer $token" -H 'content-type: application/json' \
+  -d "{\"label\": \"$(hostname)\", \"nk\": \"$nk\"}"
+```
+
+Aimed at any other network — a sibling in the same org, or the same name in
+another org — a join key gets `404`, the same answer a stranger gets, so a
+leaked one cannot be used to find out what else the org runs. Everything else
+it might try is refused, including reading the very network it may add to:
+`403 join_key_forbidden` from the JSON API, and a plain-text `404` from
+`…/browse/file`, which lives below that layer and collapses every reason it
+will not serve you into one answer.
+
+An org key or a person reaches the same route at the `member` floor, since it
+is the same act.
+
+### What a key can reach
+
+`<org>` is the org slug, `<net>` a network name, `<dev>` and `<key>` the ids the
+listings return.
+
+| Method | Path | Role | What |
+| --- | --- | --- | --- |
+| `GET` | `/api/orgs/<org>` | member | the org: its networks, its device count, your role |
+| `GET` | `/api/orgs/<org>/networks` | member | each network and how many devices it holds |
+| `POST` | `/api/orgs/<org>/networks` | admin | `{"name": "prod"}` — a DNS label |
+| `GET` | `/api/orgs/<org>/networks/<net>` | member | every device, its live keys, the zone's signature health |
+| `DELETE` | `/api/orgs/<org>/networks/<net>` | admin | `{"confirm": "<net>"}` — typed back, as the UI asks |
+| `GET` | `/api/orgs/<org>/devices` | member | every device, with its keys and its networks |
+| `POST` | `/api/orgs/<org>/devices` | member | `{"label", "nk", "relay"?, "addr"?}` — org only; in no network, so in no zone |
+| `PATCH` | `/api/orgs/<org>/devices/<dev>` | member | `{"relay", "addr"}` — **both**, always: an omitted one is cleared |
+| `DELETE` | `/api/orgs/<org>/devices/<dev>` | admin | the device and its keys leave the zone |
+| `POST` | `/api/orgs/<org>/networks/<net>/devices` | member | `{"label", "nk", "relay"?, "addr"?}` — create **and** assign, one transaction |
+| `PUT` | `/api/orgs/<org>/networks/<net>/devices/<dev>` | member | assign a device that already exists; no body |
+| `DELETE` | `/api/orgs/<org>/networks/<net>/devices/<dev>` | member | unassign |
+| `POST` | `/api/orgs/<org>/devices/<dev>/keys` | member | `{"nk": "<key>"}` — opens the rotation window |
+| `POST` | `/api/orgs/<org>/devices/<dev>/keys/<key>/retire` | member | closes it; no body |
+| `POST` | `/api/orgs/<org>/devices/<dev>/keys/<key>/revoke` | admin | out of the zone, and out of every open tunnel |
+
+The rotation of **Key rotation** above, in three calls: `POST …/keys` with the
+new key (both publish, the old one `retiring`), `synch key activate` on the
+device, then `POST …/<old>/retire`. A second `POST …/keys` while a window is
+open is refused with `rotation_open` rather than opening a second one.
+
+The browse surface is the same read-only tunnel `synch cloud status` reports
+from the node's side, and it stays gated on the org's per-network switch:
+
+| Method | Path | Role | What |
+| --- | --- | --- | --- |
+| `GET` | `…/networks/<net>/browse` | member | is browsing on, and which daemons are attached |
+| `PUT` | `…/networks/<net>/browse/enabled` | admin | `{"enabled": true}` |
+| `GET` | `…/browse/ls?space=&path=&origin=&cursor=&all=1` | member | one directory of the unified tree |
+| `GET` | `…/browse/stat?space=&path=&origin=` | member | every version of one path, with attestors |
+| `GET` | `…/browse/file?space=&path=&from=&origin=` | member | the bytes, streamed; `Range` honoured, plain-text refusals |
+| `GET` | `…/networks/<net>/delegations` | member | the delegated keys an attached daemon reports |
+
+Space and path are query parameters and never path segments — a file path may
+contain anything, separators included.
+
+Downloads are capped at four open at once **per credential**: a key gets its
+own budget rather than spending the budget of whoever minted it, and the
+fifth concurrent stream is a `429` naming the limit.
+
+### The join key's surface
+
+One row, and that is the point:
+
+| Method | Path | What |
+| --- | --- | --- |
+| `POST` | `/api/orgs/<org>/networks/<net>/devices` | the network it was minted for, and no other |
+
+Every other route that reads a credential — including `GET` on that same
+network — refuses it: `403 join_key_forbidden` from the JSON API, and a
+plain-text `404` from the streaming `…/browse/file`, which sits below that
+layer. (`POST /api/logout` is the exception that proves it: it reads only the
+session cookie, so a bearer-only request is a no-op `200`.) That is not a
+list somebody maintains: every org-scoped route resolves its caller through
+one function, and that function refuses the whole family before it reads a
+rank. A join key has no rank to read.
+
+Minting one is the ordinary create with `role: "join"` and the network named:
+
+```json
+POST /api/orgs/acme/api-keys
+{"name": "rack 3 provisioning", "role": "join",
+ "network": "prod", "expires_in": 2592000}
+```
+
+`expires_in` is **required** here, where it is optional on an org key. An org
+key lives in a secret store somebody guards, so a permanent one is a choice; a
+join key lives where nobody is guarding, and nothing bounds how many devices
+one enrols — so its lifetime is the only bound it has, and leaving the field
+out would have handed out a permanent credential by default. Omitting it is a
+`400 bad_expiry` that says so.
+
+Shown without a `curl` because **no key can mint a key**, this one included:
+that route is a signed-in person's, so it is the dashboard's Settings → API
+keys, or a session cookie and its `x-csrf` header. A key that could mint keys
+could mint one that never expires.
+
+`network` and `role: "join"` imply each other: neither is accepted without the
+other, and the schema says the same thing, so a row that is one without the
+other cannot exist. A key's *kind* is settled at minting — `PATCH` will move
+its name and its expiry but not what it is, because a join key promoted to
+admin is not an edit, it is a different credential with a secret that is
+already deployed.
+
+**What a join key does not bound is how many.** Anyone holding it can enrol
+devices until it expires or is revoked — which is why the expiry is required
+rather than offered, and why the audit trail records every `network.join`
+under `key:<id>`, with the key's name and its minter's address on the same
+row. Revoking is the same one call as any other key.
+
+### What a key can never reach
+
+Four families, and each is a way a scoped credential could reach past its
+scope. The first three answer `403 api_key_forbidden`:
+
+- **accounts** — creating an org, accepting an invitation, `/api/me`. These are
+  about a person, and a key is not one.
+- **membership** — invitations, role changes, removals, the roster read at
+  `GET /api/orgs/<org>/members`, and the audit trail at
+  `GET /api/orgs/<org>/audit`. An admin key that could invite an admin would be
+  handing out standing human access that outlives the key; a leaked one should
+  not carry the address book; and the trail carries the address book *and* an
+  inventory of the org's other keys, so closing the roster while leaving it
+  open would have closed nothing.
+- **API keys themselves**, the listing included. A key that could mint keys
+  could mint one that never expires, and revoking the one you knew about would
+  not have ended the access.
+
+**Owner-gated routes** — ownership transfer, org deletion, the SSO
+configuration — refuse every key too, because no key is ever an owner. Which
+code you get depends on which check runs first, so do not branch on it:
+ownership transfer and org deletion name keys (`api_key_forbidden` /
+`join_key_forbidden`), while the SSO configuration is refused by the ordinary
+role floor and answers `forbidden`, *"requires owner role"*. **Match on the
+403, not on the code.**
+
+### Answers, and what the refusals mean
+
+A JSON error is `{"error": {"code": "...", "message": "..."}}`, and every
+zone-shaping mutation answers `{"ok": true, "soa_serial": N, "result": {...}}`.
+
+**Two answers are not JSON**, so parse defensively: `…/browse/file` refuses in
+plain text at every status (its success is a byte stream, and its failures are
+not dressed as this API's), and a path *or method* no route matches is wisp's
+own plain-text `404 Not found`. There is no `405` under `/api` — a wrong
+method is a route that does not exist, so it is a 404 like any other.
+
+| Status | `code` | Means |
+| --- | --- | --- |
+| `400` | `bad_request` (a malformed body, or a missing `space=`), `bad_name`, `bad_role`, `bad_scope`, `bad_expiry`, `confirm`, `invalid_nk`, … | the request itself; the message names the field and why |
+| `401` | `unauthenticated` | no credential, one that is unknown, expired or revoked, or an unreadable `Authorization` header |
+| `403` | `forbidden` | your role is under the route's floor; the message names it |
+| `403` | `api_key_forbidden` | a person's endpoint, reached with a key |
+| `403` | `join_key_forbidden` | anything but the one route a join key may take |
+| `404` | `not_found` | it does not exist, or it is not in your org — one answer for both, on purpose |
+| `409` | `conflict` | the change collides with a record that exists; the message names the invariant |
+| `409` | `rotation_open` / `not_retiring` | a second rotation window while one is open; retiring a key that is not the retiring one |
+| `409` | `browse-disabled` | the org has not turned browsing on for this network |
+| `409` | `duplicate_label`, `ambiguous_nk`, `bad_glue`, … | the zone the change would produce is refused — the 400 vocabulary, caught later |
+| `409` | `read-only-replica` | this node holds a read-only copy; the `primary` field names where writes go |
+| `409` | `no_rekor_record` | the transparency gate is holding the zone key back — an operator ceremony, not your request |
+| `416` | — | plain text from `…/browse/file`: a `Range` this route will not serve (multi-range, or past the end); the `Content-Range` header names the size |
+| `500` | `internal` | this service's fault, not the request's — a storage failure, or a publish that could not complete. The detail is in its log, never in the body |
+| `502` | `internal`, or a code relayed verbatim | the attached daemon answered wrongly, or with something this build does not know |
+| `503` | `no-device-attached`, `unavailable` | no daemon is attached to answer this browse call, or the one that is went away |
+
+**Codes come in both shapes, and the shape means nothing.** Most are
+`snake_case`, but `browse-disabled`, `no-device-attached` and
+`read-only-replica` are this service's own, and `not-found`, `invalid`,
+`divergent` and `unavailable` are relayed from a daemon — all `kebab-case`. A
+client that matches `not_found` will miss a browse 404, and one that infers
+"kebab means it came from a daemon" will be wrong three times. Match the exact
+strings in this table.
+
+A `not_found` for an org you believe you can reach is worth reading twice: an
+org is not enumerable by whoever cannot see it, so a key pointed at somebody
+else's org gets exactly what a stranger gets.
+
+`read-only-replica` is the one worth handling rather than retrying: a
+deployment's apex names every node, and reads are answered by all of them while
+writes go to one. Follow the `primary` field.
+
+Every *change* a key makes lands in the org's audit trail as `key:<id>` — the
+credential, not whoever minted it, so it stays true after that person's role
+has changed or they have left. The row's `detail` also carries `key_name` and
+`key_minted_by`, so it says which key and whose without a second lookup, and
+still says it after the key has been revoked.
+
+Reads are not recorded, browse reads included: they are an org reading its own
+files through a tunnel its own daemon opened, and a row per download would be
+a log of ordinary use.
 
 ## Global flags
 
@@ -559,6 +828,8 @@ Amazon S3.
 
 - `synch <command> --help` — every flag, with the reasoning attached.
 - `synch doctor` — the state of this node, in full.
+- the control plane's own dashboard, at the host that served this document —
+  the same acts as **The control-plane API**, with a person driving.
 - `DESIGN.md` — the architecture; the `§` numbers in CLI help point into it.
   It ships in every release archive, next to the binaries.
 - `docs/REKOR-ZONE-KEY.md` — zone-key transparency, end to end. It lives in

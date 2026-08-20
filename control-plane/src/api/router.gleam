@@ -10,11 +10,21 @@
 //// primary, which is the one fact a read-only node holds that a 404 does
 //// not carry.
 ////
+//// **Three credentials reach the product API**, and the split above is the
+//// reason all of them are resolved in one place: a session cookie (a
+//// person), a bearer org key, and a bearer join key. `with_principal`
+//// resolves whichever the request carries, `api/common.check_org` decides
+//// what it permits, and no route below has to know which arrived — except
+//// the handful that are a person's alone, which say so with
+//// `middleware.require_user`, and the one join route, which asks
+//// `api/common.check_join_target` instead.
+////
 //// Naming convention in api/: endpoint modules carry the `_api` suffix
 //// (auth_api, orgs_api, networks_api, devices_api); plumbing does not
 //// (router, middleware, common, static — static serves files, not an API;
 //// skill serves one file, likewise).
 
+import api/api_keys_api
 import api/auth_api.{type AuthContext}
 import api/browse_api.{type Browse}
 import api/devices_api
@@ -24,7 +34,7 @@ import api/orgs_api
 import api/reads.{type Reads}
 import api/skill
 import api/static
-import auth/session.{type Session}
+import auth/principal.{type Principal}
 import dns/doh
 import dns/serve.{type Serving}
 import gleam/http.{Delete, Get, Patch, Post, Put}
@@ -215,7 +225,11 @@ fn auth_path(req: Request) -> String {
 /// or to a refusal.
 fn read_routes(req: Request, reads: Reads, browse: Browse) -> Option(Response) {
   case wisp.path_segments(req), req.method {
-    ["api", "me"], Get -> Some(auth_api.me(req, reads))
+    ["api", "me"], Get ->
+      Some({
+        use who <- with_principal(req, reads)
+        auth_api.me(reads, who)
+      })
     // Anonymous by the same reasoning as /api/auth/methods: the invite page
     // asks it before a session exists, and the token in the query string is
     // the credential the invitation email already carried.
@@ -224,34 +238,41 @@ fn read_routes(req: Request, reads: Reads, browse: Browse) -> Option(Response) {
 
     ["api", "orgs", slug], Get ->
       Some({
-        use live <- with_session(req, reads)
-        orgs_api.get_org(reads, live, slug)
+        use who <- with_principal(req, reads)
+        orgs_api.get_org(reads, who, slug)
       })
     ["api", "orgs", slug, "members"], Get ->
       Some({
-        use live <- with_session(req, reads)
-        orgs_api.list_members(reads, live, slug)
+        use who <- with_principal(req, reads)
+        orgs_api.list_members(reads, who, slug)
       })
     ["api", "orgs", slug, "audit"], Get ->
       Some({
-        use live <- with_session(req, reads)
-        orgs_api.audit_log(req, reads, live, slug)
+        use who <- with_principal(req, reads)
+        orgs_api.audit_log(req, reads, who, slug)
       })
     ["api", "orgs", slug, "oidc"], Get ->
       Some({
-        use live <- with_session(req, reads)
-        orgs_api.get_oidc(reads, live, slug)
+        use who <- with_principal(req, reads)
+        orgs_api.get_oidc(reads, who, slug)
+      })
+    // The listing is a read like any other, so a replica answers it. The
+    // three mutations are not, and land in the write table below.
+    ["api", "orgs", slug, "api-keys"], Get ->
+      Some({
+        use who <- with_principal(req, reads)
+        api_keys_api.list_keys(reads, who, slug)
       })
 
     ["api", "orgs", slug, "networks"], Get ->
       Some({
-        use live <- with_session(req, reads)
-        networks_api.list_networks(reads, live, slug)
+        use who <- with_principal(req, reads)
+        networks_api.list_networks(reads, who, slug)
       })
     ["api", "orgs", slug, "networks", net], Get ->
       Some({
-        use live <- with_session(req, reads)
-        networks_api.network_detail(reads, live, slug, net)
+        use who <- with_principal(req, reads)
+        networks_api.network_detail(reads, who, slug, net)
       })
 
     // The browse surface is a read surface end to end: the tunnel encodes no
@@ -260,29 +281,29 @@ fn read_routes(req: Request, reads: Reads, browse: Browse) -> Option(Response) {
     // replica with daemons attached answers all of it.
     ["api", "orgs", slug, "networks", net, "browse"], Get ->
       Some({
-        use live <- with_session(req, reads)
-        browse_api.status(reads, browse, live, slug, net)
+        use who <- with_principal(req, reads)
+        browse_api.status(reads, browse, who, slug, net)
       })
     ["api", "orgs", slug, "networks", net, "delegations"], Get ->
       Some({
-        use live <- with_session(req, reads)
-        browse_api.delegations(reads, browse, live, slug, net)
+        use who <- with_principal(req, reads)
+        browse_api.delegations(reads, browse, who, slug, net)
       })
     ["api", "orgs", slug, "networks", net, "browse", "ls"], Get ->
       Some({
-        use live <- with_session(req, reads)
-        browse_api.ls(req, reads, browse, live, slug, net)
+        use who <- with_principal(req, reads)
+        browse_api.ls(req, reads, browse, who, slug, net)
       })
     ["api", "orgs", slug, "networks", net, "browse", "stat"], Get ->
       Some({
-        use live <- with_session(req, reads)
-        browse_api.stat(req, reads, browse, live, slug, net)
+        use who <- with_principal(req, reads)
+        browse_api.stat(req, reads, browse, who, slug, net)
       })
 
     ["api", "orgs", slug, "devices"], Get ->
       Some({
-        use live <- with_session(req, reads)
-        devices_api.list_devices(reads, live, slug)
+        use who <- with_principal(req, reads)
+        devices_api.list_devices(reads, who, slug)
       })
 
     _, _ -> None
@@ -304,95 +325,116 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
     ["auth", "magic", "redeem"], Get -> auth_api.magic_redeem(req, auth)
     ["api", "logout"], Post -> auth_api.logout(req, auth)
     ["api", "orgs"], Post -> {
-      use live <- with_session(req, auth.reads)
-      orgs_api.create_org(req, auth, live)
+      use who <- with_principal(req, auth.reads)
+      orgs_api.create_org(req, auth, who)
     }
     ["api", "orgs", slug], Delete -> {
-      use live <- with_session(req, auth.reads)
-      orgs_api.delete_org(req, auth, live, slug)
+      use who <- with_principal(req, auth.reads)
+      orgs_api.delete_org(req, auth, who, slug)
     }
     ["api", "orgs", slug, "members", user], Patch -> {
-      use live <- with_session(req, auth.reads)
-      orgs_api.change_role(req, auth, live, slug, user)
+      use who <- with_principal(req, auth.reads)
+      orgs_api.change_role(req, auth, who, slug, user)
     }
     ["api", "orgs", slug, "members", user], Delete -> {
-      use live <- with_session(req, auth.reads)
-      orgs_api.remove_member(auth, live, slug, user)
+      use who <- with_principal(req, auth.reads)
+      orgs_api.remove_member(auth, who, slug, user)
     }
     ["api", "orgs", slug, "transfer"], Post -> {
-      use live <- with_session(req, auth.reads)
-      orgs_api.transfer_ownership(req, auth, live, slug)
+      use who <- with_principal(req, auth.reads)
+      orgs_api.transfer_ownership(req, auth, who, slug)
     }
     ["api", "orgs", slug, "invites"], Post -> {
-      use live <- with_session(req, auth.reads)
-      orgs_api.create_invite(req, auth, live, slug)
+      use who <- with_principal(req, auth.reads)
+      orgs_api.create_invite(req, auth, who, slug)
     }
     ["api", "invites", "accept"], Post -> {
-      use live <- with_session(req, auth.reads)
-      orgs_api.accept_invite(req, auth, live)
+      use who <- with_principal(req, auth.reads)
+      orgs_api.accept_invite(req, auth, who)
     }
     ["api", "orgs", slug, "oidc"], Put -> {
-      use live <- with_session(req, auth.reads)
-      orgs_api.put_oidc(req, auth, live, slug)
+      use who <- with_principal(req, auth.reads)
+      orgs_api.put_oidc(req, auth, who, slug)
     }
     ["api", "orgs", slug, "oidc"], Delete -> {
-      use live <- with_session(req, auth.reads)
-      orgs_api.delete_oidc(auth, live, slug)
+      use who <- with_principal(req, auth.reads)
+      orgs_api.delete_oidc(auth, who, slug)
+    }
+
+    ["api", "orgs", slug, "api-keys"], Post -> {
+      use who <- with_principal(req, auth.reads)
+      api_keys_api.create_key(req, auth, who, slug)
+    }
+    ["api", "orgs", slug, "api-keys", key], Patch -> {
+      use who <- with_principal(req, auth.reads)
+      api_keys_api.update_key(req, auth, who, slug, key)
+    }
+    ["api", "orgs", slug, "api-keys", key], Delete -> {
+      use who <- with_principal(req, auth.reads)
+      api_keys_api.delete_key(auth, who, slug, key)
     }
 
     ["api", "orgs", slug, "networks"], Post -> {
-      use live <- with_session(req, auth.reads)
-      networks_api.create_network(req, auth, live, slug)
+      use who <- with_principal(req, auth.reads)
+      networks_api.create_network(req, auth, who, slug)
     }
     ["api", "orgs", slug, "networks", net], Delete -> {
-      use live <- with_session(req, auth.reads)
-      networks_api.delete_network(req, auth, live, slug, net)
+      use who <- with_principal(req, auth.reads)
+      networks_api.delete_network(req, auth, who, slug, net)
+    }
+    // A node joins a network: one call, and the only one a join key can
+    // make. Everyone else reaches it too, at the Member floor the two
+    // older routes below carry.
+    ["api", "orgs", slug, "networks", net, "devices"], Post -> {
+      use who <- with_principal(req, auth.reads)
+      networks_api.join_device(req, auth, who, slug, net)
     }
     ["api", "orgs", slug, "networks", net, "devices", dev], Put -> {
-      use live <- with_session(req, auth.reads)
-      networks_api.assign_device(auth, live, slug, net, dev)
+      use who <- with_principal(req, auth.reads)
+      networks_api.assign_device(auth, who, slug, net, dev)
     }
     ["api", "orgs", slug, "networks", net, "devices", dev], Delete -> {
-      use live <- with_session(req, auth.reads)
-      networks_api.unassign_device(auth, live, slug, net, dev)
+      use who <- with_principal(req, auth.reads)
+      networks_api.unassign_device(auth, who, slug, net, dev)
     }
 
     ["api", "orgs", slug, "networks", net, "browse", "enabled"], Put -> {
-      use live <- with_session(req, auth.reads)
-      browse_api.set_enabled(req, auth, browse, live, slug, net)
+      use who <- with_principal(req, auth.reads)
+      browse_api.set_enabled(req, auth, browse, who, slug, net)
     }
 
     ["api", "orgs", slug, "devices"], Post -> {
-      use live <- with_session(req, auth.reads)
-      devices_api.create_device(req, auth, live, slug)
+      use who <- with_principal(req, auth.reads)
+      devices_api.create_device(req, auth, who, slug)
     }
     ["api", "orgs", slug, "devices", dev], Patch -> {
-      use live <- with_session(req, auth.reads)
-      devices_api.patch_device(req, auth, live, slug, dev)
+      use who <- with_principal(req, auth.reads)
+      devices_api.patch_device(req, auth, who, slug, dev)
     }
     ["api", "orgs", slug, "devices", dev], Delete -> {
-      use live <- with_session(req, auth.reads)
-      devices_api.delete_device(auth, live, slug, dev)
+      use who <- with_principal(req, auth.reads)
+      devices_api.delete_device(auth, who, slug, dev)
     }
     ["api", "orgs", slug, "devices", dev, "keys"], Post -> {
-      use live <- with_session(req, auth.reads)
-      devices_api.add_key(req, auth, live, slug, dev)
+      use who <- with_principal(req, auth.reads)
+      devices_api.add_key(req, auth, who, slug, dev)
     }
     ["api", "orgs", slug, "devices", dev, "keys", key, "retire"], Post -> {
-      use live <- with_session(req, auth.reads)
-      devices_api.retire_key(auth, live, slug, dev, key)
+      use who <- with_principal(req, auth.reads)
+      devices_api.retire_key(auth, who, slug, dev, key)
     }
     ["api", "orgs", slug, "devices", dev, "keys", key, "revoke"], Post -> {
-      use live <- with_session(req, auth.reads)
-      devices_api.revoke_key(auth, browse, live, slug, dev, key)
+      use who <- with_principal(req, auth.reads)
+      devices_api.revoke_key(auth, browse, who, slug, dev, key)
     }
 
     _, _ -> wisp.not_found()
   }
 }
 
-/// Resolves the session on a connection borrowed only for that lookup, and
-/// gives it back before the handler runs — the handler checks out its own.
+/// Resolves the request's credential — session cookie or API key — on a
+/// connection borrowed only for that lookup, and gives it back before the
+/// handler runs; the handler checks out its own.
 ///
 /// The connection must not still be held here: every handler below opens one
 /// of its own, so holding this one across `next` would put two of a pool of
@@ -402,16 +444,16 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
 /// a deadlock broken only by `pool.acquire`'s 10s call timeout killing all
 /// four callers. The bound is the pool size, so no pool is large enough to
 /// avoid it.
-fn with_session(
+fn with_principal(
   req: Request,
   reads: Reads,
-  next: fn(Session) -> Response,
+  next: fn(Principal) -> Response,
 ) -> Response {
   // pool.with_connection rather than auth_api.with_db: the latter is
-  // Response-typed, and this needs the session out of the closure so the
+  // Response-typed, and this needs the principal out of the closure so the
   // connection can be released before `next` runs.
-  case pool.with_connection(reads.pool, middleware.check_session(req, _)) {
-    Ok(Ok(live)) -> next(live)
+  case pool.with_connection(reads.pool, middleware.check_principal(req, _)) {
+    Ok(Ok(who)) -> next(who)
     Ok(Error(refusal)) -> refusal
     Error(_) -> middleware.error_json(500, "internal", "database unavailable")
   }

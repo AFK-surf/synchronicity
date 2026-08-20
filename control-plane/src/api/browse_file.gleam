@@ -14,6 +14,9 @@
 
 import api/agent.{type Session}
 import api/browse_api.{type Browse}
+import api/middleware
+import auth/api_key
+import auth/principal.{type Principal, Cookie, Principal}
 import auth/session
 import gleam/bit_array
 import gleam/bytes_tree
@@ -41,7 +44,7 @@ const watchdog_ms = 60_000
 /// to give back and who to give it back for, plus the path the filename in
 /// `Content-Disposition` comes from.
 type Download {
-  Download(registry: Subject(agent.Msg), user_id: String, path: String)
+  Download(registry: Subject(agent.Msg), holder: String, path: String)
 }
 
 /// `GET /api/orgs/:slug/networks/:net/browse/file?space=&path=&from=&origin=`
@@ -60,13 +63,12 @@ pub fn handle(
   let from = param(params, "from")
   let origin = param(params, "origin")
 
-  use user_id <- require_user(req, db, secret)
-  use #(_org_id, network_id, enabled) <- require_network(
-    db,
-    user_id,
-    slug,
-    network,
-  )
+  use who <- require_principal(req, db, secret)
+  // The concurrency slot is claimed against the credential, not the person
+  // behind it: a key gets its own budget rather than spending the budget of
+  // whoever minted it.
+  let holder = principal.actor(who)
+  use #(_org_id, network_id, enabled) <- require_network(db, who, slug, network)
   use Nil <- require(enabled, 409, "file browsing is not enabled")
   use Nil <- require(
     space != "" && path != "",
@@ -75,7 +77,7 @@ pub fn handle(
   )
 
   let registry = browse_api.registry(browse)
-  let download = Download(registry, user_id, path)
+  let download = Download(registry, holder, path)
   let sessions = agent.sessions_for(registry, network_id)
   case browse_api.pick(space, sessions, origin) {
     Error(message) -> deny(503, message)
@@ -83,7 +85,7 @@ pub fn handle(
       // A read is a same-origin GET with cookies and needs no CSRF token, so a
       // hostile page can start one from an `img` tag. The cap is what stops it
       // starting a hundred.
-      case agent.claim_stream(registry, user_id) {
+      case agent.claim_stream(registry, holder) {
         False ->
           deny(
             429,
@@ -98,7 +100,7 @@ pub fn handle(
           // the bytes mid-download.
           case agent.ask(first, agent.Resolve(space, path, from)) {
             Error(refusal) -> {
-              agent.release_stream(registry, user_id)
+              agent.release_stream(registry, holder)
               deny(status_of(refusal.code), refusal.message)
             }
             Ok(agent.Resolved(_origin, root, size, _seq, holders)) -> {
@@ -120,7 +122,7 @@ pub fn handle(
               }
               case wanted_range(req, size) {
                 Error(Nil) -> {
-                  agent.release_stream(registry, user_id)
+                  agent.release_stream(registry, holder)
                   deny_range(size)
                 }
                 Ok(#(start, length, partial)) ->
@@ -137,7 +139,7 @@ pub fn handle(
               }
             }
             Ok(_) -> {
-              agent.release_stream(registry, user_id)
+              agent.release_stream(registry, holder)
               deny(502, "the daemon answered the wrong question")
             }
           }
@@ -246,22 +248,55 @@ fn stream(
 
 /// Gives the download's concurrency slot back, however the stream ended.
 fn record(download: Download) -> Nil {
-  agent.release_stream(download.registry, download.user_id)
+  agent.release_stream(download.registry, download.holder)
 }
 
 // -- request plumbing --------------------------------------------------------
 
-/// Resolves the session cookie without wisp, which cannot reach here.
+/// Resolves whichever credential the request carries, without wisp, which
+/// cannot reach here.
+///
+/// The same two credentials the wisp routes take and the same order:
+/// an `Authorization` header wins outright and never falls back, for the
+/// reason `middleware.check_principal` spells out. That function cannot be
+/// reused verbatim — it speaks wisp's Request and produces wisp's Response,
+/// and this route is below both — so what is shared is everything that
+/// decides the answer: the header parser and the two credential modules.
+fn require_principal(
+  req: HttpRequest(mist.Connection),
+  db: Pool,
+  secret: String,
+  next: fn(Principal) -> HttpResponse(mist.ResponseData),
+) -> HttpResponse(mist.ResponseData) {
+  case middleware.presented(req.headers) {
+    middleware.Bearer(token) ->
+      case
+        pool.with_connection(db, fn(conn) {
+          api_key.authenticate(conn, token, now_unix())
+        })
+      {
+        Ok(Ok(who)) -> next(who)
+        Ok(Error(Nil)) -> refused(401, middleware.bad_key_message)
+        Error(_) -> refused(500, "database unavailable")
+      }
+    // Terminal, exactly as above the wisp line: a header naming a credential
+    // this service cannot read is refused, not downgraded to the cookie.
+    middleware.Foreign -> refused(401, middleware.foreign_credential_message)
+    middleware.Absent -> require_session(req, db, secret, next)
+  }
+}
+
+/// The cookie half, which is what a browser download arrives with.
 ///
 /// The same signed value wisp writes and the same secret it signs with, so a
 /// cookie minted by the ordinary sign-in works unchanged; the database is then
 /// what says whether the session is live, exactly as `middleware.check_session`
 /// does. No CSRF: this is a GET, and a read needs none.
-fn require_user(
+fn require_session(
   req: HttpRequest(mist.Connection),
   db: Pool,
   secret: String,
-  next: fn(String) -> HttpResponse(mist.ResponseData),
+  next: fn(Principal) -> HttpResponse(mist.ResponseData),
 ) -> HttpResponse(mist.ResponseData) {
   let token =
     request.get_cookies(req)
@@ -278,7 +313,7 @@ fn require_user(
           session.get(conn, token, now_unix())
         })
       {
-        Ok(Ok(live)) -> next(live.user_id)
+        Ok(Ok(live)) -> next(Principal(live.user_id, Cookie(live.csrf)))
         Ok(Error(Nil)) -> refused(401, "session expired")
         Error(_) -> refused(500, "database unavailable")
       }
@@ -287,12 +322,12 @@ fn require_user(
 
 fn require_network(
   db: Pool,
-  user_id: String,
+  who: Principal,
   slug: String,
   network: String,
   next: fn(#(String, String, Bool)) -> HttpResponse(mist.ResponseData),
 ) -> HttpResponse(mist.ResponseData) {
-  case browse_api.for_download(db, user_id, slug, network) {
+  case browse_api.for_download(db, who, slug, network) {
     Ok(facts) -> next(facts)
     Error(Nil) -> refused(404, "no such network")
   }
